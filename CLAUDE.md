@@ -34,6 +34,8 @@ Deferred ideas live in [docs/BACKLOG.md](docs/BACKLOG.md).
   warnings, rustfmt clean.
 - **Every state transition that matters emits a trace event.** If it can't be seen in
   the moirae studio, it didn't happen.
+- **Every published crate carries copies of `LICENSE-MIT` and `LICENSE-APACHE`** in
+  its own directory (copies, not symlinks) so `cargo package` bundles them.
 - **Prefer boring, well-documented Rust.** This is a project meant to be read.
 - **When stuck on a distributed-systems question,** cite the paper (Raft, Percolator,
   Calvin, Spanner, FoundationDB testing talk) in the DECISIONS.md entry.

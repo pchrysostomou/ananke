@@ -39,9 +39,26 @@ pub trait Environment: Send + Sync + 'static {
 }
 ```
 
+Sub-traits (all futures are `Send` so generic code can spawn them):
+
+```rust
+pub trait Clock: Send + Sync + 'static {
+    fn now(&self) -> Instant;       // ananke-env type, monotonic (D-013)
+    fn wall(&self) -> WallTime;     // ananke-env type, Unix-epoch based (D-013)
+    fn sleep_until(&self, deadline: Instant) -> impl Future<Output = ()> + Send;
+}
+pub trait FileSystem: Send + Sync + 'static { type File: File; /* open, rename, read_dir, sync_dir, ... */ }
+pub trait Network: Send + Sync + 'static { /* see D-015 */ }
+pub trait Rng: Send + Sync + 'static { fn fill_bytes(&self, dest: &mut [u8]); /* next_u64, below, ... */ }
+```
+
+`ananke-env` also exports `DetHashMap` / `DetHashSet`, hash maps whose hasher is seeded
+from `Environment::rng()` at construction (D-014). `std::collections::HashMap` and
+`HashSet` are banned outside `ananke-env`.
+
 Two implementations:
 
-- `RealEnv` — tokio, `std::fs` (with fsync semantics honoured), `ring`/`rand` RNG,
+- `RealEnv` — tokio, `std::fs` (with fsync semantics honoured), OS entropy RNG,
   system clock.
 - `SimEnv` — single-threaded deterministic executor. Virtual clock advanced by the
   scheduler. In-memory filesystem with **fault model** (see 1.3). In-memory network with
@@ -50,7 +67,10 @@ Two implementations:
 
 ### 1.2 Clock semantics
 
-- `Clock::now() -> Instant` (monotonic) and `Clock::wall() -> SystemTime`.
+- `Clock::now() -> Instant` (monotonic) and `Clock::wall() -> WallTime`. Both are
+  `ananke-env` types (D-013): plain nanosecond counters with `Duration` arithmetic,
+  converted to and from `std::time` only inside `ananke-env`. `std::time::Instant` and
+  `std::time::SystemTime` are banned outside `ananke-env`.
 - Under simulation, each node has its own clock with configurable **skew** and **drift**.
   Nothing in ananke may assume clocks are synchronised across nodes.
 - Timers are futures resolved by the scheduler. No `tokio::time::sleep` anywhere.

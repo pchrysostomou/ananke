@@ -189,4 +189,60 @@ node acting maliciously inside the cluster. Documented, not hidden.
 
 ---
 
-_Next entry: D-013. Add one before implementing anything not covered above._
+## D-013 — Clock types are ananke-owned, not `std::time`
+
+**Context.** SPEC §1.2 had `Clock::now() -> Instant` and `Clock::wall() -> SystemTime`.
+`std::time::Instant` has no public constructor, so a simulated clock cannot produce one
+except by adding a virtual offset to a real anchor, and `Instant::elapsed` /
+`SystemTime::elapsed` read the real clock behind the abstraction. `SystemTime` has the
+same problems.
+
+**Decision.** `ananke-env` defines `Instant` (monotonic nanoseconds since an arbitrary
+per-node epoch) and `WallTime` (nanoseconds since the Unix epoch). Both are plain `Copy`
+integers with `Duration` arithmetic; `std::time::Duration` stays the duration type.
+Under `RealEnv`, `Instant` is measured from a process-start anchor and `WallTime` from
+`SystemTime::now()`. Under `SimEnv`, both come from the virtual clock with per-node skew
+and drift. Conversions to and from `std::time` exist only inside `ananke-env`, for the
+process edges (certificate validity in Phase 6, log timestamps). `std::time::Instant`
+and `std::time::SystemTime` are banned as types outside `ananke-env` via clippy
+`disallowed-types`.
+
+**Alternatives.** Reuse `std::time::Instant` and fake it under simulation (anchor plus
+virtual offset): `elapsed()` silently bypasses the simulator and any comparison against
+a real `Instant::now()` goes undetected. `tokio::time::Instant`: same, plus a tokio
+dependency in every crate.
+
+**Consequences.** One conversion at each process edge. The `elapsed()` hole is closed by
+construction rather than by lint. Trace timestamps are integers, which serialise
+trivially to moirae's format.
+
+---
+
+## D-014 — Hash maps are seeded from `Environment::rng()`
+
+**Context.** `std::collections::HashMap` and `HashSet` seed their hasher from OS entropy
+per map, so iteration order differs between runs. Any trace event emitted while
+iterating one breaks byte-identical replay (SPEC §1.5). The default states of
+`hashbrown`, `ahash` and `foldhash` have the same property.
+
+**Decision.** Those types are banned outside `ananke-env` via clippy `disallowed-types`.
+`BTreeMap` / `BTreeSet` are the default. Where hashing performance matters, `ananke-env`
+exports `DetHashMap` / `DetHashSet`: the `std` maps with a SipHash-1-3 state (the same
+algorithm `std` uses) whose two keys are drawn from `Environment::rng()` at map
+construction. The seed is never a compile-time constant. Under `SimEnv` the rng is
+seeded, so iteration order is a function of the run seed; under `RealEnv` it is OS
+entropy, so HashDoS resistance is identical to `std`'s default and nothing is deferred
+to Phase 6.
+
+**Alternatives.** Rely on review (people forget). Ban only `RandomState` (misses
+`HashMap::new()` and `collect()`, which pick it implicitly). A fixed compile-time seed
+(deterministic, but every deployment shares one key: a HashDoS vector).
+
+**Consequences.** Constructing a hash map needs an `&impl Rng` in hand, which nudges code
+towards `BTreeMap` unless it has a reason. Iteration order still varies *across* seeds,
+which is the point: a bug that depends on map order shows up as a seed-dependent failure
+instead of a heisenbug.
+
+---
+
+_Next entry: D-015. Add one before implementing anything not covered above._
