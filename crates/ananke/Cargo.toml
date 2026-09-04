@@ -1,0 +1,16 @@
+[package]
+name = "ananke"
+description = "A distributed SQL database in Rust, built from the ground up to be deterministically testable. Placeholder release reserving the name."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords = ["database", "distributed", "sql", "deterministic", "simulation"]
+categories = ["database-implementations"]
+
+[dependencies]
+
+[lints]
+workspace = true
