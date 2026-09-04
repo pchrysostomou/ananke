@@ -1,0 +1,20 @@
+[package]
+name = "ananke-sim"
+description = "Simulation scenarios for ananke, run under the deterministic simulated environment"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# Scenarios live directly in this directory (`sim/echo.rs`, ...) rather than under
+# `src/`, matching the layout in docs/BOOTSTRAP_PROMPT.md.
+[lib]
+path = "lib.rs"
+
+[dependencies]
+
+[lints]
+workspace = true

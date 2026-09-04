@@ -1,0 +1,22 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "sim"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.98"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/pchrysostomou/ananke"
+authors = ["Prodromos Chrysostomou"]
+
+[workspace.dependencies]
+# Shared dependency versions. Add an entry here and reference it from a crate with
+# `name.workspace = true`.
+
+[workspace.lints.rust]
+# Principle 3 (BOOTSTRAP_PROMPT.md): no unsafe outside storage. `deny` rather than
+# `forbid` so that `ananke-storage` alone can opt out with `#![allow(unsafe_code)]`.
+unsafe_code = "deny"
+# "Prefer boring, well-documented Rust." Promoted to an error by `-D warnings` in CI.
+missing_docs = "warn"
