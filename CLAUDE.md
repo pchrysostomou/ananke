@@ -47,7 +47,7 @@ crates/ananke/         Placeholder crate reserving the name on crates.io
 crates/ananke-env/     Environment trait + RealEnv + SimEnv
 crates/ananke-server/  Node binary (placeholder until the echo server is wired)
 sim/                   Simulation scenarios; scenario files sit directly in sim/
-docs/                  SPEC, DECISIONS, BACKLOG, BOOTSTRAP_PROMPT (local only, gitignored)
+docs/                  SPEC, DECISIONS, BACKLOG, BOOTSTRAP_PROMPT, devlog/
 scripts/               check-direct-io.sh
 clippy.toml            Banned I/O paths (disallowed-methods / disallowed-types)
 .github/workflows/     CI: rustfmt, clippy + direct-io check, cargo doc, cargo test
