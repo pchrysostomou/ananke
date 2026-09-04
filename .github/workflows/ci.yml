@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Warnings are errors everywhere in CI: rustc, clippy and rustdoc.
+  RUSTFLAGS: -D warnings
+  RUSTDOCFLAGS: -D warnings
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # No argument: rustup installs the toolchain and components pinned in
+      # rust-toolchain.toml, so CI and local runs use the same compiler.
+      - run: rustup toolchain install
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: clippy + direct I/O check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      # disallowed-methods / disallowed-types are configured in clippy.toml.
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: scripts/check-direct-io.sh
+
+  doc:
+    name: cargo doc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo doc --workspace --no-deps --all-features
+
+  test:
+    name: cargo test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --all-features --all-targets
+      - run: cargo test --workspace --all-features --doc

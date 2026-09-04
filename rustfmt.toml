@@ -1,0 +1,2 @@
+# Keep formatting identical between `cargo fmt` and editor-invoked rustfmt.
+style_edition = "2024"

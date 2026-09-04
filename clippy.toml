@@ -1,0 +1,174 @@
+# Determinism first (BOOTSTRAP_PROMPT.md principle 1, DECISIONS.md D-003).
+#
+# Every path listed here is a source of non-determinism: the real clock, real disks,
+# real sockets, unseeded randomness, or spawning outside the scheduler's control.
+# None of them may be used anywhere in the workspace except inside the real
+# implementation module of `crates/ananke-env`, which opts out with
+# `#[allow(clippy::disallowed_methods, clippy::disallowed_types)]`.
+#
+# The two lints are set to `deny` in `[workspace.lints.clippy]` (Cargo.toml), so a
+# violation fails a plain `cargo clippy` as well as CI. `scripts/check-direct-io.sh`
+# is the textual belt-and-braces check that runs alongside it.
+#
+# Paths outside `std` carry `allow-invalid = true` because clippy cannot resolve them
+# in crates that do not depend on the crate in question; the ban still applies
+# wherever the path does resolve.
+
+disallowed-methods = [
+    # std::time — the real clock (SPEC.md §1.2)
+    { path = "std::time::Instant::now", reason = "real clock; use `Clock::now` from ananke-env" },
+    { path = "std::time::Instant::elapsed", reason = "reads the real clock; subtract two `Clock::now` values instead" },
+    { path = "std::time::SystemTime::now", reason = "real clock; use `Clock::wall` from ananke-env" },
+    { path = "std::time::SystemTime::elapsed", reason = "reads the real clock; use `Clock::wall` from ananke-env" },
+
+    # std::fs — the real disk (SPEC.md §1.1, §1.3)
+    { path = "std::fs::read", reason = "direct filesystem access; use `FileSystem` from ananke-env" },
+    { path = "std::fs::read_to_string", reason = "direct filesystem access; use `FileSystem` from ananke-env" },
+    { path = "std::fs::write", reason = "direct filesystem access; use `FileSystem` from ananke-env" },
+    { path = "std::fs::copy", reason = "direct filesystem access; use `FileSystem` from ananke-env" },
+    { path = "std::fs::rename", reason = "direct filesystem access; use `FileSystem` from ananke-env" },
+    { path = "std::fs::hard_link", reason = "direct filesystem access; use `FileSystem` from ananke-env" },
+    { path = "std::fs::remove_file", reason = "direct filesystem access; use `FileSystem` from ananke-env" },
+    { path = "std::fs::remove_dir", reason = "direct filesystem access; use `FileSystem` from ananke-env" },
+    { path = "std::fs::remove_dir_all", reason = "direct filesystem access; use `FileSystem` from ananke-env" },
+    { path = "std::fs::create_dir", reason = "direct filesystem access; use `FileSystem` from ananke-env" },
+    { path = "std::fs::create_dir_all", reason = "direct filesystem access; use `FileSystem` from ananke-env" },
+    { path = "std::fs::read_dir", reason = "direct filesystem access; use `FileSystem` from ananke-env" },
+    { path = "std::fs::read_link", reason = "direct filesystem access; use `FileSystem` from ananke-env" },
+    { path = "std::fs::metadata", reason = "direct filesystem access; use `FileSystem` from ananke-env" },
+    { path = "std::fs::symlink_metadata", reason = "direct filesystem access; use `FileSystem` from ananke-env" },
+    { path = "std::fs::canonicalize", reason = "direct filesystem access; use `FileSystem` from ananke-env" },
+    { path = "std::fs::set_permissions", reason = "direct filesystem access; use `FileSystem` from ananke-env" },
+    { path = "std::fs::exists", reason = "direct filesystem access; use `FileSystem` from ananke-env" },
+    { path = "std::fs::File::open", reason = "direct filesystem access; use `FileSystem` from ananke-env" },
+    { path = "std::fs::File::create", reason = "direct filesystem access; use `FileSystem` from ananke-env" },
+    { path = "std::fs::File::create_new", reason = "direct filesystem access; use `FileSystem` from ananke-env" },
+    { path = "std::fs::File::options", reason = "direct filesystem access; use `FileSystem` from ananke-env" },
+    { path = "std::fs::OpenOptions::new", reason = "direct filesystem access; use `FileSystem` from ananke-env" },
+    { path = "std::fs::DirBuilder::new", reason = "direct filesystem access; use `FileSystem` from ananke-env" },
+
+    # std::net — real sockets (SPEC.md §1.1, §1.4)
+    { path = "std::net::TcpListener::bind", reason = "direct network access; use `Network` from ananke-env" },
+    { path = "std::net::TcpStream::connect", reason = "direct network access; use `Network` from ananke-env" },
+    { path = "std::net::TcpStream::connect_timeout", reason = "direct network access; use `Network` from ananke-env" },
+    { path = "std::net::UdpSocket::bind", reason = "direct network access; use `Network` from ananke-env" },
+    { path = "std::net::ToSocketAddrs::to_socket_addrs", reason = "DNS resolution is non-deterministic; use `Network` from ananke-env" },
+
+    # std::thread — threads and real timers outside the scheduler (SPEC.md §1.1)
+    { path = "std::thread::spawn", reason = "spawning outside the scheduler; use `Environment::spawn`" },
+    { path = "std::thread::scope", reason = "spawning outside the scheduler; use `Environment::spawn`" },
+    { path = "std::thread::Builder::new", reason = "spawning outside the scheduler; use `Environment::spawn`" },
+    { path = "std::thread::sleep", reason = "real timer; use `Clock` timers from ananke-env" },
+
+    # tokio::time — real timers (SPEC.md §1.2)
+    { path = "tokio::time::sleep", reason = "real timer; use `Clock` timers from ananke-env", allow-invalid = true },
+    { path = "tokio::time::sleep_until", reason = "real timer; use `Clock` timers from ananke-env", allow-invalid = true },
+    { path = "tokio::time::timeout", reason = "real timer; use `Clock` timers from ananke-env", allow-invalid = true },
+    { path = "tokio::time::timeout_at", reason = "real timer; use `Clock` timers from ananke-env", allow-invalid = true },
+    { path = "tokio::time::interval", reason = "real timer; use `Clock` timers from ananke-env", allow-invalid = true },
+    { path = "tokio::time::interval_at", reason = "real timer; use `Clock` timers from ananke-env", allow-invalid = true },
+    { path = "tokio::time::Instant::now", reason = "real clock; use `Clock::now` from ananke-env", allow-invalid = true },
+    { path = "tokio::time::Instant::elapsed", reason = "reads the real clock; subtract two `Clock::now` values instead", allow-invalid = true },
+
+    # tokio::net — real sockets (SPEC.md §1.1, §1.4)
+    { path = "tokio::net::TcpListener::bind", reason = "direct network access; use `Network` from ananke-env", allow-invalid = true },
+    { path = "tokio::net::TcpListener::from_std", reason = "direct network access; use `Network` from ananke-env", allow-invalid = true },
+    { path = "tokio::net::TcpStream::connect", reason = "direct network access; use `Network` from ananke-env", allow-invalid = true },
+    { path = "tokio::net::TcpStream::from_std", reason = "direct network access; use `Network` from ananke-env", allow-invalid = true },
+    { path = "tokio::net::TcpSocket::new_v4", reason = "direct network access; use `Network` from ananke-env", allow-invalid = true },
+    { path = "tokio::net::TcpSocket::new_v6", reason = "direct network access; use `Network` from ananke-env", allow-invalid = true },
+    { path = "tokio::net::UdpSocket::bind", reason = "direct network access; use `Network` from ananke-env", allow-invalid = true },
+    { path = "tokio::net::UdpSocket::from_std", reason = "direct network access; use `Network` from ananke-env", allow-invalid = true },
+    { path = "tokio::net::UnixListener::bind", reason = "direct network access; use `Network` from ananke-env", allow-invalid = true },
+    { path = "tokio::net::UnixStream::connect", reason = "direct network access; use `Network` from ananke-env", allow-invalid = true },
+    { path = "tokio::net::lookup_host", reason = "DNS resolution is non-deterministic; use `Network` from ananke-env", allow-invalid = true },
+
+    # tokio::fs — the real disk (SPEC.md §1.1, §1.3)
+    { path = "tokio::fs::read", reason = "direct filesystem access; use `FileSystem` from ananke-env", allow-invalid = true },
+    { path = "tokio::fs::read_to_string", reason = "direct filesystem access; use `FileSystem` from ananke-env", allow-invalid = true },
+    { path = "tokio::fs::write", reason = "direct filesystem access; use `FileSystem` from ananke-env", allow-invalid = true },
+    { path = "tokio::fs::copy", reason = "direct filesystem access; use `FileSystem` from ananke-env", allow-invalid = true },
+    { path = "tokio::fs::rename", reason = "direct filesystem access; use `FileSystem` from ananke-env", allow-invalid = true },
+    { path = "tokio::fs::hard_link", reason = "direct filesystem access; use `FileSystem` from ananke-env", allow-invalid = true },
+    { path = "tokio::fs::remove_file", reason = "direct filesystem access; use `FileSystem` from ananke-env", allow-invalid = true },
+    { path = "tokio::fs::remove_dir", reason = "direct filesystem access; use `FileSystem` from ananke-env", allow-invalid = true },
+    { path = "tokio::fs::remove_dir_all", reason = "direct filesystem access; use `FileSystem` from ananke-env", allow-invalid = true },
+    { path = "tokio::fs::create_dir", reason = "direct filesystem access; use `FileSystem` from ananke-env", allow-invalid = true },
+    { path = "tokio::fs::create_dir_all", reason = "direct filesystem access; use `FileSystem` from ananke-env", allow-invalid = true },
+    { path = "tokio::fs::read_dir", reason = "direct filesystem access; use `FileSystem` from ananke-env", allow-invalid = true },
+    { path = "tokio::fs::read_link", reason = "direct filesystem access; use `FileSystem` from ananke-env", allow-invalid = true },
+    { path = "tokio::fs::metadata", reason = "direct filesystem access; use `FileSystem` from ananke-env", allow-invalid = true },
+    { path = "tokio::fs::symlink_metadata", reason = "direct filesystem access; use `FileSystem` from ananke-env", allow-invalid = true },
+    { path = "tokio::fs::canonicalize", reason = "direct filesystem access; use `FileSystem` from ananke-env", allow-invalid = true },
+    { path = "tokio::fs::set_permissions", reason = "direct filesystem access; use `FileSystem` from ananke-env", allow-invalid = true },
+    { path = "tokio::fs::try_exists", reason = "direct filesystem access; use `FileSystem` from ananke-env", allow-invalid = true },
+    { path = "tokio::fs::File::open", reason = "direct filesystem access; use `FileSystem` from ananke-env", allow-invalid = true },
+    { path = "tokio::fs::File::create", reason = "direct filesystem access; use `FileSystem` from ananke-env", allow-invalid = true },
+    { path = "tokio::fs::File::create_new", reason = "direct filesystem access; use `FileSystem` from ananke-env", allow-invalid = true },
+    { path = "tokio::fs::File::options", reason = "direct filesystem access; use `FileSystem` from ananke-env", allow-invalid = true },
+    { path = "tokio::fs::File::from_std", reason = "direct filesystem access; use `FileSystem` from ananke-env", allow-invalid = true },
+    { path = "tokio::fs::OpenOptions::new", reason = "direct filesystem access; use `FileSystem` from ananke-env", allow-invalid = true },
+    { path = "tokio::fs::DirBuilder::new", reason = "direct filesystem access; use `FileSystem` from ananke-env", allow-invalid = true },
+
+    # tokio task spawning — outside the scheduler (SPEC.md §1.1)
+    { path = "tokio::spawn", reason = "spawning outside the scheduler; use `Environment::spawn`", allow-invalid = true },
+    { path = "tokio::task::spawn", reason = "spawning outside the scheduler; use `Environment::spawn`", allow-invalid = true },
+    { path = "tokio::task::spawn_blocking", reason = "spawning outside the scheduler; use `Environment::spawn`", allow-invalid = true },
+    { path = "tokio::task::spawn_local", reason = "spawning outside the scheduler; use `Environment::spawn`", allow-invalid = true },
+    { path = "tokio::task::JoinSet::spawn", reason = "spawning outside the scheduler; use `Environment::spawn`", allow-invalid = true },
+    { path = "tokio::task::JoinSet::spawn_blocking", reason = "spawning outside the scheduler; use `Environment::spawn`", allow-invalid = true },
+    { path = "tokio::task::LocalSet::spawn_local", reason = "spawning outside the scheduler; use `Environment::spawn`", allow-invalid = true },
+    { path = "tokio::runtime::Handle::spawn", reason = "spawning outside the scheduler; use `Environment::spawn`", allow-invalid = true },
+    { path = "tokio::runtime::Handle::spawn_blocking", reason = "spawning outside the scheduler; use `Environment::spawn`", allow-invalid = true },
+    { path = "tokio::runtime::Runtime::spawn", reason = "spawning outside the scheduler; use `Environment::spawn`", allow-invalid = true },
+    { path = "tokio::runtime::Runtime::spawn_blocking", reason = "spawning outside the scheduler; use `Environment::spawn`", allow-invalid = true },
+
+    # rand and friends — unseeded randomness (SPEC.md §1.1)
+    { path = "rand::thread_rng", reason = "unseeded randomness; use `Rng` from ananke-env", allow-invalid = true },
+    { path = "rand::rng", reason = "unseeded randomness; use `Rng` from ananke-env", allow-invalid = true },
+    { path = "rand::random", reason = "unseeded randomness; use `Rng` from ananke-env", allow-invalid = true },
+    { path = "rand::random_range", reason = "unseeded randomness; use `Rng` from ananke-env", allow-invalid = true },
+    { path = "rand::random_bool", reason = "unseeded randomness; use `Rng` from ananke-env", allow-invalid = true },
+    { path = "rand::random_ratio", reason = "unseeded randomness; use `Rng` from ananke-env", allow-invalid = true },
+    { path = "rand::random_iter", reason = "unseeded randomness; use `Rng` from ananke-env", allow-invalid = true },
+    { path = "rand::SeedableRng::from_entropy", reason = "unseeded randomness; use `Rng` from ananke-env", allow-invalid = true },
+    { path = "rand::SeedableRng::from_os_rng", reason = "unseeded randomness; use `Rng` from ananke-env", allow-invalid = true },
+    { path = "rand::SeedableRng::try_from_os_rng", reason = "unseeded randomness; use `Rng` from ananke-env", allow-invalid = true },
+    { path = "rand_core::SeedableRng::from_os_rng", reason = "unseeded randomness; use `Rng` from ananke-env", allow-invalid = true },
+    { path = "rand_core::SeedableRng::try_from_os_rng", reason = "unseeded randomness; use `Rng` from ananke-env", allow-invalid = true },
+    { path = "getrandom::fill", reason = "unseeded randomness; use `Rng` from ananke-env", allow-invalid = true },
+    { path = "getrandom::getrandom", reason = "unseeded randomness; use `Rng` from ananke-env", allow-invalid = true },
+    { path = "getrandom::u32", reason = "unseeded randomness; use `Rng` from ananke-env", allow-invalid = true },
+    { path = "getrandom::u64", reason = "unseeded randomness; use `Rng` from ananke-env", allow-invalid = true },
+]
+
+# Types whose mere presence means real I/O is happening. Catches constructors the
+# method list above cannot name (`FromRawFd`, `From<std::fs::File>`, and so on).
+disallowed-types = [
+    { path = "std::fs::File", reason = "direct filesystem access; use `FileSystem` from ananke-env" },
+    { path = "std::fs::OpenOptions", reason = "direct filesystem access; use `FileSystem` from ananke-env" },
+    { path = "std::fs::DirBuilder", reason = "direct filesystem access; use `FileSystem` from ananke-env" },
+    { path = "std::fs::ReadDir", reason = "direct filesystem access; use `FileSystem` from ananke-env" },
+    { path = "std::net::TcpListener", reason = "direct network access; use `Network` from ananke-env" },
+    { path = "std::net::TcpStream", reason = "direct network access; use `Network` from ananke-env" },
+    { path = "std::net::UdpSocket", reason = "direct network access; use `Network` from ananke-env" },
+    { path = "std::thread::Builder", reason = "spawning outside the scheduler; use `Environment::spawn`" },
+    { path = "tokio::net::TcpListener", reason = "direct network access; use `Network` from ananke-env", allow-invalid = true },
+    { path = "tokio::net::TcpStream", reason = "direct network access; use `Network` from ananke-env", allow-invalid = true },
+    { path = "tokio::net::TcpSocket", reason = "direct network access; use `Network` from ananke-env", allow-invalid = true },
+    { path = "tokio::net::UdpSocket", reason = "direct network access; use `Network` from ananke-env", allow-invalid = true },
+    { path = "tokio::net::UnixListener", reason = "direct network access; use `Network` from ananke-env", allow-invalid = true },
+    { path = "tokio::net::UnixStream", reason = "direct network access; use `Network` from ananke-env", allow-invalid = true },
+    { path = "tokio::net::UnixDatagram", reason = "direct network access; use `Network` from ananke-env", allow-invalid = true },
+    { path = "tokio::fs::File", reason = "direct filesystem access; use `FileSystem` from ananke-env", allow-invalid = true },
+    { path = "tokio::fs::OpenOptions", reason = "direct filesystem access; use `FileSystem` from ananke-env", allow-invalid = true },
+    { path = "tokio::fs::DirBuilder", reason = "direct filesystem access; use `FileSystem` from ananke-env", allow-invalid = true },
+    { path = "tokio::fs::ReadDir", reason = "direct filesystem access; use `FileSystem` from ananke-env", allow-invalid = true },
+    { path = "tokio::time::Sleep", reason = "real timer; use `Clock` timers from ananke-env", allow-invalid = true },
+    { path = "tokio::time::Interval", reason = "real timer; use `Clock` timers from ananke-env", allow-invalid = true },
+    { path = "tokio::time::Timeout", reason = "real timer; use `Clock` timers from ananke-env", allow-invalid = true },
+    { path = "tokio::time::Instant", reason = "real clock; use `Clock` from ananke-env", allow-invalid = true },
+    { path = "rand::rngs::OsRng", reason = "unseeded randomness; use `Rng` from ananke-env", allow-invalid = true },
+    { path = "rand::rngs::ThreadRng", reason = "unseeded randomness; use `Rng` from ananke-env", allow-invalid = true },
+    { path = "rand_core::OsRng", reason = "unseeded randomness; use `Rng` from ananke-env", allow-invalid = true },
+]

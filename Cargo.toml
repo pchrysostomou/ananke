@@ -20,3 +20,9 @@ authors = ["Prodromos Chrysostomou"]
 unsafe_code = "deny"
 # "Prefer boring, well-documented Rust." Promoted to an error by `-D warnings` in CI.
 missing_docs = "warn"
+
+[workspace.lints.clippy]
+# Determinism first (principle 1): the banned I/O paths live in clippy.toml at the
+# workspace root. Denied here so a plain `cargo clippy` fails without `-D warnings`.
+disallowed_methods = "deny"
+disallowed_types = "deny"

@@ -20,9 +20,12 @@ Deferred ideas live in [docs/BACKLOG.md](docs/BACKLOG.md).
   approval.
 - **Never widen scope inside a phase.** Anything tempting goes in `docs/BACKLOG.md`
   with one line of justification.
-- **Determinism first.** No direct `std::time`, `std::fs`, `tokio::net`, `tokio::time`,
-  `rand`, or thread spawning outside `crates/ananke-env`. CI fails on violation via
-  clippy `disallowed-methods`.
+- **Determinism first.** No direct `std::time`, `std::fs`, `std::net`, `tokio::net`,
+  `tokio::time`, `tokio::fs`, `rand`, or thread/task spawning outside
+  `crates/ananke-env`. The banned paths are listed in `clippy.toml`; only the real
+  implementation module inside `ananke-env` may carry
+  `#[allow(clippy::disallowed_methods, clippy::disallowed_types)]`.
+  `scripts/check-direct-io.sh` is the textual second check. Both run in CI.
 - **No `unsafe` outside `crates/ananke-storage`.** The workspace lint is
   `deny(unsafe_code)`; `ananke-storage` is the only crate permitted to
   `#![allow(unsafe_code)]`. Every `unsafe` block carries a `// SAFETY:` comment and
@@ -40,10 +43,14 @@ Deferred ideas live in [docs/BACKLOG.md](docs/BACKLOG.md).
 ## Layout (Phase 0)
 
 ```
+crates/ananke/         Placeholder crate reserving the name on crates.io
 crates/ananke-env/     Environment trait + RealEnv + SimEnv
 crates/ananke-server/  Node binary (placeholder until the echo server is wired)
 sim/                   Simulation scenarios; scenario files sit directly in sim/
-docs/                  SPEC, DECISIONS, BACKLOG, BOOTSTRAP_PROMPT
+docs/                  SPEC, DECISIONS, BACKLOG, BOOTSTRAP_PROMPT (local only, gitignored)
+scripts/               check-direct-io.sh
+clippy.toml            Banned I/O paths (disallowed-methods / disallowed-types)
+.github/workflows/     CI: rustfmt, clippy + direct-io check, cargo doc, cargo test
 ```
 
 ## Verification commands
@@ -52,6 +59,7 @@ docs/                  SPEC, DECISIONS, BACKLOG, BOOTSTRAP_PROMPT
 cargo build --workspace
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
+scripts/check-direct-io.sh
 cargo fmt --all -- --check
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 ```
