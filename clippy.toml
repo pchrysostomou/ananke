@@ -2,9 +2,12 @@
 #
 # Every path listed here is a source of non-determinism: the real clock, real disks,
 # real sockets, unseeded randomness, or spawning outside the scheduler's control.
-# None of them may be used anywhere in the workspace except inside the real
-# implementation module of `crates/ananke-env`, which opts out with
-# `#[allow(clippy::disallowed_methods, clippy::disallowed_types)]`.
+# None of them may be used anywhere in the workspace except inside the `real` module
+# of `crates/ananke-env`, which opts out with
+# `#![allow(clippy::disallowed_methods, clippy::disallowed_types)]`. Two further files
+# in that crate carry a narrower `allow(clippy::disallowed_types)`: `time.rs` (the
+# `SystemTime` edge conversions) and `collections.rs` (the `DetHashMap` aliases).
+# `scripts/check-direct-io.sh` fails if any other file carries either allow.
 #
 # The two lints are set to `deny` in `[workspace.lints.clippy]` (Cargo.toml), so a
 # violation fails a plain `cargo clippy` as well as CI. `scripts/check-direct-io.sh`
@@ -145,6 +148,23 @@ disallowed-methods = [
 # Types whose mere presence means real I/O is happening. Catches constructors the
 # method list above cannot name (`FromRawFd`, `From<std::fs::File>`, and so on).
 disallowed-types = [
+    # D-013: time is `ananke_env::Instant` / `WallTime`; std's types can reach the real clock.
+    { path = "std::time::Instant", reason = "use `ananke_env::Instant` (DECISIONS.md D-013)" },
+    { path = "std::time::SystemTime", reason = "use `ananke_env::WallTime` (DECISIONS.md D-013)" },
+
+    # D-014: hash maps seeded from OS entropy iterate in a different order every run.
+    { path = "std::collections::HashMap", reason = "iteration order is random per run; use `BTreeMap` or `ananke_env::DetHashMap` (DECISIONS.md D-014)" },
+    { path = "std::collections::HashSet", reason = "iteration order is random per run; use `BTreeSet` or `ananke_env::DetHashSet` (DECISIONS.md D-014)" },
+    { path = "std::hash::RandomState", reason = "seeded from OS entropy; use `ananke_env::DetState` (DECISIONS.md D-014)" },
+    { path = "hashbrown::HashMap", reason = "iteration order is random per run; use `BTreeMap` or `ananke_env::DetHashMap` (DECISIONS.md D-014)", allow-invalid = true },
+    { path = "hashbrown::HashSet", reason = "iteration order is random per run; use `BTreeSet` or `ananke_env::DetHashSet` (DECISIONS.md D-014)", allow-invalid = true },
+    { path = "hashbrown::DefaultHashBuilder", reason = "seeded from OS entropy; use `ananke_env::DetState` (DECISIONS.md D-014)", allow-invalid = true },
+    { path = "ahash::RandomState", reason = "seeded from OS entropy; use `ananke_env::DetState` (DECISIONS.md D-014)", allow-invalid = true },
+    { path = "ahash::AHashMap", reason = "iteration order is random per run; use `BTreeMap` or `ananke_env::DetHashMap` (DECISIONS.md D-014)", allow-invalid = true },
+    { path = "ahash::AHashSet", reason = "iteration order is random per run; use `BTreeSet` or `ananke_env::DetHashSet` (DECISIONS.md D-014)", allow-invalid = true },
+    { path = "foldhash::fast::RandomState", reason = "seeded from OS entropy; use `ananke_env::DetState` (DECISIONS.md D-014)", allow-invalid = true },
+    { path = "foldhash::quality::RandomState", reason = "seeded from OS entropy; use `ananke_env::DetState` (DECISIONS.md D-014)", allow-invalid = true },
+
     { path = "std::fs::File", reason = "direct filesystem access; use `FileSystem` from ananke-env" },
     { path = "std::fs::OpenOptions", reason = "direct filesystem access; use `FileSystem` from ananke-env" },
     { path = "std::fs::DirBuilder", reason = "direct filesystem access; use `FileSystem` from ananke-env" },

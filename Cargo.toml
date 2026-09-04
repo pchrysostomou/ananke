@@ -12,7 +12,13 @@ authors = ["Prodromos Chrysostomou"]
 
 [workspace.dependencies]
 # Shared dependency versions. Add an entry here and reference it from a crate with
-# `name.workspace = true`.
+# `name.workspace = true` (features go on the crate side).
+bytes = "1.12"
+getrandom = "0.4"
+siphasher = "1.0"
+tempfile = "3.27"
+tokio = { version = "1.53", default-features = false }
+tracing = "0.1"
 
 [workspace.lints.rust]
 # Principle 3 (BOOTSTRAP_PROMPT.md): no unsafe outside storage. `deny` rather than

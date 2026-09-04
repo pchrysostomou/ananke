@@ -7,3 +7,4 @@ with the reason for deferring. Promote an item by moving it into SPEC.md.
 
 - **README.md** — nothing to show before the Phase 0 tag; write it alongside the first devlog post.
 - **Lint canary in CI** — a test that compiles a deliberate `std::fs` call in a scratch crate and asserts clippy rejects it, so a broken `clippy.toml` cannot pass silently; verified by hand in Phase 0 step 2 instead.
+- **`RealFs` on Windows** — positional I/O uses `std::os::unix::fs::FileExt`; a `std::os::windows::fs::FileExt` branch is a small `cfg` split, deferred until anyone needs a Windows build.

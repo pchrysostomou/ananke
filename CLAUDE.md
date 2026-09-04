@@ -21,11 +21,13 @@ Deferred ideas live in [docs/BACKLOG.md](docs/BACKLOG.md).
 - **Never widen scope inside a phase.** Anything tempting goes in `docs/BACKLOG.md`
   with one line of justification.
 - **Determinism first.** No direct `std::time`, `std::fs`, `std::net`, `tokio::net`,
-  `tokio::time`, `tokio::fs`, `rand`, or thread/task spawning outside
-  `crates/ananke-env`. The banned paths are listed in `clippy.toml`; only the real
-  implementation module inside `ananke-env` may carry
-  `#[allow(clippy::disallowed_methods, clippy::disallowed_types)]`.
-  `scripts/check-direct-io.sh` is the textual second check. Both run in CI.
+  `tokio::time`, `tokio::fs`, `rand`, `std::collections::HashMap`, or thread/task
+  spawning outside `crates/ananke-env`. Time is `ananke_env::Instant` / `WallTime`
+  (D-013); hash maps are `DetHashMap` / `DetHashSet` seeded from `Environment::rng()`
+  (D-014). The banned paths are listed in `clippy.toml`; only `ananke-env`'s `real`
+  module, plus the edge files `time.rs` and `collections.rs`, may carry
+  `allow(clippy::disallowed_*)`. `scripts/check-direct-io.sh` is the textual second
+  check and fails if any other file carries the allow. Both run in CI.
 - **No `unsafe` outside `crates/ananke-storage`.** The workspace lint is
   `deny(unsafe_code)`; `ananke-storage` is the only crate permitted to
   `#![allow(unsafe_code)]`. Every `unsafe` block carries a `// SAFETY:` comment and

@@ -103,14 +103,13 @@ _Update this section at the end of every session._
 
 - Phase: 0 (in progress)
 - Last tag: none
-- Done: step 1 workspace scaffold (`crates/ananke-env`, `crates/ananke-server`,
-  `sim/`, placeholder `crates/ananke` with passing `cargo publish --dry-run`,
-  MIT/Apache-2.0 texts). Step 2 CI: `clippy.toml` bans direct I/O outside
-  `ananke-env` (disallowed-methods + disallowed-types, denied in workspace lints),
-  `scripts/check-direct-io.sh`, rustfmt `style_edition = "2024"`, GitHub Actions
-  (fmt, clippy + direct-io, doc, test; warnings are errors). Repo is public at
-  github.com/pchrysostomou/ananke; `docs/` is gitignored.
-- Next concrete task: step 3, the `Environment` trait (SPEC.md §1.1) with Clock,
-  FileSystem, Network, Rng sub-traits and `RealEnv` on tokio. Open design question
-  to settle first: whether `Clock::now` returns `std::time::Instant` or an
-  ananke-owned monotonic type (needs a DECISIONS.md entry).
+- Done: step 1 workspace scaffold; step 2 CI (clippy `disallowed-methods` /
+  `disallowed-types` from `clippy.toml`, `scripts/check-direct-io.sh`, GitHub
+  Actions); D-013 (`Instant` / `WallTime`) and D-014 (`DetHashMap` seeded from
+  `Environment::rng()`); step 3 `Environment` trait with `Clock`, `FileSystem`, `Rng`
+  sub-traits, `TaskHandle`, `TraceEvent`, and `RealEnv` on tokio with real-env
+  integration tests. `Network` is a marker trait pending D-015.
+- Next concrete task: settle D-015 (message-oriented vs stream-oriented `Network`),
+  implement it for `RealEnv`, then step 4: `SimEnv` (single-threaded deterministic
+  executor, virtual clock, seeded RNG, in-memory network and filesystem with the
+  §1.3 / §1.4 fault models, trace to an in-memory `Vec<TraceEvent>`).

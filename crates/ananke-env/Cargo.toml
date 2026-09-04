@@ -9,6 +9,15 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+bytes.workspace = true
+getrandom.workspace = true
+siphasher.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "time"] }
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["sync"] }
 
 [lints]
 workspace = true
