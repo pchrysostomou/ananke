@@ -204,14 +204,12 @@ fn node_json(node: NodeId) -> Json {
     Json::Int(i64::from(node.get()))
 }
 
-/// A number, or its decimal string when it does not fit a JavaScript integer: a
-/// rotted sequence number is still data, and the studio must still open the trace.
+/// An integer for the trace. Past 2^53 the writer emits it as a decimal string
+/// (moirae SPEC §5, moirae-trace 0.0.2); past `i64` it is a string from here, since
+/// `Json::Int` cannot hold it. A rotted sequence number is still data, and the studio
+/// must still open the trace.
 fn int(v: u64) -> Json {
-    if v <= moirae_trace::MAX_SAFE_INTEGER {
-        Json::Int(i64::try_from(v).expect("below 2^53"))
-    } else {
-        Json::Str(v.to_string())
-    }
+    i64::try_from(v).map_or_else(|_| Json::Str(v.to_string()), Json::Int)
 }
 
 fn convert(

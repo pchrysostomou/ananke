@@ -20,8 +20,8 @@ crossbeam-skiplist = "0.1"
 getrandom = "0.4"
 # The moirae bridge (SPEC §1.5, moirae ADR-009): the trace format and the scheduling
 # policies, published from the moirae repo.
-moirae-sched = "0.0.1"
-moirae-trace = "0.0.1"
+moirae-sched = "0.0.2"
+moirae-trace = "0.0.2"
 siphasher = "1.0"
 tempfile = "3.27"
 tokio = { version = "1.53", default-features = false }
