@@ -101,13 +101,20 @@ ananke/
 
 _Update this section at the end of every session._
 
-- Phase: 0 done (v0.1.0, 2026-09-05). Phase 1 not started.
+- Phase: 1 started (2026-09-05). The BACKLOG gate before Phase 1 is closed: bit rot,
+  directory-entry loss and the poll budget are in `SimEnv`, and the echo scenario's
+  100-seed sweep exercises all three through the echo journal. The LSM is not started.
 - Last tag: v0.1.0
-- Next concrete task: the BACKLOG "required before Phase 1 starts" gate, in this order:
-  bit rot after a crash, directory-entry loss for unsynced renames, and a poll budget
-  for `Sim::run_until` so a busy-looping task fails a test instead of hanging a
-  10k-seed nightly run. Then Phase 1, the LSM storage engine (SPEC §2), starting with
-  the WAL and its crash-injection tests.
+- Next concrete task: the LSM storage engine (SPEC §2), starting with the WAL and its
+  crash-injection tests, in a new `crates/ananke-storage`. Stop for review before it.
+- Phase 1 gate record: `FsFaults::p_bitrot` flips one bit per block per crash
+  (`BlockRotted`); creating, removing and renaming a file is durable only after
+  `sync_dir`, and a crash keeps a random prefix of each directory's pending operations
+  (`DirectoryEntryLost`); `SimConfig::poll_budget` fails a run whose task is polled too
+  often at one instant (`PollBudgetExceeded`, then a panic naming the task). The echo
+  protocol keeps a checksummed journal (`ananke_server::echo::Journal`) that syncs
+  every few records and rotates without `sync_dir`, and `sim/echo.rs` checks what the
+  restarted node found against the trace. Pinned trace body hash: `19f19201df99a799`.
 - Phase 0 record: `Environment` with `Clock`, `FileSystem`, `Network`, `Rng`; `RealEnv`
   on tokio; `sim::Sim` / `SimEnv` with the §1.3 torn-write and lost-fsync model and the
   §1.4 drop / delay / partition model; D-013 to D-017; the moirae bridge through

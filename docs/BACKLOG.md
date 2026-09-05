@@ -3,20 +3,6 @@
 Things that were tempting but are out of scope for the current step. One line each,
 with the reason for deferring. Promote an item by moving it into SPEC.md.
 
-## Required before Phase 1 starts
-
-These are demanded by SPEC §1.3 and the Phase 1 exit criteria (10k crash-injection
-seeds), so Phase 1 cannot begin without them.
-
-- **Bit rot** — after a crash any block of a file may be corrupted; the storage engine's
-  checksums must catch it (SPEC §1.3).
-- **Directory-entry loss** — `rename` / `create` / `remove` without a following
-  `sync_dir` may be lost at crash; `SimFs` currently makes directory entries
-  immediately durable (SPEC §1.3).
-- **Poll budget for `Sim::run_until`** — a task that wakes itself without ever yielding
-  to time loops forever; a configurable budget must turn that into a failing test, not
-  a hung 10k-seed nightly run.
-
 ## Required before Phase 2 starts
 
 Demanded by SPEC §1.4 and by the D-015 rationale (protocols are written against loss
@@ -24,10 +10,6 @@ and reorder from the start), so Raft cannot be tested honestly without it.
 
 - **Message duplication** — deliver a message more than once with a configurable
   probability (SPEC §1.4).
-
-## Phase 0 tag follow-up
-
-- **Publish `ananke` 0.1.0 and `ananke-env` 0.1.0** from the `v0.1.0` tag; both pass `cargo publish --dry-run`, and neither name exists on crates.io yet. Needs the crates.io token (D-001, D-011).
 
 ## General
 
@@ -39,3 +21,6 @@ and reorder from the start), so Raft cannot be tested honestly without it.
 - **`RealFs` on Windows** — positional I/O uses `std::os::unix::fs::FileExt`; a `std::os::windows::fs::FileExt` branch is a small `cfg` split, deferred until anyone needs a Windows build.
 - **Per-op filesystem latency, slow links and bandwidth caps** — SPEC §1.3 / §1.4 performance-shaped faults; not needed for correctness testing until there is something to measure.
 - **`RealRng` cost** — every call is a `getrandom` syscall and `race` draws one bit per poll; switch to a CSPRNG reseeded from the OS if it ever shows in a profile.
+- **Lost fsync in the echo sweep** — `sim/echo.rs` keeps `p_durable` at 1.0; the Phase 0 unit tests cover lost fsync and the journal invariants hold under it, so it waits for the WAL's crash tests, where it matters.
+- **Trace names for a file after a lost rename** — `BlockRotted` and `WriteTorn` name the inode's last visible path; after directory-entry loss its durable name may differ (`/echo/journal.prev` for a file the restarted node reads as `/echo/journal`). Add inode ids, or the durable name, when the studio needs to follow a file across a crash.
+- **Unreachable inodes in `NodeFs`** — a rename over an existing entry or an unlink leaves the old inode in the map, still subject to bit rot at later crashes; harmless for short runs, garbage-collect when a 10k-seed run's memory shows it.
