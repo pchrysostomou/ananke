@@ -11,15 +11,15 @@ order, before doing anything:
 3. [docs/DECISIONS.md](docs/DECISIONS.md) — *why this over that*. Never delete an
    entry; supersede it. The next free entry number is at the bottom.
 
-Deferred ideas live in [docs/BACKLOG.md](docs/BACKLOG.md).
+Deferred ideas are GitHub issues labelled by phase; [docs/BACKLOG.md](docs/BACKLOG.md) says how.
 
 ## Working agreements
 
 - **Read SPEC.md and DECISIONS.md before writing code.** If a design question is not
   answered there, propose a DECISIONS.md entry *before* implementing and wait for
   approval.
-- **Never widen scope inside a phase.** Anything tempting goes in `docs/BACKLOG.md`
-  with one line of justification.
+- **Never widen scope inside a phase.** Anything tempting becomes a GitHub issue with
+  its phase label and one line of justification (`docs/BACKLOG.md`).
 - **Determinism first.** No direct `std::time`, `std::fs`, `std::net`, `tokio::net`,
   `tokio::time`, `tokio::fs`, `rand`, `std::collections::HashMap`, or thread/task
   spawning outside `crates/ananke-env`. Time is `ananke_env::Instant` / `WallTime`

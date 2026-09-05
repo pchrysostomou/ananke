@@ -101,19 +101,36 @@ ananke/
 
 _Update this section at the end of every session._
 
-- Phase: 1 in progress (2026-09-05). The gate is closed; the WAL (D-018, D-019), the
+- Phase: 1 complete pending review and tag (2026-09-05). The WAL (D-018, D-019), the
   memtable and engine (D-020, D-021), SSTables with the manifest and log truncation
-  (D-022), and versions, snapshots, `scan` and leveled compaction (D-023) are done.
-  A missing log head is refused unless `allow_head_gap` discards the log (D-022).
-  `sim/wal.rs` and `sim/engine.rs` run the §2.8 crash property with every §1.3
-  fault on, filesystem latency, crashes between polls, scans at snapshots and
-  compaction under crashes; the correct code passes every seed, each known-buggy
-  variant is caught. Sweeps run `ANANKE_SEEDS` seeds: 20 at the gate, 100 in CI,
-  10 000 nightly.
-- Last tag: v0.1.0
-- Next concrete task: the Phase 1 exit checklist (SPEC §2.8): the rest of the §2.7
-  API (`write` with batches, `checkpoint`), the real-environment bench, and the
-  Phase 1 devlog and tag. Stop for review before the checklist.
+  (D-022), versions, snapshots, `scan` and leveled compaction (D-023), write batches,
+  writes without a sync and checkpoints (D-024) are done. A store is refused rather
+  than opened as a state that never existed: a missing log head and an unreadable
+  `CURRENT` or manifest fail `open` unless the caller allows the discard or a fallback
+  onto an intact manifest (D-022). `sim/wal.rs` and `sim/engine.rs` run the §2.8
+  crash property with every §1.3 fault on, filesystem latency, crashes between polls,
+  batches, unsynced writes, scans at snapshots, checkpoints opened fresh after the
+  crash, and compaction under crashes; the correct code passes every seed, each of
+  the three known-buggy engines and three known-buggy logs is caught. Sweeps run
+  `ANANKE_SEEDS` seeds: 20 at the gate, 100 in CI, 10 000 nightly, plus a nightly
+  deep-levels run of `ANANKE_DEEP_SEEDS`.
+- Phase 1 exit criteria (SPEC §2.8), with evidence:
+  1. Property test, random ops and random crash points, recovered state equals the
+     model: `sim/engine.rs` and `sim/wal.rs`, run by `sim/tests/engine.rs` and
+     `sim/tests/wal.rs`; the model is `Model::state_after`, a `BTreeMap` fold over
+     the writes the faults left; three buggy engine variants and three buggy log
+     variants are caught alongside. Met.
+  2. 10k seeds green in CI nightly: `.github/workflows/nightly.yml`, every sweep in
+     release at `ANANKE_SEEDS=10000`; the run recorded in the Phase 1 devlog. Met
+     when that run is green on the commit the tag is cut from.
+  3. Bench over 200k writes/s single-threaded on the real environment, a sanity
+     number: `cargo run --release -p ananke-storage --example bench`, 468 writes/s
+     with a sync per write, 33 523 without, 299 169 in batches of a hundred without
+     (one laptop disk, 2026-09-05). Met in the shape the flag exists for.
+- Last tag: v0.1.0. Next tag: v0.2.0, once the exit criteria are reviewed.
+- Next concrete task: after the review, bump to 0.2.0, tag, publish `ananke-storage`,
+  finish the Phase 1 devlog. Then Phase 2: message duplication in the simulator
+  (issue #1) before Raft, per SPEC §1.4 and D-015.
 - Fault-model tests follow the CLAUDE.md pattern: a known-buggy variant the sweep
   must catch beside the correct one it must pass (`Journal::sync_dir_on_rotate`,
   `wal::Variant`).

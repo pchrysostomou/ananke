@@ -129,7 +129,7 @@ on most seeds, and the correct code passes ten thousand.
 | Phase | Deliverable | State |
 |---|---|---|
 | 0 | `Environment`, `RealEnv`, `SimEnv`, the fault model, the moirae bridge | Done. Tagged `v0.1.0`; `ananke-env` 0.1.0 on crates.io; [devlog](docs/devlog/00-phase-0.md) |
-| 1 | Storage engine | In progress. WAL (D-018, D-019), memtable and engine (D-020, D-021), SSTables with the manifest and log truncation (D-022), versions, snapshots, scans and leveled compaction (D-023) done; the §2.7 API's `write` batches and `checkpoint`, the bench and the devlog remain |
+| 1 | Storage engine | Built, under review before the `v0.2.0` tag. WAL (D-018, D-019), memtable and engine (D-020, D-021), SSTables with the manifest and log truncation (D-022), versions, snapshots, scans and leveled compaction (D-023), write batches, unsynced writes and checkpoints (D-024); [devlog draft](docs/devlog/01-phase-1.md) |
 | 2 | Raft | Not started |
 | 3 | Multi-raft sharding | Not started |
 | 4 | Transactions | Not started |
@@ -139,7 +139,8 @@ on most seeds, and the correct code passes ten thousand.
 
 Sweeps run `ANANKE_SEEDS` consecutive seeds per scenario: 20 at the pre-commit gate,
 100 in CI on every push, 10 000 every night in release mode with failing traces
-uploaded as artifacts.
+uploaded as artifacts, plus a nightly run of the engine sweep with level limits small
+enough for compaction to reach level 3.
 
 ## Bugs the simulator has found so far
 
@@ -194,9 +195,10 @@ npx moirae replay sim/out/engine-42.jsonl
 
 - [docs/SPEC.md](docs/SPEC.md): what each phase builds and how.
 - [docs/DECISIONS.md](docs/DECISIONS.md): why this over that, one entry per decision, never deleted.
-- [docs/BACKLOG.md](docs/BACKLOG.md): what was tempting and deferred, with the reason.
+- [docs/BACKLOG.md](docs/BACKLOG.md): where deferred ideas live, which is the issue tracker, by phase.
 - [docs/devlog/](docs/devlog/): one post per phase.
-- [CLAUDE.md](CLAUDE.md): the working agreements, including the gate and the buggy-variant rule.
+- [CONTRIBUTING.md](CONTRIBUTING.md): the working agreements, for anyone sending a change.
+- [CLAUDE.md](CLAUDE.md): the same agreements as an agent session reads them.
 - [moirae](https://github.com/pchrysostomou/moirae): the simulation framework and studio; `moirae-trace` and `moirae-sched` on crates.io.
 
 Licensed under MIT or Apache-2.0, at your option.
