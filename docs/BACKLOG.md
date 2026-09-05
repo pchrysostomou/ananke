@@ -19,7 +19,7 @@ and reorder from the start), so Raft cannot be tested honestly without it.
 - **README.md** — nothing to show before the Phase 0 tag; write it alongside the first devlog post.
 - **Lint canary in CI** — a test that compiles a deliberate `std::fs` call in a scratch crate and asserts clippy rejects it, so a broken `clippy.toml` cannot pass silently; verified by hand in Phase 0 step 2 instead.
 - **`RealFs` on Windows** — positional I/O uses `std::os::unix::fs::FileExt`; a `std::os::windows::fs::FileExt` branch is a small `cfg` split, deferred until anyone needs a Windows build.
-- **Per-op filesystem latency, slow links and bandwidth caps** — SPEC §1.3 / §1.4 performance-shaped faults; not needed for correctness testing until there is something to measure.
+- **Per-op filesystem latency, slow links and bandwidth caps** — SPEC §1.3 / §1.4 performance-shaped faults. Latency also matters for correctness: with zero-latency I/O the window between a write and its sync is one scheduling step, so an acknowledge-before-sync bug is caught by the oracle's acknowledged-without-sync property rather than by a crash inside the window (D-020).
 - **`RealRng` cost** — every call is a `getrandom` syscall and `race` draws one bit per poll; switch to a CSPRNG reseeded from the OS if it ever shows in a profile.
 - **Lost fsync in the echo sweep** — `sim/echo.rs` keeps `p_durable` at 1.0; the Phase 0 unit tests cover lost fsync and the journal invariants hold under it, so it waits for the WAL's crash tests, where it matters.
 - **Trace names for a file after a lost rename** — `BlockRotted` and `WriteTorn` name the inode's last visible path; after directory-entry loss its durable name may differ (`/echo/journal.prev` for a file the restarted node reads as `/echo/journal`). Add inode ids, or the durable name, when the studio needs to follow a file across a crash.
@@ -28,3 +28,5 @@ and reorder from the start), so Raft cannot be tested honestly without it.
 - **CRC-32C with SSE4.2** — the `crc32c` crate is several times faster than the table in `ananke_storage::crc32c`; switch if a profile shows the checksum (D-018).
 - **First sequence number after front truncation** — once the engine deletes WAL segments behind a flush, recovery can no longer expect record 1 first; the manifest must carry the first expected number (D-019).
 - **`sim/out/wal-42.jsonl` as a studio fixture** — the echo trace is the pinned fixture in the moirae repo; the WAL trace shows `ananke.wal.*` and every §1.3 fault at once and would make a second, unpinned example.
+- **WAL truncation behind a flush** — segments whose records are all in flushed SSTables can be deleted; needs the SSTable and the manifest first, and the manifest must then carry the first sequence number recovery expects (D-019, D-020).
+- **`memtable_bytes` default of 64 MiB** — SPEC §2.3's default; `EngineConfig` has no defaults yet because only sweeps and tests construct it.

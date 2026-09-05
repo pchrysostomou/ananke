@@ -16,6 +16,7 @@ use ananke_env::{Environment, File, FileSystem, OpenOptions, RealEnv};
 use bytes::Bytes;
 
 pub mod echo;
+pub mod engine;
 pub mod wal;
 
 /// The default number of seeds a sweep runs.

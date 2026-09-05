@@ -8,7 +8,8 @@
 //! must reach every record that was acknowledged and covered by a sync the simulator
 //! honoured, with three excuses and no more: a record covered only by lost syncs, a
 //! stop on a record bit rot hit, and a stop exactly where a cut whose sync was lost
-//! had been. Every [`Variant`] runs through the same check; the correct log must pass
+//! had been. And, whatever recovery returned, nothing may have been acknowledged
+//! before a sync was asked for: that is the bug an excuse must never hide. Every [`Variant`] runs through the same check; the correct log must pass
 //! every seed and each buggy one must fail some (CLAUDE.md).
 
 use std::collections::BTreeSet;
@@ -199,7 +200,8 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
                     m.appended.clone(),
                 )
             };
-            let (verdict, excuse) = check_epoch(&lock(&model), base, &recovery, &events);
+            let (verdict, excuse) =
+                check_epoch(&lock(&model), base, &recovery, &events, Path::new(DIR));
             epochs.push(Epoch {
                 recovery: recovery.clone(),
                 appended,
@@ -225,6 +227,9 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
         let span = schedule.run_max.saturating_sub(schedule.run_min);
         let extra = Duration::from_nanos(harness.below(span.as_nanos() as u64 + 1));
         sim.run_for(schedule.run_min + extra);
+        // Then a few more scheduling steps, so the crash lands between two polls at
+        // one instant and not only where every queue has drained.
+        sim.run_steps(harness.below(64));
         sim.crash(node);
         sim.restart(node);
     }
@@ -316,11 +321,13 @@ fn spawn_appenders(
 }
 
 /// Checks one recovery against the model. Returns the verdict and the excuse used.
-fn check_epoch(
+/// Shared with the engine scenario, whose log records are its ops.
+pub fn check_epoch(
     model: &Model,
     base: usize,
     recovery: &Recovery,
     events: &[&TraceEvent],
+    dir: &Path,
 ) -> (Result<(), String>, Option<Excuse>) {
     let recovered = &recovery.records;
     // Property A: what came back is a prefix of what was appended.
@@ -348,7 +355,6 @@ fn check_epoch(
         }
     }
     // The syncs the log claimed, and whether the simulator honoured each.
-    let dir = Path::new(DIR);
     let mut lost_since: BTreeSet<u64> = BTreeSet::new();
     let mut syncs: Vec<(Seq, Seq, bool)> = Vec::new();
     let mut cuts: Vec<(u64, u64, bool)> = Vec::new();
@@ -370,6 +376,25 @@ fn check_epoch(
                 cuts.push((*segment, *len, lost_since.remove(segment)));
             }
             _ => {}
+        }
+    }
+    // Property C: nothing was acknowledged before a sync was asked for. Independent
+    // of what recovery returned, so a lost fsync earlier in the log cannot hide it.
+    for (i, &acked) in model.acked.iter().enumerate() {
+        let seq = i as u64 + 1;
+        if seq as usize <= base || !acked {
+            continue;
+        }
+        if !syncs
+            .iter()
+            .any(|&(first, up_to, _)| first <= seq && seq <= up_to)
+        {
+            return (
+                Err(format!(
+                    "record {seq} was acknowledged with no sync attempted before the crash"
+                )),
+                None,
+            );
         }
     }
     // Whether the stop is explained: bit rot inside the record it stopped on, or a

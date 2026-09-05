@@ -101,14 +101,15 @@ ananke/
 
 _Update this section at the end of every session._
 
-- Phase: 1 in progress (2026-09-05). The gate is closed and the WAL is done:
-  `crates/ananke-storage` has `crc32c` and `wal` (D-018, D-019), and `sim/wal.rs` runs
-  the §2.8 crash property reduced to the log with every §1.3 fault on, passing the
-  correct log on 100 seeds and catching each of three known-buggy variants. The
-  memtable is not started.
+- Phase: 1 in progress (2026-09-05). The gate is closed; the WAL (D-018, D-019) and
+  the memtable with the engine in front of the log (D-020) are done. `sim/wal.rs` and
+  `sim/engine.rs` run the §2.8 crash property with every §1.3 fault on and crashes
+  between polls; the correct code passes every seed, each known-buggy variant is
+  caught. Sweeps run `ANANKE_SEEDS` seeds: 20 at the gate, 100 in CI, 10 000 nightly.
+  SSTables are not started.
 - Last tag: v0.1.0
-- Next concrete task: the memtable (SPEC §2.3) on top of the WAL, then the SSTable.
-  Stop for review after each.
+- Next concrete task: the SSTable (SPEC §2.4) as the engine's flush sink, replacing
+  `Retain`, then the manifest and compaction. Stop for review after each.
 - Fault-model tests follow the CLAUDE.md pattern: a known-buggy variant the sweep
   must catch beside the correct one it must pass (`Journal::sync_dir_on_rotate`,
   `wal::Variant`).
