@@ -278,28 +278,83 @@ impl Sim {
     }
 
     /// Blocks every link between the two groups, both directions.
+    ///
+    /// When the two groups are disjoint and together cover every node this is a
+    /// symmetric partition and the trace records `PartitionStarted`, which moirae shows
+    /// as a wall. Anything else, or a second partition while one is in force, is
+    /// recorded as one `LinkBlocked` per direction, which moirae's group model cannot
+    /// express (SPEC §1.5).
     pub fn partition(&mut self, a: &[NodeId], b: &[NodeId]) {
         let mut st = self.shared.lock();
-        for &x in a {
-            for &y in b {
+        let mut ga: Vec<NodeId> = a.to_vec();
+        let mut gb: Vec<NodeId> = b.to_vec();
+        ga.sort_unstable();
+        ga.dedup();
+        gb.sort_unstable();
+        gb.dedup();
+        let mut covered: Vec<NodeId> = ga.iter().chain(gb.iter()).copied().collect();
+        covered.sort_unstable();
+        let all: Vec<NodeId> = st.nodes.keys().copied().collect();
+        let symmetric = covered == all
+            && ga.iter().all(|x| !gb.contains(x))
+            && st.fabric.active_partition.is_none();
+        for &x in &ga {
+            for &y in &gb {
                 st.fabric.block(x, y);
                 st.fabric.block(y, x);
             }
         }
+        if symmetric {
+            let groups = vec![ga, gb];
+            st.fabric.active_partition = Some(groups.clone());
+            st.record(None, TraceEvent::PartitionStarted { groups });
+        } else {
+            for &x in &ga {
+                for &y in &gb {
+                    for (from, to) in [(x, y), (y, x)] {
+                        if st.fabric.links.insert((from, to)) {
+                            st.record(Some(from), TraceEvent::LinkBlocked { from, to });
+                        }
+                    }
+                }
+            }
+        }
     }
 
-    /// Blocks one direction of one link.
+    /// Blocks one direction of one link. Recorded as `LinkBlocked`.
     pub fn block(&mut self, from: NodeId, to: NodeId) {
-        self.shared.lock().fabric.block(from, to);
+        let mut st = self.shared.lock();
+        st.fabric.block(from, to);
+        if st.fabric.links.insert((from, to)) {
+            st.record(Some(from), TraceEvent::LinkBlocked { from, to });
+        }
     }
 
-    /// Removes every block.
+    /// Removes every block: `PartitionHealed` for a symmetric partition in force, then
+    /// one `LinkUnblocked` per individually blocked direction.
     pub fn heal(&mut self) {
-        self.shared.lock().fabric.heal();
+        let mut st = self.shared.lock();
+        st.fabric.heal();
+        if let Some(groups) = st.fabric.active_partition.take() {
+            st.record(None, TraceEvent::PartitionHealed { groups });
+        }
+        let links = std::mem::take(&mut st.fabric.links);
+        for (from, to) in links {
+            st.record(Some(from), TraceEvent::LinkUnblocked { from, to });
+        }
+    }
+
+    /// Marks `node` as starting again after a crash: records `NodeRestarted`. Spawning
+    /// the node's tasks on `sim.env(node)` afterwards is the restart itself; what the
+    /// tasks find on disk is what survived the crash.
+    pub fn restart(&mut self, node: NodeId) {
+        let mut st = self.shared.lock();
+        assert!(st.nodes.contains_key(&node), "unknown node {node}");
+        st.record(Some(node), TraceEvent::NodeRestarted { node });
     }
 
     /// Kills every task on `node`, unbinds its sockets, and applies the §1.3 crash
-    /// model to its disk. Spawning on `sim.env(node)` afterwards is the restart.
+    /// model to its disk. Call [`restart`](Self::restart) and spawn again to bring it back.
     pub fn crash(&mut self, node: NodeId) {
         let futures: Vec<BoxFuture> = {
             let mut st = self.shared.lock();

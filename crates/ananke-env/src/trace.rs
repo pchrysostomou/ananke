@@ -120,6 +120,37 @@ pub enum TraceEvent {
         /// The crashed node.
         node: NodeId,
     },
+    /// A crashed node is about to be started again from what survived on its disk.
+    NodeRestarted {
+        /// The node.
+        node: NodeId,
+    },
+    /// A symmetric partition began: the groups cannot reach each other, and together
+    /// they cover every node.
+    PartitionStarted {
+        /// The groups, each sorted.
+        groups: Vec<Vec<NodeId>>,
+    },
+    /// The symmetric partition ended.
+    PartitionHealed {
+        /// The groups that just ended.
+        groups: Vec<Vec<NodeId>>,
+    },
+    /// One direction of one link was blocked: an asymmetric or partial partition, which
+    /// moirae's group partitions cannot express.
+    LinkBlocked {
+        /// Messages from this node...
+        from: NodeId,
+        /// ...to this node are dropped.
+        to: NodeId,
+    },
+    /// A blocked link direction was reopened.
+    LinkUnblocked {
+        /// The sender.
+        from: NodeId,
+        /// The receiver.
+        to: NodeId,
+    },
 }
 
 /// Why a message was discarded.

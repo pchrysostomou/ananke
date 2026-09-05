@@ -181,16 +181,35 @@ impl Report {
         if delivered(n2, n1, Instant::ZERO, t_restart) == 0 {
             return fail("node 2 never reached node 1".to_owned());
         }
-        // The restarted node comes back.
-        if !self
+        // The restarted node comes back, and the trace says so in order.
+        let crashed = self
             .records
             .iter()
-            .any(|r| r.event == TraceEvent::NodeCrashed { node: n2 })
-        {
-            return fail("no NodeCrashed event for node 2".to_owned());
+            .position(|r| r.event == TraceEvent::NodeCrashed { node: n2 });
+        let restarted = self
+            .records
+            .iter()
+            .position(|r| r.event == TraceEvent::NodeRestarted { node: n2 });
+        match (crashed, restarted) {
+            (Some(c), Some(r)) if c < r => {}
+            _ => return fail("node 3 must crash, then restart, in that order".to_owned()),
         }
         if delivered(n0, n2, t_one_way, t_restart) + delivered(n1, n2, t_one_way, t_restart) == 0 {
-            return fail("node 2 received nothing after restarting".to_owned());
+            return fail("node 3 received nothing after restarting".to_owned());
+        }
+        // The symmetric partition and the one-way block are recorded as moirae will show them.
+        let count =
+            |f: &dyn Fn(&TraceEvent) -> bool| self.records.iter().filter(|r| f(&r.event)).count();
+        let shape = (
+            count(&|e| matches!(e, TraceEvent::PartitionStarted { .. })),
+            count(&|e| matches!(e, TraceEvent::PartitionHealed { .. })),
+            count(&|e| matches!(e, TraceEvent::LinkBlocked { .. })),
+            count(&|e| matches!(e, TraceEvent::LinkUnblocked { .. })),
+        );
+        if shape != (1, 1, 1, 1) {
+            return fail(format!(
+                "expected one partition, one heal, one link block and one unblock; got {shape:?}"
+            ));
         }
         // The fault model was actually exercised.
         for (name, wanted) in [
@@ -298,6 +317,7 @@ pub fn run_with(seed: u64, schedule: Schedule) -> Report {
 
     sim.heal();
     sim.crash(nodes[2]);
+    sim.restart(nodes[2]);
     spawn(&sim, 2, 1);
     sim.run_for(schedule.after_restart);
     phase_ends[4] = sim.now();

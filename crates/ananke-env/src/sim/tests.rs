@@ -854,3 +854,44 @@ fn message_ids_correlate_send_delivery_and_drop() {
     );
     assert!(ev.iter().any(|e| matches!(e, TraceEvent::MessageDropped { id, reason: DropReason::Unreachable, .. } if *id == ids[1])));
 }
+
+#[test]
+fn partition_heal_block_and_restart_are_traced() {
+    let mut sim = Sim::new(SimConfig::new(1));
+    let (a, b, c) = (sim.add_node(), sim.add_node(), sim.add_node());
+    sim.partition(&[a], &[c, b]);
+    sim.heal();
+    sim.partition(&[a], &[b]); // does not cover c: links, not a partition
+    sim.block(b, c);
+    sim.block(b, c); // already blocked: no second event
+    sim.heal();
+    sim.crash(b);
+    sim.restart(b);
+    let ev = events(&sim);
+    let expected = vec![
+        TraceEvent::PartitionStarted {
+            groups: vec![vec![a], vec![b, c]],
+        },
+        TraceEvent::PartitionHealed {
+            groups: vec![vec![a], vec![b, c]],
+        },
+        TraceEvent::LinkBlocked { from: a, to: b },
+        TraceEvent::LinkBlocked { from: b, to: a },
+        TraceEvent::LinkBlocked { from: b, to: c },
+        TraceEvent::LinkUnblocked { from: a, to: b },
+        TraceEvent::LinkUnblocked { from: b, to: a },
+        TraceEvent::LinkUnblocked { from: b, to: c },
+        TraceEvent::NodeCrashed { node: b },
+        TraceEvent::NodeRestarted { node: b },
+    ];
+    assert_eq!(ev, expected);
+    let started = sim
+        .trace()
+        .into_iter()
+        .find(|r| matches!(r.event, TraceEvent::PartitionStarted { .. }))
+        .unwrap();
+    assert_eq!(
+        started.node, None,
+        "a symmetric partition belongs to the simulator, not a node"
+    );
+}

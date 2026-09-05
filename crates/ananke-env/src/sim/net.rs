@@ -39,6 +39,10 @@ pub(super) struct Fabric {
     sockets: BTreeMap<SocketAddr, SocketState>,
     deliveries: BTreeMap<(Instant, u64), Delivery>,
     blocked: BTreeSet<(NodeId, NodeId)>,
+    /// The symmetric partition in force, if any, as recorded in the trace.
+    pub(super) active_partition: Option<Vec<Vec<NodeId>>>,
+    /// Link directions blocked individually, as recorded in the trace.
+    pub(super) links: BTreeSet<(NodeId, NodeId)>,
     next_socket: u64,
     next_port: u16,
     next_message: u64,
