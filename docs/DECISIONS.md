@@ -497,4 +497,35 @@ acknowledged-without-sync property is part of every crash sweep from here on.
 
 ---
 
-_Next entry: D-021. Add one before implementing anything not covered above._
+## D-021 — Engine writes apply in sequence order, not in acknowledgement-poll order
+
+**Context.** D-020 had each caller apply its own write to the active memtable when
+it saw the log's acknowledgement, and relied on the memtable's sequence guard to make
+the callers' polling order irrelevant. The first nightly sweep (seed 420, epoch 1)
+showed the guard is not enough: two writes to one key acknowledged in the same group
+were applied newer-first, the active memtable rotated between the two applications,
+and the older write went into the new active memtable, where a read found it first
+and returned a value two writes old. The guard only orders writes within one
+memtable; rotation is what it cannot see.
+
+**Decision.** The engine keeps every appended write in a map by sequence number until
+it is applied. When any caller sees its write acknowledged, it applies every pending
+write up to its own, oldest first: the log acknowledges in sequence order, so all of
+them are durable by then. Applying is thus in sequence order whatever the executor
+does, and a rotation can only ever fall between an older and a newer write in that
+order. The memtable's guard stays, as a second line. This supersedes D-020's
+"applied by whichever task is polled first". Seed 420 is pinned in the gate.
+
+**Alternatives.** Applying in the log writer's acknowledgement path: the same order
+by construction, but memtable work on the one task every appender waits for. Keys
+versioned by sequence number in the memtable, with reads taking the newest across
+all memtables (SPEC §2.6): the LSM answer, and what the SSTable step will bring;
+until then the order rule is smaller and does not change the memtable's shape.
+
+**Consequences.** One more lock per write and a map that is empty between groups.
+Found by the nightly on its first run, at seed 420: twenty seeds at the gate and a
+hundred in CI had not reached the interleaving, which is what ten thousand are for.
+
+---
+
+_Next entry: D-022. Add one before implementing anything not covered above._

@@ -2,7 +2,14 @@
 //!
 //! A write is one log record, `put` or `delete` with its key and value, appended
 //! through the [`Wal`] and applied to the active [`Memtable`] once the log has
-//! acknowledged it: nothing is visible before it is durable. When the active memtable
+//! acknowledged it: nothing is visible before it is durable. Writes are applied in
+//! sequence order whatever order their callers are polled in: the log acknowledges
+//! in sequence order, so when a caller sees its write acknowledged every earlier
+//! write is durable too, and it applies all of them that are still pending, oldest
+//! first. Otherwise two writes to one key acknowledged together could be applied
+//! older-last, and if the memtable rotated between them the older one would sit in
+//! the newer memtable and shadow the newer: the nightly sweep's seed 420, D-020.
+//! When the active memtable
 //! exceeds `memtable_bytes` it becomes immutable and a fresh one takes its place; a
 //! flusher task hands each immutable memtable, oldest first, to the [`FlushSink`] and
 //! releases it once the sink has it. Reads consult the active memtable, then the
@@ -17,7 +24,7 @@
 //! [`Variant::NoWalBeforeMemtable`], which applies a write and acknowledges it
 //! before the log has, the bug the sweep must catch.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 use std::io;
 use std::path::PathBuf;
@@ -180,6 +187,8 @@ struct Shared<E: Environment, S: FlushSink> {
     tables: Mutex<Tables>,
     flusher: Mutex<Flusher>,
     next_memtable: AtomicU64,
+    /// Writes appended and not yet applied, by sequence number.
+    pending: Mutex<BTreeMap<Seq, (Bytes, Value)>>,
 }
 
 /// What [`Engine::open`] found.
@@ -236,6 +245,7 @@ impl<E: Environment, S: FlushSink> Engine<E, S> {
                 closed: false,
             }),
             next_memtable: AtomicU64::new(2),
+            pending: Mutex::new(BTreeMap::new()),
         });
         for (i, record) in recovery.records.iter().enumerate() {
             let (key, value) = decode_op(record.clone())?;
@@ -265,18 +275,18 @@ impl<E: Environment, S: FlushSink> Engine<E, S> {
 
     fn write(&self, key: Bytes, value: Value) -> Write<E, S> {
         let append = self.shared.wal.append(encode_op(&key, &value));
-        let pending = match self.shared.config.variant {
-            Variant::Correct => Some((key, value)),
+        match self.shared.config.variant {
+            Variant::Correct => {
+                lock(&self.shared.pending).insert(append.seq(), (key, value));
+            }
             Variant::NoWalBeforeMemtable => {
                 // The bug: visible and acknowledged before the log has it.
                 self.shared.apply(append.seq(), key, value);
-                None
             }
-        };
+        }
         Write {
             shared: self.shared.clone(),
             append,
-            pending,
         }
     }
 
@@ -329,6 +339,24 @@ impl<E: Environment, S: FlushSink> Drop for Engine<E, S> {
 }
 
 impl<E: Environment, S: FlushSink> Shared<E, S> {
+    /// Applies every pending write up to and including `seq`, oldest first: the log
+    /// acknowledged `seq`, so all of them are durable.
+    fn apply_through(&self, seq: Seq) {
+        loop {
+            let next = {
+                let mut pending = lock(&self.pending);
+                match pending.first_key_value() {
+                    Some((&first, _)) if first <= seq => pending.pop_first(),
+                    _ => None,
+                }
+            };
+            let Some((s, (key, value))) = next else {
+                return;
+            };
+            self.apply(s, key, value);
+        }
+    }
+
     /// Applies a durable write and rotates the active memtable if it is now full.
     fn apply(&self, seq: Seq, key: Bytes, value: Value) {
         let active = lock(&self.tables).active.clone();
@@ -364,8 +392,6 @@ impl<E: Environment, S: FlushSink> Shared<E, S> {
 pub struct Write<E: Environment, S: FlushSink> {
     shared: Arc<Shared<E, S>>,
     append: Append,
-    /// What to apply on acknowledgement; `None` once applied.
-    pending: Option<(Bytes, Value)>,
 }
 
 impl<E: Environment, S: FlushSink> Write<E, S> {
@@ -388,9 +414,7 @@ impl<E: Environment, S: FlushSink> Future for Write<E, S> {
             Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
             Poll::Ready(Ok(seq)) => seq,
         };
-        if let Some((key, value)) = self.pending.take() {
-            self.shared.apply(seq, key, value);
-        }
+        self.shared.apply_through(seq);
         Poll::Ready(Ok(seq))
     }
 }

@@ -102,7 +102,7 @@ ananke/
 _Update this section at the end of every session._
 
 - Phase: 1 in progress (2026-09-05). The gate is closed; the WAL (D-018, D-019) and
-  the memtable with the engine in front of the log (D-020) are done. `sim/wal.rs` and
+  the memtable with the engine in front of the log (D-020, D-021) are done. `sim/wal.rs` and
   `sim/engine.rs` run the §2.8 crash property with every §1.3 fault on and crashes
   between polls; the correct code passes every seed, each known-buggy variant is
   caught. Sweeps run `ANANKE_SEEDS` seeds: 20 at the gate, 100 in CI, 10 000 nightly.

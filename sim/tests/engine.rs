@@ -39,6 +39,16 @@ fn the_correct_engine_passes_every_seed() {
     coverage.assert_complete();
 }
 
+/// The first nightly sweep failed here: a live read of k46 returned a value two
+/// writes old. Two writes to one key acknowledged in the same group were applied by
+/// their callers newer-first, the memtable rotated in between, and the older write
+/// landed in the newer memtable and shadowed the newer one. Writes now apply in
+/// sequence order (D-021); this seed stays in the gate so they keep doing so.
+#[test]
+fn seed_420_which_the_first_nightly_found_stays_green() {
+    engine::run(420, Variant::Correct).check().unwrap();
+}
+
 /// The negative control: acknowledging before the log is caught.
 #[test]
 fn an_engine_that_acknowledges_before_the_log_is_caught() {
