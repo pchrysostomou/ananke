@@ -32,8 +32,11 @@ Deferred ideas live in [docs/BACKLOG.md](docs/BACKLOG.md).
   `deny(unsafe_code)`; `ananke-storage` is the only crate permitted to
   `#![allow(unsafe_code)]`. Every `unsafe` block carries a `// SAFETY:` comment and
   gets a Miri run in CI.
-- **Every change:** tests under simulation, clippy clean, `cargo doc` without
-  warnings, rustfmt clean.
+- **The gate is one command.** `scripts/gate.sh` runs rustfmt, clippy, the direct-I/O
+  check, `cargo doc` and every test in sequence under `set -euo pipefail`. No commit is
+  made unless `scripts/gate.sh` has exited 0 on the exact tree being committed, run as
+  that single command, never as separate shell lines whose failures can be missed. CI
+  runs the same checks as parallel jobs.
 - **Every state transition that matters emits a trace event.** If it can't be seen in
   the moirae studio, it didn't happen. A scenario's trace is `Sim::to_moirae` JSONL;
   CI pins its hash, and a deliberate change updates the constant in the same commit and
@@ -54,7 +57,7 @@ crates/ananke-env/     Environment trait; real/ (RealEnv on tokio); sim/ (Sim + 
 crates/ananke-server/  Node binary + library of the protocols it runs (echo for Phase 0)
 sim/                   Simulation scenarios; scenario files sit directly in sim/ (echo.rs first)
 docs/                  SPEC, DECISIONS, BACKLOG, BOOTSTRAP_PROMPT, devlog/
-scripts/               check-direct-io.sh
+scripts/               gate.sh (run before every commit), check-direct-io.sh
 clippy.toml            Banned I/O paths (disallowed-methods / disallowed-types)
 .github/workflows/     CI: rustfmt, clippy + direct-io check, cargo doc, cargo test
 ```
@@ -62,10 +65,10 @@ clippy.toml            Banned I/O paths (disallowed-methods / disallowed-types)
 ## Verification commands
 
 ```
-cargo build --workspace
-cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
-scripts/check-direct-io.sh
-cargo fmt --all -- --check
-RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+scripts/gate.sh          # the only command that precedes a commit
 ```
+
+It runs, in order: `cargo fmt --all -- --check`, `cargo clippy --workspace
+--all-targets --all-features -- -D warnings`, `scripts/check-direct-io.sh`, `cargo doc
+--workspace --no-deps` with warnings as errors, `cargo test --workspace --all-targets`
+and the doctests.
