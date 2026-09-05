@@ -17,7 +17,11 @@
 //! hold. A crash anywhere before the switch leaves the old manifest in force and the
 //! new files as orphans, which recovery removes; the log still has the records.
 //! Reads consult the active memtable, the immutable ones newest first, then the
-//! tables newest first.
+//! tables newest first, and take the newest write of the key at or below the
+//! snapshot they read at (D-023). A [`Snapshot`] pins the versions it can see against
+//! compaction until it is dropped; a scan merges every memtable and table into one
+//! walk in key order and reports the newest write per key at the snapshot, so it is
+//! one consistent view whatever is written meanwhile.
 //!
 //! Recovery reads `CURRENT`, the manifest it names (falling back to the newest
 //! readable one if `CURRENT` or that manifest cannot be read, and then rewriting
@@ -35,6 +39,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
 use std::io;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -44,10 +49,12 @@ use std::task::{Context, Poll, Waker};
 use ananke_env::{Environment, File, FileSystem, OpenOptions, TraceEvent};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
+use crate::ikey;
 use crate::manifest::{
     self, Manifest, SstMeta, current_path, current_tmp_path, manifest_path, sst_path,
 };
 use crate::memtable::{Memtable, Value};
+use crate::merge::{MergeIter, Source};
 use crate::sst::{SstReader, SstWriter};
 use crate::wal::{self, Append, HeadGapPolicy, Recovery, Seq, Wal, WalConfig};
 
@@ -89,6 +96,22 @@ pub struct EngineConfig {
     /// tables are the state, a clean prefix. Replaying past the gap would give a
     /// state that never existed (D-022).
     pub allow_head_gap: bool,
+}
+
+impl EngineConfig {
+    /// The defaults for a store in `dir`: a 64 MiB memtable (SPEC §2.3), 16 MiB log
+    /// segments, the correct engine and log, and a missing log head refused.
+    #[must_use]
+    pub fn new(dir: PathBuf) -> Self {
+        Self {
+            dir,
+            memtable_bytes: 64 << 20,
+            segment_bytes: 16 << 20,
+            variant: Variant::Correct,
+            wal_variant: wal::Variant::Correct,
+            allow_head_gap: false,
+        }
+    }
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -170,6 +193,12 @@ struct Shared<E: Environment> {
     next_memtable: AtomicU64,
     /// Writes appended and not yet applied, by sequence number.
     pending: Mutex<BTreeMap<Seq, (Bytes, Value)>>,
+    /// The highest sequence number applied: what a read without a snapshot reads at,
+    /// and what a new snapshot pins. Writes apply in order (D-021), so everything at
+    /// or below it is visible.
+    visible: AtomicU64,
+    /// Live snapshots by sequence number, with how many pin each.
+    snapshots: Mutex<BTreeMap<Seq, usize>>,
 }
 
 /// What [`Engine::open`] found.
@@ -199,6 +228,42 @@ pub struct EngineRecovery {
 /// stops the flusher once the queue is empty.
 pub struct Engine<E: Environment> {
     shared: Arc<Shared<E>>,
+}
+
+/// A point in the engine's history: reads at it see every write numbered at or
+/// below its version and nothing newer, and compaction keeps the versions it needs
+/// until it is dropped.
+pub struct Snapshot<E: Environment> {
+    shared: Arc<Shared<E>>,
+    version: Seq,
+}
+
+impl<E: Environment> Snapshot<E> {
+    /// The sequence number the snapshot reads at.
+    #[must_use]
+    pub fn version(&self) -> Seq {
+        self.version
+    }
+}
+
+impl<E: Environment> std::fmt::Debug for Snapshot<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Snapshot")
+            .field("version", &self.version)
+            .finish()
+    }
+}
+
+impl<E: Environment> Drop for Snapshot<E> {
+    fn drop(&mut self) {
+        let mut snapshots = lock(&self.shared.snapshots);
+        if let Some(count) = snapshots.get_mut(&self.version) {
+            *count -= 1;
+            if *count == 0 {
+                snapshots.remove(&self.version);
+            }
+        }
+    }
 }
 
 impl<E: Environment> std::fmt::Debug for Engine<E> {
@@ -416,6 +481,8 @@ impl<E: Environment> Engine<E> {
             }),
             next_memtable: AtomicU64::new(2),
             pending: Mutex::new(BTreeMap::new()),
+            visible: AtomicU64::new(flushed_seq),
+            snapshots: Mutex::new(BTreeMap::new()),
         });
         let mut replayed = 0;
         for (i, record) in recovery.records.iter().enumerate() {
@@ -472,39 +539,67 @@ impl<E: Environment> Engine<E> {
         }
     }
 
-    /// The value under `key`, if it is present: the active memtable first, then the
-    /// immutable ones newest first, then the tables newest first.
+    /// A snapshot at the newest write applied.
+    #[must_use]
+    pub fn snapshot(&self) -> Snapshot<E> {
+        let version = self.shared.visible.load(Ordering::Acquire);
+        *lock(&self.shared.snapshots).entry(version).or_default() += 1;
+        Snapshot {
+            shared: self.shared.clone(),
+            version,
+        }
+    }
+
+    /// The value under `key` as of the newest write applied, if it is present.
     ///
     /// # Errors
     ///
     /// A table read's error.
     pub async fn get(&self, key: &[u8]) -> io::Result<Option<Bytes>> {
-        let (active, immutable, ssts) = {
-            let tables = lock(&self.shared.tables);
-            (
-                tables.active.clone(),
-                tables.immutable.clone(),
-                tables
-                    .ssts
-                    .iter()
-                    .map(|(_, r)| r.clone())
-                    .collect::<Vec<_>>(),
-            )
-        };
-        if let Some(value) = active.get(key) {
-            return Ok(value.live());
-        }
-        for memtable in immutable.iter().rev() {
-            if let Some(value) = memtable.get(key) {
-                return Ok(value.live());
+        self.shared
+            .read(key, self.shared.visible.load(Ordering::Acquire))
+            .await
+    }
+
+    /// The value under `key` as of `snapshot`, if it is present.
+    ///
+    /// # Errors
+    ///
+    /// A table read's error.
+    pub async fn get_at(&self, key: &[u8], snapshot: &Snapshot<E>) -> io::Result<Option<Bytes>> {
+        self.shared.read(key, snapshot.version).await
+    }
+
+    /// Every present key in `range` as of `snapshot`, in key order, with its value:
+    /// one merge over every memtable and table, taking the newest write per key at
+    /// or below the snapshot.
+    ///
+    /// # Errors
+    ///
+    /// A table read's error.
+    pub async fn scan(
+        &self,
+        range: Range<&[u8]>,
+        snapshot: &Snapshot<E>,
+    ) -> io::Result<Vec<(Bytes, Bytes)>> {
+        let mut merge = self.shared.merge_all();
+        merge.seek(&ikey::lower_bound(range.start)).await?;
+        let mut out = Vec::new();
+        let mut last_user: Option<Bytes> = None;
+        while let Some((key, value)) = merge.next().await? {
+            let (user, seq) = ikey::decode(&key)?;
+            if user[..] >= *range.end {
+                break;
+            }
+            if seq > snapshot.version || last_user.as_ref() == Some(&user) {
+                continue;
+            }
+            last_user = Some(user.clone());
+            if let Value::Live(bytes) = value {
+                out.push((user, bytes));
             }
         }
-        for sst in ssts.iter().rev() {
-            if let Some(value) = sst.get(key).await? {
-                return Ok(value.live());
-            }
-        }
-        Ok(None)
+        Ok(out)
     }
 
     /// Immutable memtables not yet flushed.
@@ -546,6 +641,47 @@ impl<E: Environment> Drop for Engine<E> {
 }
 
 impl<E: Environment> Shared<E> {
+    /// The newest write of `key` at or below `snapshot`: the active memtable first,
+    /// then the immutable ones newest first, then the tables newest first. Each holds
+    /// newer writes than the next, so the first that has one has the newest.
+    async fn read(&self, key: &[u8], snapshot: Seq) -> io::Result<Option<Bytes>> {
+        let (active, immutable, ssts) = {
+            let tables = lock(&self.tables);
+            (
+                tables.active.clone(),
+                tables.immutable.clone(),
+                tables
+                    .ssts
+                    .iter()
+                    .map(|(_, r)| r.clone())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        if let Some((_, value)) = active.get(key, snapshot) {
+            return Ok(value.live());
+        }
+        for memtable in immutable.iter().rev() {
+            if let Some((_, value)) = memtable.get(key, snapshot) {
+                return Ok(value.live());
+            }
+        }
+        for sst in ssts.iter().rev() {
+            if let Some((_, value)) = sst.get(key, snapshot).await? {
+                return Ok(value.live());
+            }
+        }
+        Ok(None)
+    }
+
+    /// One merge over every memtable and table in service right now.
+    fn merge_all(&self) -> MergeIter<FileOf<E>> {
+        let tables = lock(&self.tables);
+        let mut sources = vec![Source::memtable(tables.active.clone())];
+        sources.extend(tables.immutable.iter().cloned().map(Source::memtable));
+        sources.extend(tables.ssts.iter().map(|(_, r)| Source::Sst(r.iter())));
+        MergeIter::new(sources)
+    }
+
     /// Applies every pending write up to and including `seq`, oldest first: the log
     /// acknowledged `seq`, so all of them are durable.
     fn apply_through(&self, seq: Seq) {
@@ -568,6 +704,7 @@ impl<E: Environment> Shared<E> {
     fn apply(&self, seq: Seq, key: Bytes, value: Value) {
         let active = lock(&self.tables).active.clone();
         active.apply(seq, key, value);
+        self.visible.fetch_max(seq, Ordering::AcqRel);
         if active.bytes() <= self.config.memtable_bytes {
             return;
         }
@@ -614,8 +751,8 @@ impl<E: Environment> Shared<E> {
     async fn write_sst(&self, memtable: &Memtable) -> io::Result<(SstMeta, SstReader<FileOf<E>>)> {
         let number = lock(&self.tables).manifest.next_sst;
         let mut writer = SstWriter::new();
-        for (key, _, value) in memtable.entries() {
-            writer.add(&key, &value);
+        for (key, seq, value) in memtable.entries() {
+            writer.add(&key, seq, &value);
         }
         let entries = writer.entries();
         let bytes = writer.finish();

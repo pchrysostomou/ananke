@@ -1,5 +1,5 @@
-//! The ananke storage engine (SPEC.md §2): a write-ahead log and a memtable now, an
-//! LSM tree as Phase 1 proceeds. Everything is generic over [`ananke_env::Environment`], so the
+//! The ananke storage engine (SPEC.md §2): a write-ahead log, versioned memtables and
+//! SSTables under a manifest, an LSM tree as Phase 1 proceeds. Everything is generic over [`ananke_env::Environment`], so the
 //! code that runs on a real disk is the code the simulator crashes ten thousand times.
 //!
 //! This is the one crate the workspace permits `unsafe` in (BOOTSTRAP_PROMPT.md,
@@ -14,12 +14,14 @@
 
 pub mod crc32c;
 pub mod engine;
+pub mod ikey;
 pub mod manifest;
 pub mod memtable;
+pub mod merge;
 pub mod sst;
 pub mod wal;
 
-pub use engine::{Engine, EngineConfig, EngineRecovery, Write};
+pub use engine::{Engine, EngineConfig, EngineRecovery, Snapshot, Write};
 pub use memtable::{Memtable, Value};
 pub use wal::{
     Append, CoveredStop, HeadGap, HeadGapPolicy, Recovery, Seq, Variant, Wal, WalConfig,

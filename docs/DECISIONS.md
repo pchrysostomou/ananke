@@ -619,4 +619,45 @@ the records is the check that matters.
 
 ---
 
-_Next entry: D-023. Add one before implementing anything not covered above._
+## D-023 — Versions in the memtable and the tables, snapshots, one merge for reads and compaction, and leveled compaction
+
+**Context.** SPEC §2.5 asks for leveled compaction, crash-safe through the manifest,
+and §2.7 for `get` and `scan` at a snapshot version. D-020's memtable kept the newest
+write per key and D-022's tables the same, so a snapshot had nothing to read from:
+a key overwritten after the snapshot was gone, and a scan could see a key before a
+write and its neighbour after it.
+
+**Decision.** Keys are internal keys: the user key, escaped so a shorter key sorts
+before every longer key it is a prefix of, then `!seq` big-endian, so byte order is
+user key ascending and newest write first (`ikey`). The memtable keeps every write
+since the last flush under its internal key, and a table holds whatever writes its
+flush or compaction gave it, several of one user key allowed; the bloom filter is
+over user keys, and the table format is version 2. A read at sequence number `s`
+seeks to `(key, s)` and answers with the first entry if it is a write of `key`: the
+newest at or below `s`. The engine's `visible` is the highest number applied; a
+`Snapshot` pins that number, counted in a map compaction consults for the oldest
+version it must keep, and is released on drop. `get` reads at `visible`, `get_at` at
+a snapshot, and `scan` merges every memtable and table into one walk in internal-key
+order, seeks to the range's start and reports the newest write per user key at or
+below the snapshot, tombstones hiding older ones. The merge iterator (`merge`) is
+the same one compaction reads its inputs through. This supersedes D-020's newest
+write per key and D-021's guard, which the numbering makes unnecessary; writes still
+apply in sequence order, which is what makes `visible` mean "everything at or below".
+
+**Alternatives.** Snapshots by version in the user key alone (§2.6): that is the
+transaction layer's versioning, above the engine, and it cannot give a consistent
+scan across an engine write that lands mid-walk. A `Version` parameter without a
+guard, as §2.7 sketches: compaction would have no way to know which versions are
+still wanted; the guard carries the version and its lifetime. Materialising a
+memtable for a scan: the cursor asks the skiplist for the next entry past the last
+instead, so a scan holds no borrow and no copy.
+
+**Consequences.** A memtable fills with every write, not every key, and flushes
+about twice as often in the sweep. The sweep's readers now scan at snapshots and
+compare with the model folded over exactly the ops the version covers, which is
+exact rather than tolerant of in-flight writes; and the state check after a recovery
+scans the whole space besides reading every key.
+
+---
+
+_Next entry: D-024. Add one before implementing anything not covered above._

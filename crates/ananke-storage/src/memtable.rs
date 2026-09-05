@@ -1,22 +1,25 @@
-//! The memtable (SPEC.md §2.3, D-020): the newest write per key, in key order, in
-//! memory. A skiplist (`crossbeam-skiplist`) so that appenders on different tasks
-//! insert without a lock and readers walk it in order; its level generator is a
-//! constant-seeded xorshift, so a memtable's shape is a function of its inserts.
+//! The memtable (SPEC.md §2.3, D-020, D-023): every write since the last flush, in
+//! memory, ordered by internal key: user key, then newest first. A skiplist
+//! (`crossbeam-skiplist`) so that appenders on different tasks insert without a lock
+//! and readers walk it in order; its level generator is a constant-seeded xorshift,
+//! so a memtable's shape is a function of its inserts.
 //!
-//! Every entry carries the log sequence number of the write that made it, and an
-//! insert takes effect only if its number is higher than what is there. Acknowledged
-//! writes are applied by whichever task is polled first, so two writes to one key can
-//! arrive in either order; the number, not the arrival, decides.
+//! Every write is kept, not only the newest per key, so that a read at a snapshot
+//! sees the newest write at or below it, and a scan at a snapshot is consistent
+//! whatever is written meanwhile. Compaction drops versions nobody can see any more
+//! (D-023).
 
+use std::ops::Bound;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use crossbeam_skiplist::SkipMap;
 
 use crate::Seq;
+use crate::ikey;
 
 /// What a key holds: a value, or a tombstone left by a delete that must shadow older
-/// values in older memtables and, later, in SSTables.
+/// values in older memtables and in SSTables.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Value {
     /// The key is present with this value.
@@ -35,7 +38,9 @@ impl Value {
         }
     }
 
-    fn bytes(&self) -> u64 {
+    /// The value's bytes, none for a tombstone.
+    #[must_use]
+    pub fn bytes(&self) -> u64 {
         match self {
             Value::Live(bytes) => bytes.len() as u64,
             Value::Tombstone => 0,
@@ -43,21 +48,14 @@ impl Value {
     }
 }
 
-/// One key's newest write.
-#[derive(Clone, Debug)]
-struct Entry {
-    seq: Seq,
-    value: Value,
-}
-
 /// Per-entry accounting overhead, on top of the key and value bytes.
 const ENTRY_OVERHEAD: u64 = 32;
 
-/// The newest write per key, in key order.
+/// Every write since the last flush, by internal key.
 #[derive(Debug)]
 pub struct Memtable {
     id: u64,
-    map: SkipMap<Bytes, Entry>,
+    map: SkipMap<Bytes, Value>,
     bytes: AtomicU64,
     min_seq: AtomicU64,
     max_seq: AtomicU64,
@@ -83,47 +81,51 @@ impl Memtable {
         self.id
     }
 
-    /// Records the write numbered `seq` unless a newer one is already there. Returns
-    /// whether it took effect.
-    pub fn apply(&self, seq: Seq, key: Bytes, value: Value) -> bool {
-        let size = key.len() as u64 + value.bytes() + ENTRY_OVERHEAD;
-        let previous = self
-            .map
-            .get(&key)
-            .map(|e| e.key().len() as u64 + e.value().value.bytes() + ENTRY_OVERHEAD);
-        let entry = self
-            .map
-            .compare_insert(key, Entry { seq, value }, |existing| existing.seq < seq);
-        let won = entry.value().seq == seq;
-        if won {
-            self.min_seq.fetch_min(seq, Ordering::Relaxed);
-            self.max_seq.fetch_max(seq, Ordering::Relaxed);
-            let delta = size as i64 - previous.unwrap_or(0) as i64;
-            if delta >= 0 {
-                self.bytes.fetch_add(delta as u64, Ordering::Relaxed);
-            } else {
-                self.bytes
-                    .fetch_sub(delta.unsigned_abs(), Ordering::Relaxed);
-            }
-        }
-        won
+    /// Records the write numbered `seq`. A number is written once, so this never
+    /// replaces anything.
+    pub fn apply(&self, seq: Seq, key: Bytes, value: Value) {
+        let ikey = ikey::encode(&key, seq);
+        let size = ikey.len() as u64 + value.bytes() + ENTRY_OVERHEAD;
+        self.map.insert(ikey, value);
+        self.min_seq.fetch_min(seq, Ordering::Relaxed);
+        self.max_seq.fetch_max(seq, Ordering::Relaxed);
+        self.bytes.fetch_add(size, Ordering::Relaxed);
     }
 
-    /// The newest write to `key`, if the memtable has one.
+    /// The newest write to `key` numbered at or below `snapshot`, if the memtable has
+    /// one, with its number.
     #[must_use]
-    pub fn get(&self, key: &[u8]) -> Option<Value> {
-        self.map.get(key).map(|e| e.value().value.clone())
+    pub fn get(&self, key: &[u8], snapshot: Seq) -> Option<(Seq, Value)> {
+        let from = ikey::encode(key, snapshot);
+        let entry = self.map.range(from..).next()?;
+        if !ikey::is_user(entry.key(), key) {
+            return None;
+        }
+        Some((ikey::seq_of(entry.key())?, entry.value().clone()))
     }
 
-    /// Every entry in key order, with the sequence number of its write.
+    /// The first entry from `from` on, as the internal key and the value: a cursor a
+    /// scan advances without holding a borrow, by asking again from past the last
+    /// key it saw.
+    #[must_use]
+    pub fn next_from(&self, from: Bound<&[u8]>) -> Option<(Bytes, Value)> {
+        let entry = self.map.range::<[u8], _>((from, Bound::Unbounded)).next()?;
+        Some((entry.key().clone(), entry.value().clone()))
+    }
+
+    /// Every entry in internal-key order, decoded: user key, sequence number, value.
+    #[must_use]
     pub fn entries(&self) -> Vec<(Bytes, Seq, Value)> {
         self.map
             .iter()
-            .map(|e| (e.key().clone(), e.value().seq, e.value().value.clone()))
+            .filter_map(|e| {
+                let (user, seq) = ikey::decode(e.key()).ok()?;
+                Some((user, seq, e.value().clone()))
+            })
             .collect()
     }
 
-    /// Keys held.
+    /// Writes held.
     #[must_use]
     pub fn len(&self) -> usize {
         self.map.len()
@@ -164,30 +166,47 @@ mod tests {
     }
 
     #[test]
-    fn the_highest_sequence_number_wins_regardless_of_arrival_order() {
+    fn every_version_is_kept_and_a_snapshot_sees_the_newest_at_or_below_it() {
         let m = Memtable::new(1);
-        assert!(m.apply(2, b("k"), Value::Live(b("second"))));
-        assert!(!m.apply(1, b("k"), Value::Live(b("first"))));
-        assert_eq!(m.get(b"k"), Some(Value::Live(b("second"))));
-        assert!(m.apply(3, b("k"), Value::Tombstone));
-        assert_eq!(m.get(b"k"), Some(Value::Tombstone));
-        assert_eq!(m.get(b"k").unwrap().live(), None);
-        assert_eq!(m.max_seq(), 3);
-        assert_eq!(m.len(), 1);
+        m.apply(2, b("k"), Value::Live(b("second")));
+        m.apply(1, b("k"), Value::Live(b("first")));
+        m.apply(3, b("k"), Value::Tombstone);
+        assert_eq!(m.get(b"k", ikey::LATEST), Some((3, Value::Tombstone)));
+        assert_eq!(m.get(b"k", 2), Some((2, Value::Live(b("second")))));
+        assert_eq!(m.get(b"k", 1), Some((1, Value::Live(b("first")))));
+        assert_eq!(m.get(b"k", 0), None);
+        assert_eq!(m.get(b"j", ikey::LATEST), None);
+        assert_eq!(m.get(b"kk", ikey::LATEST), None);
+        assert_eq!((m.min_seq(), m.max_seq(), m.len()), (1, 3, 3));
     }
 
     #[test]
-    fn entries_come_in_key_order_and_bytes_follow_replacements() {
+    fn entries_come_in_key_order_newest_first_and_bytes_add_up() {
         let m = Memtable::new(1);
         m.apply(1, b("b"), Value::Live(b("1")));
         m.apply(2, b("a"), Value::Live(b("22")));
         m.apply(3, b("c"), Value::Tombstone);
-        let keys: Vec<Bytes> = m.entries().into_iter().map(|(k, _, _)| k).collect();
-        assert_eq!(keys, vec![b("a"), b("b"), b("c")]);
-        assert_eq!(m.bytes(), 3 * ENTRY_OVERHEAD + 3 + 3);
         m.apply(4, b("a"), Value::Live(b("2222")));
-        assert_eq!(m.bytes(), 3 * ENTRY_OVERHEAD + 3 + 5);
-        m.apply(5, b("a"), Value::Tombstone);
-        assert_eq!(m.bytes(), 3 * ENTRY_OVERHEAD + 3 + 1);
+        let entries: Vec<(Bytes, Seq)> = m.entries().into_iter().map(|(k, s, _)| (k, s)).collect();
+        assert_eq!(
+            entries,
+            vec![(b("a"), 4), (b("a"), 2), (b("b"), 1), (b("c"), 3)]
+        );
+        // Each key is one byte, ten more encoded.
+        assert_eq!(m.bytes(), 4 * (ENTRY_OVERHEAD + 11) + 1 + 2 + 4);
+        let mut cursor: Option<Bytes> = None;
+        let mut seen = Vec::new();
+        while let Some((ikey, _)) =
+            m.next_from(cursor.as_deref().map_or(Bound::Unbounded, Bound::Excluded))
+        {
+            seen.push(ikey::decode(&ikey).unwrap().1);
+            cursor = Some(ikey);
+        }
+        assert_eq!(seen, vec![4, 2, 1, 3]);
+        assert_eq!(
+            m.next_from(Bound::Included(&ikey::lower_bound(b"b")))
+                .map(|(k, _)| ikey::decode(&k).unwrap()),
+            Some((b("b"), 1))
+        );
     }
 }

@@ -26,7 +26,6 @@ and reorder from the start), so Raft cannot be tested honestly without it.
 - **Streaming WAL recovery** — `Wal::open` reads each segment whole; stream it record by record when segments are large enough for that to matter.
 - **CRC-32C with SSE4.2** — the `crc32c` crate is several times faster than the table in `ananke_storage::crc32c`; switch if a profile shows the checksum (D-018).
 - **`sim/out/wal-42.jsonl` as a studio fixture** — the echo trace is the pinned fixture in the moirae repo; the WAL trace shows `ananke.wal.*` and every §1.3 fault at once and would make a second, unpinned example.
-- **`memtable_bytes` default of 64 MiB** — SPEC §2.3's default; `EngineConfig` has no defaults yet because only sweeps and tests construct it.
 - **Manifest garbage collection** — manifests are never deleted (D-022); keep the last few once the fallback rule has a sweep of its own.
 - **Lazy table verification** — every open reads every table whole to find bit rot early (D-022); verify blocks on first read once tables are large.
 - **Manifest repair when a table is dropped** — a dropped table stays listed and is dropped again at every open (D-022); rewriting the manifest without it is a state change under a fault and deserves its own sweep.

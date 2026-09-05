@@ -1,15 +1,19 @@
-//! SSTables (SPEC.md §2.4, D-022): a sorted, immutable table of the newest write per
-//! key, written once by a flush and read by point lookups.
+//! SSTables (SPEC.md §2.4, D-022, D-023): a sorted, immutable table of writes,
+//! written once by a flush or a compaction and read by point lookups at a snapshot
+//! and by iterators.
 //!
-//! The file is data blocks, a bloom block, an index block and a footer:
+//! Keys are internal keys ([`ikey`]): the user key and the sequence number of the
+//! write, in byte order that is user key ascending, newest first. A table may hold
+//! several writes of one user key. The file is data blocks, a bloom block, an index
+//! block and a footer:
 //!
 //! ```text
 //! data block   entries: shared: u16 | unshared: u16 | value_len: u32 | key suffix | value
 //!              then crc32c: u32 over the entries. Keys are prefix-compressed against
 //!              the previous key in the block; a block's first key is stored whole.
 //!              A value_len of u32::MAX is a tombstone with no value bytes.
-//! bloom block  bits: u32 | k: u8 | bit bytes, then crc32c. Ten bits per key, seven
-//!              hashes from one FNV-1a hash and a mix of it.
+//! bloom block  bits: u32 | k: u8 | bit bytes, then crc32c. Ten bits per user key,
+//!              seven hashes from one FNV-1a hash and a mix of it.
 //! index block  count: u32, then per data block: key_len: u16 | first key |
 //!              offset: u64 | len: u32 (the block with its crc), then crc32c.
 //! footer       index_offset: u64 | index_len: u32 | bloom_offset: u64 | bloom_len: u32 |
@@ -18,24 +22,29 @@
 //! ```
 //!
 //! A data block is sealed when the next entry would carry it past [`BLOCK_BYTES`]. A
-//! lookup tests the bloom filter, binary-searches the index for the last block whose
-//! first key is not greater than the key, reads that block, checks its crc and walks
-//! it. [`SstReader::verify`] reads and checks every block; recovery runs it on every
-//! table the manifest lists, so bit rot is found at open rather than at the read
-//! that happens to hit it.
+//! lookup at a snapshot tests the bloom filter for the user key, seeks to the first
+//! entry at or after the internal key of the user key at the snapshot, and answers
+//! with it if it is a write of that user key. [`SstReader::verify`] reads and checks
+//! every block; recovery runs it on every table the manifest lists, so bit rot is
+//! found at open rather than at the read that happens to hit it. [`SstIter`] walks a
+//! table block by block, for scans and for compaction.
 
+use std::collections::VecDeque;
 use std::io;
+use std::sync::Arc;
 
 use ananke_env::File;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 use crate::crc32c;
+use crate::ikey;
 use crate::memtable::Value;
+use crate::wal::Seq;
 
 /// The size a data block is sealed at.
 pub const BLOCK_BYTES: usize = 4096;
-/// The on-disk format version in the footer.
-pub const FORMAT_VERSION: u32 = 1;
+/// The on-disk format version in the footer: 2 since keys became internal keys.
+pub const FORMAT_VERSION: u32 = 2;
 /// The footer's size.
 pub const FOOTER_LEN: usize = 48;
 /// Bits per key in the bloom filter.
@@ -159,13 +168,18 @@ struct IndexEntry {
     len: u32,
 }
 
-/// Builds a table in memory from keys added in strictly increasing order.
+/// Builds a table in memory from writes added in internal-key order: user key
+/// ascending, newest first.
 #[derive(Debug, Default)]
 pub struct SstWriter {
     file: Vec<u8>,
     block: Vec<u8>,
     block_first_key: Option<Bytes>,
     last_key: Option<Bytes>,
+    first_user: Option<Bytes>,
+    last_user: Option<Bytes>,
+    min_seq: Option<Seq>,
+    max_seq: Option<Seq>,
     index: Vec<IndexEntry>,
     hashes: Vec<(u64, u64)>,
     entries: u64,
@@ -178,16 +192,33 @@ impl SstWriter {
         Self::default()
     }
 
-    /// Adds `key` with `value`. Keys must arrive in strictly increasing order.
+    /// Adds the write of `user` numbered `seq` with `value`. Writes must arrive in
+    /// internal-key order: user key ascending, and for one user key newest first.
     ///
     /// # Panics
     ///
-    /// If `key` is not greater than the previous one, or longer than `u16::MAX`.
-    pub fn add(&mut self, key: &[u8], value: &Value) {
+    /// If the write does not follow the previous one in that order, or the key is
+    /// longer than `u16::MAX` bytes once encoded.
+    pub fn add(&mut self, user: &[u8], seq: Seq, value: &Value) {
+        let key = ikey::encode(user, seq);
+        let key = &key[..];
         assert!(
             self.last_key.as_deref().is_none_or(|last| key > last),
-            "SSTable keys must be added in strictly increasing order"
+            "SSTable writes must be added in internal-key order"
         );
+        if self.first_user.is_none() {
+            self.first_user = Some(Bytes::copy_from_slice(user));
+        }
+        if self.last_user.as_deref() != Some(user) {
+            self.last_user = Some(Bytes::copy_from_slice(user));
+            self.hashes.push(bloom_hashes(user));
+        }
+        self.min_seq = Some(self.min_seq.map_or(seq, |m| m.min(seq)));
+        self.max_seq = Some(self.max_seq.map_or(seq, |m| m.max(seq)));
+        self.add_encoded(key, value);
+    }
+
+    fn add_encoded(&mut self, key: &[u8], value: &Value) {
         let key_len = u16::try_from(key.len()).expect("SSTable key exceeds u16");
         let shared = match (&self.block_first_key, &self.last_key) {
             (Some(_), Some(last)) => last.iter().zip(key).take_while(|(a, b)| a == b).count(),
@@ -204,7 +235,7 @@ impl SstWriter {
         if !self.block.is_empty() && self.block.len() + entry_len + 4 > BLOCK_BYTES {
             self.seal_block();
             // A block's first key is stored whole.
-            return self.add(key, value);
+            return self.add_encoded(key, value);
         }
         if self.block.is_empty() {
             self.block_first_key = Some(Bytes::copy_from_slice(key));
@@ -215,8 +246,26 @@ impl SstWriter {
         self.block.put_slice(&key[shared..]);
         self.block.put_slice(value_bytes);
         self.last_key = Some(Bytes::copy_from_slice(key));
-        self.hashes.push(bloom_hashes(key));
         self.entries += 1;
+    }
+
+    /// The first and last user keys added, if any were.
+    #[must_use]
+    pub fn key_range(&self) -> Option<(Bytes, Bytes)> {
+        Some((self.first_user.clone()?, self.last_user.clone()?))
+    }
+
+    /// The lowest and highest sequence numbers added, if any were.
+    #[must_use]
+    pub fn seq_range(&self) -> Option<(Seq, Seq)> {
+        Some((self.min_seq?, self.max_seq?))
+    }
+
+    /// The bytes the file will have once finished, so far: what a compaction splits
+    /// its outputs by.
+    #[must_use]
+    pub fn bytes_so_far(&self) -> usize {
+        self.file.len() + self.block.len()
     }
 
     fn seal_block(&mut self) {
@@ -449,37 +498,125 @@ impl<F: File> SstReader<F> {
         Ok(())
     }
 
-    /// The newest write to `key` in this table, if the table has one.
+    /// The newest write of `user` numbered at or below `snapshot` in this table, if
+    /// the table has one, with its number.
     ///
     /// # Errors
     ///
-    /// `InvalidData` if the block the key would be in is torn or fails its crc.
-    pub async fn get(&self, key: &[u8]) -> io::Result<Option<Value>> {
-        if !self.bloom.might_contain(key) {
+    /// `InvalidData` if the block the write would be in is torn or fails its crc.
+    pub async fn get(&self, user: &[u8], snapshot: Seq) -> io::Result<Option<(Seq, Value)>> {
+        if !self.bloom.might_contain(user) {
             return Ok(None);
         }
-        let candidate = self.index.partition_point(|e| e.first_key.as_ref() <= key);
-        if candidate == 0 {
-            return Ok(None);
-        }
-        let entry = &self.index[candidate - 1];
-        let block = Self::read_sealed(&self.file, entry.offset, entry.len).await?;
-        let mut current = Vec::new();
-        let mut rest = &block[..];
-        while !rest.is_empty() {
-            let (shared, suffix, value) = decode_entry(&mut rest)?;
-            if shared > current.len() {
-                return Err(invalid("shared prefix longer than the previous key"));
+        let target = ikey::encode(user, snapshot);
+        // The block holding the first entry at or after the target: the last block
+        // whose first key is not greater, or the next block's first entry when every
+        // entry of that block is smaller.
+        let candidate = self.index.partition_point(|e| e.first_key <= target);
+        let mut block = candidate.saturating_sub(1);
+        loop {
+            if block >= self.index.len() {
+                return Ok(None);
             }
-            current.truncate(shared);
-            current.extend_from_slice(suffix);
-            match current.as_slice().cmp(key) {
-                std::cmp::Ordering::Less => {}
-                std::cmp::Ordering::Equal => return Ok(Some(value)),
-                std::cmp::Ordering::Greater => return Ok(None),
+            let entry = &self.index[block];
+            if block > candidate && !ikey::is_user(&entry.first_key, user) {
+                return Ok(None);
+            }
+            let entries = self.read_block(block).await?;
+            if let Some((key, value)) = entries.into_iter().find(|(key, _)| key[..] >= target[..]) {
+                return Ok(ikey::is_user(&key, user)
+                    .then(|| ikey::seq_of(&key).map(|seq| (seq, value)))
+                    .flatten());
+            }
+            block += 1;
+        }
+    }
+
+    /// Reads data block `block`, checks it, and decodes its entries with whole keys.
+    async fn read_block(&self, block: usize) -> io::Result<Vec<(Bytes, Value)>> {
+        let entry = &self.index[block];
+        let bytes = Self::read_sealed(&self.file, entry.offset, entry.len).await?;
+        decode_block(&bytes)
+    }
+
+    /// An iterator over the table from its first entry.
+    #[must_use]
+    pub fn iter(self: &Arc<Self>) -> SstIter<F> {
+        SstIter {
+            reader: self.clone(),
+            next_block: 0,
+            entries: VecDeque::new(),
+        }
+    }
+}
+
+/// Decodes a data block's entries, each with its whole key.
+fn decode_block(block: &[u8]) -> io::Result<Vec<(Bytes, Value)>> {
+    let mut entries = Vec::new();
+    let mut current = Vec::new();
+    let mut rest = block;
+    while !rest.is_empty() {
+        let (shared, suffix, value) = decode_entry(&mut rest)?;
+        if shared > current.len() {
+            return Err(invalid("shared prefix longer than the previous key"));
+        }
+        current.truncate(shared);
+        current.extend_from_slice(suffix);
+        entries.push((Bytes::copy_from_slice(&current), value));
+    }
+    Ok(entries)
+}
+
+/// Walks a table in internal-key order, one block in memory at a time.
+pub struct SstIter<F: File> {
+    reader: Arc<SstReader<F>>,
+    next_block: usize,
+    entries: VecDeque<(Bytes, Value)>,
+}
+
+impl<F: File> SstIter<F> {
+    /// Positions the iterator at the first entry whose internal key is at or after
+    /// `target`.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidData` if the block is torn or fails its crc.
+    pub async fn seek(&mut self, target: &[u8]) -> io::Result<()> {
+        let candidate = self
+            .reader
+            .index
+            .partition_point(|e| e.first_key[..] <= *target);
+        let block = candidate.saturating_sub(1);
+        self.entries.clear();
+        self.next_block = block;
+        if block < self.reader.index.len() {
+            self.entries = self.reader.read_block(block).await?.into();
+            self.next_block = block + 1;
+            while self
+                .entries
+                .front()
+                .is_some_and(|(key, _)| key[..] < *target)
+            {
+                self.entries.pop_front();
             }
         }
-        Ok(None)
+        Ok(())
+    }
+
+    /// The next entry: its internal key and value.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidData` if a block is torn or fails its crc.
+    pub async fn next(&mut self) -> io::Result<Option<(Bytes, Value)>> {
+        while self.entries.is_empty() {
+            if self.next_block >= self.reader.index.len() {
+                return Ok(None);
+            }
+            self.entries = self.reader.read_block(self.next_block).await?.into();
+            self.next_block += 1;
+        }
+        Ok(self.entries.pop_front())
     }
 }
 
@@ -540,23 +677,39 @@ mod tests {
         for i in 0..2000u32 {
             writer.add(
                 format!("k{i:06}").as_bytes(),
+                u64::from(i) + 1,
                 &Value::Live(Bytes::from(vec![b'v'; 50])),
             );
         }
+        assert_eq!(
+            writer.key_range(),
+            Some((Bytes::from("k000000"), Bytes::from("k001999")))
+        );
+        assert_eq!(writer.seq_range(), Some((1, 2000)));
         let bytes = writer.finish();
         assert!(bytes.len() > 2000 * 50, "values are all there");
-        // 2000 entries of ~60 bytes each is about 30 blocks of 4 KiB.
+        // 2000 entries of ~70 bytes each (the internal key adds ten bytes, of which
+        // the sequence number shares no prefix) is about 35 blocks of 4 KiB.
         assert!(
-            bytes.len() < 2000 * 70,
-            "prefix compression keeps the keys short"
+            bytes.len() < 2000 * 80,
+            "prefix compression keeps the keys short: {} bytes",
+            bytes.len()
         );
     }
 
     #[test]
-    #[should_panic(expected = "strictly increasing")]
+    #[should_panic(expected = "internal-key order")]
     fn keys_must_increase() {
         let mut writer = SstWriter::new();
-        writer.add(b"b", &Value::Tombstone);
-        writer.add(b"a", &Value::Tombstone);
+        writer.add(b"b", 1, &Value::Tombstone);
+        writer.add(b"a", 2, &Value::Tombstone);
+    }
+
+    #[test]
+    #[should_panic(expected = "internal-key order")]
+    fn versions_of_one_key_must_come_newest_first() {
+        let mut writer = SstWriter::new();
+        writer.add(b"a", 1, &Value::Tombstone);
+        writer.add(b"a", 2, &Value::Tombstone);
     }
 }

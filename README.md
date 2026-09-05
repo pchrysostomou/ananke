@@ -53,13 +53,16 @@ from the seed by name. A run's trace exports as a moirae format v2 trace.
 **ananke-storage** (in progress). A write-ahead log: segmented, append-only, records
 framed as `len | crc32c | seq | payload`, group commit through one writer task, recovery
 that stops at the first torn record, bad checksum or gap in the numbering and cuts what
-follows. A memtable: a skiplist holding the newest write per key with its log sequence
-number, applied in sequence order once the log has acknowledged. An engine that puts
-the log in front of the memtable, rotates full memtables into an immutable queue, and
-flushes them to SSTables: 4 KiB blocks with prefix-compressed keys and a CRC each, a
-bloom filter, an index and a versioned footer, under a manifest that `CURRENT` names
-and that recovery falls back from when a crash damaged it. Log segments are deleted
-once a manifest covers their records. Planned in this phase: leveled compaction and
+follows. A memtable: a skiplist holding every write since the last flush under its
+key and log sequence number, newest first, applied in sequence order once the log has
+acknowledged. An engine that puts the log in front of the memtable, rotates full
+memtables into an immutable queue, and flushes them to SSTables: 4 KiB blocks with
+prefix-compressed keys and a CRC each, a bloom filter, an index and a versioned
+footer, under a manifest that `CURRENT` names and that recovery falls back from when a
+crash damaged it. Log segments are deleted once a manifest covers their records; a log
+whose head is missing is refused rather than replayed past. Reads and scans take a
+snapshot, a sequence number, and see the newest write at or below it through one
+merge over every memtable and table. Planned in this phase: leveled compaction and
 the rest of the `Engine` API.
 
 **ananke-raft, ananke-shard, ananke-txn, ananke-sql** (planned). Raft with pre-vote,

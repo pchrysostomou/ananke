@@ -292,10 +292,11 @@ fn a_flush_lands_in_a_table_under_a_manifest_and_frees_the_log() {
 fn a_missing_log_head_is_refused_unless_allowed_and_then_the_tables_are_the_state() {
     let mut sim = Sim::new(SimConfig::new(11));
     let node = sim.add_node();
-    // Small segments, so the tail of the log past the last flush spans several.
+    // Segments of two records, so the tail of the log past the last flush spans
+    // several whatever the flushes did.
     let config = || {
         let mut c = config(600);
-        c.segment_bytes = 128;
+        c.segment_bytes = 64;
         c
     };
     let (flushed_seq, names) = on_node(&mut sim, node, |env| {
@@ -310,23 +311,27 @@ fn a_missing_log_head_is_refused_unless_allowed_and_then_the_tables_are_the_stat
                 .unwrap();
             }
             env.clock().sleep(Duration::from_millis(1)).await;
-            let flushed_seq = db.manifest().flushed_seq;
-            // A few more writes, fewer than fill a memtable, so the tail past the
-            // last flush spans several segments and none of it is flushed.
-            for i in 80..94u32 {
+            // More writes until the tail past the last flush spans several segments
+            // and the flushes have settled, wherever a flush falls.
+            let mut i = 80u32;
+            loop {
                 db.put(
                     Bytes::from(format!("k{:03}", i % 30)),
                     Bytes::from(format!("v{i}")),
                 )
                 .await
                 .unwrap();
+                i += 1;
+                if db.wal_segments().len() >= 5 {
+                    env.clock().sleep(Duration::from_millis(1)).await;
+                    if db.wal_segments().len() >= 5 && db.immutable_memtables() == 0 {
+                        break;
+                    }
+                }
             }
-            assert_eq!(db.manifest().flushed_seq, flushed_seq);
+            let flushed_seq = db.manifest().flushed_seq;
+            assert!(flushed_seq > 30, "{flushed_seq}");
             let segments = db.wal_segments();
-            assert!(
-                segments.len() >= 4,
-                "a tail of several segments: {segments:?}"
-            );
             drop(db);
             // The head is in one of the two oldest segments left (the older may hold
             // only flushed records); without both, the log starts past the head.
@@ -345,7 +350,6 @@ fn a_missing_log_head_is_refused_unless_allowed_and_then_the_tables_are_the_stat
             (flushed_seq, names)
         })
     });
-    assert!(flushed_seq > 30);
     let (gap, names_after) = on_node(&mut sim, node, |env| {
         Box::pin(async move {
             let err = match Engine::open(env.clone(), config()).await {
@@ -369,7 +373,7 @@ fn a_missing_log_head_is_refused_unless_allowed_and_then_the_tables_are_the_stat
             let mut allowed = config();
             allowed.allow_head_gap = true;
             let (db, recovery) = Engine::open(env, allowed).await.unwrap();
-            // k000 was written at ops 0, 30 and 60; the state is the manifest's
+            // k000 was written at every thirtieth op; the state is the manifest's
             // prefix, so the newest write at or below flushed_seq is what shows.
             let newest = (flushed_seq - 1) / 30 * 30;
             assert_eq!(db.get(b"k000").await.unwrap(), value(newest as u32));
@@ -388,6 +392,82 @@ fn a_missing_log_head_is_refused_unless_allowed_and_then_the_tables_are_the_stat
             found: gap.found,
             discarded: true
         }));
+}
+
+/// A snapshot sees what was written at or before it and nothing after, across the
+/// active memtable, older memtables and tables; a scan at it is the newest write
+/// per key in key order, tombstones hiding older values.
+#[test]
+fn a_snapshot_pins_what_a_read_or_scan_sees() {
+    let mut sim = Sim::new(SimConfig::new(12));
+    let node = sim.add_node();
+    on_node(&mut sim, node, |env| {
+        Box::pin(async move {
+            let (db, _) = Engine::open(env.clone(), config(300)).await.unwrap();
+            for i in 0..40u32 {
+                db.put(
+                    Bytes::from(format!("k{:02}", i % 10)),
+                    Bytes::from(format!("v{i}")),
+                )
+                .await
+                .unwrap();
+            }
+            db.delete(b("k03")).await.unwrap();
+            env.clock().sleep(Duration::from_millis(1)).await;
+            assert!(db.ssts() >= 2, "several memtables were flushed");
+            let before = db.snapshot();
+            assert_eq!(before.version(), 41);
+            // Newer writes, one of them a tombstone, and a flush of some of them.
+            for i in 40..60u32 {
+                db.put(
+                    Bytes::from(format!("k{:02}", i % 10)),
+                    Bytes::from(format!("v{i}")),
+                )
+                .await
+                .unwrap();
+            }
+            db.delete(b("k05")).await.unwrap();
+            env.clock().sleep(Duration::from_millis(1)).await;
+            let after = db.snapshot();
+            assert_eq!(after.version(), 62);
+            // Reads at the older snapshot see the older writes.
+            assert_eq!(db.get_at(b"k00", &before).await.unwrap(), Some(b("v30")));
+            assert_eq!(db.get_at(b"k03", &before).await.unwrap(), None);
+            assert_eq!(db.get_at(b"k05", &before).await.unwrap(), Some(b("v35")));
+            assert_eq!(db.get_at(b"k00", &after).await.unwrap(), Some(b("v50")));
+            assert_eq!(db.get_at(b"k03", &after).await.unwrap(), Some(b("v53")));
+            assert_eq!(db.get_at(b"k05", &after).await.unwrap(), None);
+            assert_eq!(db.get(b"k05").await.unwrap(), None);
+            // Scans likewise, in key order, without the deleted key.
+            let keys = |scan: Vec<(Bytes, Bytes)>| -> Vec<String> {
+                scan.into_iter()
+                    .map(|(k, v)| {
+                        format!(
+                            "{}={}",
+                            String::from_utf8_lossy(&k),
+                            String::from_utf8_lossy(&v)
+                        )
+                    })
+                    .collect()
+            };
+            let all = db.scan(&b"k"[..]..&b"l"[..], &before).await.unwrap();
+            assert_eq!(
+                keys(all),
+                [
+                    "k00=v30", "k01=v31", "k02=v32", "k04=v34", "k05=v35", "k06=v36", "k07=v37",
+                    "k08=v38", "k09=v39"
+                ]
+            );
+            let some = db.scan(&b"k02"[..]..&b"k06"[..], &after).await.unwrap();
+            assert_eq!(keys(some), ["k02=v52", "k03=v53", "k04=v54"]);
+            assert!(
+                db.scan(&b"x"[..]..&b"y"[..], &after)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        })
+    });
 }
 
 /// Files a crash left behind are removed at open: a table no manifest lists, a

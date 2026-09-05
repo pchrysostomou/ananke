@@ -85,6 +85,7 @@ struct Coverage {
     epochs: u32,
     ops: usize,
     reads: u64,
+    scans: u64,
     rotations: u32,
     flushes: u32,
     crashes_mid_flush: u32,
@@ -112,6 +113,7 @@ impl Coverage {
             .map(|e| e.appended - e.base)
             .sum::<usize>();
         self.reads += report.reads;
+        self.scans += report.scans;
         self.rotations += report
             .records
             .iter()
@@ -159,6 +161,10 @@ impl Coverage {
     fn assert_complete(&self) {
         for (what, seen) in [
             ("live reads", u32::try_from(self.reads).unwrap_or(u32::MAX)),
+            (
+                "scans at a snapshot",
+                u32::try_from(self.scans).unwrap_or(u32::MAX),
+            ),
             ("memtable rotations", self.rotations),
             ("memtable flushes", self.flushes),
             ("crashes with a memtable mid-flush", self.crashes_mid_flush),

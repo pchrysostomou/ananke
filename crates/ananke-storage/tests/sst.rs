@@ -7,8 +7,9 @@ use std::time::Duration;
 
 use ananke_env::sim::{Sim, SimConfig};
 use ananke_env::{Environment, File, FileSystem, OpenOptions};
-use ananke_storage::Value;
+use ananke_storage::ikey::{self, LATEST};
 use ananke_storage::sst::{SstReader, SstWriter};
+use ananke_storage::{Seq, Value};
 use bytes::Bytes;
 
 fn value(i: u32) -> Value {
@@ -64,10 +65,15 @@ fn with_table<T: Send + 'static>(
 
 use std::future::Future;
 
+/// The write of key `i` is numbered `i + 1`.
+fn seq(i: u32) -> Seq {
+    u64::from(i) + 1
+}
+
 fn table(n: u32) -> Bytes {
     let mut writer = SstWriter::new();
     for i in 0..n {
-        writer.add(&key(i), &value(i));
+        writer.add(&key(i), seq(i), &value(i));
     }
     writer.finish()
 }
@@ -84,17 +90,37 @@ fn every_key_comes_back_and_absent_keys_do_not() {
                 reader.verify().await.unwrap();
                 for i in 0..3000 {
                     assert_eq!(
-                        reader.get(&key(i)).await.unwrap(),
-                        Some(value(i)),
+                        reader.get(&key(i), LATEST).await.unwrap(),
+                        Some((seq(i), value(i))),
                         "key {i}"
                     );
+                    // At a snapshot before the write, the key is not there.
+                    assert_eq!(reader.get(&key(i), seq(i) - 1).await.unwrap(), None);
                 }
                 for i in 0..3000u32 {
                     let absent = format!("user/table/{:08}/column", i * 3 + 1);
-                    assert_eq!(reader.get(absent.as_bytes()).await.unwrap(), None);
+                    assert_eq!(reader.get(absent.as_bytes(), LATEST).await.unwrap(), None);
                 }
-                assert_eq!(reader.get(b"").await.unwrap(), None);
-                assert_eq!(reader.get(b"zzz").await.unwrap(), None);
+                assert_eq!(reader.get(b"", LATEST).await.unwrap(), None);
+                assert_eq!(reader.get(b"zzz", LATEST).await.unwrap(), None);
+                // The iterator walks every entry in order.
+                let reader = Arc::new(reader);
+                let mut iter = reader.iter();
+                let mut n = 0u32;
+                while let Some((ikey, value)) = iter.next().await.unwrap() {
+                    let (user, s) = ikey::decode(&ikey).unwrap();
+                    assert_eq!((user.to_vec(), s, value), (key(n), seq(n), self::value(n)));
+                    n += 1;
+                }
+                assert_eq!(n, 3000);
+                // Seeking lands on the first entry at or after the target, in any block.
+                for target in [0u32, 1, 777, 2999] {
+                    iter.seek(&ikey::lower_bound(&key(target))).await.unwrap();
+                    let (ikey, _) = iter.next().await.unwrap().unwrap();
+                    assert_eq!(ikey::decode(&ikey).unwrap().0.to_vec(), key(target));
+                }
+                iter.seek(&ikey::lower_bound(b"zzz")).await.unwrap();
+                assert!(iter.next().await.unwrap().is_none());
                 (reader.blocks(), reader.entries())
             })
         },
@@ -113,7 +139,7 @@ fn an_empty_table_opens_and_holds_nothing() {
             Box::pin(async move {
                 let reader = reader.unwrap();
                 reader.verify().await.unwrap();
-                assert_eq!(reader.get(b"a").await.unwrap(), None);
+                assert_eq!(reader.get(b"a", LATEST).await.unwrap(), None);
                 assert_eq!((reader.blocks(), reader.entries()), (0, 0));
             })
         },
@@ -131,8 +157,11 @@ fn a_flipped_bit_in_a_data_block_fails_verify_and_the_read_that_hits_it() {
                 let reader = reader.unwrap();
                 assert!(reader.verify().await.is_err());
                 // The first block is the one with the flip; a key in it fails, a later one reads.
-                assert!(reader.get(&key(0)).await.is_err());
-                assert_eq!(reader.get(&key(499)).await.unwrap(), Some(value(499)));
+                assert!(reader.get(&key(0), LATEST).await.is_err());
+                assert_eq!(
+                    reader.get(&key(499), LATEST).await.unwrap(),
+                    Some((seq(499), value(499)))
+                );
             })
         },
     );
@@ -174,6 +203,55 @@ fn a_torn_tail_or_a_flipped_footer_bit_does_not_open() {
             Box::pin(async move {
                 // A flip in the index block.
                 assert!(reader.is_err());
+            })
+        },
+    );
+}
+
+/// Several writes of one key sit together, newest first; a lookup at a snapshot
+/// answers with the newest at or below it, and a tombstone answers as itself.
+#[test]
+fn a_lookup_at_a_snapshot_sees_the_newest_write_at_or_below_it() {
+    let mut writer = SstWriter::new();
+    writer.add(b"a", 9, &Value::Tombstone);
+    writer.add(b"a", 6, &Value::Live(Bytes::from("a6")));
+    writer.add(b"a", 2, &Value::Live(Bytes::from("a2")));
+    writer.add(b"b", 4, &Value::Live(Bytes::from("b4")));
+    assert_eq!(
+        writer.key_range(),
+        Some((Bytes::from("a"), Bytes::from("b")))
+    );
+    assert_eq!(writer.seq_range(), Some((2, 9)));
+    assert_eq!(writer.entries(), 4);
+    with_table(
+        6,
+        writer.finish(),
+        |_| {},
+        |reader| {
+            Box::pin(async move {
+                let reader = reader.unwrap();
+                reader.verify().await.unwrap();
+                let get = |key: &'static [u8], at: Seq| {
+                    let reader = &reader;
+                    async move { reader.get(key, at).await.unwrap() }
+                };
+                assert_eq!(get(b"a", LATEST).await, Some((9, Value::Tombstone)));
+                assert_eq!(get(b"a", 9).await, Some((9, Value::Tombstone)));
+                assert_eq!(
+                    get(b"a", 8).await,
+                    Some((6, Value::Live(Bytes::from("a6"))))
+                );
+                assert_eq!(
+                    get(b"a", 5).await,
+                    Some((2, Value::Live(Bytes::from("a2"))))
+                );
+                assert_eq!(get(b"a", 1).await, None);
+                assert_eq!(
+                    get(b"b", LATEST).await,
+                    Some((4, Value::Live(Bytes::from("b4"))))
+                );
+                assert_eq!(get(b"b", 3).await, None);
+                assert_eq!(get(b"ab", LATEST).await, None);
             })
         },
     );

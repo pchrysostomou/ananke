@@ -101,8 +101,10 @@ pub struct Model {
     /// Records lost with a dropped table or manifest and not brought back by a log
     /// replay, for good.
     pub lost: BTreeSet<u64>,
-    /// Live reads performed.
+    /// Live reads performed, scans included.
     pub reads: u64,
+    /// Of those, scans at a snapshot.
+    pub scans: u64,
     /// Live reads that disagreed with the model.
     pub read_violations: Vec<String>,
 }
@@ -162,8 +164,10 @@ pub struct Report {
     pub variant: Variant,
     /// Each crash and its recovery, in order.
     pub epochs: Vec<Epoch>,
-    /// Live reads over the run.
+    /// Live reads over the run, scans included.
     pub reads: u64,
+    /// Of those, scans at a snapshot.
+    pub scans: u64,
     /// The whole trace.
     pub records: Vec<TraceRecord>,
     /// The trace as moirae JSONL.
@@ -469,12 +473,16 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
         sim.crash(node);
         sim.restart(node);
     }
-    let reads = lock(&model).reads;
+    let (reads, scans) = {
+        let m = lock(&model);
+        (m.reads, m.scans)
+    };
     Report {
         seed,
         variant,
         epochs,
         reads,
+        scans,
         jsonl: sim
             .to_moirae(&Export::new(&bytes_decoder))
             .expect("the engine trace exports to moirae v2"),
@@ -578,6 +586,24 @@ fn check_state(
                 ));
             }
         }
+        // And the same through a scan of the whole space.
+        let snapshot = db.snapshot();
+        let scanned = db
+            .scan(&key(0)[..]..&key(KEYS)[..], &snapshot)
+            .await
+            .expect("tables read");
+        let want: Vec<(Bytes, Bytes)> = expected
+            .iter()
+            .filter_map(|(k, v)| v.clone().live().map(|v| (k.clone(), v)))
+            .collect();
+        if scanned != want {
+            violations.push(format!(
+                "after recovering through record {end}, a scan at version {} saw {} keys but the model has {}",
+                snapshot.version(),
+                scanned.len(),
+                want.len()
+            ));
+        }
         *o.lock().unwrap_or_else(PoisonError::into_inner) = Some(violations);
     });
     while out.lock().unwrap_or_else(PoisonError::into_inner).is_none() {
@@ -648,6 +674,45 @@ fn spawn_clients(sim: &Sim, node: NodeId, db: Db, schedule: &Schedule, model: &S
         let (env, db, model) = (sim.env(node), db.clone(), model.clone());
         env.clone().spawn("reader", async move {
             loop {
+                // Every other read is a scan at a snapshot: the engine's version pins
+                // exactly which ops the model folds, so the answer is exact.
+                if env.rng().below(2) == 0 {
+                    let lo = env.rng().below(KEYS);
+                    let hi = lo + env.rng().below(KEYS - lo + 1);
+                    let snapshot = db.snapshot();
+                    let want: Vec<(Bytes, Bytes)> = {
+                        let m = lock(&model);
+                        let n = usize::try_from(snapshot.version()).expect("fits");
+                        m.state_after(n.min(m.ops.len()))
+                            .into_iter()
+                            .filter(|(k, _)| *k >= key(lo) && *k < key(hi))
+                            .filter_map(|(k, v)| v.live().map(|v| (k, v)))
+                            .collect()
+                    };
+                    let got = db
+                        .scan(&key(lo)[..]..&key(hi)[..], &snapshot)
+                        .await
+                        .expect("tables read");
+                    {
+                        let mut m = lock(&model);
+                        m.reads += 1;
+                        m.scans += 1;
+                        if got != want {
+                            m.read_violations.push(format!(
+                                "scan of k{lo:02}..k{hi:02} at version {} saw {} keys but the model has {}: {:?} against {:?}",
+                                snapshot.version(),
+                                got.len(),
+                                want.len(),
+                                got.iter().map(|(k, _)| String::from_utf8_lossy(k).into_owned()).collect::<Vec<_>>(),
+                                want.iter().map(|(k, _)| String::from_utf8_lossy(k).into_owned()).collect::<Vec<_>>()
+                            ));
+                        }
+                    }
+                    drop(snapshot);
+                    let gap = env.rng().below(gap_max_us + 1);
+                    env.clock().sleep(Duration::from_micros(gap)).await;
+                    continue;
+                }
                 let key = key(env.rng().below(KEYS));
                 let expected = {
                     let m = lock(&model);
