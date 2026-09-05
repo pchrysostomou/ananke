@@ -109,6 +109,10 @@ impl Environment for RealEnv {
         &self.inner.rng
     }
 
+    fn sched_rng(&self) -> &RealRng {
+        &self.inner.rng
+    }
+
     fn spawn<F: Future<Output = ()> + Send + 'static>(
         &self,
         name: &'static str,

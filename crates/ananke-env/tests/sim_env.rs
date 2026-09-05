@@ -36,7 +36,7 @@ async fn node<E: Environment>(env: E, me: u16, peer: u16) {
         // Either a message arrives or it is time to ping.
         let recv = pin!(sock.recv());
         let timer = pin!(env.clock().sleep_until(next_ping));
-        let message = match race(env.rng(), recv, timer).await {
+        let message = match race(&env, recv, timer).await {
             Either::Left(m) => Some(m.unwrap()),
             Either::Right(()) => None,
         };

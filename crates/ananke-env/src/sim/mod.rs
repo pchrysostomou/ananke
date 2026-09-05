@@ -230,12 +230,14 @@ impl Sim {
         // 1-based, as in moirae traces (see `NodeId`).
         let id = NodeId::new(u32::try_from(st.nodes.len() + 1).expect("too many nodes"));
         let protocol = st.node_stream(id, "protocol");
+        let sched = st.node_stream(id, "sched");
         st.nodes.insert(
             id,
             state::Node {
                 skew_nanos,
                 drift_ppm,
                 protocol,
+                sched,
             },
         );
         st.fs.entry(id).or_insert_with(fs::NodeFs::new);
@@ -250,13 +252,13 @@ impl Sim {
     /// If `node` was not added to this simulation.
     #[must_use]
     pub fn env(&self, node: NodeId) -> SimEnv {
-        let rng = {
+        let (rng, sched_rng) = {
             let st = self.shared.lock();
             let n = st
                 .nodes
                 .get(&node)
                 .unwrap_or_else(|| panic!("unknown node {node}"));
-            n.protocol.clone()
+            (n.protocol.clone(), n.sched.clone())
         };
         SimEnv {
             node,
@@ -273,6 +275,7 @@ impl Sim {
                 node,
             },
             rng,
+            sched_rng,
             shared: self.shared.clone(),
         }
     }
@@ -520,6 +523,7 @@ pub struct SimEnv {
     fs: SimFs,
     net: SimNet,
     rng: SimRng,
+    sched_rng: SimRng,
 }
 
 impl fmt::Debug for SimEnv {
@@ -558,6 +562,10 @@ impl Environment for SimEnv {
 
     fn rng(&self) -> &SimRng {
         &self.rng
+    }
+
+    fn sched_rng(&self) -> &SimRng {
+        &self.sched_rng
     }
 
     fn spawn<F: Future<Output = ()> + Send + 'static>(

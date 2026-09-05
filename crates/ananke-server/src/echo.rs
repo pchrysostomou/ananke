@@ -126,7 +126,7 @@ pub async fn node<E: Environment>(env: E, echo: Echo, stats: SharedStats) {
     loop {
         let recv = pin!(sock.recv());
         let timer = pin!(env.clock().sleep_until(next_ping));
-        match race(env.rng(), recv, timer).await {
+        match race(&env, recv, timer).await {
             Either::Left(Err(_)) => return,
             Either::Left(Ok((from, msg))) => match Message::decode(&msg) {
                 Some(Message::Ping(n)) => {

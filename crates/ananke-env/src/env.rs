@@ -25,8 +25,13 @@ pub trait Environment: Send + Sync + 'static {
     fn fs(&self) -> &Self::Fs;
     /// This node's network.
     fn net(&self) -> &Self::Net;
-    /// This node's randomness.
+    /// This node's randomness: the protocol stream (D-017). What protocol code and
+    /// `DetHashMap` seeds draw from.
     fn rng(&self) -> &Self::Rng;
+    /// This node's scheduling stream (D-017): what [`race`](crate::race) draws its poll
+    /// order from. Kept apart from [`rng`](Self::rng) so an executor change never moves a
+    /// protocol-visible draw. Under `RealEnv` both are OS entropy.
+    fn sched_rng(&self) -> &Self::Rng;
     /// Runs `f` as a task named `name`.
     ///
     /// The name appears in traces and need not be unique. Dropping the returned handle

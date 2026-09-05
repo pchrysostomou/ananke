@@ -4,7 +4,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use crate::Rng;
+use crate::{Environment, Rng};
 
 /// The outcome of [`race`]: which future finished first, with its output.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -17,33 +17,45 @@ pub enum Either<A, B> {
 
 /// Resolves with whichever of `a` and `b` completes first; the other is dropped.
 ///
-/// Which side is polled first is decided on every poll by one bit from `rng`, so
-/// neither side can starve the other: once both are ready, each wins the next poll
-/// with probability one half. A fixed bias would let a node under a steady stream of
-/// ready messages never fire its timer, and in Phase 2 that is a Raft follower flooded
-/// with `AppendEntries` that never times out, a bug the simulator must expose rather
-/// than mask. Under `SimEnv` the bit comes from the node's seeded stream, so the choice
-/// is reproducible from the seed; under `RealEnv` it is OS entropy.
+/// Which side is polled first is decided on every poll by one bit from the
+/// environment's scheduling stream, [`Environment::sched_rng`], so neither side can
+/// starve the other: once both are ready, each wins the next poll with probability one
+/// half. A fixed bias would let a node under a steady stream of ready messages never
+/// fire its timer, and in Phase 2 that is a Raft follower flooded with `AppendEntries`
+/// that never times out, a bug the simulator must expose rather than mask (D-016).
+/// Taking the environment rather than a bare [`Rng`] means a caller cannot draw the bit
+/// from the protocol stream by mistake (D-017). Under `SimEnv` the bit is reproducible
+/// from the seed; under `RealEnv` it is OS entropy.
 ///
 /// Pin the futures with `std::pin::pin!`:
 ///
 /// ```
 /// use std::pin::pin;
-/// use ananke_env::real::RealRng;
-/// use ananke_env::{Either, race};
+/// use ananke_env::sim::{Sim, SimConfig};
+/// use ananke_env::{Either, Environment, Instant, race};
 ///
-/// # block_on(async {
-/// let message = pin!(async { "message" });
-/// let timer = pin!(std::future::pending::<()>());
-/// assert_eq!(race(&RealRng, message, timer).await, Either::Left("message"));
-/// # });
-/// # fn block_on<F: std::future::Future<Output = ()>>(f: F) {
-/// #     let mut f = std::pin::pin!(f);
-/// #     let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
-/// #     while f.as_mut().poll(&mut cx).is_pending() {}
-/// # }
+/// let mut sim = Sim::new(SimConfig::new(1));
+/// let node = sim.add_node();
+/// let env = sim.env(node);
+/// env.clone().spawn("race", async move {
+///     let message = pin!(async { "message" });
+///     let timer = pin!(std::future::pending::<()>());
+///     assert_eq!(race(&env, message, timer).await, Either::Left("message"));
+/// });
+/// sim.run_until(Instant::ZERO);
 /// ```
-pub fn race<'r, R, A, B>(rng: &'r R, a: A, b: B) -> Race<'r, R, A, B>
+pub fn race<E, A, B>(env: &E, a: A, b: B) -> Race<'_, E::Rng, A, B>
+where
+    E: Environment + ?Sized,
+    A: Future + Unpin,
+    B: Future + Unpin,
+{
+    race_with(env.sched_rng(), a, b)
+}
+
+/// [`race`] over an explicit stream. Crate-private so callers outside cannot pick the
+/// wrong stream; tests use it with a scripted generator.
+pub(crate) fn race_with<'r, R, A, B>(rng: &'r R, a: A, b: B) -> Race<'r, R, A, B>
 where
     R: Rng + ?Sized,
     A: Future + Unpin,
@@ -107,15 +119,15 @@ mod tests {
     const RIGHT_FIRST: u64 = 1;
 
     #[test]
-    fn the_rng_decides_who_wins_when_both_are_ready() {
+    fn the_stream_decides_who_wins_when_both_are_ready() {
         let rng = Scripted::new([LEFT_FIRST]);
         assert_eq!(
-            poll_once(pin!(race(&rng, pin!(ready(1)), pin!(ready(2))))),
+            poll_once(pin!(race_with(&rng, pin!(ready(1)), pin!(ready(2))))),
             Poll::Ready(Either::Left(1))
         );
         let rng = Scripted::new([RIGHT_FIRST]);
         assert_eq!(
-            poll_once(pin!(race(&rng, pin!(ready(1)), pin!(ready(2))))),
+            poll_once(pin!(race_with(&rng, pin!(ready(1)), pin!(ready(2))))),
             Poll::Ready(Either::Right(2))
         );
     }
@@ -125,12 +137,12 @@ mod tests {
         for draw in [LEFT_FIRST, RIGHT_FIRST] {
             let rng = Scripted::new([draw]);
             assert_eq!(
-                poll_once(pin!(race(&rng, pin!(ready(1)), pin!(pending::<u8>())))),
+                poll_once(pin!(race_with(&rng, pin!(ready(1)), pin!(pending::<u8>())))),
                 Poll::Ready(Either::Left(1))
             );
             let rng = Scripted::new([draw]);
             assert_eq!(
-                poll_once(pin!(race(&rng, pin!(pending::<u8>()), pin!(ready(2))))),
+                poll_once(pin!(race_with(&rng, pin!(pending::<u8>()), pin!(ready(2))))),
                 Poll::Ready(Either::Right(2))
             );
         }
@@ -140,7 +152,7 @@ mod tests {
     fn pending_when_neither_is_ready() {
         let rng = Scripted::new([LEFT_FIRST]);
         assert_eq!(
-            poll_once(pin!(race(
+            poll_once(pin!(race_with(
                 &rng,
                 pin!(pending::<u8>()),
                 pin!(pending::<u8>())

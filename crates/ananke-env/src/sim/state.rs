@@ -56,6 +56,8 @@ pub(super) struct Node {
     pub(super) drift_ppm: i64,
     /// The node's protocol stream, `n{id}/protocol` (D-017).
     pub(super) protocol: SimRng,
+    /// The node's scheduling stream, `n{id}/sched`; what `race` draws from (D-017).
+    pub(super) sched: SimRng,
 }
 
 pub(super) struct Task {

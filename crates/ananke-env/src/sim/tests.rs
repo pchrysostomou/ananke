@@ -789,7 +789,7 @@ fn race_lets_a_timer_fire_under_a_flood_of_ready_messages() {
                 count += 1;
                 let message = pin!(std::future::ready(()));
                 let timer = pin!(env.clock().sleep_until(deadline));
-                match race(env.rng(), message, timer).await {
+                match race(&env, message, timer).await {
                     // "Handle" the message; this is what lets virtual time move.
                     Either::Left(()) => env.clock().sleep(PROCESSING).await,
                     Either::Right(()) => break,
@@ -951,5 +951,36 @@ fn the_policy_comes_from_the_seed_unless_fixed() {
     assert_eq!(
         SimConfig::run_length_hint_for(3, Duration::from_millis(1_400)),
         4_200
+    );
+}
+
+#[test]
+fn a_race_never_moves_a_protocol_draw() {
+    // D-017: the protocol stream is untouched by however many times race polls.
+    let draw_after = |races: u32| {
+        let mut sim = Sim::new(SimConfig::new(5));
+        let n = sim.add_node();
+        let env = sim.env(n);
+        let seen: Log<u64> = log();
+        let s = seen.clone();
+        env.clone().spawn("racer", async move {
+            for _ in 0..races {
+                let ready = std::pin::pin!(std::future::ready(()));
+                let never = std::pin::pin!(std::future::pending::<()>());
+                let _ = crate::race(&env, ready, never).await;
+            }
+            s.lock().unwrap().push(env.rng().next_u64());
+        });
+        sim.run_until(Instant::ZERO);
+        seen.lock().unwrap()[0]
+    };
+    assert_eq!(draw_after(0), draw_after(50));
+    let mut sim = Sim::new(SimConfig::new(5));
+    let n = sim.add_node();
+    let env = sim.env(n);
+    assert_ne!(
+        env.rng().next_u64(),
+        env.sched_rng().next_u64(),
+        "protocol and scheduling streams differ"
     );
 }
