@@ -16,7 +16,7 @@ path = "lib.rs"
 
 [dependencies]
 ananke-env = { path = "../crates/ananke-env" }
-bytes.workspace = true
+ananke-server = { path = "../crates/ananke-server" }
 
 [lints]
 workspace = true

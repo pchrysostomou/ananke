@@ -31,3 +31,4 @@ and reorder from the start), so Raft cannot be tested honestly without it.
 - **Lint canary in CI** — a test that compiles a deliberate `std::fs` call in a scratch crate and asserts clippy rejects it, so a broken `clippy.toml` cannot pass silently; verified by hand in Phase 0 step 2 instead.
 - **`RealFs` on Windows** — positional I/O uses `std::os::unix::fs::FileExt`; a `std::os::windows::fs::FileExt` branch is a small `cfg` split, deferred until anyone needs a Windows build.
 - **Per-op filesystem latency, slow links and bandwidth caps** — SPEC §1.3 / §1.4 performance-shaped faults; not needed for correctness testing until there is something to measure.
+- **`RealRng` cost** — every call is a `getrandom` syscall and `race` draws one bit per poll; switch to a CSPRNG reseeded from the OS if it ever shows in a profile.

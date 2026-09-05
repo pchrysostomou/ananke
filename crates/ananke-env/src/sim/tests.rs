@@ -766,3 +766,53 @@ fn equal_delivery_times_keep_send_order() {
     sim.run_until(Instant::from_nanos(1_000_000_000));
     assert_eq!(*got.lock().unwrap(), (0..10).collect::<Vec<_>>());
 }
+
+/// `race` draws its poll order from the node's seeded stream, so a task with an
+/// always-ready message source still fires its timer soon after it is due.
+#[test]
+fn race_lets_a_timer_fire_under_a_flood_of_ready_messages() {
+    use std::pin::pin;
+
+    use crate::{Either, race};
+
+    const DEADLINE: Duration = Duration::from_millis(10);
+    const PROCESSING: Duration = Duration::from_millis(1);
+    // Ten polls reach the deadline; after that each poll fires the timer with
+    // probability one half, so 64 more is a 2^-64 chance of failing per seed.
+    const BOUND: u32 = 10 + 64;
+
+    for seed in 0..100 {
+        let mut sim = Sim::new(SimConfig::new(seed));
+        let n = sim.add_node();
+        let env = sim.env(n);
+        let polls: Log<u32> = log();
+        let p = polls.clone();
+        env.clone().spawn("flooded", async move {
+            let deadline = env.clock().now() + DEADLINE;
+            let mut count = 0u32;
+            loop {
+                count += 1;
+                let message = pin!(std::future::ready(()));
+                let timer = pin!(env.clock().sleep_until(deadline));
+                match race(env.rng(), message, timer).await {
+                    // "Handle" the message; this is what lets virtual time move.
+                    Either::Left(()) => env.clock().sleep(PROCESSING).await,
+                    Either::Right(()) => break,
+                }
+            }
+            p.lock().unwrap().push(count);
+        });
+        sim.run_until(Instant::from_nanos(10_000_000_000));
+        let count = polls
+            .lock()
+            .unwrap()
+            .first()
+            .copied()
+            .unwrap_or_else(|| panic!("seed {seed}: the timer never fired"));
+        assert!(count <= BOUND, "seed {seed}: timer took {count} polls");
+        assert!(
+            count >= 10,
+            "seed {seed}: timer fired before it was due after {count} polls"
+        );
+    }
+}

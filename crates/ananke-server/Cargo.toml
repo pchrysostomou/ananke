@@ -9,6 +9,9 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+ananke-env = { path = "../ananke-env" }
+bytes.workspace = true
+clap.workspace = true
 
 [lints]
 workspace = true

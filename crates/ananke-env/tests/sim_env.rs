@@ -3,11 +3,13 @@
 
 use std::net::SocketAddr;
 use std::path::Path;
+use std::pin::pin;
 use std::time::Duration;
 
 use ananke_env::sim::{Sim, SimConfig};
 use ananke_env::{
-    Clock, Environment, File, FileSystem, Network, OpenOptions, Rng, Socket, det_hash_map,
+    Clock, Either, Environment, File, FileSystem, Network, OpenOptions, Rng, Socket, det_hash_map,
+    race,
 };
 use bytes::Bytes;
 
@@ -32,9 +34,11 @@ async fn node<E: Environment>(env: E, me: u16, peer: u16) {
     let mut next_ping = env.clock().now();
     loop {
         // Either a message arrives or it is time to ping.
-        let message = tokio::select! {
-            m = sock.recv() => Some(m.unwrap()),
-            () = env.clock().sleep_until(next_ping) => None,
+        let recv = pin!(sock.recv());
+        let timer = pin!(env.clock().sleep_until(next_ping));
+        let message = match race(env.rng(), recv, timer).await {
+            Either::Left(m) => Some(m.unwrap()),
+            Either::Right(()) => None,
         };
         match message {
             Some((from, msg)) => {

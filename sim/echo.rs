@@ -1,24 +1,19 @@
-//! The Phase 0 scenario (SPEC.md §1.6): three nodes running an echo protocol under
-//! drops, delays, clock skew, partitions and a crash.
+//! The Phase 0 scenario (SPEC.md §1.6): three nodes running the echo protocol from
+//! `ananke_server::echo` under drops, delays, clock skew, partitions and a crash.
 //!
-//! Every node pings a random peer every [`PING_INTERVAL`] and answers every ping with
-//! a pong carrying the same sequence number. The protocol is generic over
-//! [`Environment`], so the same code will run on `RealEnv` when the echo binary is
-//! wired. [`run`] drives the fault schedule and returns a [`Report`] whose
-//! [`check`](Report::check) states the invariants the run must satisfy; the tests in
-//! `tests/echo.rs` use it as a determinism check and as a smoke test for the simulator.
+//! The protocol itself lives in `ananke-server` so the binary and this scenario run
+//! identical code. [`run`] drives the fault schedule and returns a [`Report`] whose
+//! [`check`](Report::check) states the invariants the run must satisfy: the
+//! protocol-level ones from [`Stats::check`] per node, plus trace-level ones about the
+//! partitions and the crash. The tests in `tests/echo.rs` use it as a determinism
+//! check and as a smoke test for the simulator.
 
-use std::collections::BTreeSet;
 use std::net::SocketAddr;
-use std::pin::pin;
-use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use ananke_env::sim::{Sim, SimConfig, TraceRecord};
-use ananke_env::{
-    Clock, DropReason, Either, Environment, Instant, Network, NodeId, Rng, Socket, TraceEvent, race,
-};
-use bytes::Bytes;
+use ananke_env::{DropReason, Environment, Instant, NodeId, TraceEvent};
+use ananke_server::echo::{self, Echo, SharedStats, Stats};
 
 /// How many nodes the scenario runs.
 pub const NODES: u32 = 3;
@@ -41,100 +36,6 @@ pub fn node_addr(n: u32) -> SocketAddr {
 
 fn node_of(addr: SocketAddr) -> Option<NodeId> {
     (0..NODES).find(|&n| node_addr(n) == addr).map(NodeId::new)
-}
-
-/// What the nodes observed, kept outside the simulation so the harness can check it.
-#[derive(Debug, Default)]
-struct Stats {
-    /// Pings sent and not yet answered, as (sender, peer, seq).
-    outstanding: BTreeSet<(u32, u32, u64)>,
-    pings_sent: u64,
-    pongs_received: u64,
-    /// Pongs that matched no outstanding ping: fabricated or duplicated.
-    unknown_pongs: u64,
-    /// Messages that did not parse.
-    garbage: u64,
-}
-
-type SharedStats = Arc<Mutex<Stats>>;
-
-fn lock_stats(shared: &SharedStats) -> std::sync::MutexGuard<'_, Stats> {
-    shared.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
-enum Message {
-    Ping(u64),
-    Pong(u64),
-}
-
-impl Message {
-    fn encode(&self) -> Bytes {
-        match self {
-            Message::Ping(seq) => Bytes::from(format!("ping {seq}")),
-            Message::Pong(seq) => Bytes::from(format!("pong {seq}")),
-        }
-    }
-
-    fn decode(bytes: &[u8]) -> Option<Message> {
-        let text = std::str::from_utf8(bytes).ok()?;
-        let (kind, seq) = text.split_once(' ')?;
-        let seq = seq.parse().ok()?;
-        match kind {
-            "ping" => Some(Message::Ping(seq)),
-            "pong" => Some(Message::Pong(seq)),
-            _ => None,
-        }
-    }
-}
-
-/// One node of the echo protocol. `incarnation` distinguishes sequence numbers across
-/// restarts so a late pong for a pre-crash ping is still recognised.
-async fn echo_node<E: Environment>(env: E, me: u32, incarnation: u32, stats: SharedStats) {
-    let sock = match env.net().bind(node_addr(me)).await {
-        Ok(sock) => sock,
-        Err(_) => return,
-    };
-    let mut seq = u64::from(incarnation) << 32;
-    let mut next_ping = env.clock().now();
-    loop {
-        let recv = pin!(sock.recv());
-        let timer = pin!(env.clock().sleep_until(next_ping));
-        match race(recv, timer).await {
-            Either::Left(Err(_)) => return,
-            Either::Left(Ok((from, msg))) => match Message::decode(&msg) {
-                Some(Message::Ping(n)) => {
-                    let _ = sock.send(from, Message::Pong(n).encode()).await;
-                }
-                Some(Message::Pong(n)) => {
-                    let mut stats = lock_stats(&stats);
-                    match node_of(from) {
-                        Some(peer) if stats.outstanding.remove(&(me, peer.get(), n)) => {
-                            stats.pongs_received += 1
-                        }
-                        _ => stats.unknown_pongs += 1,
-                    }
-                }
-                None => lock_stats(&stats).garbage += 1,
-            },
-            Either::Right(()) => {
-                // Pick one of the other nodes from this node's own seeded stream.
-                let mut peer = u32::try_from(env.rng().below(u64::from(NODES) - 1)).expect("fits");
-                if peer >= me {
-                    peer += 1;
-                }
-                seq += 1;
-                {
-                    let mut stats = lock_stats(&stats);
-                    stats.outstanding.insert((me, peer, seq));
-                    stats.pings_sent += 1;
-                }
-                let _ = sock
-                    .send(node_addr(peer), Message::Ping(seq).encode())
-                    .await;
-                next_ping = env.clock().now() + PING_INTERVAL;
-            }
-        }
-    }
 }
 
 /// The fault schedule, in global virtual time. Each phase starts when the previous
@@ -176,10 +77,8 @@ pub struct Report {
     pub records: Vec<TraceRecord>,
     /// Global time at which each phase ended.
     pub phase_ends: [Instant; 5],
-    pings_sent: u64,
-    pongs_received: u64,
-    unknown_pongs: u64,
-    garbage: u64,
+    /// What each node observed, by node index.
+    pub stats: Vec<Stats>,
 }
 
 impl Report {
@@ -191,20 +90,10 @@ impl Report {
     pub fn check(&self) -> Result<(), String> {
         let seed = self.seed;
         let fail = |what: String| Err(format!("seed {seed}: {what}"));
-        if self.unknown_pongs > 0 {
-            return fail(format!(
-                "{} pongs matched no outstanding ping (fabricated or duplicated)",
-                self.unknown_pongs
-            ));
-        }
-        if self.garbage > 0 {
-            return fail(format!("{} messages failed to parse", self.garbage));
-        }
-        if self.pongs_received == 0 || self.pongs_received > self.pings_sent {
-            return fail(format!(
-                "{} pongs for {} pings",
-                self.pongs_received, self.pings_sent
-            ));
+        for (n, stats) in self.stats.iter().enumerate() {
+            if let Err(violation) = stats.check() {
+                return fail(format!("node {n}: {violation}"));
+            }
         }
 
         let [t_warmup, t_partition, t_healed, t_one_way, t_restart] = self.phase_ends;
@@ -213,6 +102,16 @@ impl Report {
                 .iter()
                 .filter(|r| r.at > after && r.at <= until)
                 .filter(|r| matches!(&r.event, TraceEvent::MessageDelivered { from: f, to: t, .. } if node_of(*f) == Some(from) && node_of(*t) == Some(to)))
+                .count()
+        };
+        let dropped_partitioned = |from: NodeId, to: NodeId, after: Instant, until: Instant| {
+            self.records
+                .iter()
+                .filter(|r| r.at > after && r.at <= until)
+                .filter(|r| {
+                    matches!(&r.event, TraceEvent::MessageDropped { from: f, to: t, reason: DropReason::Partitioned }
+                        if node_of(*f) == Some(from) && node_of(*t) == Some(to))
+                })
                 .count()
         };
         let (n0, n1, n2) = (NodeId::new(0), NodeId::new(1), NodeId::new(2));
@@ -245,7 +144,16 @@ impl Report {
         if partition_drops == 0 {
             return fail("no MessageDropped(Partitioned) events during the partition".to_owned());
         }
-        // Healing restores both directions.
+        // Healing restores both directions: nothing is dropped as partitioned any more,
+        // and traffic to and from node 0 flows again.
+        for (a, b) in [(n0, n1), (n1, n0), (n0, n2), (n2, n0)] {
+            let dropped = dropped_partitioned(a, b, t_partition, t_healed);
+            if dropped > 0 {
+                return fail(format!(
+                    "{dropped} messages {a} -> {b} dropped as partitioned after healing"
+                ));
+            }
+        }
         if delivered(n1, n0, t_partition, t_healed) + delivered(n2, n0, t_partition, t_healed) == 0
         {
             return fail("node 0 received nothing after the partition healed".to_owned());
@@ -254,14 +162,21 @@ impl Report {
         {
             return fail("node 0 reached nobody after the partition healed".to_owned());
         }
-        // A one-way block is one-way.
+        // A one-way block is one-way: nothing crosses the blocked direction, and the
+        // other direction is never treated as partitioned. Whether node 2 happens to
+        // ping node 1 in the window is up to its seeded peer choice, so liveness of
+        // that direction is asserted over the whole run instead.
         if delivered(n1, n2, t_healed, t_one_way) > 0 {
             return fail("node 1 reached node 2 through a one-way block".to_owned());
         }
-        if delivered(n2, n1, t_healed, t_one_way) == 0 {
+        if dropped_partitioned(n2, n1, t_healed, t_one_way) > 0 {
             return fail(
-                "node 2 could not reach node 1 during a block of the other direction".to_owned(),
+                "node 2 -> node 1 was dropped as partitioned during a block of the other direction"
+                    .to_owned(),
             );
+        }
+        if delivered(n2, n1, Instant::ZERO, t_restart) == 0 {
+            return fail("node 2 never reached node 1".to_owned());
         }
         // The restarted node comes back.
         if !self
@@ -311,13 +226,13 @@ impl Report {
     /// Pings sent across the whole run.
     #[must_use]
     pub fn pings_sent(&self) -> u64 {
-        self.pings_sent
+        self.stats.iter().map(|s| s.pings_sent).sum()
     }
 
     /// Pongs received across the whole run.
     #[must_use]
     pub fn pongs_received(&self) -> u64 {
-        self.pongs_received
+        self.stats.iter().map(|s| s.pongs_received).sum()
     }
 }
 
@@ -344,12 +259,18 @@ pub fn run(seed: u64) -> Report {
 pub fn run_with(seed: u64, schedule: Schedule) -> Report {
     let mut sim = Sim::new(config(seed));
     let nodes: Vec<NodeId> = (0..NODES).map(|_| sim.add_node()).collect();
-    let stats: SharedStats = Arc::default();
+    let stats: Vec<SharedStats> = (0..NODES).map(|_| SharedStats::default()).collect();
     let spawn = |sim: &Sim, n: u32, incarnation: u32| {
         let env = sim.env(nodes[n as usize]);
+        let config = Echo {
+            listen: node_addr(n),
+            peers: (0..NODES).filter(|&p| p != n).map(node_addr).collect(),
+            interval: PING_INTERVAL,
+            incarnation,
+        };
         env.spawn(
             "echo",
-            echo_node(env.clone(), n, incarnation, stats.clone()),
+            echo::node(env.clone(), config, stats[n as usize].clone()),
         );
     };
     for n in 0..NODES {
@@ -378,15 +299,11 @@ pub fn run_with(seed: u64, schedule: Schedule) -> Report {
     sim.run_for(schedule.after_restart);
     phase_ends[4] = sim.now();
 
-    let stats = lock_stats(&stats);
     Report {
         seed,
         trace_text: sim.trace_text(),
         records: sim.trace(),
         phase_ends,
-        pings_sent: stats.pings_sent,
-        pongs_received: stats.pongs_received,
-        unknown_pongs: stats.unknown_pongs,
-        garbage: stats.garbage,
+        stats: stats.iter().map(|s| echo::lock(s).clone()).collect(),
     }
 }

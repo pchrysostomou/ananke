@@ -14,6 +14,7 @@ authors = ["Prodromos Chrysostomou"]
 # Shared dependency versions. Add an entry here and reference it from a crate with
 # `name.workspace = true` (features go on the crate side).
 bytes = "1.12"
+clap = { version = "4", features = ["derive"] }
 getrandom = "0.4"
 siphasher = "1.0"
 tempfile = "3.27"

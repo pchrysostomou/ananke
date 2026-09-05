@@ -116,9 +116,15 @@ _Update this section at the end of every session._
 - Step 5: `sim/echo.rs` runs 3 nodes under drops, delays, skew, a symmetric
   partition, a one-way block and a crash/restart; `sim/tests/echo.rs` asserts
   byte-identical trace text for equal seeds and runs 100 consecutive seeds against
-  the scenario's invariants as a simulator smoke test. `ananke_env::race` is the
-  runtime-free "message or timer" combinator protocols use.
-- Next concrete task: the moirae bridge (SPEC §1.5, with the scheduling-policy
-  decision entry) and the `ananke-server` echo binary on `RealEnv`, which together
-  close the Phase 0 exit criteria. Before Phase 1: the BACKLOG "required before
-  Phase 1" gate.
+  the scenario's invariants as a simulator smoke test.
+- The echo protocol lives in `ananke_server::echo` and runs unchanged under the
+  simulator and as `ananke-server echo --listen .. --peers ..` on `RealEnv`;
+  `crates/ananke-server/tests/echo_cluster.rs` runs three real processes and checks
+  the protocol invariants. `ananke_env::race` draws its poll order from the
+  environment's RNG so no side can starve the other.
+- Phase 0 exit criteria still open: the moirae bridge (trace opens in the studio).
+- Next concrete task: the moirae bridge, **design step only, no code until approved**:
+  propose (a) the mapping from `TraceRecord` to moirae's trace format, (b) the
+  scheduling-policy decision entry (PCT-style vs uniform random, paper cited), and
+  (c) what `moirae-rs` in the moirae repo needs to expose. Before Phase 1: the
+  BACKLOG "required before Phase 1" gate.
