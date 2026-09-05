@@ -17,6 +17,8 @@
 //! | `FsyncLost` / `WriteTorn`                | `log` `ananke.fs.fsync-lost` / `.write-torn`  |
 //! | `BlockRotted`                            | `log` `ananke.fs.bit-rot`                     |
 //! | `DirectoryEntryLost`                     | `log` `ananke.fs.dir-entry-lost`              |
+//! | `WalSegmentOpened` / `WalSynced`         | `log` `ananke.wal.segment-opened` / `.synced` |
+//! | `WalTruncated` / `WalRecovered`          | `log` `ananke.wal.truncated` / `.recovered`   |
 //! | `TimeAdvanced`                           | nothing: every line carries `t`               |
 //!
 //! `t` is global virtual time in nanoseconds and the header says `unit: "ns"`. Node ids
@@ -334,6 +336,53 @@ fn convert(
                         DirEntryOp::Rename => "rename",
                     }),
                 ),
+            ])),
+        ),
+        TraceEvent::WalSegmentOpened { segment, first } => log(
+            "ananke.wal.segment-opened",
+            Some(Json::obj(vec![
+                ("segment", int(*segment)),
+                ("first", int(*first)),
+            ])),
+        ),
+        TraceEvent::WalSynced {
+            segment,
+            first,
+            up_to,
+        } => log(
+            "ananke.wal.synced",
+            Some(Json::obj(vec![
+                ("segment", int(*segment)),
+                ("first", int(*first)),
+                ("upTo", int(*up_to)),
+            ])),
+        ),
+        TraceEvent::WalTruncated { segment, len } => log(
+            "ananke.wal.truncated",
+            Some(Json::obj(vec![
+                ("segment", int(*segment)),
+                ("len", int(*len)),
+            ])),
+        ),
+        TraceEvent::WalRecovered {
+            records,
+            stop,
+            discarded,
+        } => log(
+            "ananke.wal.recovered",
+            Some(Json::obj(vec![
+                ("records", int(*records)),
+                (
+                    "stop",
+                    stop.map_or(Json::Null, |stop| {
+                        Json::obj(vec![
+                            ("segment", int(stop.segment)),
+                            ("offset", int(stop.offset)),
+                            ("reason", Json::str(stop.reason.as_str())),
+                        ])
+                    }),
+                ),
+                ("discarded", int(*discarded)),
             ])),
         ),
         TraceEvent::NodeCrashed { node } => Some(Event::Crash {

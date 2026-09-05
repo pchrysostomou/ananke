@@ -137,6 +137,41 @@ pub enum TraceEvent {
         /// What was lost.
         op: DirEntryOp,
     },
+    /// The write-ahead log opened a segment file for appending (SPEC §2.2).
+    WalSegmentOpened {
+        /// The segment number, which names the file.
+        segment: u64,
+        /// The sequence number the first record written to it will have.
+        first: u64,
+    },
+    /// One `sync` covered every record from `first` to `up_to` in `segment`: a group
+    /// commit. Recorded after the call returned, so a `FsyncLost` for the segment's
+    /// file immediately before it says the call lied.
+    WalSynced {
+        /// The segment.
+        segment: u64,
+        /// The first record in the segment.
+        first: u64,
+        /// The last record the sync covered.
+        up_to: u64,
+    },
+    /// Recovery cut a segment after its last good record and synced it. Recorded after
+    /// the sync, so a `FsyncLost` immediately before it says the cut may not hold.
+    WalTruncated {
+        /// The segment.
+        segment: u64,
+        /// The length it was cut to.
+        len: u64,
+    },
+    /// Recovery finished.
+    WalRecovered {
+        /// Records recovered, in order from the first segment.
+        records: u64,
+        /// Where reading stopped, if not at the end of the last segment.
+        stop: Option<WalStop>,
+        /// Segments after the stop that were discarded.
+        discarded: u64,
+    },
     /// A node's tasks were killed and the filesystem fault model applied to its disk.
     NodeCrashed {
         /// The crashed node.
@@ -193,6 +228,42 @@ pub enum DirEntryOp {
     Unlink,
     /// A file was renamed.
     Rename,
+}
+
+/// Where write-ahead log recovery stopped short of the end.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WalStop {
+    /// The segment.
+    pub segment: u64,
+    /// The offset of the record that could not be read.
+    pub offset: u64,
+    /// What was wrong with it.
+    pub reason: WalStopReason,
+}
+
+/// Why write-ahead log recovery stopped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum WalStopReason {
+    /// The segment ended inside a record: a torn write.
+    TornRecord,
+    /// The record's checksum did not match: bit rot, or a torn write of an earlier
+    /// crash that was never cut.
+    BadChecksum,
+    /// The next segment in sequence does not exist: a lost directory entry.
+    MissingSegment,
+}
+
+impl WalStopReason {
+    /// The name the moirae bridge writes.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WalStopReason::TornRecord => "torn-record",
+            WalStopReason::BadChecksum => "bad-checksum",
+            WalStopReason::MissingSegment => "missing-segment",
+        }
+    }
 }
 
 /// Why a message was discarded.
