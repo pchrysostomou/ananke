@@ -16,7 +16,6 @@ and reorder from the start), so Raft cannot be tested honestly without it.
 - **Replay scheduler (bridge v2)** — a `moirae_sched::Scheduler` that feeds a recorded decision log back instead of the PRNG, asserting each recorded choice is in the runnable set; needs a decision-log export mode that also records `race` coins. `Sim::verify_moirae` covers the Phase 0 need.
 - **`ananke trace filter`** — carve a per-range or per-transaction sub-trace (`range`, `term`, `index`, `txn` fields) before the studio sees it; the studio stays protocol-agnostic. Phase 2, when there is a range to filter by.
 
-- **README.md** — nothing to show before the Phase 0 tag; write it alongside the first devlog post.
 - **Lint canary in CI** — a test that compiles a deliberate `std::fs` call in a scratch crate and asserts clippy rejects it, so a broken `clippy.toml` cannot pass silently; verified by hand in Phase 0 step 2 instead.
 - **`RealFs` on Windows** — positional I/O uses `std::os::unix::fs::FileExt`; a `std::os::windows::fs::FileExt` branch is a small `cfg` split, deferred until anyone needs a Windows build.
 - **Per-op filesystem latency, slow links and bandwidth caps** — SPEC §1.3 / §1.4 performance-shaped faults. Latency also matters for correctness: with zero-latency I/O the window between a write and its sync is one scheduling step, so an acknowledge-before-sync bug is caught by the oracle's acknowledged-without-sync property rather than by a crash inside the window (D-020).
