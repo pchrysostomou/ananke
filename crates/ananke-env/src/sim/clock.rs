@@ -42,11 +42,7 @@ impl Clock for SimClock {
 
     fn sleep_until(&self, deadline: Instant) -> impl Future<Output = ()> + Send {
         let at = self.shared.lock().global_time(self.node, deadline);
-        SimSleep {
-            shared: self.shared.clone(),
-            at,
-            registered: false,
-        }
+        SimSleep::new(self.shared.clone(), at)
     }
 }
 
@@ -55,6 +51,17 @@ pub struct SimSleep {
     shared: Arc<Shared>,
     at: Instant,
     registered: bool,
+}
+
+impl SimSleep {
+    /// A timer for global time `at`.
+    pub(super) fn new(shared: Arc<Shared>, at: Instant) -> Self {
+        Self {
+            shared,
+            at,
+            registered: false,
+        }
+    }
 }
 
 impl Future for SimSleep {

@@ -989,6 +989,54 @@ fn a_busy_loop_fails_the_run_instead_of_hanging() {
     sim.run_until(Instant::from_nanos(1));
 }
 
+/// With a latency range every operation takes time, and one in flight at a crash
+/// never reaches the disk: the write below is issued and the node crashes while the
+/// operation is still waiting, so nothing of it survives.
+#[test]
+fn filesystem_operations_take_time_and_one_in_flight_at_a_crash_is_lost() {
+    let mut config = SimConfig::new(7);
+    config.fs.latency_min = ms(2);
+    config.fs.latency_max = ms(3);
+    let mut sim = Sim::new(config);
+    let n = sim.add_node();
+    let env = sim.env(n);
+    let done: Log<Instant> = log();
+    let d = done.clone();
+    env.clone().spawn("writer", async move {
+        let fs = env.fs();
+        let file = fs
+            .open(Path::new("/f"), OpenOptions::new().write(true).create(true))
+            .await
+            .unwrap();
+        fs.sync_dir(Path::new("/")).await.unwrap();
+        file.write_at(0, Bytes::from_static(b"first"))
+            .await
+            .unwrap();
+        file.sync().await.unwrap();
+        d.lock().unwrap().push(env.clock().now());
+        file.write_at(5, Bytes::from_static(b"second"))
+            .await
+            .unwrap();
+        file.sync().await.unwrap();
+        d.lock().unwrap().push(env.clock().now());
+    });
+    // Four operations of at least two milliseconds each precede the first mark.
+    sim.run_for(ms(7));
+    assert!(done.lock().unwrap().is_empty());
+    while done.lock().unwrap().is_empty() {
+        sim.run_for(ms(1));
+    }
+    assert!(done.lock().unwrap()[0] >= Instant::ZERO + ms(8));
+    // Less than a millisecond has passed since the second write was issued, so it is
+    // still in flight: crash now, and it never happened.
+    sim.crash(n);
+    assert_eq!(
+        sim.durable_contents(n, Path::new("/f")).as_deref(),
+        Some(&b"first"[..])
+    );
+    assert_eq!(done.lock().unwrap().len(), 1);
+}
+
 /// A step is one poll, or one advance of time when nothing is runnable; a crash after
 /// `run_steps` can therefore land between two tasks' polls at one instant.
 #[test]

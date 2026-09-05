@@ -9,6 +9,9 @@
 //! once but durable only after [`FileSystem::sync_dir`] on the directory, and at a crash
 //! a random prefix of a directory's pending operations survives. A rename is recorded
 //! against its destination's directory. Directories themselves are immediately durable.
+//! Every operation takes a delay drawn from `FsFaults::latency_min..=latency_max` on
+//! the `fs` stream, applied when the delay ends; with the default of zero it applies
+//! at the instant it was issued and nothing is drawn.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
@@ -18,6 +21,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 
+use super::clock::SimSleep;
 use super::state::{Shared, State};
 use crate::{DirEntryOp, File, FileSystem, NodeId, OpenOptions, TraceEvent};
 
@@ -287,6 +291,18 @@ impl State {
         self.fs.entry(node).or_insert_with(NodeFs::new)
     }
 
+    /// The timer an operation issued now waits on, if operations take time.
+    fn io_delay(&mut self, shared: &Arc<Shared>) -> Option<SimSleep> {
+        let (min, max) = (self.config.fs.latency_min, self.config.fs.latency_max);
+        if max.is_zero() {
+            return None;
+        }
+        let span = max.saturating_sub(min).as_nanos() as u64;
+        let extra = self.fs_stream.below(span + 1);
+        let at = self.now + min + std::time::Duration::from_nanos(extra);
+        Some(SimSleep::new(shared.clone(), at))
+    }
+
     fn fs_sync(&mut self, node: NodeId, inode: InodeId) -> io::Result<()> {
         let p_durable = self.config.fs.p_durable;
         let durable = self.fs_stream.chance(p_durable);
@@ -378,9 +394,20 @@ impl std::fmt::Debug for SimFs {
 }
 
 impl SimFs {
-    fn with<T>(&self, f: impl FnOnce(&mut NodeFs) -> T) -> T {
-        let mut st = self.shared.lock();
-        f(st.node_fs(self.node))
+    /// Runs `f` on the node's disk after the operation's delay, if any.
+    fn with<T: Send + 'static>(
+        &self,
+        f: impl FnOnce(&mut NodeFs) -> T + Send + 'static,
+    ) -> impl Future<Output = T> + Send {
+        let delay = self.shared.lock().io_delay(&self.shared);
+        let (shared, node) = (self.shared.clone(), self.node);
+        async move {
+            if let Some(sleep) = delay {
+                sleep.await;
+            }
+            let mut st = shared.lock();
+            f(st.node_fs(node))
+        }
     }
 }
 
@@ -392,34 +419,43 @@ impl FileSystem for SimFs {
         path: &Path,
         options: OpenOptions,
     ) -> impl Future<Output = io::Result<SimFile>> + Send {
-        let result = self.with(|fs| fs.open(path, options)).map(|inode| SimFile {
-            shared: self.shared.clone(),
-            node: self.node,
-            inode,
-            readable: options.is_read(),
-            writable: options.is_write(),
-        });
-        std::future::ready(result)
+        let path = path.to_path_buf();
+        let (shared, node) = (self.shared.clone(), self.node);
+        let opened = self.with(move |fs| fs.open(&path, options));
+        async move {
+            opened.await.map(|inode| SimFile {
+                shared,
+                node,
+                inode,
+                readable: options.is_read(),
+                writable: options.is_write(),
+            })
+        }
     }
 
     fn create_dir_all(&self, path: &Path) -> impl Future<Output = io::Result<()>> + Send {
-        std::future::ready(self.with(|fs| fs.create_dir_all(path)))
+        let path = path.to_path_buf();
+        self.with(move |fs| fs.create_dir_all(&path))
     }
 
     fn read_dir(&self, path: &Path) -> impl Future<Output = io::Result<Vec<PathBuf>>> + Send {
-        std::future::ready(self.with(|fs| fs.read_dir(path)))
+        let path = path.to_path_buf();
+        self.with(move |fs| fs.read_dir(&path))
     }
 
     fn rename(&self, from: &Path, to: &Path) -> impl Future<Output = io::Result<()>> + Send {
-        std::future::ready(self.with(|fs| fs.rename(from, to)))
+        let (from, to) = (from.to_path_buf(), to.to_path_buf());
+        self.with(move |fs| fs.rename(&from, &to))
     }
 
     fn remove_file(&self, path: &Path) -> impl Future<Output = io::Result<()>> + Send {
-        std::future::ready(self.with(|fs| fs.remove_file(path)))
+        let path = path.to_path_buf();
+        self.with(move |fs| fs.remove_file(&path))
     }
 
     fn sync_dir(&self, path: &Path) -> impl Future<Output = io::Result<()>> + Send {
-        std::future::ready(self.with(|fs| fs.sync_dir(path)))
+        let path = path.to_path_buf();
+        self.with(move |fs| fs.sync_dir(&path))
     }
 }
 
@@ -450,61 +486,84 @@ fn denied(what: &str) -> io::Error {
 }
 
 impl SimFile {
-    fn with<T>(&self, f: impl FnOnce(&mut Inode) -> T) -> io::Result<T> {
-        let mut st = self.shared.lock();
-        st.node_fs(self.node).inode_mut(self.inode).map(f)
+    /// Runs `f` on the inode after the operation's delay, if any.
+    fn with<T: Send + 'static>(
+        &self,
+        f: impl FnOnce(&mut Inode) -> T + Send + 'static,
+    ) -> impl Future<Output = io::Result<T>> + Send {
+        let delay = self.shared.lock().io_delay(&self.shared);
+        let (shared, node, inode) = (self.shared.clone(), self.node, self.inode);
+        async move {
+            if let Some(sleep) = delay {
+                sleep.await;
+            }
+            let mut st = shared.lock();
+            st.node_fs(node).inode_mut(inode).map(f)
+        }
     }
 }
 
 impl File for SimFile {
     fn read_at(&self, offset: u64, len: usize) -> impl Future<Output = io::Result<Bytes>> + Send {
-        let result = if self.readable {
-            self.with(|inode| {
-                let start = usize::try_from(offset)
-                    .unwrap_or(usize::MAX)
-                    .min(inode.visible.len());
-                let end = start.saturating_add(len).min(inode.visible.len());
-                Bytes::copy_from_slice(&inode.visible[start..end])
-            })
-        } else {
-            Err(denied("reading"))
-        };
-        std::future::ready(result)
+        let readable = self.readable;
+        let read = self.with(move |inode| {
+            let start = usize::try_from(offset)
+                .unwrap_or(usize::MAX)
+                .min(inode.visible.len());
+            let end = start.saturating_add(len).min(inode.visible.len());
+            Bytes::copy_from_slice(&inode.visible[start..end])
+        });
+        async move {
+            if !readable {
+                return Err(denied("reading"));
+            }
+            read.await
+        }
     }
 
     fn write_at(&self, offset: u64, data: Bytes) -> impl Future<Output = io::Result<()>> + Send {
-        let result = if self.writable {
-            self.with(|inode| {
-                let op = PendingOp::Write { offset, data };
-                apply(&mut inode.visible, &op, None);
-                inode.pending.push(op);
-            })
-        } else {
-            Err(denied("writing"))
-        };
-        std::future::ready(result)
+        let writable = self.writable;
+        let write = self.with(move |inode| {
+            let op = PendingOp::Write { offset, data };
+            apply(&mut inode.visible, &op, None);
+            inode.pending.push(op);
+        });
+        async move {
+            if !writable {
+                return Err(denied("writing"));
+            }
+            write.await
+        }
     }
 
     fn size(&self) -> impl Future<Output = io::Result<u64>> + Send {
-        std::future::ready(self.with(|inode| inode.visible.len() as u64))
+        self.with(|inode| inode.visible.len() as u64)
     }
 
     fn set_size(&self, size: u64) -> impl Future<Output = io::Result<()>> + Send {
-        let result = if self.writable {
-            self.with(|inode| {
-                let op = PendingOp::Truncate(size);
-                apply(&mut inode.visible, &op, None);
-                inode.pending.push(op);
-            })
-        } else {
-            Err(denied("writing"))
-        };
-        std::future::ready(result)
+        let writable = self.writable;
+        let truncate = self.with(move |inode| {
+            let op = PendingOp::Truncate(size);
+            apply(&mut inode.visible, &op, None);
+            inode.pending.push(op);
+        });
+        async move {
+            if !writable {
+                return Err(denied("writing"));
+            }
+            truncate.await
+        }
     }
 
     fn sync(&self) -> impl Future<Output = io::Result<()>> + Send {
-        let result = self.shared.lock().fs_sync(self.node, self.inode);
-        std::future::ready(result)
+        let delay = self.shared.lock().io_delay(&self.shared);
+        let (shared, node, inode) = (self.shared.clone(), self.node, self.inode);
+        async move {
+            if let Some(sleep) = delay {
+                sleep.await;
+            }
+            shared.lock().fs_sync(node, inode)
+        }
     }
 }
 

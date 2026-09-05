@@ -184,6 +184,67 @@ pub enum TraceEvent {
         /// The highest log sequence number it holds.
         up_to: u64,
     },
+    /// An SSTable was written and synced (SPEC §2.4). Recorded after the sync
+    /// returned, so a `FsyncLost` for its file immediately before it says it lied.
+    SstWritten {
+        /// The table's number, which names the file.
+        number: u64,
+        /// Keys it holds.
+        entries: u64,
+        /// Its size.
+        bytes: u64,
+        /// The lowest and highest log sequence numbers of the writes it holds.
+        first_seq: u64,
+        /// See `first_seq`.
+        max_seq: u64,
+    },
+    /// A manifest was written and synced. Recorded after the sync returned, like
+    /// `SstWritten`.
+    ManifestWritten {
+        /// The manifest's number, which names the file.
+        number: u64,
+        /// Every log record up to this is in an SSTable it lists.
+        flushed_seq: u64,
+        /// Tables it lists.
+        ssts: u64,
+    },
+    /// `CURRENT` was pointed at a manifest by rename and the directory synced: the
+    /// manifest is now the one recovery reads.
+    CurrentSwitched {
+        /// The manifest's number.
+        manifest: u64,
+    },
+    /// Recovery could not read the manifest `CURRENT` names and fell back to an
+    /// older one; everything flushed since is lost.
+    ManifestFallback {
+        /// The manifest `CURRENT` named.
+        from: u64,
+        /// The one used instead; 0 is the empty state.
+        to: u64,
+    },
+    /// Recovery could not read an SSTable the manifest lists and dropped it; the
+    /// writes in its sequence range are lost.
+    SstDropped {
+        /// The table's number.
+        number: u64,
+        /// The lowest sequence number it held.
+        first_seq: u64,
+        /// The highest sequence number it held.
+        max_seq: u64,
+        /// What was wrong with it.
+        reason: &'static str,
+    },
+    /// Recovery removed a file no manifest refers to: an SSTable or manifest whose
+    /// flush or switch did not complete.
+    OrphanRemoved {
+        /// The file.
+        path: PathBuf,
+    },
+    /// The log deleted a segment whose records are all in SSTables.
+    WalSegmentDeleted {
+        /// The segment.
+        segment: u64,
+    },
     /// An immutable memtable was flushed and released.
     MemtableFlushed {
         /// The memtable's number.

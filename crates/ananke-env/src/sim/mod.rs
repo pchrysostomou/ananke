@@ -73,6 +73,14 @@ pub struct FsFaults {
     pub p_bitrot: f64,
     /// The block size bit rot is drawn over, in bytes.
     pub block_size: u64,
+    /// The least time any filesystem operation takes.
+    pub latency_min: Duration,
+    /// The most time any filesystem operation takes; a delay is drawn uniformly from
+    /// the range for every operation. Zero, the default, makes every operation
+    /// complete at the instant it was issued and draws nothing. With a range, an
+    /// operation in flight when the node crashes never reaches the disk, and the
+    /// time between a write and its sync is a real window for a crash to land in.
+    pub latency_max: Duration,
 }
 
 impl Default for FsFaults {
@@ -81,6 +89,8 @@ impl Default for FsFaults {
             p_durable: 1.0,
             p_bitrot: 0.0,
             block_size: 4096,
+            latency_min: Duration::ZERO,
+            latency_max: Duration::ZERO,
         }
     }
 }

@@ -20,6 +20,9 @@
 //! | `WalSegmentOpened` / `WalSynced`         | `log` `ananke.wal.segment-opened` / `.synced` |
 //! | `WalTruncated` / `WalRecovered`          | `log` `ananke.wal.truncated` / `.recovered`   |
 //! | `MemtableRotated` / `MemtableFlushed`    | `log` `ananke.memtable.rotated` / `.flushed`  |
+//! | `SstWritten` / `SstDropped`              | `log` `ananke.sst.written` / `.dropped`       |
+//! | `ManifestWritten` / `CurrentSwitched` / `ManifestFallback` | `log` `ananke.manifest.written` / `.switched` / `.fallback` |
+//! | `OrphanRemoved` / `WalSegmentDeleted`    | `log` `ananke.fs.orphan-removed` / `ananke.wal.segment-deleted` |
 //! | `TimeAdvanced`                           | nothing: every line carries `t`               |
 //!
 //! `t` is global virtual time in nanoseconds and the header says `unit: "ns"`. Node ids
@@ -408,6 +411,63 @@ fn convert(
                 ("bytes", int(*bytes)),
                 ("upTo", int(*up_to)),
             ])),
+        ),
+        TraceEvent::SstWritten {
+            number,
+            entries,
+            bytes,
+            first_seq,
+            max_seq,
+        } => log(
+            "ananke.sst.written",
+            Some(Json::obj(vec![
+                ("number", int(*number)),
+                ("entries", int(*entries)),
+                ("bytes", int(*bytes)),
+                ("firstSeq", int(*first_seq)),
+                ("maxSeq", int(*max_seq)),
+            ])),
+        ),
+        TraceEvent::SstDropped {
+            number,
+            first_seq,
+            max_seq,
+            reason,
+        } => log(
+            "ananke.sst.dropped",
+            Some(Json::obj(vec![
+                ("number", int(*number)),
+                ("firstSeq", int(*first_seq)),
+                ("maxSeq", int(*max_seq)),
+                ("reason", Json::str(reason)),
+            ])),
+        ),
+        TraceEvent::ManifestWritten {
+            number,
+            flushed_seq,
+            ssts,
+        } => log(
+            "ananke.manifest.written",
+            Some(Json::obj(vec![
+                ("number", int(*number)),
+                ("flushedSeq", int(*flushed_seq)),
+                ("ssts", int(*ssts)),
+            ])),
+        ),
+        TraceEvent::CurrentSwitched { manifest } => log(
+            "ananke.manifest.switched",
+            Some(Json::obj(vec![("manifest", int(*manifest))])),
+        ),
+        TraceEvent::ManifestFallback { from, to } => log(
+            "ananke.manifest.fallback",
+            Some(Json::obj(vec![("from", int(*from)), ("to", int(*to))])),
+        ),
+        TraceEvent::OrphanRemoved { path } => {
+            log("ananke.fs.orphan-removed", Some(path_data(path)))
+        }
+        TraceEvent::WalSegmentDeleted { segment } => log(
+            "ananke.wal.segment-deleted",
+            Some(Json::obj(vec![("segment", int(*segment))])),
         ),
         TraceEvent::MemtableFlushed { memtable, up_to } => log(
             "ananke.memtable.flushed",
