@@ -57,12 +57,13 @@ Deferred ideas live in [docs/BACKLOG.md](docs/BACKLOG.md).
 - **At the end of every session,** update the "Current status" section at the bottom
   of `docs/BOOTSTRAP_PROMPT.md`.
 
-## Layout (Phase 0)
+## Layout
 
 ```
 crates/ananke/         Placeholder crate reserving the name on crates.io
 crates/ananke-env/     Environment trait; real/ (RealEnv on tokio); sim/ (Sim + SimEnv); moirae.rs (trace export)
 crates/ananke-server/  Node binary + library of the protocols it runs (echo for Phase 0)
+crates/ananke-storage/ Storage engine: crc32c, wal (Phase 1)
 sim/                   Simulation scenarios; scenario files sit directly in sim/ (echo.rs first)
 docs/                  SPEC, DECISIONS, BACKLOG, BOOTSTRAP_PROMPT, devlog/
 scripts/               gate.sh (run before every commit), check-direct-io.sh

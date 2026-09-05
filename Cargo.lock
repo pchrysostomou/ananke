@@ -40,6 +40,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ananke-storage"
+version = "0.1.0"
+dependencies = [
+ "ananke-env",
+ "bytes",
+ "tempfile",
+]
+
+[[package]]
 name = "anstream"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

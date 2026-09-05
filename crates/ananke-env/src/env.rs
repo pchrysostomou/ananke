@@ -8,8 +8,9 @@ use crate::{Clock, FileSystem, Network, Rng, TaskHandle, TraceEvent};
 ///
 /// Every crate is generic over `E: Environment` and never touches the outside world
 /// except through it (DECISIONS.md D-003). Implementations are handles: cheap to clone
-/// and passed by value into the tasks they spawn.
-pub trait Environment: Send + Sync + 'static {
+/// and passed by value into the tasks they spawn, which is why `Clone` is part of the
+/// contract.
+pub trait Environment: Clone + Send + Sync + 'static {
     /// Monotonic time, wall time and timers.
     type Clock: Clock;
     /// The filesystem.

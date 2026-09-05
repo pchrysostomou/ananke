@@ -1,0 +1,315 @@
+//! The write-ahead log under the simulator without faults: framing, recovery's stop
+//! rule, group commit. The crash sweep with every fault on is `sim/wal.rs`.
+
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use ananke_env::sim::{Sim, SimConfig};
+use ananke_env::{Environment, File, FileSystem, OpenOptions, TraceEvent, WalStop, WalStopReason};
+use ananke_storage::wal::{HEADER_LEN, encode_record, segment_path};
+use ananke_storage::{Recovery, Variant, Wal, WalConfig};
+use bytes::Bytes;
+
+const DIR: &str = "/wal";
+
+fn config(variant: Variant) -> WalConfig {
+    WalConfig {
+        dir: DIR.into(),
+        segment_bytes: 256,
+        variant,
+    }
+}
+
+type Out<T> = Arc<Mutex<Option<T>>>;
+
+fn out<T>() -> Out<T> {
+    Arc::new(Mutex::new(None))
+}
+
+fn take<T>(out: &Out<T>) -> T {
+    out.lock().unwrap().take().expect("the task finished")
+}
+
+/// Writes `bytes` as segment `segment`, durably.
+async fn write_segment<E: Environment>(env: &E, segment: u64, bytes: Vec<u8>) {
+    let fs = env.fs();
+    fs.create_dir_all(Path::new(DIR)).await.unwrap();
+    let file = fs
+        .open(
+            &segment_path(Path::new(DIR), segment),
+            OpenOptions::new().write(true).create_new(true),
+        )
+        .await
+        .unwrap();
+    file.write_at(0, Bytes::from(bytes)).await.unwrap();
+    file.sync().await.unwrap();
+    fs.sync_dir(Path::new(DIR)).await.unwrap();
+}
+
+fn records(payloads: &[&[u8]]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    for payload in payloads {
+        encode_record(&mut buf, payload);
+    }
+    buf
+}
+
+fn payload(i: u64) -> Bytes {
+    Bytes::from(vec![
+        u8::try_from(i % 251).unwrap();
+        usize::try_from(i % 40).unwrap()
+    ])
+}
+
+#[test]
+fn an_empty_directory_recovers_nothing_and_starts_segment_one() {
+    let mut sim = Sim::new(SimConfig::new(1));
+    let node = sim.add_node();
+    let env = sim.env(node);
+    let result: Out<(Recovery, Vec<std::path::PathBuf>)> = out();
+    let r = result.clone();
+    env.clone().spawn("open", async move {
+        let (_wal, recovery) = Wal::open(env.clone(), config(Variant::Correct))
+            .await
+            .unwrap();
+        let names = env.fs().read_dir(Path::new(DIR)).await.unwrap();
+        *r.lock().unwrap() = Some((recovery, names));
+    });
+    sim.run_for(Duration::from_millis(1));
+    let (recovery, names) = take(&result);
+    assert_eq!(
+        recovery,
+        Recovery {
+            records: vec![],
+            stop: None,
+            discarded: 0,
+            next_seq: 1
+        }
+    );
+    assert_eq!(names, vec![std::path::PathBuf::from("000001.wal")]);
+}
+
+#[test]
+fn records_come_back_in_order_after_reopen_across_segments() {
+    let mut sim = Sim::new(SimConfig::new(2));
+    let node = sim.add_node();
+    let env = sim.env(node);
+    let seqs: Out<Vec<u64>> = out();
+    let s = seqs.clone();
+    env.clone().spawn("writer", async move {
+        let (wal, _) = Wal::open(env, config(Variant::Correct)).await.unwrap();
+        let mut got = Vec::new();
+        for i in 0..60 {
+            let append = wal.append(payload(i));
+            assert_eq!(append.seq(), i + 1, "the number is known at enqueue");
+            got.push(append.await.unwrap());
+        }
+        *s.lock().unwrap() = Some(got);
+    });
+    sim.run_for(Duration::from_millis(1));
+    assert_eq!(take(&seqs), (1..=60).collect::<Vec<_>>());
+    let opened = sim
+        .trace()
+        .iter()
+        .filter(|r| matches!(r.event, TraceEvent::WalSegmentOpened { .. }))
+        .count();
+    assert!(
+        opened > 2,
+        "60 records of up to 40 bytes span several 256-byte segments, got {opened}"
+    );
+
+    let env = sim.env(node);
+    let result: Out<Recovery> = out();
+    let r = result.clone();
+    env.clone().spawn("reader", async move {
+        let (_wal, recovery) = Wal::open(env, config(Variant::Correct)).await.unwrap();
+        *r.lock().unwrap() = Some(recovery);
+    });
+    sim.run_for(Duration::from_millis(1));
+    let recovery = take(&result);
+    assert_eq!(recovery.records, (0..60).map(payload).collect::<Vec<_>>());
+    assert_eq!(
+        (recovery.stop, recovery.discarded, recovery.next_seq),
+        (None, 0, 61)
+    );
+}
+
+#[test]
+fn concurrent_appenders_share_syncs() {
+    let mut fewer_syncs_than_records = 0;
+    for seed in 0..20 {
+        let mut sim = Sim::new(SimConfig::new(seed));
+        let node = sim.add_node();
+        let env = sim.env(node);
+        let seqs: Out<Vec<u64>> = Arc::new(Mutex::new(Some(Vec::new())));
+        let opened: Out<Arc<Wal<_>>> = out();
+        let o = opened.clone();
+        env.clone().spawn("open", async move {
+            let (wal, _) = Wal::open(env, config(Variant::Correct)).await.unwrap();
+            *o.lock().unwrap() = Some(Arc::new(wal));
+        });
+        sim.run_for(Duration::from_millis(1));
+        let wal = take(&opened);
+        for _ in 0..4 {
+            let (wal, seqs) = (wal.clone(), seqs.clone());
+            sim.env(node).spawn("appender", async move {
+                for i in 0..8 {
+                    let seq = wal.append(payload(i)).await.unwrap();
+                    seqs.lock().unwrap().as_mut().unwrap().push(seq);
+                }
+            });
+        }
+        drop(wal);
+        sim.run_for(Duration::from_millis(1));
+        let mut got = take(&seqs);
+        got.sort_unstable();
+        assert_eq!(got, (1..=32).collect::<Vec<_>>(), "seed {seed}");
+        let syncs = sim
+            .trace()
+            .iter()
+            .filter(|r| matches!(r.event, TraceEvent::WalSynced { .. }))
+            .count();
+        assert!(syncs <= 32, "seed {seed}: {syncs} syncs for 32 records");
+        fewer_syncs_than_records += usize::from(syncs < 32);
+    }
+    assert!(
+        fewer_syncs_than_records > 0,
+        "no seed ever grouped two records under one sync"
+    );
+}
+
+/// Recovers with `variant` after the segments were written by hand; the log is
+/// dropped at once so the directory shows recovery's cleanup.
+fn recover(sim: &mut Sim, node: ananke_env::NodeId, variant: Variant) -> (Recovery, Vec<String>) {
+    let env = sim.env(node);
+    let result: Out<(Recovery, Vec<String>)> = out();
+    let r = result.clone();
+    env.clone().spawn("recover", async move {
+        let (wal, recovery) = Wal::open(env.clone(), config(variant)).await.unwrap();
+        drop(wal);
+        let names = env.fs().read_dir(Path::new(DIR)).await.unwrap();
+        let names = names.iter().map(|n| n.display().to_string()).collect();
+        *r.lock().unwrap() = Some((recovery, names));
+    });
+    sim.run_for(Duration::from_millis(1));
+    take(&result)
+}
+
+#[test]
+fn recovery_stops_at_a_torn_record_cuts_it_and_discards_later_segments() {
+    let mut sim = Sim::new(SimConfig::new(3));
+    let node = sim.add_node();
+    let env = sim.env(node);
+    env.clone().spawn("setup", async move {
+        let mut one = records(&[b"alpha", b"beta"]);
+        let good = one.len() as u64;
+        one.extend_from_slice(&records(&[b"gamma"])[..HEADER_LEN + 2]);
+        write_segment(&env, 1, one).await;
+        write_segment(&env, 2, records(&[b"delta"])).await;
+        assert_eq!(good, 2 * HEADER_LEN as u64 + 9);
+    });
+    sim.run_for(Duration::from_millis(1));
+    let (recovery, names) = recover(&mut sim, node, Variant::Correct);
+    assert_eq!(
+        recovery.records,
+        vec![Bytes::from("alpha"), Bytes::from("beta")]
+    );
+    assert_eq!(
+        recovery.stop,
+        Some(WalStop {
+            segment: 1,
+            offset: 2 * HEADER_LEN as u64 + 9,
+            reason: WalStopReason::TornRecord
+        })
+    );
+    assert_eq!((recovery.discarded, recovery.next_seq), (1, 3));
+    // Segment 2 was discarded and recreated fresh; segment 1 was cut.
+    assert_eq!(names, ["000001.wal", "000002.wal"]);
+    assert_eq!(
+        sim.durable_contents(node, &segment_path(Path::new(DIR), 1))
+            .map(|b| b.len()),
+        Some(2 * HEADER_LEN + 9)
+    );
+    assert_eq!(
+        sim.durable_contents(node, &segment_path(Path::new(DIR), 2))
+            .map(|b| b.len()),
+        Some(0)
+    );
+    assert!(sim.trace().iter().any(|r| r.event
+        == TraceEvent::WalTruncated {
+            segment: 1,
+            len: 2 * HEADER_LEN as u64 + 9
+        }));
+    // A second recovery is clean.
+    let (again, _) = recover(&mut sim, node, Variant::Correct);
+    assert_eq!(again.records.len(), 2);
+    assert_eq!((again.stop, again.discarded, again.next_seq), (None, 0, 3));
+}
+
+#[test]
+fn recovery_stops_at_a_bad_checksum_unless_the_variant_skips_it() {
+    for variant in [Variant::Correct, Variant::NoChecksum] {
+        let mut sim = Sim::new(SimConfig::new(4));
+        let node = sim.add_node();
+        let env = sim.env(node);
+        env.clone().spawn("setup", async move {
+            let mut one = records(&[b"alpha", b"beta", b"gamma"]);
+            // Flip one bit of "beta"'s payload.
+            let beta = HEADER_LEN + 5 + HEADER_LEN;
+            one[beta] ^= 0x10;
+            write_segment(&env, 1, one).await;
+        });
+        sim.run_for(Duration::from_millis(1));
+        let (recovery, _) = recover(&mut sim, node, variant);
+        match variant {
+            Variant::Correct => {
+                assert_eq!(recovery.records, vec![Bytes::from("alpha")]);
+                assert_eq!(
+                    recovery.stop,
+                    Some(WalStop {
+                        segment: 1,
+                        offset: HEADER_LEN as u64 + 5,
+                        reason: WalStopReason::BadChecksum
+                    })
+                );
+            }
+            _ => {
+                // The bug: the flipped byte comes back as data.
+                assert_eq!(
+                    recovery.records,
+                    vec![
+                        Bytes::from("alpha"),
+                        Bytes::from("reta"),
+                        Bytes::from("gamma")
+                    ]
+                );
+                assert_eq!(recovery.stop, None);
+            }
+        }
+    }
+}
+
+#[test]
+fn recovery_stops_at_a_missing_segment_and_discards_the_rest() {
+    let mut sim = Sim::new(SimConfig::new(5));
+    let node = sim.add_node();
+    let env = sim.env(node);
+    env.clone().spawn("setup", async move {
+        write_segment(&env, 1, records(&[b"alpha"])).await;
+        write_segment(&env, 3, records(&[b"gamma"])).await;
+    });
+    sim.run_for(Duration::from_millis(1));
+    let (recovery, names) = recover(&mut sim, node, Variant::Correct);
+    assert_eq!(recovery.records, vec![Bytes::from("alpha")]);
+    assert_eq!(
+        recovery.stop,
+        Some(WalStop {
+            segment: 2,
+            offset: 0,
+            reason: WalStopReason::MissingSegment
+        })
+    );
+    assert_eq!((recovery.discarded, recovery.next_seq), (1, 2));
+    assert_eq!(names, ["000001.wal", "000002.wal"]);
+}

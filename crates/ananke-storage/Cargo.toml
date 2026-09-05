@@ -1,0 +1,22 @@
+[package]
+name = "ananke-storage"
+description = "The ananke storage engine: a write-ahead log and LSM tree generic over the ananke Environment, tested under deterministic crash injection"
+readme = "README.md"
+keywords = ["lsm", "wal", "storage-engine", "database", "dst"]
+categories = ["database-implementations"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+ananke-env = { path = "../ananke-env", version = "0.1" }
+bytes.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

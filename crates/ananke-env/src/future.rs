@@ -46,7 +46,7 @@ pub enum Either<A, B> {
 /// ```
 pub fn race<E, A, B>(env: &E, a: A, b: B) -> Race<'_, E::Rng, A, B>
 where
-    E: Environment + ?Sized,
+    E: Environment,
     A: Future + Unpin,
     B: Future + Unpin,
 {

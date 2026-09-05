@@ -359,4 +359,56 @@ trace changed once; nothing was pinned yet.
 
 ---
 
-_Next entry: D-018. Add one before implementing anything not covered above._
+## D-018 — WAL: record framing, one writer task, recovery's cut, and what the crash sweep may excuse
+
+**Context.** SPEC §2.2 fixes the record shape, group commit and the stop rule, and
+leaves open the checksum's scope and source, segment naming and rotation, how the
+writer is structured, what recovery does with a bad tail, and what "recovered equals
+the committed prefix" (§2.8) can mean under lost fsync and bit rot, which no
+single-disk log survives.
+
+**Decision.** A record is `len: u32 LE | crc32c: u32 LE | payload`, the CRC-32C over
+the length bytes and the payload. CRC-32C is implemented in `ananke_storage::crc32c`,
+table driven and checked against the standard check value, with no dependency.
+Segments are `<n>.wal` with `n` zero-padded to six digits so listings sort in log
+order, numbered from 1, created with `create_new` and `sync_dir`, and rotated before
+a group that would start at or beyond `segment_bytes`. Each `Wal` has one writer task
+spawned through `Environment::spawn`; `append` enqueues, assigns the sequence number,
+and returns a future; the writer takes everything queued as one group, writes it with
+one `write_at`, syncs once and acknowledges the group, which is group commit. Recovery
+reads segments in order and stops at the first torn record, bad checksum or missing
+segment; the stopping segment is cut to its last good record and synced, later
+segments are removed, the directory is synced, and a fresh segment is opened. Four
+trace events say what happened: `WalSegmentOpened`, `WalSynced` (one sync covering
+`first..up_to` of a segment, recorded after the call so a preceding `FsyncLost` says it
+lied), `WalTruncated` (recovery's cut, likewise) and `WalRecovered`.
+
+The crash sweep's oracle (`sim/wal.rs`) is built from the appenders' acknowledgements
+and the trace, never from the disk. A record that was acknowledged and covered by a
+sync the simulator honoured must be recovered. A record covered only by syncs the
+simulator lost is excused, and so is everything after it. A record acknowledged with
+no sync attempt at all is the bug, never excused. A stop is explained, and ends the
+obligation, when a `BlockRotted` falls inside the record it stopped on, or when it
+lands exactly where a `WalTruncated` whose sync was lost had cut. Nothing else is
+excused: a torn write or a lost directory entry never touches a correctly synced
+record, so either reaching one is a bug. The log ships in four `Variant`s: `Correct`,
+`NoSyncDir` (rotation without `sync_dir`), `NoChecksum` (recovery trusts the length),
+`AckBeforeSync` (acknowledge on write, sync on an interval); the sweep must pass the
+first and catch each of the others (CLAUDE.md).
+
+**Alternatives.** The `crc32c` crate (SSE4.2): faster, but a dependency for twenty
+lines; revisit if a profile shows it. CRC over the payload only as the checksum bug:
+a flipped length changes the payload the reader checksums, so the sim cannot tell it
+from the correct scope, and a bug the sweep cannot catch is not a control. Reading on
+into the next segment after a bad tail: would produce holes. Strict-mode sweeps only:
+would never exercise lost fsync.
+
+**Consequences.** Recovery reads whole segments into memory (BACKLOG: streaming). A
+lost fsync of the cut can make the next recovery discard a good later segment; the
+sweep excuses exactly that and the devlog should explain it. The `Variant` enum is in
+the public API with `Correct` as the default. `Environment` gained `Clone` as a
+supertrait, which its doc comment had promised all along.
+
+---
+
+_Next entry: D-019. Add one before implementing anything not covered above._
