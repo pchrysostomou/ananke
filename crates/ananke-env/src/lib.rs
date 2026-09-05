@@ -5,9 +5,9 @@
 //!
 //! - [`RealEnv`] — tokio, `std::fs` with fsync semantics honoured, OS entropy, system
 //!   clock.
-//! - `SimEnv` — a single-threaded deterministic executor with a virtual clock, seeded
-//!   RNG, and in-memory network and filesystem with fault models (§1.3, §1.4). Not yet
-//!   implemented.
+//! - [`sim::SimEnv`] — a single-threaded deterministic executor with a virtual clock,
+//!   seeded RNG, and in-memory network and filesystem with fault models (§1.3, §1.4),
+//!   driven by [`sim::Sim`].
 //!
 //! This is the only crate permitted to touch `std::time`, `std::fs`, `std::net`, tokio's
 //! I/O and timers, or OS entropy, and inside it only the [`real`] module may do so.
@@ -26,18 +26,21 @@ mod collections;
 mod env;
 mod fs;
 mod net;
+mod node;
 mod rng;
 mod task;
 mod time;
 mod trace;
 
 pub mod real;
+pub mod sim;
 
 pub use clock::Clock;
 pub use collections::{DetHashMap, DetHashSet, DetState, det_hash_map, det_hash_set};
 pub use env::Environment;
 pub use fs::{File, FileSystem, OpenOptions};
 pub use net::{MAX_FRAME_LEN, Network, Socket};
+pub use node::NodeId;
 pub use real::RealEnv;
 pub use rng::Rng;
 pub use task::{TaskHandle, TaskId};

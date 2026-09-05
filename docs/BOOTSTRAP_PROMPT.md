@@ -103,13 +103,16 @@ _Update this section at the end of every session._
 
 - Phase: 0 (in progress)
 - Last tag: none
-- Done: step 1 workspace scaffold; step 2 CI (clippy `disallowed-methods` /
-  `disallowed-types` from `clippy.toml`, `scripts/check-direct-io.sh`, GitHub
-  Actions); D-013 (`Instant` / `WallTime`) and D-014 (`DetHashMap` seeded from
-  `Environment::rng()`); step 3 `Environment` trait with `Clock`, `FileSystem`, `Rng`
-  sub-traits, `TaskHandle`, `TraceEvent`, and `RealEnv` on tokio with real-env
-  integration tests. `Network` is a marker trait pending D-015.
-- Next concrete task: settle D-015 (message-oriented vs stream-oriented `Network`),
-  implement it for `RealEnv`, then step 4: `SimEnv` (single-threaded deterministic
-  executor, virtual clock, seeded RNG, in-memory network and filesystem with the
-  §1.3 / §1.4 fault models, trace to an in-memory `Vec<TraceEvent>`).
+- Done: steps 1–4. Workspace, CI (clippy `disallowed-methods` / `disallowed-types`
+  from `clippy.toml`, `scripts/check-direct-io.sh`, GitHub Actions), D-013 clock
+  types, D-014 seeded hash maps, D-015 message-oriented `Network` with non-blocking
+  `send`; `Environment` trait with `Clock`, `FileSystem`, `Network`, `Rng`; `RealEnv`
+  on tokio (positional fs, TCP transport with reconnect, OS entropy); `sim::Sim` /
+  `SimEnv`: single-threaded deterministic executor with seeded random scheduling,
+  virtual clock with per-node skew and drift, seeded per-node RNG, in-memory network
+  with drop / delay (reorder) / partition, in-memory filesystem with torn writes and
+  lost fsync applied at `Sim::crash`, trace to an in-memory `Vec<TraceRecord>` with a
+  stable text dump. Determinism test: same seed, byte-identical trace.
+- Next concrete task: step 5, `sim/echo.rs` with 3 nodes under partitions and the CI
+  determinism test; then the moirae bridge (SPEC §1.5) and the `ananke-server` echo
+  binary on `RealEnv` for the Phase 0 exit criteria.

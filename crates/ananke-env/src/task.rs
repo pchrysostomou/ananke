@@ -23,7 +23,7 @@ impl TaskId {
 
 impl fmt::Display for TaskId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "task#{}", self.0)
+        f.pad(&format!("task#{}", self.0))
     }
 }
 
