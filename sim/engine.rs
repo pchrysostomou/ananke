@@ -681,12 +681,6 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
             .filter(|(manifest, _)| *manifest <= recovery.manifest)
             .flat_map(|(_, dropped)| dropped.iter().cloned())
             .collect();
-        // A record is compacted away when every write of it not present was dropped.
-        let compacted = |seq: u64| {
-            writes_of(seq)
-                .iter()
-                .all(|k| present_write(k, seq) || compacted_writes.contains(&(k.clone(), seq)))
-        };
         let mut verdict = Ok(());
         let synced = syncs(&events, dir);
         // Damage to a table lasts: a table torn at one crash is dropped at every open
@@ -711,10 +705,23 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
                 .copied()
                 .or_else(|| previous_manifest.map(|(n, _)| n))
                 .unwrap_or(0);
+            // Whether the file now on disk under manifest number `m` was written to
+            // the end and synced: a number is written again after a fallback
+            // abandoned its first life and the open removed that file as an orphan,
+            // so only a write after the last removal counts.
             let written = |m: u64| {
-                all.iter().any(
+                let path = manifest::manifest_path(dir, m);
+                let last_removed = all.iter().rposition(
+                    |e| matches!(e, TraceEvent::OrphanRemoved { path: p } if *p == path),
+                );
+                let last_written = all.iter().rposition(
                     |e| matches!(e, TraceEvent::ManifestWritten { number, .. } if *number == m),
-                )
+                );
+                match (last_written, last_removed) {
+                    (Some(w), Some(r)) => w > r,
+                    (Some(_), None) => true,
+                    (None, _) => false,
+                }
             };
             let manifest_fault = |m: u64| -> Option<Excuse> {
                 if !written(m) || all_synced.manifest_betrayed.contains(&m) {
@@ -822,11 +829,17 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
                 None => {}
             }
         }
-        // Every record the tables owed that is not there, with why: dropped by a
+        // Every write the tables owed that is not there, with why: dropped by a
         // compaction in the manifest's lineage, in a dropped table, in a table a
-        // fallback left behind, or lost before and not brought back. What was lost
-        // before stays lost unless the log brought it back, wherever it lies.
-        let previously_lost: BTreeSet<u64> = lock(&model).lost.clone();
+        // fallback left behind, or lost before and not brought back. Judged per
+        // write, since a batch can lose one key's write to a table and keep
+        // another's; a write that no reason explains is a violation even when the
+        // rest of its record is there. What was lost before stays lost unless the log
+        // brought it back, wherever it lies.
+        let (previously_lost, previously_lost_writes) = {
+            let m = lock(&model);
+            (m.lost.clone(), m.lost_writes.clone())
+        };
         let mut excused: BTreeMap<u64, Excuse> = previously_lost
             .iter()
             .filter(|&&seq| !present(seq))
@@ -845,50 +858,60 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
         } else {
             recovery.flushed_seq
         };
+        let held_by = |t: &u64, key: &Bytes, seq: u64| {
+            mirror
+                .tables
+                .get(t)
+                .is_some_and(|t| t.writes.contains(&(key.clone(), seq)))
+        };
         for seq in 1..=owed_through {
-            if present(seq) {
-                continue;
-            }
-            let held_by = |t: &u64| {
-                mirror
-                    .tables
-                    .get(t)
-                    .is_some_and(|t| t.writes.iter().any(|(_, s)| *s == seq))
-            };
-            if seq > recovery.flushed_seq {
-                if mirror.tables.keys().any(held_by)
-                    && let Some(why) = fallback_why
+            let mut record_why: Option<Excuse> = None;
+            for key in writes_of(seq) {
+                if present_write(&key, seq) {
+                    continue;
+                }
+                if seq > recovery.flushed_seq {
+                    // Owed by nothing but a fallback that left the table behind.
+                    if mirror.tables.keys().any(|t| held_by(t, &key, seq))
+                        && let Some(why) = fallback_why
+                    {
+                        record_why = record_why.or(Some(why));
+                    }
+                    continue;
+                }
+                let why = if compacted_writes.contains(&(key.clone(), seq)) {
+                    Some(Excuse::Compacted)
+                } else if let Some(why) = table_why
+                    .iter()
+                    .find(|(t, _)| held_by(t, &key, seq))
+                    .map(|(_, why)| *why)
                 {
-                    excused.insert(seq, why);
+                    Some(why)
+                } else if fallback_why.is_some()
+                    && mirror.tables.keys().any(|t| held_by(t, &key, seq))
+                {
+                    fallback_why
+                } else if previously_lost_writes.contains(&(key.clone(), seq)) {
+                    Some(Excuse::LostFsync)
+                } else {
+                    None
+                };
+                match why {
+                    Some(why) => record_why = record_why.or(Some(why)),
+                    None if verdict.is_ok() => {
+                        verdict = Err(format!(
+                            "the write of {} at record {seq} is in no table manifest {} lists, no compaction dropped it, and no fault explains it",
+                            String::from_utf8_lossy(&key),
+                            recovery.manifest
+                        ));
+                    }
+                    None => {}
                 }
-                continue;
             }
-            let why = if compacted(seq) {
-                Some(Excuse::Compacted)
-            } else if let Some(why) = table_why
-                .iter()
-                .find(|(t, _)| held_by(t))
-                .map(|(_, why)| *why)
+            if !present(seq)
+                && let Some(why) = record_why
             {
-                Some(why)
-            } else if fallback_why.is_some() && mirror.tables.keys().any(held_by) {
-                fallback_why
-            } else if previously_lost.contains(&seq) {
-                Some(Excuse::LostFsync)
-            } else {
-                None
-            };
-            match why {
-                Some(why) => {
-                    excused.insert(seq, why);
-                }
-                None if verdict.is_ok() => {
-                    verdict = Err(format!(
-                        "record {seq} is in no table manifest {} lists, no compaction dropped it, and no fault explains it",
-                        recovery.manifest
-                    ));
-                }
-                None => {}
+                excused.insert(seq, why);
             }
         }
         // After a missing head the log is discarded: nothing replays, and the state
