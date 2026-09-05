@@ -313,7 +313,7 @@ fn partitions_drop_with_reason_and_heal() {
         !sim.shared
             .lock()
             .fabric
-            .is_blocked(NodeId::new(1), NodeId::new(0))
+            .is_blocked(NodeId::new(1), NodeId::new(1))
     );
 }
 
@@ -548,18 +548,18 @@ fn write_three_then(config: SimConfig, sync: bool) -> Sim {
 fn synced_data_survives_a_crash_in_strict_mode() {
     let mut sim = write_three_then(SimConfig::new(1), true);
     assert_eq!(
-        sim.durable_contents(NodeId::new(0), Path::new("/f"))
+        sim.durable_contents(NodeId::new(1), Path::new("/f"))
             .unwrap(),
         b"aaaabbbbcccc"
     );
-    sim.crash(NodeId::new(0));
+    sim.crash(NodeId::new(1));
     assert_eq!(
-        sim.durable_contents(NodeId::new(0), Path::new("/f"))
+        sim.durable_contents(NodeId::new(1), Path::new("/f"))
             .unwrap(),
         b"aaaabbbbcccc"
     );
     assert!(events(&sim).contains(&TraceEvent::NodeCrashed {
-        node: NodeId::new(0)
+        node: NodeId::new(1)
     }));
 }
 
@@ -570,14 +570,14 @@ fn unsynced_writes_survive_a_crash_only_as_a_prefix() {
     for seed in 0..64 {
         let mut sim = write_three_then(SimConfig::new(seed), false);
         assert!(
-            sim.durable_contents(NodeId::new(0), Path::new("/f"))
+            sim.durable_contents(NodeId::new(1), Path::new("/f"))
                 .unwrap()
                 .is_empty(),
             "nothing is durable before the crash"
         );
-        sim.crash(NodeId::new(0));
+        sim.crash(NodeId::new(1));
         let on_disk = sim
-            .durable_contents(NodeId::new(0), Path::new("/f"))
+            .durable_contents(NodeId::new(1), Path::new("/f"))
             .unwrap();
         assert!(
             b"aaaabbbbcccc".starts_with(&on_disk),
@@ -588,7 +588,7 @@ fn unsynced_writes_survive_a_crash_only_as_a_prefix() {
             .iter()
             .any(|e| matches!(e, TraceEvent::WriteTorn { .. }));
         // What the restarted node reads is exactly what is on disk.
-        let env = sim.env(NodeId::new(0));
+        let env = sim.env(NodeId::new(1));
         let seen: Log<Bytes> = log();
         let s = seen.clone();
         env.clone().spawn("reader", async move {
@@ -618,14 +618,14 @@ fn lost_fsync_returns_ok_but_persists_nothing() {
             .any(|e| matches!(e, TraceEvent::FsyncLost { .. }))
     );
     assert!(
-        sim.durable_contents(NodeId::new(0), Path::new("/f"))
+        sim.durable_contents(NodeId::new(1), Path::new("/f"))
             .unwrap()
             .is_empty()
     );
-    sim.crash(NodeId::new(0));
+    sim.crash(NodeId::new(1));
     assert!(
         b"aaaabbbbcccc".starts_with(
-            &sim.durable_contents(NodeId::new(0), Path::new("/f"))
+            &sim.durable_contents(NodeId::new(1), Path::new("/f"))
                 .unwrap()
         )
     );
@@ -699,9 +699,9 @@ fn trace_text_is_stable_and_readable() {
     let text = sim.trace_text();
     assert_eq!(
         text,
-        "              0   n0 TaskSpawned { task: TaskId(1), name: \"noop\" }\n\
-         \x20             0   n0 TaskPolled { task: TaskId(1) }\n\
-         \x20             0   n0 TaskCompleted { task: TaskId(1) }\n\
+        "              0   n1 TaskSpawned { task: TaskId(1), name: \"noop\" }\n\
+         \x20             0   n1 TaskPolled { task: TaskId(1) }\n\
+         \x20             0   n1 TaskCompleted { task: TaskId(1) }\n\
          \x20             1    - TimeAdvanced { to: Instant(1ns) }\n"
     );
 }

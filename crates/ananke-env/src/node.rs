@@ -3,7 +3,9 @@
 use std::fmt;
 
 /// Identifies a node within one simulation. `Sim::add_node` allocates these
-/// sequentially from 0.
+/// sequentially from 1: moirae traces number nodes `1..=nodes` (SPEC §1.5), and using
+/// the same numbering here means the bridge carries ids through unchanged, with no
+/// mapping function to get wrong. Zero is never a node.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NodeId(u32);
 

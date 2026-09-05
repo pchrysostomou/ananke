@@ -34,8 +34,11 @@ pub fn node_addr(n: u32) -> SocketAddr {
     ))
 }
 
+/// The node id (1-based, like the trace) bound to `addr`; `node_addr(n)` belongs to node `n + 1`.
 fn node_of(addr: SocketAddr) -> Option<NodeId> {
-    (0..NODES).find(|&n| node_addr(n) == addr).map(NodeId::new)
+    (0..NODES)
+        .find(|&n| node_addr(n) == addr)
+        .map(|n| NodeId::new(n + 1))
 }
 
 /// The fault schedule, in global virtual time. Each phase starts when the previous
@@ -114,7 +117,7 @@ impl Report {
                 })
                 .count()
         };
-        let (n0, n1, n2) = (NodeId::new(0), NodeId::new(1), NodeId::new(2));
+        let (n0, n1, n2) = (NodeId::new(1), NodeId::new(2), NodeId::new(3));
 
         // Nothing crosses a symmetric partition, in either direction.
         for (a, b) in [(n0, n1), (n1, n0), (n0, n2), (n2, n0)] {

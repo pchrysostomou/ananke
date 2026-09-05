@@ -196,7 +196,8 @@ impl Sim {
     pub fn add_node_with_clock(&mut self, skew_nanos: i64, drift_ppm: i64) -> NodeId {
         assert!(drift_ppm > -1_000_000, "drift_ppm must be above -1,000,000");
         let mut st = self.shared.lock();
-        let id = NodeId::new(u32::try_from(st.nodes.len()).expect("too many nodes"));
+        // 1-based, as in moirae traces (see `NodeId`).
+        let id = NodeId::new(u32::try_from(st.nodes.len() + 1).expect("too many nodes"));
         st.nodes.insert(
             id,
             state::Node {
