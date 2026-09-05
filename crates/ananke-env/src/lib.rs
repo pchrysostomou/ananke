@@ -19,6 +19,7 @@
 //! - Async trait methods return `impl Future<Output = _> + Send` rather than being
 //!   `async fn`, so generic code can spawn the futures it builds.
 //! - Time is [`Instant`] and [`WallTime`], never `std::time` (D-013).
+//! - A simulation's trace leaves through [`moirae`] as a moirae trace (SPEC §1.5).
 //! - Hash maps are [`DetHashMap`] / [`DetHashSet`], seeded from an [`Rng`] (D-014).
 
 mod clock;
@@ -33,6 +34,7 @@ mod task;
 mod time;
 mod trace;
 
+pub mod moirae;
 pub mod real;
 pub mod sim;
 

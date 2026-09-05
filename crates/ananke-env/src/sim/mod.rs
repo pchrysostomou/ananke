@@ -154,6 +154,16 @@ impl fmt::Display for TraceRecord {
     }
 }
 
+/// What the moirae export reads: the configuration, the policy, each node's clock, every
+/// address ever bound, and the records.
+pub(crate) struct Snapshot {
+    pub(crate) config: SimConfig,
+    pub(crate) policy: Policy,
+    pub(crate) clocks: Vec<(NodeId, i64, i64)>,
+    pub(crate) addrs: Vec<(std::net::SocketAddr, NodeId)>,
+    pub(crate) records: Vec<TraceRecord>,
+}
+
 /// A simulation: the executor, the clock, the fabric, the disks and the trace.
 pub struct Sim {
     shared: Arc<Shared>,
@@ -423,6 +433,22 @@ impl Sim {
     #[must_use]
     pub fn trace(&self) -> Vec<TraceRecord> {
         self.shared.lock().trace.clone()
+    }
+
+    /// Everything the moirae export needs, copied out from under the lock.
+    pub(crate) fn snapshot(&self) -> Snapshot {
+        let st = self.shared.lock();
+        Snapshot {
+            config: st.config.clone(),
+            policy: st.policy,
+            clocks: st
+                .nodes
+                .iter()
+                .map(|(id, n)| (*id, n.skew_nanos, n.drift_ppm))
+                .collect(),
+            addrs: st.fabric.known.iter().map(|(a, n)| (*a, *n)).collect(),
+            records: st.trace.clone(),
+        }
     }
 
     /// The trace so far as text, one record per line. Two runs with the same config

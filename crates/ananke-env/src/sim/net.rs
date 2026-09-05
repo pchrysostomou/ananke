@@ -43,6 +43,8 @@ pub(super) struct Fabric {
     pub(super) active_partition: Option<Vec<Vec<NodeId>>>,
     /// Link directions blocked individually, as recorded in the trace.
     pub(super) links: BTreeSet<(NodeId, NodeId)>,
+    /// Every address ever bound and the node that bound it, for the moirae export.
+    pub(super) known: BTreeMap<SocketAddr, NodeId>,
     next_socket: u64,
     next_port: u16,
     next_message: u64,
@@ -105,6 +107,7 @@ impl State {
         }
         let id = self.fabric.next_socket;
         self.fabric.next_socket += 1;
+        self.fabric.known.insert(addr, node);
         self.fabric.sockets.insert(
             addr,
             SocketState {
