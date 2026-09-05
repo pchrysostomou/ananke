@@ -2,8 +2,10 @@
 //! `ananke_server::echo` under drops, delays, clock skew, partitions and a crash. Each
 //! node keeps the echo [`Journal`], so the crash also exercises the SPEC §1.3 disk
 //! model: torn writes, bit rot and directory-entry loss, all cross-checked against
-//! what the restarted node found on disk. The run has a poll budget, so a busy loop
-//! fails it instead of hanging a sweep.
+//! what the restarted node found on disk. The journal runs in two [`Variant`]s, the
+//! correct one and one with a known bug, and [`Report::check`] expects different
+//! things of each: that pair is what shows the fault model telling them apart. The
+//! run has a poll budget, so a busy loop fails it instead of hanging a sweep.
 //!
 //! The protocol itself lives in `ananke-server` so the binary and this scenario run
 //! identical code. [`run`] drives the fault schedule and returns a [`Report`] whose
@@ -29,14 +31,26 @@ pub const PING_INTERVAL: Duration = Duration::from_millis(20);
 /// Where each node keeps its journal, on its own disk.
 pub const JOURNAL_DIR: &str = "/echo";
 
+/// Which journal the nodes run: the standard pair for every fault-model test.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Variant {
+    /// `sync_dir` after every rename and create, as `ananke-server` ships. The
+    /// positive control: the journal must always be found after the crash.
+    Correct,
+    /// No `sync_dir` on rotation. The negative control: the sweep must see the
+    /// journal vanish, or the fault model is not doing its job.
+    NoSyncDir,
+}
+
 /// The journal every node keeps: synced every 4 records, rotated every 16, so a crash
-/// finds pending writes and unsynced renames.
+/// finds pending writes and, in the buggy variant, unsynced renames.
 #[must_use]
-pub fn journal() -> Journal {
+pub fn journal(variant: Variant) -> Journal {
     Journal {
         dir: PathBuf::from(JOURNAL_DIR),
         sync_every: 4,
         rotate_every: 16,
+        sync_dir_on_rotate: variant == Variant::Correct,
     }
 }
 
@@ -102,6 +116,8 @@ impl Default for Schedule {
 pub struct Report {
     /// The seed the run used.
     pub seed: u64,
+    /// Which journal the nodes ran.
+    pub variant: Variant,
     /// The trace as moirae JSONL (SPEC §1.5), byte-identical across runs with the same
     /// seed; `sim/tests/echo.rs` pins its hash.
     pub jsonl: String,
@@ -280,7 +296,9 @@ impl Report {
     }
 
     /// The disk after the crash is exactly what the §1.3 model says survived, and the
-    /// journal's checksums caught every flipped bit the restarted node could see.
+    /// journal's checksums caught every flipped bit the restarted node could see. What
+    /// "survived" means depends on the [`Variant`]: the correct journal never loses a
+    /// directory entry; the buggy one loses exactly what the model dropped.
     fn check_journals(&self) -> Result<(), String> {
         let count =
             |f: &dyn Fn(&TraceEvent) -> bool| self.records.iter().filter(|r| f(&r.event)).count();
@@ -326,9 +344,7 @@ impl Report {
                 return Err(format!("node {n} stopped journalling after node 2 crashed"));
             }
         }
-        // The crashed node: the directory model first. After the one synced create,
-        // every rotation appended `rename(journal, journal.prev)` then `create(journal)`
-        // to the directory's pending operations, and the crash kept a prefix of them.
+        // The crashed node: the directory model first.
         let before = self.stats_at_crash[2]
             .journal
             .as_ref()
@@ -344,32 +360,61 @@ impl Report {
                 _ => None,
             })
             .collect();
-        let pending_at_crash = 2 * before.rotations;
-        if lost.len() as u64 > pending_at_crash {
-            return Err(format!(
-                "{} directory operations lost but only {pending_at_crash} were pending",
-                lost.len()
-            ));
+        match self.variant {
+            Variant::Correct => {
+                // Every rename and create was synced: nothing was pending at the crash,
+                // so nothing was lost, the journal is there, and journal.prev is there
+                // whenever a rotation completed before the crash.
+                if !lost.is_empty() {
+                    return Err(format!(
+                        "the correct journal lost directory entries: {lost:?}"
+                    ));
+                }
+                if !after.found {
+                    return Err("the correct journal was missing after the restart".to_owned());
+                }
+                if after.found_previous != (before.rotations > 0) {
+                    return Err(format!(
+                        "journal.prev found={} after restart with {} rotations before the crash",
+                        after.found_previous, before.rotations
+                    ));
+                }
+            }
+            Variant::NoSyncDir => {
+                // After the one synced create, every rotation appended
+                // `rename(journal, journal.prev)` then `create(journal)` to the
+                // directory's pending operations, and the crash kept a prefix of them.
+                let pending_at_crash = 2 * before.rotations;
+                if lost.len() as u64 > pending_at_crash {
+                    return Err(format!(
+                        "{} directory operations lost but only {pending_at_crash} were pending",
+                        lost.len()
+                    ));
+                }
+                // `journal` is missing exactly when the first dropped operation was its
+                // creation.
+                let journal_missing =
+                    lost.first() == Some(&(dir.join(Journal::CURRENT), DirEntryOp::Link));
+                if after.found == journal_missing {
+                    return Err(format!(
+                        "journal found={} after restart, but the crash dropped {lost:?}",
+                        after.found
+                    ));
+                }
+                // `journal.prev` exists exactly when at least one rename survived.
+                let previous_kept = before.rotations > 0 && (lost.len() as u64) < pending_at_crash;
+                if after.found_previous != previous_kept {
+                    return Err(format!(
+                        "journal.prev found={} after restart, but {} rotations happened and the crash dropped {lost:?}",
+                        after.found_previous, before.rotations
+                    ));
+                }
+            }
         }
-        // `journal` is missing exactly when the first dropped operation was its creation.
-        let journal_missing = lost.first() == Some(&(dir.join(Journal::CURRENT), DirEntryOp::Link));
-        if after.found == journal_missing {
-            return Err(format!(
-                "journal found={} after restart, but the crash dropped {lost:?}",
-                after.found
-            ));
-        }
-        // `journal.prev` exists exactly when at least one rename survived.
-        let previous_kept = before.rotations > 0 && (lost.len() as u64) < pending_at_crash;
-        if after.found_previous != previous_kept {
-            return Err(format!(
-                "journal.prev found={} after restart, but {} rotations happened and the crash dropped {lost:?}",
-                after.found_previous, before.rotations
-            ));
-        }
-        // Then the data model. Every rotted block flips one bit of one record, and the
-        // checksum catches every single-bit flip; every torn write leaves one partial
-        // tail. The node sees only the files still linked, so the counts are bounds.
+        // Then the data model, the same for both variants. Every rotted block flips
+        // one bit of one record, and the checksum catches every single-bit flip; every
+        // torn write leaves one partial tail. The node sees only the files still
+        // linked, so the counts are bounds.
         let rotted = count(&|e| matches!(e, TraceEvent::BlockRotted { path, .. } if in_dir(path)));
         let torn = count(&|e| matches!(e, TraceEvent::WriteTorn { path, .. } if in_dir(path)));
         if after.corrupt as usize > rotted {
@@ -390,7 +435,7 @@ impl Report {
                 after.valid, after.corrupt, after.torn, before.written
             ));
         }
-        if !after.found && after.valid + after.corrupt > 0 && !after.found_previous {
+        if !after.found && !after.found_previous && after.valid + after.corrupt > 0 {
             return Err("replayed records from files that were not found".to_owned());
         }
         Ok(())
@@ -445,13 +490,13 @@ pub fn config(seed: u64) -> SimConfig {
 
 /// Runs the scenario for `seed` with the default [`Schedule`].
 #[must_use]
-pub fn run(seed: u64) -> Report {
-    run_with(seed, Schedule::default())
+pub fn run(seed: u64, variant: Variant) -> Report {
+    run_with(seed, Schedule::default(), variant)
 }
 
 /// Runs the scenario for `seed` with an explicit fault schedule.
 #[must_use]
-pub fn run_with(seed: u64, schedule: Schedule) -> Report {
+pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
     let mut config = config(seed);
     config.run_length_hint = SimConfig::run_length_hint_for(NODES, schedule.total());
     let mut sim = Sim::new(config);
@@ -464,7 +509,7 @@ pub fn run_with(seed: u64, schedule: Schedule) -> Report {
             peers: (0..NODES).filter(|&p| p != n).map(node_addr).collect(),
             interval: PING_INTERVAL,
             incarnation,
-            journal: Some(journal()),
+            journal: Some(journal(variant)),
         };
         env.spawn(
             "echo",
@@ -501,6 +546,7 @@ pub fn run_with(seed: u64, schedule: Schedule) -> Report {
 
     Report {
         seed,
+        variant,
         jsonl: sim
             .to_moirae(&Export::new(&decoder))
             .expect("the echo trace exports to moirae v2"),

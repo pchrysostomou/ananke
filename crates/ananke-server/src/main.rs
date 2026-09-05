@@ -65,6 +65,7 @@ fn run_echo(args: EchoArgs) -> ExitCode {
                 dir,
                 sync_every: 8,
                 rotate_every: 64,
+                sync_dir_on_rotate: true,
             }),
         };
         let task = env.spawn("echo", echo::node(env.clone(), config, stats.clone()));

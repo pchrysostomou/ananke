@@ -41,6 +41,14 @@ Deferred ideas live in [docs/BACKLOG.md](docs/BACKLOG.md).
   the moirae studio, it didn't happen. A scenario's trace is `Sim::to_moirae` JSONL;
   CI pins its hash, and a deliberate change updates the constant in the same commit and
   says why (`sim/tests/echo.rs`).
+- **Every fault-model test runs a known-buggy variant and a correct one.** The buggy
+  variant must be seen to fail under the sweep and the correct one must pass under the
+  same seeds. A sweep that only passes may not be injecting the fault; one that only
+  fails may be failing correct code; the pair proves the fault model distinguishes a
+  bug from correct code. The shape: a config flag or variant enum on the code under
+  test (`Journal::sync_dir_on_rotate`, the WAL's variants), a scenario `Report::check`
+  that expects different things of each, and a sweep test that asserts both. Ship the
+  correct default.
 - **Every published crate carries copies of `LICENSE-MIT` and `LICENSE-APACHE`** in
   its own directory (copies, not symlinks) so `cargo package` bundles them.
 - **Prefer boring, well-documented Rust.** This is a project meant to be read.

@@ -39,12 +39,14 @@ pub struct Echo {
 
 /// The journal of pings sent: `journal` in a directory, rotated to `journal.prev`.
 ///
-/// It exists so the §1.3 fault model has something to act on, and it is deliberately
-/// only as careful as that needs. Records are synced every `sync_every` writes, so a
-/// crash finds pending writes to keep, tear or drop. Rotation renames without
-/// `sync_dir`, so a crash finds directory operations to lose. Every record carries a
-/// checksum, so bit rot is caught at replay ([`replay`]). A storage engine syncs both
-/// the data and the directory (SPEC §2); this journal shows what happens when it does not.
+/// It exists so the §1.3 fault model has something to act on. Records are synced
+/// every `sync_every` writes, so a crash finds pending writes to keep, tear or drop.
+/// Every record carries a checksum, so bit rot is caught at replay ([`replay`]).
+/// Rotation renames the file and creates a new one; with `sync_dir_on_rotate` the
+/// directory is synced after each, which is what a correct program does and what
+/// `ananke-server` ships. Without it the rename and the create stay pending, so a
+/// crash finds directory operations to lose: the known bug the echo scenario runs as
+/// its negative control, next to the correct variant as the positive one.
 #[derive(Clone, Debug)]
 pub struct Journal {
     /// The directory holding `journal` and `journal.prev`; created if missing.
@@ -53,6 +55,9 @@ pub struct Journal {
     pub sync_every: u64,
     /// Records per file before rotating; 0 never rotates.
     pub rotate_every: u64,
+    /// Whether rotation syncs the directory after the rename and after the create.
+    /// `false` is a bug, kept so the fault model can be shown to catch it.
+    pub sync_dir_on_rotate: bool,
 }
 
 impl Journal {
@@ -333,16 +338,21 @@ impl<F: File> OpenJournal<F> {
             self.since_sync = 0;
         }
         if self.config.rotate_every > 0 && self.in_file >= self.config.rotate_every {
-            // On purpose without `sync_dir`: see `Journal`.
             let fs = env.fs();
             fs.rename(&self.config.current(), &self.config.previous())
                 .await?;
+            if self.config.sync_dir_on_rotate {
+                fs.sync_dir(&self.config.dir).await?;
+            }
             self.file = fs
                 .open(
                     &self.config.current(),
                     OpenOptions::new().read(true).write(true).create_new(true),
                 )
                 .await?;
+            if self.config.sync_dir_on_rotate {
+                fs.sync_dir(&self.config.dir).await?;
+            }
             self.offset = 0;
             self.in_file = 0;
             self.since_sync = 0;
