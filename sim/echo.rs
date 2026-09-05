@@ -1,5 +1,9 @@
 //! The Phase 0 scenario (SPEC.md §1.6): three nodes running the echo protocol from
-//! `ananke_server::echo` under drops, delays, clock skew, partitions and a crash.
+//! `ananke_server::echo` under drops, delays, clock skew, partitions and a crash. Each
+//! node keeps the echo [`Journal`], so the crash also exercises the SPEC §1.3 disk
+//! model: torn writes, bit rot and directory-entry loss, all cross-checked against
+//! what the restarted node found on disk. The run has a poll budget, so a busy loop
+//! fails it instead of hanging a sweep.
 //!
 //! The protocol itself lives in `ananke-server` so the binary and this scenario run
 //! identical code. [`run`] drives the fault schedule and returns a [`Report`] whose
@@ -9,18 +13,32 @@
 //! check and as a smoke test for the simulator.
 
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use ananke_env::moirae::{Export, bytes_decoder};
 use ananke_env::sim::{Sim, SimConfig, TraceRecord};
-use ananke_env::{DropReason, Environment, Instant, NodeId, TraceEvent};
-use ananke_server::echo::{self, Echo, Message, SharedStats, Stats};
+use ananke_env::{DirEntryOp, DropReason, Environment, Instant, NodeId, TraceEvent};
+use ananke_server::echo::{self, Echo, Journal, Message, SharedStats, Stats};
 use moirae_trace::Json;
 
 /// How many nodes the scenario runs.
 pub const NODES: u32 = 3;
 /// How often each node pings.
 pub const PING_INTERVAL: Duration = Duration::from_millis(20);
+/// Where each node keeps its journal, on its own disk.
+pub const JOURNAL_DIR: &str = "/echo";
+
+/// The journal every node keeps: synced every 4 records, rotated every 16, so a crash
+/// finds pending writes and unsynced renames.
+#[must_use]
+pub fn journal() -> Journal {
+    Journal {
+        dir: PathBuf::from(JOURNAL_DIR),
+        sync_every: 4,
+        rotate_every: 16,
+    }
+}
 
 /// The synthetic address of node `n`.
 #[must_use]
@@ -93,6 +111,8 @@ pub struct Report {
     pub phase_ends: [Instant; 5],
     /// What each node observed, by node index.
     pub stats: Vec<Stats>,
+    /// What each node had observed when node 2 crashed, by node index.
+    pub stats_at_crash: Vec<Stats>,
 }
 
 impl Report {
@@ -211,6 +231,9 @@ impl Report {
         // The symmetric partition and the one-way block are recorded as moirae will show them.
         let count =
             |f: &dyn Fn(&TraceEvent) -> bool| self.records.iter().filter(|r| f(&r.event)).count();
+        if let Err(violation) = self.check_journals() {
+            return fail(violation);
+        }
         let shape = (
             count(&|e| matches!(e, TraceEvent::PartitionStarted { .. })),
             count(&|e| matches!(e, TraceEvent::PartitionHealed { .. })),
@@ -256,6 +279,123 @@ impl Report {
         Ok(())
     }
 
+    /// The disk after the crash is exactly what the §1.3 model says survived, and the
+    /// journal's checksums caught every flipped bit the restarted node could see.
+    fn check_journals(&self) -> Result<(), String> {
+        let count =
+            |f: &dyn Fn(&TraceEvent) -> bool| self.records.iter().filter(|r| f(&r.event)).count();
+        let dir = Path::new(JOURNAL_DIR);
+        let in_dir = |path: &Path| path.parent() == Some(dir);
+        // Fresh disks at the start: nothing to find, nothing torn, nothing corrupt.
+        for (n, stats) in self.stats_at_crash.iter().enumerate() {
+            let Some(journal) = &stats.journal else {
+                return Err(format!("node {n} kept no journal"));
+            };
+            if journal.found
+                || journal.found_previous
+                || journal.valid + journal.corrupt + journal.torn > 0
+            {
+                return Err(format!(
+                    "node {n} found a journal on a fresh disk: {journal:?}"
+                ));
+            }
+            if journal.written == 0 || journal.written != stats.pings_sent {
+                return Err(format!(
+                    "node {n} journalled {} of {} pings",
+                    journal.written, stats.pings_sent
+                ));
+            }
+        }
+        // Nodes that never crashed keep writing to the same file.
+        for n in [0, 1] {
+            let (before, after) = (&self.stats_at_crash[n], &self.stats[n]);
+            if after
+                .journal
+                .as_ref()
+                .map(|j| (j.found, j.valid, j.corrupt, j.torn))
+                != Some((false, 0, 0, 0))
+            {
+                return Err(format!(
+                    "node {n} never crashed but its journal changed: {:?}",
+                    after.journal
+                ));
+            }
+            if after.journal.as_ref().map_or(0, |j| j.written)
+                <= before.journal.as_ref().map_or(0, |j| j.written)
+            {
+                return Err(format!("node {n} stopped journalling after node 2 crashed"));
+            }
+        }
+        // The crashed node: the directory model first. After the one synced create,
+        // every rotation appended `rename(journal, journal.prev)` then `create(journal)`
+        // to the directory's pending operations, and the crash kept a prefix of them.
+        let before = self.stats_at_crash[2]
+            .journal
+            .as_ref()
+            .expect("checked above");
+        let after = self.stats[2].journal.as_ref().expect("checked above");
+        let lost: Vec<(PathBuf, DirEntryOp)> = self
+            .records
+            .iter()
+            .filter_map(|r| match &r.event {
+                TraceEvent::DirectoryEntryLost { dir: d, entry, op } if d == dir => {
+                    Some((entry.clone(), *op))
+                }
+                _ => None,
+            })
+            .collect();
+        let pending_at_crash = 2 * before.rotations;
+        if lost.len() as u64 > pending_at_crash {
+            return Err(format!(
+                "{} directory operations lost but only {pending_at_crash} were pending",
+                lost.len()
+            ));
+        }
+        // `journal` is missing exactly when the first dropped operation was its creation.
+        let journal_missing = lost.first() == Some(&(dir.join(Journal::CURRENT), DirEntryOp::Link));
+        if after.found == journal_missing {
+            return Err(format!(
+                "journal found={} after restart, but the crash dropped {lost:?}",
+                after.found
+            ));
+        }
+        // `journal.prev` exists exactly when at least one rename survived.
+        let previous_kept = before.rotations > 0 && (lost.len() as u64) < pending_at_crash;
+        if after.found_previous != previous_kept {
+            return Err(format!(
+                "journal.prev found={} after restart, but {} rotations happened and the crash dropped {lost:?}",
+                after.found_previous, before.rotations
+            ));
+        }
+        // Then the data model. Every rotted block flips one bit of one record, and the
+        // checksum catches every single-bit flip; every torn write leaves one partial
+        // tail. The node sees only the files still linked, so the counts are bounds.
+        let rotted = count(&|e| matches!(e, TraceEvent::BlockRotted { path, .. } if in_dir(path)));
+        let torn = count(&|e| matches!(e, TraceEvent::WriteTorn { path, .. } if in_dir(path)));
+        if after.corrupt as usize > rotted {
+            return Err(format!(
+                "{} corrupt records but only {rotted} rotted blocks",
+                after.corrupt
+            ));
+        }
+        if after.torn as usize > torn {
+            return Err(format!(
+                "{} torn files but only {torn} torn writes",
+                after.torn
+            ));
+        }
+        if after.valid + after.corrupt + after.torn > before.written {
+            return Err(format!(
+                "replayed {} + {} + {} records but only {} were written before the crash",
+                after.valid, after.corrupt, after.torn, before.written
+            ));
+        }
+        if !after.found && after.valid + after.corrupt > 0 && !after.found_previous {
+            return Err("replayed records from files that were not found".to_owned());
+        }
+        Ok(())
+    }
+
     /// Pings sent across the whole run.
     #[must_use]
     pub fn pings_sent(&self) -> u64 {
@@ -295,6 +435,11 @@ pub fn config(seed: u64) -> SimConfig {
     config.net.delay_max = Duration::from_millis(10);
     config.clock.max_skew = Duration::from_millis(50);
     config.clock.max_drift_ppm = 500;
+    // One block in four rots at a crash; the journal's checksums must notice.
+    config.fs.p_bitrot = 0.25;
+    // Nothing in this scenario is polled more than a few times at one instant; a task
+    // that is has stopped yielding to time.
+    config.poll_budget = 1_000;
     config
 }
 
@@ -319,6 +464,7 @@ pub fn run_with(seed: u64, schedule: Schedule) -> Report {
             peers: (0..NODES).filter(|&p| p != n).map(node_addr).collect(),
             interval: PING_INTERVAL,
             incarnation,
+            journal: Some(journal()),
         };
         env.spawn(
             "echo",
@@ -346,6 +492,7 @@ pub fn run_with(seed: u64, schedule: Schedule) -> Report {
     phase_ends[3] = sim.now();
 
     sim.heal();
+    let stats_at_crash = stats.iter().map(|s| echo::lock(s).clone()).collect();
     sim.crash(nodes[2]);
     sim.restart(nodes[2]);
     spawn(&sim, 2, 1);
@@ -360,5 +507,6 @@ pub fn run_with(seed: u64, schedule: Schedule) -> Report {
         records: sim.trace(),
         phase_ends,
         stats: stats.iter().map(|s| echo::lock(s).clone()).collect(),
+        stats_at_crash,
     }
 }

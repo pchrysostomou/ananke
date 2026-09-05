@@ -5,11 +5,12 @@
 //! (SPEC.md §1.6).
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
 use ananke_env::{Clock, Environment, RealEnv};
-use ananke_server::echo::{self, Echo, SharedStats};
+use ananke_server::echo::{self, Echo, Journal, SharedStats};
 use clap::{Args, Parser, Subcommand};
 
 #[derive(Parser)]
@@ -39,6 +40,9 @@ struct EchoArgs {
     /// Ping interval in milliseconds.
     #[arg(long, default_value_t = 20)]
     interval_ms: u64,
+    /// Directory to journal the pings sent in; created if missing.
+    #[arg(long)]
+    journal: Option<PathBuf>,
 }
 
 fn main() -> ExitCode {
@@ -57,6 +61,11 @@ fn run_echo(args: EchoArgs) -> ExitCode {
             peers: args.peers,
             interval: Duration::from_millis(args.interval_ms),
             incarnation: 0,
+            journal: args.journal.map(|dir| Journal {
+                dir,
+                sync_every: 8,
+                rotate_every: 64,
+            }),
         };
         let task = env.spawn("echo", echo::node(env.clone(), config, stats.clone()));
         if args.duration_secs == 0 {
@@ -77,6 +86,18 @@ fn run_echo(args: EchoArgs) -> ExitCode {
             stats.unknown_pongs,
             stats.garbage
         );
+        if let Some(journal) = &stats.journal {
+            println!(
+                "journal found={} found_previous={} valid={} corrupt={} torn={} written={} rotations={}",
+                journal.found,
+                journal.found_previous,
+                journal.valid,
+                journal.corrupt,
+                journal.torn,
+                journal.written,
+                journal.rotations
+            );
+        }
         match stats.check() {
             Ok(()) => {
                 println!("ok");
