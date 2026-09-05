@@ -1,0 +1,21 @@
+[package]
+name = "ananke-raft"
+description = "Raft for ananke: a pure protocol core, its log in the ananke storage engine, and the server that runs it under the ananke Environment, tested under deterministic simulation"
+readme = "README.md"
+keywords = ["raft", "consensus", "distributed", "dst", "simulation"]
+categories = ["algorithms", "database-implementations"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+ananke-env = { path = "../ananke-env", version = "0.2" }
+ananke-storage = { path = "../ananke-storage", version = "0.2" }
+bytes.workspace = true
+moirae-trace.workspace = true
+
+[lints]
+workspace = true

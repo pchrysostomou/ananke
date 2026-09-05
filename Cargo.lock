@@ -21,6 +21,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ananke-raft"
+version = "0.2.0"
+dependencies = [
+ "ananke-env",
+ "ananke-storage",
+ "bytes",
+ "moirae-trace",
+]
+
+[[package]]
 name = "ananke-server"
 version = "0.2.0"
 dependencies = [

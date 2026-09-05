@@ -759,4 +759,63 @@ back, only ever one that asked for no sync. Every store directory has a `CURRENT
 
 ---
 
-_Next entry: D-025. Add one before implementing anything not covered above._
+## D-025 — The Raft core as a pure step function, its state in the engine, and the invariants as folds
+
+**Context.** RAFT.md fixes the variant and the invariants. Stage A of its
+implementation order is the protocol without a server: the core, the wire form, the
+persistent state, and the paper's scenarios as tests.
+
+**Decision.** `ananke_raft::core::Raft` is Figure 2 with pre-vote (thesis §9.6), a
+no-op on election (thesis §6.4), batching and pipelining with moirae's deviation D1,
+as a state machine with no I/O: `step(Input) -> Vec<Output>`, inputs being a message,
+a tick, a proposal or a completed apply, outputs a persist, sends, an apply, a
+rejection or a trace event. Outputs come in an order the server keeps: the persist
+first, then the messages that depend on it; that order is the persistence discipline
+of Figure 2, and the server variant that sends first is what stage B's sweep must
+catch. The core holds the log as a vector and draws election timeouts from a
+generator seeded by the server, so it is a function of its inputs and its seed. The
+known-buggy cores are variants on it: no pre-vote, counting an older term's entry
+for commit, truncating on every append, resetting the timer on any message, and the
+election restriction by length first.
+
+The wire form is one frame, `kind | from | term | fields`, little-endian, entries as
+`term | index | payload`; a frame that does not decode is a dropped message. The
+studio decoder turns a frame into `{"type": "raft.<kind>", "from", "term", ...}` with
+the entry range rather than the entries, the field set issue #3 filters by.
+
+The persistent state lives in the engine under tenant 0 with SPEC §2.6's key shape:
+the hard state and the applied index under one key in table 0, the log one key per
+index in table 1. A persist is one synced batch of the hard state when it changed, the
+truncation's deletes and the appends; applying an entry is one synced batch of the
+entry's writes under the user tenant and the applied index, so both are durable or
+neither is and an entry applies exactly once whatever the crash schedule. Commands
+are put, delete and compare-and-set, the last so that a double apply shows as a wrong
+boolean. The store refuses an engine whose recovery dropped a table, fell back to an
+older manifest or discarded a log head (`LostState`): the engine keeps what it can
+and reports the rest, which is right for a store on its own, but under Raft a hole
+below the applied index is a state that never existed (D-022), and the channel for
+re-supplying it is a snapshot, not a start. The engine is opened with fallback and
+head-gap discard off for the same reason.
+
+The four log invariants of Figure 3 are folds over the trace events the core emits
+(`RaftTerm`, `RaftVote`, `RaftLeader`, `RaftAppend`, `RaftTruncate`, `RaftCommit`,
+`RaftApply`), in `ananke_raft::invariants`, so the paper's scenarios check them over a
+few cores stepped by hand and stage B's sweep checks them over a run.
+
+**Alternatives.** raft-rs's `Ready` with an explicit `advance`: the same idea with more
+ceremony; ordered outputs say the same thing in one list. A log in its own file: the
+engine already gives synced batches, scans and checkpoints, and SPEC §3 puts the log
+in it. A core that owns its timers with real time: nothing in the core may touch a
+clock, so ticks are inputs.
+
+**Consequences.** The whole log sits in memory in the core until snapshots (stage E)
+let it drop a prefix. Every buggy core is shown breaking its rule in
+`crates/ananke-raft/tests/paper.rs` and the correct core holding it, before any
+simulator run exists. A node whose disk lied about a sync under a flushed table
+refuses to start until stage E gives it a snapshot to start from; the store's crash
+test (`crates/ananke-raft/tests/store.rs`) shows the refusal on the seeds where the
+simulated disk does that, and the exact state on the rest.
+
+---
+
+_Next entry: D-026. Add one before implementing anything not covered above._

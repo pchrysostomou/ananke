@@ -64,6 +64,7 @@ crates/ananke/         Placeholder crate reserving the name on crates.io
 crates/ananke-env/     Environment trait; real/ (RealEnv on tokio); sim/ (Sim + SimEnv); moirae.rs (trace export)
 crates/ananke-server/  Node binary + library of the protocols it runs (echo for Phase 0)
 crates/ananke-storage/ Storage engine: crc32c, wal, memtable, sst, manifest, engine (Phase 1)
+crates/ananke-raft/    Raft: core (pure step function), message (codec, studio decoder), store (tenant 0), apply, invariants (Phase 2)
 sim/                   Simulation scenarios; scenario files sit directly in sim/ (echo.rs first)
 docs/                  SPEC, DECISIONS, BACKLOG, BOOTSTRAP_PROMPT, devlog/
 scripts/               gate.sh (run before every commit), check-direct-io.sh
