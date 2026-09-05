@@ -15,6 +15,7 @@
 pub mod crc32c;
 pub mod engine;
 pub mod memtable;
+pub mod sst;
 pub mod wal;
 
 pub use engine::{Engine, EngineConfig, EngineRecovery, FlushSink, Retain, Write};
