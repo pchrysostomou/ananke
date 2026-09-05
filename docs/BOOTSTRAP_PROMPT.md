@@ -101,7 +101,7 @@ ananke/
 
 _Update this section at the end of every session._
 
-- Phase: 1 complete pending review and tag (2026-09-05). The WAL (D-018, D-019), the
+- Phase: 1 done, tagged v0.2.0 (2026-09-05); Phase 2 not started. The WAL (D-018, D-019), the
   memtable and engine (D-020, D-021), SSTables with the manifest and log truncation
   (D-022), versions, snapshots, `scan` and leveled compaction (D-023), write batches,
   writes without a sync and checkpoints (D-024) are done. A store is refused rather
@@ -127,10 +127,13 @@ _Update this section at the end of every session._
      number: `cargo run --release -p ananke-storage --example bench`, 468 writes/s
      with a sync per write, 33 523 without, 299 169 in batches of a hundred without
      (one laptop disk, 2026-09-05). Met in the shape the flag exists for.
-- Last tag: v0.1.0. Next tag: v0.2.0, once the exit criteria are reviewed.
-- Next concrete task: after the review, bump to 0.2.0, tag, publish `ananke-storage`,
-  finish the Phase 1 devlog. Then Phase 2: message duplication in the simulator
-  (issue #1) before Raft, per SPEC §1.4 and D-015.
+- Last tag: v0.2.0. `ananke`, `ananke-env` and `ananke-storage` 0.2.0 on crates.io.
+  Devlog: `docs/devlog/01-phase-1.md`.
+- Next concrete task: Phase 2 opens with design. Message duplication in the simulator
+  (issue #1) first, since Raft needs it (SPEC §1.4, D-015); then `docs/RAFT.md`: the
+  Raft variant, the five invariants of SPEC §3 and how the trace checks each, the
+  linearizability checker, the `ananke-raft` crate layout and the buggy variants the
+  sweep must catch from day one. No Raft code before the design is reviewed.
 - Fault-model tests follow the CLAUDE.md pattern: a known-buggy variant the sweep
   must catch beside the correct one it must pass (`Journal::sync_dir_on_rotate`,
   `wal::Variant`).

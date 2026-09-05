@@ -12,7 +12,7 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
-ananke-env = { path = "../ananke-env", version = "0.1" }
+ananke-env = { path = "../ananke-env", version = "0.2" }
 bytes.workspace = true
 crossbeam-skiplist.workspace = true
 

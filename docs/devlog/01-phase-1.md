@@ -1,6 +1,6 @@
 # Phase 1: a storage engine the simulator kept catching
 
-_Draft. September 2026._
+_September 2026. Tagged v0.2.0; `ananke-storage` 0.2.0 on crates.io._
 
 ## What Phase 1 built
 
@@ -125,6 +125,23 @@ That one is in the list because it is the shape of most of the disagreements: th
 had the fact, the oracle had a rule that was true until a fault made it false, and the
 sweep found the seed where it was false.
 
+## The oracle is code too
+
+Two of the nightly's last findings were not about the engine at all. At seed 1953 the
+manifest `CURRENT` named was still being written when the crash came: whole on disk,
+never synced, so the trace had no record of it being written, and recovery rightly
+passed it over. The oracle had no notion of a write in flight and called the fallback
+unexplained. At seed 6771 a manifest number that a fallback had abandoned was written
+again, and the trace event from its first life stood in for the file now on disk. In
+both cases the engine was right and the oracle was reading the trace naively.
+
+That is the price of an oracle that forgives by reading the trace: it is a second
+implementation of the recovery rules, and it has its own bugs. The rule that made these
+cheap to fix is the one from Phase 0: every state transition emits an event, so the
+oracle's misreading is always a question of which event it should have looked at, and
+the seed replays until the answer is found. Both fixes were a few lines. Neither would
+have been found by reasoning; both were found by the tenth thousand seed.
+
 ## What the sweep is now
 
 The engine scenario runs eight crashes per seed with lost syncs at twenty percent, bit
@@ -161,6 +178,6 @@ SPEC §2.8 names three.
 ## What is next
 
 Raft, on top of this engine, with the network faults the simulator has had since Phase
-0 and the message duplication it still lacks. Raft's snapshots will be checkpoints. Its
+0 and message duplication, which lands first. Raft's snapshots will be checkpoints. Its
 log will not be this log; it will be a table in this engine, which is why the engine has
 scans.

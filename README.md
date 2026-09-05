@@ -129,7 +129,7 @@ on most seeds, and the correct code passes ten thousand.
 | Phase | Deliverable | State |
 |---|---|---|
 | 0 | `Environment`, `RealEnv`, `SimEnv`, the fault model, the moirae bridge | Done. Tagged `v0.1.0`; `ananke-env` 0.1.0 on crates.io; [devlog](docs/devlog/00-phase-0.md) |
-| 1 | Storage engine | Built, under review before the `v0.2.0` tag. WAL (D-018, D-019), memtable and engine (D-020, D-021), SSTables with the manifest and log truncation (D-022), versions, snapshots, scans and leveled compaction (D-023), write batches, unsynced writes and checkpoints (D-024); [devlog draft](docs/devlog/01-phase-1.md) |
+| 1 | Storage engine | Done. Tagged `v0.2.0`; `ananke-storage` 0.2.0 on crates.io; [devlog](docs/devlog/01-phase-1.md). WAL (D-018, D-019), memtable and engine (D-020, D-021), SSTables with the manifest and log truncation (D-022), versions, snapshots, scans and leveled compaction (D-023), write batches, unsynced writes and checkpoints (D-024) |
 | 2 | Raft | Not started |
 | 3 | Multi-raft sharding | Not started |
 | 4 | Transactions | Not started |
