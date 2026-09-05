@@ -25,9 +25,9 @@ and reorder from the start), so Raft cannot be tested honestly without it.
 - **Message duplication** — deliver a message more than once with a configurable
   probability (SPEC §1.4).
 
-## Before the Phase 0 tag
+## Phase 0 tag follow-up
 
-- **Publish `moirae-trace` and `moirae-sched`** and switch ananke's `[workspace.dependencies]` from git revisions to versions; `cargo publish` refuses git dependencies (D-011).
+- **Publish `ananke` 0.1.0 and `ananke-env` 0.1.0** from the `v0.1.0` tag; both pass `cargo publish --dry-run`, and neither name exists on crates.io yet. Needs the crates.io token (D-001, D-011).
 
 ## General
 

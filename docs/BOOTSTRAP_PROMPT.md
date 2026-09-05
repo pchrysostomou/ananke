@@ -101,41 +101,16 @@ ananke/
 
 _Update this section at the end of every session._
 
-- Phase: 0 (in progress)
-- Last tag: none
-- Done: steps 1–4. Workspace, CI (clippy `disallowed-methods` / `disallowed-types`
-  from `clippy.toml`, `scripts/check-direct-io.sh`, GitHub Actions), D-013 clock
-  types, D-014 seeded hash maps, D-015 message-oriented `Network` with non-blocking
-  `send`; `Environment` trait with `Clock`, `FileSystem`, `Network`, `Rng`; `RealEnv`
-  on tokio (positional fs, TCP transport with reconnect, OS entropy); `sim::Sim` /
-  `SimEnv`: single-threaded deterministic executor with seeded random scheduling,
-  virtual clock with per-node skew and drift, seeded per-node RNG, in-memory network
-  with drop / delay (reorder) / partition, in-memory filesystem with torn writes and
-  lost fsync applied at `Sim::crash`, trace to an in-memory `Vec<TraceRecord>` with a
-  stable text dump. Determinism test: same seed, byte-identical trace.
-- Step 5: `sim/echo.rs` runs 3 nodes under drops, delays, skew, a symmetric
-  partition, a one-way block and a crash/restart; `sim/tests/echo.rs` asserts
-  byte-identical trace text for equal seeds and runs 100 consecutive seeds against
-  the scenario's invariants as a simulator smoke test.
-- The echo protocol lives in `ananke_server::echo` and runs unchanged under the
-  simulator and as `ananke-server echo --listen .. --peers ..` on `RealEnv`;
-  `crates/ananke-server/tests/echo_cluster.rs` runs three real processes and checks
-  the protocol invariants. `ananke_env::race` draws its poll order from the
-  environment's RNG so no side can starve the other.
-- Phase 0 exit criteria still open: the moirae bridge (trace opens in the studio).
-- moirae bridge, built (2026-09-05). moirae side, PR #49 merged and #50 open: ADR-009,
-  trace format v2 with a header `unit`, crates `moirae-trace` (byte-exact writer,
-  `Verify` sink, fixtures held on both sides) and `moirae-sched` (PCG32 with the
-  engine's seeding, named substreams, `Uniform` and `Pct` with geometric change
-  points). ananke side: D-016 hybrid policy, D-017 named substreams with
-  `Environment::sched_rng` and `race` over the environment, 1-based node ids, message
-  ids and payloads, restart / partition / heal / link events,
-  `ananke_env::moirae` (`Sim::to_moirae`, `Sim::verify_moirae`), and `sim/tests/echo.rs`
-  pinning the FNV-1a hash of the seed-42 trace, written to `sim/out/echo-42.jsonl`.
-  The same bytes are the studio fixture in the moirae repo.
-- Open before the Phase 0 tag: publish `moirae-trace` and `moirae-sched` to crates.io
-  (both still absent there) and switch ananke's git-revision dependencies to versions,
-  since `cargo publish` refuses git dependencies; merge moirae PR #50; the Replay
-  scheduler is bridge v2 (BACKLOG).
-- Next concrete task: the Phase 0 tag checklist (D-011): exit criteria in CI, tag,
-  publish, devlog post. Then the BACKLOG "required before Phase 1" gate.
+- Phase: 0 done (v0.1.0, 2026-09-05). Phase 1 not started.
+- Last tag: v0.1.0
+- Next concrete task: the BACKLOG "required before Phase 1 starts" gate, in this order:
+  bit rot after a crash, directory-entry loss for unsynced renames, and a poll budget
+  for `Sim::run_until` so a busy-looping task fails a test instead of hanging a
+  10k-seed nightly run. Then Phase 1, the LSM storage engine (SPEC §2), starting with
+  the WAL and its crash-injection tests.
+- Phase 0 record: `Environment` with `Clock`, `FileSystem`, `Network`, `Rng`; `RealEnv`
+  on tokio; `sim::Sim` / `SimEnv` with the §1.3 torn-write and lost-fsync model and the
+  §1.4 drop / delay / partition model; D-013 to D-017; the moirae bridge through
+  `moirae-trace` and `moirae-sched` 0.0.1 (moirae ADR-009, format v2); `sim/echo.rs`
+  with its pinned trace hash and the studio fixture in the moirae repo. Devlog:
+  `docs/devlog/00-phase-0.md`.
