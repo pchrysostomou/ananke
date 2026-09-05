@@ -326,6 +326,7 @@ fn open(
         variant,
         expected_head: 1,
         // A bare log holds nothing elsewhere: a missing head empties it.
+        refuse_damage: false,
         head_gap: HeadGapPolicy::Discard,
     };
     env.clone().spawn("wal-open", async move {

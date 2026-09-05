@@ -1133,6 +1133,7 @@ fn open(
         variant,
         wal_variant: wal::Variant::Correct,
         // A missing head is judged by the oracle, so the run goes on past it.
+        refuse_log_damage: false,
         allow_head_gap: true,
         allow_manifest_fallback: schedule.allow_manifest_fallback,
         l0_trigger: schedule.l0_trigger,
@@ -1235,6 +1236,7 @@ fn check_checkpoint(
         segment_bytes: schedule.segment_bytes,
         variant: Variant::Correct,
         wal_variant: wal::Variant::Correct,
+        refuse_log_damage: false,
         allow_head_gap: false,
         allow_manifest_fallback: false,
         l0_trigger: schedule.l0_trigger,

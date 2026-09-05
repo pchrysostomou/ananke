@@ -20,6 +20,7 @@ fn config(memtable_bytes: u64) -> EngineConfig {
         segment_bytes: 4096,
         variant: Variant::Correct,
         wal_variant: wal::Variant::Correct,
+        refuse_log_damage: false,
         allow_head_gap: false,
         allow_manifest_fallback: false,
         l0_trigger: 4,

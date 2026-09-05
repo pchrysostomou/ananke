@@ -19,6 +19,7 @@ fn config(variant: Variant) -> WalConfig {
         segment_bytes: 256,
         variant,
         expected_head: 1,
+        refuse_damage: false,
         head_gap: HeadGapPolicy::Discard,
     }
 }

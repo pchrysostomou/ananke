@@ -111,6 +111,12 @@ pub struct EngineConfig {
     /// tables are the state, a clean prefix. Replaying past the gap would give a
     /// state that never existed (D-022).
     pub allow_head_gap: bool,
+    /// Refuse to open, touching nothing, when the log is damaged past a torn tail:
+    /// a bad checksum, a gap, or a corrupt record skipped in a segment the tables
+    /// cover (`wal::LogDamaged`, D-027). Off, the log is cut at the damage and the
+    /// open reports it. A store under Raft sets this: a log shortened once would
+    /// read as whole at the next open.
+    pub refuse_log_damage: bool,
     /// Level 0 is compacted once it holds this many tables.
     pub l0_trigger: usize,
     /// Level 1 is compacted once it holds more than this many bytes; each deeper
@@ -138,6 +144,7 @@ impl EngineConfig {
             wal_variant: wal::Variant::Correct,
             allow_manifest_fallback: false,
             allow_head_gap: false,
+            refuse_log_damage: false,
             l0_trigger: 4,
             level_base_bytes: 256 << 20,
             sst_bytes: 64 << 20,
@@ -844,6 +851,7 @@ impl<E: Environment> Engine<E> {
                 } else {
                     HeadGapPolicy::Refuse
                 },
+                refuse_damage: config.refuse_log_damage,
             },
         )
         .await?;

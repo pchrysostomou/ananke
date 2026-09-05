@@ -16,6 +16,7 @@ fn appends_and_recovers_on_a_real_disk() {
         segment_bytes: 4096,
         variant: Variant::Correct,
         expected_head: 1,
+        refuse_damage: false,
         head_gap: HeadGapPolicy::Refuse,
     };
     // Five appenders at once, so the writer groups their records under shared fsyncs;

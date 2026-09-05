@@ -1,7 +1,12 @@
 //! The write-ahead log (SPEC.md §2.2, D-018): append-only, segmented, group committed.
 //!
-//! A record on disk is `len: u32 LE | crc32c: u32 LE | seq: u64 LE | payload`, the
-//! checksum covering the length, the sequence number and the payload. Records go to
+//! A record on disk is `len: u32 LE | header crc32c: u32 LE | crc32c: u32 LE | seq:
+//! u64 LE | payload`: the header checksum covers the length and the sequence number,
+//! the record checksum covers those and the payload. The header has its own so that
+//! a flipped bit in the length reads as a bad checksum and not as a record torn at
+//! the end of the file, which is what a length that runs past the end would
+//! otherwise look like; a torn record is one whose bytes are missing, and only a
+//! write in flight at a crash leaves one (D-027). Records go to
 //! numbered segment files (`000001.wal`, `000002.wal`, ...) in a directory; a segment
 //! is rotated before a group that would start at or beyond
 //! [`WalConfig::segment_bytes`]. The sequence number is there for recovery: a sync the
@@ -53,8 +58,9 @@ use crate::crc32c;
 /// recovery that discarded records, the next append reuses the discarded numbers.
 pub type Seq = u64;
 
-/// The bytes before the payload: `len: u32 LE | crc32c: u32 LE | seq: u64 LE`.
-pub const HEADER_LEN: usize = 16;
+/// The bytes before the payload: `len: u32 LE | header crc32c: u32 LE | crc32c: u32
+/// LE | seq: u64 LE`.
+pub const HEADER_LEN: usize = 20;
 
 /// The log to run: the correct one, or one of the known bugs the crash sweep must
 /// catch. The sweep passing the correct log and failing each buggy one is what shows
@@ -143,7 +149,58 @@ pub struct WalConfig {
     pub expected_head: Seq,
     /// What to do about a missing head.
     pub head_gap: HeadGapPolicy,
+    /// Fail the open with [`LogDamaged`], touching nothing on disk, when reading
+    /// stopped at a bad checksum or a gap, or skipped a corrupt record in a segment
+    /// below the expected head: records past the damage, acknowledged or not, are
+    /// gone, and a caller that promised them cannot go on (D-027). Off, the log is
+    /// cut at the stop as the SPEC says. A torn record is cut either way: only a
+    /// write in flight at a crash leaves one, and it was never acknowledged.
+    pub refuse_damage: bool,
 }
+
+/// The error [`Wal::open`] fails with under [`WalConfig::refuse_damage`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogDamaged {
+    /// Where reading stopped, at a bad checksum or a gap.
+    pub stop: Option<WalStop>,
+    /// Corrupt records skipped in segments below the expected head.
+    pub covered: Vec<WalStop>,
+}
+
+impl LogDamaged {
+    /// The damage an I/O error carries, if it is one.
+    #[must_use]
+    pub fn from_io(error: &io::Error) -> Option<LogDamaged> {
+        error.get_ref()?.downcast_ref::<LogDamaged>().cloned()
+    }
+}
+
+impl std::fmt::Display for LogDamaged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the log is damaged:")?;
+        if let Some(stop) = &self.stop {
+            write!(
+                f,
+                " reading stopped at segment {} offset {} ({})",
+                stop.segment,
+                stop.offset,
+                stop.reason.as_str()
+            )?;
+        }
+        for stop in &self.covered {
+            write!(
+                f,
+                " a record at segment {} offset {} ({}) was skipped and the rest of the segment with it",
+                stop.segment,
+                stop.offset,
+                stop.reason.as_str()
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for LogDamaged {}
 
 /// The name of segment `n`: six digits and `.wal`, so a listing sorts in log order.
 #[must_use]
@@ -166,11 +223,15 @@ pub fn encode_record(out: &mut Vec<u8>, seq: Seq, payload: &[u8]) {
     let len = u32::try_from(payload.len()).expect("record payload exceeds u32");
     let len_bytes = len.to_le_bytes();
     let seq_bytes = seq.to_le_bytes();
+    let mut header = crc32c::Hasher::new();
+    header.update(&len_bytes);
+    header.update(&seq_bytes);
     let mut hasher = crc32c::Hasher::new();
     hasher.update(&len_bytes);
     hasher.update(&seq_bytes);
     hasher.update(payload);
     out.extend_from_slice(&len_bytes);
+    out.extend_from_slice(&header.finish().to_le_bytes());
     out.extend_from_slice(&hasher.finish().to_le_bytes());
     out.extend_from_slice(&seq_bytes);
     out.extend_from_slice(payload);
@@ -234,15 +295,24 @@ fn parse_segment(
             return Err((at, WalStopReason::TornRecord));
         }
         let len = u32::from_le_bytes(rest[..4].try_into().expect("4 bytes")) as usize;
-        let crc = u32::from_le_bytes(rest[4..8].try_into().expect("4 bytes"));
-        let seq = u64::from_le_bytes(rest[8..16].try_into().expect("8 bytes"));
+        let header_crc = u32::from_le_bytes(rest[4..8].try_into().expect("4 bytes"));
+        let crc = u32::from_le_bytes(rest[8..12].try_into().expect("4 bytes"));
+        let seq = u64::from_le_bytes(rest[12..20].try_into().expect("8 bytes"));
+        if verify {
+            let mut header = crc32c::Hasher::new();
+            header.update(&rest[..4]);
+            header.update(&rest[12..20]);
+            if header.finish() != header_crc {
+                return Err((at, WalStopReason::BadChecksum));
+            }
+        }
         let Some(payload) = rest.get(HEADER_LEN..HEADER_LEN + len) else {
             return Err((at, WalStopReason::TornRecord));
         };
         if verify {
             let mut hasher = crc32c::Hasher::new();
             hasher.update(&rest[..4]);
-            hasher.update(&rest[8..16]);
+            hasher.update(&rest[12..20]);
             hasher.update(payload);
             if hasher.finish() != crc {
                 return Err((at, WalStopReason::BadChecksum));
@@ -461,6 +531,27 @@ impl<E: Environment> Wal<E> {
             });
             records.clear();
             first_seq = None;
+        }
+
+        // Damage the caller will not live with: refused before anything is cut, so
+        // the next open sees the same damage and refuses again, rather than a log
+        // that was quietly shortened once (D-027).
+        if config.refuse_damage {
+            let damaged_stop = stop.filter(|s| {
+                matches!(
+                    s.reason,
+                    WalStopReason::BadChecksum | WalStopReason::Gap { .. }
+                )
+            });
+            if damaged_stop.is_some() || !covered_stops.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    LogDamaged {
+                        stop: damaged_stop,
+                        covered: covered_stops.iter().map(|c| c.stop).collect(),
+                    },
+                ));
+            }
         }
 
         // Everything after the stop is discarded: the stopping segment is cut to its
