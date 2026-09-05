@@ -15,6 +15,8 @@ authors = ["Prodromos Chrysostomou"]
 # `name.workspace = true` (features go on the crate side).
 bytes = "1.12"
 clap = { version = "4", features = ["derive"] }
+# The memtable (SPEC §2.3): a lock-free ordered map with a deterministic level generator.
+crossbeam-skiplist = "0.1"
 getrandom = "0.4"
 # The moirae bridge (SPEC §1.5, moirae ADR-009): the trace format and the scheduling
 # policies, published from the moirae repo.

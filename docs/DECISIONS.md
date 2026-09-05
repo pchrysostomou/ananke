@@ -445,4 +445,56 @@ sweep's first run, which is the point of the sweep.
 
 ---
 
-_Next entry: D-020. Add one before implementing anything not covered above._
+## D-020 — Memtable and engine: a sequence-guarded skiplist, a flush sink that stands in for SSTables, and what the sweep may not excuse
+
+**Context.** SPEC §2.3 names the skiplist and the rule that an immutable memtable stays
+readable until its flush completes, and leaves open how writes acknowledged together
+apply in order, where flushed memtables go before SSTables exist, how recovery rebuilds
+memtables, and how a sweep can catch an engine that acknowledges before the log when a
+lost fsync somewhere earlier would excuse the loss anyway.
+
+**Decision.** The memtable is a `crossbeam-skiplist` map from key bytes to the newest
+write, each entry carrying the log sequence number of the write that made it and a
+value or a tombstone; `apply` is a `compare_insert` guarded by that number, so two
+writes to one key acknowledged in the same group may be applied by their callers in
+either order and the number decides. Its level generator is a constant-seeded
+xorshift, so a memtable's shape is a function of its inserts. The engine writes one
+log record per `put` or `delete`, `tag | key_len | key | value`, applies it to the
+active memtable once the log has acknowledged it, and rotates the active memtable
+into an immutable queue when it accounts for more than `memtable_bytes`; a flusher
+task hands the queue's head to a `FlushSink` and releases it once the sink has it.
+Reads consult the active memtable, the immutable ones newest first, then the sink.
+`Retain`, the sink until §2.4, keeps flushed memtables in memory; the log is not
+truncated until SSTables exist, so recovery replays every record into fresh memtables.
+`Variant::NoWalBeforeMemtable` applies and acknowledges before the log has the
+record, the bug the sweep must catch.
+
+Two things the sweep needed. `Sim::run_steps` takes one scheduling step at a time,
+because `run_until` stops only with nothing runnable, so a crash after it always
+found every queue drained; the crash scenarios now run a random handful of steps past
+their deadline and crash between two polls. And the oracle gained a property that no
+excuse touches: a record acknowledged with no sync attempted before the crash is a
+violation whatever recovery returned. Without it the buggy engine was caught on four
+seeds in twenty, because a lost fsync earlier in the log, rightly excusing every later
+record's absence, also hid the one record nobody had asked the disk about. After each
+recovery the engine's state must equal the model folded over exactly the recovered
+prefix, key by key, and during the run every read of a key with no write in flight
+must return the newest acknowledged write.
+
+**Alternatives.** A `Mutex<BTreeMap>`: simpler, serialises every writer, and the SPEC
+names the skiplist. Applying writes in the log writer's acknowledgement path: keeps
+order by construction but puts memtable work on the one task every appender waits
+for; the sequence guard makes arrival order irrelevant instead. A sorted file as the
+sink: the SSTable step by another name. Per-operation I/O latency to widen the window
+between a write and its sync, which is where an acknowledge-before-sync bug lives on a
+real disk: the principled fix, in BACKLOG; the acknowledged-without-sync property
+catches the bug without it.
+
+**Consequences.** One dependency with `unsafe` inside it, none in this crate. Flushed
+data lives in memory until SSTables land, so a long run grows without bound: fine for
+sweeps, not for anything else. `run_steps` changes no existing trace. The
+acknowledged-without-sync property is part of every crash sweep from here on.
+
+---
+
+_Next entry: D-021. Add one before implementing anything not covered above._
