@@ -559,8 +559,8 @@ Recovery reads `CURRENT` and the manifest it names. No `CURRENT` at all is the
 empty state, since a switch is what creates it. If `CURRENT` cannot be read, or
 names a manifest that cannot be, `Engine::open` fails with an error naming the file,
 unless `allow_manifest_fallback` is set: then recovery uses the newest older manifest
-whose every table is on disk and passes its checks, never one with a table missing
-and never the empty state, reports the fallback, and rewrites `CURRENT` to name the
+whose every table is on disk and passes its checks, never one that lists a missing
+or damaged table, reports the fallback, and rewrites `CURRENT` to name the
 manifest it chose; with no such manifest it fails as well. The first version fell
 back to the newest readable manifest and, at seed 44 of the compaction sweep,
 landed on one whose tables a later compaction had deleted, and the store came back
@@ -738,7 +738,8 @@ synced in that order, under the turnstile so no flush or compaction runs meanwhi
 A crash leaves either a complete checkpoint or one without `CURRENT`. So that the
 latter is recognisable, every store now writes an empty first manifest and `CURRENT`
 at its first open: from then on a missing `CURRENT` with manifests or tables on disk
-is refused, and a fallback never lands on a manifest that lists no table. The sweep
+is refused. The first manifest, which lists no table, is a valid fallback: with the
+log replayed after it, what opens is the true state, not an empty one. The sweep
 takes checkpoints while it runs, records the model's state at each version, and
 after the crash opens each checkpoint fresh, requiring no table dropped, nothing
 replayed and every key and a scan equal to that state, unless a fault touched a file

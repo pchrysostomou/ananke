@@ -60,8 +60,9 @@ fn seed_420_which_the_first_nightly_found_stays_green() {
 /// (D-022). The seed's earlier fallbacks take a different path under that rule, so
 /// the run no longer reaches the same crash; what is pinned is the rule on the seed
 /// that motivated it. With fallback allowed, every fallback in the run lands on a
-/// manifest with no table missing and the store is never empty; without it, the
-/// first unreadable CURRENT refuses the store for a fault and the run ends.
+/// manifest with no table missing, and what it opens is what that manifest and the
+/// log hold; without it, the first unreadable CURRENT refuses the store for a fault
+/// and the run ends.
 #[test]
 fn seed_44_never_opens_empty_in_either_mode() {
     // The schedule the sweep ran with when it found the seed: level 1 eight times
@@ -83,7 +84,13 @@ fn seed_44_never_opens_empty_in_either_mode() {
     );
     for epoch in fallbacks {
         assert!(epoch.recovery.dropped.is_empty(), "{:?}", epoch.recovery);
-        assert!(epoch.recovery.ssts > 0, "{:?}", epoch.recovery);
+        assert!(
+            epoch.recovery.ssts > 0
+                || epoch.recovery.replayed > 0
+                || epoch.recovery.flushed_seq == 0,
+            "{:?}",
+            epoch.recovery
+        );
     }
     if let Some(refusal) = &allowed.refused {
         assert!(

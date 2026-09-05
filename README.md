@@ -60,7 +60,7 @@ memtables into an immutable queue, and flushes them to SSTables: 4 KiB blocks wi
 prefix-compressed keys and a CRC each, a bloom filter, an index and a versioned
 footer, under a manifest that `CURRENT` names. A store whose `CURRENT` or manifest
 cannot be read is refused, or with an option falls back to the newest older manifest
-whose every table is intact, never to an empty one. Log segments are deleted once a
+whose every table is intact. Log segments are deleted once a
 manifest covers their records; a log whose head is missing is refused rather than
 replayed past. Reads and scans take a
 snapshot, a sequence number, and see the newest write at or below it through one

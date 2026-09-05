@@ -107,7 +107,7 @@ Every step was excused by a fault, so the oracle passed the epoch, and the state
 was what failed: forty-eight keys that the model said were there and the engine said were
 not. The fix was to the rule: a store whose `CURRENT` or manifest cannot be read is
 refused, and with fallback allowed recovery uses only an older manifest whose every table
-is on disk and intact, never one with a table missing and never the empty state. That
+is on disk and intact, never one that lists a missing table. That
 is the same principle as the missing log head. A rollback onto a manifest whose tables
 are gone is a state that never existed.
 

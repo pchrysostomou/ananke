@@ -764,7 +764,6 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
             }
             for (m, why) in &recovery.rejected {
                 let explained = match why {
-                    engine::Rejected::NoTables => Some(Excuse::LostFsync),
                     engine::Rejected::Unreadable => manifest_fault(*m),
                     engine::Rejected::TableMissing(t) | engine::Rejected::TableDamaged(t) => {
                         table_fault(*t)

@@ -101,7 +101,7 @@ pub struct EngineConfig {
     /// Whether to open when `CURRENT` or the manifest it names cannot be read. Off,
     /// `open` fails with an error carrying an [`OpenRefused`]; on, recovery uses the
     /// newest older manifest whose every table is on disk and passes its checks,
-    /// never one with a table missing and never the empty state, and fails when
+    /// never one that lists a missing or damaged table, and fails when
     /// there is none. A rollback onto a manifest whose tables a later compaction had
     /// deleted is a state that never existed (D-022).
     pub allow_manifest_fallback: bool,
@@ -411,9 +411,9 @@ pub enum OpenRefused {
     CurrentMissing,
     /// The manifest `CURRENT` names cannot be read.
     ManifestUnreadable(u64),
-    /// Fallback was allowed, but no older manifest lists a table and has every table
-    /// it lists on disk and intact. `named` is the manifest `CURRENT` named, 0 if
-    /// `CURRENT` itself could not be read.
+    /// Fallback was allowed, but no older manifest has every table it lists on disk
+    /// and intact. `named` is the manifest `CURRENT` named, 0 if `CURRENT` itself
+    /// could not be read.
     NoIntactManifest {
         /// See above.
         named: u64,
@@ -460,8 +460,6 @@ impl std::error::Error for OpenRefused {}
 pub enum Rejected {
     /// The manifest file is missing, torn or corrupt.
     Unreadable,
-    /// The manifest lists no table: the empty state, never fallen back onto.
-    NoTables,
     /// A table it lists is not on disk.
     TableMissing(u64),
     /// A table it lists does not open or fails its checks.
@@ -708,7 +706,8 @@ impl<E: Environment> Engine<E> {
         // written and never switched to. A CURRENT that cannot be read, or one naming
         // a manifest that cannot be, refuses the store unless a fallback is allowed;
         // then the newest older manifest whose every table is on disk and intact is
-        // used, never one with a table missing and never the empty state. Falling
+        // used, never one that lists a missing or damaged table; the first manifest,
+        // which lists none, is a valid fallback, since the log replays after it. Falling
         // back onto a manifest whose tables a later compaction had deleted gave an
         // empty store at seed 44 (D-022).
         let current_bytes = read_whole(&env, &current_path(&dir)).await?;
@@ -764,9 +763,7 @@ impl<E: Environment> Engine<E> {
                             rejected.push((number, Rejected::Unreadable));
                             continue;
                         };
-                        // Every table on disk and intact, and at least one: a
-                        // manifest with no tables is the empty state, never fallen
-                        // back onto.
+                        // Every table it lists on disk and intact.
                         let (opened, missing) = open_tables(&env, &dir, &candidate, false).await?;
                         if let Some(meta) = missing.first() {
                             let on_disk = sst_files.contains(&meta.number);
@@ -778,10 +775,6 @@ impl<E: Environment> Engine<E> {
                                     Rejected::TableMissing(meta.number)
                                 },
                             ));
-                            continue;
-                        }
-                        if opened.is_empty() {
-                            rejected.push((number, Rejected::NoTables));
                             continue;
                         }
                         chosen = Some((candidate, opened));

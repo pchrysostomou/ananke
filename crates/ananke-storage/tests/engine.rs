@@ -685,8 +685,9 @@ fn tombstones_survive_until_no_older_write_lies_below() {
 }
 
 /// A CURRENT that cannot be read refuses the store; with fallback allowed, the newest
-/// older manifest whose every table is intact is used and CURRENT rewritten; with no
-/// such manifest the store is refused again, never opened empty (D-022).
+/// older manifest whose every table is intact is used and CURRENT rewritten. With
+/// every table gone, the only intact manifest is the first, the empty one, and the
+/// log's head is then missing, which is refused in its turn (D-022).
 #[test]
 fn an_unreadable_current_refuses_the_store_or_falls_back_only_to_an_intact_manifest() {
     let mut sim = Sim::new(SimConfig::new(16));
@@ -757,9 +758,11 @@ fn an_unreadable_current_refuses_the_store_or_falls_back_only_to_an_intact_manif
         "the newest manifest was intact"
     );
     assert!(recovery.dropped.is_empty());
-    // Now no manifest is intact: every table is gone. Fallback refuses rather than
-    // opening an empty store.
-    let refused = on_node(&mut sim, node, |env| {
+    // Now every table is gone. Fallback passes over every manifest that lists one
+    // and lands on the first, which lists none and is intact. The log still holds
+    // every write, since its one segment was never deleted, so the store opens on
+    // the true state: everything replayed, nothing missing.
+    let recovered = on_node(&mut sim, node, |env| {
         Box::pin(async move {
             let fs = env.fs();
             for name in fs.read_dir(Path::new("/db")).await.unwrap() {
@@ -778,14 +781,87 @@ fn an_unreadable_current_refuses_the_store_or_falls_back_only_to_an_intact_manif
             fs.sync_dir(Path::new("/db")).await.unwrap();
             let mut allowed = config(400);
             allowed.allow_manifest_fallback = true;
-            let err = Engine::open(env, allowed).await.err().unwrap();
-            ananke_storage::OpenRefused::from_io(&err)
+            let (db, recovery) = Engine::open(env, allowed).await.unwrap();
+            for k in 0..20 {
+                assert_eq!(
+                    db.get(format!("k{k:03}").as_bytes()).await.unwrap(),
+                    expected(k, 60, 20),
+                    "k{k:03}"
+                );
+            }
+            recovery
         })
     });
+    assert_eq!((recovered.manifest, recovered.fallback_from), (1, Some(0)));
     assert_eq!(
-        refused,
-        Some(ananke_storage::OpenRefused::NoIntactManifest { named: 0 })
+        (recovered.ssts, recovered.flushed_seq, recovered.replayed),
+        (0, 0, 60)
     );
+    assert!(
+        recovered
+            .rejected
+            .iter()
+            .all(|(_, why)| matches!(why, ananke_storage::Rejected::TableMissing(_))),
+        "{:?}",
+        recovered.rejected
+    );
+    assert!(recovered.wal.head_gap.is_none());
+}
+
+/// The first manifest lists no table and is a valid fallback: with the writes still
+/// in the log and CURRENT damaged, the store opens on it and replays every write.
+#[test]
+fn a_fallback_onto_the_first_manifest_replays_the_log() {
+    let mut sim = Sim::new(SimConfig::new(20));
+    let node = sim.add_node();
+    let current = Path::new("/db/CURRENT");
+    on_node(&mut sim, node, |env| {
+        Box::pin(async move {
+            // A memtable nothing fills, so no flush and every write stays in the log.
+            let (db, _) = Engine::open(env.clone(), config(1 << 20)).await.unwrap();
+            fill(&db, 0..60, 20).await;
+            assert_eq!(db.manifest().number, 1);
+            drop(db);
+            let fs = env.fs();
+            let file = fs
+                .open(current, OpenOptions::new().read(true).write(true))
+                .await
+                .unwrap();
+            let mut bytes = file.read_at(0, 64).await.unwrap().to_vec();
+            bytes[3] ^= 0x10;
+            file.write_at(0, Bytes::from(bytes)).await.unwrap();
+            file.sync().await.unwrap();
+        })
+    });
+    let recovery = on_node(&mut sim, node, |env| {
+        Box::pin(async move {
+            let err = Engine::open(env.clone(), config(1 << 20))
+                .await
+                .err()
+                .unwrap();
+            assert_eq!(
+                ananke_storage::OpenRefused::from_io(&err),
+                Some(ananke_storage::OpenRefused::CurrentUnreadable)
+            );
+            let mut allowed = config(1 << 20);
+            allowed.allow_manifest_fallback = true;
+            let (db, recovery) = Engine::open(env, allowed).await.unwrap();
+            for k in 0..20 {
+                assert_eq!(
+                    db.get(format!("k{k:03}").as_bytes()).await.unwrap(),
+                    expected(k, 60, 20),
+                    "k{k:03}"
+                );
+            }
+            recovery
+        })
+    });
+    assert_eq!((recovery.manifest, recovery.fallback_from), (1, Some(0)));
+    assert_eq!(
+        (recovery.ssts, recovery.flushed_seq, recovery.replayed),
+        (0, 0, 60)
+    );
+    assert!(recovery.wal.head_gap.is_none());
 }
 
 /// Files a crash left behind are removed at open: a table no manifest lists, a
