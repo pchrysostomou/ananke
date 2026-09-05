@@ -33,7 +33,8 @@ pub trait Environment: Send + Sync + 'static {
     fn clock(&self) -> &Self::Clock;
     fn fs(&self) -> &Self::Fs;
     fn net(&self) -> &Self::Net;
-    fn rng(&self) -> &Self::Rng;
+    fn rng(&self) -> &Self::Rng;        // the node's protocol stream (D-017)
+    fn sched_rng(&self) -> &Self::Rng;  // the node's scheduling stream; what `race` draws from (D-017)
     fn spawn<F: Future<Output = ()> + Send + 'static>(&self, name: &'static str, f: F) -> TaskHandle;
     fn trace(&self, event: TraceEvent);
 }
@@ -98,12 +99,22 @@ survives 10k random seeds here, it is likely correct on real disks.
 
 ### 1.5 moirae bridge
 
-- `SimEnv` is built on `moirae-core`'s scheduler and emits `moirae-protocols` trace events.
-- ananke defines a `TraceEvent` enum; the bridge serialises it to moirae's format with
-  ananke-specific payloads (range id, term, log index, txn id) so the studio can
-  filter/visualise per range and per txn.
+- `SimEnv` asks `moirae-sched` for every scheduling decision (D-016) and derives every
+  random stream from the seed by name (D-017). Both crates live in the moirae repo
+  (moirae ADR-009); the TypeScript engine stays the canonical implementation of the
+  trace format.
+- ananke defines a `TraceEvent` enum; `ananke_env::moirae` maps it to moirae's trace
+  format v2 through `moirae-trace`: `t` is global virtual time in nanoseconds
+  (`unit: "ns"`); node ids are moirae's 1-based ids, and ananke's `NodeId` is 1-based
+  for exactly that reason, so there is no mapping; messages carry a `msgId` and a
+  payload decoded by the scenario; task and filesystem events are `log` lines
+  namespaced `ananke.*`; ananke-specific payloads (range id, term, log index, txn id in
+  later phases) travel as `range`, `term`, `index`, `txn` fields in `msg`, `log.data`
+  and `state.patch`, so a filter can carve a per-range trace before the studio sees it.
 - Trace must be stable: a bug reproduced from seed `s` in version `v` must still reproduce
-  in `v` given the same seed.
+  in `v` given the same seed. CI pins the FNV-1a hash of each scenario's trace, and a
+  `Verify` writer replays a recording with its seed and stops at the first divergent
+  line.
 
 ### 1.6 Phase 0 exit criteria
 

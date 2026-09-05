@@ -292,4 +292,71 @@ Stream-oriented client connections get a separate listener API when Phase 5 need
 
 ---
 
-_Next entry: D-016. Add one before implementing anything not covered above._
+## D-016 — Scheduling policy: a hybrid of uniform random and PCT, chosen per seed
+
+**Context.** In a discrete-event simulator a scheduling choice exists only when several
+tasks are runnable at the same instant; most message reordering comes from the network
+delay draws. Uniform random selection is fair, so liveness holds, but the chance of
+producing one specific ordering of d events among k polls decays exponentially in d.
+PCT — Burckhardt, Kothari, Musuvathi and Nagarakatte, "A Randomized Scheduler with
+Probabilistic Guarantees of Finding Bugs", ASPLOS 2010 — gives every task a random
+priority, always runs the highest runnable one, and lowers the running task at d−1
+change points; it finds any bug of depth d with probability at least 1/(n·k^(d−1)) per
+run, and is unfair by construction. PCTCP — Ozkan, Majumdar, Niksic, Tabaei Befrouei
+and Weissenbacher, "Randomized Testing of Distributed Systems with Probabilistic
+Guarantees", OOPSLA 2018 — carries the idea to message passing. Deligiannis et al.,
+"Uncovering Bugs in Distributed Storage Systems during Testing (Not in Production!)",
+FAST 2016, found bugs with a mix that neither policy found alone.
+
+**Decision.** The policy is chosen per run from the seed by `moirae_sched::Policy::for_seed`:
+half the seeds run uniform random, the rest PCT with depth 2 to 4. The choice is
+recorded in the trace header. Both live behind `moirae_sched::Scheduler`; the executor
+asks `choose(runnable)` and never knows which. PCT draws priorities at spawn, serves the
+runnable set by priority, and places change points as a geometric process over polls at
+rate (d−1)/hint, where the hint is an estimate of the run's total polls that
+`SimConfig::run_length_hint` supplies from the scenario's duration and node count, never
+from a poll budget. Unfairness is bounded to one instant because virtual time advances
+only when nothing is runnable, and the poll budget (BACKLOG, Phase 1 gate) turns a task
+that keeps itself runnable into a failing test. Liveness invariants are asserted only on
+uniform seeds. `race` stays a fair coin under both policies, drawn from the node's
+`n/sched` substream (D-017), the same stream `moirae_sched::Scheduler::coin` reads; a
+biased coin would reintroduce the starvation removed in Phase 0 step 5.
+
+**Alternatives.** Uniform only (misses deep bugs). PCT only (no liveness testing).
+Choosing the policy by configuration rather than by seed (a fuzz campaign would need two
+configs and two golden traces per scenario).
+
+**Consequences.** Trace size does not depend on the policy, since one `TaskPolled` line
+is emitted per poll either way; PCT's replay input is tiny. Interleaving power grows
+with task count, so the payoff arrives with Raft's per-peer tasks in Phase 2. A Replay
+scheduler that feeds recorded decisions back is v2 of the bridge.
+
+---
+
+## D-017 — Named RNG substreams; `Environment::sched_rng`; `race` takes the environment
+
+**Context.** Task selection and fault draws shared one generator, so a scheduler change
+reshuffled which messages dropped; and `race` drew from the protocol stream, so adding
+one poll changed which peer a node pinged. This entry must outlive any change to D-016:
+whatever the scheduling policy becomes, protocol-visible randomness must not move.
+
+**Decision.** Every stream is derived from the seed by name through
+`moirae_sched::stream(seed, label)` — PCG32 seeded by FNV-1a over `"{seed}/{label}"`,
+exactly as moirae's engine derives its own streams: `sched` for task selection, `net`
+for drops and delays, `fs` for lost fsyncs and torn writes, `clock` for skew and drift,
+and per node `n{id}/protocol` and `n{id}/sched`. `Environment::rng()` is the node's
+protocol stream and seeds `DetHashMap` (D-014). `Environment::sched_rng()` is the node's
+scheduling stream; `race` takes `&impl Environment` and draws its poll order from it, so
+a caller cannot pick the wrong stream. Under `RealEnv` both are OS entropy. ananke's
+in-crate xoshiro is gone; the generator is `moirae-sched`'s PCG32.
+
+**Alternatives.** One stream (the status quo). Per-node streams only (fault draws would
+still depend on scheduling order).
+
+**Consequences.** Adding a poll, a race, or a whole policy changes only `sched` and
+`n/sched` draws, never which messages drop or which peer a node pings. Every existing
+trace changed once; nothing was pinned yet.
+
+---
+
+_Next entry: D-018. Add one before implementing anything not covered above._
