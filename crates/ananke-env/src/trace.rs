@@ -104,6 +104,18 @@ pub enum TraceEvent {
         /// The file that was synced.
         path: PathBuf,
     },
+    /// At a crash one bit of a block flipped on disk (SPEC.md §1.3, bit rot). Checksums
+    /// must catch this.
+    BlockRotted {
+        /// The file.
+        path: PathBuf,
+        /// Which block, counting from zero in `FsFaults::block_size` units.
+        block: u64,
+        /// The byte offset of the flipped bit, from the start of the file.
+        offset: u64,
+        /// Which bit of that byte, 0 to 7.
+        bit: u8,
+    },
     /// At a crash only a prefix of a pending write survived (SPEC.md §1.3).
     WriteTorn {
         /// The file that was written.

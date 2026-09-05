@@ -68,11 +68,20 @@ impl Default for NetFaults {
 pub struct FsFaults {
     /// Probability that `sync` actually persists. `1.0` is strict mode.
     pub p_durable: f64,
+    /// Probability, per block per crash, that one bit of the block flips on disk. Bit
+    /// rot: the storage engine's checksums must catch it.
+    pub p_bitrot: f64,
+    /// The block size bit rot is drawn over, in bytes.
+    pub block_size: u64,
 }
 
 impl Default for FsFaults {
     fn default() -> Self {
-        Self { p_durable: 1.0 }
+        Self {
+            p_durable: 1.0,
+            p_bitrot: 0.0,
+            block_size: 4096,
+        }
     }
 }
 
@@ -195,6 +204,11 @@ impl Sim {
             (0.0..=1.0).contains(&config.fs.p_durable),
             "p_durable must be within 0..=1"
         );
+        assert!(
+            (0.0..=1.0).contains(&config.fs.p_bitrot),
+            "p_bitrot must be within 0..=1"
+        );
+        assert!(config.fs.block_size > 0, "block_size must be positive");
         assert!(
             config.clock.max_drift_ppm < 1_000_000,
             "max_drift_ppm must be below 1,000,000"

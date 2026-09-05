@@ -15,6 +15,7 @@
 //! | `TaskSpawned` / `TaskPolled` / `TaskCompleted` | `log` `ananke.task.*`; polls are optional |
 //! | `PollBudgetExceeded`                     | `log` `ananke.task.budget-exceeded`           |
 //! | `FsyncLost` / `WriteTorn`                | `log` `ananke.fs.fsync-lost` / `.write-torn`  |
+//! | `BlockRotted`                            | `log` `ananke.fs.bit-rot`                     |
 //! | `TimeAdvanced`                           | nothing: every line carries `t`               |
 //!
 //! `t` is global virtual time in nanoseconds and the header says `unit: "ns"`. Node ids
@@ -291,6 +292,20 @@ fn convert(
             .to_owned(),
         }),
         TraceEvent::FsyncLost { path } => log("ananke.fs.fsync-lost", Some(path_data(path))),
+        TraceEvent::BlockRotted {
+            path,
+            block,
+            offset,
+            bit,
+        } => log(
+            "ananke.fs.bit-rot",
+            Some(Json::obj(vec![
+                ("path", Json::str(&path.display().to_string())),
+                ("block", int(*block)),
+                ("offset", int(*offset)),
+                ("bit", Json::Int(i64::from(*bit))),
+            ])),
+        ),
         TraceEvent::WriteTorn {
             path,
             offset,

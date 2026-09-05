@@ -1009,3 +1009,95 @@ fn the_poll_budget_restarts_when_time_moves() {
     sim.run_until(Instant::from_nanos(100_000_000));
     assert_eq!(*done.lock().unwrap(), [1]);
 }
+
+#[test]
+fn bit_rot_flips_one_bit_per_block_at_crash_and_is_traced() {
+    let mut config = SimConfig::new(3);
+    config.fs.p_bitrot = 1.0;
+    config.fs.block_size = 4;
+    let mut sim = Sim::new(config);
+    let n = sim.add_node();
+    let env = sim.env(n);
+    env.clone().spawn("writer", async move {
+        let f = env.fs().open(Path::new("/f"), open_rw()).await.unwrap();
+        f.write_at(0, Bytes::from_static(b"aaaabbbbcc"))
+            .await
+            .unwrap();
+        f.sync().await.unwrap();
+        env.fs().sync_dir(Path::new("/")).await.unwrap();
+    });
+    sim.run_until(Instant::ZERO);
+    assert_eq!(
+        sim.durable_contents(n, Path::new("/f")).unwrap(),
+        b"aaaabbbbcc"
+    );
+    sim.crash(n);
+    let rotted = sim.durable_contents(n, Path::new("/f")).unwrap();
+    let original = b"aaaabbbbcc";
+    let flipped: Vec<usize> = (0..original.len())
+        .filter(|&i| rotted[i] != original[i])
+        .collect();
+    assert_eq!(
+        flipped.len(),
+        3,
+        "one flipped byte per block, three blocks: {flipped:?}"
+    );
+    for i in flipped {
+        assert_eq!(
+            (rotted[i] ^ original[i]).count_ones(),
+            1,
+            "exactly one bit differs"
+        );
+    }
+    let events: Vec<_> = events(&sim)
+        .into_iter()
+        .filter(|e| matches!(e, TraceEvent::BlockRotted { .. }))
+        .collect();
+    assert_eq!(events.len(), 3);
+    assert!(
+        matches!(&events[0], TraceEvent::BlockRotted { path, block: 0, offset, .. } if path == Path::new("/f") && *offset < 4)
+    );
+    // What the restarted node reads is the rotted content.
+    let env = sim.env(n);
+    let seen: Log<Bytes> = log();
+    let s = seen.clone();
+    env.clone().spawn("reader", async move {
+        let f = env
+            .fs()
+            .open(Path::new("/f"), OpenOptions::new().read(true))
+            .await
+            .unwrap();
+        let contents = f.read_at(0, 100).await.unwrap();
+        s.lock().unwrap().push(contents);
+    });
+    sim.run_until(Instant::ZERO);
+    assert_eq!(seen.lock().unwrap()[0][..], rotted[..]);
+}
+
+#[test]
+fn no_bit_rot_by_default_and_none_on_empty_files() {
+    let mut config = SimConfig::new(3);
+    config.fs.p_bitrot = 1.0;
+    let mut sim = Sim::new(config);
+    let n = sim.add_node();
+    let env = sim.env(n);
+    env.clone().spawn("creator", async move {
+        env.fs().open(Path::new("/empty"), open_rw()).await.unwrap();
+        env.fs().sync_dir(Path::new("/")).await.unwrap();
+    });
+    sim.run_until(Instant::ZERO);
+    sim.crash(n);
+    assert!(
+        sim.durable_contents(n, Path::new("/empty"))
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        !events(&sim)
+            .iter()
+            .any(|e| matches!(e, TraceEvent::BlockRotted { .. }))
+    );
+    let default = SimConfig::new(1);
+    assert_eq!(default.fs.p_bitrot, 0.0);
+    assert_eq!(default.fs.block_size, 4096);
+}

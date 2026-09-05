@@ -217,9 +217,11 @@ impl State {
 
     /// The §1.3 crash model: for every inode a random prefix of its pending writes
     /// survives in full, the next one may survive as a torn prefix, and the rest are
-    /// gone. What the node sees afterwards is exactly what is durable.
+    /// gone. Then, with `p_bitrot` per block, one bit of the block flips on disk. What
+    /// the node sees afterwards is exactly what is durable.
     pub(super) fn apply_crash_faults(&mut self, node: NodeId) {
         let mut events = Vec::new();
+        let (p_bitrot, block_size) = (self.config.fs.p_bitrot, self.config.fs.block_size);
         let rng = &mut self.fs_stream;
         if let Some(fs) = self.fs.get_mut(&node) {
             for inode in fs.inodes.values_mut() {
@@ -241,6 +243,27 @@ impl State {
                             kept,
                         });
                     }
+                }
+                // Bit rot, block by block. `chance(0.0)` draws nothing, so runs without
+                // bit rot configured keep their traces.
+                let len = inode.durable.len() as u64;
+                let blocks = len.div_ceil(block_size);
+                for block in 0..blocks {
+                    if !rng.chance(p_bitrot) {
+                        continue;
+                    }
+                    let start = block * block_size;
+                    let span = (len - start).min(block_size);
+                    let offset = start + rng.below(span);
+                    let bit = u8::try_from(rng.below(8)).expect("0..8 fits u8");
+                    let index = usize::try_from(offset).expect("offset fits usize");
+                    inode.durable[index] ^= 1 << bit;
+                    events.push(TraceEvent::BlockRotted {
+                        path: inode.path.clone(),
+                        block,
+                        offset,
+                        bit,
+                    });
                 }
                 inode.visible.clone_from(&inode.durable);
             }
