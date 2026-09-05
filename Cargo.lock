@@ -218,7 +218,8 @@ dependencies = [
 [[package]]
 name = "moirae-sched"
 version = "0.0.1"
-source = "git+https://github.com/pchrysostomou/moirae?rev=843f3acadb1cc10bf2000849cb7aff80d05d2c00#843f3acadb1cc10bf2000849cb7aff80d05d2c00"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "55dbcc57044910bac2fb7ea51db3200292b3e16979ffdf4373675268a23d36ed"
 dependencies = [
  "moirae-trace",
 ]
@@ -226,7 +227,8 @@ dependencies = [
 [[package]]
 name = "moirae-trace"
 version = "0.0.1"
-source = "git+https://github.com/pchrysostomou/moirae?rev=843f3acadb1cc10bf2000849cb7aff80d05d2c00#843f3acadb1cc10bf2000849cb7aff80d05d2c00"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "938e0074ff87d9cb2ff40a6c7eafe35d8dbd734ee8ea816553bc4391f5be60d2"
 
 [[package]]
 name = "once_cell"
