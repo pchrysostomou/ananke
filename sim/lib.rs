@@ -6,3 +6,4 @@
 //! properties such as byte-identical traces for equal seeds (SPEC.md §1.6).
 
 pub mod echo;
+pub mod wal;

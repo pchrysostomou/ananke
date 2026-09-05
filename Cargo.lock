@@ -35,7 +35,9 @@ version = "0.1.0"
 dependencies = [
  "ananke-env",
  "ananke-server",
+ "ananke-storage",
  "bytes",
+ "moirae-sched",
  "moirae-trace",
 ]
 

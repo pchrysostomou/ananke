@@ -101,12 +101,17 @@ ananke/
 
 _Update this section at the end of every session._
 
-- Phase: 1 started (2026-09-05). The BACKLOG gate before Phase 1 is closed: bit rot,
-  directory-entry loss and the poll budget are in `SimEnv`, and the echo scenario's
-  100-seed sweep exercises all three through the echo journal. The LSM is not started.
+- Phase: 1 in progress (2026-09-05). The gate is closed and the WAL is done:
+  `crates/ananke-storage` has `crc32c` and `wal` (D-018, D-019), and `sim/wal.rs` runs
+  the §2.8 crash property reduced to the log with every §1.3 fault on, passing the
+  correct log on 100 seeds and catching each of three known-buggy variants. The
+  memtable is not started.
 - Last tag: v0.1.0
-- Next concrete task: the LSM storage engine (SPEC §2), starting with the WAL and its
-  crash-injection tests, in a new `crates/ananke-storage`. Stop for review before it.
+- Next concrete task: the memtable (SPEC §2.3) on top of the WAL, then the SSTable.
+  Stop for review after each.
+- Fault-model tests follow the CLAUDE.md pattern: a known-buggy variant the sweep
+  must catch beside the correct one it must pass (`Journal::sync_dir_on_rotate`,
+  `wal::Variant`).
 - Phase 1 gate record: `FsFaults::p_bitrot` flips one bit per block per crash
   (`BlockRotted`); creating, removing and renaming a file is durable only after
   `sync_dir`, and a crash keeps a random prefix of each directory's pending operations
