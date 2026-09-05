@@ -9,12 +9,15 @@ use ananke_sim::echo;
 use bytes::Bytes;
 use moirae_trace::trace_hash;
 
-/// The FNV-1a hash of the seed-42 trace (`out/echo-42.jsonl`), as moirae pins its
-/// example traces. It changes only when the simulator, the protocol, the export, the
-/// scheduling policy, or the crate version in the trace header changes on purpose:
-/// update it in the same commit and say why, and update the copy of the trace committed
-/// in the moirae repo as the studio's `echo-42.jsonl` fixture.
-const GOLDEN: &str = "1e45f59f9b66c501";
+/// The pinned hash of the seed-42 trace (`out/echo-42.jsonl`), as moirae pins its
+/// example traces. It covers the **body**: every line after the header, hashed with
+/// FNV-1a over the exact bytes. The header is excluded because it carries the crate
+/// version, and a release must not invalidate every fixture; everything the header
+/// describes still shapes the body. The value changes only when the simulator, the
+/// protocol, the export or the scheduling policy changes on purpose: update it in the
+/// same commit and say why, and update the copy of the trace committed in the moirae
+/// repo as the studio's `echo-42.jsonl` fixture, whose test pins the same rule and value.
+const GOLDEN: &str = "d3daa9b2184ebd18";
 
 /// Two runs with the same seed produce byte-identical traces.
 #[test]
@@ -49,7 +52,7 @@ fn trace_hash_matches_the_pinned_golden() {
         file.write_at(0, Bytes::from(jsonl)).await.unwrap();
         file.sync().await.unwrap();
     });
-    assert_eq!(trace_hash(&report.jsonl), GOLDEN);
+    assert_eq!(body_hash(&report.jsonl), GOLDEN);
 }
 
 /// Different seeds explore different runs.
@@ -71,4 +74,10 @@ fn one_hundred_seeds_satisfy_the_invariants() {
         pongs += report.pongs_received();
     }
     assert!(pongs > 0);
+}
+
+/// The pin rule: the body is everything after the header line's LF.
+fn body_hash(jsonl: &str) -> String {
+    let body = jsonl.split_once('\n').map_or("", |(_, rest)| rest);
+    trace_hash(body)
 }
