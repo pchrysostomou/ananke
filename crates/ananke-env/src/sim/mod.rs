@@ -6,12 +6,15 @@
 //! time, thread scheduling or OS entropy, so two runs with the same [`SimConfig`]
 //! produce byte-identical traces.
 //!
-//! Scheduling policy: when several tasks are runnable the next one is chosen uniformly
-//! at random from the seeded generator, and every choice is recorded as
+//! Scheduling policy (DECISIONS.md D-016): every decision comes from a
+//! [`moirae_sched::Scheduler`], chosen per seed by [`moirae_sched::Policy::for_seed`]
+//! unless [`SimConfig::policy`] fixes it: half the seeds pick uniformly at random among
+//! the runnable tasks, the rest run PCT. Every choice is recorded as
 //! [`TraceEvent::TaskPolled`]. When nothing is runnable, virtual time jumps to the next
-//! timer or message delivery. This is an interim policy. The real one is chosen with
-//! the moirae bridge (SPEC.md §1.5), likely PCT-style priority scheduling rather than
-//! uniform random, and gets its DECISIONS.md entry then.
+//! timer or message delivery.
+//!
+//! Randomness (D-017): every stream is derived from the seed by name, so a scheduling
+//! change never moves a fault draw or a protocol draw; see `rng.rs`.
 //!
 //! Ties at equal virtual timestamps are broken by one sequence counter shared by timers
 //! and deliveries, never by container iteration order; see `state.rs`.
@@ -29,6 +32,8 @@ use std::future::Future;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
+
+use moirae_sched::Policy;
 
 pub use self::clock::{SimClock, SimSleep};
 pub use self::fs::{SimFile, SimFs};
@@ -93,6 +98,13 @@ pub struct SimConfig {
     pub clock: ClockFaults,
     /// What a node with zero skew reads as wall time at global time zero.
     pub wall_epoch: WallTime,
+    /// The scheduling policy (D-016); `None` picks one from the seed, which is what a
+    /// fuzz campaign wants. Fix it to compare the two on one seed.
+    pub policy: Option<Policy>,
+    /// PCT's estimate of the run's total polls, which sets its change-point rate
+    /// (moirae-sched `Pct`). Derive it with [`SimConfig::run_length_hint_for`] from the
+    /// scenario's duration and node count; it is never a per-task poll budget.
+    pub run_length_hint: u64,
 }
 
 impl SimConfig {
@@ -105,7 +117,20 @@ impl SimConfig {
             fs: FsFaults::default(),
             clock: ClockFaults::default(),
             wall_epoch: WallTime::from_unix_nanos(1_767_225_600 * 1_000_000_000),
+            policy: None,
+            run_length_hint: 10_000,
         }
+    }
+
+    /// A [`run_length_hint`](Self::run_length_hint) for a scenario: one poll per node per
+    /// millisecond of virtual time, which is the right order of magnitude for
+    /// message-driven protocols with timers in the tens of milliseconds.
+    #[must_use]
+    pub fn run_length_hint_for(nodes: u32, duration: Duration) -> u64 {
+        u64::from(nodes)
+            * u64::try_from(duration.as_millis())
+                .unwrap_or(u64::MAX)
+                .max(1)
     }
 }
 
@@ -178,14 +203,20 @@ impl Sim {
         self.shared.lock().config.seed
     }
 
-    /// Adds a node whose clock skew and drift are drawn from the configured ranges.
+    /// The scheduling policy this run uses (D-016).
+    #[must_use]
+    pub fn policy(&self) -> Policy {
+        self.shared.lock().policy
+    }
+
+    /// Adds a node whose clock skew and drift are drawn from the `clock` stream.
     pub fn add_node(&mut self) -> NodeId {
         let (skew, drift) = {
             let mut st = self.shared.lock();
             let max_skew = i64::try_from(st.config.clock.max_skew.as_nanos()).unwrap_or(i64::MAX);
             let max_drift = i64::from(st.config.clock.max_drift_ppm);
-            let skew = symmetric(&mut st.rng, max_skew);
-            let drift = symmetric(&mut st.rng, max_drift);
+            let skew = rng::symmetric(&mut st.clock_stream, max_skew);
+            let drift = rng::symmetric(&mut st.clock_stream, max_drift);
             (skew, drift)
         };
         self.add_node_with_clock(skew, drift)
@@ -198,32 +229,34 @@ impl Sim {
         let mut st = self.shared.lock();
         // 1-based, as in moirae traces (see `NodeId`).
         let id = NodeId::new(u32::try_from(st.nodes.len() + 1).expect("too many nodes"));
+        let protocol = st.node_stream(id, "protocol");
         st.nodes.insert(
             id,
             state::Node {
                 skew_nanos,
                 drift_ppm,
+                protocol,
             },
         );
         st.fs.entry(id).or_insert_with(fs::NodeFs::new);
         id
     }
 
-    /// An [`Environment`] handle for `node`. Any number may exist; they share the node.
+    /// An [`Environment`] handle for `node`. Any number may exist; they share the node,
+    /// including its random streams.
     ///
     /// # Panics
     ///
     /// If `node` was not added to this simulation.
     #[must_use]
     pub fn env(&self, node: NodeId) -> SimEnv {
-        let node_seed = {
+        let rng = {
             let st = self.shared.lock();
-            assert!(st.nodes.contains_key(&node), "unknown node {node}");
-            // Derive the node's stream from the seed and its id, not from the master
-            // generator, so it does not depend on when `env` is first called.
-            st.config.seed
-                ^ (u64::from(node.get()) + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15)
-                ^ st.nodes[&node].skew_nanos.unsigned_abs()
+            let n = st
+                .nodes
+                .get(&node)
+                .unwrap_or_else(|| panic!("unknown node {node}"));
+            n.protocol.clone()
         };
         SimEnv {
             node,
@@ -239,7 +272,7 @@ impl Sim {
                 shared: self.shared.clone(),
                 node,
             },
-            rng: SimRng::new(node_seed),
+            rng,
             shared: self.shared.clone(),
         }
     }
@@ -431,7 +464,7 @@ impl Sim {
             let mut st = self.shared.lock();
             match outcome {
                 Poll::Ready(()) => {
-                    if let Some(task) = st.tasks.remove(&id) {
+                    if let Some(task) = st.take_task(id) {
                         st.record(Some(task.node), TraceEvent::TaskCompleted { task: id });
                     }
                     Some(future)
@@ -474,14 +507,6 @@ impl Drop for Sim {
         };
         drop(futures);
     }
-}
-
-fn symmetric(rng: &mut rng::Xoshiro256StarStar, max: i64) -> i64 {
-    if max <= 0 {
-        return 0;
-    }
-    let span = (max as u64) * 2 + 1;
-    i64::try_from(rng.below(span)).unwrap_or(0) - max
 }
 
 use crate::TaskId;

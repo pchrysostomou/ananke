@@ -202,7 +202,7 @@ impl State {
 
     fn fs_sync(&mut self, node: NodeId, inode: InodeId) -> io::Result<()> {
         let p_durable = self.config.fs.p_durable;
-        let durable = self.rng.chance(p_durable);
+        let durable = self.fs_stream.chance(p_durable);
         let ino = self.node_fs(node).inode_mut(inode)?;
         if durable {
             ino.durable.clone_from(&ino.visible);
@@ -220,7 +220,7 @@ impl State {
     /// gone. What the node sees afterwards is exactly what is durable.
     pub(super) fn apply_crash_faults(&mut self, node: NodeId) {
         let mut events = Vec::new();
-        let rng = &mut self.rng;
+        let rng = &mut self.fs_stream;
         if let Some(fs) = self.fs.get_mut(&node) {
             for inode in fs.inodes.values_mut() {
                 let pending = std::mem::take(&mut inode.pending);

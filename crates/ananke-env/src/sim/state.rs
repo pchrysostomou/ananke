@@ -11,9 +11,11 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::task::{Wake, Waker};
 
+use moirae_sched::{Pcg32, Policy, Scheduler, stream};
+
 use super::fs::NodeFs;
 use super::net::Fabric;
-use super::rng::Xoshiro256StarStar;
+use super::rng::SimRng;
 use super::{SimConfig, TraceRecord};
 use crate::task::TaskControl;
 use crate::{Instant, NodeId, TaskId, TraceEvent};
@@ -52,6 +54,8 @@ impl Shared {
 pub(super) struct Node {
     pub(super) skew_nanos: i64,
     pub(super) drift_ppm: i64,
+    /// The node's protocol stream, `n{id}/protocol` (D-017).
+    pub(super) protocol: SimRng,
 }
 
 pub(super) struct Task {
@@ -64,7 +68,15 @@ pub(super) struct Task {
 pub(super) struct State {
     pub(super) config: SimConfig,
     pub(super) now: Instant,
-    pub(super) rng: Xoshiro256StarStar,
+    /// The scheduling policy in force (D-016); it owns the `sched` stream.
+    scheduler: Box<dyn Scheduler>,
+    pub(super) policy: Policy,
+    /// The `net` stream: drops and delays (D-017).
+    pub(super) net_stream: Pcg32,
+    /// The `fs` stream: lost fsyncs and torn writes.
+    pub(super) fs_stream: Pcg32,
+    /// The `clock` stream: skew and drift when a node is added.
+    pub(super) clock_stream: Pcg32,
     next_task: u64,
     next_seq: u64,
     pub(super) tasks: BTreeMap<TaskId, Task>,
@@ -79,11 +91,17 @@ pub(super) struct State {
 
 impl State {
     pub(super) fn new(config: SimConfig) -> Self {
-        let rng = Xoshiro256StarStar::seed_from_u64(config.seed);
+        let seed = config.seed;
+        let policy = config.policy.unwrap_or_else(|| Policy::for_seed(seed));
+        let scheduler = policy.scheduler(seed, config.run_length_hint);
         Self {
             config,
             now: Instant::ZERO,
-            rng,
+            scheduler,
+            policy,
+            net_stream: stream(seed, "net"),
+            fs_stream: stream(seed, "fs"),
+            clock_stream: stream(seed, "clock"),
             next_task: 1,
             next_seq: 0,
             tasks: BTreeMap::new(),
@@ -110,6 +128,14 @@ impl State {
         let seq = self.next_seq;
         self.next_seq += 1;
         seq
+    }
+
+    /// A node's own stream, derived from the seed and the node id (D-017).
+    pub(super) fn node_stream(&self, node: NodeId, label: &str) -> SimRng {
+        SimRng::new(stream(
+            self.config.seed,
+            &format!("n{}/{label}", node.get()),
+        ))
     }
 
     // --- node clocks -----------------------------------------------------------------
@@ -158,6 +184,7 @@ impl State {
                 abort_requested: false,
             },
         );
+        self.scheduler.spawned(id.get());
         self.record(Some(node), TraceEvent::TaskSpawned { task: id, name });
         self.make_runnable(id);
         id
@@ -169,23 +196,31 @@ impl State {
         }
     }
 
-    /// Picks the next task to poll: uniformly at random among the runnable ones, from
-    /// the seeded generator. This is the interim scheduling policy until the moirae
-    /// bridge supplies the decisions.
+    /// Asks the policy which runnable task polls next (D-016).
     pub(super) fn pick_runnable(&mut self) -> Option<TaskId> {
         if self.runnable.is_empty() {
             return None;
         }
-        let index = usize::try_from(self.rng.below(self.runnable.len() as u64)).unwrap_or(0);
+        let raw: Vec<u64> = self.runnable.iter().map(|t| t.get()).collect();
+        let index = self.scheduler.choose(&raw);
         let id = self.runnable.swap_remove(index);
         self.queued.remove(&id);
         Some(id)
     }
 
+    /// Forgets `id`: the policy, the run queue, and the task table. The task's future,
+    /// if it is not currently being polled, is handed back so the caller can drop it
+    /// outside the lock.
+    pub(super) fn take_task(&mut self, id: TaskId) -> Option<Task> {
+        self.queued.remove(&id);
+        let task = self.tasks.remove(&id)?;
+        self.scheduler.finished(id.get());
+        Some(task)
+    }
+
     /// Removes `id` and hands back its future so the caller can drop it outside the lock.
     pub(super) fn remove_task(&mut self, id: TaskId) -> Option<BoxFuture> {
-        self.queued.remove(&id);
-        self.tasks.remove(&id).and_then(|task| task.future)
+        self.take_task(id).and_then(|task| task.future)
     }
 
     // --- timers ----------------------------------------------------------------------
@@ -194,7 +229,7 @@ impl State {
     // by timers and deliveries, so it follows registration order and never container
     // iteration order: both maps are `BTreeMap`s keyed by `(time, seq)`. At one instant
     // every due timer fires before every due delivery. Firing only makes tasks runnable;
-    // which runnable task polls next is drawn from the seeded generator.
+    // which runnable task polls next is the policy's decision.
 
     pub(super) fn register_timer(&mut self, at: Instant, waker: Waker) {
         let seq = self.next_seq();

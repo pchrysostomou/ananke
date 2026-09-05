@@ -156,7 +156,7 @@ impl State {
             return Ok(());
         }
         let p_drop = self.config.net.p_drop;
-        if self.rng.chance(p_drop) {
+        if self.net_stream.chance(p_drop) {
             self.record(
                 Some(node),
                 TraceEvent::MessageDropped {
@@ -169,7 +169,7 @@ impl State {
             return Ok(());
         }
         let (min, max) = (self.config.net.delay_min, self.config.net.delay_max);
-        let delay = self.rng.duration_between(min, max);
+        let delay = super::rng::duration_between(&mut self.net_stream, min, max);
         let at = self.now + delay;
         let seq = self.next_seq();
         self.fabric.deliveries.insert(

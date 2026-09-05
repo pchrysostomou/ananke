@@ -9,6 +9,8 @@ use std::time::Duration;
 
 use bytes::Bytes;
 
+use moirae_sched::Policy;
+
 use super::*;
 use crate::{Clock, DropReason, File, FileSystem, MessageId, Network, OpenOptions, Rng, Socket};
 
@@ -893,5 +895,61 @@ fn partition_heal_block_and_restart_are_traced() {
     assert_eq!(
         started.node, None,
         "a symmetric partition belongs to the simulator, not a node"
+    );
+}
+
+#[test]
+fn every_env_handle_shares_the_node_stream() {
+    let mut sim = Sim::new(SimConfig::new(1));
+    let n = sim.add_node();
+    let first = sim.env(n).rng().next_u64();
+    let second = sim.env(n).rng().next_u64();
+    let mut fresh = Sim::new(SimConfig::new(1));
+    let m = fresh.add_node();
+    let env = fresh.env(m);
+    assert_eq!(
+        (env.rng().next_u64(), env.rng().next_u64()),
+        (first, second),
+        "two handles continue one stream"
+    );
+}
+
+#[test]
+fn fault_draws_do_not_move_when_the_policy_changes() {
+    // D-017: the same seed under both policies produces the same drops and delays.
+    let run = |policy: Policy| {
+        let mut config = SimConfig::new(3);
+        config.net.p_drop = 0.3;
+        config.net.delay_min = ms(0);
+        config.net.delay_max = ms(10);
+        config.policy = Some(policy);
+        let (sim, _) = ping_and_count(config, |_, _, _| {});
+        sim.trace()
+            .into_iter()
+            .filter_map(|r| match r.event {
+                TraceEvent::MessageDropped { id, reason, .. } => Some((id, reason)),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let uniform = run(Policy::Uniform);
+    let pct = run(Policy::Pct { depth: 3 });
+    assert!(!uniform.is_empty());
+    assert_eq!(uniform, pct);
+}
+
+#[test]
+fn the_policy_comes_from_the_seed_unless_fixed() {
+    assert_eq!(Sim::new(SimConfig::new(0)).policy(), Policy::Uniform);
+    assert_eq!(
+        Sim::new(SimConfig::new(2)).policy(),
+        Policy::Pct { depth: 2 }
+    );
+    let mut config = SimConfig::new(2);
+    config.policy = Some(Policy::Uniform);
+    assert_eq!(Sim::new(config).policy(), Policy::Uniform);
+    assert_eq!(
+        SimConfig::run_length_hint_for(3, Duration::from_millis(1_400)),
+        4_200
     );
 }
