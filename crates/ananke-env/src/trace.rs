@@ -252,6 +252,15 @@ pub enum WalStopReason {
     BadChecksum,
     /// The next segment in sequence does not exist: a lost directory entry.
     MissingSegment,
+    /// The record carries a sequence number other than the one expected next: a
+    /// record before it never reached the disk, typically because the sync that
+    /// covered it was lost before the segment was rotated (D-019).
+    Gap {
+        /// The sequence number recovery expected.
+        expected: u64,
+        /// The one the record carried.
+        found: u64,
+    },
 }
 
 impl WalStopReason {
@@ -262,6 +271,7 @@ impl WalStopReason {
             WalStopReason::TornRecord => "torn-record",
             WalStopReason::BadChecksum => "bad-checksum",
             WalStopReason::MissingSegment => "missing-segment",
+            WalStopReason::Gap { .. } => "gap",
         }
     }
 }

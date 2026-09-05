@@ -411,4 +411,38 @@ supertrait, which its doc comment had promised all along.
 
 ---
 
-_Next entry: D-019. Add one before implementing anything not covered above._
+## D-019 — WAL records carry their sequence number; recovery stops at a gap
+
+**Context.** The first crash sweep of the D-018 log failed on the correct variant, seed
+59: the sync covering the last two records of a segment was lost, the segment was
+rotated, the next segment's syncs were honoured, and the crash dropped the pending
+tail. Recovery read the shortened segment to its clean end, went on to the intact
+next segment, and returned a log with a hole in it: records 1 to 61, then 63 onward,
+every checksum valid. "First CRC failure or torn record" (SPEC §2.2) cannot see a hole
+whose edges are both well-formed, and a hole is worse than a short log: the memtable
+would replay 63 without 62.
+
+**Decision.** The record header is `len: u32 LE | crc32c: u32 LE | seq: u64 LE`, the
+checksum covering all three fields and the payload, and recovery expects each record
+to carry the number after the previous one, starting at 1. A record that does not
+stops recovery with `WalStopReason::Gap { expected, found }`, treated like any other
+stop: cut there, discard what follows. The sweep's oracle needs no change: the record
+before the gap was covered only by lost syncs, so it and everything after it are
+excused. SPEC §2.2 is amended to say so. The bridge writes any integer above
+JavaScript's safe range as a decimal string, because a rotted sequence number read
+by the `NoChecksum` variant is still data and the studio must still open the trace.
+
+**Alternatives.** A checksum chained from the previous record's: no extra bytes and
+the same detection, but no record can then be verified on its own, and a stop reads
+as "bad checksum" rather than "gap". A sealing footer written and synced before
+rotation: an extra write per segment, and the footer itself can be lost. Assuming a
+sync that returned is durable: exactly the assumption SPEC §1.3 exists to break.
+
+**Consequences.** Sixteen-byte headers. When the engine starts deleting old segments
+after a flush, the first surviving record will not be number 1; the manifest must
+then carry the first sequence number recovery should expect (BACKLOG). Found in the
+sweep's first run, which is the point of the sweep.
+
+---
+
+_Next entry: D-020. Add one before implementing anything not covered above._

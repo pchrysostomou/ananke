@@ -1,9 +1,12 @@
 //! The write-ahead log (SPEC.md §2.2, D-018): append-only, segmented, group committed.
 //!
-//! A record on disk is `len: u32 LE | crc32c: u32 LE | payload`, the checksum covering
-//! the length bytes and the payload. Records go to numbered segment files
-//! (`000001.wal`, `000002.wal`, ...) in a directory; a segment is rotated before a
-//! group that would start at or beyond [`WalConfig::segment_bytes`].
+//! A record on disk is `len: u32 LE | crc32c: u32 LE | seq: u64 LE | payload`, the
+//! checksum covering the length, the sequence number and the payload. Records go to
+//! numbered segment files (`000001.wal`, `000002.wal`, ...) in a directory; a segment
+//! is rotated before a group that would start at or beyond
+//! [`WalConfig::segment_bytes`]. The sequence number is there for recovery: a sync the
+//! disk lied about can leave a segment shorter than the one after it, and without
+//! the number the hole would read as a valid log (D-019).
 //!
 //! Every [`Wal`] has one writer task, spawned through the [`Environment`], and
 //! [`append`](Wal::append) only enqueues. The writer takes everything queued as one
@@ -12,7 +15,7 @@
 //! fsync shares it.
 //!
 //! [`open`](Wal::open) recovers first: it reads the segments in order and stops at the
-//! first torn record, bad checksum, or missing segment. Everything after the stop is
+//! first torn record, bad checksum, gap in the numbering, or missing segment. Everything after the stop is
 //! discarded, as the SPEC says: the stopping segment is cut to its last good record,
 //! later segments are removed, and a fresh segment is started.
 //!
@@ -41,8 +44,8 @@ use crate::crc32c;
 /// recovery that discarded records, the next append reuses the discarded numbers.
 pub type Seq = u64;
 
-/// The bytes before the payload: `len: u32 LE | crc32c: u32 LE`.
-pub const HEADER_LEN: usize = 8;
+/// The bytes before the payload: `len: u32 LE | crc32c: u32 LE | seq: u64 LE`.
+pub const HEADER_LEN: usize = 16;
 
 /// The log to run: the correct one, or one of the known bugs the crash sweep must
 /// catch. The sweep passing the correct log and failing each buggy one is what shows
@@ -86,20 +89,28 @@ pub fn segment_path(dir: &Path, segment: u64) -> PathBuf {
     dir.join(format!("{segment:06}.wal"))
 }
 
-/// The segment number a file name carries, if it is a segment.
-fn segment_of(name: &Path) -> Option<u64> {
-    name.to_str()?.strip_suffix(".wal")?.parse().ok()
+/// The segment number a path names, if it names a segment.
+#[must_use]
+pub fn segment_of(path: &Path) -> Option<u64> {
+    path.file_name()?
+        .to_str()?
+        .strip_suffix(".wal")?
+        .parse()
+        .ok()
 }
 
 /// Appends one encoded record to `out`.
-pub fn encode_record(out: &mut Vec<u8>, payload: &[u8]) {
+pub fn encode_record(out: &mut Vec<u8>, seq: Seq, payload: &[u8]) {
     let len = u32::try_from(payload.len()).expect("record payload exceeds u32");
     let len_bytes = len.to_le_bytes();
+    let seq_bytes = seq.to_le_bytes();
     let mut hasher = crc32c::Hasher::new();
     hasher.update(&len_bytes);
+    hasher.update(&seq_bytes);
     hasher.update(payload);
     out.extend_from_slice(&len_bytes);
     out.extend_from_slice(&hasher.finish().to_le_bytes());
+    out.extend_from_slice(&seq_bytes);
     out.extend_from_slice(payload);
 }
 
@@ -116,7 +127,8 @@ pub struct Recovery {
     pub next_seq: Seq,
 }
 
-/// Parses one segment's bytes; `verify` false is the [`Variant::NoChecksum`] bug.
+/// Parses one segment's bytes, expecting the records to continue the numbering from
+/// `records.len() + 1`; `verify` false is the [`Variant::NoChecksum`] bug.
 fn parse_segment(
     bytes: &[u8],
     verify: bool,
@@ -131,16 +143,28 @@ fn parse_segment(
         }
         let len = u32::from_le_bytes(rest[..4].try_into().expect("4 bytes")) as usize;
         let crc = u32::from_le_bytes(rest[4..8].try_into().expect("4 bytes"));
+        let seq = u64::from_le_bytes(rest[8..16].try_into().expect("8 bytes"));
         let Some(payload) = rest.get(HEADER_LEN..HEADER_LEN + len) else {
             return Err((at, WalStopReason::TornRecord));
         };
         if verify {
             let mut hasher = crc32c::Hasher::new();
             hasher.update(&rest[..4]);
+            hasher.update(&rest[8..16]);
             hasher.update(payload);
             if hasher.finish() != crc {
                 return Err((at, WalStopReason::BadChecksum));
             }
+        }
+        let expected = records.len() as u64 + 1;
+        if seq != expected {
+            return Err((
+                at,
+                WalStopReason::Gap {
+                    expected,
+                    found: seq,
+                },
+            ));
         }
         records.push(Bytes::copy_from_slice(payload));
         offset += HEADER_LEN + len;
@@ -470,7 +494,7 @@ impl<E: Environment> Writer<E> {
         }
         let mut buf = Vec::new();
         for queued in group {
-            encode_record(&mut buf, &queued.payload);
+            encode_record(&mut buf, queued.seq, &queued.payload);
         }
         let len = buf.len() as u64;
         self.file.write_at(self.size, Bytes::from(buf)).await?;

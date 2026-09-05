@@ -141,9 +141,13 @@ workload (Raft log + MVCC versions) is write-heavy.
 
 ### 2.2 WAL
 
-- Append-only, segmented. Record = `len | crc32c | payload`.
+- Append-only, segmented. Record = `len | crc32c | seq | payload`; the CRC covers the
+  three header fields and the payload, and `seq` numbers records from 1 (D-018,
+  D-019).
 - Group commit: batch writers waiting on the same fsync.
-- Recovery reads until first CRC failure or torn record; everything after is discarded.
+- Recovery reads until the first CRC failure, torn record, gap in the numbering or
+  missing segment; everything after is discarded (the stopping segment is cut to its
+  last good record, later segments removed).
 
 ### 2.3 Memtable
 

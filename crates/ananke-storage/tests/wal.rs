@@ -47,10 +47,11 @@ async fn write_segment<E: Environment>(env: &E, segment: u64, bytes: Vec<u8>) {
     fs.sync_dir(Path::new(DIR)).await.unwrap();
 }
 
-fn records(payloads: &[&[u8]]) -> Vec<u8> {
+/// Records numbered from `first`.
+fn records(first: u64, payloads: &[&[u8]]) -> Vec<u8> {
     let mut buf = Vec::new();
-    for payload in payloads {
-        encode_record(&mut buf, payload);
+    for (i, payload) in payloads.iter().enumerate() {
+        encode_record(&mut buf, first + i as u64, payload);
     }
     buf
 }
@@ -202,11 +203,11 @@ fn recovery_stops_at_a_torn_record_cuts_it_and_discards_later_segments() {
     let node = sim.add_node();
     let env = sim.env(node);
     env.clone().spawn("setup", async move {
-        let mut one = records(&[b"alpha", b"beta"]);
+        let mut one = records(1, &[b"alpha", b"beta"]);
         let good = one.len() as u64;
-        one.extend_from_slice(&records(&[b"gamma"])[..HEADER_LEN + 2]);
+        one.extend_from_slice(&records(3, &[b"gamma"])[..HEADER_LEN + 2]);
         write_segment(&env, 1, one).await;
-        write_segment(&env, 2, records(&[b"delta"])).await;
+        write_segment(&env, 2, records(3, &[b"delta"])).await;
         assert_eq!(good, 2 * HEADER_LEN as u64 + 9);
     });
     sim.run_for(Duration::from_millis(1));
@@ -254,7 +255,7 @@ fn recovery_stops_at_a_bad_checksum_unless_the_variant_skips_it() {
         let node = sim.add_node();
         let env = sim.env(node);
         env.clone().spawn("setup", async move {
-            let mut one = records(&[b"alpha", b"beta", b"gamma"]);
+            let mut one = records(1, &[b"alpha", b"beta", b"gamma"]);
             // Flip one bit of "beta"'s payload.
             let beta = HEADER_LEN + 5 + HEADER_LEN;
             one[beta] ^= 0x10;
@@ -296,8 +297,8 @@ fn recovery_stops_at_a_missing_segment_and_discards_the_rest() {
     let node = sim.add_node();
     let env = sim.env(node);
     env.clone().spawn("setup", async move {
-        write_segment(&env, 1, records(&[b"alpha"])).await;
-        write_segment(&env, 3, records(&[b"gamma"])).await;
+        write_segment(&env, 1, records(1, &[b"alpha"])).await;
+        write_segment(&env, 3, records(2, &[b"gamma"])).await;
     });
     sim.run_for(Duration::from_millis(1));
     let (recovery, names) = recover(&mut sim, node, Variant::Correct);
@@ -312,4 +313,38 @@ fn recovery_stops_at_a_missing_segment_and_discards_the_rest() {
     );
     assert_eq!((recovery.discarded, recovery.next_seq), (1, 2));
     assert_eq!(names, ["000001.wal", "000002.wal"]);
+}
+
+/// A segment that ends early because the sync of its last group was lost, followed
+/// by an intact next segment, reads as a hole; the sequence numbers catch it.
+#[test]
+fn recovery_stops_at_a_gap_in_the_numbering() {
+    let mut sim = Sim::new(SimConfig::new(6));
+    let node = sim.add_node();
+    let env = sim.env(node);
+    env.clone().spawn("setup", async move {
+        write_segment(&env, 1, records(1, &[b"alpha", b"beta"])).await;
+        // Record 3 never reached the disk; segment 2 starts at 4.
+        write_segment(&env, 2, records(4, &[b"delta", b"epsilon"])).await;
+    });
+    sim.run_for(Duration::from_millis(1));
+    let (recovery, names) = recover(&mut sim, node, Variant::Correct);
+    assert_eq!(
+        recovery.records,
+        vec![Bytes::from("alpha"), Bytes::from("beta")]
+    );
+    assert_eq!(
+        recovery.stop,
+        Some(WalStop {
+            segment: 2,
+            offset: 0,
+            reason: WalStopReason::Gap {
+                expected: 3,
+                found: 4
+            }
+        })
+    );
+    assert_eq!((recovery.discarded, recovery.next_seq), (0, 3));
+    // Segment 2 was cut to nothing and reopened fresh as the next segment.
+    assert_eq!(names, ["000001.wal", "000002.wal", "000003.wal"]);
 }

@@ -35,7 +35,7 @@ use std::net::SocketAddr;
 use moirae_trace::{Cause, Collect, Error, Event, Header, Json, Sink, TimeUnit, Verify, Writer};
 
 use crate::sim::{Sim, Snapshot, TraceRecord};
-use crate::{DirEntryOp, DropReason, NodeId, TraceEvent};
+use crate::{DirEntryOp, DropReason, NodeId, TraceEvent, WalStopReason};
 
 /// Turns a message payload into the `msg` object of a `send` line: an object whose
 /// `type` is a string, which is what the studio labels and filters by.
@@ -203,8 +203,14 @@ fn node_json(node: NodeId) -> Json {
     Json::Int(i64::from(node.get()))
 }
 
+/// A number, or its decimal string when it does not fit a JavaScript integer: a
+/// rotted sequence number is still data, and the studio must still open the trace.
 fn int(v: u64) -> Json {
-    Json::Int(i64::try_from(v).unwrap_or(i64::MAX))
+    if v <= moirae_trace::MAX_SAFE_INTEGER {
+        Json::Int(i64::try_from(v).expect("below 2^53"))
+    } else {
+        Json::Str(v.to_string())
+    }
 }
 
 fn convert(
@@ -375,11 +381,16 @@ fn convert(
                 (
                     "stop",
                     stop.map_or(Json::Null, |stop| {
-                        Json::obj(vec![
+                        let mut fields = vec![
                             ("segment", int(stop.segment)),
                             ("offset", int(stop.offset)),
                             ("reason", Json::str(stop.reason.as_str())),
-                        ])
+                        ];
+                        if let WalStopReason::Gap { expected, found } = stop.reason {
+                            fields.push(("expected", int(expected)));
+                            fields.push(("found", int(found)));
+                        }
+                        Json::obj(fields)
                     }),
                 ),
                 ("discarded", int(*discarded)),
