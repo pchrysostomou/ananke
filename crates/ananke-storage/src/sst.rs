@@ -532,6 +532,18 @@ impl<F: File> SstReader<F> {
         }
     }
 
+    /// The whole file, for a copy.
+    ///
+    /// # Errors
+    ///
+    /// The file's.
+    pub async fn bytes(&self) -> io::Result<Bytes> {
+        let size = self.file.size().await?;
+        self.file
+            .read_at(0, usize::try_from(size).unwrap_or(usize::MAX))
+            .await
+    }
+
     /// Reads data block `block`, checks it, and decodes its entries with whole keys.
     async fn read_block(&self, block: usize) -> io::Result<Vec<(Bytes, Value)>> {
         let entry = &self.index[block];

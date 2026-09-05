@@ -25,7 +25,7 @@ use ananke_env::sim::{Sim, SimConfig, SimEnv, TraceRecord};
 use ananke_env::{Clock, Environment, NodeId, Rng, TraceEvent};
 use ananke_storage::engine;
 use ananke_storage::manifest;
-use ananke_storage::{Engine, EngineConfig, EngineRecovery, Value, wal};
+use ananke_storage::{Engine, EngineConfig, EngineRecovery, Value, WriteBatch, wal};
 use bytes::Bytes;
 
 pub use ananke_storage::engine::Variant;
@@ -114,6 +114,31 @@ pub fn key(i: u64) -> Bytes {
     Bytes::from(format!("k{i:02}"))
 }
 
+/// One log record's writes, in order: one for a put or a delete, several for a
+/// batch (D-024).
+pub type Record = Vec<(Bytes, Value)>;
+
+/// The writes a record leaves in the memtable: the last one per key, in key order.
+#[must_use]
+pub fn effective(record: &[(Bytes, Value)]) -> Vec<(Bytes, Value)> {
+    let mut last: BTreeMap<Bytes, Value> = BTreeMap::new();
+    for (key, value) in record {
+        last.insert(key.clone(), value.clone());
+    }
+    last.into_iter().collect()
+}
+
+/// A checkpoint the run took and what it must hold (D-024).
+#[derive(Clone, Debug)]
+pub struct Checkpoint {
+    /// Its directory.
+    pub dir: PathBuf,
+    /// The version it was taken at.
+    pub version: u64,
+    /// The model's state at that version when it was taken.
+    pub expected: BTreeMap<Bytes, Value>,
+}
+
 /// What the writers know, on top of the log model: the ops in log order, which keys
 /// have a write in flight, the committed value per key, and which records are gone
 /// for good with an explanation.
@@ -121,35 +146,48 @@ pub fn key(i: u64) -> Bytes {
 pub struct Model {
     /// The log model: encoded ops and their acknowledgements.
     pub log: LogModel,
-    /// The ops by position, parallel to `log.appended`.
-    pub ops: Vec<(Bytes, Value)>,
+    /// The records by position, parallel to `log.appended`.
+    pub ops: Vec<Record>,
     /// Writes enqueued and not yet acknowledged, per key.
     pub in_flight: BTreeMap<Bytes, u32>,
     /// The newest acknowledged write per key, by sequence number.
     pub committed: BTreeMap<Bytes, (u64, Value)>,
-    /// Records lost with a dropped table or manifest and not brought back by a log
-    /// replay, for good.
+    /// Records none of whose writes survives: lost with a dropped table or manifest
+    /// and not brought back by a log replay, for good.
     pub lost: BTreeSet<u64>,
+    /// Writes, as (key, record), that no table in service holds and the log did not
+    /// replay: compacted away, or lost. The state folds over the rest (D-024).
+    pub lost_writes: BTreeSet<(Bytes, u64)>,
     /// Live reads performed, scans included.
     pub reads: u64,
     /// Of those, scans at a snapshot.
     pub scans: u64,
     /// Live reads that disagreed with the model.
     pub read_violations: Vec<String>,
+    /// Checkpoints taken and not yet verified.
+    pub checkpoints: Vec<Checkpoint>,
+    /// Checkpoints taken over the run.
+    pub checkpoints_taken: u64,
+    /// Batches of more than one write over the run.
+    pub batches: u64,
+    /// Writes that asked for no sync over the run.
+    pub unsynced: u64,
 }
 
 impl Model {
-    /// The state after the first `n` ops, minus the ones lost for good: the newest
-    /// surviving write per key.
+    /// The state after the first `n` records, minus the ones lost for good: the
+    /// newest surviving write per key.
     #[must_use]
     pub fn state_after(&self, n: usize) -> BTreeMap<Bytes, Value> {
         let mut state = BTreeMap::new();
-        for (i, (key, value)) in self.ops[..n].iter().enumerate() {
+        for (i, record) in self.ops[..n].iter().enumerate() {
             let seq = i as u64 + 1;
-            if self.lost.contains(&seq) {
-                continue;
+            for (key, value) in effective(record) {
+                if self.lost_writes.contains(&(key.clone(), seq)) {
+                    continue;
+                }
+                state.insert(key, value);
             }
-            state.insert(key.clone(), value.clone());
         }
         state
     }
@@ -166,8 +204,8 @@ pub struct TableMirror {
     pub first_key: Bytes,
     /// See `first_key`.
     pub last_key: Bytes,
-    /// The sequence numbers of the writes it holds.
-    pub records: BTreeSet<u64>,
+    /// The writes it holds, as (key, record number).
+    pub writes: BTreeSet<(Bytes, u64)>,
 }
 
 /// The trace's account of what every table holds and every manifest lists: flushes
@@ -183,8 +221,8 @@ pub struct Mirror {
     pub tables: BTreeMap<u64, TableMirror>,
     /// The tables each manifest lists.
     pub manifests: BTreeMap<u64, Vec<u64>>,
-    /// Each compaction's manifest and the records it dropped, in order.
-    pub compactions: Vec<(u64, BTreeSet<u64>)>,
+    /// Each compaction's manifest and the writes it dropped, in order.
+    pub compactions: Vec<(u64, BTreeSet<(Bytes, u64)>)>,
     /// Tables the engine deleted once no manifest in force listed them: inputs of a
     /// compaction that had finished, or orphans an open removed. A deletion before
     /// the manifest stopped listing the table is the bug, and is not here.
@@ -201,7 +239,7 @@ pub struct Mirror {
 impl Mirror {
     /// Mirrors `events` against `ops`.
     #[must_use]
-    pub fn build(events: &[&TraceEvent], ops: &[(Bytes, Value)]) -> Self {
+    pub fn build(events: &[&TraceEvent], ops: &[Record]) -> Self {
         let mut mirror = Self::default();
         for event in events {
             match event {
@@ -216,17 +254,24 @@ impl Mirror {
                     max_seq,
                     ..
                 } => {
-                    let records: BTreeSet<u64> = (*first_seq..=*max_seq)
+                    // A flushed table holds what every record in its range left in
+                    // the memtable: its last write per key.
+                    let writes: BTreeSet<(Bytes, u64)> = (*first_seq..=*max_seq)
                         .filter(|&seq| seq as usize <= ops.len())
+                        .flat_map(|seq| {
+                            effective(&ops[seq as usize - 1])
+                                .into_iter()
+                                .map(move |(key, _)| (key, seq))
+                        })
                         .collect();
-                    let keys = || records.iter().map(|&seq| &ops[seq as usize - 1].0);
+                    let keys = || writes.iter().map(|(k, _)| k);
                     mirror.tables.insert(
                         *number,
                         TableMirror {
                             level: 0,
                             first_key: keys().min().cloned().unwrap_or_default(),
                             last_key: keys().max().cloned().unwrap_or_default(),
-                            records,
+                            writes,
                         },
                     );
                 }
@@ -284,7 +329,7 @@ impl Mirror {
     /// Merges the inputs by the engine's rules and fills in the outputs.
     fn compaction(
         &mut self,
-        ops: &[(Bytes, Value)],
+        ops: &[Record],
         level: u8,
         manifest: u64,
         inputs: &[u64],
@@ -315,36 +360,43 @@ impl Mirror {
             .filter(|t| t.level > output_level)
             .map(|t| (t.first_key.clone(), t.last_key.clone()))
             .collect();
-        let mut by_key: BTreeMap<Bytes, Vec<u64>> = BTreeMap::new();
+        // Every write the inputs hold, by user key, as (number, is a tombstone).
+        let mut by_key: BTreeMap<Bytes, Vec<(u64, bool)>> = BTreeMap::new();
         for table in inputs {
             let Some(table) = self.tables.get(table) else {
                 continue;
             };
-            for &seq in &table.records {
-                if seq as usize <= ops.len() {
-                    by_key
-                        .entry(ops[seq as usize - 1].0.clone())
-                        .or_default()
-                        .push(seq);
+            for (key, seq) in &table.writes {
+                if *seq as usize > ops.len() {
+                    continue;
                 }
+                let tombstone = ops[*seq as usize - 1]
+                    .iter()
+                    .rev()
+                    .find(|(k, _)| k == key)
+                    .is_some_and(|(_, v)| *v == Value::Tombstone);
+                by_key
+                    .entry(key.clone())
+                    .or_default()
+                    .push((*seq, tombstone));
             }
         }
         let mut dropped = BTreeSet::new();
         let mut kept: Vec<(Bytes, u64)> = Vec::new();
-        for (key, mut seqs) in by_key {
-            seqs.sort_unstable_by(|a, b| b.cmp(a));
+        for (key, mut writes) in by_key {
+            writes.sort_unstable_by_key(|(seq, _)| std::cmp::Reverse(*seq));
             let mut prev: Option<u64> = None;
-            for seq in seqs {
+            for (seq, tombstone) in writes {
                 let drop = match prev {
                     Some(previous) => previous <= snapshot,
                     None => {
-                        ops[seq as usize - 1].1 == Value::Tombstone
+                        tombstone
                             && seq <= snapshot
                             && !deeper.iter().any(|(f, l)| *f <= key && key <= *l)
                     }
                 };
                 if drop {
-                    dropped.insert(seq);
+                    dropped.insert((key.clone(), seq));
                 } else {
                     kept.push((key.clone(), seq));
                 }
@@ -352,10 +404,10 @@ impl Mirror {
             }
         }
         for (number, first, last) in outputs {
-            let records = kept
+            let writes = kept
                 .iter()
                 .filter(|(k, _)| first <= k && k <= last)
-                .map(|(_, seq)| *seq)
+                .cloned()
                 .collect();
             self.tables.insert(
                 *number,
@@ -363,7 +415,7 @@ impl Mirror {
                     level: output_level,
                     first_key: first.clone(),
                     last_key: last.clone(),
-                    records,
+                    writes,
                 },
             );
         }
@@ -393,8 +445,8 @@ pub struct Epoch {
     pub excuse: Option<Excuse>,
     /// The first violation, if any.
     pub verdict: Result<(), String>,
-    /// The model's ops when the node crashed, for diagnosis.
-    pub ops: Vec<(Bytes, Value)>,
+    /// The model's records when the node crashed, for diagnosis.
+    pub ops: Vec<Record>,
     /// Records counted as lost after this recovery, for diagnosis.
     pub lost: Vec<u64>,
 }
@@ -427,6 +479,16 @@ pub struct Report {
     pub reads: u64,
     /// Of those, scans at a snapshot.
     pub scans: u64,
+    /// Batches of more than one write.
+    pub batches: u64,
+    /// Writes that asked for no sync.
+    pub unsynced: u64,
+    /// Checkpoints taken.
+    pub checkpoints_taken: u64,
+    /// Checkpoints opened fresh and checked after a crash.
+    pub checkpoints_verified: u64,
+    /// Checkpoints a fault touched, not checked.
+    pub checkpoints_damaged: u64,
     /// The whole trace.
     pub records: Vec<TraceRecord>,
     /// The trace as moirae JSONL.
@@ -504,6 +566,7 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
     let mut epoch_start = 0;
     let mut previous_manifest: Option<(u64, u64)> = None;
     let mut refused = None;
+    let (mut checkpoints_verified, mut checkpoints_damaged) = (0u64, 0u64);
     for crash in 0..=schedule.crashes {
         let before_open = sim.trace().len();
         let dir = Path::new(DIR);
@@ -580,7 +643,7 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
         // record is present if a table in service holds it or the log replayed it;
         // every other record the tables owed needs an explanation, else it is a
         // violation.
-        let ops_now: Vec<(Bytes, Value)> = lock(&model).ops.clone();
+        let ops_now: Vec<Record> = lock(&model).ops.clone();
         let mirror = Mirror::build(&all, &ops_now);
         // What the manifest in force lists comes from the recovery, not the trace: a
         // manifest can be whole on disk without the sync that would have reported it
@@ -594,33 +657,52 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
             .collect();
         let last_recovered = recovery.first_seq_end();
         let replayed = (recovery.flushed_seq + 1).max(recovery.wal.first_seq)..=last_recovered;
-        let present = |seq: u64| {
+        // A write is present if a table in service holds it or the log replayed its
+        // record; a record is present if any of its writes is.
+        let present_write = |key: &Bytes, seq: u64| {
             (!recovery.wal.records.is_empty() && replayed.contains(&seq))
                 || in_service.iter().any(|t| {
                     mirror
                         .tables
                         .get(t)
-                        .is_some_and(|t| t.records.contains(&seq))
+                        .is_some_and(|t| t.writes.contains(&(key.clone(), seq)))
                 })
         };
-        let compacted: BTreeSet<u64> = mirror
+        let writes_of = |seq: u64| -> Vec<Bytes> {
+            ops_now
+                .get(seq as usize - 1)
+                .map(|record| effective(record).into_iter().map(|(k, _)| k).collect())
+                .unwrap_or_default()
+        };
+        let present = |seq: u64| writes_of(seq).iter().any(|k| present_write(k, seq));
+        let compacted_writes: BTreeSet<(Bytes, u64)> = mirror
             .compactions
             .iter()
             .filter(|(manifest, _)| *manifest <= recovery.manifest)
-            .flat_map(|(_, dropped)| dropped.iter().copied())
+            .flat_map(|(_, dropped)| dropped.iter().cloned())
             .collect();
+        // A record is compacted away when every write of it not present was dropped.
+        let compacted = |seq: u64| {
+            writes_of(seq)
+                .iter()
+                .all(|k| present_write(k, seq) || compacted_writes.contains(&(k.clone(), seq)))
+        };
         let mut verdict = Ok(());
         let synced = syncs(&events, dir);
         // Damage to a table lasts: a table torn at one crash is dropped at every open
         // after, so its lost sync is looked for in the whole trace.
         let all_synced = syncs(&all, dir);
-        // A fallback that used an older manifest lost everything flushed since, and
-        // must be explained: CURRENT itself was damaged (unreadable, or naming
-        // something it never was switched to) because its content's sync was lost,
-        // for the switch or one in flight at the crash, or bit rot hit it; or the
-        // manifest was damaged because its sync was lost or bit rot hit it. Nothing
-        // else explains it. A fallback that used the last manifest switched to, or a
-        // newer one written but never switched to, lost nothing.
+        // A fallback used an older manifest than CURRENT should have named. Every
+        // step of it must be explained by a fault, or by a write that was in flight
+        // at the crash. The manifest CURRENT named could not be used: CURRENT itself
+        // unreadable (its content's sync lost, for the switch or one in flight, or
+        // bit rot), or the manifest unreadable (its sync lost, bit rot, or its write
+        // never synced before the crash, which the trace shows as no record of it
+        // written). And each manifest passed over on the way to the one used was
+        // rejected for a fault on it or on a table it lists, or because it lists no
+        // table. A fallback that used the last manifest switched to lost nothing,
+        // since CURRENT named a switch still in flight; only one that went older
+        // lost what was flushed since.
         let mut fallback_why: Option<Excuse> = None;
         if let Some(named) = recovery.fallback_from {
             let from = synced
@@ -629,28 +711,73 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
                 .copied()
                 .or_else(|| previous_manifest.map(|(n, _)| n))
                 .unwrap_or(0);
-            if recovery.manifest < from {
-                let current_damaged = named != from;
-                let current_betrayed =
-                    synced.current_betrayed.contains(&from) || synced.current_tmp_lost_in_flight;
-                fallback_why = if current_damaged && current_betrayed {
+            let written = |m: u64| {
+                all.iter().any(
+                    |e| matches!(e, TraceEvent::ManifestWritten { number, .. } if *number == m),
+                )
+            };
+            let manifest_fault = |m: u64| -> Option<Excuse> {
+                if !written(m) || all_synced.manifest_betrayed.contains(&m) {
                     Some(Excuse::LostFsync)
-                } else if current_damaged && rotted(&all, &manifest::current_path(dir)) {
-                    Some(Excuse::BitRot)
-                } else if synced.manifest_betrayed.contains(&from) {
-                    Some(Excuse::LostFsync)
-                } else if rotted(&all, &manifest::manifest_path(dir, from)) {
+                } else if rotted(&all, &manifest::manifest_path(dir, m)) {
                     Some(Excuse::BitRot)
                 } else {
                     None
+                }
+            };
+            let table_fault = |t: u64| -> Option<Excuse> {
+                if all_synced.sst_betrayed.contains(&t) || mirror.deleted.contains(&t) {
+                    Some(Excuse::LostFsync)
+                } else if rotted(&all, &manifest::sst_path(dir, t)) {
+                    Some(Excuse::BitRot)
+                } else {
+                    None
+                }
+            };
+            let named_why = if named == 0 {
+                let current_betrayed =
+                    synced.current_betrayed.contains(&from) || synced.current_tmp_lost_in_flight;
+                if current_betrayed {
+                    Some(Excuse::LostFsync)
+                } else if rotted(&all, &manifest::current_path(dir)) {
+                    Some(Excuse::BitRot)
+                } else {
+                    None
+                }
+            } else {
+                manifest_fault(named)
+            };
+            let mut unexplained: Option<String> = None;
+            if named_why.is_none() {
+                unexplained = Some(if named == 0 {
+                    "CURRENT could not be read and no fault touched it".to_owned()
+                } else {
+                    format!("manifest {named} could not be read and no fault touched it")
+                });
+            }
+            for (m, why) in &recovery.rejected {
+                let explained = match why {
+                    engine::Rejected::NoTables => Some(Excuse::LostFsync),
+                    engine::Rejected::Unreadable => manifest_fault(*m),
+                    engine::Rejected::TableMissing(t) | engine::Rejected::TableDamaged(t) => {
+                        table_fault(*t)
+                    }
                 };
-                if fallback_why.is_none() {
-                    verdict = Err(format!(
-                        "CURRENT named manifest {named} and recovery used {}, but the last switch was to {from} and no fault touched CURRENT or manifest {from}",
-                        recovery.manifest
+                if explained.is_none() && unexplained.is_none() {
+                    unexplained = Some(format!(
+                        "manifest {m} was passed over as {why:?} and no fault explains it"
                     ));
                 }
             }
+            if let Some(what) = unexplained
+                && recovery.manifest < from
+            {
+                verdict = Err(format!(
+                    "CURRENT named manifest {named} and recovery used {}, but the last switch was to {from}: {what}",
+                    recovery.manifest
+                ));
+            }
+            fallback_why = named_why.or(Some(Excuse::LostFsync));
         }
         // A dropped table: its sync was lost or bit rot hit it; or it is missing
         // because the engine deleted it once no manifest in force listed it, as a
@@ -711,7 +838,7 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
             mirror
                 .tables
                 .values()
-                .filter_map(|t| t.records.iter().next_back().copied())
+                .filter_map(|t| t.writes.iter().map(|(_, s)| *s).max())
                 .max()
                 .unwrap_or(0)
                 .max(recovery.flushed_seq)
@@ -726,7 +853,7 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
                 mirror
                     .tables
                     .get(t)
-                    .is_some_and(|t| t.records.contains(&seq))
+                    .is_some_and(|t| t.writes.iter().any(|(_, s)| *s == seq))
             };
             if seq > recovery.flushed_seq {
                 if mirror.tables.keys().any(held_by)
@@ -736,7 +863,7 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
                 }
                 continue;
             }
-            let why = if compacted.contains(&seq) {
+            let why = if compacted(seq) {
                 Some(Excuse::Compacted)
             } else if let Some(why) = table_why
                 .iter()
@@ -779,6 +906,14 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
         {
             let mut m = lock(&model);
             m.lost = (1..=end as u64).filter(|&seq| !present(seq)).collect();
+            m.lost_writes = (1..=end as u64)
+                .flat_map(|seq| {
+                    writes_of(seq)
+                        .into_iter()
+                        .filter(move |k| !present_write(k, seq))
+                        .map(move |k| (k, seq))
+                })
+                .collect();
         }
 
         if crash > 0 {
@@ -850,12 +985,35 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
         } else if let Some(epoch) = epochs.last_mut() {
             epoch.verdict = verdict.clone();
         }
+        // Every checkpoint taken before the crash opens fresh at its version, unless
+        // a fault touched its files, which the crash's bit rot or a lost sync can.
+        let pending: Vec<Checkpoint> = std::mem::take(&mut lock(&model).checkpoints);
+        for checkpoint in pending {
+            let touched = all.iter().any(|e| match e {
+                TraceEvent::BlockRotted { path, .. }
+                | TraceEvent::FsyncLost { path }
+                | TraceEvent::WriteTorn { path, .. } => path.starts_with(&checkpoint.dir),
+                _ => false,
+            });
+            if touched {
+                checkpoints_damaged += 1;
+                continue;
+            }
+            if let Some(epoch) = epochs.last_mut()
+                && epoch.verdict.is_ok()
+                && let Err(violation) = check_checkpoint(&mut sim, node, &schedule, &checkpoint)
+            {
+                epoch.verdict = Err(violation);
+            }
+            checkpoints_verified += 1;
+        }
         previous_manifest = Some((recovery.manifest, recovery.flushed_seq));
         base = end;
         {
             let mut m = lock(&model);
             m.log.appended.truncate(base);
             m.log.acked.truncate(base);
+            m.log.sync_requested.truncate(base);
             m.log.acked.iter_mut().for_each(|a| *a = true);
             m.ops.truncate(base);
             m.in_flight.clear();
@@ -880,9 +1038,9 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
         sim.crash(node);
         sim.restart(node);
     }
-    let (reads, scans) = {
+    let (reads, scans, batches, unsynced, checkpoints_taken) = {
         let m = lock(&model);
-        (m.reads, m.scans)
+        (m.reads, m.scans, m.batches, m.unsynced, m.checkpoints_taken)
     };
     Report {
         seed,
@@ -891,6 +1049,11 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
         refused,
         reads,
         scans,
+        batches,
+        unsynced,
+        checkpoints_taken,
+        checkpoints_verified,
+        checkpoints_damaged,
         jsonl: sim
             .to_moirae(&Export::new(&bytes_decoder))
             .expect("the engine trace exports to moirae v2"),
@@ -1032,6 +1195,95 @@ fn check_state(
     violations.into_iter().next().map_or(Ok(()), Err)
 }
 
+/// Opens `checkpoint`'s directory as a fresh store and compares every key and a
+/// scan with what the model says it holds.
+fn check_checkpoint(
+    sim: &mut Sim,
+    node: NodeId,
+    schedule: &Schedule,
+    checkpoint: &Checkpoint,
+) -> Result<(), String> {
+    let env = sim.env(node);
+    let out: Arc<Mutex<Option<Result<(), String>>>> = Arc::default();
+    let o = out.clone();
+    let checkpoint = checkpoint.clone();
+    let config = EngineConfig {
+        dir: checkpoint.dir.clone(),
+        memtable_bytes: schedule.memtable_bytes,
+        segment_bytes: schedule.segment_bytes,
+        variant: Variant::Correct,
+        wal_variant: wal::Variant::Correct,
+        allow_head_gap: false,
+        allow_manifest_fallback: false,
+        l0_trigger: schedule.l0_trigger,
+        level_base_bytes: schedule.level_base_bytes,
+        sst_bytes: schedule.sst_bytes,
+        background_compaction: false,
+    };
+    env.clone().spawn("checkpoint-check", async move {
+        let result = async {
+            let (db, recovery) = Engine::open(env, config).await.map_err(|e| {
+                format!(
+                    "checkpoint {} at version {} does not open: {e}",
+                    checkpoint.dir.display(),
+                    checkpoint.version
+                )
+            })?;
+            if !recovery.dropped.is_empty() || recovery.replayed != 0 {
+                return Err(format!(
+                    "checkpoint {} at version {} opened with {} tables dropped and {} records replayed",
+                    checkpoint.dir.display(),
+                    checkpoint.version,
+                    recovery.dropped.len(),
+                    recovery.replayed
+                ));
+            }
+            for i in 0..KEYS {
+                let key = key(i);
+                let got = db.get(&key).await.expect("tables read");
+                let want = checkpoint.expected.get(&key).cloned().and_then(Value::live);
+                if got != want {
+                    return Err(format!(
+                        "checkpoint {} at version {}: key {} holds {got:?} but the model has {want:?}",
+                        checkpoint.dir.display(),
+                        checkpoint.version,
+                        String::from_utf8_lossy(&key)
+                    ));
+                }
+            }
+            let snapshot = db.snapshot();
+            let scanned = db
+                .scan(&key(0)[..]..&key(KEYS)[..], &snapshot)
+                .await
+                .expect("tables read");
+            let want: Vec<(Bytes, Bytes)> = checkpoint
+                .expected
+                .iter()
+                .filter_map(|(k, v)| v.clone().live().map(|v| (k.clone(), v)))
+                .collect();
+            if scanned != want {
+                return Err(format!(
+                    "checkpoint {} at version {}: a scan saw {} keys but the model has {}",
+                    checkpoint.dir.display(),
+                    checkpoint.version,
+                    scanned.len(),
+                    want.len()
+                ));
+            }
+            Ok(())
+        }
+        .await;
+        *o.lock().unwrap_or_else(PoisonError::into_inner) = Some(result);
+    });
+    while out.lock().unwrap_or_else(PoisonError::into_inner).is_none() {
+        sim.run_for(Duration::from_millis(1));
+    }
+    out.lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .take()
+        .expect("the check completed")
+}
+
 /// Starts the writers and readers; they run until the crash.
 fn spawn_clients(sim: &Sim, node: NodeId, db: Db, schedule: &Schedule, model: &SharedModel) {
     let (value_max, gap_max_us) = (schedule.value_max, schedule.gap_max_us);
@@ -1039,30 +1291,50 @@ fn spawn_clients(sim: &Sim, node: NodeId, db: Db, schedule: &Schedule, model: &S
         let (env, db, model) = (sim.env(node), db.clone(), model.clone());
         env.clone().spawn("writer", async move {
             loop {
-                let key = key(env.rng().below(KEYS));
-                let value = if env.rng().below(10) < 3 {
-                    Value::Tombstone
+                // One write in four is a batch of up to four, keys repeating; one in
+                // four asks for no sync (D-024).
+                let count = if env.rng().below(4) == 0 {
+                    1 + env.rng().below(4)
                 } else {
-                    let len = usize::try_from(env.rng().below(value_max + 1)).expect("fits");
-                    let mut bytes = vec![0u8; len];
-                    env.rng().fill_bytes(&mut bytes);
-                    Value::Live(Bytes::from(bytes))
+                    1
                 };
-                let write = match &value {
-                    Value::Live(bytes) => db.put(key.clone(), bytes.clone()),
-                    Value::Tombstone => db.delete(key.clone()),
-                };
+                let sync = env.rng().below(4) != 0;
+                let mut record: Record = Vec::new();
+                let mut batch = WriteBatch::new();
+                for _ in 0..count {
+                    let key = key(env.rng().below(KEYS));
+                    let value = if env.rng().below(10) < 3 {
+                        Value::Tombstone
+                    } else {
+                        let len = usize::try_from(env.rng().below(value_max + 1)).expect("fits");
+                        let mut bytes = vec![0u8; len];
+                        env.rng().fill_bytes(&mut bytes);
+                        Value::Live(Bytes::from(bytes))
+                    };
+                    match &value {
+                        Value::Live(bytes) => batch.put(key.clone(), bytes.clone()),
+                        Value::Tombstone => batch.delete(key.clone()),
+                    };
+                    record.push((key, value));
+                }
+                let write = db.write(batch, sync);
+                let keys: BTreeSet<Bytes> = record.iter().map(|(k, _)| k.clone()).collect();
                 {
                     let mut m = lock(&model);
-                    m.log.appended.push(engine::encode_op(&key, &value));
+                    m.log.appended.push(engine::encode_batch(&record));
                     m.log.acked.push(false);
-                    m.ops.push((key.clone(), value.clone()));
+                    m.log.sync_requested.push(sync);
+                    m.ops.push(record.clone());
+                    m.batches += u64::from(count > 1);
+                    m.unsynced += u64::from(!sync);
                     assert_eq!(
                         m.ops.len() as u64,
                         write.seq(),
                         "the model and the log number writes alike"
                     );
-                    *m.in_flight.entry(key.clone()).or_default() += 1;
+                    for key in &keys {
+                        *m.in_flight.entry(key.clone()).or_default() += 1;
+                    }
                 }
                 match write.await {
                     Ok(seq) => {
@@ -1070,18 +1342,48 @@ fn spawn_clients(sim: &Sim, node: NodeId, db: Db, schedule: &Schedule, model: &S
                         if let Some(acked) = m.log.acked.get_mut(seq as usize - 1) {
                             *acked = true;
                         }
-                        if let Some(n) = m.in_flight.get_mut(&key) {
-                            *n -= 1;
+                        for key in &keys {
+                            if let Some(n) = m.in_flight.get_mut(key) {
+                                *n -= 1;
+                            }
                         }
-                        let newer = m.committed.get(&key).is_none_or(|(s, _)| *s < seq);
-                        if newer {
-                            m.committed.insert(key, (seq, value));
+                        for (key, value) in effective(&record) {
+                            let newer = m.committed.get(&key).is_none_or(|(s, _)| *s < seq);
+                            if newer {
+                                m.committed.insert(key, (seq, value));
+                            }
                         }
                     }
                     Err(_) => return,
                 }
                 let gap = env.rng().below(gap_max_us + 1);
                 env.clock().sleep(Duration::from_micros(gap)).await;
+            }
+        });
+    }
+    // One task takes checkpoints now and then, into a directory of its own each,
+    // and records what each must hold: the model's state at the version the engine
+    // reports, which nothing after can change.
+    {
+        let (env, db, model) = (sim.env(node), db.clone(), model.clone());
+        env.clone().spawn("checkpointer", async move {
+            loop {
+                let gap = 2000 + env.rng().below(6000);
+                env.clock().sleep(Duration::from_micros(gap)).await;
+                let n = lock(&model).checkpoints_taken;
+                let dir = PathBuf::from(format!("/ckpt/{n:04}"));
+                lock(&model).checkpoints_taken += 1;
+                let Ok(info) = db.checkpoint(&dir).await else {
+                    return;
+                };
+                let mut m = lock(&model);
+                let version = usize::try_from(info.version).expect("fits");
+                let expected = m.state_after(version.min(m.ops.len()));
+                m.checkpoints.push(Checkpoint {
+                    dir,
+                    version: info.version,
+                    expected,
+                });
             }
         });
     }

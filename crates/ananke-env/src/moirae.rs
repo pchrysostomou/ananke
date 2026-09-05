@@ -22,6 +22,7 @@
 //! | `HeadGap`                                | `log` `ananke.wal.head-gap`                   |
 //! | `MemtableRotated` / `MemtableFlushed`    | `log` `ananke.memtable.rotated` / `.flushed`  |
 //! | `FlusherFailed`                          | `log` `ananke.engine.flusher-failed`          |
+//! | `CheckpointWritten`                      | `log` `ananke.engine.checkpoint-written`      |
 //! | `SstWritten` / `SstDropped` / `SstDeleted` | `log` `ananke.sst.written` / `.dropped` / `.deleted` |
 //! | `CompactionWritten`                      | `log` `ananke.compaction.written`             |
 //! | `ManifestWritten` / `CurrentSwitched` / `ManifestFallback` | `log` `ananke.manifest.written` / `.switched` / `.fallback` |
@@ -539,6 +540,18 @@ fn convert(
         TraceEvent::WalSegmentDeleted { segment } => log(
             "ananke.wal.segment-deleted",
             Some(Json::obj(vec![("segment", int(*segment))])),
+        ),
+        TraceEvent::CheckpointWritten {
+            dir,
+            version,
+            tables,
+        } => log(
+            "ananke.engine.checkpoint-written",
+            Some(Json::obj(vec![
+                ("dir", Json::str(&dir.display().to_string())),
+                ("version", int(*version)),
+                ("tables", int(*tables)),
+            ])),
         ),
         TraceEvent::FlusherFailed { error } => log(
             "ananke.engine.flusher-failed",

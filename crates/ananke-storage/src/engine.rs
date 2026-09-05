@@ -179,6 +179,141 @@ fn value_len(value: &Value) -> usize {
     }
 }
 
+/// One log record for a batch of writes applied together: `tag: u8 = 2 | count: u32 LE`,
+/// then per write `tag: u8 | key_len: u32 LE | key | value_len: u32 LE | value`, the
+/// value absent for a delete (D-024). A batch of one write is encoded as that write.
+#[must_use]
+pub fn encode_batch(ops: &[(Bytes, Value)]) -> Bytes {
+    if let [(key, value)] = ops {
+        return encode_op(key, value);
+    }
+    let mut out = BytesMut::with_capacity(5 + ops.len() * 9);
+    out.put_u8(2);
+    out.put_u32_le(u32::try_from(ops.len()).expect("batch size exceeds u32"));
+    for (key, value) in ops {
+        let len = u32::try_from(key.len()).expect("key length exceeds u32");
+        match value {
+            Value::Live(bytes) => {
+                out.put_u8(0);
+                out.put_u32_le(len);
+                out.put_slice(key);
+                out.put_u32_le(u32::try_from(bytes.len()).expect("value length exceeds u32"));
+                out.put_slice(bytes);
+            }
+            Value::Tombstone => {
+                out.put_u8(1);
+                out.put_u32_le(len);
+                out.put_slice(key);
+            }
+        }
+    }
+    out.freeze()
+}
+
+/// Decodes a record written by [`encode_op`] or [`encode_batch`]: the writes it
+/// carries, in order.
+///
+/// # Errors
+///
+/// `InvalidData` for anything else.
+pub fn decode_record(mut record: Bytes) -> io::Result<Vec<(Bytes, Value)>> {
+    let bad = || io::Error::new(io::ErrorKind::InvalidData, "malformed engine record");
+    if record.first() != Some(&2) {
+        return decode_op(record).map(|op| vec![op]);
+    }
+    if record.len() < 5 {
+        return Err(bad());
+    }
+    record.advance(1);
+    let count = record.get_u32_le() as usize;
+    let mut ops = Vec::with_capacity(count.min(1024));
+    for _ in 0..count {
+        if record.len() < 5 {
+            return Err(bad());
+        }
+        let tag = record.get_u8();
+        let len = record.get_u32_le() as usize;
+        if record.len() < len {
+            return Err(bad());
+        }
+        let key = record.split_to(len);
+        let value = match tag {
+            0 => {
+                if record.len() < 4 {
+                    return Err(bad());
+                }
+                let len = record.get_u32_le() as usize;
+                if record.len() < len {
+                    return Err(bad());
+                }
+                Value::Live(record.split_to(len))
+            }
+            1 => Value::Tombstone,
+            _ => return Err(bad()),
+        };
+        ops.push((key, value));
+    }
+    if !record.is_empty() {
+        return Err(bad());
+    }
+    Ok(ops)
+}
+
+/// Writes applied together and acknowledged together: one log record, one sequence
+/// number, all visible at once. A later write to a key in the same batch replaces
+/// an earlier one.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WriteBatch {
+    ops: Vec<(Bytes, Value)>,
+}
+
+impl WriteBatch {
+    /// An empty batch.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Adds a put.
+    pub fn put(&mut self, key: Bytes, value: Bytes) -> &mut Self {
+        self.ops.push((key, Value::Live(value)));
+        self
+    }
+
+    /// Adds a delete.
+    pub fn delete(&mut self, key: Bytes) -> &mut Self {
+        self.ops.push((key, Value::Tombstone));
+        self
+    }
+
+    /// The writes, in order.
+    #[must_use]
+    pub fn ops(&self) -> &[(Bytes, Value)] {
+        &self.ops
+    }
+
+    /// Writes in the batch.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.ops.len()
+    }
+
+    /// Whether the batch has no writes.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.ops.is_empty()
+    }
+}
+
+/// What [`Engine::checkpoint`] wrote.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CheckpointInfo {
+    /// The version the checkpoint is the state at.
+    pub version: Seq,
+    /// Tables in it.
+    pub tables: usize,
+}
+
 /// Decodes a record written by [`encode_op`].
 ///
 /// # Errors
@@ -253,8 +388,9 @@ pub(crate) struct Shared<E: Environment> {
     /// the level.
     pub(crate) compact_pointer: Mutex<Vec<Option<Bytes>>>,
     next_memtable: AtomicU64,
-    /// Writes appended and not yet applied, by sequence number.
-    pending: Mutex<BTreeMap<Seq, (Bytes, Value)>>,
+    /// Writes appended and not yet applied, by sequence number: each record's
+    /// writes in order.
+    pending: Mutex<BTreeMap<Seq, Vec<(Bytes, Value)>>>,
     /// The highest sequence number applied: what a read without a snapshot reads at,
     /// and what a new snapshot pins. Writes apply in order (D-021), so everything at
     /// or below it is visible.
@@ -269,11 +405,15 @@ pub(crate) struct Shared<E: Environment> {
 pub enum OpenRefused {
     /// `CURRENT` exists but cannot be read: torn, or a bit flipped.
     CurrentUnreadable,
+    /// `CURRENT` is missing while manifests or tables are on disk: a checkpoint
+    /// written only part way, or a store damaged past recognition. Every store has
+    /// a `CURRENT` from its first open on.
+    CurrentMissing,
     /// The manifest `CURRENT` names cannot be read.
     ManifestUnreadable(u64),
-    /// Fallback was allowed, but no older manifest has every table it lists on disk
-    /// and intact. `named` is the manifest `CURRENT` named, 0 if `CURRENT` itself
-    /// could not be read.
+    /// Fallback was allowed, but no older manifest lists a table and has every table
+    /// it lists on disk and intact. `named` is the manifest `CURRENT` named, 0 if
+    /// `CURRENT` itself could not be read.
     NoIntactManifest {
         /// See above.
         named: u64,
@@ -296,6 +436,12 @@ impl std::fmt::Display for OpenRefused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             OpenRefused::CurrentUnreadable => write!(f, "CURRENT cannot be read"),
+            OpenRefused::CurrentMissing => {
+                write!(
+                    f,
+                    "CURRENT is missing while manifests or tables are on disk"
+                )
+            }
             OpenRefused::ManifestUnreadable(n) => {
                 write!(f, "MANIFEST-{n:06}, which CURRENT names, cannot be read")
             }
@@ -309,6 +455,19 @@ impl std::fmt::Display for OpenRefused {
 
 impl std::error::Error for OpenRefused {}
 
+/// Why a fallback passed over a manifest (D-022).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Rejected {
+    /// The manifest file is missing, torn or corrupt.
+    Unreadable,
+    /// The manifest lists no table: the empty state, never fallen back onto.
+    NoTables,
+    /// A table it lists is not on disk.
+    TableMissing(u64),
+    /// A table it lists does not open or fails its checks.
+    TableDamaged(u64),
+}
+
 /// What [`Engine::open`] found.
 #[derive(Clone, Debug)]
 pub struct EngineRecovery {
@@ -318,6 +477,9 @@ pub struct EngineRecovery {
     /// one was used, or when `CURRENT` itself could not be read (then 0): everything
     /// flushed after the one used is lost.
     pub fallback_from: Option<u64>,
+    /// The manifests a fallback passed over on its way to the one used, newest
+    /// first, each with why.
+    pub rejected: Vec<(u64, Rejected)>,
     /// Every log record numbered this or below is in a table, if its table survived.
     pub flushed_seq: Seq,
     /// Tables in service.
@@ -386,8 +548,14 @@ impl<E: Environment> std::fmt::Debug for Engine<E> {
 }
 
 /// Points `CURRENT` at manifest `number`: written as `CURRENT.tmp`, synced, renamed
-/// over `CURRENT`, and the directory synced.
-async fn switch_current<E: Environment>(env: &E, dir: &Path, number: u64) -> io::Result<()> {
+/// over `CURRENT`, and the directory synced. Traced as the store's switch unless
+/// `quiet`, which a checkpoint's is.
+async fn switch_current_in<E: Environment>(
+    env: &E,
+    dir: &Path,
+    number: u64,
+    quiet: bool,
+) -> io::Result<()> {
     let fs = env.fs();
     let tmp = fs
         .open(
@@ -400,7 +568,42 @@ async fn switch_current<E: Environment>(env: &E, dir: &Path, number: u64) -> io:
     fs.rename(&current_tmp_path(dir), &current_path(dir))
         .await?;
     fs.sync_dir(dir).await?;
-    env.trace(TraceEvent::CurrentSwitched { manifest: number });
+    if !quiet {
+        env.trace(TraceEvent::CurrentSwitched { manifest: number });
+    }
+    Ok(())
+}
+
+/// The store's own switch of `CURRENT`.
+async fn switch_current<E: Environment>(env: &E, dir: &Path, number: u64) -> io::Result<()> {
+    switch_current_in(env, dir, number, false).await
+}
+
+/// Writes `bytes` as a new file at `path` and syncs it.
+async fn write_file<E: Environment>(env: &E, path: &Path, bytes: Bytes) -> io::Result<()> {
+    let file = env
+        .fs()
+        .open(path, OpenOptions::new().write(true).create_new(true))
+        .await?;
+    file.write_at(0, bytes).await?;
+    file.sync().await
+}
+
+/// Writes `manifest` into `dir` and syncs it, traced as the store's unless `quiet`.
+async fn write_manifest_in<E: Environment>(
+    env: &E,
+    dir: &Path,
+    manifest: &Manifest,
+    quiet: bool,
+) -> io::Result<()> {
+    write_file(env, &manifest_path(dir, manifest.number), manifest.encode()).await?;
+    if !quiet {
+        env.trace(TraceEvent::ManifestWritten {
+            number: manifest.number,
+            flushed_seq: manifest.flushed_seq,
+            tables: manifest.ssts.iter().map(|m| m.number).collect(),
+        });
+    }
     Ok(())
 }
 
@@ -514,7 +717,22 @@ impl<E: Environment> Engine<E> {
         let mut ssts = Vec::new();
         let mut dropped = Vec::new();
         let mut fallback_from = None;
-        if current_bytes.is_some() {
+        let mut rejected = Vec::new();
+        if current_bytes.is_none() {
+            // A fresh store gets its first manifest, the empty state, and CURRENT
+            // naming it, so that from here on a missing CURRENT is damage: a
+            // checkpoint written only part way, or a store past recognition.
+            if !manifests.is_empty() || !sst_files.is_empty() {
+                let refused = OpenRefused::CurrentMissing;
+                env.trace(TraceEvent::OpenRefused {
+                    reason: refused.to_string(),
+                });
+                return Err(refused.into_io());
+            }
+            manifest.number = 1;
+            write_manifest_in(&env, &dir, &manifest, false).await?;
+            switch_current(&env, &dir, 1).await?;
+        } else {
             let named = match current {
                 Some(number) => read_manifest(&env, &dir, number).await?,
                 None => None,
@@ -543,13 +761,31 @@ impl<E: Environment> Engine<E> {
                         .filter(|&&m| current.is_none_or(|named| m < named))
                     {
                         let Some(candidate) = read_manifest(&env, &dir, number).await? else {
+                            rejected.push((number, Rejected::Unreadable));
                             continue;
                         };
+                        // Every table on disk and intact, and at least one: a
+                        // manifest with no tables is the empty state, never fallen
+                        // back onto.
                         let (opened, missing) = open_tables(&env, &dir, &candidate, false).await?;
-                        if missing.is_empty() {
-                            chosen = Some((candidate, opened));
-                            break;
+                        if let Some(meta) = missing.first() {
+                            let on_disk = sst_files.contains(&meta.number);
+                            rejected.push((
+                                number,
+                                if on_disk {
+                                    Rejected::TableDamaged(meta.number)
+                                } else {
+                                    Rejected::TableMissing(meta.number)
+                                },
+                            ));
+                            continue;
                         }
+                        if opened.is_empty() {
+                            rejected.push((number, Rejected::NoTables));
+                            continue;
+                        }
+                        chosen = Some((candidate, opened));
+                        break;
                     }
                     let Some((chosen, opened)) = chosen else {
                         let refused = OpenRefused::NoIntactManifest { named };
@@ -650,8 +886,8 @@ impl<E: Environment> Engine<E> {
             if seq <= flushed_seq {
                 continue;
             }
-            let (key, value) = decode_op(record.clone())?;
-            shared.apply(seq, key, value);
+            let ops = decode_record(record.clone())?;
+            shared.apply(seq, ops);
             replayed += 1;
         }
         env.spawn("flusher", flusher(shared.clone()));
@@ -661,6 +897,7 @@ impl<E: Environment> Engine<E> {
             EngineRecovery {
                 manifest: manifest_number,
                 fallback_from,
+                rejected,
                 flushed_seq,
                 ssts,
                 tables: listed,
@@ -675,23 +912,34 @@ impl<E: Environment> Engine<E> {
     /// Writes `value` under `key`. The returned future resolves once the write is
     /// durable and visible, with its log sequence number.
     pub fn put(&self, key: Bytes, value: Bytes) -> Write<E> {
-        self.write(key, Value::Live(value))
+        let mut batch = WriteBatch::new();
+        batch.put(key, value);
+        self.write(batch, true)
     }
 
     /// Deletes `key`, leaving a tombstone. Resolves like [`put`](Self::put).
     pub fn delete(&self, key: Bytes) -> Write<E> {
-        self.write(key, Value::Tombstone)
+        let mut batch = WriteBatch::new();
+        batch.delete(key);
+        self.write(batch, true)
     }
 
-    fn write(&self, key: Bytes, value: Value) -> Write<E> {
-        let append = self.shared.wal.append(encode_op(&key, &value));
+    /// Writes `batch` as one log record: its writes become visible together, under
+    /// one sequence number, and a crash keeps all or none of them. With `sync`, the
+    /// future resolves once the record is durable; without it, once the record is
+    /// written, and the next synced write, rotation or close makes it durable, so a
+    /// crash before then loses it though it was acknowledged and read (D-024). An
+    /// empty batch still takes a number.
+    pub fn write(&self, batch: WriteBatch, sync: bool) -> Write<E> {
+        let ops = batch.ops;
+        let append = self.shared.wal.append_with(encode_batch(&ops), sync);
         match self.shared.config.variant {
             Variant::NoWalBeforeMemtable => {
                 // The bug: visible and acknowledged before the log has it.
-                self.shared.apply(append.seq(), key, value);
+                self.shared.apply(append.seq(), ops);
             }
             _ => {
-                lock(&self.shared.pending).insert(append.seq(), (key, value));
+                lock(&self.shared.pending).insert(append.seq(), ops);
             }
         }
         Write {
@@ -795,6 +1043,96 @@ impl<E: Environment> Engine<E> {
         self.shared.compact().await
     }
 
+    /// Writes the state as of the newest write applied into `dir`, which must not
+    /// exist or must be empty, as a store of its own: a copy of every table in
+    /// service, one table of what the memtables hold at that version, a manifest
+    /// listing them, and `CURRENT`, each synced, in that order. A crash leaves either
+    /// a complete checkpoint or one without `CURRENT`, which `open` refuses. A fresh
+    /// [`Engine::open`] on `dir` is the store at that version (SPEC §2.7, D-024).
+    /// Holds the turnstile, so no flush or compaction runs meanwhile.
+    ///
+    /// # Errors
+    ///
+    /// `AlreadyExists` if `dir` is not empty; else the filesystem's.
+    pub async fn checkpoint(&self, dir: &Path) -> io::Result<CheckpointInfo> {
+        let _turn = self.shared.turnstile.acquire().await;
+        let shared = &self.shared;
+        let fs = shared.env.fs();
+        fs.create_dir_all(dir).await?;
+        if !fs.read_dir(dir).await?.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "the checkpoint directory is not empty",
+            ));
+        }
+        let version = shared.visible.load(Ordering::Acquire);
+        let (tables, memtables) = {
+            let t = lock(&shared.tables);
+            let mut memtables: Vec<Arc<Memtable>> = t.immutable.iter().cloned().collect();
+            memtables.push(t.active.clone());
+            (t.ssts.clone(), memtables)
+        };
+        let mut listed = Vec::new();
+        let mut next_sst = 1;
+        for (meta, reader) in &tables {
+            write_file(
+                &shared.env,
+                &sst_path(dir, meta.number),
+                reader.bytes().await?,
+            )
+            .await?;
+            next_sst = next_sst.max(meta.number + 1);
+            listed.push(meta.clone());
+        }
+        // What the memtables hold at the version, as one table at level 0.
+        let mut merge: MergeIter<FileOf<E>> =
+            MergeIter::new(memtables.into_iter().map(Source::memtable).collect());
+        let mut writer = SstWriter::new();
+        while let Some((key, value)) = merge.next().await? {
+            let (user, seq) = ikey::decode(&key)?;
+            if seq <= version {
+                writer.add(&user, seq, &value);
+            }
+        }
+        if writer.entries() > 0 {
+            let number = next_sst;
+            next_sst += 1;
+            let (first_key, last_key) = writer.key_range().expect("has writes");
+            let (first_seq, max_seq) = writer.seq_range().expect("has writes");
+            let entries = writer.entries();
+            let bytes = writer.finish();
+            let len = bytes.len() as u64;
+            write_file(&shared.env, &sst_path(dir, number), bytes).await?;
+            listed.push(SstMeta {
+                number,
+                level: 0,
+                first_seq,
+                max_seq,
+                entries,
+                bytes: len,
+                first_key,
+                last_key,
+            });
+        }
+        let manifest = Manifest {
+            number: 1,
+            next_sst,
+            flushed_seq: version,
+            ssts: listed,
+        };
+        write_manifest_in(&shared.env, dir, &manifest, true).await?;
+        switch_current_in(&shared.env, dir, 1, true).await?;
+        shared.env.trace(TraceEvent::CheckpointWritten {
+            dir: dir.to_path_buf(),
+            version,
+            tables: manifest.ssts.len() as u64,
+        });
+        Ok(CheckpointInfo {
+            version,
+            tables: manifest.ssts.len(),
+        })
+    }
+
     /// The manifest in force.
     #[must_use]
     pub fn manifest(&self) -> Manifest {
@@ -871,17 +1209,20 @@ impl<E: Environment> Shared<E> {
                     _ => None,
                 }
             };
-            let Some((s, (key, value))) = next else {
+            let Some((s, ops)) = next else {
                 return;
             };
-            self.apply(s, key, value);
+            self.apply(s, ops);
         }
     }
 
-    /// Applies a durable write and rotates the active memtable if it is now full.
-    fn apply(&self, seq: Seq, key: Bytes, value: Value) {
+    /// Applies an acknowledged record's writes and rotates the active memtable if it
+    /// is now full.
+    fn apply(&self, seq: Seq, ops: Vec<(Bytes, Value)>) {
         let active = lock(&self.tables).active.clone();
-        active.apply(seq, key, value);
+        for (key, value) in ops {
+            active.apply(seq, key, value);
+        }
         self.visible.fetch_max(seq, Ordering::AcqRel);
         if active.bytes() <= self.config.memtable_bytes {
             return;
@@ -998,22 +1339,7 @@ impl<E: Environment> Shared<E> {
 
     /// Writes `next` and syncs it. Nothing names it until [`switch_to`](Self::switch_to).
     pub(crate) async fn write_manifest_file(&self, next: &Manifest) -> io::Result<()> {
-        let fs = self.env.fs();
-        let dir = &self.config.dir;
-        let file = fs
-            .open(
-                &manifest_path(dir, next.number),
-                OpenOptions::new().write(true).create_new(true),
-            )
-            .await?;
-        file.write_at(0, next.encode()).await?;
-        file.sync().await?;
-        self.env.trace(TraceEvent::ManifestWritten {
-            number: next.number,
-            flushed_seq: next.flushed_seq,
-            tables: next.ssts.iter().map(|m| m.number).collect(),
-        });
-        Ok(())
+        write_manifest_in(&self.env, &self.config.dir, next, false).await
     }
 
     /// Switches `CURRENT` to `next`, which is on disk and synced.

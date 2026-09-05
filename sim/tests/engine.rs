@@ -202,6 +202,10 @@ struct Coverage {
     head_gaps: u32,
     flusher_failures: u32,
     refusals: u32,
+    batches: u64,
+    unsynced_writes: u64,
+    checkpoints_verified: u64,
+    checkpoints_damaged: u64,
     compactions: u32,
     compactions_below_level_0: u32,
     tables_deleted: u32,
@@ -259,6 +263,10 @@ impl Coverage {
         self.flusher_failures +=
             report.count(|e| matches!(e, TraceEvent::FlusherFailed { .. })) as u32;
         self.refusals += u32::from(report.refused.is_some());
+        self.batches += report.batches;
+        self.unsynced_writes += report.unsynced;
+        self.checkpoints_verified += report.checkpoints_verified;
+        self.checkpoints_damaged += report.checkpoints_damaged;
         self.compactions +=
             report.count(|e| matches!(e, TraceEvent::CompactionWritten { .. })) as u32;
         self.compactions_below_level_0 += report
@@ -327,7 +335,15 @@ impl Coverage {
             ),
             ("manifest fallbacks", self.manifest_fallbacks),
             ("missing log heads, discarded", self.head_gaps),
-            ("stores refused for a fault, ending the run", self.refusals),
+            ("batches", u32::try_from(self.batches).unwrap_or(u32::MAX)),
+            (
+                "writes without a sync",
+                u32::try_from(self.unsynced_writes).unwrap_or(u32::MAX),
+            ),
+            (
+                "checkpoints opened fresh after a crash",
+                u32::try_from(self.checkpoints_verified).unwrap_or(u32::MAX),
+            ),
             ("compactions", self.compactions),
             ("compactions below level 0", self.compactions_below_level_0),
             ("input tables deleted", self.tables_deleted),
@@ -349,6 +365,10 @@ impl Coverage {
             assert!(
                 self.crashes_mid_compaction > 0,
                 "the sweep never saw a crash inside a compaction: {self:?}"
+            );
+            assert!(
+                self.refusals > 0,
+                "the sweep never saw a store refused for a fault: {self:?}"
             );
         }
         // The simulator raises no I/O error of its own, so a flusher that stopped hit

@@ -712,4 +712,50 @@ repair D-022 left in BACKLOG, done by the same rule that writes every manifest.
 
 ---
 
-_Next entry: D-024. Add one before implementing anything not covered above._
+## D-024 — Write batches, writes without a sync, checkpoints, and the first manifest
+
+**Context.** SPEC §2.7 gives `write(batch, sync)` and `checkpoint(dir)`, and §2.8 a
+write rate no log that syncs every write can reach. The engine wrote one record per
+put or delete, synced before acknowledging, and had no way to hand a state to Raft.
+
+**Decision.** A `WriteBatch` is one log record under one sequence number: `2 |
+count | writes`, a batch of one encoded as that write. Its writes apply together and
+become visible together, a later write to a key in it replacing an earlier one, and
+a crash keeps all or none. `write(batch, sync)`: with `sync`, the future resolves
+once the record is durable, as every write did; without it, once the record is
+written, and the next group that asks for a sync, the next rotation or the close
+makes it durable. A write without a sync is visible at once and a crash before its
+sync loses it, acknowledged and read or not: that is what the caller asked for, and
+the sweep's oracle owes it nothing until a later sync covers it, exempting it from
+the acknowledged-without-sync property. The model records what a batch leaves in the
+memtable, its last write per key, and a record is compacted away only when every
+write of it is.
+
+`checkpoint(dir)` writes the state as of the newest write applied into an empty
+directory as a store of its own: a copy of every table in service, one table of what
+the memtables hold at that version, a manifest listing them and `CURRENT`, each
+synced in that order, under the turnstile so no flush or compaction runs meanwhile.
+A crash leaves either a complete checkpoint or one without `CURRENT`. So that the
+latter is recognisable, every store now writes an empty first manifest and `CURRENT`
+at its first open: from then on a missing `CURRENT` with manifests or tables on disk
+is refused, and a fallback never lands on a manifest that lists no table. The sweep
+takes checkpoints while it runs, records the model's state at each version, and
+after the crash opens each checkpoint fresh, requiring no table dropped, nothing
+replayed and every key and a scan equal to that state, unless a fault touched a file
+under it.
+
+**Alternatives.** A number per write inside a batch: the log numbers records, and
+the memtable's replace-on-insert gives the same last-write-wins. A checkpoint by
+hard links, as RocksDB makes them: the simulator's filesystem has no links, and a
+copy is what the fault model can tear. A temporary directory renamed into place:
+directory renames are not modelled either; `CURRENT` last is the same atomicity.
+Treating `sync: false` as a hint and syncing anyway: honest but pointless, since the
+flag exists for the rate it buys.
+
+**Consequences.** The bench (SPEC §2.8) measures single writes with and without a
+sync and batches without one. A reader can see a write that a crash then takes
+back, only ever one that asked for no sync. Every store directory has a `CURRENT`.
+
+---
+
+_Next entry: D-025. Add one before implementing anything not covered above._

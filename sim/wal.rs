@@ -69,6 +69,10 @@ pub struct Model {
     pub appended: Vec<Bytes>,
     /// Whether the append at each position resolved with `Ok`.
     pub acked: Vec<bool>,
+    /// Whether the append at each position asked for a sync before it was
+    /// acknowledged; empty means every one did. One that did not is owed nothing
+    /// until a later sync covers it (D-024).
+    pub sync_requested: Vec<bool>,
     /// Records below the log's first after the last recovery: gone with their
     /// segments, already judged, and not owed again.
     pub lost: BTreeSet<Seq>,
@@ -271,6 +275,7 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
                 .min(m.appended.len());
             m.appended.truncate(base);
             m.acked.truncate(base);
+            m.sync_requested.truncate(base);
             m.acked.iter_mut().for_each(|a| *a = false);
             // Only records the model holds can be owed; a log numbering past them
             // (a checksum skipped over a rotted number) was judged above.
@@ -369,6 +374,7 @@ fn spawn_appenders(
                     }
                     m.appended.push(payload);
                     m.acked.push(false);
+                    m.sync_requested.push(true);
                 }
                 match append.await {
                     Ok(seq) => {
@@ -557,9 +563,10 @@ pub fn check_epoch(
     let syncs = syncs(events, dir);
     // Property C: nothing was acknowledged before a sync was asked for. Independent
     // of what recovery returned, so a lost fsync earlier in the log cannot hide it.
+    let sync_requested = |i: usize| model.sync_requested.get(i).copied().unwrap_or(true);
     for (i, &acked) in model.acked.iter().enumerate() {
         let seq = i as u64 + 1;
-        if seq as usize <= base || !acked {
+        if seq as usize <= base || !acked || !sync_requested(i) {
             continue;
         }
         if !syncs
@@ -700,7 +707,9 @@ pub fn check_epoch(
         let honoured = attempts.iter().any(|&lost| !lost);
         let attempted = !attempts.is_empty();
         let acked = model.acked.get(seq as usize - 1).copied().unwrap_or(false);
-        let owed = seq as usize <= base || honoured || (acked && !attempted);
+        let owed = seq as usize <= base
+            || honoured
+            || (acked && !attempted && sync_requested(seq as usize - 1));
         if !owed {
             if attempted {
                 excuse = Some(Excuse::LostFsync);

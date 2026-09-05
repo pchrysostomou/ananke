@@ -253,8 +253,9 @@ fn a_flush_lands_in_a_table_under_a_manifest_and_frees_the_log() {
             (db.manifest(), db.wal_segments(), names)
         })
     });
-    assert!(manifest.number >= 3, "several flushes: {manifest:?}");
-    assert_eq!(manifest.ssts.len() as u64, manifest.number);
+    assert!(manifest.number >= 4, "several flushes: {manifest:?}");
+    // Manifest 1 is the empty state written at the first open; each flush wrote one.
+    assert_eq!(manifest.ssts.len() as u64, manifest.number - 1);
     assert!(manifest.flushed_seq > 40);
     assert!(
         segments.len() < 4,
@@ -267,7 +268,7 @@ fn a_flush_lands_in_a_table_under_a_manifest_and_frees_the_log() {
         listed.iter().any(|n| n.starts_with("MANIFEST-")),
         "{listed:?}"
     );
-    assert!(listed.iter().filter(|n| n.ends_with(".sst")).count() as u64 == manifest.number);
+    assert!(listed.iter().filter(|n| n.ends_with(".sst")).count() as u64 == manifest.number - 1);
 
     let recovery = on_node(&mut sim, node, |env| {
         Box::pin(async move {
@@ -795,8 +796,10 @@ fn orphans_are_removed_at_open() {
     let node = sim.add_node();
     let recovery = on_node(&mut sim, node, |env| {
         Box::pin(async move {
+            // A store exists: its first open wrote the empty manifest and CURRENT.
+            let (db, _) = Engine::open(env.clone(), config(1 << 20)).await.unwrap();
+            drop(db);
             let fs = env.fs();
-            fs.create_dir_all(Path::new("/db")).await.unwrap();
             for name in ["000007.sst", "MANIFEST-000009", "CURRENT.tmp"] {
                 let file = fs
                     .open(
@@ -819,8 +822,192 @@ fn orphans_are_removed_at_open() {
     let (recovery, names) = recovery;
     assert_eq!(
         (recovery.manifest, recovery.orphans, recovery.ssts),
-        (0, 3, 0)
+        (1, 3, 0)
     );
     let listed: Vec<String> = names.iter().map(|n| n.display().to_string()).collect();
-    assert_eq!(listed, vec!["000001.wal"]);
+    assert_eq!(
+        listed,
+        vec!["000001.wal", "000002.wal", "CURRENT", "MANIFEST-000001"]
+    );
+}
+
+/// A batch is one log record: its writes become visible together under one number,
+/// a later write to a key in it replaces an earlier one, and a reopen replays it
+/// whole. Files without a CURRENT are a store past recognition, refused.
+#[test]
+fn a_batch_is_applied_and_replayed_as_one() {
+    let mut sim = Sim::new(SimConfig::new(17));
+    let node = sim.add_node();
+    on_node(&mut sim, node, |env| {
+        Box::pin(async move {
+            let (db, _) = Engine::open(env.clone(), config(1 << 20)).await.unwrap();
+            db.put(b("a"), b("old")).await.unwrap();
+            let before = db.snapshot();
+            let mut batch = ananke_storage::WriteBatch::new();
+            batch
+                .put(b("a"), b("first"))
+                .put(b("b"), b("2"))
+                .delete(b("c"))
+                .put(b("a"), b("last"));
+            assert_eq!(batch.len(), 4);
+            let seq = db.write(batch, true).await.unwrap();
+            assert_eq!(seq, 2);
+            assert_eq!(db.snapshot().version(), 2);
+            assert_eq!(db.get(b"a").await.unwrap(), Some(b("last")));
+            assert_eq!(db.get(b"b").await.unwrap(), Some(b("2")));
+            assert_eq!(db.get_at(b"a", &before).await.unwrap(), Some(b("old")));
+            assert_eq!(db.get_at(b"b", &before).await.unwrap(), None);
+            // An empty batch takes a number and changes nothing.
+            assert_eq!(
+                db.write(ananke_storage::WriteBatch::new(), true)
+                    .await
+                    .unwrap(),
+                3
+            );
+        })
+    });
+    let recovery = on_node(&mut sim, node, |env| {
+        Box::pin(async move {
+            let (db, recovery) = Engine::open(env, config(1 << 20)).await.unwrap();
+            assert_eq!(db.get(b"a").await.unwrap(), Some(b("last")));
+            assert_eq!(db.get(b"b").await.unwrap(), Some(b("2")));
+            assert_eq!(db.get(b"c").await.unwrap(), None);
+            recovery
+        })
+    });
+    assert_eq!(recovery.replayed, 3);
+    // Round trips of the record encoding, batches of one included.
+    let ops = vec![
+        (b("k"), Value::Live(b("v"))),
+        (b(""), Value::Tombstone),
+        (b("k"), Value::Live(Bytes::from(vec![7u8; 5000]))),
+    ];
+    assert_eq!(
+        engine::decode_record(engine::encode_batch(&ops)).unwrap(),
+        ops
+    );
+    assert_eq!(
+        engine::decode_record(engine::encode_batch(&ops[..1])).unwrap(),
+        ops[..1]
+    );
+    assert_eq!(
+        engine::decode_record(engine::encode_batch(&[])).unwrap(),
+        vec![]
+    );
+    let mut torn = engine::encode_batch(&ops).to_vec();
+    torn.truncate(torn.len() - 1);
+    assert!(engine::decode_record(Bytes::from(torn)).is_err());
+}
+
+/// A write without sync is acknowledged once written and visible at once; the next
+/// synced write makes it durable, and so does closing the engine.
+#[test]
+fn an_unsynced_write_is_durable_once_a_later_sync_or_the_close_covers_it() {
+    let mut sim = Sim::new(SimConfig::new(18));
+    let node = sim.add_node();
+    on_node(&mut sim, node, |env| {
+        Box::pin(async move {
+            let (db, _) = Engine::open(env.clone(), config(1 << 20)).await.unwrap();
+            let mut batch = ananke_storage::WriteBatch::new();
+            batch.put(b("a"), b("1"));
+            let seq = db.write(batch, false).await.unwrap();
+            assert_eq!(seq, 1);
+            assert_eq!(db.get(b"a").await.unwrap(), Some(b("1")), "visible at once");
+            db.put(b("b"), b("2")).await.unwrap();
+            let mut batch = ananke_storage::WriteBatch::new();
+            batch.put(b("c"), b("3"));
+            db.write(batch, false).await.unwrap();
+            drop(db);
+            env.clock().sleep(Duration::from_millis(1)).await;
+        })
+    });
+    // No sync was forced for record 1; the put's sync covered it, and the close's
+    // covered record 3.
+    let synced: Vec<u64> = sim
+        .trace()
+        .iter()
+        .filter_map(|r| match r.event {
+            TraceEvent::WalSynced { up_to, .. } => Some(up_to),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(synced, vec![2, 3], "one sync for the put, one at the close");
+    on_node(&mut sim, node, |env| {
+        Box::pin(async move {
+            let (db, recovery) = Engine::open(env, config(1 << 20)).await.unwrap();
+            assert_eq!(recovery.replayed, 3);
+            assert_eq!(db.get(b"c").await.unwrap(), Some(b("3")));
+        })
+    });
+}
+
+/// A checkpoint is a store of its own at the version it was taken: a fresh open on
+/// its directory sees exactly what a snapshot at that version sees, whatever was
+/// written since, and one without its CURRENT is refused.
+#[test]
+fn a_checkpoint_opens_fresh_at_its_version() {
+    let mut sim = Sim::new(SimConfig::new(19));
+    let node = sim.add_node();
+    let (version, expected) = on_node(&mut sim, node, |env| {
+        Box::pin(async move {
+            let mut c = config(400);
+            c.background_compaction = true;
+            let (db, _) = Engine::open(env.clone(), c).await.unwrap();
+            fill(&db, 0..90, 20).await;
+            env.clock().sleep(Duration::from_millis(1)).await;
+            let info = db.checkpoint(Path::new("/ckpt/one")).await.unwrap();
+            assert_eq!(info.version, 90);
+            assert!(info.tables >= 2, "{info:?}");
+            let expected: Vec<Option<Bytes>> = (0..20).map(|k| expected(k, 90, 20)).collect();
+            // Writes after the checkpoint do not reach it.
+            fill(&db, 90..130, 20).await;
+            env.clock().sleep(Duration::from_millis(1)).await;
+            // The directory must be empty.
+            assert_eq!(
+                db.checkpoint(Path::new("/ckpt/one"))
+                    .await
+                    .err()
+                    .map(|e| e.kind()),
+                Some(std::io::ErrorKind::AlreadyExists)
+            );
+            (info.version, expected)
+        })
+    });
+    let recovery = on_node(&mut sim, node, |env| {
+        Box::pin(async move {
+            let mut c = config(400);
+            c.dir = "/ckpt/one".into();
+            let (db, recovery) = Engine::open(env.clone(), c).await.unwrap();
+            for (k, want) in expected.iter().enumerate() {
+                assert_eq!(
+                    db.get(format!("k{k:03}").as_bytes()).await.unwrap(),
+                    *want,
+                    "k{k:03} in the checkpoint"
+                );
+            }
+            assert_eq!(db.snapshot().version(), version);
+            // A write to the checkpoint continues its numbering.
+            assert_eq!(db.put(b("k000"), b("x")).await.unwrap(), version + 1);
+            drop(db);
+            // Without its CURRENT the checkpoint is refused, never opened empty.
+            let fs = env.fs();
+            fs.remove_file(Path::new("/ckpt/one/CURRENT"))
+                .await
+                .unwrap();
+            fs.sync_dir(Path::new("/ckpt/one")).await.unwrap();
+            let mut c = config(400);
+            c.dir = "/ckpt/one".into();
+            let err = Engine::open(env, c).await.err().unwrap();
+            assert_eq!(
+                ananke_storage::OpenRefused::from_io(&err),
+                Some(ananke_storage::OpenRefused::CurrentMissing)
+            );
+            recovery
+        })
+    });
+    assert_eq!((recovery.manifest, recovery.flushed_seq), (1, version));
+    assert_eq!(
+        (recovery.dropped.len(), recovery.orphans, recovery.replayed),
+        (0, 0, 0)
+    );
 }

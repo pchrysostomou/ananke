@@ -301,6 +301,16 @@ pub enum TraceEvent {
         /// The error's text.
         error: String,
     },
+    /// A checkpoint was written whole into a directory (SPEC §2.7, D-024): its
+    /// tables, manifest and `CURRENT`, all synced.
+    CheckpointWritten {
+        /// The directory.
+        dir: PathBuf,
+        /// The version it is the state at.
+        version: u64,
+        /// Tables in it.
+        tables: u64,
+    },
     /// An immutable memtable was flushed and released.
     MemtableFlushed {
         /// The memtable's number.

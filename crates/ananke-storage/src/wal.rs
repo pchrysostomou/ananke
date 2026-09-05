@@ -278,6 +278,8 @@ struct Queued {
     seq: Seq,
     payload: Bytes,
     slot: Arc<Slot>,
+    /// Whether the record asks for a sync before it is acknowledged.
+    sync: bool,
 }
 
 /// Where the writer leaves a record's outcome for its [`Append`] future.
@@ -607,6 +609,14 @@ impl<E: Environment> Wal<E> {
     /// durable, with its sequence number. The number is assigned now:
     /// [`Append::seq`] knows it before the record is written.
     pub fn append(&self, payload: Bytes) -> Append {
+        self.append_with(payload, true)
+    }
+
+    /// Like [`append`](Self::append), but with `sync` off the record is acknowledged
+    /// once written, without a sync forced for it: the next group that asks for one,
+    /// or the next rotation or close, makes it durable (D-024). A crash before then
+    /// loses it, acknowledged or not.
+    pub fn append_with(&self, payload: Bytes, sync: bool) -> Append {
         let slot = Arc::new(Slot::default());
         let (seq, waker) = {
             let mut st = lock(&self.shared.state);
@@ -616,6 +626,7 @@ impl<E: Environment> Wal<E> {
                 seq,
                 payload,
                 slot: slot.clone(),
+                sync,
             });
             (seq, st.writer.take())
         };
@@ -715,6 +726,10 @@ impl<E: Environment> Writer<E> {
         loop {
             let group = NextGroup(&self.shared.state).await;
             if group.is_empty() {
+                // Closed: what was acknowledged without a sync gets one now.
+                if self.unsynced {
+                    let _ = self.sync().await;
+                }
                 return;
             }
             if let Err(e) = self.commit(&group).await {
@@ -751,7 +766,13 @@ impl<E: Environment> Writer<E> {
                 }
             }
             _ => {
-                self.sync().await?;
+                // A group nobody asked a sync for is acknowledged as written; the
+                // next synced group, rotation or close covers it.
+                if group.iter().any(|q| q.sync) {
+                    self.sync().await?;
+                } else {
+                    self.unsynced = true;
+                }
                 for queued in group {
                     queued.slot.resolve(Ok(()));
                 }
