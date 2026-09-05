@@ -63,7 +63,7 @@ fn a_persist_comes_back_at_the_next_open_and_a_truncation_removes_the_tail() {
     on_node(&mut sim, node, |env| {
         Box::pin(async move {
             let (engine, recovery) = Engine::open(env, config()).await.unwrap();
-            let (mut store, log) = RaftStore::open(Arc::new(engine), &recovery).await.unwrap();
+            let (store, log) = RaftStore::open(Arc::new(engine), &recovery).await.unwrap();
             assert!(log.is_empty());
             assert_eq!((store.term(), store.vote(), store.applied()), (0, None, 0));
             store
@@ -132,7 +132,7 @@ fn an_entrys_writes_and_the_applied_index_are_durable_together() {
         let a = applied_by_task.clone();
         env.clone().spawn("applier", async move {
             let (engine, recovery) = Engine::open(env.clone(), config()).await.unwrap();
-            let (mut store, _) = RaftStore::open(Arc::new(engine), &recovery).await.unwrap();
+            let (store, _) = RaftStore::open(Arc::new(engine), &recovery).await.unwrap();
             let mut done = Vec::new();
             // Entries 3k+1 and 3k+2 put key k; entry 3k+3 swaps it.
             for index in 1..=30u64 {
@@ -149,9 +149,7 @@ fn an_entrys_writes_and_the_applied_index_are_durable_together() {
                         value: Bytes::from(format!("v{index}")),
                     }
                 };
-                let outcome = apply_command(&mut store, index, Some(&command))
-                    .await
-                    .unwrap();
+                let outcome = apply_command(&store, index, Some(&command)).await.unwrap();
                 done.push((index, outcome.clone()));
                 *a.lock().unwrap() = Some(done.clone());
                 env.clock().sleep(Duration::from_micros(50)).await;

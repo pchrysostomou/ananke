@@ -21,14 +21,24 @@ use bytes::Bytes;
 use crate::message::Message;
 use crate::types::{Configuration, Entry, Index, Payload, ServerId, Term};
 
-/// The known-buggy cores beside the correct one (RAFT.md §5). Each breaks one rule;
-/// the sweep must catch each and pass the correct one. The server-level variants,
-/// sending before persisting and applying before committing, live in the server.
+/// The known-buggy variants beside the correct one (RAFT.md §5). Each breaks one
+/// rule; the sweep must catch each and pass the correct one. The core enforces the
+/// rules of the protocol; the server (`node.rs`) enforces the two disciplines that
+/// are about I/O order, [`Variant::SendBeforePersist`] and
+/// [`Variant::ApplyBeforeCommit`], and the core ignores those.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Variant {
     /// Figure 2 with pre-vote, as RAFT.md §1 says.
     #[default]
     Correct,
+    /// The server sends a step's messages before the step's persist is durable
+    /// (Figure 2, thesis §3.8): a crash between the two lets a leader count an entry
+    /// on a follower that never had it.
+    SendBeforePersist,
+    /// The server applies entries as they are appended, not as they are committed
+    /// (Figure 2): a follower or a deposed leader applies an entry that is later
+    /// truncated, and a client is told its write happened.
+    ApplyBeforeCommit,
     /// Elections start without a pre-vote round (thesis §9.6): a rejoining server
     /// raises the term and deposes a working leader.
     NoPreVote,
@@ -164,6 +174,11 @@ struct Progress {
     matched: Index,
     /// The last index of each AppendEntries with entries not yet answered.
     inflight: VecDeque<Index>,
+    /// Set by a rejection: one message in flight, a probe, until a success. The
+    /// value is the probe's `prev_index`. A rejection of anything else is stale and
+    /// ignored; without this, every rejection of a pipeline's other messages would
+    /// restart the pipeline, and the leader would flood the follower (D-026).
+    probe: Option<Index>,
 }
 
 /// One server's protocol state.
@@ -504,6 +519,7 @@ impl Raft {
                         next: last + 1,
                         matched: 0,
                         inflight: VecDeque::new(),
+                        probe: None,
                     },
                 )
             })
@@ -585,8 +601,10 @@ impl Raft {
         };
         let mut next = progress.next;
         let mut inflight = progress.inflight.clone();
+        let probing = progress.probe.is_some();
+        let limit = if probing { 1 } else { max_inflight };
         let mut sends = Vec::new();
-        while inflight.len() < max_inflight && next <= last {
+        while inflight.len() < limit && next <= last {
             let end = last.min(next + max_batch as Index - 1);
             let entries: Vec<Entry> = self.log[next as usize - 1..end as usize].to_vec();
             sends.push(Message::AppendEntries {
@@ -609,6 +627,12 @@ impl Raft {
             });
         }
         if let Some(progress) = self.progress.get_mut(&to) {
+            if probing {
+                // The probe is the first message sent, at what `next` was.
+                if let Some(Message::AppendEntries { prev_index, .. }) = sends.first() {
+                    progress.probe = Some(*prev_index);
+                }
+            }
             progress.next = next;
             progress.inflight = inflight;
         }
@@ -655,12 +679,13 @@ impl Raft {
                                 },
                             );
                         }
-                        Message::AppendEntries { .. } => {
+                        Message::AppendEntries { prev_index, .. } => {
                             self.send(
                                 from,
                                 Message::AppendEntriesResponse {
                                     term: self.term,
                                     success: false,
+                                    prev_index,
                                     match_index: 0,
                                     hint: 0,
                                 },
@@ -698,10 +723,11 @@ impl Raft {
             } => self.on_append_entries(from, prev_index, prev_term, entries, commit),
             Message::AppendEntriesResponse {
                 success,
+                prev_index,
                 match_index,
                 hint,
                 ..
-            } => self.on_append_entries_response(from, success, match_index, hint),
+            } => self.on_append_entries_response(from, success, prev_index, match_index, hint),
         }
     }
 
@@ -834,6 +860,7 @@ impl Raft {
                 Message::AppendEntriesResponse {
                     term: self.term,
                     success: false,
+                    prev_index,
                     match_index: 0,
                     hint,
                 },
@@ -843,6 +870,7 @@ impl Raft {
         if self.config.variant == Variant::TruncateOnEveryAppend && !entries.is_empty() {
             self.truncate(prev_index + 1);
         }
+        let entries_len = entries.len() as Index;
         let mut to_append = Vec::new();
         for entry in entries {
             match self.term_at(entry.index) {
@@ -854,12 +882,9 @@ impl Raft {
                 None => to_append.push(entry),
             }
         }
-        let matched = if to_append.is_empty() {
-            prev_index.max(self.last_index().min(prev_index))
-        } else {
-            to_append.last().map_or(prev_index, |e| e.index)
-        };
-        let matched = matched.max(prev_index);
+        // Deviation D1: every entry the request carried is now in the log, matched
+        // or appended, so the match is the request's last index.
+        let matched = prev_index + entries_len;
         if !to_append.is_empty() {
             self.append_local(to_append);
         }
@@ -881,16 +906,23 @@ impl Raft {
             Message::AppendEntriesResponse {
                 term: self.term,
                 success: true,
+                prev_index,
                 match_index: matched,
                 hint: 0,
             },
         );
     }
 
+    /// A success moves the follower's match forward and resumes the pipeline; a
+    /// rejection moves `next` back to the hint and probes with one message at a
+    /// time. While probing, only a rejection of the outstanding probe counts: the
+    /// pipeline's other messages are rejected too, each carrying an older
+    /// `prev_index`, and acting on each would restart the probe as many times.
     fn on_append_entries_response(
         &mut self,
         from: ServerId,
         success: bool,
+        prev_index: Index,
         match_index: Index,
         hint: Index,
     ) {
@@ -911,9 +943,14 @@ impl Raft {
                 progress.inflight.pop_front();
             }
             progress.next = progress.next.max(progress.matched + 1);
+            progress.probe = None;
             self.maybe_commit();
         } else {
+            if progress.probe.is_some_and(|probe| probe != prev_index) {
+                return;
+            }
             progress.next = hint.max(1).max(progress.matched + 1);
+            progress.probe = Some(progress.next - 1);
             progress.inflight.clear();
         }
         self.replicate(from, false);

@@ -4,9 +4,12 @@
 //!
 //! A command is `tag: u8 | key_len: u32 | key | ...`: a put with `value_len: u32 |
 //! value`, a delete with nothing more, a compare-and-set with `has_expect: u8 |
-//! [expect_len: u32 | expect] | value_len: u32 | value`. Compare-and-set exists so
-//! that an entry applied twice, or a lost write, shows as a wrong boolean in the
-//! linearizability check and not only as a stale value later.
+//! [expect_len: u32 | expect] | value_len: u32 | value`, a get with nothing more.
+//! Compare-and-set exists so that an entry applied twice, or a lost write, shows as
+//! a wrong boolean in the linearizability check and not only as a stale value later.
+//! A get goes through the log until read-index reads arrive (RAFT.md §1, stage C):
+//! it is applied like any entry, reads the key at its place in the order, and is
+//! linearizable by construction.
 
 use std::io;
 
@@ -52,6 +55,24 @@ pub enum Command {
         /// The value to set.
         value: Bytes,
     },
+    /// Read `key` at this entry's place in the log.
+    Get {
+        /// The key.
+        key: Bytes,
+    },
+}
+
+impl Command {
+    /// The key the command touches.
+    #[must_use]
+    pub fn key(&self) -> &Bytes {
+        match self {
+            Command::Put { key, .. }
+            | Command::Delete { key }
+            | Command::Cas { key, .. }
+            | Command::Get { key } => key,
+        }
+    }
 }
 
 /// What applying a command produced.
@@ -61,6 +82,8 @@ pub enum Outcome {
     Done,
     /// Whether a compare-and-set took effect.
     Swapped(bool),
+    /// What a get found.
+    Value(Option<Bytes>),
 }
 
 fn bad(what: &str) -> io::Error {
@@ -110,6 +133,10 @@ impl Command {
                 }
                 put_bytes(&mut out, value);
             }
+            Command::Get { key } => {
+                out.put_u8(3);
+                put_bytes(&mut out, key);
+            }
         }
         out.freeze()
     }
@@ -147,6 +174,9 @@ impl Command {
                     value: get_bytes(&mut bytes)?,
                 }
             }
+            3 => Command::Get {
+                key: get_bytes(&mut bytes)?,
+            },
             _ => return Err(bad("command malformed")),
         };
         if !bytes.is_empty() {
@@ -165,7 +195,7 @@ impl Command {
 ///
 /// The engine's.
 pub async fn apply_command<E: Environment>(
-    store: &mut RaftStore<E>,
+    store: &RaftStore<E>,
     index: Index,
     command: Option<&Command>,
 ) -> io::Result<Outcome> {
@@ -189,6 +219,7 @@ pub async fn apply_command<E: Environment>(
                 Outcome::Swapped(false)
             }
         }
+        Some(Command::Get { key }) => Outcome::Value(store.engine().get(&user_key(key)).await?),
     };
     store.apply(index, batch).await?;
     Ok(outcome)
@@ -217,6 +248,9 @@ mod tests {
                 key: Bytes::from_static(b"k"),
                 expect: Some(Bytes::from_static(b"1")),
                 value: Bytes::from_static(b"2"),
+            },
+            Command::Get {
+                key: Bytes::from_static(b"k"),
             },
         ];
         for command in commands {

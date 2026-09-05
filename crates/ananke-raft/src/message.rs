@@ -65,15 +65,18 @@ pub enum Message {
         /// The leader's commit index.
         commit: Index,
     },
-    /// The answer to AppendEntries. `match_index` is `prev_index` plus the entries
-    /// stored, moirae's deviation D1; `hint` is where the leader should resume
-    /// after a rejection: the follower's last index plus one, or the first index of
-    /// the term that conflicted.
+    /// The answer to AppendEntries. `prev_index` is the request's, so the leader
+    /// can tell a rejection of its outstanding probe from a stale one; `match_index`
+    /// is `prev_index` plus the entries stored, moirae's deviation D1; `hint` is
+    /// where the leader should resume after a rejection: the follower's last index
+    /// plus one, or the first index of the term that conflicted.
     AppendEntriesResponse {
         /// The responder's current term.
         term: Term,
         /// Whether the entries were stored.
         success: bool,
+        /// The request's `prev_index`.
+        prev_index: Index,
         /// See above.
         match_index: Index,
         /// See above.
@@ -285,11 +288,13 @@ impl Frame {
             }
             Message::AppendEntriesResponse {
                 success,
+                prev_index,
                 match_index,
                 hint,
                 ..
             } => {
                 out.put_u8(u8::from(*success));
+                out.put_u64_le(*prev_index);
                 out.put_u64_le(*match_index);
                 out.put_u64_le(*hint);
             }
@@ -370,11 +375,13 @@ impl Frame {
                     1 => true,
                     _ => return Err(bad("frame malformed")),
                 };
+                let prev_index = u64_field(&mut bytes)?;
                 let match_index = u64_field(&mut bytes)?;
                 let hint = u64_field(&mut bytes)?;
                 Message::AppendEntriesResponse {
                     term,
                     success,
+                    prev_index,
                     match_index,
                     hint,
                 }
@@ -398,6 +405,9 @@ fn int(v: u64) -> Json {
 /// `raft.malformed` with its length. Pass it to `ananke_env::moirae::Export`.
 #[must_use]
 pub fn studio(payload: &[u8]) -> Json {
+    if let Some(json) = crate::client::studio(payload) {
+        return json;
+    }
     let Ok(frame) = Frame::decode(Bytes::copy_from_slice(payload)) else {
         return Json::obj(vec![
             ("type", Json::str("raft.malformed")),
@@ -442,11 +452,13 @@ pub fn studio(payload: &[u8]) -> Json {
         }
         Message::AppendEntriesResponse {
             success,
+            prev_index,
             match_index,
             hint,
             ..
         } => {
             fields.push(("success", Json::Bool(*success)));
+            fields.push(("prevIndex", int(*prev_index)));
             fields.push(("matchIndex", int(*match_index)));
             fields.push(("hint", int(*hint)));
         }
@@ -508,6 +520,7 @@ mod tests {
             Message::AppendEntriesResponse {
                 term: 3,
                 success: false,
+                prev_index: 9,
                 match_index: 7,
                 hint: 5,
             },

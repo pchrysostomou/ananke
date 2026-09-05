@@ -101,12 +101,18 @@ ananke/
 
 _Update this section at the end of every session._
 
-- Phase: 2 in progress (2026-09-05), stage A of RAFT.md's order done: the pure core,
-  the codec with the studio decoder, the state under tenant 0 with the applied index
-  in the batch and a refusal of any recovery that lost state, the four log invariants
-  as folds, the paper's Figures 7 and 8 and moirae's rules as tests with every buggy
-  core shown failing (D-025). Message duplication landed in the simulator (issue #1).
-  No server, no sweep yet.
+- Phase: 2 in progress (2026-09-05), stages A and B of RAFT.md's order done. A: the
+  pure core, the codec with the studio decoder, the state under tenant 0 with the
+  applied index in the batch and a refusal of any recovery that lost state, the four
+  log invariants as folds, the paper's Figures 7 and 8 and moirae's rules as tests
+  (D-025). B: the server as `raft`, `net` and `apply` tasks in `ananke-raft`'s
+  `node.rs`, a single-shard key-value store with gets through the log, the
+  linearizability checker in `sim/lin.rs`, and the sweep in `sim/raft.rs` under
+  drops, duplicates, reordering, skew and drift, partitions, one-way blocks and
+  crashes with the disk model, checking the log invariants, three rule folds,
+  linearizability, pre-vote's property and two liveness bounds on uniform seeds; the
+  correct server passes every seed and each of the six stage-B variants is caught
+  (D-026). No reads by read-index, no leases, no membership changes, no snapshots.
 - Phase 1 record: done, tagged v0.2.0 (2026-09-05). The WAL (D-018, D-019), the
   memtable and engine (D-020, D-021), SSTables with the manifest and log truncation
   (D-022), versions, snapshots, `scan` and leveled compaction (D-023), write batches,
@@ -135,12 +141,11 @@ _Update this section at the end of every session._
      (one laptop disk, 2026-09-05). Met in the shape the flag exists for.
 - Last tag: v0.2.0. `ananke`, `ananke-env` and `ananke-storage` 0.2.0 on crates.io.
   Devlog: `docs/devlog/01-phase-1.md`.
-- Next concrete task: stage B of RAFT.md's order: the four-task server on
-  `Environment`, election and replication only, a single-shard KV, the five
-  invariants folded from the trace, the porcupine-style checker in `sim/lin.rs`, and
-  the sweep under partitions, drops, duplicates, reorder, skew and crashes, catching
-  no pre-vote, send before persist, apply before commit, Figure 8, truncate on every
-  append and timer reset on any RPC. Stop for review after each stage.
+- Next concrete task: stage C of RAFT.md's order: read-index reads, then lease reads
+  with the conservative drift guard, `Variant::LeaseTrustsTheClock`, and the lease
+  safety invariant under the simulator's drift violation. Check quorum (RAFT.md §1)
+  lands with it, since the lease and the step-down use the same test. Stop for
+  review after each stage.
 - Fault-model tests follow the CLAUDE.md pattern: a known-buggy variant the sweep
   must catch beside the correct one it must pass (`Journal::sync_dir_on_rotate`,
   `wal::Variant`).

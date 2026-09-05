@@ -44,6 +44,7 @@ name = "ananke-sim"
 version = "0.2.0"
 dependencies = [
  "ananke-env",
+ "ananke-raft",
  "ananke-server",
  "ananke-storage",
  "bytes",

@@ -40,9 +40,13 @@ response carries `match_index = prev_log_index + entries.len()`, moirae's deviat
 and the leader's `match_index` is monotone: a stale or duplicated response can only
 propose a value already passed. On a rejection the leader resets `next_index` for that
 follower to the rejection's hint (the follower's last index plus one, or the first index
-of the conflicting term) and drops what was in flight past it. Conflicts truncate only
-from the first genuinely conflicting entry (rule 3), and only a follower truncates; a
-leader appends (rule 8).
+of the conflicting term) and drops what was in flight past it. From then on it probes
+with one message at a time until a success, and a rejection of anything but the
+outstanding probe is stale and ignored: the pipeline's other messages are rejected too,
+each with an older `prev_index` carried back in the response, and acting on each would
+restart the probe as many times, which is a flood the sweep found (D-026). Conflicts
+truncate only from the first genuinely conflicting entry (rule 3), and only a follower
+truncates; a leader appends (rule 8).
 
 **Commit (paper §5.4.2).** The commit index advances to the highest index replicated on
 a majority whose term is the leader's current term, and to nothing older on its own.
@@ -138,8 +142,13 @@ events, all carrying the node and the term:
 | `RaftSnapshot` | a snapshot is taken or installed | `last_index`, `last_term`, `taken` |
 | `RaftRead` | a read is served | `index`, `lease` |
 | `RaftLeaseRevoked` | the guard revoked a lease | `follower`, `offset_moved` |
-| `ClientInvoke` | a client operation starts | `client`, `op`, `key`, `arg` |
-| `ClientReturn` | it returns | `client`, `result` |
+| `RaftRecovered` | a server starts on what its store held | `term`, `applied`, `last_index` |
+| `RaftProposed` | a leader made a client's request an entry | `client`, `seq`, `index`, `term` |
+| `RaftRefused` | a server's store lost state and it will not start | `reason` |
+| `RaftServerFailed` | a server stopped on an I/O error | `reason` |
+| `RaftInboxDropped` | a full inbox dropped a message | `kind` |
+| `ClientInvoke` | a client operation starts | `client`, `seq`, `op` |
+| `ClientReturn` | it returns | `client`, `seq`, `result` |
 
 Each event carries the node's persistent term, so the studio's per-term filter (issue
 #3) needs nothing more. The checks, all in `sim/raft.rs` over the trace of a run, after
@@ -162,7 +171,12 @@ every crash and at the end:
    second value for an index is a violation. Per node, applied indices must be the
    consecutive integers from one, so an entry applied twice or skipped shows here as
    well, which is where the applied index being written in the same batch as the
-   entry's writes (§3) is proven.
+   entry's writes (§3) is proven. An apply durable at a crash but not yet traced
+   shows at the restart as `RaftRecovered` carrying an applied index past the last
+   traced apply; the entries between are what the server's log holds there, and
+   are checked like any other. For the same reason a restarting server re-states
+   its durable log, a truncation at its end and an append per entry, before
+   `RaftRecovered`, so the trace's picture of every log is the disk's.
 5. **Linearizability of the KV API.** The history is the `ClientInvoke` and
    `ClientReturn` pairs with their virtual times, checked by the checker in §4. An
    operation that never returned, because its client's node crashed or the run ended,
@@ -175,6 +189,19 @@ every crash and at the end:
    run passes only if no lease read was served stale. The invariant is a fold over
    `RaftRead`, `RaftLeaseRevoked` and the simulator's clock configuration, and the
    checker in §4 is what decides staleness; the guard's sufficiency is never assumed.
+
+Three more folds check the rules behind the properties directly, so a broken rule is
+seen the first time it is exercised and not only when its consequence happens to
+land: *commit by majority*, every entry a leader commits was durable, as `RaftAppend`
+after the persist says, on a majority when it did; *commit by current term* (§5.4.2),
+a leader's commit index only ever lands on an entry of its own term; *committed
+entries stay*, no server truncates at or below its own commit index. Two checks are
+about time and run only on seeds the simulator scheduled uniformly, where no task can
+be starved (D-016): after the last fault heals, a client write completes within ten
+maximum election timeouts; and a follower that heard from no leader of its term and
+granted no vote for three maximum election timeouts has started an election (moirae
+rule 5). One check is pre-vote's own property (thesis §9.6): a server the schedule
+isolated has, at the heal, the term it had when the isolation began.
 
 The pair rule holds for each: a buggy variant in §5 fails each check, and the correct
 variant passes every seed. Every check is a function of the trace alone, so a failing
@@ -215,28 +242,36 @@ reserved tenant, tenant 0 in the §2.6 key encoding, table ids by purpose:
 
 | Key | Value |
 |---|---|
-| `0 / 0 / meta` | current term, vote, the applied index |
+| `0 / 0 / hard` | current term, vote |
+| `0 / 0 / applied` | the applied index |
 | `0 / 1 / <index: u64 BE>` | the entry: term, payload |
 | `0 / 2 / config` | the latest configuration entry's index and content |
 | `0 / 3 / snapshot` | last snapshot's index, term, and its checkpoint directory |
 
 Appending entries is a `WriteBatch` with `sync: true` of the entries and, when the
-term or vote changed with them, `meta`; the batch's future resolving is the persist the
-core waits for before sending. Truncation is deletes of the conflicting indices in the
+term or vote changed with them, `hard`; the batch's future resolving is the persist the
+core waits for before sending. The hard state and the applied index are separate keys
+because separate tasks write them, the `raft` task and the `apply` task, and neither
+waits for the other. Truncation is deletes of the conflicting indices in the
 same batch as the entries that replace them. Reading entries back for a follower behind
 the leader is a `scan` over the index range, which is what the engine's scan exists for.
 Applying entry `i` is one `WriteBatch` with the command's writes under the user's
-tenant and the applied index in `meta`: the two are durable together, so a crash
+tenant and the applied index in `applied`: the two are durable together, so a crash
 between them cannot exist, and an entry is applied exactly once whatever the crash
-schedule. The Raft log is compacted by deleting indices at or below a snapshot's;
+schedule. Until read-index reads arrive (stage C), a get is a command like any other:
+it goes through the log and reads its key at its place in the order. The Raft log is compacted by deleting indices at or below a snapshot's;
 the engine's compaction reclaims the space in its own time.
 
 The engine is opened with `allow_manifest_fallback` and `allow_head_gap` off, and the
 store refuses a recovery that dropped an unreadable table, fell back to an older
-manifest, or discarded a log head: each is a hole in the middle of the state, and an
-applied index over a hole names a state that never existed (D-022). A server whose
-disk lost state does not start; it is re-seeded by a snapshot from the leader (§5,
-stage E).
+manifest, discarded a log head, stopped reading the log at a bad checksum or a gap,
+or skipped a corrupt record in a segment the tables cover and with it the rest of
+that segment: each is a hole in the middle of the state, and an applied index over a
+hole names a state that never existed (D-022). Raft's safety argument assumes
+persistent state is persistent, so a node that lost it cannot vote or serve: a
+refused server traces `RaftRefused` and participates in nothing, no votes and no
+responses, until stage E re-seeds it with a snapshot from the leader. It never binds
+its socket, so a peer's messages to it reach no one.
 
 **The message codec.** `Message` is `PreVote`, `PreVoteResponse`, `RequestVote`,
 `RequestVoteResponse`, `AppendEntries`, `AppendEntriesResponse`, `InstallSnapshot`,
@@ -250,7 +285,8 @@ n}` and its kin, so the studio labels lanes by message kind and filters by term 
 index, which is issue #3's field set.
 
 **The node's tasks.** One server is four tasks under `Environment::spawn`, and this is
-where PCT gets something to bite, since every interleaving between them is a real one:
+where PCT gets something to bite, since every interleaving between them is a real one.
+Stage B runs the first three; the `snapshot` task arrives with snapshots (stage E):
 
 - `raft`: owns the core and the timers; one loop over a `race` of the inbox, the tick,
   proposals and completions; executes every output in order, awaiting each `Persist`
@@ -271,6 +307,17 @@ awaiting a persist is a queued message, not a lost one, and so that the interlea
 chooses. The workload's clients are tasks too, on their own nodes, talking to the
 cluster over the simulated network.
 
+Client requests share the servers' socket and inbox, told apart by their first byte.
+A server that is not the leader answers `NotLeader` with the leader it knows; the
+leader answers once the entry applies, with the same term it was proposed in, and
+never otherwise, since an entry replaced by a later leader's may still commit
+elsewhere. The network delivers at least once, so a leader keeps the index and term
+of every request it proposed while the entry is in its log and does not propose a
+copy again; the sweep's first seed found a duplicated compare-and-set applied twice
+(D-026). A client that hears nothing does not resend a write; it abandons the
+operation as pending and continues as a new process (§4). Exactly-once retries
+across leaders need client sessions (thesis §6.3), issue #21.
+
 **What the simulator gains.** Message duplication (issue #1, landed with this
 proposal), so that rule 3 and D1 are testable. A per-scenario clock configuration that
 sets drift beyond `drift_bound` for the lease runs. Nothing else: partitions, delay,
@@ -285,7 +332,15 @@ Horn and Kroening's memoisation, which is what porcupine does.
 pending operation has no return and may be linearized or discarded. Operations are
 `Put(k, v)`, `Get(k) → Option<v>`, `Delete(k)`, `Cas(k, expect, v) → bool` and
 `Scan(range) → Vec<(k, v)>`; `Cas` exists so that a double apply or a lost write is
-visible as a wrong boolean, not only as a stale value later.
+visible as a wrong boolean, not only as a stale value later. The trace closes most
+pending operations: `RaftProposed` says which entry a request became, and an
+abandoned operation whose entry applied took effect then, so it returns at the apply
+with a result the client never saw and the model may give it any; one no leader
+proposed cannot have taken effect and leaves the history; one proposed and never
+applied stays pending. A pending operation is a candidate at every step of the
+search, so closing them is what keeps the search small. The search has a budget of
+states per key; exhausting it is reported apart from a violation, and the correct
+server must never reach it.
 
 **Partitioning.** Single-key operations partition by key, since the KV model is a
 product of independent registers: a history is linearizable iff each key's
@@ -319,14 +374,14 @@ variant to delete.
 
 | Variant | The rule it breaks | What catches it | Needs |
 |---|---|---|---|
-| `NoPreVote` | thesis §9.6: a rejoining node's election disrupts the leader | the leader-within-bound liveness check after a partition heals: terms must not rise more than once per heal | partitions |
+| `NoPreVote` | thesis §9.6: a rejoining node's election disrupts the leader | pre-vote's property at every heal: the isolated server's term is what it was when the isolation began | partitions |
 | `VoteBeforePersist` | Figure 2: persist term and vote before responding | election safety: a crash between the vote and its persist lets the node vote twice in one term | crashes during elections |
-| `SendBeforePersist` | the same discipline for `AppendEntries`: append the entry, then respond | leader completeness: an entry counted on a majority was never durable on one of them | crashes between polls |
-| `ApplyBeforeCommit` | Figure 2: apply only up to the commit index | state machine safety and linearizability: a truncated entry was applied | partitions |
-| `CountOlderTermForCommit` | §5.4.2, Figure 8 | leader completeness: a committed entry is missing from a later leader | the Figure 8 partition sequence, which the sweep reaches on its own |
-| `TruncateOnEveryAppend` | moirae rule 3 | leader completeness: a duplicated older `AppendEntries` deletes committed entries | duplication (issue #1) |
+| `SendBeforePersist` | the same discipline for `AppendEntries`: append the entry, then respond | commit by majority: an entry a leader committed was not durable on a majority when it did, since `RaftAppend` is traced after the persist; with a crash between the send and the persist, leader completeness | nothing beyond the discipline; crashes between polls for the consequence |
+| `ApplyBeforeCommit` | Figure 2: apply only up to the commit index | state machine safety: an index applied under two terms on two servers after a truncation; linearizability: a write acknowledged and lost | the leader isolated with a client |
+| `CountOlderTermForCommit` | §5.4.2, Figure 8 | commit by current term: a leader's commit landed on an older term's entry; leader completeness on the seeds where that entry is then overwritten | a follower behind by more than a batch when a leader takes over, so the older entries and the leader's own arrive in separate messages: the sweep runs small batches |
+| `TruncateOnEveryAppend` | moirae rule 3 | committed entries stay: a server truncated at or below its own commit index | duplication and reordering (issue #1) |
 | `IndexFirstElectionRestriction` | §5.4.1: compare last terms first | leader completeness | crashes and partitions |
-| `ResetTimerOnAnyRpc` | moirae rule 5 | liveness: no leader within the bound after a leader crash | crashes |
+| `ResetTimerOnAnyRpc` | moirae rule 5 | timers fire: a follower that heard from no leader of its term and granted no vote for three maximum election timeouts did not campaign | a deposed leader whose heartbeats still arrive one-way while the new leader is down: the stale-leader schedule |
 | `LeaseTrustsTheClock` | §1 above: no drift guard | invariant 6, lease safety under drift: the checker reports a stale lease read with no revoke before it | the drift violation |
 | `ApplyNotAtomicWithIndex` | §3: the applied index written in a separate batch | state machine safety per node: an entry applied twice after a crash; and `Cas` in the linearizability check | crashes during apply |
 | `SnapshotWithoutCurrentLast` | §1: a snapshot installed from a staging directory without `CURRENT` written last | state machine safety after a crash mid-install: the node comes back on a state that never existed | crashes during install |

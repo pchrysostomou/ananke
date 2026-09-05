@@ -627,6 +627,7 @@ fn a_higher_term_steps_a_leader_down_and_a_stale_response_is_ignored() {
             message: Message::AppendEntriesResponse {
                 term: term - 1,
                 success: true,
+                prev_index: 0,
                 match_index: 99,
                 hint: 0,
             },
@@ -679,6 +680,7 @@ fn a_replayed_success_response_does_not_move_match_index_back() {
             message: Message::AppendEntriesResponse {
                 term,
                 success: true,
+                prev_index: 0,
                 match_index: 1,
                 hint: 0,
             },

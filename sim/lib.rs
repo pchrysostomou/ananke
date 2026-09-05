@@ -17,6 +17,8 @@ use bytes::Bytes;
 
 pub mod echo;
 pub mod engine;
+pub mod lin;
+pub mod raft;
 pub mod wal;
 
 /// The default number of seeds a sweep runs.

@@ -6,9 +6,11 @@
 //! must keep: a persist before the messages that depend on it. [`store::RaftStore`]
 //! keeps the hard state and the log under a reserved tenant of the engine and applies
 //! an entry's writes with the applied index in one batch. [`message`] is the wire
-//! form and the studio's view of it. [`invariants`] are the four log properties of
-//! Figure 3 as folds over trace events. The server that runs a core under the
-//! `Environment`, the sweep and the linearizability checker are the next stage.
+//! form and the studio's view of it, and [`client`] the requests and responses that
+//! share the servers' socket. [`invariants`] are the four log properties of Figure 3
+//! and three folds of the rules behind them, over trace events. [`node`] runs a core
+//! under the `Environment` as the `raft`, `net` and `apply` tasks, joined by
+//! [`queue`]s; the sweep and the linearizability checker live in `sim/`.
 //!
 //! # Fault-model tests
 //!
@@ -17,14 +19,18 @@
 //! correct one holding, and the sweep must catch each under faults (CLAUDE.md).
 
 pub mod apply;
+pub mod client;
 pub mod core;
 pub mod invariants;
 pub mod message;
+pub mod node;
+pub mod queue;
 pub mod store;
 pub mod types;
 
 pub use apply::{Command, Outcome};
 pub use core::{Input, Output, Persist, Raft, RaftConfig, Role, Variant};
 pub use message::{Frame, Message};
+pub use node::{NodeConfig, run};
 pub use store::{LostState, RaftStore};
 pub use types::{Configuration, Entry, Index, Payload, ServerId, Term};

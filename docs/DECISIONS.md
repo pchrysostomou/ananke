@@ -818,4 +818,136 @@ simulated disk does that, and the exact state on the rest.
 
 ---
 
-_Next entry: D-026. Add one before implementing anything not covered above._
+## D-026 — The server's tasks, the sweep's checks, and what the sweep found
+
+**Context.** Stage B of RAFT.md's order: the server on `Environment`, election and
+replication only, a single-shard key-value store, the invariants folded from the
+trace, the linearizability checker, and the sweep under the network fault model,
+partitions, one-way blocks and crashes with the disk model, with six known-buggy
+variants that must each be caught.
+
+**Decision.** One server is three tasks for now, `raft`, `net` and `apply`, under
+`Environment::spawn`, joined by queues with no runtime behind them
+(`ananke_raft::queue`); the `snapshot` task of RAFT.md §3 arrives with snapshots. The
+`raft` task executes a step's outputs in order and awaits the persist before the sends
+that follow it; `Variant::SendBeforePersist` sends first, and its trace events still
+follow the persist, so the trace says what is durable. `Variant::ApplyBeforeCommit`
+hands the `apply` task entries as they are appended. The inbox is bounded and drops
+the oldest heartbeat first, never an `AppendEntries` with entries, recording
+`RaftInboxDropped`. The hard state and the applied index are separate keys, since
+separate tasks write them, and the store is shared behind an `Arc` with atomics for
+what each task caches.
+
+The sweep's disk honours `fsync`. A disk that acknowledges a sync it did not do loses
+persistent state silently, and Raft's safety argument assumes persistent state is
+persistent: no consensus protocol survives a lying disk, and a sweep that excused the
+resulting violations would check nothing. Bit rot and torn writes stay on, and every
+way the engine's recovery can lose state in the middle, a dropped table, a fallback, a
+discarded head, a log stopped at a bad checksum or a gap, a corrupt record skipped in
+a segment the tables cover, is a refusal (`LostState`): the server traces
+`RaftRefused`, never binds its socket, and takes part in nothing until stage E
+re-seeds it.
+
+Gets go through the log until stage C, so every client operation is an entry and the
+history is linearizable by construction if the log is right. A client that hears
+nothing back about a write does not resend it, since the entry may yet commit; it
+abandons the operation and continues as a new process. A get may be retried. Client
+sessions (thesis §6.3), which would make a retry safe across leaders, are issue #21.
+A leader deduplicates a request the network delivered twice, by client and sequence
+number, while the entry is in its log.
+
+The checks are functions of the trace (RAFT.md §2): the four log invariants; three
+folds of the rules behind them, commit by majority, commit by current term, committed
+entries stay; linearizability by a Wing-Gong search with memoisation and a budget of
+states per key, over a history in which the trace closes abandoned operations through
+`RaftProposed`; pre-vote's property, that an isolated server's term does not move;
+and, on uniformly scheduled seeds only, two liveness bounds, a client write within ten
+maximum election timeouts of the last heal and an election within three of a
+follower's last legitimate timer reset. The sweep runs small batches so that a
+follower a few entries behind is caught up in several messages, which is where the
+Figure 8 window lies. Two events exist for the checks alone: `RaftRecovered`, so an
+apply durable at a crash but not yet traced is accounted for at the restart, and
+`RaftProposed`.
+
+**What the sweep found before it passed.** Seed 42, the first seed run: a client
+request the network duplicated was proposed twice by the leader, and a
+compare-and-set applied twice; the client was told the second, failing swap while the
+first had changed the value, and the checker reported the key. The fix is the
+deduplication above. Seed 42 again: a rotted block under a log record the tables
+already covered made recovery skip the rest of that segment, acknowledged records
+included, and the server came back on a state that went backwards; state machine
+safety reported the double apply, and the fix is the covered-stop refusal above. Seed
+2: an apply that was durable when the crash landed but never traced, since the crash
+fell between the sync completing and the task's next poll; the trace had a gap, the
+system was right, and `RaftRecovered` closes it. Seed 38, the same for an append: a
+restarting server re-states its durable log before `RaftRecovered`, so the trace's
+picture of a log is the disk's. And `CountOlderTermForCommit` was
+never caught at the default batch size: a new leader's own no-op is sent in the same
+message as the older entries it re-sends, so a follower matches both at once and the
+count rule never gets its window. That is a hole in the sweep, not a reason to keep
+the variant unexercised: the sweep runs one entry per message and checks the rule
+directly; a batched sweep needs a driver for the window (issue #22). Then, with one
+entry per message, the correct leader flooded a follower with forty thousand
+appends: a rejection reset the follower's pipeline and re-sent up to eight messages,
+every other message of the pipeline was rejected in turn, and each of those
+rejections re-sent eight more. The leader now probes with one message after a
+rejection and ignores a rejection of anything but the probe, which is why
+`AppendEntriesResponse` carries the request's `prev_index`. The same seed's follower
+matched an entry it already held and reported the index below it, against
+deviation D1; the match is now the request's last index. And seed 16 found bit rot in
+a record's length reading as a torn tail, and a log cut at one open reading as whole
+at the next: D-027.
+
+**Alternatives.** Client sessions now: correct and small, but a state-machine change
+with a clock for expiry, better done as its own step (#21). A lying disk with
+violations excused by the trace, as Phase 1's sweep did for lost writes: an excused
+safety violation is no check. A fourth task now: nothing for it to do until snapshots.
+Retrying writes after a timeout: at-least-once without sessions is a second write.
+
+**Consequences.** Every operation costs a log entry, gets included, until stage C. A
+refused server stays down for the rest of a run until stage E, and liveness is asked
+only while a majority is up. The checker's budget is a knob the correct server must
+never hit; a seed that does is a sweep problem to fix, not a pass.
+
+---
+
+## D-027 — The WAL record header carries its own checksum
+
+**Context.** The Raft sweep (D-026), seed 16: bit rot flipped a bit in the length
+field of a log record that had been synced and acknowledged. Recovery read the bogus
+length as running past the end of the file, reported a torn record, kept what came
+before, and the server started on a log shorter than what it had promised: its
+applied index went from 81 back to 68, which state machine safety reported. A torn
+record was the one stop the store did not refuse (D-026), because a write in flight at
+a crash leaves one and was never acknowledged; but a flipped bit in a length looks
+the same, and the two cannot be told apart from the payload checksum, which cannot be
+checked without the payload.
+
+**Decision.** The record is `len | header crc32c | crc32c | seq | payload`: the header
+checksum covers the length and the sequence number and is checked before the length
+is trusted. A flipped bit anywhere in the header is a bad checksum; a torn record is
+one whose bytes are missing, which only a write in flight at a crash leaves. SPEC §2.2
+is amended; the WAL has no versioning yet and no released store to migrate, so the
+change is the format.
+
+The same seed showed a second thing: recovery cuts the log at a stop before the
+caller sees the recovery, so a store refused for a bad checksum at one open found a
+whole, shorter log at the next and started. `WalConfig::refuse_damage`, reached
+through `EngineConfig::refuse_log_damage`, fails the open with `wal::LogDamaged`
+before anything is cut, at a bad checksum, a gap, or a corrupt record skipped in a
+covered segment; a torn tail is still cut. A Raft server always opens its engine with
+it, fallback off and head-gap discard off, whatever configuration it is handed.
+
+**Alternatives.** Refusing a Raft store on any torn record: a write is in flight at
+most crashes, so most restarts would refuse and the cluster would lose its servers
+one crash at a time. Trusting a length that runs past the file only when nothing
+follows it: with a torn write the file ends at the partial record and with a rotted
+length it also appears to, so there is nothing to see.
+
+**Consequences.** Four more bytes per record. The engine's crash sweeps see rot in a
+header as a bad checksum from now on, which they excuse like any stop a fault
+explains; the Raft store refuses it.
+
+---
+
+_Next entry: D-028. Add one before implementing anything not covered above._
