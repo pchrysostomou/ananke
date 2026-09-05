@@ -10,10 +10,11 @@ use bytes::Bytes;
 use moirae_trace::trace_hash;
 
 /// The FNV-1a hash of the seed-42 trace (`out/echo-42.jsonl`), as moirae pins its
-/// example traces. It changes only when the simulator, the protocol, the export or the
-/// scheduling policy changes on purpose: update it in the same commit and say why. The
-/// same bytes are committed in the moirae repo as the studio's `echo-42.jsonl` fixture.
-const GOLDEN: &str = "5bd6ce7c13644af5";
+/// example traces. It changes only when the simulator, the protocol, the export, the
+/// scheduling policy, or the crate version in the trace header changes on purpose:
+/// update it in the same commit and say why, and update the copy of the trace committed
+/// in the moirae repo as the studio's `echo-42.jsonl` fixture.
+const GOLDEN: &str = "1e45f59f9b66c501";
 
 /// Two runs with the same seed produce byte-identical traces.
 #[test]
