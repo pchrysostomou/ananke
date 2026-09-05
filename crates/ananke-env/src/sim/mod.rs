@@ -493,6 +493,12 @@ impl Sim {
         self.shared.lock().trace.clone()
     }
 
+    /// How many records the trace holds so far, without copying it.
+    #[must_use]
+    pub fn trace_len(&self) -> usize {
+        self.shared.lock().trace.len()
+    }
+
     /// Everything the moirae export needs, copied out from under the lock.
     pub(crate) fn snapshot(&self) -> Snapshot {
         let st = self.shared.lock();

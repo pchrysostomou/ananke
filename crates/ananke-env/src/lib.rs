@@ -49,4 +49,6 @@ pub use real::RealEnv;
 pub use rng::Rng;
 pub use task::{TaskHandle, TaskId};
 pub use time::{Instant, WallTime, WallTimeOutOfRange};
-pub use trace::{DirEntryOp, DropReason, MessageId, TraceEvent, WalStop, WalStopReason};
+pub use trace::{
+    ClientOp, ClientResult, DirEntryOp, DropReason, MessageId, TraceEvent, WalStop, WalStopReason,
+};

@@ -29,6 +29,8 @@
 //! | `OpenRefused`                            | `log` `ananke.engine.open-refused`            |
 //! | `OrphanRemoved` / `WalSegmentDeleted`    | `log` `ananke.fs.orphan-removed` / `ananke.wal.segment-deleted` |
 //! | `RaftTerm` / `RaftVote` / `RaftLeader` / `RaftAppend` / `RaftTruncate` / `RaftCommit` / `RaftApply` | `log` `ananke.raft.term` / `.vote` / `.leader` / `.append` / `.truncate` / `.commit` / `.apply` |
+//! | `RaftRecovered` / `RaftProposed` / `RaftRefused` / `RaftServerFailed` / `RaftInboxDropped` | `log` `ananke.raft.recovered` / `.proposed` / `.refused` / `.failed` / `.inbox-dropped` |
+//! | `ClientInvoke` / `ClientReturn`          | `log` `ananke.client.invoke` / `.return`      |
 //! | `TimeAdvanced`                           | nothing: every line carries `t`               |
 //!
 //! `t` is global virtual time in nanoseconds and the header says `unit: "ns"`. Node ids
@@ -45,7 +47,7 @@ use std::net::SocketAddr;
 use moirae_trace::{Cause, Collect, Error, Event, Header, Json, Sink, TimeUnit, Verify, Writer};
 
 use crate::sim::{Sim, Snapshot, TraceRecord};
-use crate::{DirEntryOp, DropReason, NodeId, TraceEvent, WalStopReason};
+use crate::{ClientOp, ClientResult, DirEntryOp, DropReason, NodeId, TraceEvent, WalStopReason};
 
 /// Turns a message payload into the `msg` object of a `send` line: an object whose
 /// `type` is a string, which is what the studio labels and filters by.
@@ -625,6 +627,95 @@ fn convert(
                 ("hash", int(*hash)),
             ])),
         ),
+        TraceEvent::RaftRecovered {
+            server,
+            term,
+            applied,
+            last_index,
+        } => log(
+            "ananke.raft.recovered",
+            Some(Json::obj(vec![
+                ("server", int(*server)),
+                ("term", int(*term)),
+                ("applied", int(*applied)),
+                ("lastIndex", int(*last_index)),
+            ])),
+        ),
+        TraceEvent::RaftProposed {
+            server,
+            client,
+            seq,
+            index,
+            term,
+        } => log(
+            "ananke.raft.proposed",
+            Some(Json::obj(vec![
+                ("server", int(*server)),
+                ("client", int(*client)),
+                ("seq", int(*seq)),
+                ("index", int(*index)),
+                ("term", int(*term)),
+            ])),
+        ),
+        TraceEvent::RaftRefused { server, reason } => log(
+            "ananke.raft.refused",
+            Some(Json::obj(vec![
+                ("server", int(*server)),
+                ("reason", Json::str(reason)),
+            ])),
+        ),
+        TraceEvent::RaftServerFailed { server, reason } => log(
+            "ananke.raft.failed",
+            Some(Json::obj(vec![
+                ("server", int(*server)),
+                ("reason", Json::str(reason)),
+            ])),
+        ),
+        TraceEvent::RaftInboxDropped { server, kind } => log(
+            "ananke.raft.inbox-dropped",
+            Some(Json::obj(vec![
+                ("server", int(*server)),
+                ("kind", Json::str(kind)),
+            ])),
+        ),
+        TraceEvent::ClientInvoke { client, seq, op } => {
+            let text = |bytes: &[u8]| Json::str(&String::from_utf8_lossy(bytes));
+            let mut fields = vec![
+                ("client", int(*client)),
+                ("seq", int(*seq)),
+                ("op", Json::str(op.name())),
+                ("key", text(op.key())),
+            ];
+            match op {
+                ClientOp::Put { value, .. } => fields.push(("value", text(value))),
+                ClientOp::Cas { expect, value, .. } => {
+                    fields.push(("expect", expect.as_ref().map_or(Json::Null, |e| text(e))));
+                    fields.push(("value", text(value)));
+                }
+                ClientOp::Get { .. } | ClientOp::Delete { .. } => {}
+            }
+            log("ananke.client.invoke", Some(Json::obj(fields)))
+        }
+        TraceEvent::ClientReturn {
+            client,
+            seq,
+            result,
+        } => {
+            let text = |bytes: &[u8]| Json::str(&String::from_utf8_lossy(bytes));
+            let mut fields = vec![("client", int(*client)), ("seq", int(*seq))];
+            match result {
+                ClientResult::Done => fields.push(("result", Json::str("done"))),
+                ClientResult::Value(value) => {
+                    fields.push(("result", Json::str("value")));
+                    fields.push(("value", value.as_ref().map_or(Json::Null, |v| text(v))));
+                }
+                ClientResult::Swapped(swapped) => {
+                    fields.push(("result", Json::str("swapped")));
+                    fields.push(("swapped", Json::Bool(*swapped)));
+                }
+            }
+            log("ananke.client.return", Some(Json::obj(fields)))
+        }
         TraceEvent::CheckpointWritten {
             dir,
             version,

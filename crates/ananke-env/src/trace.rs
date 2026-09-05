@@ -390,6 +390,82 @@ pub enum TraceEvent {
         /// The hash of the entry's payload.
         hash: u64,
     },
+    /// A Raft server started on what its store held: the term, the applied index
+    /// and the last log index it resumes from. An apply durable at a crash but not
+    /// yet traced shows here as the applied index being past the last `RaftApply`.
+    RaftRecovered {
+        /// The server.
+        server: u64,
+        /// The term it resumes in.
+        term: u64,
+        /// The applied index on disk.
+        applied: u64,
+        /// The last log index on disk.
+        last_index: u64,
+    },
+    /// A Raft leader proposed a client's request as a log entry (RAFT.md §4): the
+    /// link from an operation of the history to the entry that carries it, so an
+    /// abandoned operation can be closed by the entry's fate.
+    RaftProposed {
+        /// The server.
+        server: u64,
+        /// The client process.
+        client: u64,
+        /// The operation's number within the process.
+        seq: u64,
+        /// The entry's index.
+        index: u64,
+        /// The entry's term.
+        term: u64,
+    },
+    /// A Raft server refused to start because its store's recovery lost state
+    /// (RAFT.md §3): it takes part in nothing, no votes and no responses, until a
+    /// snapshot re-seeds it.
+    RaftRefused {
+        /// The server.
+        server: u64,
+        /// Why.
+        reason: String,
+    },
+    /// A Raft server stopped on an I/O error after starting. The simulator raises no
+    /// I/O error of its own, so under simulation this is an engine bug.
+    RaftServerFailed {
+        /// The server.
+        server: u64,
+        /// The error.
+        reason: String,
+    },
+    /// A Raft server's inbox was full and a message was dropped before the core saw
+    /// it (RAFT.md §3): the oldest heartbeat first, never an AppendEntries with
+    /// entries.
+    RaftInboxDropped {
+        /// The server.
+        server: u64,
+        /// The kind of message dropped.
+        kind: &'static str,
+    },
+    /// A client operation started (RAFT.md §2): the invocation end of one operation
+    /// of the linearizability history. Its time is the record's.
+    ClientInvoke {
+        /// The client process. A client that abandons an operation whose fate it
+        /// does not know continues as a new process, so every process's history is
+        /// sequential.
+        client: u64,
+        /// The operation's number within the process.
+        seq: u64,
+        /// The operation.
+        op: ClientOp,
+    },
+    /// A client operation returned with a definite result. An operation with no
+    /// return is pending: it may have taken effect or not.
+    ClientReturn {
+        /// The client process.
+        client: u64,
+        /// The operation's number within the process.
+        seq: u64,
+        /// The result.
+        result: ClientResult,
+    },
     /// A node's tasks were killed and the filesystem fault model applied to its disk.
     NodeCrashed {
         /// The crashed node.
@@ -434,6 +510,79 @@ pub enum TraceEvent {
         /// The receiver.
         to: NodeId,
     },
+}
+
+/// A key-value operation as a client issues it (RAFT.md §4): the single-key
+/// operations of the linearizability model.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ClientOp {
+    /// Set `key` to `value`.
+    Put {
+        /// The key.
+        key: Bytes,
+        /// The value.
+        value: Bytes,
+    },
+    /// Read `key`.
+    Get {
+        /// The key.
+        key: Bytes,
+    },
+    /// Remove `key`.
+    Delete {
+        /// The key.
+        key: Bytes,
+    },
+    /// Set `key` to `value` if it holds `expect`, none for absent.
+    Cas {
+        /// The key.
+        key: Bytes,
+        /// What it must hold.
+        expect: Option<Bytes>,
+        /// The value to set.
+        value: Bytes,
+    },
+}
+
+impl ClientOp {
+    /// The key the operation touches.
+    #[must_use]
+    pub fn key(&self) -> &Bytes {
+        match self {
+            ClientOp::Put { key, .. }
+            | ClientOp::Get { key }
+            | ClientOp::Delete { key }
+            | ClientOp::Cas { key, .. } => key,
+        }
+    }
+
+    /// The operation's name: `put`, `get`, `delete` or `cas`.
+    #[must_use]
+    pub fn name(&self) -> &'static str {
+        match self {
+            ClientOp::Put { .. } => "put",
+            ClientOp::Get { .. } => "get",
+            ClientOp::Delete { .. } => "delete",
+            ClientOp::Cas { .. } => "cas",
+        }
+    }
+
+    /// Whether the operation changes the key.
+    #[must_use]
+    pub fn is_write(&self) -> bool {
+        !matches!(self, ClientOp::Get { .. })
+    }
+}
+
+/// What a client operation returned.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ClientResult {
+    /// A put or delete took effect.
+    Done,
+    /// What a get found.
+    Value(Option<Bytes>),
+    /// Whether a compare-and-set took effect.
+    Swapped(bool),
 }
 
 /// A directory operation that must be followed by `sync_dir` to be durable.
