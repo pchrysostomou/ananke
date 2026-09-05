@@ -50,7 +50,7 @@ Deferred ideas live in [docs/BACKLOG.md](docs/BACKLOG.md).
 crates/ananke/         Placeholder crate reserving the name on crates.io
 crates/ananke-env/     Environment trait; real/ (RealEnv on tokio); sim/ (Sim + SimEnv)
 crates/ananke-server/  Node binary (placeholder until the echo server is wired)
-sim/                   Simulation scenarios; scenario files sit directly in sim/
+sim/                   Simulation scenarios; scenario files sit directly in sim/ (echo.rs first)
 docs/                  SPEC, DECISIONS, BACKLOG, BOOTSTRAP_PROMPT, devlog/
 scripts/               check-direct-io.sh
 clippy.toml            Banned I/O paths (disallowed-methods / disallowed-types)

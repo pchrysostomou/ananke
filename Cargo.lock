@@ -25,6 +25,10 @@ version = "0.0.1"
 [[package]]
 name = "ananke-sim"
 version = "0.0.1"
+dependencies = [
+ "ananke-env",
+ "bytes",
+]
 
 [[package]]
 name = "bitflags"

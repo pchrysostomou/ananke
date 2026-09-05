@@ -113,6 +113,12 @@ _Update this section at the end of every session._
   with drop / delay (reorder) / partition, in-memory filesystem with torn writes and
   lost fsync applied at `Sim::crash`, trace to an in-memory `Vec<TraceRecord>` with a
   stable text dump. Determinism test: same seed, byte-identical trace.
-- Next concrete task: step 5, `sim/echo.rs` with 3 nodes under partitions and the CI
-  determinism test; then the moirae bridge (SPEC §1.5) and the `ananke-server` echo
-  binary on `RealEnv` for the Phase 0 exit criteria.
+- Step 5: `sim/echo.rs` runs 3 nodes under drops, delays, skew, a symmetric
+  partition, a one-way block and a crash/restart; `sim/tests/echo.rs` asserts
+  byte-identical trace text for equal seeds and runs 100 consecutive seeds against
+  the scenario's invariants as a simulator smoke test. `ananke_env::race` is the
+  runtime-free "message or timer" combinator protocols use.
+- Next concrete task: the moirae bridge (SPEC §1.5, with the scheduling-policy
+  decision entry) and the `ananke-server` echo binary on `RealEnv`, which together
+  close the Phase 0 exit criteria. Before Phase 1: the BACKLOG "required before
+  Phase 1" gate.
