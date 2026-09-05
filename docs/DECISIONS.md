@@ -555,10 +555,18 @@ or below `flushed_seq`, and sync the directory. A crash before the switch leaves
 old manifest in force and the new files as orphans, which recovery removes; the log
 still holds the records.
 
-Recovery reads `CURRENT`; if it cannot be read, or names a manifest that cannot be,
-recovery uses the newest readable manifest (below the named one when `CURRENT` was
-readable), reports the fallback, and rewrites `CURRENT` to name the manifest it chose.
-Every table listed is opened and verified whole; one
+Recovery reads `CURRENT` and the manifest it names. No `CURRENT` at all is the
+empty state, since a switch is what creates it. If `CURRENT` cannot be read, or
+names a manifest that cannot be, `Engine::open` fails with an error naming the file,
+unless `allow_manifest_fallback` is set: then recovery uses the newest older manifest
+whose every table is on disk and passes its checks, never one with a table missing
+and never the empty state, reports the fallback, and rewrites `CURRENT` to name the
+manifest it chose; with no such manifest it fails as well. The first version fell
+back to the newest readable manifest and, at seed 44 of the compaction sweep,
+landed on one whose tables a later compaction had deleted, and the store came back
+empty: a rollback onto a manifest whose tables are gone is a state that never
+existed, refused for the reason a missing log head is. Seed 44 is pinned in both
+modes. Every table the manifest in force lists is opened and verified whole; one
 that cannot be read is dropped from service and reported with its range. Orphans are
 removed. The log is opened expecting its head at `flushed_seq + 1`: a first record
 past that is a missing head, reported as a `HeadGap` trace event, and the log is not

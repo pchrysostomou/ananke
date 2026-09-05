@@ -256,8 +256,15 @@ pub enum TraceEvent {
         /// The manifest's number.
         manifest: u64,
     },
+    /// Recovery refused the store: `CURRENT` or the manifest it names cannot be read
+    /// and no fallback was allowed or intact (D-022). Nothing on disk was touched.
+    OpenRefused {
+        /// Why, as the error says it.
+        reason: String,
+    },
     /// Recovery could not read the manifest `CURRENT` names, or `CURRENT` itself, and
-    /// used another; everything flushed after it is lost.
+    /// used an older manifest whose every table is intact; everything flushed after
+    /// it is lost.
     ManifestFallback {
         /// The manifest `CURRENT` named; 0 when `CURRENT` could not be read.
         from: u64,

@@ -24,7 +24,7 @@ pub mod turnstile;
 pub mod wal;
 
 pub use compaction::Compaction;
-pub use engine::{Engine, EngineConfig, EngineRecovery, Snapshot, Write};
+pub use engine::{Engine, EngineConfig, EngineRecovery, OpenRefused, Snapshot, Write};
 pub use memtable::{Memtable, Value};
 pub use wal::{
     Append, CoveredStop, HeadGap, HeadGapPolicy, Recovery, Seq, Variant, Wal, WalConfig,

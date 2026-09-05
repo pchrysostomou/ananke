@@ -52,6 +52,100 @@ fn seed_420_which_the_first_nightly_found_stays_green() {
     engine::run(420, Variant::Correct).check().unwrap();
 }
 
+/// The first 3000-seed sweep with compaction found this: CURRENT and the two newest
+/// manifests were damaged at one crash, recovery fell back to the newest readable
+/// manifest, whose tables a later compaction had deleted, and the store came back
+/// empty. Recovery now refuses a store whose CURRENT or manifest cannot be read, and
+/// with fallback allowed uses only an older manifest whose every table is intact
+/// (D-022). The seed's earlier fallbacks take a different path under that rule, so
+/// the run no longer reaches the same crash; what is pinned is the rule on the seed
+/// that motivated it. With fallback allowed, every fallback in the run lands on a
+/// manifest with no table missing and the store is never empty; without it, the
+/// first unreadable CURRENT refuses the store for a fault and the run ends.
+#[test]
+fn seed_44_never_opens_empty_in_either_mode() {
+    // The schedule the sweep ran with when it found the seed: level 1 eight times
+    // larger than the gate's.
+    let schedule = engine::Schedule {
+        level_base_bytes: 8192,
+        ..engine::Schedule::default()
+    };
+    let allowed = engine::run_with(44, schedule, Variant::Correct);
+    allowed.check().unwrap();
+    let fallbacks: Vec<&engine::Epoch> = allowed
+        .epochs
+        .iter()
+        .filter(|e| e.recovery.fallback_from.is_some())
+        .collect();
+    assert!(
+        !fallbacks.is_empty(),
+        "the seed still exercises the fallback"
+    );
+    for epoch in fallbacks {
+        assert!(epoch.recovery.dropped.is_empty(), "{:?}", epoch.recovery);
+        assert!(epoch.recovery.ssts > 0, "{:?}", epoch.recovery);
+    }
+    if let Some(refusal) = &allowed.refused {
+        assert!(
+            refusal.reason.contains("no manifest older than"),
+            "{refusal:?}"
+        );
+    }
+    let refusing = engine::run_with(
+        44,
+        engine::Schedule {
+            allow_manifest_fallback: false,
+            ..schedule
+        },
+        Variant::Correct,
+    );
+    refusing.check().unwrap();
+    let refusal = refusing.refused.as_ref().expect("the store is refused");
+    assert!(refusal.reason.contains("cannot be read"), "{refusal:?}");
+    assert!(
+        refusing.epochs.len() < allowed.epochs.len(),
+        "refusing ends the run earlier"
+    );
+}
+
+/// The nightly's deep-levels run: per-level limits so small that compaction reaches
+/// level 3 and below, which the gate's and CI's schedule never does with its key
+/// space. Runs only when `ANANKE_DEEP_SEEDS` is set, as the nightly sets it.
+#[test]
+fn the_correct_engine_passes_every_seed_with_deep_levels() {
+    let seeds = ananke_sim::deep_seeds();
+    if seeds == 0 {
+        eprintln!("ANANKE_DEEP_SEEDS is not set: skipped");
+        return;
+    }
+    let mut rounds_at_or_below_level_2 = 0u32;
+    let mut deepest = 0u8;
+    for seed in 0..seeds {
+        let report = engine::run_with(seed, engine::Schedule::deep(), Variant::Correct);
+        if let Err(violation) = report.check() {
+            write_trace(&format!("engine-deep-{seed}"), &report.jsonl);
+            panic!("{violation}");
+        }
+        for record in &report.records {
+            if let TraceEvent::CompactionWritten { level, .. } = record.event {
+                rounds_at_or_below_level_2 += u32::from(level >= 2);
+                deepest = deepest.max(level + 1);
+            }
+        }
+    }
+    eprintln!(
+        "deep levels: {rounds_at_or_below_level_2} rounds from level 2 or deeper, deepest level {deepest}"
+    );
+    assert!(
+        rounds_at_or_below_level_2 > 0,
+        "no round compacted level 2 or deeper into the level below"
+    );
+    assert!(
+        deepest >= 3,
+        "compaction never reached level 3: deepest {deepest}"
+    );
+}
+
 /// The negative controls: each known bug is caught on some seed.
 fn is_caught(variant: Variant) {
     let mut caught = Vec::new();
@@ -107,6 +201,7 @@ struct Coverage {
     manifest_fallbacks: u32,
     head_gaps: u32,
     flusher_failures: u32,
+    refusals: u32,
     compactions: u32,
     compactions_below_level_0: u32,
     tables_deleted: u32,
@@ -163,6 +258,7 @@ impl Coverage {
             .count() as u32;
         self.flusher_failures +=
             report.count(|e| matches!(e, TraceEvent::FlusherFailed { .. })) as u32;
+        self.refusals += u32::from(report.refused.is_some());
         self.compactions +=
             report.count(|e| matches!(e, TraceEvent::CompactionWritten { .. })) as u32;
         self.compactions_below_level_0 += report
@@ -231,6 +327,7 @@ impl Coverage {
             ),
             ("manifest fallbacks", self.manifest_fallbacks),
             ("missing log heads, discarded", self.head_gaps),
+            ("stores refused for a fault, ending the run", self.refusals),
             ("compactions", self.compactions),
             ("compactions below level 0", self.compactions_below_level_0),
             ("input tables deleted", self.tables_deleted),

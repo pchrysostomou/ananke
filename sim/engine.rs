@@ -66,6 +66,9 @@ pub struct Schedule {
     pub level_base_bytes: u64,
     /// Compaction outputs are sealed at this size.
     pub sst_bytes: u64,
+    /// Whether the engine may fall back to an older intact manifest when `CURRENT`
+    /// or the manifest it names cannot be read; off, it refuses the store (D-022).
+    pub allow_manifest_fallback: bool,
 }
 
 impl Default for Schedule {
@@ -86,6 +89,21 @@ impl Default for Schedule {
             // of live data, so rounds below level 0 happen in every run.
             level_base_bytes: 1024,
             sst_bytes: 2048,
+            allow_manifest_fallback: true,
+        }
+    }
+}
+
+impl Schedule {
+    /// The nightly's deep-levels shape: level limits so small that a few kilobytes of
+    /// live data overflow level 1 into 2 and level 2 into 3 and below, so the rounds
+    /// that only deep levels take are exercised. Everything else as the default.
+    #[must_use]
+    pub fn deep() -> Self {
+        Self {
+            level_base_bytes: 64,
+            sst_bytes: 512,
+            ..Self::default()
         }
     }
 }
@@ -381,6 +399,19 @@ pub struct Epoch {
     pub lost: Vec<u64>,
 }
 
+/// An open the engine refused, which ends the run: the store cannot be trusted to
+/// be a state that existed (D-022). Excused only by a fault on `CURRENT` or the
+/// manifest it named.
+#[derive(Debug)]
+pub struct Refusal {
+    /// The epoch whose open was refused, counting crashes from 1.
+    pub after_crash: u32,
+    /// What the engine said.
+    pub reason: String,
+    /// Whether a fault explains it.
+    pub verdict: Result<(), String>,
+}
+
 /// What one run produced.
 #[derive(Debug)]
 pub struct Report {
@@ -390,6 +421,8 @@ pub struct Report {
     pub variant: Variant,
     /// Each crash and its recovery, in order.
     pub epochs: Vec<Epoch>,
+    /// The open that ended the run early, if one did.
+    pub refused: Option<Refusal>,
     /// Live reads over the run, scans included.
     pub reads: u64,
     /// Of those, scans at a snapshot.
@@ -414,6 +447,14 @@ impl Report {
                     self.seed, self.variant
                 ));
             }
+        }
+        if let Some(refusal) = &self.refused
+            && let Err(violation) = &refusal.verdict
+        {
+            return Err(format!(
+                "seed {} {:?} after crash {}: {violation}",
+                self.seed, self.variant, refusal.after_crash
+            ));
         }
         Ok(())
     }
@@ -462,10 +503,65 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
     let mut base = 0;
     let mut epoch_start = 0;
     let mut previous_manifest: Option<(u64, u64)> = None;
+    let mut refused = None;
     for crash in 0..=schedule.crashes {
         let before_open = sim.trace().len();
-        let (db, recovery) = open(&mut sim, node, &schedule, variant);
         let dir = Path::new(DIR);
+        let (db, recovery) = match open(&mut sim, node, &schedule, variant) {
+            Ok(opened) => opened,
+            Err(error) => {
+                // A refused store ends the run. The refusal is excused only if a
+                // fault explains why CURRENT or the manifest it named could not be
+                // read: its content's sync lost, for the switch or one in flight at
+                // the crash, or bit rot.
+                let records = sim.trace();
+                let events: Vec<&TraceEvent> = records[epoch_start..before_open]
+                    .iter()
+                    .map(|r| &r.event)
+                    .collect();
+                let all: Vec<&TraceEvent> =
+                    records[..before_open].iter().map(|r| &r.event).collect();
+                let synced = syncs(&events, dir);
+                let refusal = engine::OpenRefused::from_io(&error);
+                let named = match refusal {
+                    Some(engine::OpenRefused::ManifestUnreadable(n)) => Some(n),
+                    Some(engine::OpenRefused::NoIntactManifest { named }) if named > 0 => {
+                        Some(named)
+                    }
+                    _ => None,
+                };
+                let explained = match named {
+                    Some(n) => {
+                        synced.manifest_betrayed.contains(&n)
+                            || rotted(&all, &manifest::manifest_path(dir, n))
+                    }
+                    None => {
+                        let from = synced
+                            .switched
+                            .last()
+                            .copied()
+                            .or_else(|| previous_manifest.map(|(n, _)| n));
+                        from.is_some_and(|from| synced.current_betrayed.contains(&from))
+                            || synced.current_tmp_lost_in_flight
+                            || rotted(&all, &manifest::current_path(dir))
+                    }
+                };
+                refused = Some(Refusal {
+                    after_crash: crash,
+                    reason: error.to_string(),
+                    verdict: if refusal.is_none() {
+                        Err(format!(
+                            "open failed with something other than a refusal: {error}"
+                        ))
+                    } else if explained {
+                        Ok(())
+                    } else {
+                        Err(format!("open was refused without a fault: {error}"))
+                    },
+                });
+                break;
+            }
+        };
         let records = sim.trace();
         let events: Vec<&TraceEvent> = records[epoch_start..before_open]
             .iter()
@@ -792,6 +888,7 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
         seed,
         variant,
         epochs,
+        refused,
         reads,
         scans,
         jsonl: sim
@@ -831,8 +928,8 @@ fn unflushed(events: &[&TraceEvent]) -> usize {
 
 type Db = Arc<Engine<SimEnv>>;
 
-/// Where the open task leaves the engine and what it recovered.
-type Opened = Arc<Mutex<Option<(Db, EngineRecovery)>>>;
+/// Where the open task leaves the engine and what it recovered, or the error.
+type Opened = Arc<Mutex<Option<std::io::Result<(Db, EngineRecovery)>>>>;
 
 /// Opens the engine on `node` and runs the open to completion.
 fn open(
@@ -840,7 +937,7 @@ fn open(
     node: NodeId,
     schedule: &Schedule,
     variant: Variant,
-) -> (Db, EngineRecovery) {
+) -> std::io::Result<(Db, EngineRecovery)> {
     let env = sim.env(node);
     let opened: Opened = Arc::default();
     let o = opened.clone();
@@ -852,14 +949,17 @@ fn open(
         wal_variant: wal::Variant::Correct,
         // A missing head is judged by the oracle, so the run goes on past it.
         allow_head_gap: true,
+        allow_manifest_fallback: schedule.allow_manifest_fallback,
         l0_trigger: schedule.l0_trigger,
         level_base_bytes: schedule.level_base_bytes,
         sst_bytes: schedule.sst_bytes,
         background_compaction: true,
     };
     env.clone().spawn("engine-open", async move {
-        let (db, recovery) = Engine::open(env, config).await.expect("the engine opens");
-        *o.lock().unwrap_or_else(PoisonError::into_inner) = Some((Arc::new(db), recovery));
+        let opened = Engine::open(env, config)
+            .await
+            .map(|(db, recovery)| (Arc::new(db), recovery));
+        *o.lock().unwrap_or_else(PoisonError::into_inner) = Some(opened);
     });
     // Recovery reads files, which take time; nothing else is running yet.
     while opened

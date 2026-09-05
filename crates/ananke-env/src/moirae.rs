@@ -25,6 +25,7 @@
 //! | `SstWritten` / `SstDropped` / `SstDeleted` | `log` `ananke.sst.written` / `.dropped` / `.deleted` |
 //! | `CompactionWritten`                      | `log` `ananke.compaction.written`             |
 //! | `ManifestWritten` / `CurrentSwitched` / `ManifestFallback` | `log` `ananke.manifest.written` / `.switched` / `.fallback` |
+//! | `OpenRefused`                            | `log` `ananke.engine.open-refused`            |
 //! | `OrphanRemoved` / `WalSegmentDeleted`    | `log` `ananke.fs.orphan-removed` / `ananke.wal.segment-deleted` |
 //! | `TimeAdvanced`                           | nothing: every line carries `t`               |
 //!
@@ -523,6 +524,10 @@ fn convert(
         TraceEvent::CurrentSwitched { manifest } => log(
             "ananke.manifest.switched",
             Some(Json::obj(vec![("manifest", int(*manifest))])),
+        ),
+        TraceEvent::OpenRefused { reason } => log(
+            "ananke.engine.open-refused",
+            Some(Json::obj(vec![("reason", Json::str(reason))])),
         ),
         TraceEvent::ManifestFallback { from, to } => log(
             "ananke.manifest.fallback",

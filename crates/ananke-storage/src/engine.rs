@@ -23,13 +23,15 @@
 //! walk in key order and reports the newest write per key at the snapshot, so it is
 //! one consistent view whatever is written meanwhile.
 //!
-//! Recovery reads `CURRENT`, the manifest it names (falling back to the newest
-//! readable one if `CURRENT` or that manifest cannot be read, and then rewriting
-//! `CURRENT` to say so), opens and fully verifies every table listed, dropping one it
-//! cannot read and reporting the writes lost with it, removes orphans, and replays
-//! the log from one past the manifest's `flushed_seq`. A log whose first record is
-//! past that is missing its head: the open fails unless `allow_head_gap` is set, and
-//! then the log is discarded and the tables are the state.
+//! Recovery reads `CURRENT` and the manifest it names, opens and fully verifies
+//! every table listed, dropping one it cannot read and reporting the writes lost
+//! with it, removes orphans, and replays the log from one past the manifest's
+//! `flushed_seq`. If `CURRENT` or that manifest cannot be read the open fails,
+//! unless `allow_manifest_fallback` is set: then the newest older manifest whose
+//! every table is intact is used and `CURRENT` rewritten to say so. A log whose
+//! first record is past the manifest's head is missing its head: the open fails
+//! unless `allow_head_gap` is set, and then the log is discarded and the tables are
+//! the state. Either way what comes back is a state that existed.
 //!
 //! The [`Variant`]s for the crash sweep: [`Variant::Correct`];
 //! [`Variant::NoWalBeforeMemtable`], which applies and acknowledges a write before
@@ -96,6 +98,13 @@ pub struct EngineConfig {
     pub variant: Variant,
     /// Which log to run underneath; `wal::Variant::Correct` outside a sweep.
     pub wal_variant: wal::Variant,
+    /// Whether to open when `CURRENT` or the manifest it names cannot be read. Off,
+    /// `open` fails with an error carrying an [`OpenRefused`]; on, recovery uses the
+    /// newest older manifest whose every table is on disk and passes its checks,
+    /// never one with a table missing and never the empty state, and fails when
+    /// there is none. A rollback onto a manifest whose tables a later compaction had
+    /// deleted is a state that never existed (D-022).
+    pub allow_manifest_fallback: bool,
     /// Whether to open when the log's head is missing (its first record is past the
     /// manifest's `flushed_seq + 1`). Off, `open` fails with an error carrying a
     /// [`HeadGap`](crate::wal::HeadGap) and touches nothing; on, the log is discarded and the manifest's
@@ -127,6 +136,7 @@ impl EngineConfig {
             segment_bytes: 16 << 20,
             variant: Variant::Correct,
             wal_variant: wal::Variant::Correct,
+            allow_manifest_fallback: false,
             allow_head_gap: false,
             l0_trigger: 4,
             level_base_bytes: 256 << 20,
@@ -253,14 +263,60 @@ pub(crate) struct Shared<E: Environment> {
     pub(crate) snapshots: Mutex<BTreeMap<Seq, usize>>,
 }
 
+/// Why [`Engine::open`] refused a store (D-022): what is on disk cannot be trusted
+/// to be a state that existed, and no fallback the configuration allows is intact.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OpenRefused {
+    /// `CURRENT` exists but cannot be read: torn, or a bit flipped.
+    CurrentUnreadable,
+    /// The manifest `CURRENT` names cannot be read.
+    ManifestUnreadable(u64),
+    /// Fallback was allowed, but no older manifest has every table it lists on disk
+    /// and intact. `named` is the manifest `CURRENT` named, 0 if `CURRENT` itself
+    /// could not be read.
+    NoIntactManifest {
+        /// See above.
+        named: u64,
+    },
+}
+
+impl OpenRefused {
+    /// The refusal an I/O error carries, if it is one.
+    #[must_use]
+    pub fn from_io(error: &io::Error) -> Option<OpenRefused> {
+        error.get_ref()?.downcast_ref::<OpenRefused>().cloned()
+    }
+
+    fn into_io(self) -> io::Error {
+        io::Error::new(io::ErrorKind::InvalidData, self)
+    }
+}
+
+impl std::fmt::Display for OpenRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OpenRefused::CurrentUnreadable => write!(f, "CURRENT cannot be read"),
+            OpenRefused::ManifestUnreadable(n) => {
+                write!(f, "MANIFEST-{n:06}, which CURRENT names, cannot be read")
+            }
+            OpenRefused::NoIntactManifest { named } => write!(
+                f,
+                "no manifest older than {named} has every table it lists on disk and intact"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for OpenRefused {}
+
 /// What [`Engine::open`] found.
 #[derive(Clone, Debug)]
 pub struct EngineRecovery {
     /// The manifest in force; 0 is the empty state.
     pub manifest: u64,
-    /// Set when the manifest `CURRENT` named could not be read and another was used,
-    /// or when `CURRENT` itself could not be read (then 0): every table flushed after
-    /// the one used is lost.
+    /// Set when the manifest `CURRENT` named could not be read and an older intact
+    /// one was used, or when `CURRENT` itself could not be read (then 0): everything
+    /// flushed after the one used is lost.
     pub fallback_from: Option<u64>,
     /// Every log record numbered this or below is in a table, if its table survived.
     pub flushed_seq: Seq,
@@ -348,6 +404,64 @@ async fn switch_current<E: Environment>(env: &E, dir: &Path, number: u64) -> io:
     Ok(())
 }
 
+/// Reads manifest `number`, or `None` if it is missing or does not decode.
+async fn read_manifest<E: Environment>(
+    env: &E,
+    dir: &Path,
+    number: u64,
+) -> io::Result<Option<Manifest>> {
+    Ok(read_whole(env, &manifest_path(dir, number))
+        .await?
+        .and_then(|bytes| Manifest::decode(&bytes).ok()))
+}
+
+/// Opens and checks whole every table `manifest` lists: the readers of those that
+/// are on disk and intact, and the rest with what was wrong, reported as dropped
+/// when `report` is set.
+async fn open_tables<E: Environment>(
+    env: &E,
+    dir: &Path,
+    manifest: &Manifest,
+    report: bool,
+) -> io::Result<(Vec<(SstMeta, Arc<SstReader<FileOf<E>>>)>, Vec<SstMeta>)> {
+    let fs = env.fs();
+    let mut ssts = Vec::new();
+    let mut dropped = Vec::new();
+    for meta in &manifest.ssts {
+        let path = sst_path(dir, meta.number);
+        let file = match fs.open(&path, OpenOptions::new().read(true)).await {
+            Ok(file) => Some(file),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e),
+        };
+        let reader = match file {
+            None => Err("missing"),
+            Some(file) => match SstReader::open(file).await {
+                Err(_) => Err("unreadable"),
+                Ok(reader) => match reader.verify().await {
+                    Err(_) => Err("corrupt"),
+                    Ok(()) => Ok(reader),
+                },
+            },
+        };
+        match reader {
+            Ok(reader) => ssts.push((meta.clone(), Arc::new(reader))),
+            Err(reason) => {
+                if report {
+                    env.trace(TraceEvent::SstDropped {
+                        number: meta.number,
+                        first_seq: meta.first_seq,
+                        max_seq: meta.max_seq,
+                        reason,
+                    });
+                }
+                dropped.push(meta.clone());
+            }
+        }
+    }
+    Ok((ssts, dropped))
+}
+
 /// Reads a whole file, or `None` if it does not exist.
 async fn read_whole<E: Environment>(env: &E, path: &Path) -> io::Result<Option<Bytes>> {
     match env.fs().open(path, OpenOptions::new().read(true)).await {
@@ -370,9 +484,11 @@ impl<E: Environment> Engine<E> {
     /// # Errors
     ///
     /// Any I/O error from the directory, the manifests, the tables or the log;
-    /// `InvalidData` for a log record that is not an op; and `InvalidData` carrying a
-    /// [`HeadGap`](crate::wal::HeadGap) when the log's head is missing and `config.allow_head_gap` is off,
-    /// with nothing on disk touched.
+    /// `InvalidData` for a log record that is not an op; `InvalidData` carrying an
+    /// [`OpenRefused`] when `CURRENT` or the manifest it names cannot be read and no
+    /// fallback is allowed or intact; and `InvalidData` carrying a
+    /// [`HeadGap`](crate::wal::HeadGap) when the log's head is missing and
+    /// `config.allow_head_gap` is off. A refusal touches nothing on disk.
     pub async fn open(env: E, config: EngineConfig) -> io::Result<(Self, EngineRecovery)> {
         let fs = env.fs();
         let dir = config.dir.clone();
@@ -384,78 +500,71 @@ impl<E: Environment> Engine<E> {
             .collect();
         let sst_files: BTreeSet<u64> = names.iter().filter_map(|n| manifest::sst_of(n)).collect();
 
-        // The manifest: the one CURRENT names, else the newest readable one below it;
-        // if CURRENT itself cannot be read, the newest readable one there is. A crash
-        // can leave CURRENT empty (its content's sync lied) or flip a bit in it, and
-        // the manifests it would have named are still on disk.
+        // The manifest in force: the one CURRENT names. No CURRENT at all is the empty
+        // state, since a switch is what creates it: manifests on disk without it were
+        // written and never switched to. A CURRENT that cannot be read, or one naming
+        // a manifest that cannot be, refuses the store unless a fallback is allowed;
+        // then the newest older manifest whose every table is on disk and intact is
+        // used, never one with a table missing and never the empty state. Falling
+        // back onto a manifest whose tables a later compaction had deleted gave an
+        // empty store at seed 44 (D-022).
         let current_bytes = read_whole(&env, &current_path(&dir)).await?;
         let current = current_bytes.as_deref().and_then(manifest::parse_current);
         let mut manifest = Manifest::empty();
-        let mut fallback_from = None;
-        if current.is_some() || !manifests.is_empty() {
-            let named = current.unwrap_or(0);
-            let mut candidates: Vec<u64> = manifests
-                .iter()
-                .copied()
-                .filter(|&m| current.is_none_or(|named| m < named))
-                .collect();
-            if let Some(named) = current {
-                candidates.push(named);
-            }
-            let mut found = None;
-            while let Some(number) = candidates.pop() {
-                let readable = match read_whole(&env, &manifest_path(&dir, number)).await? {
-                    Some(bytes) => Manifest::decode(&bytes).ok(),
-                    None => None,
-                };
-                if let Some(m) = readable {
-                    found = Some(m);
-                    break;
-                }
-            }
-            manifest = found.unwrap_or_else(Manifest::empty);
-            // A fallback is anything but reading CURRENT and the manifest it names:
-            // an unreadable CURRENT with manifests on disk counts, even when none of
-            // them can be read and the empty state is all that is left.
-            if manifest.number != named || current.is_none() {
-                fallback_from = Some(named);
-                env.trace(TraceEvent::ManifestFallback {
-                    from: named,
-                    to: manifest.number,
-                });
-            }
-        }
-
-        // The tables: opened and checked whole; one that cannot be read is dropped.
         let mut ssts = Vec::new();
         let mut dropped = Vec::new();
-        for meta in &manifest.ssts {
-            let path = sst_path(&dir, meta.number);
-            let file = match fs.open(&path, OpenOptions::new().read(true)).await {
-                Ok(file) => Some(file),
-                Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-                Err(e) => return Err(e),
+        let mut fallback_from = None;
+        if current_bytes.is_some() {
+            let named = match current {
+                Some(number) => read_manifest(&env, &dir, number).await?,
+                None => None,
             };
-            let reader = match file {
-                None => Err("missing"),
-                Some(file) => match SstReader::open(file).await {
-                    Err(_) => Err("unreadable"),
-                    Ok(reader) => match reader.verify().await {
-                        Err(_) => Err("corrupt"),
-                        Ok(()) => Ok(reader),
-                    },
-                },
-            };
-            match reader {
-                Ok(reader) => ssts.push((meta.clone(), Arc::new(reader))),
-                Err(reason) => {
-                    env.trace(TraceEvent::SstDropped {
-                        number: meta.number,
-                        first_seq: meta.first_seq,
-                        max_seq: meta.max_seq,
-                        reason,
+            match named {
+                Some(m) => {
+                    manifest = m;
+                    (ssts, dropped) = open_tables(&env, &dir, &manifest, true).await?;
+                }
+                None => {
+                    let refused = match current {
+                        Some(number) => OpenRefused::ManifestUnreadable(number),
+                        None => OpenRefused::CurrentUnreadable,
+                    };
+                    if !config.allow_manifest_fallback {
+                        env.trace(TraceEvent::OpenRefused {
+                            reason: refused.to_string(),
+                        });
+                        return Err(refused.into_io());
+                    }
+                    let named = current.unwrap_or(0);
+                    let mut chosen = None;
+                    for &number in manifests
+                        .iter()
+                        .rev()
+                        .filter(|&&m| current.is_none_or(|named| m < named))
+                    {
+                        let Some(candidate) = read_manifest(&env, &dir, number).await? else {
+                            continue;
+                        };
+                        let (opened, missing) = open_tables(&env, &dir, &candidate, false).await?;
+                        if missing.is_empty() {
+                            chosen = Some((candidate, opened));
+                            break;
+                        }
+                    }
+                    let Some((chosen, opened)) = chosen else {
+                        let refused = OpenRefused::NoIntactManifest { named };
+                        env.trace(TraceEvent::OpenRefused {
+                            reason: refused.to_string(),
+                        });
+                        return Err(refused.into_io());
+                    };
+                    env.trace(TraceEvent::ManifestFallback {
+                        from: named,
+                        to: chosen.number,
                     });
-                    dropped.push(meta.clone());
+                    fallback_from = Some(named);
+                    manifest = chosen;
+                    ssts = opened;
                 }
             }
         }
@@ -488,18 +597,9 @@ impl<E: Environment> Engine<E> {
             fs.sync_dir(&dir).await?;
         }
         // After a fallback, CURRENT is made to say what recovery decided, so the next
-        // open does not have to decide again from a damaged file: rewritten to name
-        // the manifest used, or removed when nothing readable was left.
+        // open does not have to decide again from a damaged file.
         if fallback_from.is_some() {
-            if manifest.number > 0 {
-                switch_current(&env, &dir, manifest.number).await?;
-            } else if current_bytes.is_some() {
-                fs.remove_file(&current_path(&dir)).await?;
-                env.trace(TraceEvent::OrphanRemoved {
-                    path: current_path(&dir),
-                });
-                fs.sync_dir(&dir).await?;
-            }
+            switch_current(&env, &dir, manifest.number).await?;
         }
 
         // The log, from where the tables leave off.

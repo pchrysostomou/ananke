@@ -58,9 +58,11 @@ key and log sequence number, newest first, applied in sequence order once the lo
 acknowledged. An engine that puts the log in front of the memtable, rotates full
 memtables into an immutable queue, and flushes them to SSTables: 4 KiB blocks with
 prefix-compressed keys and a CRC each, a bloom filter, an index and a versioned
-footer, under a manifest that `CURRENT` names and that recovery falls back from when a
-crash damaged it. Log segments are deleted once a manifest covers their records; a log
-whose head is missing is refused rather than replayed past. Reads and scans take a
+footer, under a manifest that `CURRENT` names. A store whose `CURRENT` or manifest
+cannot be read is refused, or with an option falls back to the newest older manifest
+whose every table is intact, never to an empty one. Log segments are deleted once a
+manifest covers their records; a log whose head is missing is refused rather than
+replayed past. Reads and scans take a
 snapshot, a sequence number, and see the newest write at or below it through one
 merge over every memtable and table. Leveled compaction, levels 0 to 6 at size ratio
 10, merges tables down one level at a time under the same manifest order, drops
@@ -159,8 +161,13 @@ uploaded as artifacts.
   turned the `000007` in `CURRENT` into `000003`, the name of a manifest that still
   existed. Recovery took that manifest as the one in force and removed four newer
   tables as orphans. `CURRENT` now carries the crc32c of the name it holds, and a
-  `CURRENT` that fails it counts as unreadable, so recovery falls back to the newest
-  readable manifest and says so in the trace.
+  `CURRENT` that fails it counts as unreadable and refuses the store.
+- **A fallback onto deleted tables** (seed 44, [D-022](docs/DECISIONS.md)). `CURRENT`
+  and the two newest manifests were damaged at one crash. Recovery fell back to the
+  newest readable manifest, whose tables a later compaction had deleted, and the
+  store came back empty. Recovery now refuses a store whose `CURRENT` or manifest
+  cannot be read, and with fallback allowed uses only a manifest whose every table is
+  intact.
 
 ## Quick start
 

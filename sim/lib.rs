@@ -32,6 +32,16 @@ pub fn seeds() -> u64 {
         .unwrap_or(DEFAULT_SEEDS)
 }
 
+/// How many seeds the nightly's deep-levels run sweeps: `ANANKE_DEEP_SEEDS`, 0 when
+/// unset, which skips the run. Set only by the nightly.
+#[must_use]
+pub fn deep_seeds() -> u64 {
+    std::env::var("ANANKE_DEEP_SEEDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
+}
+
 /// Writes a moirae trace to `out/<name>.jsonl` under the crate directory, replacing
 /// any previous one, so a mismatch or a failing seed leaves the bytes on disk to open
 /// in the studio or upload from CI.
