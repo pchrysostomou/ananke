@@ -48,7 +48,8 @@ pub trait Clock: Send + Sync + 'static {
     fn sleep_until(&self, deadline: Instant) -> impl Future<Output = ()> + Send;
 }
 pub trait FileSystem: Send + Sync + 'static { type File: File; /* open, rename, read_dir, sync_dir, ... */ }
-pub trait Network: Send + Sync + 'static { /* see D-015 */ }
+pub trait Network: Send + Sync + 'static { type Socket: Socket; fn bind(&self, addr: SocketAddr) -> impl Future<Output = io::Result<Self::Socket>> + Send; }
+pub trait Socket: Send + Sync + 'static { /* local_addr, send (enqueue-and-return), recv -> (from, msg); see D-015 */ }
 pub trait Rng: Send + Sync + 'static { fn fill_bytes(&self, dest: &mut [u8]); /* next_u64, below, ... */ }
 ```
 

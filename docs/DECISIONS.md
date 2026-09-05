@@ -245,4 +245,51 @@ instead of a heisenbug.
 
 ---
 
-_Next entry: D-015. Add one before implementing anything not covered above._
+## D-015 — Network is message-oriented, and `send` never blocks
+
+**Context.** SPEC §1.4 lists per-link drop, duplicate, reorder and delay, which only
+exist for messages, while the BOOTSTRAP_PROMPT.md status line said "simulated TCP pair",
+a byte stream. Raft, the first real consumer, is a message protocol. The client wire
+protocol (Phase 5) is a stream.
+
+**Decision.** `Network::bind(addr)` yields a `Socket`. A socket carries unreliable,
+unordered, at-most-once datagrams between `std::net::SocketAddr`s: `send(to, msg)` and
+`recv() -> (from, msg)`, where `from` is the bound address of the sending socket.
+Reliability is the protocol's job.
+
+The send semantics are part of this decision because Raft's liveness depends on them:
+`send` is enqueue-and-return. It never awaits a connect, a slow peer, or a full socket
+buffer. Each destination has a bounded queue; on overflow the oldest queued frame is
+dropped and a `MessageDropped` trace event is emitted. Connecting and reconnecting
+happen in a background task owned by the socket. A dead or slow peer must never stall
+the caller.
+
+Frames are capped at `MAX_FRAME_LEN` (16 MiB), one constant in `ananke-env` that Phase 2
+snapshot chunking reads.
+
+`RealEnv`: one TCP connection per destination, connected lazily on first send, a hello
+frame carrying the sender's bound address, then length-prefixed frames; reconnect with
+bounded backoff. Frames in flight on a broken connection are lost, never retransmitted.
+TLS (Phase 6) sits under the framing. `SimEnv`: synthetic addresses and a delivery
+queue with the §1.4 faults.
+
+**Alternatives.** Stream-only (FoundationDB's Flow model): the simulator must model
+partial delivery, backpressure and bandwidth caps at byte level, and drop, duplicate and
+reorder cannot be expressed, so Raft's stale-message paths only get exercised through
+reconnects. Both APIs from day one: more surface than Phase 0 needs. A blocking `send`
+with backpressure: simpler, but a partitioned follower would stall the leader's
+heartbeat loop.
+
+**Consequences.** Every node-to-node protocol is written against loss and reorder from
+the start; the Phase 0 echo scenario is "send ping, expect pong or time out".
+`SocketAddr` as peer identity is a Phase 0–5 simplification: under mTLS in Phase 6 the
+authenticated identity comes from the certificate, and `recv` will need to return a
+peer handle rather than a bare address. Not solved now; recorded so it is not forgotten.
+The reconnect path is real-only and invisible to the simulator, so it stays as small and
+boring as possible, and a `RealEnv` integration test kills the connection mid-traffic
+and asserts that the pair recovers and that frames in flight were lost, not duplicated.
+Stream-oriented client connections get a separate listener API when Phase 5 needs it.
+
+---
+
+_Next entry: D-016. Add one before implementing anything not covered above._

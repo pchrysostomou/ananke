@@ -18,7 +18,7 @@ use tokio::runtime::Handle;
 
 pub use self::clock::RealClock;
 pub use self::fs::{RealFile, RealFs};
-pub use self::net::RealNet;
+pub use self::net::{RealNet, RealSocket, SEND_QUEUE_LEN};
 pub use self::rng::RealRng;
 use crate::task::TaskControl;
 use crate::{Environment, TaskHandle, TaskId, TraceEvent};
@@ -71,9 +71,9 @@ impl RealEnv {
         RealEnv {
             inner: Arc::new(Inner {
                 fs: RealFs::new(handle.clone()),
+                net: RealNet::new(handle.clone()),
                 handle,
                 clock: RealClock::new(),
-                net: RealNet,
                 rng: RealRng,
                 next_task: AtomicU64::new(1),
             }),
@@ -125,8 +125,14 @@ impl Environment for RealEnv {
     }
 
     fn trace(&self, event: TraceEvent) {
-        tracing::debug!(target: "ananke::trace", ?event);
+        emit(event);
     }
+}
+
+/// Where real-environment trace events go: the `ananke::trace` tracing target at debug
+/// level. The moirae studio path is the simulator's; this is for logs.
+pub(super) fn emit(event: TraceEvent) {
+    tracing::debug!(target: "ananke::trace", ?event);
 }
 
 struct RealTask(tokio::task::JoinHandle<()>);

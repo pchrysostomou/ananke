@@ -145,3 +145,134 @@ fn spawn_runs_tasks_and_abort_cancels_them() {
         assert!(rx.await.is_err(), "aborted task must not reach its send");
     });
 }
+
+use std::future::Future;
+
+use ananke_env::{MAX_FRAME_LEN, Network, Socket};
+
+/// Resolves `fut` or gives up after `limit` on the environment's clock.
+async fn within<T>(clock: &impl Clock, limit: Duration, fut: impl Future<Output = T>) -> Option<T> {
+    tokio::select! {
+        value = fut => Some(value),
+        () = clock.sleep(limit) => None,
+    }
+}
+
+fn frame(n: u32) -> Bytes {
+    Bytes::copy_from_slice(&n.to_be_bytes())
+}
+
+fn number(msg: &Bytes) -> u32 {
+    u32::from_be_bytes(msg[..].try_into().unwrap())
+}
+
+const RECV_LIMIT: Duration = Duration::from_secs(10);
+
+#[test]
+fn sockets_exchange_messages_both_ways() {
+    RealEnv::run(|env| async move {
+        let net = env.net();
+        let a = net.bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let b = net.bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        assert_ne!(a.local_addr().port(), 0);
+
+        a.send(b.local_addr(), Bytes::from_static(b"ping"))
+            .await
+            .unwrap();
+        let (from, msg) = within(env.clock(), RECV_LIMIT, b.recv())
+            .await
+            .expect("b never received")
+            .unwrap();
+        assert_eq!((from, msg), (a.local_addr(), Bytes::from_static(b"ping")));
+
+        b.send(from, Bytes::from_static(b"pong")).await.unwrap();
+        let (from, msg) = within(env.clock(), RECV_LIMIT, a.recv())
+            .await
+            .expect("a never received")
+            .unwrap();
+        assert_eq!((from, msg), (b.local_addr(), Bytes::from_static(b"pong")));
+
+        // Ordering holds on one live connection.
+        for n in 0..100 {
+            a.send(b.local_addr(), frame(n)).await.unwrap();
+        }
+        for n in 0..100 {
+            let (_, msg) = within(env.clock(), RECV_LIMIT, b.recv())
+                .await
+                .expect("stream stalled")
+                .unwrap();
+            assert_eq!(number(&msg), n);
+        }
+
+        // Oversized frames are refused at send time; sending to nobody is not an error.
+        let err = a
+            .send(b.local_addr(), Bytes::from(vec![0u8; MAX_FRAME_LEN + 1]))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        a.send("127.0.0.1:1".parse().unwrap(), Bytes::from_static(b"void"))
+            .await
+            .unwrap();
+    });
+}
+
+/// D-015: kill the connection mid-traffic; the pair must recover, and frames in flight
+/// must be lost rather than duplicated.
+#[test]
+fn killed_connection_recovers_without_duplicates() {
+    RealEnv::run(|env| async move {
+        let net = env.net();
+        let a = net.bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let b1 = net.bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let b_addr = b1.local_addr();
+
+        // Phase 1: a live connection delivers 0..10 in order.
+        for n in 0..10 {
+            a.send(b_addr, frame(n)).await.unwrap();
+        }
+        for n in 0..10 {
+            let (from, msg) = within(env.clock(), RECV_LIMIT, b1.recv())
+                .await
+                .expect("phase 1 stalled")
+                .unwrap();
+            assert_eq!(from, a.local_addr());
+            assert_eq!(number(&msg), n);
+        }
+
+        // Kill: dropping b1 closes its listener and the accepted connection. Frame 10
+        // is written into a dead connection and lost; the write error is noticed at
+        // the latest on the next frame, after which frames queue until reconnection.
+        drop(b1);
+        for n in 10..20 {
+            a.send(b_addr, frame(n)).await.unwrap();
+        }
+        env.clock().sleep(Duration::from_millis(200)).await;
+
+        // Recover: a fresh socket on the same address.
+        let b2 = net.bind(b_addr).await.unwrap();
+        for n in 20..30 {
+            a.send(b_addr, frame(n)).await.unwrap();
+        }
+        let mut got = Vec::new();
+        loop {
+            let (from, msg) = within(env.clock(), RECV_LIMIT, b2.recv())
+                .await
+                .expect("never recovered")
+                .unwrap();
+            assert_eq!(from, a.local_addr());
+            got.push(number(&msg));
+            if got.last() == Some(&29) {
+                break;
+            }
+        }
+
+        // Nothing from before the kill is delivered again, frame 10 is gone, and what
+        // survives is one contiguous in-order tail.
+        assert!(
+            got[0] >= 11,
+            "frame 10 was in flight and must be lost: {got:?}"
+        );
+        let expected: Vec<u32> = (got[0]..30).collect();
+        assert_eq!(got, expected, "tail must be contiguous with no duplicates");
+    });
+}
