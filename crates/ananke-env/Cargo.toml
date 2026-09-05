@@ -1,6 +1,9 @@
 [package]
 name = "ananke-env"
 description = "The Environment trait through which all ananke I/O flows, with real (tokio) and simulated implementations"
+readme = "README.md"
+keywords = ["dst", "distributed-systems", "testing", "simulation", "database"]
+categories = ["simulation", "development-tools::testing"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

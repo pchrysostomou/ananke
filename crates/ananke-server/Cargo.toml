@@ -1,6 +1,8 @@
 [package]
 name = "ananke-server"
 description = "ananke node binary: assembles one node from the workspace crates"
+# The binary is not published; the library half exists so sim/ runs the same protocol code.
+publish = false
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

@@ -3,6 +3,7 @@
 //! `Environment` abstraction, so the code that runs in production also runs inside a
 //! deterministic simulator.
 //!
-//! This release is a placeholder that reserves the crate name. It will become the
-//! public facade over the workspace crates once there is something to expose.
-//! Development happens at <https://github.com/pchrysostomou/ananke>.
+//! Phase 0 ships the deterministic runtime as the `ananke-env` crate; this crate is
+//! still the placeholder that reserves the name, and becomes the public facade over the
+//! workspace crates once there is a database to expose. Development happens at
+//! <https://github.com/pchrysostomou/ananke>.
