@@ -123,8 +123,16 @@ _Update this section at the end of every session._
   the protocol invariants. `ananke_env::race` draws its poll order from the
   environment's RNG so no side can starve the other.
 - Phase 0 exit criteria still open: the moirae bridge (trace opens in the studio).
-- Next concrete task: the moirae bridge, **design step only, no code until approved**:
-  propose (a) the mapping from `TraceRecord` to moirae's trace format, (b) the
-  scheduling-policy decision entry (PCT-style vs uniform random, paper cited), and
-  (c) what `moirae-rs` in the moirae repo needs to expose. Before Phase 1: the
-  BACKLOG "required before Phase 1" gate.
+- moirae bridge, design approved (three proposals, 2026-09-05): integer-nanosecond `t`
+  with a header `unit` field in trace format v2; D-016 hybrid scheduling (uniform half
+  the seeds, PCT the other half, fair coin, liveness only on uniform seeds) and D-017
+  named RNG substreams with `Environment::sched_rng` and `race` taking the environment;
+  crates `moirae-trace` and `moirae-sched` in the moirae repo. The moirae side is done
+  on branch `rust-crates` (PR open): ADR-009, format v2, both crates with fixture and
+  PCG32 parity tests, CI. Placeholders still need publishing to crates.io.
+- Next concrete task: the ananke side of the bridge, after the moirae PR is reviewed:
+  D-016 and D-017 entries, substreams, message ids, `Sim::restart` and partition/heal
+  events, the bridge module writing JSONL through `moirae-trace`, the hash-pinned CI
+  check, and the committed `echo-42.jsonl` fixture opening in the studio via a test.
+  Node ids: pick 1-based ananke ids or one mapping function with a round-trip test, and
+  say which in the bridge code. Verify writer is Phase 0; the Replay scheduler is v2.
