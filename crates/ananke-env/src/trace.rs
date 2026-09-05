@@ -163,6 +163,18 @@ pub enum TraceEvent {
         /// The length it was cut to.
         len: u64,
     },
+    /// The log's first record was numbered past the head its caller expected: the
+    /// records between are gone with their segments. Replaying past the gap would
+    /// give a state that never existed (D-022), so the open was refused, or the whole
+    /// log discarded when the caller allowed that.
+    HeadGap {
+        /// The sequence number the caller expected the log to start at.
+        expected: u64,
+        /// The one the first record carried.
+        found: u64,
+        /// Whether the log was discarded (else the open failed).
+        discarded: bool,
+    },
     /// Recovery finished.
     WalRecovered {
         /// Records recovered, in order from the first segment.
@@ -244,6 +256,13 @@ pub enum TraceEvent {
     WalSegmentDeleted {
         /// The segment.
         segment: u64,
+    },
+    /// The engine's flusher task stopped on an I/O error: nothing is flushed from
+    /// here on, and the log grows until the engine is reopened. Never expected of a
+    /// correct engine in the simulator, where the only I/O errors are its own.
+    FlusherFailed {
+        /// The error's text.
+        error: String,
     },
     /// An immutable memtable was flushed and released.
     MemtableFlushed {

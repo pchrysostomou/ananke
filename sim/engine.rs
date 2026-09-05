@@ -341,6 +341,17 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
             }
         }
         let last_recovered = recovery.first_seq_end();
+        // After a missing head the log is discarded: nothing replays, and the state
+        // must be the manifest's prefix and nothing else (D-022).
+        if verdict.is_ok()
+            && let Some((expected, found)) = recovery.wal.head_gap
+            && (recovery.replayed > 0 || !recovery.wal.records.is_empty())
+        {
+            verdict = Err(format!(
+                "the log's head was missing (expected record {expected}, found {found}) but {} records were replayed past it",
+                recovery.replayed
+            ));
+        }
         let end = usize::try_from(recovery.flushed_seq.max(last_recovered)).expect("fits");
         // What the log replayed into memtables is back, whatever a table lost: the
         // records past the manifest's flushed point and from the log's first record,
@@ -417,7 +428,12 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
                 m.state_after(n)
             };
             if let Err(violation) = check_state(&mut sim, node, &db, expected, end) {
-                verdict = Err(violation);
+                verdict = Err(match recovery.wal.head_gap {
+                    Some((expected, found)) => format!(
+                        "after a missing head (expected record {expected}, found {found}) the state is not the manifest's prefix: {violation}"
+                    ),
+                    None => violation,
+                });
             }
             epoch.verdict = verdict.clone();
         } else if let Some(epoch) = epochs.last_mut() {
@@ -515,6 +531,8 @@ fn open(
         segment_bytes: schedule.segment_bytes,
         variant,
         wal_variant: wal::Variant::Correct,
+        // A missing head is judged by the oracle, so the run goes on past it.
+        allow_head_gap: true,
     };
     env.clone().spawn("engine-open", async move {
         let (db, recovery) = Engine::open(env, config).await.expect("the engine opens");

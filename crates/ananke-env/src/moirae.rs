@@ -19,7 +19,9 @@
 //! | `DirectoryEntryLost`                     | `log` `ananke.fs.dir-entry-lost`              |
 //! | `WalSegmentOpened` / `WalSynced`         | `log` `ananke.wal.segment-opened` / `.synced` |
 //! | `WalTruncated` / `WalRecovered`          | `log` `ananke.wal.truncated` / `.recovered`   |
+//! | `HeadGap`                                | `log` `ananke.wal.head-gap`                   |
 //! | `MemtableRotated` / `MemtableFlushed`    | `log` `ananke.memtable.rotated` / `.flushed`  |
+//! | `FlusherFailed`                          | `log` `ananke.engine.flusher-failed`          |
 //! | `SstWritten` / `SstDropped`              | `log` `ananke.sst.written` / `.dropped`       |
 //! | `ManifestWritten` / `CurrentSwitched` / `ManifestFallback` | `log` `ananke.manifest.written` / `.switched` / `.fallback` |
 //! | `OrphanRemoved` / `WalSegmentDeleted`    | `log` `ananke.fs.orphan-removed` / `ananke.wal.segment-deleted` |
@@ -372,6 +374,18 @@ fn convert(
                 ("len", int(*len)),
             ])),
         ),
+        TraceEvent::HeadGap {
+            expected,
+            found,
+            discarded,
+        } => log(
+            "ananke.wal.head-gap",
+            Some(Json::obj(vec![
+                ("expected", int(*expected)),
+                ("found", int(*found)),
+                ("discarded", Json::Bool(*discarded)),
+            ])),
+        ),
         TraceEvent::WalRecovered {
             records,
             stop,
@@ -468,6 +482,10 @@ fn convert(
         TraceEvent::WalSegmentDeleted { segment } => log(
             "ananke.wal.segment-deleted",
             Some(Json::obj(vec![("segment", int(*segment))])),
+        ),
+        TraceEvent::FlusherFailed { error } => log(
+            "ananke.engine.flusher-failed",
+            Some(Json::obj(vec![("error", Json::str(error))])),
         ),
         TraceEvent::MemtableFlushed { memtable, up_to } => log(
             "ananke.memtable.flushed",

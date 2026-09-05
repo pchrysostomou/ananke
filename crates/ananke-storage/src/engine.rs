@@ -23,7 +23,9 @@
 //! readable one if `CURRENT` or that manifest cannot be read, and then rewriting
 //! `CURRENT` to say so), opens and fully verifies every table listed, dropping one it
 //! cannot read and reporting the writes lost with it, removes orphans, and replays
-//! the log from one past the manifest's `flushed_seq`.
+//! the log from one past the manifest's `flushed_seq`. A log whose first record is
+//! past that is missing its head: the open fails unless `allow_head_gap` is set, and
+//! then the log is discarded and the tables are the state.
 //!
 //! The [`Variant`]s for the crash sweep: [`Variant::Correct`];
 //! [`Variant::NoWalBeforeMemtable`], which applies and acknowledges a write before
@@ -47,7 +49,7 @@ use crate::manifest::{
 };
 use crate::memtable::{Memtable, Value};
 use crate::sst::{SstReader, SstWriter};
-use crate::wal::{self, Append, Recovery, Seq, Wal, WalConfig};
+use crate::wal::{self, Append, HeadGapPolicy, Recovery, Seq, Wal, WalConfig};
 
 type FileOf<E> = <<E as Environment>::Fs as FileSystem>::File;
 
@@ -81,6 +83,12 @@ pub struct EngineConfig {
     pub variant: Variant,
     /// Which log to run underneath; `wal::Variant::Correct` outside a sweep.
     pub wal_variant: wal::Variant,
+    /// Whether to open when the log's head is missing (its first record is past the
+    /// manifest's `flushed_seq + 1`). Off, `open` fails with an error carrying a
+    /// [`HeadGap`](crate::wal::HeadGap) and touches nothing; on, the log is discarded and the manifest's
+    /// tables are the state, a clean prefix. Replaying past the gap would give a
+    /// state that never existed (D-022).
+    pub allow_head_gap: bool,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -241,8 +249,10 @@ impl<E: Environment> Engine<E> {
     ///
     /// # Errors
     ///
-    /// Any I/O error from the directory, the manifests, the tables or the log, or
-    /// `InvalidData` for a log record that is not an op.
+    /// Any I/O error from the directory, the manifests, the tables or the log;
+    /// `InvalidData` for a log record that is not an op; and `InvalidData` carrying a
+    /// [`HeadGap`](crate::wal::HeadGap) when the log's head is missing and `config.allow_head_gap` is off,
+    /// with nothing on disk touched.
     pub async fn open(env: E, config: EngineConfig) -> io::Result<(Self, EngineRecovery)> {
         let fs = env.fs();
         let dir = config.dir.clone();
@@ -380,6 +390,11 @@ impl<E: Environment> Engine<E> {
                 segment_bytes: config.segment_bytes,
                 variant: config.wal_variant,
                 expected_head: manifest.flushed_seq + 1,
+                head_gap: if config.allow_head_gap {
+                    HeadGapPolicy::Discard
+                } else {
+                    HeadGapPolicy::Refuse
+                },
             },
         )
         .await?;
@@ -724,7 +739,8 @@ impl<E: Environment> Future for NextImmutable<'_, E> {
 
 /// The one task that flushes immutable memtables, oldest first: table, manifest,
 /// switch, release, then the log segments the table made redundant. On an I/O error
-/// it stops; reads keep working from the memtables it left.
+/// it reports `FlusherFailed` and stops; reads keep working from the memtables it
+/// left, and the log grows.
 async fn flusher<E: Environment>(shared: Arc<Shared<E>>) {
     while let Some(memtable) = NextImmutable(&shared).await {
         let flushed = async {
@@ -748,7 +764,10 @@ async fn flusher<E: Environment>(shared: Arc<Shared<E>>) {
             }
             Ok::<(), io::Error>(())
         };
-        if flushed.await.is_err() {
+        if let Err(error) = flushed.await {
+            shared.env.trace(TraceEvent::FlusherFailed {
+                error: error.to_string(),
+            });
             return;
         }
     }

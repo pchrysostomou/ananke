@@ -8,7 +8,7 @@ use std::time::Duration;
 use ananke_env::sim::{Sim, SimConfig};
 use ananke_env::{Environment, File, FileSystem, OpenOptions, TraceEvent, WalStop, WalStopReason};
 use ananke_storage::wal::{HEADER_LEN, encode_record, segment_path};
-use ananke_storage::{Recovery, Variant, Wal, WalConfig};
+use ananke_storage::{HeadGap, HeadGapPolicy, Recovery, Variant, Wal, WalConfig};
 use bytes::Bytes;
 
 const DIR: &str = "/wal";
@@ -19,6 +19,7 @@ fn config(variant: Variant) -> WalConfig {
         segment_bytes: 256,
         variant,
         expected_head: 1,
+        head_gap: HeadGapPolicy::Discard,
     }
 }
 
@@ -319,6 +320,92 @@ fn a_hole_in_the_segment_numbers_is_not_a_stop_while_the_records_are_contiguous(
     assert_eq!((recovery.discarded, recovery.next_seq), (0, 3));
     // The fresh segment is numbered past the highest one held.
     assert_eq!(names, ["000001.wal", "000003.wal", "000004.wal"]);
+}
+
+/// A first record past the expected head is a missing head: refused, the open fails
+/// and touches nothing; discarded, the whole log goes and a fresh segment starts at
+/// the head (D-022).
+#[test]
+fn a_missing_head_is_refused_or_discards_the_log() {
+    let mut sim = Sim::new(SimConfig::new(7));
+    let node = sim.add_node();
+    let env = sim.env(node);
+    env.clone().spawn("setup", async move {
+        write_segment(&env, 1, records(3, &[b"gamma", b"delta"])).await;
+        write_segment(&env, 2, records(5, &[b"epsilon"])).await;
+    });
+    sim.run_for(Duration::from_millis(1));
+    /// What an open produced: the recovery, or the head gap the error carried, and
+    /// the directory listing after it.
+    type Outcome = (Result<Recovery, Option<HeadGap>>, Vec<String>);
+    let open = |sim: &mut Sim, policy: HeadGapPolicy| {
+        let env = sim.env(node);
+        let result: Out<Outcome> = out();
+        let r = result.clone();
+        env.clone().spawn("open", async move {
+            let mut config = config(Variant::Correct);
+            config.head_gap = policy;
+            let outcome = match Wal::open(env.clone(), config).await {
+                Ok((wal, recovery)) => {
+                    drop(wal);
+                    Ok(recovery)
+                }
+                Err(e) => Err(HeadGap::from_io(&e)),
+            };
+            let names = env.fs().read_dir(Path::new(DIR)).await.unwrap();
+            let names = names.iter().map(|n| n.display().to_string()).collect();
+            *r.lock().unwrap() = Some((outcome, names));
+        });
+        sim.run_for(Duration::from_millis(1));
+        take(&result)
+    };
+    let (refused, names) = open(&mut sim, HeadGapPolicy::Refuse);
+    assert_eq!(
+        refused.unwrap_err(),
+        Some(HeadGap {
+            expected: 1,
+            found: 3
+        })
+    );
+    assert_eq!(names, ["000001.wal", "000002.wal"]);
+    assert_eq!(
+        sim.durable_contents(node, &segment_path(Path::new(DIR), 1))
+            .map(|b| b.len()),
+        Some(2 * HEADER_LEN + 10),
+        "nothing was cut"
+    );
+    let (discarded, names) = open(&mut sim, HeadGapPolicy::Discard);
+    let recovery = discarded.unwrap();
+    assert_eq!(recovery.head_gap, Some((1, 3)));
+    assert!(recovery.records.is_empty());
+    assert_eq!(
+        recovery.stop,
+        Some(WalStop {
+            segment: 1,
+            offset: 0,
+            reason: WalStopReason::Gap {
+                expected: 1,
+                found: 3
+            }
+        })
+    );
+    // Every segment is removed rather than cut, so a lost sync cannot bring the
+    // old records back; the fresh segment is numbered past them all.
+    assert_eq!((recovery.discarded, recovery.next_seq), (2, 1));
+    assert_eq!(names, ["000003.wal"]);
+    let gaps: Vec<(u64, u64, bool)> = sim
+        .trace()
+        .iter()
+        .filter_map(|r| match r.event {
+            TraceEvent::HeadGap {
+                expected,
+                found,
+                discarded,
+            } => Some((expected, found, discarded)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(gaps, [(1, 3, false), (1, 3, true)]);
 }
 
 /// A segment that ends early because the sync of its last group was lost, followed

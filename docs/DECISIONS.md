@@ -561,10 +561,16 @@ readable), reports the fallback, and rewrites `CURRENT` to name the manifest it 
 Every table listed is opened and verified whole; one
 that cannot be read is dropped from service and reported with its range. Orphans are
 removed. The log is opened expecting its head at `flushed_seq + 1`: a first record
-past that is reported as a head gap and replay goes on from it; a jump in the
-numbering that lands at or below the head skips only records the tables hold and is
-not a stop; replay applies records past `flushed_seq` only; the next number is never
-one below the head. After a recovery that discarded segments, the fresh segment is
+past that is a missing head, reported as a `HeadGap` trace event, and the log is not
+replayed past it. `Engine::open` then fails, with an error carrying the gap and
+nothing on disk touched, unless `allow_head_gap` is set, which discards the whole log
+and keeps the manifest's tables as the state: a clean prefix. A state with a hole in
+it is one that never existed, and a store that serves it has lied about every write
+in the hole; the records are gone either way, and Raft (Phase 2) is the channel for
+re-supplying lost writes from a peer, not a replay that skips over them. A jump in
+the numbering that lands at or below the head skips only records the tables hold and
+is not a stop; replay applies records past `flushed_seq` only; the next number is
+never one below the head. After a recovery that discarded segments, the fresh segment is
 numbered past every segment the directory held, discarded ones included: a segment
 number is never reused, so the trace names one file per number. This supersedes
 D-019's note that the manifest must carry the
@@ -579,10 +585,14 @@ orphan and its records nowhere. The
 sweep excuses exactly these losses: a dropped table whose sync the simulator lost or
 which bit rot hit; a fallback whose manifest's sync, or whose `CURRENT.tmp` sync, was
 lost or which rot hit, with everything flushed after the manifest used; a head of the
-log gone because every sync of the segment that held it was lost, never because the
-segment was deleted, since tables owed a deleted segment's records; and a record lost
-that way stays lost in later epochs unless a log replay brought it back. Nothing else
-is excused. The WAL scenario follows the log's numbering rather than assuming it, and
+log gone, and the log discarded with it, because every sync of the segment that held
+it was lost, or a fault at a covered stop before it took it, or a previous recovery's
+cut of the segment it is found in was betrayed by a lost sync, or the fallback that
+left the head behind is itself excused; never because the segment was deleted, since
+tables owed a deleted segment's records. A record lost that way stays lost in later
+epochs unless a log replay brought it back. After a missing head the sweep also
+requires that nothing was replayed and that the state equals the manifest's prefix
+exactly. Nothing else is excused. The WAL scenario follows the log's numbering rather than assuming it, and
 a log that numbers an append other than by position is a violation of its own.
 
 **Alternatives.** A manifest log appended to, as RocksDB keeps one: fewer bytes per

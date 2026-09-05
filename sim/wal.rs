@@ -22,7 +22,7 @@ use ananke_env::sim::{Sim, SimConfig, SimEnv, TraceRecord};
 use ananke_env::{Clock, Environment, NodeId, Rng, TraceEvent, WalStop};
 use ananke_storage::manifest;
 use ananke_storage::wal::{HEADER_LEN, segment_path};
-use ananke_storage::{CoveredStop, Recovery, Seq, Variant, Wal, WalConfig};
+use ananke_storage::{CoveredStop, HeadGapPolicy, Recovery, Seq, Variant, Wal, WalConfig};
 use bytes::Bytes;
 
 /// Where the log lives on the node's disk.
@@ -317,6 +317,8 @@ fn open(
         segment_bytes: schedule.segment_bytes,
         variant,
         expected_head: 1,
+        // A bare log holds nothing elsewhere: a missing head empties it.
+        head_gap: HeadGapPolicy::Discard,
     };
     env.clone().spawn("wal-open", async move {
         let (wal, recovery) = Wal::open(env, config).await.expect("the log opens");
@@ -393,7 +395,7 @@ pub struct Recovered<'a> {
     /// Where the log stopped short, if it did.
     pub stop: Option<WalStop>,
     /// Records from the expected head up to the first one found, gone with their
-    /// segments.
+    /// segments, and the whole log discarded with them (D-022).
     pub head_gap: Option<(Seq, Seq)>,
     /// Stops the log skipped because the tables held the record; each cost the rest
     /// of its segment.
@@ -622,7 +624,24 @@ pub fn check_epoch(
             .unwrap_or(1);
         unrecoverable.push((from, hi, explain(&skip.stop, from)));
     }
-    if let Some(stop) = recovered.stop {
+    if let Some((expected, _)) = recovered.head_gap {
+        // A missing head: the whole log went with it (D-022), so one range from the
+        // expected head on. On the log's side two things explain it: the segment that
+        // held the head was emptied at the crash because every sync of it was lost,
+        // or a skip over a covered stop before the first record found, explained by
+        // the fault at that stop, took the head with the rest of its segment; and a
+        // previous recovery's cut of the segment the gap is found in, whose sync was
+        // lost, brings the old records back in front of the new ones. Off the log's
+        // side, the caller may have excused the head itself: a manifest fallback that
+        // lost the tables the head's segments were deleted for.
+        let skipped = unrecoverable.iter().find_map(|&(_, _, why)| why);
+        let why = betrayed(u64::MAX, expected)
+            .then_some(Excuse::LostFsync)
+            .or(skipped)
+            .or_else(|| recovered.stop.and_then(|stop| explain(&stop, expected)))
+            .or_else(|| recovered.excused.get(&expected).copied());
+        unrecoverable.push((expected, u64::MAX, why));
+    } else if let Some(stop) = recovered.stop {
         // The record the log stopped at: the one after the last recovered, or, when
         // nothing was, the first record of the stopping segment, which the log may
         // not know when the segments before it were deleted after a flush.
@@ -636,15 +655,6 @@ pub fn check_epoch(
             last_recovered + 1
         };
         unrecoverable.push((from, u64::MAX, explain(&stop, from)));
-    }
-    if let Some((expected, found)) = recovered.head_gap {
-        // A missing head that no covered skip accounts for. On the log's side only one
-        // thing explains it: the segment that held the head was emptied at the crash
-        // because every sync of it was lost, which a torn or rotted record would have
-        // shown as a stop instead. Otherwise only a table or manifest loss the caller
-        // excused can. Last, so a skip's explanation is found first.
-        let why = betrayed(u64::MAX, expected).then_some(Excuse::LostFsync);
-        unrecoverable.push((expected, found - 1, why));
     }
     let excused_by = |seq: Seq| recovered.excused.get(&seq).copied();
     let present = |seq: Seq| {

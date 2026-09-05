@@ -20,6 +20,7 @@ fn config(memtable_bytes: u64) -> EngineConfig {
         segment_bytes: 4096,
         variant: Variant::Correct,
         wal_variant: wal::Variant::Correct,
+        allow_head_gap: false,
     }
 }
 
@@ -282,6 +283,111 @@ fn a_flush_lands_in_a_table_under_a_manifest_and_frees_the_log() {
     assert!(recovery.fallback_from.is_none());
     assert!(recovery.wal.head_gap.is_none());
     assert_eq!(recovery.replayed as u64, 81 - manifest.flushed_seq);
+}
+
+/// A log whose first record is past the manifest's `flushed_seq + 1` is missing its
+/// head. The open fails and touches nothing unless `allow_head_gap` is set; then the
+/// log is discarded and the tables are the state, a clean prefix (D-022).
+#[test]
+fn a_missing_log_head_is_refused_unless_allowed_and_then_the_tables_are_the_state() {
+    let mut sim = Sim::new(SimConfig::new(11));
+    let node = sim.add_node();
+    // Small segments, so the tail of the log past the last flush spans several.
+    let config = || {
+        let mut c = config(600);
+        c.segment_bytes = 128;
+        c
+    };
+    let (flushed_seq, names) = on_node(&mut sim, node, |env| {
+        Box::pin(async move {
+            let (db, _) = Engine::open(env.clone(), config()).await.unwrap();
+            for i in 0..80u32 {
+                db.put(
+                    Bytes::from(format!("k{:03}", i % 30)),
+                    Bytes::from(format!("v{i}")),
+                )
+                .await
+                .unwrap();
+            }
+            env.clock().sleep(Duration::from_millis(1)).await;
+            let flushed_seq = db.manifest().flushed_seq;
+            // A few more writes, fewer than fill a memtable, so the tail past the
+            // last flush spans several segments and none of it is flushed.
+            for i in 80..94u32 {
+                db.put(
+                    Bytes::from(format!("k{:03}", i % 30)),
+                    Bytes::from(format!("v{i}")),
+                )
+                .await
+                .unwrap();
+            }
+            assert_eq!(db.manifest().flushed_seq, flushed_seq);
+            let segments = db.wal_segments();
+            assert!(
+                segments.len() >= 4,
+                "a tail of several segments: {segments:?}"
+            );
+            drop(db);
+            // The head is in one of the two oldest segments left (the older may hold
+            // only flushed records); without both, the log starts past the head.
+            let fs = env.fs();
+            for &segment in &segments[..2] {
+                fs.remove_file(&ananke_storage::wal::segment_path(
+                    Path::new("/db"),
+                    segment,
+                ))
+                .await
+                .unwrap();
+            }
+            fs.sync_dir(Path::new("/db")).await.unwrap();
+            let mut names = fs.read_dir(Path::new("/db")).await.unwrap();
+            names.sort();
+            (flushed_seq, names)
+        })
+    });
+    assert!(flushed_seq > 30);
+    let (gap, names_after) = on_node(&mut sim, node, |env| {
+        Box::pin(async move {
+            let err = match Engine::open(env.clone(), config()).await {
+                Err(e) => e,
+                Ok((db, recovery)) => {
+                    panic!("opened with {recovery:?}, segments {:?}", db.wal_segments())
+                }
+            };
+            let gap = ananke_storage::HeadGap::from_io(&err).unwrap();
+            let mut names = env.fs().read_dir(Path::new("/db")).await.unwrap();
+            names.sort();
+            (gap, names)
+        })
+    });
+    assert_eq!(gap.expected, flushed_seq + 1);
+    assert!(gap.found > gap.expected);
+    assert_eq!(names_after, names, "a refused open touches nothing");
+    let value = |i: u32| Some(Bytes::from(format!("v{i}")));
+    let recovery = on_node(&mut sim, node, |env| {
+        Box::pin(async move {
+            let mut allowed = config();
+            allowed.allow_head_gap = true;
+            let (db, recovery) = Engine::open(env, allowed).await.unwrap();
+            // k000 was written at ops 0, 30 and 60; the state is the manifest's
+            // prefix, so the newest write at or below flushed_seq is what shows.
+            let newest = (flushed_seq - 1) / 30 * 30;
+            assert_eq!(db.get(b"k000").await.unwrap(), value(newest as u32));
+            // The log starts fresh at the head.
+            let seq = db.put(b("k000"), b("fresh")).await.unwrap();
+            assert_eq!(seq, flushed_seq + 1);
+            recovery
+        })
+    });
+    assert_eq!(recovery.wal.head_gap, Some((gap.expected, gap.found)));
+    assert_eq!((recovery.replayed, recovery.wal.records.len()), (0, 0));
+    assert!(recovery.wal.discarded >= 1);
+    assert!(sim.trace().iter().any(|r| r.event
+        == TraceEvent::HeadGap {
+            expected: gap.expected,
+            found: gap.found,
+            discarded: true
+        }));
 }
 
 /// Files a crash left behind are removed at open: a table no manifest lists, a

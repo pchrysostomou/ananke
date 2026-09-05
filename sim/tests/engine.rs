@@ -99,6 +99,7 @@ struct Coverage {
     tables_dropped: u32,
     manifest_fallbacks: u32,
     head_gaps: u32,
+    flusher_failures: u32,
 }
 
 impl Coverage {
@@ -146,6 +147,8 @@ impl Coverage {
             .iter()
             .filter(|e| e.recovery.fallback_from.is_some())
             .count() as u32;
+        self.flusher_failures +=
+            report.count(|e| matches!(e, TraceEvent::FlusherFailed { .. })) as u32;
         self.head_gaps += report
             .epochs
             .iter()
@@ -178,9 +181,16 @@ impl Coverage {
                 self.tables_dropped,
             ),
             ("manifest fallbacks", self.manifest_fallbacks),
+            ("missing log heads, discarded", self.head_gaps),
         ] {
             assert!(seen > 0, "the sweep never saw {what}: {self:?}");
         }
+        // The simulator raises no I/O error of its own, so a flusher that stopped hit
+        // one the engine made (a stale segment it tried to delete twice, once).
+        assert_eq!(
+            self.flusher_failures, 0,
+            "the flusher stopped on an error: {self:?}"
+        );
         assert!(
             self.ops as u64 > 100 * self.seeds,
             "too few ops to mean much: {self:?}"

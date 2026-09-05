@@ -21,4 +21,6 @@ pub mod wal;
 
 pub use engine::{Engine, EngineConfig, EngineRecovery, Write};
 pub use memtable::{Memtable, Value};
-pub use wal::{Append, CoveredStop, Recovery, Seq, Variant, Wal, WalConfig};
+pub use wal::{
+    Append, CoveredStop, HeadGap, HeadGapPolicy, Recovery, Seq, Variant, Wal, WalConfig,
+};

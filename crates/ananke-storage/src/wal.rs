@@ -23,7 +23,10 @@
 //! goes on with the next. Everything after a stop is
 //! discarded, as the SPEC says: the stopping segment is cut to its last good record,
 //! later segments are removed, and a fresh segment is started, numbered past every
-//! segment the directory held so that a segment number is never reused.
+//! segment the directory held so that a segment number is never reused. A first
+//! record numbered past the expected head is a missing head: the open is refused, or
+//! under [`HeadGapPolicy::Discard`] the whole log is discarded, since replaying past
+//! the gap would produce a state that never existed (D-022).
 //!
 //! The [`Variant`] enum carries the correct log and three with known bugs. The crash
 //! sweep in `sim/wal.rs` must pass the first and catch each of the others; that pair is
@@ -78,6 +81,51 @@ pub enum Variant {
     },
 }
 
+/// What to do when the log's head is missing: its first record is numbered past
+/// [`WalConfig::expected_head`], so the records between are gone with the segments
+/// that held them. Replaying past the gap would produce a state that never existed
+/// (D-022), so neither choice does; they differ in what becomes of the tail.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HeadGapPolicy {
+    /// Open fails with a [`HeadGap`] error and the files are left as they are, for
+    /// someone to look at.
+    #[default]
+    Refuse,
+    /// The whole log is discarded, every segment removed: what the caller holds
+    /// elsewhere is the state, and a fresh segment starts at the expected head.
+    Discard,
+}
+
+/// The error [`Wal::open`] fails with under [`HeadGapPolicy::Refuse`]: the first
+/// record found is `found`, the caller expected `expected`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeadGap {
+    /// The sequence number the caller expected the log to start at.
+    pub expected: Seq,
+    /// The one the first record carried.
+    pub found: Seq,
+}
+
+impl HeadGap {
+    /// The head gap an I/O error carries, if it is one.
+    #[must_use]
+    pub fn from_io(error: &io::Error) -> Option<HeadGap> {
+        error.get_ref()?.downcast_ref::<HeadGap>().copied()
+    }
+}
+
+impl std::fmt::Display for HeadGap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the log's head is missing: expected record {}, found {}",
+            self.expected, self.found
+        )
+    }
+}
+
+impl std::error::Error for HeadGap {}
+
 /// How to open a [`Wal`].
 #[derive(Clone, Debug)]
 pub struct WalConfig {
@@ -91,9 +139,10 @@ pub struct WalConfig {
     /// was ever deleted from; one past the manifest's `flushed_seq` for a log behind
     /// SSTables, whose segments are deleted once their records are flushed (D-022).
     /// An older record is fine, it is skipped by the engine; a newer one means the
-    /// log's head is missing, which recovery reports as [`Recovery::head_gap`] and
-    /// goes on from.
+    /// log's head is missing, which [`head_gap`](Self::head_gap) decides.
     pub expected_head: Seq,
+    /// What to do about a missing head.
+    pub head_gap: HeadGapPolicy,
 }
 
 /// The name of segment `n`: six digits and `.wal`, so a listing sorts in log order.
@@ -147,8 +196,10 @@ pub struct CoveredStop {
 pub struct Recovery {
     /// The sequence number of the first record; `next_seq` when there are none.
     pub first_seq: Seq,
-    /// Set when the first record's number is past `WalConfig::expected_head`: records
-    /// from the expected head up to it are gone with the segments that held them.
+    /// Set when the first record's number was past `WalConfig::expected_head`: records
+    /// from the expected head up to it were gone with the segments that held them,
+    /// and under [`HeadGapPolicy::Discard`] the whole log went with them: `records`
+    /// is empty and `stop` is the gap at that first record.
     pub head_gap: Option<(Seq, Seq)>,
     /// Stops at records the caller holds elsewhere, skipped rather than stopped at.
     pub covered_stops: Vec<CoveredStop>,
@@ -325,6 +376,8 @@ impl<E: Environment> Wal<E> {
         // never reused; it is the records' numbering that must be whole. A segment
         // that went missing with records in it shows as a gap at the next segment's
         // first record.
+        // The segment the log's first record was read from, for a head gap.
+        let mut first_segment = None;
         for &segment in &segments {
             let path = segment_path(&config.dir, segment);
             let file = fs.open(&path, OpenOptions::new().read(true)).await?;
@@ -333,6 +386,7 @@ impl<E: Environment> Wal<E> {
                 .read_at(0, usize::try_from(size).unwrap_or(usize::MAX))
                 .await?;
             let before = records.len() as u64;
+            let unread = first_seq.is_none();
             let parsed = parse_segment(
                 &bytes,
                 verify,
@@ -343,6 +397,9 @@ impl<E: Environment> Wal<E> {
             // The segment's first number: its first record's, or the next number if
             // it is empty; unknown until the log's first record is seen.
             if let Some(first) = first_seq {
+                if unread {
+                    first_segment = Some(segment);
+                }
                 firsts.insert(segment, first + before);
                 if let Some(skip) = covered_stops.last_mut()
                     && skip.resumed.is_none()
@@ -375,28 +432,67 @@ impl<E: Environment> Wal<E> {
             }
             last_good = segment;
         }
+        // A missing head: the records from the expected head to the first one found
+        // are gone, and replaying past them would produce a state that never existed.
+        // Refused, nothing on disk is touched; discarded, the stop is the first record
+        // and the whole log goes with it.
         let head_gap = first_seq
             .filter(|&first| first > config.expected_head)
             .map(|first| (config.expected_head, first));
+        if let Some((expected, found)) = head_gap {
+            let discard = config.head_gap == HeadGapPolicy::Discard;
+            env.trace(TraceEvent::HeadGap {
+                expected,
+                found,
+                discarded: discard,
+            });
+            if !discard {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    HeadGap { expected, found },
+                ));
+            }
+            stop = Some(WalStop {
+                segment: first_segment.expect("a first record has a segment"),
+                offset: 0,
+                reason: WalStopReason::Gap { expected, found },
+            });
+            records.clear();
+            first_seq = None;
+        }
 
         // Everything after the stop is discarded: the stopping segment is cut to its
-        // last good record, and later segments are removed.
+        // last good record, and later segments are removed. A missing head discards
+        // every segment by removal, never by a cut to nothing: a cut whose sync the
+        // disk lied about brings the old records back at the next crash, in front of
+        // the new ones and numbered as if they were current (the sweep found this at
+        // seed 191), whereas a removal is durable once the directory is synced.
         let mut discarded = 0;
         if let Some(stop) = stop {
-            let path = segment_path(&config.dir, stop.segment);
-            let file = fs
-                .open(&path, OpenOptions::new().read(true).write(true))
-                .await?;
-            file.set_size(stop.offset).await?;
-            file.sync().await?;
-            env.trace(TraceEvent::WalTruncated {
-                segment: stop.segment,
-                len: stop.offset,
-            });
-            last_good = stop.segment;
-            for &segment in segments.iter().filter(|&&s| s > last_good) {
-                fs.remove_file(&segment_path(&config.dir, segment)).await?;
-                discarded += 1;
+            if head_gap.is_some() {
+                for &segment in &segments {
+                    fs.remove_file(&segment_path(&config.dir, segment)).await?;
+                    discarded += 1;
+                }
+                // Nothing read before the gap was detected is on disk any more.
+                firsts.clear();
+                last_good = 0;
+            } else {
+                let path = segment_path(&config.dir, stop.segment);
+                let file = fs
+                    .open(&path, OpenOptions::new().read(true).write(true))
+                    .await?;
+                file.set_size(stop.offset).await?;
+                file.sync().await?;
+                env.trace(TraceEvent::WalTruncated {
+                    segment: stop.segment,
+                    len: stop.offset,
+                });
+                last_good = stop.segment;
+                for &segment in segments.iter().filter(|&&s| s > last_good) {
+                    fs.remove_file(&segment_path(&config.dir, segment)).await?;
+                    discarded += 1;
+                }
             }
             fs.sync_dir(&config.dir).await?;
         }
