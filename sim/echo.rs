@@ -112,7 +112,7 @@ impl Report {
                 .iter()
                 .filter(|r| r.at > after && r.at <= until)
                 .filter(|r| {
-                    matches!(&r.event, TraceEvent::MessageDropped { from: f, to: t, reason: DropReason::Partitioned }
+                    matches!(&r.event, TraceEvent::MessageDropped { from: f, to: t, reason: DropReason::Partitioned, .. }
                         if node_of(*f) == Some(from) && node_of(*t) == Some(to))
                 })
                 .count()

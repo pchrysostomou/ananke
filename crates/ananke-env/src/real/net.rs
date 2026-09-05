@@ -2,14 +2,17 @@
 //!
 //! One outbound TCP connection per destination, created lazily by a background task
 //! owned by the socket. The first frame on a connection is a hello carrying the
-//! sender's bound address; every frame is a big-endian `u32` length followed by the
-//! payload. Nothing is retransmitted: a frame handed to a connection that then breaks is
-//! lost. This path is invisible to the simulator, so it is kept deliberately small.
+//! sender's bound address; every frame is a big-endian `u32` payload length, a
+//! big-endian `u64` message id, then the payload, so the receiver's trace names the
+//! same message the sender's does. Nothing is retransmitted: a frame handed to a
+//! connection that then breaks is lost. This path is invisible to the simulator, so it
+//! is kept deliberately small.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -21,7 +24,7 @@ use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinHandle;
 
 use super::emit;
-use crate::{DropReason, MAX_FRAME_LEN, Network, Socket, TraceEvent};
+use crate::{DropReason, MAX_FRAME_LEN, MessageId, Network, Socket, TraceEvent};
 
 /// Frames queued per destination before the oldest is dropped.
 pub const SEND_QUEUE_LEN: usize = 1024;
@@ -35,11 +38,16 @@ const RECONNECT_MAX: Duration = Duration::from_secs(2);
 #[derive(Clone, Debug)]
 pub struct RealNet {
     handle: Handle,
+    /// Message ids, unique within this environment across every socket.
+    next_message: Arc<AtomicU64>,
 }
 
 impl RealNet {
     pub(super) fn new(handle: Handle) -> Self {
-        Self { handle }
+        Self {
+            handle,
+            next_message: Arc::new(AtomicU64::new(0)),
+        }
     }
 }
 
@@ -48,6 +56,7 @@ impl Network for RealNet {
 
     fn bind(&self, addr: SocketAddr) -> impl Future<Output = io::Result<RealSocket>> + Send {
         let handle = self.handle.clone();
+        let next_message = self.next_message.clone();
         async move {
             let listener = TcpListener::bind(addr).await?;
             let local = listener.local_addr()?;
@@ -57,6 +66,7 @@ impl Network for RealNet {
                 inner: Arc::new(SocketInner {
                     handle,
                     local,
+                    next_message,
                     inbound: tokio::sync::Mutex::new(inbound_rx),
                     peers: Mutex::new(BTreeMap::new()),
                     accept,
@@ -76,6 +86,7 @@ pub struct RealSocket {
 struct SocketInner {
     handle: Handle,
     local: SocketAddr,
+    next_message: Arc<AtomicU64>,
     inbound: tokio::sync::Mutex<mpsc::Receiver<(SocketAddr, Bytes)>>,
     peers: Mutex<BTreeMap<SocketAddr, Peer>>,
     accept: JoinHandle<()>,
@@ -111,22 +122,26 @@ struct Peer {
 /// The bounded per-destination queue: drop-oldest on overflow (D-015).
 #[derive(Default)]
 struct SendQueue {
-    frames: Mutex<VecDeque<Bytes>>,
+    frames: Mutex<VecDeque<(MessageId, Bytes)>>,
     notify: Notify,
 }
 
 impl SendQueue {
-    /// Appends `frame`; returns `true` if the oldest frame was dropped to make room.
-    fn push(&self, frame: Bytes) -> bool {
+    /// Appends `frame`; returns the id of the oldest frame if it was dropped to make room.
+    fn push(&self, id: MessageId, frame: Bytes) -> Option<MessageId> {
         let mut frames = self.frames.lock().unwrap_or_else(PoisonError::into_inner);
-        let dropped = frames.len() >= SEND_QUEUE_LEN && frames.pop_front().is_some();
-        frames.push_back(frame);
+        let dropped = if frames.len() >= SEND_QUEUE_LEN {
+            frames.pop_front().map(|(id, _)| id)
+        } else {
+            None
+        };
+        frames.push_back((id, frame));
         drop(frames);
         self.notify.notify_one();
         dropped
     }
 
-    async fn pop(&self) -> Bytes {
+    async fn pop(&self) -> (MessageId, Bytes) {
         loop {
             let next = self
                 .frames
@@ -169,7 +184,7 @@ impl SocketInner {
                 "message exceeds MAX_FRAME_LEN",
             ));
         }
-        let len = msg.len();
+        let id = MessageId::new(self.next_message.fetch_add(1, Ordering::Relaxed));
         let queue = {
             let mut peers = self.peers.lock().unwrap_or_else(PoisonError::into_inner);
             let peer = peers.entry(to).or_insert_with(|| {
@@ -179,14 +194,15 @@ impl SocketInner {
             });
             peer.queue.clone()
         };
-        let dropped = queue.push(msg);
         emit(TraceEvent::MessageSent {
+            id,
             from: self.local,
             to,
-            len,
+            payload: msg.clone(),
         });
-        if dropped {
+        if let Some(dropped) = queue.push(id, msg) {
             emit(TraceEvent::MessageDropped {
+                id: dropped,
                 from: self.local,
                 to,
                 reason: DropReason::QueueFull,
@@ -210,9 +226,9 @@ async fn peer_loop(local: SocketAddr, peer: SocketAddr, queue: Arc<SendQueue>) {
         };
         backoff = RECONNECT_MIN;
         loop {
-            let frame = queue.pop().await;
+            let (id, frame) = queue.pop().await;
             // A failed write loses this frame; nothing is retried (D-015).
-            if write_frame(&mut stream, &frame).await.is_err() {
+            if write_frame(&mut stream, id, &frame).await.is_err() {
                 break;
             }
         }
@@ -224,7 +240,7 @@ async fn connect(peer: SocketAddr, local: SocketAddr) -> io::Result<TcpStream> {
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "connect timed out"))??;
     stream.set_nodelay(true)?;
-    write_frame(&mut stream, local.to_string().as_bytes()).await?;
+    write_frame(&mut stream, MessageId::new(0), local.to_string().as_bytes()).await?;
     Ok(stream)
 }
 
@@ -258,10 +274,10 @@ async fn reader_loop(
     };
     let from = hello
         .ok()
-        .and_then(|h| std::str::from_utf8(&h).ok()?.parse::<SocketAddr>().ok());
+        .and_then(|(_, h)| std::str::from_utf8(&h).ok()?.parse::<SocketAddr>().ok());
     let Some(from) = from else { return };
     loop {
-        let frame = tokio::select! {
+        let (id, frame) = tokio::select! {
             frame = read_frame(&mut stream) => match frame {
                 Ok(frame) => frame,
                 Err(_) => return,
@@ -273,6 +289,7 @@ async fn reader_loop(
             return;
         }
         emit(TraceEvent::MessageDelivered {
+            id,
             from,
             to: local,
             len,
@@ -280,7 +297,7 @@ async fn reader_loop(
     }
 }
 
-async fn read_frame(stream: &mut TcpStream) -> io::Result<Bytes> {
+async fn read_frame(stream: &mut TcpStream) -> io::Result<(MessageId, Bytes)> {
     let len = stream.read_u32().await? as usize;
     if len > MAX_FRAME_LEN {
         return Err(io::Error::new(
@@ -288,14 +305,16 @@ async fn read_frame(stream: &mut TcpStream) -> io::Result<Bytes> {
             "frame exceeds MAX_FRAME_LEN",
         ));
     }
+    let id = MessageId::new(stream.read_u64().await?);
     let mut buf = vec![0u8; len];
     stream.read_exact(&mut buf).await?;
-    Ok(Bytes::from(buf))
+    Ok((id, Bytes::from(buf)))
 }
 
-async fn write_frame(stream: &mut TcpStream, frame: &[u8]) -> io::Result<()> {
+async fn write_frame(stream: &mut TcpStream, id: MessageId, frame: &[u8]) -> io::Result<()> {
     let len = u32::try_from(frame.len())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "frame too long"))?;
     stream.write_u32(len).await?;
+    stream.write_u64(id.get()).await?;
     stream.write_all(frame).await
 }

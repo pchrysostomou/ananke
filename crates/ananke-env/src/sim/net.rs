@@ -16,7 +16,7 @@ use std::task::{Context, Poll, Waker};
 use bytes::Bytes;
 
 use super::state::{Shared, State};
-use crate::{DropReason, Instant, MAX_FRAME_LEN, Network, NodeId, Socket, TraceEvent};
+use crate::{DropReason, Instant, MAX_FRAME_LEN, MessageId, Network, NodeId, Socket, TraceEvent};
 
 pub(super) struct SocketState {
     node: NodeId,
@@ -26,6 +26,7 @@ pub(super) struct SocketState {
 }
 
 pub(super) struct Delivery {
+    id: MessageId,
     from: SocketAddr,
     from_node: NodeId,
     to: SocketAddr,
@@ -40,6 +41,7 @@ pub(super) struct Fabric {
     blocked: BTreeSet<(NodeId, NodeId)>,
     next_socket: u64,
     next_port: u16,
+    next_message: u64,
 }
 
 impl Fabric {
@@ -124,12 +126,15 @@ impl State {
                 "message exceeds MAX_FRAME_LEN",
             ));
         }
+        let id = MessageId::new(self.fabric.next_message);
+        self.fabric.next_message += 1;
         self.record(
             Some(node),
             TraceEvent::MessageSent {
+                id,
                 from,
                 to,
-                len: msg.len(),
+                payload: msg.clone(),
             },
         );
         if let Some(to_node) = self.fabric.sockets.get(&to).map(|s| s.node)
@@ -138,6 +143,7 @@ impl State {
             self.record(
                 Some(node),
                 TraceEvent::MessageDropped {
+                    id,
                     from,
                     to,
                     reason: DropReason::Partitioned,
@@ -150,6 +156,7 @@ impl State {
             self.record(
                 Some(node),
                 TraceEvent::MessageDropped {
+                    id,
                     from,
                     to,
                     reason: DropReason::Injected,
@@ -164,6 +171,7 @@ impl State {
         self.fabric.deliveries.insert(
             (at, seq),
             Delivery {
+                id,
                 from,
                 from_node: node,
                 to,
@@ -175,6 +183,7 @@ impl State {
 
     pub(super) fn deliver(&mut self, delivery: Delivery, wakers: &mut Vec<Waker>) {
         let Delivery {
+            id,
             from,
             from_node,
             to,
@@ -184,6 +193,7 @@ impl State {
             self.record(
                 Some(from_node),
                 TraceEvent::MessageDropped {
+                    id,
                     from,
                     to,
                     reason: DropReason::Unreachable,
@@ -195,6 +205,7 @@ impl State {
             self.record(
                 Some(from_node),
                 TraceEvent::MessageDropped {
+                    id,
                     from,
                     to,
                     reason: DropReason::Partitioned,
@@ -209,7 +220,7 @@ impl State {
         }
         self.record(
             Some(to_node),
-            TraceEvent::MessageDelivered { from, to, len },
+            TraceEvent::MessageDelivered { id, from, to, len },
         );
     }
 }

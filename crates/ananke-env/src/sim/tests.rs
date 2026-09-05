@@ -10,7 +10,7 @@ use std::time::Duration;
 use bytes::Bytes;
 
 use super::*;
-use crate::{Clock, DropReason, File, FileSystem, Network, OpenOptions, Rng, Socket};
+use crate::{Clock, DropReason, File, FileSystem, MessageId, Network, OpenOptions, Rng, Socket};
 
 fn ms(n: u64) -> Duration {
     Duration::from_millis(n)
@@ -243,16 +243,17 @@ fn messages_are_delivered_after_the_configured_delay() {
         )]
     );
     let ev = events(&sim);
-    assert!(ev.contains(&TraceEvent::MessageSent {
-        from: addr(1),
-        to: addr(2),
-        len: 2
-    }));
-    assert!(ev.contains(&TraceEvent::MessageDelivered {
-        from: addr(1),
-        to: addr(2),
-        len: 2
-    }));
+    let sent = ev.iter().find_map(|e| match e {
+        TraceEvent::MessageSent {
+            id,
+            from,
+            to,
+            payload,
+        } if *from == addr(1) && *to == addr(2) && payload[..] == b"hi"[..] => Some(*id),
+        _ => None,
+    });
+    let sent = sent.expect("a MessageSent for the ping");
+    assert!(ev.iter().any(|e| matches!(e, TraceEvent::MessageDelivered { id, from, to, len: 2 } if *id == sent && *from == addr(1) && *to == addr(2))));
 }
 
 fn ping_and_count(config: SimConfig, setup: impl FnOnce(&mut Sim, NodeId, NodeId)) -> (Sim, usize) {
@@ -350,11 +351,7 @@ fn unbound_destinations_are_unreachable() {
             .unwrap();
     });
     sim.run_until(Instant::from_nanos(1_000_000_000));
-    assert!(events(&sim).contains(&TraceEvent::MessageDropped {
-        from: addr(1),
-        to: addr(9),
-        reason: DropReason::Unreachable
-    }));
+    assert!(events(&sim).iter().any(|e| matches!(e, TraceEvent::MessageDropped { from, to, reason: DropReason::Unreachable, .. } if *from == addr(1) && *to == addr(9))));
 }
 
 #[test]
@@ -658,11 +655,7 @@ fn crash_kills_tasks_and_unbinds_sockets() {
             .unwrap();
     });
     sim.run_until(Instant::from_nanos(100_000_000));
-    assert!(events(&sim).contains(&TraceEvent::MessageDropped {
-        from: addr(2),
-        to: addr(1),
-        reason: DropReason::Unreachable
-    }));
+    assert!(events(&sim).iter().any(|e| matches!(e, TraceEvent::MessageDropped { from, to, reason: DropReason::Unreachable, .. } if *from == addr(2) && *to == addr(1))));
     // Restart: the address is free again.
     let env_a = sim.env(a);
     let bound: Log<bool> = log();
@@ -815,4 +808,49 @@ fn race_lets_a_timer_fire_under_a_flood_of_ready_messages() {
             "seed {seed}: timer fired before it was due after {count} polls"
         );
     }
+}
+
+#[test]
+fn message_ids_correlate_send_delivery_and_drop() {
+    let mut config = SimConfig::new(6);
+    config.net.delay_min = ms(1);
+    config.net.delay_max = ms(1);
+    let mut sim = Sim::new(config);
+    let (a, b) = (sim.add_node(), sim.add_node());
+    let env_b = sim.env(b);
+    env_b.clone().spawn("receiver", async move {
+        let sock = env_b.net().bind(addr(2)).await.unwrap();
+        loop {
+            sock.recv().await.unwrap();
+        }
+    });
+    let env_a = sim.env(a);
+    env_a.clone().spawn("sender", async move {
+        let sock = env_a.net().bind(addr(1)).await.unwrap();
+        sock.send(addr(2), Bytes::from_static(b"one"))
+            .await
+            .unwrap();
+        sock.send(addr(9), Bytes::from_static(b"nobody"))
+            .await
+            .unwrap();
+    });
+    sim.run_until(Instant::from_nanos(1_000_000_000));
+    let ev = events(&sim);
+    let ids: Vec<MessageId> = ev
+        .iter()
+        .filter_map(|e| match e {
+            TraceEvent::MessageSent { id, .. } => Some(*id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        ids,
+        [MessageId::new(0), MessageId::new(1)],
+        "ids are sequential per simulation"
+    );
+    assert!(
+        ev.iter()
+            .any(|e| matches!(e, TraceEvent::MessageDelivered { id, .. } if *id == ids[0]))
+    );
+    assert!(ev.iter().any(|e| matches!(e, TraceEvent::MessageDropped { id, reason: DropReason::Unreachable, .. } if *id == ids[1])));
 }

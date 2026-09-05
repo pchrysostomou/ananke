@@ -1,9 +1,38 @@
 //! [`TraceEvent`]: what the environment records for moirae (SPEC.md §1.5).
 
+use std::fmt;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
+use bytes::Bytes;
+
 use crate::{Instant, NodeId, TaskId};
+
+/// Identifies one message from its send to its delivery or drop, within one
+/// environment. Assigned at send; the same id appears on the receiving side, so the
+/// three events of a message correlate (moirae's `msgId`, SPEC §1.5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct MessageId(u64);
+
+impl MessageId {
+    /// Wraps a raw id.
+    #[must_use]
+    pub const fn new(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    /// The raw id.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl fmt::Display for MessageId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.pad(&format!("msg#{}", self.0))
+    }
+}
 
 /// A state transition worth seeing in the moirae studio.
 ///
@@ -39,15 +68,19 @@ pub enum TraceEvent {
     },
     /// A socket accepted a message for sending. It may still be lost.
     MessageSent {
+        /// The message's id.
+        id: MessageId,
         /// The sending socket's bound address.
         from: SocketAddr,
         /// The destination address.
         to: SocketAddr,
-        /// Payload length in bytes.
-        len: usize,
+        /// The payload, so the trace can be decoded later; `Bytes` is reference-counted.
+        payload: Bytes,
     },
     /// A message reached the destination socket's receive queue.
     MessageDelivered {
+        /// The message's id.
+        id: MessageId,
         /// The sending socket's bound address.
         from: SocketAddr,
         /// The receiving socket's bound address.
@@ -57,6 +90,8 @@ pub enum TraceEvent {
     },
     /// A message was discarded and will never be delivered.
     MessageDropped {
+        /// The message's id.
+        id: MessageId,
         /// The sending socket's bound address.
         from: SocketAddr,
         /// The destination address.
