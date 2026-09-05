@@ -69,6 +69,12 @@ pub struct Model {
     pub appended: Vec<Bytes>,
     /// Whether the append at each position resolved with `Ok`.
     pub acked: Vec<bool>,
+    /// Records below the log's first after the last recovery: gone with their
+    /// segments, already judged, and not owed again.
+    pub lost: BTreeSet<Seq>,
+    /// Appends the log numbered other than the model expected, which no property
+    /// could judge from then on.
+    pub numbering: Vec<String>,
 }
 
 type SharedModel = Arc<Mutex<Model>>;
@@ -201,18 +207,29 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
                     m.appended.clone(),
                 )
             };
+            let segment_first: BTreeMap<u64, Seq> = records
+                .iter()
+                .filter_map(|r| match r.event {
+                    TraceEvent::WalSegmentOpened { segment, first } => Some((segment, first)),
+                    _ => None,
+                })
+                .collect();
             let recovered = Recovered {
                 first_seq: recovery.first_seq,
                 records: &recovery.records,
                 stop: recovery.stop,
                 head_gap: recovery.head_gap,
                 covered_stops: &recovery.covered_stops,
-                segment_first: &BTreeMap::new(),
+                segment_first: &segment_first,
                 covered_through: 0,
-                excused: BTreeMap::new(),
+                excused: lock(&model)
+                    .lost
+                    .iter()
+                    .map(|&seq| (seq, Excuse::LostFsync))
+                    .collect(),
             };
             let all: Vec<&TraceEvent> = records[..before_open].iter().map(|r| &r.event).collect();
-            let (verdict, excuse) = check_epoch(
+            let (mut verdict, excuse) = check_epoch(
                 &lock(&model),
                 base,
                 &recovered,
@@ -220,6 +237,17 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
                 &all,
                 Path::new(DIR),
             );
+            if verdict.is_ok()
+                && let Some(violation) = lock(&model).numbering.first()
+            {
+                verdict = Err(violation.clone());
+            }
+            if verdict.is_ok() && recovery.next_seq > appended as u64 + 1 {
+                verdict = Err(format!(
+                    "the log's next number is {} but only {appended} records were ever appended",
+                    recovery.next_seq
+                ));
+            }
             epochs.push(Epoch {
                 recovery: recovery.clone(),
                 appended,
@@ -230,12 +258,21 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
                 verdict,
             });
         }
-        base = recovery.records.len();
+        // The model follows the log's numbering: the next append takes `next_seq`,
+        // so the model holds `next_seq - 1` records, and those below the log's first
+        // are gone with their segments.
         {
             let mut m = lock(&model);
+            base = usize::try_from(recovery.next_seq - 1)
+                .unwrap_or(usize::MAX)
+                .min(m.appended.len());
             m.appended.truncate(base);
             m.acked.truncate(base);
             m.acked.iter_mut().for_each(|a| *a = false);
+            // Only records the model holds can be owed; a log numbering past them
+            // (a checksum skipped over a rotted number) was judged above.
+            m.lost = (1..recovery.first_seq.min(base as u64 + 1)).collect();
+            m.numbering.clear();
         }
         epoch_start = before_open;
         if crash == schedule.crashes {
@@ -315,13 +352,18 @@ fn spawn_appenders(
                 let append = wal.append(payload.clone());
                 {
                     let mut m = lock(&model);
+                    let expected = m.appended.len() as u64 + 1;
+                    if append.seq() != expected {
+                        // A log numbering records other than by position is a
+                        // violation no other property can judge: record it and stop.
+                        m.numbering.push(format!(
+                            "the log numbered an append {} where the model expected {expected}",
+                            append.seq()
+                        ));
+                        return;
+                    }
                     m.appended.push(payload);
                     m.acked.push(false);
-                    assert_eq!(
-                        m.appended.len() as u64,
-                        append.seq(),
-                        "the model and the log number records alike"
-                    );
                 }
                 match append.await {
                     Ok(seq) => {
@@ -385,6 +427,9 @@ pub struct Syncs {
     /// A switch was in flight at the end with its `CURRENT.tmp` sync lost: the rename
     /// may have survived the crash with nothing behind it.
     pub current_tmp_lost_in_flight: bool,
+    /// Segments the engine deleted once tables held their records: nothing that
+    /// happened to their syncs explains a loss.
+    pub deleted: BTreeSet<u64>,
 }
 
 /// Reads the syncs out of an epoch's events: a sync event for a file that a
@@ -430,6 +475,9 @@ pub fn syncs(events: &[&TraceEvent], dir: &Path) -> Syncs {
                     out.current_betrayed.insert(*number);
                 }
                 out.switched.push(*number);
+            }
+            TraceEvent::WalSegmentDeleted { segment } => {
+                out.deleted.insert(*segment);
             }
             _ => {}
         }
@@ -514,6 +562,28 @@ pub fn check_epoch(
     // covered is skipped rather than cut, so the fault may be epochs old: these look
     // at the whole trace, by segment, since segment numbers are never reused.
     let last_recovered = first + records.len() as u64 - 1;
+    // Whether every sync that covered record `from` was lost, in the latest segment
+    // numbered at most `bound` that held a record of that number: a gap is found at
+    // the next segment's first byte while the missing record lived in the one before,
+    // and numbers are reused after a cut, so the latest such segment is the record
+    // that matters. A segment the engine deleted explains nothing: tables owed its
+    // records, whatever became of its syncs.
+    let betrayed = |bound: u64, from: Seq| -> bool {
+        let mut by_segment: BTreeMap<u64, Vec<bool>> = BTreeMap::new();
+        for &(segment, f, up_to, lost) in &all_syncs.wal {
+            if segment <= bound
+                && f <= from
+                && from <= up_to
+                && !all_syncs.deleted.contains(&segment)
+            {
+                by_segment.entry(segment).or_default().push(lost);
+            }
+        }
+        by_segment
+            .iter()
+            .next_back()
+            .is_some_and(|(_, attempts)| attempts.iter().all(|&lost| lost))
+    };
     let explain = |stop: &WalStop, from: Seq| -> Option<Excuse> {
         let len = model.appended.get(from as usize - 1).map_or(0, Bytes::len) as u64;
         let span = stop.offset..stop.offset + HEADER_LEN as u64 + len;
@@ -532,20 +602,7 @@ pub fn check_epoch(
             .cuts
             .iter()
             .any(|&(segment, len, lost)| lost && segment == stop.segment && len == stop.offset);
-        // The record's syncs, in the latest segment at or before the stop that held
-        // a record of that number: a gap is found at the next segment's first byte
-        // while the missing record lived in the one before, and numbers are reused
-        // after a cut, so the latest such segment is the record that matters.
-        let mut by_segment: BTreeMap<u64, Vec<bool>> = BTreeMap::new();
-        for &(segment, f, up_to, lost) in &all_syncs.wal {
-            if segment <= stop.segment && f <= from && from <= up_to {
-                by_segment.entry(segment).or_default().push(lost);
-            }
-        }
-        let betrayed = by_segment
-            .iter()
-            .next_back()
-            .is_some_and(|(_, attempts)| attempts.iter().all(|&lost| lost));
+        let betrayed = betrayed(stop.segment, from);
         if rotted {
             Some(Excuse::BitRot)
         } else if torn || betrayed {
@@ -581,10 +638,13 @@ pub fn check_epoch(
         unrecoverable.push((from, u64::MAX, explain(&stop, from)));
     }
     if let Some((expected, found)) = recovered.head_gap {
-        // A missing head that no covered skip accounts for: nothing on the log's side
-        // explains it, only a table or manifest loss the caller excused can. Last, so
-        // a skip's explanation is found first.
-        unrecoverable.push((expected, found - 1, None));
+        // A missing head that no covered skip accounts for. On the log's side only one
+        // thing explains it: the segment that held the head was emptied at the crash
+        // because every sync of it was lost, which a torn or rotted record would have
+        // shown as a stop instead. Otherwise only a table or manifest loss the caller
+        // excused can. Last, so a skip's explanation is found first.
+        let why = betrayed(u64::MAX, expected).then_some(Excuse::LostFsync);
+        unrecoverable.push((expected, found - 1, why));
     }
     let excused_by = |seq: Seq| recovered.excused.get(&seq).copied();
     let present = |seq: Seq| {

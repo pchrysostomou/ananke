@@ -578,9 +578,12 @@ service, before the manifest names it: a crash in that window leaves the table a
 orphan and its records nowhere. The
 sweep excuses exactly these losses: a dropped table whose sync the simulator lost or
 which bit rot hit; a fallback whose manifest's sync, or whose `CURRENT.tmp` sync, was
-lost or which rot hit, with everything flushed after the manifest used; and a record
-lost that way stays lost in later epochs unless a log replay brought it back. Nothing
-else is excused.
+lost or which rot hit, with everything flushed after the manifest used; a head of the
+log gone because every sync of the segment that held it was lost, never because the
+segment was deleted, since tables owed a deleted segment's records; and a record lost
+that way stays lost in later epochs unless a log replay brought it back. Nothing else
+is excused. The WAL scenario follows the log's numbering rather than assuming it, and
+a log that numbers an append other than by position is a violation of its own.
 
 **Alternatives.** A manifest log appended to, as RocksDB keeps one: fewer bytes per
 flush and more code; whole rewrites are small while tables are few. Repairing the
