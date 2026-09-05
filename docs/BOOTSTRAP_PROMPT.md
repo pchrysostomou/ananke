@@ -121,8 +121,8 @@ _Update this section at the end of every session._
      the writes the faults left; three buggy engine variants and three buggy log
      variants are caught alongside. Met.
   2. 10k seeds green in CI nightly: `.github/workflows/nightly.yml`, every sweep in
-     release at `ANANKE_SEEDS=10000`; the run recorded in the Phase 1 devlog. Met
-     when that run is green on the commit the tag is cut from.
+     release at `ANANKE_SEEDS=10000` and the deep-levels run at 1000; run
+     33986588539 on commit `85b78df`, green in 33 minutes. Met.
   3. Bench over 200k writes/s single-threaded on the real environment, a sanity
      number: `cargo run --release -p ananke-storage --example bench`, 468 writes/s
      with a sync per write, 33 523 without, 299 169 in batches of a hundred without

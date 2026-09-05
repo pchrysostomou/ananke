@@ -149,8 +149,9 @@ SPEC §2.8 names three.
   `sim/tests/wal.rs`; the model is the `BTreeMap` fold in `Model::state_after` over the
   writes the faults left. Every known-buggy variant is caught alongside.
 - **10k seeds green in CI nightly.** The nightly workflow runs `ANANKE_SEEDS=10000` in
-  release for every sweep and the deep-levels run; the run this post links is the one on
-  the commit the tag will be cut from.
+  release for every sweep, and the deep-levels run at a thousand:
+  [run 33986588539](https://github.com/pchrysostomou/ananke/actions/runs/33986588539)
+  on commit `85b78df`, green in 33 minutes.
 - **Bench: over 200k writes per second single-threaded on the real environment, as a
   sanity number.** `cargo run --release -p ananke-storage --example bench` on one laptop
   disk: 468 writes/s with a sync per write, 33 523 without, 299 169 in batches of a
