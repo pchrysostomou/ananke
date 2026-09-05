@@ -25,7 +25,14 @@ and reorder from the start), so Raft cannot be tested honestly without it.
 - **Message duplication** — deliver a message more than once with a configurable
   probability (SPEC §1.4).
 
+## Before the Phase 0 tag
+
+- **Publish `moirae-trace` and `moirae-sched`** and switch ananke's `[workspace.dependencies]` from git revisions to versions; `cargo publish` refuses git dependencies (D-011).
+
 ## General
+
+- **Replay scheduler (bridge v2)** — a `moirae_sched::Scheduler` that feeds a recorded decision log back instead of the PRNG, asserting each recorded choice is in the runnable set; needs a decision-log export mode that also records `race` coins. `Sim::verify_moirae` covers the Phase 0 need.
+- **`ananke trace filter`** — carve a per-range or per-transaction sub-trace (`range`, `term`, `index`, `txn` fields) before the studio sees it; the studio stays protocol-agnostic. Phase 2, when there is a range to filter by.
 
 - **README.md** — nothing to show before the Phase 0 tag; write it alongside the first devlog post.
 - **Lint canary in CI** — a test that compiles a deliberate `std::fs` call in a scratch crate and asserts clippy rejects it, so a broken `clippy.toml` cannot pass silently; verified by hand in Phase 0 step 2 instead.

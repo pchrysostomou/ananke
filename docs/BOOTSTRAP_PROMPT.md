@@ -123,16 +123,19 @@ _Update this section at the end of every session._
   the protocol invariants. `ananke_env::race` draws its poll order from the
   environment's RNG so no side can starve the other.
 - Phase 0 exit criteria still open: the moirae bridge (trace opens in the studio).
-- moirae bridge, design approved (three proposals, 2026-09-05): integer-nanosecond `t`
-  with a header `unit` field in trace format v2; D-016 hybrid scheduling (uniform half
-  the seeds, PCT the other half, fair coin, liveness only on uniform seeds) and D-017
-  named RNG substreams with `Environment::sched_rng` and `race` taking the environment;
-  crates `moirae-trace` and `moirae-sched` in the moirae repo. The moirae side is done
-  on branch `rust-crates` (PR open): ADR-009, format v2, both crates with fixture and
-  PCG32 parity tests, CI. Placeholders still need publishing to crates.io.
-- Next concrete task: the ananke side of the bridge, after the moirae PR is reviewed:
-  D-016 and D-017 entries, substreams, message ids, `Sim::restart` and partition/heal
-  events, the bridge module writing JSONL through `moirae-trace`, the hash-pinned CI
-  check, and the committed `echo-42.jsonl` fixture opening in the studio via a test.
-  Node ids: pick 1-based ananke ids or one mapping function with a round-trip test, and
-  say which in the bridge code. Verify writer is Phase 0; the Replay scheduler is v2.
+- moirae bridge, built (2026-09-05). moirae side, PR #49 merged and #50 open: ADR-009,
+  trace format v2 with a header `unit`, crates `moirae-trace` (byte-exact writer,
+  `Verify` sink, fixtures held on both sides) and `moirae-sched` (PCG32 with the
+  engine's seeding, named substreams, `Uniform` and `Pct` with geometric change
+  points). ananke side: D-016 hybrid policy, D-017 named substreams with
+  `Environment::sched_rng` and `race` over the environment, 1-based node ids, message
+  ids and payloads, restart / partition / heal / link events,
+  `ananke_env::moirae` (`Sim::to_moirae`, `Sim::verify_moirae`), and `sim/tests/echo.rs`
+  pinning the FNV-1a hash of the seed-42 trace, written to `sim/out/echo-42.jsonl`.
+  The same bytes are the studio fixture in the moirae repo.
+- Open before the Phase 0 tag: publish `moirae-trace` and `moirae-sched` to crates.io
+  (both still absent there) and switch ananke's git-revision dependencies to versions,
+  since `cargo publish` refuses git dependencies; merge moirae PR #50; the Replay
+  scheduler is bridge v2 (BACKLOG).
+- Next concrete task: the Phase 0 tag checklist (D-011): exit criteria in CI, tag,
+  publish, devlog post. Then the BACKLOG "required before Phase 1" gate.

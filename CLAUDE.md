@@ -35,7 +35,9 @@ Deferred ideas live in [docs/BACKLOG.md](docs/BACKLOG.md).
 - **Every change:** tests under simulation, clippy clean, `cargo doc` without
   warnings, rustfmt clean.
 - **Every state transition that matters emits a trace event.** If it can't be seen in
-  the moirae studio, it didn't happen.
+  the moirae studio, it didn't happen. A scenario's trace is `Sim::to_moirae` JSONL;
+  CI pins its hash, and a deliberate change updates the constant in the same commit and
+  says why (`sim/tests/echo.rs`).
 - **Every published crate carries copies of `LICENSE-MIT` and `LICENSE-APACHE`** in
   its own directory (copies, not symlinks) so `cargo package` bundles them.
 - **Prefer boring, well-documented Rust.** This is a project meant to be read.
@@ -48,7 +50,7 @@ Deferred ideas live in [docs/BACKLOG.md](docs/BACKLOG.md).
 
 ```
 crates/ananke/         Placeholder crate reserving the name on crates.io
-crates/ananke-env/     Environment trait; real/ (RealEnv on tokio); sim/ (Sim + SimEnv)
+crates/ananke-env/     Environment trait; real/ (RealEnv on tokio); sim/ (Sim + SimEnv); moirae.rs (trace export)
 crates/ananke-server/  Node binary + library of the protocols it runs (echo for Phase 0)
 sim/                   Simulation scenarios; scenario files sit directly in sim/ (echo.rs first)
 docs/                  SPEC, DECISIONS, BACKLOG, BOOTSTRAP_PROMPT, devlog/
