@@ -686,22 +686,6 @@ fn node_rng_is_seeded_and_independent_of_scheduling() {
 }
 
 #[test]
-fn trace_text_is_stable_and_readable() {
-    let mut sim = Sim::new(SimConfig::new(1));
-    let n = sim.add_node();
-    sim.env(n).spawn("noop", async {});
-    sim.run_until(Instant::from_nanos(1));
-    let text = sim.trace_text();
-    assert_eq!(
-        text,
-        "              0   n1 TaskSpawned { task: TaskId(1), name: \"noop\" }\n\
-         \x20             0   n1 TaskPolled { task: TaskId(1) }\n\
-         \x20             0   n1 TaskCompleted { task: TaskId(1) }\n\
-         \x20             1    - TimeAdvanced { to: Instant(1ns) }\n"
-    );
-}
-
-#[test]
 fn equal_timestamps_fire_in_registration_order() {
     struct Recorder(Log<u8>, u8);
     impl std::task::Wake for Recorder {

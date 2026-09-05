@@ -11,9 +11,11 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use ananke_env::moirae::{Export, bytes_decoder};
 use ananke_env::sim::{Sim, SimConfig, TraceRecord};
 use ananke_env::{DropReason, Environment, Instant, NodeId, TraceEvent};
-use ananke_server::echo::{self, Echo, SharedStats, Stats};
+use ananke_server::echo::{self, Echo, Message, SharedStats, Stats};
+use moirae_trace::Json;
 
 /// How many nodes the scenario runs.
 pub const NODES: u32 = 3;
@@ -57,6 +59,14 @@ pub struct Schedule {
     pub after_restart: Duration,
 }
 
+impl Schedule {
+    /// The whole run's virtual duration.
+    #[must_use]
+    pub fn total(&self) -> Duration {
+        self.warmup + self.partition + self.healed + self.one_way + self.after_restart
+    }
+}
+
 impl Default for Schedule {
     fn default() -> Self {
         Self {
@@ -74,8 +84,9 @@ impl Default for Schedule {
 pub struct Report {
     /// The seed the run used.
     pub seed: u64,
-    /// The trace, one record per line, byte-identical across runs with the same seed.
-    pub trace_text: String,
+    /// The trace as moirae JSONL (SPEC §1.5), byte-identical across runs with the same
+    /// seed; `sim/tests/echo.rs` pins its hash.
+    pub jsonl: String,
     /// The trace as records.
     pub records: Vec<TraceRecord>,
     /// Global time at which each phase ended.
@@ -258,6 +269,23 @@ impl Report {
     }
 }
 
+/// Decodes echo payloads for the studio: `{"type":"ping","seq":N}` and the same for
+/// `pong`; anything else falls back to [`bytes_decoder`].
+#[must_use]
+pub fn decoder(payload: &[u8]) -> Json {
+    match Message::decode(payload) {
+        Some(Message::Ping(seq)) => Json::obj(vec![
+            ("type", Json::str("ping")),
+            ("seq", Json::Int(i64::try_from(seq).unwrap_or(i64::MAX))),
+        ]),
+        Some(Message::Pong(seq)) => Json::obj(vec![
+            ("type", Json::str("pong")),
+            ("seq", Json::Int(i64::try_from(seq).unwrap_or(i64::MAX))),
+        ]),
+        None => bytes_decoder(payload),
+    }
+}
+
 /// The simulator configuration the scenario uses for `seed`.
 #[must_use]
 pub fn config(seed: u64) -> SimConfig {
@@ -279,7 +307,9 @@ pub fn run(seed: u64) -> Report {
 /// Runs the scenario for `seed` with an explicit fault schedule.
 #[must_use]
 pub fn run_with(seed: u64, schedule: Schedule) -> Report {
-    let mut sim = Sim::new(config(seed));
+    let mut config = config(seed);
+    config.run_length_hint = SimConfig::run_length_hint_for(NODES, schedule.total());
+    let mut sim = Sim::new(config);
     let nodes: Vec<NodeId> = (0..NODES).map(|_| sim.add_node()).collect();
     let stats: Vec<SharedStats> = (0..NODES).map(|_| SharedStats::default()).collect();
     let spawn = |sim: &Sim, n: u32, incarnation: u32| {
@@ -324,7 +354,9 @@ pub fn run_with(seed: u64, schedule: Schedule) -> Report {
 
     Report {
         seed,
-        trace_text: sim.trace_text(),
+        jsonl: sim
+            .to_moirae(&Export::new(&decoder))
+            .expect("the echo trace exports to moirae v2"),
         records: sim.trace(),
         phase_ends,
         stats: stats.iter().map(|s| echo::lock(s).clone()).collect(),

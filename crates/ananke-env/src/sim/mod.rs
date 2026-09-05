@@ -145,15 +145,6 @@ pub struct TraceRecord {
     pub event: TraceEvent,
 }
 
-impl fmt::Display for TraceRecord {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.node {
-            Some(node) => write!(f, "{:>15} {:>4} {:?}", self.at.as_nanos(), node, self.event),
-            None => write!(f, "{:>15}    - {:?}", self.at.as_nanos(), self.event),
-        }
-    }
-}
-
 /// What the moirae export reads: the configuration, the policy, each node's clock, every
 /// address ever bound, and the records.
 pub(crate) struct Snapshot {
@@ -449,19 +440,6 @@ impl Sim {
             addrs: st.fabric.known.iter().map(|(a, n)| (*a, *n)).collect(),
             records: st.trace.clone(),
         }
-    }
-
-    /// The trace so far as text, one record per line. Two runs with the same config
-    /// produce identical text.
-    #[must_use]
-    pub fn trace_text(&self) -> String {
-        let st = self.shared.lock();
-        let mut out = String::new();
-        for record in &st.trace {
-            out.push_str(&record.to_string());
-            out.push('\n');
-        }
-        out
     }
 
     fn enqueue_wakes(&self) {

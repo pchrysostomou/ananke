@@ -6,6 +6,7 @@ use std::path::Path;
 use std::pin::pin;
 use std::time::Duration;
 
+use ananke_env::moirae::{Export, bytes_decoder};
 use ananke_env::sim::{Sim, SimConfig};
 use ananke_env::{
     Clock, Either, Environment, File, FileSystem, Network, OpenOptions, Rng, Socket, det_hash_map,
@@ -81,9 +82,10 @@ fn run(seed: u64) -> String {
     sim.heal();
     sim.run_for(Duration::from_millis(50));
     sim.crash(b);
+    sim.restart(b);
     sim.env(b).spawn("node b again", node(sim.env(b), 2, 1));
     sim.run_for(Duration::from_millis(100));
-    sim.trace_text()
+    sim.to_moirae(&Export::new(&bytes_decoder)).expect("export")
 }
 
 #[test]
@@ -95,13 +97,13 @@ fn same_seed_same_trace() {
         "the scenario should produce a substantial trace"
     );
     for needle in [
-        "MessageDelivered",
-        "MessageDropped",
-        "Partitioned",
-        "Injected",
-        "TimeAdvanced",
-        "NodeCrashed",
-        "FsyncLost",
+        "\"kind\":\"deliver\"",
+        "\"reason\":\"partition\"",
+        "\"reason\":\"loss\"",
+        "\"fault\":\"crash\"",
+        "\"fault\":\"restart\"",
+        "ananke.fs.fsync-lost",
+        "\"unit\":\"ns\"",
     ] {
         assert!(first.contains(needle), "trace lacks {needle}");
     }
