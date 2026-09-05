@@ -172,6 +172,25 @@ pub enum TraceEvent {
         /// Segments after the stop that were discarded.
         discarded: u64,
     },
+    /// The active memtable was full and became immutable; a fresh one took its place
+    /// (SPEC §2.3). It stays readable until `MemtableFlushed` says the flush completed.
+    MemtableRotated {
+        /// The memtable's number, counting from 1 per engine open.
+        memtable: u64,
+        /// Keys it holds.
+        entries: u64,
+        /// Bytes it accounts for.
+        bytes: u64,
+        /// The highest log sequence number it holds.
+        up_to: u64,
+    },
+    /// An immutable memtable was flushed and released.
+    MemtableFlushed {
+        /// The memtable's number.
+        memtable: u64,
+        /// The highest log sequence number it held.
+        up_to: u64,
+    },
     /// A node's tasks were killed and the filesystem fault model applied to its disk.
     NodeCrashed {
         /// The crashed node.

@@ -989,6 +989,34 @@ fn a_busy_loop_fails_the_run_instead_of_hanging() {
     sim.run_until(Instant::from_nanos(1));
 }
 
+/// A step is one poll, or one advance of time when nothing is runnable; a crash after
+/// `run_steps` can therefore land between two tasks' polls at one instant.
+#[test]
+fn run_steps_takes_one_poll_at_a_time_and_advances_time_only_when_idle() {
+    let mut sim = Sim::new(SimConfig::new(1));
+    let n = sim.add_node();
+    let env = sim.env(n);
+    let done: Log<&'static str> = log();
+    for name in ["a", "b", "c"] {
+        let (env, d) = (env.clone(), done.clone());
+        env.clone().spawn(name, async move {
+            env.clock().sleep(ms(1)).await;
+            d.lock().unwrap().push(name);
+        });
+    }
+    // Three spawns are three runnable tasks: three polls register three timers.
+    assert_eq!(sim.run_steps(3), 3);
+    assert!(done.lock().unwrap().is_empty());
+    assert_eq!(sim.now(), Instant::ZERO);
+    // Nothing is runnable: the next step advances time to the timers, then one poll
+    // completes one task, leaving the other two between polls at the same instant.
+    assert_eq!(sim.run_steps(2), 2);
+    assert_eq!(sim.now(), Instant::ZERO + ms(1));
+    assert_eq!(done.lock().unwrap().len(), 1);
+    assert_eq!(sim.run_steps(100), 2, "two polls remained, then nothing");
+    assert_eq!(done.lock().unwrap().len(), 3);
+}
+
 #[test]
 fn the_poll_budget_restarts_when_time_moves() {
     // 400 yields per millisecond for 10 ms is 4000 polls in total, but never more than

@@ -339,6 +339,33 @@ impl Sim {
         self.run_until(deadline);
     }
 
+    /// Takes up to `steps` scheduling steps: each is one poll of a runnable task or,
+    /// when nothing is runnable, one advance of virtual time to the next timer. Stops
+    /// early when nothing is left to do, and returns the steps taken.
+    ///
+    /// [`run_until`](Self::run_until) only ever stops with nothing runnable at the
+    /// current instant, so a crash after it always finds every task between steps
+    /// and every queue drained. A crash after `run_steps` can land between any two
+    /// polls, which is where the bugs are.
+    pub fn run_steps(&mut self, steps: u64) -> u64 {
+        let mut taken = 0;
+        while taken < steps {
+            self.enqueue_wakes();
+            let next = self.shared.lock().pick_runnable();
+            if let Some(id) = next {
+                self.poll(id);
+                taken += 1;
+                continue;
+            }
+            let Some(at) = self.shared.lock().next_event_time() else {
+                break;
+            };
+            self.advance_to(at);
+            taken += 1;
+        }
+        taken
+    }
+
     /// Blocks every link between the two groups, both directions.
     ///
     /// When the two groups are disjoint and together cover every node this is a

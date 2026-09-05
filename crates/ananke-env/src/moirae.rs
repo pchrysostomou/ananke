@@ -19,6 +19,7 @@
 //! | `DirectoryEntryLost`                     | `log` `ananke.fs.dir-entry-lost`              |
 //! | `WalSegmentOpened` / `WalSynced`         | `log` `ananke.wal.segment-opened` / `.synced` |
 //! | `WalTruncated` / `WalRecovered`          | `log` `ananke.wal.truncated` / `.recovered`   |
+//! | `MemtableRotated` / `MemtableFlushed`    | `log` `ananke.memtable.rotated` / `.flushed`  |
 //! | `TimeAdvanced`                           | nothing: every line carries `t`               |
 //!
 //! `t` is global virtual time in nanoseconds and the header says `unit: "ns"`. Node ids
@@ -394,6 +395,27 @@ fn convert(
                     }),
                 ),
                 ("discarded", int(*discarded)),
+            ])),
+        ),
+        TraceEvent::MemtableRotated {
+            memtable,
+            entries,
+            bytes,
+            up_to,
+        } => log(
+            "ananke.memtable.rotated",
+            Some(Json::obj(vec![
+                ("memtable", int(*memtable)),
+                ("entries", int(*entries)),
+                ("bytes", int(*bytes)),
+                ("upTo", int(*up_to)),
+            ])),
+        ),
+        TraceEvent::MemtableFlushed { memtable, up_to } => log(
+            "ananke.memtable.flushed",
+            Some(Json::obj(vec![
+                ("memtable", int(*memtable)),
+                ("upTo", int(*up_to)),
             ])),
         ),
         TraceEvent::NodeCrashed { node } => Some(Event::Crash {
