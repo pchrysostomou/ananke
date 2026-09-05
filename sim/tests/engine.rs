@@ -1,8 +1,9 @@
 //! The Phase 1 crash-injection property (SPEC.md §2.8) for the engine: the correct
 //! engine passes every seed with every §1.3 fault on, filesystem latency and crashes
-//! mid-flush; the engine that acknowledges before the log is caught, and so is the
-//! one that releases a memtable and its log segments before the manifest names its
-//! table.
+//! mid-flush and mid-compaction; the engine that acknowledges before the log is
+//! caught, and so are the one that releases a memtable and its log segments before
+//! the manifest names its table and the one whose compaction deletes its inputs
+//! before the manifest stops naming them.
 
 use ananke_env::TraceEvent;
 use ananke_sim::engine::{self, Variant};
@@ -78,6 +79,11 @@ fn an_engine_that_releases_a_memtable_before_the_manifest_is_caught() {
     is_caught(Variant::ReleaseBeforeManifest);
 }
 
+#[test]
+fn a_compaction_that_deletes_its_inputs_before_the_manifest_is_caught() {
+    is_caught(Variant::DeleteBeforeManifest);
+}
+
 /// What the correct engine's sweep saw.
 #[derive(Debug, Default)]
 struct Coverage {
@@ -101,6 +107,12 @@ struct Coverage {
     manifest_fallbacks: u32,
     head_gaps: u32,
     flusher_failures: u32,
+    compactions: u32,
+    compactions_below_level_0: u32,
+    tables_deleted: u32,
+    versions_dropped: u64,
+    tombstones_dropped: u64,
+    crashes_mid_compaction: u32,
 }
 
 impl Coverage {
@@ -151,6 +163,37 @@ impl Coverage {
             .count() as u32;
         self.flusher_failures +=
             report.count(|e| matches!(e, TraceEvent::FlusherFailed { .. })) as u32;
+        self.compactions +=
+            report.count(|e| matches!(e, TraceEvent::CompactionWritten { .. })) as u32;
+        self.compactions_below_level_0 += report
+            .count(|e| matches!(e, TraceEvent::CompactionWritten { level, .. } if *level > 0))
+            as u32;
+        self.tables_deleted += report.count(|e| matches!(e, TraceEvent::SstDeleted { .. })) as u32;
+        for record in &report.records {
+            if let TraceEvent::CompactionWritten {
+                dropped_versions,
+                dropped_tombstones,
+                ..
+            } = record.event
+            {
+                self.versions_dropped += dropped_versions;
+                self.tombstones_dropped += dropped_tombstones;
+            }
+        }
+        // A crash inside a compaction: an output written for a deeper level, and the
+        // next crash before any manifest was switched to.
+        let mut pending = false;
+        for record in &report.records {
+            match record.event {
+                TraceEvent::SstWritten { level, .. } if level > 0 => pending = true,
+                TraceEvent::CurrentSwitched { .. } => pending = false,
+                TraceEvent::NodeCrashed { .. } => {
+                    self.crashes_mid_compaction += u32::from(pending);
+                    pending = false;
+                }
+                _ => {}
+            }
+        }
         self.head_gaps += report
             .epochs
             .iter()
@@ -188,8 +231,28 @@ impl Coverage {
             ),
             ("manifest fallbacks", self.manifest_fallbacks),
             ("missing log heads, discarded", self.head_gaps),
+            ("compactions", self.compactions),
+            ("compactions below level 0", self.compactions_below_level_0),
+            ("input tables deleted", self.tables_deleted),
+            (
+                "writes dropped by compaction",
+                u32::try_from(self.versions_dropped).unwrap_or(u32::MAX),
+            ),
+            (
+                "tombstones dropped by compaction",
+                u32::try_from(self.tombstones_dropped).unwrap_or(u32::MAX),
+            ),
         ] {
             assert!(seen > 0, "the sweep never saw {what}: {self:?}");
+        }
+        // A crash inside a compaction needs one to land in the few operations between
+        // an output's write and the manifest's: about one seed in six. Twenty seeds
+        // cannot promise one; a hundred can.
+        if self.seeds >= 100 {
+            assert!(
+                self.crashes_mid_compaction > 0,
+                "the sweep never saw a crash inside a compaction: {self:?}"
+            );
         }
         // The simulator raises no I/O error of its own, so a flusher that stopped hit
         // one the engine made (a stale segment it tried to delete twice, once).

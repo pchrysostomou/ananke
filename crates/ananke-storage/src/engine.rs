@@ -49,16 +49,18 @@ use std::task::{Context, Poll, Waker};
 use ananke_env::{Environment, File, FileSystem, OpenOptions, TraceEvent};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
+pub use crate::compaction::Compaction;
 use crate::ikey;
 use crate::manifest::{
-    self, Manifest, SstMeta, current_path, current_tmp_path, manifest_path, sst_path,
+    self, LEVELS, Manifest, SstMeta, current_path, current_tmp_path, manifest_path, sst_path,
 };
 use crate::memtable::{Memtable, Value};
 use crate::merge::{MergeIter, Source};
 use crate::sst::{SstReader, SstWriter};
+use crate::turnstile::Turnstile;
 use crate::wal::{self, Append, HeadGapPolicy, Recovery, Seq, Wal, WalConfig};
 
-type FileOf<E> = <<E as Environment>::Fs as FileSystem>::File;
+pub(crate) type FileOf<E> = <<E as Environment>::Fs as FileSystem>::File;
 
 /// Which engine to run: the correct one, or a known bug the crash sweep must catch.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -75,6 +77,10 @@ pub enum Variant {
     /// A crash before the manifest is durable leaves the table an orphan and its
     /// records nowhere.
     ReleaseBeforeManifest,
+    /// A compaction deletes its input tables before the manifest stops naming them.
+    /// A crash between leaves a manifest naming tables that are gone, and the
+    /// outputs as orphans: their writes are nowhere.
+    DeleteBeforeManifest,
 }
 
 /// How to open an [`Engine`].
@@ -96,11 +102,23 @@ pub struct EngineConfig {
     /// tables are the state, a clean prefix. Replaying past the gap would give a
     /// state that never existed (D-022).
     pub allow_head_gap: bool,
+    /// Level 0 is compacted once it holds this many tables.
+    pub l0_trigger: usize,
+    /// Level 1 is compacted once it holds more than this many bytes; each deeper
+    /// level, ten times more (SPEC §2.5).
+    pub level_base_bytes: u64,
+    /// A compaction seals an output table once it reaches this size.
+    pub sst_bytes: u64,
+    /// Whether the flusher runs compaction rounds after each flush until no level is
+    /// over its limit. Off, [`Engine::compact_once`] is the only trigger, for tests.
+    pub background_compaction: bool,
 }
 
 impl EngineConfig {
     /// The defaults for a store in `dir`: a 64 MiB memtable (SPEC §2.3), 16 MiB log
-    /// segments, the correct engine and log, and a missing log head refused.
+    /// segments, the correct engine and log, a missing log head refused, level 0
+    /// compacted at four tables, level 1 at 256 MiB, outputs of 64 MiB, compaction
+    /// in the background.
     #[must_use]
     pub fn new(dir: PathBuf) -> Self {
         Self {
@@ -110,11 +128,15 @@ impl EngineConfig {
             variant: Variant::Correct,
             wal_variant: wal::Variant::Correct,
             allow_head_gap: false,
+            l0_trigger: 4,
+            level_base_bytes: 256 << 20,
+            sst_bytes: 64 << 20,
+            background_compaction: true,
         }
     }
 }
 
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
@@ -171,12 +193,35 @@ pub fn decode_op(mut record: Bytes) -> io::Result<(Bytes, Value)> {
 }
 
 /// The memtables and tables reads consult, and the manifest in force.
-struct Tables<E: Environment> {
-    active: Arc<Memtable>,
-    immutable: VecDeque<Arc<Memtable>>,
-    /// Oldest first.
-    ssts: Vec<(SstMeta, Arc<SstReader<FileOf<E>>>)>,
-    manifest: Manifest,
+pub(crate) struct Tables<E: Environment> {
+    pub(crate) active: Arc<Memtable>,
+    pub(crate) immutable: VecDeque<Arc<Memtable>>,
+    /// The tables in service, in the order they were put there: a dropped table is
+    /// not here though the manifest may still list it.
+    pub(crate) ssts: Vec<(SstMeta, Arc<SstReader<FileOf<E>>>)>,
+    pub(crate) manifest: Manifest,
+}
+
+impl<E: Environment> Tables<E> {
+    /// The readers a lookup of `key` consults after the memtables: level 0 newest
+    /// first, then the one table per deeper level whose range holds the key.
+    fn readers_for(&self, key: &[u8]) -> Vec<Arc<SstReader<FileOf<E>>>> {
+        let mut l0: Vec<&(SstMeta, Arc<SstReader<FileOf<E>>>)> =
+            self.ssts.iter().filter(|(m, _)| m.level == 0).collect();
+        l0.sort_by_key(|(m, _)| std::cmp::Reverse(m.number));
+        let mut readers: Vec<Arc<SstReader<FileOf<E>>>> =
+            l0.into_iter().map(|(_, r)| r.clone()).collect();
+        for level in 1..LEVELS as u8 {
+            if let Some((_, r)) = self
+                .ssts
+                .iter()
+                .find(|(m, _)| m.level == level && m.contains(key))
+            {
+                readers.push(r.clone());
+            }
+        }
+        readers
+    }
 }
 
 struct Flusher {
@@ -184,21 +229,28 @@ struct Flusher {
     closed: bool,
 }
 
-struct Shared<E: Environment> {
-    env: E,
-    config: EngineConfig,
+pub(crate) struct Shared<E: Environment> {
+    pub(crate) env: E,
+    pub(crate) config: EngineConfig,
     wal: Wal<E>,
-    tables: Mutex<Tables<E>>,
+    pub(crate) tables: Mutex<Tables<E>>,
     flusher: Mutex<Flusher>,
+    /// One flush or compaction at a time (D-023).
+    turnstile: Turnstile,
+    /// The number the next table gets.
+    pub(crate) next_sst: AtomicU64,
+    /// Per level, the last key the last compaction round on it wrote, so rounds walk
+    /// the level.
+    pub(crate) compact_pointer: Mutex<Vec<Option<Bytes>>>,
     next_memtable: AtomicU64,
     /// Writes appended and not yet applied, by sequence number.
     pending: Mutex<BTreeMap<Seq, (Bytes, Value)>>,
     /// The highest sequence number applied: what a read without a snapshot reads at,
     /// and what a new snapshot pins. Writes apply in order (D-021), so everything at
     /// or below it is visible.
-    visible: AtomicU64,
+    pub(crate) visible: AtomicU64,
     /// Live snapshots by sequence number, with how many pin each.
-    snapshots: Mutex<BTreeMap<Seq, usize>>,
+    pub(crate) snapshots: Mutex<BTreeMap<Seq, usize>>,
 }
 
 /// What [`Engine::open`] found.
@@ -214,6 +266,9 @@ pub struct EngineRecovery {
     pub flushed_seq: Seq,
     /// Tables in service.
     pub ssts: usize,
+    /// Every table the manifest lists, dropped ones included: what the file on disk
+    /// says, whether or not the trace saw it written.
+    pub tables: Vec<SstMeta>,
     /// Tables the manifest lists that could not be read; their writes are lost.
     pub dropped: Vec<SstMeta>,
     /// Files no manifest referred to, removed.
@@ -392,7 +447,7 @@ impl<E: Environment> Engine<E> {
                 },
             };
             match reader {
-                Ok(reader) => ssts.push((*meta, Arc::new(reader))),
+                Ok(reader) => ssts.push((meta.clone(), Arc::new(reader))),
                 Err(reason) => {
                     env.trace(TraceEvent::SstDropped {
                         number: meta.number,
@@ -400,7 +455,7 @@ impl<E: Environment> Engine<E> {
                         max_seq: meta.max_seq,
                         reason,
                     });
-                    dropped.push(*meta);
+                    dropped.push(meta.clone());
                 }
             }
         }
@@ -465,6 +520,8 @@ impl<E: Environment> Engine<E> {
         .await?;
         let flushed_seq = manifest.flushed_seq;
         let manifest_number = manifest.number;
+        let next_sst = manifest.next_sst;
+        let listed = manifest.ssts.clone();
         let shared = Arc::new(Shared {
             env: env.clone(),
             config,
@@ -479,6 +536,9 @@ impl<E: Environment> Engine<E> {
                 waker: None,
                 closed: false,
             }),
+            turnstile: Turnstile::default(),
+            next_sst: AtomicU64::new(next_sst),
+            compact_pointer: Mutex::new(vec![None; LEVELS]),
             next_memtable: AtomicU64::new(2),
             pending: Mutex::new(BTreeMap::new()),
             visible: AtomicU64::new(flushed_seq),
@@ -503,6 +563,7 @@ impl<E: Environment> Engine<E> {
                 fallback_from,
                 flushed_seq,
                 ssts,
+                tables: listed,
                 dropped,
                 orphans: orphans.len(),
                 wal: recovery,
@@ -614,6 +675,26 @@ impl<E: Environment> Engine<E> {
         lock(&self.shared.tables).ssts.len()
     }
 
+    /// The tables in service by level, level 0 first: a deeper level in key order.
+    #[must_use]
+    pub fn levels(&self) -> Vec<Vec<SstMeta>> {
+        let tables = lock(&self.shared.tables);
+        let mut manifest = tables.manifest.clone();
+        manifest.ssts = tables.ssts.iter().map(|(m, _)| m.clone()).collect();
+        (0..LEVELS).map(|l| manifest.level(l as u8)).collect()
+    }
+
+    /// Runs one round of compaction if any level is over its limit: the manual
+    /// trigger (SPEC §2.5). Waits for a flush or another round in progress.
+    ///
+    /// # Errors
+    ///
+    /// The filesystem's, or a table's `InvalidData`.
+    pub async fn compact_once(&self) -> io::Result<Option<Compaction>> {
+        let _turn = self.shared.turnstile.acquire().await;
+        self.shared.compact().await
+    }
+
     /// The manifest in force.
     #[must_use]
     pub fn manifest(&self) -> Manifest {
@@ -642,19 +723,16 @@ impl<E: Environment> Drop for Engine<E> {
 
 impl<E: Environment> Shared<E> {
     /// The newest write of `key` at or below `snapshot`: the active memtable first,
-    /// then the immutable ones newest first, then the tables newest first. Each holds
-    /// newer writes than the next, so the first that has one has the newest.
+    /// then the immutable ones newest first, then level 0 newest first, then one
+    /// table per deeper level. Each holds newer writes of a key than the next, so the
+    /// first that has one has the newest.
     async fn read(&self, key: &[u8], snapshot: Seq) -> io::Result<Option<Bytes>> {
-        let (active, immutable, ssts) = {
+        let (active, immutable, readers) = {
             let tables = lock(&self.tables);
             (
                 tables.active.clone(),
                 tables.immutable.clone(),
-                tables
-                    .ssts
-                    .iter()
-                    .map(|(_, r)| r.clone())
-                    .collect::<Vec<_>>(),
+                tables.readers_for(key),
             )
         };
         if let Some((_, value)) = active.get(key, snapshot) {
@@ -665,7 +743,7 @@ impl<E: Environment> Shared<E> {
                 return Ok(value.live());
             }
         }
-        for sst in ssts.iter().rev() {
+        for sst in &readers {
             if let Some((_, value)) = sst.get(key, snapshot).await? {
                 return Ok(value.live());
             }
@@ -747,15 +825,13 @@ impl<E: Environment> Shared<E> {
         });
     }
 
-    /// Writes `memtable` as the next table and syncs it.
-    async fn write_sst(&self, memtable: &Memtable) -> io::Result<(SstMeta, SstReader<FileOf<E>>)> {
-        let number = lock(&self.tables).manifest.next_sst;
-        let mut writer = SstWriter::new();
-        for (key, seq, value) in memtable.entries() {
-            writer.add(&key, seq, &value);
-        }
-        let entries = writer.entries();
-        let bytes = writer.finish();
+    /// Writes `bytes` as table `number`, syncs it, and opens it: the reader and the
+    /// file's size.
+    pub(crate) async fn write_table(
+        &self,
+        number: u64,
+        bytes: Bytes,
+    ) -> io::Result<(SstReader<FileOf<E>>, u64)> {
         let fs = self.env.fs();
         let file = fs
             .open(
@@ -766,36 +842,62 @@ impl<E: Environment> Shared<E> {
         let len = bytes.len() as u64;
         file.write_at(0, bytes).await?;
         file.sync().await?;
+        let reader = SstReader::open(file).await?;
+        Ok((reader, len))
+    }
+
+    /// Writes `memtable` as the next table, at level 0, and syncs it.
+    async fn write_sst(&self, memtable: &Memtable) -> io::Result<(SstMeta, SstReader<FileOf<E>>)> {
+        let number = self.next_sst.fetch_add(1, Ordering::Relaxed);
+        let mut writer = SstWriter::new();
+        for (key, seq, value) in memtable.entries() {
+            writer.add(&key, seq, &value);
+        }
+        let entries = writer.entries();
+        let (first_key, last_key) = writer.key_range().unwrap_or_default();
+        let bytes = writer.finish();
+        let (reader, len) = self.write_table(number, bytes).await?;
         let meta = SstMeta {
             number,
+            level: 0,
             first_seq: memtable.min_seq(),
             max_seq: memtable.max_seq(),
             entries,
+            bytes: len,
+            first_key,
+            last_key,
         };
         self.env.trace(TraceEvent::SstWritten {
             number,
+            level: 0,
             entries,
             bytes: len,
             first_seq: meta.first_seq,
             max_seq: meta.max_seq,
         });
-        let reader = SstReader::open(file).await?;
         Ok((meta, reader))
     }
 
-    /// The manifest that follows the one in force, listing `meta` after its tables.
-    fn next_manifest(&self, meta: &SstMeta) -> Manifest {
+    /// The manifest that follows the one in force: the tables in service without
+    /// `removed`, plus `added`. Built from the tables in service rather than the
+    /// manifest's list, so a table dropped at open is not listed again.
+    pub(crate) fn manifest_edit(&self, removed: &[u64], added: Vec<SstMeta>) -> Manifest {
         let tables = lock(&self.tables);
         let mut next = tables.manifest.clone();
         next.number += 1;
-        next.next_sst = meta.number + 1;
-        next.flushed_seq = meta.max_seq;
-        next.ssts.push(*meta);
+        next.next_sst = self.next_sst.load(Ordering::Relaxed);
+        next.ssts = tables
+            .ssts
+            .iter()
+            .map(|(m, _)| m.clone())
+            .filter(|m| !removed.contains(&m.number))
+            .chain(added)
+            .collect();
         next
     }
 
-    /// Writes `next`, syncs it, and switches `CURRENT` to it.
-    async fn write_manifest(&self, next: &Manifest) -> io::Result<()> {
+    /// Writes `next` and syncs it. Nothing names it until [`switch_to`](Self::switch_to).
+    pub(crate) async fn write_manifest_file(&self, next: &Manifest) -> io::Result<()> {
         let fs = self.env.fs();
         let dir = &self.config.dir;
         let file = fs
@@ -809,15 +911,35 @@ impl<E: Environment> Shared<E> {
         self.env.trace(TraceEvent::ManifestWritten {
             number: next.number,
             flushed_seq: next.flushed_seq,
-            ssts: next.ssts.len() as u64,
+            tables: next.ssts.iter().map(|m| m.number).collect(),
         });
-        switch_current(&self.env, dir, next.number).await
+        Ok(())
     }
 
-    /// Puts the table in service under `next`, which lists it.
-    fn serve(&self, meta: SstMeta, reader: SstReader<FileOf<E>>, next: Manifest) {
+    /// Switches `CURRENT` to `next`, which is on disk and synced.
+    pub(crate) async fn switch_to(&self, next: &Manifest) -> io::Result<()> {
+        switch_current(&self.env, &self.config.dir, next.number).await
+    }
+
+    /// Writes `next`, syncs it, and switches `CURRENT` to it.
+    pub(crate) async fn write_manifest(&self, next: &Manifest) -> io::Result<()> {
+        self.write_manifest_file(next).await?;
+        self.switch_to(next).await
+    }
+
+    /// Takes `removed` out of service and puts `added` in, under `next`, which lists
+    /// the result.
+    pub(crate) fn install(
+        &self,
+        next: Manifest,
+        removed: &[u64],
+        added: Vec<(SstMeta, SstReader<FileOf<E>>)>,
+    ) {
         let mut tables = lock(&self.tables);
-        tables.ssts.push((meta, Arc::new(reader)));
+        tables.ssts.retain(|(m, _)| !removed.contains(&m.number));
+        tables
+            .ssts
+            .extend(added.into_iter().map(|(m, r)| (m, Arc::new(r))));
         tables.manifest = next;
     }
 }
@@ -875,29 +997,43 @@ impl<E: Environment> Future for NextImmutable<'_, E> {
 }
 
 /// The one task that flushes immutable memtables, oldest first: table, manifest,
-/// switch, release, then the log segments the table made redundant. On an I/O error
-/// it reports `FlusherFailed` and stops; reads keep working from the memtables it
-/// left, and the log grows.
+/// switch, release, then the log segments the table made redundant; after each
+/// flush, compaction rounds until no level is over its limit, when the engine runs
+/// compaction in the background. Each step holds the turnstile. On an I/O error it
+/// reports `FlusherFailed` and stops; reads keep working from the memtables it left,
+/// and the log grows.
 async fn flusher<E: Environment>(shared: Arc<Shared<E>>) {
     while let Some(memtable) = NextImmutable(&shared).await {
         let flushed = async {
-            let (meta, reader) = shared.write_sst(&memtable).await?;
-            let next = shared.next_manifest(&meta);
-            let max_seq = meta.max_seq;
-            if shared.config.variant == Variant::ReleaseBeforeManifest {
-                // The bug: the table is taken for durable once written. It serves
-                // reads, the memtable goes, the log segments go, and only then is the
-                // manifest written. A crash before the manifest is durable leaves the
-                // table an orphan and its records nowhere.
-                shared.serve(meta, reader, next.clone());
-                shared.release(&memtable);
-                shared.wal.delete_segments_through(max_seq).await?;
-                shared.write_manifest(&next).await?;
-            } else {
-                shared.write_manifest(&next).await?;
-                shared.serve(meta, reader, next);
-                shared.release(&memtable);
-                shared.wal.delete_segments_through(max_seq).await?;
+            {
+                let _turn = shared.turnstile.acquire().await;
+                let (meta, reader) = shared.write_sst(&memtable).await?;
+                let mut next = shared.manifest_edit(&[], vec![meta.clone()]);
+                next.flushed_seq = meta.max_seq;
+                let max_seq = meta.max_seq;
+                if shared.config.variant == Variant::ReleaseBeforeManifest {
+                    // The bug: the table is taken for durable once written. It serves
+                    // reads, the memtable goes, the log segments go, and only then is
+                    // the manifest written. A crash before the manifest is durable
+                    // leaves the table an orphan and its records nowhere.
+                    shared.install(next.clone(), &[], vec![(meta, reader)]);
+                    shared.release(&memtable);
+                    shared.wal.delete_segments_through(max_seq).await?;
+                    shared.write_manifest(&next).await?;
+                } else {
+                    shared.write_manifest(&next).await?;
+                    shared.install(next, &[], vec![(meta, reader)]);
+                    shared.release(&memtable);
+                    shared.wal.delete_segments_through(max_seq).await?;
+                }
+            }
+            if shared.config.background_compaction {
+                loop {
+                    let _turn = shared.turnstile.acquire().await;
+                    if shared.compact().await?.is_none() {
+                        break;
+                    }
+                }
             }
             Ok::<(), io::Error>(())
         };

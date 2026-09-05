@@ -28,4 +28,6 @@ and reorder from the start), so Raft cannot be tested honestly without it.
 - **`sim/out/wal-42.jsonl` as a studio fixture** — the echo trace is the pinned fixture in the moirae repo; the WAL trace shows `ananke.wal.*` and every §1.3 fault at once and would make a second, unpinned example.
 - **Manifest garbage collection** — manifests are never deleted (D-022); keep the last few once the fallback rule has a sweep of its own.
 - **Lazy table verification** — every open reads every table whole to find bit rot early (D-022); verify blocks on first read once tables are large.
-- **Manifest repair when a table is dropped** — a dropped table stays listed and is dropped again at every open (D-022); rewriting the manifest without it is a state change under a fault and deserves its own sweep.
+- **Trivial moves in compaction** — a table picked from a level with nothing overlapping below is rewritten rather than moved down whole (D-023); LevelDB re-labels it in the manifest instead.
+- **Compaction against every live snapshot** — only the oldest live snapshot bounds what a round keeps (D-023), so one long-lived snapshot keeps every newer version; RocksDB keeps the newest write below each snapshot and drops the rest.
+- **Streaming scans** — `Engine::scan` collects its result into a `Vec`; an iterator the caller pulls, for ranges too large to hold.

@@ -19,9 +19,9 @@ use std::time::Duration;
 
 use ananke_env::moirae::{Export, bytes_decoder};
 use ananke_env::sim::{Sim, SimConfig, SimEnv, TraceRecord};
-use ananke_env::{Clock, Environment, NodeId, Rng, TraceEvent, WalStop};
+use ananke_env::{Clock, DirEntryOp, Environment, NodeId, Rng, TraceEvent, WalStop};
 use ananke_storage::manifest;
-use ananke_storage::wal::{HEADER_LEN, segment_path};
+use ananke_storage::wal::{HEADER_LEN, segment_of, segment_path};
 use ananke_storage::{CoveredStop, HeadGapPolicy, Recovery, Seq, Variant, Wal, WalConfig};
 use bytes::Bytes;
 
@@ -93,6 +93,9 @@ pub enum Excuse {
     /// Recovery stopped exactly where the previous recovery had cut a segment, and
     /// the sync of that cut was lost.
     BetrayedCut,
+    /// A compaction dropped the record: a newer write of its key hid it, or it was a
+    /// tombstone with nothing older below (D-023). Only the engine scenario uses it.
+    Compacted,
 }
 
 /// One crash and the recovery after it, checked.
@@ -457,9 +460,13 @@ pub fn syncs(events: &[&TraceEvent], dir: &Path) -> Syncs {
                 let lost = lost_since.remove(&segment_path(dir, *segment));
                 out.cuts.push((*segment, *len, lost));
             }
+            // A table or manifest number can be written again after a fallback
+            // abandoned its first life; the latest write is the file on disk.
             TraceEvent::SstWritten { number, .. } => {
                 if lost_since.remove(&manifest::sst_path(dir, *number)) {
                     out.sst_betrayed.insert(*number);
+                } else {
+                    out.sst_betrayed.remove(number);
                 }
             }
             TraceEvent::ManifestWritten {
@@ -469,6 +476,8 @@ pub fn syncs(events: &[&TraceEvent], dir: &Path) -> Syncs {
             } => {
                 if lost_since.remove(&manifest::manifest_path(dir, *number)) {
                     out.manifest_betrayed.insert(*number);
+                } else {
+                    out.manifest_betrayed.remove(number);
                 }
                 out.manifest_flushed.insert(*number, *flushed_seq);
             }
@@ -480,6 +489,17 @@ pub fn syncs(events: &[&TraceEvent], dir: &Path) -> Syncs {
             }
             TraceEvent::WalSegmentDeleted { segment } => {
                 out.deleted.insert(*segment);
+            }
+            // A deletion the crash undid: the segment is back, and what became of
+            // its syncs explains its records again.
+            TraceEvent::DirectoryEntryLost {
+                entry,
+                op: DirEntryOp::Unlink,
+                ..
+            } => {
+                if let Some(segment) = segment_of(entry) {
+                    out.deleted.remove(&segment);
+                }
             }
             _ => {}
         }

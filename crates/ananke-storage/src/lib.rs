@@ -12,6 +12,7 @@
 //! code and known-buggy versions of it. The crash sweeps in `sim/` must pass the
 //! former and catch the latter; either alone proves nothing (CLAUDE.md).
 
+pub mod compaction;
 pub mod crc32c;
 pub mod engine;
 pub mod ikey;
@@ -19,8 +20,10 @@ pub mod manifest;
 pub mod memtable;
 pub mod merge;
 pub mod sst;
+pub mod turnstile;
 pub mod wal;
 
+pub use compaction::Compaction;
 pub use engine::{Engine, EngineConfig, EngineRecovery, Snapshot, Write};
 pub use memtable::{Memtable, Value};
 pub use wal::{

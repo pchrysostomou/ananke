@@ -120,7 +120,7 @@ impl Coverage {
                 Some(Excuse::LostFsync) => self.excused_lost_fsync += 1,
                 Some(Excuse::BitRot) => self.excused_bit_rot += 1,
                 Some(Excuse::BetrayedCut) => self.excused_betrayed_cut += 1,
-                None => {}
+                Some(Excuse::Compacted) | None => {}
             }
         }
     }

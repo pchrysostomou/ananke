@@ -21,6 +21,10 @@ fn config(memtable_bytes: u64) -> EngineConfig {
         variant: Variant::Correct,
         wal_variant: wal::Variant::Correct,
         allow_head_gap: false,
+        l0_trigger: 4,
+        level_base_bytes: 8192,
+        sst_bytes: 2048,
+        background_compaction: false,
     }
 }
 
@@ -466,6 +470,214 @@ fn a_snapshot_pins_what_a_read_or_scan_sees() {
                     .unwrap()
                     .is_empty()
             );
+        })
+    });
+}
+
+/// Writes keys with overwrites and deletes until several memtables have flushed.
+async fn fill(db: &Engine<SimEnv>, ops: std::ops::Range<u32>, keys: u32) {
+    for i in ops {
+        let key = Bytes::from(format!("k{:03}", i % keys));
+        if i % 11 == 7 {
+            db.delete(key).await.unwrap();
+        } else {
+            db.put(key, Bytes::from(format!("v{i}"))).await.unwrap();
+        }
+    }
+}
+
+/// The value key `k` should hold after `fill(0..n)`: its newest write, or none if
+/// that was a delete.
+fn expected(k: u32, n: u32, keys: u32) -> Option<Bytes> {
+    let last = (0..n).rev().find(|i| i % keys == k)?;
+    (last % 11 != 7).then(|| Bytes::from(format!("v{last}")))
+}
+
+/// Level 0 fills with flushed memtables; a round of compaction merges them into
+/// level 1, keeping the newest write per key and dropping what a newer write hides,
+/// and the inputs are deleted once the manifest no longer names them. Reads and
+/// scans see the same state before and after, and after a reopen.
+#[test]
+fn compaction_merges_level_0_into_level_1_and_deletes_its_inputs() {
+    let mut sim = Sim::new(SimConfig::new(13));
+    let node = sim.add_node();
+    let (rounds, levels, names) = on_node(&mut sim, node, |env| {
+        Box::pin(async move {
+            let (db, _) = Engine::open(env.clone(), config(400)).await.unwrap();
+            fill(&db, 0..120, 20).await;
+            env.clock().sleep(Duration::from_millis(1)).await;
+            let before = db.levels();
+            assert!(before[0].len() >= 4, "level 0 filled: {before:?}");
+            assert!(before[1..].iter().all(Vec::is_empty));
+            let mut rounds = Vec::new();
+            while let Some(round) = db.compact_once().await.unwrap() {
+                rounds.push(round);
+            }
+            for k in 0..20 {
+                assert_eq!(
+                    db.get(format!("k{k:03}").as_bytes()).await.unwrap(),
+                    expected(k, 120, 20),
+                    "k{k:03}"
+                );
+            }
+            let snapshot = db.snapshot();
+            let scanned: Vec<(Bytes, Bytes)> =
+                db.scan(&b"k"[..]..&b"l"[..], &snapshot).await.unwrap();
+            let want: Vec<(Bytes, Bytes)> = (0..20)
+                .filter_map(|k| expected(k, 120, 20).map(|v| (Bytes::from(format!("k{k:03}")), v)))
+                .collect();
+            assert_eq!(scanned, want);
+            let levels = db.levels();
+            drop(db);
+            let mut names = env.fs().read_dir(Path::new("/db")).await.unwrap();
+            names.sort();
+            (rounds, levels, names)
+        })
+    });
+    assert!(!rounds.is_empty());
+    assert_eq!(rounds[0].level, 0);
+    assert!(rounds[0].dropped_versions > 0, "{:?}", rounds[0]);
+    assert!(levels[0].is_empty(), "{levels:?}");
+    assert!(!levels[1].is_empty(), "{levels:?}");
+    // Level 1 is a run: tables in key order that do not overlap.
+    for pair in levels[1].windows(2) {
+        assert!(pair[0].last_key < pair[1].first_key, "{levels:?}");
+    }
+    let on_disk: Vec<String> = names.iter().map(|n| n.display().to_string()).collect();
+    for round in &rounds {
+        for input in &round.inputs {
+            assert!(
+                !on_disk.contains(&format!("{input:06}.sst")),
+                "input {input} deleted: {on_disk:?}"
+            );
+        }
+        for output in &round.outputs {
+            assert!(on_disk.contains(&format!("{output:06}.sst")), "{on_disk:?}");
+        }
+    }
+    // After a reopen the manifest's levels are what was installed.
+    let reopened = on_node(&mut sim, node, |env| {
+        Box::pin(async move {
+            let (db, recovery) = Engine::open(env, config(400)).await.unwrap();
+            assert_eq!((recovery.dropped.len(), recovery.orphans), (0, 0));
+            for k in 0..20 {
+                assert_eq!(
+                    db.get(format!("k{k:03}").as_bytes()).await.unwrap(),
+                    expected(k, 120, 20)
+                );
+            }
+            db.levels()
+        })
+    });
+    assert_eq!(reopened, levels);
+}
+
+/// A live snapshot keeps the versions it can see through compaction; once it is
+/// dropped, the next round drops them.
+#[test]
+fn a_snapshot_keeps_its_versions_through_compaction() {
+    let mut sim = Sim::new(SimConfig::new(14));
+    let node = sim.add_node();
+    on_node(&mut sim, node, |env| {
+        Box::pin(async move {
+            let (db, _) = Engine::open(env.clone(), config(400)).await.unwrap();
+            fill(&db, 0..40, 20).await;
+            env.clock().sleep(Duration::from_millis(1)).await;
+            let old = db.snapshot();
+            fill(&db, 40..120, 20).await;
+            env.clock().sleep(Duration::from_millis(1)).await;
+            let mut kept = 0;
+            while let Some(round) = db.compact_once().await.unwrap() {
+                kept += round.dropped_versions;
+            }
+            let _ = kept;
+            for k in 0..20 {
+                assert_eq!(
+                    db.get_at(format!("k{k:03}").as_bytes(), &old)
+                        .await
+                        .unwrap(),
+                    expected(k, 40, 20),
+                    "k{k:03} at the old snapshot"
+                );
+                assert_eq!(
+                    db.get(format!("k{k:03}").as_bytes()).await.unwrap(),
+                    expected(k, 120, 20),
+                    "k{k:03} now"
+                );
+            }
+            // Once the snapshot is gone, more writes and a round drop what it saw.
+            drop(old);
+            fill(&db, 120..200, 20).await;
+            env.clock().sleep(Duration::from_millis(1)).await;
+            let mut dropped = 0;
+            while let Some(round) = db.compact_once().await.unwrap() {
+                dropped += round.dropped_versions;
+            }
+            assert!(dropped > 0);
+            let entries: u64 = db.levels().iter().flatten().map(|m| m.entries).sum();
+            assert!(
+                entries <= 20 + 20,
+                "one or two versions per key remain: {entries}"
+            );
+        })
+    });
+}
+
+/// A tombstone survives compaction while an older write of its key lies deeper,
+/// and goes once nothing does; the older write goes with it, never resurfacing.
+#[test]
+fn tombstones_survive_until_no_older_write_lies_below() {
+    let mut sim = Sim::new(SimConfig::new(15));
+    let node = sim.add_node();
+    on_node(&mut sim, node, |env| {
+        Box::pin(async move {
+            // A tiny level 1, so every round pushes tables to the level below and
+            // older writes end up deep.
+            let mut c = config(400);
+            c.level_base_bytes = 1;
+            let (db, _) = Engine::open(env.clone(), c).await.unwrap();
+            for i in 0..60u32 {
+                db.put(
+                    Bytes::from(format!("k{:03}", i % 20)),
+                    Bytes::from(format!("v{i}")),
+                )
+                .await
+                .unwrap();
+            }
+            env.clock().sleep(Duration::from_millis(1)).await;
+            while db.compact_once().await.unwrap().is_some() {}
+            let levels = db.levels();
+            let deepest = levels.iter().rposition(|l| !l.is_empty()).unwrap();
+            assert!(deepest >= 2, "writes went deep: {levels:?}");
+            // Delete every key, flush, and compact the tombstones down one level at
+            // a time: they survive as long as the values lie deeper.
+            for k in 0..20u32 {
+                db.delete(Bytes::from(format!("k{k:03}"))).await.unwrap();
+            }
+            for i in 60..80u32 {
+                db.put(Bytes::from(format!("x{i}")), Bytes::from("filler"))
+                    .await
+                    .unwrap();
+            }
+            env.clock().sleep(Duration::from_millis(1)).await;
+            let mut tombstones_dropped = 0;
+            let mut rounds = 0;
+            while let Some(round) = db.compact_once().await.unwrap() {
+                rounds += 1;
+                tombstones_dropped += round.dropped_tombstones;
+                for k in 0..20u32 {
+                    assert_eq!(
+                        db.get(format!("k{k:03}").as_bytes()).await.unwrap(),
+                        None,
+                        "k{k:03} stays deleted after round {rounds}"
+                    );
+                }
+            }
+            assert_eq!(tombstones_dropped, 20, "every tombstone reached its values");
+            // The tables hold fillers and nothing else; some fillers may still sit
+            // in the active memtable.
+            let entries: u64 = db.levels().iter().flatten().map(|m| m.entries).sum();
+            assert!(entries <= 20, "only fillers remain: {entries}");
         })
     });
 }

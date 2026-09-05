@@ -625,7 +625,8 @@ the records is the check that matters.
 and §2.7 for `get` and `scan` at a snapshot version. D-020's memtable kept the newest
 write per key and D-022's tables the same, so a snapshot had nothing to read from:
 a key overwritten after the snapshot was gone, and a scan could see a key before a
-write and its neighbour after it.
+write and its neighbour after it. And the sweep's oracle judged a dropped table by
+its sequence range, which is exact only while every table is a flushed memtable.
 
 **Decision.** Keys are internal keys: the user key, escaped so a shorter key sorts
 before every longer key it is a prefix of, then `!seq` big-endian, so byte order is
@@ -644,19 +645,62 @@ the same one compaction reads its inputs through. This supersedes D-020's newest
 write per key and D-021's guard, which the numbering makes unnecessary; writes still
 apply in sequence order, which is what makes `visible` mean "everything at or below".
 
+Compaction is leveled, levels 0 to 6, level 1 allowed `level_base_bytes` and each
+deeper level ten times more; level 0 is compacted at `l0_trigger` tables. The
+manifest carries each table's level, key range and size (format version 2). A round
+picks the level furthest over its limit: every table from level 0, one from a deeper
+level, the first past where the last round on that level stopped; the next level's
+tables that overlap join; one merge writes the outputs into the next level, sealed at
+`sst_bytes` and never between two writes of one user key, so a lookup finds every
+write of a key in the one table its range names. A write is dropped when a newer
+write of its key is at or below the oldest live snapshot; a tombstone that is the
+newest write of its key is dropped when it is at or below that snapshot and no table
+deeper than the output level holds the key. Deletes thus survive until they reach the
+bottom or no older write lies below. The order is the flush's: outputs written and
+synced, the manifest written, synced and switched to, the outputs installed, then the
+inputs deleted and the directory synced; `Variant::DeleteBeforeManifest` deletes
+first, the bug the sweep must catch. The next manifest is built from the tables in
+service, so a table dropped at open is not listed again. One flush or compaction
+runs at a time, through a turnstile, since both compute their manifest from the one
+in force. The flusher runs rounds after each flush until no level is over its limit;
+`Engine::compact_once` is the manual trigger. A read consults level 0 newest first
+and then the one table per deeper level whose range holds the key.
+
+The sweep's oracle mirrors the trace: a flushed table holds every write in its
+sequence range, a compaction's outputs hold what the merge of its inputs kept by the
+same rules, split by the key ranges the trace records, and each manifest lists the
+tables the trace says. A record is present if a table the manifest in force lists
+and the open did not drop holds it, or the log replayed it. Every other record the
+tables owed is excused only if a compaction in the manifest's lineage dropped it, a
+dropped table held it (its sync lost, bit rot, or deleted by a compaction after a
+manifest that an explained fallback then abandoned), a fallback left it in a table
+no manifest in force lists, or it was lost before; else it is a violation. The
+state check folds the model over present records only, so a version compaction
+dropped is skipped and its newer shadow is what counts, as in the engine.
+
 **Alternatives.** Snapshots by version in the user key alone (§2.6): that is the
 transaction layer's versioning, above the engine, and it cannot give a consistent
 scan across an engine write that lands mid-walk. A `Version` parameter without a
 guard, as §2.7 sketches: compaction would have no way to know which versions are
 still wanted; the guard carries the version and its lifetime. Materialising a
 memtable for a scan: the cursor asks the skiplist for the next entry past the last
-instead, so a scan holds no borrow and no copy.
+instead, so a scan holds no borrow and no copy. Judging dropped tables by sequence
+range: exact for flushed tables, wrong once a compaction's siblings share a range,
+which is why the oracle mirrors the trace instead. Reading the tables back from the
+simulated disk for the oracle: would check the engine against its own files and
+miss a merge that keeps the wrong version. Tiered or size-tiered compaction: the
+SPEC names leveled, and Raft's snapshots (Phase 2) want one run per level to copy.
 
 **Consequences.** A memtable fills with every write, not every key, and flushes
 about twice as often in the sweep. The sweep's readers now scan at snapshots and
 compare with the model folded over exactly the ops the version covers, which is
 exact rather than tolerant of in-flight writes; and the state check after a recovery
-scans the whole space besides reading every key.
+scans the whole space besides reading every key. A compaction rewrites a table it
+could have moved down whole (LevelDB's trivial move): BACKLOG. Only the oldest live
+snapshot bounds what compaction keeps, so one long-lived snapshot keeps every
+version newer than it: BACKLOG. A table dropped at open is forgotten by the next
+manifest and its file removed as an orphan at the open after, which is the manifest
+repair D-022 left in BACKLOG, done by the same rule that writes every manifest.
 
 ---
 

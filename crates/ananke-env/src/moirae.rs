@@ -22,7 +22,8 @@
 //! | `HeadGap`                                | `log` `ananke.wal.head-gap`                   |
 //! | `MemtableRotated` / `MemtableFlushed`    | `log` `ananke.memtable.rotated` / `.flushed`  |
 //! | `FlusherFailed`                          | `log` `ananke.engine.flusher-failed`          |
-//! | `SstWritten` / `SstDropped`              | `log` `ananke.sst.written` / `.dropped`       |
+//! | `SstWritten` / `SstDropped` / `SstDeleted` | `log` `ananke.sst.written` / `.dropped` / `.deleted` |
+//! | `CompactionWritten`                      | `log` `ananke.compaction.written`             |
 //! | `ManifestWritten` / `CurrentSwitched` / `ManifestFallback` | `log` `ananke.manifest.written` / `.switched` / `.fallback` |
 //! | `OrphanRemoved` / `WalSegmentDeleted`    | `log` `ananke.fs.orphan-removed` / `ananke.wal.segment-deleted` |
 //! | `TimeAdvanced`                           | nothing: every line carries `t`               |
@@ -213,6 +214,11 @@ fn node_json(node: NodeId) -> Json {
 /// (moirae SPEC §5, moirae-trace 0.0.2); past `i64` it is a string from here, since
 /// `Json::Int` cannot hold it. A rotted sequence number is still data, and the studio
 /// must still open the trace.
+/// Key bytes as lowercase hex, since a key is not necessarily text.
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 fn int(v: u64) -> Json {
     i64::try_from(v).map_or_else(|_| Json::Str(v.to_string()), Json::Int)
 }
@@ -428,6 +434,7 @@ fn convert(
         ),
         TraceEvent::SstWritten {
             number,
+            level,
             entries,
             bytes,
             first_seq,
@@ -436,6 +443,7 @@ fn convert(
             "ananke.sst.written",
             Some(Json::obj(vec![
                 ("number", int(*number)),
+                ("level", Json::Int(i64::from(*level))),
                 ("entries", int(*entries)),
                 ("bytes", int(*bytes)),
                 ("firstSeq", int(*first_seq)),
@@ -459,14 +467,58 @@ fn convert(
         TraceEvent::ManifestWritten {
             number,
             flushed_seq,
-            ssts,
+            tables,
         } => log(
             "ananke.manifest.written",
             Some(Json::obj(vec![
                 ("number", int(*number)),
                 ("flushedSeq", int(*flushed_seq)),
-                ("ssts", int(*ssts)),
+                (
+                    "tables",
+                    Json::Array(tables.iter().map(|&t| int(t)).collect()),
+                ),
             ])),
+        ),
+        TraceEvent::CompactionWritten {
+            level,
+            manifest,
+            inputs,
+            outputs,
+            snapshot,
+            dropped_versions,
+            dropped_tombstones,
+        } => log(
+            "ananke.compaction.written",
+            Some(Json::obj(vec![
+                ("level", Json::Int(i64::from(*level))),
+                ("manifest", int(*manifest)),
+                (
+                    "inputs",
+                    Json::Array(inputs.iter().map(|&t| int(t)).collect()),
+                ),
+                (
+                    "outputs",
+                    Json::Array(
+                        outputs
+                            .iter()
+                            .map(|(number, first, last)| {
+                                Json::obj(vec![
+                                    ("number", int(*number)),
+                                    ("firstKey", Json::str(&hex(first))),
+                                    ("lastKey", Json::str(&hex(last))),
+                                ])
+                            })
+                            .collect(),
+                    ),
+                ),
+                ("snapshot", int(*snapshot)),
+                ("droppedVersions", int(*dropped_versions)),
+                ("droppedTombstones", int(*dropped_tombstones)),
+            ])),
+        ),
+        TraceEvent::SstDeleted { number } => log(
+            "ananke.sst.deleted",
+            Some(Json::obj(vec![("number", int(*number))])),
         ),
         TraceEvent::CurrentSwitched { manifest } => log(
             "ananke.manifest.switched",

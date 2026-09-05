@@ -8,9 +8,14 @@
 //!
 //! ```text
 //! magic: u64 | format_version: u32 | number: u64 | next_sst: u64 | flushed_seq: u64 |
-//! count: u32 | per table: number: u64 | first_seq: u64 | max_seq: u64 | entries: u64 |
-//! crc32c: u32 over everything before it
+//! count: u32 | per table: number: u64 | level: u8 | first_seq: u64 | max_seq: u64 |
+//! entries: u64 | bytes: u64 | first_key_len: u16 | first_key | last_key_len: u16 |
+//! last_key | crc32c: u32 over everything before it
 //! ```
+//!
+//! A table's level and key range are what leveled compaction (D-023) picks and
+//! overlaps by: level 0 tables may overlap one another, tables of a deeper level
+//! never do.
 //!
 //! `CURRENT` holds one line, `MANIFEST-<n> <crc32c of the name in hex>`.
 
@@ -22,21 +27,48 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use crate::Seq;
 use crate::crc32c;
 
-/// The on-disk format version.
-pub const FORMAT_VERSION: u32 = 1;
+/// The on-disk format version: 2 since tables carry a level, a key range and a size.
+pub const FORMAT_VERSION: u32 = 2;
 const MAGIC: u64 = u64::from_le_bytes(*b"ANANKMAN");
 
+/// The deepest level.
+pub const BOTTOM_LEVEL: u8 = 6;
+/// How many levels there are.
+pub const LEVELS: usize = BOTTOM_LEVEL as usize + 1;
+
 /// One table the manifest lists.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SstMeta {
     /// The table's number, which names its file.
     pub number: u64,
+    /// The level it sits at: 0 for a flushed memtable, deeper for compaction output.
+    pub level: u8,
     /// The lowest log sequence number of the writes it holds.
     pub first_seq: Seq,
     /// The highest.
     pub max_seq: Seq,
-    /// Keys it holds.
+    /// Writes it holds.
     pub entries: u64,
+    /// The file's size.
+    pub bytes: u64,
+    /// The smallest user key it holds.
+    pub first_key: Bytes,
+    /// The largest.
+    pub last_key: Bytes,
+}
+
+impl SstMeta {
+    /// Whether the table's key range overlaps `[first, last]`.
+    #[must_use]
+    pub fn overlaps(&self, first: &[u8], last: &[u8]) -> bool {
+        self.first_key[..] <= *last && *first <= self.last_key[..]
+    }
+
+    /// Whether the table's key range contains `key`.
+    #[must_use]
+    pub fn contains(&self, key: &[u8]) -> bool {
+        self.first_key[..] <= *key && *key <= self.last_key[..]
+    }
 }
 
 /// The engine's durable state description.
@@ -64,10 +96,28 @@ impl Manifest {
         }
     }
 
+    /// The tables at `level`, in key order for a deeper level and by number, oldest
+    /// first, at level 0.
+    #[must_use]
+    pub fn level(&self, level: u8) -> Vec<SstMeta> {
+        let mut tables: Vec<SstMeta> = self
+            .ssts
+            .iter()
+            .filter(|t| t.level == level)
+            .cloned()
+            .collect();
+        if level == 0 {
+            tables.sort_by_key(|t| t.number);
+        } else {
+            tables.sort_by(|a, b| a.first_key.cmp(&b.first_key));
+        }
+        tables
+    }
+
     /// The file's bytes.
     #[must_use]
     pub fn encode(&self) -> Bytes {
-        let mut out = BytesMut::with_capacity(48 + 32 * self.ssts.len());
+        let mut out = BytesMut::with_capacity(48 + 64 * self.ssts.len());
         out.put_u64_le(MAGIC);
         out.put_u32_le(FORMAT_VERSION);
         out.put_u64_le(self.number);
@@ -76,9 +126,15 @@ impl Manifest {
         out.put_u32_le(u32::try_from(self.ssts.len()).expect("table count fits u32"));
         for sst in &self.ssts {
             out.put_u64_le(sst.number);
+            out.put_u8(sst.level);
             out.put_u64_le(sst.first_seq);
             out.put_u64_le(sst.max_seq);
             out.put_u64_le(sst.entries);
+            out.put_u64_le(sst.bytes);
+            out.put_u16_le(u16::try_from(sst.first_key.len()).expect("key fits u16"));
+            out.put_slice(&sst.first_key);
+            out.put_u16_le(u16::try_from(sst.last_key.len()).expect("key fits u16"));
+            out.put_slice(&sst.last_key);
         }
         let crc = crc32c::crc32c(&out);
         out.put_u32_le(crc);
@@ -110,17 +166,47 @@ impl Manifest {
         let next_sst = body.get_u64_le();
         let flushed_seq = body.get_u64_le();
         let count = body.get_u32_le() as usize;
-        if body.len() != count * 32 {
-            return Err(bad("manifest table list malformed"));
-        }
         let mut ssts = Vec::with_capacity(count);
         for _ in 0..count {
+            if body.len() < 41 {
+                return Err(bad("manifest table list malformed"));
+            }
+            let number = body.get_u64_le();
+            let level = body.get_u8();
+            let first_seq = body.get_u64_le();
+            let max_seq = body.get_u64_le();
+            let entries = body.get_u64_le();
+            let bytes = body.get_u64_le();
+            let key = |body: &mut &[u8]| -> io::Result<Bytes> {
+                if body.len() < 2 {
+                    return Err(bad("manifest table list malformed"));
+                }
+                let len = body.get_u16_le() as usize;
+                if body.len() < len {
+                    return Err(bad("manifest table list malformed"));
+                }
+                let key = Bytes::copy_from_slice(&body[..len]);
+                body.advance(len);
+                Ok(key)
+            };
+            let first_key = key(&mut body)?;
+            let last_key = key(&mut body)?;
+            if level > BOTTOM_LEVEL {
+                return Err(bad("manifest table level out of range"));
+            }
             ssts.push(SstMeta {
-                number: body.get_u64_le(),
-                first_seq: body.get_u64_le(),
-                max_seq: body.get_u64_le(),
-                entries: body.get_u64_le(),
+                number,
+                level,
+                first_seq,
+                max_seq,
+                entries,
+                bytes,
+                first_key,
+                last_key,
             });
+        }
+        if !body.is_empty() {
+            return Err(bad("manifest table list malformed"));
         }
         Ok(Self {
             number,
@@ -216,18 +302,31 @@ mod tests {
             ssts: vec![
                 SstMeta {
                     number: 3,
+                    level: 1,
                     first_seq: 1,
                     max_seq: 900,
                     entries: 40,
+                    bytes: 2000,
+                    first_key: Bytes::from("a"),
+                    last_key: Bytes::from("m"),
                 },
                 SstMeta {
                     number: 11,
+                    level: 0,
                     first_seq: 901,
                     max_seq: 4096,
                     entries: 48,
+                    bytes: 2500,
+                    first_key: Bytes::from(""),
+                    last_key: Bytes::from("zz\x00"),
                 },
             ],
         };
+        assert_eq!(manifest.level(0).len(), 1);
+        assert_eq!(manifest.level(1)[0].number, 3);
+        assert!(manifest.ssts[0].overlaps(b"m", b"z"));
+        assert!(!manifest.ssts[0].overlaps(b"n", b"z"));
+        assert!(manifest.ssts[0].contains(b"c") && !manifest.ssts[0].contains(b"n"));
         let bytes = manifest.encode();
         assert_eq!(Manifest::decode(&bytes).unwrap(), manifest);
         assert_eq!(

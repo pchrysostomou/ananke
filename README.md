@@ -62,8 +62,11 @@ footer, under a manifest that `CURRENT` names and that recovery falls back from 
 crash damaged it. Log segments are deleted once a manifest covers their records; a log
 whose head is missing is refused rather than replayed past. Reads and scans take a
 snapshot, a sequence number, and see the newest write at or below it through one
-merge over every memtable and table. Planned in this phase: leveled compaction and
-the rest of the `Engine` API.
+merge over every memtable and table. Leveled compaction, levels 0 to 6 at size ratio
+10, merges tables down one level at a time under the same manifest order, drops
+writes no live snapshot can see and tombstones with nothing older below, and runs
+in the flusher's task after each flush or by a manual trigger. Planned in this
+phase: the rest of the `Engine` API.
 
 **ananke-raft, ananke-shard, ananke-txn, ananke-sql** (planned). Raft with pre-vote,
 leader leases bounded by the clock drift the simulator will violate on purpose, joint
@@ -124,7 +127,7 @@ on most seeds, and the correct code passes ten thousand.
 | Phase | Deliverable | State |
 |---|---|---|
 | 0 | `Environment`, `RealEnv`, `SimEnv`, the fault model, the moirae bridge | Done. Tagged `v0.1.0`; `ananke-env` 0.1.0 on crates.io; [devlog](docs/devlog/00-phase-0.md) |
-| 1 | Storage engine | In progress. WAL (D-018, D-019), memtable and engine (D-020, D-021), SSTables with the manifest and log truncation (D-022) done; compaction not started |
+| 1 | Storage engine | In progress. WAL (D-018, D-019), memtable and engine (D-020, D-021), SSTables with the manifest and log truncation (D-022), versions, snapshots, scans and leveled compaction (D-023) done; the §2.7 API's `write` batches and `checkpoint`, the bench and the devlog remain |
 | 2 | Raft | Not started |
 | 3 | Multi-raft sharding | Not started |
 | 4 | Transactions | Not started |

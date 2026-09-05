@@ -201,7 +201,10 @@ pub enum TraceEvent {
     SstWritten {
         /// The table's number, which names the file.
         number: u64,
-        /// Keys it holds.
+        /// The level it is written for: 0 for a flushed memtable, deeper for a
+        /// compaction's output.
+        level: u8,
+        /// Writes it holds.
         entries: u64,
         /// Its size.
         bytes: u64,
@@ -217,8 +220,35 @@ pub enum TraceEvent {
         number: u64,
         /// Every log record up to this is in an SSTable it lists.
         flushed_seq: u64,
-        /// Tables it lists.
-        ssts: u64,
+        /// The tables it lists, by number.
+        tables: Vec<u64>,
+    },
+    /// A compaction's outputs are written and synced (SPEC §2.5, D-023); the manifest
+    /// listing them in place of the inputs is written next, `CURRENT` switched to it,
+    /// the outputs put in service and the inputs deleted. Recorded before the manifest
+    /// is written, since a crash can leave the manifest whole on disk, and `CURRENT`
+    /// naming it, without the syncs that would have reported either.
+    CompactionWritten {
+        /// The level compacted; the outputs sit one deeper.
+        level: u8,
+        /// The manifest that will list the outputs.
+        manifest: u64,
+        /// The tables merged: the level's and the deeper level's that overlapped.
+        inputs: Vec<u64>,
+        /// The tables written, each with the first and last user key it holds.
+        outputs: Vec<(u64, Bytes, Bytes)>,
+        /// The oldest snapshot version live when the merge began: a write hidden by
+        /// a newer one at or below it was dropped.
+        snapshot: u64,
+        /// Writes dropped because a newer write of the key hid them.
+        dropped_versions: u64,
+        /// Tombstones dropped because no older write of the key lay below.
+        dropped_tombstones: u64,
+    },
+    /// A compaction deleted an input table once the manifest no longer listed it.
+    SstDeleted {
+        /// The table's number.
+        number: u64,
     },
     /// `CURRENT` was pointed at a manifest by rename and the directory synced: the
     /// manifest is now the one recovery reads.

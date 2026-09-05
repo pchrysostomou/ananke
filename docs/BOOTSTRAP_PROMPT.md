@@ -102,16 +102,18 @@ ananke/
 _Update this section at the end of every session._
 
 - Phase: 1 in progress (2026-09-05). The gate is closed; the WAL (D-018, D-019), the
-  memtable and engine (D-020, D-021), and SSTables with the manifest and log
-  truncation (D-022) are done. `sim/wal.rs` and `sim/engine.rs` run the §2.8 crash
-  property with every §1.3 fault on, filesystem latency and crashes between polls;
-  the correct code passes every seed, each known-buggy variant is caught. Sweeps run
-  `ANANKE_SEEDS` seeds: 20 at the gate, 100 in CI, 10 000 nightly. Compaction is not
-  started.
+  memtable and engine (D-020, D-021), SSTables with the manifest and log truncation
+  (D-022), and versions, snapshots, `scan` and leveled compaction (D-023) are done.
+  A missing log head is refused unless `allow_head_gap` discards the log (D-022).
+  `sim/wal.rs` and `sim/engine.rs` run the §2.8 crash property with every §1.3
+  fault on, filesystem latency, crashes between polls, scans at snapshots and
+  compaction under crashes; the correct code passes every seed, each known-buggy
+  variant is caught. Sweeps run `ANANKE_SEEDS` seeds: 20 at the gate, 100 in CI,
+  10 000 nightly.
 - Last tag: v0.1.0
-- Next concrete task: leveled compaction (SPEC §2.5), crash-safe through the manifest,
-  with a manual trigger for tests; then the `Engine` API of §2.7 (`scan`, `snapshot`,
-  `checkpoint`) and the Phase 1 exit criteria. Stop for review after each.
+- Next concrete task: the Phase 1 exit checklist (SPEC §2.8): the rest of the §2.7
+  API (`write` with batches, `checkpoint`), the real-environment bench, and the
+  Phase 1 devlog and tag. Stop for review before the checklist.
 - Fault-model tests follow the CLAUDE.md pattern: a known-buggy variant the sweep
   must catch beside the correct one it must pass (`Journal::sync_dir_on_rotate`,
   `wal::Variant`).
