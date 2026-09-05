@@ -189,6 +189,12 @@ impl State {
     }
 
     // --- timers ----------------------------------------------------------------------
+    //
+    // Ordering at equal virtual timestamps is decided by `next_seq`, one counter shared
+    // by timers and deliveries, so it follows registration order and never container
+    // iteration order: both maps are `BTreeMap`s keyed by `(time, seq)`. At one instant
+    // every due timer fires before every due delivery. Firing only makes tasks runnable;
+    // which runnable task polls next is drawn from the seeded generator.
 
     pub(super) fn register_timer(&mut self, at: Instant, waker: Waker) {
         let seq = self.next_seq();

@@ -705,3 +705,64 @@ fn trace_text_is_stable_and_readable() {
          \x20             1    - TimeAdvanced { to: Instant(1ns) }\n"
     );
 }
+
+#[test]
+fn equal_timestamps_fire_in_registration_order() {
+    struct Recorder(Log<u8>, u8);
+    impl std::task::Wake for Recorder {
+        fn wake(self: Arc<Self>) {
+            self.0.lock().unwrap().push(self.1);
+        }
+    }
+    let mut sim = Sim::new(SimConfig::new(1));
+    sim.add_node();
+    let woken: Log<u8> = log();
+    let at = Instant::from_nanos(50);
+    {
+        let mut st = sim.shared.lock();
+        for id in [1u8, 2, 3] {
+            st.register_timer(
+                at,
+                std::task::Waker::from(Arc::new(Recorder(woken.clone(), id))),
+            );
+        }
+    }
+    let mut wakers = Vec::new();
+    sim.shared.lock().advance_to(at, &mut wakers);
+    for waker in wakers {
+        waker.wake();
+    }
+    assert_eq!(*woken.lock().unwrap(), [1, 2, 3]);
+}
+
+#[test]
+fn equal_delivery_times_keep_send_order() {
+    let mut config = SimConfig::new(6);
+    config.net.delay_min = ms(5);
+    config.net.delay_max = ms(5);
+    let mut sim = Sim::new(config);
+    let (a, b) = (sim.add_node(), sim.add_node());
+    let got: Log<u32> = log();
+    let g = got.clone();
+    let env_b = sim.env(b);
+    env_b.clone().spawn("receiver", async move {
+        let sock = env_b.net().bind(addr(2)).await.unwrap();
+        loop {
+            let (_, msg) = sock.recv().await.unwrap();
+            g.lock()
+                .unwrap()
+                .push(u32::from_be_bytes(msg[..].try_into().unwrap()));
+        }
+    });
+    let env_a = sim.env(a);
+    env_a.clone().spawn("sender", async move {
+        let sock = env_a.net().bind(addr(1)).await.unwrap();
+        for n in 0..10u32 {
+            sock.send(addr(2), Bytes::copy_from_slice(&n.to_be_bytes()))
+                .await
+                .unwrap();
+        }
+    });
+    sim.run_until(Instant::from_nanos(1_000_000_000));
+    assert_eq!(*got.lock().unwrap(), (0..10).collect::<Vec<_>>());
+}

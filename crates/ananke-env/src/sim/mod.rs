@@ -9,8 +9,12 @@
 //! Scheduling policy: when several tasks are runnable the next one is chosen uniformly
 //! at random from the seeded generator, and every choice is recorded as
 //! [`TraceEvent::TaskPolled`]. When nothing is runnable, virtual time jumps to the next
-//! timer or message delivery. This is the interim policy until the moirae bridge
-//! supplies the decisions (SPEC.md §1.5).
+//! timer or message delivery. This is an interim policy. The real one is chosen with
+//! the moirae bridge (SPEC.md §1.5), likely PCT-style priority scheduling rather than
+//! uniform random, and gets its DECISIONS.md entry then.
+//!
+//! Ties at equal virtual timestamps are broken by one sequence counter shared by timers
+//! and deliveries, never by container iteration order; see `state.rs`.
 
 mod clock;
 mod fs;
