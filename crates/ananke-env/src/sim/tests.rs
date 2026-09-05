@@ -12,7 +12,9 @@ use bytes::Bytes;
 use moirae_sched::Policy;
 
 use super::*;
-use crate::{Clock, DropReason, File, FileSystem, MessageId, Network, OpenOptions, Rng, Socket};
+use crate::{
+    Clock, DirEntryOp, DropReason, File, FileSystem, MessageId, Network, OpenOptions, Rng, Socket,
+};
 
 fn ms(n: u64) -> Duration {
     Duration::from_millis(n)
@@ -532,6 +534,7 @@ fn write_three_then(config: SimConfig, sync: bool) -> Sim {
     let env = sim.env(n);
     env.clone().spawn("writer", async move {
         let f = env.fs().open(Path::new("/f"), open_rw()).await.unwrap();
+        env.fs().sync_dir(Path::new("/")).await.unwrap(); // the entry is durable; only the writes are at risk
         f.write_at(0, Bytes::from_static(b"aaaa")).await.unwrap();
         f.write_at(4, Bytes::from_static(b"bbbb")).await.unwrap();
         f.write_at(8, Bytes::from_static(b"cccc")).await.unwrap();
@@ -1100,4 +1103,103 @@ fn no_bit_rot_by_default_and_none_on_empty_files() {
     let default = SimConfig::new(1);
     assert_eq!(default.fs.p_bitrot, 0.0);
     assert_eq!(default.fs.block_size, 4096);
+}
+
+#[test]
+fn a_rename_without_sync_dir_may_be_lost_at_crash_but_never_both_or_neither() {
+    let mut old_seen = 0;
+    let mut new_seen = 0;
+    for seed in 0..64 {
+        let mut sim = Sim::new(SimConfig::new(seed));
+        let n = sim.add_node();
+        let env = sim.env(n);
+        env.clone().spawn("renamer", async move {
+            let fs = env.fs();
+            let f = fs.open(Path::new("/a"), open_rw()).await.unwrap();
+            f.write_at(0, Bytes::from_static(b"data")).await.unwrap();
+            f.sync().await.unwrap();
+            fs.sync_dir(Path::new("/")).await.unwrap();
+            fs.rename(Path::new("/a"), Path::new("/b")).await.unwrap();
+            // no sync_dir: the rename may be lost
+        });
+        sim.run_until(Instant::ZERO);
+        sim.crash(n);
+        let a = sim.durable_contents(n, Path::new("/a"));
+        let b = sim.durable_contents(n, Path::new("/b"));
+        let old_name_kept = a.is_some();
+        match (a, b) {
+            (Some(bytes), None) => {
+                old_seen += 1;
+                assert_eq!(bytes, b"data");
+                assert!(events(&sim).iter().any(|e| matches!(e, TraceEvent::DirectoryEntryLost { entry, op: DirEntryOp::Rename, .. } if entry == Path::new("/b"))));
+            }
+            (None, Some(bytes)) => {
+                new_seen += 1;
+                assert_eq!(bytes, b"data");
+                assert!(
+                    !events(&sim)
+                        .iter()
+                        .any(|e| matches!(e, TraceEvent::DirectoryEntryLost { .. }))
+                );
+            }
+            other => {
+                panic!("seed {seed}: the file must exist under exactly one name, got {other:?}")
+            }
+        }
+        // The restarted node sees the same namespace.
+        let env = sim.env(n);
+        let listed: Log<Vec<std::path::PathBuf>> = log();
+        let l = listed.clone();
+        env.clone().spawn("lister", async move {
+            let names = env.fs().read_dir(Path::new("/")).await.unwrap();
+            l.lock().unwrap().push(names);
+        });
+        sim.run_until(Instant::ZERO);
+        let names = listed.lock().unwrap()[0].clone();
+        assert_eq!(names.len(), 1);
+        assert_eq!(
+            names[0].to_str().unwrap(),
+            if old_name_kept { "a" } else { "b" }
+        );
+    }
+    assert!(
+        old_seen > 0 && new_seen > 0,
+        "64 seeds: old {old_seen}, new {new_seen}"
+    );
+}
+
+#[test]
+fn sync_dir_makes_entries_durable_and_an_unsynced_create_may_vanish() {
+    let mut vanished = 0;
+    for seed in 0..32 {
+        let mut sim = Sim::new(SimConfig::new(seed));
+        let n = sim.add_node();
+        let env = sim.env(n);
+        env.clone().spawn("creator", async move {
+            let fs = env.fs();
+            fs.open(Path::new("/synced"), open_rw()).await.unwrap();
+            fs.sync_dir(Path::new("/")).await.unwrap();
+            fs.open(Path::new("/unsynced"), open_rw()).await.unwrap();
+        });
+        sim.run_until(Instant::ZERO);
+        sim.crash(n);
+        assert!(
+            sim.durable_contents(n, Path::new("/synced")).is_some(),
+            "seed {seed}: a synced entry survives"
+        );
+        if sim.durable_contents(n, Path::new("/unsynced")).is_none() {
+            vanished += 1;
+            assert!(events(&sim).iter().any(|e| matches!(
+                e,
+                TraceEvent::DirectoryEntryLost {
+                    op: DirEntryOp::Link,
+                    ..
+                }
+            )));
+        }
+    }
+    assert!(
+        vanished > 0,
+        "an unsynced create never vanished in 32 seeds"
+    );
 }

@@ -5,7 +5,10 @@
 //! makes everything durable with probability `p_durable`, otherwise returns Ok while
 //! persisting nothing (lost fsync). At a crash, a random prefix of the pending writes
 //! survives and the next write may be torn to a random prefix of itself. Directory
-//! entries are immediately durable in this version (see BACKLOG.md).
+//! entries follow the same rule: creating, removing or renaming a file is visible at
+//! once but durable only after [`FileSystem::sync_dir`] on the directory, and at a crash
+//! a random prefix of a directory's pending operations survives. A rename is recorded
+//! against its destination's directory. Directories themselves are immediately durable.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
@@ -16,7 +19,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 
 use super::state::{Shared, State};
-use crate::{File, FileSystem, NodeId, OpenOptions, TraceEvent};
+use crate::{DirEntryOp, File, FileSystem, NodeId, OpenOptions, TraceEvent};
 
 pub(super) type InodeId = u64;
 
@@ -49,10 +52,67 @@ fn apply(target: &mut Vec<u8>, op: &PendingOp, limit: Option<usize>) {
     }
 }
 
+/// A directory operation not yet made durable by `sync_dir`.
+enum DirOp {
+    Link {
+        path: PathBuf,
+        inode: InodeId,
+    },
+    Unlink {
+        path: PathBuf,
+    },
+    Rename {
+        from: PathBuf,
+        to: PathBuf,
+        inode: InodeId,
+    },
+}
+
+impl DirOp {
+    fn entry(&self) -> &Path {
+        match self {
+            DirOp::Link { path, .. } | DirOp::Unlink { path } => path,
+            DirOp::Rename { to, .. } => to,
+        }
+    }
+
+    fn kind(&self) -> DirEntryOp {
+        match self {
+            DirOp::Link { .. } => DirEntryOp::Link,
+            DirOp::Unlink { .. } => DirEntryOp::Unlink,
+            DirOp::Rename { .. } => DirEntryOp::Rename,
+        }
+    }
+
+    fn apply(&self, entries: &mut BTreeMap<PathBuf, InodeId>) {
+        match self {
+            DirOp::Link { path, inode } => {
+                entries.insert(path.clone(), *inode);
+            }
+            DirOp::Unlink { path } => {
+                entries.remove(path);
+            }
+            DirOp::Rename { from, to, inode } => {
+                entries.remove(from);
+                entries.insert(to.clone(), *inode);
+            }
+        }
+    }
+}
+
+fn parent_of(path: &Path) -> PathBuf {
+    path.parent().unwrap_or_else(|| Path::new("")).to_path_buf()
+}
+
 /// One node's disk.
 pub(super) struct NodeFs {
     dirs: BTreeSet<PathBuf>,
+    /// The namespace the running node sees.
     entries: BTreeMap<PathBuf, InodeId>,
+    /// The namespace that survives a crash.
+    durable_entries: BTreeMap<PathBuf, InodeId>,
+    /// Per directory, the operations since its last `sync_dir`.
+    pending_dirs: BTreeMap<PathBuf, Vec<DirOp>>,
     inodes: BTreeMap<InodeId, Inode>,
     next_inode: InodeId,
 }
@@ -69,6 +129,8 @@ impl NodeFs {
         Self {
             dirs,
             entries: BTreeMap::new(),
+            durable_entries: BTreeMap::new(),
+            pending_dirs: BTreeMap::new(),
             inodes: BTreeMap::new(),
             next_inode: 1,
         }
@@ -122,6 +184,13 @@ impl NodeFs {
             },
         );
         self.entries.insert(path.to_path_buf(), id);
+        self.pending_dirs
+            .entry(parent_of(path))
+            .or_default()
+            .push(DirOp::Link {
+                path: path.to_path_buf(),
+                inode: id,
+            });
         Ok(id)
     }
 
@@ -165,6 +234,14 @@ impl NodeFs {
         if let Some(inode) = self.inodes.get_mut(&id) {
             inode.path = to.to_path_buf();
         }
+        self.pending_dirs
+            .entry(parent_of(to))
+            .or_default()
+            .push(DirOp::Rename {
+                from: from.to_path_buf(),
+                to: to.to_path_buf(),
+                inode: id,
+            });
         Ok(())
     }
 
@@ -175,15 +252,25 @@ impl NodeFs {
                 "is a directory",
             ));
         }
-        self.entries.remove(path).map(|_| ()).ok_or_else(not_found)
+        self.entries.remove(path).ok_or_else(not_found)?;
+        self.pending_dirs
+            .entry(parent_of(path))
+            .or_default()
+            .push(DirOp::Unlink {
+                path: path.to_path_buf(),
+            });
+        Ok(())
     }
 
-    fn sync_dir(&self, path: &Path) -> io::Result<()> {
-        if self.dirs.contains(path) {
-            Ok(())
-        } else {
-            Err(not_found())
+    /// Makes every pending operation on `path`'s entries durable.
+    fn sync_dir(&mut self, path: &Path) -> io::Result<()> {
+        if !self.dirs.contains(path) {
+            return Err(not_found());
         }
+        for op in self.pending_dirs.remove(path).unwrap_or_default() {
+            op.apply(&mut self.durable_entries);
+        }
+        Ok(())
     }
 
     fn inode(&self, id: InodeId) -> io::Result<&Inode> {
@@ -267,6 +354,7 @@ impl State {
                 }
                 inode.visible.clone_from(&inode.durable);
             }
+            fs.apply_crash_to_directories(rng, &mut events);
         }
         for event in events {
             self.record(Some(node), event);
@@ -421,9 +509,36 @@ impl File for SimFile {
 }
 
 impl NodeFs {
-    /// For tests and the harness: what is on disk for `path` right now.
+    /// For tests and the harness: what is on disk for `path` right now, in the durable
+    /// namespace.
     pub(super) fn durable_contents(&self, path: &Path) -> Option<&[u8]> {
-        let id = self.entries.get(path)?;
+        let id = self.durable_entries.get(path)?;
         self.inode(*id).ok().map(|inode| inode.durable.as_slice())
+    }
+
+    /// The §1.3 directory-entry loss model: per directory, a random prefix of the
+    /// operations since its last `sync_dir` survives; the rest are reported and gone.
+    /// Afterwards the node sees exactly the durable namespace.
+    fn apply_crash_to_directories(
+        &mut self,
+        rng: &mut moirae_sched::Pcg32,
+        events: &mut Vec<TraceEvent>,
+    ) {
+        let pending = std::mem::take(&mut self.pending_dirs);
+        for (dir, ops) in pending {
+            let keep = usize::try_from(rng.below(ops.len() as u64 + 1)).unwrap_or(0);
+            for (i, op) in ops.iter().enumerate() {
+                if i < keep {
+                    op.apply(&mut self.durable_entries);
+                } else {
+                    events.push(TraceEvent::DirectoryEntryLost {
+                        dir: dir.clone(),
+                        entry: op.entry().to_path_buf(),
+                        op: op.kind(),
+                    });
+                }
+            }
+        }
+        self.entries.clone_from(&self.durable_entries);
     }
 }

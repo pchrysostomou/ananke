@@ -127,6 +127,16 @@ pub enum TraceEvent {
         /// How many of them reached the disk.
         kept: usize,
     },
+    /// At a crash a directory operation that was never followed by `sync_dir` was lost
+    /// (SPEC.md §1.3, directory-entry loss).
+    DirectoryEntryLost {
+        /// The directory whose entries the operation changed.
+        dir: PathBuf,
+        /// The entry the operation concerned; for a rename, the destination.
+        entry: PathBuf,
+        /// What was lost.
+        op: DirEntryOp,
+    },
     /// A node's tasks were killed and the filesystem fault model applied to its disk.
     NodeCrashed {
         /// The crashed node.
@@ -171,6 +181,18 @@ pub enum TraceEvent {
         /// The receiver.
         to: NodeId,
     },
+}
+
+/// A directory operation that must be followed by `sync_dir` to be durable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DirEntryOp {
+    /// A file was created.
+    Link,
+    /// A file was removed.
+    Unlink,
+    /// A file was renamed.
+    Rename,
 }
 
 /// Why a message was discarded.

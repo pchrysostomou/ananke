@@ -16,6 +16,7 @@
 //! | `PollBudgetExceeded`                     | `log` `ananke.task.budget-exceeded`           |
 //! | `FsyncLost` / `WriteTorn`                | `log` `ananke.fs.fsync-lost` / `.write-torn`  |
 //! | `BlockRotted`                            | `log` `ananke.fs.bit-rot`                     |
+//! | `DirectoryEntryLost`                     | `log` `ananke.fs.dir-entry-lost`              |
 //! | `TimeAdvanced`                           | nothing: every line carries `t`               |
 //!
 //! `t` is global virtual time in nanoseconds and the header says `unit: "ns"`. Node ids
@@ -32,7 +33,7 @@ use std::net::SocketAddr;
 use moirae_trace::{Cause, Collect, Error, Event, Header, Json, Sink, TimeUnit, Verify, Writer};
 
 use crate::sim::{Sim, Snapshot, TraceRecord};
-use crate::{DropReason, NodeId, TraceEvent};
+use crate::{DirEntryOp, DropReason, NodeId, TraceEvent};
 
 /// Turns a message payload into the `msg` object of a `send` line: an object whose
 /// `type` is a string, which is what the studio labels and filters by.
@@ -318,6 +319,21 @@ fn convert(
                 ("offset", int(*offset)),
                 ("written", int(*written as u64)),
                 ("kept", int(*kept as u64)),
+            ])),
+        ),
+        TraceEvent::DirectoryEntryLost { dir, entry, op } => log(
+            "ananke.fs.dir-entry-lost",
+            Some(Json::obj(vec![
+                ("dir", Json::str(&dir.display().to_string())),
+                ("entry", Json::str(&entry.display().to_string())),
+                (
+                    "op",
+                    Json::str(match op {
+                        DirEntryOp::Link => "link",
+                        DirEntryOp::Unlink => "unlink",
+                        DirEntryOp::Rename => "rename",
+                    }),
+                ),
             ])),
         ),
         TraceEvent::NodeCrashed { node } => Some(Event::Crash {
