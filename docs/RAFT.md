@@ -1,7 +1,7 @@
 # RAFT.md — ananke's Raft
 
-_Status: proposed, 2026-09-05. Design only; no code exists. Approval turns the sections
-below into DECISIONS.md entries and the layout into crates._
+_Status: approved 2026-09-05, with the lease section rewritten as approved. Each
+implementation stage turns its part into a DECISIONS.md entry as it lands._
 
 Sources of truth, in order: Ongaro and Ousterhout, *In Search of an Understandable
 Consensus Algorithm* (USENIX ATC 2014), cited as the paper; Ongaro, *Consensus: Bridging
@@ -68,19 +68,22 @@ heartbeat_margin`, over the earliest such time among a majority. A read arriving
 before `lease_end` is served at the commit index without the round.
 
 The lease assumes bounded clock rate drift between the leader and each follower over
-one lease period. The simulator will run with drift beyond `drift_bound` on some seeds
-(SPEC §3), and what "handling it" means is fixed here: the leader measures the drift it
-assumed away. Every response also carries the follower's local time; the leader keeps,
-per follower, the offset between the follower's clock and its own as seen at each
-response, and if the offset moves by more than `drift_bound × elapsed` between two
-responses from the same follower, the leader revokes its lease and serves reads by
-read-index until a fresh majority of responses shows the drift back inside the bound.
-Rate drift beyond the bound shows as offset movement, so it is detectable in one
-heartbeat interval; the sweep runs the drift violation with the guard on, where reads
-must stay linearizable, and with the guard off, `Variant::LeaseTrustsTheClock`, where the
-checker must catch a stale read. If the drift violation the simulator injects is too
-small to show as offset movement within one lease, it is also too small to make a
-lease-read stale, and the bound is the arithmetic that says so.
+one lease period, and the simulator will run with drift beyond `drift_bound` on some
+seeds (SPEC §3). The leader guards against what it assumed: every response also
+carries the follower's local time, and the leader keeps, per follower, the offset
+between the follower's clock and its own as seen at each response. The guard is
+conservative. Heartbeat responses carry network delay, and delay jitter is
+indistinguishable from clock movement in either direction, so the leader revokes its
+lease on any observed movement of a follower's offset beyond `drift_bound × elapsed`,
+jitter included, and serves reads by read-index until a fresh majority of responses
+shows the offsets steady again. A spurious revoke costs one read-index round trip; a
+missed one costs a stale read. No argument here establishes that the guard is
+sufficient. Lease safety is established by the sweep, as the sixth invariant in §2:
+in every seed where the simulator's drift exceeds the configured bound, either the
+guard revoked the lease before the lease read, or the linearizability checker reports
+the stale read and the run fails. The sweep runs the drift violation with the guard on,
+where the invariant must hold on every seed, and with the guard off,
+`Variant::LeaseTrustsTheClock`, where the checker must catch a stale read on some.
 
 **Membership changes by joint consensus (thesis §4.3).** A change from C_old to C_new
 is two log entries: `C_old,new` and, once that is committed, `C_new`. While the joint
@@ -134,6 +137,7 @@ events, all carrying the node and the term:
 | `RaftConfig` | a configuration entry takes effect | `index`, `old`, `new`, `joint` |
 | `RaftSnapshot` | a snapshot is taken or installed | `last_index`, `last_term`, `taken` |
 | `RaftRead` | a read is served | `index`, `lease` |
+| `RaftLeaseRevoked` | the guard revoked a lease | `follower`, `offset_moved` |
 | `ClientInvoke` | a client operation starts | `client`, `op`, `key`, `arg` |
 | `ClientReturn` | it returns | `client`, `result` |
 
@@ -163,6 +167,14 @@ every crash and at the end:
    `ClientReturn` pairs with their virtual times, checked by the checker in §4. An
    operation that never returned, because its client's node crashed or the run ended,
    is kept as pending and may take effect or not, as porcupine treats it.
+6. **Lease safety under drift.** For every `RaftRead` with `lease` set, served while
+   the simulator's clock drift between the leader and some voter exceeded the
+   configured `drift_bound` over the lease period, either a `RaftLeaseRevoked` event on
+   that leader precedes the read, or the read is a linearizability violation reported
+   by check 5. Stated the other way: on every seed with the drift violation on, the
+   run passes only if no lease read was served stale. The invariant is a fold over
+   `RaftRead`, `RaftLeaseRevoked` and the simulator's clock configuration, and the
+   checker in §4 is what decides staleness; the guard's sufficiency is never assumed.
 
 The pair rule holds for each: a buggy variant in §5 fails each check, and the correct
 variant passes every seed. Every check is a function of the trace alone, so a failing
@@ -218,6 +230,13 @@ tenant and the applied index in `meta`: the two are durable together, so a crash
 between them cannot exist, and an entry is applied exactly once whatever the crash
 schedule. The Raft log is compacted by deleting indices at or below a snapshot's;
 the engine's compaction reclaims the space in its own time.
+
+The engine is opened with `allow_manifest_fallback` and `allow_head_gap` off, and the
+store refuses a recovery that dropped an unreadable table, fell back to an older
+manifest, or discarded a log head: each is a hole in the middle of the state, and an
+applied index over a hole names a state that never existed (D-022). A server whose
+disk lost state does not start; it is re-seeded by a snapshot from the leader (§5,
+stage E).
 
 **The message codec.** `Message` is `PreVote`, `PreVoteResponse`, `RequestVote`,
 `RequestVoteResponse`, `AppendEntries`, `AppendEntriesResponse`, `InstallSnapshot`,
@@ -308,7 +327,7 @@ variant to delete.
 | `TruncateOnEveryAppend` | moirae rule 3 | leader completeness: a duplicated older `AppendEntries` deletes committed entries | duplication (issue #1) |
 | `IndexFirstElectionRestriction` | §5.4.1: compare last terms first | leader completeness | crashes and partitions |
 | `ResetTimerOnAnyRpc` | moirae rule 5 | liveness: no leader within the bound after a leader crash | crashes |
-| `LeaseTrustsTheClock` | §1 above: no drift guard | linearizability: a stale lease read | the drift violation |
+| `LeaseTrustsTheClock` | §1 above: no drift guard | invariant 6, lease safety under drift: the checker reports a stale lease read with no revoke before it | the drift violation |
 | `ApplyNotAtomicWithIndex` | §3: the applied index written in a separate batch | state machine safety per node: an entry applied twice after a crash; and `Cas` in the linearizability check | crashes during apply |
 | `SnapshotWithoutCurrentLast` | §1: a snapshot installed from a staging directory without `CURRENT` written last | state machine safety after a crash mid-install: the node comes back on a state that never existed | crashes during install |
 | `SingleMajorityInJointConsensus` | thesis §4.3: commit needs both majorities | election safety or leader completeness during 3 → 5 → 3 under partition | the membership scenario |
