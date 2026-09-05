@@ -11,6 +11,8 @@ authors.workspace = true
 [dependencies]
 bytes.workspace = true
 getrandom.workspace = true
+moirae-sched.workspace = true
+moirae-trace.workspace = true
 siphasher.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "time", "net", "io-util", "sync", "macros"] }
 tracing.workspace = true

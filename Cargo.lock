@@ -12,6 +12,8 @@ version = "0.0.1"
 dependencies = [
  "bytes",
  "getrandom",
+ "moirae-sched",
+ "moirae-trace",
  "siphasher",
  "tempfile",
  "tokio",
@@ -210,6 +212,19 @@ dependencies = [
  "wasi",
  "windows-sys",
 ]
+
+[[package]]
+name = "moirae-sched"
+version = "0.0.1"
+source = "git+https://github.com/pchrysostomou/moirae?rev=843f3acadb1cc10bf2000849cb7aff80d05d2c00#843f3acadb1cc10bf2000849cb7aff80d05d2c00"
+dependencies = [
+ "moirae-trace",
+]
+
+[[package]]
+name = "moirae-trace"
+version = "0.0.1"
+source = "git+https://github.com/pchrysostomou/moirae?rev=843f3acadb1cc10bf2000849cb7aff80d05d2c00#843f3acadb1cc10bf2000849cb7aff80d05d2c00"
 
 [[package]]
 name = "once_cell"
