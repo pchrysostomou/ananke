@@ -13,6 +13,7 @@
 //! | `PartitionStarted` / `PartitionHealed`   | `fault` `partition` / `heal`                  |
 //! | `LinkBlocked` / `LinkUnblocked`          | `log` `ananke.link.blocked` / `.unblocked`    |
 //! | `TaskSpawned` / `TaskPolled` / `TaskCompleted` | `log` `ananke.task.*`; polls are optional |
+//! | `PollBudgetExceeded`                     | `log` `ananke.task.budget-exceeded`           |
 //! | `FsyncLost` / `WriteTorn`                | `log` `ananke.fs.fsync-lost` / `.write-torn`  |
 //! | `TimeAdvanced`                           | nothing: every line carries `t`               |
 //!
@@ -242,6 +243,13 @@ fn convert(
         TraceEvent::TaskCompleted { task } => log(
             "ananke.task.completed",
             Some(Json::obj(vec![("task", int(task.get()))])),
+        ),
+        TraceEvent::PollBudgetExceeded { task, polls } => log(
+            "ananke.task.budget-exceeded",
+            Some(Json::obj(vec![
+                ("task", int(task.get())),
+                ("polls", int(*polls)),
+            ])),
         ),
         TraceEvent::TimeAdvanced { .. } => None,
         TraceEvent::MessageSent {

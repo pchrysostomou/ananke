@@ -62,14 +62,19 @@ pub(super) struct Node {
 
 pub(super) struct Task {
     pub(super) node: NodeId,
+    pub(super) name: &'static str,
     pub(super) future: Option<BoxFuture>,
     pub(super) waker: Waker,
     pub(super) abort_requested: bool,
+    /// The instant this task was last polled at, and how many polls it has taken there.
+    pub(super) polls_at: (u64, u64),
 }
 
 pub(super) struct State {
     pub(super) config: SimConfig,
     pub(super) now: Instant,
+    /// Counts the times virtual time moved; a task's poll count restarts with it.
+    pub(super) instant: u64,
     /// The scheduling policy in force (D-016); it owns the `sched` stream.
     scheduler: Box<dyn Scheduler>,
     pub(super) policy: Policy,
@@ -99,6 +104,7 @@ impl State {
         Self {
             config,
             now: Instant::ZERO,
+            instant: 0,
             scheduler,
             policy,
             net_stream: stream(seed, "net"),
@@ -181,9 +187,11 @@ impl State {
             id,
             Task {
                 node,
+                name,
                 future: Some(future),
                 waker,
                 abort_requested: false,
+                polls_at: (0, 0),
             },
         );
         self.scheduler.spawned(id.get());
@@ -253,6 +261,7 @@ impl State {
     pub(super) fn advance_to(&mut self, to: Instant, wakers: &mut Vec<Waker>) {
         if to > self.now {
             self.now = to;
+            self.instant += 1;
             self.record(None, TraceEvent::TimeAdvanced { to });
         }
         let due: Vec<(Instant, u64)> = self

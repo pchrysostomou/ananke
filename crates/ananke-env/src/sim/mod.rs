@@ -105,6 +105,11 @@ pub struct SimConfig {
     /// (moirae-sched `Pct`). Derive it with [`SimConfig::run_length_hint_for`] from the
     /// scenario's duration and node count; it is never a per-task poll budget.
     pub run_length_hint: u64,
+    /// How many times one task may be polled at a single virtual instant. A task that
+    /// keeps itself runnable without letting time move is a busy loop; exceeding this
+    /// records [`TraceEvent::PollBudgetExceeded`] and panics, so a 10k-seed run fails
+    /// instead of hanging. Unrelated to `run_length_hint`.
+    pub poll_budget: u64,
 }
 
 impl SimConfig {
@@ -119,6 +124,7 @@ impl SimConfig {
             wall_epoch: WallTime::from_unix_nanos(1_767_225_600 * 1_000_000_000),
             policy: None,
             run_length_hint: 10_000,
+            poll_budget: 100_000,
         }
     }
 
@@ -193,6 +199,11 @@ impl Sim {
             config.clock.max_drift_ppm < 1_000_000,
             "max_drift_ppm must be below 1,000,000"
         );
+        assert!(
+            config.run_length_hint > 0,
+            "run_length_hint must be positive"
+        );
+        assert!(config.poll_budget > 0, "poll_budget must be positive");
         Self {
             shared: Arc::new(Shared::new(State::new(config))),
         }
@@ -456,14 +467,32 @@ impl Sim {
     fn poll(&self, id: TaskId) {
         let (mut future, waker) = {
             let mut st = self.shared.lock();
+            let (instant, budget) = (st.instant, st.config.poll_budget);
             let Some(task) = st.tasks.get_mut(&id) else {
                 return;
             };
             let Some(future) = task.future.take() else {
                 return;
             };
-            let (node, waker) = (task.node, task.waker.clone());
+            let (node, name, waker) = (task.node, task.name, task.waker.clone());
+            if task.polls_at.0 != instant {
+                task.polls_at = (instant, 0);
+            }
+            task.polls_at.1 += 1;
+            let polls = task.polls_at.1;
             st.record(Some(node), TraceEvent::TaskPolled { task: id });
+            if polls > budget {
+                st.record(
+                    Some(node),
+                    TraceEvent::PollBudgetExceeded { task: id, polls },
+                );
+                let now = st.now;
+                drop(st);
+                panic!(
+                    "{id} ({name}) on {node} was polled {polls} times at virtual time {now:?} without time \
+                     advancing: busy loop (SimConfig::poll_budget = {budget})"
+                );
+            }
             (future, waker)
         };
         let outcome = future.as_mut().poll(&mut Context::from_waker(&waker));

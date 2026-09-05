@@ -120,6 +120,14 @@ pub enum TraceEvent {
         /// The crashed node.
         node: NodeId,
     },
+    /// A task was polled more than `SimConfig::poll_budget` times at one virtual instant
+    /// without letting time move: a busy loop. The run fails right after this is recorded.
+    PollBudgetExceeded {
+        /// The looping task.
+        task: TaskId,
+        /// How many polls it took at that instant.
+        polls: u64,
+    },
     /// A crashed node is about to be started again from what survived on its disk.
     NodeRestarted {
         /// The node.

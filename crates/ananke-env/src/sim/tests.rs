@@ -968,3 +968,44 @@ fn a_race_never_moves_a_protocol_draw() {
         "protocol and scheduling streams differ"
     );
 }
+
+/// A task that keeps itself runnable without letting virtual time move must fail the
+/// run, not hang it.
+#[test]
+#[should_panic(expected = "busy loop")]
+fn a_busy_loop_fails_the_run_instead_of_hanging() {
+    let mut config = SimConfig::new(1);
+    config.poll_budget = 500;
+    let mut sim = Sim::new(config);
+    let n = sim.add_node();
+    sim.env(n).spawn("spinner", async {
+        loop {
+            YieldOnce(false).await;
+        }
+    });
+    sim.run_until(Instant::from_nanos(1));
+}
+
+#[test]
+fn the_poll_budget_restarts_when_time_moves() {
+    // 400 yields per millisecond for 10 ms is 4000 polls in total, but never more than
+    // ~401 at one instant, so a budget of 500 is not exceeded.
+    let mut config = SimConfig::new(1);
+    config.poll_budget = 500;
+    let mut sim = Sim::new(config);
+    let n = sim.add_node();
+    let env = sim.env(n);
+    let done: Log<u32> = log();
+    let d = done.clone();
+    env.clone().spawn("bursty", async move {
+        for _ in 0..10 {
+            for _ in 0..400 {
+                YieldOnce(false).await;
+            }
+            env.clock().sleep(ms(1)).await;
+        }
+        d.lock().unwrap().push(1);
+    });
+    sim.run_until(Instant::from_nanos(100_000_000));
+    assert_eq!(*done.lock().unwrap(), [1]);
+}
