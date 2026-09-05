@@ -149,6 +149,12 @@ uploaded as artifacts.
   The harness's model of what the disk owed hard-coded one scenario's directory, so in
   the engine scenario no sync was ever counted as lost and no bit rot ever matched a
   stop. The correct engine failed its own sweep, which is how the harness bug surfaced.
+- **A flipped bit that named an older manifest** ([D-022](docs/DECISIONS.md)). Bit rot
+  turned the `000007` in `CURRENT` into `000003`, the name of a manifest that still
+  existed. Recovery took that manifest as the one in force and removed four newer
+  tables as orphans. `CURRENT` now carries the crc32c of the name it holds, and a
+  `CURRENT` that fails it counts as unreadable, so recovery falls back to the newest
+  readable manifest and says so in the trace.
 
 ## Quick start
 

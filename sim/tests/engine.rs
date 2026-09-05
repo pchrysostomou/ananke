@@ -1,7 +1,8 @@
 //! The Phase 1 crash-injection property (SPEC.md §2.8) for the engine: the correct
 //! engine passes every seed with every §1.3 fault on, filesystem latency and crashes
 //! mid-flush; the engine that acknowledges before the log is caught, and so is the
-//! one that releases a memtable before the manifest names its table.
+//! one that releases a memtable and its log segments before the manifest names its
+//! table.
 
 use ananke_env::TraceEvent;
 use ananke_sim::engine::{self, Variant};

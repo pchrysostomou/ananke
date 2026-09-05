@@ -573,7 +573,9 @@ first sequence number: the log's records number themselves, the manifest carries
 
 The simulator's filesystem operations now take time (`FsFaults::latency`), so a crash
 lands inside a flush as often as between two, and `Variant::ReleaseBeforeManifest`
-releases a memtable once its table is written but before the manifest names it. The
+releases a memtable and deletes its log segments once its table is written and in
+service, before the manifest names it: a crash in that window leaves the table an
+orphan and its records nowhere. The
 sweep excuses exactly these losses: a dropped table whose sync the simulator lost or
 which bit rot hit; a fallback whose manifest's sync, or whose `CURRENT.tmp` sync, was
 lost or which rot hit, with everything flushed after the manifest used; and a record

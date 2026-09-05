@@ -28,7 +28,7 @@
 //! The [`Variant`]s for the crash sweep: [`Variant::Correct`];
 //! [`Variant::NoWalBeforeMemtable`], which applies and acknowledges a write before
 //! the log has it; and [`Variant::ReleaseBeforeManifest`], which releases a memtable
-//! once its table is written but before the manifest names it.
+//! and its log segments once its table is written but before the manifest names it.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
@@ -61,8 +61,10 @@ pub enum Variant {
     /// A write is applied to the memtable and acknowledged at once; the log record is
     /// queued but nobody waits for it. A crash loses acknowledged writes.
     NoWalBeforeMemtable,
-    /// A memtable is released as soon as its table is written, before the manifest
-    /// names the table. Until it does, the memtable's keys are readable nowhere.
+    /// A memtable is released, and the log segments it covered deleted, as soon as
+    /// its table is written and serving reads, before the manifest names the table.
+    /// A crash before the manifest is durable leaves the table an orphan and its
+    /// records nowhere.
     ReleaseBeforeManifest,
 }
 
@@ -629,18 +631,19 @@ impl<E: Environment> Shared<E> {
         Ok((meta, reader))
     }
 
-    /// Writes the next manifest listing `meta`, syncs it, switches `CURRENT` to it,
-    /// and puts the table in service.
-    async fn commit_manifest(&self, meta: SstMeta, reader: SstReader<FileOf<E>>) -> io::Result<()> {
-        let next = {
-            let tables = lock(&self.tables);
-            let mut next = tables.manifest.clone();
-            next.number += 1;
-            next.next_sst = meta.number + 1;
-            next.flushed_seq = meta.max_seq;
-            next.ssts.push(meta);
-            next
-        };
+    /// The manifest that follows the one in force, listing `meta` after its tables.
+    fn next_manifest(&self, meta: &SstMeta) -> Manifest {
+        let tables = lock(&self.tables);
+        let mut next = tables.manifest.clone();
+        next.number += 1;
+        next.next_sst = meta.number + 1;
+        next.flushed_seq = meta.max_seq;
+        next.ssts.push(*meta);
+        next
+    }
+
+    /// Writes `next`, syncs it, and switches `CURRENT` to it.
+    async fn write_manifest(&self, next: &Manifest) -> io::Result<()> {
         let fs = self.env.fs();
         let dir = &self.config.dir;
         let file = fs
@@ -656,11 +659,14 @@ impl<E: Environment> Shared<E> {
             flushed_seq: next.flushed_seq,
             ssts: next.ssts.len() as u64,
         });
-        switch_current(&self.env, dir, next.number).await?;
+        switch_current(&self.env, dir, next.number).await
+    }
+
+    /// Puts the table in service under `next`, which lists it.
+    fn serve(&self, meta: SstMeta, reader: SstReader<FileOf<E>>, next: Manifest) {
         let mut tables = lock(&self.tables);
         tables.ssts.push((meta, Arc::new(reader)));
         tables.manifest = next;
-        Ok(())
     }
 }
 
@@ -723,15 +729,23 @@ async fn flusher<E: Environment>(shared: Arc<Shared<E>>) {
     while let Some(memtable) = NextImmutable(&shared).await {
         let flushed = async {
             let (meta, reader) = shared.write_sst(&memtable).await?;
+            let next = shared.next_manifest(&meta);
+            let max_seq = meta.max_seq;
             if shared.config.variant == Variant::ReleaseBeforeManifest {
-                // The bug: gone from the memtables before any manifest names the table.
+                // The bug: the table is taken for durable once written. It serves
+                // reads, the memtable goes, the log segments go, and only then is the
+                // manifest written. A crash before the manifest is durable leaves the
+                // table an orphan and its records nowhere.
+                shared.serve(meta, reader, next.clone());
                 shared.release(&memtable);
-                shared.commit_manifest(meta, reader).await?;
+                shared.wal.delete_segments_through(max_seq).await?;
+                shared.write_manifest(&next).await?;
             } else {
-                shared.commit_manifest(meta, reader).await?;
+                shared.write_manifest(&next).await?;
+                shared.serve(meta, reader, next);
                 shared.release(&memtable);
+                shared.wal.delete_segments_through(max_seq).await?;
             }
-            shared.wal.delete_segments_through(meta.max_seq).await?;
             Ok::<(), io::Error>(())
         };
         if flushed.await.is_err() {

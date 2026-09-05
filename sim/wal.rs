@@ -566,8 +566,15 @@ pub fn check_epoch(
         unrecoverable.push((from, hi, explain(&skip.stop, from)));
     }
     if let Some(stop) = recovered.stop {
+        // The record the log stopped at: the one after the last recovered, or, when
+        // nothing was, the first record of the stopping segment, which the log may
+        // not know when the segments before it were deleted after a flush.
         let from = if records.is_empty() {
-            first
+            recovered
+                .segment_first
+                .get(&stop.segment)
+                .copied()
+                .unwrap_or(first)
         } else {
             last_recovered + 1
         };
