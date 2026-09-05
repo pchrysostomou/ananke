@@ -257,7 +257,7 @@ fn messages_are_delivered_after_the_configured_delay() {
         _ => None,
     });
     let sent = sent.expect("a MessageSent for the ping");
-    assert!(ev.iter().any(|e| matches!(e, TraceEvent::MessageDelivered { id, from, to, len: 2 } if *id == sent && *from == addr(1) && *to == addr(2))));
+    assert!(ev.iter().any(|e| matches!(e, TraceEvent::MessageDelivered { id, from, to, len: 2, .. } if *id == sent && *from == addr(1) && *to == addr(2))));
 }
 
 fn ping_and_count(config: SimConfig, setup: impl FnOnce(&mut Sim, NodeId, NodeId)) -> (Sim, usize) {
@@ -340,6 +340,54 @@ fn injected_drops_lose_everything_at_probability_one() {
             ))
             .count(),
         20
+    );
+}
+
+/// The pair for duplication: at probability one every message arrives twice, the
+/// copy traced as such, and at zero never, with the same draws for everything else.
+#[test]
+fn duplicates_arrive_twice_at_probability_one_and_never_at_zero() {
+    let mut config = SimConfig::new(9);
+    config.net.p_duplicate = 1.0;
+    let (sim, count) = ping_and_count(config, |_, _, _| {});
+    assert_eq!(count, 40);
+    let dups = events(&sim)
+        .iter()
+        .filter(|e| matches!(e, TraceEvent::MessageDelivered { dup: true, .. }))
+        .count();
+    assert_eq!(dups, 20);
+    let (sim, count) = ping_and_count(SimConfig::new(9), |_, _, _| {});
+    assert_eq!(count, 20);
+    assert!(
+        !events(&sim)
+            .iter()
+            .any(|e| matches!(e, TraceEvent::MessageDelivered { dup: true, .. }))
+    );
+}
+
+/// A duplicate takes its own delay, so it can overtake the original.
+#[test]
+fn a_duplicate_can_arrive_before_the_original() {
+    let mut config = SimConfig::new(11);
+    config.net.p_duplicate = 1.0;
+    config.net.delay_min = ms(1);
+    config.net.delay_max = ms(20);
+    let (sim, count) = ping_and_count(config, |_, _, _| {});
+    assert_eq!(count, 40);
+    // For some message the copy's delivery precedes the original's.
+    let mut first_seen = std::collections::BTreeMap::new();
+    let mut overtook = false;
+    for e in events(&sim) {
+        if let TraceEvent::MessageDelivered { id, dup, .. } = e {
+            let earlier = *first_seen.entry(id).or_insert(dup);
+            if dup && earlier {
+                overtook = true;
+            }
+        }
+    }
+    assert!(
+        overtook,
+        "over twenty messages with a wide delay range one copy overtakes"
     );
 }
 

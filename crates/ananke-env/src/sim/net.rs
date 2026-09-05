@@ -31,6 +31,8 @@ pub(super) struct Delivery {
     from_node: NodeId,
     to: SocketAddr,
     msg: Bytes,
+    /// A second delivery of a message the fault model duplicated.
+    dup: bool,
 }
 
 /// Every socket, every message in flight, and every blocked link.
@@ -182,9 +184,30 @@ impl State {
                 from,
                 from_node: node,
                 to,
-                msg,
+                msg: msg.clone(),
+                dup: false,
             },
         );
+        // A duplicate is a second delivery with a delay of its own, so the copy can
+        // overtake the original; the draws come from the network stream only when
+        // duplication is on, so that a zero changes no trace.
+        let p_duplicate = self.config.net.p_duplicate;
+        if p_duplicate > 0.0 && self.net_stream.chance(p_duplicate) {
+            let delay = super::rng::duration_between(&mut self.net_stream, min, max);
+            let at = self.now + delay;
+            let seq = self.next_seq();
+            self.fabric.deliveries.insert(
+                (at, seq),
+                Delivery {
+                    id,
+                    from,
+                    from_node: node,
+                    to,
+                    msg,
+                    dup: true,
+                },
+            );
+        }
         Ok(())
     }
 
@@ -195,6 +218,7 @@ impl State {
             from_node,
             to,
             msg,
+            dup,
         } = delivery;
         let Some(to_node) = self.fabric.sockets.get(&to).map(|s| s.node) else {
             self.record(
@@ -227,7 +251,13 @@ impl State {
         }
         self.record(
             Some(to_node),
-            TraceEvent::MessageDelivered { id, from, to, len },
+            TraceEvent::MessageDelivered {
+                id,
+                from,
+                to,
+                len,
+                dup,
+            },
         );
     }
 }

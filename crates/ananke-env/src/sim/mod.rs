@@ -47,6 +47,10 @@ use crate::{Environment, Instant, NodeId, TaskHandle, TraceEvent, WallTime};
 pub struct NetFaults {
     /// Probability that a sent message is lost outright.
     pub p_drop: f64,
+    /// Probability that a sent message is delivered twice: the copy takes its own
+    /// delay, so it arrives before or after the original (SPEC §1.4). Drawn on the
+    /// network stream only when above zero, so a zero leaves every trace unchanged.
+    pub p_duplicate: f64,
     /// Shortest delivery delay.
     pub delay_min: Duration,
     /// Longest delivery delay. Messages with different delays reorder.
@@ -57,6 +61,7 @@ impl Default for NetFaults {
     fn default() -> Self {
         Self {
             p_drop: 0.0,
+            p_duplicate: 0.0,
             delay_min: Duration::from_millis(1),
             delay_max: Duration::from_millis(1),
         }

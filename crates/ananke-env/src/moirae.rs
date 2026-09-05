@@ -7,7 +7,7 @@
 //! | ananke                                   | moirae line                                   |
 //! |------------------------------------------|-----------------------------------------------|
 //! | `MessageSent`                            | `send` with `msgId` and the decoded payload   |
-//! | `MessageDelivered`                       | `deliver`                                     |
+//! | `MessageDelivered`                       | `deliver`, with `dup` for a duplicate's second copy |
 //! | `MessageDropped`                         | `drop` with `loss`, `partition`, `crashed` or `queue-full` |
 //! | `NodeCrashed` / `NodeRestarted`          | `fault` `crash` (no field lists) / `restart`  |
 //! | `PartitionStarted` / `PartitionHealed`   | `fault` `partition` / `heal`                  |
@@ -296,10 +296,10 @@ fn convert(
                 ])),
             ),
         },
-        TraceEvent::MessageDelivered { id, .. } => Some(Event::Deliver {
+        TraceEvent::MessageDelivered { id, dup, .. } => Some(Event::Deliver {
             t,
             msg_id: id.get(),
-            dup: false,
+            dup: *dup,
         }),
         TraceEvent::MessageDropped { id, reason, .. } => Some(Event::Drop {
             t,

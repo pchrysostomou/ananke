@@ -289,6 +289,7 @@ async fn reader_loop(
             return;
         }
         emit(TraceEvent::MessageDelivered {
+            dup: false,
             id,
             from,
             to: local,

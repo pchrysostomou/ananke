@@ -94,7 +94,7 @@ The disk model (SPEC §1.3): a write is visible at once and durable only after `
 random prefix of the pending writes survives, the next may survive as a torn prefix,
 one bit per block flips with probability `p_bitrot`, and a random prefix of each
 directory's unsynced creates, removes and renames survives. The network model (SPEC
-§1.4): drops, delays, symmetric partitions and one-way blocks. The scheduler picks
+§1.4): drops, duplicates that take a delay of their own, delays, symmetric partitions and one-way blocks. The scheduler picks
 which runnable task to poll next, uniformly or with probabilistic concurrency testing,
 per seed.
 

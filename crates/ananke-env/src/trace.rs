@@ -87,6 +87,9 @@ pub enum TraceEvent {
         to: SocketAddr,
         /// Payload length in bytes.
         len: usize,
+        /// Whether this is a second delivery of a message the fault model
+        /// duplicated (SPEC §1.4); the first carries `false`.
+        dup: bool,
     },
     /// A message was discarded and will never be delivered.
     MessageDropped {
