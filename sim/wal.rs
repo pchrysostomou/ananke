@@ -48,7 +48,7 @@ pub struct Schedule {
 impl Default for Schedule {
     fn default() -> Self {
         Self {
-            crashes: 4,
+            crashes: 8,
             appenders: 3,
             payload_max: 64,
             gap_max_us: 500,
@@ -156,7 +156,7 @@ impl Report {
 #[must_use]
 pub fn config(seed: u64, schedule: &Schedule) -> SimConfig {
     let mut config = SimConfig::new(seed);
-    config.fs.p_durable = 0.9;
+    config.fs.p_durable = 0.8;
     config.fs.p_bitrot = 0.05;
     config.poll_budget = 10_000;
     let total = schedule.run_max * (schedule.crashes + 1);

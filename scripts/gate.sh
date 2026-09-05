@@ -6,6 +6,9 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 export RUSTFLAGS="-D warnings" RUSTDOCFLAGS="-D warnings"
+# Sweeps run this many seeds; CI runs 100 and the nightly 10 000 (sim/lib.rs). The
+# gate must stay under a minute as the storage engine grows.
+export ANANKE_SEEDS="${ANANKE_SEEDS:-20}"
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 scripts/check-direct-io.sh

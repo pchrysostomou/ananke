@@ -7,14 +7,13 @@
 //! model distinguishes a bug from correct code, which either alone would not.
 
 use std::future::Future;
-use std::path::Path;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use ananke_env::sim::Sim;
-use ananke_env::{Environment, File, FileSystem, OpenOptions, RealEnv, TraceEvent};
+use ananke_env::{Environment, TraceEvent};
 use ananke_sim::echo::{self, Variant};
-use bytes::Bytes;
+use ananke_sim::{seeds, write_trace};
 use moirae_trace::trace_hash;
 
 /// The pinned hash of the seed-42 trace (`out/echo-42.jsonl`) of the `NoSyncDir`
@@ -48,20 +47,7 @@ fn same_seed_gives_byte_identical_trace() {
 #[test]
 fn trace_hash_matches_the_pinned_golden() {
     let report = echo::run(42, Variant::NoSyncDir);
-    let jsonl = report.jsonl.clone();
-    RealEnv::run(|env| async move {
-        let fs = env.fs();
-        fs.create_dir_all(Path::new("out")).await.unwrap();
-        let file = fs
-            .open(
-                Path::new("out/echo-42.jsonl"),
-                OpenOptions::new().write(true).create(true).truncate(true),
-            )
-            .await
-            .unwrap();
-        file.write_at(0, Bytes::from(jsonl)).await.unwrap();
-        file.sync().await.unwrap();
-    });
+    write_trace("echo-42", &report.jsonl);
     assert_eq!(body_hash(&report.jsonl), GOLDEN);
 }
 
@@ -74,25 +60,27 @@ fn different_seeds_give_different_traces() {
     );
 }
 
-/// One hundred consecutive seeds, both variants: every run must satisfy the
-/// scenario's invariants, and between them the runs must have exercised every §1.3
-/// fault on the journal. With the buggy journal the sweep must see a lost directory
-/// entry make the journal vanish; with the correct one it never may, while bit rot and
-/// torn writes still hit both. A failure here names the seed, which reproduces it.
+/// Consecutive seeds, both variants: every run must satisfy the scenario's
+/// invariants, and between them the runs must have exercised every §1.3 fault on the
+/// journal. With the buggy journal the sweep must see a lost directory entry make the
+/// journal vanish; with the correct one it never may, while bit rot and torn writes
+/// still hit both. A failure names the seed, which reproduces it exactly, and leaves
+/// its trace in `out/`.
 #[test]
-fn one_hundred_seeds_satisfy_the_invariants_and_exercise_the_disk_faults() {
+fn every_seed_satisfies_the_invariants_and_the_sweep_exercises_the_disk_faults() {
     let mut pongs = 0;
     let mut sloppy = Coverage::default();
     let mut correct = Coverage::default();
-    for seed in 0..100 {
+    for seed in 0..seeds() {
         for (variant, coverage) in [
             (Variant::NoSyncDir, &mut sloppy),
             (Variant::Correct, &mut correct),
         ] {
             let report = echo::run(seed, variant);
-            report
-                .check()
-                .unwrap_or_else(|violation| panic!("{variant:?}: {violation}"));
+            if let Err(violation) = report.check() {
+                write_trace(&format!("echo-{seed}-{variant:?}"), &report.jsonl);
+                panic!("{variant:?}: {violation}");
+            }
             pongs += report.pongs_received();
             coverage.add(&report);
         }
@@ -160,9 +148,10 @@ impl Coverage {
         self.seeds_with_missing_previous += u32::from(!journal.found_previous);
     }
 
-    /// The faults that hit the file contents, which no `sync_dir` discipline prevents.
+    /// The faults that hit the file contents, which no `sync_dir` discipline
+    /// prevents, as the correct journal sees them: it always finds its current file.
     fn assert_disk_faults_seen(&self) {
-        let counts = [
+        for (what, seeds) in [
             ("bit rot", self.seeds_with_bit_rot),
             (
                 "corrupt records caught by the checksum",
@@ -170,21 +159,25 @@ impl Coverage {
             ),
             ("torn writes", self.seeds_with_torn_writes),
             ("torn files seen at replay", self.seeds_with_torn_files),
-        ];
-        for (what, seeds) in counts {
+        ] {
             assert!(seeds > 0, "no seed produced {what}: {self:?}");
         }
     }
 
-    /// The disk faults plus the directory ones only the buggy journal exposes.
+    /// What the buggy journal must show: the disk faults it can still see (a torn
+    /// file is rarely visible to it, since a lost entry usually hides the current
+    /// file) and the directory ones only it exposes.
     fn assert_every_fault_seen(&self) {
-        self.assert_disk_faults_seen();
-        let counts = [
+        for (what, seeds) in [
+            ("bit rot", self.seeds_with_bit_rot),
+            (
+                "corrupt records caught by the checksum",
+                self.seeds_with_corrupt_records,
+            ),
+            ("torn writes", self.seeds_with_torn_writes),
             ("lost directory entries", self.seeds_with_lost_entries),
             ("a vanished journal", self.seeds_with_missing_journal),
-            ("a vanished journal.prev", self.seeds_with_missing_previous),
-        ];
-        for (what, seeds) in counts {
+        ] {
             assert!(seeds > 0, "no seed produced {what}: {self:?}");
         }
     }

@@ -1,0 +1,35 @@
+name: Nightly sweep
+
+# The full sweep: every simulation scenario over 10 000 seeds, in release mode. A
+# failing seed leaves its trace in sim/out, which is uploaded so it can be opened in
+# the moirae studio (sim/lib.rs).
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  ANANKE_SEEDS: 10000
+
+jobs:
+  sweep:
+    name: 10 000 seeds
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --all-features --release --all-targets
+      - name: Upload the traces of failing seeds
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: failing-traces
+          path: sim/out/*.jsonl
+          if-no-files-found: ignore

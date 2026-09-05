@@ -52,6 +52,9 @@ jobs:
   test:
     name: cargo test
     runs-on: ubuntu-latest
+    env:
+      # Sweeps run 100 seeds here; the gate runs 20, the nightly 10 000 (sim/lib.rs).
+      ANANKE_SEEDS: 100
     steps:
       - uses: actions/checkout@v7
       - run: rustup toolchain install

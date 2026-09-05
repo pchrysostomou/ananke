@@ -1,16 +1,14 @@
 //! The Phase 1 crash-injection property (SPEC.md §2.8) for the write-ahead log, as
 //! the sweep CLAUDE.md asks of every fault-model test: the correct log passes every
-//! seed with every §1.3 fault on, and each known-buggy variant is caught.
+//! seed with every §1.3 fault on, and each known-buggy variant is caught. One test per
+//! variant, so they run side by side and a nightly of 10 000 seeds stays tractable.
 
-use std::path::Path;
 use std::time::Duration;
 
-use ananke_env::{Environment, File, FileSystem, OpenOptions, RealEnv, TraceEvent, WalStopReason};
+use ananke_env::{TraceEvent, WalStopReason};
 use ananke_sim::wal::{self, Excuse};
+use ananke_sim::{seeds, write_trace};
 use ananke_storage::Variant;
-use bytes::Bytes;
-
-const SEEDS: u64 = 100;
 
 /// Two runs with the same seed produce byte-identical traces.
 #[test]
@@ -26,66 +24,65 @@ fn same_seed_gives_byte_identical_trace() {
 fn the_seed_42_trace_is_written_for_the_studio() {
     let report = wal::run(42, Variant::Correct);
     report.check().unwrap();
-    let jsonl = report.jsonl.clone();
-    RealEnv::run(|env| async move {
-        let fs = env.fs();
-        fs.create_dir_all(Path::new("out")).await.unwrap();
-        let file = fs
-            .open(
-                Path::new("out/wal-42.jsonl"),
-                OpenOptions::new().write(true).create(true).truncate(true),
-            )
-            .await
-            .unwrap();
-        file.write_at(0, Bytes::from(jsonl)).await.unwrap();
-        file.sync().await.unwrap();
-    });
+    write_trace("wal-42", &report.jsonl);
 }
 
 /// The positive control: the correct log satisfies the property on every seed, and
-/// the sweep actually reached every fault and used every excuse. The negative
-/// controls: each known bug is caught on some seed.
+/// the sweep actually reached every fault and used every excuse. A failing seed
+/// leaves its trace in `out/`.
 #[test]
-fn the_correct_log_passes_every_seed_and_every_bug_is_caught() {
+fn the_correct_log_passes_every_seed() {
     let mut coverage = Coverage::default();
-    let mut violations = Vec::new();
-    for seed in 0..SEEDS {
+    for seed in 0..seeds() {
         let report = wal::run(seed, Variant::Correct);
         coverage.add(&report);
         if let Err(violation) = report.check() {
-            violations.push(violation);
+            write_trace(&format!("wal-{seed}"), &report.jsonl);
+            panic!("{violation}");
         }
     }
     eprintln!("Correct: {coverage:?}");
-    assert!(violations.is_empty(), "{violations:#?}");
     coverage.assert_complete();
+}
 
-    for variant in [
-        Variant::NoSyncDir,
-        Variant::NoChecksum,
-        Variant::AckBeforeSync {
-            interval: Duration::from_millis(2),
-        },
-    ] {
-        let mut caught = Vec::new();
-        for seed in 0..SEEDS {
-            if let Err(violation) = wal::run(seed, variant).check() {
-                caught.push(violation);
-            }
+/// The negative controls: each known bug is caught on some seed.
+fn is_caught(variant: Variant) {
+    let mut caught = Vec::new();
+    for seed in 0..seeds() {
+        if let Err(violation) = wal::run(seed, variant).check() {
+            caught.push(violation);
         }
-        eprintln!(
-            "{variant:?}: caught on {} of {SEEDS} seeds, first: {}",
-            caught.len(),
-            caught.first().map_or("", String::as_str)
-        );
-        assert!(!caught.is_empty(), "{variant:?} was never caught");
     }
+    eprintln!(
+        "{variant:?}: caught on {} of {} seeds, first: {}",
+        caught.len(),
+        seeds(),
+        caught.first().map_or("", String::as_str)
+    );
+    assert!(!caught.is_empty(), "{variant:?} was never caught");
+}
+
+#[test]
+fn a_log_that_skips_sync_dir_on_rotation_is_caught() {
+    is_caught(Variant::NoSyncDir);
+}
+
+#[test]
+fn a_log_that_skips_the_checksum_is_caught() {
+    is_caught(Variant::NoChecksum);
+}
+
+#[test]
+fn a_log_that_acknowledges_before_syncing_is_caught() {
+    is_caught(Variant::AckBeforeSync {
+        interval: Duration::from_millis(2),
+    });
 }
 
 /// What the correct log's sweep saw.
 #[derive(Debug, Default)]
 struct Coverage {
-    seeds: u32,
+    seeds: u64,
     epochs: u32,
     records: usize,
     torn_writes: u32,
@@ -94,6 +91,7 @@ struct Coverage {
     lost_entries: u32,
     stops_torn: u32,
     stops_bad_checksum: u32,
+    stops_gap: u32,
     stops_missing: u32,
     discarded: u32,
     excused_lost_fsync: u32,
@@ -115,6 +113,7 @@ impl Coverage {
             match epoch.recovery.stop.map(|s| s.reason) {
                 Some(WalStopReason::TornRecord) => self.stops_torn += 1,
                 Some(WalStopReason::BadChecksum) => self.stops_bad_checksum += 1,
+                Some(WalStopReason::Gap { .. }) => self.stops_gap += 1,
                 Some(WalStopReason::MissingSegment) => self.stops_missing += 1,
                 _ => {}
             }
@@ -142,6 +141,12 @@ impl Coverage {
         ] {
             assert!(seen > 0, "the sweep never saw {what}: {self:?}");
         }
+        // A gap needs a lost sync on a segment's last group and then a crash that
+        // drops that write whole rather than tearing it: one to two epochs in a
+        // hundred. Twenty seeds cannot promise one; a hundred can.
+        if self.seeds >= 100 {
+            assert!(self.stops_gap > 0, "the sweep never saw a gap: {self:?}");
+        }
         // A correctly synced log never has a directory operation pending at a crash,
         // and so never loses a segment.
         assert_eq!(
@@ -150,7 +155,7 @@ impl Coverage {
             "the correct log lost a directory entry: {self:?}"
         );
         assert!(
-            self.records > 10_000,
+            self.records as u64 > 100 * self.seeds,
             "too few records to mean much: {self:?}"
         );
     }
