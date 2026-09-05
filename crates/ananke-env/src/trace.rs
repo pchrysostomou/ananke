@@ -321,6 +321,75 @@ pub enum TraceEvent {
         /// The highest log sequence number it held.
         up_to: u64,
     },
+    /// A Raft server's current term changed, with the role it took (RAFT.md §2).
+    RaftTerm {
+        /// The server.
+        server: u64,
+        /// The new term.
+        term: u64,
+        /// The role: `follower`, `pre-candidate`, `candidate` or `leader`.
+        role: &'static str,
+    },
+    /// A Raft server granted or refused a vote or a pre-vote.
+    RaftVote {
+        /// The server voting.
+        server: u64,
+        /// The term voted in (the prospective term, for a pre-vote).
+        term: u64,
+        /// The candidate.
+        candidate: u64,
+        /// Whether the vote was granted.
+        granted: bool,
+        /// Whether it was a pre-vote.
+        pre: bool,
+    },
+    /// A Raft server became leader.
+    RaftLeader {
+        /// The server.
+        server: u64,
+        /// Its term.
+        term: u64,
+        /// Its last log index on election.
+        last_index: u64,
+    },
+    /// A Raft server wrote an entry to its log.
+    RaftAppend {
+        /// The server.
+        server: u64,
+        /// The entry's index.
+        index: u64,
+        /// The entry's term.
+        entry_term: u64,
+        /// A hash of the entry's payload, for log matching across servers.
+        hash: u64,
+    },
+    /// A Raft server removed entries from its log on a conflict.
+    RaftTruncate {
+        /// The server.
+        server: u64,
+        /// The first index removed.
+        from_index: u64,
+    },
+    /// A Raft server's commit index advanced.
+    RaftCommit {
+        /// The server.
+        server: u64,
+        /// Its term.
+        term: u64,
+        /// The new commit index.
+        index: u64,
+    },
+    /// A Raft server applied an entry to its state machine.
+    RaftApply {
+        /// The server.
+        server: u64,
+        /// The entry's index.
+        index: u64,
+        /// The entry's term.
+        entry_term: u64,
+        /// The hash of the entry's payload.
+        hash: u64,
+    },
     /// A node's tasks were killed and the filesystem fault model applied to its disk.
     NodeCrashed {
         /// The crashed node.

@@ -28,6 +28,7 @@
 //! | `ManifestWritten` / `CurrentSwitched` / `ManifestFallback` | `log` `ananke.manifest.written` / `.switched` / `.fallback` |
 //! | `OpenRefused`                            | `log` `ananke.engine.open-refused`            |
 //! | `OrphanRemoved` / `WalSegmentDeleted`    | `log` `ananke.fs.orphan-removed` / `ananke.wal.segment-deleted` |
+//! | `RaftTerm` / `RaftVote` / `RaftLeader` / `RaftAppend` / `RaftTruncate` / `RaftCommit` / `RaftApply` | `log` `ananke.raft.term` / `.vote` / `.leader` / `.append` / `.truncate` / `.commit` / `.apply` |
 //! | `TimeAdvanced`                           | nothing: every line carries `t`               |
 //!
 //! `t` is global virtual time in nanoseconds and the header says `unit: "ns"`. Node ids
@@ -540,6 +541,89 @@ fn convert(
         TraceEvent::WalSegmentDeleted { segment } => log(
             "ananke.wal.segment-deleted",
             Some(Json::obj(vec![("segment", int(*segment))])),
+        ),
+        TraceEvent::RaftTerm { server, term, role } => log(
+            "ananke.raft.term",
+            Some(Json::obj(vec![
+                ("server", int(*server)),
+                ("term", int(*term)),
+                ("role", Json::str(role)),
+            ])),
+        ),
+        TraceEvent::RaftVote {
+            server,
+            term,
+            candidate,
+            granted,
+            pre,
+        } => log(
+            "ananke.raft.vote",
+            Some(Json::obj(vec![
+                ("server", int(*server)),
+                ("term", int(*term)),
+                ("candidate", int(*candidate)),
+                ("granted", Json::Bool(*granted)),
+                ("pre", Json::Bool(*pre)),
+            ])),
+        ),
+        TraceEvent::RaftLeader {
+            server,
+            term,
+            last_index,
+        } => log(
+            "ananke.raft.leader",
+            Some(Json::obj(vec![
+                ("server", int(*server)),
+                ("term", int(*term)),
+                ("lastIndex", int(*last_index)),
+            ])),
+        ),
+        TraceEvent::RaftAppend {
+            server,
+            index,
+            entry_term,
+            hash,
+        } => log(
+            "ananke.raft.append",
+            Some(Json::obj(vec![
+                ("server", int(*server)),
+                ("index", int(*index)),
+                ("entryTerm", int(*entry_term)),
+                ("hash", int(*hash)),
+            ])),
+        ),
+        TraceEvent::RaftTruncate { server, from_index } => log(
+            "ananke.raft.truncate",
+            Some(Json::obj(vec![
+                ("server", int(*server)),
+                ("fromIndex", int(*from_index)),
+            ])),
+        ),
+        TraceEvent::RaftCommit {
+            server,
+            term,
+            index,
+        } => log(
+            "ananke.raft.commit",
+            Some(Json::obj(vec![
+                ("server", int(*server)),
+                ("term", int(*term)),
+                ("index", int(*index)),
+            ])),
+        ),
+        TraceEvent::RaftApply {
+            server,
+            index,
+            entry_term,
+            hash,
+        } => log(
+            "ananke.raft.apply",
+            Some(Json::obj(vec![
+                ("server", int(*server)),
+                ("index", int(*index)),
+                ("entryTerm", int(*entry_term)),
+                ("hash", int(*hash)),
+            ])),
         ),
         TraceEvent::CheckpointWritten {
             dir,
