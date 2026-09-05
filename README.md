@@ -52,13 +52,15 @@ from the seed by name. A run's trace exports as a moirae format v2 trace.
 
 **ananke-storage** (in progress). A write-ahead log: segmented, append-only, records
 framed as `len | crc32c | seq | payload`, group commit through one writer task, recovery
-that stops at the first torn record, bad checksum, gap or missing segment and cuts what
+that stops at the first torn record, bad checksum or gap in the numbering and cuts what
 follows. A memtable: a skiplist holding the newest write per key with its log sequence
 number, applied in sequence order once the log has acknowledged. An engine that puts
 the log in front of the memtable, rotates full memtables into an immutable queue, and
-flushes them through a `FlushSink`. The sink is an in-memory stand-in until SSTables
-exist; the log is not truncated yet. Planned in this phase: SSTables with prefix
-compression, per-block CRCs and bloom filters; a manifest; leveled compaction.
+flushes them to SSTables: 4 KiB blocks with prefix-compressed keys and a CRC each, a
+bloom filter, an index and a versioned footer, under a manifest that `CURRENT` names
+and that recovery falls back from when a crash damaged it. Log segments are deleted
+once a manifest covers their records. Planned in this phase: leveled compaction and
+the rest of the `Engine` API.
 
 **ananke-raft, ananke-shard, ananke-txn, ananke-sql** (planned). Raft with pre-vote,
 leader leases bounded by the clock drift the simulator will violate on purpose, joint
@@ -119,7 +121,7 @@ on most seeds, and the correct code passes ten thousand.
 | Phase | Deliverable | State |
 |---|---|---|
 | 0 | `Environment`, `RealEnv`, `SimEnv`, the fault model, the moirae bridge | Done. Tagged `v0.1.0`; `ananke-env` 0.1.0 on crates.io; [devlog](docs/devlog/00-phase-0.md) |
-| 1 | Storage engine | In progress. WAL done (D-018, D-019); memtable and engine done (D-020, D-021); SSTables, manifest and compaction not started |
+| 1 | Storage engine | In progress. WAL (D-018, D-019), memtable and engine (D-020, D-021), SSTables with the manifest and log truncation (D-022) done; compaction not started |
 | 2 | Raft | Not started |
 | 3 | Multi-raft sharding | Not started |
 | 4 | Transactions | Not started |

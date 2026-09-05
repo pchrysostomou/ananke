@@ -136,7 +136,7 @@ workload (Raft log + MVCC versions) is write-heavy.
   MANIFEST-<n>         current manifest (versioned, CRC)
   <n>.wal              write-ahead log segments
   <n>.sst              sorted string tables
-  CURRENT              points at active manifest (written via rename)
+  CURRENT              points at active manifest, with a checksum (written via rename)
 ```
 
 ### 2.2 WAL
@@ -145,9 +145,10 @@ workload (Raft log + MVCC versions) is write-heavy.
   three header fields and the payload, and `seq` numbers records from 1 (D-018,
   D-019).
 - Group commit: batch writers waiting on the same fsync.
-- Recovery reads until the first CRC failure, torn record, gap in the numbering or
-  missing segment; everything after is discarded (the stopping segment is cut to its
-  last good record, later segments removed).
+- Recovery reads until the first CRC failure, torn record or gap in the numbering
+  (which is how a missing segment shows); everything after is discarded (the stopping
+  segment is cut to its last good record, later segments removed). Segment numbers
+  are never reused, so they may have holes; the records' numbering must not.
 
 ### 2.3 Memtable
 

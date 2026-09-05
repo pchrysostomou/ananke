@@ -528,4 +528,80 @@ hundred in CI had not reached the interleaving, which is what ten thousand are f
 
 ---
 
-_Next entry: D-022. Add one before implementing anything not covered above._
+## D-022 — SSTables, the manifest, the flush order, log truncation, and what the sweep excuses
+
+**Context.** SPEC §2.1 and §2.4 fix the file layout and the table's parts and leave
+open how a flush is made crash-safe, when log segments may go, what recovery does with
+files a crash left behind or damaged, and how the crash sweep tells a fault's damage
+from a bug's. Before this step the engine kept flushed memtables in memory and never
+truncated the log, so a flush had no durability consequence to test.
+
+**Decision.** A table is data blocks sealed near 4 KiB with a crc32c each, keys
+prefix-compressed against the previous key and stored whole at a block's start,
+tombstones as a value length of `u32::MAX`; a bloom block at ten bits per key with
+seven probes; an index block of first keys and block locations; a 48-byte footer with
+the offsets, the entry count, the format version, a magic and its own crc. The reader
+keeps the index and bloom in memory, reads one block per lookup, and verifies every
+block at open. The manifest is one file `MANIFEST-<n>` written whole with a crc,
+listing the tables with their sequence ranges, the next table number and
+`flushed_seq`; `CURRENT` names it, written as `CURRENT.tmp` and renamed, one line of
+the name and the crc32c of the name, and must parse exactly with `n` at least 1 or it
+names nothing. Manifests are never modified and older ones are kept.
+
+A flush, in order: write and sync the table; write and sync the next manifest; write
+and sync `CURRENT.tmp`, rename it over `CURRENT`, sync the directory; put the table in
+service and release the memtable; delete every log segment whose records are all at
+or below `flushed_seq`, and sync the directory. A crash before the switch leaves the
+old manifest in force and the new files as orphans, which recovery removes; the log
+still holds the records.
+
+Recovery reads `CURRENT`; if it cannot be read, or names a manifest that cannot be,
+recovery uses the newest readable manifest (below the named one when `CURRENT` was
+readable), reports the fallback, and rewrites `CURRENT` to name the manifest it chose.
+Every table listed is opened and verified whole; one
+that cannot be read is dropped from service and reported with its range. Orphans are
+removed. The log is opened expecting its head at `flushed_seq + 1`: a first record
+past that is reported as a head gap and replay goes on from it; a jump in the
+numbering that lands at or below the head skips only records the tables hold and is
+not a stop; replay applies records past `flushed_seq` only; the next number is never
+one below the head. After a recovery that discarded segments, the fresh segment is
+numbered past every segment the directory held, discarded ones included: a segment
+number is never reused, so the trace names one file per number. This supersedes
+D-019's note that the manifest must carry the
+first sequence number: the log's records number themselves, the manifest carries
+`flushed_seq`, and the engine tells the log what head to expect.
+
+The simulator's filesystem operations now take time (`FsFaults::latency`), so a crash
+lands inside a flush as often as between two, and `Variant::ReleaseBeforeManifest`
+releases a memtable once its table is written but before the manifest names it. The
+sweep excuses exactly these losses: a dropped table whose sync the simulator lost or
+which bit rot hit; a fallback whose manifest's sync, or whose `CURRENT.tmp` sync, was
+lost or which rot hit, with everything flushed after the manifest used; and a record
+lost that way stays lost in later epochs unless a log replay brought it back. Nothing
+else is excused.
+
+**Alternatives.** A manifest log appended to, as RocksDB keeps one: fewer bytes per
+flush and more code; whole rewrites are small while tables are few. Repairing the
+manifest at open when a table is dropped: BACKLOG, since a repair that rewrites state
+under a fault deserves its own sweep. Lazy verification of tables: BACKLOG, once tables
+are large enough for a full read at open to cost something.
+
+**Consequences.** Manifests accumulate until a garbage collector keeps the last few
+(BACKLOG). Every open reads every table whole. Found by the sweep during this step: a
+torn `CURRENT` parsed as "manifest 0" and recovery, taking the store for fresh,
+deleted a durable manifest and its table as orphans; a hole in the log inside the
+flushed range stopped recovery and discarded the tail the tables did not cover; an
+unreadable `CURRENT` had no fallback at all; and one flipped bit turned `CURRENT`'s
+`000007` into `000003`, a manifest that existed, so recovery reverted to it and
+deleted four newer tables as orphans, which is why `CURRENT` now carries a checksum.
+Found by the 3000-seed sweep of the correct engine: after a recovery discarded
+segments, the fresh segment reused the first discarded number, so two unrelated files
+had lived under one name and the sweep's oracle, which reads a segment's sync history
+by number, could not tell them apart; segment numbers are now monotone, and with holes
+in the numbering allowed the "missing segment" stop is gone, since a segment lost with
+records in it shows as a gap at the next segment's first record and the numbering of
+the records is the check that matters.
+
+---
+
+_Next entry: D-023. Add one before implementing anything not covered above._

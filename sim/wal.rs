@@ -12,16 +12,17 @@
 //! before a sync was asked for: that is the bug an excuse must never hide. Every [`Variant`] runs through the same check; the correct log must pass
 //! every seed and each buggy one must fail some (CLAUDE.md).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use ananke_env::moirae::{Export, bytes_decoder};
 use ananke_env::sim::{Sim, SimConfig, SimEnv, TraceRecord};
-use ananke_env::{Clock, Environment, NodeId, Rng, TraceEvent};
-use ananke_storage::wal::{HEADER_LEN, segment_of, segment_path};
-use ananke_storage::{Recovery, Seq, Variant, Wal, WalConfig};
+use ananke_env::{Clock, Environment, NodeId, Rng, TraceEvent, WalStop};
+use ananke_storage::manifest;
+use ananke_storage::wal::{HEADER_LEN, segment_path};
+use ananke_storage::{CoveredStop, Recovery, Seq, Variant, Wal, WalConfig};
 use bytes::Bytes;
 
 /// Where the log lives on the node's disk.
@@ -200,8 +201,25 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
                     m.appended.clone(),
                 )
             };
-            let (verdict, excuse) =
-                check_epoch(&lock(&model), base, &recovery, &events, Path::new(DIR));
+            let recovered = Recovered {
+                first_seq: recovery.first_seq,
+                records: &recovery.records,
+                stop: recovery.stop,
+                head_gap: recovery.head_gap,
+                covered_stops: &recovery.covered_stops,
+                segment_first: &BTreeMap::new(),
+                covered_through: 0,
+                excused: BTreeMap::new(),
+            };
+            let all: Vec<&TraceEvent> = records[..before_open].iter().map(|r| &r.event).collect();
+            let (verdict, excuse) = check_epoch(
+                &lock(&model),
+                base,
+                &recovered,
+                &events,
+                &all,
+                Path::new(DIR),
+            );
             epochs.push(Epoch {
                 recovery: recovery.clone(),
                 appended,
@@ -261,6 +279,7 @@ fn open(
         dir: PathBuf::from(DIR),
         segment_bytes: schedule.segment_bytes,
         variant,
+        expected_head: 1,
     };
     env.clone().spawn("wal-open", async move {
         let (wal, recovery) = Wal::open(env, config).await.expect("the log opens");
@@ -320,33 +339,143 @@ fn spawn_appenders(
     }
 }
 
+/// What a recovery answers for: the log records that came back, numbered from
+/// `first_seq`, plus what is held elsewhere. A bare log covers nothing and excuses
+/// nothing; the engine passes its manifest's `flushed_seq` and the ranges whose loss
+/// the trace explained.
+pub struct Recovered<'a> {
+    /// The sequence number of `records[0]`.
+    pub first_seq: Seq,
+    /// The records the log recovered.
+    pub records: &'a [Bytes],
+    /// Where the log stopped short, if it did.
+    pub stop: Option<WalStop>,
+    /// Records from the expected head up to the first one found, gone with their
+    /// segments.
+    pub head_gap: Option<(Seq, Seq)>,
+    /// Stops the log skipped because the tables held the record; each cost the rest
+    /// of its segment.
+    pub covered_stops: &'a [CoveredStop],
+    /// The first sequence number of every segment the log ever opened, from the
+    /// whole trace, for a skip whose stop was a segment's first record.
+    pub segment_first: &'a BTreeMap<u64, Seq>,
+    /// Records numbered this or below are held in tables, unless excused.
+    pub covered_through: Seq,
+    /// Records that are gone for a reason the trace explained.
+    pub excused: BTreeMap<Seq, Excuse>,
+}
+
+/// Syncs the trace recorded and whether the simulator honoured each, by file.
+#[derive(Debug, Default)]
+pub struct Syncs {
+    /// The log's group syncs: (segment, first, up_to, lost).
+    pub wal: Vec<(u64, Seq, Seq, bool)>,
+    /// Recovery's cuts: (segment, len, lost).
+    pub cuts: Vec<(u64, u64, bool)>,
+    /// Tables whose sync was lost.
+    pub sst_betrayed: BTreeSet<u64>,
+    /// Manifests whose sync was lost.
+    pub manifest_betrayed: BTreeSet<u64>,
+    /// Every manifest written and what it covered.
+    pub manifest_flushed: BTreeMap<u64, Seq>,
+    /// Manifests `CURRENT` was switched to, in order.
+    pub switched: Vec<u64>,
+    /// Switches whose `CURRENT.tmp` sync was lost: `CURRENT` may come back empty.
+    pub current_betrayed: BTreeSet<u64>,
+    /// A switch was in flight at the end with its `CURRENT.tmp` sync lost: the rename
+    /// may have survived the crash with nothing behind it.
+    pub current_tmp_lost_in_flight: bool,
+}
+
+/// Reads the syncs out of an epoch's events: a sync event for a file that a
+/// `FsyncLost` for the same file preceded, with no sync event in between, was lost.
+#[must_use]
+pub fn syncs(events: &[&TraceEvent], dir: &Path) -> Syncs {
+    let mut lost_since: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut out = Syncs::default();
+    for event in events {
+        match event {
+            TraceEvent::FsyncLost { path } if path.parent() == Some(dir) => {
+                lost_since.insert(path.clone());
+            }
+            TraceEvent::WalSynced {
+                segment,
+                first,
+                up_to,
+            } => {
+                let lost = lost_since.remove(&segment_path(dir, *segment));
+                out.wal.push((*segment, *first, *up_to, lost));
+            }
+            TraceEvent::WalTruncated { segment, len } => {
+                let lost = lost_since.remove(&segment_path(dir, *segment));
+                out.cuts.push((*segment, *len, lost));
+            }
+            TraceEvent::SstWritten { number, .. } => {
+                if lost_since.remove(&manifest::sst_path(dir, *number)) {
+                    out.sst_betrayed.insert(*number);
+                }
+            }
+            TraceEvent::ManifestWritten {
+                number,
+                flushed_seq,
+                ..
+            } => {
+                if lost_since.remove(&manifest::manifest_path(dir, *number)) {
+                    out.manifest_betrayed.insert(*number);
+                }
+                out.manifest_flushed.insert(*number, *flushed_seq);
+            }
+            TraceEvent::CurrentSwitched { manifest: number } => {
+                if lost_since.remove(&manifest::current_tmp_path(dir)) {
+                    out.current_betrayed.insert(*number);
+                }
+                out.switched.push(*number);
+            }
+            _ => {}
+        }
+    }
+    out.current_tmp_lost_in_flight = lost_since.contains(&manifest::current_tmp_path(dir));
+    out
+}
+
+/// Whether a `BlockRotted` in `events` hit `path`.
+#[must_use]
+pub fn rotted(events: &[&TraceEvent], path: &Path) -> bool {
+    events
+        .iter()
+        .any(|e| matches!(e, TraceEvent::BlockRotted { path: p, .. } if p == path))
+}
+
 /// Checks one recovery against the model. Returns the verdict and the excuse used.
-/// Shared with the engine scenario, whose log records are its ops.
+/// Shared with the engine scenario, whose log records are its ops. `events` are the
+/// epoch's, for the syncs; `all_events` the whole trace so far, for bit rot, which
+/// stays in a file until the file is cut or deleted and can bite epochs later.
 pub fn check_epoch(
     model: &Model,
     base: usize,
-    recovery: &Recovery,
+    recovered: &Recovered<'_>,
     events: &[&TraceEvent],
+    all_events: &[&TraceEvent],
     dir: &Path,
 ) -> (Result<(), String>, Option<Excuse>) {
-    let recovered = &recovery.records;
-    // Property A: what came back is a prefix of what was appended.
-    if recovered.len() > model.appended.len() {
-        return (
-            Err(format!(
-                "recovered {} records but only {} were ever appended",
-                recovered.len(),
-                model.appended.len()
-            )),
-            None,
-        );
-    }
-    for (i, (got, want)) in recovered.iter().zip(&model.appended).enumerate() {
+    let records = recovered.records;
+    let first = recovered.first_seq;
+    // Property A: what came back is what was appended, at the same numbers.
+    for (i, got) in records.iter().enumerate() {
+        let seq = first + i as u64;
+        let Some(want) = model.appended.get(seq as usize - 1) else {
+            return (
+                Err(format!(
+                    "recovered record {seq} but only {} were ever appended",
+                    model.appended.len()
+                )),
+                None,
+            );
+        };
         if got != want {
             return (
                 Err(format!(
-                    "record {} came back changed: {} bytes recovered, {} appended",
-                    i + 1,
+                    "record {seq} came back changed: {} bytes recovered, {} appended",
                     got.len(),
                     want.len()
                 )),
@@ -354,30 +483,8 @@ pub fn check_epoch(
             );
         }
     }
-    // The syncs the log claimed, and whether the simulator honoured each.
-    let mut lost_since: BTreeSet<u64> = BTreeSet::new();
-    let mut syncs: Vec<(Seq, Seq, bool)> = Vec::new();
-    let mut cuts: Vec<(u64, u64, bool)> = Vec::new();
-    for event in events {
-        match event {
-            TraceEvent::FsyncLost { path } => {
-                if path.parent() == Some(dir)
-                    && let Some(segment) = segment_of(path)
-                {
-                    lost_since.insert(segment);
-                }
-            }
-            TraceEvent::WalSynced {
-                segment,
-                first,
-                up_to,
-            } => syncs.push((*first, *up_to, lost_since.remove(segment))),
-            TraceEvent::WalTruncated { segment, len } => {
-                cuts.push((*segment, *len, lost_since.remove(segment)));
-            }
-            _ => {}
-        }
-    }
+    let all_syncs = syncs(all_events, dir);
+    let syncs = syncs(events, dir);
     // Property C: nothing was acknowledged before a sync was asked for. Independent
     // of what recovery returned, so a lost fsync earlier in the log cannot hide it.
     for (i, &acked) in model.acked.iter().enumerate() {
@@ -386,8 +493,9 @@ pub fn check_epoch(
             continue;
         }
         if !syncs
+            .wal
             .iter()
-            .any(|&(first, up_to, _)| first <= seq && seq <= up_to)
+            .any(|&(_, first, up_to, _)| first <= seq && seq <= up_to)
         {
             return (
                 Err(format!(
@@ -397,71 +505,142 @@ pub fn check_epoch(
             );
         }
     }
-    // Whether the stop is explained: bit rot inside the record it stopped on, or a
-    // betrayed cut exactly there.
-    let stop_excuse = recovery.stop.and_then(|stop| {
-        let next = model.appended.get(recovered.len()).map_or(0, Bytes::len) as u64;
-        let span = stop.offset..stop.offset + HEADER_LEN as u64 + next;
+    // What a stop costs and what explains it. A stop, or a skip over a covered stop,
+    // makes a range of records unrecoverable: everything after a stop, the rest of
+    // the segment after a skip. Each is explained by a fault on the record it stopped
+    // at: bit rot inside it, a write of it the crash tore, a cut whose sync was lost
+    // exactly there, or the record having been covered only by lost syncs. Damage to
+    // a file is durable until the file is cut or deleted, and a record the tables
+    // covered is skipped rather than cut, so the fault may be epochs old: these look
+    // at the whole trace, by segment, since segment numbers are never reused.
+    let last_recovered = first + records.len() as u64 - 1;
+    let explain = |stop: &WalStop, from: Seq| -> Option<Excuse> {
+        let len = model.appended.get(from as usize - 1).map_or(0, Bytes::len) as u64;
+        let span = stop.offset..stop.offset + HEADER_LEN as u64 + len;
         let path = segment_path(dir, stop.segment);
-        let rotted = events.iter().any(|e| {
+        let rotted = all_events.iter().any(|e| {
             matches!(e, TraceEvent::BlockRotted { path: p, offset, .. }
                 if *p == path && span.contains(offset))
         });
-        let betrayed_cut = cuts
+        // A torn group write spans every record of the group; the stop is at the
+        // first record the tear cut into, anywhere inside the write.
+        let torn = all_events.iter().any(|e| {
+            matches!(e, TraceEvent::WriteTorn { path: p, offset, written, .. }
+                if *p == path && *offset <= stop.offset && stop.offset < *offset + *written as u64)
+        });
+        let betrayed_cut = all_syncs
+            .cuts
             .iter()
             .any(|&(segment, len, lost)| lost && segment == stop.segment && len == stop.offset);
+        // The record's syncs, in the latest segment at or before the stop that held
+        // a record of that number: a gap is found at the next segment's first byte
+        // while the missing record lived in the one before, and numbers are reused
+        // after a cut, so the latest such segment is the record that matters.
+        let mut by_segment: BTreeMap<u64, Vec<bool>> = BTreeMap::new();
+        for &(segment, f, up_to, lost) in &all_syncs.wal {
+            if segment <= stop.segment && f <= from && from <= up_to {
+                by_segment.entry(segment).or_default().push(lost);
+            }
+        }
+        let betrayed = by_segment
+            .iter()
+            .next_back()
+            .is_some_and(|(_, attempts)| attempts.iter().all(|&lost| lost));
         if rotted {
             Some(Excuse::BitRot)
+        } else if torn || betrayed {
+            Some(Excuse::LostFsync)
         } else if betrayed_cut {
             Some(Excuse::BetrayedCut)
         } else {
             None
         }
-    });
-    // Property B: every record the log owed is there.
+    };
+    let mut unrecoverable: Vec<(Seq, Seq, Option<Excuse>)> = Vec::new();
+    for skip in recovered.covered_stops {
+        let hi = skip.resumed.map_or(u64::MAX, |r| r - 1);
+        let from = skip
+            .from
+            .or_else(|| recovered.segment_first.get(&skip.stop.segment).copied())
+            .unwrap_or(1);
+        unrecoverable.push((from, hi, explain(&skip.stop, from)));
+    }
+    if let Some(stop) = recovered.stop {
+        let from = if records.is_empty() {
+            first
+        } else {
+            last_recovered + 1
+        };
+        unrecoverable.push((from, u64::MAX, explain(&stop, from)));
+    }
+    if let Some((expected, found)) = recovered.head_gap {
+        // A missing head that no covered skip accounts for: nothing on the log's side
+        // explains it, only a table or manifest loss the caller excused can. Last, so
+        // a skip's explanation is found first.
+        unrecoverable.push((expected, found - 1, None));
+    }
+    let excused_by = |seq: Seq| recovered.excused.get(&seq).copied();
+    let present = |seq: Seq| {
+        (seq <= recovered.covered_through && excused_by(seq).is_none())
+            || (!records.is_empty() && seq >= first && seq <= last_recovered)
+    };
+    // Property B: every record the log owed is there, or its absence is explained.
     let mut excuse = None;
-    for seq in (recovered.len() as u64 + 1)..=(model.appended.len() as u64) {
+    for seq in 1..=(model.appended.len() as u64) {
+        if present(seq) {
+            continue;
+        }
+        if let Some(why) = excused_by(seq) {
+            excuse = Some(why);
+            continue;
+        }
         let attempts: Vec<bool> = syncs
+            .wal
             .iter()
-            .filter(|&&(first, up_to, _)| first <= seq && seq <= up_to)
-            .map(|&(_, _, lost)| lost)
+            .filter(|&&(_, f, up_to, _)| f <= seq && seq <= up_to)
+            .map(|&(_, _, _, lost)| lost)
             .collect();
         let honoured = attempts.iter().any(|&lost| !lost);
         let attempted = !attempts.is_empty();
         let acked = model.acked.get(seq as usize - 1).copied().unwrap_or(false);
         let owed = seq as usize <= base || honoured || (acked && !attempted);
-        if owed {
-            if let Some(why) = stop_excuse {
-                excuse = Some(why);
-                break;
+        if !owed {
+            if attempted {
+                excuse = Some(Excuse::LostFsync);
             }
-            let reason = recovery.stop.map_or("the end of the log".to_owned(), |s| {
-                format!(
-                    "segment {} offset {} ({})",
-                    s.segment,
-                    s.offset,
-                    s.reason.as_str()
-                )
-            });
-            let what = if seq as usize <= base {
-                "was on disk at the start of the epoch"
-            } else if honoured {
-                "was acknowledged after a sync the simulator honoured"
-            } else {
-                "was acknowledged without any sync"
-            };
-            return (
-                Err(format!(
-                    "record {seq} {what} but recovery stopped at {reason} with {} records",
-                    recovered.len()
-                )),
-                None,
-            );
+            continue;
         }
-        if attempted {
-            excuse = Some(Excuse::LostFsync);
-            break;
+        let range = unrecoverable
+            .iter()
+            .find(|&&(lo, hi, _)| lo <= seq && seq <= hi);
+        match range {
+            Some(&(_, _, Some(why))) => excuse = Some(why),
+            Some(&(lo, _, None)) => {
+                let what = if seq as usize <= base {
+                    "was on disk at the start of the epoch"
+                } else if honoured {
+                    "was acknowledged after a sync the simulator honoured"
+                } else {
+                    "was acknowledged without any sync"
+                };
+                return (
+                    Err(format!(
+                        "record {seq} {what} but it is gone with the log from record {lo} on, and no fault explains the stop there (records {first}..={last_recovered}, tables through {}, stop {:?})",
+                        recovered.covered_through, recovered.stop
+                    )),
+                    None,
+                );
+            }
+            None => {
+                return (
+                    Err(format!(
+                        "record {seq} is gone although the log stopped at nothing near it (records {first}..={last_recovered}, tables through {})",
+                        recovered.covered_through
+                    )),
+                    None,
+                );
+            }
         }
     }
-    (Ok(()), excuse.or(stop_excuse))
+    (Ok(()), excuse)
 }

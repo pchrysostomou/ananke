@@ -15,16 +15,22 @@
 //! fsync shares it.
 //!
 //! [`open`](Wal::open) recovers first: it reads the segments in order and stops at the
-//! first torn record, bad checksum, gap in the numbering, or missing segment. Everything after the stop is
+//! first torn record, bad checksum, or gap in the numbering (which is how a missing
+//! segment shows: the segment numbers themselves may have holes, since a discarded
+//! segment's number is never reused), unless
+//! the record it would stop at is numbered below [`WalConfig::expected_head`], which
+//! the caller holds elsewhere: then the rest of that segment is skipped and reading
+//! goes on with the next. Everything after a stop is
 //! discarded, as the SPEC says: the stopping segment is cut to its last good record,
-//! later segments are removed, and a fresh segment is started.
+//! later segments are removed, and a fresh segment is started, numbered past every
+//! segment the directory held so that a segment number is never reused.
 //!
 //! The [`Variant`] enum carries the correct log and three with known bugs. The crash
 //! sweep in `sim/wal.rs` must pass the first and catch each of the others; that pair is
 //! what shows the fault model works (CLAUDE.md). Production uses the default,
 //! [`Variant::Correct`].
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -81,6 +87,13 @@ pub struct WalConfig {
     pub segment_bytes: u64,
     /// Which log to run; [`Variant::Correct`] outside a fault-model test.
     pub variant: Variant,
+    /// The highest sequence number the oldest record may carry: 1 for a log nothing
+    /// was ever deleted from; one past the manifest's `flushed_seq` for a log behind
+    /// SSTables, whose segments are deleted once their records are flushed (D-022).
+    /// An older record is fine, it is skipped by the engine; a newer one means the
+    /// log's head is missing, which recovery reports as [`Recovery::head_gap`] and
+    /// goes on from.
+    pub expected_head: Seq,
 }
 
 /// The name of segment `n`: six digits and `.wal`, so a listing sorts in log order.
@@ -114,24 +127,52 @@ pub fn encode_record(out: &mut Vec<u8>, seq: Seq, payload: &[u8]) {
     out.extend_from_slice(payload);
 }
 
+/// A stop recovery skipped because the record it would have stopped at is numbered
+/// below the expected head: the rest of that segment is gone, reading resumed with
+/// the next segment's first record.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CoveredStop {
+    /// Where and why.
+    pub stop: WalStop,
+    /// The sequence number the stopped-at record would have had; unknown when no
+    /// record of the log had been read yet, that is, when the stop is the first
+    /// retained segment's first record.
+    pub from: Option<Seq>,
+    /// The first record read after the skip, if any followed.
+    pub resumed: Option<Seq>,
+}
+
 /// What [`Wal::open`] found on disk.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Recovery {
+    /// The sequence number of the first record; `next_seq` when there are none.
+    pub first_seq: Seq,
+    /// Set when the first record's number is past `WalConfig::expected_head`: records
+    /// from the expected head up to it are gone with the segments that held them.
+    pub head_gap: Option<(Seq, Seq)>,
+    /// Stops at records the caller holds elsewhere, skipped rather than stopped at.
+    pub covered_stops: Vec<CoveredStop>,
     /// The records, in order from the first segment up to the stop.
     pub records: Vec<Bytes>,
     /// Where reading stopped short of the end of the last segment, if it did.
     pub stop: Option<WalStop>,
     /// Segments after the stop that were removed.
     pub discarded: u64,
-    /// The sequence number the next append gets: one past the last recovered record.
+    /// The sequence number the next append gets: one past the last recovered record,
+    /// or `WalConfig::expected_head` if that is higher.
     pub next_seq: Seq,
 }
 
 /// Parses one segment's bytes, expecting the records to continue the numbering from
-/// `records.len() + 1`; `verify` false is the [`Variant::NoChecksum`] bug.
+/// `first_seq + records.len()`; the log's first record sets `first_seq`. A jump
+/// forward that lands at or below `expected_head` skips only records held elsewhere,
+/// so the records before it are dropped and the numbering restarts there rather than
+/// stopping. `verify` false is the [`Variant::NoChecksum`] bug.
 fn parse_segment(
     bytes: &[u8],
     verify: bool,
+    expected_head: Seq,
+    first_seq: &mut Option<Seq>,
     records: &mut Vec<Bytes>,
 ) -> Result<(), (u64, WalStopReason)> {
     let mut offset = 0usize;
@@ -156,15 +197,24 @@ fn parse_segment(
                 return Err((at, WalStopReason::BadChecksum));
             }
         }
-        let expected = records.len() as u64 + 1;
-        if seq != expected {
-            return Err((
-                at,
-                WalStopReason::Gap {
-                    expected,
-                    found: seq,
-                },
-            ));
+        match *first_seq {
+            None => *first_seq = Some(seq),
+            Some(first) => {
+                let expected = first + records.len() as u64;
+                if seq > expected && seq <= expected_head {
+                    // Everything skipped is below the head the caller holds elsewhere.
+                    records.clear();
+                    *first_seq = Some(seq);
+                } else if seq != expected {
+                    return Err((
+                        at,
+                        WalStopReason::Gap {
+                            expected,
+                            found: seq,
+                        },
+                    ));
+                }
+            }
         }
         records.push(Bytes::copy_from_slice(payload));
         offset += HEADER_LEN + len;
@@ -213,6 +263,9 @@ struct Shared<E: Environment> {
     env: E,
     config: WalConfig,
     state: Mutex<State>,
+    /// Every segment on disk and the sequence number its first record has, or will
+    /// have; what [`Wal::delete_segments_through`] decides from.
+    segments: Mutex<BTreeMap<u64, Seq>>,
 }
 
 struct State {
@@ -256,25 +309,63 @@ impl<E: Environment> Wal<E> {
 
         let verify = config.variant != Variant::NoChecksum;
         let mut records = Vec::new();
+        let mut first_seq = None;
+        let mut firsts: BTreeMap<u64, Seq> = BTreeMap::new();
         let mut stop = None;
         let mut last_good = 0;
-        let mut expected = segments.first().copied().unwrap_or(1);
+        // A stop at a record the caller holds elsewhere (numbered below the expected
+        // head) loses nothing: the rest of that segment is skipped and reading goes on
+        // with the next one, whose first record then sets the numbering again.
+        let head = config.expected_head;
+        let covered = |first_seq: Option<Seq>, len: usize| {
+            first_seq.map_or(head > 1, |first| (first + len as u64) < head)
+        };
+        let mut covered_stops: Vec<CoveredStop> = Vec::new();
+        // Segment numbers may have holes, where a discarded segment's number was
+        // never reused; it is the records' numbering that must be whole. A segment
+        // that went missing with records in it shows as a gap at the next segment's
+        // first record.
         for &segment in &segments {
-            if segment != expected {
-                stop = Some(WalStop {
-                    segment: expected,
-                    offset: 0,
-                    reason: WalStopReason::MissingSegment,
-                });
-                break;
-            }
             let path = segment_path(&config.dir, segment);
             let file = fs.open(&path, OpenOptions::new().read(true)).await?;
             let size = file.size().await?;
             let bytes = file
                 .read_at(0, usize::try_from(size).unwrap_or(usize::MAX))
                 .await?;
-            if let Err((offset, reason)) = parse_segment(&bytes, verify, &mut records) {
+            let before = records.len() as u64;
+            let parsed = parse_segment(
+                &bytes,
+                verify,
+                config.expected_head,
+                &mut first_seq,
+                &mut records,
+            );
+            // The segment's first number: its first record's, or the next number if
+            // it is empty; unknown until the log's first record is seen.
+            if let Some(first) = first_seq {
+                firsts.insert(segment, first + before);
+                if let Some(skip) = covered_stops.last_mut()
+                    && skip.resumed.is_none()
+                {
+                    skip.resumed = Some(first + before);
+                }
+            }
+            if let Err((offset, reason)) = parsed {
+                if covered(first_seq, records.len()) {
+                    covered_stops.push(CoveredStop {
+                        stop: WalStop {
+                            segment,
+                            offset,
+                            reason,
+                        },
+                        from: first_seq.map(|f| f + records.len() as u64),
+                        resumed: None,
+                    });
+                    records.clear();
+                    first_seq = None;
+                    last_good = segment;
+                    continue;
+                }
                 stop = Some(WalStop {
                     segment,
                     offset,
@@ -283,42 +374,48 @@ impl<E: Environment> Wal<E> {
                 break;
             }
             last_good = segment;
-            expected = segment + 1;
         }
+        let head_gap = first_seq
+            .filter(|&first| first > config.expected_head)
+            .map(|first| (config.expected_head, first));
 
         // Everything after the stop is discarded: the stopping segment is cut to its
         // last good record, and later segments are removed.
         let mut discarded = 0;
         if let Some(stop) = stop {
-            if stop.reason != WalStopReason::MissingSegment {
-                let path = segment_path(&config.dir, stop.segment);
-                let file = fs
-                    .open(&path, OpenOptions::new().read(true).write(true))
-                    .await?;
-                file.set_size(stop.offset).await?;
-                file.sync().await?;
-                env.trace(TraceEvent::WalTruncated {
-                    segment: stop.segment,
-                    len: stop.offset,
-                });
-                last_good = stop.segment;
-            }
+            let path = segment_path(&config.dir, stop.segment);
+            let file = fs
+                .open(&path, OpenOptions::new().read(true).write(true))
+                .await?;
+            file.set_size(stop.offset).await?;
+            file.sync().await?;
+            env.trace(TraceEvent::WalTruncated {
+                segment: stop.segment,
+                len: stop.offset,
+            });
+            last_good = stop.segment;
             for &segment in segments.iter().filter(|&&s| s > last_good) {
                 fs.remove_file(&segment_path(&config.dir, segment)).await?;
                 discarded += 1;
             }
             fs.sync_dir(&config.dir).await?;
         }
-        let next_seq = records.len() as u64 + 1;
+        let first_seq = first_seq.unwrap_or(config.expected_head);
+        // The next number follows the last record recovered, and never reuses a
+        // number the caller says is already held elsewhere (below the expected head).
+        let next_seq = (first_seq + records.len() as u64).max(config.expected_head);
         env.trace(TraceEvent::WalRecovered {
             records: records.len() as u64,
             stop,
             discarded,
         });
 
-        // A fresh segment, synced into the directory: rotation may skip that in the
-        // NoSyncDir variant, opening never does.
-        let segment = last_good + 1;
+        // A fresh segment, numbered past every segment the directory held, discarded
+        // ones included: a segment number is never reused, so a number names one file
+        // for the life of the log and the trace can tell them apart. Synced into the
+        // directory: rotation may skip that in the NoSyncDir variant, opening never
+        // does.
+        let segment = segments.last().copied().unwrap_or(0).max(last_good) + 1;
         let file = fs
             .open(
                 &segment_path(&config.dir, segment),
@@ -330,6 +427,12 @@ impl<E: Environment> Wal<E> {
             segment,
             first: next_seq,
         });
+        // Segments that were cut or emptied, or preceded the first record, count from
+        // the first sequence number they could hold.
+        for &s in segments.iter().filter(|&&s| s <= last_good) {
+            firsts.entry(s).or_insert(first_seq);
+        }
+        firsts.insert(segment, next_seq);
 
         let shared = Arc::new(Shared {
             env: env.clone(),
@@ -340,6 +443,7 @@ impl<E: Environment> Wal<E> {
                 writer: None,
                 closed: false,
             }),
+            segments: Mutex::new(firsts),
         });
         let writer = Writer {
             shared: shared.clone(),
@@ -355,12 +459,52 @@ impl<E: Environment> Wal<E> {
         Ok((
             Self { shared },
             Recovery {
+                first_seq,
+                head_gap,
+                covered_stops,
                 records,
                 stop,
                 discarded,
                 next_seq,
             },
         ))
+    }
+
+    /// Deletes every segment whose records are all numbered `seq` or below, never
+    /// the one being written, and syncs the directory. Returns the segments deleted.
+    /// Call it only once the records are durable elsewhere (D-022).
+    ///
+    /// # Errors
+    ///
+    /// The filesystem's.
+    pub async fn delete_segments_through(&self, seq: Seq) -> io::Result<Vec<u64>> {
+        let deletable: Vec<u64> = {
+            let segments = lock(&self.shared.segments);
+            let ids: Vec<(u64, Seq)> = segments.iter().map(|(&n, &first)| (n, first)).collect();
+            ids.windows(2)
+                .filter(|pair| pair[1].1 <= seq + 1)
+                .map(|pair| pair[0].0)
+                .collect()
+        };
+        let fs = self.shared.env.fs();
+        for &segment in &deletable {
+            fs.remove_file(&segment_path(&self.shared.config.dir, segment))
+                .await?;
+            lock(&self.shared.segments).remove(&segment);
+            self.shared
+                .env
+                .trace(TraceEvent::WalSegmentDeleted { segment });
+        }
+        if !deletable.is_empty() {
+            fs.sync_dir(&self.shared.config.dir).await?;
+        }
+        Ok(deletable)
+    }
+
+    /// The segments on disk, oldest first.
+    #[must_use]
+    pub fn segments(&self) -> Vec<u64> {
+        lock(&self.shared.segments).keys().copied().collect()
     }
 
     /// Enqueues `payload` and returns the future that resolves once the record is
@@ -550,6 +694,7 @@ impl<E: Environment> Writer<E> {
             fs.sync_dir(&self.shared.config.dir).await?;
         }
         let first = self.written_up_to + 1;
+        lock(&self.shared.segments).insert(segment, first);
         self.shared
             .env
             .trace(TraceEvent::WalSegmentOpened { segment, first });

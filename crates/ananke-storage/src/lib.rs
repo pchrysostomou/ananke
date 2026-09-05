@@ -14,10 +14,11 @@
 
 pub mod crc32c;
 pub mod engine;
+pub mod manifest;
 pub mod memtable;
 pub mod sst;
 pub mod wal;
 
-pub use engine::{Engine, EngineConfig, EngineRecovery, FlushSink, Retain, Write};
+pub use engine::{Engine, EngineConfig, EngineRecovery, Write};
 pub use memtable::{Memtable, Value};
-pub use wal::{Append, Recovery, Seq, Variant, Wal, WalConfig};
+pub use wal::{Append, CoveredStop, Recovery, Seq, Variant, Wal, WalConfig};

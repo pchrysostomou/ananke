@@ -15,6 +15,7 @@ fn appends_and_recovers_on_a_real_disk() {
         dir: dir.path().join("wal"),
         segment_bytes: 4096,
         variant: Variant::Correct,
+        expected_head: 1,
     };
     // Five appenders at once, so the writer groups their records under shared fsyncs;
     // every record still comes back, in the order the log assigned.

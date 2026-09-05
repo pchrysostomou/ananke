@@ -92,7 +92,6 @@ struct Coverage {
     stops_torn: u32,
     stops_bad_checksum: u32,
     stops_gap: u32,
-    stops_missing: u32,
     discarded: u32,
     excused_lost_fsync: u32,
     excused_bit_rot: u32,
@@ -114,7 +113,6 @@ impl Coverage {
                 Some(WalStopReason::TornRecord) => self.stops_torn += 1,
                 Some(WalStopReason::BadChecksum) => self.stops_bad_checksum += 1,
                 Some(WalStopReason::Gap { .. }) => self.stops_gap += 1,
-                Some(WalStopReason::MissingSegment) => self.stops_missing += 1,
                 _ => {}
             }
             self.discarded += u32::from(epoch.recovery.discarded > 0);
@@ -150,8 +148,7 @@ impl Coverage {
         // A correctly synced log never has a directory operation pending at a crash,
         // and so never loses a segment.
         assert_eq!(
-            (self.lost_entries, self.stops_missing),
-            (0, 0),
+            self.lost_entries, 0,
             "the correct log lost a directory entry: {self:?}"
         );
         assert!(

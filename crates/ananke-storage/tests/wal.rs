@@ -18,6 +18,7 @@ fn config(variant: Variant) -> WalConfig {
         dir: DIR.into(),
         segment_bytes: 256,
         variant,
+        expected_head: 1,
     }
 }
 
@@ -82,6 +83,9 @@ fn an_empty_directory_recovers_nothing_and_starts_segment_one() {
     assert_eq!(
         recovery,
         Recovery {
+            first_seq: 1,
+            head_gap: None,
+            covered_stops: vec![],
             records: vec![],
             stop: None,
             discarded: 0,
@@ -225,15 +229,16 @@ fn recovery_stops_at_a_torn_record_cuts_it_and_discards_later_segments() {
         })
     );
     assert_eq!((recovery.discarded, recovery.next_seq), (1, 3));
-    // Segment 2 was discarded and recreated fresh; segment 1 was cut.
-    assert_eq!(names, ["000001.wal", "000002.wal"]);
+    // Segment 1 was cut; segment 2 was discarded and the fresh segment numbered past
+    // it, since a segment number is never reused.
+    assert_eq!(names, ["000001.wal", "000003.wal"]);
     assert_eq!(
         sim.durable_contents(node, &segment_path(Path::new(DIR), 1))
             .map(|b| b.len()),
         Some(2 * HEADER_LEN + 9)
     );
     assert_eq!(
-        sim.durable_contents(node, &segment_path(Path::new(DIR), 2))
+        sim.durable_contents(node, &segment_path(Path::new(DIR), 3))
             .map(|b| b.len()),
         Some(0)
     );
@@ -291,8 +296,12 @@ fn recovery_stops_at_a_bad_checksum_unless_the_variant_skips_it() {
     }
 }
 
+/// A hole in the segment numbers is not a stop while the records stay contiguous:
+/// a discarded segment's number is never reused, so holes are normal. A segment that
+/// went missing with records in it shows as a gap at the next segment's first record
+/// (`recovery_stops_at_a_gap_in_the_numbering`).
 #[test]
-fn recovery_stops_at_a_missing_segment_and_discards_the_rest() {
+fn a_hole_in_the_segment_numbers_is_not_a_stop_while_the_records_are_contiguous() {
     let mut sim = Sim::new(SimConfig::new(5));
     let node = sim.add_node();
     let env = sim.env(node);
@@ -302,17 +311,14 @@ fn recovery_stops_at_a_missing_segment_and_discards_the_rest() {
     });
     sim.run_for(Duration::from_millis(1));
     let (recovery, names) = recover(&mut sim, node, Variant::Correct);
-    assert_eq!(recovery.records, vec![Bytes::from("alpha")]);
     assert_eq!(
-        recovery.stop,
-        Some(WalStop {
-            segment: 2,
-            offset: 0,
-            reason: WalStopReason::MissingSegment
-        })
+        recovery.records,
+        vec![Bytes::from("alpha"), Bytes::from("gamma")]
     );
-    assert_eq!((recovery.discarded, recovery.next_seq), (1, 2));
-    assert_eq!(names, ["000001.wal", "000002.wal"]);
+    assert_eq!(recovery.stop, None);
+    assert_eq!((recovery.discarded, recovery.next_seq), (0, 3));
+    // The fresh segment is numbered past the highest one held.
+    assert_eq!(names, ["000001.wal", "000003.wal", "000004.wal"]);
 }
 
 /// A segment that ends early because the sync of its last group was lost, followed

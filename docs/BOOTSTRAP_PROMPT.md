@@ -101,15 +101,17 @@ ananke/
 
 _Update this section at the end of every session._
 
-- Phase: 1 in progress (2026-09-05). The gate is closed; the WAL (D-018, D-019) and
-  the memtable with the engine in front of the log (D-020, D-021) are done. `sim/wal.rs` and
-  `sim/engine.rs` run the §2.8 crash property with every §1.3 fault on and crashes
-  between polls; the correct code passes every seed, each known-buggy variant is
-  caught. Sweeps run `ANANKE_SEEDS` seeds: 20 at the gate, 100 in CI, 10 000 nightly.
-  SSTables are not started.
+- Phase: 1 in progress (2026-09-05). The gate is closed; the WAL (D-018, D-019), the
+  memtable and engine (D-020, D-021), and SSTables with the manifest and log
+  truncation (D-022) are done. `sim/wal.rs` and `sim/engine.rs` run the §2.8 crash
+  property with every §1.3 fault on, filesystem latency and crashes between polls;
+  the correct code passes every seed, each known-buggy variant is caught. Sweeps run
+  `ANANKE_SEEDS` seeds: 20 at the gate, 100 in CI, 10 000 nightly. Compaction is not
+  started.
 - Last tag: v0.1.0
-- Next concrete task: the SSTable (SPEC §2.4) as the engine's flush sink, replacing
-  `Retain`, then the manifest and compaction. Stop for review after each.
+- Next concrete task: leveled compaction (SPEC §2.5), crash-safe through the manifest,
+  with a manual trigger for tests; then the `Engine` API of §2.7 (`scan`, `snapshot`,
+  `checkpoint`) and the Phase 1 exit criteria. Stop for review after each.
 - Fault-model tests follow the CLAUDE.md pattern: a known-buggy variant the sweep
   must catch beside the correct one it must pass (`Journal::sync_dir_on_rotate`,
   `wal::Variant`).

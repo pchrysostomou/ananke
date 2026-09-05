@@ -59,6 +59,7 @@ pub struct Memtable {
     id: u64,
     map: SkipMap<Bytes, Entry>,
     bytes: AtomicU64,
+    min_seq: AtomicU64,
     max_seq: AtomicU64,
 }
 
@@ -71,6 +72,7 @@ impl Memtable {
             id,
             map: SkipMap::new(),
             bytes: AtomicU64::new(0),
+            min_seq: AtomicU64::new(u64::MAX),
             max_seq: AtomicU64::new(0),
         }
     }
@@ -94,6 +96,7 @@ impl Memtable {
             .compare_insert(key, Entry { seq, value }, |existing| existing.seq < seq);
         let won = entry.value().seq == seq;
         if won {
+            self.min_seq.fetch_min(seq, Ordering::Relaxed);
             self.max_seq.fetch_max(seq, Ordering::Relaxed);
             let delta = size as i64 - previous.unwrap_or(0) as i64;
             if delta >= 0 {
@@ -143,6 +146,12 @@ impl Memtable {
     #[must_use]
     pub fn max_seq(&self) -> Seq {
         self.max_seq.load(Ordering::Relaxed)
+    }
+
+    /// The lowest sequence number applied; `u64::MAX` when nothing was.
+    #[must_use]
+    pub fn min_seq(&self) -> Seq {
+        self.min_seq.load(Ordering::Relaxed)
     }
 }
 

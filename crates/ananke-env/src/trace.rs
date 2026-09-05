@@ -214,10 +214,10 @@ pub enum TraceEvent {
         /// The manifest's number.
         manifest: u64,
     },
-    /// Recovery could not read the manifest `CURRENT` names and fell back to an
-    /// older one; everything flushed since is lost.
+    /// Recovery could not read the manifest `CURRENT` names, or `CURRENT` itself, and
+    /// used another; everything flushed after it is lost.
     ManifestFallback {
-        /// The manifest `CURRENT` named.
+        /// The manifest `CURRENT` named; 0 when `CURRENT` could not be read.
         from: u64,
         /// The one used instead; 0 is the empty state.
         to: u64,
@@ -330,11 +330,10 @@ pub enum WalStopReason {
     /// The record's checksum did not match: bit rot, or a torn write of an earlier
     /// crash that was never cut.
     BadChecksum,
-    /// The next segment in sequence does not exist: a lost directory entry.
-    MissingSegment,
     /// The record carries a sequence number other than the one expected next: a
     /// record before it never reached the disk, typically because the sync that
-    /// covered it was lost before the segment was rotated (D-019).
+    /// covered it was lost before the segment was rotated (D-019), or the whole
+    /// segment before it is gone with a lost directory entry.
     Gap {
         /// The sequence number recovery expected.
         expected: u64,
@@ -350,7 +349,6 @@ impl WalStopReason {
         match self {
             WalStopReason::TornRecord => "torn-record",
             WalStopReason::BadChecksum => "bad-checksum",
-            WalStopReason::MissingSegment => "missing-segment",
             WalStopReason::Gap { .. } => "gap",
         }
     }

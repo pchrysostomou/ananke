@@ -1,6 +1,7 @@
-//! The Phase 1 crash-injection property (SPEC.md §2.8) for the engine so far: the
-//! correct engine passes every seed with every §1.3 fault on and crashes mid-flush,
-//! and the engine that acknowledges before the log is caught.
+//! The Phase 1 crash-injection property (SPEC.md §2.8) for the engine: the correct
+//! engine passes every seed with every §1.3 fault on, filesystem latency and crashes
+//! mid-flush; the engine that acknowledges before the log is caught, and so is the
+//! one that releases a memtable before the manifest names its table.
 
 use ananke_env::TraceEvent;
 use ananke_sim::engine::{self, Variant};
@@ -49,22 +50,31 @@ fn seed_420_which_the_first_nightly_found_stays_green() {
     engine::run(420, Variant::Correct).check().unwrap();
 }
 
-/// The negative control: acknowledging before the log is caught.
-#[test]
-fn an_engine_that_acknowledges_before_the_log_is_caught() {
+/// The negative controls: each known bug is caught on some seed.
+fn is_caught(variant: Variant) {
     let mut caught = Vec::new();
     for seed in 0..seeds() {
-        if let Err(violation) = engine::run(seed, Variant::NoWalBeforeMemtable).check() {
+        if let Err(violation) = engine::run(seed, variant).check() {
             caught.push(violation);
         }
     }
     eprintln!(
-        "NoWalBeforeMemtable: caught on {} of {} seeds, first: {}",
+        "{variant:?}: caught on {} of {} seeds, first: {}",
         caught.len(),
         seeds(),
         caught.first().map_or("", String::as_str)
     );
-    assert!(!caught.is_empty(), "NoWalBeforeMemtable was never caught");
+    assert!(!caught.is_empty(), "{variant:?} was never caught");
+}
+
+#[test]
+fn an_engine_that_acknowledges_before_the_log_is_caught() {
+    is_caught(Variant::NoWalBeforeMemtable);
+}
+
+#[test]
+fn an_engine_that_releases_a_memtable_before_the_manifest_is_caught() {
+    is_caught(Variant::ReleaseBeforeManifest);
 }
 
 /// What the correct engine's sweep saw.
@@ -82,6 +92,12 @@ struct Coverage {
     lost_fsyncs: u32,
     bit_rot: u32,
     torn_writes: u32,
+    tables_written: u32,
+    segments_deleted: u32,
+    orphans_removed: u32,
+    tables_dropped: u32,
+    manifest_fallbacks: u32,
+    head_gaps: u32,
 }
 
 impl Coverage {
@@ -114,6 +130,26 @@ impl Coverage {
         self.lost_fsyncs += u32::from(report.has(|e| matches!(e, TraceEvent::FsyncLost { .. })));
         self.bit_rot += u32::from(report.has(|e| matches!(e, TraceEvent::BlockRotted { .. })));
         self.torn_writes += u32::from(report.has(|e| matches!(e, TraceEvent::WriteTorn { .. })));
+        self.tables_written += report.count(|e| matches!(e, TraceEvent::SstWritten { .. })) as u32;
+        self.segments_deleted +=
+            report.count(|e| matches!(e, TraceEvent::WalSegmentDeleted { .. })) as u32;
+        self.orphans_removed +=
+            report.count(|e| matches!(e, TraceEvent::OrphanRemoved { .. })) as u32;
+        self.tables_dropped += report
+            .epochs
+            .iter()
+            .map(|e| e.recovery.dropped.len() as u32)
+            .sum::<u32>();
+        self.manifest_fallbacks += report
+            .epochs
+            .iter()
+            .filter(|e| e.recovery.fallback_from.is_some())
+            .count() as u32;
+        self.head_gaps += report
+            .epochs
+            .iter()
+            .filter(|e| e.recovery.wal.head_gap.is_some())
+            .count() as u32;
     }
 
     fn assert_complete(&self) {
@@ -130,6 +166,17 @@ impl Coverage {
             ("lost fsyncs", self.lost_fsyncs),
             ("bit rot", self.bit_rot),
             ("torn writes", self.torn_writes),
+            ("tables written", self.tables_written),
+            ("log segments deleted behind a flush", self.segments_deleted),
+            (
+                "orphans removed after a crash mid-flush",
+                self.orphans_removed,
+            ),
+            (
+                "tables dropped for a fault the trace explains",
+                self.tables_dropped,
+            ),
+            ("manifest fallbacks", self.manifest_fallbacks),
         ] {
             assert!(seen > 0, "the sweep never saw {what}: {self:?}");
         }
