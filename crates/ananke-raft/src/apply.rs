@@ -55,22 +55,30 @@ pub enum Command {
         /// The value to set.
         value: Bytes,
     },
-    /// Read `key` at this entry's place in the log.
+    /// Read `key`: served by the leader's lease or a heartbeat round, never
+    /// through the log (RAFT.md §1).
     Get {
         /// The key.
         key: Bytes,
     },
+    /// An operator's request that the leader hand leadership to server `to`
+    /// (thesis §3.10). Never an entry: the server acts on it directly.
+    Transfer {
+        /// The server to lead next.
+        to: u64,
+    },
 }
 
 impl Command {
-    /// The key the command touches.
+    /// The key the command touches, if it touches one.
     #[must_use]
-    pub fn key(&self) -> &Bytes {
+    pub fn key(&self) -> Option<&Bytes> {
         match self {
             Command::Put { key, .. }
             | Command::Delete { key }
             | Command::Cas { key, .. }
-            | Command::Get { key } => key,
+            | Command::Get { key } => Some(key),
+            Command::Transfer { .. } => None,
         }
     }
 }
@@ -137,6 +145,10 @@ impl Command {
                 out.put_u8(3);
                 put_bytes(&mut out, key);
             }
+            Command::Transfer { to } => {
+                out.put_u8(4);
+                out.put_u64_le(*to);
+            }
         }
         out.freeze()
     }
@@ -177,6 +189,14 @@ impl Command {
             3 => Command::Get {
                 key: get_bytes(&mut bytes)?,
             },
+            4 => {
+                if bytes.len() < 8 {
+                    return Err(bad("command torn"));
+                }
+                Command::Transfer {
+                    to: bytes.get_u64_le(),
+                }
+            }
             _ => return Err(bad("command malformed")),
         };
         if !bytes.is_empty() {
@@ -220,6 +240,7 @@ pub async fn apply_command<E: Environment>(
             }
         }
         Some(Command::Get { key }) => Outcome::Value(store.engine().get(&user_key(key)).await?),
+        Some(Command::Transfer { .. }) => Outcome::Done,
     };
     store.apply(index, batch).await?;
     Ok(outcome)

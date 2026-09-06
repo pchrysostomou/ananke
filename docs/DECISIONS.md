@@ -950,4 +950,86 @@ explains; the Raft store refuses it.
 
 ---
 
-_Next entry: D-028. Add one before implementing anything not covered above._
+## D-028 — Reads, leases, the guard as built, check quorum, the vote rule, and leadership transfer
+
+**Context.** Stage C of RAFT.md's order: read-index reads, lease reads with the
+conservative guard, check quorum, `Variant::LeaseTrustsTheClock`, and invariant 6
+under the simulator's drift; and, from the stage B review, a stale-sender scenario so
+that `ResetTimerOnAnyRpc` is caught at a useful rate.
+
+**Decision.** The core takes the server's clock as a number on the inputs that need
+it, a message's arrival and a read's, and stays a function of its inputs. An
+AppendEntries carries `sent`, the leader's clock at sending, stamped by the server on
+the way out; the response echoes it and adds `local`, the follower's clock, stamped
+the same way. `sent` is what a promise runs from and what tells a read-index round
+which acknowledgements came after the read; `local − sent` is what the guard watches.
+The guard observes each follower through the fastest response of a window, compares
+windows with the first, revokes on movement beyond the bound over the time between
+them, and trusts a follower only from its first steady comparison; a fresh leader
+therefore serves by read-index for two windows, and a spurious revoke at the first
+comparison, where jitter and the allowance are of a size, costs a round trip. The
+lease is the latest-expiring promise among trusted followers that makes a majority
+with the leader; a read the lease covers is served at the commit index once applied,
+any other after a heartbeat round a majority acknowledged with requests sent after
+it, and neither before the term's no-op commits. A leader that stops leading drops
+its pending reads and the client asks elsewhere.
+
+Check quorum runs every minimum election timeout on the leader's ticks over the
+responses since the last check. The vote rule behind the lease is etcd's: a follower
+that has heard from its leader within its minimum election timeout ignores a vote
+request, term included; with pre-vote, a candidate that reached a real election
+already has a majority that has not heard, so liveness is kept. Leadership transfer
+(thesis §3.10) is the exception, marked on the vote request: `TimeoutNow` from the
+leader makes the target campaign without a pre-vote once its log matches, and
+followers vote for it although they heard from the old leader, who steps down on the
+higher term. An operator asks for a transfer with a client command the server acts on
+directly.
+
+The sweep draws every server's clock per seed: within a third of the bound on half
+the seeds; on the other half one server slow and two fast, moderately, two thousand
+to a hundred thousand parts per million, where the guard must notice movement the
+lease's margin still absorbs, or severely, the slow one at a quarter to a third of
+true rate and the fast ones a quarter to a third fast, where a lease the slow server
+measures by its own clock outlives the fast followers' timers. A slow clock never
+leads on its own, its timer fires late in real time and the fast servers win every
+election, so every schedule opens with a lease trial: an operator transfers
+leadership to the slowest clock, its lease forms, and it is cut off with a
+read-heavy client while the others elect and write. The adversary chose the clocks
+and chooses the operator's request. The stale sender for rule 5 is a follower cut
+off from receiving for a second, pre-voting into the majority every timeout, with the
+leader crashed part way; it replaces the stale-leader schedule of D-026, whose
+deposed leader now stops within an election timeout under check quorum. The timer
+bound is two maximum election timeouts scaled by the server's own clock rate.
+
+**What the sweep found before it passed.** With independent random rate errors the
+stale window never opened, since the leader was never the slow server; crashing the
+faster servers to hand it the lead lost a server to bit rot on many seeds and still
+lost the post-restart election to the faster timers; transfer is the tool. With four
+keys and a mixed client on the cut-off side, the window was hit but no write to the
+key read had landed in it; two keys, a read-heavy client there, a write that gets one
+try of a hundred and twenty milliseconds, a get that tries elsewhere after forty, and
+a retry that avoids the server that went quiet are what make the majority side write
+into the window. With the lease's arithmetic, a hundred-millisecond election timeout,
+a tick of margin and heartbeats that must still arrive within the fast followers'
+minimum timeout, the rates that open a window are tens of percent, which no real
+clock does; the arithmetic is the same at any scale, and this is where the sweep can
+reach it.
+
+**Alternatives.** A clock rate that changes mid-run to make an elected leader slow:
+the guard cannot see a change within a window by construction, so the correct server
+would serve a stale read for one window and the test would say nothing about the
+guard. Sudden drift is a different fault from the one the lease assumes bounded.
+Refusing every vote request while leading, without the transfer exception: no
+transfer, and no way to test the lease on a slow leader. Reads through the log, as
+stage B did: linearizable, and a log entry per read.
+
+**Consequences.** Every AppendEntries and its response carry two more words. A lease
+read is served by the `raft` task from the engine directly. The correct server's
+lease reads, revocations and check-quorum step-downs are coverage the sweep asserts;
+the lease-safety test reports, at every seed count, how many seeds exceeded the
+bound and, of those, how many the guard revoked on and how many read stale without
+it.
+
+---
+
+_Next entry: D-029. Add one before implementing anything not covered above._

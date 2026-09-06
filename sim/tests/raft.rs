@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use ananke_env::{ClientOp, DropReason, TraceEvent};
 use ananke_raft::core::Variant;
+use ananke_sim::raft::DRIFT_BOUND_PPM;
 use ananke_sim::raft::{self, Fault};
 use ananke_sim::{seeds, write_trace};
 
@@ -92,6 +93,53 @@ fn a_server_that_resets_its_timer_on_any_message_is_caught() {
     is_caught(Variant::ResetTimerOnAnyRpc);
 }
 
+/// Lease safety under drift (RAFT.md §2, invariant 6): on every seed where the
+/// simulated drift exceeds the bound, either the guard revoked the drifting
+/// follower's trust or the checker reports the stale read and the run fails. The
+/// correct server passes every seed (above); here each exceeded seed is run with
+/// the guard and without it, and the report says how many revoked, how many read
+/// stale without the guard, and how many did neither.
+#[test]
+fn a_leader_that_trusts_the_clock_is_caught_and_the_guard_revokes() {
+    let mut exceeded = 0;
+    let mut revoked = 0;
+    let mut stale = 0;
+    let mut neither = 0;
+    let mut lease_reads_within = 0;
+    let mut slowest_led = 0;
+    let mut first_stale = String::new();
+    for seed in 0..seeds() {
+        let correct = raft::run(seed, Variant::Correct);
+        slowest_led += usize::from(correct.trial_led_by_slowest);
+        if !correct.drift_exceeded() {
+            lease_reads_within += correct.lease_reads();
+            continue;
+        }
+        exceeded += 1;
+        let guard_revoked = correct.lease_revokes() > 0;
+        revoked += usize::from(guard_revoked);
+        let buggy = raft::run(seed, Variant::LeaseTrustsTheClock);
+        let read_stale = match buggy.check() {
+            Err(violation) if violation.contains("linearizability") => {
+                if first_stale.is_empty() {
+                    first_stale = violation;
+                }
+                true
+            }
+            _ => false,
+        };
+        stale += usize::from(read_stale);
+        neither += usize::from(!guard_revoked && !read_stale);
+    }
+    eprintln!(
+        "lease safety: drift beyond {DRIFT_BOUND_PPM} ppm on {exceeded} of {} seeds; of those, the guard revoked on {revoked}, a stale read was caught without the guard on {stale}, neither on {neither}; the slowest clock led the trial on {slowest_led} seeds; {lease_reads_within} lease reads on the seeds within the bound; first stale: {first_stale}",
+        seeds()
+    );
+    assert!(exceeded > 0, "no seed exceeded the drift bound");
+    assert!(revoked > 0, "the guard never revoked");
+    assert!(stale > 0, "LeaseTrustsTheClock was never caught");
+}
+
 /// What the correct server's sweep saw.
 #[derive(Debug, Default)]
 struct Coverage {
@@ -101,7 +149,12 @@ struct Coverage {
     one_way_blocks: usize,
     crashes: usize,
     leader_crashes: usize,
-    stale_leader_faults: usize,
+    stale_sender_faults: usize,
+    drift_exceeded_seeds: u64,
+    lease_reads: usize,
+    read_index_reads: usize,
+    lease_revokes: usize,
+    quorum_losses: usize,
     refusals: usize,
     duplicates: usize,
     drops: usize,
@@ -141,12 +194,17 @@ impl Coverage {
             .iter()
             .filter(|f| matches!(f, Fault::CrashLeader { .. }))
             .count();
-        self.stale_leader_faults += report
+        self.stale_sender_faults += report
             .schedule
             .faults
             .iter()
-            .filter(|f| matches!(f, Fault::StaleLeader { .. }))
+            .filter(|f| matches!(f, Fault::StaleSender { .. }))
             .count();
+        self.drift_exceeded_seeds += u64::from(report.drift_exceeded());
+        self.lease_reads += report.lease_reads();
+        self.read_index_reads += report.read_index_reads();
+        self.lease_revokes += report.lease_revokes();
+        self.quorum_losses += report.quorum_losses();
         self.refusals += report.refused.len();
         self.duplicates +=
             report.count(|e| matches!(e, TraceEvent::MessageDelivered { dup: true, .. }));
@@ -191,7 +249,15 @@ impl Coverage {
             ("one-way blocks", self.one_way_blocks as u64),
             ("crashes", self.crashes as u64),
             ("leader crashes", self.leader_crashes as u64),
-            ("stale-leader faults", self.stale_leader_faults as u64),
+            ("stale-sender faults", self.stale_sender_faults as u64),
+            (
+                "seeds with drift beyond the bound",
+                self.drift_exceeded_seeds,
+            ),
+            ("lease reads", self.lease_reads as u64),
+            ("read-index reads", self.read_index_reads as u64),
+            ("lease revocations", self.lease_revokes as u64),
+            ("check-quorum step-downs", self.quorum_losses as u64),
             ("duplicated deliveries", self.duplicates as u64),
             ("injected drops", self.drops as u64),
             ("elections", self.leaders as u64),

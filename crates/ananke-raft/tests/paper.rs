@@ -47,6 +47,15 @@ struct Cluster {
     no_appends: Vec<(ServerId, ServerId)>,
     /// Servers taken down: their messages are dropped and they are not stepped.
     down: Vec<ServerId>,
+    /// The harness clock, in nanoseconds: advanced by `tick`, stamped on messages
+    /// where a server would stamp its own clock.
+    now: u64,
+    /// Each server's clock rate error in parts per million, for the guard tests.
+    drift_ppm: BTreeMap<ServerId, i64>,
+    /// Reads the cores declared ready: (server, read id, read index).
+    reads: Vec<(ServerId, u64, Index)>,
+    /// Reads the cores dropped: (server, read id).
+    dropped: Vec<(ServerId, u64)>,
 }
 
 impl Cluster {
@@ -97,7 +106,18 @@ impl Cluster {
             cut: Vec::new(),
             no_appends: Vec::new(),
             down: Vec::new(),
+            now: 0,
+            drift_ppm: BTreeMap::new(),
+            reads: Vec::new(),
+            dropped: Vec::new(),
         }
+    }
+
+    /// A server's own clock at the harness time `now`.
+    fn local_clock(&self, id: ServerId) -> u64 {
+        let ppm = self.drift_ppm.get(&id).copied().unwrap_or(0);
+        let now = i128::from(self.now);
+        u64::try_from(now + now * i128::from(ppm) / 1_000_000).expect("positive")
     }
 
     fn step(&mut self, id: ServerId, input: Input) -> Vec<Output> {
@@ -117,9 +137,19 @@ impl Cluster {
                     if !persisted && outputs.iter().any(|o| matches!(o, Output::Persist(_))) {
                         sends_before_persist = true;
                     }
-                    self.inbox.push((id, *to, message.clone()));
+                    let mut message = message.clone();
+                    match &mut message {
+                        Message::AppendEntries { sent, .. } => *sent = self.local_clock(id),
+                        Message::AppendEntriesResponse { local, .. } => {
+                            *local = self.local_clock(id);
+                        }
+                        _ => {}
+                    }
+                    self.inbox.push((id, *to, message));
                 }
                 Output::Trace(event) => self.events.push(event.clone()),
+                Output::ReadReady { id: read, index } => self.reads.push((id, *read, *index)),
+                Output::ReadDropped { id: read } => self.dropped.push((id, *read)),
                 Output::Apply { .. } | Output::Rejected { .. } => {}
             }
         }
@@ -165,11 +195,13 @@ impl Cluster {
         {
             return;
         }
-        self.step(to, Input::Message { from, message });
+        let now = self.local_clock(to);
+        self.step(to, Input::Message { from, message, now });
     }
 
     fn tick(&mut self, id: ServerId, ticks: u64) {
         for _ in 0..ticks {
+            self.now += self.cores[&id].config().tick_nanos;
             self.step(id, Input::Tick);
         }
     }
@@ -269,6 +301,7 @@ fn config(variant: Variant) -> RaftConfig {
         max_batch: 64,
         max_inflight: 8,
         variant,
+        ..RaftConfig::default()
     }
 }
 
@@ -306,11 +339,13 @@ fn figure_7_votes_follow_last_term_then_length() {
                 log_of(terms),
             );
             let out = voter.step(Input::Message {
+                now: 0,
                 from: s(1),
                 message: Message::RequestVote {
                     term: 8,
                     last_index: leader_terms.len() as Index,
                     last_term: *leader_terms.last().unwrap(),
+                    transfer: false,
                 },
             });
             let grant = out.iter().any(|o| {
@@ -346,11 +381,13 @@ fn figure_7_votes_follow_last_term_then_length() {
         );
         let f = &logs[6].1;
         let out = voter.step(Input::Message {
+            now: 0,
             from: s(1),
             message: Message::RequestVote {
                 term: 8,
                 last_index: f.len() as Index,
                 last_term: *f.last().unwrap(),
+                transfer: false,
             },
         });
         let grant = out.iter().any(|o| {
@@ -570,11 +607,13 @@ fn stale_requests_do_not_reset_the_election_timer() {
         let mut started = false;
         for _ in 0..100 {
             let out = follower.step(Input::Message {
+                now: 0,
                 from: s(3),
                 message: Message::RequestVote {
                     term: 2,
                     last_index: 0,
                     last_term: 0,
+                    transfer: false,
                 },
             });
             assert!(
@@ -623,6 +662,7 @@ fn a_higher_term_steps_a_leader_down_and_a_stale_response_is_ignored() {
     cluster.step(
         s(1),
         Input::Message {
+            now: 0,
             from: s(2),
             message: Message::AppendEntriesResponse {
                 term: term - 1,
@@ -630,20 +670,44 @@ fn a_higher_term_steps_a_leader_down_and_a_stale_response_is_ignored() {
                 prev_index: 0,
                 match_index: 99,
                 hint: 0,
+                echo: 0,
+                local: 0,
             },
         },
     );
     assert_eq!(cluster.role(s(1)), Role::Leader);
     assert_eq!(cluster.commit(s(1)), 1, "a stale success moved nothing");
-    // A message from a higher term.
+    // A vote request from a higher term: ignored while this server leads (RAFT.md
+    // §1), term and all, since its followers promised it their votes.
     cluster.step(
         s(1),
         Input::Message {
+            now: 0,
             from: s(3),
             message: Message::RequestVote {
                 term: term + 5,
                 last_index: 1,
                 last_term: term,
+                transfer: false,
+            },
+        },
+    );
+    assert_eq!(cluster.role(s(1)), Role::Leader);
+    assert_eq!(cluster.term(s(1)), term);
+    // An AppendEntries from a higher term: a leader of that term exists, so this one
+    // steps down (moirae rule 1).
+    cluster.step(
+        s(1),
+        Input::Message {
+            now: 0,
+            from: s(3),
+            message: Message::AppendEntries {
+                term: term + 5,
+                prev_index: 0,
+                prev_term: 0,
+                entries: Vec::new(),
+                commit: 0,
+                sent: 0,
             },
         },
     );
@@ -676,6 +740,7 @@ fn a_replayed_success_response_does_not_move_match_index_back() {
     cluster.step(
         s(1),
         Input::Message {
+            now: 0,
             from: s(2),
             message: Message::AppendEntriesResponse {
                 term,
@@ -683,6 +748,8 @@ fn a_replayed_success_response_does_not_move_match_index_back() {
                 prev_index: 0,
                 match_index: 1,
                 hint: 0,
+                echo: 0,
+                local: 0,
             },
         },
     );
@@ -744,4 +811,330 @@ fn a_partitioned_server_does_not_disrupt_a_leader_when_it_rejoins() {
         }
         invariants::all(&cluster.events).unwrap();
     }
+}
+
+/// Ticks the leader through `rounds` heartbeat rounds, settling each, so the guard
+/// sees a window of steady responses per `guard_window_nanos` of harness time.
+fn heartbeat_rounds(cluster: &mut Cluster, leader: ServerId, rounds: u64) {
+    let beat = cluster.cores[&leader].config().heartbeat_ticks;
+    for _ in 0..rounds {
+        cluster.tick(leader, beat);
+        cluster.settle();
+    }
+}
+
+/// A leader with a committed, applied entry of its term and every follower's
+/// promise observed steady through two guard windows: the state a lease starts from.
+fn leader_with_lease(cluster: &mut Cluster, leader: ServerId) {
+    cluster.elect(leader);
+    cluster.propose(leader, "x");
+    cluster.settle();
+    let commit = cluster.commit(leader);
+    cluster.step(leader, Input::Applied(commit));
+    // Two windows of 400ms at 20ms a round, and a round to close the second.
+    heartbeat_rounds(cluster, leader, 45);
+}
+
+/// Read-index (thesis §6.4): a read is confirmed only by acknowledgements of
+/// requests sent after it arrived, and served once its index is applied.
+#[test]
+fn a_read_index_read_needs_acknowledgements_sent_after_it() {
+    let members = vec![s(1), s(2), s(3)];
+    let mut cluster = Cluster::new(&members, &config(Variant::Correct), &[]);
+    cluster.elect(s(1));
+    cluster.propose(s(1), "x");
+    cluster.settle();
+    let commit = cluster.commit(s(1));
+    cluster.step(s(1), Input::Applied(commit));
+    // A heartbeat round whose requests are sent now, then time passes before the
+    // read arrives: their acknowledgements are older than the read.
+    let beat = cluster.cores[&s(1)].config().heartbeat_ticks;
+    cluster.tick(s(1), beat);
+    let old: Vec<(ServerId, ServerId, Message)> = std::mem::take(&mut cluster.inbox);
+    cluster.now += 5_000_000;
+    let out = cluster.step(
+        s(1),
+        Input::Read {
+            id: 7,
+            now: cluster.now,
+        },
+    );
+    assert!(
+        !out.iter().any(|o| matches!(o, Output::ReadReady { .. })),
+        "no lease yet: the read waits for a round"
+    );
+    let fresh: Vec<(ServerId, ServerId, Message)> = std::mem::take(&mut cluster.inbox);
+    assert!(
+        fresh
+            .iter()
+            .any(|(_, _, m)| matches!(m, Message::AppendEntries { .. })),
+        "the read sent a heartbeat round"
+    );
+    // The old round's acknowledgements arrive first: not enough.
+    cluster.inbox = old;
+    cluster.settle();
+    assert!(
+        cluster.reads.is_empty(),
+        "acknowledgements from before the read confirmed it"
+    );
+    // The fresh round's do.
+    cluster.inbox = fresh;
+    cluster.settle();
+    assert_eq!(cluster.reads, vec![(s(1), 7, commit)]);
+    let lease_reads = cluster
+        .events
+        .iter()
+        .filter(|e| matches!(e, TraceEvent::RaftRead { lease: true, .. }))
+        .count();
+    assert_eq!(lease_reads, 0, "served by a round, not a lease");
+}
+
+/// A lease read (RAFT.md §1): served at once within the promise of a majority,
+/// and not after it, when only a round can confirm the leader.
+#[test]
+fn a_lease_read_is_served_within_the_promise_and_not_after() {
+    let members = vec![s(1), s(2), s(3)];
+    let mut cluster = Cluster::new(&members, &config(Variant::Correct), &[]);
+    leader_with_lease(&mut cluster, s(1));
+    let commit = cluster.commit(s(1));
+    let lease_end = cluster.cores[&s(1)].lease_end();
+    assert!(lease_end > cluster.now, "a lease holds after steady rounds");
+    let out = cluster.step(
+        s(1),
+        Input::Read {
+            id: 1,
+            now: cluster.now,
+        },
+    );
+    assert!(
+        out.iter()
+            .any(|o| matches!(o, Output::ReadReady { id: 1, index } if *index == commit)),
+        "served at once by the lease: {out:?}"
+    );
+    assert!(cluster.events.iter().any(|e| matches!(
+        e,
+        TraceEvent::RaftRead {
+            server: 1,
+            lease: true,
+            ..
+        }
+    )));
+    // Time passes past the lease with nothing heard: the next read needs a round.
+    cluster.cut = vec![(s(2), s(1)), (s(3), s(1))];
+    while cluster.now < lease_end {
+        cluster.tick(s(2), 1);
+    }
+    cluster.inbox.clear();
+    let out = cluster.step(
+        s(1),
+        Input::Read {
+            id: 2,
+            now: cluster.now,
+        },
+    );
+    assert!(
+        !out.iter().any(|o| matches!(o, Output::ReadReady { .. })),
+        "past the promise the lease is gone: {out:?}"
+    );
+    assert!(
+        out.iter().any(|o| matches!(
+            o,
+            Output::Send {
+                message: Message::AppendEntries { .. },
+                ..
+            }
+        )),
+        "a round was started instead"
+    );
+}
+
+/// The drift guard (RAFT.md §1): a follower whose clock runs fast against the
+/// leader's is revoked once a window's fastest response has moved beyond the bound,
+/// and the lease then rests on the others; with every follower moving there is no
+/// lease at all.
+#[test]
+fn the_guard_revokes_a_follower_whose_clock_moves() {
+    let members = vec![s(1), s(2), s(3)];
+    let mut cluster = Cluster::new(&members, &config(Variant::Correct), &[]);
+    cluster.drift_ppm.insert(s(2), 300_000);
+    leader_with_lease(&mut cluster, s(1));
+    let revoked: Vec<u64> = cluster
+        .events
+        .iter()
+        .filter_map(|e| match e {
+            TraceEvent::RaftLeaseRevoked {
+                server: 1,
+                follower,
+                ..
+            } => Some(*follower),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        revoked.contains(&2),
+        "the fast follower was revoked: {revoked:?}"
+    );
+    assert!(
+        !revoked.contains(&3),
+        "the steady follower was not: {revoked:?}"
+    );
+    assert!(
+        cluster.cores[&s(1)].lease_holds(cluster.now),
+        "the lease rests on server 3"
+    );
+    // Every follower moving: no majority of promises to trust.
+    let mut cluster = Cluster::new(&members, &config(Variant::Correct), &[]);
+    cluster.drift_ppm.insert(s(2), 300_000);
+    cluster.drift_ppm.insert(s(3), -200_000);
+    leader_with_lease(&mut cluster, s(1));
+    assert!(
+        !cluster.cores[&s(1)].lease_holds(cluster.now),
+        "no lease with every promise in doubt"
+    );
+    // The buggy leader trusts them all.
+    let mut cluster = Cluster::new(&members, &config(Variant::LeaseTrustsTheClock), &[]);
+    cluster.drift_ppm.insert(s(2), 300_000);
+    cluster.drift_ppm.insert(s(3), -200_000);
+    leader_with_lease(&mut cluster, s(1));
+    assert!(
+        cluster.cores[&s(1)].lease_holds(cluster.now),
+        "the buggy leader holds a lease anyway"
+    );
+}
+
+/// Check quorum (RAFT.md §1): a leader that hears from no majority for the minimum
+/// election timeout steps down, and drops the reads it was holding.
+#[test]
+fn check_quorum_steps_a_leader_down_that_hears_from_no_majority() {
+    let members = vec![s(1), s(2), s(3)];
+    let mut cluster = Cluster::new(&members, &config(Variant::Correct), &[]);
+    cluster.elect(s(1));
+    cluster.settle();
+    cluster.cut = vec![(s(2), s(1)), (s(3), s(1))];
+    cluster.step(
+        s(1),
+        Input::Read {
+            id: 9,
+            now: cluster.now,
+        },
+    );
+    let min = cluster.cores[&s(1)].config().election_ticks.0;
+    for _ in 0..2 * min {
+        cluster.tick(s(1), 1);
+        cluster.settle();
+        cluster.inbox.clear();
+    }
+    assert_eq!(cluster.role(s(1)), Role::Follower);
+    assert!(
+        cluster
+            .events
+            .iter()
+            .any(|e| matches!(e, TraceEvent::RaftQuorumLost { server: 1, .. }))
+    );
+    assert_eq!(
+        cluster.dropped,
+        vec![(s(1), 9)],
+        "the read was dropped, not served"
+    );
+}
+
+/// The vote rule behind the lease (RAFT.md §1, thesis §6.4.1): a follower that has
+/// heard from its leader within the minimum election timeout ignores a vote
+/// request, term and all; once it has not, it grants one.
+#[test]
+fn a_follower_that_heard_from_its_leader_ignores_a_vote_request() {
+    let members = vec![s(1), s(2), s(3)];
+    let mut cluster = Cluster::new(&members, &config(Variant::Correct), &[]);
+    cluster.elect(s(1));
+    cluster.settle();
+    let term = cluster.term(s(2));
+    let request = Message::RequestVote {
+        term: term + 1,
+        last_index: cluster.log(s(2)).len() as Index,
+        last_term: term,
+        transfer: false,
+    };
+    cluster.step(
+        s(2),
+        Input::Message {
+            now: 0,
+            from: s(3),
+            message: request.clone(),
+        },
+    );
+    assert_eq!(cluster.term(s(2)), term, "the term did not move");
+    assert!(cluster.inbox.is_empty(), "nothing was answered");
+    assert!(cluster.events.iter().any(|e| matches!(
+        e,
+        TraceEvent::RaftVote {
+            server: 2,
+            granted: false,
+            pre: false,
+            ..
+        }
+    )));
+    // The leader goes quiet for the minimum timeout.
+    cluster.cut = vec![(s(1), s(2))];
+    let min = cluster.cores[&s(2)].config().election_ticks.0;
+    cluster.tick(s(2), min);
+    cluster.inbox.clear();
+    cluster.step(
+        s(2),
+        Input::Message {
+            now: 0,
+            from: s(3),
+            message: request,
+        },
+    );
+    assert_eq!(cluster.term(s(2)), term + 1);
+    assert!(cluster.events.iter().any(|e| matches!(
+        e,
+        TraceEvent::RaftVote {
+            server: 2,
+            granted: true,
+            pre: false,
+            ..
+        }
+    )));
+}
+
+/// Leadership transfer (thesis §3.10): the leader sends TimeoutNow to a follower
+/// whose log matches its own, the follower starts an election without a pre-vote,
+/// its vote requests carry the leader's wish, and followers that heard from the
+/// old leader vote anyway; the old leader steps down on the higher term.
+#[test]
+fn leadership_transfer_makes_the_target_leader_without_a_pre_vote() {
+    let members = vec![s(1), s(2), s(3)];
+    let mut cluster = Cluster::new(&members, &config(Variant::Correct), &[]);
+    cluster.elect(s(1));
+    cluster.propose(s(1), "x");
+    cluster.settle();
+    let term = cluster.term(s(1));
+    let out = cluster.step(s(1), Input::Transfer(s(2)));
+    assert!(
+        out.iter().any(
+            |o| matches!(o, Output::Send { to, message: Message::TimeoutNow { .. } } if *to == s(2))
+        ),
+        "TimeoutNow went to the caught-up follower: {out:?}"
+    );
+    cluster.settle();
+    assert_eq!(cluster.role(s(2)), Role::Leader);
+    assert_eq!(cluster.term(s(2)), term + 1);
+    assert_eq!(cluster.role(s(1)), Role::Follower);
+    let pre_votes = cluster
+        .events
+        .iter()
+        .filter(|e| matches!(e, TraceEvent::RaftVote { pre: true, term: t, .. } if *t == term + 1))
+        .count();
+    assert_eq!(pre_votes, 0, "no pre-vote round for a transfer");
+    assert!(
+        cluster
+            .events
+            .iter()
+            .any(|e| matches!(e, TraceEvent::RaftTransfer { server: 1, to: 2 }))
+    );
+    assert!(
+        cluster.events.iter().any(|e| matches!(e, TraceEvent::RaftVote { server: 3, granted: true, pre: false, term: t, .. } if *t == term + 1)),
+        "server 3 voted although it had heard from server 1"
+    );
 }

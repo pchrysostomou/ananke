@@ -241,14 +241,23 @@ pub fn studio(payload: &[u8]) -> Option<Json> {
             Command::Delete { .. } => "delete",
             Command::Cas { .. } => "cas",
             Command::Get { .. } => "get",
+            Command::Transfer { .. } => "transfer",
         };
-        Json::obj(vec![
+        let mut fields = vec![
             ("type", Json::str("client.request")),
             ("client", int(request.client)),
             ("seq", int(request.seq)),
             ("op", Json::str(op)),
-            ("key", text(request.command.key())),
-        ])
+        ];
+        match &request.command {
+            Command::Transfer { to } => fields.push(("to", int(*to))),
+            command => {
+                if let Some(key) = command.key() {
+                    fields.push(("key", text(key)));
+                }
+            }
+        }
+        Json::obj(fields)
     } else {
         let Ok(response) = Response::decode(bytes) else {
             return Some(malformed());

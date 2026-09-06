@@ -48,7 +48,7 @@ use std::time::Duration;
 use ananke_env::{Clock, Either, Environment, Network, Rng, Socket, TraceEvent, race};
 use ananke_storage::{Engine, EngineConfig};
 
-use crate::apply::{Command, apply_command};
+use crate::apply::{Command, Outcome, apply_command, user_key};
 use crate::client::{self, Reply, Request, Response};
 use crate::core::{Input, Output, Raft, RaftConfig, Variant};
 use crate::message::{Frame, Message};
@@ -70,11 +70,13 @@ pub struct NodeConfig {
     /// The engine's. Fallback and head-gap discard are turned off and log-damage
     /// refusal on whatever is passed (RAFT.md §3).
     pub engine: EngineConfig,
-    /// How long one of the core's ticks is: the minimum election timeout over
-    /// `raft.election_ticks.0`.
-    pub tick: Duration,
     /// How many messages the inbox holds before it drops.
     pub inbox_capacity: usize,
+}
+
+/// The server's clock in nanoseconds: what the core's lease arithmetic runs on.
+fn now_nanos<E: Environment>(env: &E) -> u64 {
+    env.clock().now().as_nanos()
 }
 
 /// What the `raft` task takes from its inbox.
@@ -118,10 +120,10 @@ pub async fn run<E: Environment>(env: E, config: NodeConfig) -> io::Result<()> {
         servers,
         raft,
         engine,
-        tick,
         inbox_capacity,
     } = config;
     let server = id.0;
+    let tick = Duration::from_nanos(raft.tick_nanos);
     // The store's recovery must never hand back a state with a hole (RAFT.md §3):
     // no fallback, no discarded head, and a damaged log refused before it is cut.
     let engine = EngineConfig {
@@ -293,6 +295,8 @@ pub async fn run<E: Environment>(env: E, config: NodeConfig) -> io::Result<()> {
         variant,
         apply_sent: applied,
         proposed: BTreeMap::new(),
+        reads: BTreeMap::new(),
+        next_read: 0,
     };
     let mut next_tick = env.clock().now() + tick;
     loop {
@@ -308,25 +312,67 @@ pub async fn run<E: Environment>(env: E, config: NodeConfig) -> io::Result<()> {
                 }
             }
         };
-        let (input, request) = match event {
-            None => (Input::Tick, None),
-            Some(Event::Message { from, message }) => (Input::Message { from, message }, None),
-            Some(Event::Applied(index)) => (Input::Applied(index), None),
+        let (input, request, read) = match event {
+            None => (Input::Tick, None, None),
+            Some(Event::Message { from, message }) => (
+                Input::Message {
+                    from,
+                    message,
+                    now: now_nanos(&env),
+                },
+                None,
+                None,
+            ),
+            Some(Event::Applied(index)) => (Input::Applied(index), None, None),
             Some(Event::Request { from, request }) => {
-                if let Some(&(index, term)) = node.proposed.get(&(request.client, request.seq))
-                    && core.term_at(index) == Some(term)
-                {
-                    // A copy of a request whose entry is in the log: it is answered
-                    // when that entry applies, once.
-                    continue;
+                if let Command::Transfer { to } = request.command {
+                    // An operator's wish, acted on at once and answered at once.
+                    let response = Response {
+                        client: request.client,
+                        seq: request.seq,
+                        reply: Reply::Outcome(Outcome::Done),
+                    };
+                    let _ = node.sock.send(from, response.encode()).await;
+                    (Input::Transfer(ServerId(to)), None, None)
+                } else if matches!(request.command, Command::Get { .. }) {
+                    // A read: served by the lease or after a heartbeat round, never
+                    // through the log.
+                    let id = node.next_read;
+                    node.next_read += 1;
+                    node.reads.insert(id, (from, request));
+                    (
+                        Input::Read {
+                            id,
+                            now: now_nanos(&env),
+                        },
+                        None,
+                        Some(id),
+                    )
+                } else {
+                    if let Some(&(index, term)) = node.proposed.get(&(request.client, request.seq))
+                        && core.term_at(index) == Some(term)
+                    {
+                        // A copy of a request whose entry is in the log: it is
+                        // answered when that entry applies, once.
+                        continue;
+                    }
+                    (
+                        Input::Propose(request.command.encode()),
+                        Some((from, request)),
+                        None,
+                    )
                 }
-                (
-                    Input::Propose(request.command.encode()),
-                    Some((from, request)),
-                )
             }
         };
         let outputs = core.step(input);
+        if let Some(id) = read
+            && let Some(leader) = outputs.iter().find_map(|output| match output {
+                Output::Rejected { leader } => Some(*leader),
+                _ => None,
+            })
+        {
+            node.answer_read(id, Reply::NotLeader { leader }).await;
+        }
         if let Some((from, request)) = request {
             let rejected = outputs.iter().find_map(|output| match output {
                 Output::Rejected { leader } => Some(*leader),
@@ -431,19 +477,41 @@ struct Server<E: Environment> {
     /// and term their entry took: a duplicate of one still in the log is not
     /// proposed again.
     proposed: BTreeMap<(u64, u64), (Index, Term)>,
+    /// Reads waiting on the core, by the id handed to it.
+    reads: BTreeMap<u64, (SocketAddr, Request)>,
+    next_read: u64,
 }
 
 /// How many proposals a server remembers against duplicates.
 const PROPOSED_REMEMBERED: usize = 4096;
 
 impl<E: Environment> Server<E> {
-    async fn send(&self, to: ServerId, message: Message) {
+    /// Sends a message, stamping the clock where the lease reads it: `sent` on an
+    /// AppendEntries, `local` on its response (RAFT.md §1).
+    async fn send(&self, to: ServerId, mut message: Message) {
+        match &mut message {
+            Message::AppendEntries { sent, .. } => *sent = now_nanos(&self.env),
+            Message::AppendEntriesResponse { local, .. } => *local = now_nanos(&self.env),
+            _ => {}
+        }
         if let Some(addr) = self.addrs.get(&to) {
             let frame = Frame {
                 from: self.id,
                 message,
             };
             let _ = self.sock.send(*addr, frame.encode()).await;
+        }
+    }
+
+    /// Answers the client that asked for read `id`, if it is still waiting.
+    async fn answer_read(&mut self, id: u64, reply: Reply) {
+        if let Some((from, request)) = self.reads.remove(&id) {
+            let response = Response {
+                client: request.client,
+                seq: request.seq,
+                reply,
+            };
+            let _ = self.sock.send(from, response.encode()).await;
         }
     }
 
@@ -505,6 +573,30 @@ impl<E: Environment> Server<E> {
                 }
                 Output::Apply { through } => self.apply_through(core, through),
                 Output::Rejected { .. } => {}
+                Output::ReadReady { id, .. } => {
+                    let key = match self.reads.get(&id) {
+                        Some((_, request)) => match request.command.key() {
+                            Some(key) => key.clone(),
+                            None => continue,
+                        },
+                        None => continue,
+                    };
+                    let reply = match self.store.engine().get(&user_key(&key)).await {
+                        Ok(value) => Reply::Outcome(Outcome::Value(value)),
+                        Err(error) => {
+                            self.env.trace(TraceEvent::RaftServerFailed {
+                                server: self.id.0,
+                                reason: error.to_string(),
+                            });
+                            return Err(error);
+                        }
+                    };
+                    self.answer_read(id, reply).await;
+                }
+                Output::ReadDropped { id } => {
+                    self.answer_read(id, Reply::NotLeader { leader: None })
+                        .await;
+                }
                 Output::Trace(event) => self.env.trace(event),
             }
         }

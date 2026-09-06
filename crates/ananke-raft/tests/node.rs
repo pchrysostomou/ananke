@@ -42,7 +42,6 @@ fn node_config(id: u64, servers: &[u64]) -> NodeConfig {
         servers: servers.iter().map(|&s| (ServerId(s), addr(s))).collect(),
         raft: RaftConfig::default(),
         engine: engine_config(),
-        tick: Duration::from_millis(10),
         inbox_capacity: 64,
     }
 }
@@ -147,7 +146,8 @@ fn three_servers_elect_a_leader_and_a_clients_write_is_applied_on_every_server()
     let events: Vec<TraceEvent> = sim.trace().into_iter().map(|r| r.event).collect();
     invariants::all(&events).unwrap();
     invariants::commit_majority(&events, 3).unwrap();
-    // Every server applied the put: the same index with the same hash on all three.
+    // Every server applied the no-op and the put, the same index with the same hash
+    // on all three; the get was served by a lease or a heartbeat round, not the log.
     let applied_by = |server: u64| -> Vec<(u64, u64)> {
         events
             .iter()
@@ -163,11 +163,11 @@ fn three_servers_elect_a_leader_and_a_clients_write_is_applied_on_every_server()
             .collect()
     };
     let first = applied_by(1);
-    assert!(first.len() >= 3, "server 1 applied {first:?}");
+    assert!(first.len() >= 2, "server 1 applied {first:?}");
     for server in [2, 3] {
         let other = applied_by(server);
         assert!(
-            other.len() >= first.len().min(3),
+            other.len() >= first.len().min(2),
             "server {server} applied {other:?}"
         );
         for (a, b) in first.iter().zip(other.iter()) {
@@ -242,6 +242,7 @@ fn a_server_whose_store_lost_state_takes_part_in_nothing() {
                     term: 5,
                     last_index: 0,
                     last_term: 0,
+                    transfer: false,
                 },
                 Message::AppendEntries {
                     term: 5,
@@ -249,6 +250,7 @@ fn a_server_whose_store_lost_state_takes_part_in_nothing() {
                     prev_term: 0,
                     entries: Vec::new(),
                     commit: 0,
+                    sent: 0,
                 },
             ] {
                 let frame = Frame {

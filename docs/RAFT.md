@@ -1,7 +1,18 @@
 # RAFT.md — ananke's Raft
 
 _Status: approved 2026-09-05, with the lease section rewritten as approved. Each
-implementation stage turns its part into a DECISIONS.md entry as it lands._
+implementation stage turns its part into a DECISIONS.md entry as it lands: A and B on
+2026-09-05 and 2026-09-06 (D-025, D-026, D-027), C on 2026-09-06 (D-028)._
+
+**A stated assumption.** Raft's safety argument here assumes the disk is honest about
+`fsync`: a sync the disk acknowledged but did not do loses the hard state or the log's
+tail, and that loss is undetectable by construction from the server's own disk, so a
+server that comes back short of what it promised can vote twice in a term or drop a
+committed entry. The sweep runs with `p_durable = 1` for that reason (D-026); bit rot
+and torn writes stay on, and the engine's checksums turn them into a refusal. What can
+be done instead, recovery that knows the protocol and repairs the local log from the
+other replicas, is Alagappan et al., *Protocol-Aware Recovery for Consensus-Based
+Storage* (FAST 2018), issue #23.
 
 Sources of truth, in order: Ongaro and Ousterhout, *In Search of an Understandable
 Consensus Algorithm* (USENIX ATC 2014), cited as the paper; Ongaro, *Consensus: Bridging
@@ -89,6 +100,25 @@ the stale read and the run fails. The sweep runs the drift violation with the gu
 where the invariant must hold on every seed, and with the guard off,
 `Variant::LeaseTrustsTheClock`, where the checker must catch a stale read on some.
 
+As built (D-028): a request carries the leader's clock at its sending, `sent`, and the
+response echoes it and adds the follower's clock, `local`; the offset the guard sees
+is `local − sent`, which includes the one-way delay. The guard takes the fastest
+response of each window of `guard_window` as the window's observation, the way an NTP
+clock filter does, and compares it with the first window's: movement beyond
+`drift_bound` times the time between the two windows revokes, and what jitter the
+fastest response still carries counts as movement. A follower is trusted only from its
+first steady comparison, so a fresh leader serves by read-index for two windows. The
+promise a follower's response makes runs from `sent`: the minimum election timeout
+less one tick, scaled down by the bound, less a tick of margin. The lease is the
+promise, among trusted followers, that a majority with the leader expires latest. The
+promise holds because a follower that has heard from its leader within its minimum
+election timeout ignores a vote request altogether, term and all (thesis §6.4.1): with
+pre-vote, a candidate that reached a real election already has a majority that has not
+heard. A vote request marked as a leadership transfer (thesis §3.10) is the one
+exception, since the leader asked for it: `TimeoutNow` makes the target campaign at
+once without a pre-vote, and the sweep uses it to hand leadership to the server with
+the slowest clock, the only way such a server ever leads.
+
 **Membership changes by joint consensus (thesis §4.3).** A change from C_old to C_new
 is two log entries: `C_old,new` and, once that is committed, `C_new`. While the joint
 entry is in the log, uncommitted or committed, elections and commits need majorities
@@ -122,7 +152,10 @@ the snapshot.
 protocol stream over `[election_timeout_min, 2 × election_timeout_min)`; heartbeats
 every `election_timeout_min / 5`. The simulator's clocks skew and drift per node, so
 nothing compares timestamps from two nodes except the lease guard above, which is
-built to.
+built to. Check quorum runs on the leader's ticks: every minimum election timeout it
+asks whether a majority answered since the last time, and steps down
+(`RaftQuorumLost`) if not, so a leader on the wrong side of a partition stops serving
+within two of them.
 
 ## 2. The five invariants and how the trace checks each
 
@@ -142,6 +175,8 @@ events, all carrying the node and the term:
 | `RaftSnapshot` | a snapshot is taken or installed | `last_index`, `last_term`, `taken` |
 | `RaftRead` | a read is served | `index`, `lease` |
 | `RaftLeaseRevoked` | the guard revoked a lease | `follower`, `offset_moved` |
+| `RaftQuorumLost` | a leader stepped down for want of a majority | `term` |
+| `RaftTransfer` | a leader sent TimeoutNow | `to` |
 | `RaftRecovered` | a server starts on what its store held | `term`, `applied`, `last_index` |
 | `RaftProposed` | a leader made a client's request an entry | `client`, `seq`, `index`, `term` |
 | `RaftRefused` | a server's store lost state and it will not start | `reason` |
@@ -258,8 +293,10 @@ the leader is a `scan` over the index range, which is what the engine's scan exi
 Applying entry `i` is one `WriteBatch` with the command's writes under the user's
 tenant and the applied index in `applied`: the two are durable together, so a crash
 between them cannot exist, and an entry is applied exactly once whatever the crash
-schedule. Until read-index reads arrive (stage C), a get is a command like any other:
-it goes through the log and reads its key at its place in the order. The Raft log is compacted by deleting indices at or below a snapshot's;
+schedule. A get never enters the log: the server hands it to the core as a read, and
+the core answers it by the lease or after a heartbeat round, once the read index is
+applied (§1). A `Transfer` command is an operator's request the server acts on
+directly, never an entry. The Raft log is compacted by deleting indices at or below a snapshot's;
 the engine's compaction reclaims the space in its own time.
 
 The engine is opened with `allow_manifest_fallback` and `allow_head_gap` off, and the
@@ -381,8 +418,8 @@ variant to delete.
 | `CountOlderTermForCommit` | §5.4.2, Figure 8 | commit by current term: a leader's commit landed on an older term's entry; leader completeness on the seeds where that entry is then overwritten | a follower behind by more than a batch when a leader takes over, so the older entries and the leader's own arrive in separate messages: the sweep runs small batches |
 | `TruncateOnEveryAppend` | moirae rule 3 | committed entries stay: a server truncated at or below its own commit index | duplication and reordering (issue #1) |
 | `IndexFirstElectionRestriction` | §5.4.1: compare last terms first | leader completeness | crashes and partitions |
-| `ResetTimerOnAnyRpc` | moirae rule 5 | timers fire: a follower that heard from no leader of its term and granted no vote for three maximum election timeouts did not campaign | a deposed leader whose heartbeats still arrive one-way while the new leader is down: the stale-leader schedule |
-| `LeaseTrustsTheClock` | §1 above: no drift guard | invariant 6, lease safety under drift: the checker reports a stale lease read with no revoke before it | the drift violation |
+| `ResetTimerOnAnyRpc` | moirae rule 5 | timers fire: a follower that heard from no leader of its term and granted no vote for two maximum election timeouts, scaled by its clock's rate, did not campaign | a follower cut off from receiving that pre-votes into the majority every timeout, each request declined, while the leader is down: the stale-sender schedule. Under check quorum a deposed leader's heartbeats stop within a timeout, so this is the stale sender that lasts |
+| `LeaseTrustsTheClock` | §1 above: no drift guard | invariant 6, lease safety under drift: the checker reports a stale lease read with no revoke before it | the lease trial: leadership transferred to the server with the slowest clock, its lease formed, then cut off with a reading client while the fast followers elect and write; and a slow clock severe enough that its lease outlives their timers |
 | `ApplyNotAtomicWithIndex` | §3: the applied index written in a separate batch | state machine safety per node: an entry applied twice after a crash; and `Cas` in the linearizability check | crashes during apply |
 | `SnapshotWithoutCurrentLast` | §1: a snapshot installed from a staging directory without `CURRENT` written last | state machine safety after a crash mid-install: the node comes back on a state that never existed | crashes during install |
 | `SingleMajorityInJointConsensus` | thesis §4.3: commit needs both majorities | election safety or leader completeness during 3 → 5 → 3 under partition | the membership scenario |

@@ -101,7 +101,12 @@ ananke/
 
 _Update this section at the end of every session._
 
-- Phase: 2 in progress (2026-09-05), stages A and B of RAFT.md's order done. A: the
+- Phase: 2 in progress (2026-09-06), stages A, B and C of RAFT.md's order done. C:
+  read-index reads and lease reads with the conservative guard as built, check
+  quorum, the vote rule behind the lease, leadership transfer, the lease trial and the
+  stale-sender schedule in the sweep, and invariant 6 reported per seed (D-028).
+  Before the Phase 2 tag: issue #22, the count rule caught under batching. Before
+  Phase 4: issue #21, client sessions. A: the
   pure core, the codec with the studio decoder, the state under tenant 0 with the
   applied index in the batch and a refusal of any recovery that lost state, the four
   log invariants as folds, the paper's Figures 7 and 8 and moirae's rules as tests
@@ -141,11 +146,9 @@ _Update this section at the end of every session._
      (one laptop disk, 2026-09-05). Met in the shape the flag exists for.
 - Last tag: v0.2.0. `ananke`, `ananke-env` and `ananke-storage` 0.2.0 on crates.io.
   Devlog: `docs/devlog/01-phase-1.md`.
-- Next concrete task: stage C of RAFT.md's order: read-index reads, then lease reads
-  with the conservative drift guard, `Variant::LeaseTrustsTheClock`, and the lease
-  safety invariant under the simulator's drift violation. Check quorum (RAFT.md §1)
-  lands with it, since the lease and the step-down use the same test. Stop for
-  review after each stage.
+- Next concrete task: stage D of RAFT.md's order: joint consensus with learners, the
+  3 → 5 → 3 scenario under partition with a leader on the minority side, and
+  `Variant::SingleMajorityInJointConsensus`. Stop for review after each stage.
 - Fault-model tests follow the CLAUDE.md pattern: a known-buggy variant the sweep
   must catch beside the correct one it must pass (`Journal::sync_dir_on_rotate`,
   `wal::Variant`).

@@ -54,6 +54,10 @@ pub enum Variant {
     /// The election restriction compares last indices before last terms (§5.4.1):
     /// a longer stale log wins.
     IndexFirstElectionRestriction,
+    /// The leader trusts every follower's promise without the drift guard (RAFT.md
+    /// §1): a follower whose clock runs fast times out before the leader thinks
+    /// its lease ends, and a lease read is served stale.
+    LeaseTrustsTheClock,
 }
 
 /// The core's parameters.
@@ -67,6 +71,18 @@ pub struct RaftConfig {
     pub max_batch: usize,
     /// AppendEntries with entries in flight per follower.
     pub max_inflight: usize,
+    /// How long one tick is, in nanoseconds: what the lease's arithmetic on the
+    /// election timeout is measured in. The server ticks the core at this rate.
+    pub tick_nanos: u64,
+    /// The bound on the rate at which two clocks may drift apart, in parts per
+    /// million: what the lease assumes and what the guard watches for (RAFT.md §1).
+    pub drift_bound_ppm: u64,
+    /// How long the guard observes a follower's offset before comparing it, in
+    /// nanoseconds: the window over which the fastest response is taken.
+    pub guard_window_nanos: u64,
+    /// Taken off every lease, in nanoseconds, beyond the drift bound: the timer's
+    /// tick granularity at the follower.
+    pub lease_margin_nanos: u64,
     /// Which core to run.
     pub variant: Variant,
 }
@@ -78,8 +94,25 @@ impl Default for RaftConfig {
             heartbeat_ticks: 2,
             max_batch: 64,
             max_inflight: 8,
+            tick_nanos: 10_000_000,
+            drift_bound_ppm: 1_000,
+            guard_window_nanos: 400_000_000,
+            lease_margin_nanos: 10_000_000,
             variant: Variant::Correct,
         }
+    }
+}
+
+impl RaftConfig {
+    /// How long a follower's promise holds from the moment the acknowledged request
+    /// was sent, by the leader's clock (RAFT.md §1): the minimum election timeout
+    /// less one tick, scaled down by the drift bound, less the margin.
+    #[must_use]
+    pub fn lease_span_nanos(&self) -> u64 {
+        let ticks = self.election_ticks.0.saturating_sub(1);
+        let span = ticks * self.tick_nanos;
+        let scaled = span - span * self.drift_bound_ppm / 1_000_000;
+        scaled.saturating_sub(self.lease_margin_nanos)
     }
 }
 
@@ -116,11 +149,24 @@ pub enum Input {
         from: ServerId,
         /// The message.
         message: Message,
+        /// The server's clock, in nanoseconds, when it arrived.
+        now: u64,
     },
     /// One tick of the server's timer passed.
     Tick,
     /// A client proposes a command.
     Propose(Bytes),
+    /// An operator asks the leader to hand leadership to a follower (thesis
+    /// §3.10): the leader sends it TimeoutNow once its log is caught up.
+    Transfer(ServerId),
+    /// A client asks for a linearizable read (RAFT.md §1), answered with
+    /// [`Output::ReadReady`] once the state to read is applied.
+    Read {
+        /// The server's id for the request.
+        id: u64,
+        /// The server's clock, in nanoseconds, when it arrived.
+        now: u64,
+    },
     /// The server applied every entry through `index`.
     Applied(Index),
 }
@@ -156,13 +202,112 @@ pub enum Output {
         /// The commit index.
         through: Index,
     },
-    /// A proposal was refused because this server is not the leader.
+    /// A proposal or a read was refused because this server is not the leader.
     Rejected {
         /// The leader, if known.
         leader: Option<ServerId>,
     },
+    /// The read `id` may be served from the state machine: every entry through
+    /// `index` is applied, and this server was leader when the read arrived by a
+    /// lease or a heartbeat round since.
+    ReadReady {
+        /// The read.
+        id: u64,
+        /// The read index.
+        index: Index,
+    },
+    /// The read `id` will not be served: this server stopped leading first.
+    ReadDropped {
+        /// The read.
+        id: u64,
+    },
     /// A state transition that matters, for the trace.
     Trace(TraceEvent),
+}
+
+/// The drift guard's view of one follower (RAFT.md §1): the follower's clock
+/// against the leader's, observed through the fastest response of each window,
+/// compared with the first window's.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Guard {
+    /// When the current window opened, by the leader's clock; 0 for none.
+    window_start: u64,
+    /// The smallest offset seen in the window: follower clock less leader send time.
+    window_min: Option<i128>,
+    /// The first window's (midpoint, offset), the base every later window is
+    /// compared with.
+    base: Option<(u64, i128)>,
+    /// Whether the last comparison found the offset steady.
+    trusted: bool,
+}
+
+/// A read waiting for its confirmation and its state (RAFT.md §1).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingRead {
+    id: u64,
+    /// The read index.
+    index: Index,
+    /// When it arrived, by the leader's clock: only acknowledgements of requests
+    /// sent after this confirm it.
+    at: u64,
+    /// Followers whose acknowledgement confirmed it.
+    acks: Vec<ServerId>,
+    /// Confirmed by a lease or by a majority of acknowledgements.
+    confirmed: bool,
+    /// Whether the lease confirmed it.
+    lease: bool,
+}
+
+/// An AppendEntries response with the leader's clock at its arrival.
+struct Ack {
+    success: bool,
+    prev_index: Index,
+    match_index: Index,
+    hint: Index,
+    echo: u64,
+    local: u64,
+    now: u64,
+}
+
+impl Guard {
+    /// Takes one observation: the follower's clock `local` against the leader's
+    /// send time `echo`, at leader time `now`. Every `guard_window_nanos` the
+    /// window's fastest response is compared with the first window's; movement
+    /// beyond the drift bound over the time between them revokes the follower's
+    /// trust, jitter included, and the comparison starts over from here. Returns
+    /// the movement that revoked, if this observation closed a window that did.
+    fn observe(&mut self, config: &RaftConfig, now: u64, echo: u64, local: u64) -> Option<u64> {
+        let offset = i128::from(local) - i128::from(echo);
+        if self.window_start == 0 {
+            self.window_start = now;
+        }
+        self.window_min = Some(self.window_min.map_or(offset, |m| m.min(offset)));
+        if now.saturating_sub(self.window_start) < config.guard_window_nanos {
+            return None;
+        }
+        let mid = self.window_start + (now - self.window_start) / 2;
+        let envelope = self.window_min.take().unwrap_or(offset);
+        self.window_start = now;
+        let mut revoked = None;
+        match self.base {
+            None => {
+                self.base = Some((mid, envelope));
+            }
+            Some((base_at, base_offset)) => {
+                let moved = (envelope - base_offset).unsigned_abs();
+                let elapsed = u128::from(mid.saturating_sub(base_at));
+                let allowed = elapsed * u128::from(config.drift_bound_ppm) / 1_000_000;
+                if moved > allowed {
+                    self.trusted = false;
+                    self.base = Some((mid, envelope));
+                    revoked = Some(u64::try_from(moved).unwrap_or(u64::MAX));
+                } else {
+                    self.trusted = true;
+                }
+            }
+        }
+        revoked
+    }
 }
 
 /// What a leader knows about a follower.
@@ -179,6 +324,13 @@ struct Progress {
     /// ignored; without this, every rejection of a pipeline's other messages would
     /// restart the pipeline, and the leader would flood the follower (D-026).
     probe: Option<Index>,
+    /// The latest `sent` the follower acknowledged: its promise not to vote runs
+    /// from there (RAFT.md §1).
+    promise: Option<u64>,
+    /// Whether the follower answered since the last quorum check.
+    active: bool,
+    /// The drift guard.
+    guard: Guard,
 }
 
 /// One server's protocol state.
@@ -201,6 +353,17 @@ pub struct Raft {
     election_elapsed: u64,
     election_timeout: u64,
     heartbeat_elapsed: u64,
+    /// Ticks since the leader last checked it had heard from a majority.
+    quorum_elapsed: u64,
+    /// The index of the current term's first entry, the no-op, on a leader: a read
+    /// waits for it to commit (thesis §6.4).
+    first_of_term: Index,
+    reads: Vec<PendingRead>,
+    /// The follower a transfer waits to catch up before TimeoutNow is sent.
+    transferee: Option<ServerId>,
+    /// Whether the election under way was asked for by the leader: the vote
+    /// requests say so, and followers that heard from their leader vote anyway.
+    transfer: bool,
     rng: u64,
     /// Outputs of the step under way.
     outputs: Vec<Output>,
@@ -245,6 +408,11 @@ impl Raft {
             election_elapsed: 0,
             election_timeout: 0,
             heartbeat_elapsed: 0,
+            quorum_elapsed: 0,
+            first_of_term: 0,
+            reads: Vec::new(),
+            transferee: None,
+            transfer: false,
             rng: seed | 1,
             outputs: Vec::new(),
             hard_state_changed: false,
@@ -350,10 +518,161 @@ impl Raft {
         match input {
             Input::Tick => self.on_tick(),
             Input::Propose(command) => self.on_propose(command),
-            Input::Applied(index) => self.applied = self.applied.max(index),
-            Input::Message { from, message } => self.on_message(from, message),
+            Input::Transfer(to) => self.on_transfer(to),
+            Input::Read { id, now } => self.on_read(id, now),
+            Input::Applied(index) => {
+                self.applied = self.applied.max(index);
+                self.serve_reads();
+            }
+            Input::Message { from, message, now } => self.on_message(from, message, now),
         }
         self.finish()
+    }
+
+    /// When the lease ends, by this leader's clock: the promise of the majority
+    /// that expires latest, this server counted in. Zero for no lease.
+    #[must_use]
+    pub fn lease_end(&self) -> u64 {
+        let voters = self.voters();
+        let needed = voters.len() / 2 + 1;
+        if needed <= 1 {
+            return u64::MAX;
+        }
+        let trusts_all = self.config.variant == Variant::LeaseTrustsTheClock;
+        let mut promises: Vec<u64> = self
+            .progress
+            .iter()
+            .filter(|(id, p)| voters.contains(id) && (trusts_all || p.guard.trusted))
+            .filter_map(|(_, p)| p.promise)
+            .collect();
+        promises.sort_unstable_by(|a, b| b.cmp(a));
+        promises
+            .get(needed - 2)
+            .map_or(0, |&sent| sent + self.config.lease_span_nanos())
+    }
+
+    /// Whether the lease holds at `now`: a leader that has committed an entry of
+    /// its term, within the promise of a majority.
+    #[must_use]
+    pub fn lease_holds(&self, now: u64) -> bool {
+        self.role == Role::Leader && self.commit >= self.first_of_term && now < self.lease_end()
+    }
+
+    /// A linearizable read (thesis §6.4): served by the lease when it holds, else
+    /// after a heartbeat round acknowledged by a majority; either way not before
+    /// this term's no-op is committed and the read index is applied.
+    fn on_read(&mut self, id: u64, now: u64) {
+        if self.role != Role::Leader {
+            self.outputs.push(Output::Rejected {
+                leader: self.leader,
+            });
+            return;
+        }
+        let index = self.commit.max(self.first_of_term);
+        let lease = self.lease_holds(now);
+        self.reads.push(PendingRead {
+            id,
+            index,
+            at: now,
+            acks: Vec::new(),
+            confirmed: lease,
+            lease,
+        });
+        if lease {
+            self.trace(TraceEvent::RaftRead {
+                server: self.id.0,
+                index,
+                lease: true,
+            });
+            self.serve_reads();
+        } else {
+            // The round: a heartbeat to everyone, sent after the read arrived.
+            self.heartbeat_elapsed = 0;
+            for peer in self.peers() {
+                self.replicate(peer, true);
+            }
+        }
+    }
+
+    /// Confirms reads a majority has acknowledged since they arrived, and emits
+    /// every confirmed read whose index is applied.
+    fn serve_reads(&mut self) {
+        let mut ready = Vec::new();
+        let mut kept = Vec::new();
+        for mut read in std::mem::take(&mut self.reads) {
+            if !read.confirmed {
+                let mut on = read.acks.clone();
+                on.push(self.id);
+                if self.membership.has_majority(&on) && self.commit >= self.first_of_term {
+                    read.confirmed = true;
+                    read.index = read.index.max(self.first_of_term);
+                    self.trace(TraceEvent::RaftRead {
+                        server: self.id.0,
+                        index: read.index,
+                        lease: false,
+                    });
+                }
+            }
+            if read.confirmed && self.applied >= read.index {
+                ready.push(read);
+            } else {
+                kept.push(read);
+            }
+        }
+        self.reads = kept;
+        for read in ready {
+            self.outputs.push(Output::ReadReady {
+                id: read.id,
+                index: read.index,
+            });
+        }
+    }
+
+    /// Leadership transfer (thesis §3.10): the target gets TimeoutNow as soon as its
+    /// log matches the leader's, and starts an election without a pre-vote.
+    fn on_transfer(&mut self, to: ServerId) {
+        if self.role != Role::Leader {
+            self.outputs.push(Output::Rejected {
+                leader: self.leader,
+            });
+            return;
+        }
+        if to == self.id || !self.progress.contains_key(&to) {
+            return;
+        }
+        let caught_up = self.progress[&to].matched == self.last_index();
+        if caught_up {
+            self.send_timeout_now(to);
+        } else {
+            self.transferee = Some(to);
+            self.replicate(to, false);
+        }
+    }
+
+    fn send_timeout_now(&mut self, to: ServerId) {
+        self.transferee = None;
+        self.trace(TraceEvent::RaftTransfer {
+            server: self.id.0,
+            to: to.0,
+        });
+        self.send(to, Message::TimeoutNow { term: self.term });
+    }
+
+    /// The leader asked this server to take over: an election now, no pre-vote,
+    /// with vote requests marked as the leader's wish.
+    fn on_timeout_now(&mut self, from: ServerId) {
+        if self.role == Role::Leader || self.leader != Some(from) {
+            return;
+        }
+        self.transfer = true;
+        self.become_candidate();
+    }
+
+    /// Drops every pending read: this server stopped leading.
+    fn drop_reads(&mut self) {
+        for read in std::mem::take(&mut self.reads) {
+            self.outputs.push(Output::ReadDropped { id: read.id });
+        }
     }
 
     /// Orders the step's outputs: the persist first, then the rest as they came.
@@ -418,6 +737,9 @@ impl Raft {
         self.leader = leader;
         self.granted.clear();
         self.progress.clear();
+        self.transferee = None;
+        self.transfer = false;
+        self.drop_reads();
         self.set_role(Role::Follower);
     }
 
@@ -441,6 +763,30 @@ impl Raft {
                     self.heartbeat_elapsed = 0;
                     for peer in self.peers() {
                         self.replicate(peer, true);
+                    }
+                }
+                // Check quorum (RAFT.md §1): a leader that heard from no majority
+                // within the minimum election timeout has lost its followers to
+                // another leader or a partition, and stops serving.
+                self.quorum_elapsed += 1;
+                if self.quorum_elapsed >= self.config.election_ticks.0 {
+                    self.quorum_elapsed = 0;
+                    let mut heard: Vec<ServerId> = self
+                        .progress
+                        .iter()
+                        .filter(|(_, p)| p.active)
+                        .map(|(&s, _)| s)
+                        .collect();
+                    heard.push(self.id);
+                    for progress in self.progress.values_mut() {
+                        progress.active = false;
+                    }
+                    if !self.membership.has_majority(&heard) {
+                        self.trace(TraceEvent::RaftQuorumLost {
+                            server: self.id.0,
+                            term: self.term,
+                        });
+                        self.become_follower(self.term, None);
                     }
                 }
             }
@@ -495,6 +841,7 @@ impl Raft {
             term: self.term,
             last_index: self.last_index(),
             last_term: self.last_term(),
+            transfer: self.transfer,
         };
         for peer in self.peers() {
             self.send(peer, message.clone());
@@ -506,9 +853,13 @@ impl Raft {
     fn become_leader(&mut self) {
         self.leader = Some(self.id);
         self.heartbeat_elapsed = 0;
+        self.quorum_elapsed = 0;
         self.granted.clear();
+        self.transfer = false;
+        self.transferee = None;
         self.set_role(Role::Leader);
         let last = self.last_index();
+        self.first_of_term = last + 1;
         self.progress = self
             .peers()
             .into_iter()
@@ -520,6 +871,9 @@ impl Raft {
                         matched: 0,
                         inflight: VecDeque::new(),
                         probe: None,
+                        promise: None,
+                        active: false,
+                        guard: Guard::default(),
                     },
                 )
             })
@@ -613,6 +967,7 @@ impl Raft {
                 prev_term: self.term_at(next - 1).unwrap_or(0),
                 entries,
                 commit,
+                sent: 0,
             });
             inflight.push_back(end);
             next = end + 1;
@@ -624,6 +979,7 @@ impl Raft {
                 prev_term: self.term_at(next - 1).unwrap_or(0),
                 entries: Vec::new(),
                 commit,
+                sent: 0,
             });
         }
         if let Some(progress) = self.progress.get_mut(&to) {
@@ -653,11 +1009,40 @@ impl Raft {
         }
     }
 
-    fn on_message(&mut self, from: ServerId, message: Message) {
+    /// Whether this server has heard from a leader within its minimum election
+    /// timeout, or is one: the test behind pre-votes, the promise behind leases,
+    /// and the vote rule below (RAFT.md §1).
+    fn heard_from_leader(&self) -> bool {
+        self.role == Role::Leader
+            || (self.leader.is_some() && self.election_elapsed < self.config.election_ticks.0)
+    }
+
+    fn on_message(&mut self, from: ServerId, message: Message, now: u64) {
         if self.config.variant == Variant::ResetTimerOnAnyRpc {
             self.election_elapsed = 0;
         }
         let term = message.term();
+        // A vote request while this server has heard from its leader is ignored,
+        // term and all (RAFT.md §1, thesis §6.4.1): it promised its leader as much,
+        // which is what a lease read rests on, and with pre-vote a candidate that
+        // reached a real election already has a majority that has not heard.
+        if matches!(
+            message,
+            Message::RequestVote {
+                transfer: false,
+                ..
+            }
+        ) && self.heard_from_leader()
+        {
+            self.trace(TraceEvent::RaftVote {
+                server: self.id.0,
+                term,
+                candidate: from.0,
+                granted: false,
+                pre: false,
+            });
+            return;
+        }
         // The term rule first (moirae rule 1), except for pre-votes, which carry a
         // term nobody has started, and their responses.
         match &message {
@@ -679,7 +1064,9 @@ impl Raft {
                                 },
                             );
                         }
-                        Message::AppendEntries { prev_index, .. } => {
+                        Message::AppendEntries {
+                            prev_index, sent, ..
+                        } => {
                             self.send(
                                 from,
                                 Message::AppendEntriesResponse {
@@ -688,6 +1075,8 @@ impl Raft {
                                     prev_index,
                                     match_index: 0,
                                     hint: 0,
+                                    echo: sent,
+                                    local: 0,
                                 },
                             );
                         }
@@ -711,6 +1100,7 @@ impl Raft {
                 last_term,
                 ..
             } => self.on_request_vote(from, last_index, last_term),
+            Message::TimeoutNow { .. } => self.on_timeout_now(from),
             Message::RequestVoteResponse { granted, .. } => {
                 self.on_request_vote_response(from, granted)
             }
@@ -719,15 +1109,29 @@ impl Raft {
                 prev_term,
                 entries,
                 commit,
+                sent,
                 ..
-            } => self.on_append_entries(from, prev_index, prev_term, entries, commit),
+            } => self.on_append_entries(from, prev_index, prev_term, entries, commit, sent),
             Message::AppendEntriesResponse {
                 success,
                 prev_index,
                 match_index,
                 hint,
+                echo,
+                local,
                 ..
-            } => self.on_append_entries_response(from, success, prev_index, match_index, hint),
+            } => self.on_append_entries_response(
+                from,
+                Ack {
+                    success,
+                    prev_index,
+                    match_index,
+                    hint,
+                    echo,
+                    local,
+                    now,
+                },
+            ),
         }
     }
 
@@ -735,10 +1139,9 @@ impl Raft {
     /// its minimum election timeout and whose log the candidate's is at least as up
     /// to date as; it changes nothing here.
     fn on_pre_vote(&mut self, from: ServerId, term: Term, last_index: Index, last_term: Term) {
-        let heard_from_leader = self.role == Role::Leader
-            || (self.leader.is_some() && self.election_elapsed < self.config.election_ticks.0);
-        let granted =
-            term > self.term && !heard_from_leader && self.log_up_to_date(last_index, last_term);
+        let granted = term > self.term
+            && !self.heard_from_leader()
+            && self.log_up_to_date(last_index, last_term);
         self.trace(TraceEvent::RaftVote {
             server: self.id.0,
             term,
@@ -829,6 +1232,7 @@ impl Raft {
         prev_term: Term,
         entries: Vec<Entry>,
         leader_commit: Index,
+        sent: u64,
     ) {
         if self.role == Role::Leader {
             // Two leaders of one term cannot exist; a message saying so is ignored.
@@ -863,6 +1267,8 @@ impl Raft {
                     prev_index,
                     match_index: 0,
                     hint,
+                    echo: sent,
+                    local: 0,
                 },
             );
             return;
@@ -909,6 +1315,8 @@ impl Raft {
                 prev_index,
                 match_index: matched,
                 hint: 0,
+                echo: sent,
+                local: 0,
             },
         );
     }
@@ -918,16 +1326,40 @@ impl Raft {
     /// time. While probing, only a rejection of the outstanding probe counts: the
     /// pipeline's other messages are rejected too, each carrying an older
     /// `prev_index`, and acting on each would restart the probe as many times.
-    fn on_append_entries_response(
-        &mut self,
-        from: ServerId,
-        success: bool,
-        prev_index: Index,
-        match_index: Index,
-        hint: Index,
-    ) {
+    fn on_append_entries_response(&mut self, from: ServerId, ack: Ack) {
         if self.role != Role::Leader {
             return;
+        }
+        let Ack {
+            success,
+            prev_index,
+            match_index,
+            hint,
+            echo,
+            local,
+            now,
+        } = ack;
+        let Some(progress) = self.progress.get_mut(&from) else {
+            return;
+        };
+        // Any answer in this term is a sign of life for check quorum and a promise
+        // for the lease, whether the entries fit or not: the follower reset its
+        // timer on the request either way (moirae rule 5).
+        progress.active = true;
+        progress.promise = progress.promise.max(Some(echo));
+        if let Some(moved) = progress.guard.observe(&self.config, now, echo, local) {
+            self.trace(TraceEvent::RaftLeaseRevoked {
+                server: self.id.0,
+                follower: from.0,
+                offset_moved: moved,
+            });
+        }
+        // A read-index round: an acknowledgement of a request sent after the read
+        // arrived says this server was still leader then.
+        for read in &mut self.reads {
+            if !read.confirmed && echo >= read.at && !read.acks.contains(&from) {
+                read.acks.push(from);
+            }
         }
         let Some(progress) = self.progress.get_mut(&from) else {
             return;
@@ -944,7 +1376,12 @@ impl Raft {
             }
             progress.next = progress.next.max(progress.matched + 1);
             progress.probe = None;
+            let caught_up = progress.matched == self.last_index();
             self.maybe_commit();
+            self.serve_reads();
+            if self.transferee == Some(from) && caught_up {
+                self.send_timeout_now(from);
+            }
         } else {
             if progress.probe.is_some_and(|probe| probe != prev_index) {
                 return;

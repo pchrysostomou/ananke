@@ -36,7 +36,9 @@ pub enum Message {
         /// Whether the sender would vote.
         granted: bool,
     },
-    /// Figure 2's RequestVote.
+    /// Figure 2's RequestVote. With `transfer` set the leader asked for this
+    /// election (thesis §3.10), and a follower that has heard from its leader votes
+    /// anyway.
     RequestVote {
         /// The candidate's term.
         term: Term,
@@ -44,6 +46,8 @@ pub enum Message {
         last_index: Index,
         /// The candidate's last log term.
         last_term: Term,
+        /// Whether the leader asked for this election.
+        transfer: bool,
     },
     /// The answer to a vote request.
     RequestVoteResponse {
@@ -64,6 +68,11 @@ pub enum Message {
         entries: Vec<Entry>,
         /// The leader's commit index.
         commit: Index,
+        /// The leader's clock when it sent this, in nanoseconds, opaque to the
+        /// follower and echoed back in the response: what a lease is measured
+        /// from, and what tells a read-index round which acknowledgements came
+        /// after the read (RAFT.md §1). The server stamps it on the way out.
+        sent: u64,
     },
     /// The answer to AppendEntries. `prev_index` is the request's, so the leader
     /// can tell a rejection of its outstanding probe from a stale one; `match_index`
@@ -81,6 +90,17 @@ pub enum Message {
         match_index: Index,
         /// See above.
         hint: Index,
+        /// The request's `sent`, echoed.
+        echo: u64,
+        /// The follower's clock when it answered, in nanoseconds, for the leader's
+        /// drift guard (RAFT.md §1). The server stamps it on the way out.
+        local: u64,
+    },
+    /// The leader asks the receiver to start an election at once, without a
+    /// pre-vote (thesis §3.10, leadership transfer).
+    TimeoutNow {
+        /// The leader's term.
+        term: Term,
     },
 }
 
@@ -94,7 +114,8 @@ impl Message {
             | Message::RequestVote { term, .. }
             | Message::RequestVoteResponse { term, .. }
             | Message::AppendEntries { term, .. }
-            | Message::AppendEntriesResponse { term, .. } => *term,
+            | Message::AppendEntriesResponse { term, .. }
+            | Message::TimeoutNow { term } => *term,
         }
     }
 
@@ -108,6 +129,7 @@ impl Message {
             Message::RequestVoteResponse { .. } => "request-vote-response",
             Message::AppendEntries { .. } => "append-entries",
             Message::AppendEntriesResponse { .. } => "append-entries-response",
+            Message::TimeoutNow { .. } => "timeout-now",
         }
     }
 
@@ -119,6 +141,7 @@ impl Message {
             Message::RequestVoteResponse { .. } => 4,
             Message::AppendEntries { .. } => 5,
             Message::AppendEntriesResponse { .. } => 6,
+            Message::TimeoutNow { .. } => 7,
         }
     }
 }
@@ -261,15 +284,21 @@ impl Frame {
                 last_index,
                 last_term,
                 ..
-            }
-            | Message::RequestVote {
-                last_index,
-                last_term,
-                ..
             } => {
                 out.put_u64_le(*last_index);
                 out.put_u64_le(*last_term);
             }
+            Message::RequestVote {
+                last_index,
+                last_term,
+                transfer,
+                ..
+            } => {
+                out.put_u64_le(*last_index);
+                out.put_u64_le(*last_term);
+                out.put_u8(u8::from(*transfer));
+            }
+            Message::TimeoutNow { .. } => {}
             Message::PreVoteResponse { granted, .. }
             | Message::RequestVoteResponse { granted, .. } => {
                 out.put_u8(u8::from(*granted));
@@ -279,11 +308,13 @@ impl Frame {
                 prev_term,
                 entries,
                 commit,
+                sent,
                 ..
             } => {
                 out.put_u64_le(*prev_index);
                 out.put_u64_le(*prev_term);
                 out.put_u64_le(*commit);
+                out.put_u64_le(*sent);
                 put_entries(&mut out, entries);
             }
             Message::AppendEntriesResponse {
@@ -291,12 +322,16 @@ impl Frame {
                 prev_index,
                 match_index,
                 hint,
+                echo,
+                local,
                 ..
             } => {
                 out.put_u8(u8::from(*success));
                 out.put_u64_le(*prev_index);
                 out.put_u64_le(*match_index);
                 out.put_u64_le(*hint);
+                out.put_u64_le(*echo);
+                out.put_u64_le(*local);
             }
         }
         out.freeze()
@@ -331,13 +366,23 @@ impl Frame {
                         last_term,
                     }
                 } else {
+                    if bytes.is_empty() {
+                        return Err(bad("frame torn"));
+                    }
+                    let transfer = match bytes.get_u8() {
+                        0 => false,
+                        1 => true,
+                        _ => return Err(bad("frame malformed")),
+                    };
                     Message::RequestVote {
                         term,
                         last_index,
                         last_term,
+                        transfer,
                     }
                 }
             }
+            7 => Message::TimeoutNow { term },
             2 | 4 => {
                 if bytes.is_empty() {
                     return Err(bad("frame torn"));
@@ -357,6 +402,7 @@ impl Frame {
                 let prev_index = u64_field(&mut bytes)?;
                 let prev_term = u64_field(&mut bytes)?;
                 let commit = u64_field(&mut bytes)?;
+                let sent = u64_field(&mut bytes)?;
                 let entries = get_entries(&mut bytes)?;
                 Message::AppendEntries {
                     term,
@@ -364,6 +410,7 @@ impl Frame {
                     prev_term,
                     entries,
                     commit,
+                    sent,
                 }
             }
             6 => {
@@ -378,12 +425,16 @@ impl Frame {
                 let prev_index = u64_field(&mut bytes)?;
                 let match_index = u64_field(&mut bytes)?;
                 let hint = u64_field(&mut bytes)?;
+                let echo = u64_field(&mut bytes)?;
+                let local = u64_field(&mut bytes)?;
                 Message::AppendEntriesResponse {
                     term,
                     success,
                     prev_index,
                     match_index,
                     hint,
+                    echo,
+                    local,
                 }
             }
             _ => return Err(bad("unknown message kind")),
@@ -424,15 +475,21 @@ pub fn studio(payload: &[u8]) -> Json {
             last_index,
             last_term,
             ..
-        }
-        | Message::RequestVote {
-            last_index,
-            last_term,
-            ..
         } => {
             fields.push(("lastIndex", int(*last_index)));
             fields.push(("lastTerm", int(*last_term)));
         }
+        Message::RequestVote {
+            last_index,
+            last_term,
+            transfer,
+            ..
+        } => {
+            fields.push(("lastIndex", int(*last_index)));
+            fields.push(("lastTerm", int(*last_term)));
+            fields.push(("transfer", Json::Bool(*transfer)));
+        }
+        Message::TimeoutNow { .. } => {}
         Message::PreVoteResponse { granted, .. } | Message::RequestVoteResponse { granted, .. } => {
             fields.push(("granted", Json::Bool(*granted)));
         }
@@ -485,7 +542,9 @@ mod tests {
                 term: 3,
                 last_index: 7,
                 last_term: 2,
+                transfer: true,
             },
+            Message::TimeoutNow { term: 3 },
             Message::RequestVoteResponse {
                 term: 3,
                 granted: false,
@@ -516,6 +575,7 @@ mod tests {
                     },
                 ],
                 commit: 6,
+                sent: 123_456_789,
             },
             Message::AppendEntriesResponse {
                 term: 3,
@@ -523,6 +583,8 @@ mod tests {
                 prev_index: 9,
                 match_index: 7,
                 hint: 5,
+                echo: 123_456_789,
+                local: 987_654_321,
             },
         ]
     }
@@ -564,7 +626,10 @@ mod tests {
     fn the_studio_sees_the_kind_the_term_and_the_range() {
         let frame = Frame {
             from: ServerId(2),
-            message: every_kind().remove(4),
+            message: every_kind()
+                .into_iter()
+                .find(|m| matches!(m, Message::AppendEntries { .. }))
+                .expect("an AppendEntries"),
         };
         let json = studio(&frame.encode());
         let Json::Object(fields) = json else {
