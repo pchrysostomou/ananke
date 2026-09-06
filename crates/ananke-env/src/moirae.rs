@@ -30,6 +30,7 @@
 //! | `OrphanRemoved` / `WalSegmentDeleted`    | `log` `ananke.fs.orphan-removed` / `ananke.wal.segment-deleted` |
 //! | `RaftTerm` / `RaftVote` / `RaftLeader` / `RaftAppend` / `RaftTruncate` / `RaftCommit` / `RaftApply` | `log` `ananke.raft.term` / `.vote` / `.leader` / `.append` / `.truncate` / `.commit` / `.apply` |
 //! | `RaftRecovered` / `RaftProposed` / `RaftRefused` / `RaftServerFailed` / `RaftInboxDropped` | `log` `ananke.raft.recovered` / `.proposed` / `.refused` / `.failed` / `.inbox-dropped` |
+//! | `RaftRead` / `RaftLeaseRevoked` / `RaftQuorumLost` / `RaftTransfer` | `log` `ananke.raft.read` / `.lease-revoked` / `.quorum-lost` / `.transfer` |
 //! | `ClientInvoke` / `ClientReturn`          | `log` `ananke.client.invoke` / `.return`      |
 //! | `TimeAdvanced`                           | nothing: every line carries `t`               |
 //!
@@ -625,6 +626,41 @@ fn convert(
                 ("index", int(*index)),
                 ("entryTerm", int(*entry_term)),
                 ("hash", int(*hash)),
+            ])),
+        ),
+        TraceEvent::RaftRead {
+            server,
+            index,
+            lease,
+        } => log(
+            "ananke.raft.read",
+            Some(Json::obj(vec![
+                ("server", int(*server)),
+                ("index", int(*index)),
+                ("lease", Json::Bool(*lease)),
+            ])),
+        ),
+        TraceEvent::RaftLeaseRevoked {
+            server,
+            follower,
+            offset_moved,
+        } => log(
+            "ananke.raft.lease-revoked",
+            Some(Json::obj(vec![
+                ("server", int(*server)),
+                ("follower", int(*follower)),
+                ("offsetMovedNs", int(*offset_moved)),
+            ])),
+        ),
+        TraceEvent::RaftTransfer { server, to } => log(
+            "ananke.raft.transfer",
+            Some(Json::obj(vec![("server", int(*server)), ("to", int(*to))])),
+        ),
+        TraceEvent::RaftQuorumLost { server, term } => log(
+            "ananke.raft.quorum-lost",
+            Some(Json::obj(vec![
+                ("server", int(*server)),
+                ("term", int(*term)),
             ])),
         ),
         TraceEvent::RaftRecovered {

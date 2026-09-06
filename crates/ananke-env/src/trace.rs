@@ -390,6 +390,41 @@ pub enum TraceEvent {
         /// The hash of the entry's payload.
         hash: u64,
     },
+    /// A Raft leader served a linearizable read (RAFT.md §1): at `index`, by its
+    /// lease or after a read-index round.
+    RaftRead {
+        /// The server.
+        server: u64,
+        /// The read index.
+        index: u64,
+        /// Whether the lease served it, rather than a heartbeat round.
+        lease: bool,
+    },
+    /// A Raft leader's drift guard stopped trusting a follower's promise (RAFT.md
+    /// §1): the follower's clock moved against the leader's by more than the bound.
+    RaftLeaseRevoked {
+        /// The leader.
+        server: u64,
+        /// The follower.
+        follower: u64,
+        /// How far the offset moved, in nanoseconds.
+        offset_moved: u64,
+    },
+    /// A Raft leader asked a follower to take over (thesis §3.10): it sent TimeoutNow.
+    RaftTransfer {
+        /// The leader.
+        server: u64,
+        /// The follower asked to lead.
+        to: u64,
+    },
+    /// A Raft leader stepped down for want of a majority within an election timeout
+    /// (check quorum, RAFT.md §1).
+    RaftQuorumLost {
+        /// The server.
+        server: u64,
+        /// The term it led.
+        term: u64,
+    },
     /// A Raft server started on what its store held: the term, the applied index
     /// and the last log index it resumes from. An apply durable at a crash but not
     /// yet traced shows here as the applied index being past the last `RaftApply`.
