@@ -41,6 +41,20 @@
 //! a coin toss of the fault geometry; two per seed keep the variant's catch rate
 //! from being one window's statistical noise.
 //!
+//! One fault is a driver rather than an outage: [`Fault::FigureEight`] opens the
+//! §5.4.2 window at the default batch size (issue #22, D-031). A follower a new
+//! leader must catch up in more than one AppendEntries only exists behind a
+//! backlog of more than `max_batch` uncommitted entries, which client-paced
+//! traffic never builds: the driver isolates a follower with a client, fires a
+//! burst of puts at the leader without awaiting replies, crashes the leader with
+//! the burst appended, and steers it back into the lead — a restart resets the
+//! commit index, the third server's sends are blocked so only the restarted
+//! leader can assemble a majority, and the isolated follower votes it in. The new
+//! leader re-sends its backlog in batches, and one that counts older-term
+//! replicas for commit (`Variant::CountOlderTermForCommit`) advances its commit
+//! index onto an older term's entry at the first acknowledgement below its no-op,
+//! which the commit-by-current-term fold reports.
+//!
 //! Every fault-model test runs a known-buggy variant beside the correct one
 //! (CLAUDE.md): each [`Variant`] of RAFT.md §5 that this stage ships must be caught
 //! by one of these checks on some seed, and the correct server must pass every seed.
@@ -144,6 +158,13 @@ pub fn admin_addr(n: u64) -> SocketAddr {
     SocketAddr::from(([10, 0, 2, u8::try_from(n).expect("small")], 7000))
 }
 
+/// The burst client's address for the schedule's `n`th Figure 8 driver (1-based):
+/// its own socket per driver, like the operator's per request.
+#[must_use]
+pub fn burst_addr(n: u64) -> SocketAddr {
+    SocketAddr::from(([10, 0, 3, u8::try_from(n).expect("small")], 7000))
+}
+
 /// The server bound to `addr`, if it is a server's.
 #[must_use]
 pub fn server_of(addr: SocketAddr) -> Option<u64> {
@@ -213,6 +234,39 @@ pub enum Fault {
         /// How long it stays down.
         down: Duration,
     },
+    /// The Figure 8 driver (issue #22, D-031): the §5.4.2 window at the default
+    /// batch size, which needs a new leader re-sending more uncommitted older-term
+    /// entries than one AppendEntries carries. `follower` is isolated with
+    /// `client` while the majority commits; a burst of puts is fired at the
+    /// leader without awaiting replies, so its log runs far ahead of the isolated
+    /// follower; the leader crashes with the burst appended and restarts with its
+    /// commit index reset, since the commit index is not persisted; the third
+    /// server's sends are blocked so neither it nor the isolated follower can
+    /// assemble a majority, and the restarted leader, holding the longest log,
+    /// campaigns and wins with the isolated follower's vote. It then re-sends its
+    /// backlog in batches of `max_batch`, and a leader that counts older-term
+    /// replicas for commit advances onto an older term's entry at the first
+    /// acknowledgement below its no-op, which commit-by-current-term reports.
+    FigureEight {
+        /// The follower cut off with `client`; the leader's neighbour if it leads.
+        follower: u64,
+        /// The client on its side (1-based).
+        client: u64,
+        /// How long the isolation runs before the burst: the majority commits
+        /// ahead of the isolated follower.
+        settle: Duration,
+        /// How many puts the burst fires: drawn so the appended backlog exceeds
+        /// `max_batch` with margin.
+        burst: u64,
+        /// How long after the burst starts the leader crashes: time to append
+        /// most of it, one synced batch per entry.
+        crash_after: Duration,
+        /// How long the crashed leader stays down.
+        down: Duration,
+        /// How long the third server's sends stay blocked past the restart: time
+        /// for the old leader to campaign and re-send its backlog.
+        steer: Duration,
+    },
 }
 
 /// One lease trial; two open every schedule, see the module documentation.
@@ -231,6 +285,14 @@ const TRANSFER_WAIT: Duration = Duration::from_millis(300);
 const TRIAL_GAP: Duration = Duration::from_millis(500);
 /// The operator's client process in the trace.
 const ADMIN: u64 = 99 << 32;
+/// The base of the burst clients' process ids in the trace: the schedule's `n`th
+/// Figure 8 driver writes as process `BURST | n`, distinct per driver so two
+/// bursts' sequence numbers never collide in the history.
+const BURST: u64 = 98 << 32;
+/// The key the bursts write, outside the clients' [`KEYS`]: nothing ever reads
+/// it, so the checker's per-key search sees only puts that always apply and the
+/// hundred-odd pending operations a burst leaves cost it nothing.
+const BURST_KEY: &[u8] = b"burst";
 
 /// The fault schedule of one run, in global virtual time.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -264,8 +326,14 @@ impl Schedule {
         let count = 3 + rng.below(4);
         let mut faults = Vec::new();
         let mut gaps = Vec::new();
+        // The Figure 8 driver draws from its own stream, so its parameters can be
+        // tuned without re-drawing every schedule's other faults, clocks and
+        // trials; and it takes two slots of eight, since its window needs the
+        // burst, the crash and the steering to line up and a rarer draw would be
+        // seen lining up on too few seeds to report a rate.
+        let mut f8 = moirae_sched::stream(seed, "figure8");
         for _ in 0..count {
-            let fault = match rng.below(6) {
+            let fault = match rng.below(8) {
                 0 => Fault::Isolate {
                     server: 1 + rng.below(SERVERS),
                     client: 1 + rng.below(CLIENTS),
@@ -290,11 +358,20 @@ impl Schedule {
                 4 => Fault::CrashLeader {
                     down: ms(&mut rng, 50, 400),
                 },
-                _ => Fault::StaleSender {
+                5 => Fault::StaleSender {
                     server: 1 + rng.below(SERVERS),
                     one_way: ms(&mut rng, 900, 1300),
                     crash_after: ms(&mut rng, 200, 400),
                     down: ms(&mut rng, 300, 500),
+                },
+                _ => Fault::FigureEight {
+                    follower: 1 + f8.below(SERVERS),
+                    client: 1 + f8.below(CLIENTS),
+                    settle: ms(&mut f8, 300, 600),
+                    burst: 112 + f8.below(65),
+                    crash_after: ms(&mut f8, 450, 750),
+                    down: ms(&mut f8, 150, 350),
+                    steer: ms(&mut f8, 600, 1000),
                 },
             };
             faults.push(fault);
@@ -397,6 +474,13 @@ impl Schedule {
                 | Fault::OneWay { for_, .. } => *for_,
                 Fault::Crash { down, .. } | Fault::CrashLeader { down } => *down,
                 Fault::StaleSender { one_way, .. } => *one_way,
+                Fault::FigureEight {
+                    settle,
+                    crash_after,
+                    down,
+                    steer,
+                    ..
+                } => *settle + *crash_after + *down + *steer,
             })
             .sum();
         let trials: Duration = self
@@ -484,6 +568,14 @@ impl Report {
     #[must_use]
     pub fn quorum_losses(&self) -> usize {
         self.count(|e| matches!(e, TraceEvent::RaftQuorumLost { .. }))
+    }
+
+    /// Puts the Figure 8 drivers' bursts invoked on this run.
+    #[must_use]
+    pub fn burst_puts(&self) -> usize {
+        self.count(
+            |e| matches!(e, TraceEvent::ClientInvoke { client, .. } if client >> 32 == BURST >> 32),
+        )
     }
 }
 
@@ -733,15 +825,17 @@ pub fn node_config(id: u64, variant: Variant) -> NodeConfig {
         servers: (1..=SERVERS)
             .map(|s| (ServerId(s), server_addr(s)))
             .collect(),
-        // One entry per message: a follower behind by any number of entries is
-        // caught up one message at a time, so the pipeline is exercised and a new
-        // leader's own no-op reaches a follower in a message of its own, after the
-        // older entries it re-sent. That is the Figure 8 window, a few milliseconds
-        // wide, and with batching it closes whenever the older entries fit in the
-        // no-op's batch (D-026, issue #22 for a batched sweep).
+        // The default batch size: a follower behind by up to `max_batch` entries
+        // is caught up in one message, so under client-paced traffic a new
+        // leader's own no-op rides with the older entries it re-sends and the
+        // Figure 8 window never opens. [`Fault::FigureEight`] opens it
+        // deliberately: a burst leaves a restarted leader re-sending a backlog of
+        // more entries than one message carries, and the window is every
+        // acknowledgement below its no-op (D-031, issue #22). D-026's sweep ran
+        // one entry per message instead, so the window opened on ordinary
+        // catch-ups and the batched paths went unexercised.
         raft: RaftConfig {
             variant,
-            max_batch: 1,
             tick_nanos: u64::try_from(TICK.as_nanos()).expect("small"),
             drift_bound_ppm: DRIFT_BOUND_PPM,
             ..RaftConfig::default()
@@ -952,6 +1046,44 @@ async fn client<E: Environment>(env: E, n: u64, stats: SharedStats) {
     }
 }
 
+/// The Figure 8 driver's burst: `count` puts on [`BURST_KEY`] fired at server
+/// `target` without awaiting replies, as the schedule's `n`th driver. Every
+/// operation is invoked in the trace and abandoned; the checker closes each at
+/// its entry's apply, with a result no client saw, or leaves it pending
+/// (RAFT.md §4). The ones the doomed leader appends are the backlog the driver
+/// needs; a reply, had anyone read one, would arrive only after the entry
+/// applied, so never for the entries the crash cuts off.
+async fn burst<E: Environment>(env: E, n: u64, target: u64, count: u64) {
+    let Ok(sock) = env.net().bind(burst_addr(n)).await else {
+        return;
+    };
+    let process = BURST | n;
+    for seq in 0..count {
+        let key = Bytes::from_static(BURST_KEY);
+        let value = Bytes::from(format!("b{n}.{seq}"));
+        env.trace(TraceEvent::ClientInvoke {
+            client: process,
+            seq,
+            op: ClientOp::Put {
+                key: key.clone(),
+                value: value.clone(),
+            },
+        });
+        let request = Request {
+            client: process,
+            seq,
+            command: Command::Put { key, value },
+        };
+        if sock
+            .send(server_addr(target), request.encode())
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
+}
+
 /// Runs the scenario for `seed` with the schedule drawn from it.
 #[must_use]
 pub fn run(seed: u64, variant: Variant) -> Report {
@@ -1035,6 +1167,7 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
         last_heal = sim.now();
         advance(&mut sim, TRIAL_GAP, &mut watch);
     }
+    let mut figure8s = 0u64;
     for (fault, gap) in schedule.faults.iter().zip(schedule.gaps.iter()) {
         if watch.stopped.is_some() {
             break;
@@ -1106,6 +1239,54 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
                 if *one_way > spent {
                     advance(&mut sim, *one_way - spent, &mut watch);
                 }
+                sim.heal();
+            }
+            Fault::FigureEight {
+                follower,
+                client,
+                settle,
+                burst: count,
+                crash_after,
+                down,
+                steer,
+            } => {
+                let leader = leader_now(&sim);
+                let behind = if *follower == leader {
+                    follower % SERVERS + 1
+                } else {
+                    *follower
+                };
+                let (side, rest) = all_but(behind, *client);
+                let from = sim.now();
+                sim.partition(&side, &rest);
+                advance(&mut sim, *settle, &mut watch);
+                // The burst lands on whoever leads the majority side now; the
+                // third server is the one kept mute after the crash.
+                let leader = leader_now(&sim);
+                let mute = (1..=SERVERS)
+                    .find(|&s| s != leader && s != behind)
+                    .expect("three servers");
+                figure8s += 1;
+                let env = sim.env(admin);
+                let inner = env.clone();
+                let (n, target, puts) = (figure8s, leader, *count);
+                env.spawn("burst", async move {
+                    burst(inner, n, target, puts).await;
+                });
+                advance(&mut sim, *crash_after, &mut watch);
+                sim.crash(node_of_server(leader));
+                sim.heal();
+                isolations.push((behind, from, sim.now()));
+                // The steering: with the mute server's sends blocked, it cannot
+                // answer and the isolated follower, whose log is the shortest,
+                // cannot be voted in; the restarted leader campaigns, the
+                // isolated follower grants, and the backlog is re-sent to it in
+                // batches.
+                sim.block(node_of_server(mute), node_of_server(leader));
+                sim.block(node_of_server(mute), node_of_server(behind));
+                advance(&mut sim, *down, &mut watch);
+                restart(&mut sim, leader);
+                advance(&mut sim, *steer, &mut watch);
                 sim.heal();
             }
         }

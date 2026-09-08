@@ -1032,4 +1032,98 @@ it.
 
 ---
 
+## D-031 — The Figure 8 driver and the batched sweep
+
+**Context.** Issue #22. The sweep ran one entry per AppendEntries (D-026) because
+`Variant::CountOlderTermForCommit` (§5.4.2, Figure 8) was never caught at the
+default batch size: `become_leader` appends the term's no-op before its first
+replicate, so whenever a follower is behind by no more than a batch the no-op
+rides in the same message as the older entries the new leader re-sends, the
+follower matches both at once, and the count rule never sees an older-term entry
+acknowledged without one of the leader's own above it. The window needs a new
+leader holding a backlog of uncommitted older-term entries longer than
+`max_batch`, and a follower that lacks them.
+
+**Decision.** The sweep runs the default batch size, and one fault of the
+schedule is a driver rather than an outage. `Fault::FigureEight` isolates a
+follower with a client, fires a burst of puts at the leader without awaiting
+replies — each invoked in the trace as its own client process and abandoned, on
+a key of its own, so the checker closes each at its entry's apply and the
+per-key search sees only puts that always take effect — crashes the leader with
+the burst appended, and steers it back into the lead: the third server's sends
+are blocked, so it can answer nothing and the isolated follower, whose log is
+short, can be voted in by nobody, and the restarted leader, holding the longest
+log, campaigns and wins with the isolated follower's vote. It then re-sends its
+backlog in batches, and the buggy leader advances its commit index onto an
+older term's entry at the first acknowledgement below its no-op, which the
+commit-by-current-term fold reports on the spot; the correct leader commits
+nothing until the batch carrying the no-op is acknowledged. The driver's
+parameters are drawn from a stream of their own, so tuning them re-draws no
+other schedule; it takes two slots of eight in the fault draw, since its window
+needs the burst, the crash, the disk and the steering to line up and a rarer
+draw reports no rate; and `paper.rs` steps the mechanism by hand at the core
+level, batches of four against a log of ten.
+
+**What the sweep found.** The issue's sketch — crash the leader before its
+commit advance reaches the surviving follower — cannot open the window at this
+sweep's speeds, and no crash timing fixes it. A leader appends one entry per
+synced batch, a millisecond or two each, and a follower's commit knowledge lags
+its appends by one message round trip, so the gap between what the survivor
+holds and what it knows committed is the append rate times the round trip: ten
+or twenty entries, never sixty-four. What opens the window is the crash itself:
+the commit index is not persisted (Figure 2 keeps it volatile), so the doomed
+leader restarts with commit zero and its whole log above it uncommitted-as-far-
+as-it-knows. Steered back into the lead, it rebuilds its commit index by
+counting acknowledgements from the one follower allowed to answer, batch end by
+batch end from far below — every end under the no-op is the violation. The rule
+follows: the driver needs the old leader re-elected, not the survivor, and the
+steering earns its keep — a first cut that let the survivor win caught nothing,
+since the survivor's commit knowledge was a round trip behind its log, ten
+entries, and one batch covered its whole catch-up. Two of its windows die with
+the fault model and are left to it: the restart is refused outright where bit
+rot under the crash landed where recovery refuses to guess (D-026, D-027), and
+a severely slow clock (D-028's draw) can put the restarted leader's election
+past the steering window, after which the heal makes the run an ordinary
+leader crash. The crash window has to fit the disk,
+not the network: a first cut crashed the leader a few hundred milliseconds
+after the burst and on the slower seeds it died holding thirty to sixty
+entries, under a batch, since every proposal costs a synced batch to append
+and another to apply and the adversarial scheduler (D-016) stretches both —
+the crash now waits four hundred and fifty to seven hundred and fifty
+milliseconds, drawn from the seed. And adding a fault arm re-draws every
+schedule after it from the shared stream: the lease trials' geometry reshuffled
+and `LeaseTrustsTheClock` went uncaught on the gate's twenty seeds until the
+driver's draws moved to their own stream — the catch rates of every variant are
+a function of the whole schedule, and a driver must not move the others' dice.
+At a hundred seeds, release: batch one without the driver caught
+`CountOlderTermForCommit` on 58; the default batch without the driver on none,
+D-026's hole verified; the default batch with the driver on 58, the driver
+drawn on 78 of the hundred schedules. What the driver loses it loses to the
+fault model and the adversary: the restart is refused on about a sixth of its
+windows, the starved seeds append less than a batch before the crash, and on
+two windows the burst arrived just as leadership moved and no entry of it was
+ever proposed. Every other variant's rate held, and the correct server passes
+all hundred: normal client-paced traffic still replicates one entry per
+message, so batching bites only on the backlogs the driver builds.
+
+**Alternatives.** A one-way block of the survivor's acknowledgements during the
+burst, to freeze the doomed leader's commit index: works, but check quorum
+steps the leader down within two hundred milliseconds of the block and caps the
+backlog, and the restart's commit reset makes the freeze redundant. Crashing
+the survivor instead of muting it: the majority is then the restarted leader
+and the isolated follower, the same window, but a second crash doubles the
+refusals. `max_batch: 1` forever: the batched send and receive paths, which
+every deployment would run, stay unexercised — the hole D-026 recorded. A
+guaranteed driver per schedule, like the lease trials: the plain outages would
+lose half their draws, and the variant does not need every seed, only a rate.
+
+**Consequences.** The sweep exercises batching and pipelining on every seed and
+the Figure 8 window on most. A schedule's faults now draw from two streams, and
+any future fault arm must bring its own stream rather than lengthen the shared
+one. The burst leaves a hundred-odd pending puts in the history on its own key,
+which the checker disposes of linearly. Coverage counts the drivers drawn and
+the burst puts invoked, and the sweep asserts both were seen.
+
+---
+
 _Next entry: D-029. Add one before implementing anything not covered above._

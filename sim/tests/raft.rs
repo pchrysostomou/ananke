@@ -150,6 +150,8 @@ struct Coverage {
     crashes: usize,
     leader_crashes: usize,
     stale_sender_faults: usize,
+    figure_eight_faults: usize,
+    burst_puts: usize,
     drift_exceeded_seeds: u64,
     lease_reads: usize,
     read_index_reads: usize,
@@ -200,6 +202,13 @@ impl Coverage {
             .iter()
             .filter(|f| matches!(f, Fault::StaleSender { .. }))
             .count();
+        self.figure_eight_faults += report
+            .schedule
+            .faults
+            .iter()
+            .filter(|f| matches!(f, Fault::FigureEight { .. }))
+            .count();
+        self.burst_puts += report.burst_puts();
         self.drift_exceeded_seeds += u64::from(report.drift_exceeded());
         self.lease_reads += report.lease_reads();
         self.read_index_reads += report.read_index_reads();
@@ -250,6 +259,8 @@ impl Coverage {
             ("crashes", self.crashes as u64),
             ("leader crashes", self.leader_crashes as u64),
             ("stale-sender faults", self.stale_sender_faults as u64),
+            ("figure-8 drivers", self.figure_eight_faults as u64),
+            ("burst puts", self.burst_puts as u64),
             (
                 "seeds with drift beyond the bound",
                 self.drift_exceeded_seeds,
