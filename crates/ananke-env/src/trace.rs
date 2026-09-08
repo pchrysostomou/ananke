@@ -390,6 +390,37 @@ pub enum TraceEvent {
         /// The hash of the entry's payload.
         hash: u64,
     },
+    /// A Raft configuration entry took effect on a server (RAFT.md §1): appended
+    /// to its log, restored at a restart, or re-stated after a truncation
+    /// reverted to an earlier entry. The membership in force is the latest
+    /// configuration entry in the log, committed or not.
+    RaftConfig {
+        /// The server.
+        server: u64,
+        /// The configuration entry's index; 0 for the initial configuration.
+        index: u64,
+        /// The voters, or the old voters while joint.
+        old: Vec<u64>,
+        /// The new voters while joint; empty otherwise.
+        new: Vec<u64>,
+        /// Whether the configuration is joint: elections and commits then need
+        /// majorities of both voter sets.
+        joint: bool,
+        /// Members that receive entries and count for nothing (thesis §4.2.1).
+        learners: Vec<u64>,
+    },
+    /// A Raft server took a snapshot of its state machine, or installed one a
+    /// leader streamed to it (RAFT.md §1).
+    RaftSnapshot {
+        /// The server.
+        server: u64,
+        /// The snapshot's last applied index.
+        last_index: u64,
+        /// That entry's term.
+        last_term: u64,
+        /// Whether the snapshot was taken here, rather than installed.
+        taken: bool,
+    },
     /// A Raft leader served a linearizable read (RAFT.md §1): at `index`, by its
     /// lease or after a read-index round.
     RaftRead {

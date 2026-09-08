@@ -31,6 +31,7 @@
 //! | `RaftTerm` / `RaftVote` / `RaftLeader` / `RaftAppend` / `RaftTruncate` / `RaftCommit` / `RaftApply` | `log` `ananke.raft.term` / `.vote` / `.leader` / `.append` / `.truncate` / `.commit` / `.apply` |
 //! | `RaftRecovered` / `RaftProposed` / `RaftRefused` / `RaftServerFailed` / `RaftInboxDropped` | `log` `ananke.raft.recovered` / `.proposed` / `.refused` / `.failed` / `.inbox-dropped` |
 //! | `RaftRead` / `RaftLeaseRevoked` / `RaftQuorumLost` / `RaftTransfer` | `log` `ananke.raft.read` / `.lease-revoked` / `.quorum-lost` / `.transfer` |
+//! | `RaftConfig` / `RaftSnapshot`            | `log` `ananke.raft.config` / `.snapshot`      |
 //! | `ClientInvoke` / `ClientReturn`          | `log` `ananke.client.invoke` / `.return`      |
 //! | `TimeAdvanced`                           | nothing: every line carries `t`               |
 //!
@@ -626,6 +627,41 @@ fn convert(
                 ("index", int(*index)),
                 ("entryTerm", int(*entry_term)),
                 ("hash", int(*hash)),
+            ])),
+        ),
+        TraceEvent::RaftConfig {
+            server,
+            index,
+            old,
+            new,
+            joint,
+            learners,
+        } => {
+            let ids = |list: &[u64]| Json::Array(list.iter().map(|&id| int(id)).collect());
+            log(
+                "ananke.raft.config",
+                Some(Json::obj(vec![
+                    ("server", int(*server)),
+                    ("index", int(*index)),
+                    ("old", ids(old)),
+                    ("new", ids(new)),
+                    ("joint", Json::Bool(*joint)),
+                    ("learners", ids(learners)),
+                ])),
+            )
+        }
+        TraceEvent::RaftSnapshot {
+            server,
+            last_index,
+            last_term,
+            taken,
+        } => log(
+            "ananke.raft.snapshot",
+            Some(Json::obj(vec![
+                ("server", int(*server)),
+                ("lastIndex", int(*last_index)),
+                ("lastTerm", int(*last_term)),
+                ("taken", Json::Bool(*taken)),
             ])),
         ),
         TraceEvent::RaftRead {
