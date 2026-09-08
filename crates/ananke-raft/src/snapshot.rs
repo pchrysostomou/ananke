@@ -568,7 +568,10 @@ impl<E: Environment> Assembler<E> {
             }
             let complete = offset + data.len() as u64 >= total;
             if complete {
+                // The file and its directory entry: a completed file survives a
+                // crash, so what an offset was acknowledged for is really there.
                 handle.sync().await?;
+                self.env.fs().sync_dir(&self.staging).await?;
             }
         }
         let stream = self.stream.as_mut().expect("a stream");

@@ -1032,6 +1032,100 @@ it.
 
 ---
 
+## D-030 — Snapshots: the compacted log, the streamed checkpoint, the staged install, and the re-seeded server
+
+**Context.** Stage E of RAFT.md's order: snapshots per §1 and §3 — a checkpoint as
+the snapshot, `InstallSnapshot` streaming with resumption, the staged install, log
+compaction, the `snapshot` task, the refused server re-seeded, the
+`SnapshotWithoutCurrentLast` variant, and the invariants learning `RaftSnapshot`.
+The genuinely new choices the documents leave open are PROPOSED D-035..D-038;
+what follows is the approved design as built.
+
+**Decision.** The core's log carries a compacted prefix: a (last index, last
+term) pair the tail starts after, `term_at` answering at the boundary, the
+election restriction and the consistency check reading the snapshot when the log
+is empty, and a follower whose `next` falls at or below the prefix — or one
+designated snapshot-fed (D-037) — fed through `Output::Snapshot(Install)` rather
+than entries. Compaction is part of a persist (`compact_to`), taken only when
+every follower is past the checkpoint or designated, and traced `RaftCompacted`.
+A take is triggered on the leader's tick once the log outgrows
+`snapshot_threshold` past the last take, with one deferral: a fresh leader waits
+two minimum election timeouts before its first threshold take, because a
+checkpoint stalls applies (D-036) and a fresh leader's first duty is its no-op
+and its followers; a follower that needs a snapshot sooner gets one on demand.
+
+The take runs in the apply task (D-036): the record under `0 / 3 / snapshot`
+first, synced, then `Engine::checkpoint` to `snap-<index>`, so the copy carries
+its own identity before its `CURRENT` (D-024). Streaming keeps one chunk
+outstanding; the acknowledgement names the next byte wanted, a timeout resends
+from there — the resumption RAFT.md asks for, traced `RaftSnapshotResumed` —
+eight resends give the stream up, a receiver's restart starts it over, and two
+restarts retake the checkpoint. The stream's identity is (sender, leader term,
+last index, last term); a change starts the staging over. The receiver assembles
+under `install/`, holds the streamed `CURRENT` aside in memory, syncs each
+completed file and its directory entry, verifies every staged table with the
+engine's own checks, and installs by one repair table and a successor manifest —
+the receiver's hard state, the applied index at the snapshot, the record, the
+kept tail (kept only when its entry at the snapshot's last index carries the
+snapshot's last term), tombstones for the leader's log keys, the quarantine on a
+re-seed — with the staged `CURRENT` written last (D-038). The `raft` loop
+quiesces the apply task before handing the repair over, so the applied index is
+final and the kept tail exact; the completed install retires the incarnation and
+the next open adopts the staged store. A refused server binds in re-seed mode,
+answers every AppendEntries with a rejection asking from index 1, and is
+quarantined for good on the store the install builds (D-035).
+
+The invariants fold `RaftSnapshot` as a per-server floor standing in for the
+committed prefix: log matching compares at the boundary only what both sides
+still show and requires two snapshots ending at one index to agree in term;
+leader completeness and commit majority count a floor as holding the entry;
+state machine safety resumes applies at an installed snapshot's index, resets a
+refused server's floor for the re-seed restatement, and is exactly what reports
+the variant — an unrepaired adoption re-states a *taken* snapshot and a
+recovered applied index its restated log cannot account for. The sweep runs
+`snapshot_threshold` 12 and `snapshot_chunk` 4096, counts takes, installs,
+resumes, compactions, re-seeds and completed re-seeds, treats a re-seeded server
+as up again and exempts it from the timer bound, and aims `CrashInstalling` —
+drawn from its own `moirae_sched` stream, never lengthening the shared schedule
+stream (D-031) — by isolating a follower past the threshold and crashing it a
+few milliseconds after the stream's final chunk lands.
+
+**What the sweep found before it passed.** Seed 9 of the twenty-seed gate, the
+first run with re-seeding live: the re-seeded server was flagged by the timer
+check for never campaigning — which is its design (D-035) — so the check
+exempts it. With the threshold at twelve, `LeaseTrustsTheClock` stopped being
+caught at all: every trial's fresh majority-side leader took its first
+checkpoint the moment it was elected — its whole history was past the threshold
+— and the apply stall delayed the write that must land inside the stale-read
+window past the client's sixty-millisecond budget; the fresh-leader deferral
+above restored the catch. Seed 8: a server that finished installing during an
+isolation re-stated the stream's term inside the window and the pre-vote check
+called it a term raise; isolations during a refusal, a re-seed or an install
+are now skipped. And the variant was uncatchable until the assembler synced the
+staging directory's *entries*: the simulated crash keeps only directory
+operations `sync_dir` covered, so the staged files all vanished at the crash
+and the bogus `CURRENT` never had a store to win — the honest assembler now
+syncs the directory as each file completes, which is also what makes an
+acknowledged offset durable, and the variant's window became real: caught on 6
+of 20 seeds at the gate.
+
+**Alternatives.** Multiple chunks in flight: resumption bookkeeping for a
+pipeline, for a path whose cost is the checkpoint, not the round trips.
+Follower-triggered snapshots: RAFT.md gives taking to the leader, and nothing
+here needs more. Deleting checkpoint directories eagerly: a stream may still be
+reading one; GC is a backlog line. Streaming the live store instead of a
+checkpoint: the checkpoint is the engine's own consistent copy and D-024 already
+paid for it.
+
+**Consequences.** A follower fed a snapshot restarts its incarnation on the
+adopted store; its socket and inbox survive, so peers see a pause, not a loss.
+Applies stall for the duration of a take (D-036). Checkpoint directories
+accumulate until a GC exists. The re-seed path makes a refusal recoverable, at
+the price of a quarantined voter (D-035), and the sweep asserts a refused server
+comes back and applies again across a hundred seeds.
+
+---
+
 ## PROPOSED — needs approval
 
 ## PROPOSED D-035 — A re-seeded server never votes again on that store

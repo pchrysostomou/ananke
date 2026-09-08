@@ -204,7 +204,7 @@ fn a_leader_compacts_only_when_every_follower_is_past_the_checkpoint() {
         ..RaftConfig::default()
     };
     let mut leader = Raft::new(s(1), members(&[1, 2]), config.clone(), 17);
-    let mut follower = Raft::new(s(2), members(&[1, 2]), config, 19);
+    let mut follower = Raft::new(s(2), members(&[1, 2]), config.clone(), 19);
     elect(&mut leader, &mut follower);
     for n in 0..5 {
         let outputs = leader.step(Input::Propose(Bytes::from(format!("c{n}"))));
@@ -217,14 +217,26 @@ fn a_leader_compacts_only_when_every_follower_is_past_the_checkpoint() {
     }
     assert_eq!(leader.last_index(), 6, "a no-op and five commands");
     assert_eq!(leader.commit(), 6);
-    // The log has outgrown the threshold, but nothing is applied yet: no take.
-    let outputs = leader.step(Input::Tick);
-    assert!(
-        !outputs
-            .iter()
-            .any(|o| matches!(o, Output::Snapshot(SnapshotAction::Take))),
-        "a take before anything applied"
-    );
+    // The log has outgrown the threshold, but nothing is applied yet: however
+    // long the leader leads, no take. The follower keeps answering, so neither
+    // check quorum nor the designation fires meanwhile.
+    for _ in 0..3 * config.election_ticks.0 {
+        let outputs = leader.step(Input::Tick);
+        assert!(
+            !outputs
+                .iter()
+                .any(|o| matches!(o, Output::Snapshot(SnapshotAction::Take))),
+            "a take before anything applied"
+        );
+        let from = leader.id();
+        let outbound: Vec<_> = sends(&outputs)
+            .into_iter()
+            .map(|(to, message)| (from, to, message))
+            .collect();
+        settle(&mut leader, &mut follower, outbound, &mut Vec::new());
+    }
+    // Applied past the threshold, and the leader has led long enough (a fresh
+    // leader defers its first take): the next tick asks for exactly one take.
     let _ = leader.step(Input::Applied(5));
     let outputs = leader.step(Input::Tick);
     assert_eq!(

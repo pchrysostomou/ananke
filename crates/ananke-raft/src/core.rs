@@ -446,6 +446,9 @@ pub struct Raft {
     election_elapsed: u64,
     election_timeout: u64,
     heartbeat_elapsed: u64,
+    /// Ticks led since the last election won: a fresh leader defers threshold
+    /// snapshots until it has led a while (D-030).
+    leader_ticks: u64,
     /// Ticks since the leader last checked it had heard from a majority.
     quorum_elapsed: u64,
     /// The index of the current term's first entry, the no-op, on a leader: a read
@@ -534,6 +537,7 @@ impl Raft {
             election_elapsed: 0,
             election_timeout: 0,
             heartbeat_elapsed: 0,
+            leader_ticks: 0,
             quorum_elapsed: 0,
             first_of_term: 0,
             reads: Vec::new(),
@@ -924,6 +928,7 @@ impl Raft {
         self.heartbeat_elapsed += 1;
         match self.role {
             Role::Leader => {
+                self.leader_ticks = self.leader_ticks.saturating_add(1);
                 if self.heartbeat_elapsed >= self.config.heartbeat_ticks {
                     self.heartbeat_elapsed = 0;
                     for peer in self.peers() {
@@ -931,7 +936,13 @@ impl Raft {
                     }
                 }
                 // A snapshot when the log has outgrown the last one (RAFT.md §1).
-                if !self.take_pending
+                // A fresh leader holds off for two minimum election timeouts: its
+                // first duty is its no-op and its followers, and a checkpoint
+                // stalls applies for its duration (D-030, PROPOSED(D-036)); a
+                // follower that needs the snapshot sooner gets one on demand
+                // through `replicate`.
+                if self.leader_ticks >= 2 * self.config.election_ticks.0
+                    && !self.take_pending
                     && self.applied > self.taken.map_or(0, |(i, _)| i)
                     && self.last_index() - self.taken.map_or(0, |(i, _)| i)
                         > self.config.snapshot_threshold
@@ -1053,6 +1064,7 @@ impl Raft {
     fn become_leader(&mut self) {
         self.leader = Some(self.id);
         self.heartbeat_elapsed = 0;
+        self.leader_ticks = 0;
         self.quorum_elapsed = 0;
         self.granted.clear();
         self.transfer = false;

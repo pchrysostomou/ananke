@@ -4,6 +4,7 @@
 //! ships (RAFT.md §5) is caught on some seed. The catch rate of each is printed, so a
 //! hundred-seed run reports it.
 
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 use ananke_env::{ClientOp, DropReason, TraceEvent};
@@ -93,6 +94,17 @@ fn a_server_that_resets_its_timer_on_any_message_is_caught() {
     is_caught(Variant::ResetTimerOnAnyRpc);
 }
 
+/// The install that writes the staged store's `CURRENT` before the repair is
+/// durable (RAFT.md §5): a crash mid-install then adopts the leader's identity, a
+/// state this server never held, and state machine safety reports the restart
+/// whose restated log cannot account for its recovered applied index. The
+/// crash-mid-install fault aims the crash; the pair rule holds because the
+/// correct server passes the same seeds above.
+#[test]
+fn a_server_that_installs_without_current_last_is_caught() {
+    is_caught(Variant::SnapshotWithoutCurrentLast);
+}
+
 /// Lease safety under drift (RAFT.md §2, invariant 6): on every seed where the
 /// simulated drift exceeds the bound, either the guard revoked the drifting
 /// follower's trust or the checker reports the stale read and the run fails. The
@@ -164,6 +176,13 @@ struct Coverage {
     commits: usize,
     applies: usize,
     inbox_drops: usize,
+    snapshots_taken: usize,
+    snapshots_installed: usize,
+    snapshot_resumes: usize,
+    compactions: usize,
+    reseeded: usize,
+    reseed_completions: u64,
+    install_crash_faults: usize,
     bit_rot: usize,
     torn_writes: usize,
     puts: u64,
@@ -174,6 +193,26 @@ struct Coverage {
     abandoned: u64,
     redirected: u64,
     slowest_write_after_heal: Duration,
+}
+
+/// Whether some refused server came back (RAFT.md §3): a `RaftRefused`, then a
+/// re-seeded restatement on that server, then an apply on it.
+fn reseed_completed(report: &raft::Report) -> bool {
+    let mut refused: BTreeSet<u64> = BTreeSet::new();
+    let mut reseeded: BTreeSet<u64> = BTreeSet::new();
+    for record in &report.records {
+        match &record.event {
+            TraceEvent::RaftRefused { server, .. } => {
+                refused.insert(*server);
+            }
+            TraceEvent::RaftReseeded { server } if refused.contains(server) => {
+                reseeded.insert(*server);
+            }
+            TraceEvent::RaftApply { server, .. } if reseeded.contains(server) => return true,
+            _ => {}
+        }
+    }
+    false
 }
 
 impl Coverage {
@@ -225,6 +264,21 @@ impl Coverage {
         self.commits += report.count(|e| matches!(e, TraceEvent::RaftCommit { .. }));
         self.applies += report.count(|e| matches!(e, TraceEvent::RaftApply { .. }));
         self.inbox_drops += report.count(|e| matches!(e, TraceEvent::RaftInboxDropped { .. }));
+        self.snapshots_taken +=
+            report.count(|e| matches!(e, TraceEvent::RaftSnapshot { taken: true, .. }));
+        self.snapshots_installed +=
+            report.count(|e| matches!(e, TraceEvent::RaftSnapshot { taken: false, .. }));
+        self.snapshot_resumes +=
+            report.count(|e| matches!(e, TraceEvent::RaftSnapshotResumed { .. }));
+        self.compactions += report.count(|e| matches!(e, TraceEvent::RaftCompacted { .. }));
+        self.reseeded += report.count(|e| matches!(e, TraceEvent::RaftReseeded { .. }));
+        self.reseed_completions += u64::from(reseed_completed(report));
+        self.install_crash_faults += report
+            .schedule
+            .faults
+            .iter()
+            .filter(|f| matches!(f, Fault::CrashInstalling { .. }))
+            .count();
         self.bit_rot += report.count(|e| matches!(e, TraceEvent::BlockRotted { .. }));
         self.torn_writes += report.count(|e| matches!(e, TraceEvent::WriteTorn { .. }));
         for op in &report.history.ops {
@@ -263,6 +317,9 @@ impl Coverage {
             ("elections", self.leaders as u64),
             ("seeds with a term above one", self.terms_above_one),
             ("log truncations", self.truncations as u64),
+            ("snapshots taken", self.snapshots_taken as u64),
+            ("log compactions", self.compactions as u64),
+            ("crash-mid-install faults", self.install_crash_faults as u64),
             ("commits", self.commits as u64),
             ("applies", self.applies as u64),
             ("bit rot", self.bit_rot as u64),
@@ -278,7 +335,9 @@ impl Coverage {
             assert!(seen > 0, "the sweep never saw {what}: {self:?}");
         }
         // A refusal needs bit rot to land in a table or a log block still in use:
-        // twenty seeds cannot promise one; a hundred can.
+        // twenty seeds cannot promise one; a hundred can. The same goes for what
+        // follows from a refusal — the re-seed — and for a resumed stream, which
+        // needs a drop to land on a chunk or its acknowledgement.
         if self.seeds >= 100 {
             assert!(
                 self.refusals > 0,
@@ -287,6 +346,22 @@ impl Coverage {
             assert!(
                 self.torn_writes > 0,
                 "the sweep never saw a torn write: {self:?}"
+            );
+            assert!(
+                self.snapshots_installed > 0,
+                "the sweep never saw a snapshot installed: {self:?}"
+            );
+            assert!(
+                self.snapshot_resumes > 0,
+                "the sweep never saw a snapshot stream resumed after loss: {self:?}"
+            );
+            assert!(
+                self.reseeded > 0,
+                "the sweep never saw a re-seeded server: {self:?}"
+            );
+            assert!(
+                self.reseed_completions > 0,
+                "no refused server was ever re-seeded and applying again: {self:?}"
             );
         }
         assert!(
