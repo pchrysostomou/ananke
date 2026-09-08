@@ -150,7 +150,7 @@ impl Cluster {
                 Output::Trace(event) => self.events.push(event.clone()),
                 Output::ReadReady { id: read, index } => self.reads.push((id, *read, *index)),
                 Output::ReadDropped { id: read } => self.dropped.push((id, *read)),
-                Output::Apply { .. } | Output::Rejected { .. } => {}
+                Output::Apply { .. } | Output::Rejected { .. } | Output::Snapshot(_) => {}
             }
         }
         assert!(
@@ -164,13 +164,16 @@ impl Cluster {
         let state = self.persisted.get_mut(&id).expect("a member");
         state.0 = persist.term;
         state.1 = persist.vote;
+        if let Some(to) = persist.compact_to {
+            state.2.retain(|e| e.index > to);
+        }
         if let Some(from) = persist.truncate_from {
-            state.2.truncate(from as usize - 1);
+            state.2.retain(|e| e.index < from);
         }
         for entry in &persist.append {
             assert_eq!(
                 entry.index,
-                state.2.len() as Index + 1,
+                state.2.last().map_or(0, |e| e.index) + 1,
                 "appends are consecutive"
             );
             state.2.push(entry.clone());

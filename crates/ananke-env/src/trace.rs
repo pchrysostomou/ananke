@@ -510,6 +510,34 @@ pub enum TraceEvent {
         /// The kind of message dropped.
         kind: &'static str,
     },
+    /// A Raft server compacted its log to a snapshot (RAFT.md §1): every entry at
+    /// or below `through` is deleted from the log, the snapshot standing in for
+    /// them.
+    RaftCompacted {
+        /// The server.
+        server: u64,
+        /// The highest index removed: the snapshot's last index.
+        through: u64,
+    },
+    /// A Raft server that refused to start on a store that lost state is running in
+    /// re-seed mode, or serving on a store a re-seed rebuilt (RAFT.md §3): it
+    /// replicates, applies and counts for commit majorities, but grants no vote and
+    /// no pre-vote and makes no lease promise for the rest of its life on that
+    /// store, because the lost state may have included a vote.
+    RaftReseeded {
+        /// The server.
+        server: u64,
+    },
+    /// A snapshot stream was resumed (RAFT.md §1): the sender re-sent from the last
+    /// acknowledged offset of the last file after loss, rather than from zero.
+    RaftSnapshotResumed {
+        /// The sending server.
+        server: u64,
+        /// The receiver.
+        to: u64,
+        /// The offset within the current file the stream resumed from.
+        offset: u64,
+    },
     /// A client operation started (RAFT.md §2): the invocation end of one operation
     /// of the linearizability history. Its time is the record's.
     ClientInvoke {

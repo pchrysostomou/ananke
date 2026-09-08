@@ -142,7 +142,7 @@ pub async fn run<E: Environment>(env: E, config: NodeConfig) -> io::Result<()> {
             return Err(error);
         }
     };
-    let (store, log) = match RaftStore::open(Arc::new(engine), &recovery).await {
+    let (store, recovered) = match RaftStore::open(Arc::new(engine), &recovery).await {
         Ok(opened) => opened,
         Err(error) => {
             env.trace(TraceEvent::RaftRefused {
@@ -158,14 +158,22 @@ pub async fn run<E: Environment>(env: E, config: NodeConfig) -> io::Result<()> {
     let voters: Vec<ServerId> = servers.iter().map(|(id, _)| *id).collect();
     let variant = raft.variant;
     let seed = env.rng().next_u64();
-    let mut core = Raft::restore(
+    let snapshot = recovered.snapshot.clone();
+    let (snap_index, snap_term) = snapshot
+        .as_ref()
+        .map_or((0, 0), |s| (s.last_index, s.last_term));
+    let quarantined = recovered.quarantined;
+    let mut core = Raft::restore_compacted(
         id,
         Configuration::of(&voters),
         raft,
         seed,
         store.term(),
         store.vote(),
-        log,
+        snap_index,
+        snap_term,
+        recovered.log,
+        quarantined,
     );
     let applied = store.applied();
     core.step(Input::Applied(applied));
@@ -258,11 +266,24 @@ pub async fn run<E: Environment>(env: E, config: NodeConfig) -> io::Result<()> {
 
     // The start: the log as the disk holds it, re-stated so the trace's picture of
     // this server's log is the durable one. An append or a truncation persisted at a
-    // crash but not yet traced would otherwise be missing from it.
+    // crash but not yet traced would otherwise be missing from it. A snapshot the
+    // store records is re-stated the same way: it sets the applied floor and stands
+    // in for the log prefix it replaced (RAFT.md §2).
     env.trace(TraceEvent::RaftTruncate {
         server,
         from_index: core.last_index() + 1,
     });
+    if snap_index > 0 {
+        env.trace(TraceEvent::RaftSnapshot {
+            server,
+            last_index: snap_index,
+            last_term: snap_term,
+            taken: snapshot.as_ref().is_some_and(|s| s.taken),
+        });
+    }
+    if quarantined {
+        env.trace(TraceEvent::RaftReseeded { server });
+    }
     for entry in core.log() {
         env.trace(TraceEvent::RaftAppend {
             server,
@@ -597,6 +618,10 @@ impl<E: Environment> Server<E> {
                     self.answer_read(id, Reply::NotLeader { leader: None })
                         .await;
                 }
+                // The snapshot task takes and streams these (stage E); until it is
+                // wired in, nothing asks for them: the default threshold is far
+                // above any test's log.
+                Output::Snapshot(_) => {}
                 Output::Trace(event) => self.env.trace(event),
             }
         }
