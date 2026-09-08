@@ -1,7 +1,7 @@
 //! One server under the simulator, without faults: three servers elect a leader and
-//! apply a client's write on every server; and a server whose store lost state takes
-//! part in nothing (RAFT.md §3): it has no core to step, binds no socket, and a
-//! peer's votes and appends reach nobody.
+//! apply a client's write on every server; and a server whose store lost state runs
+//! in re-seed mode (RAFT.md §3): it has no core to step, grants nothing, and asks
+//! every AppendEntries to feed it from index 1, the snapshot ask.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -9,12 +9,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ananke_env::sim::{Sim, SimConfig, SimEnv};
-use ananke_env::{Clock, DropReason, Environment, FileSystem, Network, NodeId, Socket, TraceEvent};
+use ananke_env::{Clock, Environment, FileSystem, Network, NodeId, Socket, TraceEvent};
 use ananke_raft::apply::{Command, Outcome};
 use ananke_raft::client::{Reply, Request, Response};
 use ananke_raft::core::Persist;
 use ananke_raft::message::{Frame, Message};
-use ananke_raft::store::{LostState, RaftStore};
+use ananke_raft::store::RaftStore;
 use ananke_raft::types::{Entry, Payload};
 use ananke_raft::{NodeConfig, RaftConfig, ServerId, invariants, run};
 use ananke_storage::manifest::sst_path;
@@ -178,11 +178,15 @@ fn three_servers_elect_a_leader_and_a_clients_write_is_applied_on_every_server()
 }
 
 /// A store with a table flushed, then that table removed from the disk: the next
-/// open drops it, the store is refused, and the server never starts. The peer that
-/// asks it for a vote and sends it entries gets nothing back: its messages reach no
-/// socket.
+/// open drops it and the store is refused.
+///
+/// A server whose store lost state runs in re-seed mode (RAFT.md §3): it traces
+/// the refusal and steps no core — no term, no vote, no append. It stays
+/// reachable, ignores vote and pre-vote requests altogether, and answers an
+/// AppendEntries only with the re-seed ask: a rejection whose hint is 1 and whose
+/// echo is 0, so no lease promise is ever measured from it.
 #[test]
-fn a_server_whose_store_lost_state_takes_part_in_nothing() {
+fn a_server_whose_store_lost_state_asks_to_be_reseeded_and_grants_nothing() {
     let mut sim = Sim::new(SimConfig::new(5));
     let node = sim.add_node();
     let peer = sim.add_node();
@@ -207,6 +211,7 @@ fn a_server_whose_store_lost_state_takes_part_in_nothing() {
                     truncate_from: None,
                     append: entries,
                     config: None,
+                    compact_to: None,
                 })
                 .await
                 .unwrap();
@@ -226,20 +231,25 @@ fn a_server_whose_store_lost_state_takes_part_in_nothing() {
             fs.sync_dir(Path::new(DIR)).await.unwrap();
         })
     });
-    // The server refuses to start.
-    let result = on_node(&mut sim, node, |env| {
-        Box::pin(async move { run(env, node_config(1, &[1, 2, 3])).await })
+    // The server refuses the store and waits in re-seed mode; run never returns.
+    let env = sim.env(node);
+    let inner = env.clone();
+    env.spawn("raft", async move {
+        let _ = run(inner, node_config(1, &[1, 2, 3])).await;
     });
-    let error = result.expect_err("the server is refused");
-    let lost = LostState::from_io(&error).expect("a LostState refusal");
-    assert_eq!(lost.dropped, vec![table], "{lost}");
+    sim.run_for(Duration::from_millis(50));
     assert!(sim.trace().iter().any(|r| matches!(&r.event,
         TraceEvent::RaftRefused { server: 1, reason } if reason.contains("dropped tables"))));
-    // A peer asks for a vote and sends entries: nothing arrives, nothing comes back.
-    on_node(&mut sim, peer, |env| {
+    // A peer asks for a pre-vote, a vote, and sends an append.
+    let answers = on_node(&mut sim, peer, |env| {
         Box::pin(async move {
             let sock = env.net().bind(addr(2)).await.unwrap();
             for message in [
+                Message::PreVote {
+                    term: 5,
+                    last_index: 0,
+                    last_term: 0,
+                },
                 Message::RequestVote {
                     term: 5,
                     last_index: 0,
@@ -248,11 +258,11 @@ fn a_server_whose_store_lost_state_takes_part_in_nothing() {
                 },
                 Message::AppendEntries {
                     term: 5,
-                    prev_index: 0,
-                    prev_term: 0,
+                    prev_index: 7,
+                    prev_term: 1,
                     entries: Vec::new(),
                     commit: 0,
-                    sent: 0,
+                    sent: 123,
                 },
             ] {
                 let frame = Frame {
@@ -261,30 +271,44 @@ fn a_server_whose_store_lost_state_takes_part_in_nothing() {
                 };
                 sock.send(addr(1), frame.encode()).await.unwrap();
             }
-            env.clock().sleep(Duration::from_millis(100)).await;
+            let deadline = env.clock().now() + Duration::from_millis(200);
+            let mut answers = Vec::new();
+            loop {
+                let recv = std::pin::pin!(sock.recv());
+                let timer = std::pin::pin!(env.clock().sleep_until(deadline));
+                match ananke_env::race(&env, recv, timer).await {
+                    ananke_env::Either::Left(Ok((_, bytes))) => {
+                        if let Ok(frame) = Frame::decode(bytes) {
+                            answers.push(frame.message);
+                        }
+                    }
+                    _ => break,
+                }
+            }
+            answers
         })
     });
-    let records = sim.trace();
-    let delivered_to_one = records
-        .iter()
-        .filter(|r| matches!(&r.event, TraceEvent::MessageDelivered { to, .. } if *to == addr(1)))
-        .count();
-    let unreachable = records
-        .iter()
-        .filter(|r| {
-            matches!(&r.event, TraceEvent::MessageDropped { to, reason: DropReason::Unreachable, .. } if *to == addr(1))
-        })
-        .count();
-    let sent_by_one = records
-        .iter()
-        .filter(|r| matches!(&r.event, TraceEvent::MessageSent { from, .. } if *from == addr(1)))
-        .count();
-    assert_eq!(
-        (delivered_to_one, unreachable, sent_by_one),
-        (0, 2, 0),
-        "delivered {delivered_to_one}, unreachable {unreachable}, sent {sent_by_one}"
-    );
-    let raft_events_of_one = records
+    // Exactly one answer: the re-seed ask for the append; the votes got nothing.
+    assert_eq!(answers.len(), 1, "answers: {answers:?}");
+    match &answers[0] {
+        Message::AppendEntriesResponse {
+            term,
+            success,
+            prev_index,
+            hint,
+            echo,
+            ..
+        } => {
+            assert_eq!(
+                (*term, *success, *prev_index, *hint, *echo),
+                (5, false, 7, 1, 0),
+                "the re-seed ask"
+            );
+        }
+        other => panic!("expected the re-seed rejection, got {other:?}"),
+    }
+    let raft_events_of_one = sim
+        .trace()
         .iter()
         .filter(|r| {
             matches!(

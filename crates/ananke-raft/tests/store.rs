@@ -63,8 +63,8 @@ fn a_persist_comes_back_at_the_next_open_and_a_truncation_removes_the_tail() {
     on_node(&mut sim, node, |env| {
         Box::pin(async move {
             let (engine, recovery) = Engine::open(env, config()).await.unwrap();
-            let (store, log) = RaftStore::open(Arc::new(engine), &recovery).await.unwrap();
-            assert!(log.is_empty());
+            let (store, recovered) = RaftStore::open(Arc::new(engine), &recovery).await.unwrap();
+            assert!(recovered.log.is_empty());
             assert_eq!((store.term(), store.vote(), store.applied()), (0, None, 0));
             store
                 .persist(&Persist {
@@ -73,6 +73,7 @@ fn a_persist_comes_back_at_the_next_open_and_a_truncation_removes_the_tail() {
                     truncate_from: None,
                     append: vec![entry(1, 1, "a"), entry(3, 2, "b"), entry(3, 3, "c")],
                     config: None,
+                    compact_to: None,
                 })
                 .await
                 .unwrap();
@@ -83,6 +84,7 @@ fn a_persist_comes_back_at_the_next_open_and_a_truncation_removes_the_tail() {
                     truncate_from: Some(3),
                     append: vec![entry(4, 3, "c'"), entry(4, 4, "d")],
                     config: None,
+                    compact_to: None,
                 })
                 .await
                 .unwrap();
@@ -93,10 +95,10 @@ fn a_persist_comes_back_at_the_next_open_and_a_truncation_removes_the_tail() {
         Box::pin(async move {
             let (engine, recovery) = Engine::open(env, config()).await.unwrap();
             assert!(recovery.replayed > 0, "the writes were in the log");
-            let (store, log) = RaftStore::open(Arc::new(engine), &recovery).await.unwrap();
+            let (store, recovered) = RaftStore::open(Arc::new(engine), &recovery).await.unwrap();
             assert_eq!((store.term(), store.vote(), store.applied()), (4, None, 0));
             assert_eq!(
-                log,
+                recovered.log,
                 vec![
                     entry(1, 1, "a"),
                     entry(3, 2, "b"),
@@ -104,6 +106,8 @@ fn a_persist_comes_back_at_the_next_open_and_a_truncation_removes_the_tail() {
                     entry(4, 4, "d")
                 ]
             );
+            assert!(recovered.snapshot.is_none());
+            assert!(!recovered.quarantined);
             assert_eq!(store.last_index(), 4);
         })
     });
@@ -275,6 +279,7 @@ fn the_config_key_comes_back_consistent_and_a_mismatch_is_refused() {
                     truncate_from: None,
                     append: vec![entry(1, 1, "a"), config_entry],
                     config: Some((2, joint)),
+                    compact_to: None,
                 })
                 .await
                 .unwrap();
@@ -285,8 +290,8 @@ fn the_config_key_comes_back_consistent_and_a_mismatch_is_refused() {
         let config_entry = config_entry.clone();
         Box::pin(async move {
             let (engine, recovery) = Engine::open(env, config()).await.unwrap();
-            let (_, log) = RaftStore::open(Arc::new(engine), &recovery).await.unwrap();
-            assert_eq!(log, vec![entry(1, 1, "a"), config_entry]);
+            let (_, recovered) = RaftStore::open(Arc::new(engine), &recovery).await.unwrap();
+            assert_eq!(recovered.log, vec![entry(1, 1, "a"), config_entry]);
         })
     });
     // Something else rewrites the key: the store is refused.

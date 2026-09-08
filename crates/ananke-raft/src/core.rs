@@ -66,6 +66,13 @@ pub enum Variant {
     /// forbid. Caught during 3 → 5 → 3 under partition by commit majority,
     /// election safety or leader completeness.
     SingleMajorityInJointConsensus,
+    /// The server installing a snapshot writes the staging directory's `CURRENT`
+    /// before the rest of the staged store is durable (RAFT.md §1, D-024): a crash
+    /// mid-install then comes back on a store that opens but was never repaired,
+    /// the leader's tenant 0 in place of the receiver's, and state machine safety
+    /// catches the state that never existed after the restart. The install order is
+    /// the server's business (`snapshot.rs`); the core ignores this variant.
+    SnapshotWithoutCurrentLast,
 }
 
 /// The core's parameters.
@@ -91,6 +98,12 @@ pub struct RaftConfig {
     /// Taken off every lease, in nanoseconds, beyond the drift bound: the timer's
     /// tick granularity at the follower.
     pub lease_margin_nanos: u64,
+    /// A leader takes a snapshot when its log holds more than this many entries
+    /// past the last snapshot it took (RAFT.md §1).
+    pub snapshot_threshold: u64,
+    /// How many bytes of a checkpoint's file one InstallSnapshot chunk carries;
+    /// must stay under `ananke_env::MAX_FRAME_LEN` with the frame's own fields.
+    pub snapshot_chunk: usize,
     /// Which core to run.
     pub variant: Variant,
 }
@@ -106,6 +119,8 @@ impl Default for RaftConfig {
             drift_bound_ppm: 1_000,
             guard_window_nanos: 400_000_000,
             lease_margin_nanos: 10_000_000,
+            snapshot_threshold: 4096,
+            snapshot_chunk: 256 * 1024,
             variant: Variant::Correct,
         }
     }
@@ -183,6 +198,31 @@ pub enum Input {
     Change(Vec<ServerId>),
     /// The server applied every entry through `index`.
     Applied(Index),
+    /// The snapshot task completed a [`SnapshotAction::Take`]: a checkpoint at
+    /// `index`, whose entry has `term`, is on disk and recorded (RAFT.md §1).
+    SnapshotTaken {
+        /// The checkpoint's applied index.
+        index: Index,
+        /// That entry's term.
+        term: Term,
+    },
+    /// The snapshot task streamed the snapshot to `to`, which installed it: the
+    /// follower now holds everything through `index`.
+    SnapshotInstalled {
+        /// The follower.
+        to: ServerId,
+        /// The snapshot's last index.
+        index: Index,
+    },
+    /// The snapshot task gave up streaming to `to`: a timeout, a lost leadership,
+    /// or a checkpoint the receiver's checks refused. With `retake` the checkpoint
+    /// itself is unusable and the next need takes a fresh one.
+    SnapshotFailed {
+        /// The follower.
+        to: ServerId,
+        /// Whether the checkpoint is unusable.
+        retake: bool,
+    },
 }
 
 /// A change to persistent state: what must be durable before anything after it.
@@ -201,6 +241,9 @@ pub struct Persist {
     /// config` key in the same synced batch (RAFT.md §3); index 0 and the initial
     /// configuration after a truncation removed every configuration entry.
     pub config: Option<(Index, Configuration)>,
+    /// Entries at or below this index deleted: the log compacted to a snapshot
+    /// (RAFT.md §1). Never overlaps `append`.
+    pub compact_to: Option<Index>,
 }
 
 /// What the core wants done, in order.
@@ -242,6 +285,28 @@ pub enum Output {
     },
     /// A state transition that matters, for the trace.
     Trace(TraceEvent),
+    /// Snapshot work for the `snapshot` task (RAFT.md §3): the core only says what
+    /// it needs; taking checkpoints and streaming them is the server's.
+    Snapshot(SnapshotAction),
+}
+
+/// What the core asks the `snapshot` task to do (RAFT.md §3).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SnapshotAction {
+    /// Take a checkpoint of the state machine at the applied index, with the
+    /// metadata written before the checkpoint's `CURRENT`, and answer with
+    /// [`Input::SnapshotTaken`].
+    Take,
+    /// Stream the snapshot at (`index`, `term`) to `to`, and answer with
+    /// [`Input::SnapshotInstalled`] or [`Input::SnapshotFailed`].
+    Install {
+        /// The follower to feed.
+        to: ServerId,
+        /// The snapshot's last index.
+        index: Index,
+        /// That entry's term.
+        term: Term,
+    },
 }
 
 /// The drift guard's view of one follower (RAFT.md §1): the follower's clock
@@ -377,6 +442,16 @@ struct Progress {
     active: bool,
     /// The drift guard.
     guard: Guard,
+    /// The snapshot task is streaming a snapshot to this follower: no entries go
+    /// until it answers.
+    installing: bool,
+    /// The follower is designated snapshot-fed (RAFT.md §1, "a learner being
+    /// replaced by the snapshot"): it no longer blocks compaction. Set for a
+    /// follower far behind and unresponsive, or one that rejected an append at
+    /// index 1, which no follower with a log does (a re-seeding server's ask).
+    needs_snapshot: bool,
+    /// Ticks since the follower last answered anything.
+    quiet_ticks: u64,
 }
 
 /// One server's protocol state.
@@ -400,8 +475,31 @@ pub struct Raft {
     vote: Option<ServerId>,
     role: Role,
     leader: Option<ServerId>,
-    /// The log, index `i` at position `i - 1`.
+    /// The log's tail past the compacted prefix: index `i` at position
+    /// `i - 1 - snap_index`.
     log: Vec<Entry>,
+    /// The compacted prefix's last index: the log starts at `snap_index + 1`, and
+    /// the snapshot stands in for everything at or below (RAFT.md §1). Zero for no
+    /// snapshot.
+    snap_index: Index,
+    /// That entry's term.
+    snap_term: Term,
+    /// The configuration in force at the compacted prefix's last index: the floor
+    /// a truncation's revert can reach once compaction has swallowed the entry
+    /// itself (RAFT.md §1, D-029). None while nothing is compacted, when the
+    /// initial configuration serves.
+    snap_config: Option<Configuration>,
+    /// The last checkpoint taken or installed here, streamable to a follower;
+    /// `snap_index` never passes it. None until one is taken.
+    taken: Option<(Index, Term)>,
+    /// A [`SnapshotAction::Take`] is with the snapshot task.
+    take_pending: bool,
+    /// This server runs on a re-seeded store (RAFT.md §3): the state it lost may
+    /// have included a vote, so it grants no vote and no pre-vote, never
+    /// campaigns, and makes no lease promise, for the rest of its life on that
+    /// store. It still replicates, applies and counts for commit majorities.
+    // PROPOSED(D-035): re-seeded servers are quarantined from voting for good.
+    quarantined: bool,
     commit: Index,
     applied: Index,
     /// Votes or pre-votes granted in the round under way, this server included.
@@ -410,6 +508,9 @@ pub struct Raft {
     election_elapsed: u64,
     election_timeout: u64,
     heartbeat_elapsed: u64,
+    /// Ticks led since the last election won: a fresh leader defers threshold
+    /// snapshots until it has led a while (D-030).
+    leader_ticks: u64,
     /// Ticks since the leader last checked it had heard from a majority.
     quorum_elapsed: u64,
     /// The index of the current term's first entry, the no-op, on a leader: a read
@@ -431,6 +532,7 @@ pub struct Raft {
     /// The step's log changes.
     truncate_from: Option<Index>,
     appended: Vec<Entry>,
+    compacted_to: Option<Index>,
 }
 
 impl Raft {
@@ -454,12 +556,52 @@ impl Raft {
         vote: Option<ServerId>,
         log: Vec<Entry>,
     ) -> Self {
+        Self::restore_compacted(
+            id, membership, config, seed, term, vote, 0, 0, None, log, false,
+        )
+    }
+
+    /// A server with the persistent state its store held, the log compacted to a
+    /// snapshot at (`snap_index`, `snap_term`): `log` is the tail past it, starting
+    /// at `snap_index + 1`. `snap_config` is the configuration the snapshot's
+    /// record carries: the configuration in force is the log tail's latest
+    /// configuration entry, committed or not (RAFT.md §1), and when compaction has
+    /// swallowed the entry itself the snapshot's record is where it survives. With
+    /// `quarantined` the server runs on a re-seeded store and grants no vote, no
+    /// pre-vote and no lease promise for good (RAFT.md §3).
+    #[must_use]
+    #[expect(clippy::too_many_arguments, reason = "a restart states everything")]
+    pub fn restore_compacted(
+        id: ServerId,
+        membership: Configuration,
+        config: RaftConfig,
+        seed: u64,
+        term: Term,
+        vote: Option<ServerId>,
+        snap_index: Index,
+        snap_term: Term,
+        snap_config: Option<Configuration>,
+        log: Vec<Entry>,
+        quarantined: bool,
+    ) -> Self {
+        debug_assert!(
+            log.first().is_none_or(|e| e.index == snap_index + 1),
+            "the log is the tail past the snapshot"
+        );
         let (membership_index, in_force) =
             log.iter()
                 .fold((0, None), |kept, entry| match &entry.payload {
                     Payload::Config(config) => (entry.index, Some(config.clone())),
                     _ => kept,
                 });
+        // After an install or a compaction the configuration entry in force may
+        // sit at or below the snapshot's last index: the record's configuration
+        // is then the one in force, held as of the snapshot (D-029, RAFT.md §3).
+        let (membership_index, in_force) = match (in_force, &snap_config) {
+            (Some(config), _) => (membership_index, Some(config)),
+            (None, Some(config)) if snap_index > 0 => (snap_index, Some(config.clone())),
+            (None, _) => (0, None),
+        };
         let mut raft = Self {
             id,
             config,
@@ -473,13 +615,22 @@ impl Raft {
             role: Role::Follower,
             leader: None,
             log,
-            commit: 0,
-            applied: 0,
+            snap_index,
+            snap_term,
+            snap_config,
+            taken: (snap_index > 0).then_some((snap_index, snap_term)),
+            take_pending: false,
+            quarantined,
+            // Everything the snapshot covers is committed and applied by
+            // construction (RAFT.md §1).
+            commit: snap_index,
+            applied: snap_index,
             granted: Vec::new(),
             progress: BTreeMap::new(),
             election_elapsed: 0,
             election_timeout: 0,
             heartbeat_elapsed: 0,
+            leader_ticks: 0,
             quorum_elapsed: 0,
             first_of_term: 0,
             reads: Vec::new(),
@@ -491,6 +642,7 @@ impl Raft {
             config_changed: false,
             truncate_from: None,
             appended: Vec::new(),
+            compacted_to: None,
         };
         raft.election_timeout = raft.draw_timeout();
         raft
@@ -538,40 +690,70 @@ impl Raft {
         self.applied
     }
 
-    /// The log.
+    /// The log's tail past the compacted prefix (all of it while nothing is
+    /// compacted).
     #[must_use]
     pub fn log(&self) -> &[Entry] {
         &self.log
     }
 
-    /// The last index, 0 for an empty log.
+    /// The compacted prefix's (last index, last term): the snapshot the log starts
+    /// after. (0, 0) for none.
+    #[must_use]
+    pub fn snapshot(&self) -> (Index, Term) {
+        (self.snap_index, self.snap_term)
+    }
+
+    /// Whether this server runs on a re-seeded store and grants no vote, no
+    /// pre-vote and no lease promise (RAFT.md §3).
+    #[must_use]
+    pub fn quarantined(&self) -> bool {
+        self.quarantined
+    }
+
+    /// The first index the log holds: one past the snapshot.
+    #[must_use]
+    pub fn first_index(&self) -> Index {
+        self.snap_index + 1
+    }
+
+    /// The last index: of the log, or of the snapshot when the log is empty; 0 for
+    /// neither.
     #[must_use]
     pub fn last_index(&self) -> Index {
-        self.log.len() as Index
+        self.snap_index + self.log.len() as Index
     }
 
-    /// The last entry's term, 0 for an empty log.
+    /// The last entry's term, the snapshot's when the log is empty, 0 for neither.
+    /// The election restriction and the consistency check read the snapshot's term
+    /// and index exactly here (RAFT.md §1).
     #[must_use]
     pub fn last_term(&self) -> Term {
-        self.log.last().map_or(0, |e| e.term)
+        self.log.last().map_or(self.snap_term, |e| e.term)
     }
 
-    /// The term of the entry at `index`: 0 at index 0, none past the log.
+    /// The term of the entry at `index`: 0 at index 0, the snapshot's term at its
+    /// boundary, none below the snapshot or past the log.
     #[must_use]
     pub fn term_at(&self, index: Index) -> Option<Term> {
-        if index == 0 {
-            return Some(0);
+        if index == self.snap_index {
+            return Some(self.snap_term);
         }
-        self.log.get(index as usize - 1).map(|e| e.term)
-    }
-
-    /// The entry at `index`, if the log has it.
-    #[must_use]
-    pub fn entry(&self, index: Index) -> Option<&Entry> {
-        if index == 0 {
+        if index < self.snap_index {
             return None;
         }
-        self.log.get(index as usize - 1)
+        self.log
+            .get((index - self.snap_index) as usize - 1)
+            .map(|e| e.term)
+    }
+
+    /// The entry at `index`, if the log still holds it.
+    #[must_use]
+    pub fn entry(&self, index: Index) -> Option<&Entry> {
+        if index <= self.snap_index {
+            return None;
+        }
+        self.log.get((index - self.snap_index) as usize - 1)
     }
 
     /// The configuration in force: the latest configuration entry in the log,
@@ -585,6 +767,23 @@ impl Raft {
     #[must_use]
     pub fn membership_index(&self) -> Index {
         self.membership_index
+    }
+
+    /// The configuration in force at the applied index: what a snapshot taken
+    /// there must record (RAFT.md §1). The log tail's latest configuration entry
+    /// at or below the applied index, else the compacted prefix's, else the
+    /// initial one.
+    #[must_use]
+    pub fn applied_membership(&self) -> Configuration {
+        self.log
+            .iter()
+            .take_while(|e| e.index <= self.applied)
+            .fold(None, |kept, e| match &e.payload {
+                Payload::Config(config) => Some(config.clone()),
+                _ => kept,
+            })
+            .or_else(|| self.snap_config.clone())
+            .unwrap_or_else(|| self.initial_membership.clone())
     }
 
     /// The parameters.
@@ -605,6 +804,9 @@ impl Raft {
                 self.applied = self.applied.max(index);
                 self.serve_reads();
             }
+            Input::SnapshotTaken { index, term } => self.on_snapshot_taken(index, term),
+            Input::SnapshotInstalled { to, index } => self.on_snapshot_installed(to, index),
+            Input::SnapshotFailed { to, retake } => self.on_snapshot_failed(to, retake),
             Input::Message { from, message, now } => self.on_message(from, message, now),
         }
         self.finish()
@@ -753,9 +955,11 @@ impl Raft {
 
     /// The leader asked this server to take over: an election now, no pre-vote,
     /// with vote requests marked as the leader's wish. A server that is not a
-    /// voter of the configuration in force cannot win and does not try.
+    /// voter of the configuration in force cannot win and does not try; a
+    /// quarantined server never campaigns (RAFT.md §3).
     fn on_timeout_now(&mut self, from: ServerId) {
-        if self.role == Role::Leader
+        if self.quarantined
+            || self.role == Role::Leader
             || self.leader != Some(from)
             || !self.membership.is_voter(self.id)
         {
@@ -778,6 +982,7 @@ impl Raft {
         if self.hard_state_changed
             || self.config_changed
             || self.truncate_from.is_some()
+            || self.compacted_to.is_some()
             || !self.appended.is_empty()
         {
             out.push(Output::Persist(Persist {
@@ -788,6 +993,7 @@ impl Raft {
                 config: self
                     .config_changed
                     .then(|| (self.membership_index, self.membership.clone())),
+                compact_to: self.compacted_to.take(),
             }));
             self.hard_state_changed = false;
             self.config_changed = false;
@@ -906,11 +1112,49 @@ impl Raft {
         self.heartbeat_elapsed += 1;
         match self.role {
             Role::Leader => {
+                self.leader_ticks = self.leader_ticks.saturating_add(1);
                 if self.heartbeat_elapsed >= self.config.heartbeat_ticks {
                     self.heartbeat_elapsed = 0;
                     for peer in self.replication_peers() {
                         self.replicate(peer, true);
                     }
+                }
+                // A snapshot when the log has outgrown the last one (RAFT.md §1).
+                // A fresh leader holds off for two minimum election timeouts: its
+                // first duty is its no-op and its followers, and a checkpoint
+                // stalls applies for its duration (D-030, PROPOSED(D-036)); a
+                // follower that needs the snapshot sooner gets one on demand
+                // through `replicate`.
+                if self.leader_ticks >= 2 * self.config.election_ticks.0
+                    && !self.take_pending
+                    && self.applied > self.taken.map_or(0, |(i, _)| i)
+                    && self.last_index() - self.taken.map_or(0, |(i, _)| i)
+                        > self.config.snapshot_threshold
+                {
+                    self.take_pending = true;
+                    self.outputs.push(Output::Snapshot(SnapshotAction::Take));
+                }
+                // Designation (RAFT.md §1's "being replaced by the snapshot"): a
+                // follower far behind and quiet for two minimum election timeouts
+                // no longer blocks compaction; when it comes back it is fed the
+                // snapshot, since its entries are gone.
+                // PROPOSED(D-037): the compaction trigger for unresponsive followers.
+                let threshold = self.config.snapshot_threshold;
+                let quiet = 2 * self.config.election_ticks.0;
+                let last = self.last_index();
+                let mut designated = false;
+                for progress in self.progress.values_mut() {
+                    progress.quiet_ticks += 1;
+                    if !progress.needs_snapshot
+                        && last - progress.matched > threshold
+                        && progress.quiet_ticks >= quiet
+                    {
+                        progress.needs_snapshot = true;
+                        designated = true;
+                    }
+                }
+                if designated {
+                    self.maybe_compact();
                 }
                 // Check quorum (RAFT.md §1): a leader that heard from no majority
                 // within the minimum election timeout has lost its followers to
@@ -939,7 +1183,9 @@ impl Raft {
             }
             Role::Follower | Role::PreCandidate | Role::Candidate => {
                 if self.election_elapsed >= self.election_timeout {
-                    if !self.membership.is_voter(self.id) {
+                    // A quarantined server never campaigns: leading takes a vote
+                    // for itself, and it grants none (RAFT.md §3).
+                    if self.quarantined || !self.membership.is_voter(self.id) {
                         // PROPOSED(D-033): a server that is not a voter of the
                         // configuration in force does not campaign. A learner, a
                         // server with no configuration yet, and a removed server
@@ -1006,6 +1252,7 @@ impl Raft {
     fn become_leader(&mut self) {
         self.leader = Some(self.id);
         self.heartbeat_elapsed = 0;
+        self.leader_ticks = 0;
         self.quorum_elapsed = 0;
         self.granted.clear();
         self.transfer = false;
@@ -1028,6 +1275,9 @@ impl Raft {
                         promise: None,
                         active: false,
                         guard: Guard::default(),
+                        installing: false,
+                        needs_snapshot: false,
+                        quiet_ticks: 0,
                     },
                 )
             })
@@ -1093,13 +1343,17 @@ impl Raft {
     }
 
     /// Removes entries from `from` on, in the log and in the step's persist. A
-    /// truncation that removes the configuration entry in force reverts to the
-    /// latest surviving one, or to the initial configuration (RAFT.md §1).
+    /// snapshot's entries are committed, so a conflict never reaches below the
+    /// compacted prefix; the clamp guards the variant that truncates on every
+    /// append. A truncation that removes the configuration entry in force reverts
+    /// to the latest surviving one, to the compacted prefix's, or to the initial
+    /// configuration (RAFT.md §1).
     fn truncate(&mut self, from: Index) {
+        let from = from.max(self.snap_index + 1);
         if from > self.last_index() {
             return;
         }
-        self.log.truncate(from as usize - 1);
+        self.log.truncate((from - self.snap_index) as usize - 1);
         self.appended.retain(|e| e.index < from);
         self.truncate_from = Some(self.truncate_from.map_or(from, |f| f.min(from)));
         self.trace(TraceEvent::RaftTruncate {
@@ -1115,9 +1369,99 @@ impl Raft {
                     Payload::Config(config) => Some((entry.index, config.clone())),
                     _ => None,
                 })
-                .unwrap_or((0, self.initial_membership.clone()));
+                .unwrap_or_else(|| match &self.snap_config {
+                    // The compacted prefix's entries are committed, so its
+                    // configuration is the floor a revert can reach (RAFT.md §1).
+                    Some(config) => (self.snap_index, config.clone()),
+                    None => (0, self.initial_membership.clone()),
+                });
             self.adopt(index, config);
         }
+    }
+
+    /// Records a completed checkpoint and compacts to it if every follower is past
+    /// it or designated snapshot-fed.
+    fn on_snapshot_taken(&mut self, index: Index, term: Term) {
+        self.take_pending = false;
+        if self.taken.is_none_or(|(i, _)| i < index) {
+            self.taken = Some((index, term));
+        }
+        self.maybe_compact();
+    }
+
+    /// The snapshot task streamed a snapshot to `to`, which runs on it now: its
+    /// match is at least the snapshot's last index.
+    fn on_snapshot_installed(&mut self, to: ServerId, index: Index) {
+        if self.role != Role::Leader {
+            return;
+        }
+        let Some(progress) = self.progress.get_mut(&to) else {
+            return;
+        };
+        progress.installing = false;
+        progress.needs_snapshot = false;
+        progress.matched = progress.matched.max(index);
+        progress.next = progress.next.max(progress.matched + 1);
+        progress.probe = None;
+        progress.inflight.clear();
+        self.maybe_commit();
+        self.maybe_compact();
+        self.replicate(to, false);
+    }
+
+    /// The snapshot task gave up on `to`; with `retake` the checkpoint itself is
+    /// unusable and the next need takes a fresh one. A failed take arrives the
+    /// same way, with `to` naming this server: `retake` then also clears the
+    /// pending take, so the next tick may ask again.
+    fn on_snapshot_failed(&mut self, to: ServerId, retake: bool) {
+        if retake {
+            self.taken = None;
+            self.take_pending = false;
+        }
+        if let Some(progress) = self.progress.get_mut(&to) {
+            progress.installing = false;
+        }
+    }
+
+    /// Compacts the log to the last checkpoint once every follower's match is past
+    /// it or the follower is designated snapshot-fed (RAFT.md §1): the prefix at or
+    /// below it is deleted, the snapshot standing in for it.
+    fn maybe_compact(&mut self) {
+        if self.role != Role::Leader {
+            return;
+        }
+        let Some((index, term)) = self.taken else {
+            return;
+        };
+        if index <= self.snap_index {
+            return;
+        }
+        let blocked = self
+            .progress
+            .values()
+            .any(|p| p.matched < index && !p.needs_snapshot && !p.installing);
+        if blocked {
+            return;
+        }
+        // The prefix may swallow the configuration entry in force: keep the
+        // configuration at the new prefix's end as the revert floor (D-029).
+        let drained =
+            self.log
+                .drain(..(index - self.snap_index) as usize)
+                .fold(None, |kept, entry| match entry.payload {
+                    Payload::Config(config) => Some(config),
+                    _ => kept,
+                });
+        if drained.is_some() {
+            self.snap_config = drained;
+        }
+        self.snap_index = index;
+        self.snap_term = term;
+        self.compacted_to = Some(index);
+        self.trace(TraceEvent::RaftCompacted {
+            server: self.id.0,
+            through: index,
+        });
     }
 
     fn on_propose(&mut self, command: Bytes) {
@@ -1195,6 +1539,9 @@ impl Raft {
                             promise: None,
                             active: false,
                             guard: Guard::default(),
+                            installing: false,
+                            needs_snapshot: false,
+                            quiet_ticks: 0,
                         },
                     );
                     tracked.insert(
@@ -1308,7 +1655,10 @@ impl Raft {
 
     /// Sends `to` what it has not got, up to the batch and pipeline limits; with
     /// `heartbeat` an empty AppendEntries goes when there is nothing to send, which
-    /// resets the follower's timer and carries the commit index.
+    /// resets the follower's timer and carries the commit index. A follower whose
+    /// `next` falls at or below the compacted prefix, or one designated
+    /// snapshot-fed, is fed the snapshot instead (RAFT.md §1): the core asks the
+    /// snapshot task to stream the last checkpoint, or to take one first.
     fn replicate(&mut self, to: ServerId, heartbeat: bool) {
         let last = self.last_index();
         let commit = self.commit;
@@ -1317,6 +1667,41 @@ impl Raft {
         let Some(progress) = self.progress.get(&to) else {
             return;
         };
+        if progress.installing || progress.needs_snapshot || progress.next <= self.snap_index {
+            if !progress.installing {
+                match self.taken {
+                    Some((index, snap_term)) => {
+                        if let Some(progress) = self.progress.get_mut(&to) {
+                            progress.installing = true;
+                        }
+                        self.outputs.push(Output::Snapshot(SnapshotAction::Install {
+                            to,
+                            index,
+                            term: snap_term,
+                        }));
+                    }
+                    None if !self.take_pending && self.applied > 0 => {
+                        self.take_pending = true;
+                        self.outputs.push(Output::Snapshot(SnapshotAction::Take));
+                    }
+                    None => {}
+                }
+            }
+            if heartbeat {
+                // The follower's timer and the leader's check quorum still need
+                // the round trip while the snapshot task works.
+                let message = Message::AppendEntries {
+                    term,
+                    prev_index: last,
+                    prev_term: self.last_term(),
+                    entries: Vec::new(),
+                    commit,
+                    sent: 0,
+                };
+                self.send(to, message);
+            }
+            return;
+        }
         let mut next = progress.next;
         let mut inflight = progress.inflight.clone();
         let probing = progress.probe.is_some();
@@ -1324,7 +1709,8 @@ impl Raft {
         let mut sends = Vec::new();
         while inflight.len() < limit && next <= last {
             let end = last.min(next + max_batch as Index - 1);
-            let entries: Vec<Entry> = self.log[next as usize - 1..end as usize].to_vec();
+            let at = (next - self.snap_index) as usize - 1;
+            let entries: Vec<Entry> = self.log[at..at + (end - next) as usize + 1].to_vec();
             sends.push(Message::AppendEntries {
                 term,
                 prev_index: next - 1,
@@ -1431,6 +1817,7 @@ impl Raft {
                         Message::AppendEntries {
                             prev_index, sent, ..
                         } => {
+                            let echo = if self.quarantined { 0 } else { sent };
                             self.send(
                                 from,
                                 Message::AppendEntriesResponse {
@@ -1439,7 +1826,7 @@ impl Raft {
                                     prev_index,
                                     match_index: 0,
                                     hint: 0,
-                                    echo: sent,
+                                    echo,
                                     local: 0,
                                 },
                             );
@@ -1496,6 +1883,9 @@ impl Raft {
                     now,
                 },
             ),
+            // Snapshot streaming is the snapshot task's (RAFT.md §3): the server
+            // routes these to it before the core sees them.
+            Message::InstallSnapshot { .. } | Message::InstallSnapshotResponse { .. } => {}
         }
     }
 
@@ -1503,7 +1893,8 @@ impl Raft {
     /// its minimum election timeout and whose log the candidate's is at least as up
     /// to date as; it changes nothing here.
     fn on_pre_vote(&mut self, from: ServerId, term: Term, last_index: Index, last_term: Term) {
-        let granted = term > self.term
+        let granted = !self.quarantined
+            && term > self.term
             && !self.heard_from_leader()
             && self.log_up_to_date(last_index, last_term);
         self.trace(TraceEvent::RaftVote {
@@ -1547,8 +1938,9 @@ impl Raft {
     /// up to date; the vote is persisted before the response leaves, and granting it
     /// resets the election timer (moirae rule 5).
     fn on_request_vote(&mut self, from: ServerId, last_index: Index, last_term: Term) {
-        let granted =
-            self.vote.is_none_or(|v| v == from) && self.log_up_to_date(last_index, last_term);
+        let granted = !self.quarantined
+            && self.vote.is_none_or(|v| v == from)
+            && self.log_up_to_date(last_index, last_term);
         if granted {
             if self.vote != Some(from) {
                 self.vote = Some(from);
@@ -1607,6 +1999,40 @@ impl Raft {
         }
         self.leader = Some(from);
         self.election_elapsed = 0;
+        // The promise a response makes runs from `sent`; a quarantined server makes
+        // none, so it echoes 0 and no lease is ever measured from it (RAFT.md §3).
+        let echo = if self.quarantined { 0 } else { sent };
+        // The response always carries the request's own previous index, so the
+        // leader can tell an answer to its outstanding probe from a stale one.
+        let request_prev = prev_index;
+        // Entries the compacted prefix covers are committed here, so they match by
+        // definition (RAFT.md §1): a request reaching below the prefix is answered
+        // for its suffix past it, or as already held when it has none.
+        let (prev_index, prev_term, entries) = if prev_index < self.snap_index {
+            let end = prev_index + entries.len() as Index;
+            if end <= self.snap_index {
+                self.send(
+                    from,
+                    Message::AppendEntriesResponse {
+                        term: self.term,
+                        success: true,
+                        prev_index: request_prev,
+                        match_index: end,
+                        hint: 0,
+                        echo,
+                        local: 0,
+                    },
+                );
+                return;
+            }
+            let tail: Vec<Entry> = entries
+                .into_iter()
+                .filter(|e| e.index > self.snap_index)
+                .collect();
+            (self.snap_index, self.snap_term, tail)
+        } else {
+            (prev_index, prev_term, entries)
+        };
         let consistent = match self.term_at(prev_index) {
             Some(t) => t == prev_term,
             None => false,
@@ -1615,12 +2041,16 @@ impl Raft {
             let hint = match self.term_at(prev_index) {
                 None => self.last_index() + 1,
                 Some(conflicting) => {
-                    // The first index of the conflicting term, so the leader skips it.
+                    // The first index of the conflicting term, so the leader skips
+                    // it; the walk stops at the compacted prefix, whose entries
+                    // cannot conflict.
                     let mut first = prev_index;
-                    while first > 1 && self.term_at(first - 1) == Some(conflicting) {
+                    while first > self.snap_index + 1
+                        && self.term_at(first - 1) == Some(conflicting)
+                    {
                         first -= 1;
                     }
-                    first
+                    first.max(1)
                 }
             };
             self.send(
@@ -1628,10 +2058,10 @@ impl Raft {
                 Message::AppendEntriesResponse {
                     term: self.term,
                     success: false,
-                    prev_index,
+                    prev_index: request_prev,
                     match_index: 0,
                     hint,
-                    echo: sent,
+                    echo,
                     local: 0,
                 },
             );
@@ -1676,10 +2106,10 @@ impl Raft {
             Message::AppendEntriesResponse {
                 term: self.term,
                 success: true,
-                prev_index,
+                prev_index: request_prev,
                 match_index: matched,
                 hint: 0,
-                echo: sent,
+                echo,
                 local: 0,
             },
         );
@@ -1708,21 +2138,27 @@ impl Raft {
         };
         // Any answer in this term is a sign of life for check quorum and a promise
         // for the lease, whether the entries fit or not: the follower reset its
-        // timer on the request either way (moirae rule 5).
+        // timer on the request either way (moirae rule 5). An echo of zero is a
+        // quarantined follower's (RAFT.md §3): a sign of life, never a promise and
+        // never a read's confirmation, since it grants votes to nobody and a vote
+        // majority need not cross it.
         progress.active = true;
-        progress.promise = progress.promise.max(Some(echo));
-        if let Some(moved) = progress.guard.observe(&self.config, now, echo, local) {
-            self.trace(TraceEvent::RaftLeaseRevoked {
-                server: self.id.0,
-                follower: from.0,
-                offset_moved: moved,
-            });
-        }
-        // A read-index round: an acknowledgement of a request sent after the read
-        // arrived says this server was still leader then.
-        for read in &mut self.reads {
-            if !read.confirmed && echo >= read.at && !read.acks.contains(&from) {
-                read.acks.push(from);
+        progress.quiet_ticks = 0;
+        if echo != 0 {
+            progress.promise = progress.promise.max(Some(echo));
+            if let Some(moved) = progress.guard.observe(&self.config, now, echo, local) {
+                self.trace(TraceEvent::RaftLeaseRevoked {
+                    server: self.id.0,
+                    follower: from.0,
+                    offset_moved: moved,
+                });
+            }
+            // A read-index round: an acknowledgement of a request sent after the
+            // read arrived says this server was still leader then.
+            for read in &mut self.reads {
+                if !read.confirmed && echo >= read.at && !read.acks.contains(&from) {
+                    read.acks.push(from);
+                }
             }
         }
         let Some(progress) = self.progress.get_mut(&from) else {
@@ -1731,6 +2167,7 @@ impl Raft {
         if success {
             // Monotone: a stale or duplicated response proposes only what was passed.
             progress.matched = progress.matched.max(match_index);
+            progress.needs_snapshot = false;
             while progress
                 .inflight
                 .front()
@@ -1744,11 +2181,19 @@ impl Raft {
             let caught_up = matched == self.last_index();
             self.note_learner_round(from, matched);
             self.maybe_commit();
+            self.maybe_compact();
             self.serve_reads();
             if self.transferee == Some(from) && caught_up {
                 self.send_timeout_now(from);
             }
         } else {
+            // A rejection of an append at index 1 is a server with no log at all
+            // asking to be re-seeded (RAFT.md §3): index 0 is consistent with any
+            // log, so no follower with one rejects it. It no longer blocks
+            // compaction and is fed the snapshot.
+            if prev_index == 0 {
+                progress.needs_snapshot = true;
+            }
             if progress.probe.is_some_and(|probe| probe != prev_index) {
                 return;
             }

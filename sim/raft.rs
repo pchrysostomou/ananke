@@ -267,7 +267,35 @@ pub enum Fault {
         /// for the old leader to campaign and re-send its backlog.
         steer: Duration,
     },
+    /// A crash aimed at the middle of a snapshot install (RAFT.md §5, stage E).
+    /// First `server` is isolated for `isolate`, long enough to fall behind the
+    /// snapshot threshold and go quiet past the designation, so the leader
+    /// compacts and feeds it the snapshot on heal; then the run advances in
+    /// small slices until the stream's final chunk is delivered to it, waits
+    /// `grace` for the receiver's repair to be in flight, and crashes it for
+    /// `down`. The correct install has no window here — its staging directory is
+    /// not a store until the repair is durable and `CURRENT` is written last —
+    /// while `Variant::SnapshotWithoutCurrentLast` comes back on the leader's
+    /// identity, which state machine safety reports. If no final chunk lands
+    /// within [`INSTALL_WAIT_BUDGET`], the crash never fires and the fault was
+    /// an isolation. Drawn from its own `moirae_sched` stream
+    /// ("snapshot-crash"), never lengthening the shared schedule stream (D-031).
+    CrashInstalling {
+        /// The follower isolated and then crashed mid-install; the leader's
+        /// neighbour if it leads when the fault starts.
+        server: u64,
+        /// How long it is cut off first, to fall behind the threshold.
+        isolate: Duration,
+        /// How long after the final chunk's delivery the crash lands.
+        grace: Duration,
+        /// How long the receiver stays down.
+        down: Duration,
+    },
 }
+
+/// The longest a [`Fault::CrashInstalling`] waits for an install to stream
+/// before giving up and doing nothing.
+pub const INSTALL_WAIT_BUDGET: Duration = Duration::from_millis(4000);
 
 /// One lease trial; two open every schedule, see the module documentation.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -377,6 +405,20 @@ impl Schedule {
             faults.push(fault);
             gaps.push(ms(&mut rng, 450, 700));
         }
+        // A crash aimed mid-install, on half the seeds, appended after the drawn
+        // faults. It draws from its own stream so the shared "schedule" stream's
+        // draws — and with them every other fault's dice — never move when this
+        // arm changes (D-031).
+        let mut snap = moirae_sched::stream(seed, "snapshot-crash");
+        if snap.below(2) == 0 {
+            faults.push(Fault::CrashInstalling {
+                server: 1 + snap.below(SERVERS),
+                isolate: ms(&mut snap, 700, 1100),
+                grace: ms(&mut snap, 2, 20),
+                down: ms(&mut snap, 50, 300),
+            });
+            gaps.push(ms(&mut snap, 450, 700));
+        }
         // Clocks, as the module documentation says: within the bound, or one
         // server slow and two fast, moderately or severely.
         let within = rng.below(2) == 0;
@@ -481,6 +523,12 @@ impl Schedule {
                     steer,
                     ..
                 } => *settle + *crash_after + *down + *steer,
+                Fault::CrashInstalling {
+                    isolate,
+                    grace,
+                    down,
+                    ..
+                } => *isolate + INSTALL_WAIT_BUDGET + *grace + *down,
             })
             .sum();
         let trials: Duration = self
@@ -602,10 +650,36 @@ impl Report {
         self.policy == Policy::Uniform
     }
 
-    /// Whether a majority of servers was running at the end: liveness needs one.
+    /// Whether a majority that can still elect a leader was running at the end:
+    /// liveness needs one. A refused server is down until a snapshot re-seeds it,
+    /// which its restatement's `RaftRecovered` says (RAFT.md §3) — but a re-seeded
+    /// server never votes again (PROPOSED(D-035)), so while it counts for commits
+    /// it cannot help elect, and a cluster whose impaired servers reach half has
+    /// no leader to wait for: a refused server can only be re-seeded *by* a
+    /// leader, so the deadlock is real and priced into D-035, not a liveness
+    /// failure. The release run's seed 60 reached exactly that: one server
+    /// quarantined by an early re-seed, a second refused by rot, and the last
+    /// pre-voting forever with nobody left to grant.
     #[must_use]
     pub fn majority_up(&self) -> bool {
-        (self.refused.len() as u64) * 2 < SERVERS
+        let mut down: BTreeSet<u64> = BTreeSet::new();
+        let mut quarantined: BTreeSet<u64> = BTreeSet::new();
+        for record in &self.records {
+            match &record.event {
+                TraceEvent::RaftRefused { server, .. } => {
+                    down.insert(*server);
+                }
+                TraceEvent::RaftRecovered { server, .. } => {
+                    down.remove(server);
+                }
+                TraceEvent::RaftReseeded { server } => {
+                    quarantined.insert(*server);
+                }
+                _ => {}
+            }
+        }
+        let impaired: BTreeSet<u64> = down.union(&quarantined).copied().collect();
+        (impaired.len() as u64) * 2 < SERVERS
     }
 
     /// How long after the last heal the first client write completed, if one did.
@@ -675,9 +749,24 @@ impl Report {
 
     /// Pre-vote (thesis §9.6): a server that receives nothing does not raise its
     /// term. Checked over every isolation the schedule made: the server's term at
-    /// the heal equals its term when the isolation began.
+    /// the heal equals its term when the isolation began. An isolation during
+    /// which the server was refused, re-seeded or finished installing a snapshot
+    /// is skipped: an install's restatement re-states the term the stream
+    /// carried, which is no election of the isolated server's (RAFT.md §3).
     fn isolation_keeps_the_term(&self) -> Result<(), String> {
         for &(server, from, until) in &self.isolations {
+            let reseeding = self.records.iter().any(|r| {
+                r.at >= from
+                    && r.at <= until
+                    && matches!(&r.event,
+                        TraceEvent::RaftRefused { server: s, .. }
+                        | TraceEvent::RaftReseeded { server: s }
+                        | TraceEvent::RaftSnapshot { server: s, taken: false, .. }
+                        if *s == server)
+            });
+            if reseeding {
+                continue;
+            }
             let term_at = |at: Instant| {
                 self.records
                     .iter()
@@ -704,7 +793,8 @@ impl Report {
     /// Election timers fire (moirae rule 5): a running server that is not the
     /// leader campaigns within [`TIMER_TIMEOUTS`] maximum election timeouts of the
     /// last AppendEntries it received from a leader of its term or later, the last
-    /// vote it granted, or its start.
+    /// vote it granted, or its start. A re-seeded server is exempt: it never
+    /// campaigns on that store, by design (RAFT.md §3, PROPOSED(D-035)).
     fn timers_fire(&self) -> Result<(), String> {
         // A server measures its timeout by its own clock: a slow one takes longer
         // in global time, and the bound scales with its rate.
@@ -716,11 +806,15 @@ impl Report {
         let mut payloads: BTreeMap<ananke_env::MessageId, Bytes> = BTreeMap::new();
         let mut up: BTreeSet<u64> = BTreeSet::new();
         let mut leaders: BTreeSet<u64> = BTreeSet::new();
+        let mut reseeded: BTreeSet<u64> = BTreeSet::new();
         let mut terms: BTreeMap<u64, u64> = BTreeMap::new();
         let mut last_reset: BTreeMap<u64, Instant> = BTreeMap::new();
         for record in &self.records {
             let at = record.at;
             match &record.event {
+                TraceEvent::RaftReseeded { server } => {
+                    reseeded.insert(*server);
+                }
                 TraceEvent::MessageSent { id, payload, .. } => {
                     payloads.insert(*id, payload.clone());
                 }
@@ -776,7 +870,7 @@ impl Report {
                 _ => {}
             }
             for server in &up {
-                if leaders.contains(server) {
+                if leaders.contains(server) || reseeded.contains(server) {
                     continue;
                 }
                 let since = last_reset.get(server).copied().unwrap_or(at);
@@ -835,10 +929,19 @@ pub fn node_config(id: u64, variant: Variant) -> NodeConfig {
         // acknowledgement below its no-op (D-031, issue #22). D-026's sweep ran
         // one entry per message instead, so the window opened on ordinary
         // catch-ups and the batched paths went unexercised.
+        //
+        // A small snapshot threshold, so leaders compact routinely and a follower
+        // partitioned away for under a second falls behind by more than it —
+        // the clients write a couple of dozen entries a second — and lands in
+        // the snapshot path on real schedules; a chunk small enough that an
+        // install takes many chunks, so resumption under drops actually happens
+        // (RAFT.md §1, stage E).
         raft: RaftConfig {
             variant,
             tick_nanos: u64::try_from(TICK.as_nanos()).expect("small"),
             drift_bound_ppm: DRIFT_BOUND_PPM,
+            snapshot_threshold: 12,
+            snapshot_chunk: 4096,
             ..RaftConfig::default()
         },
         engine,
@@ -1213,6 +1316,40 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
                 advance(&mut sim, *down, &mut watch);
                 restart(&mut sim, leader);
             }
+            Fault::CrashInstalling {
+                server,
+                isolate,
+                grace,
+                down,
+            } => {
+                // The victim first falls behind the threshold and goes quiet past
+                // the designation, so a stream follows the heal.
+                let leader = leader_now(&sim);
+                let victim = if *server == leader {
+                    server % SERVERS + 1
+                } else {
+                    *server
+                };
+                let side = vec![servers[victim as usize - 1]];
+                let rest: Vec<NodeId> = servers
+                    .iter()
+                    .chain(clients.iter())
+                    .chain(std::iter::once(&admin))
+                    .copied()
+                    .filter(|n| *n != side[0])
+                    .collect();
+                let from = sim.now();
+                sim.partition(&side, &rest);
+                advance(&mut sim, *isolate, &mut watch);
+                sim.heal();
+                isolations.push((victim, from, sim.now()));
+                if install_landing(&mut sim, &mut watch, victim) {
+                    advance(&mut sim, *grace, &mut watch);
+                    sim.crash(node_of_server(victim));
+                    advance(&mut sim, *down, &mut watch);
+                    restart(&mut sim, victim);
+                }
+            }
             Fault::StaleSender {
                 server,
                 one_way,
@@ -1339,6 +1476,61 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
 struct Watch {
     slices: u32,
     stopped: Option<String>,
+}
+
+/// Advances the run in small slices until `victim` receives the final chunk of a
+/// snapshot stream, or [`INSTALL_WAIT_BUDGET`] runs out: the moment
+/// [`Fault::CrashInstalling`] aims its crash at. The safety folds are skipped
+/// inside the small slices — the next ordinary [`advance`] runs them over
+/// everything — but the trace cap still stops a runaway.
+fn install_landing(sim: &mut Sim, watch: &mut Watch, victim: u64) -> bool {
+    if watch.stopped.is_some() {
+        return false;
+    }
+    let step = Duration::from_millis(5);
+    let mut payloads: BTreeMap<ananke_env::MessageId, Bytes> = BTreeMap::new();
+    // Only deliveries from here on count: a done-chunk of some earlier stream
+    // must not draw the crash. Sends are scanned a slice further back, so a
+    // chunk sent just before the watch began still decodes when it lands.
+    let mut scanned = sim.trace_len();
+    for record in sim.trace().iter().rev().take(2000) {
+        if let TraceEvent::MessageSent { id, payload, .. } = &record.event {
+            payloads.entry(*id).or_insert_with(|| payload.clone());
+        }
+    }
+    let mut waited = Duration::ZERO;
+    while waited < INSTALL_WAIT_BUDGET {
+        sim.run_for(step);
+        waited += step;
+        let len = sim.trace_len();
+        if len > TRACE_CAP {
+            watch.stopped = Some(format!(
+                "runaway: {len} trace records by {:?}, over the cap of {TRACE_CAP}",
+                sim.now()
+            ));
+            return false;
+        }
+        let records = sim.trace();
+        for record in &records[scanned..] {
+            match &record.event {
+                TraceEvent::MessageSent { id, payload, .. } => {
+                    payloads.insert(*id, payload.clone());
+                }
+                TraceEvent::MessageDelivered { id, to, .. } => {
+                    if server_of(*to) == Some(victim)
+                        && let Some(payload) = payloads.get(id)
+                        && let Ok(frame) = Frame::decode(payload.clone())
+                        && matches!(frame.message, Message::InstallSnapshot { done: true, .. })
+                    {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        scanned = records.len();
+    }
+    false
 }
 
 /// Runs the simulation for `duration` in slices of [`SLICE`], running the safety
