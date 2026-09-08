@@ -558,12 +558,20 @@ impl Report {
         self.policy == Policy::Uniform
     }
 
-    /// Whether a majority of servers was running at the end: liveness needs one.
-    /// A refused server is down; one a snapshot re-seeded is up again, which its
-    /// restatement's `RaftRecovered` says (RAFT.md §3).
+    /// Whether a majority that can still elect a leader was running at the end:
+    /// liveness needs one. A refused server is down until a snapshot re-seeds it,
+    /// which its restatement's `RaftRecovered` says (RAFT.md §3) — but a re-seeded
+    /// server never votes again (PROPOSED(D-035)), so while it counts for commits
+    /// it cannot help elect, and a cluster whose impaired servers reach half has
+    /// no leader to wait for: a refused server can only be re-seeded *by* a
+    /// leader, so the deadlock is real and priced into D-035, not a liveness
+    /// failure. The release run's seed 60 reached exactly that: one server
+    /// quarantined by an early re-seed, a second refused by rot, and the last
+    /// pre-voting forever with nobody left to grant.
     #[must_use]
     pub fn majority_up(&self) -> bool {
         let mut down: BTreeSet<u64> = BTreeSet::new();
+        let mut quarantined: BTreeSet<u64> = BTreeSet::new();
         for record in &self.records {
             match &record.event {
                 TraceEvent::RaftRefused { server, .. } => {
@@ -572,10 +580,14 @@ impl Report {
                 TraceEvent::RaftRecovered { server, .. } => {
                     down.remove(server);
                 }
+                TraceEvent::RaftReseeded { server } => {
+                    quarantined.insert(*server);
+                }
                 _ => {}
             }
         }
-        (down.len() as u64) * 2 < SERVERS
+        let impaired: BTreeSet<u64> = down.union(&quarantined).copied().collect();
+        (impaired.len() as u64) * 2 < SERVERS
     }
 
     /// How long after the last heal the first client write completed, if one did.

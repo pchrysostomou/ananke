@@ -1107,7 +1107,17 @@ operations `sync_dir` covered, so the staged files all vanished at the crash
 and the bogus `CURRENT` never had a store to win — the honest assembler now
 syncs the directory as each file completes, which is also what makes an
 acknowledged offset durable, and the variant's window became real: caught on 6
-of 20 seeds at the gate.
+of 20 seeds at the gate. And the hundred-seed release run, seed 60: rot refused
+one server while another was already quarantined from an earlier re-seed, and
+the one remaining voter pre-voted forever — a quarantined server grants nothing
+(D-035) and a refused one can only be re-seeded *by* a leader, so no leader can
+ever form. That deadlock is D-035's priced-in availability cost, not a liveness
+bug: the sweep's liveness bound is now asked only of clusters whose unimpaired
+servers — neither refused nor quarantined — still form a majority. The same
+seed showed the repair had to own the quarantine key outright: carried forward
+when the receiver's history was ever re-seeded, whatever kind of install
+refreshes the store, and tombstoned otherwise so a flag riding in the leader's
+checkpointed tenant 0 can never quarantine a healthy receiver.
 
 **Alternatives.** Multiple chunks in flight: resumption bookkeeping for a
 pipeline, for a path whose cost is the checkpoint, not the round trips.
@@ -1170,9 +1180,15 @@ by construction.
 
 **Consequences.** A cluster that re-seeds a server keeps one fewer potential
 candidate and lease promiser until the operator replaces the store; repeated
-refusals could quarantine a majority and cost availability with safety intact.
-The sweep's liveness checks treat a re-seeded server as up, since it commits and
-applies. Every affected site is marked `PROPOSED(D-035)`.
+refusals can leave no electable majority and cost availability with safety
+intact — the release run's seed 60 reached exactly that, one quarantined voter
+plus one refused server, with the last server pre-voting into silence. The
+sweep prices this in: its liveness bound is asked only where the unimpaired
+servers still form a majority, and a re-seeded server otherwise counts as up,
+since it commits and applies. The quarantine sticks to the store's history:
+any later install carries it forward, and the repair tombstones the key
+otherwise so the leader's own tenant 0 cannot quarantine a receiver. Every
+affected site is marked `PROPOSED(D-035)`.
 
 ---
 

@@ -707,11 +707,17 @@ impl<E: Environment> Assembler<E> {
             store::snapshot_key(),
             Value::Live(store::encode_snapshot_record(&record)),
         );
+        // The quarantine key is always written explicitly: set when this store's
+        // history was ever re-seeded, and a tombstone otherwise — the streamed
+        // checkpoint carries the *leader's* tenant 0, and a flag of the leader's
+        // must not quarantine the receiver. PROPOSED(D-035).
         if repair.quarantined {
             writes.insert(
                 store::quarantine_key(),
                 Value::Live(Bytes::from_static(&[1])),
             );
+        } else {
+            writes.insert(store::quarantine_key(), Value::Tombstone);
         }
         for entry in &repair.tail {
             writes.insert(

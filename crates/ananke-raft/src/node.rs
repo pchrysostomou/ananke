@@ -633,7 +633,10 @@ async fn install_decision<E: Environment>(
             term: node.store.term(),
             vote: node.store.vote(),
             tail,
-            quarantined: false,
+            // A quarantined server stays quarantined across any install on that
+            // history: the vote its lost state may have held is still unknown.
+            // PROPOSED(D-035): re-seeded servers are quarantined from voting for good.
+            quarantined: core.quarantined(),
         }));
     }
     loop {
