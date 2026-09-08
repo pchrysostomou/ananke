@@ -40,6 +40,7 @@ fn node_config(id: u64, servers: &[u64]) -> NodeConfig {
         id: ServerId(id),
         listen: addr(id),
         servers: servers.iter().map(|&s| (ServerId(s), addr(s))).collect(),
+        initial_voters: servers.iter().map(|&s| ServerId(s)).collect(),
         raft: RaftConfig::default(),
         engine: engine_config(),
         inbox_capacity: 64,

@@ -239,3 +239,77 @@ fn an_entrys_writes_and_the_applied_index_are_durable_together() {
         "only {verified} of 40 seeds came back as a state; refused: {refused:?}"
     );
 }
+
+/// The `0 / 2 / config` key (RAFT.md §3): a persist that carries the
+/// configuration in force writes it in the same synced batch, the next open
+/// reads it back consistent with the log, and a store whose key disagrees with
+/// its log — something else wrote it — is refused.
+#[test]
+fn the_config_key_comes_back_consistent_and_a_mismatch_is_refused() {
+    use ananke_raft::store::key;
+    use ananke_raft::types::Configuration;
+    use ananke_storage::WriteBatch;
+
+    let mut sim = Sim::new(SimConfig::new(23));
+    let node = sim.add_node();
+    let joint = Configuration {
+        voters: vec![ServerId(1), ServerId(2), ServerId(3)],
+        new_voters: Some(vec![ServerId(1), ServerId(2), ServerId(3), ServerId(4)]),
+        learners: Vec::new(),
+    };
+    let config_entry = Entry {
+        term: 1,
+        index: 2,
+        payload: Payload::Config(joint.clone()),
+    };
+    on_node(&mut sim, node, |env| {
+        let joint = joint.clone();
+        let config_entry = config_entry.clone();
+        Box::pin(async move {
+            let (engine, recovery) = Engine::open(env, config()).await.unwrap();
+            let (store, _) = RaftStore::open(Arc::new(engine), &recovery).await.unwrap();
+            store
+                .persist(&Persist {
+                    term: 1,
+                    vote: None,
+                    truncate_from: None,
+                    append: vec![entry(1, 1, "a"), config_entry],
+                    config: Some((2, joint)),
+                })
+                .await
+                .unwrap();
+        })
+    });
+    // The next open finds the key and the log in step.
+    on_node(&mut sim, node, |env| {
+        let config_entry = config_entry.clone();
+        Box::pin(async move {
+            let (engine, recovery) = Engine::open(env, config()).await.unwrap();
+            let (_, log) = RaftStore::open(Arc::new(engine), &recovery).await.unwrap();
+            assert_eq!(log, vec![entry(1, 1, "a"), config_entry]);
+        })
+    });
+    // Something else rewrites the key: the store is refused.
+    on_node(&mut sim, node, |env| {
+        Box::pin(async move {
+            let (engine, _) = Engine::open(env, config()).await.unwrap();
+            let mut batch = WriteBatch::new();
+            batch.put(
+                key(0, 2, b"config"),
+                Bytes::from_static(b"\x09\x00\x00\x00\x00\x00\x00\x00\x00"),
+            );
+            engine.write(batch, true).await.unwrap();
+        })
+    });
+    let refused = on_node(&mut sim, node, |env| {
+        Box::pin(async move {
+            let (engine, recovery) = Engine::open(env, config()).await.unwrap();
+            RaftStore::open(Arc::new(engine), &recovery)
+                .await
+                .err()
+                .map(|e| e.to_string())
+        })
+    });
+    let refused = refused.expect("the mismatched key refuses the store");
+    assert!(refused.contains("config"), "{refused}");
+}

@@ -20,6 +20,14 @@
 //! | `0 / 0 / hard` | `term: u64 \| vote: u64 (u64::MAX for none)` |
 //! | `0 / 0 / applied` | `applied: u64` |
 //! | `0 / 1 / <index: u64 BE>` | `term: u64 \| payload` |
+//! | `0 / 2 / config` | `index: u64 \| configuration` |
+//!
+//! The `config` key carries the latest configuration entry's index and content
+//! (RAFT.md §3), written in the same synced batch as the append or truncation
+//! that changed which entry that is, so the two can never disagree. The log scan
+//! recovers the same configuration today; the key exists so a snapshotted,
+//! compacted store still knows its configuration (stage E), and the open checks
+//! the two against each other.
 //!
 //! The engine recovers what it can and reports what it lost: a table it could not
 //! read, a manifest it fell back from, a log head it discarded, a log it stopped
@@ -45,12 +53,13 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 use crate::core::Persist;
 use crate::message::{get_payload, put_payload};
-use crate::types::{Entry, Index, ServerId, Term};
+use crate::types::{Configuration, Entry, Index, Payload, ServerId, Term};
 
 /// The tenant the protocol's state lives under.
 pub const RAFT_TENANT: u64 = 0;
 const META_TABLE: u64 = 0;
 const LOG_TABLE: u64 = 1;
+const CONFIG_TABLE: u64 = 2;
 const NO_VOTE: u64 = u64::MAX;
 
 /// A key under `tenant` and `table`.
@@ -73,6 +82,10 @@ fn applied_key() -> Bytes {
 
 fn log_key(index: Index) -> Bytes {
     key(RAFT_TENANT, LOG_TABLE, &index.to_be_bytes())
+}
+
+fn config_key() -> Bytes {
+    key(RAFT_TENANT, CONFIG_TABLE, b"config")
 }
 
 fn bad(what: &str) -> io::Error {
@@ -207,6 +220,10 @@ impl<E: Environment> RaftStore<E> {
             None => 0,
             Some(bytes) => decode_applied(bytes)?,
         };
+        let stored_config = match engine.get(&config_key()).await? {
+            None => None,
+            Some(bytes) => Some(decode_config(bytes)?),
+        };
         let snapshot = engine.snapshot();
         let start = key(RAFT_TENANT, LOG_TABLE, &[]);
         let end = key(RAFT_TENANT, LOG_TABLE + 1, &[]);
@@ -218,6 +235,18 @@ impl<E: Environment> RaftStore<E> {
                 return Err(bad("log indices not consecutive"));
             }
             log.push(entry);
+        }
+        // The config key and the log are written in one batch, so they can only
+        // disagree if something else wrote the store: refuse it (RAFT.md §3).
+        let in_log = log.iter().fold(None, |kept, entry| match &entry.payload {
+            Payload::Config(config) => Some((entry.index, config.clone())),
+            _ => kept,
+        });
+        match (&stored_config, &in_log) {
+            (None, None) => {}
+            (Some((0, _)), None) => {}
+            (Some(stored), Some(latest)) if stored == latest => {}
+            _ => return Err(bad("the configuration key is out of step with the log")),
         }
         let last_index = log.len() as Index;
         Ok((
@@ -293,6 +322,9 @@ impl<E: Environment> RaftStore<E> {
             batch.put(log_key(entry.index), encode_entry(entry));
             last_index = last_index.max(entry.index);
         }
+        if let Some((index, config)) = &persist.config {
+            batch.put(config_key(), encode_config(*index, config));
+        }
         if batch.is_empty() {
             return Ok(());
         }
@@ -352,6 +384,24 @@ fn encode_entry(entry: &Entry) -> Bytes {
     out.put_u64_le(entry.term);
     put_payload(&mut out, &entry.payload);
     out.freeze()
+}
+
+fn encode_config(index: Index, config: &Configuration) -> Bytes {
+    let mut out = BytesMut::with_capacity(32);
+    out.put_u64_le(index);
+    put_payload(&mut out, &Payload::Config(config.clone()));
+    out.freeze()
+}
+
+fn decode_config(mut bytes: Bytes) -> io::Result<(Index, Configuration)> {
+    if bytes.len() < 8 {
+        return Err(bad("config value"));
+    }
+    let index = bytes.get_u64_le();
+    match get_payload(&mut bytes)? {
+        Payload::Config(config) if bytes.is_empty() => Ok((index, config)),
+        _ => Err(bad("config value")),
+    }
 }
 
 fn decode_entry(index: Index, mut bytes: Bytes) -> io::Result<Entry> {

@@ -733,6 +733,7 @@ pub fn node_config(id: u64, variant: Variant) -> NodeConfig {
         servers: (1..=SERVERS)
             .map(|s| (ServerId(s), server_addr(s)))
             .collect(),
+        initial_voters: (1..=SERVERS).map(ServerId).collect(),
         // One entry per message: a follower behind by any number of entries is
         // caught up one message at a time, so the pipeline is exercised and a new
         // leader's own no-op reaches a follower in a message of its own, after the

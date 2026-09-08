@@ -67,6 +67,14 @@ pub enum Command {
         /// The server to lead next.
         to: u64,
     },
+    /// An operator's request that the group's voters become `voters` (RAFT.md
+    /// §1, joint consensus). The command is only the trigger: the leader
+    /// catches new servers up as learners and drives the joint and `C_new`
+    /// configuration ENTRIES; the command itself is never one.
+    Change {
+        /// The servers that are to be the voters.
+        voters: Vec<u64>,
+    },
 }
 
 impl Command {
@@ -78,7 +86,7 @@ impl Command {
             | Command::Delete { key }
             | Command::Cas { key, .. }
             | Command::Get { key } => Some(key),
-            Command::Transfer { .. } => None,
+            Command::Transfer { .. } | Command::Change { .. } => None,
         }
     }
 }
@@ -149,6 +157,13 @@ impl Command {
                 out.put_u8(4);
                 out.put_u64_le(*to);
             }
+            Command::Change { voters } => {
+                out.put_u8(5);
+                out.put_u32_le(u32::try_from(voters.len()).expect("voter count fits u32"));
+                for voter in voters {
+                    out.put_u64_le(*voter);
+                }
+            }
         }
         out.freeze()
     }
@@ -197,6 +212,18 @@ impl Command {
                     to: bytes.get_u64_le(),
                 }
             }
+            5 => {
+                if bytes.len() < 4 {
+                    return Err(bad("command torn"));
+                }
+                let count = bytes.get_u32_le() as usize;
+                if bytes.len() < count * 8 {
+                    return Err(bad("command torn"));
+                }
+                Command::Change {
+                    voters: (0..count).map(|_| bytes.get_u64_le()).collect(),
+                }
+            }
             _ => return Err(bad("command malformed")),
         };
         if !bytes.is_empty() {
@@ -240,7 +267,7 @@ pub async fn apply_command<E: Environment>(
             }
         }
         Some(Command::Get { key }) => Outcome::Value(store.engine().get(&user_key(key)).await?),
-        Some(Command::Transfer { .. }) => Outcome::Done,
+        Some(Command::Transfer { .. }) | Some(Command::Change { .. }) => Outcome::Done,
     };
     store.apply(index, batch).await?;
     Ok(outcome)
@@ -272,6 +299,10 @@ mod tests {
             },
             Command::Get {
                 key: Bytes::from_static(b"k"),
+            },
+            Command::Transfer { to: 3 },
+            Command::Change {
+                voters: vec![1, 2, 3, 4, 5],
             },
         ];
         for command in commands {
