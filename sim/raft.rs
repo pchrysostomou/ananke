@@ -761,7 +761,7 @@ fn spawn_server(sim: &Sim, id: u64, variant: Variant) {
 }
 
 /// The leader in force: the server of the latest `RaftLeader` event, or server 1.
-fn leader_now(sim: &Sim) -> u64 {
+pub(crate) fn leader_now(sim: &Sim) -> u64 {
     sim.trace()
         .iter()
         .rev()
@@ -800,7 +800,9 @@ fn to_result(outcome: Outcome) -> ClientResult {
 /// following NotLeader hints, abandoning a write it hears nothing about. Client 1
 /// reads more than it writes: it is the client the trial and the leader isolation
 /// keep on the cut-off leader's side, where a lease read is what matters.
-async fn client<E: Environment>(env: E, n: u64, stats: SharedStats) {
+/// `servers` is how many server nodes it may try: the membership scenario runs
+/// five, this sweep three.
+pub(crate) async fn client<E: Environment>(env: E, n: u64, servers: u64, stats: SharedStats) {
     let Ok(sock) = env.net().bind(client_addr(n)).await else {
         return;
     };
@@ -841,9 +843,9 @@ async fn client<E: Environment>(env: E, n: u64, stats: SharedStats) {
                 OP_TIMEOUT
             };
         let mut target = leader.unwrap_or_else(|| {
-            let pick = 1 + env.rng().below(SERVERS);
+            let pick = 1 + env.rng().below(servers);
             if avoid == Some(pick) {
-                pick % SERVERS + 1
+                pick % servers + 1
             } else {
                 pick
             }
@@ -900,14 +902,14 @@ async fn client<E: Environment>(env: E, n: u64, stats: SharedStats) {
                         Some(l) => target = l.0,
                         None => {
                             env.clock().sleep(Duration::from_millis(20)).await;
-                            target = target % SERVERS + 1;
+                            target = target % servers + 1;
                         }
                     }
                 }
                 None => {
                     // A get can be asked again elsewhere; a write cannot.
                     if !op.is_write() && now < deadline {
-                        target = target % SERVERS + 1;
+                        target = target % servers + 1;
                     } else {
                         break;
                     }
@@ -976,7 +978,7 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
         let env = sim.env(node);
         let inner = env.clone();
         let stats = stats[i].clone();
-        env.spawn("client", client(inner, i as u64 + 1, stats));
+        env.spawn("client", client(inner, i as u64 + 1, SERVERS, stats));
     }
     let all_but = |server: u64, client: u64| -> (Vec<NodeId>, Vec<NodeId>) {
         let side: Vec<NodeId> = vec![servers[server as usize - 1], clients[client as usize - 1]];

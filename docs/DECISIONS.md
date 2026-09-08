@@ -1032,4 +1032,163 @@ it.
 
 ---
 
+## D-029 — Joint-consensus membership changes: the configuration in force, learners first, and one change in flight
+
+**Context.** Stage D of RAFT.md's order: membership changes by joint consensus
+(thesis §4.3), servers being added catching up as non-voting learners first
+(thesis §4.2.1), one change in flight at a time, the `0 / 2 / config` key, the
+3 → 5 → 3 scenario under partition with its availability criterion (SPEC §3),
+and `Variant::SingleMajorityInJointConsensus`.
+
+**Decision.** A change from C_old to C_new is two entries, `C_old,new` and, once
+that is committed, `C_new`, and a server uses the latest configuration entry in
+its log, committed or not (RAFT.md §1): the core adopts it on append, leader
+and follower alike, reverts on truncation to the latest surviving entry or the
+initial configuration, and restores at restart by scanning the log the store
+hands back. Every take-effect emits `RaftConfig`; at a restart the node
+re-states the configuration in force after the log re-statement and before
+`RaftRecovered`, an order that is kept stable. The step's persist carries the
+configuration when it changed, and the store writes it under `0 / 2 / config`
+in the same synced batch as the append or truncation, checks it against the
+log at open, and refuses a store whose key and log disagree.
+
+Counting and addressing were pulled apart, which is where the stage's latent
+bug lived: `voters()` used to return every member. Now votes, pre-votes,
+commits, check quorum and read-index acknowledgements are counted through
+`Configuration::has_majority`, which takes a majority of each voter set in
+force and counts only members of each set — so a leader outside C_new
+contributes nothing to the majorities that commit it (thesis §4.3) with no
+special case, and learner acknowledgements count for nothing anywhere. The
+lease generalises the same way: per voter set, the promise that makes a
+majority of the set expire latest, the leader counted where it is a member,
+and while joint the earlier of the two sets' ends. Replication and heartbeats
+go to members plus the learners of the change under way.
+
+A learner's catch-up is measured in rounds by the leader's ticks: a round runs
+from its start to the acknowledgement covering the leader's then-last index,
+a round shorter than the minimum election timeout promotes the learner, a
+longer one starts the next round at the current last index, and the joint
+entry is proposed once every learner is caught up. The catch-up state is
+leader-local and volatile (PROPOSED D-032). From the joint entry on the change
+drives itself on whichever leader holds it: commit of the joint entry proposes
+C_new, commit of C_new steps the leader down if it is not in it, so the change
+survives the leader that started it. One change is in flight at a time,
+catch-up included: a request for different voters while one is under way, or
+while the latest configuration entry is uncommitted, is refused the way a
+proposal to a non-leader is; a request for the voters of the change under way
+or already in force asks for what is already true, is answered `Done`, and
+proposes nothing, so an operator's retry over a lossy network is harmless. The
+operator asks with `Command::Change { voters }`, a trigger and never an entry,
+answered `Done` on accept like a transfer (D-028), completion being
+configuration entries the trace shows. `NodeConfig` now separates the address
+book, every server that may exist, from `initial_voters`, what a fresh store
+starts with: the scenario's servers 4 and 5 start with no configuration at
+all, and a server that is not a voter of its configuration in force does not
+campaign (PROPOSED D-033). `commit_majority` judges every commit against the
+configuration in force on the committing leader at that moment, followed
+through `RaftConfig` events, both majorities while joint, with the `servers`
+parameter as the initial-configuration fallback.
+
+The scenario (`sim/membership.rs`) runs five server nodes, servers 4 and 5
+outside the initial {1, 2, 3}; the operator grows to five voters and shrinks
+back, each change with a seed-drawn partition that puts the leader in force on
+the minority side of the old voters, alone with a client or keeping 4 and 5;
+on half the seeds leadership is handed to 4 or 5 between the changes, so the
+shrink exercises the step-down. A change the partition killed is asked for
+again, up to four requests. Availability is SPEC §3's criterion as the
+existing liveness checks are shaped: on uniformly scheduled seeds, the longest
+gap between consecutive completed client operations, with time inside the
+partition windows taken out, must stay under ten maximum election timeouts —
+the partition itself may block writes while the leader is on the minority
+side, so the clock effectively starts at the heal. The variant counts one
+merged majority of the two sets while joint, in commits and elections both:
+the single-majority rule §4.3 exists to forbid, since a majority of the union
+need not contain a majority of either set.
+
+**What the sweep found.** The stage landed green: the core-level tests
+(`crates/ananke-raft/tests/membership.rs`) pinned the majority arithmetic
+before the simulator ran, and the first twenty-seed sweep passed with every
+coverage counter lit — six configuration reverts, three elections while
+joint, seven step-downs of a leader outside C_new. The variant is caught on
+twenty-eight of a hundred seeds, first as commit majority: leader 2 committed
+an entry durable on servers 2, 4 and 5 alone, three of the five merged voters
+but one of the three old ones — the disjoint-majority window the partition
+with the leader keeping 4 and 5 opens while servers 1 and 3 still stand on
+C_old. The measured worst completion gap on the correct server at a hundred
+seeds was just under three hundred milliseconds, under a sixth of the
+two-second bound; the ten-thousand-seed nightly will say whether it can
+tighten.
+
+**Alternatives.** Single-server changes (thesis §4.1): SPEC §3 asks for the
+hard version deliberately. Replicating the learner phase as its own
+configuration entry, etcd's shape: survives a leader crash mid-catch-up, but
+leaves a new leader holding learners with no recorded target C_new and needs
+a second entry form; a leader-local phase whose loss the operator observes
+and retries is smaller. Refusing a same-voters retry outright: an operator
+behind a lossy network could not tell "accepted, answer lost" from "refused"
+and would be wedged. Answering the operator only when C_new commits: couples
+one response to a multi-round future the trace already shows.
+
+**Consequences.** A leadership change during catch-up abandons the change and
+the operator retries. Removed servers keep the last configuration they saw,
+sit quiet under the D-033 rule, and are never told to shut down — an
+operator's business, left to the backlog. Configuration entries carry empty
+learner lists in this stage; the field waits for snapshots (stage E), which
+also inherit the `0 / 2 / config` key so a compacted store still knows its
+configuration.
+
+---
+
 _Next entry: D-029. Add one before implementing anything not covered above._
+
+## PROPOSED — needs approval
+
+## PROPOSED D-032 — Learner catch-up state is leader-local and volatile
+
+**Context.** RAFT.md §1 has servers being added catch up as learners before
+the joint entry exists, but does not say where the catch-up state lives. A
+leader can crash or be deposed mid-catch-up.
+
+**Decision.** The catch-up phase is leader-local and not replicated: the set
+of learners, each one's round and the target voters live in the core of the
+leader that accepted the change, and `become_follower` or `become_leader`
+clears them. A leadership change during catch-up abandons the change; the
+operator sees no joint entry in the trace and asks again, which is harmless
+because a request for the same voters is idempotent (D-029).
+
+**Alternatives.** A configuration entry that adds learners, the way etcd's
+AddLearnerNode does: the change would survive leader crashes, but the new
+leader would hold learners with no recorded target C_new to promote them
+into, and the log would need a second configuration-entry form. Blocking the
+operator until the joint entry exists: the answer would ride on a replication
+future the accept does not control.
+
+**Consequences.** A change can vanish without a trace entry beyond the
+request's `Done`; the membership scenario's driver retries, and an operator
+must too. Configuration entries always carry empty learner lists in stage D.
+
+## PROPOSED D-033 — A server that is not a voter of its configuration in force does not campaign
+
+**Context.** The thesis makes learners non-voting (§4.2.1) and discusses
+disruptive removed servers (§4.2.3); the stage D brief requires a server with
+no configuration and an empty log to sit quiet. Nothing in RAFT.md says
+whether such a server may start elections; pre-vote alone would keep it from
+winning but not from knocking every timeout, and `has_majority` of an empty
+voter set being false only makes the loss certain, not the knocking quiet.
+
+**Decision.** On its election timeout, a server that is not a voter of the
+configuration in force resets its timer and stays a follower: a learner, a
+server with no configuration yet, and a removed server cannot win an election
+and would only knock. It still grants votes and pre-votes by the usual rules,
+still follows any leader that appends to it, and ignores `TimeoutNow` for the
+same reason.
+
+**Alternatives.** Campaigning and losing: floods the trace with a role change
+and a message fan-out every timeout, forever, on every removed or waiting
+server. Special-casing only the empty configuration: leaves a removed server
+knocking, the §4.2.3 disruption pre-vote only dampens.
+
+**Consequences.** A server whose latest configuration entry excludes it never
+campaigns even while that entry is uncommitted; if a truncation reverts the
+entry, the revert restores its right to campaign with its configuration, so
+no liveness is lost that the thesis' rules would have kept.
