@@ -242,6 +242,7 @@ pub fn studio(payload: &[u8]) -> Option<Json> {
             Command::Cas { .. } => "cas",
             Command::Get { .. } => "get",
             Command::Transfer { .. } => "transfer",
+            Command::Change { .. } => "change",
         };
         let mut fields = vec![
             ("type", Json::str("client.request")),
@@ -251,6 +252,10 @@ pub fn studio(payload: &[u8]) -> Option<Json> {
         ];
         match &request.command {
             Command::Transfer { to } => fields.push(("to", int(*to))),
+            Command::Change { voters } => fields.push((
+                "voters",
+                Json::Array(voters.iter().map(|&v| int(v)).collect()),
+            )),
             command => {
                 if let Some(key) = command.key() {
                     fields.push(("key", text(key)));

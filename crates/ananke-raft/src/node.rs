@@ -31,6 +31,13 @@
 //! of the same term; an entry replaced by a later leader's is never answered, since
 //! its fate is not known here.
 //!
+//! An operator's [`Command::Transfer`] and [`Command::Change`] are triggers, never
+//! entries: the server hands them to the core directly. A transfer is answered
+//! Done at once (D-028); a change is answered Done when the leader accepts it,
+//! since its completion is configuration entries the trace shows, and NotLeader
+//! when it refuses — naming this server itself when the refusal is a different
+//! change already in flight (RAFT.md §1, D-029).
+//!
 //! The network delivers at least once: a request it duplicates arrives twice, and a
 //! leader that proposed both copies would apply the command twice, which for a
 //! compare-and-set is a second, failing swap the client may be told about instead of
@@ -63,8 +70,15 @@ pub struct NodeConfig {
     pub id: ServerId,
     /// The address it binds.
     pub listen: SocketAddr,
-    /// Every voter and its address, this server included.
+    /// The address book: every server that may exist and its address, this
+    /// server included, whether or not it is a voter today — membership changes
+    /// (RAFT.md §1) make voters of servers that were not.
     pub servers: Vec<(ServerId, SocketAddr)>,
+    /// The voters a FRESH store starts with. A store already holding a
+    /// configuration entry uses that one instead (RAFT.md §1); a server that is
+    /// not yet in any configuration starts with an empty list and sits quiet
+    /// until a leader's entries reach it.
+    pub initial_voters: Vec<ServerId>,
     /// The core's parameters.
     pub raft: RaftConfig,
     /// The engine's. Fallback and head-gap discard are turned off and log-damage
@@ -118,6 +132,7 @@ pub async fn run<E: Environment>(env: E, config: NodeConfig) -> io::Result<()> {
         id,
         listen,
         servers,
+        initial_voters,
         raft,
         engine,
         inbox_capacity,
@@ -155,12 +170,11 @@ pub async fn run<E: Environment>(env: E, config: NodeConfig) -> io::Result<()> {
     let store = Arc::new(store);
     let sock = Arc::new(env.net().bind(listen).await?);
     let addrs: Arc<BTreeMap<ServerId, SocketAddr>> = Arc::new(servers.iter().copied().collect());
-    let voters: Vec<ServerId> = servers.iter().map(|(id, _)| *id).collect();
     let variant = raft.variant;
     let seed = env.rng().next_u64();
     let mut core = Raft::restore(
         id,
-        Configuration::of(&voters),
+        Configuration::of(&initial_voters),
         raft,
         seed,
         store.term(),
@@ -271,6 +285,22 @@ pub async fn run<E: Environment>(env: E, config: NodeConfig) -> io::Result<()> {
             hash: entry.payload.hash(),
         });
     }
+    // The configuration in force, re-stated after the log so the trace always
+    // shows every server's, initial or restored (RAFT.md §1); before
+    // RaftRecovered, an order that is kept stable (D-029).
+    let membership = core.membership();
+    env.trace(TraceEvent::RaftConfig {
+        server,
+        index: core.membership_index(),
+        old: membership.voters.iter().map(|s| s.0).collect(),
+        new: membership
+            .new_voters
+            .as_ref()
+            .map(|new| new.iter().map(|s| s.0).collect())
+            .unwrap_or_default(),
+        joint: membership.new_voters.is_some(),
+        learners: membership.learners.iter().map(|s| s.0).collect(),
+    });
     // Then what the server resumes from, and the term for the trace's term lane and
     // the sweep's timer check, which counts from here.
     env.trace(TraceEvent::RaftRecovered {
@@ -312,8 +342,8 @@ pub async fn run<E: Environment>(env: E, config: NodeConfig) -> io::Result<()> {
                 }
             }
         };
-        let (input, request, read) = match event {
-            None => (Input::Tick, None, None),
+        let (input, request, read, change) = match event {
+            None => (Input::Tick, None, None, None),
             Some(Event::Message { from, message }) => (
                 Input::Message {
                     from,
@@ -322,8 +352,9 @@ pub async fn run<E: Environment>(env: E, config: NodeConfig) -> io::Result<()> {
                 },
                 None,
                 None,
+                None,
             ),
-            Some(Event::Applied(index)) => (Input::Applied(index), None, None),
+            Some(Event::Applied(index)) => (Input::Applied(index), None, None, None),
             Some(Event::Request { from, request }) => {
                 if let Command::Transfer { to } = request.command {
                     // An operator's wish, acted on at once and answered at once.
@@ -333,7 +364,16 @@ pub async fn run<E: Environment>(env: E, config: NodeConfig) -> io::Result<()> {
                         reply: Reply::Outcome(Outcome::Done),
                     };
                     let _ = node.sock.send(from, response.encode()).await;
-                    (Input::Transfer(ServerId(to)), None, None)
+                    (Input::Transfer(ServerId(to)), None, None, None)
+                } else if let Command::Change { voters } = &request.command {
+                    // An operator's membership change (RAFT.md §1): the command
+                    // is only the trigger, the change itself becomes
+                    // configuration entries. Answered Done once the leader
+                    // accepts it — completion is observable in the trace — and
+                    // NotLeader when it refuses, naming itself when the refusal
+                    // is a change already in flight (D-029).
+                    let voters = voters.iter().copied().map(ServerId).collect();
+                    (Input::Change(voters), None, None, Some((from, request)))
                 } else if matches!(request.command, Command::Get { .. }) {
                     // A read: served by the lease or after a heartbeat round, never
                     // through the log.
@@ -347,6 +387,7 @@ pub async fn run<E: Environment>(env: E, config: NodeConfig) -> io::Result<()> {
                         },
                         None,
                         Some(id),
+                        None,
                     )
                 } else {
                     if let Some(&(index, term)) = node.proposed.get(&(request.client, request.seq))
@@ -360,6 +401,7 @@ pub async fn run<E: Environment>(env: E, config: NodeConfig) -> io::Result<()> {
                         Input::Propose(request.command.encode()),
                         Some((from, request)),
                         None,
+                        None,
                     )
                 }
             }
@@ -372,6 +414,22 @@ pub async fn run<E: Environment>(env: E, config: NodeConfig) -> io::Result<()> {
             })
         {
             node.answer_read(id, Reply::NotLeader { leader }).await;
+        }
+        if let Some((from, request)) = change {
+            let refused = outputs.iter().find_map(|output| match output {
+                Output::Rejected { leader } => Some(*leader),
+                _ => None,
+            });
+            let reply = match refused {
+                Some(leader) => Reply::NotLeader { leader },
+                None => Reply::Outcome(Outcome::Done),
+            };
+            let response = Response {
+                client: request.client,
+                seq: request.seq,
+                reply,
+            };
+            let _ = node.sock.send(from, response.encode()).await;
         }
         if let Some((from, request)) = request {
             let rejected = outputs.iter().find_map(|output| match output {

@@ -306,3 +306,184 @@ impl Coverage {
         );
     }
 }
+
+// --- The membership scenario (SPEC §3, RAFT.md §1, stage D) ---
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use ananke_sim::membership;
+
+/// Two membership runs with the same seed produce byte-identical traces: the
+/// driver's decisions are functions of the trace and the seed alone.
+#[test]
+fn the_membership_scenario_has_byte_identical_traces_for_one_seed() {
+    let first = membership::run(7, Variant::Correct);
+    let second = membership::run(7, Variant::Correct);
+    assert_eq!(first.jsonl.as_bytes(), second.jsonl.as_bytes());
+}
+
+/// The positive control: the correct server passes 3 → 5 → 3 under partition on
+/// every seed, and the runs reached the states that matter.
+#[test]
+fn the_correct_server_passes_the_membership_scenario_on_every_seed() {
+    let mut coverage = MembershipCoverage::default();
+    for seed in 0..seeds() {
+        let report = membership::run(seed, Variant::Correct);
+        coverage.add(&report);
+        if let Err(violation) = report.check() {
+            write_trace(&format!("membership-{seed}"), &report.jsonl);
+            panic!("{violation}");
+        }
+    }
+    eprintln!("Membership: {coverage:?}");
+    coverage.assert_complete(seeds());
+}
+
+/// The negative control: a server that counts one merged majority while joint
+/// (thesis §4.3) is caught by the membership scenario's checks on some seed.
+#[test]
+fn a_server_that_counts_one_majority_in_joint_consensus_is_caught() {
+    let mut caught = Vec::new();
+    for seed in 0..seeds() {
+        if let Err(violation) =
+            membership::run(seed, Variant::SingleMajorityInJointConsensus).check()
+        {
+            caught.push(violation);
+        }
+    }
+    eprintln!(
+        "SingleMajorityInJointConsensus: caught on {} of {} seeds, first: {}",
+        caught.len(),
+        seeds(),
+        caught.first().map_or("", String::as_str)
+    );
+    assert!(
+        !caught.is_empty(),
+        "SingleMajorityInJointConsensus was never caught"
+    );
+}
+
+/// What the correct server's membership runs saw.
+#[derive(Debug, Default)]
+struct MembershipCoverage {
+    seeds: u64,
+    uniform_seeds: u64,
+    grows_completed: u64,
+    shrinks_completed: u64,
+    joint_configs_taken: usize,
+    new_configs_taken: usize,
+    learners_promoted: usize,
+    config_reverts: usize,
+    elections_while_joint: usize,
+    step_downs_outside_new: usize,
+    partitions: usize,
+    completed: u64,
+    abandoned: u64,
+    redirected: u64,
+    worst_completion_gap: Duration,
+    slowest_write_after_heal: Duration,
+}
+
+impl MembershipCoverage {
+    fn add(&mut self, report: &membership::Report) {
+        self.seeds += 1;
+        self.uniform_seeds += u64::from(report.uniform());
+        self.grows_completed += u64::from(report.grow_completed);
+        self.shrinks_completed += u64::from(report.shrink_completed);
+        self.partitions += report.partitions.len();
+        self.completed += report.clients.completed;
+        self.abandoned += report.clients.abandoned;
+        self.redirected += report.clients.redirected;
+        if report.uniform() {
+            if let Some(gap) = report.longest_completion_gap() {
+                self.worst_completion_gap = self.worst_completion_gap.max(gap);
+            }
+            if let Some(took) = report.time_to_write_after_heal() {
+                self.slowest_write_after_heal = self.slowest_write_after_heal.max(took);
+            }
+        }
+        // The configurations each server had in force, and who led, over the run.
+        let mut in_force: BTreeMap<u64, (u64, bool)> = BTreeMap::new();
+        let mut leading: BTreeSet<u64> = BTreeSet::new();
+        let mut promoted: BTreeSet<(u64, u64)> = BTreeSet::new();
+        for event in report.events() {
+            match event {
+                TraceEvent::RaftConfig {
+                    server,
+                    index,
+                    old,
+                    new,
+                    joint,
+                    ..
+                } => {
+                    if joint {
+                        self.joint_configs_taken += 1;
+                        for id in &new {
+                            if !old.contains(id) {
+                                promoted.insert((index, *id));
+                            }
+                        }
+                    } else if index > 0 {
+                        self.new_configs_taken += 1;
+                        if leading.contains(&server) && !old.contains(&server) {
+                            self.step_downs_outside_new += 1;
+                        }
+                    }
+                    if let Some(&(previous, _)) = in_force.get(&server)
+                        && index < previous
+                    {
+                        self.config_reverts += 1;
+                    }
+                    in_force.insert(server, (index, joint));
+                }
+                TraceEvent::RaftTerm { server, role, .. } => {
+                    if role == "leader" {
+                        leading.insert(server);
+                    } else {
+                        leading.remove(&server);
+                    }
+                }
+                TraceEvent::RaftLeader { server, .. } => {
+                    leading.insert(server);
+                    if in_force.get(&server).is_some_and(|&(_, joint)| joint) {
+                        self.elections_while_joint += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.learners_promoted += promoted.len();
+    }
+
+    fn assert_complete(&self, seeds: u64) {
+        for (what, seen) in [
+            ("grow completions", self.grows_completed),
+            ("shrink completions", self.shrinks_completed),
+            (
+                "joint configurations taken",
+                self.joint_configs_taken as u64,
+            ),
+            ("new configurations taken", self.new_configs_taken as u64),
+            ("learners promoted", self.learners_promoted as u64),
+            ("partitions", self.partitions as u64),
+            ("completed operations", self.completed),
+            ("uniformly scheduled seeds", self.uniform_seeds),
+        ] {
+            assert!(seen > 0, "the membership runs never saw {what}: {self:?}");
+        }
+        // Rarer states need the partition to land inside a narrow phase of the
+        // change: twenty seeds cannot promise them; a hundred can.
+        if seeds >= 100 {
+            for (what, seen) in [
+                ("elections while joint", self.elections_while_joint as u64),
+                (
+                    "step-downs of a leader outside C_new",
+                    self.step_downs_outside_new as u64,
+                ),
+                ("configuration reverts", self.config_reverts as u64),
+            ] {
+                assert!(seen > 0, "the membership runs never saw {what}: {self:?}");
+            }
+        }
+    }
+}

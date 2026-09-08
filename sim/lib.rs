@@ -18,6 +18,7 @@ use bytes::Bytes;
 pub mod echo;
 pub mod engine;
 pub mod lin;
+pub mod membership;
 pub mod raft;
 pub mod wal;
 
