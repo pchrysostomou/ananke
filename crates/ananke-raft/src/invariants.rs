@@ -240,20 +240,35 @@ pub fn state_machine_safety(events: &[TraceEvent]) -> Result<(), String> {
     Ok(())
 }
 
-/// Commit on a majority: every entry a leader's commit index covers was appended,
-/// durably as the trace reports it, on a majority of the `servers` when the leader
-/// committed it, with the leader's term and payload at that index.
+/// Commit on a majority of the configuration in force (RAFT.md §2 check 3): every
+/// entry a leader's commit index covers was appended, durably as the trace reports
+/// it, on a majority of the voters in force on that leader when it committed, with
+/// the leader's term and payload at that index — a majority of both voter sets
+/// while the configuration is joint (thesis §4.3). The configuration in force is
+/// followed through `RaftConfig` events; a server that has emitted none yet is on
+/// the initial configuration, servers 1 through `servers`.
 ///
 /// # Errors
 ///
 /// The first committed index short of a majority.
 pub fn commit_majority(events: &[TraceEvent], servers: usize) -> Result<(), String> {
+    let initial: Vec<u64> = (1..=servers as u64).collect();
     let mut logs: BTreeMap<u64, Log> = BTreeMap::new();
     let mut is_leader: BTreeMap<u64, Term> = BTreeMap::new();
     let mut checked: BTreeMap<u64, Index> = BTreeMap::new();
+    let mut configs: BTreeMap<u64, (Vec<u64>, Option<Vec<u64>>)> = BTreeMap::new();
     for event in events {
         replay(&mut logs, event);
         match event {
+            TraceEvent::RaftConfig {
+                server,
+                old,
+                new,
+                joint,
+                ..
+            } => {
+                configs.insert(*server, (old.clone(), joint.then(|| new.clone())));
+            }
             TraceEvent::RaftTerm { server, role, term } => {
                 if *role == "leader" {
                     is_leader.insert(*server, *term);
@@ -271,20 +286,29 @@ pub fn commit_majority(events: &[TraceEvent], servers: usize) -> Result<(), Stri
             } if is_leader.get(server) == Some(term) => {
                 let from = checked.get(server).copied().unwrap_or(0) + 1;
                 let log = logs.get(server).cloned().unwrap_or_default();
+                let (old, new) = configs
+                    .get(server)
+                    .cloned()
+                    .unwrap_or((initial.clone(), None));
                 for i in from..=*index {
                     let Some(entry) = log.get(&i) else {
                         return Err(format!(
                             "commit majority: leader {server} committed index {i} in term {term} without holding it"
                         ));
                     };
-                    let on = logs
-                        .values()
-                        .filter(|other| other.get(&i) == Some(entry))
-                        .count();
-                    if on * 2 <= servers {
+                    let on: Vec<u64> = logs
+                        .iter()
+                        .filter(|(_, other)| other.get(&i) == Some(entry))
+                        .map(|(&s, _)| s)
+                        .collect();
+                    let majority_of =
+                        |set: &[u64]| set.iter().filter(|s| on.contains(s)).count() * 2 > set.len();
+                    if !(majority_of(&old) && new.as_deref().is_none_or(majority_of)) {
                         return Err(format!(
-                            "commit majority: leader {server} committed index {i} (term {}) in term {term} with it durable on {on} of {servers} servers",
-                            entry.0
+                            "commit majority: leader {server} committed index {i} (term {}) in term {term} with it durable on {on:?} of voters {old:?}{}",
+                            entry.0,
+                            new.as_ref()
+                                .map_or(String::new(), |n| format!(" joint with {n:?}"))
                         ));
                     }
                 }

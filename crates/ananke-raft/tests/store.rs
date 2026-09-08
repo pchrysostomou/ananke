@@ -72,6 +72,7 @@ fn a_persist_comes_back_at_the_next_open_and_a_truncation_removes_the_tail() {
                     vote: Some(ServerId(2)),
                     truncate_from: None,
                     append: vec![entry(1, 1, "a"), entry(3, 2, "b"), entry(3, 3, "c")],
+                    config: None,
                 })
                 .await
                 .unwrap();
@@ -81,6 +82,7 @@ fn a_persist_comes_back_at_the_next_open_and_a_truncation_removes_the_tail() {
                     vote: None,
                     truncate_from: Some(3),
                     append: vec![entry(4, 3, "c'"), entry(4, 4, "d")],
+                    config: None,
                 })
                 .await
                 .unwrap();

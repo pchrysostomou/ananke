@@ -205,6 +205,7 @@ fn a_server_whose_store_lost_state_takes_part_in_nothing() {
                     vote: Some(ServerId(1)),
                     truncate_from: None,
                     append: entries,
+                    config: None,
                 })
                 .await
                 .unwrap();
