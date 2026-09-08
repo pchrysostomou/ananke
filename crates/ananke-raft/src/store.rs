@@ -52,7 +52,7 @@ use crate::types::{Configuration, Entry, Index, Payload, ServerId, Term};
 /// The tenant the protocol's state lives under.
 pub const RAFT_TENANT: u64 = 0;
 const META_TABLE: u64 = 0;
-const LOG_TABLE: u64 = 1;
+pub(crate) const LOG_TABLE: u64 = 1;
 /// The table the snapshot record lives under (RAFT.md §3): written into the live
 /// store before a checkpoint is taken, so the checkpoint's copy carries the
 /// snapshot's own identity, before the checkpoint's `CURRENT` (D-024).
@@ -504,6 +504,21 @@ fn decode_hard(mut bytes: Bytes) -> io::Result<(Term, Option<ServerId>)> {
     Ok((term, vote))
 }
 
+/// The value under the hard-state key: term and vote, as one persist writes it.
+pub(crate) fn encode_hard(term: Term, vote: Option<ServerId>) -> Bytes {
+    let mut out = BytesMut::with_capacity(16);
+    out.put_u64_le(term);
+    out.put_u64_le(vote.map_or(NO_VOTE, |v| v.0));
+    out.freeze()
+}
+
+/// The value under the applied-index key.
+pub(crate) fn encode_applied(applied: Index) -> Bytes {
+    let mut out = BytesMut::with_capacity(8);
+    out.put_u64_le(applied);
+    out.freeze()
+}
+
 fn decode_applied(mut bytes: Bytes) -> io::Result<Index> {
     if bytes.len() != 8 {
         return Err(bad("applied index value"));
@@ -511,7 +526,7 @@ fn decode_applied(mut bytes: Bytes) -> io::Result<Index> {
     Ok(bytes.get_u64_le())
 }
 
-fn encode_entry(entry: &Entry) -> Bytes {
+pub(crate) fn encode_entry(entry: &Entry) -> Bytes {
     let mut out = BytesMut::with_capacity(16);
     out.put_u64_le(entry.term);
     put_payload(&mut out, &entry.payload);

@@ -25,6 +25,7 @@ pub mod invariants;
 pub mod message;
 pub mod node;
 pub mod queue;
+pub mod snapshot;
 pub mod store;
 pub mod types;
 

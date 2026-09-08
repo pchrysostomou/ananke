@@ -1160,10 +1160,13 @@ impl Raft {
     }
 
     /// The snapshot task gave up on `to`; with `retake` the checkpoint itself is
-    /// unusable and the next need takes a fresh one.
+    /// unusable and the next need takes a fresh one. A failed take arrives the
+    /// same way, with `to` naming this server: `retake` then also clears the
+    /// pending take, so the next tick may ask again.
     fn on_snapshot_failed(&mut self, to: ServerId, retake: bool) {
         if retake {
             self.taken = None;
+            self.take_pending = false;
         }
         if let Some(progress) = self.progress.get_mut(&to) {
             progress.installing = false;

@@ -511,9 +511,23 @@ impl Report {
     }
 
     /// Whether a majority of servers was running at the end: liveness needs one.
+    /// A refused server is down; one a snapshot re-seeded is up again, which its
+    /// restatement's `RaftRecovered` says (RAFT.md §3).
     #[must_use]
     pub fn majority_up(&self) -> bool {
-        (self.refused.len() as u64) * 2 < SERVERS
+        let mut down: BTreeSet<u64> = BTreeSet::new();
+        for record in &self.records {
+            match &record.event {
+                TraceEvent::RaftRefused { server, .. } => {
+                    down.insert(*server);
+                }
+                TraceEvent::RaftRecovered { server, .. } => {
+                    down.remove(server);
+                }
+                _ => {}
+            }
+        }
+        (down.len() as u64) * 2 < SERVERS
     }
 
     /// How long after the last heal the first client write completed, if one did.
@@ -612,7 +626,8 @@ impl Report {
     /// Election timers fire (moirae rule 5): a running server that is not the
     /// leader campaigns within [`TIMER_TIMEOUTS`] maximum election timeouts of the
     /// last AppendEntries it received from a leader of its term or later, the last
-    /// vote it granted, or its start.
+    /// vote it granted, or its start. A re-seeded server is exempt: it never
+    /// campaigns on that store, by design (RAFT.md §3, PROPOSED(D-035)).
     fn timers_fire(&self) -> Result<(), String> {
         // A server measures its timeout by its own clock: a slow one takes longer
         // in global time, and the bound scales with its rate.
@@ -624,11 +639,15 @@ impl Report {
         let mut payloads: BTreeMap<ananke_env::MessageId, Bytes> = BTreeMap::new();
         let mut up: BTreeSet<u64> = BTreeSet::new();
         let mut leaders: BTreeSet<u64> = BTreeSet::new();
+        let mut reseeded: BTreeSet<u64> = BTreeSet::new();
         let mut terms: BTreeMap<u64, u64> = BTreeMap::new();
         let mut last_reset: BTreeMap<u64, Instant> = BTreeMap::new();
         for record in &self.records {
             let at = record.at;
             match &record.event {
+                TraceEvent::RaftReseeded { server } => {
+                    reseeded.insert(*server);
+                }
                 TraceEvent::MessageSent { id, payload, .. } => {
                     payloads.insert(*id, payload.clone());
                 }
@@ -684,7 +703,7 @@ impl Report {
                 _ => {}
             }
             for server in &up {
-                if leaders.contains(server) {
+                if leaders.contains(server) || reseeded.contains(server) {
                     continue;
                 }
                 let since = last_reset.get(server).copied().unwrap_or(at);
