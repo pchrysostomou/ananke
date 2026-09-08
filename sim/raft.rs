@@ -30,14 +30,16 @@
 //! scale. [`Report::drift_exceeded`] says which a seed was.
 //!
 //! A slow clock never leads on its own: its timer fires late in real time and the
-//! fast servers win every election. So every schedule opens with a lease trial
-//! ([`Trial`]): an operator asks the leader to hand over to the server with the
-//! slowest clock (leadership transfer, thesis §3.10), its lease forms, and it is
-//! then cut off with a reading client while the others elect and write. The
-//! adversary chose the clocks and chooses the operator's request; correlating them
-//! is its privilege. Under the guard the slow leader trusts no promise whose offset
-//! moved and serves by heartbeat round; without it
-//! (`Variant::LeaseTrustsTheClock`) it serves a stale read.
+//! fast servers win every election. So every schedule opens with two lease trials
+//! ([`Trial`]), one after the other: an operator asks the leader to hand over to
+//! the server with the slowest clock (leadership transfer, thesis §3.10), its
+//! lease forms, and it is then cut off with a reading client while the others
+//! elect and write. The adversary chose the clocks and chooses the operator's
+//! request; correlating them is its privilege. Under the guard the slow leader
+//! trusts no promise whose offset moved and serves by heartbeat round; without it
+//! (`Variant::LeaseTrustsTheClock`) it serves a stale read. One trial's window is
+//! a coin toss of the fault geometry; two per seed keep the variant's catch rate
+//! from being one window's statistical noise.
 //!
 //! Every fault-model test runs a known-buggy variant beside the correct one
 //! (CLAUDE.md): each [`Variant`] of RAFT.md §5 that this stage ships must be caught
@@ -134,10 +136,12 @@ pub fn client_addr(n: u64) -> SocketAddr {
     SocketAddr::from(([10, 0, 1, u8::try_from(n).expect("small")], 7000))
 }
 
-/// The operator's address.
+/// The operator's address for its `n`th request (1-based): one socket per
+/// request, so a second trial's transfer does not depend on the first socket's
+/// fate.
 #[must_use]
-pub fn admin_addr() -> SocketAddr {
-    SocketAddr::from(([10, 0, 2, 1], 7000))
+pub fn admin_addr(n: u64) -> SocketAddr {
+    SocketAddr::from(([10, 0, 2, u8::try_from(n).expect("small")], 7000))
 }
 
 /// The server bound to `addr`, if it is a server's.
@@ -211,7 +215,7 @@ pub enum Fault {
     },
 }
 
-/// The lease trial that opens every schedule; see the module documentation.
+/// One lease trial; two open every schedule, see the module documentation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Trial {
     /// How long the slowest leads before it is cut off: time for its lease.
@@ -220,8 +224,11 @@ pub struct Trial {
     pub isolate: Duration,
 }
 
-/// How long the trial gives the transfer before it looks for the new leader.
+/// How long a trial gives the transfer before it looks for the new leader.
 const TRANSFER_WAIT: Duration = Duration::from_millis(300);
+/// The quiet after each trial's heal, before the next trial or the faults: time
+/// for the cluster to elect and for the clients to write between the windows.
+const TRIAL_GAP: Duration = Duration::from_millis(500);
 /// The operator's client process in the trace.
 const ADMIN: u64 = 99 << 32;
 
@@ -230,8 +237,8 @@ const ADMIN: u64 = 99 << 32;
 pub struct Schedule {
     /// All links up, servers electing and clients starting.
     pub warmup: Duration,
-    /// The lease trial, right after the warmup.
-    pub trial: Trial,
+    /// The lease trials, one after the other, right after the warmup.
+    pub trials: Vec<Trial>,
     /// The faults, each healed before the next, with `gaps[i]` of quiet after it.
     pub faults: Vec<Fault>,
     /// The quiet after each fault.
@@ -329,10 +336,16 @@ impl Schedule {
         }
         Self {
             warmup: Duration::from_millis(1200),
-            trial: Trial {
-                settle: ms(&mut rng, 600, 900),
-                isolate: ms(&mut rng, 500, 800),
-            },
+            trials: vec![
+                Trial {
+                    settle: ms(&mut rng, 600, 900),
+                    isolate: ms(&mut rng, 500, 800),
+                },
+                Trial {
+                    settle: ms(&mut rng, 600, 900),
+                    isolate: ms(&mut rng, 500, 800),
+                },
+            ],
             faults,
             gaps,
             settle: election_max() * LIVENESS_TIMEOUTS + Duration::from_millis(200),
@@ -386,8 +399,12 @@ impl Schedule {
                 Fault::StaleSender { one_way, .. } => *one_way,
             })
             .sum();
-        let trial = TRANSFER_WAIT + self.trial.settle + self.trial.isolate;
-        self.warmup + trial + faults + self.gaps.iter().sum::<Duration>() + self.settle
+        let trials: Duration = self
+            .trials
+            .iter()
+            .map(|t| TRANSFER_WAIT + t.settle + t.isolate + TRIAL_GAP)
+            .sum();
+        self.warmup + trials + faults + self.gaps.iter().sum::<Duration>() + self.settle
     }
 }
 
@@ -423,8 +440,9 @@ pub struct Report {
     pub last_heal: Instant,
     /// Every isolation of one server: (server, from, until).
     pub isolations: Vec<(u64, Instant, Instant)>,
-    /// Whether the slowest clock led when the trial cut the leader off.
-    pub trial_led_by_slowest: bool,
+    /// In how many of the trials the slowest clock led when the trial cut the
+    /// leader off.
+    pub trials_led_by_slowest: usize,
     /// Servers refused at a restart, with the reason.
     pub refused: Vec<(u64, String)>,
     /// Why the run stopped early, if it did: a safety violation the folds saw at a
@@ -977,39 +995,46 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
         sim.restart(node_of_server(server));
         spawn_server(sim, server, variant);
     };
-    // The lease trial: the operator hands leadership to the slowest clock, which
-    // leads for a while and is then cut off with client 1.
+    // The lease trials: the operator hands leadership to the slowest clock, which
+    // leads for a while and is then cut off with client 1; twice, so the variant's
+    // catch rate is not one window's noise.
     let slowest = schedule.slowest();
-    let leader = leader_now(&sim);
-    if leader != slowest {
-        let env = sim.env(admin);
-        let inner = env.clone();
-        env.spawn("admin", async move {
-            let Ok(sock) = inner.net().bind(admin_addr()).await else {
-                return;
-            };
-            let request = Request {
-                client: ADMIN,
-                seq: 0,
-                command: Command::Transfer { to: slowest },
-            };
-            let _ = sock.send(server_addr(leader), request.encode()).await;
-        });
-        advance(&mut sim, TRANSFER_WAIT, &mut watch);
-    }
-    advance(&mut sim, schedule.trial.settle, &mut watch);
-    let leader = leader_now(&sim);
-    let trial_led_by_slowest = leader == slowest;
-    {
+    let mut trials_led_by_slowest = 0;
+    let mut last_heal = sim.now();
+    for (n, trial) in schedule.trials.iter().enumerate() {
+        if watch.stopped.is_some() {
+            break;
+        }
+        let leader = leader_now(&sim);
+        if leader != slowest {
+            let env = sim.env(admin);
+            let inner = env.clone();
+            let seq = n as u64;
+            env.spawn("admin", async move {
+                let Ok(sock) = inner.net().bind(admin_addr(seq + 1)).await else {
+                    return;
+                };
+                let request = Request {
+                    client: ADMIN,
+                    seq,
+                    command: Command::Transfer { to: slowest },
+                };
+                let _ = sock.send(server_addr(leader), request.encode()).await;
+            });
+            advance(&mut sim, TRANSFER_WAIT, &mut watch);
+        }
+        advance(&mut sim, trial.settle, &mut watch);
+        let leader = leader_now(&sim);
+        trials_led_by_slowest += usize::from(leader == slowest);
         let (side, rest) = all_but(leader, 1);
         let from = sim.now();
         sim.partition(&side, &rest);
-        advance(&mut sim, schedule.trial.isolate, &mut watch);
+        advance(&mut sim, trial.isolate, &mut watch);
         sim.heal();
         isolations.push((leader, from, sim.now()));
+        last_heal = sim.now();
+        advance(&mut sim, TRIAL_GAP, &mut watch);
     }
-    let mut last_heal = sim.now();
-    advance(&mut sim, Duration::from_millis(500), &mut watch);
     for (fault, gap) in schedule.faults.iter().zip(schedule.gaps.iter()) {
         if watch.stopped.is_some() {
             break;
@@ -1117,7 +1142,7 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
         records,
         last_heal,
         isolations,
-        trial_led_by_slowest,
+        trials_led_by_slowest,
         refused,
         stopped: watch.stopped,
         history,

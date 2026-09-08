@@ -110,7 +110,7 @@ fn a_leader_that_trusts_the_clock_is_caught_and_the_guard_revokes() {
     let mut first_stale = String::new();
     for seed in 0..seeds() {
         let correct = raft::run(seed, Variant::Correct);
-        slowest_led += usize::from(correct.trial_led_by_slowest);
+        slowest_led += correct.trials_led_by_slowest;
         if !correct.drift_exceeded() {
             lease_reads_within += correct.lease_reads();
             continue;
@@ -132,7 +132,7 @@ fn a_leader_that_trusts_the_clock_is_caught_and_the_guard_revokes() {
         neither += usize::from(!guard_revoked && !read_stale);
     }
     eprintln!(
-        "lease safety: drift beyond {DRIFT_BOUND_PPM} ppm on {exceeded} of {} seeds; of those, the guard revoked on {revoked}, a stale read was caught without the guard on {stale}, neither on {neither}; the slowest clock led the trial on {slowest_led} seeds; {lease_reads_within} lease reads on the seeds within the bound; first stale: {first_stale}",
+        "lease safety: drift beyond {DRIFT_BOUND_PPM} ppm on {exceeded} of {} seeds; of those, the guard revoked on {revoked}, a stale read was caught without the guard on {stale}, neither on {neither}; the slowest clock led {slowest_led} of the trials; {lease_reads_within} lease reads on the seeds within the bound; first stale: {first_stale}",
         seeds()
     );
     assert!(exceeded > 0, "no seed exceeded the drift bound");
