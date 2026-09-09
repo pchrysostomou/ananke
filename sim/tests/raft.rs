@@ -29,6 +29,20 @@ fn the_seed_42_trace_is_written_for_the_studio() {
     report.check().unwrap();
 }
 
+/// The first correct-server failures the ten-thousand-seed nightly ever produced,
+/// both the timer check misreading a follower being fed a snapshot: seed 164, a
+/// follower two hundred entries behind a compacting leader, fed by a train of
+/// InstallSnapshot chunks the check did not count as the leader's contact; seed
+/// 385, a follower cut off alone mid-install, campaigning a hundred milliseconds
+/// after the install's restatement rebuilt its core with a fresh timer and
+/// twenty-five past the bound (D-030, PROPOSED D-039). Both stay in the gate.
+#[test]
+fn seeds_164_and_385_which_the_first_nightly_found_stay_green() {
+    for seed in [164, 385] {
+        raft::run(seed, Variant::Correct).check().unwrap();
+    }
+}
+
 /// The positive control: the correct server satisfies every property on every
 /// seed, and the sweep reached the states that matter.
 #[test]

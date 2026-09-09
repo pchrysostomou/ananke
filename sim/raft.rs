@@ -842,6 +842,17 @@ impl Report {
                         last_reset.insert(server, at);
                     }
                 }
+                // PROPOSED(D-039): a completed snapshot install re-states the server
+                // and rebuilds its incarnation with a fresh election timer. The
+                // install was the leader's doing and the server was busy finishing
+                // it, so the restatement counts as the leader's contact here. A crash
+                // restart re-states the same way and is reset below when its RaftTerm
+                // re-admits it; this arm is for the server that never went down. The
+                // nightly's seed 385: cut off alone mid-install, it campaigned a
+                // hundred milliseconds after the switch and twenty-five past the bound.
+                TraceEvent::RaftRecovered { server, .. } if up.contains(server) => {
+                    last_reset.insert(*server, at);
+                }
                 TraceEvent::RaftTerm { server, term, role } => {
                     terms.insert(*server, *term);
                     if !up.contains(server) {

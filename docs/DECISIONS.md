@@ -1578,4 +1578,45 @@ sites are marked `PROPOSED(D-038)`.
 
 ---
 
-_Next entry: D-039. Add one before implementing anything not covered above._
+## PROPOSED D-039 — A completed snapshot install counts as the leader's contact for the timer check
+
+**Context.** The ten-thousand-seed nightly produced the sweep's first two
+correct-server failures, both from the timers-fire check (RAFT.md §2, moirae rule
+5: a follower that hears from no leader of its term and grants no vote for two
+maximum election timeouts must have campaigned), and both against a follower
+being fed a snapshot. Seed 164: a follower two hundred entries behind a leader
+whose log was compacted past it, reached only by a train of `InstallSnapshot`
+chunks the check did not read as contact, since the core routes them to the
+snapshot task; that half is a plain checker gap, fixed in D-030's stanza. Seed
+385: a follower cut off alone by a partition mid-install spent two hundred and
+twenty-five milliseconds finishing the install locally — verifying the staged
+tables, repairing tenant 0, switching stores — after which the incarnation
+switch of D-030 rebuilt its core with a fresh election timer, and it campaigned a
+hundred milliseconds later: three hundred and twenty-seven milliseconds from the
+leader's last contact, twenty-five past its bound. The code resets the timer at
+the switch; the check did not know that.
+
+**Decision.** For the timer check, a completed snapshot install is the leader's
+contact: the install was leader-initiated and the server was legitimately busy
+finishing it, so the install's restatement (`RaftRecovered` on a server that
+never went down) resets the check's clock the way a crash restart's restatement
+does. The protocol is unchanged: a new incarnation draws a fresh timeout as it
+always has, and the check now models that. Seeds 164 and 385 are pinned in the
+gate.
+
+**Alternatives.** Widening `TIMER_TIMEOUTS` from two to three, the knob RAFT.md
+§5 names for bounds the ten-thousand-seed sweep trips: blunt, and it dulls the
+check that catches `ResetTimerOnAnyRpc`. Changing the code so a new incarnation
+inherits the old timer's elapsed count: arguably closer to the paper, where an
+install is one RPC and not a fresh start, but a behaviour change to the
+protocol's timing under review, and the fresh timer is defensible — a server that
+just installed the leader's snapshot has just heard from it.
+
+**Consequences.** An install that takes longer than the bound with no
+completion in the window would still trip the check, which is the right
+sensitivity to keep: the sweep should see an install that slow. The check stays
+a function of the trace alone. The site is marked `PROPOSED(D-039)`.
+
+---
+
+_Next entry: D-040. Add one before implementing anything not covered above._
