@@ -819,11 +819,25 @@ impl Report {
                     payloads.insert(*id, payload.clone());
                 }
                 TraceEvent::MessageDelivered { id, to, .. } => {
+                    // Any contact from a leader of the server's term or later resets
+                    // its election timer (moirae rule 5): an AppendEntries, whether
+                    // its consistency check passes or not, and equally an
+                    // InstallSnapshot, which is how a leader reaches a follower whose
+                    // next index has fallen below the leader's compacted prefix
+                    // (RAFT.md §1). The core routes the snapshot to its own task, but
+                    // the follower is hearing from the leader all the same, and its
+                    // incarnation's timer stays fresh across the install; a follower
+                    // caught up only by a long train of snapshots would otherwise be
+                    // read as starved though a leader is feeding it every few
+                    // milliseconds. The nightly's seed 164 was exactly that.
                     if let Some(server) = server_of(*to)
                         && let Some(payload) = payloads.get(id)
                         && let Ok(frame) = Frame::decode(payload.clone())
-                        && let Message::AppendEntries { term, .. } = frame.message
-                        && term >= terms.get(&server).copied().unwrap_or(0)
+                        && matches!(
+                            frame.message,
+                            Message::AppendEntries { .. } | Message::InstallSnapshot { .. }
+                        )
+                        && frame.message.term() >= terms.get(&server).copied().unwrap_or(0)
                     {
                         last_reset.insert(server, at);
                     }

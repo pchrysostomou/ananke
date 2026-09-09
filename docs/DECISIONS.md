@@ -1225,7 +1225,19 @@ servers — neither refused nor quarantined — still form a majority. The same
 seed showed the repair had to own the quarantine key outright: carried forward
 when the receiver's history was ever re-seeded, whatever kind of install
 refreshes the store, and tombstoned otherwise so a flag riding in the leader's
-checkpointed tenant 0 can never quarantine a healthy receiver.
+checkpointed tenant 0 can never quarantine a healthy receiver. And the
+ten-thousand-seed nightly, seed 164, the first correct-server failure the sweep
+ever produced: a follower two hundred entries behind, fed by a long train of
+`InstallSnapshot` chunks because the leader's log past it was compacted, was
+flagged by the timer check for not campaigning across four hundred milliseconds
+— while the leader was reaching it every few milliseconds. An InstallSnapshot
+is a leader's contact as much as an AppendEntries (moirae rule 5), and the real
+follower's incarnation keeps its election timer fresh across the install; the
+core routes the snapshot to its own task, so the timer check, which read only
+AppendEntries as a reset, saw a gap that the server never had. It now counts an
+InstallSnapshot from a leader of the server's term or later as a reset too. The
+hundred-seed runs never reached a follower that far behind under a compacting
+leader; ten thousand did, which is what ten thousand are for.
 
 **Alternatives.** Multiple chunks in flight: resumption bookkeeping for a
 pipeline, for a path whose cost is the checkpoint, not the round trips.
