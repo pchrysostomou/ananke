@@ -38,6 +38,11 @@ Deferred ideas are GitHub issues labelled by phase; [docs/BACKLOG.md](docs/BACKL
   made unless `scripts/gate.sh` has exited 0 on the exact tree being committed, run as
   that single command, never as separate shell lines whose failures can be missed. CI
   runs the same checks as parallel jobs.
+- **Every commit is the author's.** Commits are authored and committed as
+  `pchrysostomou <prodromosch@hotmail.co.uk>`, never with a `Co-Authored-By` or any
+  other AI trailer. Before any push, `git log --format='%an %cn' main..HEAD | sort -u`
+  must print that one line and nothing else; if anything else appears, stop and fix
+  the history before it leaves the machine.
 - **Every state transition that matters emits a trace event.** If it can't be seen in
   the moirae studio, it didn't happen. A scenario's trace is `Sim::to_moirae` JSONL;
   CI pins its hash, and a deliberate change updates the constant in the same commit and
@@ -78,6 +83,7 @@ clippy.toml            Banned I/O paths (disallowed-methods / disallowed-types)
 ```
 scripts/gate.sh          # the only command that precedes a commit: 20 seeds, debug
 scripts/premerge.sh      # before asking for a merge: 1000 seeds, release, ~15 min
+git log --format='%an %cn' main..HEAD | sort -u   # before any push: one line, pchrysostomou pchrysostomou
 ```
 
 The gate runs, in order: `cargo fmt --all -- --check`, `cargo clippy --workspace
