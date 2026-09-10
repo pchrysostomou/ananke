@@ -3,11 +3,12 @@
 //! seed with every §1.3 fault on, and each known-buggy variant is caught. One test per
 //! variant, so they run side by side and a nightly of 10 000 seeds stays tractable.
 
+use std::sync::Mutex;
 use std::time::Duration;
 
 use ananke_env::{TraceEvent, WalStopReason};
 use ananke_sim::wal::{self, Excuse};
-use ananke_sim::{seeds, write_trace};
+use ananke_sim::{seeds, sweep, verdict, write_trace};
 use ananke_storage::Variant;
 
 /// Two runs with the same seed produce byte-identical traces.
@@ -32,27 +33,31 @@ fn the_seed_42_trace_is_written_for_the_studio() {
 /// leaves its trace in `out/`.
 #[test]
 fn the_correct_log_passes_every_seed() {
-    let mut coverage = Coverage::default();
-    for seed in 0..seeds() {
+    let coverage = Mutex::new(Coverage::default());
+    let verdicts = sweep(seeds(), |seed| {
         let report = wal::run(seed, Variant::Correct);
-        coverage.add(&report);
-        if let Err(violation) = report.check() {
+        coverage.lock().unwrap().add(&report);
+        report.check().map_err(|violation| {
             write_trace(&format!("wal-{seed}"), &report.jsonl);
-            panic!("{violation}");
-        }
-    }
+            format!("seed {seed}: {violation}")
+        })
+    });
+    let coverage = coverage.into_inner().unwrap();
     eprintln!("Correct: {coverage:?}");
+    if let Err(violation) = verdict(&verdicts) {
+        panic!("{violation}");
+    }
     coverage.assert_complete();
 }
 
 /// The negative controls: each known bug is caught on some seed.
 fn is_caught(variant: Variant) {
-    let mut caught = Vec::new();
-    for seed in 0..seeds() {
-        if let Err(violation) = wal::run(seed, variant).check() {
-            caught.push(violation);
-        }
-    }
+    let caught: Vec<String> = sweep(seeds(), |seed| {
+        wal::run(seed, variant).check().err().map(|v| v.to_string())
+    })
+    .into_iter()
+    .flatten()
+    .collect();
     eprintln!(
         "{variant:?}: caught on {} of {} seeds, first: {}",
         caught.len(),

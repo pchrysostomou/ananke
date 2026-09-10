@@ -116,20 +116,19 @@ knowledge — is Alagappan et al.'s protocol-aware recovery (FAST 2018), issue #
 
 ## The sweep by the numbers
 
-At 100 seeds in release on the overnight branch (the union of all three stages):
-every one of the nine sweep-tested variants caught — SendBeforePersist and
-TruncateOnEveryAppend and NoPreVote on 100/100, ApplyBeforeCommit 92,
-CountOlderTermForCommit 42 under default batching, ResetTimerOnAnyRpc 44,
-SingleMajorityInJointConsensus 28, SnapshotWithoutCurrentLast 26, and the guardless
-lease server caught serving a stale read with the guard revoking on every one of the
-52 drift-exceeded seeds. The membership scenario completed its 3 → 5 → 3 change under
-partition on all 100 seeds, worst availability gap 469 ms against a 2 s bound. The
-correct server: green on every seed of both sweeps, with 3116 snapshots taken, 1292
-installed, 4941 streams resumed after loss, and 46 completed refusal → re-seed →
-applying-again cycles.
-
-<!-- TODO(nightly): replace with the 10k-seed table and wall-clock once the run
-completes; note any seed the 10k run found that 100 did not. -->
+At 1000 seeds in release (`scripts/premerge.sh`, seeds in parallel, D-040; the
+10k verdict is pending on the GitHub nightly): every one of the nine sweep-tested
+variants caught — SendBeforePersist, TruncateOnEveryAppend and NoPreVote on
+1000/1000, ApplyBeforeCommit 895, ResetTimerOnAnyRpc 438, CountOlderTermForCommit
+406 under default batching, SnapshotWithoutCurrentLast 326,
+SingleMajorityInJointConsensus 275, and the guardless lease server caught serving a
+stale read on 41 of the 503 drift-exceeded seeds with the guard revoking on every
+one of them. The membership scenario completed its 3 → 5 → 3 change under
+partition on all 1000 seeds, worst availability gap 469 ms against a 2 s bound.
+The correct server: green on every seed of both sweeps — 4820 partitions, 3165
+crashes, 580 refusals and 17 046 lease revocations later. The Phase 1 sweeps hold
+at a thousand too. A thousand seeds take a quarter of an hour on a laptop; that
+is the tier a branch is merged on, and ten thousand are the nightly's.
 
 ## What is deferred, deliberately
 

@@ -5,9 +5,11 @@
 //! the manifest names its table and the one whose compaction deletes its inputs
 //! before the manifest stops naming them.
 
+use std::sync::Mutex;
+
 use ananke_env::TraceEvent;
 use ananke_sim::engine::{self, Variant};
-use ananke_sim::{seeds, write_trace};
+use ananke_sim::{seeds, sweep, verdict, write_trace};
 
 /// Two runs with the same seed produce byte-identical traces.
 #[test]
@@ -29,16 +31,20 @@ fn the_seed_42_trace_is_written_for_the_studio() {
 /// and the sweep reached the states that matter.
 #[test]
 fn the_correct_engine_passes_every_seed() {
-    let mut coverage = Coverage::default();
-    for seed in 0..seeds() {
+    let coverage = Mutex::new(Coverage::default());
+    let verdicts = sweep(seeds(), |seed| {
         let report = engine::run(seed, Variant::Correct);
-        coverage.add(&report);
-        if let Err(violation) = report.check() {
+        coverage.lock().unwrap().add(&report);
+        report.check().map_err(|violation| {
             write_trace(&format!("engine-{seed}"), &report.jsonl);
-            panic!("{violation}");
-        }
-    }
+            format!("seed {seed}: {violation}")
+        })
+    });
+    let coverage = coverage.into_inner().unwrap();
     eprintln!("Correct: {coverage:?}");
+    if let Err(violation) = verdict(&verdicts) {
+        panic!("{violation}");
+    }
     coverage.assert_complete();
 }
 
@@ -125,20 +131,32 @@ fn the_correct_engine_passes_every_seed_with_deep_levels() {
         eprintln!("ANANKE_DEEP_SEEDS is not set: skipped");
         return;
     }
-    let mut rounds_at_or_below_level_2 = 0u32;
-    let mut deepest = 0u8;
-    for seed in 0..seeds {
+    let per_seed = sweep(seeds, |seed| {
         let report = engine::run_with(seed, engine::Schedule::deep(), Variant::Correct);
-        if let Err(violation) = report.check() {
+        let verdict = report.check().map_err(|violation| {
             write_trace(&format!("engine-deep-{seed}"), &report.jsonl);
-            panic!("{violation}");
-        }
+            format!("seed {seed}: {violation}")
+        });
+        let mut rounds = 0u32;
+        let mut deepest = 0u8;
         for record in &report.records {
             if let TraceEvent::CompactionWritten { level, .. } = record.event {
-                rounds_at_or_below_level_2 += u32::from(level >= 2);
+                rounds += u32::from(level >= 2);
                 deepest = deepest.max(level + 1);
             }
         }
+        (verdict, rounds, deepest)
+    });
+    let mut rounds_at_or_below_level_2 = 0u32;
+    let mut deepest = 0u8;
+    let mut verdicts = Vec::with_capacity(per_seed.len());
+    for (verdict, rounds, deep) in per_seed {
+        rounds_at_or_below_level_2 += rounds;
+        deepest = deepest.max(deep);
+        verdicts.push(verdict);
+    }
+    if let Err(violation) = verdict(&verdicts) {
+        panic!("{violation}");
     }
     eprintln!(
         "deep levels: {rounds_at_or_below_level_2} rounds from level 2 or deeper, deepest level {deepest}"
@@ -155,12 +173,15 @@ fn the_correct_engine_passes_every_seed_with_deep_levels() {
 
 /// The negative controls: each known bug is caught on some seed.
 fn is_caught(variant: Variant) {
-    let mut caught = Vec::new();
-    for seed in 0..seeds() {
-        if let Err(violation) = engine::run(seed, variant).check() {
-            caught.push(violation);
-        }
-    }
+    let caught: Vec<String> = sweep(seeds(), |seed| {
+        engine::run(seed, variant)
+            .check()
+            .err()
+            .map(|v| v.to_string())
+    })
+    .into_iter()
+    .flatten()
+    .collect();
     eprintln!(
         "{variant:?}: caught on {} of {} seeds, first: {}",
         caught.len(),

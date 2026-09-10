@@ -27,7 +27,8 @@ Deferred ideas are GitHub issues labelled by phase; [docs/BACKLOG.md](docs/BACKL
   (D-014). The banned paths are listed in `clippy.toml`; only `ananke-env`'s `real`
   module, plus the edge files `time.rs` and `collections.rs`, may carry
   `allow(clippy::disallowed_*)`. `scripts/check-direct-io.sh` is the textual second
-  check and fails if any other file carries the allow. Both run in CI.
+  check and fails if any other file carries the allow; it also confines `rayon`, the
+  sweep driver's thread pool, to `sim/parallel.rs` (D-040). Both run in CI.
 - **No `unsafe` outside `crates/ananke-storage`.** The workspace lint is
   `deny(unsafe_code)`; `ananke-storage` is the only crate permitted to
   `#![allow(unsafe_code)]`. Every `unsafe` block carries a `// SAFETY:` comment and
@@ -75,10 +76,16 @@ clippy.toml            Banned I/O paths (disallowed-methods / disallowed-types)
 ## Verification commands
 
 ```
-scripts/gate.sh          # the only command that precedes a commit
+scripts/gate.sh          # the only command that precedes a commit: 20 seeds, debug
+scripts/premerge.sh      # before asking for a merge: 1000 seeds, release, ~15 min
 ```
 
-It runs, in order: `cargo fmt --all -- --check`, `cargo clippy --workspace
+The gate runs, in order: `cargo fmt --all -- --check`, `cargo clippy --workspace
 --all-targets --all-features -- -D warnings`, `scripts/check-direct-io.sh`, `cargo doc
 --workspace --no-deps` with warnings as errors, `cargo test --workspace --all-targets`
-and the doctests.
+and the doctests. The sweeps' four tiers (D-040): 20 seeds at the gate, 100 in CI,
+1000 under `scripts/premerge.sh` on the machine in front of you, 10 000 in the
+nightly workflow on GitHub — the only place ten thousand run. Every sweep runs its
+seeds in parallel through `ananke_sim::sweep` (`sim/parallel.rs`, the one file
+outside `ananke-env` allowed host threads); each seed's simulation is independent,
+so a trace and a failing seed mean the same whichever way the sweep ran.

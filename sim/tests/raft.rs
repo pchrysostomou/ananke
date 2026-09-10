@@ -5,13 +5,14 @@
 //! hundred-seed run reports it.
 
 use std::collections::BTreeSet;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use ananke_env::{ClientOp, DropReason, TraceEvent};
 use ananke_raft::core::Variant;
 use ananke_sim::raft::DRIFT_BOUND_PPM;
 use ananke_sim::raft::{self, Fault};
-use ananke_sim::{seeds, write_trace};
+use ananke_sim::{seeds, sweep, verdict, write_trace};
 
 /// Two runs with the same seed produce byte-identical traces.
 #[test]
@@ -47,28 +48,29 @@ fn seeds_164_and_385_which_the_first_nightly_found_stay_green() {
 /// seed, and the sweep reached the states that matter.
 #[test]
 fn the_correct_server_passes_every_seed() {
-    let mut coverage = Coverage::default();
-    for seed in 0..seeds() {
+    let coverage = Mutex::new(Coverage::default());
+    let verdicts = sweep(seeds(), |seed| {
         let report = raft::run(seed, Variant::Correct);
-        coverage.add(&report);
-        if let Err(violation) = report.check() {
-            write_trace(&format!("raft-{seed}"), &report.jsonl);
-            panic!("{violation}");
-        }
-    }
+        coverage.lock().unwrap().add(&report);
+        report
+            .check()
+            .inspect_err(|_| write_trace(&format!("raft-{seed}"), &report.jsonl))
+    });
+    let coverage = coverage.into_inner().unwrap();
     eprintln!("Correct: {coverage:?}");
+    if let Err(violation) = verdict(&verdicts) {
+        panic!("{violation}");
+    }
     coverage.assert_complete();
 }
 
 /// The negative controls: each known bug is caught on some seed, and the rate is
 /// reported.
 fn is_caught(variant: Variant) {
-    let mut caught = Vec::new();
-    for seed in 0..seeds() {
-        if let Err(violation) = raft::run(seed, variant).check() {
-            caught.push(violation);
-        }
-    }
+    let caught: Vec<String> = sweep(seeds(), |seed| raft::run(seed, variant).check().err())
+        .into_iter()
+        .flatten()
+        .collect();
     eprintln!(
         "{variant:?}: caught on {} of {} seeds, first: {}",
         caught.len(),
@@ -127,6 +129,40 @@ fn a_server_that_installs_without_current_last_is_caught() {
 /// stale without the guard, and how many did neither.
 #[test]
 fn a_leader_that_trusts_the_clock_is_caught_and_the_guard_revokes() {
+    /// What one seed contributes: the guardless server runs only where the drift
+    /// exceeded the bound, and its stale read's violation is kept for the report.
+    struct Seed {
+        led: usize,
+        exceeded: bool,
+        revoked: bool,
+        stale: Option<String>,
+        lease_reads_within: usize,
+    }
+    let per_seed = sweep(seeds(), |seed| {
+        let correct = raft::run(seed, Variant::Correct);
+        let led = correct.trials_led_by_slowest;
+        if !correct.drift_exceeded() {
+            return Seed {
+                led,
+                exceeded: false,
+                revoked: false,
+                stale: None,
+                lease_reads_within: correct.lease_reads(),
+            };
+        }
+        let revoked = correct.lease_revokes() > 0;
+        let stale = match raft::run(seed, Variant::LeaseTrustsTheClock).check() {
+            Err(violation) if violation.contains("linearizability") => Some(violation),
+            _ => None,
+        };
+        Seed {
+            led,
+            exceeded: true,
+            revoked,
+            stale,
+            lease_reads_within: 0,
+        }
+    });
     let mut exceeded = 0;
     let mut revoked = 0;
     let mut stale = 0;
@@ -134,28 +170,22 @@ fn a_leader_that_trusts_the_clock_is_caught_and_the_guard_revokes() {
     let mut lease_reads_within = 0;
     let mut slowest_led = 0;
     let mut first_stale = String::new();
-    for seed in 0..seeds() {
-        let correct = raft::run(seed, Variant::Correct);
-        slowest_led += correct.trials_led_by_slowest;
-        if !correct.drift_exceeded() {
-            lease_reads_within += correct.lease_reads();
+    for seed in per_seed {
+        slowest_led += seed.led;
+        lease_reads_within += seed.lease_reads_within;
+        if !seed.exceeded {
             continue;
         }
         exceeded += 1;
-        let guard_revoked = correct.lease_revokes() > 0;
-        revoked += usize::from(guard_revoked);
-        let buggy = raft::run(seed, Variant::LeaseTrustsTheClock);
-        let read_stale = match buggy.check() {
-            Err(violation) if violation.contains("linearizability") => {
-                if first_stale.is_empty() {
-                    first_stale = violation;
-                }
-                true
-            }
-            _ => false,
-        };
+        revoked += usize::from(seed.revoked);
+        let read_stale = seed.stale.is_some();
+        if let Some(violation) = seed.stale
+            && first_stale.is_empty()
+        {
+            first_stale = violation;
+        }
         stale += usize::from(read_stale);
-        neither += usize::from(!guard_revoked && !read_stale);
+        neither += usize::from(!seed.revoked && !read_stale);
     }
     eprintln!(
         "lease safety: drift beyond {DRIFT_BOUND_PPM} ppm on {exceeded} of {} seeds; of those, the guard revoked on {revoked}, a stale read was caught without the guard on {stale}, neither on {neither}; the slowest clock led {slowest_led} of the trials; {lease_reads_within} lease reads on the seeds within the bound; first stale: {first_stale}",
@@ -415,16 +445,19 @@ fn the_membership_scenario_has_byte_identical_traces_for_one_seed() {
 /// every seed, and the runs reached the states that matter.
 #[test]
 fn the_correct_server_passes_the_membership_scenario_on_every_seed() {
-    let mut coverage = MembershipCoverage::default();
-    for seed in 0..seeds() {
+    let coverage = Mutex::new(MembershipCoverage::default());
+    let verdicts = sweep(seeds(), |seed| {
         let report = membership::run(seed, Variant::Correct);
-        coverage.add(&report);
-        if let Err(violation) = report.check() {
-            write_trace(&format!("membership-{seed}"), &report.jsonl);
-            panic!("{violation}");
-        }
-    }
+        coverage.lock().unwrap().add(&report);
+        report
+            .check()
+            .inspect_err(|_| write_trace(&format!("membership-{seed}"), &report.jsonl))
+    });
+    let coverage = coverage.into_inner().unwrap();
     eprintln!("Membership: {coverage:?}");
+    if let Err(violation) = verdict(&verdicts) {
+        panic!("{violation}");
+    }
     coverage.assert_complete(seeds());
 }
 
@@ -432,14 +465,14 @@ fn the_correct_server_passes_the_membership_scenario_on_every_seed() {
 /// (thesis §4.3) is caught by the membership scenario's checks on some seed.
 #[test]
 fn a_server_that_counts_one_majority_in_joint_consensus_is_caught() {
-    let mut caught = Vec::new();
-    for seed in 0..seeds() {
-        if let Err(violation) =
-            membership::run(seed, Variant::SingleMajorityInJointConsensus).check()
-        {
-            caught.push(violation);
-        }
-    }
+    let caught: Vec<String> = sweep(seeds(), |seed| {
+        membership::run(seed, Variant::SingleMajorityInJointConsensus)
+            .check()
+            .err()
+    })
+    .into_iter()
+    .flatten()
+    .collect();
     eprintln!(
         "SingleMajorityInJointConsensus: caught on {} of {} seeds, first: {}",
         caught.len(),

@@ -8,12 +8,13 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Mutex;
 use std::task::{Context, Poll};
 
 use ananke_env::sim::Sim;
 use ananke_env::{Environment, TraceEvent};
 use ananke_sim::echo::{self, Variant};
-use ananke_sim::{seeds, write_trace};
+use ananke_sim::{seeds, sweep, verdict, write_trace};
 use moirae_trace::trace_hash;
 
 /// The pinned hash of the seed-42 trace (`out/echo-42.jsonl`) of the `NoSyncDir`
@@ -68,23 +69,31 @@ fn different_seeds_give_different_traces() {
 /// its trace in `out/`.
 #[test]
 fn every_seed_satisfies_the_invariants_and_the_sweep_exercises_the_disk_faults() {
-    let mut pongs = 0;
-    let mut sloppy = Coverage::default();
-    let mut correct = Coverage::default();
-    for seed in 0..seeds() {
-        for (variant, coverage) in [
-            (Variant::NoSyncDir, &mut sloppy),
-            (Variant::Correct, &mut correct),
-        ] {
+    let sloppy = Mutex::new(Coverage::default());
+    let correct = Mutex::new(Coverage::default());
+    let per_seed = sweep(seeds(), |seed| {
+        let mut pongs = 0;
+        for (variant, coverage) in [(Variant::NoSyncDir, &sloppy), (Variant::Correct, &correct)] {
             let report = echo::run(seed, variant);
             if let Err(violation) = report.check() {
                 write_trace(&format!("echo-{seed}-{variant:?}"), &report.jsonl);
-                panic!("{variant:?}: {violation}");
+                return (Err(format!("seed {seed}: {variant:?}: {violation}")), pongs);
             }
             pongs += report.pongs_received();
-            coverage.add(&report);
+            coverage.lock().unwrap().add(&report);
         }
+        (Ok(()), pongs)
+    });
+    let mut pongs = 0;
+    let mut verdicts = Vec::with_capacity(per_seed.len());
+    for (verdict, seed_pongs) in per_seed {
+        pongs += seed_pongs;
+        verdicts.push(verdict);
     }
+    if let Err(violation) = verdict(&verdicts) {
+        panic!("{violation}");
+    }
+    let (sloppy, correct) = (sloppy.into_inner().unwrap(), correct.into_inner().unwrap());
     assert!(pongs > 0);
     eprintln!("NoSyncDir: {sloppy:?}");
     eprintln!("Correct: {correct:?}");

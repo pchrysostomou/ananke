@@ -16,6 +16,9 @@ moirae changes.
 | `8b79ca8` | merge of stage D onto the batched sweep |
 | `c9fc814` `75e24fc` `101db4e` `51754ad` | stage E: snapshots — compacted log, codec, the snapshot task, streaming and the staged install, the re-seeded server, the quarantine, snapshot-aware invariants (D-030) |
 | `1373601` | merge of stage E onto D+#22: nine files reconciled; the install repair now writes `0/2/config` (proven by a negative control); two latent composition bugs fixed (the truncation revert floor on a compacted log; the take-record's configuration following applied `Config` entries) |
+| `f54b468` | raft sweep: an InstallSnapshot resets the timer check — the nightly's seed 164 (D-030 stanza) |
+| `74b93c5` | raft sweep: seed 385, the install's restatement resets the timer check (PROPOSED D-039); seeds 164 and 385 pinned; this record, the devlog draft and BOOTSTRAP's status committed |
+| (this commit) | sim: seeds in parallel through `ananke_sim::sweep` with its proof test, the four tiers with `scripts/premerge.sh`, the nightly's `--nocapture` (D-040); the 1000-seed numbers |
 
 Work ran as three parallel worktree branches (`phase-2-overnight-22`, `-d`, `-e`),
 merged in that order through the gate; the branches are kept for inspection.
@@ -25,31 +28,38 @@ bugs chosen and told), and the "Current status" section of BOOTSTRAP_PROMPT.md.
 
 ## Catch rates per variant
 
-At 100 seeds, release, on the final tree (`1373601`); the correct server passes
-all 100 seeds of both sweeps:
+**1000 seeds, `scripts/premerge.sh` (release, seeds in parallel), on the final
+tree; 10k pending on the GitHub nightly.** The correct server passes all 1000
+seeds of both Raft sweeps, and the Phase 1 sweeps stay green at 1000 too. The
+100-seed column is the CI tier on the same code (`1373601`).
 
-| Variant | Caught | Catching check |
-|---|---|---|
-| SendBeforePersist | 100/100 | commit majority |
-| TruncateOnEveryAppend | 100/100 | committed entries stay |
-| NoPreVote | 100/100 | pre-vote's isolation property |
-| ApplyBeforeCommit | 92/100 | state machine safety |
-| ResetTimerOnAnyRpc | 44/100 | timers fire |
-| CountOlderTermForCommit | 42/100 | commit by current term — **with `max_batch` at its default**; 0/100 before the D-031 driver |
-| SingleMajorityInJointConsensus | 28/100 | commit majority / leader completeness, membership scenario |
-| SnapshotWithoutCurrentLast | 26/100 | state machine safety after a crash mid-install |
-| LeaseTrustsTheClock | stale read caught on 2 of 52 drift-exceeded seeds; the guard revoked on all 52; "neither" on 0 | invariant 6 via the checker |
+| Variant | 1000 seeds | 100 seeds | Catching check |
+|---|---|---|---|
+| SendBeforePersist | 1000/1000 | 100/100 | commit majority |
+| TruncateOnEveryAppend | 1000/1000 | 100/100 | committed entries stay |
+| NoPreVote | 1000/1000 | 100/100 | pre-vote's isolation property |
+| ApplyBeforeCommit | 895/1000 | 92/100 | state machine safety |
+| ResetTimerOnAnyRpc | 438/1000 | 44/100 | timers fire |
+| CountOlderTermForCommit | 406/1000 | 42/100 | commit by current term — **with `max_batch` at its default**; 0/100 before the D-031 driver |
+| SnapshotWithoutCurrentLast | 326/1000 | 26/100 | state machine safety after a crash mid-install |
+| SingleMajorityInJointConsensus | 275/1000 | 28/100 | commit majority / leader completeness, membership scenario |
+| LeaseTrustsTheClock | stale read caught on 41 of 503 drift-exceeded seeds; the guard revoked on all 503; "neither" on 0 | 2 of 52 | invariant 6 via the checker |
+
+Phase 1 at 1000 seeds: engine — NoWalBeforeMemtable 984, ReleaseBeforeManifest
+627, DeleteBeforeManifest 570, the correct engine green with 114 refusals; log —
+AckBeforeSync 1000, NoChecksum 964, NoSyncDir 909, the correct log green; the
+echo journal never vanished on 1000 seeds under the correct variant.
 
 Context for the lease line: the two-trial change (`9d2bfec`) measurably doubled the
 single-trial catch (2→4 of 46 at 100 seeds on the pre-D/E tree); the rate moves a
 few counts with every schedule reshuffle (D-031 changed every seed's draws), which
 is exactly why the nightly's 10 000 seeds are the number that matters.
 
-Membership scenario: grows and shrinks completed on 100/100 seeds, 248 learners
-promoted, 6 elections while joint, 37 step-downs of a leader outside C_new, worst
-completion gap 469 ms against the 2 s bound. Snapshot coverage: 3116 taken, 1292
-installed, 4941 streams resumed, 2722 compactions, 46 completed
-refusal → re-seed → applying-again cycles.
+Membership scenario at 1000 seeds: grows and shrinks completed on 1000/1000,
+2456 learners promoted, 46 elections while joint, 432 step-downs of a leader
+outside C_new, worst completion gap 469 ms against the 2 s bound, slowest write
+after a heal 617 ms. The main sweep at 1000: 4820 partitions, 3165 crashes, 1143
+Figure 8 drivers, 580 refusals, 17 046 lease revocations, 104 174 lease reads.
 
 **Nightly at 10 000 seeds — two runs so far, both red on the correct server,
 both false positives of one check; the third run is pending (numbers below are
@@ -71,10 +81,30 @@ still the 100-seed ones).**
   approval; seeds 164 and 385 are pinned in the gate. The run was killed at ~14%
   because its verdict was already red and the Mac had been sleeping through
   most of its wall-clock (lid closed, on battery).
-- Run 3: launched after this commit under `caffeinate -i` with `--nocapture`
-  (~3 h awake); its per-variant rates and verdict go here.
-<!-- TODO(nightly-v3): paste per-variant rates at 10k, the correct-server
-verdict, any further seed, and wall-clock. -->
+- Run 3 was started and then killed by decision: ten thousand seeds are no
+  longer a laptop's job. The sweeps now run their seeds in parallel and in four
+  tiers (D-040) — 20 at the gate, 100 in CI, 1000 under `scripts/premerge.sh`,
+  10 000 only in the nightly on GitHub — and the numbers above are the
+  1000-seed tier's. The clean 10k verdict is the GitHub nightly's to give, on
+  this branch by `workflow_dispatch` once pushed and nightly on `main` after the
+  merge; its catch rates are now printed into the job log.
+- `scripts/premerge.sh` on this machine (4 performance + 4 efficiency cores):
+  **~12.7 min of tests** — raft binary 667–705 s, engine 81 s, wal 8 s, the rest
+  seconds — with an instant warm build; under the 15-minute target. Two runs
+  gave identical catch rates and coverage, field for field. (Both wall-clock
+  readings said 28 min because the lid was closed mid-run and the Mac took a
+  fourteen-minute *Clamshell Sleep* each time; libtest's clock stops during
+  sleep, `date` does not. `caffeinate -i` does not prevent clamshell sleep.)
+- The raft sweep is about four times heavier since stage E: 100 seeds take 81 s
+  on this machine against 23 s on the pre-E tree, because snapshots on every
+  schedule lengthen every trace and the sweep's periodic safety check
+  (`advance` in `sim/raft.rs`) clones the whole trace so far every ten slices
+  and re-runs every fold from scratch — quadratic in trace length, and the
+  hottest frames in a profile (`Vec<TraceRecord>::clone`, the drops, `replay`).
+  Backlog: fold incrementally over the new suffix. The parallel driver neither
+  caused nor cures this; it matches the old regime on a full binary and beats
+  it at the tail (672 s for the raft binary at 1000 seeds against roughly 990 s
+  extrapolated from the sequential runs).
 
 ## Every PROPOSED entry (in DECISIONS.md under "PROPOSED — needs approval")
 
@@ -145,17 +175,43 @@ approves plus as-built detail and what the sweep found, per the house convention
   membership+snapshots on one schedule; checkpoint-directory GC (`snap-<n>` dirs
   never deleted); a multi-stream snapshot sender; a studio metric for stream
   health; RAFT.md §5 driver touch-up; an operator mechanism to retire a removed
-  server.
+  server; **the sweep's periodic safety check made incremental** (it re-folds
+  the whole trace every ten slices; quadratic, and the dominant cost of a raft
+  seed since stage E — see the operational notes).
 - **Moirae** — no changes needed; no PR opened.
+
+## Pushing the branch and opening the PR
+
+This machine has no `gh`, no Homebrew, and no GitHub credential in the keychain;
+`git` uses the `osxkeychain` helper and `user.name` / `user.email` are unset, so
+the branch's commits are authored `Makis <makis@Makiss-MacBook-Pro.local>` while
+`main`'s are `pchrysostomou <prodromosch@hotmail.co.uk>`.
+
+1. Identity, once: `git config --global user.name pchrysostomou` and
+   `git config --global user.email prodromosch@hotmail.co.uk`.
+2. A token: GitHub → Settings → Developer settings → Fine-grained tokens, repository
+   `pchrysostomou/ananke`, permissions Contents and Pull requests read/write. Store it
+   for git without ever pasting it into a chat:
+   `printf 'protocol=https\nhost=github.com\nusername=pchrysostomou\npassword=TOKEN\n' | git credential-osxkeychain store`
+   (or run any `git push` in a terminal and let the prompt store it).
+3. Re-author the unpushed commits to the identity above (optional; not a force-push,
+   the branch has never been pushed):
+   `FILTER_BRANCH_SQUELCH_WARNING=1 git filter-branch -f --env-filter 'export GIT_AUTHOR_NAME=pchrysostomou GIT_AUTHOR_EMAIL=prodromosch@hotmail.co.uk GIT_COMMITTER_NAME=pchrysostomou GIT_COMMITTER_EMAIL=prodromosch@hotmail.co.uk' main..phase-2-overnight`
+4. `git push -u origin phase-2-overnight`, then open
+   `https://github.com/pchrysostomou/ananke/compare/main...phase-2-overnight?expand=1`
+   and create the PR (a body was drafted in the session's hand-over, beside the
+   repo, not in it).
+   The nightly workflow runs the ten thousand seeds on the branch once it is
+   pushed (`workflow_dispatch`), and nightly on `main` after the merge.
 
 ## Operational notes
 
 - Three agent instances died to a 600 s no-output watchdog mid-build and were
   resumed from their on-disk state; no work was lost beyond wall-clock.
 - The second 10k run lost most of its wall-clock to the Mac sleeping (battery,
-  lid closed: sleep → 2 s DarkWake → sleep, 13:28–14:32); the third runs under
-  `caffeinate -i`. A 10k run here needs ~3 h awake.
-- The nightly's catch rates are only visible with `--nocapture`; suggested
-  follow-up: add it to `nightly.yml`'s test command so CI reports them too.
+  lid closed: sleep → 2 s DarkWake → sleep, 13:28–14:32). A 10k run here needs
+  ~3 h awake, which is why ten thousand moved to GitHub (D-040).
+- The nightly's catch rates were invisible until `--nocapture` was added to
+  `nightly.yml`'s test command; `scripts/premerge.sh` prints them the same way.
 - The `ananke-22/-d/-e/-int` worktrees are left in place beside the repo for
   archaeology; `git worktree remove` them when done.

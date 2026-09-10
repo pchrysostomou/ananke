@@ -1351,6 +1351,56 @@ the burst puts invoked, and the sweep asserts both were seen.
 
 ---
 
+## D-040 — Seeds run in parallel, and the sweeps' four tiers
+
+**Context.** A ten-thousand-seed run of the Phase 2 sweeps takes about three hours
+awake on a laptop, and a laptop is not awake for three hours: the second such run
+of the overnight session spent most of its wall-clock asleep behind a closed lid
+and did twenty-four minutes of work in three hours forty. Every sweep also ran
+its seeds one after another inside its test, so a single test's tail — the lease
+test, which runs the guardless server on top of the correct one — set the
+binary's wall-clock whatever the machine had to offer. And the nightly's catch
+rates were never seen: cargo captures a passing test's output.
+
+**Decision.** Every sweep runs its seeds in parallel through `ananke_sim::sweep`
+(`sim/parallel.rs`): `0..count` over rayon's global thread pool, results in seed
+order. Every seed's `Sim` is independent — nothing in the workspace holds
+process-wide mutable state, and a `Sim` draws every stream from its seed by name
+(D-017) — so a trace does not depend on which thread ran it or on what ran
+beside it; `sim/tests/parallel.rs` proves it, hashing a seed run alone against
+the same seed run inside the driver among its neighbours, for every scenario.
+The pool is one per process, so the sweeps of one test binary share it and no
+more simulations run at once than the machine has cores, whatever the test
+harness's own parallelism. A sweep's closure returns something small and drops
+the report, writing a failing seed's trace where the report still is; the
+verdict names the first failing seed in seed order and every other one. The
+driver is the one place outside `crates/ananke-env` that puts work on host
+threads: the scheduler's ban on spawning is about the code under test, which
+must not escape the simulator, and `scripts/check-direct-io.sh` confines `rayon`
+to that file.
+
+The seeds come in four tiers: 20 at the gate, 100 in CI, 1000 under
+`scripts/premerge.sh` — release, seeds in parallel, catch rates printed, run on a
+branch before asking for its merge, about a quarter of an hour — and 10 000 in
+the nightly workflow on GitHub, which is the only place ten thousand run. The
+nightly prints its catch rates too (`--nocapture`).
+
+**Alternatives.** `std::thread::scope` in the sim crate: banned by clippy.toml
+and the textual check, and sanctioning a fourth file for the allow would put a
+hand-rolled pool and its concurrency cap beside the driver for no gain over
+rayon's. One process per seed: the traces and reports are in memory for the
+checks, and a process per seed would serialise them for nothing. Running the ten
+thousand on the laptop anyway, awake: three hours per verdict, and a closed lid
+away from none.
+
+**Consequences.** The coverage folds add reports in whatever order seeds finish;
+every field is a sum or a maximum, so the totals are the same. A run that fails
+on several seeds reports all of them at once instead of stopping at the first.
+Memory is the cores' worth of simulations at a time, which the test harness's
+parallelism already was. One dependency, `rayon`, used in one file.
+
+---
+
 ## PROPOSED — needs approval
 
 ## PROPOSED D-032 — Learner catch-up state is leader-local and volatile

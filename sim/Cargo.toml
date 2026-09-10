@@ -22,6 +22,8 @@ ananke-storage = { path = "../crates/ananke-storage" }
 bytes.workspace = true
 moirae-sched.workspace = true
 moirae-trace.workspace = true
+# The seed-parallel sweep driver (D-040), used in `parallel.rs` alone.
+rayon.workspace = true
 
 [lints]
 workspace = true

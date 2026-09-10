@@ -22,6 +22,9 @@ getrandom = "0.4"
 # policies, published from the moirae repo.
 moirae-sched = "0.0.2"
 moirae-trace = "0.0.2"
+# The sweeps run their seeds in parallel (D-040): `sim/parallel.rs` is the one file
+# that may use it (scripts/check-direct-io.sh).
+rayon = "1"
 siphasher = "1.0"
 tempfile = "3.27"
 tokio = { version = "1.53", default-features = false }

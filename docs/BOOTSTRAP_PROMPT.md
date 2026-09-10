@@ -116,7 +116,9 @@ _Update this section at the end of every session._
   `max_batch` at its default (was 0/100 batched). The 10k nightly found two
   correct-server false positives of the timer check against snapshot-fed
   followers (seeds 164 and 385, both pinned; D-030 and PROPOSED D-039); the
-  clean 10k verdict is pending. Before the tag: review the seven PROPOSED
+  clean 10k verdict is the GitHub nightly's to give — the sweeps now run their
+  seeds in parallel and in four tiers, 20 / 100 / 1000 (`scripts/premerge.sh`) /
+  10 000 on GitHub only (D-040). Before the tag: review the seven PROPOSED
   entries at the bottom of DECISIONS.md, that verdict, the devlog draft
   (`docs/devlog/02-phase-2.md`), and `docs/OVERNIGHT.md` for the session's full
   record; the branch is unpushed (no credentials on the machine).
