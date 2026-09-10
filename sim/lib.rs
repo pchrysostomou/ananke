@@ -5,10 +5,12 @@
 //! produced. Integration tests under `tests/` drive the scenarios and check
 //! properties such as byte-identical traces for equal seeds (SPEC.md §1.6).
 //!
-//! Every sweep runs [`seeds`] consecutive seeds: 20 by default and under
-//! `scripts/gate.sh`, 100 in CI, 10 000 in the nightly workflow. A seed that fails a
-//! sweep has its trace written through [`write_trace`] so the nightly can upload it
-//! and the studio can open it.
+//! Every sweep runs [`seeds`] consecutive seeds, in parallel through [`sweep`]
+//! (D-040), in four tiers: 20 by default and under `scripts/gate.sh`, 100 in CI,
+//! 1000 under `scripts/premerge.sh` in release on the machine in front of you, and
+//! 10 000 in the nightly workflow on GitHub, the only place ten thousand run. A seed
+//! that fails a sweep has its trace written through [`write_trace`] so the nightly
+//! can upload it and the studio can open it.
 
 use std::path::Path;
 
@@ -18,8 +20,12 @@ use bytes::Bytes;
 pub mod echo;
 pub mod engine;
 pub mod lin;
+pub mod membership;
+pub mod parallel;
 pub mod raft;
 pub mod wal;
+
+pub use parallel::{sweep, verdict};
 
 /// The default number of seeds a sweep runs.
 pub const DEFAULT_SEEDS: u64 = 20;

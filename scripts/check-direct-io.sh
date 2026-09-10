@@ -18,6 +18,19 @@ if [ -n "$hits" ]; then
     exit 1
 fi
 
+# Host threads outside crates/ananke-env exist in one file: the seed-parallel sweep
+# driver (D-040), which only decides which simulator runs next. rayon may appear
+# nowhere else.
+threads=$(grep -rnE --include='*.rs' '\brayon\b' crates sim \
+    | grep -vE '^(crates/ananke-env/|sim/parallel\.rs:)' \
+    | grep -vE '^[^:]+:[0-9]+:[[:space:]]*//' || true)
+
+if [ -n "$threads" ]; then
+    echo "rayon outside sim/parallel.rs (DECISIONS.md D-040):" >&2
+    echo "$threads" >&2
+    exit 1
+fi
+
 # Only three files may switch the lints off: the `real` module, the SystemTime edge
 # conversions in time.rs, and the DetHashMap aliases in collections.rs.
 allows=$(grep -rnE --include='*.rs' 'clippy::disallowed_(methods|types)' crates sim \

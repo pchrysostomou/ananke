@@ -101,12 +101,29 @@ ananke/
 
 _Update this section at the end of every session._
 
-- Phase: 2 in progress (2026-09-06), stages A, B and C of RAFT.md's order done. C:
-  read-index reads and lease reads with the conservative guard as built, check
-  quorum, the vote rule behind the lease, leadership transfer, the lease trial and the
-  stale-sender schedule in the sweep, and invariant 6 reported per seed (D-028).
-  Before the Phase 2 tag: issue #22, the count rule caught under batching. Before
-  Phase 4: issue #21, client sessions. A: the
+- Phase: 2 CODE-COMPLETE on branch `phase-2-overnight` (2026-09-09), not tagged and
+  not merged to main: stages D and E of RAFT.md's order and issue #22 landed there
+  overnight (D-029, D-030, D-031), every commit gated, the correct server green on
+  100 release seeds of both sweeps with all nine sweep-tested variants caught.
+  D: joint consensus with learners first, the configuration in force from the log
+  with the `0/2/config` key, one change in flight, the 3→5→3-under-partition
+  scenario (worst availability gap 469 ms against the 2 s bound),
+  `SingleMajorityInJointConsensus` caught 28/100. E: snapshots as resumable chunked
+  streams of `Engine::checkpoint`, the compacted log in the core, the staged
+  install committing by CURRENT-last, LostState-refused servers re-seeded under a
+  durable vote quarantine (PROPOSED D-035), `SnapshotWithoutCurrentLast` caught
+  26/100. #22: the Figure 8 driver, `CountOlderTermForCommit` caught 42/100 with
+  `max_batch` at its default (was 0/100 batched). The 10k nightly found two
+  correct-server false positives of the timer check against snapshot-fed
+  followers (seeds 164 and 385, both pinned; D-030 and PROPOSED D-039); the
+  clean 10k verdict is the GitHub nightly's to give — the sweeps now run their
+  seeds in parallel and in four tiers, 20 / 100 / 1000 (`scripts/premerge.sh`) /
+  10 000 on GitHub only (D-040). Before the tag: review the seven PROPOSED
+  entries at the bottom of DECISIONS.md, that verdict, the devlog draft
+  (`docs/devlog/02-phase-2.md`), and `docs/OVERNIGHT.md` for the session's full
+  record; the branch is unpushed (no credentials on the machine).
+  Before Phase 4: issue #21, client sessions.
+- Stage A, B, C record: A: the
   pure core, the codec with the studio decoder, the state under tenant 0 with the
   applied index in the batch and a refusal of any recovery that lost state, the four
   log invariants as folds, the paper's Figures 7 and 8 and moirae's rules as tests
@@ -146,9 +163,9 @@ _Update this section at the end of every session._
      (one laptop disk, 2026-09-05). Met in the shape the flag exists for.
 - Last tag: v0.2.0. `ananke`, `ananke-env` and `ananke-storage` 0.2.0 on crates.io.
   Devlog: `docs/devlog/01-phase-1.md`.
-- Next concrete task: stage D of RAFT.md's order: joint consensus with learners, the
-  3 → 5 → 3 scenario under partition with a leader on the minority side, and
-  `Variant::SingleMajorityInJointConsensus`. Stop for review after each stage.
+- Next concrete task: review the overnight branch — the PROPOSED entries
+  (D-032..D-038), the devlog draft, the nightly's numbers — then merge, tag and
+  publish Phase 2 per D-011, and file the backlog issues OVERNIGHT.md lists.
 - Fault-model tests follow the CLAUDE.md pattern: a known-buggy variant the sweep
   must catch beside the correct one it must pass (`Journal::sync_dir_on_rotate`,
   `wal::Variant`).

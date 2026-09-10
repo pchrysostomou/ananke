@@ -150,7 +150,7 @@ impl Cluster {
                 Output::Trace(event) => self.events.push(event.clone()),
                 Output::ReadReady { id: read, index } => self.reads.push((id, *read, *index)),
                 Output::ReadDropped { id: read } => self.dropped.push((id, *read)),
-                Output::Apply { .. } | Output::Rejected { .. } => {}
+                Output::Apply { .. } | Output::Rejected { .. } | Output::Snapshot(_) => {}
             }
         }
         assert!(
@@ -164,13 +164,16 @@ impl Cluster {
         let state = self.persisted.get_mut(&id).expect("a member");
         state.0 = persist.term;
         state.1 = persist.vote;
+        if let Some(to) = persist.compact_to {
+            state.2.retain(|e| e.index > to);
+        }
         if let Some(from) = persist.truncate_from {
-            state.2.truncate(from as usize - 1);
+            state.2.retain(|e| e.index < from);
         }
         for entry in &persist.append {
             assert_eq!(
                 entry.index,
-                state.2.len() as Index + 1,
+                state.2.last().map_or(0, |e| e.index) + 1,
                 "appends are consecutive"
             );
             state.2.push(entry.clone());
@@ -538,6 +541,67 @@ fn figure_8_an_older_terms_entry_is_not_committed_by_count() {
         }
         invariants::election_safety(&cluster.events).unwrap();
         invariants::log_matching(&cluster.events).unwrap();
+    }
+}
+
+/// Figure 8 with batching (issue #22, D-031): the window needs a new leader
+/// holding a backlog of uncommitted older-term entries longer than one batch,
+/// since the no-op otherwise rides in the same AppendEntries as the older
+/// entries it re-sends and a follower matches both at once. A leader elected on
+/// such a log, its commit index at zero the way a restart leaves it, catches a
+/// behind follower up in batches; the buggy core advances its commit onto an
+/// older term's entry at the first acknowledgement below its no-op, and the
+/// correct core commits nothing until the batch carrying the no-op is
+/// acknowledged.
+#[test]
+fn figure_8_with_batching_commits_only_at_the_no_ops_batch() {
+    for variant in [Variant::Correct, Variant::CountOlderTermForCommit] {
+        let members: Vec<ServerId> = (1..=3).map(s).collect();
+        let c = RaftConfig {
+            max_batch: 4,
+            max_inflight: 2,
+            ..config(variant)
+        };
+        // S1 holds ten entries of term 1 to S3's one, and its commit index is
+        // what a restart leaves, zero. S2 holds the same ten but is down: the
+        // majority is S1 and S3, and every acknowledgement is S3's.
+        let initial = vec![
+            (s(1), 1, log_of(&[1; 10])),
+            (s(2), 1, log_of(&[1; 10])),
+            (s(3), 1, log_of(&[1])),
+        ];
+        let mut cluster = Cluster::new(&members, &c, &initial);
+        cluster.down.push(s(2));
+        cluster.elect(s(1));
+        assert_eq!(cluster.term(s(1)), 2);
+        // The election settled the whole exchange: the probe found S3's log and
+        // batches of four caught it up through the no-op at index 11.
+        assert_eq!(terms_of(&cluster.log(s(3))), terms_of(&cluster.log(s(1))));
+        assert_eq!(cluster.commit(s(1)), 11);
+        // The first commit tells the cores apart: the correct leader's lands on
+        // its own no-op, the buggy one's on the first batch acknowledged below it.
+        let first_commit = cluster.events.iter().find_map(|e| match e {
+            TraceEvent::RaftCommit {
+                server: 1, index, ..
+            } => Some(*index),
+            _ => None,
+        });
+        let verdict = invariants::all(&cluster.events);
+        match variant {
+            Variant::Correct => {
+                assert_eq!(first_commit, Some(11), "nothing commits below the no-op");
+                verdict.unwrap();
+            }
+            _ => {
+                let first = first_commit.expect("the buggy leader committed");
+                assert!(
+                    first < 11,
+                    "an older term's entry commits by count: {first}"
+                );
+                let violation = verdict.unwrap_err();
+                assert!(violation.contains("commit by current term"), "{violation}");
+            }
+        }
     }
 }
 

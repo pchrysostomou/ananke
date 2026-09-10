@@ -30,14 +30,30 @@
 //! scale. [`Report::drift_exceeded`] says which a seed was.
 //!
 //! A slow clock never leads on its own: its timer fires late in real time and the
-//! fast servers win every election. So every schedule opens with a lease trial
-//! ([`Trial`]): an operator asks the leader to hand over to the server with the
-//! slowest clock (leadership transfer, thesis §3.10), its lease forms, and it is
-//! then cut off with a reading client while the others elect and write. The
-//! adversary chose the clocks and chooses the operator's request; correlating them
-//! is its privilege. Under the guard the slow leader trusts no promise whose offset
-//! moved and serves by heartbeat round; without it
-//! (`Variant::LeaseTrustsTheClock`) it serves a stale read.
+//! fast servers win every election. So every schedule opens with two lease trials
+//! ([`Trial`]), one after the other: an operator asks the leader to hand over to
+//! the server with the slowest clock (leadership transfer, thesis §3.10), its
+//! lease forms, and it is then cut off with a reading client while the others
+//! elect and write. The adversary chose the clocks and chooses the operator's
+//! request; correlating them is its privilege. Under the guard the slow leader
+//! trusts no promise whose offset moved and serves by heartbeat round; without it
+//! (`Variant::LeaseTrustsTheClock`) it serves a stale read. One trial's window is
+//! a coin toss of the fault geometry; two per seed keep the variant's catch rate
+//! from being one window's statistical noise.
+//!
+//! One fault is a driver rather than an outage: [`Fault::FigureEight`] opens the
+//! §5.4.2 window at the default batch size (issue #22, D-031). A follower a new
+//! leader must catch up in more than one AppendEntries only exists behind a
+//! backlog of more than `max_batch` uncommitted entries, which client-paced
+//! traffic never builds: the driver isolates a follower with a client, fires a
+//! burst of puts at the leader without awaiting replies, crashes the leader with
+//! the burst appended, and steers it back into the lead — a restart resets the
+//! commit index, the third server's sends are blocked so only the restarted
+//! leader can assemble a majority, and the isolated follower votes it in. The new
+//! leader re-sends its backlog in batches, and one that counts older-term
+//! replicas for commit (`Variant::CountOlderTermForCommit`) advances its commit
+//! index onto an older term's entry at the first acknowledgement below its no-op,
+//! which the commit-by-current-term fold reports.
 //!
 //! Every fault-model test runs a known-buggy variant beside the correct one
 //! (CLAUDE.md): each [`Variant`] of RAFT.md §5 that this stage ships must be caught
@@ -134,10 +150,19 @@ pub fn client_addr(n: u64) -> SocketAddr {
     SocketAddr::from(([10, 0, 1, u8::try_from(n).expect("small")], 7000))
 }
 
-/// The operator's address.
+/// The operator's address for its `n`th request (1-based): one socket per
+/// request, so a second trial's transfer does not depend on the first socket's
+/// fate.
 #[must_use]
-pub fn admin_addr() -> SocketAddr {
-    SocketAddr::from(([10, 0, 2, 1], 7000))
+pub fn admin_addr(n: u64) -> SocketAddr {
+    SocketAddr::from(([10, 0, 2, u8::try_from(n).expect("small")], 7000))
+}
+
+/// The burst client's address for the schedule's `n`th Figure 8 driver (1-based):
+/// its own socket per driver, like the operator's per request.
+#[must_use]
+pub fn burst_addr(n: u64) -> SocketAddr {
+    SocketAddr::from(([10, 0, 3, u8::try_from(n).expect("small")], 7000))
 }
 
 /// The server bound to `addr`, if it is a server's.
@@ -209,9 +234,70 @@ pub enum Fault {
         /// How long it stays down.
         down: Duration,
     },
+    /// The Figure 8 driver (issue #22, D-031): the §5.4.2 window at the default
+    /// batch size, which needs a new leader re-sending more uncommitted older-term
+    /// entries than one AppendEntries carries. `follower` is isolated with
+    /// `client` while the majority commits; a burst of puts is fired at the
+    /// leader without awaiting replies, so its log runs far ahead of the isolated
+    /// follower; the leader crashes with the burst appended and restarts with its
+    /// commit index reset, since the commit index is not persisted; the third
+    /// server's sends are blocked so neither it nor the isolated follower can
+    /// assemble a majority, and the restarted leader, holding the longest log,
+    /// campaigns and wins with the isolated follower's vote. It then re-sends its
+    /// backlog in batches of `max_batch`, and a leader that counts older-term
+    /// replicas for commit advances onto an older term's entry at the first
+    /// acknowledgement below its no-op, which commit-by-current-term reports.
+    FigureEight {
+        /// The follower cut off with `client`; the leader's neighbour if it leads.
+        follower: u64,
+        /// The client on its side (1-based).
+        client: u64,
+        /// How long the isolation runs before the burst: the majority commits
+        /// ahead of the isolated follower.
+        settle: Duration,
+        /// How many puts the burst fires: drawn so the appended backlog exceeds
+        /// `max_batch` with margin.
+        burst: u64,
+        /// How long after the burst starts the leader crashes: time to append
+        /// most of it, one synced batch per entry.
+        crash_after: Duration,
+        /// How long the crashed leader stays down.
+        down: Duration,
+        /// How long the third server's sends stay blocked past the restart: time
+        /// for the old leader to campaign and re-send its backlog.
+        steer: Duration,
+    },
+    /// A crash aimed at the middle of a snapshot install (RAFT.md §5, stage E).
+    /// First `server` is isolated for `isolate`, long enough to fall behind the
+    /// snapshot threshold and go quiet past the designation, so the leader
+    /// compacts and feeds it the snapshot on heal; then the run advances in
+    /// small slices until the stream's final chunk is delivered to it, waits
+    /// `grace` for the receiver's repair to be in flight, and crashes it for
+    /// `down`. The correct install has no window here — its staging directory is
+    /// not a store until the repair is durable and `CURRENT` is written last —
+    /// while `Variant::SnapshotWithoutCurrentLast` comes back on the leader's
+    /// identity, which state machine safety reports. If no final chunk lands
+    /// within [`INSTALL_WAIT_BUDGET`], the crash never fires and the fault was
+    /// an isolation. Drawn from its own `moirae_sched` stream
+    /// ("snapshot-crash"), never lengthening the shared schedule stream (D-031).
+    CrashInstalling {
+        /// The follower isolated and then crashed mid-install; the leader's
+        /// neighbour if it leads when the fault starts.
+        server: u64,
+        /// How long it is cut off first, to fall behind the threshold.
+        isolate: Duration,
+        /// How long after the final chunk's delivery the crash lands.
+        grace: Duration,
+        /// How long the receiver stays down.
+        down: Duration,
+    },
 }
 
-/// The lease trial that opens every schedule; see the module documentation.
+/// The longest a [`Fault::CrashInstalling`] waits for an install to stream
+/// before giving up and doing nothing.
+pub const INSTALL_WAIT_BUDGET: Duration = Duration::from_millis(4000);
+
+/// One lease trial; two open every schedule, see the module documentation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Trial {
     /// How long the slowest leads before it is cut off: time for its lease.
@@ -220,18 +306,29 @@ pub struct Trial {
     pub isolate: Duration,
 }
 
-/// How long the trial gives the transfer before it looks for the new leader.
+/// How long a trial gives the transfer before it looks for the new leader.
 const TRANSFER_WAIT: Duration = Duration::from_millis(300);
+/// The quiet after each trial's heal, before the next trial or the faults: time
+/// for the cluster to elect and for the clients to write between the windows.
+const TRIAL_GAP: Duration = Duration::from_millis(500);
 /// The operator's client process in the trace.
 const ADMIN: u64 = 99 << 32;
+/// The base of the burst clients' process ids in the trace: the schedule's `n`th
+/// Figure 8 driver writes as process `BURST | n`, distinct per driver so two
+/// bursts' sequence numbers never collide in the history.
+const BURST: u64 = 98 << 32;
+/// The key the bursts write, outside the clients' [`KEYS`]: nothing ever reads
+/// it, so the checker's per-key search sees only puts that always apply and the
+/// hundred-odd pending operations a burst leaves cost it nothing.
+const BURST_KEY: &[u8] = b"burst";
 
 /// The fault schedule of one run, in global virtual time.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Schedule {
     /// All links up, servers electing and clients starting.
     pub warmup: Duration,
-    /// The lease trial, right after the warmup.
-    pub trial: Trial,
+    /// The lease trials, one after the other, right after the warmup.
+    pub trials: Vec<Trial>,
     /// The faults, each healed before the next, with `gaps[i]` of quiet after it.
     pub faults: Vec<Fault>,
     /// The quiet after each fault.
@@ -257,8 +354,14 @@ impl Schedule {
         let count = 3 + rng.below(4);
         let mut faults = Vec::new();
         let mut gaps = Vec::new();
+        // The Figure 8 driver draws from its own stream, so its parameters can be
+        // tuned without re-drawing every schedule's other faults, clocks and
+        // trials; and it takes two slots of eight, since its window needs the
+        // burst, the crash and the steering to line up and a rarer draw would be
+        // seen lining up on too few seeds to report a rate.
+        let mut f8 = moirae_sched::stream(seed, "figure8");
         for _ in 0..count {
-            let fault = match rng.below(6) {
+            let fault = match rng.below(8) {
                 0 => Fault::Isolate {
                     server: 1 + rng.below(SERVERS),
                     client: 1 + rng.below(CLIENTS),
@@ -283,15 +386,38 @@ impl Schedule {
                 4 => Fault::CrashLeader {
                     down: ms(&mut rng, 50, 400),
                 },
-                _ => Fault::StaleSender {
+                5 => Fault::StaleSender {
                     server: 1 + rng.below(SERVERS),
                     one_way: ms(&mut rng, 900, 1300),
                     crash_after: ms(&mut rng, 200, 400),
                     down: ms(&mut rng, 300, 500),
                 },
+                _ => Fault::FigureEight {
+                    follower: 1 + f8.below(SERVERS),
+                    client: 1 + f8.below(CLIENTS),
+                    settle: ms(&mut f8, 300, 600),
+                    burst: 112 + f8.below(65),
+                    crash_after: ms(&mut f8, 450, 750),
+                    down: ms(&mut f8, 150, 350),
+                    steer: ms(&mut f8, 600, 1000),
+                },
             };
             faults.push(fault);
             gaps.push(ms(&mut rng, 450, 700));
+        }
+        // A crash aimed mid-install, on half the seeds, appended after the drawn
+        // faults. It draws from its own stream so the shared "schedule" stream's
+        // draws — and with them every other fault's dice — never move when this
+        // arm changes (D-031).
+        let mut snap = moirae_sched::stream(seed, "snapshot-crash");
+        if snap.below(2) == 0 {
+            faults.push(Fault::CrashInstalling {
+                server: 1 + snap.below(SERVERS),
+                isolate: ms(&mut snap, 700, 1100),
+                grace: ms(&mut snap, 2, 20),
+                down: ms(&mut snap, 50, 300),
+            });
+            gaps.push(ms(&mut snap, 450, 700));
         }
         // Clocks, as the module documentation says: within the bound, or one
         // server slow and two fast, moderately or severely.
@@ -329,10 +455,16 @@ impl Schedule {
         }
         Self {
             warmup: Duration::from_millis(1200),
-            trial: Trial {
-                settle: ms(&mut rng, 600, 900),
-                isolate: ms(&mut rng, 500, 800),
-            },
+            trials: vec![
+                Trial {
+                    settle: ms(&mut rng, 600, 900),
+                    isolate: ms(&mut rng, 500, 800),
+                },
+                Trial {
+                    settle: ms(&mut rng, 600, 900),
+                    isolate: ms(&mut rng, 500, 800),
+                },
+            ],
             faults,
             gaps,
             settle: election_max() * LIVENESS_TIMEOUTS + Duration::from_millis(200),
@@ -384,10 +516,27 @@ impl Schedule {
                 | Fault::OneWay { for_, .. } => *for_,
                 Fault::Crash { down, .. } | Fault::CrashLeader { down } => *down,
                 Fault::StaleSender { one_way, .. } => *one_way,
+                Fault::FigureEight {
+                    settle,
+                    crash_after,
+                    down,
+                    steer,
+                    ..
+                } => *settle + *crash_after + *down + *steer,
+                Fault::CrashInstalling {
+                    isolate,
+                    grace,
+                    down,
+                    ..
+                } => *isolate + INSTALL_WAIT_BUDGET + *grace + *down,
             })
             .sum();
-        let trial = TRANSFER_WAIT + self.trial.settle + self.trial.isolate;
-        self.warmup + trial + faults + self.gaps.iter().sum::<Duration>() + self.settle
+        let trials: Duration = self
+            .trials
+            .iter()
+            .map(|t| TRANSFER_WAIT + t.settle + t.isolate + TRIAL_GAP)
+            .sum();
+        self.warmup + trials + faults + self.gaps.iter().sum::<Duration>() + self.settle
     }
 }
 
@@ -423,8 +572,9 @@ pub struct Report {
     pub last_heal: Instant,
     /// Every isolation of one server: (server, from, until).
     pub isolations: Vec<(u64, Instant, Instant)>,
-    /// Whether the slowest clock led when the trial cut the leader off.
-    pub trial_led_by_slowest: bool,
+    /// In how many of the trials the slowest clock led when the trial cut the
+    /// leader off.
+    pub trials_led_by_slowest: usize,
     /// Servers refused at a restart, with the reason.
     pub refused: Vec<(u64, String)>,
     /// Why the run stopped early, if it did: a safety violation the folds saw at a
@@ -467,6 +617,14 @@ impl Report {
     pub fn quorum_losses(&self) -> usize {
         self.count(|e| matches!(e, TraceEvent::RaftQuorumLost { .. }))
     }
+
+    /// Puts the Figure 8 drivers' bursts invoked on this run.
+    #[must_use]
+    pub fn burst_puts(&self) -> usize {
+        self.count(
+            |e| matches!(e, TraceEvent::ClientInvoke { client, .. } if client >> 32 == BURST >> 32),
+        )
+    }
 }
 
 impl Report {
@@ -492,10 +650,36 @@ impl Report {
         self.policy == Policy::Uniform
     }
 
-    /// Whether a majority of servers was running at the end: liveness needs one.
+    /// Whether a majority that can still elect a leader was running at the end:
+    /// liveness needs one. A refused server is down until a snapshot re-seeds it,
+    /// which its restatement's `RaftRecovered` says (RAFT.md §3) — but a re-seeded
+    /// server never votes again (PROPOSED(D-035)), so while it counts for commits
+    /// it cannot help elect, and a cluster whose impaired servers reach half has
+    /// no leader to wait for: a refused server can only be re-seeded *by* a
+    /// leader, so the deadlock is real and priced into D-035, not a liveness
+    /// failure. The release run's seed 60 reached exactly that: one server
+    /// quarantined by an early re-seed, a second refused by rot, and the last
+    /// pre-voting forever with nobody left to grant.
     #[must_use]
     pub fn majority_up(&self) -> bool {
-        (self.refused.len() as u64) * 2 < SERVERS
+        let mut down: BTreeSet<u64> = BTreeSet::new();
+        let mut quarantined: BTreeSet<u64> = BTreeSet::new();
+        for record in &self.records {
+            match &record.event {
+                TraceEvent::RaftRefused { server, .. } => {
+                    down.insert(*server);
+                }
+                TraceEvent::RaftRecovered { server, .. } => {
+                    down.remove(server);
+                }
+                TraceEvent::RaftReseeded { server } => {
+                    quarantined.insert(*server);
+                }
+                _ => {}
+            }
+        }
+        let impaired: BTreeSet<u64> = down.union(&quarantined).copied().collect();
+        (impaired.len() as u64) * 2 < SERVERS
     }
 
     /// How long after the last heal the first client write completed, if one did.
@@ -565,9 +749,24 @@ impl Report {
 
     /// Pre-vote (thesis §9.6): a server that receives nothing does not raise its
     /// term. Checked over every isolation the schedule made: the server's term at
-    /// the heal equals its term when the isolation began.
+    /// the heal equals its term when the isolation began. An isolation during
+    /// which the server was refused, re-seeded or finished installing a snapshot
+    /// is skipped: an install's restatement re-states the term the stream
+    /// carried, which is no election of the isolated server's (RAFT.md §3).
     fn isolation_keeps_the_term(&self) -> Result<(), String> {
         for &(server, from, until) in &self.isolations {
+            let reseeding = self.records.iter().any(|r| {
+                r.at >= from
+                    && r.at <= until
+                    && matches!(&r.event,
+                        TraceEvent::RaftRefused { server: s, .. }
+                        | TraceEvent::RaftReseeded { server: s }
+                        | TraceEvent::RaftSnapshot { server: s, taken: false, .. }
+                        if *s == server)
+            });
+            if reseeding {
+                continue;
+            }
             let term_at = |at: Instant| {
                 self.records
                     .iter()
@@ -594,7 +793,8 @@ impl Report {
     /// Election timers fire (moirae rule 5): a running server that is not the
     /// leader campaigns within [`TIMER_TIMEOUTS`] maximum election timeouts of the
     /// last AppendEntries it received from a leader of its term or later, the last
-    /// vote it granted, or its start.
+    /// vote it granted, or its start. A re-seeded server is exempt: it never
+    /// campaigns on that store, by design (RAFT.md §3, PROPOSED(D-035)).
     fn timers_fire(&self) -> Result<(), String> {
         // A server measures its timeout by its own clock: a slow one takes longer
         // in global time, and the bound scales with its rate.
@@ -606,23 +806,52 @@ impl Report {
         let mut payloads: BTreeMap<ananke_env::MessageId, Bytes> = BTreeMap::new();
         let mut up: BTreeSet<u64> = BTreeSet::new();
         let mut leaders: BTreeSet<u64> = BTreeSet::new();
+        let mut reseeded: BTreeSet<u64> = BTreeSet::new();
         let mut terms: BTreeMap<u64, u64> = BTreeMap::new();
         let mut last_reset: BTreeMap<u64, Instant> = BTreeMap::new();
         for record in &self.records {
             let at = record.at;
             match &record.event {
+                TraceEvent::RaftReseeded { server } => {
+                    reseeded.insert(*server);
+                }
                 TraceEvent::MessageSent { id, payload, .. } => {
                     payloads.insert(*id, payload.clone());
                 }
                 TraceEvent::MessageDelivered { id, to, .. } => {
+                    // Any contact from a leader of the server's term or later resets
+                    // its election timer (moirae rule 5): an AppendEntries, whether
+                    // its consistency check passes or not, and equally an
+                    // InstallSnapshot, which is how a leader reaches a follower whose
+                    // next index has fallen below the leader's compacted prefix
+                    // (RAFT.md §1). The core routes the snapshot to its own task, but
+                    // the follower is hearing from the leader all the same, and its
+                    // incarnation's timer stays fresh across the install; a follower
+                    // caught up only by a long train of snapshots would otherwise be
+                    // read as starved though a leader is feeding it every few
+                    // milliseconds. The nightly's seed 164 was exactly that.
                     if let Some(server) = server_of(*to)
                         && let Some(payload) = payloads.get(id)
                         && let Ok(frame) = Frame::decode(payload.clone())
-                        && let Message::AppendEntries { term, .. } = frame.message
-                        && term >= terms.get(&server).copied().unwrap_or(0)
+                        && matches!(
+                            frame.message,
+                            Message::AppendEntries { .. } | Message::InstallSnapshot { .. }
+                        )
+                        && frame.message.term() >= terms.get(&server).copied().unwrap_or(0)
                     {
                         last_reset.insert(server, at);
                     }
+                }
+                // PROPOSED(D-039): a completed snapshot install re-states the server
+                // and rebuilds its incarnation with a fresh election timer. The
+                // install was the leader's doing and the server was busy finishing
+                // it, so the restatement counts as the leader's contact here. A crash
+                // restart re-states the same way and is reset below when its RaftTerm
+                // re-admits it; this arm is for the server that never went down. The
+                // nightly's seed 385: cut off alone mid-install, it campaigned a
+                // hundred milliseconds after the switch and twenty-five past the bound.
+                TraceEvent::RaftRecovered { server, .. } if up.contains(server) => {
+                    last_reset.insert(*server, at);
                 }
                 TraceEvent::RaftTerm { server, term, role } => {
                     terms.insert(*server, *term);
@@ -666,7 +895,7 @@ impl Report {
                 _ => {}
             }
             for server in &up {
-                if leaders.contains(server) {
+                if leaders.contains(server) || reseeded.contains(server) {
                     continue;
                 }
                 let since = last_reset.get(server).copied().unwrap_or(at);
@@ -715,17 +944,29 @@ pub fn node_config(id: u64, variant: Variant) -> NodeConfig {
         servers: (1..=SERVERS)
             .map(|s| (ServerId(s), server_addr(s)))
             .collect(),
-        // One entry per message: a follower behind by any number of entries is
-        // caught up one message at a time, so the pipeline is exercised and a new
-        // leader's own no-op reaches a follower in a message of its own, after the
-        // older entries it re-sent. That is the Figure 8 window, a few milliseconds
-        // wide, and with batching it closes whenever the older entries fit in the
-        // no-op's batch (D-026, issue #22 for a batched sweep).
+        initial_voters: (1..=SERVERS).map(ServerId).collect(),
+        // The default batch size: a follower behind by up to `max_batch` entries
+        // is caught up in one message, so under client-paced traffic a new
+        // leader's own no-op rides with the older entries it re-sends and the
+        // Figure 8 window never opens. [`Fault::FigureEight`] opens it
+        // deliberately: a burst leaves a restarted leader re-sending a backlog of
+        // more entries than one message carries, and the window is every
+        // acknowledgement below its no-op (D-031, issue #22). D-026's sweep ran
+        // one entry per message instead, so the window opened on ordinary
+        // catch-ups and the batched paths went unexercised.
+        //
+        // A small snapshot threshold, so leaders compact routinely and a follower
+        // partitioned away for under a second falls behind by more than it —
+        // the clients write a couple of dozen entries a second — and lands in
+        // the snapshot path on real schedules; a chunk small enough that an
+        // install takes many chunks, so resumption under drops actually happens
+        // (RAFT.md §1, stage E).
         raft: RaftConfig {
             variant,
-            max_batch: 1,
             tick_nanos: u64::try_from(TICK.as_nanos()).expect("small"),
             drift_bound_ppm: DRIFT_BOUND_PPM,
+            snapshot_threshold: 12,
+            snapshot_chunk: 4096,
             ..RaftConfig::default()
         },
         engine,
@@ -742,7 +983,7 @@ fn spawn_server(sim: &Sim, id: u64, variant: Variant) {
 }
 
 /// The leader in force: the server of the latest `RaftLeader` event, or server 1.
-fn leader_now(sim: &Sim) -> u64 {
+pub(crate) fn leader_now(sim: &Sim) -> u64 {
     sim.trace()
         .iter()
         .rev()
@@ -781,7 +1022,9 @@ fn to_result(outcome: Outcome) -> ClientResult {
 /// following NotLeader hints, abandoning a write it hears nothing about. Client 1
 /// reads more than it writes: it is the client the trial and the leader isolation
 /// keep on the cut-off leader's side, where a lease read is what matters.
-async fn client<E: Environment>(env: E, n: u64, stats: SharedStats) {
+/// `servers` is how many server nodes it may try: the membership scenario runs
+/// five, this sweep three.
+pub(crate) async fn client<E: Environment>(env: E, n: u64, servers: u64, stats: SharedStats) {
     let Ok(sock) = env.net().bind(client_addr(n)).await else {
         return;
     };
@@ -822,9 +1065,9 @@ async fn client<E: Environment>(env: E, n: u64, stats: SharedStats) {
                 OP_TIMEOUT
             };
         let mut target = leader.unwrap_or_else(|| {
-            let pick = 1 + env.rng().below(SERVERS);
+            let pick = 1 + env.rng().below(servers);
             if avoid == Some(pick) {
-                pick % SERVERS + 1
+                pick % servers + 1
             } else {
                 pick
             }
@@ -881,14 +1124,14 @@ async fn client<E: Environment>(env: E, n: u64, stats: SharedStats) {
                         Some(l) => target = l.0,
                         None => {
                             env.clock().sleep(Duration::from_millis(20)).await;
-                            target = target % SERVERS + 1;
+                            target = target % servers + 1;
                         }
                     }
                 }
                 None => {
                     // A get can be asked again elsewhere; a write cannot.
                     if !op.is_write() && now < deadline {
-                        target = target % SERVERS + 1;
+                        target = target % servers + 1;
                     } else {
                         break;
                     }
@@ -934,6 +1177,44 @@ async fn client<E: Environment>(env: E, n: u64, stats: SharedStats) {
     }
 }
 
+/// The Figure 8 driver's burst: `count` puts on [`BURST_KEY`] fired at server
+/// `target` without awaiting replies, as the schedule's `n`th driver. Every
+/// operation is invoked in the trace and abandoned; the checker closes each at
+/// its entry's apply, with a result no client saw, or leaves it pending
+/// (RAFT.md §4). The ones the doomed leader appends are the backlog the driver
+/// needs; a reply, had anyone read one, would arrive only after the entry
+/// applied, so never for the entries the crash cuts off.
+async fn burst<E: Environment>(env: E, n: u64, target: u64, count: u64) {
+    let Ok(sock) = env.net().bind(burst_addr(n)).await else {
+        return;
+    };
+    let process = BURST | n;
+    for seq in 0..count {
+        let key = Bytes::from_static(BURST_KEY);
+        let value = Bytes::from(format!("b{n}.{seq}"));
+        env.trace(TraceEvent::ClientInvoke {
+            client: process,
+            seq,
+            op: ClientOp::Put {
+                key: key.clone(),
+                value: value.clone(),
+            },
+        });
+        let request = Request {
+            client: process,
+            seq,
+            command: Command::Put { key, value },
+        };
+        if sock
+            .send(server_addr(target), request.encode())
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
+}
+
 /// Runs the scenario for `seed` with the schedule drawn from it.
 #[must_use]
 pub fn run(seed: u64, variant: Variant) -> Report {
@@ -957,7 +1238,7 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
         let env = sim.env(node);
         let inner = env.clone();
         let stats = stats[i].clone();
-        env.spawn("client", client(inner, i as u64 + 1, stats));
+        env.spawn("client", client(inner, i as u64 + 1, SERVERS, stats));
     }
     let all_but = |server: u64, client: u64| -> (Vec<NodeId>, Vec<NodeId>) {
         let side: Vec<NodeId> = vec![servers[server as usize - 1], clients[client as usize - 1]];
@@ -977,39 +1258,47 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
         sim.restart(node_of_server(server));
         spawn_server(sim, server, variant);
     };
-    // The lease trial: the operator hands leadership to the slowest clock, which
-    // leads for a while and is then cut off with client 1.
+    // The lease trials: the operator hands leadership to the slowest clock, which
+    // leads for a while and is then cut off with client 1; twice, so the variant's
+    // catch rate is not one window's noise.
     let slowest = schedule.slowest();
-    let leader = leader_now(&sim);
-    if leader != slowest {
-        let env = sim.env(admin);
-        let inner = env.clone();
-        env.spawn("admin", async move {
-            let Ok(sock) = inner.net().bind(admin_addr()).await else {
-                return;
-            };
-            let request = Request {
-                client: ADMIN,
-                seq: 0,
-                command: Command::Transfer { to: slowest },
-            };
-            let _ = sock.send(server_addr(leader), request.encode()).await;
-        });
-        advance(&mut sim, TRANSFER_WAIT, &mut watch);
-    }
-    advance(&mut sim, schedule.trial.settle, &mut watch);
-    let leader = leader_now(&sim);
-    let trial_led_by_slowest = leader == slowest;
-    {
+    let mut trials_led_by_slowest = 0;
+    let mut last_heal = sim.now();
+    for (n, trial) in schedule.trials.iter().enumerate() {
+        if watch.stopped.is_some() {
+            break;
+        }
+        let leader = leader_now(&sim);
+        if leader != slowest {
+            let env = sim.env(admin);
+            let inner = env.clone();
+            let seq = n as u64;
+            env.spawn("admin", async move {
+                let Ok(sock) = inner.net().bind(admin_addr(seq + 1)).await else {
+                    return;
+                };
+                let request = Request {
+                    client: ADMIN,
+                    seq,
+                    command: Command::Transfer { to: slowest },
+                };
+                let _ = sock.send(server_addr(leader), request.encode()).await;
+            });
+            advance(&mut sim, TRANSFER_WAIT, &mut watch);
+        }
+        advance(&mut sim, trial.settle, &mut watch);
+        let leader = leader_now(&sim);
+        trials_led_by_slowest += usize::from(leader == slowest);
         let (side, rest) = all_but(leader, 1);
         let from = sim.now();
         sim.partition(&side, &rest);
-        advance(&mut sim, schedule.trial.isolate, &mut watch);
+        advance(&mut sim, trial.isolate, &mut watch);
         sim.heal();
         isolations.push((leader, from, sim.now()));
+        last_heal = sim.now();
+        advance(&mut sim, TRIAL_GAP, &mut watch);
     }
-    let mut last_heal = sim.now();
-    advance(&mut sim, Duration::from_millis(500), &mut watch);
+    let mut figure8s = 0u64;
     for (fault, gap) in schedule.faults.iter().zip(schedule.gaps.iter()) {
         if watch.stopped.is_some() {
             break;
@@ -1052,6 +1341,40 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
                 advance(&mut sim, *down, &mut watch);
                 restart(&mut sim, leader);
             }
+            Fault::CrashInstalling {
+                server,
+                isolate,
+                grace,
+                down,
+            } => {
+                // The victim first falls behind the threshold and goes quiet past
+                // the designation, so a stream follows the heal.
+                let leader = leader_now(&sim);
+                let victim = if *server == leader {
+                    server % SERVERS + 1
+                } else {
+                    *server
+                };
+                let side = vec![servers[victim as usize - 1]];
+                let rest: Vec<NodeId> = servers
+                    .iter()
+                    .chain(clients.iter())
+                    .chain(std::iter::once(&admin))
+                    .copied()
+                    .filter(|n| *n != side[0])
+                    .collect();
+                let from = sim.now();
+                sim.partition(&side, &rest);
+                advance(&mut sim, *isolate, &mut watch);
+                sim.heal();
+                isolations.push((victim, from, sim.now()));
+                if install_landing(&mut sim, &mut watch, victim) {
+                    advance(&mut sim, *grace, &mut watch);
+                    sim.crash(node_of_server(victim));
+                    advance(&mut sim, *down, &mut watch);
+                    restart(&mut sim, victim);
+                }
+            }
             Fault::StaleSender {
                 server,
                 one_way,
@@ -1081,6 +1404,54 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
                 if *one_way > spent {
                     advance(&mut sim, *one_way - spent, &mut watch);
                 }
+                sim.heal();
+            }
+            Fault::FigureEight {
+                follower,
+                client,
+                settle,
+                burst: count,
+                crash_after,
+                down,
+                steer,
+            } => {
+                let leader = leader_now(&sim);
+                let behind = if *follower == leader {
+                    follower % SERVERS + 1
+                } else {
+                    *follower
+                };
+                let (side, rest) = all_but(behind, *client);
+                let from = sim.now();
+                sim.partition(&side, &rest);
+                advance(&mut sim, *settle, &mut watch);
+                // The burst lands on whoever leads the majority side now; the
+                // third server is the one kept mute after the crash.
+                let leader = leader_now(&sim);
+                let mute = (1..=SERVERS)
+                    .find(|&s| s != leader && s != behind)
+                    .expect("three servers");
+                figure8s += 1;
+                let env = sim.env(admin);
+                let inner = env.clone();
+                let (n, target, puts) = (figure8s, leader, *count);
+                env.spawn("burst", async move {
+                    burst(inner, n, target, puts).await;
+                });
+                advance(&mut sim, *crash_after, &mut watch);
+                sim.crash(node_of_server(leader));
+                sim.heal();
+                isolations.push((behind, from, sim.now()));
+                // The steering: with the mute server's sends blocked, it cannot
+                // answer and the isolated follower, whose log is the shortest,
+                // cannot be voted in; the restarted leader campaigns, the
+                // isolated follower grants, and the backlog is re-sent to it in
+                // batches.
+                sim.block(node_of_server(mute), node_of_server(leader));
+                sim.block(node_of_server(mute), node_of_server(behind));
+                advance(&mut sim, *down, &mut watch);
+                restart(&mut sim, leader);
+                advance(&mut sim, *steer, &mut watch);
                 sim.heal();
             }
         }
@@ -1117,7 +1488,7 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
         records,
         last_heal,
         isolations,
-        trial_led_by_slowest,
+        trials_led_by_slowest,
         refused,
         stopped: watch.stopped,
         history,
@@ -1130,6 +1501,61 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
 struct Watch {
     slices: u32,
     stopped: Option<String>,
+}
+
+/// Advances the run in small slices until `victim` receives the final chunk of a
+/// snapshot stream, or [`INSTALL_WAIT_BUDGET`] runs out: the moment
+/// [`Fault::CrashInstalling`] aims its crash at. The safety folds are skipped
+/// inside the small slices — the next ordinary [`advance`] runs them over
+/// everything — but the trace cap still stops a runaway.
+fn install_landing(sim: &mut Sim, watch: &mut Watch, victim: u64) -> bool {
+    if watch.stopped.is_some() {
+        return false;
+    }
+    let step = Duration::from_millis(5);
+    let mut payloads: BTreeMap<ananke_env::MessageId, Bytes> = BTreeMap::new();
+    // Only deliveries from here on count: a done-chunk of some earlier stream
+    // must not draw the crash. Sends are scanned a slice further back, so a
+    // chunk sent just before the watch began still decodes when it lands.
+    let mut scanned = sim.trace_len();
+    for record in sim.trace().iter().rev().take(2000) {
+        if let TraceEvent::MessageSent { id, payload, .. } = &record.event {
+            payloads.entry(*id).or_insert_with(|| payload.clone());
+        }
+    }
+    let mut waited = Duration::ZERO;
+    while waited < INSTALL_WAIT_BUDGET {
+        sim.run_for(step);
+        waited += step;
+        let len = sim.trace_len();
+        if len > TRACE_CAP {
+            watch.stopped = Some(format!(
+                "runaway: {len} trace records by {:?}, over the cap of {TRACE_CAP}",
+                sim.now()
+            ));
+            return false;
+        }
+        let records = sim.trace();
+        for record in &records[scanned..] {
+            match &record.event {
+                TraceEvent::MessageSent { id, payload, .. } => {
+                    payloads.insert(*id, payload.clone());
+                }
+                TraceEvent::MessageDelivered { id, to, .. } => {
+                    if server_of(*to) == Some(victim)
+                        && let Some(payload) = payloads.get(id)
+                        && let Ok(frame) = Frame::decode(payload.clone())
+                        && matches!(frame.message, Message::InstallSnapshot { done: true, .. })
+                    {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        scanned = records.len();
+    }
+    false
 }
 
 /// Runs the simulation for `duration` in slices of [`SLICE`], running the safety

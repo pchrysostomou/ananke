@@ -1032,4 +1032,641 @@ it.
 
 ---
 
-_Next entry: D-029. Add one before implementing anything not covered above._
+## D-029 — Joint-consensus membership changes: the configuration in force, learners first, and one change in flight
+
+**Context.** Stage D of RAFT.md's order: membership changes by joint consensus
+(thesis §4.3), servers being added catching up as non-voting learners first
+(thesis §4.2.1), one change in flight at a time, the `0 / 2 / config` key, the
+3 → 5 → 3 scenario under partition with its availability criterion (SPEC §3),
+and `Variant::SingleMajorityInJointConsensus`.
+
+**Decision.** A change from C_old to C_new is two entries, `C_old,new` and, once
+that is committed, `C_new`, and a server uses the latest configuration entry in
+its log, committed or not (RAFT.md §1): the core adopts it on append, leader
+and follower alike, reverts on truncation to the latest surviving entry or the
+initial configuration, and restores at restart by scanning the log the store
+hands back. Every take-effect emits `RaftConfig`; at a restart the node
+re-states the configuration in force after the log re-statement and before
+`RaftRecovered`, an order that is kept stable. The step's persist carries the
+configuration when it changed, and the store writes it under `0 / 2 / config`
+in the same synced batch as the append or truncation, checks it against the
+log at open, and refuses a store whose key and log disagree.
+
+Counting and addressing were pulled apart, which is where the stage's latent
+bug lived: `voters()` used to return every member. Now votes, pre-votes,
+commits, check quorum and read-index acknowledgements are counted through
+`Configuration::has_majority`, which takes a majority of each voter set in
+force and counts only members of each set — so a leader outside C_new
+contributes nothing to the majorities that commit it (thesis §4.3) with no
+special case, and learner acknowledgements count for nothing anywhere. The
+lease generalises the same way: per voter set, the promise that makes a
+majority of the set expire latest, the leader counted where it is a member,
+and while joint the earlier of the two sets' ends. Replication and heartbeats
+go to members plus the learners of the change under way.
+
+A learner's catch-up is measured in rounds by the leader's ticks: a round runs
+from its start to the acknowledgement covering the leader's then-last index,
+a round shorter than the minimum election timeout promotes the learner, a
+longer one starts the next round at the current last index, and the joint
+entry is proposed once every learner is caught up. The catch-up state is
+leader-local and volatile (PROPOSED D-032). From the joint entry on the change
+drives itself on whichever leader holds it: commit of the joint entry proposes
+C_new, commit of C_new steps the leader down if it is not in it, so the change
+survives the leader that started it. One change is in flight at a time,
+catch-up included: a request for different voters while one is under way, or
+while the latest configuration entry is uncommitted, is refused the way a
+proposal to a non-leader is; a request for the voters of the change under way
+or already in force asks for what is already true, is answered `Done`, and
+proposes nothing, so an operator's retry over a lossy network is harmless. The
+operator asks with `Command::Change { voters }`, a trigger and never an entry,
+answered `Done` on accept like a transfer (D-028), completion being
+configuration entries the trace shows. `NodeConfig` now separates the address
+book, every server that may exist, from `initial_voters`, what a fresh store
+starts with: the scenario's servers 4 and 5 start with no configuration at
+all, and a server that is not a voter of its configuration in force does not
+campaign (PROPOSED D-033). `commit_majority` judges every commit against the
+configuration in force on the committing leader at that moment, followed
+through `RaftConfig` events, both majorities while joint, with the `servers`
+parameter as the initial-configuration fallback.
+
+The scenario (`sim/membership.rs`) runs five server nodes, servers 4 and 5
+outside the initial {1, 2, 3}; the operator grows to five voters and shrinks
+back, each change with a seed-drawn partition that puts the leader in force on
+the minority side of the old voters, alone with a client or keeping 4 and 5;
+on half the seeds leadership is handed to 4 or 5 between the changes, so the
+shrink exercises the step-down. A change the partition killed is asked for
+again, up to four requests. Availability is SPEC §3's criterion as the
+existing liveness checks are shaped: on uniformly scheduled seeds, the longest
+gap between consecutive completed client operations, with time inside the
+partition windows taken out, must stay under ten maximum election timeouts —
+the partition itself may block writes while the leader is on the minority
+side, so the clock effectively starts at the heal. The variant counts one
+merged majority of the two sets while joint, in commits and elections both:
+the single-majority rule §4.3 exists to forbid, since a majority of the union
+need not contain a majority of either set.
+
+**What the sweep found.** The stage landed green: the core-level tests
+(`crates/ananke-raft/tests/membership.rs`) pinned the majority arithmetic
+before the simulator ran, and the first twenty-seed sweep passed with every
+coverage counter lit — six configuration reverts, three elections while
+joint, seven step-downs of a leader outside C_new. The variant is caught on
+twenty-eight of a hundred seeds, first as commit majority: leader 2 committed
+an entry durable on servers 2, 4 and 5 alone, three of the five merged voters
+but one of the three old ones — the disjoint-majority window the partition
+with the leader keeping 4 and 5 opens while servers 1 and 3 still stand on
+C_old. The measured worst completion gap on the correct server at a hundred
+seeds was just under three hundred milliseconds, under a sixth of the
+two-second bound; the ten-thousand-seed nightly will say whether it can
+tighten.
+
+**Alternatives.** Single-server changes (thesis §4.1): SPEC §3 asks for the
+hard version deliberately. Replicating the learner phase as its own
+configuration entry, etcd's shape: survives a leader crash mid-catch-up, but
+leaves a new leader holding learners with no recorded target C_new and needs
+a second entry form; a leader-local phase whose loss the operator observes
+and retries is smaller. Refusing a same-voters retry outright: an operator
+behind a lossy network could not tell "accepted, answer lost" from "refused"
+and would be wedged. Answering the operator only when C_new commits: couples
+one response to a multi-round future the trace already shows.
+
+**Consequences.** A leadership change during catch-up abandons the change and
+the operator retries. Removed servers keep the last configuration they saw,
+sit quiet under the D-033 rule, and are never told to shut down — an
+operator's business, left to the backlog. Configuration entries carry empty
+learner lists in this stage; the field waits for snapshots (stage E), which
+also inherit the `0 / 2 / config` key so a compacted store still knows its
+configuration.
+
+---
+
+
+## D-030 — Snapshots: the compacted log, the streamed checkpoint, the staged install, and the re-seeded server
+
+**Context.** Stage E of RAFT.md's order: snapshots per §1 and §3 — a checkpoint as
+the snapshot, `InstallSnapshot` streaming with resumption, the staged install, log
+compaction, the `snapshot` task, the refused server re-seeded, the
+`SnapshotWithoutCurrentLast` variant, and the invariants learning `RaftSnapshot`.
+The genuinely new choices the documents leave open are PROPOSED D-035..D-038;
+what follows is the approved design as built.
+
+**Decision.** The core's log carries a compacted prefix: a (last index, last
+term) pair the tail starts after, `term_at` answering at the boundary, the
+election restriction and the consistency check reading the snapshot when the log
+is empty, and a follower whose `next` falls at or below the prefix — or one
+designated snapshot-fed (D-037) — fed through `Output::Snapshot(Install)` rather
+than entries. Compaction is part of a persist (`compact_to`), taken only when
+every follower is past the checkpoint or designated, and traced `RaftCompacted`.
+A take is triggered on the leader's tick once the log outgrows
+`snapshot_threshold` past the last take, with one deferral: a fresh leader waits
+two minimum election timeouts before its first threshold take, because a
+checkpoint stalls applies (D-036) and a fresh leader's first duty is its no-op
+and its followers; a follower that needs a snapshot sooner gets one on demand.
+
+The take runs in the apply task (D-036): the record under `0 / 3 / snapshot`
+first, synced, then `Engine::checkpoint` to `snap-<index>`, so the copy carries
+its own identity before its `CURRENT` (D-024). Streaming keeps one chunk
+outstanding; the acknowledgement names the next byte wanted, a timeout resends
+from there — the resumption RAFT.md asks for, traced `RaftSnapshotResumed` —
+eight resends give the stream up, a receiver's restart starts it over, and two
+restarts retake the checkpoint. The stream's identity is (sender, leader term,
+last index, last term); a change starts the staging over. The receiver assembles
+under `install/`, holds the streamed `CURRENT` aside in memory, syncs each
+completed file and its directory entry, verifies every staged table with the
+engine's own checks, and installs by one repair table and a successor manifest —
+the receiver's hard state, the applied index at the snapshot, the record, the
+kept tail (kept only when its entry at the snapshot's last index carries the
+snapshot's last term), tombstones for the leader's log keys, the quarantine on a
+re-seed — with the staged `CURRENT` written last (D-038). The `raft` loop
+quiesces the apply task before handing the repair over, so the applied index is
+final and the kept tail exact; the completed install retires the incarnation and
+the next open adopts the staged store. A refused server binds in re-seed mode,
+answers every AppendEntries with a rejection asking from index 1, and is
+quarantined for good on the store the install builds (D-035).
+
+The invariants fold `RaftSnapshot` as a per-server floor standing in for the
+committed prefix: log matching compares at the boundary only what both sides
+still show and requires two snapshots ending at one index to agree in term;
+leader completeness and commit majority count a floor as holding the entry;
+state machine safety resumes applies at an installed snapshot's index, resets a
+refused server's floor for the re-seed restatement, and is exactly what reports
+the variant — an unrepaired adoption re-states a *taken* snapshot and a
+recovered applied index its restated log cannot account for. The sweep runs
+`snapshot_threshold` 12 and `snapshot_chunk` 4096, counts takes, installs,
+resumes, compactions, re-seeds and completed re-seeds, treats a re-seeded server
+as up again and exempts it from the timer bound, and aims `CrashInstalling` —
+drawn from its own `moirae_sched` stream, never lengthening the shared schedule
+stream (D-031) — by isolating a follower past the threshold and crashing it a
+few milliseconds after the stream's final chunk lands.
+
+**What the sweep found before it passed.** Seed 9 of the twenty-seed gate, the
+first run with re-seeding live: the re-seeded server was flagged by the timer
+check for never campaigning — which is its design (D-035) — so the check
+exempts it. With the threshold at twelve, `LeaseTrustsTheClock` stopped being
+caught at all: every trial's fresh majority-side leader took its first
+checkpoint the moment it was elected — its whole history was past the threshold
+— and the apply stall delayed the write that must land inside the stale-read
+window past the client's sixty-millisecond budget; the fresh-leader deferral
+above restored the catch. Seed 8: a server that finished installing during an
+isolation re-stated the stream's term inside the window and the pre-vote check
+called it a term raise; isolations during a refusal, a re-seed or an install
+are now skipped. And the variant was uncatchable until the assembler synced the
+staging directory's *entries*: the simulated crash keeps only directory
+operations `sync_dir` covered, so the staged files all vanished at the crash
+and the bogus `CURRENT` never had a store to win — the honest assembler now
+syncs the directory as each file completes, which is also what makes an
+acknowledged offset durable, and the variant's window became real: caught on 6
+of 20 seeds at the gate. And the hundred-seed release run, seed 60: rot refused
+one server while another was already quarantined from an earlier re-seed, and
+the one remaining voter pre-voted forever — a quarantined server grants nothing
+(D-035) and a refused one can only be re-seeded *by* a leader, so no leader can
+ever form. That deadlock is D-035's priced-in availability cost, not a liveness
+bug: the sweep's liveness bound is now asked only of clusters whose unimpaired
+servers — neither refused nor quarantined — still form a majority. The same
+seed showed the repair had to own the quarantine key outright: carried forward
+when the receiver's history was ever re-seeded, whatever kind of install
+refreshes the store, and tombstoned otherwise so a flag riding in the leader's
+checkpointed tenant 0 can never quarantine a healthy receiver. And the
+ten-thousand-seed nightly, seed 164, the first correct-server failure the sweep
+ever produced: a follower two hundred entries behind, fed by a long train of
+`InstallSnapshot` chunks because the leader's log past it was compacted, was
+flagged by the timer check for not campaigning across four hundred milliseconds
+— while the leader was reaching it every few milliseconds. An InstallSnapshot
+is a leader's contact as much as an AppendEntries (moirae rule 5), and the real
+follower's incarnation keeps its election timer fresh across the install; the
+core routes the snapshot to its own task, so the timer check, which read only
+AppendEntries as a reset, saw a gap that the server never had. It now counts an
+InstallSnapshot from a leader of the server's term or later as a reset too. The
+hundred-seed runs never reached a follower that far behind under a compacting
+leader; ten thousand did, which is what ten thousand are for.
+
+**Alternatives.** Multiple chunks in flight: resumption bookkeeping for a
+pipeline, for a path whose cost is the checkpoint, not the round trips.
+Follower-triggered snapshots: RAFT.md gives taking to the leader, and nothing
+here needs more. Deleting checkpoint directories eagerly: a stream may still be
+reading one; GC is a backlog line. Streaming the live store instead of a
+checkpoint: the checkpoint is the engine's own consistent copy and D-024 already
+paid for it.
+
+**Consequences.** A follower fed a snapshot restarts its incarnation on the
+adopted store; its socket and inbox survive, so peers see a pause, not a loss.
+Applies stall for the duration of a take (D-036). Checkpoint directories
+accumulate until a GC exists. The re-seed path makes a refusal recoverable, at
+the price of a quarantined voter (D-035), and the sweep asserts a refused server
+comes back and applies again across a hundred seeds.
+
+---
+
+
+## D-031 — The Figure 8 driver and the batched sweep
+
+**Context.** Issue #22. The sweep ran one entry per AppendEntries (D-026) because
+`Variant::CountOlderTermForCommit` (§5.4.2, Figure 8) was never caught at the
+default batch size: `become_leader` appends the term's no-op before its first
+replicate, so whenever a follower is behind by no more than a batch the no-op
+rides in the same message as the older entries the new leader re-sends, the
+follower matches both at once, and the count rule never sees an older-term entry
+acknowledged without one of the leader's own above it. The window needs a new
+leader holding a backlog of uncommitted older-term entries longer than
+`max_batch`, and a follower that lacks them.
+
+**Decision.** The sweep runs the default batch size, and one fault of the
+schedule is a driver rather than an outage. `Fault::FigureEight` isolates a
+follower with a client, fires a burst of puts at the leader without awaiting
+replies — each invoked in the trace as its own client process and abandoned, on
+a key of its own, so the checker closes each at its entry's apply and the
+per-key search sees only puts that always take effect — crashes the leader with
+the burst appended, and steers it back into the lead: the third server's sends
+are blocked, so it can answer nothing and the isolated follower, whose log is
+short, can be voted in by nobody, and the restarted leader, holding the longest
+log, campaigns and wins with the isolated follower's vote. It then re-sends its
+backlog in batches, and the buggy leader advances its commit index onto an
+older term's entry at the first acknowledgement below its no-op, which the
+commit-by-current-term fold reports on the spot; the correct leader commits
+nothing until the batch carrying the no-op is acknowledged. The driver's
+parameters are drawn from a stream of their own, so tuning them re-draws no
+other schedule; it takes two slots of eight in the fault draw, since its window
+needs the burst, the crash, the disk and the steering to line up and a rarer
+draw reports no rate; and `paper.rs` steps the mechanism by hand at the core
+level, batches of four against a log of ten.
+
+**What the sweep found.** The issue's sketch — crash the leader before its
+commit advance reaches the surviving follower — cannot open the window at this
+sweep's speeds, and no crash timing fixes it. A leader appends one entry per
+synced batch, a millisecond or two each, and a follower's commit knowledge lags
+its appends by one message round trip, so the gap between what the survivor
+holds and what it knows committed is the append rate times the round trip: ten
+or twenty entries, never sixty-four. What opens the window is the crash itself:
+the commit index is not persisted (Figure 2 keeps it volatile), so the doomed
+leader restarts with commit zero and its whole log above it uncommitted-as-far-
+as-it-knows. Steered back into the lead, it rebuilds its commit index by
+counting acknowledgements from the one follower allowed to answer, batch end by
+batch end from far below — every end under the no-op is the violation. The rule
+follows: the driver needs the old leader re-elected, not the survivor, and the
+steering earns its keep — a first cut that let the survivor win caught nothing,
+since the survivor's commit knowledge was a round trip behind its log, ten
+entries, and one batch covered its whole catch-up. Two of its windows die with
+the fault model and are left to it: the restart is refused outright where bit
+rot under the crash landed where recovery refuses to guess (D-026, D-027), and
+a severely slow clock (D-028's draw) can put the restarted leader's election
+past the steering window, after which the heal makes the run an ordinary
+leader crash. The crash window has to fit the disk,
+not the network: a first cut crashed the leader a few hundred milliseconds
+after the burst and on the slower seeds it died holding thirty to sixty
+entries, under a batch, since every proposal costs a synced batch to append
+and another to apply and the adversarial scheduler (D-016) stretches both —
+the crash now waits four hundred and fifty to seven hundred and fifty
+milliseconds, drawn from the seed. And adding a fault arm re-draws every
+schedule after it from the shared stream: the lease trials' geometry reshuffled
+and `LeaseTrustsTheClock` went uncaught on the gate's twenty seeds until the
+driver's draws moved to their own stream — the catch rates of every variant are
+a function of the whole schedule, and a driver must not move the others' dice.
+At a hundred seeds, release: batch one without the driver caught
+`CountOlderTermForCommit` on 58; the default batch without the driver on none,
+D-026's hole verified; the default batch with the driver on 58, the driver
+drawn on 78 of the hundred schedules. What the driver loses it loses to the
+fault model and the adversary: the restart is refused on about a sixth of its
+windows, the starved seeds append less than a batch before the crash, and on
+two windows the burst arrived just as leadership moved and no entry of it was
+ever proposed. Every other variant's rate held, and the correct server passes
+all hundred: normal client-paced traffic still replicates one entry per
+message, so batching bites only on the backlogs the driver builds.
+
+**Alternatives.** A one-way block of the survivor's acknowledgements during the
+burst, to freeze the doomed leader's commit index: works, but check quorum
+steps the leader down within two hundred milliseconds of the block and caps the
+backlog, and the restart's commit reset makes the freeze redundant. Crashing
+the survivor instead of muting it: the majority is then the restarted leader
+and the isolated follower, the same window, but a second crash doubles the
+refusals. `max_batch: 1` forever: the batched send and receive paths, which
+every deployment would run, stay unexercised — the hole D-026 recorded. A
+guaranteed driver per schedule, like the lease trials: the plain outages would
+lose half their draws, and the variant does not need every seed, only a rate.
+
+**Consequences.** The sweep exercises batching and pipelining on every seed and
+the Figure 8 window on most. A schedule's faults now draw from two streams, and
+any future fault arm must bring its own stream rather than lengthen the shared
+one. The burst leaves a hundred-odd pending puts in the history on its own key,
+which the checker disposes of linearly. Coverage counts the drivers drawn and
+the burst puts invoked, and the sweep asserts both were seen.
+
+---
+
+## D-040 — Seeds run in parallel, and the sweeps' four tiers
+
+**Context.** A ten-thousand-seed run of the Phase 2 sweeps takes about three hours
+awake on a laptop, and a laptop is not awake for three hours: the second such run
+of the overnight session spent most of its wall-clock asleep behind a closed lid
+and did twenty-four minutes of work in three hours forty. Every sweep also ran
+its seeds one after another inside its test, so a single test's tail — the lease
+test, which runs the guardless server on top of the correct one — set the
+binary's wall-clock whatever the machine had to offer. And the nightly's catch
+rates were never seen: cargo captures a passing test's output.
+
+**Decision.** Every sweep runs its seeds in parallel through `ananke_sim::sweep`
+(`sim/parallel.rs`): `0..count` over rayon's global thread pool, results in seed
+order. Every seed's `Sim` is independent — nothing in the workspace holds
+process-wide mutable state, and a `Sim` draws every stream from its seed by name
+(D-017) — so a trace does not depend on which thread ran it or on what ran
+beside it; `sim/tests/parallel.rs` proves it, hashing a seed run alone against
+the same seed run inside the driver among its neighbours, for every scenario.
+The pool is one per process, so the sweeps of one test binary share it and no
+more simulations run at once than the machine has cores, whatever the test
+harness's own parallelism. A sweep's closure returns something small and drops
+the report, writing a failing seed's trace where the report still is; the
+verdict names the first failing seed in seed order and every other one. The
+driver is the one place outside `crates/ananke-env` that puts work on host
+threads: the scheduler's ban on spawning is about the code under test, which
+must not escape the simulator, and `scripts/check-direct-io.sh` confines `rayon`
+to that file.
+
+The seeds come in four tiers: 20 at the gate, 100 in CI, 1000 under
+`scripts/premerge.sh` — release, seeds in parallel, catch rates printed, run on a
+branch before asking for its merge, about a quarter of an hour — and 10 000 in
+the nightly workflow on GitHub, which is the only place ten thousand run. The
+nightly prints its catch rates too (`--nocapture`).
+
+**Alternatives.** `std::thread::scope` in the sim crate: banned by clippy.toml
+and the textual check, and sanctioning a fourth file for the allow would put a
+hand-rolled pool and its concurrency cap beside the driver for no gain over
+rayon's. One process per seed: the traces and reports are in memory for the
+checks, and a process per seed would serialise them for nothing. Running the ten
+thousand on the laptop anyway, awake: three hours per verdict, and a closed lid
+away from none.
+
+**Consequences.** The coverage folds add reports in whatever order seeds finish;
+every field is a sum or a maximum, so the totals are the same. A run that fails
+on several seeds reports all of them at once instead of stopping at the first.
+Memory is the cores' worth of simulations at a time, which the test harness's
+parallelism already was. One dependency, `rayon`, used in one file.
+
+---
+
+## PROPOSED — needs approval
+
+## PROPOSED D-032 — Learner catch-up state is leader-local and volatile
+
+**Context.** RAFT.md §1 has servers being added catch up as learners before
+the joint entry exists, but does not say where the catch-up state lives. A
+leader can crash or be deposed mid-catch-up.
+
+**Decision.** The catch-up phase is leader-local and not replicated: the set
+of learners, each one's round and the target voters live in the core of the
+leader that accepted the change, and `become_follower` or `become_leader`
+clears them. A leadership change during catch-up abandons the change; the
+operator sees no joint entry in the trace and asks again, which is harmless
+because a request for the same voters is idempotent (D-029).
+
+**Alternatives.** A configuration entry that adds learners, the way etcd's
+AddLearnerNode does: the change would survive leader crashes, but the new
+leader would hold learners with no recorded target C_new to promote them
+into, and the log would need a second configuration-entry form. Blocking the
+operator until the joint entry exists: the answer would ride on a replication
+future the accept does not control.
+
+**Consequences.** A change can vanish without a trace entry beyond the
+request's `Done`; the membership scenario's driver retries, and an operator
+must too. Configuration entries always carry empty learner lists in stage D.
+
+## PROPOSED D-033 — A server that is not a voter of its configuration in force does not campaign
+
+**Context.** The thesis makes learners non-voting (§4.2.1) and discusses
+disruptive removed servers (§4.2.3); the stage D brief requires a server with
+no configuration and an empty log to sit quiet. Nothing in RAFT.md says
+whether such a server may start elections; pre-vote alone would keep it from
+winning but not from knocking every timeout, and `has_majority` of an empty
+voter set being false only makes the loss certain, not the knocking quiet.
+
+**Decision.** On its election timeout, a server that is not a voter of the
+configuration in force resets its timer and stays a follower: a learner, a
+server with no configuration yet, and a removed server cannot win an election
+and would only knock. It still grants votes and pre-votes by the usual rules,
+still follows any leader that appends to it, and ignores `TimeoutNow` for the
+same reason.
+
+**Alternatives.** Campaigning and losing: floods the trace with a role change
+and a message fan-out every timeout, forever, on every removed or waiting
+server. Special-casing only the empty configuration: leaves a removed server
+knocking, the §4.2.3 disruption pre-vote only dampens.
+
+**Consequences.** A server whose latest configuration entry excludes it never
+campaigns even while that entry is uncommitted; if a truncation reverts the
+entry, the revert restores its right to campaign with its configuration, so
+no liveness is lost that the thesis' rules would have kept.
+
+---
+
+## PROPOSED D-035 — A re-seeded server never votes again on that store
+
+**Context.** RAFT.md §3: a server whose store lost state is refused and re-seeded
+with a snapshot from the leader (stage E). The lost state may have included the
+current term and a vote cast in it, and neither survives the loss by definition: a
+re-seeded server that voted normally could vote twice in a term it already voted
+in, which breaks election safety, the one property everything else stands on. The
+documents fix the re-seed but not what the re-seeded server may afterwards do.
+
+**Decision.** A store rebuilt by a re-seed carries a durable quarantine flag
+(`0 / 0 / reseeded`), written in the same repair as the rest of the staged store's
+tenant 0, and a server on such a store, for the rest of its life on it and across
+any number of clean restarts: grants no vote and no pre-vote, never campaigns, and
+makes no lease promise — its AppendEntries responses carry an echo of zero, which
+the leader's lease and read-index arithmetic ignore. It still replicates, applies,
+answers reads it would forward anyway, and counts for commit majorities.
+
+That is safe by the quorum arithmetic. Election safety needs no help: this server
+casts no vote at all, so the vote it may have lost cannot be doubled. Leader
+completeness holds because a candidate still needs a true majority of the full
+membership, so with one server of three quarantined it needs both of the other
+two; any commit majority is two of three and therefore intersects the vote quorum
+in at least one *voting* server, which holds the committed entry and bounds the
+winner's log by the election restriction. With two of three quarantined no
+election can succeed at all: availability is lost, safety is not, which is the
+conservative side. The lease is the same story one level down: a promise majority
+must intersect a vote quorum in a voter, and a quarantined server's answers form
+no promise.
+
+**Alternatives.** Wiping the server and re-adding it through joint consensus as a
+new member: the clean answer, but it needs stage D's machinery in the recovery
+path and an operator's membership change for every refusal. Protocol-aware
+recovery, repairing the local log from the other replicas and reconstructing what
+was promised — Alagappan et al., *Protocol-Aware Recovery for Consensus-Based
+Storage* (FAST 2018) — is the full answer and is issue #23; this quarantine is
+the conservative floor to stand on until then. Suppressing the vote only until
+the term visibly advances past anything the server could have voted in:
+under-specified exactly where it matters, since the lost vote's term is unknown
+by construction.
+
+**Consequences.** A cluster that re-seeds a server keeps one fewer potential
+candidate and lease promiser until the operator replaces the store; repeated
+refusals can leave no electable majority and cost availability with safety
+intact — the release run's seed 60 reached exactly that, one quarantined voter
+plus one refused server, with the last server pre-voting into silence. The
+sweep prices this in: its liveness bound is asked only where the unimpaired
+servers still form a majority, and a re-seeded server otherwise counts as up,
+since it commits and applies. The quarantine sticks to the store's history:
+any later install carries it forward, and the repair tombstones the key
+otherwise so the leader's own tenant 0 cannot quarantine a receiver. Every
+affected site is marked `PROPOSED(D-035)`.
+
+---
+
+## PROPOSED D-036 — The snapshot's metadata is made exact by taking it in the apply task
+
+**Context.** RAFT.md §1: a snapshot's identity — index, term, configuration — is
+written into the checkpoint's reserved tenant *before* the checkpoint's `CURRENT`.
+The apply task advances the applied index concurrently, so metadata written by any
+other task can be stale by the time `Engine::checkpoint` captures the store, and
+an installed snapshot with a wrong index is a state machine safety violation
+waiting to be installed. The documents ask for exactness and give the seam (the
+apply queue) but do not fix the mechanism.
+
+**Decision.** A take is a job on the same queue as the entries the apply task
+applies. The apply task, between applies, writes the snapshot record under
+`0 / 3 / snapshot` into the live store, synced, with its own applied index and the
+term of the last entry it applied, and then calls `Engine::checkpoint`. The apply
+task is the only writer of user state and of the applied index, and it is busy
+checkpointing, so no apply lands between the record and the copy: the record is
+exact by construction, and the checkpoint's copy carries it before the
+checkpoint's own `CURRENT` (D-024). Applies queue behind the take and resume
+after it.
+
+**Alternatives.** Quiescing the apply task from the snapshot task with a
+handshake: the same guarantee with more machinery and two tasks touching the
+checkpoint. Reconciling after the fact — checkpoint first, then read back what it
+captured: the engine's checkpoint does not expose "the applied key as of the
+copy" without opening the copy, which is a second store open per take.
+
+**Consequences.** Applies stall for the duration of a checkpoint; the sweep sees
+that as apply latency, not a fault. A crash between the record and the checkpoint
+leaves a record naming a directory that is incomplete: it never touches the
+store's own correctness, and a stream that trips on it fails with a retake, which
+takes a fresh checkpoint. Every affected site is marked `PROPOSED(D-036)`.
+
+---
+
+## PROPOSED D-037 — When an unresponsive follower stops blocking compaction
+
+**Context.** RAFT.md §1: the log compacts to a snapshot only once every
+follower's match is past it, *or the follower is a learner being replaced by the
+snapshot*. An unresponsive follower must not block compaction forever, or a
+refused server's re-seed path never runs: the leader must at some point decide a
+follower will be fed the snapshot rather than the log. The documents license the
+designation and do not fix its trigger.
+
+**Decision.** A leader designates a follower snapshot-fed when the follower is
+behind by more than `snapshot_threshold` entries and has answered nothing for two
+minimum election timeouts — long enough that a live follower would have
+heartbeat-acknowledged several times — or immediately when the follower rejects
+an append at index 1, which no follower with a log does (index 0 is consistent
+with every log): that rejection is the re-seed ask of a server whose store is
+gone (RAFT.md §3). A designated follower no longer blocks compaction, and
+replication to it goes through the snapshot path; a successful append
+acknowledgement clears the designation.
+
+**Alternatives.** Blocking until the follower answers: the re-seed path
+deadlocks, since a refused server can never answer from a log it does not have.
+Compacting on threshold alone, unconditionally: a follower briefly partitioned
+away loses its log tail on the leader and pays a whole snapshot for a
+half-second's absence. An operator command: right for real deployments,
+untestable in a sweep that must exercise the path on random schedules.
+
+**Consequences.** A follower partitioned for more than two election timeouts
+while the leader outruns it by more than the threshold is fed a snapshot on heal
+rather than the log, which costs a stream where a shorter partition would have
+cost a scan. The sweep's `snapshot_threshold` is set low so this happens on real
+schedules. The site is marked `PROPOSED(D-037)`.
+
+---
+
+## PROPOSED D-038 — The staged install commits by CURRENT-last and is adopted by copy at open
+
+**Context.** RAFT.md §1 fixes what an install must do; D-024 fixes the atomicity
+anchor (`CURRENT` last is the store's commit point) and rules out directory
+renames, which the fault model does not have. What shape the staging directory
+takes, how the receiver's identity gets into the staged store before its
+`CURRENT`, and how a complete install replaces the old store across crashes, the
+documents do not fully answer.
+
+**Decision.** Three parts, all in `snapshot.rs`.
+
+*Assembly.* Chunks land in `install/` under the server's data directory. The
+streamed `CURRENT` is held aside in memory, never written, so the staging
+directory is not a store while the stream runs; every other file is written at
+its offsets and synced when complete.
+
+*Repair, then CURRENT.* On the final chunk the staged tables are verified with
+the engine's own checks and the staged record must match the stream's identity.
+The repair is one new level-0 table and a successor manifest, built with the
+engine's own writers at `flushed_seq + 1`: the receiver's hard state, the applied
+index at the snapshot, the snapshot record (installed, no directory), the kept
+log tail, tombstones for the leader's log keys, and the quarantine flag on a
+re-seed. Only after the repair is durable is the staged `CURRENT` written,
+tmp-and-rename, the same commit point as every store switch (D-024). A crash
+before it leaves debris the next open sweeps; a crash after it leaves a complete
+install. `Variant::SnapshotWithoutCurrentLast` writes the streamed `CURRENT` the
+moment it arrives instead, so a crash mid-install adopts the leader's identity —
+the state that never existed, which state machine safety reports.
+
+*Adoption.* At every server start, before the engine opens: a staging directory
+with a valid `CURRENT` wins. The old store's `CURRENT` is deleted first, then its
+files, then the staged files are copied over with `CURRENT` last again, and only
+then is the staging directory's own `CURRENT` deleted — the point of no return,
+after which the staging directory can never win again and the adopted store's
+own writes are safe. Every step is idempotent, so a crash anywhere re-runs the
+adoption on the same bytes.
+
+**Alternatives.** Renaming the staging directory into place: not modelled
+(D-024). Running the engine at the staging path forever after: two live
+locations for one store, and every later open must decide which is real. An
+install-complete marker key checked by opening the staged store: makes winning
+depend on a read through the engine rather than on the filesystem's one atomic
+switch, and moves the variant off the `CURRENT`-last rule RAFT.md names.
+
+**Consequences.** An install costs one extra copy of the store at the next open.
+Old checkpoint directories (`snap-<index>`) are never deleted, since a stream may
+still be reading one: garbage until a GC exists, recorded as a backlog line. The
+sites are marked `PROPOSED(D-038)`.
+
+---
+
+## PROPOSED D-039 — A completed snapshot install counts as the leader's contact for the timer check
+
+**Context.** The ten-thousand-seed nightly produced the sweep's first two
+correct-server failures, both from the timers-fire check (RAFT.md §2, moirae rule
+5: a follower that hears from no leader of its term and grants no vote for two
+maximum election timeouts must have campaigned), and both against a follower
+being fed a snapshot. Seed 164: a follower two hundred entries behind a leader
+whose log was compacted past it, reached only by a train of `InstallSnapshot`
+chunks the check did not read as contact, since the core routes them to the
+snapshot task; that half is a plain checker gap, fixed in D-030's stanza. Seed
+385: a follower cut off alone by a partition mid-install spent two hundred and
+twenty-five milliseconds finishing the install locally — verifying the staged
+tables, repairing tenant 0, switching stores — after which the incarnation
+switch of D-030 rebuilt its core with a fresh election timer, and it campaigned a
+hundred milliseconds later: three hundred and twenty-seven milliseconds from the
+leader's last contact, twenty-five past its bound. The code resets the timer at
+the switch; the check did not know that.
+
+**Decision.** For the timer check, a completed snapshot install is the leader's
+contact: the install was leader-initiated and the server was legitimately busy
+finishing it, so the install's restatement (`RaftRecovered` on a server that
+never went down) resets the check's clock the way a crash restart's restatement
+does. The protocol is unchanged: a new incarnation draws a fresh timeout as it
+always has, and the check now models that. Seeds 164 and 385 are pinned in the
+gate.
+
+**Alternatives.** Widening `TIMER_TIMEOUTS` from two to three, the knob RAFT.md
+§5 names for bounds the ten-thousand-seed sweep trips: blunt, and it dulls the
+check that catches `ResetTimerOnAnyRpc`. Changing the code so a new incarnation
+inherits the old timer's elapsed count: arguably closer to the paper, where an
+install is one RPC and not a fresh start, but a behaviour change to the
+protocol's timing under review, and the fresh timer is defensible — a server that
+just installed the leader's snapshot has just heard from it.
+
+**Consequences.** An install that takes longer than the bound with no
+completion in the window would still trip the check, which is the right
+sensitivity to keep: the sweep should see an install that slow. The check stays
+a function of the trace alone. The site is marked `PROPOSED(D-039)`.
+
+---
+
+_Next entry: D-040. Add one before implementing anything not covered above._

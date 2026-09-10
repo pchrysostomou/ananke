@@ -19,7 +19,18 @@
 //! |---|---|
 //! | `0 / 0 / hard` | `term: u64 \| vote: u64 (u64::MAX for none)` |
 //! | `0 / 0 / applied` | `applied: u64` |
+//! | `0 / 0 / reseeded` | present on a store a re-seed rebuilt (RAFT.md §3) |
 //! | `0 / 1 / <index: u64 BE>` | `term: u64 \| payload` |
+//! | `0 / 2 / config` | `index: u64 \| configuration` |
+//! | `0 / 3 / snapshot` | the last snapshot's index, term, configuration, checkpoint directory |
+//!
+//! The `config` key carries the latest configuration entry's index and content
+//! (RAFT.md §3), written in the same synced batch as the append or truncation
+//! that changed which entry that is, so the two can never disagree, and the open
+//! checks the two against each other. On a compacted store the entry itself may
+//! sit at or below the snapshot's last index: the log then holds nothing to
+//! check against, and the key — rewritten by an install's repair, checked here
+//! against the snapshot record — is how the store still knows its configuration.
 //!
 //! The engine recovers what it can and reports what it lost: a table it could not
 //! read, a manifest it fell back from, a log head it discarded, a log it stopped
@@ -45,12 +56,17 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 use crate::core::Persist;
 use crate::message::{get_payload, put_payload};
-use crate::types::{Entry, Index, ServerId, Term};
+use crate::types::{Configuration, Entry, Index, Payload, ServerId, Term};
 
 /// The tenant the protocol's state lives under.
 pub const RAFT_TENANT: u64 = 0;
 const META_TABLE: u64 = 0;
-const LOG_TABLE: u64 = 1;
+pub(crate) const LOG_TABLE: u64 = 1;
+const CONFIG_TABLE: u64 = 2;
+/// The table the snapshot record lives under (RAFT.md §3): written into the live
+/// store before a checkpoint is taken, so the checkpoint's copy carries the
+/// snapshot's own identity, before the checkpoint's `CURRENT` (D-024).
+const SNAP_TABLE: u64 = 3;
 const NO_VOTE: u64 = u64::MAX;
 
 /// A key under `tenant` and `table`.
@@ -63,16 +79,36 @@ pub fn key(tenant: u64, table: u64, user: &[u8]) -> Bytes {
     out.freeze()
 }
 
-fn hard_key() -> Bytes {
+pub(crate) fn hard_key() -> Bytes {
     key(RAFT_TENANT, META_TABLE, b"hard")
 }
 
-fn applied_key() -> Bytes {
+pub(crate) fn applied_key() -> Bytes {
     key(RAFT_TENANT, META_TABLE, b"applied")
 }
 
-fn log_key(index: Index) -> Bytes {
+pub(crate) fn log_key(index: Index) -> Bytes {
     key(RAFT_TENANT, LOG_TABLE, &index.to_be_bytes())
+}
+
+/// The `0 / 2 / config` key (RAFT.md §3): the latest configuration entry's index
+/// and content, written in the same synced batch as the append or truncation that
+/// changed which entry that is, and rewritten by an install's repair so a
+/// compacted store still knows its configuration.
+pub(crate) fn config_key() -> Bytes {
+    key(RAFT_TENANT, CONFIG_TABLE, b"config")
+}
+
+/// The `0 / 3 / snapshot` key (RAFT.md §3).
+pub(crate) fn snapshot_key() -> Bytes {
+    key(RAFT_TENANT, SNAP_TABLE, b"snapshot")
+}
+
+/// The re-seed quarantine flag: present on a store rebuilt from a snapshot after a
+/// refusal (RAFT.md §3), durable so a later clean restart keeps the suppression.
+// PROPOSED(D-035): re-seeded servers are quarantined from voting for good.
+pub(crate) fn quarantine_key() -> Bytes {
+    key(RAFT_TENANT, META_TABLE, b"reseeded")
 }
 
 fn bad(what: &str) -> io::Error {
@@ -171,6 +207,80 @@ impl std::fmt::Display for LostState {
 
 impl std::error::Error for LostState {}
 
+/// The last snapshot, as `0 / 3 / snapshot` records it (RAFT.md §3): written into
+/// the live store before its checkpoint is taken, so the checkpoint carries its own
+/// identity before its `CURRENT`; written by an install's repair with the identity
+/// of the snapshot installed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SnapshotRecord {
+    /// The snapshot's last applied index.
+    pub last_index: Index,
+    /// That entry's term.
+    pub last_term: Term,
+    /// The configuration at that index.
+    pub config: Configuration,
+    /// The checkpoint's directory on this server; empty for an installed snapshot,
+    /// whose checkpoint was the leader's.
+    pub dir: String,
+    /// Whether the snapshot was taken here rather than installed.
+    pub taken: bool,
+}
+
+/// What [`RaftStore::open`] found beside the store itself.
+#[derive(Clone, Debug)]
+pub struct Recovered {
+    /// The log's tail past the snapshot, in index order; the whole log without one.
+    pub log: Vec<Entry>,
+    /// The last snapshot, if the store records one.
+    pub snapshot: Option<SnapshotRecord>,
+    /// Whether this store was rebuilt by a re-seed: the server must grant no vote,
+    /// no pre-vote and no lease promise on it, ever (RAFT.md §3).
+    // PROPOSED(D-035): re-seeded servers are quarantined from voting for good.
+    pub quarantined: bool,
+}
+
+pub(crate) fn encode_snapshot_record(record: &SnapshotRecord) -> Bytes {
+    let mut out = BytesMut::with_capacity(64);
+    out.put_u64_le(record.last_index);
+    out.put_u64_le(record.last_term);
+    out.put_u8(u8::from(record.taken));
+    out.put_u32_le(u32::try_from(record.dir.len()).expect("directory fits u32"));
+    out.put_slice(record.dir.as_bytes());
+    put_payload(&mut out, &Payload::Config(record.config.clone()));
+    out.freeze()
+}
+
+pub(crate) fn decode_snapshot_record(mut bytes: Bytes) -> io::Result<SnapshotRecord> {
+    if bytes.len() < 21 {
+        return Err(bad("snapshot record"));
+    }
+    let last_index = bytes.get_u64_le();
+    let last_term = bytes.get_u64_le();
+    let taken = match bytes.get_u8() {
+        0 => false,
+        1 => true,
+        _ => return Err(bad("snapshot record malformed")),
+    };
+    let len = bytes.get_u32_le() as usize;
+    if bytes.len() < len {
+        return Err(bad("snapshot record torn"));
+    }
+    let dir = String::from_utf8(bytes.split_to(len).to_vec()).map_err(|_| bad("directory"))?;
+    let Payload::Config(config) = get_payload(&mut bytes)? else {
+        return Err(bad("snapshot record configuration"));
+    };
+    if !bytes.is_empty() {
+        return Err(bad("snapshot record has trailing bytes"));
+    }
+    Ok(SnapshotRecord {
+        last_index,
+        last_term,
+        config,
+        dir,
+        taken,
+    })
+}
+
 /// The Raft state in the engine, for one server. Shared between the task that
 /// persists and the task that applies; see the module documentation.
 pub struct RaftStore<E: Environment> {
@@ -178,14 +288,19 @@ pub struct RaftStore<E: Environment> {
     /// The hard state on disk, written by [`persist`](Self::persist) only.
     term: AtomicU64,
     vote: AtomicU64,
+    /// The first log index on disk: one past the snapshot's.
+    first_index: AtomicU64,
     last_index: AtomicU64,
     /// The applied index on disk, written by [`apply`](Self::apply) only.
     applied: AtomicU64,
 }
 
 impl<E: Environment> RaftStore<E> {
-    /// Loads the state the engine holds: the hard state, the applied index, and the
-    /// log, in index order. `recovery` is what the engine's open reported.
+    /// Loads the state the engine holds: the hard state, the applied index, the
+    /// snapshot record and the log's tail past it, in index order. `recovery` is
+    /// what the engine's open reported. Log keys the snapshot covers are deleted
+    /// here: a crash between a snapshot's record and its compaction leaves them,
+    /// and this cleanup is idempotent.
     ///
     /// # Errors
     ///
@@ -195,7 +310,7 @@ impl<E: Environment> RaftStore<E> {
     pub async fn open(
         engine: Arc<Engine<E>>,
         recovery: &EngineRecovery,
-    ) -> io::Result<(Self, Vec<Entry>)> {
+    ) -> io::Result<(Self, Recovered)> {
         if let Some(lost) = LostState::of(recovery) {
             return Err(io::Error::new(io::ErrorKind::InvalidData, lost));
         }
@@ -207,28 +322,73 @@ impl<E: Environment> RaftStore<E> {
             None => 0,
             Some(bytes) => decode_applied(bytes)?,
         };
+        let stored_config = match engine.get(&config_key()).await? {
+            None => None,
+            Some(bytes) => Some(decode_config(bytes)?),
+        };
+        let record = match engine.get(&snapshot_key()).await? {
+            None => None,
+            Some(bytes) => Some(decode_snapshot_record(bytes)?),
+        };
+        let quarantined = engine.get(&quarantine_key()).await?.is_some();
+        let snap_index = record.as_ref().map_or(0, |r| r.last_index);
         let snapshot = engine.snapshot();
         let start = key(RAFT_TENANT, LOG_TABLE, &[]);
         let end = key(RAFT_TENANT, LOG_TABLE + 1, &[]);
         let mut log = Vec::new();
+        let mut stale = WriteBatch::new();
         for (k, value) in engine.scan(&start[..]..&end[..], &snapshot).await? {
             let index = u64::from_be_bytes(k[16..24].try_into().map_err(|_| bad("log key"))?);
+            if index <= snap_index {
+                stale.delete(Bytes::copy_from_slice(&k));
+                continue;
+            }
             let entry = decode_entry(index, value)?;
-            if entry.index != log.len() as Index + 1 {
+            if entry.index != snap_index + log.len() as Index + 1 {
                 return Err(bad("log indices not consecutive"));
             }
             log.push(entry);
         }
-        let last_index = log.len() as Index;
+        if !stale.is_empty() {
+            engine.write(stale, true).await?;
+        }
+        // The config key and the log are written in one batch, so they can only
+        // disagree if something else wrote the store: refuse it (RAFT.md §3). On
+        // a compacted store the latest configuration entry may sit at or below
+        // the snapshot's last index; the log then holds nothing to check against,
+        // and the key must agree with the snapshot record instead, which an
+        // install's repair wrote in the same table swap.
+        let in_log = log.iter().fold(None, |kept, entry| match &entry.payload {
+            Payload::Config(config) => Some((entry.index, config.clone())),
+            _ => kept,
+        });
+        match (&stored_config, &in_log) {
+            (None, None) => {}
+            (Some((0, _)), None) => {}
+            (Some(stored), Some(latest)) if stored == latest => {}
+            (Some((index, config)), None)
+                if *index <= snap_index && record.as_ref().is_some_and(|r| r.config == *config) => {
+            }
+            _ => return Err(bad("the configuration key is out of step with the log")),
+        }
+        let last_index = snap_index + log.len() as Index;
+        // The snapshot's state is applied by construction; the applied key says at
+        // least as much on any store a take or an install wrote.
+        let applied = applied.max(snap_index);
         Ok((
             Self {
                 engine,
                 term: AtomicU64::new(term),
                 vote: AtomicU64::new(vote.map_or(NO_VOTE, |v| v.0)),
+                first_index: AtomicU64::new(snap_index + 1),
                 last_index: AtomicU64::new(last_index),
                 applied: AtomicU64::new(applied),
             },
-            log,
+            Recovered {
+                log,
+                snapshot: record,
+                quarantined,
+            },
         ))
     }
 
@@ -253,10 +413,43 @@ impl<E: Environment> RaftStore<E> {
         self.applied.load(Ordering::Acquire)
     }
 
+    /// The first log index on disk: one past the snapshot's last.
+    #[must_use]
+    pub fn first_index(&self) -> Index {
+        self.first_index.load(Ordering::Acquire)
+    }
+
     /// The last log index on disk.
     #[must_use]
     pub fn last_index(&self) -> Index {
         self.last_index.load(Ordering::Acquire)
+    }
+
+    /// Writes the snapshot record (RAFT.md §3), synced: called by the snapshot task
+    /// before it takes the checkpoint, so the checkpoint's copy carries the
+    /// snapshot's own identity before the checkpoint's `CURRENT` is written
+    /// (D-024).
+    ///
+    /// # Errors
+    ///
+    /// The engine's.
+    pub async fn record_snapshot(&self, record: &SnapshotRecord) -> io::Result<()> {
+        let mut batch = WriteBatch::new();
+        batch.put(snapshot_key(), encode_snapshot_record(record));
+        self.engine.write(batch, true).await?;
+        Ok(())
+    }
+
+    /// Reads the snapshot record back, if the store holds one.
+    ///
+    /// # Errors
+    ///
+    /// The engine's, or `InvalidData` for a value that is not a record.
+    pub async fn snapshot_record(&self) -> io::Result<Option<SnapshotRecord>> {
+        match self.engine.get(&snapshot_key()).await? {
+            None => Ok(None),
+            Some(bytes) => Ok(Some(decode_snapshot_record(bytes)?)),
+        }
     }
 
     /// The engine.
@@ -266,8 +459,9 @@ impl<E: Environment> RaftStore<E> {
     }
 
     /// Makes a step's persistent changes durable as one synced batch: the hard
-    /// state when it changed, the truncation's deletes, the appends. Resolves once
-    /// the batch is durable. One task calls this.
+    /// state when it changed, the truncation's deletes, the appends, the
+    /// compaction's deletes (RAFT.md §3). Resolves once the batch is durable. One
+    /// task calls this.
     ///
     /// # Errors
     ///
@@ -282,7 +476,17 @@ impl<E: Environment> RaftStore<E> {
             out.put_u64_le(vote);
             batch.put(hard_key(), out.freeze());
         }
+        let mut first_index = self.first_index();
         let mut last_index = self.last_index();
+        if let Some(to) = persist.compact_to {
+            // The log compacted to a snapshot: the engine's compaction reclaims
+            // the space in its own time (RAFT.md §3).
+            for index in first_index..=to.min(last_index) {
+                batch.delete(log_key(index));
+            }
+            first_index = first_index.max(to + 1);
+            last_index = last_index.max(to);
+        }
         if let Some(from) = persist.truncate_from {
             for index in from..=last_index {
                 batch.delete(log_key(index));
@@ -293,6 +497,9 @@ impl<E: Environment> RaftStore<E> {
             batch.put(log_key(entry.index), encode_entry(entry));
             last_index = last_index.max(entry.index);
         }
+        if let Some((index, config)) = &persist.config {
+            batch.put(config_key(), encode_config(*index, config));
+        }
         if batch.is_empty() {
             return Ok(());
         }
@@ -301,6 +508,7 @@ impl<E: Environment> RaftStore<E> {
             self.term.store(persist.term, Ordering::Release);
             self.vote.store(vote, Ordering::Release);
         }
+        self.first_index.store(first_index, Ordering::Release);
         self.last_index.store(last_index, Ordering::Release);
         Ok(())
     }
@@ -340,6 +548,21 @@ fn decode_hard(mut bytes: Bytes) -> io::Result<(Term, Option<ServerId>)> {
     Ok((term, vote))
 }
 
+/// The value under the hard-state key: term and vote, as one persist writes it.
+pub(crate) fn encode_hard(term: Term, vote: Option<ServerId>) -> Bytes {
+    let mut out = BytesMut::with_capacity(16);
+    out.put_u64_le(term);
+    out.put_u64_le(vote.map_or(NO_VOTE, |v| v.0));
+    out.freeze()
+}
+
+/// The value under the applied-index key.
+pub(crate) fn encode_applied(applied: Index) -> Bytes {
+    let mut out = BytesMut::with_capacity(8);
+    out.put_u64_le(applied);
+    out.freeze()
+}
+
 fn decode_applied(mut bytes: Bytes) -> io::Result<Index> {
     if bytes.len() != 8 {
         return Err(bad("applied index value"));
@@ -347,11 +570,29 @@ fn decode_applied(mut bytes: Bytes) -> io::Result<Index> {
     Ok(bytes.get_u64_le())
 }
 
-fn encode_entry(entry: &Entry) -> Bytes {
+pub(crate) fn encode_entry(entry: &Entry) -> Bytes {
     let mut out = BytesMut::with_capacity(16);
     out.put_u64_le(entry.term);
     put_payload(&mut out, &entry.payload);
     out.freeze()
+}
+
+pub(crate) fn encode_config(index: Index, config: &Configuration) -> Bytes {
+    let mut out = BytesMut::with_capacity(32);
+    out.put_u64_le(index);
+    put_payload(&mut out, &Payload::Config(config.clone()));
+    out.freeze()
+}
+
+fn decode_config(mut bytes: Bytes) -> io::Result<(Index, Configuration)> {
+    if bytes.len() < 8 {
+        return Err(bad("config value"));
+    }
+    let index = bytes.get_u64_le();
+    match get_payload(&mut bytes)? {
+        Payload::Config(config) if bytes.is_empty() => Ok((index, config)),
+        _ => Err(bad("config value")),
+    }
 }
 
 fn decode_entry(index: Index, mut bytes: Bytes) -> io::Result<Entry> {

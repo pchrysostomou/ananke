@@ -102,6 +102,90 @@ pub enum Message {
         /// The leader's term.
         term: Term,
     },
+    /// One chunk of a snapshot's checkpoint (RAFT.md §1): the files are streamed in
+    /// order, each chunk naming its file, the offset the data starts at and the
+    /// file's total size, so the receiver can assemble them in a staging directory
+    /// and acknowledge what it has. The snapshot's identity is its last index and
+    /// term together with the leader's term: a chunk of a different identity starts
+    /// the staging directory over.
+    InstallSnapshot {
+        /// The leader's term.
+        term: Term,
+        /// The snapshot's last applied index.
+        last_index: Index,
+        /// That entry's term.
+        last_term: Term,
+        /// The name of the file this chunk belongs to.
+        file: Bytes,
+        /// Where in the file the data starts.
+        offset: u64,
+        /// The file's total size in bytes.
+        total: u64,
+        /// Whether this is the last chunk of the last file: the receiver installs
+        /// once it has it.
+        done: bool,
+        /// The bytes.
+        data: Bytes,
+    },
+    /// The answer to a chunk: where the receiver is, so a resend after loss resumes
+    /// from the last acknowledged offset of the last file rather than from zero.
+    InstallSnapshotResponse {
+        /// The receiver's current term.
+        term: Term,
+        /// The snapshot's last index, echoed.
+        last_index: Index,
+        /// The snapshot's last term, echoed.
+        last_term: Term,
+        /// The file the receiver expects data for next.
+        file: Bytes,
+        /// How many bytes of it the receiver has.
+        offset: u64,
+        /// Whether the receiver wants more, has installed, or wants the stream to
+        /// start over.
+        status: SnapshotStatus,
+    },
+}
+
+/// Where an [`Message::InstallSnapshotResponse`] leaves the transfer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SnapshotStatus {
+    /// The chunk was taken (or was already held); send from `file` at `offset`.
+    More,
+    /// The snapshot is installed: the receiver runs on it.
+    Installed,
+    /// The receiver cannot use the stream, because the identity changed under it
+    /// or the assembled store failed its checks: start over from the first file,
+    /// or take a fresh snapshot.
+    Restart,
+}
+
+impl SnapshotStatus {
+    fn tag(self) -> u8 {
+        match self {
+            SnapshotStatus::More => 0,
+            SnapshotStatus::Installed => 1,
+            SnapshotStatus::Restart => 2,
+        }
+    }
+
+    fn of(tag: u8) -> io::Result<Self> {
+        Ok(match tag {
+            0 => SnapshotStatus::More,
+            1 => SnapshotStatus::Installed,
+            2 => SnapshotStatus::Restart,
+            _ => return Err(bad("snapshot status malformed")),
+        })
+    }
+
+    /// The status as the studio shows it.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            SnapshotStatus::More => "more",
+            SnapshotStatus::Installed => "installed",
+            SnapshotStatus::Restart => "restart",
+        }
+    }
 }
 
 impl Message {
@@ -115,6 +199,8 @@ impl Message {
             | Message::RequestVoteResponse { term, .. }
             | Message::AppendEntries { term, .. }
             | Message::AppendEntriesResponse { term, .. }
+            | Message::InstallSnapshot { term, .. }
+            | Message::InstallSnapshotResponse { term, .. }
             | Message::TimeoutNow { term } => *term,
         }
     }
@@ -130,6 +216,8 @@ impl Message {
             Message::AppendEntries { .. } => "append-entries",
             Message::AppendEntriesResponse { .. } => "append-entries-response",
             Message::TimeoutNow { .. } => "timeout-now",
+            Message::InstallSnapshot { .. } => "install-snapshot",
+            Message::InstallSnapshotResponse { .. } => "install-snapshot-response",
         }
     }
 
@@ -142,6 +230,8 @@ impl Message {
             Message::AppendEntries { .. } => 5,
             Message::AppendEntriesResponse { .. } => 6,
             Message::TimeoutNow { .. } => 7,
+            Message::InstallSnapshot { .. } => 8,
+            Message::InstallSnapshotResponse { .. } => 9,
         }
     }
 }
@@ -333,6 +423,41 @@ impl Frame {
                 out.put_u64_le(*echo);
                 out.put_u64_le(*local);
             }
+            Message::InstallSnapshot {
+                last_index,
+                last_term,
+                file,
+                offset,
+                total,
+                done,
+                data,
+                ..
+            } => {
+                out.put_u64_le(*last_index);
+                out.put_u64_le(*last_term);
+                out.put_u32_le(u32::try_from(file.len()).expect("file name fits u32"));
+                out.put_slice(file);
+                out.put_u64_le(*offset);
+                out.put_u64_le(*total);
+                out.put_u8(u8::from(*done));
+                out.put_u32_le(u32::try_from(data.len()).expect("chunk fits u32"));
+                out.put_slice(data);
+            }
+            Message::InstallSnapshotResponse {
+                last_index,
+                last_term,
+                file,
+                offset,
+                status,
+                ..
+            } => {
+                out.put_u64_le(*last_index);
+                out.put_u64_le(*last_term);
+                out.put_u32_le(u32::try_from(file.len()).expect("file name fits u32"));
+                out.put_slice(file);
+                out.put_u64_le(*offset);
+                out.put_u8(status.tag());
+            }
         }
         out.freeze()
     }
@@ -354,6 +479,16 @@ impl Frame {
                 return Err(bad("frame torn"));
             }
             Ok(bytes.get_u64_le())
+        };
+        let bytes_field = |bytes: &mut Bytes| -> io::Result<Bytes> {
+            if bytes.len() < 4 {
+                return Err(bad("frame torn"));
+            }
+            let len = bytes.get_u32_le() as usize;
+            if bytes.len() < len {
+                return Err(bad("frame torn"));
+            }
+            Ok(bytes.split_to(len))
         };
         let message = match tag {
             1 | 3 => {
@@ -435,6 +570,50 @@ impl Frame {
                     hint,
                     echo,
                     local,
+                }
+            }
+            8 => {
+                let last_index = u64_field(&mut bytes)?;
+                let last_term = u64_field(&mut bytes)?;
+                let file = bytes_field(&mut bytes)?;
+                let offset = u64_field(&mut bytes)?;
+                let total = u64_field(&mut bytes)?;
+                if bytes.is_empty() {
+                    return Err(bad("frame torn"));
+                }
+                let done = match bytes.get_u8() {
+                    0 => false,
+                    1 => true,
+                    _ => return Err(bad("frame malformed")),
+                };
+                let data = bytes_field(&mut bytes)?;
+                Message::InstallSnapshot {
+                    term,
+                    last_index,
+                    last_term,
+                    file,
+                    offset,
+                    total,
+                    done,
+                    data,
+                }
+            }
+            9 => {
+                let last_index = u64_field(&mut bytes)?;
+                let last_term = u64_field(&mut bytes)?;
+                let file = bytes_field(&mut bytes)?;
+                let offset = u64_field(&mut bytes)?;
+                if bytes.is_empty() {
+                    return Err(bad("frame torn"));
+                }
+                let status = SnapshotStatus::of(bytes.get_u8())?;
+                Message::InstallSnapshotResponse {
+                    term,
+                    last_index,
+                    last_term,
+                    file,
+                    offset,
+                    status,
                 }
             }
             _ => return Err(bad("unknown message kind")),
@@ -519,6 +698,38 @@ pub fn studio(payload: &[u8]) -> Json {
             fields.push(("matchIndex", int(*match_index)));
             fields.push(("hint", int(*hint)));
         }
+        Message::InstallSnapshot {
+            last_index,
+            last_term,
+            file,
+            offset,
+            total,
+            done,
+            data,
+            ..
+        } => {
+            fields.push(("lastIndex", int(*last_index)));
+            fields.push(("lastTerm", int(*last_term)));
+            fields.push(("file", Json::str(&String::from_utf8_lossy(file))));
+            fields.push(("offset", int(*offset)));
+            fields.push(("total", int(*total)));
+            fields.push(("len", int(data.len() as u64)));
+            fields.push(("done", Json::Bool(*done)));
+        }
+        Message::InstallSnapshotResponse {
+            last_index,
+            last_term,
+            file,
+            offset,
+            status,
+            ..
+        } => {
+            fields.push(("lastIndex", int(*last_index)));
+            fields.push(("lastTerm", int(*last_term)));
+            fields.push(("file", Json::str(&String::from_utf8_lossy(file))));
+            fields.push(("offset", int(*offset)));
+            fields.push(("status", Json::str(status.name())));
+        }
     }
     Json::obj(fields)
 }
@@ -586,6 +797,24 @@ mod tests {
                 echo: 123_456_789,
                 local: 987_654_321,
             },
+            Message::InstallSnapshot {
+                term: 3,
+                last_index: 40,
+                last_term: 2,
+                file: Bytes::from_static(b"000001.sst"),
+                offset: 4096,
+                total: 9000,
+                done: false,
+                data: Bytes::from_static(b"some table bytes"),
+            },
+            Message::InstallSnapshotResponse {
+                term: 3,
+                last_index: 40,
+                last_term: 2,
+                file: Bytes::from_static(b"000001.sst"),
+                offset: 4112,
+                status: SnapshotStatus::More,
+            },
         ]
     }
 
@@ -650,5 +879,46 @@ mod tests {
             panic!("an object")
         };
         assert_eq!(fields[0].1, Json::str("raft.malformed"));
+    }
+
+    #[test]
+    fn the_studio_sees_a_snapshot_chunks_file_offset_and_identity() {
+        let frame = Frame {
+            from: ServerId(1),
+            message: every_kind()
+                .into_iter()
+                .find(|m| matches!(m, Message::InstallSnapshot { .. }))
+                .expect("an InstallSnapshot"),
+        };
+        let Json::Object(fields) = studio(&frame.encode()) else {
+            panic!("an object")
+        };
+        let get = |name: &str| {
+            fields
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.clone())
+        };
+        assert_eq!(get("type"), Some(Json::str("raft.install-snapshot")));
+        assert_eq!(get("lastIndex"), Some(Json::Int(40)));
+        assert_eq!(get("lastTerm"), Some(Json::Int(2)));
+        assert_eq!(get("file"), Some(Json::str("000001.sst")));
+        assert_eq!(get("offset"), Some(Json::Int(4096)));
+        assert_eq!(get("total"), Some(Json::Int(9000)));
+        assert_eq!(get("done"), Some(Json::Bool(false)));
+        let response = Frame {
+            from: ServerId(2),
+            message: every_kind()
+                .into_iter()
+                .find(|m| matches!(m, Message::InstallSnapshotResponse { .. }))
+                .expect("an InstallSnapshotResponse"),
+        };
+        let Json::Object(fields) = studio(&response.encode()) else {
+            panic!("an object")
+        };
+        let type_of = fields.iter().find(|(k, _)| k == "type").map(|(_, v)| v);
+        assert_eq!(type_of, Some(&Json::str("raft.install-snapshot-response")));
+        let status = fields.iter().find(|(k, _)| k == "status").map(|(_, v)| v);
+        assert_eq!(status, Some(&Json::str("more")));
     }
 }

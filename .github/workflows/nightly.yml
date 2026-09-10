@@ -1,8 +1,11 @@
 name: Nightly sweep
 
-# The full sweep: every simulation scenario over 10 000 seeds, in release mode. A
-# failing seed leaves its trace in sim/out, which is uploaded so it can be opened in
-# the moirae studio (sim/lib.rs).
+# The full sweep: every simulation scenario over 10 000 seeds, in release mode, the
+# only place ten thousand run (D-040: the gate runs 20, CI 100, scripts/premerge.sh
+# 1000 on a developer's machine). Seeds run in parallel within each sweep, and every
+# sweep's catch rates are printed into the job log (`--nocapture`). A failing seed
+# leaves its trace in sim/out, which is uploaded so it can be opened in the moirae
+# studio (sim/lib.rs).
 on:
   schedule:
     - cron: "17 3 * * *"
@@ -27,7 +30,7 @@ jobs:
       - uses: actions/checkout@v7
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace --all-features --release --all-targets
+      - run: cargo test --workspace --all-features --release --all-targets -- --nocapture
       - name: Upload the traces of failing seeds
         if: failure()
         uses: actions/upload-artifact@v4

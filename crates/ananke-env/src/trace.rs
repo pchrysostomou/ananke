@@ -390,6 +390,37 @@ pub enum TraceEvent {
         /// The hash of the entry's payload.
         hash: u64,
     },
+    /// A Raft configuration entry took effect on a server (RAFT.md §1): appended
+    /// to its log, restored at a restart, or re-stated after a truncation
+    /// reverted to an earlier entry. The membership in force is the latest
+    /// configuration entry in the log, committed or not.
+    RaftConfig {
+        /// The server.
+        server: u64,
+        /// The configuration entry's index; 0 for the initial configuration.
+        index: u64,
+        /// The voters, or the old voters while joint.
+        old: Vec<u64>,
+        /// The new voters while joint; empty otherwise.
+        new: Vec<u64>,
+        /// Whether the configuration is joint: elections and commits then need
+        /// majorities of both voter sets.
+        joint: bool,
+        /// Members that receive entries and count for nothing (thesis §4.2.1).
+        learners: Vec<u64>,
+    },
+    /// A Raft server took a snapshot of its state machine, or installed one a
+    /// leader streamed to it (RAFT.md §1).
+    RaftSnapshot {
+        /// The server.
+        server: u64,
+        /// The snapshot's last applied index.
+        last_index: u64,
+        /// That entry's term.
+        last_term: u64,
+        /// Whether the snapshot was taken here, rather than installed.
+        taken: bool,
+    },
     /// A Raft leader served a linearizable read (RAFT.md §1): at `index`, by its
     /// lease or after a read-index round.
     RaftRead {
@@ -478,6 +509,34 @@ pub enum TraceEvent {
         server: u64,
         /// The kind of message dropped.
         kind: &'static str,
+    },
+    /// A Raft server compacted its log to a snapshot (RAFT.md §1): every entry at
+    /// or below `through` is deleted from the log, the snapshot standing in for
+    /// them.
+    RaftCompacted {
+        /// The server.
+        server: u64,
+        /// The highest index removed: the snapshot's last index.
+        through: u64,
+    },
+    /// A Raft server that refused to start on a store that lost state is running in
+    /// re-seed mode, or serving on a store a re-seed rebuilt (RAFT.md §3): it
+    /// replicates, applies and counts for commit majorities, but grants no vote and
+    /// no pre-vote and makes no lease promise for the rest of its life on that
+    /// store, because the lost state may have included a vote.
+    RaftReseeded {
+        /// The server.
+        server: u64,
+    },
+    /// A snapshot stream was resumed (RAFT.md §1): the sender re-sent from the last
+    /// acknowledged offset of the last file after loss, rather than from zero.
+    RaftSnapshotResumed {
+        /// The sending server.
+        server: u64,
+        /// The receiver.
+        to: u64,
+        /// The offset within the current file the stream resumed from.
+        offset: u64,
     },
     /// A client operation started (RAFT.md §2): the invocation end of one operation
     /// of the linearizability history. Its time is the record's.
