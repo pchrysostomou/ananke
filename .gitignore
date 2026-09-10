@@ -10,3 +10,6 @@ target/
 
 # Traces written by tests (sim/out/echo-42.jsonl); the record is the pinned hash.
 **/out/
+
+# Finder metadata.
+.DS_Store
