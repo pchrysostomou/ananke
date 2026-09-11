@@ -1911,12 +1911,22 @@ server beside a re-seeded one is the configuration D-035's carve-out withholds
 the liveness bound from (`majority_up`: two impaired servers of three); and
 were the bound asked there, the leader as built re-seeds the refused server
 too, when it was designated while down, and commits with it inside the bound.
-The variant and its sweep test ship as the pair rule asks, the test ignored
-with that reason rather than weakened, until the sweep can see the wedge: a
-liveness ask when a leader in force at the last heal has a commit majority
-among the servers that are up, quarantined ones included, and a schedule that
-refuses a second follower under that leader — seed 5909's shape — which only
-the disk model's rot produces and no driver can aim.
+Seeing the wedge would need a liveness ask when a leader in force at the last
+heal has a commit majority among the servers that are up, quarantined ones
+included, and a schedule that refuses a second follower under that leader —
+seed 5909's shape — which only the disk model's rot produces and no driver can
+aim.
+
+The variant and its sweep test ship as the pair rule asks, and the test is not
+ignored: a variant that cannot be caught is a hole in the sweep to be named,
+not a test to be skipped (CLAUDE.md). It asserts instead what is true of this
+leader and what a sweep that could not tell the two leaders apart would fail —
+that the leader as built never forgets a follower's progress, tracing no
+`RaftProgressReset` on any seed, where the correct server's own sweep requires
+one wherever it saw a refusal — and that the sweep reaches the state the wedge
+is built on: a refused follower re-seeded and applying again, on 67 of 100
+release seeds. The catch rate is printed at every tier, so the day it stops
+being zero is visible.
 
 **Alternatives.** Letting a rejection lower `matched`: any stale or duplicated
 rejection could then walk a live follower's match back and re-send what it
@@ -1947,9 +1957,28 @@ carries 1 again, the number the leader may have recorded for the store that was
 wiped: a wipe is outside the fault model (D-012), and a wiped server is a new
 member for the membership path, not a re-seed. `RaftRecovered` gains a field,
 `RaftProgressReset` is new, and the sweep counts the resets and requires one
-wherever it saw a refusal. Seed 5909 needs D-043 as well and is pinned by
-neither; the core-level scenario is in `crates/ananke-raft/tests/paper.rs`. Every
-site is marked `PROPOSED(D-042)`.
+wherever it saw a refusal. The core-level scenario is in
+`crates/ananke-raft/tests/paper.rs`.
+
+Seed 5909 is now pinned under each variant alone, and what the pin records is
+that it passes under each: on this tree `raft::run(5909, IgnoreIncarnation)`
+and `raft::run(5909, SharedSnapshotDir)` both check clean, and so does the
+correct server. That is a structural limit of the variant mechanism, not a gap
+in the seed. The nightly's wedge needed both bugs at once — with D-043's fix in
+place the pinned stream completes and the cluster commits through the follower
+being fed, though the leader's `matched` for the re-seeded one is stale, and
+with this entry's fix in place the re-seeded follower's incarnation resets that
+`matched` and the cluster commits through it, though the other follower's
+stream is scrambled — and `Variant` is a single enum on `RaftConfig`, so no run
+of the sweep can put both in one server. A variant that is both would be a new
+known-buggy server and a new decision; it is not taken here, and it is what a
+future entry would have to argue for. The seed's schedule has diverged as well,
+several times over: this entry's own eight-byte record change moved every
+checkpoint, and D-041, D-044 and the re-take arm have each re-drawn the fault
+list since, so seed 5909 on this tree draws neither a snapshot crash nor an
+adoption storm nor a re-take arm at all. The pin is worth keeping as a seed
+held green and worth nothing as a replay, and it says so. Every site is marked
+`PROPOSED(D-042)`.
 
 ---
 
@@ -2109,17 +2138,56 @@ record's value grows by eight bytes, with no released store to migrate. A
 leader's data directory holds the record's version plus whatever streams still
 read, and nothing else after the next sweep; a follower sweeps its old versions
 at its next start. Every stream costs one chunk in flight, so a leader feeding
-two followers has two. Seed 5909 needs this entry and D-042 together and is
-pinned by whoever merges both. The nightly is the one tier that asserts the
-variant caught, so a nightly whose ten thousand seeds never catch it goes red on
-that test until the sweep learns to aim at the shape — a targeted fault in the
-manner of `CrashInstalling` (D-030), left for the sweep's owner since the shape
-needs a re-take under a running stream and a second designated follower at
-once, which no driver-side fault forces directly. `sim/tests/raft.rs` counts versions deleted,
-takes reused and streams at once, and `crates/ananke-raft/tests/snapshot.rs`
-shows two takes at one index as two directories, a stream completing under a
-newer take where the shared directory's does not, the sweep sparing the pinned
-and the recorded versions, and two designated followers streamed to at once.
+two followers has two. Seed 5909 is pinned under this entry's variant and
+D-042's alike, and passes under each: see D-042's Consequences for why one
+enum cannot carry both bugs. `sim/tests/raft.rs` counts versions deleted, takes
+reused and streams at once, and `crates/ananke-raft/tests/snapshot.rs` shows
+two takes at one index as two directories, a stream completing under a newer
+take where the shared directory's does not, the sweep sparing the pinned and
+the recorded versions, and two designated followers streamed to at once.
+
+*The aimed fault, and what it did not buy.* This entry left the shape to the
+sweep's owner — "a re-take under a running stream and a second designated
+follower at once, which no driver-side fault forces directly" — and
+`Fault::RetakeUnderStream` is that fault, drawn on one seed in four from its
+own `"retake-stream"` stream. It fills the state machine with a couple of
+hundred keys so a checkpoint is worth streaming at all, isolates a follower
+until it is designated snapshot-fed, waits in small slices for the leader to
+open the stream to it, and then cuts the leader's *other* follower off. The
+leader keeps its quorum — the follower it is feeding answers every heartbeat,
+so check quorum is satisfied — and has nobody to count, so nothing commits and
+its applied index stands still at the index it last took, which is the index
+the running stream is reading. It reaches that state on 14 of 100 release
+seeds, and the sweep asserts at every tier that it did.
+
+It does not produce the catch, and the reason is structural rather than
+statistical. A leader needs *one* countable follower for a majority, and on
+this sweep an install is over in about a hundred and fifty milliseconds, since
+the state machine is small and a checkpoint of it is a couple of dozen chunks.
+The moment the fed follower's install completes it is countable again, the
+leader commits, its applied index moves off the index the stream was reading,
+and the freeze is over. So the queue half of the bug costs a second designated
+follower a few hundred milliseconds against a two-second liveness bound, never
+the bound itself; only a stream that never completes stalls a commit for as
+long as the check asks. Making one needs a take to land on the very directory a
+live stream has open, which as built needs the leader's applied index to be
+standing exactly where its record already points *and* a `retake` to have
+cleared its checkpoint — a coincidence inside the snapshot task's own failure
+paths, reachable from the receiver's refusals and the network's duplicates but
+not from any partition, block or crash a driver can schedule. The re-take at an
+index already taken happens often enough on its own, on 48 of 100 seeds, and is
+harmless every time, because no stream had that directory open. Two ways past
+it were weighed and not taken: filling the state machine until an install runs
+longer than the bound — measured, and at four-kilobyte values the sixteen-kilobyte
+memtable rotates so often that the cluster's commit rate collapses and no
+follower falls behind enough to be designated at all — and reaching inside the
+server for a fault hook on the take, which would be a fault model of the
+implementation rather than of the world (D-012). So the catch stays asserted at
+the nightly's ten thousand, the only tier that ever produced it, the firing is
+asserted at every tier on both counts, and a nightly whose ten thousand seeds
+never catch it is still a hole in the sweep to report rather than a variant to
+delete (RAFT.md §5) — with the caveat that this branch has re-drawn every
+schedule again, so the nightly's one catch is not owed to anyone.
 
 ---
 

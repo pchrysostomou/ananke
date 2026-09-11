@@ -165,6 +165,14 @@ pub fn burst_addr(n: u64) -> SocketAddr {
     SocketAddr::from(([10, 0, 3, u8::try_from(n).expect("small")], 7000))
 }
 
+/// The filling client's address for the schedule's `n`th
+/// [`Fault::RetakeUnderStream`] (1-based): its own socket per driver, like the
+/// burst client's. PROPOSED(D-043).
+#[must_use]
+pub fn spread_addr(n: u64) -> SocketAddr {
+    SocketAddr::from(([10, 0, 4, u8::try_from(n).expect("small")], 7000))
+}
+
 /// The server bound to `addr`, if it is a server's.
 #[must_use]
 pub fn server_of(addr: SocketAddr) -> Option<u64> {
@@ -381,11 +389,83 @@ pub enum Fault {
         /// How many times it is crashed.
         crashes: u64,
     },
+    /// The shape PROPOSED D-043 named and left to the sweep's owner: a leader
+    /// re-taking a snapshot while a stream to a designated follower is in
+    /// flight, with a second designated follower behind it.
+    ///
+    /// Three steps. First `follower` is isolated for `isolate`, long enough to
+    /// fall behind the snapshot threshold and go quiet past the designation, as
+    /// [`Fault::CrashInstalling`] does, so a stream follows the heal; the run
+    /// then advances in small slices until that stream opens
+    /// ([`TraceEvent::RaftSnapshotStreams`]), or [`STREAM_WAIT_BUDGET`] runs
+    /// out, in which case the fault was an isolation and nothing else. Second,
+    /// the leader's *other* follower is cut off for `freeze`. The leader keeps
+    /// its quorum — the follower it is feeding answers every heartbeat, so
+    /// check quorum is satisfied — but it has nobody left to count: the fed
+    /// follower's match is far behind and the cut-off one is unreachable, so
+    /// nothing commits and the leader's applied index stands still at the index
+    /// it last took. That is the whole trick. A take goes at the applied index,
+    /// so while it stands still every take the leader is asked for is a take at
+    /// the index the running stream is reading, which as built means the one
+    /// directory that stream has open: `snapshot::take` sweeps it and writes it
+    /// again, the sender's file list is stale, the stream restarts from offset
+    /// 0, and a stream that restarts twice is given up with `retake`, which
+    /// clears the leader's checkpoint and asks for the take that scrambles the
+    /// next one. The correct server takes into a new numbered version and the
+    /// stream reads the version it pinned untouched (PROPOSED(D-043)). Third,
+    /// the cut-off follower heals having itself fallen behind and gone quiet, so
+    /// it too is designated: as built it waits in the backlog behind a stream
+    /// that never ends and is fed nothing, while the correct server streams to
+    /// both at once. With neither follower countable the commit index does not
+    /// move again, and the liveness check reports it `hold` and the gap and the
+    /// settle later — which is seed 5909's wedge, assembled rather than waited
+    /// for. Drawn from its own `moirae_sched` stream ("retake-stream"), never
+    /// lengthening the shared schedule stream or any other arm's (D-031).
+    /// PROPOSED(D-043).
+    RetakeUnderStream {
+        /// The follower isolated and then fed the snapshot; the leader's
+        /// neighbour if it leads when the fault starts.
+        follower: u64,
+        /// How many filling puts open the fault, each on its own key and
+        /// four hundred bytes long: the state machine, and with it the
+        /// checkpoint, has to be worth streaming before any of this is aimable.
+        fill: u64,
+        /// How long the filling puts are given to commit and reach the disk
+        /// before the isolation begins.
+        settle: Duration,
+        /// How long it is cut off first, to fall behind the threshold.
+        isolate: Duration,
+        /// How long the leader's other follower is cut off once the stream is
+        /// in flight: the window in which the leader commits nothing, its
+        /// applied index stands still, and every take it is asked for lands at
+        /// the index the stream is reading.
+        freeze: Duration,
+        /// The quiet after that follower heals, with both designated.
+        hold: Duration,
+    },
 }
 
 /// The longest a [`Fault::CrashInstalling`] waits for an install to stream
 /// before giving up and doing nothing.
 pub const INSTALL_WAIT_BUDGET: Duration = Duration::from_millis(4000);
+
+/// The longest a [`Fault::RetakeUnderStream`] waits, after healing the follower
+/// it cut off, for a stream to that follower to open before giving up and
+/// leaving the fault an isolation. A designation costs two minimum election
+/// timeouts of quiet and the stream opens on the next heartbeat after the heal,
+/// so a stream that is coming has come well inside this; the budget is shorter
+/// than [`INSTALL_WAIT_BUDGET`] because it waits for the stream's *opening*, not
+/// for a chunk of it to land. PROPOSED(D-043).
+pub const STREAM_WAIT_BUDGET: Duration = Duration::from_millis(2500);
+
+/// One seed in this many draws a [`Fault::RetakeUnderStream`], from the fault's
+/// own `moirae_sched` stream ("retake-stream"). The arm costs a seed its
+/// isolation, the wait for the stream, the freeze and the hold — some two
+/// seconds of virtual time — which is why it is not on every schedule; a quarter
+/// of the seeds is what the catch rate at the hundred-seed tier needs and what
+/// `scripts/premerge.sh`'s quarter of an hour affords beside the adoption
+/// storm's own quarter. PROPOSED(D-043).
+pub const RETAKE_STREAM_IN: u64 = 4;
 
 /// The longest a [`Fault::CrashRefused`] waits for its victim to begin flushing
 /// a memtable before crashing it anyway. A server fills a sixteen-kilobyte
@@ -442,6 +522,17 @@ const BURST: u64 = 98 << 32;
 /// it, so the checker's per-key search sees only puts that always apply and the
 /// hundred-odd pending operations a burst leaves cost it nothing.
 const BURST_KEY: &[u8] = b"burst";
+/// The base of the filling clients' process ids in the trace, one per
+/// [`Fault::RetakeUnderStream`]. PROPOSED(D-043).
+const SPREAD: u64 = 97 << 32;
+/// How many bytes each filling put carries. The state machine the clients build
+/// on their own is two keys of a dozen bytes, so a checkpoint of it is one chunk
+/// and an install is over before anything can be aimed at it; a hundred
+/// kilobytes is a checkpoint of a couple of dozen chunks, which is long enough
+/// for a stream to still be running when the next take lands and long enough for
+/// the network's drops and duplicates to make a receiver ask to start over.
+/// PROPOSED(D-043).
+const SPREAD_VALUE_BYTES: usize = 400;
 
 /// The fault schedule of one run, in global virtual time.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -576,6 +667,24 @@ impl Schedule {
             crashes: 3 + refused.below(3),
         });
         gaps.push(ms(&mut refused, 450, 700));
+        // The re-take under a running stream, on one seed in
+        // [`RETAKE_STREAM_IN`], appended after every crash storm so the wedge it
+        // builds is the last thing standing when the liveness window opens: a
+        // crash that came after it would restart a server, and a new leader's
+        // progress reset is exactly what undoes the wedge. Its own stream, so no
+        // other arm's dice move when this one changes (D-031). PROPOSED(D-043).
+        let mut retake = moirae_sched::stream(seed, "retake-stream");
+        if retake.below(RETAKE_STREAM_IN) == 0 {
+            faults.push(Fault::RetakeUnderStream {
+                follower: 1 + retake.below(SERVERS),
+                fill: 250 + retake.below(101),
+                settle: ms(&mut retake, 500, 800),
+                isolate: ms(&mut retake, 1500, 2500),
+                freeze: ms(&mut retake, 500, 900),
+                hold: ms(&mut retake, 200, 400),
+            });
+            gaps.push(ms(&mut retake, 450, 700));
+        }
         // Clocks, as the module documentation says: within the bound, or one
         // server slow and two fast, moderately or severely.
         let within = rng.below(2) == 0;
@@ -704,6 +813,15 @@ impl Schedule {
                     crashes,
                     ..
                 } => (FLUSH_WAIT_BUDGET + *grace + *down) * u32::try_from(*crashes).expect("small"),
+                // PROPOSED(D-043): the fill, the isolation, the wait for the
+                // stream, the freeze behind it and the hold after it.
+                Fault::RetakeUnderStream {
+                    settle,
+                    isolate,
+                    freeze,
+                    hold,
+                    ..
+                } => *settle + *isolate + STREAM_WAIT_BUDGET + *freeze + *hold,
             })
             .sum();
         let trials: Duration = self
@@ -750,6 +868,11 @@ pub struct Report {
     /// In how many of the trials the slowest clock led when the trial cut the
     /// leader off.
     pub trials_led_by_slowest: usize,
+    /// How many [`Fault::RetakeUnderStream`] arms got as far as a stream: the
+    /// arm's aim is a leader re-taking under a running stream, and a run where
+    /// the follower it isolated was caught up by entries instead never held a
+    /// stream to re-take under. What the sweep asserts fired. PROPOSED(D-043).
+    pub aimed_streams: usize,
     /// Servers refused at a restart, with the reason.
     pub refused: Vec<(u64, String)>,
     /// Why the run stopped early, if it did: a safety violation the folds saw at a
@@ -1390,6 +1513,45 @@ async fn burst<E: Environment>(env: E, n: u64, target: u64, count: u64) {
     }
 }
 
+/// The re-take driver's filling puts (PROPOSED(D-043)): `count` puts of
+/// [`SPREAD_VALUE_BYTES`] bytes each, every one on its own key, fired at server
+/// `target` without awaiting replies as the schedule's `n`th driver. They are
+/// there for their size, not their outcome: the state machine the two clients
+/// build is two keys of a dozen bytes, whose checkpoint is a single chunk and
+/// whose install is over in a round trip, and nothing can be aimed at a stream
+/// that short. Each key is written once and never read, so the checker's
+/// per-key search sees one put that always applies, as [`burst`]'s do.
+async fn spread<E: Environment>(env: E, n: u64, target: u64, count: u64) {
+    let Ok(sock) = env.net().bind(spread_addr(n)).await else {
+        return;
+    };
+    let process = SPREAD | n;
+    for seq in 0..count {
+        let key = Bytes::from(format!("f{n}.{seq}"));
+        let value = Bytes::from(vec![b'f'; SPREAD_VALUE_BYTES]);
+        env.trace(TraceEvent::ClientInvoke {
+            client: process,
+            seq,
+            op: ClientOp::Put {
+                key: key.clone(),
+                value: value.clone(),
+            },
+        });
+        let request = Request {
+            client: process,
+            seq,
+            command: Command::Put { key, value },
+        };
+        if sock
+            .send(server_addr(target), request.encode())
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
+}
+
 /// Runs the scenario for `seed` with the schedule drawn from it.
 #[must_use]
 pub fn run(seed: u64, variant: Variant) -> Report {
@@ -1474,6 +1636,8 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
         advance(&mut sim, TRIAL_GAP, &mut watch);
     }
     let mut bursts = 0u64;
+    let mut fills = 0u64;
+    let mut aimed_streams = 0usize;
     for (fault, gap) in schedule.faults.iter().zip(schedule.gaps.iter()) {
         if watch.stopped.is_some() {
             break;
@@ -1622,6 +1786,71 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
                     restart(&mut sim, victim);
                 }
             }
+            Fault::RetakeUnderStream {
+                follower,
+                fill,
+                settle,
+                isolate,
+                freeze,
+                hold,
+            } => {
+                // PROPOSED(D-043): a state machine worth streaming, then the
+                // install crash's setup, then the freeze that holds the leader's
+                // applied index at the index the running stream is reading, then
+                // both followers designated at once. See the fault's own
+                // documentation for why each step is there.
+                let leader = leader_now(&sim);
+                fills += 1;
+                {
+                    let env = sim.env(admin);
+                    let inner = env.clone();
+                    let (n, target, puts) = (fills, leader, *fill);
+                    env.spawn("spread", async move {
+                        spread(inner, n, target, puts).await;
+                    });
+                }
+                advance(&mut sim, *settle, &mut watch);
+                let leader = leader_now(&sim);
+                let fed = if *follower == leader {
+                    follower % SERVERS + 1
+                } else {
+                    *follower
+                };
+                let alone = |server: u64| -> (Vec<NodeId>, Vec<NodeId>) {
+                    let side = vec![servers[server as usize - 1]];
+                    let rest: Vec<NodeId> = servers
+                        .iter()
+                        .chain(clients.iter())
+                        .chain(std::iter::once(&admin))
+                        .copied()
+                        .filter(|n| *n != side[0])
+                        .collect();
+                    (side, rest)
+                };
+                let (side, rest) = alone(fed);
+                let from = sim.now();
+                sim.partition(&side, &rest);
+                advance(&mut sim, *isolate, &mut watch);
+                sim.heal();
+                isolations.push((fed, from, sim.now()));
+                if stream_opened(&mut sim, &mut watch, fed) {
+                    aimed_streams += 1;
+                    // The leader's other follower away: the fed one keeps the
+                    // leader's quorum alive by answering heartbeats, and there
+                    // is nobody left to count.
+                    let leader = leader_now(&sim);
+                    let other = (1..=SERVERS)
+                        .find(|&s| s != leader && s != fed)
+                        .unwrap_or_else(|| fed % SERVERS + 1);
+                    let (side, rest) = alone(other);
+                    let from = sim.now();
+                    sim.partition(&side, &rest);
+                    advance(&mut sim, *freeze, &mut watch);
+                    sim.heal();
+                    isolations.push((other, from, sim.now()));
+                    advance(&mut sim, *hold, &mut watch);
+                }
+            }
             Fault::StaleSender {
                 server,
                 one_way,
@@ -1736,6 +1965,7 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
         last_heal,
         isolations,
         trials_led_by_slowest,
+        aimed_streams,
         refused,
         stopped: watch.stopped,
         history,
@@ -1845,6 +2075,45 @@ fn install_completed(sim: &mut Sim, watch: &mut Watch, victim: u64) -> bool {
             return true;
         }
         scanned = records.len();
+    }
+    false
+}
+
+/// Advances the run in small slices until a leader opens a snapshot stream to
+/// `victim` ([`TraceEvent::RaftSnapshotStreams`]), or [`STREAM_WAIT_BUDGET`]
+/// runs out: the moment [`Fault::RetakeUnderStream`] freezes the leader's
+/// applied index at. Only openings from here on count — the victim was cut off
+/// until the heal just before, so no earlier stream of the run can stand in for
+/// this one. As with [`install_landing`], the safety folds are skipped inside
+/// the small slices and the trace cap still stops a runaway. PROPOSED(D-043).
+fn stream_opened(sim: &mut Sim, watch: &mut Watch, victim: u64) -> bool {
+    if watch.stopped.is_some() {
+        return false;
+    }
+    let step = Duration::from_millis(5);
+    let mut scanned = sim.trace_len();
+    let mut waited = Duration::ZERO;
+    while waited < STREAM_WAIT_BUDGET {
+        sim.run_for(step);
+        waited += step;
+        let len = sim.trace_len();
+        if len > TRACE_CAP {
+            watch.stopped = Some(format!(
+                "runaway: {len} trace records by {:?}, over the cap of {TRACE_CAP}",
+                sim.now()
+            ));
+            return false;
+        }
+        let records = sim.trace_from(scanned);
+        scanned += records.len();
+        if records.iter().any(|r| {
+            matches!(
+                &r.event,
+                TraceEvent::RaftSnapshotStreams { to, .. } if *to == victim
+            )
+        }) {
+            return true;
+        }
     }
     false
 }

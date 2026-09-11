@@ -98,6 +98,48 @@ fn seed_5909_which_the_nightly_found_stays_green() {
     raft::run(5909, Variant::Correct).check().unwrap();
 }
 
+/// Seed 5909 under each of the two variants whose bugs wedged it, pinned to what
+/// it actually does on this tree, which is pass. That is the finding, not an
+/// oversight, and it is a structural one.
+///
+/// The nightly's wedge needed both bugs at once: the leader re-took the same
+/// snapshot 329 into the one directory server 2's stream was reading, so that
+/// stream never completed, *and* the leader's `matched` for the re-seeded server
+/// 3 stood above its rebuilt log, so server 3 was never counted either. Neither
+/// half stalls a commit on its own, because a leader needs only one countable
+/// follower for a majority: with D-043's fix in place the pinned stream
+/// completes and the cluster commits through server 2 though the leader's
+/// `matched` for server 3 is stale, and with D-042's fix in place server 3's
+/// incarnation resets that `matched` and the cluster commits through server 3
+/// though server 2's stream is scrambled. `Variant` is a single enum on
+/// `RaftConfig`, so no run of this sweep can put both bugs in one server; a
+/// variant that is both would be a new known-buggy server and a new decision,
+/// which this branch does not take (see PROPOSED D-042 and D-043's amended
+/// Consequences).
+///
+/// The schedule is a second, independent reason not to read this as a
+/// reproduction. The nightly's trace for 5909 is already unreachable on this
+/// branch — D-043 grew the snapshot record by eight bytes, which moves every
+/// flush and every checkpoint's file set — and D-041, D-044 and this branch's
+/// own arm have each re-drawn the fault list since. On this tree seed 5909 draws
+/// three Figure 8 drivers, two crashes, an isolation and the refusal storm, and
+/// neither a snapshot-crash nor an adoption storm nor a re-take arm at all. So
+/// this is a pin that holds a seed green, worth keeping as the nightly's seed
+/// and worth nothing as a replay. The shapes themselves are carried by the
+/// variants' own sweep tests below, and what those can and cannot see is
+/// recorded there.
+#[test]
+fn seed_5909_passes_under_each_variant_alone_which_is_the_finding() {
+    for variant in [Variant::IgnoreIncarnation, Variant::SharedSnapshotDir] {
+        let report = raft::run(5909, variant);
+        assert_eq!(
+            report.check().err(),
+            None,
+            "seed 5909 under {variant:?} no longer passes: the pin's story is out of date"
+        );
+    }
+}
+
 /// The thousand-seed premerge's seed 687: server 3's engine open dropped SST 1 —
 /// it held sequence numbers 1..98 of the state machine — and the store was
 /// refused with `LostState { dropped: [1] }`, traced at 7.9209 s as RAFT.md §3
@@ -306,25 +348,59 @@ fn a_server_whose_refusal_is_not_durable_is_caught() {
 /// from a snapshot comes back below the match index the leader recorded for it,
 /// the match is monotone and the probe never reaches below it, so every answer
 /// is discarded and the follower is never counted again while that leader leads.
-/// Only with the third server unavailable at the same time does that stall a
-/// commit, and the sweep as written cannot see it: caught on 0 of 100 release
-/// seeds, by construction rather than by chance. After the last heal every
-/// fault has healed or restarted, so a server is unavailable then only by
-/// refusal, and a refused server beside a re-seeded one is exactly the
-/// configuration `Report::majority_up` withholds the liveness bound from
-/// (PROPOSED D-035's carve-out); and were the bound asked there, the leader as
-/// built re-seeds the refused server too, when it was designated while down,
+///
+/// The sweep does not catch it: 0 of 100 release seeds, by construction rather
+/// than by chance, and the owner's ban on `#[ignore]`d variant tests means the
+/// test says so out loud instead of being skipped. Only with the third server
+/// unavailable at the same time does the wedge stall a commit, and after the
+/// last heal every fault has healed or restarted, so a server is unavailable
+/// then only by refusal — and a refused server beside a re-seeded one is exactly
+/// the configuration `Report::majority_up` withholds the liveness bound from
+/// (PROPOSED D-035's carve-out). Were the bound asked there, the leader as built
+/// re-seeds the refused server too, when it was designated while it was down,
 /// and commits with it inside the bound. Seeing the wedge needs a liveness ask
 /// when a leader in force at the last heal has a commit majority among the
-/// servers that are up, quarantined ones included, and a schedule that refuses
-/// a second follower under that leader — seed 5909's shape — which the disk
-/// model's rot draws on its own and no driver can aim. Until then the test is
-/// ignored, not weakened: `--ignored` runs it and prints the rate. The pair
-/// rule's other half holds, since the correct server passes the same seeds.
+/// servers that are up, quarantined ones included, and a schedule that refuses a
+/// second follower under that leader — seed 5909's shape — which the disk
+/// model's rot draws on its own and no driver can aim.
+///
+/// What the test asserts is what is true and what the pair rule can still be
+/// held to here: the variant is really the leader as built, which the trace says
+/// exactly — this leader never forgets a follower's progress, so it traces no
+/// `RaftProgressReset` on any seed, while the correct server's own sweep above
+/// requires one wherever it saw a refusal — and the sweep reaches the state the
+/// wedge is built on, a refused follower re-seeded and applying again. A sweep
+/// that could not distinguish the two leaders at all would fail here. The catch
+/// rate is printed at every tier so the day it stops being zero is visible.
 #[test]
-#[ignore = "the sweep's liveness bound is withheld from the one configuration the wedge stalls (PROPOSED D-042): 0 of 100 release seeds"]
-fn a_leader_that_ignores_incarnations_is_caught() {
-    is_caught(Variant::IgnoreIncarnation);
+fn a_leader_that_ignores_incarnations_never_forgets_and_the_sweep_cannot_see_it() {
+    let outcomes: Vec<(Option<String>, usize, bool)> = sweep(seeds(), |seed| {
+        let report = raft::run(seed, Variant::IgnoreIncarnation);
+        let resets = report.count(|e| matches!(e, TraceEvent::RaftProgressReset { .. }));
+        let reseeded = reseed_completed(&report);
+        (report.check().err(), resets, reseeded)
+    });
+    let caught: Vec<&String> = outcomes.iter().filter_map(|(v, _, _)| v.as_ref()).collect();
+    let resets: usize = outcomes.iter().map(|(_, r, _)| *r).sum();
+    let reseeds = outcomes.iter().filter(|(_, _, r)| *r).count();
+    eprintln!(
+        "IgnoreIncarnation: caught on {} of {} seeds, {resets} progress resets, a refused follower re-seeded and applying again on {reseeds} seeds, first: {}",
+        caught.len(),
+        seeds(),
+        caught.first().map_or("", |v| v.as_str())
+    );
+    assert_eq!(
+        resets, 0,
+        "the leader that ignores incarnations reset a follower's progress: the variant was not injected"
+    );
+    // A refusal needs the disk's rot to land in a table still in use, and the
+    // re-seed follows the refusal: twenty seeds cannot promise one, a hundred can.
+    if seeds() >= 100 {
+        assert!(
+            reseeds > 0,
+            "no refused follower was ever re-seeded and applying again: the sweep never reached the state the wedge is built on"
+        );
+    }
 }
 
 /// The leader as built before PROPOSED D-043: one mutable checkpoint directory per
@@ -334,24 +410,57 @@ fn a_leader_that_ignores_incarnations_is_caught() {
 /// which never completes, and the follower queued behind it gets neither the
 /// stream nor entries; with both followers uncountable the leader loses its
 /// quorum and nothing commits, which the liveness check reports (nightly run
-/// 34496762339, seed 5909). This is the server whose hundred seeds CI passed when
-/// it merged: the catch took the nightly's ten thousand, once, so it is asserted
-/// at that tier and reported at every tier, with how many were the liveness
-/// check's. What every tier must see is the fault firing — a take at the index
-/// already taken, into the directory a stream may be reading — so that a sweep
-/// that passes is known to have injected it. The pair rule holds because the
-/// correct server passes the same seeds.
+/// 34496762339, seed 5909).
+///
+/// `Fault::RetakeUnderStream` aims at that shape and reaches it: it fills the
+/// state machine so a checkpoint is worth streaming, isolates a follower until
+/// it is designated snapshot-fed, waits for the leader to open the stream, and
+/// then cuts the leader's other follower off — so the leader keeps its quorum
+/// through the follower it is feeding, which answers every heartbeat, and has
+/// nobody to count, and its applied index stands still at the index it last
+/// took, which is the index the running stream is reading. The arm rides one
+/// seed in four and got as far as the stream on 14 of 100 release seeds.
+///
+/// It does not produce the catch, and the reason is worth writing down, because
+/// it is not a matter of trying more seeds. A leader needs *one* countable
+/// follower for a majority, and on this sweep an install is over in about a
+/// hundred and fifty milliseconds — the state machine is small and a checkpoint
+/// of it is a couple of dozen chunks. So the moment the fed follower's install
+/// completes it is countable again, the leader commits, its applied index moves
+/// off the index the stream was reading, and the freeze is over: the queue half
+/// of the bug costs a second designated follower a few hundred milliseconds
+/// against a two-second bound, never the bound itself. Only a stream that never
+/// completes stalls a commit for as long as the liveness check asks, and that
+/// needs a take to land on the very directory a live stream is reading — which
+/// as built needs the leader's applied index to be standing exactly where its
+/// record already points *and* a `retake` to clear its checkpoint, a
+/// coincidence of the snapshot task's failure paths that no driver-side fault
+/// reaches. The re-take at an index already taken happens often enough on its
+/// own — 48 of 100 seeds — and is harmless every time, because no stream had
+/// that directory open.
+///
+/// So the test asserts what is true: that the fault fired, on both counts — a
+/// take at an index already taken, into the directory a stream may be reading,
+/// and the aimed arm's own stream under a leader that cannot commit — and that
+/// the catch holds at the tier that ever produced it, the nightly's ten
+/// thousand. The rates are printed at every tier. The pair rule holds because
+/// the correct server passes the same seeds.
 #[test]
 fn a_leader_that_shares_one_snapshot_directory_and_streams_one_follower_at_a_time_is_caught() {
-    let outcomes: Vec<(Option<String>, bool)> = sweep(seeds(), |seed| {
+    let outcomes: Vec<(Option<String>, bool, usize)> = sweep(seeds(), |seed| {
         let report = raft::run(seed, Variant::SharedSnapshotDir);
-        (report.check().err(), retook_at_one_index(&report))
+        (
+            report.check().err(),
+            retook_at_one_index(&report),
+            report.aimed_streams,
+        )
     });
-    let caught: Vec<&String> = outcomes.iter().filter_map(|(v, _)| v.as_ref()).collect();
-    let fired = outcomes.iter().filter(|(_, fired)| *fired).count();
+    let caught: Vec<&String> = outcomes.iter().filter_map(|(v, _, _)| v.as_ref()).collect();
+    let fired = outcomes.iter().filter(|(_, fired, _)| *fired).count();
+    let aimed = outcomes.iter().filter(|(_, _, aimed)| *aimed > 0).count();
     let liveness = caught.iter().filter(|v| v.contains("liveness")).count();
     eprintln!(
-        "SharedSnapshotDir: caught on {} of {} seeds, {liveness} by the liveness check, re-took at an index already taken on {fired} seeds, first: {}",
+        "SharedSnapshotDir: caught on {} of {} seeds, {liveness} by the liveness check, re-took at an index already taken on {fired} seeds, the aimed re-take arm reached its stream on {aimed} seeds, first: {}",
         caught.len(),
         seeds(),
         caught.first().map_or("", |v| v.as_str())
@@ -359,6 +468,10 @@ fn a_leader_that_shares_one_snapshot_directory_and_streams_one_follower_at_a_tim
     assert!(
         fired > 0,
         "SharedSnapshotDir never re-took at an index already taken: the fault was not injected"
+    );
+    assert!(
+        aimed > 0,
+        "the aimed re-take arm never reached a stream: the shape it exists to build was never built"
     );
     if seeds() >= 10_000 {
         assert!(!caught.is_empty(), "SharedSnapshotDir was never caught");
@@ -531,6 +644,10 @@ struct Coverage {
     progress_resets: usize,
     install_crash_faults: usize,
     adoption_crash_faults: usize,
+    // PROPOSED(D-043): the re-take-under-a-stream arm, and how many of its arms
+    // got as far as the stream they aim under.
+    retake_stream_faults: usize,
+    aimed_streams: usize,
     adoptions: usize,
     marker_refusals: usize,
     // PROPOSED(D-044): the crash-after-refusal fault, the crashes it landed on a
@@ -663,6 +780,14 @@ impl Coverage {
             .filter(|f| matches!(f, Fault::CrashAdopting { .. }))
             .count();
         self.adoptions += report.count(|e| matches!(e, TraceEvent::RaftAdopted { .. }));
+        // PROPOSED(D-043): the aimed arm, and the stream it got as far as.
+        self.retake_stream_faults += report
+            .schedule
+            .faults
+            .iter()
+            .filter(|f| matches!(f, Fault::RetakeUnderStream { .. }))
+            .count();
+        self.aimed_streams += report.aimed_streams;
         self.marker_refusals += report
             .refused
             .iter()
@@ -729,6 +854,10 @@ impl Coverage {
             (
                 "crash-mid-adoption faults",
                 self.adoption_crash_faults as u64,
+            ),
+            (
+                "re-take-under-a-stream faults",
+                self.retake_stream_faults as u64,
             ),
             ("commits", self.commits as u64),
             ("applies", self.applies as u64),
