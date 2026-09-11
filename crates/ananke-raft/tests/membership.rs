@@ -11,7 +11,7 @@
 use std::collections::BTreeMap;
 
 use ananke_env::TraceEvent;
-use ananke_raft::core::{Input, Output, Raft, RaftConfig, Role, Variant};
+use ananke_raft::core::{Input, Output, Raft, RaftConfig, Role, Variant, Variants};
 use ananke_raft::invariants;
 use ananke_raft::message::Message;
 use ananke_raft::types::{Configuration, Entry, Index, Payload, ServerId};
@@ -25,13 +25,13 @@ fn ids(ns: &[u64]) -> Vec<ServerId> {
     ns.iter().copied().map(ServerId).collect()
 }
 
-fn config(variant: Variant) -> RaftConfig {
+fn config(variants: impl Into<Variants>) -> RaftConfig {
     RaftConfig {
         election_ticks: (10, 20),
         heartbeat_ticks: 2,
         max_batch: 1,
         max_inflight: 8,
-        variant,
+        variants: variants.into(),
         ..RaftConfig::default()
     }
 }

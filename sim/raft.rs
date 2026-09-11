@@ -56,7 +56,8 @@
 //! which the commit-by-current-term fold reports.
 //!
 //! Every fault-model test runs a known-buggy variant beside the correct one
-//! (CLAUDE.md): each [`Variant`] of RAFT.md §5 that this stage ships must be caught
+//! (CLAUDE.md): each [`Variant`](ananke_raft::core::Variant) of RAFT.md §5 that
+//! this stage ships must be caught
 //! by one of these checks on some seed, and the correct server must pass every seed.
 //!
 //! The disk honours `fsync` here (`p_durable = 1`): a disk that acknowledges a sync
@@ -84,7 +85,7 @@ use ananke_env::{
 };
 use ananke_raft::apply::{Command, Outcome};
 use ananke_raft::client::{Reply, Request, Response};
-use ananke_raft::core::{RaftConfig, Variant};
+use ananke_raft::core::{RaftConfig, Variants};
 use ananke_raft::message::{self, Frame, Message};
 use ananke_raft::{NodeConfig, ServerId, invariants, run as run_server};
 use ananke_storage::EngineConfig;
@@ -851,8 +852,10 @@ type SharedStats = Arc<Mutex<ClientStats>>;
 pub struct Report {
     /// The seed.
     pub seed: u64,
-    /// Which server ran.
-    pub variant: Variant,
+    /// Which server ran: the set of known bugs it carried, empty for the correct
+    /// one (PROPOSED D-045).
+    // PROPOSED(D-045): a variant is a set.
+    pub variants: Variants,
     /// How the run was scheduled (D-016).
     pub policy: Policy,
     /// The faults it ran.
@@ -1229,9 +1232,13 @@ pub fn config(seed: u64, schedule: &Schedule) -> SimConfig {
     config
 }
 
-/// The server configuration for `id` under `variant`.
+/// The server configuration for `id` under `variants`: the set of known bugs
+/// this server carries, which a single [`Variant`](ananke_raft::core::Variant)
+/// converts into (PROPOSED D-045).
+// PROPOSED(D-045): a variant is a set.
 #[must_use]
-pub fn node_config(id: u64, variant: Variant) -> NodeConfig {
+pub fn node_config(id: u64, variants: impl Into<Variants>) -> NodeConfig {
+    let variants = variants.into();
     let mut engine = EngineConfig::new(PathBuf::from(DIR));
     engine.memtable_bytes = 16 * 1024;
     engine.segment_bytes = 16 * 1024;
@@ -1260,7 +1267,7 @@ pub fn node_config(id: u64, variant: Variant) -> NodeConfig {
         // install takes many chunks, so resumption under drops actually happens
         // (RAFT.md §1, stage E).
         raft: RaftConfig {
-            variant,
+            variants,
             tick_nanos: u64::try_from(TICK.as_nanos()).expect("small"),
             drift_bound_ppm: DRIFT_BOUND_PPM,
             snapshot_threshold: 12,
@@ -1272,11 +1279,11 @@ pub fn node_config(id: u64, variant: Variant) -> NodeConfig {
     }
 }
 
-fn spawn_server(sim: &Sim, id: u64, variant: Variant) {
+fn spawn_server(sim: &Sim, id: u64, variants: Variants) {
     let env = sim.env(node_of_server(id));
     let inner = env.clone();
     env.spawn("raft", async move {
-        let _ = run_server(inner, node_config(id, variant)).await;
+        let _ = run_server(inner, node_config(id, variants)).await;
     });
 }
 
@@ -1570,15 +1577,21 @@ async fn spread<E: Environment>(env: E, n: u64, target: u64, count: u64) {
     }
 }
 
-/// Runs the scenario for `seed` with the schedule drawn from it.
+/// Runs the scenario for `seed` with the schedule drawn from it, under the set
+/// of bugs `variants` — a single [`Variant`](ananke_raft::core::Variant) or a
+/// [`Variants`] of several
+/// (PROPOSED D-045).
+// PROPOSED(D-045): a variant is a set.
 #[must_use]
-pub fn run(seed: u64, variant: Variant) -> Report {
-    run_with(seed, Schedule::draw(seed), variant)
+pub fn run(seed: u64, variants: impl Into<Variants>) -> Report {
+    run_with(seed, Schedule::draw(seed), variants)
 }
 
 /// Runs the scenario for `seed` with an explicit schedule.
+// PROPOSED(D-045): a variant is a set.
 #[must_use]
-pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
+pub fn run_with(seed: u64, schedule: Schedule, variants: impl Into<Variants>) -> Report {
+    let variants = variants.into();
     let mut sim = Sim::new(config(seed, &schedule));
     let servers: Vec<NodeId> = (0..SERVERS as usize)
         .map(|i| sim.add_node_with_clock(schedule.skews[i], schedule.drifts[i]))
@@ -1587,7 +1600,7 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
     let admin = sim.add_node();
     let stats: Vec<SharedStats> = (0..CLIENTS).map(|_| SharedStats::default()).collect();
     for id in 1..=SERVERS {
-        spawn_server(&sim, id, variant);
+        spawn_server(&sim, id, variants);
     }
     for (i, &node) in clients.iter().enumerate() {
         let env = sim.env(node);
@@ -1611,7 +1624,7 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
     advance(&mut sim, schedule.warmup, &mut watch);
     let restart = |sim: &mut Sim, server: u64| {
         sim.restart(node_of_server(server));
-        spawn_server(sim, server, variant);
+        spawn_server(sim, server, variants);
     };
     // The lease trials: the operator hands leadership to the slowest clock, which
     // leads for a while and is then cut off with client 1; twice, so the variant's
@@ -1973,7 +1986,7 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
     }
     Report {
         seed,
-        variant,
+        variants,
         policy: sim.policy(),
         schedule,
         jsonl: sim

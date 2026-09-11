@@ -96,7 +96,7 @@ use ananke_storage::{Engine, EngineConfig};
 
 use crate::apply::{Command, Outcome, apply_command, user_key};
 use crate::client::{self, Reply, Request, Response};
-use crate::core::{Input, Output, Raft, RaftConfig, SnapshotAction, Variant};
+use crate::core::{Input, Output, Raft, RaftConfig, SnapshotAction, Variant, Variants};
 use crate::message::{Frame, Message, SnapshotStatus};
 use crate::queue::Queue;
 use crate::snapshot::{self, Assembler, Feed, Repair, Sender, Staged};
@@ -285,13 +285,13 @@ pub async fn run<E: Environment>(env: E, config: NodeConfig) -> io::Result<()> {
     // PROPOSED(D-041): the as-built adoption is the server before the store
     // marker existed: it neither checks nor writes one, lost mark included, so
     // its disk sees exactly the operations the nightly's did.
-    let as_built = raft.variant == Variant::AdoptionAsBuilt;
+    let as_built = raft.variants.contains(Variant::AdoptionAsBuilt);
     // PROPOSED(D-044): a refusal is recorded in the store directory before
     // anything else and quiesces the engine that recovered the hole. The
     // as-built variant writes no marker at all; `RefusalNotDurable` is the
     // server before either half of the fix.
-    let durable_refusal = !as_built && raft.variant != Variant::RefusalNotDurable;
-    let quiesce_refused = raft.variant != Variant::RefusalNotDurable;
+    let durable_refusal = !as_built && !raft.variants.contains(Variant::RefusalNotDurable);
+    let quiesce_refused = !raft.variants.contains(Variant::RefusalNotDurable);
     // The store's recovery must never hand back a state with a hole (RAFT.md §3):
     // no fallback, no discarded head, and a damaged log refused before it is cut.
     let engine = EngineConfig {
@@ -342,7 +342,7 @@ pub async fn run<E: Environment>(env: E, config: NodeConfig) -> io::Result<()> {
         // be read is a damaged install, refused like a store whose recovery lost
         // state and never swept; the server waits in re-seed mode for a leader's
         // stream, which replaces the staging directory.
-        let adopted = match snapshot::adopt_staged_under(&env, &engine.dir, raft.variant).await {
+        let adopted = match snapshot::adopt_staged_under(&env, &engine.dir, raft.variants).await {
             Ok(adopted) => adopted,
             Err(error) if LostState::from_io(&error).is_some() => {
                 // PROPOSED(D-044): the loss is recorded in the store directory
@@ -500,7 +500,7 @@ async fn incarnation<E: Environment>(
 ) -> io::Result<Next> {
     let server = id.0;
     let tick = Duration::from_nanos(raft.tick_nanos);
-    let variant = raft.variant;
+    let variants = raft.variants;
     let seed = env.rng().next_u64();
     let snapshot_record = recovered.snapshot.clone();
     let (snap_index, snap_term) = snapshot_record
@@ -535,7 +535,7 @@ async fn incarnation<E: Environment>(
     // share a name with a directory that still holds files: the take counter
     // restarts at zero on an installed store, and a re-seeded server's lost
     // store may have taken at the index it takes at again.
-    if variant != Variant::SharedSnapshotDir {
+    if !variants.contains(Variant::SharedSnapshotDir) {
         sweep_versions(env, id, &store, &engine_dir, &BTreeMap::new()).await;
     }
     spawn_apply(
@@ -549,7 +549,7 @@ async fn incarnation<E: Environment>(
         &engine_dir,
         core.applied_membership(),
         core.term_at(applied).unwrap_or(0),
-        variant,
+        variants,
     );
     env.spawn(
         "snapshot",
@@ -634,7 +634,7 @@ async fn incarnation<E: Environment>(
         jobs,
         snaps: snaps.clone(),
         pending,
-        variant,
+        variants,
         apply_sent: applied,
         proposed: BTreeMap::new(),
         reads: BTreeMap::new(),
@@ -722,8 +722,8 @@ async fn incarnation<E: Environment>(
                 // cascade of seed 5909. Otherwise the checkpoint really is
                 // unusable, and the next take is a fresh version. The server as
                 // built (`SharedSnapshotDir`) asks every time.
-                let retake =
-                    retake && (!node.take_in_flight || node.variant == Variant::SharedSnapshotDir);
+                let retake = retake
+                    && (!node.take_in_flight || node.variants.contains(Variant::SharedSnapshotDir));
                 if retake {
                     node.fresh_take = true;
                 }
@@ -948,7 +948,7 @@ async fn install_decision<E: Environment>(
         &engine_dir,
         core.applied_membership(),
         core.term_at(node.store.applied()).unwrap_or(0),
-        node.variant,
+        node.variants,
     );
     node.apply_sent = node.store.applied();
     node.apply_through(core, core.commit());
@@ -969,7 +969,7 @@ fn spawn_apply<E: Environment>(
     engine_dir: &Path,
     config: Configuration,
     applied_term: Term,
-    variant: Variant,
+    variants: Variants,
 ) {
     let server = id.0;
     let env = env.clone();
@@ -998,7 +998,7 @@ fn spawn_apply<E: Environment>(
                         inbox.push(Event::TakeFailed);
                         continue;
                     }
-                    let taken = if variant == Variant::SharedSnapshotDir {
+                    let taken = if variants.contains(Variant::SharedSnapshotDir) {
                         // As built: one directory per index, swept and rewritten
                         // by every take at it, under any stream reading it.
                         let dir = snapshot::checkpoint_dir(&engine_dir, applied);
@@ -1220,7 +1220,7 @@ impl<E: Environment> Streamer<E> {
     /// shared-directory variant the next queued follower's stream starts
     /// instead, as built.
     async fn ended(&self, streams: &mut Streams) {
-        if self.config.variant == Variant::SharedSnapshotDir {
+        if self.config.variants.contains(Variant::SharedSnapshotDir) {
             if streams.outbound.is_empty()
                 && let Some((to, index, term)) = streams.backlog.pop()
             {
@@ -1287,8 +1287,8 @@ async fn snapshot_task<E: Environment>(
 ) {
     let server = id.0;
     let chunk_timeout = Duration::from_nanos(config.tick_nanos * config.election_ticks.0 / 2);
-    let shared = config.variant == Variant::SharedSnapshotDir;
-    let mut assembler = Assembler::new(env.clone(), &engine_dir, config.variant);
+    let shared = config.variants.contains(Variant::SharedSnapshotDir);
+    let mut assembler = Assembler::new(env.clone(), &engine_dir, config.variants);
     let mut staged: Option<Staged> = None;
     let streamer = Streamer {
         env: env.clone(),
@@ -1572,7 +1572,8 @@ async fn start_stream<E: Environment>(
     term: Term,
 ) -> Option<Outbound> {
     let env = &task.env;
-    let (dir, last_index, last_term) = if task.config.variant == Variant::SharedSnapshotDir {
+    let (dir, last_index, last_term) = if task.config.variants.contains(Variant::SharedSnapshotDir)
+    {
         match task.store.snapshot_record().await {
             Ok(Some(record)) if record.taken && !record.dir.is_empty() => (
                 PathBuf::from(&record.dir),
@@ -1661,7 +1662,7 @@ async fn reseed<E: Environment>(
     engine_dir: &Path,
     inbox: &Queue<Event>,
 ) -> Next {
-    let mut assembler = Assembler::new(env.clone(), engine_dir, raft.variant);
+    let mut assembler = Assembler::new(env.clone(), engine_dir, raft.variants);
     loop {
         let Some(event) = inbox.pop().await else {
             return Next::Closed;
@@ -1826,7 +1827,7 @@ struct Server<E: Environment> {
     jobs: Queue<Job>,
     snaps: Queue<Snap>,
     pending: Pending,
-    variant: Variant,
+    variants: Variants,
     /// The highest index handed to the `apply` task.
     apply_sent: Index,
     /// Requests this server proposed, by client and sequence number, with the index
@@ -1893,7 +1894,7 @@ impl<E: Environment> Server<E> {
     /// [`Variant::SendBeforePersist`] the sends go first; the trace events still
     /// follow the persist, so the trace says what is durable.
     async fn execute(&mut self, core: &Raft, outputs: Vec<Output>) -> io::Result<()> {
-        let send_first = self.variant == Variant::SendBeforePersist;
+        let send_first = self.variants.contains(Variant::SendBeforePersist);
         if send_first {
             for output in &outputs {
                 if let Output::Send { to, message } = output {
@@ -1914,7 +1915,7 @@ impl<E: Environment> Server<E> {
                     if let Some(from) = persist.truncate_from {
                         lock_pending(&self.pending).retain(|&index, _| index < from);
                     }
-                    if self.variant == Variant::ApplyBeforeCommit {
+                    if self.variants.contains(Variant::ApplyBeforeCommit) {
                         let last = persist.append.last().map_or(0, |entry| entry.index);
                         let entries: Vec<Entry> = persist
                             .append

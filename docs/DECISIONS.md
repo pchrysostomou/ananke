@@ -1976,25 +1976,69 @@ member for the membership path, not a re-seed. `RaftRecovered` gains a field,
 wherever it saw a refusal. The core-level scenario is in
 `crates/ananke-raft/tests/paper.rs`.
 
-Seed 5909 is now pinned under each variant alone, and what the pin records is
-that it passes under each: on this tree `raft::run(5909, IgnoreIncarnation)`
-and `raft::run(5909, SharedSnapshotDir)` both check clean, and so does the
-correct server. That is a structural limit of the variant mechanism, not a gap
-in the seed. The nightly's wedge needed both bugs at once — with D-043's fix in
-place the pinned stream completes and the cluster commits through the follower
-being fed, though the leader's `matched` for the re-seeded one is stale, and
-with this entry's fix in place the re-seeded follower's incarnation resets that
-`matched` and the cluster commits through it, though the other follower's
-stream is scrambled — and `Variant` is a single enum on `RaftConfig`, so no run
-of the sweep can put both in one server. A variant that is both would be a new
-known-buggy server and a new decision; it is not taken here, and it is what a
-future entry would have to argue for. The seed's schedule has diverged as well,
-several times over: this entry's own eight-byte record change moved every
-checkpoint, and D-041, D-044 and the re-take arm have each re-drawn the fault
-list since, so seed 5909 on this tree draws neither a snapshot crash nor an
-adoption storm nor a re-take arm at all. The pin is worth keeping as a seed
-held green and worth nothing as a replay, and it says so. Every site is marked
-`PROPOSED(D-042)`.
+**Amended under PROPOSED D-045.** `Variant` is a set now, so the run this entry
+said no sweep could make — one server carrying this bug *and* D-043's at once —
+is a run the sweep makes. Four things it settles.
+
+*Neither fix alone was the fix for 5909.* The nightly's wedge needed both of its
+conditions at once, because a leader needs only *one* countable follower for a
+majority: this entry's stale `matched` for the re-seeded follower, *and* D-043's
+never-completing stream to the other one. Each entry removes one of the two, and
+removing either is enough for the cluster to commit — with D-043's fix the
+pinned stream completes and the cluster commits through the follower being fed
+though `matched` for the re-seeded one is stale; with this entry's fix the
+incarnation resets that `matched` and the cluster commits through the re-seeded
+follower though the other's stream is scrambled. So neither entry is *the* fix
+for 5909, and neither claims to be. **The combined variant
+`{IgnoreIncarnation, SharedSnapshotDir}` is the negative control for that
+wedge**; each single variant is the control for its own half and never was a
+control for the whole.
+
+*Seed 5909 itself still does not reach the wedge, under the pair as under each
+single.* Measured on this tree in release: `raft::run(5909, Variants::of(&[
+IgnoreIncarnation, SharedSnapshotDir]))` checks clean, exactly as both singles
+and the correct server do. That is a seed whose schedule has moved, not a bug
+that has gone: this entry's own eight-byte record change moved every checkpoint,
+and D-041, D-044 and the re-take arm have each re-drawn every seed's fault list
+since, so 5909 on this tree draws neither a snapshot crash nor an adoption storm
+nor a re-take arm at all, and no leader ever re-takes under a running stream on
+it whatever bugs it carries. The pin stays a seed held green and is still worth
+nothing as a replay.
+
+*The set bought no new catch at the thousand-seed tier, and that is reported
+rather than dressed up.* Swept over seeds 0..1000 in release, all three servers
+on every seed: the pair is caught on **1 of 1000** — seed 680, by the liveness
+check — `IgnoreIncarnation` alone on **0 of 1000**, `SharedSnapshotDir` alone on
+**1 of 1000**, and that is the same seed 680 with the byte-identical message
+(`no client write completed after the last heal at 28.683 s`). Seeds where the
+pair is caught and *neither* single is: **0 of 1000**. So the
+combined variant is not yet shown to catch anything the stream half does not
+catch alone, and the negative control it provides for 5909's shape is a
+mechanism that now exists and a claim the sweep has not yet been able to
+discharge at the tiers run here — which is the honest reading and the one
+recorded. The reason it is hard is D-043's own: the wedge needs a stream that
+*never completes*, which needs a take to land on the very directory a live
+stream has open, and that coincidence is what is rare; once it happens the
+stream half alone already stalls the commit, and this entry's stale `matched`
+has nothing left to add.
+
+*`IgnoreIncarnation` alone stays a coverage claim — defence in depth, and the
+owner's decision.* Measured over a thousand release seeds on this tree: caught
+on **0 of 1000**, with **0** progress resets, and the precondition the wedge is
+built on — a refused follower re-seeded and applying again — reached on **637 of
+1000**, where the correct server needs a reset per refusal and this leader
+traces none. Once D-043 holds, this bug on its own is **a delay, not a wedge**:
+the stream to the other follower completes, that follower is countable within an
+install, and the leader commits through it while the stale `matched` for the
+re-seeded one costs that follower a probe walk rather than the cluster a commit.
+It is kept because the day something else makes the second follower uncountable
+— another bug, another fault arm, a schedule nobody has drawn — the stale
+`matched` is a wedge again, and because the fix is cheap while its absence is
+invisible until then. The variant ships and its test is not ignored (CLAUDE.md);
+what it asserts is what is true of it, and the rate is printed at every tier so
+the day it stops being zero is visible.
+
+Every site is marked `PROPOSED(D-042)`.
 
 ---
 
@@ -2217,6 +2261,30 @@ reaching its stream — and a nightly whose ten thousand seeds never catch it is
 still a hole in the sweep to report rather than a variant to delete (RAFT.md §5),
 the more so because this branch has re-drawn every schedule again.
 
+**Amended under PROPOSED D-045.** `Variant` is a set now, so the sweep can run
+one server carrying this entry's bug and D-042's at once, which is what the
+nightly's seed 5909 was. Neither fix alone was the fix for 5909: the wedge
+needed both of its necessary conditions — a stream that never completes to one
+follower (this entry) and a stale `matched` for the other, re-seeded one (D-042)
+— because a leader needs only one countable follower for a majority, so either
+fix alone lets the cluster commit and either variant alone leaves a cluster that
+recovers. **The combined variant `{IgnoreIncarnation, SharedSnapshotDir}` is the
+negative control for that wedge**; this entry's variant is the control for the
+stream half of it and never was a control for the whole.
+
+What the pair measures on this tree is reported as measured. Over seeds 0..1000
+in release the pair is caught on 1 of 1000 and this entry's variant alone on 1
+of 1000, and it is the *same* seed 680 with the byte-identical liveness message;
+`IgnoreIncarnation` alone is caught on 0 of 1000; and the seeds where the pair
+is caught and neither single is number 0 of 1000. That is
+consistent with this entry's own account of why the catch is rare: the wedge
+needs a stream that never completes, which needs a take to land on the very
+directory a live stream has open, and once that coincidence happens the stream
+half alone already stalls the commit for longer than the bound, leaving D-042's
+stale `matched` nothing to add. The pair costs the sweep nothing it was not
+already paying and is the only run that can ever be the nightly's server; it
+stays, and its rate is reported beside this entry's own.
+
 ---
 
 ## PROPOSED D-044 — A refusal is durable, and a refused engine does no work
@@ -2383,6 +2451,131 @@ half seconds of waiting each, which lengthens a seed's run; the correct server
 passes every seed of it. The `AdoptionAsBuilt` variant of D-041 writes no lost
 mark, since it is the server before the marker existed at all, but its engine is
 still quiesced: a variant turns off its own fix and no other.
+
+---
+
+## PROPOSED D-045 — A variant is a set
+
+**Context.** Round two's finding, recorded at the end of PROPOSED D-042 and in
+PROPOSED D-043: the nightly's seed 5909 (run 34496762339) wedged the cluster
+because *two* bugs held at once — the leader's `matched` for a re-seeded
+follower stood above its rebuilt log (D-042) and the snapshot stream to the
+other follower never completed (D-043) — and either fix alone removes one of
+the two necessary conditions, because a leader needs only *one* countable
+follower for a majority. `Variant` was a single enum on `RaftConfig`, so no run
+of the sweep could put both bugs in one server. The sweep therefore had a
+negative control for each half of that wedge and none for the wedge itself, and
+both round-two entries had to record the gap as a structural limit of the
+mechanism rather than close it. The owner's decision after that finding, which
+this entry records: `Variant` becomes a set.
+
+**Decision.** Five parts, every site marked `PROPOSED(D-045)`.
+
+*The vocabulary stays.* `Variant` remains what it was: the enum of single bugs,
+one arm per rule broken, each with its reference and its `PROPOSED(D-0xx)`
+marker. No variant's meaning changes here, and no variant is added or removed.
+`Variant::BUGS` lists the buggy arms in declaration order — `Variant::Correct`
+is not among them, because the correct server is the *absence* of every bug
+rather than a bug of its own — and `Variant::bit` maps each arm to a distinct
+bit by an exhaustive match, so a variant added later does not compile until it
+has been given one.
+
+*The set.* `Variants(u32)`: a `Copy` bitmask struct with `Variants::correct()`,
+`of(&[Variant])`, `contains(Variant)`, `with(Variant)`, `is_correct()`, `len`,
+`is_empty` and `iter`, all but `iter` `const`. The empty set is the correct
+server, so `Variants::default()` is correct and a `RaftConfig::default()`
+carries no bug. Asking a set whether it `contains(Variant::Correct)` asks
+whether it is empty: `Variant::Correct` contributes no bit, so it is the only
+answer consistent with `Variants::of(&[Variant::Correct])` being the correct
+server, and it is the conservative one — it can never report a bug that is not
+there. A bitmask rather than a collection because this is read on a path the
+core walks every step: no allocation, no hashing, `Copy` so the server's tasks
+each hold their own, and deterministic by construction. `HashSet` is banned
+outside `ananke-env` anyway (D-014), and a `BTreeSet<Variant>` would cost an
+allocation and a `Clone` for a set that never exceeds a handful of members.
+
+*The composition.* A set turns off exactly the fixes of its members and no
+others: every `contains` site reads one variant's bit and nothing else, so a
+server carrying two bugs is the server carrying each of them, with no third
+behaviour introduced between them. That is the conservative reading and the
+only one the existing sites support — each was already written as "this variant
+turns off its own fix and no other" (D-044) — and it is what makes the pair a
+negative control for the wedge rather than a new server to be argued for.
+
+*The config and its sites.* `RaftConfig::variant: Variant` becomes
+`RaftConfig::variants: Variants`, and every comparison — `core.rs`, `node.rs`,
+`snapshot.rs` — becomes `variants.contains(Variant::X)`, `!= ` becoming
+`!...contains(...)`. The `Server` and `Assembler` fields and the `apply` task's
+parameter follow the config's type. Nothing is serialized: the bits appear on
+no wire frame and in no trace event, so the numbering is an implementation
+detail free to change with the enum.
+
+*The call sites.* `sim::raft::run`, `run_with`, `node_config`, their
+`sim::membership` twins, `snapshot::Assembler::new`, `adopt_staged_under` and
+the core tests' `config` helpers take `impl Into<Variants>`, and
+`From<Variant> for Variants` converts, so the roughly thirty existing
+`raft::run(seed, Variant::Correct)` call sites compile unchanged and a single
+variant stays as short to write as it was. `Report::variant` becomes
+`Report::variants`, and `Variants`' `Debug` is written by hand rather than
+derived, because the sweep's rate lines print it: `Correct` for the empty set,
+`{IgnoreIncarnation, SharedSnapshotDir}` for a pair.
+
+**Alternatives.** *A combined variant enum arm* — one `Variant` arm meaning
+both bugs. It is the smallest change and it was rejected: every pair worth
+testing needs its own arm, which is quadratic in a list already fourteen long,
+each arm must be threaded through every `==` site it participates in, and each
+would be a new known-buggy server to document rather than a composition of two
+documented ones. *A second config flag* beside `variant`, holding an optional
+extra variant: it makes two the maximum by construction, leaves two fields that
+can disagree about the same bug, and asks every site which of them to read.
+*A `Vec<Variant>` or `BTreeSet<Variant>` on the config*: the same expressiveness
+as the bitmask, at an allocation and a `Clone` per server and a linear scan on a
+path walked every step, with `HashSet` banned outside `ananke-env` (D-014).
+*Leaving it alone and recording the gap*, which is what round two did: it is
+honest, and it leaves the sweep without a negative control for a wedge that has
+already happened once in a nightly.
+
+**Consequences.** `RaftConfig` gains a renamed field: `variant: Variant` becomes
+`variants: Variants`, which every construction of a config outside a
+`..RaftConfig::default()` must follow, and `Report::variant` becomes
+`Report::variants` for both scenarios. Nothing else about any server changes.
+The bits reach no wire frame and no trace event, so no trace hash moves and no
+schedule is re-drawn by this entry — the check that says so is that the numbers
+this branch measures for the existing variants are the numbers round two
+measured: `IgnoreIncarnation` reaches its precondition on 637 of 1000 release
+seeds and traces 0 progress resets, and `SharedSnapshotDir` is caught on seed
+680 alone of the first thousand, both unchanged. A variant added later does not
+compile until `Variant::bit` and `Variant::BUGS` have been given it, which is
+the point of the exhaustive match; the set is a `u32`, so the vocabulary may
+reach thirty-two arms before the width is a decision to revisit.
+
+What the mechanism bought, measured rather than assumed, is one run that could
+not be made before and can be made now — a server carrying `IgnoreIncarnation`
+and `SharedSnapshotDir` at once, the server the nightly's seed 5909 was — and
+the honest report of what that run does at the tiers run here. Seed 5909 itself
+passes under the pair, as it does under each single and under the correct
+server, because its schedule has moved several times since the nightly (D-042's
+amendment). Over seeds 0..1000 in release the pair is caught on 1 of 1000, seed
+680 by the liveness check; `SharedSnapshotDir` alone is caught on the same seed
+with the byte-identical message; `IgnoreIncarnation` alone on none; and the
+seeds where the pair is caught and neither single is number 0 of 1000. So
+this entry ships a mechanism and a negative control that the
+sweep has not yet been able to distinguish from its stream half, and says so:
+the set is the thing that makes the distinction *askable*, and the question is
+now asked at every tier and printed, where before it could not be posed at all.
+The combined variant is pinned on the seed the sweep does catch it on rather
+than asserted over a sweep tier, so no tier is made flaky by it, and the pair
+rule holds on that seed as everywhere: the correct server passes it.
+
+Three questions the documents did not answer, taken conservatively and recorded
+here. A set containing `Variant::Correct` is the correct server rather than a
+server with an extra bug, and `contains(Variant::Correct)` answers whether the
+set is empty: the only reading under which `Correct` keeps meaning "no bug", and
+the one that can never report a bug that is not there. A set's behaviour is the
+conjunction of its members' and nothing more — each `contains` site reads one
+bit — so composing two variants introduces no third server to document. And the
+bit numbering is an implementation detail, because it is persisted nowhere; if
+it ever reaches a trace or a frame, that is a new decision.
 
 ---
 
