@@ -1669,4 +1669,117 @@ a function of the trace alone. The site is marked `PROPOSED(D-039)`.
 
 ---
 
+## PROPOSED D-042 — Store incarnations: a leader forgets what a re-seeded follower forgot
+
+**Context.** The ten-thousand-seed nightly (run 34496762339), seed 5909: server 3
+was refused at 9.80 s and re-seeded five times, at 10.10, 10.47, 10.85, 13.27 and
+16.18 s. It had acknowledged index 333 at 13.86 s and the leader had pipelined
+334..408 to it when it crashed; after the last re-seed its log ended at 333, since
+the checkpoint a leader feeds is the last one it took, which can sit well below
+what the follower acknowledged after it. A leader's `matched` for a follower is
+monotone by design (D-026: a stale or duplicated response can only propose a
+value already passed), an install's completion raises it and never lowers it, and
+the probe rule is `next = hint.max(1).max(matched + 1)`: a leader whose `matched`
+stands above a follower's log end can never probe below it. Every rejection walks
+the probe back to `matched`, the follower rejects that too, and it is never
+counted for a commit again nor re-designated snapshot-fed, since every answer
+keeps it from going quiet — until the leader changes. The same `matched` keeps a
+refused follower from ever being re-seeded by the leader that matched it: its
+rejections ask from index 1 but reject a probe at `matched`, never at index 0,
+so the re-seed ask of D-037 is never heard, and only a designation earned by
+silence while it was down ever streams to it. Stage E's re-seed (D-030, D-035)
+broke the assumption behind monotone `matched`: a follower can now legitimately
+lose entries it acknowledged. Seed 5909's wedge also involves the snapshot
+streams (D-043); this entry closes the `matched` half of it.
+
+**Decision.** Three parts.
+
+*The store.* Every Raft store carries an incarnation number under
+`0 / 0 / incarnation`, beside `hard` and `applied`: written as 1 at a fresh
+store's first open, synced, so every store carries the key explicitly; and by an
+install's repair, with the rest of the staged store's tenant 0, before the staged
+`CURRENT` (D-038) — carried forward unchanged on an install into a live store,
+whose kept tail is everything acknowledged past the snapshot, and drawn afresh on
+a re-seed. It is not the lost store's number plus one: at a refusal the engine is
+dropped and only its directory reaches the re-seed path, and a number read from a
+store the engine refused would not be trusted anyway — a recovery that fell back
+to an older manifest could read the leader's checkpointed value, and its successor
+could then collide with what a leader had already recorded. The re-seed draws the
+number from the environment's rng, never 1, and the leader compares for
+inequality only: no order is assumed of it. The store's `RaftRecovered`
+restatement carries it.
+
+*The wire.* `AppendEntriesResponse` and `InstallSnapshotResponse` carry the
+responder's incarnation, stamped by the server on the way out like the clock, an
+additive field on the frame that the studio decoder shows. A refused server,
+which has no store, stamps 0 on the rejections it answers with; the re-seed's
+`Installed` answer carries the incarnation of the store the install built.
+
+*The leader.* `Progress` records the incarnation a follower last answered with;
+the first answer seen only records. An answer whose incarnation differs from the
+record resets the follower's progress before the answer is otherwise processed —
+`matched = 0`, `next` at the leader's last index plus one, the pipeline, the
+probe and any snapshot-feed designation cleared, traced `RaftProgressReset` — so
+a rejection's hint is where the rebuilt log ends, and the normal probe walks back
+from it rather than from the stale match. After a reset an empty probe goes at
+once, as a heartbeat would, so a successful answer that leaves nothing to send
+still finds the rebuilt log within a round trip. An install's completion resets
+the same way before the install's match is recorded. A stream in flight is left
+to the snapshot task, which ends it either way; the quiet count and the lease
+state are untouched, since the follower just answered. A refused server's 0 is
+a change like any other, so its first rejection walks the probe to index 0,
+where the leader either feeds the snapshot outright, the probe being below its
+compacted prefix, or hears the rejection at index 0 that D-037 designates on: a
+refused follower is re-seeded by the leader that matched it, whatever it was
+matched at. `Variant::IgnoreIncarnation` records and never resets: the leader
+as built. The sweep does not catch it — on 0 of 100 release seeds, by
+construction rather than by chance. The wedge stalls a commit only while the
+third server is unavailable; after the last heal every fault has healed or
+restarted, so a server is unavailable then only by refusal, and a refused
+server beside a re-seeded one is the configuration D-035's carve-out withholds
+the liveness bound from (`majority_up`: two impaired servers of three); and
+were the bound asked there, the leader as built re-seeds the refused server
+too, when it was designated while down, and commits with it inside the bound.
+The variant and its sweep test ship as the pair rule asks, the test ignored
+with that reason rather than weakened, until the sweep can see the wedge: a
+liveness ask when a leader in force at the last heal has a commit majority
+among the servers that are up, quarantined ones included, and a schedule that
+refuses a second follower under that leader — seed 5909's shape — which only
+the disk model's rot produces and no driver can aim.
+
+**Alternatives.** Letting a rejection lower `matched`: any stale or duplicated
+rejection could then walk a live follower's match back and re-send what it
+holds, the flood D-026's probe rule exists to prevent, and a rejection from the
+old store would still walk it to the wrong place. Designating a follower
+snapshot-fed whenever a probe repeats: hides the wedge behind a second stream of
+the same snapshot, which the same `matched` wedges on again. Incrementing the lost
+store's number: unreadable at the refusal, and not to be trusted if read. A
+number the leader stamps on the stream: a field on a request the snapshot streams
+carry (D-043's ground), and a leader that took over mid-stream would stamp from
+no record. The shape itself is the usual one — etcd's raft and raft-rs reset a
+follower's `Progress` when a leader takes office; a store that can lose
+acknowledged entries needs the same reset when the store changes, which is what
+the number makes visible.
+
+**Consequences.** A leader forgets a follower's progress once per refusal and
+once per re-seed, at the price of a probe walk from its own end. A rejection
+stamped 0 that is delayed past the install is a change too: the leader resets,
+the rejection asks from index 1, the follower is designated and offered the same
+snapshot, and its answer that everything is already there resets it back — a
+round trip, not a stall. The rule is inequality, so a success from the dead
+store delayed past the rebuilt store's first answer would set `matched` from the
+dead store until the next answer resets it again: a window one message delay
+long against a whole re-seed. A total order on incarnations, or a per-follower
+set of retired ones, would drop such an answer instead, and is the step to take
+if a sweep ever finds that window. A store started fresh on a wiped directory
+carries 1 again, the number the leader may have recorded for the store that was
+wiped: a wipe is outside the fault model (D-012), and a wiped server is a new
+member for the membership path, not a re-seed. `RaftRecovered` gains a field,
+`RaftProgressReset` is new, and the sweep counts the resets and requires one
+wherever it saw a refusal. Seed 5909 needs D-043 as well and is pinned by
+neither; the core-level scenario is in `crates/ananke-raft/tests/paper.rs`. Every
+site is marked `PROPOSED(D-042)`.
+
+---
+
 _Next entry: D-040. Add one before implementing anything not covered above._

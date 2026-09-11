@@ -131,6 +131,32 @@ fn a_server_that_installs_without_current_last_is_caught() {
     is_caught(Variant::SnapshotWithoutCurrentLast);
 }
 
+/// The leader that ignores the store incarnation its followers answer with
+/// (RAFT.md §3, PROPOSED(D-042)): a follower refused for lost state and re-seeded
+/// from a snapshot comes back below the match index the leader recorded for it,
+/// the match is monotone and the probe never reaches below it, so every answer
+/// is discarded and the follower is never counted again while that leader leads.
+/// Only with the third server unavailable at the same time does that stall a
+/// commit, and the sweep as written cannot see it: caught on 0 of 100 release
+/// seeds, by construction rather than by chance. After the last heal every
+/// fault has healed or restarted, so a server is unavailable then only by
+/// refusal, and a refused server beside a re-seeded one is exactly the
+/// configuration `Report::majority_up` withholds the liveness bound from
+/// (PROPOSED D-035's carve-out); and were the bound asked there, the leader as
+/// built re-seeds the refused server too, when it was designated while down,
+/// and commits with it inside the bound. Seeing the wedge needs a liveness ask
+/// when a leader in force at the last heal has a commit majority among the
+/// servers that are up, quarantined ones included, and a schedule that refuses
+/// a second follower under that leader — seed 5909's shape — which the disk
+/// model's rot draws on its own and no driver can aim. Until then the test is
+/// ignored, not weakened: `--ignored` runs it and prints the rate. The pair
+/// rule's other half holds, since the correct server passes the same seeds.
+#[test]
+#[ignore = "the sweep's liveness bound is withheld from the one configuration the wedge stalls (PROPOSED D-042): 0 of 100 release seeds"]
+fn a_leader_that_ignores_incarnations_is_caught() {
+    is_caught(Variant::IgnoreIncarnation);
+}
+
 /// Lease safety under drift (RAFT.md §2, invariant 6): on every seed where the
 /// simulated drift exceeds the bound, either the guard revoked the drifting
 /// follower's trust or the checker reports the stale read and the run fails. The
@@ -238,6 +264,7 @@ struct Coverage {
     compactions: usize,
     reseeded: usize,
     reseed_completions: u64,
+    progress_resets: usize,
     install_crash_faults: usize,
     bit_rot: usize,
     torn_writes: usize,
@@ -336,6 +363,7 @@ impl Coverage {
         self.compactions += report.count(|e| matches!(e, TraceEvent::RaftCompacted { .. }));
         self.reseeded += report.count(|e| matches!(e, TraceEvent::RaftReseeded { .. }));
         self.reseed_completions += u64::from(reseed_completed(report));
+        self.progress_resets += report.count(|e| matches!(e, TraceEvent::RaftProgressReset { .. }));
         self.install_crash_faults += report
             .schedule
             .faults
@@ -427,6 +455,13 @@ impl Coverage {
             assert!(
                 self.reseed_completions > 0,
                 "no refused server was ever re-seeded and applying again: {self:?}"
+            );
+            // A refused server answers from no store, and a leader that had
+            // matched entries on the lost one forgets them (PROPOSED(D-042)):
+            // with refusals seen, so is the reset.
+            assert!(
+                self.progress_resets > 0,
+                "no leader ever forgot a re-seeded follower's progress: {self:?}"
             );
         }
         assert!(

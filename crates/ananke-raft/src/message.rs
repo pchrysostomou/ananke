@@ -95,6 +95,14 @@ pub enum Message {
         /// The follower's clock when it answered, in nanoseconds, for the leader's
         /// drift guard (RAFT.md §1). The server stamps it on the way out.
         local: u64,
+        /// The responder's store incarnation (RAFT.md §3): 1 for a store started
+        /// fresh, a fresh value for every store a re-seed rebuilt, 0 from a
+        /// refused server that has no store. A leader that sees it change
+        /// forgets what it knew of the follower's log, since a re-seeded store
+        /// may have lost entries the follower once acknowledged. The server
+        /// stamps it on the way out, like `local`.
+        // PROPOSED(D-042): store incarnations.
+        incarnation: u64,
     },
     /// The leader asks the receiver to start an election at once, without a
     /// pre-vote (thesis §3.10, leadership transfer).
@@ -143,6 +151,12 @@ pub enum Message {
         /// Whether the receiver wants more, has installed, or wants the stream to
         /// start over.
         status: SnapshotStatus,
+        /// The receiver's store incarnation, as on
+        /// [`AppendEntriesResponse`](Message::AppendEntriesResponse): on an
+        /// `Installed` answer from a re-seed, the incarnation of the store the
+        /// install built. The server stamps it on the way out.
+        // PROPOSED(D-042): store incarnations.
+        incarnation: u64,
     },
 }
 
@@ -414,6 +428,7 @@ impl Frame {
                 hint,
                 echo,
                 local,
+                incarnation,
                 ..
             } => {
                 out.put_u8(u8::from(*success));
@@ -422,6 +437,7 @@ impl Frame {
                 out.put_u64_le(*hint);
                 out.put_u64_le(*echo);
                 out.put_u64_le(*local);
+                out.put_u64_le(*incarnation);
             }
             Message::InstallSnapshot {
                 last_index,
@@ -449,6 +465,7 @@ impl Frame {
                 file,
                 offset,
                 status,
+                incarnation,
                 ..
             } => {
                 out.put_u64_le(*last_index);
@@ -457,6 +474,7 @@ impl Frame {
                 out.put_slice(file);
                 out.put_u64_le(*offset);
                 out.put_u8(status.tag());
+                out.put_u64_le(*incarnation);
             }
         }
         out.freeze()
@@ -562,6 +580,7 @@ impl Frame {
                 let hint = u64_field(&mut bytes)?;
                 let echo = u64_field(&mut bytes)?;
                 let local = u64_field(&mut bytes)?;
+                let incarnation = u64_field(&mut bytes)?;
                 Message::AppendEntriesResponse {
                     term,
                     success,
@@ -570,6 +589,7 @@ impl Frame {
                     hint,
                     echo,
                     local,
+                    incarnation,
                 }
             }
             8 => {
@@ -607,6 +627,7 @@ impl Frame {
                     return Err(bad("frame torn"));
                 }
                 let status = SnapshotStatus::of(bytes.get_u8())?;
+                let incarnation = u64_field(&mut bytes)?;
                 Message::InstallSnapshotResponse {
                     term,
                     last_index,
@@ -614,6 +635,7 @@ impl Frame {
                     file,
                     offset,
                     status,
+                    incarnation,
                 }
             }
             _ => return Err(bad("unknown message kind")),
@@ -691,12 +713,14 @@ pub fn studio(payload: &[u8]) -> Json {
             prev_index,
             match_index,
             hint,
+            incarnation,
             ..
         } => {
             fields.push(("success", Json::Bool(*success)));
             fields.push(("prevIndex", int(*prev_index)));
             fields.push(("matchIndex", int(*match_index)));
             fields.push(("hint", int(*hint)));
+            fields.push(("incarnation", int(*incarnation)));
         }
         Message::InstallSnapshot {
             last_index,
@@ -722,6 +746,7 @@ pub fn studio(payload: &[u8]) -> Json {
             file,
             offset,
             status,
+            incarnation,
             ..
         } => {
             fields.push(("lastIndex", int(*last_index)));
@@ -729,6 +754,7 @@ pub fn studio(payload: &[u8]) -> Json {
             fields.push(("file", Json::str(&String::from_utf8_lossy(file))));
             fields.push(("offset", int(*offset)));
             fields.push(("status", Json::str(status.name())));
+            fields.push(("incarnation", int(*incarnation)));
         }
     }
     Json::obj(fields)
@@ -796,6 +822,7 @@ mod tests {
                 hint: 5,
                 echo: 123_456_789,
                 local: 987_654_321,
+                incarnation: 4,
             },
             Message::InstallSnapshot {
                 term: 3,
@@ -814,6 +841,7 @@ mod tests {
                 file: Bytes::from_static(b"000001.sst"),
                 offset: 4112,
                 status: SnapshotStatus::More,
+                incarnation: 4,
             },
         ]
     }
@@ -920,5 +948,36 @@ mod tests {
         assert_eq!(type_of, Some(&Json::str("raft.install-snapshot-response")));
         let status = fields.iter().find(|(k, _)| k == "status").map(|(_, v)| v);
         assert_eq!(status, Some(&Json::str("more")));
+        let incarnation = fields
+            .iter()
+            .find(|(k, _)| k == "incarnation")
+            .map(|(_, v)| v);
+        assert_eq!(incarnation, Some(&Json::Int(4)));
+    }
+
+    /// The studio sees the responder's store incarnation on an AppendEntries
+    /// response, so a re-seeded follower's answers can be told from its old
+    /// store's (PROPOSED(D-042)).
+    #[test]
+    fn the_studio_sees_the_incarnation_on_an_append_response() {
+        let frame = Frame {
+            from: ServerId(2),
+            message: every_kind()
+                .into_iter()
+                .find(|m| matches!(m, Message::AppendEntriesResponse { .. }))
+                .expect("an AppendEntriesResponse"),
+        };
+        let Json::Object(fields) = studio(&frame.encode()) else {
+            panic!("an object")
+        };
+        let get = |name: &str| {
+            fields
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.clone())
+        };
+        assert_eq!(get("type"), Some(Json::str("raft.append-entries-response")));
+        assert_eq!(get("hint"), Some(Json::Int(5)));
+        assert_eq!(get("incarnation"), Some(Json::Int(4)));
     }
 }

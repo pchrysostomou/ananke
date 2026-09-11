@@ -409,6 +409,12 @@ pub struct Repair {
     /// then grants no vote, no pre-vote and no lease promise on it, for good.
     // PROPOSED(D-035): re-seeded servers are quarantined from voting for good.
     pub quarantined: bool,
+    /// The incarnation number the staged store carries (RAFT.md §3): the
+    /// receiver's own on an install into a live store, and a fresh one on a
+    /// re-seed, so a leader that recorded a match index against the lost store
+    /// forgets it.
+    // PROPOSED(D-042): store incarnations.
+    pub incarnation: u64,
 }
 
 /// A verified, fully-assembled stream, ready for [`Assembler::finish`].
@@ -738,6 +744,13 @@ impl<E: Environment> Assembler<E> {
         } else {
             writes.insert(store::quarantine_key(), Value::Tombstone);
         }
+        // The incarnation key, for the same reason: the streamed checkpoint
+        // carries the leader's number, and the receiver's own must win.
+        // PROPOSED(D-042): store incarnations.
+        writes.insert(
+            store::incarnation_key(),
+            Value::Live(store::encode_incarnation(repair.incarnation)),
+        );
         for entry in &repair.tail {
             writes.insert(
                 store::log_key(entry.index),
@@ -832,6 +845,7 @@ pub fn ack(term: Term, staged: (Index, Term), file: Bytes, offset: u64) -> Messa
         file,
         offset,
         status: SnapshotStatus::More,
+        incarnation: 0,
     }
 }
 
@@ -845,6 +859,7 @@ pub fn installed(term: Term, staged: (Index, Term)) -> Message {
         file: Bytes::new(),
         offset: 0,
         status: SnapshotStatus::Installed,
+        incarnation: 0,
     }
 }
 
@@ -858,5 +873,6 @@ pub fn start_over(term: Term, staged: (Index, Term)) -> Message {
         file: Bytes::new(),
         offset: 0,
         status: SnapshotStatus::Restart,
+        incarnation: 0,
     }
 }

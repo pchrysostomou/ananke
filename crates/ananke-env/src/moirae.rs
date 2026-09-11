@@ -33,6 +33,7 @@
 //! | `RaftRead` / `RaftLeaseRevoked` / `RaftQuorumLost` / `RaftTransfer` | `log` `ananke.raft.read` / `.lease-revoked` / `.quorum-lost` / `.transfer` |
 //! | `RaftConfig` / `RaftSnapshot`            | `log` `ananke.raft.config` / `.snapshot`      |
 //! | `RaftCompacted` / `RaftReseeded` / `RaftSnapshotResumed` | `log` `ananke.raft.compacted` / `.reseeded` / `.snapshot-resumed` |
+//! | `RaftProgressReset`                      | `log` `ananke.raft.progress-reset`            |
 //! | `ClientInvoke` / `ClientReturn`          | `log` `ananke.client.invoke` / `.return`      |
 //! | `TimeAdvanced`                           | nothing: every line carries `t`               |
 //!
@@ -705,6 +706,7 @@ fn convert(
             term,
             applied,
             last_index,
+            incarnation,
         } => log(
             "ananke.raft.recovered",
             Some(Json::obj(vec![
@@ -712,6 +714,7 @@ fn convert(
                 ("term", int(*term)),
                 ("applied", int(*applied)),
                 ("lastIndex", int(*last_index)),
+                ("incarnation", int(*incarnation)),
             ])),
         ),
         TraceEvent::RaftProposed {
@@ -768,6 +771,19 @@ fn convert(
                 ("server", int(*server)),
                 ("to", int(*to)),
                 ("offset", int(*offset)),
+            ])),
+        ),
+        // PROPOSED(D-042): store incarnations.
+        TraceEvent::RaftProgressReset {
+            server,
+            follower,
+            incarnation,
+        } => log(
+            "ananke.raft.progress-reset",
+            Some(Json::obj(vec![
+                ("server", int(*server)),
+                ("follower", int(*follower)),
+                ("incarnation", int(*incarnation)),
             ])),
         ),
         TraceEvent::ClientInvoke { client, seq, op } => {

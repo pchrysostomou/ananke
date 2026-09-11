@@ -191,6 +191,7 @@ fn a_leader_feeds_the_snapshot_when_a_follower_falls_below_the_prefix() {
     let outputs = leader.step(Input::SnapshotInstalled {
         to: s(2),
         index: 10,
+        incarnation: 0,
     });
     let resumed = sends(&outputs);
     assert!(
@@ -679,6 +680,7 @@ fn an_install_carries_the_receivers_identity_and_is_adopted_at_open() {
                 vote: Some(ServerId(3)),
                 tail: vec![entry(1, 6, "tail6"), entry(1, 7, "tail7")],
                 quarantined: true,
+                incarnation: 9,
             };
             assembler.finish(&staged, &repair).await.unwrap();
             assert!(adopt_staged(&env, Path::new("/follower")).await.unwrap());
@@ -693,6 +695,11 @@ fn an_install_carries_the_receivers_identity_and_is_adopted_at_open() {
             let (store, recovered) = RaftStore::open(engine.clone(), &recovery).await.unwrap();
             assert_eq!(store.term(), 7);
             assert_eq!(store.vote(), Some(ServerId(3)));
+            assert_eq!(
+                store.incarnation(),
+                9,
+                "the repair's incarnation, not the leader's (PROPOSED(D-042))"
+            );
             assert_eq!(store.applied(), 5);
             assert_eq!((store.first_index(), store.last_index()), (6, 7));
             assert_eq!(
