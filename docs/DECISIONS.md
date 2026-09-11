@@ -2095,4 +2095,171 @@ and the recorded versions, and two designated followers streamed to at once.
 
 ---
 
-_Next entry: D-044. Add one before implementing anything not covered above._
+## PROPOSED D-044 — A refusal is durable, and a refused engine does no work
+
+**Context.** The thousand-seed premerge, seed 687: server 3's engine open dropped
+SST 1 — it held sequence numbers 1..98 of the state machine — and
+`RaftStore::open` refused with `LostState { dropped: [1] }`; the node traced
+`RaftRefused` at 7.9209 s, exactly as RAFT.md §3 and D-025 require. Seven
+milliseconds later the refused server's own engine carried on working:
+
+```
+7.9274 ananke.sst.written        {"number": 4, "level": 0, "entries": 167, "firstSeq": 275, "maxSeq": 388}
+7.9303 ananke.manifest.written   {"number": 5, "flushedSeq": 388, "tables": [2, 3, 4]}   <- table 1 forgotten
+7.9341 ananke.manifest.switched  {"manifest": 5}
+7.9341 ananke.memtable.flushed   {"memtable": 1, "upTo": 388}
+7.9348 ananke.wal.segment-deleted {"segment": 2}
+```
+
+The flush of the memtable the recovery had just replayed rewrote the manifest
+without the lost table and deleted the log segment that held its records: the
+evidence of the loss, laundered away. No leader existed for the next 5.4 s —
+server 1 had been refused at 5.92 s — so no re-seed came. The schedule crashed
+server 3 at 13.32 s and restarted it at 13.53 s; this time the open found a
+self-consistent store, removed `000001.sst` as an orphan and opened clean:
+`RaftRecovered { applied: 185, last_index: 189 }`, no refusal and no install. A
+voter with a hole in its state machine rejoined and began pre-voting, and the
+sweep reported *state machine safety: server 3 recovered an applied index of 185
+but its log does not hold index 1* — the rule that a `RaftRecovered` may not
+follow a `RaftRefused` without an install between them, which is the right rule.
+
+Two flaws behind it. **A refusal is not durable**: it lives only in the running
+process, and PROPOSED D-041's marker says a directory *was* a store, not that the
+store *lost state*, so the next start decides afresh on whatever it finds. And
+**a refused engine keeps running**: its flusher, its compaction and the
+log-segment deletion that follows a flush are all still on, and the first of them
+writes over the very hole the recovery reported. RAFT.md §3 says a refused server
+"participates in nothing"; it says nothing about the engine underneath it, and
+nothing about a refusal outliving the process that made it.
+
+**Decision.** Four parts, every site marked `PROPOSED(D-044)`.
+
+*The mark.* D-041's `RAFT-STORE` marker gains a second form. A whole store's
+marker holds one line, `ananke raft store`; a lost store's holds `ananke raft
+store lost` and the refusal's reason on the line after it, word for word
+(`store.rs`: `mark_store_lost`, `Marker`, `write_marker`). It is written in place
+and synced, with the directory synced after, through `env.fs()` and never through
+the engine, which is the thing that is damaged. `refuse_lost_store` reads the
+marker first: a lost one refuses at once with `LostState::from_mark`
+(`Damage::MarkedLost`, the recorded reason carried in the new `lost_mark` field),
+before it looks at `CURRENT` at all. **Any content that is not exactly the whole
+store's line reads as lost**: the marker is written in place, so a write a crash
+cut short leaves a file that is neither, and the store it stands for is the one
+the refusal was writing about. The node writes the mark at *every* refusal,
+before the `RaftRefused` trace and before re-seed mode — the staging damage of
+D-041 included, where the store directory may still hold a whole store: a server
+refused there has acknowledged an install it no longer has, so the store under it
+is a rollback waiting to happen, which is the failure D-041's seed 96 found. A
+marker that cannot be written fails the server (`RaftServerFailed`) rather than
+leaving it refused on a disk that will open clean.
+
+*The quiesce.* `EngineRecovery::lost_writes` is the engine's own name for a hole
+in the middle of the state — a dropped table, a manifest fallback, a discarded
+log head, a log stopped at a bad checksum or a gap, a corrupt record skipped in a
+segment the tables cover — and `ananke-raft`'s `LostState::of` now asks it rather
+than repeating the rule, so the two can never disagree. With the new
+`EngineConfig::quiesce_on_loss`, an open whose recovery lost writes **never
+spawns the flusher**: no table, no manifest, no compaction, no log segment
+deleted, and `TraceEvent::EngineQuiesced` says so. `Engine::quiesce` does the same
+to a running engine, and the node calls it the moment `RaftStore::open` refuses a
+store the engine itself opened happily. Both are needed: the flag stops the flush
+that would otherwise land while the store is still being read, which is the seven
+milliseconds seed 687 lost; the call covers a refusal only the store can see. The
+flag is off by default, so an engine whose caller allows fallbacks and head gaps
+keeps the behaviour it had; the Raft node sets it.
+
+*The install clears it.* The adoption writes the marker fresh
+(`snapshot.rs::adopt_staged_under`) immediately after the switch of `CURRENT` is
+durable — the point at which the installed store is the one in force. Before the
+switch a crash must leave the old store refused, which is what the mark is for;
+after it the store in the directory is a new one and the old one's mark goes with
+it. `Assembler::finish` needs nothing: the marker lives in the store directory,
+and only the adoption puts a store there, so the re-seed in `node.rs` clears the
+mark at its next start, through the adoption, like every other install.
+
+*The variant and its fault.* `Variant::RefusalNotDurable` is the server as built:
+no mark, and an engine that keeps working. `Fault::CrashRefused` aims at it, on
+every seed, drawn from its own stream (D-031): three to five rounds, each waiting
+for the victim to rotate a memtable it has not finished flushing and crashing it
+there, then restarting it — and when the victim is already sitting refused,
+crashing it after a grace of sixty to a hundred and sixty milliseconds instead.
+Both halves are aimed, and the measurements said why. The engine as built
+launders a refusal away only if the memtable its recovery replayed is over the
+threshold and gets flushed, and a crash at an ordinary moment leaves a tail of
+*one* memtable, which replays into a memtable that never rotates: over a hundred
+release seeds, the sweep's seventy-odd refusals for a dropped table laundered
+nothing at all. A crash inside a flush leaves a tail of two, because the manifest
+in force is still the older one until the flush switches `CURRENT`. At the
+sweep's write rate a server fills a sixteen-kilobyte memtable about every two
+seconds and takes some fifteen milliseconds to flush it, so that window is a
+hundredth of the time and no crash of its own choosing finds it; the fault waits
+for it. The grace is the second measurement: the laundering flush itself takes
+those fifteen milliseconds, and a crash two milliseconds after the refusal kills
+it half-done, which leaves the store visibly damaged and the bug invisible.
+
+**What the sweep found.** At a hundred seeds, release, `RefusalNotDurable` is
+caught on 2 of 100, both the premerge's signature — *state machine safety: server
+1 recovered an applied index of 551 but its log does not hold index 1* on the
+first — and the fault is seen firing, a crash landing on a refused server, on 67
+of those hundred seeds; at the gate's twenty it is caught on 1 of 20. The correct
+server passes all hundred of both sweeps, and its coverage over them counts 851
+refusals, 77 engines quiesced, 41 refusals the store's own lost mark made, and
+687 crashes landing on a refused server. The rate is the conjunction's: a crash
+must land inside a flush, about a hundredth of the time and the reason the fault
+waits for one; its bit rot must land in a table the manifest lists, two per cent
+per block; and the crash after it must come before a leader re-seeds the server.
+The first cut of the fault, which crashed a refused server at a moment of its own
+choosing, was caught on 0 of 100 with seventy-five dropped-table refusals to work
+with and not one of them laundered: the memtable a crash at an ordinary moment
+leaves is under the threshold and is never flushed at all, which is what sent the
+aim at the flush window. A second cut, which crashed two milliseconds after the
+refusal, was caught on 0 of 100 for the opposite reason — it killed the
+laundering flush half-done, and a store the crash interrupts stays visibly
+damaged — which is what set the grace at sixty milliseconds and up. Because the
+conjunction is thin, the variant test asserts the catch at the hundred-seed tier
+and reports the rate at every tier, the way `SharedSnapshotDir` is asserted at the
+nightly's (PROPOSED D-043); what every tier asserts is that the fault fired.
+
+**Alternatives.** A mark inside the store, under tenant 0: the engine is the
+damaged thing, and writing the refusal through it is writing through the hole.
+Removing `CURRENT` at a refusal, so D-041's marker rule alone refuses every
+start: it destroys a store to express what a line of text expresses, and it is
+irreversible if the refusal was the disk's fault and not the store's. A separate
+`RAFT-LOST` file beside the marker: two files where one has two forms, and a
+sweep that removes one of them is a bug waiting to be written. Writing the mark
+by tmp-and-rename, so a torn write cannot leave a file that is neither form: a
+crash then leaves a `RAFT-STORE.tmp` that nothing sweeps, and reading an
+unrecognised marker as lost costs nothing, since the conservative direction is
+the refusing one. Clearing the mark in `Assembler::finish`, when the staged store
+is complete: the store in the directory is still the lost one until the adoption
+switches to it. Quiescing every refused engine by dropping it: a dropped engine's
+flusher still finishes the memtables it holds (`NextImmutable` stops only when the
+queue is empty), which is exactly what seed 687 shows. Refusing writes on a
+quiesced engine as well: nothing writes to a refused store, and the log taking a
+write it never flushes harms nothing. Teaching the checker that a restatement
+after a refusal is allowed when the store looks whole: it would accept the state
+that never existed, which is the thing D-022 refuses. Aiming the fault by a trace
+event for the flush rather than by waiting for one: the same watch, one indirection
+further away.
+
+**Consequences.** A refusal costs one small file write and two syncs, on a path
+that already runs at most once per start. A store refused once needs an install
+to come back, whatever the disk looks like afterwards — including the case where
+the refusal was for damage in the staging directory and the store proper was
+whole, which now costs a re-seed it did not cost before; that is the price of not
+rolling back past an install the server acknowledged. A crash between the
+adoption's switch and the marker it writes next leaves the adopted store behind a
+lost mark and costs another install, a window of one file write. A quiesced
+engine keeps a store that is bigger than it needs to be: the memtables it
+replayed are never written down and its log segments are never deleted, until an
+install replaces the directory. `Sim` gains no accessor; `TraceEvent` gains
+`EngineQuiesced`, and the moirae bridge a line for it. Every schedule now ends
+with a crash storm aimed at a flush, three to five crashes and up to two and a
+half seconds of waiting each, which lengthens a seed's run; the correct server
+passes every seed of it. The `AdoptionAsBuilt` variant of D-041 writes no lost
+mark, since it is the server before the marker existed at all, but its engine is
+still quiesced: a variant turns off its own fix and no other.
+
+---
+
+_Next entry: D-045. Add one before implementing anything not covered above._

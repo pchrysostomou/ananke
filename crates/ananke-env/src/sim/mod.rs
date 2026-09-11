@@ -512,6 +512,22 @@ impl Sim {
         self.shared.lock().trace.len()
     }
 
+    /// A copy of the records from `from` on, and nothing before them: what a
+    /// driver watching the run for an event needs, without copying the whole
+    /// trace at every look. A `from` past the end gives nothing.
+    // PROPOSED(D-044): the crash aimed at a flush in flight watches the trace in
+    // quarter-millisecond slices, and a whole-trace copy each time is the run's
+    // cost, not the watch's.
+    #[must_use]
+    pub fn trace_from(&self, from: usize) -> Vec<TraceRecord> {
+        let state = self.shared.lock();
+        state
+            .trace
+            .get(from..)
+            .map(<[TraceRecord]>::to_vec)
+            .unwrap_or_default()
+    }
+
     /// Everything the moirae export needs, copied out from under the lock.
     pub(crate) fn snapshot(&self) -> Snapshot {
         let st = self.shared.lock();

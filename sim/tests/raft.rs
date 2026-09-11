@@ -98,6 +98,31 @@ fn seed_5909_which_the_nightly_found_stays_green() {
     raft::run(5909, Variant::Correct).check().unwrap();
 }
 
+/// The thousand-seed premerge's seed 687: server 3's engine open dropped SST 1 —
+/// it held sequence numbers 1..98 of the state machine — and the store was
+/// refused with `LostState { dropped: [1] }`, traced at 7.9209 s as RAFT.md §3
+/// and D-025 require. Seven milliseconds later the refused server's own engine
+/// flushed the memtable the recovery had replayed: table 4, then manifest 5
+/// listing tables 2, 3 and 4 with table 1 forgotten, `CURRENT` switched to it,
+/// and log segment 2 deleted. The evidence of the loss was laundered away. No
+/// leader existed for the next 5.4 s, so no re-seed came; the schedule crashed
+/// server 3 at 13.32 s and restarted it at 13.53 s, the open found a
+/// self-consistent store, removed `000001.sst` as an orphan and opened clean —
+/// `RaftRecovered { applied: 185, last_index: 189 }`, no refusal and no install
+/// — and a voter with a hole in its state machine rejoined and began pre-voting.
+/// State machine safety reported the restatement whose log does not hold the
+/// index 1 it claimed to have applied. A refusal is now recorded in the store's
+/// marker before anything else and refuses every later open until an install
+/// replaces the store, and the refused engine is quiesced (PROPOSED D-044). Said plainly: the fixed tree's schedule
+/// for this seed diverges from the premerge's — D-044 appends a crash aimed at
+/// refused servers to every schedule, which moves every seed's interleaving — so
+/// this pin holds the seed green rather than replaying the failure; the shape
+/// itself is carried by `RefusalNotDurable` below. Stays in the gate.
+#[test]
+fn seed_687_which_the_premerge_found_stays_green() {
+    raft::run(687, Variant::Correct).check().unwrap();
+}
+
 /// The positive control: the correct server satisfies every property on every
 /// seed, and the sweep reached the states that matter.
 #[test]
@@ -190,6 +215,53 @@ fn a_server_whose_adoption_is_as_built_is_caught() {
     is_caught(Variant::AdoptionAsBuilt);
 }
 
+/// The refusal that lives only in the running process, and the refused engine
+/// that keeps working: the server as built before PROPOSED D-044. Its window is
+/// a server refused for lost state whose engine then flushes the memtable the
+/// recovery replayed — a manifest without the dropped table, `CURRENT` switched
+/// to it and the log segments that held the lost records deleted — and a crash
+/// and restart before a leader re-seeds it, after which the store is
+/// self-consistent and opens clean. State machine safety reports the
+/// restatement whose recovered applied index its log cannot account for, which
+/// is how the thousand-seed premerge's seed 687 read.
+///
+/// `Fault::CrashRefused` aims at that window: the replayed memtable is over the
+/// threshold only when the crash before it landed inside a flush, which is a
+/// hundredth of the time unaimed, and a crash on a server already sitting
+/// refused is the restart that exposes the laundered store. What every tier must
+/// see is the fault firing — a crash landing on a refused server — so that a
+/// sweep which passes is known to have injected it. The pair rule holds because
+/// the correct server passes the same seeds above.
+#[test]
+fn a_server_whose_refusal_is_not_durable_is_caught() {
+    let outcomes: Vec<(Option<String>, usize)> = sweep(seeds(), |seed| {
+        let report = raft::run(seed, Variant::RefusalNotDurable);
+        (report.check().err(), crashes_while_refused(&report))
+    });
+    let caught: Vec<&String> = outcomes.iter().filter_map(|(v, _)| v.as_ref()).collect();
+    let fired = outcomes.iter().filter(|(_, hits)| *hits > 0).count();
+    eprintln!(
+        "RefusalNotDurable: caught on {} of {} seeds, crashed a refused server on {fired} seeds, first: {}",
+        caught.len(),
+        seeds(),
+        caught.first().map_or("", |v| v.as_str())
+    );
+    assert!(
+        fired > 0,
+        "no crash ever landed on a refused server: the fault was not injected"
+    );
+    // The catch needs three things of one crash: it must land inside a flush, so
+    // that the open after it replays two memtables; its bit rot must land in a
+    // table the manifest lists, so that open is refused; and the crash after it
+    // must come before a leader re-seeds the server. That is a thin conjunction
+    // — two of a hundred release seeds, one of the gate's twenty — so it is
+    // asserted at the hundred-seed tier and reported at every tier, as
+    // `SharedSnapshotDir` is at the nightly's (PROPOSED D-043).
+    if seeds() >= 100 {
+        assert!(!caught.is_empty(), "RefusalNotDurable was never caught");
+    }
+}
+
 /// The leader that ignores the store incarnation its followers answer with
 /// (RAFT.md §3, PROPOSED(D-042)): a follower refused for lost state and re-seeded
 /// from a snapshot comes back below the match index the leader recorded for it,
@@ -252,6 +324,30 @@ fn a_leader_that_shares_one_snapshot_directory_and_streams_one_follower_at_a_tim
     if seeds() >= 10_000 {
         assert!(!caught.is_empty(), "SharedSnapshotDir was never caught");
     }
+}
+
+/// How many crashes landed on a server that was sitting refused for lost state:
+/// what [`Fault::CrashRefused`] aims at, counted from the trace so a sweep that
+/// passes is known to have injected the fault (PROPOSED D-044). A server is
+/// refused from its `RaftRefused` until its next restatement.
+fn crashes_while_refused(report: &raft::Report) -> usize {
+    let mut refused: BTreeSet<u64> = BTreeSet::new();
+    let mut crashes = 0;
+    for event in report.events() {
+        match event {
+            TraceEvent::RaftRefused { server, .. } => {
+                refused.insert(server);
+            }
+            TraceEvent::RaftRecovered { server, .. } => {
+                refused.remove(&server);
+            }
+            TraceEvent::NodeCrashed { node } if refused.contains(&u64::from(node.get())) => {
+                crashes += 1;
+            }
+            _ => {}
+        }
+    }
+    crashes
 }
 
 /// Whether some server took a snapshot at the index it had already taken: the
@@ -398,6 +494,13 @@ struct Coverage {
     adoption_crash_faults: usize,
     adoptions: usize,
     marker_refusals: usize,
+    // PROPOSED(D-044): the crash-after-refusal fault, the crashes it landed on a
+    // refused server, the engines quiesced, and the refusals the store's own
+    // lost mark made.
+    refusal_crash_faults: usize,
+    refused_crashes: usize,
+    quiesced_engines: usize,
+    lost_mark_refusals: usize,
     bit_rot: usize,
     torn_writes: usize,
     puts: u64,
@@ -525,6 +628,21 @@ impl Coverage {
             .refused
             .iter()
             .filter(|(_, reason)| reason.contains(STORE_MARKER))
+            .count();
+        // PROPOSED(D-044): the crash-after-refusal arm, the crashes it landed,
+        // the engines quiesced and the refusals the lost mark itself made.
+        self.refusal_crash_faults += report
+            .schedule
+            .faults
+            .iter()
+            .filter(|f| matches!(f, Fault::CrashRefused { .. }))
+            .count();
+        self.refused_crashes += crashes_while_refused(report);
+        self.quiesced_engines += report.count(|e| matches!(e, TraceEvent::EngineQuiesced { .. }));
+        self.lost_mark_refusals += report
+            .refused
+            .iter()
+            .filter(|(_, reason)| reason.contains("marker says this store lost state"))
             .count();
         self.bit_rot += report.count(|e| matches!(e, TraceEvent::BlockRotted { .. }));
         self.torn_writes += report.count(|e| matches!(e, TraceEvent::WriteTorn { .. }));

@@ -14,7 +14,7 @@ use ananke_raft::apply::{Command, Outcome};
 use ananke_raft::client::{Reply, Request, Response};
 use ananke_raft::core::Persist;
 use ananke_raft::message::{Frame, Message};
-use ananke_raft::store::RaftStore;
+use ananke_raft::store::{RaftStore, marker_path};
 use ananke_raft::types::{Entry, Payload};
 use ananke_raft::{NodeConfig, RaftConfig, ServerId, invariants, run};
 use ananke_storage::manifest::sst_path;
@@ -320,4 +320,150 @@ fn a_server_whose_store_lost_state_asks_to_be_reseeded_and_grants_nothing() {
         })
         .count();
     assert_eq!(raft_events_of_one, 0, "the refused server stepped its core");
+}
+
+/// A refusal is durable and the refused engine does no work (PROPOSED D-044).
+/// The same store as above — two hundred entries, a table flushed, the table
+/// then lost — and the server that refuses it records the loss in the store's
+/// marker before it traces the refusal, writes nothing over it afterwards, and
+/// is refused again at the next start on the mark alone. Without the mark the
+/// engine's own flush of the memtable the recovery replayed would rewrite the
+/// manifest without the dropped table and delete the log segments that held its
+/// records, and the next start would find a store that looks whole (the
+/// thousand-seed premerge, seed 687).
+#[test]
+fn a_refusal_is_durable_and_the_refused_engine_does_no_work() {
+    let mut sim = Sim::new(SimConfig::new(7));
+    let node = sim.add_node();
+    // A log big enough to flush a table, and more records past it in the log.
+    let table = on_node(&mut sim, node, |env| {
+        Box::pin(async move {
+            let (engine, recovery) = Engine::open(env.clone(), engine_config()).await.unwrap();
+            let engine = Arc::new(engine);
+            let (store, _) = RaftStore::open(engine.clone(), &recovery).await.unwrap();
+            let append = |from: u64, to: u64| {
+                (from..=to)
+                    .map(|index| Entry {
+                        term: 1,
+                        index,
+                        payload: Payload::Command(Bytes::from(vec![b'x'; 100])),
+                    })
+                    .collect::<Vec<_>>()
+            };
+            store
+                .persist(&Persist {
+                    term: 1,
+                    vote: Some(ServerId(1)),
+                    truncate_from: None,
+                    append: append(1, 200),
+                    config: None,
+                    compact_to: None,
+                })
+                .await
+                .unwrap();
+            while engine.ssts() == 0 {
+                env.clock().sleep(Duration::from_millis(1)).await;
+            }
+            let table = engine.levels().concat()[0].number;
+            // Past the flush: these are in the log alone, and are what the
+            // refused engine would flush over the loss with.
+            store
+                .persist(&Persist {
+                    term: 1,
+                    vote: Some(ServerId(1)),
+                    truncate_from: None,
+                    append: append(201, 260),
+                    config: None,
+                    compact_to: None,
+                })
+                .await
+                .unwrap();
+            table
+        })
+    });
+    // The disk loses the table.
+    on_node(&mut sim, node, |env| {
+        Box::pin(async move {
+            let fs = env.fs();
+            fs.remove_file(&sst_path(Path::new(DIR), table))
+                .await
+                .unwrap();
+            fs.sync_dir(Path::new(DIR)).await.unwrap();
+        })
+    });
+    let from = sim.trace().len();
+    let env = sim.env(node);
+    let inner = env.clone();
+    env.spawn("raft", async move {
+        let _ = run(inner, node_config(1, &[1, 2, 3])).await;
+    });
+    sim.run_for(Duration::from_millis(200));
+    let records = sim.trace();
+    assert!(
+        records[from..]
+            .iter()
+            .any(|r| matches!(&r.event, TraceEvent::RaftRefused { server: 1, .. })),
+        "the store is refused for the dropped table"
+    );
+    // The mark is durable, and it was written before the refusal was traced.
+    let marker = sim
+        .durable_contents(node, &marker_path(Path::new(DIR)))
+        .expect("the store carries a marker");
+    let marker = String::from_utf8(marker).expect("the marker is text");
+    assert!(
+        marker.starts_with("ananke raft store lost\n"),
+        "the marker says the store lost state: {marker:?}"
+    );
+    assert!(
+        marker.contains("dropped tables"),
+        "the marker carries the refusal's reason: {marker:?}"
+    );
+    // The refused engine wrote nothing over the loss, before the refusal or
+    // after it: no table, no manifest, no switch, no segment deleted.
+    let wrote = records[from..]
+        .iter()
+        .filter(|r| {
+            matches!(
+                r.event,
+                TraceEvent::SstWritten { .. }
+                    | TraceEvent::ManifestWritten { .. }
+                    | TraceEvent::CurrentSwitched { .. }
+                    | TraceEvent::WalSegmentDeleted { .. }
+            )
+        })
+        .count();
+    assert_eq!(wrote, 0, "the refused engine wrote over the loss");
+    assert!(
+        records[from..]
+            .iter()
+            .any(|r| matches!(r.event, TraceEvent::EngineQuiesced { .. })),
+        "the engine was quiesced"
+    );
+    // The next start is refused on the mark alone, whatever is on disk: the
+    // store's own files are all there and the engine would open them.
+    sim.crash(node);
+    sim.restart(node);
+    let from = sim.trace().len();
+    let env = sim.env(node);
+    let inner = env.clone();
+    env.spawn("raft", async move {
+        let _ = run(inner, node_config(1, &[1, 2, 3])).await;
+    });
+    sim.run_for(Duration::from_millis(200));
+    let records = sim.trace();
+    let reason = records[from..]
+        .iter()
+        .find_map(|r| match &r.event {
+            TraceEvent::RaftRefused { server: 1, reason } => Some(reason.clone()),
+            _ => None,
+        })
+        .expect("the marked store is refused at the next start too");
+    assert!(
+        reason.contains("marker says this store lost state"),
+        "refused on the mark: {reason}"
+    );
+    assert!(
+        reason.contains("dropped tables"),
+        "carrying the reason the first refusal recorded: {reason}"
+    );
 }

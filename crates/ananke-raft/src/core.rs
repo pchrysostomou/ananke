@@ -109,6 +109,22 @@ pub enum Variant {
     /// directories and the streams are the server's business (`snapshot.rs`,
     /// `node.rs`); the core ignores this variant.
     SharedSnapshotDir,
+    /// A refusal that lives only in the running process, and a refused engine
+    /// that keeps working: the server as built before PROPOSED D-044. Nothing
+    /// records the loss in the store directory, so the next start decides afresh
+    /// on whatever the refused engine has since made of the disk; and that
+    /// engine, opened on a recovery which dropped a table, still flushes the
+    /// memtable the recovery replayed — a manifest without the dropped table,
+    /// `CURRENT` switched to it, and the log segments that held the lost records
+    /// deleted. The store is self-consistent by then, so a crash and restart
+    /// opens it clean: a voter with a hole in its state machine restates
+    /// `RaftRecovered`, rejoins and pre-votes, which state machine safety
+    /// reports at the restatement whose log cannot account for the applied index
+    /// it recovered (the thousand-seed premerge, seed 687). The marker and the
+    /// quiesce are the server's business (`store.rs`, `node.rs`,
+    /// `ananke-storage`); the core ignores this variant.
+    // PROPOSED(D-044): a durable refusal, and a refused engine that does no work.
+    RefusalNotDurable,
 }
 
 /// The core's parameters.

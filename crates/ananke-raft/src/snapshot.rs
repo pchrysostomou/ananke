@@ -416,6 +416,14 @@ pub async fn adopt_staged_under<E: Environment>(
     )
     .await?;
     fs.sync_dir(engine_dir).await?;
+    // PROPOSED(D-044): the store in this directory is the installed one now, so
+    // the marker is written fresh and whatever the marker said about the store
+    // before it — that it lost state — goes with that store. Straight after the
+    // switch, so the window in which a crash leaves the adopted store behind a
+    // lost mark, and costs another install, is the smallest it can be; before
+    // it, a crash would leave the old store in force with nothing saying it lost
+    // state, which is what the mark exists to prevent.
+    store::mark_store(env, engine_dir).await?;
     // The old store's files, only now: everything of the store proper that was
     // on disk before the copies, none of which shares a name with a copy. Their
     // log segments go with them; the adopted store starts with an empty log.

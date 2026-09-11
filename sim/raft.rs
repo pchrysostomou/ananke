@@ -327,11 +327,67 @@ pub enum Fault {
         /// How many times it is crashed.
         crashes: u64,
     },
+    /// A crash storm aimed at the window a refusal has to be laundered in
+    /// (PROPOSED(D-044)). Each round waits for `server` to rotate a memtable it
+    /// has not finished flushing and crashes it there: until that flush switches
+    /// `CURRENT`, the manifest in force is the older one, so the log tail is two
+    /// memtables and the open after the crash replays enough to fill a memtable
+    /// and rotate it again. When that open is also refused for lost state — the
+    /// same crash's bit rot landing in a table the manifest lists — the engine
+    /// as built flushes what it replayed and writes over the loss, and the crash
+    /// after *that* is the one that matters.
+    ///
+    /// Both halves are needed, and the second follows from the first. The
+    /// engine as built launders a refusal away only if the memtable its recovery
+    /// replayed is over the threshold and is flushed: a table, a manifest
+    /// without the dropped one, `CURRENT` switched to it, and the log segments
+    /// that held the lost records deleted. A crash at an ordinary moment leaves
+    /// a tail of *one* memtable, which replays into a memtable that never
+    /// rotates and is never flushed, so nothing is written over the loss and the
+    /// store stays visibly damaged: over a hundred release seeds the sweep's
+    /// sixty-odd refusals laundered nothing at all, and the aim is what makes
+    /// the replay big enough. At the sweep's write rate a server fills a
+    /// sixteen-kilobyte memtable about every two seconds and takes some fifteen
+    /// milliseconds to flush it, so the window is a hundredth of the time and no
+    /// crash at a moment of its own choosing finds it. Once the loss is
+    /// laundered the store is self-consistent, and the next crash and restart
+    /// opens it clean — no refusal, no install — so a voter with a hole in its
+    /// state machine rejoins and pre-votes, which state machine safety reports
+    /// at the restatement whose log cannot account for the applied index it
+    /// recovered (the thousand-seed premerge, seed 687).
+    ///
+    /// With the fix there is nothing to aim at: the refused engine is quiesced
+    /// before it can flush, and the store's marker says it lost state, so every
+    /// restart is refused again until an install replaces the store. A victim
+    /// already sitting refused when a round comes is crashed after `grace`
+    /// instead, without waiting for a flush it will never make. If no flush
+    /// begins within [`FLUSH_WAIT_BUDGET`] the round crashes at the budget's
+    /// end anyway, which is a crash at an ordinary moment, the sweep's usual
+    /// kind. Drawn from its own `moirae_sched` stream ("refusal-crash"), never
+    /// lengthening the shared schedule stream or the other crashes' (D-031).
+    CrashRefused {
+        /// The server crashed and restarted; the leader's neighbour if it leads
+        /// when the fault starts.
+        server: u64,
+        /// How long the victim stays down after each crash.
+        down: Duration,
+        /// How long after a refusal the crash lands: time enough for the engine
+        /// as built to finish flushing what the recovery replayed, which takes
+        /// some fifteen milliseconds at the sweep's disk latencies.
+        grace: Duration,
+        /// How many times it is crashed.
+        crashes: u64,
+    },
 }
 
 /// The longest a [`Fault::CrashInstalling`] waits for an install to stream
 /// before giving up and doing nothing.
 pub const INSTALL_WAIT_BUDGET: Duration = Duration::from_millis(4000);
+
+/// The longest a [`Fault::CrashRefused`] waits for its victim to begin flushing
+/// a memtable before crashing it anyway. A server fills a sixteen-kilobyte
+/// memtable about every two seconds at the sweep's write rate. PROPOSED(D-044).
+pub const FLUSH_WAIT_BUDGET: Duration = Duration::from_millis(2500);
 
 /// The longest a [`Fault::CrashAdopting`] waits, after the install's completion
 /// or a restart, for the adoption's first durable change to the store directory
@@ -484,6 +540,19 @@ impl Schedule {
             crashes: 16 + adopt.below(17),
         });
         gaps.push(ms(&mut adopt, 450, 700));
+        // A crash storm aimed at the laundering window of a refusal, on every
+        // seed, appended last: the adoption storm before it is where the disk's
+        // rot turns into refusals, and a server left refused by it takes this
+        // storm's crashes straight away. Its own stream, so no other arm's dice
+        // move when this one changes (D-031). PROPOSED(D-044).
+        let mut refused = moirae_sched::stream(seed, "refusal-crash");
+        faults.push(Fault::CrashRefused {
+            server: 1 + refused.below(SERVERS),
+            down: ms(&mut refused, 10, 40),
+            grace: ms(&mut refused, 60, 160),
+            crashes: 3 + refused.below(3),
+        });
+        gaps.push(ms(&mut refused, 450, 700));
         // Clocks, as the module documentation says: within the bound, or one
         // server slow and two fast, moderately or severely.
         let within = rng.below(2) == 0;
@@ -604,6 +673,14 @@ impl Schedule {
                         + INSTALL_WAIT_BUDGET
                         + (ADOPTION_WAIT_BUDGET + *down) * u32::try_from(*crashes).expect("small")
                 }
+                // PROPOSED(D-044): two crashes a round, either side of the
+                // catch-up, or one after the grace when the victim is refused.
+                Fault::CrashRefused {
+                    down,
+                    grace,
+                    crashes,
+                    ..
+                } => (FLUSH_WAIT_BUDGET + *grace + *down) * u32::try_from(*crashes).expect("small"),
             })
             .sum();
         let trials: Duration = self
@@ -1373,7 +1450,7 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
         last_heal = sim.now();
         advance(&mut sim, TRIAL_GAP, &mut watch);
     }
-    let mut figure8s = 0u64;
+    let mut bursts = 0u64;
     for (fault, gap) in schedule.faults.iter().zip(schedule.gaps.iter()) {
         if watch.stopped.is_some() {
             break;
@@ -1487,6 +1564,41 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
                     }
                 }
             }
+            Fault::CrashRefused {
+                server,
+                down,
+                grace,
+                crashes,
+            } => {
+                // PROPOSED(D-044): each round crashes the victim inside a flush
+                // it has begun and not finished, so a restart that is refused
+                // replays more than a memtable and the engine as built flushes
+                // over the loss; a victim already sitting refused is crashed
+                // after the grace instead, which is the shape seed 687 hit.
+                // Every crash is another roll of the disk's dice.
+                let leader = leader_now(&sim);
+                let victim = if *server == leader {
+                    server % SERVERS + 1
+                } else {
+                    *server
+                };
+                let mut scanned = 0;
+                let mut refused: BTreeSet<u64> = BTreeSet::new();
+                for _ in 0..*crashes {
+                    if watch.stopped.is_some() {
+                        break;
+                    }
+                    refreshed_refused(&sim, &mut scanned, &mut refused);
+                    if refused.contains(&victim) {
+                        advance(&mut sim, *grace, &mut watch);
+                    } else {
+                        flush_in_flight(&mut sim, &mut watch, victim);
+                    }
+                    sim.crash(node_of_server(victim));
+                    advance(&mut sim, *down, &mut watch);
+                    restart(&mut sim, victim);
+                }
+            }
             Fault::StaleSender {
                 server,
                 one_way,
@@ -1543,10 +1655,10 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
                 let mute = (1..=SERVERS)
                     .find(|&s| s != leader && s != behind)
                     .expect("three servers");
-                figure8s += 1;
+                bursts += 1;
                 let env = sim.env(admin);
                 let inner = env.clone();
-                let (n, target, puts) = (figure8s, leader, *count);
+                let (n, target, puts) = (bursts, leader, *count);
                 env.spawn("burst", async move {
                     burst(inner, n, target, puts).await;
                 });
@@ -1712,6 +1824,80 @@ fn install_completed(sim: &mut Sim, watch: &mut Watch, victim: u64) -> bool {
         scanned = records.len();
     }
     false
+}
+
+/// Reads the trace from `scanned` on into `refused`, the servers sitting refused
+/// for lost state: refused ([`TraceEvent::RaftRefused`]) with no restatement
+/// since, however long ago, since a refused server comes back only through an
+/// install (RAFT.md §3). What [`Fault::CrashRefused`] asks of its victim before
+/// each round. PROPOSED(D-044).
+fn refreshed_refused(sim: &Sim, scanned: &mut usize, refused: &mut BTreeSet<u64>) {
+    let records = sim.trace_from(*scanned);
+    *scanned += records.len();
+    for record in &records {
+        match &record.event {
+            TraceEvent::RaftRefused { server, .. } => {
+                refused.insert(*server);
+            }
+            TraceEvent::RaftRecovered { server, .. } => {
+                refused.remove(server);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Advances the run in small slices until `victim` has rotated a memtable and
+/// not yet flushed it, or [`FLUSH_WAIT_BUDGET`] runs out: the moment
+/// [`Fault::CrashRefused`] crashes it. A flush writes and syncs its table, then
+/// the manifest that lists it, then switches `CURRENT`; until that switch the
+/// manifest in force is the older one, so a crash inside the flush leaves a log
+/// tail of two memtables rather than one, and the open after it replays enough
+/// to fill a memtable and rotate it. That rotation is what gives the engine as
+/// built something to flush over a refusal with, which is the laundering
+/// PROPOSED D-044 stops. The safety folds are skipped inside the small slices,
+/// as in [`install_landing`], and the trace cap still stops a runaway.
+/// PROPOSED(D-044).
+fn flush_in_flight(sim: &mut Sim, watch: &mut Watch, victim: u64) {
+    if watch.stopped.is_some() {
+        return;
+    }
+    let node = node_of_server(victim);
+    let step = Duration::from_millis(5);
+    let mut scanned = sim.trace_len();
+    let mut pending: BTreeSet<u64> = BTreeSet::new();
+    let mut waited = Duration::ZERO;
+    while waited < FLUSH_WAIT_BUDGET {
+        sim.run_for(step);
+        waited += step;
+        let len = sim.trace_len();
+        if len > TRACE_CAP {
+            watch.stopped = Some(format!(
+                "runaway: {len} trace records by {:?}, over the cap of {TRACE_CAP}",
+                sim.now()
+            ));
+            return;
+        }
+        let records = sim.trace_from(scanned);
+        scanned += records.len();
+        for record in &records {
+            if record.node != Some(node) {
+                continue;
+            }
+            match &record.event {
+                TraceEvent::MemtableRotated { memtable, .. } => {
+                    pending.insert(*memtable);
+                }
+                TraceEvent::MemtableFlushed { memtable, .. } => {
+                    pending.remove(memtable);
+                }
+                _ => {}
+            }
+        }
+        if !pending.is_empty() {
+            return;
+        }
+    }
 }
 
 /// A name the store proper is made of, as the adoption sees it: `CURRENT`, a
