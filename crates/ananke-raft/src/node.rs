@@ -35,7 +35,7 @@
 //!   reads them, and hands the repair over; the completed install then retires this
 //!   incarnation.
 //!
-//! A server whose store is refused ([`LostState`](crate::store::LostState)) traces
+//! A server whose store is refused ([`LostState`]) traces
 //! [`TraceEvent::RaftRefused`] and runs in *re-seed mode* (RAFT.md §3): its socket
 //! stays bound but it participates in nothing — it grants no vote and no pre-vote
 //! and answers no AppendEntries with content. It answers every AppendEntries with a
@@ -81,7 +81,7 @@ use crate::core::{Input, Output, Raft, RaftConfig, SnapshotAction, Variant};
 use crate::message::{Frame, Message, SnapshotStatus};
 use crate::queue::Queue;
 use crate::snapshot::{self, Assembler, Feed, Repair, Sender, Staged};
-use crate::store::{RaftStore, Recovered};
+use crate::store::{LostState, RaftStore, Recovered, mark_store, refuse_lost_store};
 use crate::types::{Configuration, Entry, Index, Payload, ServerId, Term};
 
 /// What one server needs to run.
@@ -272,15 +272,49 @@ pub async fn run<E: Environment>(env: E, config: NodeConfig) -> io::Result<()> {
     });
 
     loop {
-        if let Err(error) = snapshot::adopt_staged(&env, &engine.dir).await {
-            env.trace(TraceEvent::RaftServerFailed {
-                server,
-                reason: format!("adopting an installed snapshot: {error}"),
-            });
-            return Err(error);
+        // PROPOSED(D-041): a staging directory whose CURRENT exists but cannot
+        // be read is a damaged install, refused like a store whose recovery lost
+        // state and never swept; the server waits in re-seed mode for a leader's
+        // stream, which replaces the staging directory.
+        let adopted = match snapshot::adopt_staged_under(&env, &engine.dir, raft.variant).await {
+            Ok(adopted) => adopted,
+            Err(error) if LostState::from_io(&error).is_some() => {
+                env.trace(TraceEvent::RaftRefused {
+                    server,
+                    reason: error.to_string(),
+                });
+                match reseed(&env, id, &sock, &addrs, &raft, &engine.dir, &inbox).await {
+                    Next::Closed => return Ok(()),
+                    Next::Reinstall => continue,
+                }
+            }
+            Err(error) => {
+                env.trace(TraceEvent::RaftServerFailed {
+                    server,
+                    reason: format!("adopting an installed snapshot: {error}"),
+                });
+                return Err(error);
+            }
+        };
+        if adopted {
+            env.trace(TraceEvent::RaftAdopted { server });
         }
-        let opened = match Engine::open(env.clone(), engine.clone()).await {
-            Ok((opened, recovery)) => RaftStore::open(Arc::new(opened), &recovery).await,
+        // PROPOSED(D-041): a directory that carries the store marker but no valid
+        // CURRENT is a lost store, never a fresh one; the engine alone would open
+        // it fresh once nothing else remains (D-024). The as-built variant is the
+        // server before the marker existed: it neither checks nor writes one, so
+        // its disk sees exactly the operations the nightly's did.
+        let as_built = raft.variant == Variant::AdoptionAsBuilt;
+        let marked = if as_built {
+            Ok(())
+        } else {
+            refuse_lost_store(&env, &engine.dir).await
+        };
+        let opened = match marked {
+            Ok(()) => match Engine::open(env.clone(), engine.clone()).await {
+                Ok((opened, recovery)) => RaftStore::open(Arc::new(opened), &recovery).await,
+                Err(error) => Err(error),
+            },
             Err(error) => Err(error),
         };
         let (store, recovered) = match opened {
@@ -298,6 +332,15 @@ pub async fn run<E: Environment>(env: E, config: NodeConfig) -> io::Result<()> {
                 }
             }
         };
+        // PROPOSED(D-041): the marker, written once the directory has opened as a
+        // store — a fresh directory at its first open — and kept for good.
+        if !as_built && let Err(error) = mark_store(&env, &engine.dir).await {
+            env.trace(TraceEvent::RaftServerFailed {
+                server,
+                reason: format!("marking the store: {error}"),
+            });
+            return Err(error);
+        }
         let next = incarnation(
             &env,
             id,

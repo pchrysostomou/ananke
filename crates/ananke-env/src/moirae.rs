@@ -32,7 +32,7 @@
 //! | `RaftRecovered` / `RaftProposed` / `RaftRefused` / `RaftServerFailed` / `RaftInboxDropped` | `log` `ananke.raft.recovered` / `.proposed` / `.refused` / `.failed` / `.inbox-dropped` |
 //! | `RaftRead` / `RaftLeaseRevoked` / `RaftQuorumLost` / `RaftTransfer` | `log` `ananke.raft.read` / `.lease-revoked` / `.quorum-lost` / `.transfer` |
 //! | `RaftConfig` / `RaftSnapshot`            | `log` `ananke.raft.config` / `.snapshot`      |
-//! | `RaftCompacted` / `RaftReseeded` / `RaftSnapshotResumed` | `log` `ananke.raft.compacted` / `.reseeded` / `.snapshot-resumed` |
+//! | `RaftCompacted` / `RaftReseeded` / `RaftSnapshotResumed` / `RaftAdopted` | `log` `ananke.raft.compacted` / `.reseeded` / `.snapshot-resumed` / `.adopted` |
 //! | `ClientInvoke` / `ClientReturn`          | `log` `ananke.client.invoke` / `.return`      |
 //! | `TimeAdvanced`                           | nothing: every line carries `t`               |
 //!
@@ -760,6 +760,11 @@ fn convert(
         ),
         TraceEvent::RaftReseeded { server } => log(
             "ananke.raft.reseeded",
+            Some(Json::obj(vec![("server", int(*server))])),
+        ),
+        // PROPOSED(D-041): the crash-safe adoption and the store identity marker.
+        TraceEvent::RaftAdopted { server } => log(
+            "ananke.raft.adopted",
             Some(Json::obj(vec![("server", int(*server))])),
         ),
         TraceEvent::RaftSnapshotResumed { server, to, offset } => log(

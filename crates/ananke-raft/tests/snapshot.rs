@@ -8,18 +8,22 @@
 //! that carries the leader's identity when the install never finished — the state
 //! the sweep's crash-mid-install seeds must catch.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ananke_env::sim::{Sim, SimConfig, SimEnv};
-use ananke_env::{Environment, TraceEvent};
+use ananke_env::{Environment, File, FileSystem, OpenOptions, TraceEvent};
 use ananke_raft::apply::{Command, apply_command, user_key};
 use ananke_raft::core::{Input, Output, Persist, Raft, RaftConfig, Role, SnapshotAction, Variant};
 use ananke_raft::message::Message;
 use ananke_raft::snapshot::{Assembler, Feed, Repair, Sender, adopt_staged, staging_dir, take};
-use ananke_raft::store::RaftStore;
+use ananke_raft::store::{
+    Damage, LostState, RaftStore, STORE_MARKER, mark_store, marker_path, refuse_lost_store,
+};
 use ananke_raft::types::{Configuration, Entry, Index, Payload, ServerId, Term};
+use ananke_storage::manifest;
 use ananke_storage::{Engine, EngineConfig};
 use bytes::Bytes;
 
@@ -770,6 +774,432 @@ fn the_variant_that_writes_current_early_adopts_the_leaders_state_on_a_crash() {
             let record = recovered.snapshot.expect("the leader's record");
             assert!(record.taken, "the leader's own record, not an install's");
             assert!(!recovered.quarantined, "no repair, no quarantine");
+        })
+    });
+}
+
+/// A follower store at `/follower` with an identity of its own — term 3, a vote
+/// for server 2, three entries of term 1 with two applied — marked as a store,
+/// so an adoption's effect on both is visible.
+async fn build_follower(env: &SimEnv) {
+    let (engine, recovery) = Engine::open(env.clone(), engine_config("/follower"))
+        .await
+        .unwrap();
+    let (store, _) = RaftStore::open(Arc::new(engine), &recovery).await.unwrap();
+    store
+        .persist(&Persist {
+            term: 3,
+            vote: Some(ServerId(2)),
+            truncate_from: None,
+            append: (1..=3u64)
+                .map(|index| entry(1, index, &format!("own{index}")))
+                .collect(),
+            config: None,
+            compact_to: None,
+        })
+        .await
+        .unwrap();
+    for index in 1..=2u64 {
+        let command = Command::Put {
+            key: Bytes::from(format!("own{index}")),
+            value: Bytes::from(format!("mine{index}")),
+        };
+        apply_command(&store, index, Some(&command)).await.unwrap();
+    }
+    mark_store(env, Path::new("/follower")).await.unwrap();
+}
+
+/// Opens `/follower` the way the server does — the adoption first, then the
+/// marker check, then the engine — and returns whether a store was adopted with
+/// the store's term and vote, or the refusal's reason.
+async fn open_follower(env: &SimEnv) -> Result<(bool, Term, Option<ServerId>), String> {
+    let adopted = adopt_staged(env, Path::new("/follower"))
+        .await
+        .map_err(|e| e.to_string())?;
+    refuse_lost_store(env, Path::new("/follower"))
+        .await
+        .map_err(|e| e.to_string())?;
+    let (engine, recovery) = Engine::open(env.clone(), engine_config("/follower"))
+        .await
+        .map_err(|e| e.to_string())?;
+    let (store, _) = RaftStore::open(Arc::new(engine), &recovery)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok((adopted, store.term(), store.vote()))
+}
+
+/// The crash-safe adoption (PROPOSED D-041): a completed install at `/follower`
+/// is adopted while the disk takes its time, and the node crashes partway — at a
+/// different point on every seed. Whatever the point, what is durable afterwards
+/// is a store: either the old store's `CURRENT` still naming the old manifest
+/// with that manifest on disk, or the adopted store's, never neither; the start
+/// that follows adopts (again, on the same staged bytes) or finds the adoption
+/// already retired, and opens the receiver's identity — never a fresh store, and
+/// never the old one, since the staged install outlives every crash before its
+/// `CURRENT` is retired. The marker survives it all.
+#[test]
+fn a_crash_inside_the_adoption_leaves_a_store_and_the_next_start_adopts() {
+    let mut outcomes = BTreeSet::new();
+    for seed in 0..24u64 {
+        let mut sim = Sim::new({
+            let mut c = SimConfig::new(300 + seed);
+            c.fs.latency_min = Duration::from_micros(100);
+            c.fs.latency_max = Duration::from_millis(2);
+            c
+        });
+        let node = sim.add_node();
+        on_node(&mut sim, node, |env| {
+            Box::pin(async move {
+                let (_leader, dir) = build_leader(&env).await;
+                build_follower(&env).await;
+                let mut assembler =
+                    Assembler::new(env.clone(), Path::new("/follower"), Variant::Correct);
+                let staged = stream(&env, &dir, &mut assembler).await;
+                let repair = Repair {
+                    term: 7,
+                    vote: Some(ServerId(3)),
+                    tail: Vec::new(),
+                    quarantined: false,
+                };
+                assembler.finish(&staged, &repair).await.unwrap();
+            })
+        });
+        // The adoption runs as the server would run it, and the crash lands
+        // after a seed-dependent slice of it.
+        let env = sim.env(node);
+        let inner = env.clone();
+        env.spawn("adopt", async move {
+            let _ = adopt_staged(&inner, Path::new("/follower")).await;
+        });
+        sim.run_for(Duration::from_millis(1 + seed * 3));
+        sim.crash(node);
+        sim.restart(node);
+        // What is durable is a store, whole: a CURRENT that parses and whose
+        // manifest is on disk, and the marker.
+        let current = sim
+            .durable_contents(node, Path::new("/follower/CURRENT"))
+            .expect("seed {seed}: a CURRENT survives every crash");
+        let named = manifest::parse_current(&current).expect("a CURRENT that parses");
+        assert!(
+            sim.durable_contents(
+                node,
+                &manifest::manifest_path(Path::new("/follower"), named)
+            )
+            .is_some(),
+            "seed {seed}: the manifest CURRENT names is on disk"
+        );
+        assert!(
+            sim.durable_contents(node, &marker_path(Path::new("/follower")))
+                .is_some(),
+            "seed {seed}: the marker survives the adoption"
+        );
+        let staging_current = sim
+            .durable_contents(
+                node,
+                &manifest::current_path(&staging_dir(Path::new("/follower"))),
+            )
+            .is_some();
+        outcomes.insert((named == 1, staging_current));
+        // The next start: the receiver's identity, adopted now or already.
+        let (adopted, term, vote) = on_node(&mut sim, node, |env| {
+            Box::pin(async move { open_follower(&env).await })
+        })
+        .unwrap_or_else(|why| panic!("seed {seed}: refused: {why}"));
+        assert_eq!(
+            (term, vote),
+            (7, Some(ServerId(3))),
+            "seed {seed}: the receiver's identity, never fresh and never the old store"
+        );
+        assert_eq!(
+            adopted, staging_current,
+            "seed {seed}: the start adopts exactly when the staging CURRENT survived"
+        );
+        // The marker is still there after the adoption's file deletions.
+        let names = on_node(&mut sim, node, |env| {
+            Box::pin(async move {
+                FileSystem::read_dir(env.fs(), Path::new("/follower"))
+                    .await
+                    .unwrap()
+            })
+        });
+        assert!(
+            names.iter().any(|n| n.to_str() == Some(STORE_MARKER)),
+            "seed {seed}: the marker is not a store file"
+        );
+    }
+    // The crashes landed on both sides of the switch: some seeds kept the old
+    // store's CURRENT (manifest 1) and re-ran the adoption, some crashed after
+    // the switch with the adoption still to be retired, and some after all of it.
+    assert!(
+        outcomes.contains(&(true, true)),
+        "no crash before the switch: {outcomes:?}"
+    );
+    assert!(
+        outcomes.contains(&(false, true)) || outcomes.contains(&(false, false)),
+        "no crash after the switch: {outcomes:?}"
+    );
+}
+
+/// A staging directory whose `CURRENT` exists but does not parse is damage, not
+/// debris (PROPOSED D-041): the adoption refuses it with `LostState`, sweeps
+/// nothing, and the old store is untouched; the same for a `CURRENT` naming a
+/// manifest that is not there. Only a staging directory with no `CURRENT` at
+/// all is swept.
+#[test]
+fn a_damaged_staging_current_is_refused_and_not_swept() {
+    let mut sim = Sim::new(SimConfig::new(80));
+    let node = sim.add_node();
+    on_node(&mut sim, node, |env| {
+        Box::pin(async move {
+            let (_leader, dir) = build_leader(&env).await;
+            build_follower(&env).await;
+            let mut assembler =
+                Assembler::new(env.clone(), Path::new("/follower"), Variant::Correct);
+            let staged = stream(&env, &dir, &mut assembler).await;
+            let repair = Repair {
+                term: 7,
+                vote: Some(ServerId(3)),
+                tail: Vec::new(),
+                quarantined: false,
+            };
+            assembler.finish(&staged, &repair).await.unwrap();
+            let staging = staging_dir(Path::new("/follower"));
+            let fs = env.fs();
+            // Bit rot on the staging CURRENT: it exists and does not parse.
+            let current = fs
+                .open(
+                    &manifest::current_path(&staging),
+                    OpenOptions::new().write(true),
+                )
+                .await
+                .unwrap();
+            current
+                .write_at(0, Bytes::from_static(b"MANIFEST-0000x1 00000000\n"))
+                .await
+                .unwrap();
+            current.sync().await.unwrap();
+            let before = fs.read_dir(&staging).await.unwrap();
+            let refused = adopt_staged(&env, Path::new("/follower"))
+                .await
+                .expect_err("a damaged staging CURRENT is refused");
+            let lost = LostState::from_io(&refused).expect("carries LostState");
+            assert_eq!(lost.damaged, Some(Damage::StagingCurrentUnreadable));
+            assert_eq!(
+                fs.read_dir(&staging).await.unwrap(),
+                before,
+                "nothing was swept"
+            );
+            // The old store is whole: it opens with its own identity.
+            let (engine, recovery) = Engine::open(env.clone(), engine_config("/follower"))
+                .await
+                .unwrap();
+            let (store, _) = RaftStore::open(Arc::new(engine), &recovery).await.unwrap();
+            assert_eq!((store.term(), store.vote()), (3, Some(ServerId(2))));
+            drop(store);
+            // A CURRENT that parses but names a manifest that is not there: the
+            // repaired manifest, the newest in the staging directory, removed.
+            let named = fs
+                .read_dir(&staging)
+                .await
+                .unwrap()
+                .iter()
+                .filter_map(|n| manifest::manifest_of(n))
+                .max()
+                .expect("the repaired manifest");
+            fs.remove_file(&manifest::manifest_path(&staging, named))
+                .await
+                .unwrap();
+            let current = fs
+                .open(
+                    &manifest::current_path(&staging),
+                    OpenOptions::new().write(true).truncate(true),
+                )
+                .await
+                .unwrap();
+            current
+                .write_at(0, manifest::encode_current(named))
+                .await
+                .unwrap();
+            current.sync().await.unwrap();
+            let refused = adopt_staged(&env, Path::new("/follower"))
+                .await
+                .expect_err("a missing staged manifest is refused");
+            assert_eq!(
+                LostState::from_io(&refused).map(|l| l.damaged),
+                Some(Some(Damage::StagingManifestUnreadable))
+            );
+            // No CURRENT at all: an install that never finished, swept.
+            fs.remove_file(&manifest::current_path(&staging))
+                .await
+                .unwrap();
+            assert!(!adopt_staged(&env, Path::new("/follower")).await.unwrap());
+            assert!(
+                fs.read_dir(&staging).await.unwrap().is_empty(),
+                "the unfinished install is swept"
+            );
+        })
+    });
+}
+
+/// The assembler's own sweep never removes a `CURRENT` (PROPOSED D-041): a
+/// completed install abandoned before its adoption — a chunk of another stream
+/// arriving first, or the re-seed stream that follows a refusal of a damaged
+/// one — loses its files but keeps its commit point, so the next start refuses
+/// rather than finding an unfinished install, sweeping it, and opening the old
+/// store the acknowledged install superseded; the next completed install
+/// replaces it and is adopted.
+#[test]
+fn an_abandoned_staging_keeps_its_current_so_no_start_opens_the_old_store() {
+    let mut sim = Sim::new(SimConfig::new(82));
+    let node = sim.add_node();
+    on_node(&mut sim, node, |env| {
+        Box::pin(async move {
+            let (_leader, dir) = build_leader(&env).await;
+            build_follower(&env).await;
+            let mut assembler =
+                Assembler::new(env.clone(), Path::new("/follower"), Variant::Correct);
+            let staged = stream(&env, &dir, &mut assembler).await;
+            let repair = Repair {
+                term: 7,
+                vote: Some(ServerId(3)),
+                tail: Vec::new(),
+                quarantined: false,
+            };
+            assembler.finish(&staged, &repair).await.unwrap();
+            let staging = staging_dir(Path::new("/follower"));
+            let fs = env.fs();
+            // Abandoned complete: the files go, CURRENT stays, and the next
+            // start refuses for the manifest it names rather than falling back.
+            assembler.abandon().await;
+            let names = fs.read_dir(&staging).await.unwrap();
+            assert_eq!(
+                names,
+                vec![PathBuf::from("CURRENT")],
+                "only CURRENT survives"
+            );
+            let refused = open_follower(&env)
+                .await
+                .expect_err("an abandoned install's CURRENT still refuses the old store");
+            assert!(
+                refused.contains("the staging directory's CURRENT names"),
+                "{refused}"
+            );
+            // Abandoned damaged: the same.
+            let current = fs
+                .open(
+                    &manifest::current_path(&staging),
+                    OpenOptions::new().write(true).truncate(true),
+                )
+                .await
+                .unwrap();
+            current
+                .write_at(0, Bytes::from_static(b"not a current\n"))
+                .await
+                .unwrap();
+            current.sync().await.unwrap();
+            assembler.abandon().await;
+            assert_eq!(
+                fs.read_dir(&staging).await.unwrap(),
+                vec![PathBuf::from("CURRENT")],
+                "a damaged CURRENT survives the sweep too"
+            );
+            let refused = open_follower(&env)
+                .await
+                .expect_err("a damaged CURRENT still refuses the old store");
+            assert!(refused.contains("exists but cannot be read"), "{refused}");
+            // The next completed install replaces it, and is adopted with the
+            // receiver's identity.
+            let staged = stream(&env, &dir, &mut assembler).await;
+            assembler.finish(&staged, &repair).await.unwrap();
+            let (adopted, term, vote) = open_follower(&env).await.unwrap();
+            assert!(adopted, "the completed install is adopted");
+            assert_eq!((term, vote), (7, Some(ServerId(3))));
+        })
+    });
+}
+
+/// The store marker (PROPOSED D-041): a fresh directory opens as a fresh store
+/// and is marked at its first open; a marked directory that has lost its
+/// `CURRENT` — even one the engine alone would open fresh again, nothing else
+/// remaining — is refused as a lost store, and so is one whose `CURRENT` does
+/// not parse.
+#[test]
+fn a_marked_directory_without_a_valid_current_is_a_lost_store_never_a_fresh_one() {
+    let mut sim = Sim::new(SimConfig::new(81));
+    let node = sim.add_node();
+    on_node(&mut sim, node, |env| {
+        Box::pin(async move {
+            let fs = env.fs();
+            let dir = Path::new("/fresh");
+            // Fresh: no marker, so the check passes and the engine opens fresh.
+            refuse_lost_store(&env, dir).await.unwrap();
+            let (engine, recovery) = Engine::open(env.clone(), engine_config("/fresh"))
+                .await
+                .unwrap();
+            let (store, _) = RaftStore::open(Arc::new(engine), &recovery).await.unwrap();
+            assert_eq!((store.term(), store.applied()), (0, 0));
+            assert!(
+                !fs.read_dir(dir)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|n| n.to_str() == Some(STORE_MARKER)),
+                "not marked before the first open completes"
+            );
+            mark_store(&env, dir).await.unwrap();
+            mark_store(&env, dir).await.unwrap();
+            assert!(
+                fs.read_dir(dir)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|n| n.to_str() == Some(STORE_MARKER)),
+                "marked after the first open"
+            );
+            refuse_lost_store(&env, dir).await.unwrap();
+            drop(store);
+            // The directory loses everything but the marker: the engine's own
+            // rule would open it fresh, since no manifest or table remains
+            // (D-024); the marker says it was a store.
+            for name in fs.read_dir(dir).await.unwrap() {
+                if name.to_str() != Some(STORE_MARKER) {
+                    fs.remove_file(&dir.join(name)).await.unwrap();
+                }
+            }
+            fs.sync_dir(dir).await.unwrap();
+            let refused = refuse_lost_store(&env, dir)
+                .await
+                .expect_err("a marked directory without CURRENT is refused");
+            assert_eq!(
+                LostState::from_io(&refused).map(|l| l.damaged),
+                Some(Some(Damage::MarkedCurrentMissing))
+            );
+            assert!(
+                Engine::open(env.clone(), engine_config("/fresh"))
+                    .await
+                    .is_ok(),
+                "the engine alone would have opened the emptied directory fresh"
+            );
+            // A CURRENT that does not parse, with the marker.
+            let current = fs
+                .open(
+                    &manifest::current_path(dir),
+                    OpenOptions::new().write(true).create(true).truncate(true),
+                )
+                .await
+                .unwrap();
+            current
+                .write_at(0, Bytes::from_static(b"not a current\n"))
+                .await
+                .unwrap();
+            current.sync().await.unwrap();
+            let refused = refuse_lost_store(&env, dir)
+                .await
+                .expect_err("a marked directory with an unreadable CURRENT is refused");
+            assert_eq!(
+                LostState::from_io(&refused).map(|l| l.damaged),
+                Some(Some(Damage::MarkedCurrentUnreadable))
+            );
         })
     });
 }

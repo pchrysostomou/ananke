@@ -291,11 +291,62 @@ pub enum Fault {
         /// How long the receiver stays down.
         down: Duration,
     },
+    /// A crash aimed at the adoption of a completed install (PROPOSED(D-041)).
+    /// The same setup as [`Fault::CrashInstalling`] — `server` isolated for
+    /// `isolate` so the leader feeds it a snapshot on heal — but the run then
+    /// waits for the receiver to trace the install complete (`RaftSnapshot {
+    /// taken: false }`, after which its next incarnation adopts the staged store
+    /// at its start), watches the receiver's store directory on the durable disk
+    /// and crashes it the moment the adoption's first change to that directory
+    /// is durable: the old store's files all gone, or a file not there before
+    /// synced in, whichever the adoption does first. The receiver is down for
+    /// `down`, restarts into the adoption the crash interrupted, and is crashed
+    /// the same way again, `crashes` times in all, the way a machine that
+    /// reboots into the same work is; a restart whose adoption makes no durable
+    /// change within [`ADOPTION_WAIT_BUDGET`] is crashed at the budget's end.
+    /// The crash-safe adoption copies and syncs before it touches the old store,
+    /// so its first durable change is a copy synced in with the old store whole,
+    /// and every crash here re-runs the adoption on the same staged bytes;
+    /// `Variant::AdoptionAsBuilt` deletes the old store first, so its first
+    /// durable change is the old store gone with the copies' entries not yet
+    /// synced, and a crash there whose bit rot lands on the staging `CURRENT` —
+    /// one block, two per cent per crash — restarts the server on a fresh store,
+    /// which committed-entries-stay reports (the nightly's seed 6325). `crashes`
+    /// is that many rolls of the rot's dice. If no install completes within
+    /// [`INSTALL_WAIT_BUDGET`], no crash fires and the fault was an isolation.
+    /// Drawn from its own `moirae_sched` stream ("adoption-crash"), never
+    /// lengthening the shared schedule stream or the install crash's (D-031).
+    CrashAdopting {
+        /// The follower isolated and then crashed mid-adoption; the leader's
+        /// neighbour if it leads when the fault starts.
+        server: u64,
+        /// How long it is cut off first, to fall behind the threshold.
+        isolate: Duration,
+        /// How long the receiver stays down after each crash.
+        down: Duration,
+        /// How many times it is crashed.
+        crashes: u64,
+    },
 }
 
 /// The longest a [`Fault::CrashInstalling`] waits for an install to stream
 /// before giving up and doing nothing.
 pub const INSTALL_WAIT_BUDGET: Duration = Duration::from_millis(4000);
+
+/// The longest a [`Fault::CrashAdopting`] waits, after the install's completion
+/// or a restart, for the adoption's first durable change to the store directory
+/// before crashing the server anyway. An adoption reaches that change within a
+/// few dozen disk operations, tens of milliseconds at the sweep's latencies; a
+/// restart that is refused instead makes no change at all. PROPOSED(D-041).
+pub const ADOPTION_WAIT_BUDGET: Duration = Duration::from_millis(100);
+
+/// How long a [`Fault::CrashAdopting`] waits after a restart that finds no store
+/// file durable in the directory at all — the old store gone and every copy's
+/// entry lost at the crash before — since then the adoption's first durable
+/// change would be its copies synced in, past the window that matters; the
+/// crash lands in the adoption's opening reads and first copies instead.
+/// PROPOSED(D-041).
+const EMPTY_STORE_DELAY: Duration = Duration::from_millis(3);
 
 /// One lease trial; two open every schedule, see the module documentation.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -419,6 +470,20 @@ impl Schedule {
             });
             gaps.push(ms(&mut snap, 450, 700));
         }
+        // A crash storm aimed at the adoption that follows a completed install,
+        // on every seed, appended after the install crash: its window is a
+        // two-per-cent roll of the disk's dice per crash, so every seed rolls
+        // sixteen to thirty-two times. Its own stream, so neither the shared
+        // "schedule" draws nor the install crash's move when this arm changes
+        // (D-031). PROPOSED(D-041).
+        let mut adopt = moirae_sched::stream(seed, "adoption-crash");
+        faults.push(Fault::CrashAdopting {
+            server: 1 + adopt.below(SERVERS),
+            isolate: ms(&mut adopt, 700, 1100),
+            down: ms(&mut adopt, 10, 40),
+            crashes: 16 + adopt.below(17),
+        });
+        gaps.push(ms(&mut adopt, 450, 700));
         // Clocks, as the module documentation says: within the bound, or one
         // server slow and two fast, moderately or severely.
         let within = rng.below(2) == 0;
@@ -529,6 +594,16 @@ impl Schedule {
                     down,
                     ..
                 } => *isolate + INSTALL_WAIT_BUDGET + *grace + *down,
+                Fault::CrashAdopting {
+                    isolate,
+                    down,
+                    crashes,
+                    ..
+                } => {
+                    *isolate
+                        + INSTALL_WAIT_BUDGET
+                        + (ADOPTION_WAIT_BUDGET + *down) * u32::try_from(*crashes).expect("small")
+                }
             })
             .sum();
         let trials: Duration = self
@@ -1375,6 +1450,43 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
                     restart(&mut sim, victim);
                 }
             }
+            Fault::CrashAdopting {
+                server,
+                isolate,
+                down,
+                crashes,
+            } => {
+                // PROPOSED(D-041): the install crash's setup, then the crashes
+                // aimed at the adoption the completed install starts, each at the
+                // adoption's first durable change to the store directory.
+                let leader = leader_now(&sim);
+                let victim = if *server == leader {
+                    server % SERVERS + 1
+                } else {
+                    *server
+                };
+                let side = vec![servers[victim as usize - 1]];
+                let rest: Vec<NodeId> = servers
+                    .iter()
+                    .chain(clients.iter())
+                    .chain(std::iter::once(&admin))
+                    .copied()
+                    .filter(|n| *n != side[0])
+                    .collect();
+                let from = sim.now();
+                sim.partition(&side, &rest);
+                advance(&mut sim, *isolate, &mut watch);
+                sim.heal();
+                isolations.push((victim, from, sim.now()));
+                if install_completed(&mut sim, &mut watch, victim) {
+                    for _ in 0..*crashes {
+                        adoption_change(&mut sim, &mut watch, victim);
+                        sim.crash(node_of_server(victim));
+                        advance(&mut sim, *down, &mut watch);
+                        restart(&mut sim, victim);
+                    }
+                }
+            }
             Fault::StaleSender {
                 server,
                 one_way,
@@ -1556,6 +1668,111 @@ fn install_landing(sim: &mut Sim, watch: &mut Watch, victim: u64) -> bool {
         scanned = records.len();
     }
     false
+}
+
+/// Advances the run in small slices until `victim` traces a snapshot install
+/// complete (`RaftSnapshot { taken: false }`, the event that precedes the
+/// adoption at its next incarnation's start), or [`INSTALL_WAIT_BUDGET`] runs
+/// out: the moment [`Fault::CrashAdopting`] measures its crash from. Only records
+/// from here on count: the victim was not restarted since the heal, so no
+/// restart's restatement can stand in for the completion. As with
+/// [`install_landing`], the safety folds are skipped inside the small slices and
+/// the trace cap still stops a runaway. PROPOSED(D-041).
+fn install_completed(sim: &mut Sim, watch: &mut Watch, victim: u64) -> bool {
+    if watch.stopped.is_some() {
+        return false;
+    }
+    let step = Duration::from_millis(5);
+    let mut scanned = sim.trace_len();
+    let mut waited = Duration::ZERO;
+    while waited < INSTALL_WAIT_BUDGET {
+        sim.run_for(step);
+        waited += step;
+        let len = sim.trace_len();
+        if len > TRACE_CAP {
+            watch.stopped = Some(format!(
+                "runaway: {len} trace records by {:?}, over the cap of {TRACE_CAP}",
+                sim.now()
+            ));
+            return false;
+        }
+        let records = sim.trace();
+        if records[scanned..].iter().any(|r| {
+            matches!(
+                &r.event,
+                TraceEvent::RaftSnapshot {
+                    server,
+                    taken: false,
+                    ..
+                } if *server == victim
+            )
+        }) {
+            return true;
+        }
+        scanned = records.len();
+    }
+    false
+}
+
+/// A name the store proper is made of, as the adoption sees it: `CURRENT`, a
+/// table, a log segment or a manifest — not the marker, not a checkpoint or the
+/// staging directory. PROPOSED(D-041).
+fn store_name(name: &std::path::Path) -> bool {
+    name.to_str().is_some_and(|n| {
+        n == "CURRENT" || n.ends_with(".sst") || n.ends_with(".wal") || n.starts_with("MANIFEST-")
+    })
+}
+
+/// Advances the run in small slices until the adoption running on `victim`
+/// makes its first durable change to the server's store directory — every store
+/// file that was durable when the watch began gone, or one that was not there
+/// synced in, whichever comes first — or [`ADOPTION_WAIT_BUDGET`] runs out: the
+/// moment [`Fault::CrashAdopting`] crashes it. A directory with no store file
+/// durable at all, which only the as-built adoption leaves behind, is given
+/// [`EMPTY_STORE_DELAY`] instead. The safety folds are skipped inside the small
+/// slices, as in [`install_landing`], and the trace cap still stops a runaway.
+/// PROPOSED(D-041).
+fn adoption_change(sim: &mut Sim, watch: &mut Watch, victim: u64) {
+    if watch.stopped.is_some() {
+        return;
+    }
+    let node = node_of_server(victim);
+    let dir = std::path::Path::new(DIR);
+    let durable = |sim: &Sim| -> BTreeSet<PathBuf> {
+        sim.durable_names(node, dir)
+            .into_iter()
+            .filter(|n| store_name(n))
+            .collect()
+    };
+    let before = durable(sim);
+    let step = Duration::from_micros(250);
+    let budget = if before.is_empty() {
+        EMPTY_STORE_DELAY
+    } else {
+        ADOPTION_WAIT_BUDGET
+    };
+    let mut waited = Duration::ZERO;
+    while waited < budget {
+        sim.run_for(step);
+        waited += step;
+        let len = sim.trace_len();
+        if len > TRACE_CAP {
+            watch.stopped = Some(format!(
+                "runaway: {len} trace records by {:?}, over the cap of {TRACE_CAP}",
+                sim.now()
+            ));
+            return;
+        }
+        if before.is_empty() {
+            continue;
+        }
+        let now = durable(sim);
+        let old_gone = before.iter().all(|n| !now.contains(n));
+        let new_synced = now.iter().any(|n| !before.contains(n));
+        if old_gone || new_synced {
+            return;
+        }
+    }
 }
 
 /// Runs the simulation for `duration` in slices of [`SLICE`], running the safety

@@ -73,6 +73,19 @@ pub enum Variant {
     /// catches the state that never existed after the restart. The install order is
     /// the server's business (`snapshot.rs`); the core ignores this variant.
     SnapshotWithoutCurrentLast,
+    /// The adoption of a staged install as it was built under D-038, before
+    /// PROPOSED(D-041): the old store's `CURRENT` and files are removed before
+    /// the staged copies and their directory entries are durable, a staging
+    /// `CURRENT` that exists but does not parse is swept as debris, and a store
+    /// directory emptied that way opens as a fresh store, since nothing marks it
+    /// as one. A crash inside the copy whose bit rot lands on the staging
+    /// `CURRENT` then restarts the server on an empty store: a voter forgets its
+    /// term, its vote and its committed entries, which committed-entries-stay
+    /// reports at the restatement (the nightly's seed 6325). The adoption is the
+    /// server's business (`snapshot.rs`, `node.rs`); the core ignores this
+    /// variant.
+    // PROPOSED(D-041): the crash-safe adoption and the store identity marker.
+    AdoptionAsBuilt,
 }
 
 /// The core's parameters.
