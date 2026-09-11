@@ -1835,6 +1835,22 @@ the storm until the gate catches it again — buys a gate signal with the very
 cost this amendment exists to remove, and the gate's twenty seeds were never the
 tier that owned this catch.
 
+What the share did not buy is the fifteen-minute target itself, and the
+measurement says where the rest of the time is. On this machine the raft test
+binary's thousand seeds now take 1648 s — down from 2218 s with the storm
+everywhere, a quarter off — but `scripts/premerge.sh` runs that binary and the
+others, so the tier is still over its quarter of an hour. Attributed at a
+hundred seeds, where the same binary takes 146.0 s: without PROPOSED D-043's
+re-take arm 138.6 s, without the adoption storm as well 99.1 s, and without
+D-044's refusal storm on top of that 90.5 s. So the storm at one seed in four is
+27 per cent of the binary, the refusal storm 6 per cent and the re-take arm 5 per
+cent, and the remaining 62 per cent — some seventeen minutes at a thousand seeds
+— is the sweep without any crash storm at all. The 667 s this entry compares
+against was measured before the sweep carried the snapshot work of D-042 and
+D-043 and the refusal work of D-044, and no share of the storms recovers it:
+getting the tier back under fifteen minutes is a separate piece of work on what
+the base run itself costs, and it is not this entry's to do.
+
 `Sim::durable_names` joins `durable_contents` as a harness accessor. Every site
 is marked `PROPOSED(D-041)`.
 
@@ -2160,34 +2176,46 @@ its applied index stands still at the index it last took, which is the index
 the running stream is reading. It reaches that state on 14 of 100 release
 seeds, and the sweep asserts at every tier that it did.
 
-It does not produce the catch, and the reason is structural rather than
-statistical. A leader needs *one* countable follower for a majority, and on
-this sweep an install is over in about a hundred and fifty milliseconds, since
-the state machine is small and a checkpoint of it is a couple of dozen chunks.
-The moment the fed follower's install completes it is countable again, the
-leader commits, its applied index moves off the index the stream was reading,
-and the freeze is over. So the queue half of the bug costs a second designated
-follower a few hundred milliseconds against a two-second liveness bound, never
-the bound itself; only a stream that never completes stalls a commit for as
-long as the check asks. Making one needs a take to land on the very directory a
-live stream has open, which as built needs the leader's applied index to be
-standing exactly where its record already points *and* a `retake` to have
-cleared its checkpoint — a coincidence inside the snapshot task's own failure
-paths, reachable from the receiver's refusals and the network's duplicates but
-not from any partition, block or crash a driver can schedule. The re-take at an
-index already taken happens often enough on its own, on 48 of 100 seeds, and is
-harmless every time, because no stream had that directory open. Two ways past
-it were weighed and not taken: filling the state machine until an install runs
-longer than the bound — measured, and at four-kilobyte values the sixteen-kilobyte
-memtable rotates so often that the cluster's commit rate collapses and no
-follower falls behind enough to be designated at all — and reaching inside the
-server for a fault hook on the take, which would be a fault model of the
-implementation rather than of the world (D-012). So the catch stays asserted at
-the nightly's ten thousand, the only tier that ever produced it, the firing is
-asserted at every tier on both counts, and a nightly whose ten thousand seeds
-never catch it is still a hole in the sweep to report rather than a variant to
-delete (RAFT.md §5) — with the caveat that this branch has re-drawn every
-schedule again, so the nightly's one catch is not owed to anyone.
+It moves the variant from uncatchable at the pre-merge tier to catchable there,
+and no further. Measured on this branch: 0 of 100 release seeds, and 1 of 1000 —
+seed 680, by the liveness check, `no client write completed after the last heal
+at 28.683 s`, which is this entry's own wedge assembled by a driver rather than
+waited for. This entry recorded 0 of 1000 before the arm existed, so the tier
+that pays for the pre-merge run now catches it, about once.
+
+Why only about once is structural rather than statistical. A leader needs *one*
+countable follower for a majority, and on this sweep an install is over in about
+a hundred and fifty milliseconds, since the state machine is small and a
+checkpoint of it is a couple of dozen chunks. The moment the fed follower's
+install completes it is countable again, the leader commits, its applied index
+moves off the index the stream was reading, and the freeze is over. So the queue
+half of the bug costs a second designated follower a few hundred milliseconds
+against a two-second liveness bound, never the bound itself; only a stream that
+never completes stalls a commit for as long as the check asks. Making one needs a
+take to land on the very directory a live stream has open, which as built needs
+the leader's applied index to be standing exactly where its record already points
+*and* a `retake` to have cleared its checkpoint — a coincidence inside the
+snapshot task's own failure paths, which the arm makes likely (a frozen applied
+index, a stream in flight, and every take asked for landing at that index) but
+cannot force, since those paths are the receiver's refusals and the network's
+duplicates rather than anything a partition, block or crash schedules. The
+re-take at an index already taken happens often on its own, on 48 of 100 seeds
+and 532 of 1000, and is harmless every time, because no stream had that directory
+open.
+
+Two ways past that were weighed and not taken. Filling the state machine until an
+install runs longer than the liveness bound: measured, and at four-kilobyte
+values the sixteen-kilobyte memtable rotates so often that the cluster's commit
+rate collapses, no follower falls behind enough to be designated, and the arm
+stops reaching its own shape at all. Reaching inside the server for a fault hook
+on the take: that is a fault model of the implementation rather than of the world
+(D-012). So the catch stays asserted at the nightly's ten thousand, where a rate
+of about one in a thousand gives some ten catches; asserting it at the pre-merge
+tier on a single observation would make that tier flaky. The firing is asserted
+at every tier on both counts — a re-take at an index already taken, and the arm
+reaching its stream — and a nightly whose ten thousand seeds never catch it is
+still a hole in the sweep to report rather than a variant to delete (RAFT.md §5),
+the more so because this branch has re-drawn every schedule again.
 
 ---
 

@@ -421,30 +421,39 @@ fn a_leader_that_ignores_incarnations_never_forgets_and_the_sweep_cannot_see_it(
 /// took, which is the index the running stream is reading. The arm rides one
 /// seed in four and got as far as the stream on 14 of 100 release seeds.
 ///
-/// It does not produce the catch, and the reason is worth writing down, because
-/// it is not a matter of trying more seeds. A leader needs *one* countable
+/// It moves the variant from uncatchable at the pre-merge tier to catchable
+/// there, and no further: 0 of 100 release seeds, 1 of 1000 — seed 680, by the
+/// liveness check, `no client write completed after the last heal at 28.683 s`,
+/// which is seed 5909's shape reproduced by construction. D-043 recorded 0 of
+/// 1000 before this arm existed, so a tier that never caught it now does, about
+/// once.
+///
+/// Why only about once is worth writing down, because it is not a matter of
+/// running more seeds at the hundred tier. A leader needs *one* countable
 /// follower for a majority, and on this sweep an install is over in about a
 /// hundred and fifty milliseconds — the state machine is small and a checkpoint
-/// of it is a couple of dozen chunks. So the moment the fed follower's install
+/// of it is a couple of dozen chunks. The moment the fed follower's install
 /// completes it is countable again, the leader commits, its applied index moves
 /// off the index the stream was reading, and the freeze is over: the queue half
 /// of the bug costs a second designated follower a few hundred milliseconds
 /// against a two-second bound, never the bound itself. Only a stream that never
-/// completes stalls a commit for as long as the liveness check asks, and that
-/// needs a take to land on the very directory a live stream is reading — which
-/// as built needs the leader's applied index to be standing exactly where its
-/// record already points *and* a `retake` to clear its checkpoint, a
-/// coincidence of the snapshot task's failure paths that no driver-side fault
-/// reaches. The re-take at an index already taken happens often enough on its
-/// own — 48 of 100 seeds — and is harmless every time, because no stream had
-/// that directory open.
+/// completes stalls a commit that long, and that needs a take to land on the
+/// very directory a live stream has open — the applied index standing exactly
+/// where the record already points *and* a `retake` having cleared the
+/// checkpoint, a coincidence inside the snapshot task's own failure paths that
+/// the arm can make likely but cannot force. The re-take at an index already
+/// taken happens often on its own — 48 of 100 seeds, 532 of 1000 — and is
+/// harmless every time, because no stream had that directory open.
 ///
 /// So the test asserts what is true: that the fault fired, on both counts — a
 /// take at an index already taken, into the directory a stream may be reading,
 /// and the aimed arm's own stream under a leader that cannot commit — and that
 /// the catch holds at the tier that ever produced it, the nightly's ten
-/// thousand. The rates are printed at every tier. The pair rule holds because
-/// the correct server passes the same seeds.
+/// thousand, where a rate of about one in a thousand gives some ten catches.
+/// Asserting it at the pre-merge tier on one observation would make that tier
+/// flaky; the rates are printed at every tier so the day the rate is worth an
+/// assertion is visible. The pair rule holds because the correct server passes
+/// the same seeds.
 #[test]
 fn a_leader_that_shares_one_snapshot_directory_and_streams_one_follower_at_a_time_is_caught() {
     let outcomes: Vec<(Option<String>, bool, usize)> = sweep(seeds(), |seed| {
