@@ -14,6 +14,7 @@
 //! a function of its inputs and its seed.
 
 use std::collections::{BTreeMap, VecDeque};
+use std::fmt;
 
 use ananke_env::TraceEvent;
 use bytes::Bytes;
@@ -127,6 +128,180 @@ pub enum Variant {
     RefusalNotDurable,
 }
 
+impl Variant {
+    /// Every buggy variant, in declaration order: the vocabulary a [`Variants`]
+    /// set is drawn from. [`Variant::Correct`] is not a member — it is the
+    /// absence of all of them — so this is what [`Variants`]'s `Debug` walks.
+    // PROPOSED(D-045): a variant is a set.
+    pub const BUGS: &'static [Variant] = &[
+        Variant::SendBeforePersist,
+        Variant::ApplyBeforeCommit,
+        Variant::NoPreVote,
+        Variant::CountOlderTermForCommit,
+        Variant::TruncateOnEveryAppend,
+        Variant::ResetTimerOnAnyRpc,
+        Variant::IndexFirstElectionRestriction,
+        Variant::LeaseTrustsTheClock,
+        Variant::SingleMajorityInJointConsensus,
+        Variant::SnapshotWithoutCurrentLast,
+        Variant::AdoptionAsBuilt,
+        Variant::IgnoreIncarnation,
+        Variant::SharedSnapshotDir,
+        Variant::RefusalNotDurable,
+    ];
+
+    /// This variant's bit in a [`Variants`] set. [`Variant::Correct`] owns no
+    /// bit: the correct server is the empty set. The match is exhaustive on
+    /// purpose, so a new variant does not compile until it has a bit.
+    // PROPOSED(D-045): a variant is a set.
+    const fn bit(self) -> u32 {
+        match self {
+            Variant::Correct => 0,
+            Variant::SendBeforePersist => 1 << 0,
+            Variant::ApplyBeforeCommit => 1 << 1,
+            Variant::NoPreVote => 1 << 2,
+            Variant::CountOlderTermForCommit => 1 << 3,
+            Variant::TruncateOnEveryAppend => 1 << 4,
+            Variant::ResetTimerOnAnyRpc => 1 << 5,
+            Variant::IndexFirstElectionRestriction => 1 << 6,
+            Variant::LeaseTrustsTheClock => 1 << 7,
+            Variant::SingleMajorityInJointConsensus => 1 << 8,
+            Variant::SnapshotWithoutCurrentLast => 1 << 9,
+            Variant::AdoptionAsBuilt => 1 << 10,
+            Variant::IgnoreIncarnation => 1 << 11,
+            Variant::SharedSnapshotDir => 1 << 12,
+            Variant::RefusalNotDurable => 1 << 13,
+        }
+    }
+}
+
+/// Which known bugs one server carries at once (PROPOSED D-045): a set of
+/// [`Variant`]s, held as a bitmask so it is `Copy`, cheap and deterministic —
+/// no hashing and no allocation on a path every step of the core walks.
+///
+/// The empty set is the correct server, so [`Variants::default`] is correct and
+/// [`Variants::is_correct`] asks whether the set is empty. The reason the set
+/// exists is that some wedges need two bugs at once: the nightly's seed 5909
+/// needed a stale `matched` for a re-seeded follower (PROPOSED D-042) and a
+/// never-completing snapshot stream to the other follower (PROPOSED D-043)
+/// together, and a single-enum `Variant` could carry only one of the two, so
+/// the sweep had no negative control for that wedge.
+///
+/// A single variant stays ergonomic: `From<Variant>` converts, and every entry
+/// point that takes a server's bugs takes `impl Into<Variants>`, so
+/// `raft::run(seed, Variant::Correct)` reads as it always did.
+///
+/// ```
+/// use ananke_raft::core::{Variant, Variants};
+///
+/// let both = Variants::of(&[Variant::IgnoreIncarnation, Variant::SharedSnapshotDir]);
+/// assert!(both.contains(Variant::IgnoreIncarnation));
+/// assert!(both.contains(Variant::SharedSnapshotDir));
+/// assert!(!both.contains(Variant::NoPreVote));
+/// assert!(!both.is_correct());
+/// assert_eq!(format!("{both:?}"), "{IgnoreIncarnation, SharedSnapshotDir}");
+///
+/// let one: Variants = Variant::NoPreVote.into();
+/// assert!(one.contains(Variant::NoPreVote));
+/// assert_eq!(format!("{one:?}"), "{NoPreVote}");
+///
+/// assert!(Variants::default().is_correct());
+/// assert_eq!(format!("{:?}", Variants::default()), "Correct");
+/// ```
+// PROPOSED(D-045): a variant is a set.
+#[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Variants(u32);
+
+impl Variants {
+    /// The correct server: no bug at all.
+    #[must_use]
+    pub const fn correct() -> Self {
+        Self(0)
+    }
+
+    /// The set of these variants. [`Variant::Correct`] contributes nothing, so
+    /// `Variants::of(&[Variant::Correct])` is the correct server.
+    #[must_use]
+    pub const fn of(variants: &[Variant]) -> Self {
+        let mut bits = 0;
+        let mut i = 0;
+        while i < variants.len() {
+            bits |= variants[i].bit();
+            i += 1;
+        }
+        Self(bits)
+    }
+
+    /// Whether this server carries `variant`. Asking for [`Variant::Correct`]
+    /// asks whether the set is empty, which is the same question as
+    /// [`Variants::is_correct`].
+    #[must_use]
+    pub const fn contains(self, variant: Variant) -> bool {
+        match variant {
+            Variant::Correct => self.is_correct(),
+            other => self.0 & other.bit() != 0,
+        }
+    }
+
+    /// Whether this is the correct server: the empty set.
+    #[must_use]
+    pub const fn is_correct(self) -> bool {
+        self.0 == 0
+    }
+
+    /// This set with `variant` added.
+    #[must_use]
+    pub const fn with(self, variant: Variant) -> Self {
+        Self(self.0 | variant.bit())
+    }
+
+    /// How many bugs this server carries.
+    #[must_use]
+    pub const fn len(self) -> u32 {
+        self.0.count_ones()
+    }
+
+    /// Whether this server carries no bug: [`Variants::is_correct`] under the
+    /// name clippy expects beside [`Variants::len`].
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.is_correct()
+    }
+
+    /// The variants in the set, in [`Variant::BUGS`] order.
+    pub fn iter(self) -> impl Iterator<Item = Variant> {
+        Variant::BUGS
+            .iter()
+            .copied()
+            .filter(move |&variant| self.contains(variant))
+    }
+}
+
+impl From<Variant> for Variants {
+    fn from(variant: Variant) -> Self {
+        Self(variant.bit())
+    }
+}
+
+/// Readable, because the sweep's rate lines print it: `Correct` for the empty
+/// set, `{IgnoreIncarnation, SharedSnapshotDir}` for a pair.
+// PROPOSED(D-045): a variant is a set.
+impl fmt::Debug for Variants {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.is_correct() {
+            return f.write_str("Correct");
+        }
+        f.write_str("{")?;
+        for (i, variant) in self.iter().enumerate() {
+            if i > 0 {
+                f.write_str(", ")?;
+            }
+            write!(f, "{variant:?}")?;
+        }
+        f.write_str("}")
+    }
+}
+
 /// The core's parameters.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RaftConfig {
@@ -156,8 +331,10 @@ pub struct RaftConfig {
     /// How many bytes of a checkpoint's file one InstallSnapshot chunk carries;
     /// must stay under `ananke_env::MAX_FRAME_LEN` with the frame's own fields.
     pub snapshot_chunk: usize,
-    /// Which core to run.
-    pub variant: Variant,
+    /// Which core to run: the set of bugs this server carries, empty for the
+    /// correct one (PROPOSED D-045).
+    // PROPOSED(D-045): a variant is a set.
+    pub variants: Variants,
 }
 
 impl Default for RaftConfig {
@@ -173,7 +350,7 @@ impl Default for RaftConfig {
             lease_margin_nanos: 10_000_000,
             snapshot_threshold: 4096,
             snapshot_chunk: 256 * 1024,
-            variant: Variant::Correct,
+            variants: Variants::correct(),
         }
     }
 }
@@ -887,7 +1064,7 @@ impl Raft {
     /// §4.3). Zero for no lease.
     #[must_use]
     pub fn lease_end(&self) -> u64 {
-        let trusts_all = self.config.variant == Variant::LeaseTrustsTheClock;
+        let trusts_all = self.config.variants.contains(Variant::LeaseTrustsTheClock);
         let of_set = |set: &[ServerId]| -> u64 {
             let mut needed = set.len() / 2 + 1;
             if set.contains(&self.id) {
@@ -1164,7 +1341,10 @@ impl Raft {
     /// merged instead, which is the single-majority rule joint consensus forbids:
     /// a majority of the union need not contain a majority of either set.
     fn counting_majority(&self, granted: &[ServerId]) -> bool {
-        if self.config.variant == Variant::SingleMajorityInJointConsensus
+        if self
+            .config
+            .variants
+            .contains(Variant::SingleMajorityInJointConsensus)
             && self.membership.new_voters.is_some()
         {
             let merged = self.voter_ids();
@@ -1259,7 +1439,7 @@ impl Raft {
                         // server with no configuration yet, and a removed server
                         // cannot win (thesis §4.2.1) and would only knock.
                         self.reset_election_timer();
-                    } else if self.config.variant == Variant::NoPreVote {
+                    } else if self.config.variants.contains(Variant::NoPreVote) {
                         self.become_candidate();
                     } else {
                         self.become_pre_candidate();
@@ -1479,7 +1659,7 @@ impl Raft {
         };
         let changed = progress.incarnation.is_some_and(|seen| seen != incarnation);
         progress.incarnation = Some(incarnation);
-        if !changed || self.config.variant == Variant::IgnoreIncarnation {
+        if !changed || self.config.variants.contains(Variant::IgnoreIncarnation) {
             return false;
         }
         progress.matched = 0;
@@ -1863,7 +2043,11 @@ impl Raft {
     /// lengths first.
     fn log_up_to_date(&self, last_index: Index, last_term: Term) -> bool {
         let (mine_index, mine_term) = (self.last_index(), self.last_term());
-        if self.config.variant == Variant::IndexFirstElectionRestriction {
+        if self
+            .config
+            .variants
+            .contains(Variant::IndexFirstElectionRestriction)
+        {
             last_index > mine_index || (last_index == mine_index && last_term >= mine_term)
         } else {
             last_term > mine_term || (last_term == mine_term && last_index >= mine_index)
@@ -1879,7 +2063,7 @@ impl Raft {
     }
 
     fn on_message(&mut self, from: ServerId, message: Message, now: u64) {
-        if self.config.variant == Variant::ResetTimerOnAnyRpc {
+        if self.config.variants.contains(Variant::ResetTimerOnAnyRpc) {
             self.election_elapsed = 0;
         }
         let term = message.term();
@@ -2183,7 +2367,12 @@ impl Raft {
             );
             return;
         }
-        if self.config.variant == Variant::TruncateOnEveryAppend && !entries.is_empty() {
+        if self
+            .config
+            .variants
+            .contains(Variant::TruncateOnEveryAppend)
+            && !entries.is_empty()
+        {
             self.truncate(prev_index + 1);
         }
         let entries_len = entries.len() as Index;
@@ -2343,7 +2532,10 @@ impl Raft {
         let last = self.last_index();
         let mut index = last;
         while index > self.commit {
-            let term_ok = self.config.variant == Variant::CountOlderTermForCommit
+            let term_ok = self
+                .config
+                .variants
+                .contains(Variant::CountOlderTermForCommit)
                 || self.term_at(index) == Some(self.term);
             if term_ok {
                 let mut on: Vec<ServerId> = self
@@ -2367,5 +2559,109 @@ impl Raft {
             }
             index -= 1;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RaftConfig, Variant, Variants};
+
+    /// Every variant owns a bit of its own, and `Correct` owns none: the set is
+    /// exactly as expressive as the vocabulary (PROPOSED D-045).
+    #[test]
+    fn every_bug_has_its_own_bit_and_correct_has_none() {
+        assert_eq!(Variant::Correct.bit(), 0);
+        let mut seen = 0u32;
+        for &variant in Variant::BUGS {
+            let bit = variant.bit();
+            assert_ne!(bit, 0, "{variant:?} owns no bit");
+            assert_eq!(bit.count_ones(), 1, "{variant:?} owns more than one bit");
+            assert_eq!(
+                seen & bit,
+                0,
+                "{variant:?} shares a bit with another variant"
+            );
+            seen |= bit;
+        }
+        assert_eq!(seen.count_ones() as usize, Variant::BUGS.len());
+    }
+
+    /// A set holds what was put in it and nothing else, whichever way it was
+    /// built, and a single variant converts.
+    #[test]
+    fn a_set_holds_what_was_put_in_it() {
+        let all = Variants::of(Variant::BUGS);
+        for &variant in Variant::BUGS {
+            let one = Variants::from(variant);
+            assert!(one.contains(variant));
+            assert_eq!(one.len(), 1);
+            assert!(!one.is_correct());
+            assert!(all.contains(variant));
+            for &other in Variant::BUGS {
+                assert_eq!(one.contains(other), other == variant);
+            }
+            assert_eq!(Variants::correct().with(variant), one);
+        }
+        assert_eq!(all.len() as usize, Variant::BUGS.len());
+        assert_eq!(all.iter().collect::<Vec<_>>(), Variant::BUGS.to_vec());
+    }
+
+    /// The empty set is the correct server, and `Variant::Correct` puts nothing
+    /// in a set — so asking a set whether it contains `Correct` asks whether it
+    /// is empty.
+    #[test]
+    fn the_empty_set_is_the_correct_server() {
+        let correct = Variants::default();
+        assert_eq!(correct, Variants::correct());
+        assert_eq!(correct, Variants::of(&[]));
+        assert_eq!(correct, Variants::of(&[Variant::Correct]));
+        assert_eq!(correct, Variants::from(Variant::Correct));
+        assert!(correct.is_correct());
+        assert!(correct.is_empty());
+        assert_eq!(correct.len(), 0);
+        assert!(correct.contains(Variant::Correct));
+        assert_eq!(correct.iter().count(), 0);
+        assert_eq!(RaftConfig::default().variants, correct);
+
+        let one = Variants::from(Variant::NoPreVote);
+        assert!(!one.contains(Variant::Correct));
+    }
+
+    /// Idempotent and order-free, as a set is: the same bugs in any order and
+    /// any number of times are the same set.
+    #[test]
+    fn a_set_is_a_set() {
+        let pair = Variants::of(&[Variant::IgnoreIncarnation, Variant::SharedSnapshotDir]);
+        assert_eq!(
+            pair,
+            Variants::of(&[Variant::SharedSnapshotDir, Variant::IgnoreIncarnation])
+        );
+        assert_eq!(
+            pair,
+            Variants::of(&[
+                Variant::IgnoreIncarnation,
+                Variant::IgnoreIncarnation,
+                Variant::SharedSnapshotDir,
+            ])
+        );
+        assert_eq!(pair.with(Variant::IgnoreIncarnation), pair);
+        assert_eq!(pair.len(), 2);
+    }
+
+    /// The rate lines print it, so it reads (PROPOSED D-045).
+    #[test]
+    fn the_debug_reads() {
+        assert_eq!(format!("{:?}", Variants::correct()), "Correct");
+        assert_eq!(
+            format!("{:?}", Variants::from(Variant::SharedSnapshotDir)),
+            "{SharedSnapshotDir}"
+        );
+        assert_eq!(
+            format!(
+                "{:?}",
+                Variants::of(&[Variant::SharedSnapshotDir, Variant::IgnoreIncarnation])
+            ),
+            "{IgnoreIncarnation, SharedSnapshotDir}"
+        );
     }
 }
