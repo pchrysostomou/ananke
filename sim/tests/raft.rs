@@ -44,6 +44,16 @@ fn seeds_164_and_385_which_the_first_nightly_found_stay_green() {
     }
 }
 
+/// The ten-thousand-seed nightly's seed 7381: a refused server re-seeded from a
+/// snapshot older than the one its lost store had, then applying entries past it.
+/// The checker's snapshot floor only ever rose, so the lost store's floor outlived
+/// it and the applied entries read as covered rather than held. An installed
+/// snapshot now sets the floor exactly (D-030). Stays in the gate.
+#[test]
+fn seed_7381_which_the_first_nightly_found_stays_green() {
+    raft::run(7381, Variant::Correct).check().unwrap();
+}
+
 /// The positive control: the correct server satisfies every property on every
 /// seed, and the sweep reached the states that matter.
 #[test]

@@ -1237,7 +1237,7 @@ core routes the snapshot to its own task, so the timer check, which read only
 AppendEntries as a reset, saw a gap that the server never had. It now counts an
 InstallSnapshot from a leader of the server's term or later as a reset too. The
 hundred-seed runs never reached a follower that far behind under a compacting
-leader; ten thousand did, which is what ten thousand are for.
+leader; ten thousand did, which is what ten thousand are for. Seed 7381 of the same run was the checker's snapshot floor: it only ever rose, so a refused server re-seeded from a snapshot older than its lost store's kept the lost store's floor and its applied entries read as covered rather than held; an installed snapshot now sets the floor exactly.
 
 **Alternatives.** Multiple chunks in flight: resumption bookkeeping for a
 pipeline, for a path whose cost is the checkpoint, not the round trips.
