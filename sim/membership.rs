@@ -385,10 +385,25 @@ impl Report {
 }
 
 /// What the sliced advance watches for, as the sweep's does.
-#[derive(Default)]
 struct Watch {
     slices: u32,
     stopped: Option<String>,
+    /// The safety checks, one checker for the whole run with the state of each
+    /// check kept across looks, as the sweep's advance does (PROPOSED D-046).
+    checker: invariants::Checker,
+    /// How many trace records the checker has been fed.
+    checked: usize,
+}
+
+impl Default for Watch {
+    fn default() -> Self {
+        Self {
+            slices: 0,
+            stopped: None,
+            checker: invariants::Checker::new(INITIAL_VOTERS as usize),
+            checked: 0,
+        }
+    }
 }
 
 /// The run under way: the simulator and what the driver tracks about it.
@@ -425,11 +440,10 @@ impl Driver {
                 return;
             }
             if self.watch.slices.is_multiple_of(crate::raft::CHECK_EVERY) {
-                let events: Vec<TraceEvent> =
-                    self.sim.trace().into_iter().map(|r| r.event).collect();
-                let verdict = invariants::all(&events)
-                    .and_then(|()| invariants::commit_majority(&events, INITIAL_VOTERS as usize));
-                if let Err(violation) = verdict {
+                let records = self.sim.trace_from(self.watch.checked);
+                self.watch.checked += records.len();
+                self.watch.checker.extend(records.iter().map(|r| &r.event));
+                if let Err(violation) = self.watch.checker.verdict() {
                     self.watch.stopped = Some(format!("{violation} (at {:?})", self.sim.now()));
                     return;
                 }

@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use ananke_env::{ClientOp, DropReason, TraceEvent};
 use ananke_raft::core::Variant;
+use ananke_raft::invariants::{self, Checker};
 use ananke_raft::store::STORE_MARKER;
 use ananke_sim::raft::DRIFT_BOUND_PPM;
 use ananke_sim::raft::{self, Fault};
@@ -1114,4 +1115,90 @@ impl MembershipCoverage {
             }
         }
     }
+}
+
+/// How many seeds the incremental checker is compared over: the hundred the owner
+/// asked for at CI's tier and above, and the gate's twenty at the gate, which is a
+/// twentieth more runs than the gate's raft sweeps already do (PROPOSED D-046).
+fn compared_seeds() -> u64 {
+    seeds().min(100)
+}
+
+/// The servers the comparison runs, one per seed in turn: the correct one, and
+/// three known-buggy ones whose violations three different checks report, so that
+/// the comparison sees `Err` verdicts and the words of their messages and not only
+/// `Ok`.
+const COMPARED: [Variant; 4] = [
+    Variant::Correct,
+    Variant::TruncateOnEveryAppend,
+    Variant::SendBeforePersist,
+    Variant::CountOlderTermForCommit,
+];
+
+/// How many prefixes of a run's trace the two are compared over, the whole trace
+/// being the last of them.
+const PREFIXES: usize = 8;
+
+/// How many events are pushed into the incremental checker at a time: a prime, so
+/// that no prefix the comparison looks at is a boundary the checker was fed on.
+const CHUNK: usize = 37;
+
+/// One run's comparison: at every prefix, the verdict of a checker fed the trace in
+/// chunks against the verdict of the folds over that whole prefix from the first
+/// record — the same `Ok` or `Err` and, when `Err`, the same words. `Ok(true)` if
+/// some prefix was in violation, so the sweep can say the comparison saw one.
+fn compare(seed: u64, variant: Variant, events: &[TraceEvent]) -> Result<bool, String> {
+    let servers = raft::SERVERS as usize;
+    let mut checker = Checker::new(servers);
+    let mut fed = 0;
+    let mut violated = false;
+    for step in 1..=PREFIXES {
+        let stop = events.len() * step / PREFIXES;
+        while fed < stop {
+            let next = (fed + CHUNK).min(stop);
+            checker.extend(&events[fed..next]);
+            fed = next;
+        }
+        let incremental = checker.verdict();
+        let whole = invariants::all(&events[..stop])
+            .and_then(|()| invariants::commit_majority(&events[..stop], servers));
+        violated |= whole.is_err();
+        if incremental != whole {
+            return Err(format!(
+                "seed {seed}: under {variant:?}, over the first {stop} of {} records, the incremental checker said {incremental:?} and the fold over the whole prefix said {whole:?}",
+                events.len()
+            ));
+        }
+    }
+    Ok(violated)
+}
+
+/// The equivalence the sweep's incremental checking rests on (issue #25, PROPOSED
+/// D-046): a checker fed a run's records in chunks as they arrive says exactly what
+/// the folds say over the whole trace from the first record — the same verdict, and
+/// when it is a violation, the same message, at every prefix and on every seed. The
+/// sweep stops a run at the first violation and the pinned seeds assert fragments of
+/// these messages, so a checker that agreed only on `Ok` would be no checker at all;
+/// a quarter of the seeds run each known-buggy server that the checks catch
+/// directly, and the count of prefixes found in violation is printed so a run that
+/// compared nothing but `Ok` is visible.
+#[test]
+fn the_incremental_checker_agrees_with_the_fold_over_the_whole_trace() {
+    let compared = compared_seeds();
+    let outcomes = sweep(compared, |seed| {
+        let variant = COMPARED[seed as usize % COMPARED.len()];
+        compare(seed, variant, &raft::run(seed, variant).events())
+    });
+    let violated = outcomes.iter().filter(|o| matches!(o, Ok(true))).count();
+    eprintln!(
+        "Incremental checker: {compared} seeds compared at {PREFIXES} prefixes each, {violated} of them with a violation to agree on"
+    );
+    let verdicts: Vec<Result<(), String>> = outcomes.into_iter().map(|o| o.map(|_| ())).collect();
+    if let Err(mismatch) = verdict(&verdicts) {
+        panic!("{mismatch}");
+    }
+    assert!(
+        violated > 0,
+        "no compared seed reached a violation: the comparison saw only Ok verdicts"
+    );
 }

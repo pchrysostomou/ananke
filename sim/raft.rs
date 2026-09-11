@@ -1281,15 +1281,33 @@ fn spawn_server(sim: &Sim, id: u64, variant: Variant) {
 }
 
 /// The leader in force: the server of the latest `RaftLeader` event, or server 1.
+///
+/// Read back over the trace's tail in windows rather than over a copy of the whole
+/// trace (PROPOSED D-046): a fault round asks this of a trace that only grows, and
+/// the answer is almost always within the last few hundred records. A window that
+/// holds no `RaftLeader` doubles until the trace is exhausted, so the answer is the
+/// whole trace's either way.
 pub(crate) fn leader_now(sim: &Sim) -> u64 {
-    sim.trace()
-        .iter()
-        .rev()
-        .find_map(|r| match r.event {
-            TraceEvent::RaftLeader { server, .. } => Some(server),
-            _ => None,
-        })
-        .unwrap_or(1)
+    let len = sim.trace_len();
+    let mut window = 256;
+    loop {
+        let from = len.saturating_sub(window);
+        let found = sim
+            .trace_from(from)
+            .iter()
+            .rev()
+            .find_map(|r| match r.event {
+                TraceEvent::RaftLeader { server, .. } => Some(server),
+                _ => None,
+            });
+        if let Some(server) = found {
+            return server;
+        }
+        if from == 0 {
+            return 1;
+        }
+        window *= 2;
+    }
 }
 
 fn to_command(op: &ClientOp) -> Command {
@@ -1974,17 +1992,35 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
 }
 
 /// What the sliced advance watches for.
-#[derive(Default)]
 struct Watch {
     slices: u32,
     stopped: Option<String>,
+    /// The safety checks, one checker for the whole run with the state of each
+    /// check kept across looks, so a look costs only the records since the last
+    /// one (PROPOSED D-046).
+    checker: invariants::Checker,
+    /// How many trace records the checker has been fed.
+    checked: usize,
+}
+
+impl Default for Watch {
+    fn default() -> Self {
+        Self {
+            slices: 0,
+            stopped: None,
+            checker: invariants::Checker::new(SERVERS as usize),
+            checked: 0,
+        }
+    }
 }
 
 /// Advances the run in small slices until `victim` receives the final chunk of a
 /// snapshot stream, or [`INSTALL_WAIT_BUDGET`] runs out: the moment
-/// [`Fault::CrashInstalling`] aims its crash at. The safety folds are skipped
-/// inside the small slices — the next ordinary [`advance`] runs them over
-/// everything — but the trace cap still stops a runaway.
+/// [`Fault::CrashInstalling`] aims its crash at. The safety checks are skipped
+/// inside the small slices — the next ordinary [`advance`] feeds them everything
+/// since its last look — but the trace cap still stops a runaway. The watch reads
+/// the records since its own last look rather than a copy of the whole trace, for
+/// the reason the checker keeps its state (PROPOSED D-046).
 fn install_landing(sim: &mut Sim, watch: &mut Watch, victim: u64) -> bool {
     if watch.stopped.is_some() {
         return false;
@@ -1995,7 +2031,7 @@ fn install_landing(sim: &mut Sim, watch: &mut Watch, victim: u64) -> bool {
     // must not draw the crash. Sends are scanned a slice further back, so a
     // chunk sent just before the watch began still decodes when it lands.
     let mut scanned = sim.trace_len();
-    for record in sim.trace().iter().rev().take(2000) {
+    for record in sim.trace_from(scanned.saturating_sub(2000)).iter().rev() {
         if let TraceEvent::MessageSent { id, payload, .. } = &record.event {
             payloads.entry(*id).or_insert_with(|| payload.clone());
         }
@@ -2012,8 +2048,9 @@ fn install_landing(sim: &mut Sim, watch: &mut Watch, victim: u64) -> bool {
             ));
             return false;
         }
-        let records = sim.trace();
-        for record in &records[scanned..] {
+        let records = sim.trace_from(scanned);
+        scanned += records.len();
+        for record in &records {
             match &record.event {
                 TraceEvent::MessageSent { id, payload, .. } => {
                     payloads.insert(*id, payload.clone());
@@ -2030,7 +2067,6 @@ fn install_landing(sim: &mut Sim, watch: &mut Watch, victim: u64) -> bool {
                 _ => {}
             }
         }
-        scanned = records.len();
     }
     false
 }
@@ -2041,8 +2077,9 @@ fn install_landing(sim: &mut Sim, watch: &mut Watch, victim: u64) -> bool {
 /// out: the moment [`Fault::CrashAdopting`] measures its crash from. Only records
 /// from here on count: the victim was not restarted since the heal, so no
 /// restart's restatement can stand in for the completion. As with
-/// [`install_landing`], the safety folds are skipped inside the small slices and
-/// the trace cap still stops a runaway. PROPOSED(D-041).
+/// [`install_landing`], the safety checks are skipped inside the small slices, the
+/// watch reads only the records since its last look (PROPOSED D-046) and the trace
+/// cap still stops a runaway. PROPOSED(D-041).
 fn install_completed(sim: &mut Sim, watch: &mut Watch, victim: u64) -> bool {
     if watch.stopped.is_some() {
         return false;
@@ -2061,8 +2098,9 @@ fn install_completed(sim: &mut Sim, watch: &mut Watch, victim: u64) -> bool {
             ));
             return false;
         }
-        let records = sim.trace();
-        if records[scanned..].iter().any(|r| {
+        let records = sim.trace_from(scanned);
+        scanned += records.len();
+        if records.iter().any(|r| {
             matches!(
                 &r.event,
                 TraceEvent::RaftSnapshot {
@@ -2074,7 +2112,6 @@ fn install_completed(sim: &mut Sim, watch: &mut Watch, victim: u64) -> bool {
         }) {
             return true;
         }
-        scanned = records.len();
     }
     false
 }
@@ -2254,10 +2291,18 @@ fn adoption_change(sim: &mut Sim, watch: &mut Watch, victim: u64) {
 }
 
 /// Runs the simulation for `duration` in slices of [`SLICE`], running the safety
-/// folds over the trace so far every [`CHECK_EVERY`] slices and stopping at the first
-/// violation, or at [`TRACE_CAP`] records. A buggy server can make the cluster do
-/// unbounded work, a follower that truncates on every append re-fetching its tail
-/// forever, and a run must still end with a verdict.
+/// checks every [`CHECK_EVERY`] slices and stopping at the first violation, or at
+/// [`TRACE_CAP`] records. A buggy server can make the cluster do unbounded work, a
+/// follower that truncates on every append re-fetching its tail forever, and a run
+/// must still end with a verdict.
+///
+/// One [`invariants::Checker`] serves the whole run and is fed only the records
+/// since the last look, so a look costs its own new events and a run costs its
+/// trace once rather than once per look (PROPOSED D-046). What it reports is what
+/// folding every check over the whole trace reports, in the same words:
+/// `the_incremental_checker_agrees_with_the_fold_over_the_whole_trace` asserts it
+/// over a hundred seeds, and [`Report::check`] folds from the first record again at
+/// the end of every run.
 fn advance(sim: &mut Sim, duration: Duration, watch: &mut Watch) {
     if watch.stopped.is_some() {
         return;
@@ -2277,10 +2322,10 @@ fn advance(sim: &mut Sim, duration: Duration, watch: &mut Watch) {
             return;
         }
         if watch.slices.is_multiple_of(CHECK_EVERY) {
-            let events: Vec<TraceEvent> = sim.trace().into_iter().map(|r| r.event).collect();
-            let verdict = invariants::all(&events)
-                .and_then(|()| invariants::commit_majority(&events, SERVERS as usize));
-            if let Err(violation) = verdict {
+            let records = sim.trace_from(watch.checked);
+            watch.checked += records.len();
+            watch.checker.extend(records.iter().map(|r| &r.event));
+            if let Err(violation) = watch.checker.verdict() {
                 watch.stopped = Some(format!("{violation} (at {:?})", sim.now()));
                 return;
             }

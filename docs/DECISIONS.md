@@ -2386,4 +2386,142 @@ still quiesced: a variant turns off its own fix and no other.
 
 ---
 
-_Next entry: D-045. Add one before implementing anything not covered above._
+## PROPOSED D-046 — The sweep's safety re-check keeps its state
+
+**Context.** `sim/raft.rs`'s `advance` runs a seed in fifty-millisecond slices and,
+every tenth slice, ran every safety fold over the trace from its first record:
+
+```rust
+let events: Vec<TraceEvent> = sim.trace().into_iter().map(|r| r.event).collect();
+let verdict = invariants::all(&events)
+    .and_then(|()| invariants::commit_majority(&events, SERVERS as usize));
+```
+
+Each look copied the whole trace — tens of thousands of `TraceRecord`s with their
+message payloads — and rebuilt every check's state from nothing: the log of every
+server, the leaders per term, the committed set, the applied map, the snapshot
+floors, the configuration in force. A run that looks L times at a trace that grows
+to N records pays O(L·N), and L grows with the run, so a seed's checking cost is
+quadratic in its length. `invariants::all` multiplied the constant: six checks, four
+of which replay the logs, replayed them four times per look, and `commit_majority`
+a fifth.
+
+The measurement on `main` at 37e3bad: the raft test binary took **1647.92 s at a
+thousand seeds** and `scripts/premerge.sh` **29 minutes**, against a 667 s binary
+before the stage-E snapshot work, which lengthened runs and so lengthened every
+look; attribution at a hundred seeds put about 62% of the cost in the storm-free
+sweep, whose dominant frames were `Vec<TraceRecord>::clone`, the drops of those
+clones, and `Logs::replay` (issue #25).
+
+Nothing in the checks needs the rebuild. RAFT.md §2 states log matching
+inductively — the check at an append reads the logs as they stand, and no earlier
+append is re-examined — and every other check is a left fold over the events with
+no lookahead. The state of a check after k events is all it needs to consume event
+k+1.
+
+**Decision.** `invariants::Checker` is every check of the module with the state of
+each kept across calls: `Checker::new(servers)`, `push(&TraceEvent)`,
+`extend(events)` and `verdict()`. `advance` keeps one checker per run and feeds it
+`Sim::trace_from(checked)` — the records since its last look (D-044) — so a look
+costs its own new events and a run costs its trace once. The membership scenario's
+`advance` does the same.
+
+*One implementation.* `all` and `commit_majority` keep their signatures and their
+meaning and are now the checker driven over the events and asked for one verdict, so
+there is one fold per check in the workspace and no second copy to drift. The
+checker also replays the logs once for the four checks that read them instead of
+once each, and follows who leads once for the three checks that ask.
+
+*A verdict per check, latched.* Each check holds `None` until its first violation
+and its message afterwards, and consumes no further events once it has one: a fold
+returns at its first violation, so no later event can change its answer.
+`verdict()` reports the first violation in the order `all` ran the checks, the
+commit-majority check last, which is what `all(events).and_then(|()|
+commit_majority(events, servers))` reported. This is why `push` returns nothing: a
+slice of events has no verdict of its own, since `all` reports the first violation
+in *its* order of the checks and not the earliest violation in the trace — an
+election safety violation at the last event outranks a log matching violation at the
+first — and only a look at every check at once can answer. A replay error, which
+`Logs::replay` raises for two snapshots that disagree at one index, is the first
+violation of every check that reads the logs and is recorded as such in each.
+
+*The equivalence test.* `the_incremental_checker_agrees_with_the_fold_over_the_whole
+_trace` runs a hundred seeds — the gate's twenty at the gate's tier — and, at eight
+prefixes of each run's trace, compares the verdict of a checker fed that trace in
+chunks of 37 events against `all` and `commit_majority` folded over the whole prefix
+from the first record: the same `Ok` or `Err`, and when `Err`, the same words. A
+quarter of the seeds run each of `TruncateOnEveryAppend`, `SendBeforePersist` and
+`CountOlderTermForCommit`, whose violations three different checks report, and the
+test asserts that some compared prefix was in violation, so a comparison that agreed
+only on `Ok` fails rather than passes.
+
+*Three other whole-trace scans per slice.* `install_landing` and `install_completed`
+copied the whole trace every five milliseconds of their watch and looked at its
+tail; they now read `trace_from` like `stream_opened` and `flush_in_flight` already
+did (D-044). `leader_now`, which every fault round asks for the latest `RaftLeader`,
+copied the whole trace to read backwards over it; it now reads back over the tail in
+windows that double until one holds a leader, which is the same answer.
+
+**Alternatives.** Checking only at the end of a run: a violation would be reported
+at the end of a trace rather than near the event that caused it, the run would keep
+going after it and the runaway a buggy variant produces would be bounded only by the
+trace cap, which is the reason the periodic check exists. Checking a sample of the
+slices, or raising `CHECK_EVERY`: it buys a constant factor and keeps the quadratic,
+and it moves a violation's report further from its cause. Keeping the folds and
+copying the trace once per run instead of once per look: the copy is only part of
+the cost, the replays are the rest. Keeping the old folds as a second implementation
+for the equivalence test to compare against: two implementations of a safety check
+is how one of them comes to be wrong, and the comparison against the folds as they
+stood at 37e3bad was run once, over a hundred seeds and twelve variants at eight
+prefixes each, before this branch's first commit rather than for ever after. An
+incremental `leader_completeness` that stops re-scanning the committed set at every
+election, and an incremental `change_complete` in the membership driver: both are
+linear in the run rather than in the slice, neither showed in the profile, and this
+entry is about the quadratic.
+
+**Consequences.** The raft test binary at a thousand seeds falls from **1647.92 s
+to 327.57 s** on the same machine, five times faster, and `scripts/premerge.sh`
+from **29 minutes to 7 minutes 26 seconds**, under the fifteen the owner asked for;
+every sweep is green at a thousand seeds and every variant is caught at its
+established rate, the rates identical to the run before. (The binary's figure is
+the one the premerge's own run reports too, 333.62 s; a third measurement said
+946.98 s and was taken while another agent's sweep had the eight-core machine at a
+load average of fifty, which is what a sweep measured on a busy laptop looks like.)
+A `sample` profile of the binary at three hundred seeds, 184 938 busy samples of
+396 029, says what the remaining time is:
+
+| what | share of busy samples |
+| --- | --- |
+| the allocator | 24.4% |
+| the simulator and the server under it, everything not named below | 33.9% |
+| `std::path` comparison, the simulated filesystem's `BTreeMap<PathBuf, _>` | 11.5% |
+| `moirae_trace` JSON and `core::fmt`, the run's JSONL export | 6.9% |
+| `memmove`/`memcpy`/`memset`/`memcmp` | 7.4% |
+| `Sim::trace_from` | 4.6% |
+| `Report::check`'s own scans and the linearizability search | 4.6% |
+| **`invariants::Checker`** | **3.9%** |
+| `Vec<TraceRecord>::clone`, the copies that remain | 2.7% |
+
+What is left is the simulation, not the checking. Two costs this entry does not
+touch and that the next measurement should look at, both outside issue #25: every
+run builds its moirae JSONL export whether or not it is written, which is the 6.9%
+of `moirae_trace` and most of the `core::fmt` beside it; and
+`Report::isolation_keeps_the_term` scans the whole trace once per isolation at the
+end of every run, a linear scan of a time-ordered trace that a binary search on
+`TraceRecord::at` would bound (5442 samples on its own). Both want a backlog issue,
+not a widening of this one.
+
+The checker is public API: `invariants::Checker`, with `new`, `push`, `extend` and
+`verdict`. Every check stays a function of the trace alone, so a failing seed still
+replays in the studio and the pinned seeds' message fragments still hold. A run now
+holds one checker's state for its whole length — the logs, the applied map and the
+committed set, which the old folds built and dropped at every look — so a seed's
+peak memory is a little higher and its allocation rate much lower. `Report::check`
+still folds `all` and `commit_majority` from the first record at the end of every
+run, over the whole trace, which is a second opinion on the incremental verdict on
+every seed of every sweep: an incremental checker that missed a violation would be
+caught there, on every seed, as a run that passed the slices and failed at the end.
+
+---
+
+_Next entry: D-047. Add one before implementing anything not covered above._
