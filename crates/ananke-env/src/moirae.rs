@@ -34,6 +34,7 @@
 //! | `RaftConfig` / `RaftSnapshot`            | `log` `ananke.raft.config` / `.snapshot`      |
 //! | `RaftCompacted` / `RaftReseeded` / `RaftSnapshotResumed` / `RaftAdopted` | `log` `ananke.raft.compacted` / `.reseeded` / `.snapshot-resumed` / `.adopted` |
 //! | `RaftProgressReset`                      | `log` `ananke.raft.progress-reset`            |
+//! | `RaftSnapshotDeleted` / `RaftSnapshotReused` / `RaftSnapshotStreams` | `log` `ananke.raft.snapshot-deleted` / `.snapshot-reused` / `.snapshot-streams` |
 //! | `ClientInvoke` / `ClientReturn`          | `log` `ananke.client.invoke` / `.return`      |
 //! | `TimeAdvanced`                           | nothing: every line carries `t`               |
 //!
@@ -789,6 +790,43 @@ fn convert(
                 ("server", int(*server)),
                 ("follower", int(*follower)),
                 ("incarnation", int(*incarnation)),
+            ])),
+        ),
+        // PROPOSED(D-043): snapshot versions and the streams pinned to them.
+        TraceEvent::RaftSnapshotDeleted {
+            server,
+            last_index,
+            take,
+        } => log(
+            "ananke.raft.snapshot-deleted",
+            Some(Json::obj(vec![
+                ("server", int(*server)),
+                ("lastIndex", int(*last_index)),
+                ("take", int(*take)),
+            ])),
+        ),
+        TraceEvent::RaftSnapshotReused {
+            server,
+            last_index,
+            take,
+        } => log(
+            "ananke.raft.snapshot-reused",
+            Some(Json::obj(vec![
+                ("server", int(*server)),
+                ("lastIndex", int(*last_index)),
+                ("take", int(*take)),
+            ])),
+        ),
+        TraceEvent::RaftSnapshotStreams {
+            server,
+            to,
+            streams,
+        } => log(
+            "ananke.raft.snapshot-streams",
+            Some(Json::obj(vec![
+                ("server", int(*server)),
+                ("to", int(*to)),
+                ("streams", int(*streams)),
             ])),
         ),
         TraceEvent::ClientInvoke { client, seq, op } => {

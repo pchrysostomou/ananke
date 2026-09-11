@@ -191,6 +191,73 @@ fn a_leader_that_ignores_incarnations_is_caught() {
     is_caught(Variant::IgnoreIncarnation);
 }
 
+/// The leader as built before PROPOSED D-043: one mutable checkpoint directory per
+/// index, rewritten by every take at that index under whatever stream reads it,
+/// and one snapshot stream at a time, every other designated follower queued
+/// behind it. A retake at the index a stream is reading scrambles that stream,
+/// which never completes, and the follower queued behind it gets neither the
+/// stream nor entries; with both followers uncountable the leader loses its
+/// quorum and nothing commits, which the liveness check reports (nightly run
+/// 34496762339, seed 5909). This is the server whose hundred seeds CI passed when
+/// it merged: the catch took the nightly's ten thousand, once, so it is asserted
+/// at that tier and reported at every tier, with how many were the liveness
+/// check's. What every tier must see is the fault firing — a take at the index
+/// already taken, into the directory a stream may be reading — so that a sweep
+/// that passes is known to have injected it. The pair rule holds because the
+/// correct server passes the same seeds.
+#[test]
+fn a_leader_that_shares_one_snapshot_directory_and_streams_one_follower_at_a_time_is_caught() {
+    let outcomes: Vec<(Option<String>, bool)> = sweep(seeds(), |seed| {
+        let report = raft::run(seed, Variant::SharedSnapshotDir);
+        (report.check().err(), retook_at_one_index(&report))
+    });
+    let caught: Vec<&String> = outcomes.iter().filter_map(|(v, _)| v.as_ref()).collect();
+    let fired = outcomes.iter().filter(|(_, fired)| *fired).count();
+    let liveness = caught.iter().filter(|v| v.contains("liveness")).count();
+    eprintln!(
+        "SharedSnapshotDir: caught on {} of {} seeds, {liveness} by the liveness check, re-took at an index already taken on {fired} seeds, first: {}",
+        caught.len(),
+        seeds(),
+        caught.first().map_or("", |v| v.as_str())
+    );
+    assert!(
+        fired > 0,
+        "SharedSnapshotDir never re-took at an index already taken: the fault was not injected"
+    );
+    if seeds() >= 10_000 {
+        assert!(!caught.is_empty(), "SharedSnapshotDir was never caught");
+    }
+}
+
+/// Whether some server took a snapshot at the index it had already taken: the
+/// re-take that, as built, sweeps and rewrites the shared directory under any
+/// stream reading it (PROPOSED D-043). A restart re-states the record's snapshot
+/// right after its `RaftTruncate`; that is the disk's picture, not a take.
+fn retook_at_one_index(report: &raft::Report) -> bool {
+    let mut last_take: BTreeMap<u64, u64> = BTreeMap::new();
+    let mut restating: BTreeSet<u64> = BTreeSet::new();
+    for event in report.events() {
+        match event {
+            TraceEvent::RaftTruncate { server, .. } => {
+                restating.insert(server);
+            }
+            TraceEvent::RaftSnapshot {
+                server,
+                last_index,
+                taken: true,
+                ..
+            } => {
+                if !restating.remove(&server) && last_take.get(&server) == Some(&last_index) {
+                    return true;
+                }
+                last_take.insert(server, last_index);
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
 /// Lease safety under drift (RAFT.md §2, invariant 6): on every seed where the
 /// simulated drift exceeds the bound, either the guard revoked the drifting
 /// follower's trust or the checker reports the stale read and the run fails. The
@@ -295,6 +362,9 @@ struct Coverage {
     snapshots_taken: usize,
     snapshots_installed: usize,
     snapshot_resumes: usize,
+    snapshot_versions_deleted: usize,
+    snapshot_takes_reused: usize,
+    snapshot_streams_at_once: usize,
     compactions: usize,
     reseeded: usize,
     reseed_completions: u64,
@@ -397,6 +467,15 @@ impl Coverage {
             report.count(|e| matches!(e, TraceEvent::RaftSnapshot { taken: false, .. }));
         self.snapshot_resumes +=
             report.count(|e| matches!(e, TraceEvent::RaftSnapshotResumed { .. }));
+        // PROPOSED(D-043): versions swept, takes answered by the recorded
+        // version, and leaders streaming to more than one follower at once.
+        self.snapshot_versions_deleted +=
+            report.count(|e| matches!(e, TraceEvent::RaftSnapshotDeleted { .. }));
+        self.snapshot_takes_reused +=
+            report.count(|e| matches!(e, TraceEvent::RaftSnapshotReused { .. }));
+        self.snapshot_streams_at_once += report.count(
+            |e| matches!(e, TraceEvent::RaftSnapshotStreams { streams, .. } if *streams > 1),
+        );
         self.compactions += report.count(|e| matches!(e, TraceEvent::RaftCompacted { .. }));
         self.reseeded += report.count(|e| matches!(e, TraceEvent::RaftReseeded { .. }));
         self.reseed_completions += u64::from(reseed_completed(report));

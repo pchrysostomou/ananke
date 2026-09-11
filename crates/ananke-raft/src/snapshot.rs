@@ -56,6 +56,19 @@
 //! old store removed first and the copies synced after, and a damaged staging
 //! `CURRENT` swept as debris — the nightly's seed 6325, where a crash inside the
 //! copy rotted the staging `CURRENT` and the server came back on a fresh store.
+//!
+//! Every take is a *version*: it goes to its own directory, [`version_dir`],
+//! `snap-<index>-<take>`, numbered by the store's take counter, which the record
+//! carries (PROPOSED(D-043)). A stream pins the version it opened for its whole
+//! life — a resend after loss resumes on it, and a newer take, at the same index
+//! or a later one, never touches it. [`find_version`] is what a stream opens: the
+//! newest *complete* version at the index the core asked for, complete meaning
+//! the checkpoint's own `CURRENT` is there, since the record precedes the
+//! checkpoint (D-036) and may name a take still in flight. [`sweep_versions`]
+//! deletes the versions that are neither the record's nor pinned by a stream.
+//! The as-built behaviour, one mutable directory per index rewritten by each
+//! take, is kept as [`Variant::SharedSnapshotDir`] through [`checkpoint_dir`] and
+//! [`take`].
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
@@ -82,10 +95,136 @@ pub fn staging_dir(engine_dir: &Path) -> PathBuf {
 
 /// The directory a checkpoint taken at `index` goes to, under the server's data
 /// directory. Never removed once a stream may have read from it; the snapshot
-/// record names the one in force.
+/// record names the one in force. One directory per index, rewritten by every
+/// take at that index: the behaviour as built, which
+/// [`Variant::SharedSnapshotDir`] keeps; the correct server takes into
+/// [`version_dir`] (PROPOSED(D-043)).
 #[must_use]
 pub fn checkpoint_dir(engine_dir: &Path, index: Index) -> PathBuf {
     engine_dir.join(format!("snap-{index}"))
+}
+
+/// The directory of the `take`th checkpoint this store took, at `index`, under
+/// the server's data directory: `snap-<index>-<take>`. Two takes at one index
+/// are two directories, and a stream that opened one reads it untouched for its
+/// whole life (PROPOSED(D-043)).
+#[must_use]
+pub fn version_dir(engine_dir: &Path, index: Index, take: u64) -> PathBuf {
+    engine_dir.join(format!("snap-{index}-{take}"))
+}
+
+/// The (index, take) a checkpoint directory's name says, if it is one: the
+/// versioned `snap-<index>-<take>`, or the shared `snap-<index>` as take 0.
+#[must_use]
+pub fn parse_version(name: &str) -> Option<(Index, u64)> {
+    let rest = name.strip_prefix("snap-")?;
+    match rest.split_once('-') {
+        Some((index, take)) => Some((index.parse().ok()?, take.parse().ok()?)),
+        None => Some((rest.parse().ok()?, 0)),
+    }
+}
+
+/// Whether the checkpoint in `dir` is complete: its `CURRENT` is there and
+/// parses. The engine writes a checkpoint's `CURRENT` last and synced (D-024),
+/// and the record names the directory before the checkpoint is written (D-036),
+/// so the record may name a take still in flight, or one a crash cut short; a
+/// stream must open neither.
+///
+/// # Errors
+///
+/// The filesystem's, other than a missing file.
+pub async fn checkpoint_complete<E: Environment>(env: &E, dir: &Path) -> io::Result<bool> {
+    Ok(match read_whole(env, &manifest::current_path(dir)).await? {
+        Some(bytes) => manifest::parse_current(&bytes).is_some(),
+        None => false,
+    })
+}
+
+/// The newest complete version of the checkpoint at `index` under `engine_dir`,
+/// with its take number: what a stream to a follower opens (PROPOSED(D-043)).
+/// None when no complete version of that index exists — the take is in flight,
+/// a crash cut it short, or the record is an install's — and the caller should
+/// ask for a fresh take.
+///
+/// # Errors
+///
+/// The filesystem's, listing the data directory.
+pub async fn find_version<E: Environment>(
+    env: &E,
+    engine_dir: &Path,
+    index: Index,
+) -> io::Result<Option<(PathBuf, u64)>> {
+    let mut takes: Vec<u64> = env
+        .fs()
+        .read_dir(engine_dir)
+        .await?
+        .iter()
+        .filter_map(|name| parse_version(name.to_str()?))
+        .filter(|&(i, _)| i == index)
+        .map(|(_, take)| take)
+        .collect();
+    takes.sort_unstable_by(|a, b| b.cmp(a));
+    for take in takes {
+        let dir = if take == 0 {
+            checkpoint_dir(engine_dir, index)
+        } else {
+            version_dir(engine_dir, index, take)
+        };
+        if checkpoint_complete(env, &dir).await? {
+            return Ok(Some((dir, take)));
+        }
+    }
+    Ok(None)
+}
+
+/// Deletes every version under `engine_dir` that is neither the record's nor
+/// pinned, and returns the (index, take) of each (PROPOSED(D-043)). `pinned`
+/// counts the streams reading each directory; a directory with a reader stays.
+/// The directories are listed *before* the record is read: a take writes its
+/// record before it creates its directory (D-036), so a directory the listing
+/// saw and the record does not name is an old version, never one in flight. The
+/// filesystem has no directory removal (D-024), so a version is deleted by
+/// removing its files, and a directory already empty is not a version.
+///
+/// # Errors
+///
+/// The filesystem's or the engine's, reading the record; a file that could not
+/// be removed is left for the next sweep.
+pub async fn sweep_versions<E: Environment>(
+    env: &E,
+    store: &RaftStore<E>,
+    engine_dir: &Path,
+    pinned: &BTreeMap<PathBuf, usize>,
+) -> io::Result<Vec<(Index, u64)>> {
+    let fs = env.fs();
+    let names = fs.read_dir(engine_dir).await?;
+    let current = store
+        .snapshot_record()
+        .await?
+        .map(|record| record.dir)
+        .unwrap_or_default();
+    let mut deleted = Vec::new();
+    for name in names {
+        let Some(version) = name.to_str().and_then(parse_version) else {
+            continue;
+        };
+        let dir = engine_dir.join(&name);
+        if dir.display().to_string() == current || pinned.get(&dir).is_some_and(|&n| n > 0) {
+            continue;
+        }
+        let Ok(files) = fs.read_dir(&dir).await else {
+            continue;
+        };
+        if files.is_empty() {
+            continue;
+        }
+        for file in files {
+            let _ = fs.remove_file(&dir.join(file)).await;
+        }
+        let _ = fs.sync_dir(&dir).await;
+        deleted.push(version);
+    }
+    Ok(deleted)
 }
 
 fn bad(what: &str) -> io::Error {
@@ -371,7 +510,11 @@ async fn adopt_staged_as_built<E: Environment>(env: &E, engine_dir: &Path) -> io
 /// checkpoint is written to `dir`, so the checkpoint's copy of the record precedes
 /// the checkpoint's `CURRENT` (RAFT.md §1, D-024). The caller must be the `apply`
 /// task with no apply in flight, so `index` is exactly what the checkpoint
-/// captures (PROPOSED(D-036)). Any earlier attempt at `dir` is swept first.
+/// captures (PROPOSED(D-036)). Any earlier attempt at `dir` is swept first — a
+/// stream reading `dir` is scrambled by that, which is the as-built behaviour
+/// [`Variant::SharedSnapshotDir`] keeps; the correct server takes through
+/// [`take_version`] (PROPOSED(D-043)). The record's take counter advances here
+/// too, so the numbering of versions is monotone whichever way a take went.
 ///
 /// # Errors
 ///
@@ -384,6 +527,54 @@ pub async fn take<E: Environment>(
     index: Index,
     term: Term,
     config: &Configuration,
+) -> io::Result<()> {
+    let number = next_take(store).await?;
+    take_numbered(env, store, dir, index, term, config, number).await
+}
+
+/// Takes a snapshot at `index` into its own version directory under
+/// `engine_dir`, [`version_dir`] numbered by the store's take counter, and
+/// returns that directory (PROPOSED(D-043)). Two takes at one index are two
+/// directories, so a stream pinned to the earlier one reads it untouched. The
+/// order is [`take`]'s: the record, naming the directory and the new count,
+/// synced first; then the checkpoint.
+///
+/// # Errors
+///
+/// The engine's or the filesystem's, as for [`take`].
+pub async fn take_version<E: Environment>(
+    env: &E,
+    store: &RaftStore<E>,
+    engine_dir: &Path,
+    index: Index,
+    term: Term,
+    config: &Configuration,
+) -> io::Result<PathBuf> {
+    let number = next_take(store).await?;
+    let dir = version_dir(engine_dir, index, number);
+    take_numbered(env, store, &dir, index, term, config, number).await?;
+    Ok(dir)
+}
+
+/// The next take number: one past the record's count, one for a store that
+/// never took (PROPOSED(D-043)).
+async fn next_take<E: Environment>(store: &RaftStore<E>) -> io::Result<u64> {
+    Ok(store
+        .snapshot_record()
+        .await?
+        .map_or(0, |record| record.take)
+        + 1)
+}
+
+/// The take itself, numbered: see [`take`].
+async fn take_numbered<E: Environment>(
+    env: &E,
+    store: &RaftStore<E>,
+    dir: &Path,
+    index: Index,
+    term: Term,
+    config: &Configuration,
+    number: u64,
 ) -> io::Result<()> {
     let fs = env.fs();
     if let Ok(names) = fs.read_dir(dir).await {
@@ -399,6 +590,7 @@ pub async fn take<E: Environment>(
             config: config.clone(),
             dir: dir.display().to_string(),
             taken: true,
+            take: number,
         })
         .await?;
     store.engine().checkpoint(dir).await?;
@@ -522,6 +714,14 @@ impl Sender {
     #[must_use]
     pub fn at_end(&self) -> bool {
         self.file >= self.files.len()
+    }
+
+    /// The checkpoint directory this stream is pinned to (PROPOSED(D-043)): the
+    /// one it opened, read for its whole life, and what a reader count keeps
+    /// from being swept meanwhile.
+    #[must_use]
+    pub fn dir(&self) -> &Path {
+        &self.dir
     }
 
     /// The offset of the chunk [`chunk`](Self::chunk) would send: what a
@@ -866,6 +1066,13 @@ impl<E: Environment> Assembler<E> {
             config: staged.config.clone(),
             dir: String::new(),
             taken: false,
+            // The receiver's versions start over on the installed store. A
+            // later take may then share a name with a directory the receiver
+            // took before — a re-seeded server's lost store may have taken at
+            // the very index it takes at again — which is harmless because the
+            // next incarnation empties every directory its record does not
+            // name before any task of it runs (PROPOSED(D-043)).
+            take: 0,
         };
         let mut writes: BTreeMap<Bytes, Value> = BTreeMap::new();
         writes.insert(

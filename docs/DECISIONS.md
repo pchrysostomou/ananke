@@ -1925,4 +1925,174 @@ site is marked `PROPOSED(D-042)`.
 
 ---
 
-_Next entry: D-043. Add one before implementing anything not covered above._
+## PROPOSED D-043 — Snapshot takes are versioned directories, a stream pins one, and a leader streams to every designated follower at once
+
+**Context.** The ten-thousand-seed nightly (run 34496762339), seed 5909: the
+leader's last commit was 329 at 13.43 s and nothing committed for the remaining
+5.4 s of the run. Server 2 had been snapshot-fed since 7.46 s — 744
+`InstallSnapshot` chunks, the stream resumed from offset 0 six times — and at the
+end the receiver was still acknowledging `000005.sst` while the sender was on
+`000010.sst`. The first of those restarts follows the leader re-taking the *same*
+snapshot 329 five times within a hundred milliseconds (checkpoint versions 779 to
+783, every one into `/raft/snap-329`), rewriting the directory under the stream.
+Server 3, refused and re-seeded, was designated snapshot-fed and received
+nothing: the `snapshot` task streams to one follower at a time, its stream waited
+behind server 2's never-ending one, and a designated follower gets no entries —
+every heartbeat rejected with hint 334, two hundred and four times. Neither
+follower could be counted; the leader lost its quorum at 13.99 s, won term 11 at
+14.76 s and was no better off. The liveness check reported it.
+
+As built (D-030, PROPOSED D-036, D-038): every take at an index writes
+`snap-<index>`, sweeping whatever was there; the record under `0 / 3 / snapshot`
+is written before the checkpoint, so it can name a directory still being
+written; the task keeps one outbound stream and a queue of followers behind it;
+and no checkpoint directory is ever deleted, the backlog line D-038 left. The
+mechanism behind the five re-takes is the record's head start: a threshold take
+wrote the record naming the directory it was about to write; an `Install` for
+another follower read the record, opened an empty or partial directory, and
+reported the checkpoint unusable; the core cleared both its checkpoint and its
+pending take, and the next heartbeat asked again — a second take at the same
+index queued behind the first, into the same directory, and so on. RAFT.md §1
+gives the stream its resumption and the leader its threshold rule; it does not
+say where a take goes, what a stream reads while the next take lands, when a
+directory may go, or how many followers a leader feeds at once.
+
+**Decision.** Six parts, every site marked `PROPOSED(D-043)`.
+
+*Versioned takes.* Every take goes to its own directory,
+`snapshot::version_dir`, `snap-<index>-<take>`, numbered by a per-store take
+counter the record carries (`SnapshotRecord::take`, eight more bytes in the
+value): the counter is read from the record and advanced by every take, so a
+restart continues the numbering, and two takes at one index are two directories.
+An install's repair writes the counter as zero, so a name can recur on a
+re-seeded server whose lost store had taken at the very index it takes at
+again; that is harmless because the sweep below empties every directory the
+record does not name before the incarnation's tasks run, and a take clears its
+directory before writing anyway. `snapshot::take` keeps its signature and its
+sweep-and-rewrite of an explicit directory, which the variant uses; the correct
+server takes through `snapshot::take_version`.
+
+*A stream pins a version.* A stream reads the directory it opened for its whole
+life: a resend after loss resumes on it, and a newer take, at the same index or
+a later one, never touches it. What it opens is `snapshot::find_version`, the
+newest *complete* version of the index the core asked for — complete meaning
+the checkpoint's own `CURRENT` is there, since the engine writes it last and
+synced (D-024) and the record precedes the checkpoint (D-036), so the record may
+name a take still in flight or one a crash cut short. The conservative option,
+taken: a leader that has taken a newer snapshot keeps streaming the pinned one
+to completion. The stream's identity on the wire is (sender, leader term, last
+index, last term), which cannot tell two takes at one index apart; switching
+versions mid-stream would let the receiver resume across them, and a deliberate
+restart at offset 0 under the same identity is read by the assembler as a
+duplicate of a file already done. Both need the codec, which D-042 owns. The
+cost is one more install where the leader compacted past the pinned index while
+the stream ran: the follower installs the older snapshot, is found below the
+prefix, and is fed the newer one.
+
+*Deletion.* `snapshot::sweep_versions` deletes every version that is neither the
+record's nor read by a stream; the `snapshot` task keeps a reader count per
+directory (`Streams::readers`), incremented when a stream opens and released
+when it ends. The directories are listed *before* the record is read: a take
+writes its record before it creates its directory, so a directory the listing
+saw and the record does not name is an old version, never one in flight. The
+filesystem has no directory removal (D-024), so a version is deleted by
+removing its files and an empty directory is not a version. The sweep runs at
+every incarnation's start, in `incarnation` before its tasks are spawned — a
+fresh incarnation reads none of its predecessor's versions, an installed
+store's record names none, and running it before any task can take is what
+keeps a recurring name from ever naming a directory with files in it — then in
+the `snapshot` task after every completed take and after every stream ends;
+each deletion is `RaftSnapshotDeleted`. This closes the checkpoint-directory GC
+that D-030 and D-038 left to the backlog.
+
+*One stream per designated follower.* The task keeps `Streams::outbound`, a
+stream per follower, and services them all: the chunk timer is the earliest
+deadline among them, every stream past its deadline is resent or given up in
+the same pass, and an acknowledgement finds its own stream by sender. A
+designated follower is never queued behind another's stream. Each opening is
+traced `RaftSnapshotStreams` with the count in flight.
+
+*The guard, and the retake gate.* A take that would not advance the index is a
+second version of the same state, so the `apply` task answers a plain
+`Job::Take` at the record's own index with the recorded version when it is
+complete, traced `RaftSnapshotReused`, and takes a fresh version otherwise. A
+take the core asks for after a checkpoint was found unusable — a stream that
+could not open one, a receiver that refused one twice, a take that failed — is
+a `Job::Retake`, a fresh version even at the record's index, since the recorded
+one is the one found wanting. And a stream that finds no complete version while
+a take is already in flight reports its failure without `retake`: the core then
+asks the stream again on the next heartbeat and finds the take landed, where a
+retake would have cleared the pending take and queued a second one at the same
+index behind it — the cascade of seed 5909. Recorded honestly: by construction
+the correct server's plain takes always advance the index — the threshold take
+requires the applied index past the last take, and the on-demand take only runs
+with no checkpoint at all — so the guard is a belt whose count the sweep
+reports; the two gates are what stop the waste.
+
+*The variant.* `Variant::SharedSnapshotDir` is the server as built: one
+directory per index through `checkpoint_dir` and `take`, one stream at a time
+with the queue behind it, the record's directory opened whatever its state, and
+a retake asked whenever a stream fails for want of a checkpoint. The sweep runs
+it beside the correct server and reports its catch rate, how many of its
+catches were the liveness check's, and on how many seeds the fault fired — a
+take at the index already taken, into the directory a stream may be reading,
+which the test folds from the trace and asserts at every tier, so a sweep that
+passes is known to have injected the fault. The catch itself is asserted at the
+nightly's tier, ten thousand seeds, the only tier that ever produced it: this
+is the server whose hundred seeds CI passed when it merged.
+
+**What the sweep found.** The hundred-seed release run: the correct server
+passes all hundred, with 2905 snapshots taken, 1279 installed, 4696 streams
+resumed, 2540 versions deleted by the sweep, 70 stream openings that made two
+streams run at once, and no take answered by the recorded version — the guard
+never fired, as the construction above predicts; the slowest write after a heal
+took 375 ms against the 2 s bound. `SharedSnapshotDir` is caught on 0 of 100
+seeds, and on 0 of 1000 at the pre-merge tier, while the fault fired — a take at
+the index already taken, into the shared directory — on 8 of the gate's 20 seeds
+and 51 of the 100. That is the expected shape, not a surprise: the
+variant is the server that passed CI's hundred seeds when it merged, and the
+catch took the nightly's ten thousand, once. As built, cb15eb1 still fails seed
+5909 on this machine with `liveness: no client write completed after the last
+heal at 16.114 s`; on this branch the same seed passes under both the correct
+server and the variant, because the record's value is eight bytes longer on
+every take, which moves the engine's flushes and with them the checkpoints'
+file sets, so no schedule on this branch replays the nightly's. The variant is
+therefore asserted caught only at the nightly's tier, `ANANKE_SEEDS` of ten
+thousand or more, and asserted to have fired at every tier; a nightly that
+does not catch it is a hole in the sweep to be reported, not a variant to
+delete (RAFT.md §5).
+
+**Alternatives.** Carrying the take number on the wire, so a stream could switch
+to a newer version by restarting under a new identity: a codec field, D-042's
+territory, for a switch nothing needs. Deriving the take number from the
+directory listing instead of the record: a scan at every take, and a crash
+between a listing and a checkpoint leaves the numbering to the next scan; the
+record is already synced before every checkpoint. Deleting versions eagerly at
+the next take: D-030 rejected it for the stream still reading. Keeping the
+core's pending take across a retake, in `core.rs`: the same effect, kept out to
+leave the core to D-042's Progress reset; the server-side gate sees the same
+events. Round-robin over one stream at a time: a stream that never ends still
+starves the rest, and RAFT.md §3 gives the task no reason to hold one back.
+Directory removal in the filesystem model: D-024's decision, out of scope.
+
+**Consequences.** Three trace events (`RaftSnapshotDeleted`,
+`RaftSnapshotReused`, `RaftSnapshotStreams`) and their moirae lines; the snapshot
+record's value grows by eight bytes, with no released store to migrate. A
+leader's data directory holds the record's version plus whatever streams still
+read, and nothing else after the next sweep; a follower sweeps its old versions
+at its next start. Every stream costs one chunk in flight, so a leader feeding
+two followers has two. Seed 5909 needs this entry and D-042 together and is
+pinned by whoever merges both. The nightly is the one tier that asserts the
+variant caught, so a nightly whose ten thousand seeds never catch it goes red on
+that test until the sweep learns to aim at the shape — a targeted fault in the
+manner of `CrashInstalling` (D-030), left for the sweep's owner since the shape
+needs a re-take under a running stream and a second designated follower at
+once, which no driver-side fault forces directly. `sim/tests/raft.rs` counts versions deleted,
+takes reused and streams at once, and `crates/ananke-raft/tests/snapshot.rs`
+shows two takes at one index as two directories, a stream completing under a
+newer take where the shared directory's does not, the sweep sparing the pinned
+and the recorded versions, and two designated followers streamed to at once.
+
+---
+
+_Next entry: D-044. Add one before implementing anything not covered above._
