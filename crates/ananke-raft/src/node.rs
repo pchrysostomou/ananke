@@ -57,7 +57,11 @@
 //! number, stamped on the way out like the clock — 0 while refused, a fresh one
 //! on the re-seeded store — so a leader that matched entries on the lost store
 //! forgets them rather than probing above a log that no longer has them
-//! (PROPOSED(D-042)).
+//! (PROPOSED(D-042)). The refusal itself is durable (PROPOSED(D-044)): before
+//! the trace and before the re-seed, the store directory's marker is made to say
+//! that this store lost state, and the engine that recovered the hole is
+//! quiesced, so nothing it does after — no table, no manifest, no deleted log
+//! segment — can make the store look whole to the next start.
 //!
 //! A client request becomes a proposal. A server that is not the leader answers
 //! [`Reply::NotLeader`] at once. The leader remembers the request against the index
@@ -97,7 +101,8 @@ use crate::message::{Frame, Message, SnapshotStatus};
 use crate::queue::Queue;
 use crate::snapshot::{self, Assembler, Feed, Repair, Sender, Staged};
 use crate::store::{
-    FIRST_INCARNATION, LostState, RaftStore, Recovered, mark_store, refuse_lost_store,
+    FIRST_INCARNATION, LostState, RaftStore, Recovered, mark_store, mark_store_lost,
+    refuse_lost_store,
 };
 use crate::types::{Configuration, Entry, Index, Payload, ServerId, Term};
 
@@ -277,12 +282,27 @@ pub async fn run<E: Environment>(env: E, config: NodeConfig) -> io::Result<()> {
         inbox_capacity,
     } = config;
     let server = id.0;
+    // PROPOSED(D-041): the as-built adoption is the server before the store
+    // marker existed: it neither checks nor writes one, lost mark included, so
+    // its disk sees exactly the operations the nightly's did.
+    let as_built = raft.variant == Variant::AdoptionAsBuilt;
+    // PROPOSED(D-044): a refusal is recorded in the store directory before
+    // anything else and quiesces the engine that recovered the hole. The
+    // as-built variant writes no marker at all; `RefusalNotDurable` is the
+    // server before either half of the fix.
+    let durable_refusal = !as_built && raft.variant != Variant::RefusalNotDurable;
+    let quiesce_refused = raft.variant != Variant::RefusalNotDurable;
     // The store's recovery must never hand back a state with a hole (RAFT.md §3):
     // no fallback, no discarded head, and a damaged log refused before it is cut.
     let engine = EngineConfig {
         allow_manifest_fallback: false,
         allow_head_gap: false,
         refuse_log_damage: true,
+        // PROPOSED(D-044): the engine that recovered a hole starts quiesced, so
+        // not even a flush between the open and the store's refusal can rewrite
+        // the manifest without the dropped table or delete the log segments that
+        // held its records.
+        quiesce_on_loss: quiesce_refused,
         ..engine
     };
     let sock = Arc::new(env.net().bind(listen).await?);
@@ -325,6 +345,12 @@ pub async fn run<E: Environment>(env: E, config: NodeConfig) -> io::Result<()> {
         let adopted = match snapshot::adopt_staged_under(&env, &engine.dir, raft.variant).await {
             Ok(adopted) => adopted,
             Err(error) if LostState::from_io(&error).is_some() => {
+                // PROPOSED(D-044): the loss is recorded in the store directory
+                // before anything else, so the store this server was running on
+                // — which the damaged install superseded and which a sweep of
+                // the staging would otherwise let it fall back to — is refused
+                // at every open until an install replaces it.
+                record_loss(&env, server, durable_refusal, &engine.dir, &error).await?;
                 env.trace(TraceEvent::RaftRefused {
                     server,
                     reason: error.to_string(),
@@ -347,10 +373,8 @@ pub async fn run<E: Environment>(env: E, config: NodeConfig) -> io::Result<()> {
         }
         // PROPOSED(D-041): a directory that carries the store marker but no valid
         // CURRENT is a lost store, never a fresh one; the engine alone would open
-        // it fresh once nothing else remains (D-024). The as-built variant is the
-        // server before the marker existed: it neither checks nor writes one, so
-        // its disk sees exactly the operations the nightly's did.
-        let as_built = raft.variant == Variant::AdoptionAsBuilt;
+        // it fresh once nothing else remains (D-024). PROPOSED(D-044): a marker
+        // that says the store lost state refuses every open on its own.
         let marked = if as_built {
             Ok(())
         } else {
@@ -358,7 +382,22 @@ pub async fn run<E: Environment>(env: E, config: NodeConfig) -> io::Result<()> {
         };
         let opened = match marked {
             Ok(()) => match Engine::open(env.clone(), engine.clone()).await {
-                Ok((opened, recovery)) => RaftStore::open(Arc::new(opened), &recovery).await,
+                Ok((opened, recovery)) => {
+                    let opened = Arc::new(opened);
+                    match RaftStore::open(opened.clone(), &recovery).await {
+                        Ok(store) => Ok(store),
+                        Err(error) => {
+                            // PROPOSED(D-044): the engine that recovered the
+                            // hole does no more work. It started quiesced when
+                            // the recovery itself reported the loss; this is
+                            // the refusal the store alone can see.
+                            if quiesce_refused {
+                                opened.quiesce();
+                            }
+                            Err(error)
+                        }
+                    }
+                }
                 Err(error) => Err(error),
             },
             Err(error) => Err(error),
@@ -366,6 +405,11 @@ pub async fn run<E: Environment>(env: E, config: NodeConfig) -> io::Result<()> {
         let (store, recovered) = match opened {
             Ok(opened) => opened,
             Err(error) => {
+                // PROPOSED(D-044): before the trace, before the re-seed, before
+                // anything that can be interrupted: the store directory itself
+                // records that this store lost state, so a restart cannot find
+                // it whole again.
+                record_loss(&env, server, durable_refusal, &engine.dir, &error).await?;
                 env.trace(TraceEvent::RaftRefused {
                     server,
                     reason: error.to_string(),
@@ -405,6 +449,38 @@ pub async fn run<E: Environment>(env: E, config: NodeConfig) -> io::Result<()> {
             Next::Reinstall => {}
         }
     }
+}
+
+/// Records a refusal in the store directory before the server acts on it: the
+/// marker says this store lost state, with the reason, written and synced
+/// through the filesystem rather than through the engine, which is the thing
+/// that is damaged (RAFT.md §3). Every open after it refuses on the mark alone
+/// until an install replaces the store, so a refusal outlives the process that
+/// made it. `durable` is off for the variants that are the server before this:
+/// `RefusalNotDurable`, and `AdoptionAsBuilt`, which writes no marker at all.
+///
+/// A marker that cannot be written is a server that cannot say it lost state,
+/// which is the failure D-044 exists to prevent: it fails the server rather
+/// than running on in re-seed mode with a disk that will open clean.
+// PROPOSED(D-044): a durable refusal, and a refused engine that does no work.
+async fn record_loss<E: Environment>(
+    env: &E,
+    server: u64,
+    durable: bool,
+    engine_dir: &Path,
+    refusal: &io::Error,
+) -> io::Result<()> {
+    if !durable {
+        return Ok(());
+    }
+    if let Err(error) = mark_store_lost(env, engine_dir, &refusal.to_string()).await {
+        env.trace(TraceEvent::RaftServerFailed {
+            server,
+            reason: format!("recording the store's lost state: {error}"),
+        });
+        return Err(error);
+    }
+    Ok(())
 }
 
 /// One incarnation: the server on one store, from restatement to the switch that

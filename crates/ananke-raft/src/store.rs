@@ -159,6 +159,11 @@ pub struct LostState {
     /// Set on its own, with every field above empty.
     // PROPOSED(D-041): the crash-safe adoption and the store identity marker.
     pub damaged: Option<Damage>,
+    /// What the store's marker says was lost, when the refusal is
+    /// [`Damage::MarkedLost`]: the reason the refusal that marked it recorded,
+    /// word for word, so a refusal outlives the process that made it.
+    // PROPOSED(D-044): a durable refusal, and a refused engine that does no work.
+    pub lost_mark: Option<String>,
 }
 
 /// What was found wrong with a store directory before the engine opened, each a
@@ -183,6 +188,10 @@ pub enum Damage {
     /// The directory carries the store marker and a `CURRENT` that does not
     /// parse.
     MarkedCurrentUnreadable,
+    /// The store's marker says this store lost state: a refusal wrote it before
+    /// it traced anything, and only an install replaces it.
+    // PROPOSED(D-044): a durable refusal, and a refused engine that does no work.
+    MarkedLost,
 }
 
 impl std::fmt::Display for Damage {
@@ -212,6 +221,7 @@ impl std::fmt::Display for Damage {
                 f,
                 "the directory carries the {STORE_MARKER} marker and a CURRENT that cannot be read"
             ),
+            Damage::MarkedLost => write!(f, "the {STORE_MARKER} marker says this store lost state"),
         }
     }
 }
@@ -232,13 +242,12 @@ impl LostState {
             log_stop,
             covered_stops: recovery.wal.covered_stops.iter().map(|c| c.stop).collect(),
             damaged: None,
+            lost_mark: None,
         };
-        (!lost.dropped.is_empty()
-            || lost.fallback_from.is_some()
-            || lost.head_gap.is_some()
-            || lost.log_stop.is_some()
-            || !lost.covered_stops.is_empty())
-        .then_some(lost)
+        // The engine's own rule for a hole in the middle of the state
+        // (PROPOSED(D-044)), so the fields above and the engine's decision to
+        // start such an open quiesced can never disagree.
+        recovery.lost_writes().then_some(lost)
     }
 
     /// The refusal for damage found before the engine opened: nothing recovered,
@@ -253,6 +262,20 @@ impl LostState {
             log_stop: None,
             covered_stops: Vec::new(),
             damaged: Some(damage),
+            lost_mark: None,
+        }
+    }
+
+    /// The refusal a store's own marker records: the reason the refusal that
+    /// wrote it gave, read back at an open that may be days and several
+    /// processes later. Only an install replaces the store and with it the
+    /// marker (RAFT.md §3).
+    // PROPOSED(D-044): a durable refusal, and a refused engine that does no work.
+    #[must_use]
+    pub fn from_mark(reason: String) -> Self {
+        Self {
+            lost_mark: Some(reason),
+            ..Self::from_damage(Damage::MarkedLost)
         }
     }
 
@@ -275,6 +298,11 @@ impl std::fmt::Display for LostState {
         match self.damaged {
             Some(damage) => write!(f, "the store is damaged: {damage}")?,
             None => write!(f, "the engine's recovery lost state:")?,
+        }
+        // PROPOSED(D-044): the reason the refusal that marked the store gave,
+        // carried word for word so the story survives the restart that reads it.
+        if let Some(reason) = &self.lost_mark {
+            write!(f, ", recorded at the refusal: {reason}")?;
         }
         if !self.dropped.is_empty() {
             write!(f, " dropped tables {:?}", self.dropped)?;
@@ -323,6 +351,13 @@ impl std::error::Error for LostState {}
 /// tables remain; a directory emptied past that opened fresh, which is how the
 /// nightly's seed 6325 turned a voter with a hundred and nineteen committed
 /// entries into a blank one.
+///
+/// The marker also carries the refusal itself (PROPOSED(D-044)): a store whose
+/// recovery lost state is marked lost, with the reason, before the server traces
+/// anything, and every open after that refuses on the mark alone until an
+/// install replaces the store. A refusal that lives only in the running process
+/// is undone by the next restart, which is how the premerge's seed 687 let a
+/// voter with a hole in its state machine rejoin.
 // PROPOSED(D-041): the crash-safe adoption and the store identity marker.
 pub const STORE_MARKER: &str = "RAFT-STORE";
 
@@ -345,32 +380,72 @@ async fn read_whole<E: Environment>(env: &E, path: &Path) -> io::Result<Option<B
     Ok(Some(file.read_at(0, size).await?))
 }
 
-/// Whether `engine_dir` carries the store marker.
-async fn marked<E: Environment>(env: &E, engine_dir: &Path) -> io::Result<bool> {
-    match env
-        .fs()
-        .open(&marker_path(engine_dir), OpenOptions::new().read(true))
-        .await
-    {
-        Ok(_) => Ok(true),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(error),
-    }
+/// What a whole store's marker holds.
+// PROPOSED(D-044): a durable refusal, and a refused engine that does no work.
+const MARKER_WHOLE: &[u8] = b"ananke raft store\n";
+
+/// What a lost store's marker starts with; the refusal's reason follows, on one
+/// line of its own.
+// PROPOSED(D-044): a durable refusal, and a refused engine that does no work.
+const MARKER_LOST: &[u8] = b"ananke raft store lost\n";
+
+/// What `engine_dir`'s marker says.
+// PROPOSED(D-044): a durable refusal, and a refused engine that does no work.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Marker {
+    /// No marker: the directory has never opened as a store.
+    Absent,
+    /// A store, whole as far as the marker knows.
+    Whole,
+    /// A store that lost state, with the reason the refusal recorded.
+    Lost(String),
 }
 
-/// The check before the engine opens: a directory that carries the store marker
-/// ([`STORE_MARKER`]) must hold a `CURRENT` that parses, or it is a lost store.
-/// A directory without the marker passes, whatever else it holds: the engine
-/// decides whether that is a fresh store or one it refuses (D-024).
+/// What `engine_dir`'s marker says. Any content that is not exactly a whole
+/// store's is a lost one: the marker is written in place, so a write that a
+/// crash cut short leaves a file that is neither, and the store it stands for is
+/// the one the refusal was writing about (RAFT.md §3, D-022).
+// PROPOSED(D-044): a durable refusal, and a refused engine that does no work.
+async fn marker<E: Environment>(env: &E, engine_dir: &Path) -> io::Result<Marker> {
+    let Some(bytes) = read_whole(env, &marker_path(engine_dir)).await? else {
+        return Ok(Marker::Absent);
+    };
+    if bytes.as_ref() == MARKER_WHOLE {
+        return Ok(Marker::Whole);
+    }
+    let reason = match bytes.as_ref().strip_prefix(MARKER_LOST) {
+        Some(rest) => String::from_utf8_lossy(rest).trim().to_owned(),
+        None => "the marker itself cannot be read".to_owned(),
+    };
+    Ok(Marker::Lost(reason))
+}
+
+/// The check before the engine opens: a directory whose store marker
+/// ([`STORE_MARKER`]) says the store lost state is refused, whatever is on disk
+/// now, and one that carries a whole store's marker must hold a `CURRENT` that
+/// parses, or it is a lost store. A directory without the marker passes,
+/// whatever else it holds: the engine decides whether that is a fresh store or
+/// one it refuses (D-024).
+///
+/// A lost mark outlives the process that wrote it and every restart after it,
+/// so a store refused once is refused at every open until an install replaces
+/// it and writes the marker fresh (PROPOSED(D-044)). Without it the refusal
+/// lived only in the running server, and a store the refused engine had since
+/// flushed into self-consistency opened clean at the next start: the premerge's
+/// seed 687.
 ///
 /// # Errors
 ///
-/// `InvalidData` carrying a [`LostState`] with [`Damage::MarkedCurrentMissing`]
-/// or [`Damage::MarkedCurrentUnreadable`]; otherwise the filesystem's.
+/// `InvalidData` carrying a [`LostState`] with [`Damage::MarkedLost`],
+/// [`Damage::MarkedCurrentMissing`] or [`Damage::MarkedCurrentUnreadable`];
+/// otherwise the filesystem's.
 // PROPOSED(D-041): the crash-safe adoption and the store identity marker.
+// PROPOSED(D-044): a durable refusal, and a refused engine that does no work.
 pub async fn refuse_lost_store<E: Environment>(env: &E, engine_dir: &Path) -> io::Result<()> {
-    if !marked(env, engine_dir).await? {
-        return Ok(());
+    match marker(env, engine_dir).await? {
+        Marker::Absent => return Ok(()),
+        Marker::Lost(reason) => return Err(LostState::from_mark(reason).into_io()),
+        Marker::Whole => {}
     }
     match read_whole(env, &manifest::current_path(engine_dir)).await? {
         None => Err(LostState::from_damage(Damage::MarkedCurrentMissing).into_io()),
@@ -381,29 +456,64 @@ pub async fn refuse_lost_store<E: Environment>(env: &E, engine_dir: &Path) -> io
     }
 }
 
-/// Writes the store marker ([`STORE_MARKER`]) into `engine_dir`, synced, with the
-/// directory synced after, unless it is already there. Called only after the
-/// engine and the store have opened successfully, so a directory is marked as a
-/// store once it has been one: a fresh directory at its first open, or a store
-/// from before the marker existed at its next.
+/// Writes the marker into `engine_dir`, synced, with the directory synced after,
+/// unless it already says the store is whole. Called after the engine and the
+/// store have opened successfully, so a directory is marked as a store once it
+/// has been one — a fresh directory at its first open, or a store from before
+/// the marker existed at its next — and by the adoption of an installed
+/// snapshot, which replaces the store and with it whatever the marker said
+/// about the one before (PROPOSED(D-044)).
 ///
 /// # Errors
 ///
 /// The filesystem's.
 // PROPOSED(D-041): the crash-safe adoption and the store identity marker.
 pub async fn mark_store<E: Environment>(env: &E, engine_dir: &Path) -> io::Result<()> {
-    if marked(env, engine_dir).await? {
+    if marker(env, engine_dir).await? == Marker::Whole {
         return Ok(());
     }
+    write_marker(env, engine_dir, Bytes::from_static(MARKER_WHOLE)).await
+}
+
+/// Records in `engine_dir`'s marker that this store lost state, with `reason`,
+/// synced, with the directory synced after: the first thing a refusal does, and
+/// the reason every open after it refuses too, until an install replaces the
+/// store (RAFT.md §3). It is written through the filesystem and not through the
+/// engine, which is the thing that is damaged.
+///
+/// # Errors
+///
+/// The filesystem's.
+// PROPOSED(D-044): a durable refusal, and a refused engine that does no work.
+pub async fn mark_store_lost<E: Environment>(
+    env: &E,
+    engine_dir: &Path,
+    reason: &str,
+) -> io::Result<()> {
+    let mut content = Vec::with_capacity(MARKER_LOST.len() + reason.len() + 1);
+    content.extend_from_slice(MARKER_LOST);
+    content.extend(reason.bytes().map(|b| if b == b'\n' { b' ' } else { b }));
+    content.push(b'\n');
+    write_marker(env, engine_dir, Bytes::from(content)).await
+}
+
+/// Writes the marker's content in place, truncating what was there, synced, with
+/// the directory synced after. A crash part way leaves a marker that is neither
+/// form, which reads as a lost store.
+// PROPOSED(D-044): a durable refusal, and a refused engine that does no work.
+async fn write_marker<E: Environment>(
+    env: &E,
+    engine_dir: &Path,
+    content: Bytes,
+) -> io::Result<()> {
     let fs = env.fs();
     let file = fs
         .open(
             &marker_path(engine_dir),
-            OpenOptions::new().write(true).create(true),
+            OpenOptions::new().write(true).create(true).truncate(true),
         )
         .await?;
-    file.write_at(0, Bytes::from_static(b"ananke raft store\n"))
-        .await?;
+    file.write_at(0, content).await?;
     file.sync().await?;
     fs.sync_dir(engine_dir).await
 }

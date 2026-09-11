@@ -265,6 +265,19 @@ pub enum TraceEvent {
         /// Why, as the error says it.
         reason: String,
     },
+    /// The engine was quiesced: no flush, no compaction and no log segment
+    /// deleted from here on. An engine whose recovery lost writes in the middle
+    /// of the state is itself the damaged thing, and a flush of what that
+    /// recovery replayed would rewrite the manifest without the dropped table
+    /// and delete the log segments that held its records — the loss laundered
+    /// away (PROPOSED D-044).
+    // PROPOSED(D-044): a durable refusal, and a refused engine that does no work.
+    EngineQuiesced {
+        /// The store directory.
+        dir: PathBuf,
+        /// Why it was quiesced.
+        reason: &'static str,
+    },
     /// Recovery could not read the manifest `CURRENT` names, or `CURRENT` itself, and
     /// used an older manifest whose every table is intact; everything flushed after
     /// it is lost.

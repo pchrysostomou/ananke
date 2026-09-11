@@ -27,6 +27,7 @@ fn config(memtable_bytes: u64) -> EngineConfig {
         level_base_bytes: 8192,
         sst_bytes: 2048,
         background_compaction: false,
+        quiesce_on_loss: false,
     }
 }
 
@@ -46,6 +47,17 @@ fn on_node<T: Send + 'static>(
     node: ananke_env::NodeId,
     f: impl FnOnce(SimEnv) -> std::pin::Pin<Box<dyn Future<Output = T> + Send>>,
 ) -> T {
+    on_node_for(sim, node, Duration::from_millis(10), f)
+}
+
+/// [`on_node`] with the run's length spelled out, for a task that sleeps longer
+/// than the ten milliseconds most tests need.
+fn on_node_for<T: Send + 'static>(
+    sim: &mut Sim,
+    node: ananke_env::NodeId,
+    budget: Duration,
+    f: impl FnOnce(SimEnv) -> std::pin::Pin<Box<dyn Future<Output = T> + Send>>,
+) -> T {
     let out: Out<T> = Arc::default();
     let o = out.clone();
     let env = sim.env(node);
@@ -53,7 +65,7 @@ fn on_node<T: Send + 'static>(
     env.spawn("test", async move {
         *o.lock().unwrap() = Some(fut.await);
     });
-    sim.run_for(Duration::from_millis(10));
+    sim.run_for(budget);
     take(&out)
 }
 
@@ -1086,5 +1098,128 @@ fn a_checkpoint_opens_fresh_at_its_version() {
     assert_eq!(
         (recovery.dropped.len(), recovery.orphans, recovery.replayed),
         (0, 0, 0)
+    );
+}
+
+/// A quiesced engine does no work (PROPOSED D-044). An open whose recovery lost
+/// writes in the middle of the state — here a table the manifest lists that
+/// cannot be read, with records past it in the log — starts quiesced when the
+/// caller asked for it: the flusher is never spawned, so the memtable the
+/// recovery replayed is never written into a table, no manifest is written and
+/// no log segment is deleted, and the next open sees the same loss. With the
+/// flag off, the engine as built, the flush happens within milliseconds: the
+/// manifest is rewritten without the dropped table and the segments that held
+/// its records are deleted, after which the store is self-consistent and the
+/// next open reports no loss at all. That laundering is what let a refused
+/// server come back clean at its next start (the thousand-seed premerge, seed
+/// 687).
+#[test]
+fn an_engine_whose_recovery_lost_writes_starts_quiesced_and_launders_nothing() {
+    let mut sim = Sim::new(SimConfig::new(44));
+    let node = sim.add_node();
+    // A store with tables and a tail of records in the log past them, then one
+    // table damaged so recovery must drop it.
+    on_node_for(&mut sim, node, Duration::from_millis(50), |env| {
+        Box::pin(async move {
+            let (db, _) = Engine::open(env.clone(), config(400)).await.unwrap();
+            fill(&db, 0..60, 20).await;
+            env.clock().sleep(Duration::from_millis(5)).await;
+            assert!(!db.manifest().ssts.is_empty(), "a table was flushed");
+            drop(db);
+            env.clock().sleep(Duration::from_millis(5)).await;
+            let fs = env.fs();
+            let table = fs
+                .read_dir(Path::new("/db"))
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|n| n.extension().is_some_and(|e| e == "sst"))
+                .expect("a table on disk");
+            let path = Path::new("/db").join(table);
+            let file = fs
+                .open(&path, OpenOptions::new().read(true).write(true))
+                .await
+                .unwrap();
+            let mut bytes = file.read_at(0, 64).await.unwrap().to_vec();
+            bytes[20] ^= 0x40;
+            file.write_at(0, Bytes::from(bytes)).await.unwrap();
+            file.sync().await.unwrap();
+        })
+    });
+    // Quiesced: the loss is reported, nothing is written over it, and the open
+    // after it sees the very same loss.
+    let from = sim.trace().len();
+    let (lost, quiesced) = on_node_for(&mut sim, node, Duration::from_millis(100), |env| {
+        Box::pin(async move {
+            let mut quiet = config(100);
+            quiet.quiesce_on_loss = true;
+            let (db, recovery) = Engine::open(env.clone(), quiet).await.unwrap();
+            assert!(!recovery.dropped.is_empty(), "a table was dropped");
+            assert!(recovery.replayed > 0, "records past the tables in the log");
+            env.clock().sleep(Duration::from_millis(50)).await;
+            (recovery.lost_writes(), db.quiesced())
+        })
+    });
+    assert!(lost, "the recovery lost writes");
+    assert!(quiesced, "the engine started quiesced");
+    let wrote = |from: usize, sim: &Sim| {
+        sim.trace()[from..]
+            .iter()
+            .filter(|r| {
+                matches!(
+                    r.event,
+                    TraceEvent::SstWritten { .. }
+                        | TraceEvent::ManifestWritten { .. }
+                        | TraceEvent::CurrentSwitched { .. }
+                        | TraceEvent::WalSegmentDeleted { .. }
+                )
+            })
+            .count()
+    };
+    assert_eq!(
+        wrote(from, &sim),
+        0,
+        "a quiesced engine wrote no table, no manifest and deleted no segment"
+    );
+    assert!(
+        sim.trace()[from..]
+            .iter()
+            .any(|r| matches!(r.event, TraceEvent::EngineQuiesced { .. })),
+        "the quiesce is in the trace"
+    );
+    let still_lost = on_node(&mut sim, node, |env| {
+        Box::pin(async move {
+            let mut quiet = config(100);
+            quiet.quiesce_on_loss = true;
+            let (_db, recovery) = Engine::open(env, quiet).await.unwrap();
+            recovery.lost_writes()
+        })
+    });
+    assert!(still_lost, "the loss is still there for the next open");
+    // As built: the flush of the replayed memtable rewrites the manifest without
+    // the dropped table and deletes the segments that held its records, and the
+    // next open reports a whole store.
+    let from = sim.trace().len();
+    on_node_for(&mut sim, node, Duration::from_millis(100), |env| {
+        Box::pin(async move {
+            let (db, recovery) = Engine::open(env.clone(), config(100)).await.unwrap();
+            assert!(recovery.lost_writes(), "the same loss, unquiesced");
+            assert!(!db.quiesced());
+            env.clock().sleep(Duration::from_millis(50)).await;
+        })
+    });
+    assert!(
+        wrote(from, &sim) > 0,
+        "the engine as built wrote over the loss"
+    );
+    let laundered = on_node(&mut sim, node, |env| {
+        Box::pin(async move {
+            let (_db, recovery) = Engine::open(env, config(100)).await.unwrap();
+            recovery.lost_writes()
+        })
+    });
+    assert!(
+        !laundered,
+        "the store as built opens clean, the loss laundered away"
     );
 }

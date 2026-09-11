@@ -26,7 +26,7 @@
 //! | `SstWritten` / `SstDropped` / `SstDeleted` | `log` `ananke.sst.written` / `.dropped` / `.deleted` |
 //! | `CompactionWritten`                      | `log` `ananke.compaction.written`             |
 //! | `ManifestWritten` / `CurrentSwitched` / `ManifestFallback` | `log` `ananke.manifest.written` / `.switched` / `.fallback` |
-//! | `OpenRefused`                            | `log` `ananke.engine.open-refused`            |
+//! | `OpenRefused` / `EngineQuiesced`         | `log` `ananke.engine.open-refused` / `.quiesced` |
 //! | `OrphanRemoved` / `WalSegmentDeleted`    | `log` `ananke.fs.orphan-removed` / `ananke.wal.segment-deleted` |
 //! | `RaftTerm` / `RaftVote` / `RaftLeader` / `RaftAppend` / `RaftTruncate` / `RaftCommit` / `RaftApply` | `log` `ananke.raft.term` / `.vote` / `.leader` / `.append` / `.truncate` / `.commit` / `.apply` |
 //! | `RaftRecovered` / `RaftProposed` / `RaftRefused` / `RaftServerFailed` / `RaftInboxDropped` | `log` `ananke.raft.recovered` / `.proposed` / `.refused` / `.failed` / `.inbox-dropped` |
@@ -537,6 +537,14 @@ fn convert(
         TraceEvent::OpenRefused { reason } => log(
             "ananke.engine.open-refused",
             Some(Json::obj(vec![("reason", Json::str(reason))])),
+        ),
+        // PROPOSED(D-044): a refused engine does no work.
+        TraceEvent::EngineQuiesced { dir, reason } => log(
+            "ananke.engine.quiesced",
+            Some(Json::obj(vec![
+                ("path", Json::str(&dir.display().to_string())),
+                ("reason", Json::str(reason)),
+            ])),
         ),
         TraceEvent::ManifestFallback { from, to } => log(
             "ananke.manifest.fallback",

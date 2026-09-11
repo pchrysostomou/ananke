@@ -44,11 +44,11 @@ use std::io;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll, Waker};
 
-use ananke_env::{Environment, File, FileSystem, OpenOptions, TraceEvent};
+use ananke_env::{Environment, File, FileSystem, OpenOptions, TraceEvent, WalStopReason};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 pub use crate::compaction::Compaction;
@@ -127,6 +127,19 @@ pub struct EngineConfig {
     /// Whether the flusher runs compaction rounds after each flush until no level is
     /// over its limit. Off, [`Engine::compact_once`] is the only trigger, for tests.
     pub background_compaction: bool,
+    /// Whether an open whose recovery lost writes in the middle of the state
+    /// ([`EngineRecovery::lost_writes`]) starts quiesced: no flusher, so no
+    /// table, no manifest, no compaction and no log segment deleted. The engine
+    /// that recovered a hole is the one damaged, and a flush of the memtable
+    /// that recovery replayed rewrites the manifest without the dropped table
+    /// and deletes the log segments it covered — the evidence of the loss,
+    /// laundered away, which is how the premerge's seed 687 turned a refused
+    /// server into one that opened clean at its next start. A caller that
+    /// refuses such a store (`ananke-raft`'s `RaftStore::open`) sets this; a
+    /// caller that allows fallbacks and head gaps means to keep running and
+    /// leaves it off.
+    // PROPOSED(D-044): a durable refusal, and a refused engine that does no work.
+    pub quiesce_on_loss: bool,
 }
 
 impl EngineConfig {
@@ -149,6 +162,9 @@ impl EngineConfig {
             level_base_bytes: 256 << 20,
             sst_bytes: 64 << 20,
             background_compaction: true,
+            // PROPOSED(D-044): off by default, so an engine whose caller allows
+            // fallbacks and head gaps keeps the behaviour it had.
+            quiesce_on_loss: false,
         }
     }
 }
@@ -387,6 +403,10 @@ pub(crate) struct Shared<E: Environment> {
     wal: Wal<E>,
     pub(crate) tables: Mutex<Tables<E>>,
     flusher: Mutex<Flusher>,
+    /// Set once the engine is quiesced: no flush, no compaction, no log segment
+    /// deleted, from the next step on. It is never unset.
+    // PROPOSED(D-044): a durable refusal, and a refused engine that does no work.
+    quiesced: AtomicBool,
     /// One flush or compaction at a time (D-023).
     turnstile: Turnstile,
     /// The number the next table gets.
@@ -500,6 +520,34 @@ pub struct EngineRecovery {
     pub wal: Recovery,
     /// Log records replayed into memtables: those past `flushed_seq`.
     pub replayed: usize,
+}
+
+impl EngineRecovery {
+    /// Whether the recovery lost writes in the middle of the state (D-022): a
+    /// table the manifest listed that could not be read, a fallback onto an
+    /// older manifest, a discarded log head, a log stopped short at a bad
+    /// checksum or a gap, or a corrupt record skipped in a segment the tables
+    /// cover. Each is a hole with acknowledged writes on both sides of it, as
+    /// against a torn record at the end of the log, which was in flight at the
+    /// crash and never acknowledged.
+    ///
+    /// This is the engine's own name for what `ananke-raft`'s `LostState`
+    /// refuses a Raft store for, so the two can never disagree, and what
+    /// [`EngineConfig::quiesce_on_loss`] starts an engine quiesced for.
+    // PROPOSED(D-044): a durable refusal, and a refused engine that does no work.
+    #[must_use]
+    pub fn lost_writes(&self) -> bool {
+        !self.dropped.is_empty()
+            || self.fallback_from.is_some()
+            || self.wal.head_gap.is_some()
+            || self.wal.stop.is_some_and(|stop| {
+                matches!(
+                    stop.reason,
+                    WalStopReason::BadChecksum | WalStopReason::Gap { .. }
+                )
+            })
+            || !self.wal.covered_stops.is_empty()
+    }
 }
 
 /// A write-ahead log in front of memtables and tables. Dropping it closes the log and
@@ -873,6 +921,7 @@ impl<E: Environment> Engine<E> {
                 waker: None,
                 closed: false,
             }),
+            quiesced: AtomicBool::new(false),
             turnstile: Turnstile::default(),
             next_sst: AtomicU64::new(next_sst),
             compact_pointer: Mutex::new(vec![None; LEVELS]),
@@ -891,23 +940,35 @@ impl<E: Environment> Engine<E> {
             shared.apply(seq, ops);
             replayed += 1;
         }
-        env.spawn("flusher", flusher(shared.clone()));
         let ssts = lock(&shared.tables).ssts.len();
-        Ok((
-            Self { shared },
-            EngineRecovery {
-                manifest: manifest_number,
-                fallback_from,
-                rejected,
-                flushed_seq,
-                ssts,
-                tables: listed,
-                dropped,
-                orphans: orphans.len(),
-                wal: recovery,
-                replayed,
-            },
-        ))
+        let recovery = EngineRecovery {
+            manifest: manifest_number,
+            fallback_from,
+            rejected,
+            flushed_seq,
+            ssts,
+            tables: listed,
+            dropped,
+            orphans: orphans.len(),
+            wal: recovery,
+            replayed,
+        };
+        // PROPOSED(D-044): an engine whose recovery lost writes in the middle of
+        // the state starts quiesced when the caller asked for it, the flusher
+        // never spawned: the flush of the memtable this open just replayed would
+        // write a manifest without the dropped table and delete the log segments
+        // that held its records, which is the loss laundered away before the
+        // caller has even seen the recovery (the premerge's seed 687).
+        if shared.config.quiesce_on_loss && recovery.lost_writes() {
+            shared.quiesced.store(true, Ordering::SeqCst);
+            env.trace(TraceEvent::EngineQuiesced {
+                dir: dir.clone(),
+                reason: "the recovery lost writes in the middle of the state",
+            });
+        } else {
+            env.spawn("flusher", flusher(shared.clone()));
+        }
+        Ok((Self { shared }, recovery))
     }
 
     /// Writes `value` under `key`. The returned future resolves once the write is
@@ -1040,8 +1101,38 @@ impl<E: Environment> Engine<E> {
     ///
     /// The filesystem's, or a table's `InvalidData`.
     pub async fn compact_once(&self) -> io::Result<Option<Compaction>> {
+        // PROPOSED(D-044): a quiesced engine does no work, this trigger included.
+        if self.quiesced() {
+            return Ok(None);
+        }
         let _turn = self.shared.turnstile.acquire().await;
         self.shared.compact().await
+    }
+
+    /// Quiesces the engine: no flush, no compaction and no log segment deleted
+    /// from here on, whatever is waiting. The flusher stops before its next
+    /// memtable, and nothing unsets it — an engine is quiesced because what it
+    /// recovered is not to be written over (RAFT.md §3, D-022): the node whose
+    /// store was refused for lost state calls this the moment it learns of the
+    /// refusal, so that no flush of the replayed memtable rewrites the manifest
+    /// without the dropped table or deletes the log segments that held its
+    /// records. An engine opened on a recovery that lost writes starts quiesced
+    /// on its own when [`EngineConfig::quiesce_on_loss`] is set, which is the
+    /// same fix a step earlier; this call catches a store refused for anything
+    /// else the caller knows and the engine does not.
+    ///
+    /// Writes are not refused: a caller that quiesces has no use for them, and
+    /// the log still takes them. Reads keep working from what is in memory.
+    // PROPOSED(D-044): a durable refusal, and a refused engine that does no work.
+    pub fn quiesce(&self) {
+        self.shared.quiesce("the store was refused for lost state");
+    }
+
+    /// Whether the engine is quiesced.
+    // PROPOSED(D-044): a durable refusal, and a refused engine that does no work.
+    #[must_use]
+    pub fn quiesced(&self) -> bool {
+        self.shared.quiesced.load(Ordering::SeqCst)
     }
 
     /// Writes the state as of the newest write applied into `dir`, which must not
@@ -1161,6 +1252,23 @@ impl<E: Environment> Drop for Engine<E> {
 }
 
 impl<E: Environment> Shared<E> {
+    /// Quiesces the engine and wakes the flusher, which stops at its check. The
+    /// first call traces it; later ones do nothing.
+    // PROPOSED(D-044): a durable refusal, and a refused engine that does no work.
+    fn quiesce(&self, reason: &'static str) {
+        if self.quiesced.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        self.env.trace(TraceEvent::EngineQuiesced {
+            dir: self.config.dir.clone(),
+            reason,
+        });
+        let waker = lock(&self.flusher).waker.take();
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
     /// The newest write of `key` at or below `snapshot`: the active memtable first,
     /// then the immutable ones newest first, then level 0 newest first, then one
     /// table per deeper level. Each holds newer writes of a key than the next, so the
@@ -1431,6 +1539,14 @@ impl<E: Environment> Future for NextImmutable<'_, E> {
 /// and the log grows.
 async fn flusher<E: Environment>(shared: Arc<Shared<E>>) {
     while let Some(memtable) = NextImmutable(&shared).await {
+        // PROPOSED(D-044): a quiesced engine does no work. The flush that
+        // follows a recovery which lost state is the one that launders the
+        // loss away — a manifest without the dropped table, and the log
+        // segments that held the records deleted — so the task stops here and
+        // leaves the disk as recovery found it.
+        if shared.quiesced.load(Ordering::SeqCst) {
+            return;
+        }
         let flushed = async {
             {
                 let _turn = shared.turnstile.acquire().await;

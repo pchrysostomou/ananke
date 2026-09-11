@@ -1805,10 +1805,54 @@ for staging damage costs a re-seed even when the store directory already holds
 the adopted store — a crash after the switch and before the staging is retired,
 with rot on the staging `CURRENT` — priced in, a two-per-cent roll inside a
 window of a few milliseconds. A store from before the marker is marked at its
-next open. Every sweep schedule now ends with an isolation, an install and a
-crash storm on the receiver, about a second of run per seed. `Sim::durable_names`
-joins `durable_contents` as a harness accessor. Every site is marked
-`PROPOSED(D-041)`.
+next open. One sweep schedule in four now ends with an isolation, an install and
+a crash storm on the receiver; the other three are as cheap as they were.
+
+That share is an amendment to what this entry first said, and the sweep's cost
+is why. The storm rode every schedule as written, and waiting for an install and
+then crashing the receiver some two dozen times with a restart each is by a wide
+margin the most expensive fault a schedule carries: it took the raft test
+binary's thousand seeds from 667 s to 2218 s, and `scripts/premerge.sh` from
+about thirteen minutes to forty, well past the quarter of an hour that tier
+exists for (D-040). The share is drawn from the fault's own `"adoption-crash"`
+stream (`raft::ADOPTION_STORM_IN`), so no other arm's dice moved with it, and
+the crash count on a seed that draws the storm is unchanged; the price is paid
+in catch rate, and it is paid about in proportion. `AdoptionAsBuilt` was caught
+on 23 of 100 release seeds and 270 of 1000 with the storm everywhere; on one
+seed in four it is caught on 8 of 100, the fault is drawn on 26 of those 100
+seeds, and the sweep still counts 851 adoptions, so `Coverage::assert_complete`'s
+`adoptions` and `adoption_crash_faults` both still hold at the hundred-seed
+tier.
+
+One trade was needed, and it is a tier rather than a dice roll. At 8 of 100 the
+catch is 0 of the gate's 20 seeds — three seeds in four never roll the rot's
+dice at all — so `a_server_whose_adoption_is_as_built_is_caught` asserts the
+catch at the hundred-seed tier and asserts at every tier that the fault fired:
+the storm drawn on some seed, and adoptions under it for the storm to crash
+into. That is the shape D-044 already gives `RefusalNotDurable`, which is caught
+on 3 of 100. The alternative — raising the crash count on the seeds that draw
+the storm until the gate catches it again — buys a gate signal with the very
+cost this amendment exists to remove, and the gate's twenty seeds were never the
+tier that owned this catch.
+
+What the share did not buy is the fifteen-minute target itself, and the
+measurement says where the rest of the time is. On this machine the raft test
+binary's thousand seeds now take 1648 s — down from 2218 s with the storm
+everywhere, a quarter off — but `scripts/premerge.sh` runs that binary and the
+others, so the tier is still over its quarter of an hour. Attributed at a
+hundred seeds, where the same binary takes 146.0 s: without PROPOSED D-043's
+re-take arm 138.6 s, without the adoption storm as well 99.1 s, and without
+D-044's refusal storm on top of that 90.5 s. So the storm at one seed in four is
+27 per cent of the binary, the refusal storm 6 per cent and the re-take arm 5 per
+cent, and the remaining 62 per cent — some seventeen minutes at a thousand seeds
+— is the sweep without any crash storm at all. The 667 s this entry compares
+against was measured before the sweep carried the snapshot work of D-042 and
+D-043 and the refusal work of D-044, and no share of the storms recovers it:
+getting the tier back under fifteen minutes is a separate piece of work on what
+the base run itself costs, and it is not this entry's to do.
+
+`Sim::durable_names` joins `durable_contents` as a harness accessor. Every site
+is marked `PROPOSED(D-041)`.
 
 ---
 
@@ -1883,12 +1927,22 @@ server beside a re-seeded one is the configuration D-035's carve-out withholds
 the liveness bound from (`majority_up`: two impaired servers of three); and
 were the bound asked there, the leader as built re-seeds the refused server
 too, when it was designated while down, and commits with it inside the bound.
-The variant and its sweep test ship as the pair rule asks, the test ignored
-with that reason rather than weakened, until the sweep can see the wedge: a
-liveness ask when a leader in force at the last heal has a commit majority
-among the servers that are up, quarantined ones included, and a schedule that
-refuses a second follower under that leader — seed 5909's shape — which only
-the disk model's rot produces and no driver can aim.
+Seeing the wedge would need a liveness ask when a leader in force at the last
+heal has a commit majority among the servers that are up, quarantined ones
+included, and a schedule that refuses a second follower under that leader —
+seed 5909's shape — which only the disk model's rot produces and no driver can
+aim.
+
+The variant and its sweep test ship as the pair rule asks, and the test is not
+ignored: a variant that cannot be caught is a hole in the sweep to be named,
+not a test to be skipped (CLAUDE.md). It asserts instead what is true of this
+leader and what a sweep that could not tell the two leaders apart would fail —
+that the leader as built never forgets a follower's progress, tracing no
+`RaftProgressReset` on any seed, where the correct server's own sweep requires
+one wherever it saw a refusal — and that the sweep reaches the state the wedge
+is built on: a refused follower re-seeded and applying again, on 67 of 100
+release seeds. The catch rate is printed at every tier, so the day it stops
+being zero is visible.
 
 **Alternatives.** Letting a rejection lower `matched`: any stale or duplicated
 rejection could then walk a live follower's match back and re-send what it
@@ -1919,9 +1973,28 @@ carries 1 again, the number the leader may have recorded for the store that was
 wiped: a wipe is outside the fault model (D-012), and a wiped server is a new
 member for the membership path, not a re-seed. `RaftRecovered` gains a field,
 `RaftProgressReset` is new, and the sweep counts the resets and requires one
-wherever it saw a refusal. Seed 5909 needs D-043 as well and is pinned by
-neither; the core-level scenario is in `crates/ananke-raft/tests/paper.rs`. Every
-site is marked `PROPOSED(D-042)`.
+wherever it saw a refusal. The core-level scenario is in
+`crates/ananke-raft/tests/paper.rs`.
+
+Seed 5909 is now pinned under each variant alone, and what the pin records is
+that it passes under each: on this tree `raft::run(5909, IgnoreIncarnation)`
+and `raft::run(5909, SharedSnapshotDir)` both check clean, and so does the
+correct server. That is a structural limit of the variant mechanism, not a gap
+in the seed. The nightly's wedge needed both bugs at once — with D-043's fix in
+place the pinned stream completes and the cluster commits through the follower
+being fed, though the leader's `matched` for the re-seeded one is stale, and
+with this entry's fix in place the re-seeded follower's incarnation resets that
+`matched` and the cluster commits through it, though the other follower's
+stream is scrambled — and `Variant` is a single enum on `RaftConfig`, so no run
+of the sweep can put both in one server. A variant that is both would be a new
+known-buggy server and a new decision; it is not taken here, and it is what a
+future entry would have to argue for. The seed's schedule has diverged as well,
+several times over: this entry's own eight-byte record change moved every
+checkpoint, and D-041, D-044 and the re-take arm have each re-drawn the fault
+list since, so seed 5909 on this tree draws neither a snapshot crash nor an
+adoption storm nor a re-take arm at all. The pin is worth keeping as a seed
+held green and worth nothing as a replay, and it says so. Every site is marked
+`PROPOSED(D-042)`.
 
 ---
 
@@ -2081,18 +2154,236 @@ record's value grows by eight bytes, with no released store to migrate. A
 leader's data directory holds the record's version plus whatever streams still
 read, and nothing else after the next sweep; a follower sweeps its old versions
 at its next start. Every stream costs one chunk in flight, so a leader feeding
-two followers has two. Seed 5909 needs this entry and D-042 together and is
-pinned by whoever merges both. The nightly is the one tier that asserts the
-variant caught, so a nightly whose ten thousand seeds never catch it goes red on
-that test until the sweep learns to aim at the shape — a targeted fault in the
-manner of `CrashInstalling` (D-030), left for the sweep's owner since the shape
-needs a re-take under a running stream and a second designated follower at
-once, which no driver-side fault forces directly. `sim/tests/raft.rs` counts versions deleted,
-takes reused and streams at once, and `crates/ananke-raft/tests/snapshot.rs`
-shows two takes at one index as two directories, a stream completing under a
-newer take where the shared directory's does not, the sweep sparing the pinned
-and the recorded versions, and two designated followers streamed to at once.
+two followers has two. Seed 5909 is pinned under this entry's variant and
+D-042's alike, and passes under each: see D-042's Consequences for why one
+enum cannot carry both bugs. `sim/tests/raft.rs` counts versions deleted, takes
+reused and streams at once, and `crates/ananke-raft/tests/snapshot.rs` shows
+two takes at one index as two directories, a stream completing under a newer
+take where the shared directory's does not, the sweep sparing the pinned and
+the recorded versions, and two designated followers streamed to at once.
+
+*The aimed fault, and what it did not buy.* This entry left the shape to the
+sweep's owner — "a re-take under a running stream and a second designated
+follower at once, which no driver-side fault forces directly" — and
+`Fault::RetakeUnderStream` is that fault, drawn on one seed in four from its
+own `"retake-stream"` stream. It fills the state machine with a couple of
+hundred keys so a checkpoint is worth streaming at all, isolates a follower
+until it is designated snapshot-fed, waits in small slices for the leader to
+open the stream to it, and then cuts the leader's *other* follower off. The
+leader keeps its quorum — the follower it is feeding answers every heartbeat,
+so check quorum is satisfied — and has nobody to count, so nothing commits and
+its applied index stands still at the index it last took, which is the index
+the running stream is reading. It reaches that state on 14 of 100 release
+seeds, and the sweep asserts at every tier that it did.
+
+It moves the variant from uncatchable at the pre-merge tier to catchable there,
+and no further. Measured on this branch: 0 of 100 release seeds, and 1 of 1000 —
+seed 680, by the liveness check, `no client write completed after the last heal
+at 28.683 s`, which is this entry's own wedge assembled by a driver rather than
+waited for. This entry recorded 0 of 1000 before the arm existed, so the tier
+that pays for the pre-merge run now catches it, about once.
+
+Why only about once is structural rather than statistical. A leader needs *one*
+countable follower for a majority, and on this sweep an install is over in about
+a hundred and fifty milliseconds, since the state machine is small and a
+checkpoint of it is a couple of dozen chunks. The moment the fed follower's
+install completes it is countable again, the leader commits, its applied index
+moves off the index the stream was reading, and the freeze is over. So the queue
+half of the bug costs a second designated follower a few hundred milliseconds
+against a two-second liveness bound, never the bound itself; only a stream that
+never completes stalls a commit for as long as the check asks. Making one needs a
+take to land on the very directory a live stream has open, which as built needs
+the leader's applied index to be standing exactly where its record already points
+*and* a `retake` to have cleared its checkpoint — a coincidence inside the
+snapshot task's own failure paths, which the arm makes likely (a frozen applied
+index, a stream in flight, and every take asked for landing at that index) but
+cannot force, since those paths are the receiver's refusals and the network's
+duplicates rather than anything a partition, block or crash schedules. The
+re-take at an index already taken happens often on its own, on 48 of 100 seeds
+and 532 of 1000, and is harmless every time, because no stream had that directory
+open.
+
+Two ways past that were weighed and not taken. Filling the state machine until an
+install runs longer than the liveness bound: measured, and at four-kilobyte
+values the sixteen-kilobyte memtable rotates so often that the cluster's commit
+rate collapses, no follower falls behind enough to be designated, and the arm
+stops reaching its own shape at all. Reaching inside the server for a fault hook
+on the take: that is a fault model of the implementation rather than of the world
+(D-012). So the catch stays asserted at the nightly's ten thousand, where a rate
+of about one in a thousand gives some ten catches; asserting it at the pre-merge
+tier on a single observation would make that tier flaky. The firing is asserted
+at every tier on both counts — a re-take at an index already taken, and the arm
+reaching its stream — and a nightly whose ten thousand seeds never catch it is
+still a hole in the sweep to report rather than a variant to delete (RAFT.md §5),
+the more so because this branch has re-drawn every schedule again.
 
 ---
 
-_Next entry: D-044. Add one before implementing anything not covered above._
+## PROPOSED D-044 — A refusal is durable, and a refused engine does no work
+
+**Context.** The thousand-seed premerge, seed 687: server 3's engine open dropped
+SST 1 — it held sequence numbers 1..98 of the state machine — and
+`RaftStore::open` refused with `LostState { dropped: [1] }`; the node traced
+`RaftRefused` at 7.9209 s, exactly as RAFT.md §3 and D-025 require. Seven
+milliseconds later the refused server's own engine carried on working:
+
+```
+7.9274 ananke.sst.written        {"number": 4, "level": 0, "entries": 167, "firstSeq": 275, "maxSeq": 388}
+7.9303 ananke.manifest.written   {"number": 5, "flushedSeq": 388, "tables": [2, 3, 4]}   <- table 1 forgotten
+7.9341 ananke.manifest.switched  {"manifest": 5}
+7.9341 ananke.memtable.flushed   {"memtable": 1, "upTo": 388}
+7.9348 ananke.wal.segment-deleted {"segment": 2}
+```
+
+The flush of the memtable the recovery had just replayed rewrote the manifest
+without the lost table and deleted the log segment that held its records: the
+evidence of the loss, laundered away. No leader existed for the next 5.4 s —
+server 1 had been refused at 5.92 s — so no re-seed came. The schedule crashed
+server 3 at 13.32 s and restarted it at 13.53 s; this time the open found a
+self-consistent store, removed `000001.sst` as an orphan and opened clean:
+`RaftRecovered { applied: 185, last_index: 189 }`, no refusal and no install. A
+voter with a hole in its state machine rejoined and began pre-voting, and the
+sweep reported *state machine safety: server 3 recovered an applied index of 185
+but its log does not hold index 1* — the rule that a `RaftRecovered` may not
+follow a `RaftRefused` without an install between them, which is the right rule.
+
+Two flaws behind it. **A refusal is not durable**: it lives only in the running
+process, and PROPOSED D-041's marker says a directory *was* a store, not that the
+store *lost state*, so the next start decides afresh on whatever it finds. And
+**a refused engine keeps running**: its flusher, its compaction and the
+log-segment deletion that follows a flush are all still on, and the first of them
+writes over the very hole the recovery reported. RAFT.md §3 says a refused server
+"participates in nothing"; it says nothing about the engine underneath it, and
+nothing about a refusal outliving the process that made it.
+
+**Decision.** Four parts, every site marked `PROPOSED(D-044)`.
+
+*The mark.* D-041's `RAFT-STORE` marker gains a second form. A whole store's
+marker holds one line, `ananke raft store`; a lost store's holds `ananke raft
+store lost` and the refusal's reason on the line after it, word for word
+(`store.rs`: `mark_store_lost`, `Marker`, `write_marker`). It is written in place
+and synced, with the directory synced after, through `env.fs()` and never through
+the engine, which is the thing that is damaged. `refuse_lost_store` reads the
+marker first: a lost one refuses at once with `LostState::from_mark`
+(`Damage::MarkedLost`, the recorded reason carried in the new `lost_mark` field),
+before it looks at `CURRENT` at all. **Any content that is not exactly the whole
+store's line reads as lost**: the marker is written in place, so a write a crash
+cut short leaves a file that is neither, and the store it stands for is the one
+the refusal was writing about. The node writes the mark at *every* refusal,
+before the `RaftRefused` trace and before re-seed mode — the staging damage of
+D-041 included, where the store directory may still hold a whole store: a server
+refused there has acknowledged an install it no longer has, so the store under it
+is a rollback waiting to happen, which is the failure D-041's seed 96 found. A
+marker that cannot be written fails the server (`RaftServerFailed`) rather than
+leaving it refused on a disk that will open clean.
+
+*The quiesce.* `EngineRecovery::lost_writes` is the engine's own name for a hole
+in the middle of the state — a dropped table, a manifest fallback, a discarded
+log head, a log stopped at a bad checksum or a gap, a corrupt record skipped in a
+segment the tables cover — and `ananke-raft`'s `LostState::of` now asks it rather
+than repeating the rule, so the two can never disagree. With the new
+`EngineConfig::quiesce_on_loss`, an open whose recovery lost writes **never
+spawns the flusher**: no table, no manifest, no compaction, no log segment
+deleted, and `TraceEvent::EngineQuiesced` says so. `Engine::quiesce` does the same
+to a running engine, and the node calls it the moment `RaftStore::open` refuses a
+store the engine itself opened happily. Both are needed: the flag stops the flush
+that would otherwise land while the store is still being read, which is the seven
+milliseconds seed 687 lost; the call covers a refusal only the store can see. The
+flag is off by default, so an engine whose caller allows fallbacks and head gaps
+keeps the behaviour it had; the Raft node sets it.
+
+*The install clears it.* The adoption writes the marker fresh
+(`snapshot.rs::adopt_staged_under`) immediately after the switch of `CURRENT` is
+durable — the point at which the installed store is the one in force. Before the
+switch a crash must leave the old store refused, which is what the mark is for;
+after it the store in the directory is a new one and the old one's mark goes with
+it. `Assembler::finish` needs nothing: the marker lives in the store directory,
+and only the adoption puts a store there, so the re-seed in `node.rs` clears the
+mark at its next start, through the adoption, like every other install.
+
+*The variant and its fault.* `Variant::RefusalNotDurable` is the server as built:
+no mark, and an engine that keeps working. `Fault::CrashRefused` aims at it, on
+every seed, drawn from its own stream (D-031): three to five rounds, each waiting
+for the victim to rotate a memtable it has not finished flushing and crashing it
+there, then restarting it — and when the victim is already sitting refused,
+crashing it after a grace of sixty to a hundred and sixty milliseconds instead.
+Both halves are aimed, and the measurements said why. The engine as built
+launders a refusal away only if the memtable its recovery replayed is over the
+threshold and gets flushed, and a crash at an ordinary moment leaves a tail of
+*one* memtable, which replays into a memtable that never rotates: over a hundred
+release seeds, the sweep's seventy-odd refusals for a dropped table laundered
+nothing at all. A crash inside a flush leaves a tail of two, because the manifest
+in force is still the older one until the flush switches `CURRENT`. At the
+sweep's write rate a server fills a sixteen-kilobyte memtable about every two
+seconds and takes some fifteen milliseconds to flush it, so that window is a
+hundredth of the time and no crash of its own choosing finds it; the fault waits
+for it. The grace is the second measurement: the laundering flush itself takes
+those fifteen milliseconds, and a crash two milliseconds after the refusal kills
+it half-done, which leaves the store visibly damaged and the bug invisible.
+
+**What the sweep found.** At a hundred seeds, release, `RefusalNotDurable` is
+caught on 2 of 100, both the premerge's signature — *state machine safety: server
+1 recovered an applied index of 551 but its log does not hold index 1* on the
+first — and the fault is seen firing, a crash landing on a refused server, on 67
+of those hundred seeds; at the gate's twenty it is caught on 1 of 20. The correct
+server passes all hundred of both sweeps, and its coverage over them counts 851
+refusals, 77 engines quiesced, 41 refusals the store's own lost mark made, and
+687 crashes landing on a refused server. The rate is the conjunction's: a crash
+must land inside a flush, about a hundredth of the time and the reason the fault
+waits for one; its bit rot must land in a table the manifest lists, two per cent
+per block; and the crash after it must come before a leader re-seeds the server.
+The first cut of the fault, which crashed a refused server at a moment of its own
+choosing, was caught on 0 of 100 with seventy-five dropped-table refusals to work
+with and not one of them laundered: the memtable a crash at an ordinary moment
+leaves is under the threshold and is never flushed at all, which is what sent the
+aim at the flush window. A second cut, which crashed two milliseconds after the
+refusal, was caught on 0 of 100 for the opposite reason — it killed the
+laundering flush half-done, and a store the crash interrupts stays visibly
+damaged — which is what set the grace at sixty milliseconds and up. Because the
+conjunction is thin, the variant test asserts the catch at the hundred-seed tier
+and reports the rate at every tier, the way `SharedSnapshotDir` is asserted at the
+nightly's (PROPOSED D-043); what every tier asserts is that the fault fired.
+
+**Alternatives.** A mark inside the store, under tenant 0: the engine is the
+damaged thing, and writing the refusal through it is writing through the hole.
+Removing `CURRENT` at a refusal, so D-041's marker rule alone refuses every
+start: it destroys a store to express what a line of text expresses, and it is
+irreversible if the refusal was the disk's fault and not the store's. A separate
+`RAFT-LOST` file beside the marker: two files where one has two forms, and a
+sweep that removes one of them is a bug waiting to be written. Writing the mark
+by tmp-and-rename, so a torn write cannot leave a file that is neither form: a
+crash then leaves a `RAFT-STORE.tmp` that nothing sweeps, and reading an
+unrecognised marker as lost costs nothing, since the conservative direction is
+the refusing one. Clearing the mark in `Assembler::finish`, when the staged store
+is complete: the store in the directory is still the lost one until the adoption
+switches to it. Quiescing every refused engine by dropping it: a dropped engine's
+flusher still finishes the memtables it holds (`NextImmutable` stops only when the
+queue is empty), which is exactly what seed 687 shows. Refusing writes on a
+quiesced engine as well: nothing writes to a refused store, and the log taking a
+write it never flushes harms nothing. Teaching the checker that a restatement
+after a refusal is allowed when the store looks whole: it would accept the state
+that never existed, which is the thing D-022 refuses. Aiming the fault by a trace
+event for the flush rather than by waiting for one: the same watch, one indirection
+further away.
+
+**Consequences.** A refusal costs one small file write and two syncs, on a path
+that already runs at most once per start. A store refused once needs an install
+to come back, whatever the disk looks like afterwards — including the case where
+the refusal was for damage in the staging directory and the store proper was
+whole, which now costs a re-seed it did not cost before; that is the price of not
+rolling back past an install the server acknowledged. A crash between the
+adoption's switch and the marker it writes next leaves the adopted store behind a
+lost mark and costs another install, a window of one file write. A quiesced
+engine keeps a store that is bigger than it needs to be: the memtables it
+replayed are never written down and its log segments are never deleted, until an
+install replaces the directory. `Sim` gains no accessor; `TraceEvent` gains
+`EngineQuiesced`, and the moirae bridge a line for it. Every schedule now ends
+with a crash storm aimed at a flush, three to five crashes and up to two and a
+half seconds of waiting each, which lengthens a seed's run; the correct server
+passes every seed of it. The `AdoptionAsBuilt` variant of D-041 writes no lost
+mark, since it is the server before the marker existed at all, but its engine is
+still quiesced: a variant turns off its own fix and no other.
+
+---
+
+_Next entry: D-045. Add one before implementing anything not covered above._

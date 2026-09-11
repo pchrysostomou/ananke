@@ -20,7 +20,8 @@ use ananke_raft::core::{Input, Output, Persist, Raft, RaftConfig, Role, Snapshot
 use ananke_raft::message::Message;
 use ananke_raft::snapshot::{Assembler, Feed, Repair, Sender, adopt_staged, staging_dir, take};
 use ananke_raft::store::{
-    Damage, LostState, RaftStore, STORE_MARKER, mark_store, marker_path, refuse_lost_store,
+    Damage, LostState, RaftStore, STORE_MARKER, mark_store, mark_store_lost, marker_path,
+    refuse_lost_store,
 };
 use ananke_raft::types::{Configuration, Entry, Index, Payload, ServerId, Term};
 use ananke_storage::manifest;
@@ -1689,4 +1690,116 @@ fn two_designated_followers_are_streamed_at_once_and_both_install() {
         .max()
         .unwrap_or(0);
     assert_eq!(most_at_once, 1, "as built, one stream at a time");
+}
+
+/// A refusal is durable (PROPOSED D-044): the store directory's marker records
+/// that this store lost state, with the reason, and every open after it refuses
+/// on the mark alone — across the restart, and however whole the store on disk
+/// looks by then. The engine is shown opening the same directory happily, which
+/// is what the refused server's own engine had made of it by flushing the
+/// memtable its recovery replayed (the thousand-seed premerge, seed 687): the
+/// mark is the only thing that remembers.
+#[test]
+fn a_refusal_is_recorded_in_the_store_and_refuses_every_later_open() {
+    let mut sim = Sim::new(SimConfig::new(91));
+    let node = sim.add_node();
+    let reason = "the engine's recovery lost state: dropped tables [1]";
+    on_node(&mut sim, node, |env| {
+        Box::pin(async move {
+            build_follower(&env).await;
+            // Whole: the marker says so and the open goes ahead.
+            open_follower(&env).await.expect("a whole store opens");
+            mark_store_lost(&env, Path::new("/follower"), reason)
+                .await
+                .unwrap();
+        })
+    });
+    // The process that refused is gone; the mark is not.
+    sim.crash(node);
+    sim.restart(node);
+    on_node(&mut sim, node, |env| {
+        Box::pin(async move {
+            let dir = Path::new("/follower");
+            for attempt in 1..=3 {
+                let refused = refuse_lost_store(&env, dir)
+                    .await
+                    .expect_err("a marked-lost store is refused at every open");
+                let lost = LostState::from_io(&refused).expect("a LostState");
+                assert_eq!(lost.damaged, Some(Damage::MarkedLost), "attempt {attempt}");
+                assert_eq!(
+                    lost.lost_mark.as_deref(),
+                    Some(reason),
+                    "attempt {attempt}: the reason the refusal recorded"
+                );
+                assert!(
+                    refused.to_string().contains(reason),
+                    "attempt {attempt}: {refused}"
+                );
+            }
+            // Nothing else refuses it: the store on disk is whole, CURRENT and
+            // all, and the engine alone would open it and let the server vote.
+            let (engine, recovery) = Engine::open(env.clone(), engine_config("/follower"))
+                .await
+                .unwrap();
+            assert!(
+                !recovery.lost_writes(),
+                "the store on disk is self-consistent"
+            );
+            let (store, _) = RaftStore::open(Arc::new(engine), &recovery).await.unwrap();
+            assert_eq!((store.term(), store.vote()), (3, Some(ServerId(2))));
+            // And the server's own open path refuses all the same.
+            let refused = open_follower(&env)
+                .await
+                .expect_err("the server refuses the marked store");
+            assert!(refused.contains(STORE_MARKER), "{refused}");
+        })
+    });
+}
+
+/// An install clears the lost mark (PROPOSED D-044): the adoption writes the
+/// marker fresh the moment the installed store is the one in force, so the store
+/// that lost state is refused until an install replaces it and not one open
+/// after.
+#[test]
+fn an_install_clears_the_lost_mark() {
+    let mut sim = Sim::new(SimConfig::new(92));
+    let node = sim.add_node();
+    on_node(&mut sim, node, |env| {
+        Box::pin(async move {
+            let (_leader, dir) = build_leader(&env).await;
+            build_follower(&env).await;
+            mark_store_lost(
+                &env,
+                Path::new("/follower"),
+                "the engine's recovery lost state: dropped tables [1]",
+            )
+            .await
+            .unwrap();
+            open_follower(&env)
+                .await
+                .expect_err("the marked store is refused");
+            // The leader's stream, completed: the next open adopts it.
+            let mut assembler =
+                Assembler::new(env.clone(), Path::new("/follower"), Variant::Correct);
+            let staged = stream(&env, &dir, &mut assembler).await;
+            let repair = Repair {
+                term: 7,
+                vote: Some(ServerId(3)),
+                tail: Vec::new(),
+                quarantined: true,
+                incarnation: 9,
+            };
+            assembler.finish(&staged, &repair).await.unwrap();
+            let (adopted, term, vote) = open_follower(&env)
+                .await
+                .expect("the adopted store opens, the mark cleared");
+            assert!(adopted, "the install was adopted");
+            assert_eq!((term, vote), (7, Some(ServerId(3))));
+            // The mark is gone for good, not just for the open that adopted.
+            refuse_lost_store(&env, Path::new("/follower"))
+                .await
+                .expect("the adopted store is whole");
+            open_follower(&env).await.expect("and stays whole");
+        })
+    });
 }
