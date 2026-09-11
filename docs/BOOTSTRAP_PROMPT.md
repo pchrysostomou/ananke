@@ -123,6 +123,12 @@ _Update this section at the end of every session._
   (`docs/devlog/02-phase-2.md`), and `docs/OVERNIGHT.md` for the session's full
   record; the branch is unpushed (no credentials on the machine).
   Before Phase 4: issue #21, client sessions.
+- Nightly follow-up (2026-09-11), branch `integrate-fixes`: the ten-thousand-seed
+  nightly's three failing seeds, 5909, 6325 and 7381, are fixed on this branch as
+  PROPOSED D-041 (the crash-safe adoption and the store marker), D-042 (store
+  incarnations) and D-043 (versioned snapshot takes, pinned streams, a stream per
+  designated follower) plus a checker fix (an installed snapshot sets the floor
+  exactly, D-030), each seed pinned in the gate, pending review and the nightly.
 - Stage A, B, C record: A: the
   pure core, the codec with the studio decoder, the state under tenant 0 with the
   applied index in the batch and a refusal of any recovery that lost state, the four

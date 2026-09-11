@@ -73,6 +73,31 @@ fn seed_6325_which_the_nightly_found_stays_green() {
     raft::run(6325, Variant::Correct).check().unwrap();
 }
 
+/// The ten-thousand-seed nightly's seed 5909 (run 34496762339): the leader's last
+/// commit was 329 at 13.43 s and nothing committed for the remaining 5.4 s of the
+/// run. Server 2 had been snapshot-fed since 7.46 s — 744 chunks, the stream
+/// restarted from offset 0 six times — because the leader re-took the same
+/// snapshot 329 five times into the one directory that stream was reading, so
+/// sender and receiver never stood on the same file again; and server 3, refused
+/// and re-seeded, was designated snapshot-fed and received nothing, its stream
+/// queued behind server 2's never-ending one, while the leader's match index for
+/// it stood above its rebuilt log, so every heartbeat it answered was rejected
+/// and it was never counted. With neither follower countable the commit froze,
+/// and the liveness check reported it. Takes are now versioned directories, a
+/// stream pins the one it opened, and every designated follower is streamed to
+/// at once (PROPOSED D-043), and a follower's store incarnation resets what the
+/// leader knew of its log (PROPOSED D-042). Said plainly: the fixed tree's
+/// schedule for this seed diverges from the nightly's trace — the snapshot record
+/// grew by eight bytes, which moves the engine's flushes and with them every
+/// checkpoint, and D-041 appends a crash storm to every schedule — so this pin
+/// holds the seed green rather than replaying the failure; the shape itself is
+/// carried by `SharedSnapshotDir` and `IgnoreIncarnation` below. Stays in the
+/// gate.
+#[test]
+fn seed_5909_which_the_nightly_found_stays_green() {
+    raft::run(5909, Variant::Correct).check().unwrap();
+}
+
 /// The positive control: the correct server satisfies every property on every
 /// seed, and the sweep reached the states that matter.
 #[test]
