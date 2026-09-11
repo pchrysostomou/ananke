@@ -853,3 +853,394 @@ fn an_identity_change_restarts_the_staging() {
         })
     });
 }
+
+// --- PROPOSED D-043: versioned takes, pinned streams, the sweep, and a stream per follower ---
+
+use std::collections::BTreeMap;
+use std::net::SocketAddr;
+
+use ananke_env::{Clock, Network, NodeId, Socket};
+use ananke_raft::apply::Outcome;
+use ananke_raft::client::{Reply, Request, Response};
+use ananke_raft::snapshot::{
+    checkpoint_complete, find_version, parse_version, sweep_versions, take_version, version_dir,
+};
+use ananke_raft::{NodeConfig, invariants, run};
+
+/// Two takes at one index are two directories, numbered by the record's counter,
+/// each a complete checkpoint; the record names the newest, and so does the
+/// version lookup a stream opens.
+#[test]
+fn two_takes_at_one_index_are_two_directories() {
+    let mut sim = Sim::new(SimConfig::new(81));
+    let node = sim.add_node();
+    on_node(&mut sim, node, |env| {
+        Box::pin(async move {
+            // The first take went to an explicit directory, the way the server
+            // as built takes: the counter advanced all the same.
+            let (store, shared) = build_leader(&env).await;
+            let leader = Path::new("/leader");
+            let config = members(&[1, 2, 3]);
+            let second = take_version(&env, &store, leader, 5, 1, &config)
+                .await
+                .unwrap();
+            let third = take_version(&env, &store, leader, 5, 1, &config)
+                .await
+                .unwrap();
+            assert_eq!(second, version_dir(leader, 5, 2));
+            assert_eq!(third, version_dir(leader, 5, 3));
+            assert_ne!(second, third, "two takes, two directories");
+            for dir in [&shared, &second, &third] {
+                assert!(
+                    checkpoint_complete(&env, dir).await.unwrap(),
+                    "{} is a complete checkpoint",
+                    dir.display()
+                );
+            }
+            let record = store.snapshot_record().await.unwrap().expect("a record");
+            assert_eq!(
+                (record.last_index, record.take, record.dir.as_str()),
+                (5, 3, "/leader/snap-5-3"),
+                "the record names the newest version and its count"
+            );
+            assert_eq!(
+                find_version(&env, leader, 5).await.unwrap(),
+                Some((third, 3)),
+                "a stream opens the newest complete version"
+            );
+            assert_eq!(find_version(&env, leader, 7).await.unwrap(), None);
+            assert_eq!(parse_version("snap-5-3"), Some((5, 3)));
+            assert_eq!(parse_version("snap-5"), Some((5, 0)));
+            assert_eq!(parse_version("000001.sst"), None);
+            assert_eq!(parse_version("snap-x-1"), None);
+        })
+    });
+}
+
+/// Feeds `sender`'s chunks into `assembler` until the stream completes or breaks:
+/// the stage on completion, `None` when a chunk could not be read, the receiver
+/// refused what it got, or the stream asked to start over.
+async fn stream_to_end(
+    env: &SimEnv,
+    sender: &mut Sender,
+    assembler: &mut Assembler<SimEnv>,
+) -> Option<ananke_raft::snapshot::Staged> {
+    for _ in 0..10_000 {
+        let Ok(Message::InstallSnapshot {
+            term,
+            last_index,
+            last_term,
+            file,
+            offset,
+            total,
+            done,
+            data,
+        }) = sender.chunk(env, 64).await
+        else {
+            return None;
+        };
+        let fed = assembler
+            .on_chunk(
+                ServerId(1),
+                term,
+                last_index,
+                last_term,
+                file,
+                offset,
+                total,
+                done,
+                data,
+            )
+            .await;
+        match fed {
+            Ok(Feed::Ack { file, offset }) => {
+                sender.on_more(&file, offset);
+            }
+            Ok(Feed::Staged(staged)) => return Some(staged),
+            Ok(Feed::Restart) | Err(_) => return None,
+        }
+    }
+    panic!("the stream never ended");
+}
+
+/// A stream pinned to a version reads it untouched while newer takes land, at
+/// the same index and a later one, and completes; the shared directory the
+/// server as built streams from is rewritten under its stream by a take at the
+/// same index, and that stream does not complete.
+#[test]
+fn a_stream_survives_a_newer_take_and_the_shared_directory_does_not() {
+    let mut sim = Sim::new(SimConfig::new(82));
+    let node = sim.add_node();
+    on_node(&mut sim, node, |env| {
+        Box::pin(async move {
+            let (store, shared) = build_leader(&env).await;
+            let leader = Path::new("/leader");
+            let config = members(&[1, 2, 3]);
+            let pinned = take_version(&env, &store, leader, 5, 1, &config)
+                .await
+                .unwrap();
+            let mut sender = Sender::open(&env, &pinned, ServerId(2), 5, 1, 4)
+                .await
+                .unwrap();
+            let mut assembler =
+                Assembler::new(env.clone(), Path::new("/follower"), Variant::Correct);
+            // The stream is under way when two newer takes land: a fresh version
+            // at the same index, then one at the next index, once it applies.
+            let first = sender.chunk(&env, 64).await.unwrap();
+            let Message::InstallSnapshot {
+                file,
+                offset,
+                total,
+                data,
+                ..
+            } = first
+            else {
+                panic!("a chunk")
+            };
+            let fed = assembler
+                .on_chunk(ServerId(1), 4, 5, 1, file, offset, total, false, data)
+                .await
+                .unwrap();
+            let Feed::Ack { file, offset } = fed else {
+                panic!("an ack")
+            };
+            sender.on_more(&file, offset);
+            let newer = take_version(&env, &store, leader, 5, 1, &config)
+                .await
+                .unwrap();
+            apply_command(&store, 6, None).await.unwrap();
+            let later = take_version(&env, &store, leader, 6, 4, &members(&[1, 2, 3, 4]))
+                .await
+                .unwrap();
+            assert_ne!(newer, pinned);
+            assert_ne!(later, pinned);
+            let staged = stream_to_end(&env, &mut sender, &mut assembler)
+                .await
+                .expect("the pinned version streams to completion");
+            assert_eq!((staged.last_index, staged.last_term), (5, 1));
+            assembler.abandon().await;
+
+            // As built: the stream reads the one directory of its index, and a
+            // take at that index sweeps and rewrites it under the stream.
+            let mut sender = Sender::open(&env, &shared, ServerId(3), 5, 1, 4)
+                .await
+                .unwrap();
+            let mut assembler =
+                Assembler::new(env.clone(), Path::new("/follower"), Variant::Correct);
+            let first = sender.chunk(&env, 64).await.unwrap();
+            let Message::InstallSnapshot {
+                file,
+                offset,
+                total,
+                data,
+                ..
+            } = first
+            else {
+                panic!("a chunk")
+            };
+            let fed = assembler
+                .on_chunk(ServerId(1), 4, 5, 1, file, offset, total, false, data)
+                .await
+                .unwrap();
+            let Feed::Ack { file, offset } = fed else {
+                panic!("an ack")
+            };
+            sender.on_more(&file, offset);
+            take(&env, &store, &shared, 5, 1, &config).await.unwrap();
+            assert!(
+                stream_to_end(&env, &mut sender, &mut assembler)
+                    .await
+                    .is_none(),
+                "a stream of a directory rewritten under it does not complete"
+            );
+        })
+    });
+}
+
+/// The sweep deletes the versions that are neither the record's nor pinned by
+/// a stream, and nothing else; a version is deleted once its last reader lets
+/// go; the record's is never deleted.
+#[test]
+fn the_sweep_deletes_only_unpinned_versions() {
+    let mut sim = Sim::new(SimConfig::new(83));
+    let node = sim.add_node();
+    on_node(&mut sim, node, |env| {
+        Box::pin(async move {
+            let (store, shared) = build_leader(&env).await;
+            let leader = Path::new("/leader");
+            let config = members(&[1, 2, 3]);
+            let second = take_version(&env, &store, leader, 5, 1, &config)
+                .await
+                .unwrap();
+            let third = take_version(&env, &store, leader, 5, 1, &config)
+                .await
+                .unwrap();
+            // A stream reads the second version; the first is nobody's.
+            let mut pinned: BTreeMap<PathBuf, usize> = BTreeMap::new();
+            pinned.insert(second.clone(), 1);
+            let deleted = sweep_versions(&env, &store, leader, &pinned).await.unwrap();
+            assert_eq!(deleted, vec![(5, 0)], "the shared directory, by its name");
+            assert!(!checkpoint_complete(&env, &shared).await.unwrap());
+            assert!(checkpoint_complete(&env, &second).await.unwrap());
+            assert!(checkpoint_complete(&env, &third).await.unwrap());
+            // The stream ends: the second version goes; the record's never does.
+            pinned.clear();
+            let deleted = sweep_versions(&env, &store, leader, &pinned).await.unwrap();
+            assert_eq!(deleted, vec![(5, 2)]);
+            assert!(!checkpoint_complete(&env, &second).await.unwrap());
+            assert!(checkpoint_complete(&env, &third).await.unwrap());
+            assert_eq!(
+                find_version(&env, leader, 5).await.unwrap(),
+                Some((third.clone(), 3))
+            );
+            // Nothing left to sweep, and the store's own files were never touched.
+            assert!(
+                sweep_versions(&env, &store, leader, &pinned)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            let (engine, recovery) = Engine::open(env.clone(), engine_config("/leader"))
+                .await
+                .unwrap();
+            let (reopened, _) = RaftStore::open(Arc::new(engine), &recovery).await.unwrap();
+            assert_eq!(reopened.applied(), 5);
+        })
+    });
+}
+
+fn addr(n: u64) -> SocketAddr {
+    SocketAddr::from(([10, 0, 0, u8::try_from(n).expect("small")], 7000))
+}
+
+/// A server of a five-voter cluster with a small snapshot threshold, so a
+/// follower cut off for a moment falls behind it.
+fn cluster_config(id: u64, variant: Variant) -> NodeConfig {
+    let mut engine = EngineConfig::new(PathBuf::from("/raft"));
+    engine.memtable_bytes = 4096;
+    engine.segment_bytes = 4096;
+    engine.background_compaction = true;
+    NodeConfig {
+        id: ServerId(id),
+        listen: addr(id),
+        servers: (1..=5).map(|s| (ServerId(s), addr(s))).collect(),
+        initial_voters: (1..=5).map(ServerId).collect(),
+        raft: RaftConfig {
+            snapshot_threshold: 4,
+            snapshot_chunk: 512,
+            variant,
+            ..RaftConfig::default()
+        },
+        engine,
+        inbox_capacity: 64,
+    }
+}
+
+/// Puts `count` keys through whichever server leads, following NotLeader hints.
+async fn put_many(env: SimEnv, count: u64) {
+    let sock = env.net().bind(addr(9)).await.unwrap();
+    let mut target = ServerId(1);
+    for seq in 0..count {
+        loop {
+            let request = Request {
+                client: 1,
+                seq,
+                command: Command::Put {
+                    key: Bytes::from(format!("k{seq}")),
+                    value: Bytes::from(format!("v{seq}")),
+                },
+            };
+            sock.send(addr(target.0), request.encode()).await.unwrap();
+            let deadline = env.clock().now() + Duration::from_millis(100);
+            let recv = std::pin::pin!(sock.recv());
+            let timer = std::pin::pin!(env.clock().sleep_until(deadline));
+            let got = match ananke_env::race(&env, recv, timer).await {
+                ananke_env::Either::Left(Ok((_, bytes))) => Response::decode(bytes).ok(),
+                _ => None,
+            };
+            match got {
+                Some(response) if response.seq == seq => match response.reply {
+                    Reply::Outcome(Outcome::Done) => break,
+                    Reply::NotLeader { leader: Some(l) } => target = l,
+                    _ => {
+                        env.clock().sleep(Duration::from_millis(20)).await;
+                        target = ServerId(target.0 % 3 + 1);
+                    }
+                },
+                _ => target = ServerId(target.0 % 3 + 1),
+            }
+        }
+    }
+}
+
+/// Runs five servers with 4 and 5 cut off until the leader has compacted past
+/// them, then heals and returns the trace: both are designated snapshot-fed and
+/// both must be streamed to.
+fn two_designated_followers(seed: u64, variant: Variant) -> Vec<TraceEvent> {
+    let mut sim = Sim::new(SimConfig::new(seed));
+    let servers: Vec<NodeId> = (0..5).map(|_| sim.add_node()).collect();
+    sim.partition(&servers[..3], &servers[3..]);
+    for (i, &node) in servers.iter().enumerate() {
+        let env = sim.env(node);
+        let inner = env.clone();
+        let config = cluster_config(i as u64 + 1, variant);
+        env.spawn("raft", async move {
+            let _ = run(inner, config).await;
+        });
+    }
+    let client = sim.add_node();
+    sim.run_for(Duration::from_millis(500));
+    on_node(&mut sim, client, |env| Box::pin(put_many(env, 40)));
+    // The leader takes once its log outgrows the threshold, designates the two
+    // quiet followers, and compacts; then they come back.
+    for _ in 0..40 {
+        sim.run_for(Duration::from_millis(50));
+        if sim
+            .trace()
+            .iter()
+            .any(|r| matches!(r.event, TraceEvent::RaftCompacted { .. }))
+        {
+            break;
+        }
+    }
+    sim.heal();
+    sim.run_for(Duration::from_millis(3000));
+    sim.trace().into_iter().map(|r| r.event).collect()
+}
+
+/// Two designated followers are streamed to at once and both install
+/// (PROPOSED(D-043)); the server as built streams to one at a time, so its
+/// second follower waits behind the first, and at this scale still completes —
+/// the sweep's seed 5909 is where the first stream never ends.
+#[test]
+fn two_designated_followers_are_streamed_at_once_and_both_install() {
+    let events = two_designated_followers(84, Variant::Correct);
+    invariants::all(&events).unwrap();
+    for server in [4, 5] {
+        assert!(
+            events.iter().any(|e| matches!(e,
+                TraceEvent::RaftSnapshot { server: s, taken: false, .. } if *s == server)),
+            "server {server} installed nothing: {events:?}"
+        );
+    }
+    let most_at_once = events
+        .iter()
+        .filter_map(|e| match e {
+            TraceEvent::RaftSnapshotStreams { streams, .. } => Some(*streams),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0);
+    assert_eq!(most_at_once, 2, "both followers streamed to at once");
+
+    let events = two_designated_followers(84, Variant::SharedSnapshotDir);
+    let most_at_once = events
+        .iter()
+        .filter_map(|e| match e {
+            TraceEvent::RaftSnapshotStreams { streams, .. } => Some(*streams),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0);
+    assert_eq!(most_at_once, 1, "as built, one stream at a time");
+}

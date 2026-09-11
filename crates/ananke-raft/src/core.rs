@@ -73,6 +73,19 @@ pub enum Variant {
     /// catches the state that never existed after the restart. The install order is
     /// the server's business (`snapshot.rs`); the core ignores this variant.
     SnapshotWithoutCurrentLast,
+    /// The leader's snapshot takes share one mutable directory per index,
+    /// rewritten by every take under whatever stream is reading it, and the
+    /// leader streams to one designated follower at a time, every other one
+    /// queued behind it: the behaviour as built before PROPOSED D-043. A take
+    /// at an index already recorded — the retake a failed stream asks for —
+    /// sweeps the directory a running stream reads, so sender and receiver fall
+    /// out of step and the stream never completes; a second designated follower
+    /// waits behind it and gets no entries either, so neither can be counted,
+    /// the leader loses its quorum and nothing commits, which the sweep's
+    /// liveness check reports (nightly run 34496762339, seed 5909). The
+    /// directories and the streams are the server's business (`snapshot.rs`,
+    /// `node.rs`); the core ignores this variant.
+    SharedSnapshotDir,
 }
 
 /// The core's parameters.

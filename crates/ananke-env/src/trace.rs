@@ -538,6 +538,38 @@ pub enum TraceEvent {
         /// The offset within the current file the stream resumed from.
         offset: u64,
     },
+    /// A Raft server deleted an old version of a snapshot: a checkpoint directory
+    /// that is no longer the record's and that no stream reads (PROPOSED(D-043)).
+    RaftSnapshotDeleted {
+        /// The server.
+        server: u64,
+        /// The version's last applied index.
+        last_index: u64,
+        /// The version's take number.
+        take: u64,
+    },
+    /// A Raft leader was asked for a checkpoint at the index its record already
+    /// names, and answered with the recorded version instead of taking a second
+    /// one of the same state (PROPOSED(D-043)).
+    RaftSnapshotReused {
+        /// The server.
+        server: u64,
+        /// The version's last applied index.
+        last_index: u64,
+        /// The version's take number.
+        take: u64,
+    },
+    /// A Raft leader opened a snapshot stream to a follower (PROPOSED(D-043)):
+    /// `streams` is how many streams it now services at once, each pinned to
+    /// the version it opened.
+    RaftSnapshotStreams {
+        /// The leader.
+        server: u64,
+        /// The follower the new stream feeds.
+        to: u64,
+        /// Streams in flight from this leader, the new one included.
+        streams: u64,
+    },
     /// A client operation started (RAFT.md §2): the invocation end of one operation
     /// of the linearizability history. Its time is the record's.
     ClientInvoke {

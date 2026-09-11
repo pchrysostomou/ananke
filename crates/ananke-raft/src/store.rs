@@ -224,6 +224,13 @@ pub struct SnapshotRecord {
     pub dir: String,
     /// Whether the snapshot was taken here rather than installed.
     pub taken: bool,
+    /// The store's take counter as of this record: every take numbers its own
+    /// directory with the next count, so two takes at one index are two
+    /// directories and a restart continues the numbering. Zero for a store that
+    /// never took one, and after an install, whose versions start over; a name
+    /// that recurs after an install is an empty directory by then, swept before
+    /// the incarnation's tasks run. PROPOSED(D-043).
+    pub take: u64,
 }
 
 /// What [`RaftStore::open`] found beside the store itself.
@@ -244,6 +251,8 @@ pub(crate) fn encode_snapshot_record(record: &SnapshotRecord) -> Bytes {
     out.put_u64_le(record.last_index);
     out.put_u64_le(record.last_term);
     out.put_u8(u8::from(record.taken));
+    // PROPOSED(D-043): the take counter rides between the flag and the directory.
+    out.put_u64_le(record.take);
     out.put_u32_le(u32::try_from(record.dir.len()).expect("directory fits u32"));
     out.put_slice(record.dir.as_bytes());
     put_payload(&mut out, &Payload::Config(record.config.clone()));
@@ -251,7 +260,7 @@ pub(crate) fn encode_snapshot_record(record: &SnapshotRecord) -> Bytes {
 }
 
 pub(crate) fn decode_snapshot_record(mut bytes: Bytes) -> io::Result<SnapshotRecord> {
-    if bytes.len() < 21 {
+    if bytes.len() < 29 {
         return Err(bad("snapshot record"));
     }
     let last_index = bytes.get_u64_le();
@@ -261,6 +270,7 @@ pub(crate) fn decode_snapshot_record(mut bytes: Bytes) -> io::Result<SnapshotRec
         1 => true,
         _ => return Err(bad("snapshot record malformed")),
     };
+    let take = bytes.get_u64_le();
     let len = bytes.get_u32_le() as usize;
     if bytes.len() < len {
         return Err(bad("snapshot record torn"));
@@ -278,6 +288,7 @@ pub(crate) fn decode_snapshot_record(mut bytes: Bytes) -> io::Result<SnapshotRec
         config,
         dir,
         taken,
+        take,
     })
 }
 

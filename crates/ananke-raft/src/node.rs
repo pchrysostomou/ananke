@@ -33,7 +33,17 @@
 //!   checkpoint directories. The final repair of a staged store needs the receiver's
 //!   own hard state and log tail, so the `raft` loop quiesces the `apply` task,
 //!   reads them, and hands the repair over; the completed install then retires this
-//!   incarnation.
+//!   incarnation. It keeps one stream per designated follower and services them
+//!   all, each pinned to the checkpoint version it opened, and sweeps the versions
+//!   no stream reads (PROPOSED(D-043)); [`Variant::SharedSnapshotDir`] is the
+//!   server as built, one mutable directory per index and one stream at a time.
+//!
+//! Two gates of the `raft` loop keep a take from being repeated for nothing
+//! (PROPOSED(D-043)): a stream that fails for want of a usable checkpoint while a
+//! take is already in flight does not ask for another, and a take the core asks
+//! for after a checkpoint was found unusable is a `Job::Retake`, a fresh
+//! version even at the record's index, where a plain `Job::Take` at that index
+//! reuses the recorded version.
 //!
 //! A server whose store is refused ([`LostState`](crate::store::LostState)) traces
 //! [`TraceEvent::RaftRefused`] and runs in *re-seed mode* (RAFT.md §3): its socket
@@ -146,14 +156,24 @@ enum Event {
 enum Job {
     /// Committed entries to apply in order.
     Entries(Vec<Entry>),
-    /// Take a snapshot at the applied index, between applies (RAFT.md §1).
+    /// Take a snapshot at the applied index, between applies (RAFT.md §1). At
+    /// the index the record already names, with its version complete, the
+    /// recorded version is answered instead of a second one of the same state
+    /// (PROPOSED(D-043)).
     Take,
+    /// Take a fresh version even at the record's index: the recorded one was
+    /// found unusable, by a stream that could not open it or a receiver that
+    /// refused it (PROPOSED(D-043)).
+    Retake,
 }
 
 /// What the `snapshot` task takes from its queue.
 enum Snap {
     /// The core asks for a stream (a take goes to the `apply` task instead).
     Action(SnapshotAction),
+    /// The `apply` task completed a take: the record names a new version, and
+    /// the ones nothing reads can go (PROPOSED(D-043)).
+    Taken,
     /// An `InstallSnapshot` chunk from a peer.
     Chunk { from: ServerId, message: Message },
     /// An `InstallSnapshotResponse` from a peer.
@@ -363,6 +383,16 @@ async fn incarnation<E: Environment>(
     let snaps: Queue<Snap> = Queue::new();
     let pending: Pending = Arc::default();
 
+    // PROPOSED(D-043): the checkpoint versions the record does not name are old
+    // ones — a predecessor incarnation's, or a leader's from before this store
+    // was installed — and no stream of this incarnation reads any yet. They go
+    // now, before any task runs, so that a take of this incarnation can never
+    // share a name with a directory that still holds files: the take counter
+    // restarts at zero on an installed store, and a re-seeded server's lost
+    // store may have taken at the index it takes at again.
+    if variant != Variant::SharedSnapshotDir {
+        sweep_versions(env, id, &store, &engine_dir, &BTreeMap::new()).await;
+    }
     spawn_apply(
         env,
         id,
@@ -374,6 +404,7 @@ async fn incarnation<E: Environment>(
         &engine_dir,
         core.applied_membership(),
         core.term_at(applied).unwrap_or(0),
+        variant,
     );
     env.spawn(
         "snapshot",
@@ -462,6 +493,8 @@ async fn incarnation<E: Environment>(
         proposed: BTreeMap::new(),
         reads: BTreeMap::new(),
         next_read: 0,
+        take_in_flight: false,
+        fresh_take: false,
     };
     let mut next_tick = env.clock().now() + tick;
     let next = loop {
@@ -502,21 +535,41 @@ async fn incarnation<E: Environment>(
             },
             Some(Event::Applied(index)) => (Input::Applied(index), None, None, None),
             Some(Event::Taken { index, term }) => {
+                // The versions nothing reads any more can go (PROPOSED(D-043)).
+                node.take_in_flight = false;
+                node.fresh_take = false;
+                node.snaps.push(Snap::Taken);
                 (Input::SnapshotTaken { index, term }, None, None, None)
             }
-            Some(Event::TakeFailed) => (
-                Input::SnapshotFailed {
-                    to: id,
-                    retake: true,
-                },
-                None,
-                None,
-                None,
-            ),
+            Some(Event::TakeFailed) => {
+                node.take_in_flight = false;
+                node.fresh_take = true;
+                (
+                    Input::SnapshotFailed {
+                        to: id,
+                        retake: true,
+                    },
+                    None,
+                    None,
+                    None,
+                )
+            }
             Some(Event::StreamDone { to, index }) => {
                 (Input::SnapshotInstalled { to, index }, None, None, None)
             }
             Some(Event::StreamFailed { to, retake }) => {
+                // PROPOSED(D-043): a stream that found no usable version while a
+                // take is in flight waits for that take rather than asking for
+                // another — the core would clear its pending take and queue a
+                // second one at the same index behind the first, the re-take
+                // cascade of seed 5909. Otherwise the checkpoint really is
+                // unusable, and the next take is a fresh version. The server as
+                // built (`SharedSnapshotDir`) asks every time.
+                let retake =
+                    retake && (!node.take_in_flight || node.variant == Variant::SharedSnapshotDir);
+                if retake {
+                    node.fresh_take = true;
+                }
                 (Input::SnapshotFailed { to, retake }, None, None, None)
             }
             Some(Event::SnapshotReady {
@@ -720,6 +773,7 @@ async fn install_decision<E: Environment>(
     // Not switching: the incarnation continues, with a fresh `apply` task in
     // place of the quiesced one, re-fed from the applied index.
     node.jobs = Queue::new();
+    node.take_in_flight = false;
     let env = node.env.clone();
     let engine_dir = node.engine_dir.clone();
     spawn_apply(
@@ -733,6 +787,7 @@ async fn install_decision<E: Environment>(
         &engine_dir,
         core.applied_membership(),
         core.term_at(node.store.applied()).unwrap_or(0),
+        node.variant,
     );
     node.apply_sent = node.store.applied();
     node.apply_through(core, core.commit());
@@ -753,6 +808,7 @@ fn spawn_apply<E: Environment>(
     engine_dir: &Path,
     config: Configuration,
     applied_term: Term,
+    variant: Variant,
 ) {
     let server = id.0;
     let env = env.clone();
@@ -770,9 +826,10 @@ fn spawn_apply<E: Environment>(
         // (RAFT.md §1, D-029).
         let mut config = config;
         while let Some(job) = jobs.pop().await {
+            let fresh = matches!(job, Job::Retake);
             let entries = match job {
                 Job::Entries(entries) => entries,
-                Job::Take => {
+                Job::Take | Job::Retake => {
                     // A snapshot at the applied index: the record first, synced,
                     // then the checkpoint, and no apply lands in between, so the
                     // record is exact (RAFT.md §1, PROPOSED(D-036)).
@@ -780,8 +837,54 @@ fn spawn_apply<E: Environment>(
                         inbox.push(Event::TakeFailed);
                         continue;
                     }
-                    let dir = snapshot::checkpoint_dir(&engine_dir, applied);
-                    match snapshot::take(&env, &store, &dir, applied, applied_term, &config).await {
+                    let taken = if variant == Variant::SharedSnapshotDir {
+                        // As built: one directory per index, swept and rewritten
+                        // by every take at it, under any stream reading it.
+                        let dir = snapshot::checkpoint_dir(&engine_dir, applied);
+                        snapshot::take(&env, &store, &dir, applied, applied_term, &config).await
+                    } else {
+                        // PROPOSED(D-043): a take at the index the record already
+                        // names is a second version of the same state. Unless a
+                        // fresh one was asked for, the recorded version answers
+                        // when it is complete; a fresh take, or one at a new
+                        // index, goes to its own numbered directory.
+                        let recorded = match store.snapshot_record().await {
+                            Ok(Some(record))
+                                if !fresh && record.taken && record.last_index == applied =>
+                            {
+                                match snapshot::checkpoint_complete(&env, Path::new(&record.dir))
+                                    .await
+                                {
+                                    Ok(true) => Some(record),
+                                    _ => None,
+                                }
+                            }
+                            _ => None,
+                        };
+                        if let Some(record) = recorded {
+                            env.trace(TraceEvent::RaftSnapshotReused {
+                                server,
+                                last_index: record.last_index,
+                                take: record.take,
+                            });
+                            inbox.push(Event::Taken {
+                                index: record.last_index,
+                                term: record.last_term,
+                            });
+                            continue;
+                        }
+                        snapshot::take_version(
+                            &env,
+                            &store,
+                            &engine_dir,
+                            applied,
+                            applied_term,
+                            &config,
+                        )
+                        .await
+                        .map(|_| ())
+                    };
+                    match taken {
                         Ok(()) => {
                             env.trace(TraceEvent::RaftSnapshot {
                                 server,
@@ -867,10 +970,148 @@ const CHUNK_RESENDS: u32 = 8;
 /// How many times a stream starts over before the checkpoint is retaken.
 const STREAM_RESTARTS: u32 = 2;
 
+/// The `snapshot` task's outbound side (PROPOSED(D-043)): a stream per
+/// designated follower, each pinned to the checkpoint version it opened, with a
+/// reader count per version so the sweep leaves what a stream reads; and, under
+/// [`Variant::SharedSnapshotDir`], the server as built — one stream at a time,
+/// every other designated follower queued behind it in `backlog`.
+#[derive(Default)]
+struct Streams {
+    outbound: BTreeMap<ServerId, Outbound>,
+    readers: BTreeMap<PathBuf, usize>,
+    backlog: Vec<(ServerId, Index, Term)>,
+}
+
+impl Streams {
+    /// The earliest chunk deadline among the streams running.
+    fn deadline(&self) -> Option<Instant> {
+        self.outbound.values().map(|out| out.deadline).min()
+    }
+
+    /// The followers whose outstanding chunk timed out by `now`.
+    fn due(&self, now: Instant) -> Vec<ServerId> {
+        self.outbound
+            .iter()
+            .filter(|(_, out)| out.deadline <= now)
+            .map(|(&to, _)| to)
+            .collect()
+    }
+
+    /// Whether `to` is being streamed to, or waits to be.
+    fn has(&self, to: ServerId) -> bool {
+        self.outbound.contains_key(&to) || self.backlog.iter().any(|(s, _, _)| *s == to)
+    }
+
+    /// Adds a stream, pinning its version; returns how many streams run now.
+    fn open(&mut self, out: Outbound) -> usize {
+        *self
+            .readers
+            .entry(out.sender.dir().to_path_buf())
+            .or_default() += 1;
+        self.outbound.insert(out.sender.to, out);
+        self.outbound.len()
+    }
+
+    /// Ends the stream to `to`, releasing its version.
+    fn end(&mut self, to: ServerId) {
+        let Some(out) = self.outbound.remove(&to) else {
+            return;
+        };
+        let dir = out.sender.dir().to_path_buf();
+        if let Some(count) = self.readers.get_mut(&dir) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.readers.remove(&dir);
+            }
+        }
+    }
+}
+
+/// What the `snapshot` task's stream helpers need of its world (PROPOSED(D-043)).
+struct Streamer<E: Environment> {
+    env: E,
+    id: ServerId,
+    sock: Arc<<E::Net as Network>::Socket>,
+    addrs: Arc<BTreeMap<ServerId, SocketAddr>>,
+    store: Arc<RaftStore<E>>,
+    config: RaftConfig,
+    engine_dir: PathBuf,
+    inbox: Queue<Event>,
+    chunk_timeout: Duration,
+}
+
+impl<E: Environment> Streamer<E> {
+    /// Opens a stream to `to` of the checkpoint at (`index`, `term`) and sends
+    /// its first chunk ([`start_stream`]), pinning the version it opened, and
+    /// traces how many streams now run.
+    async fn open(&self, streams: &mut Streams, to: ServerId, index: Index, term: Term) {
+        if let Some(out) = start_stream(self, to, index, term).await {
+            let running = streams.open(out);
+            self.env.trace(TraceEvent::RaftSnapshotStreams {
+                server: self.id.0,
+                to: to.0,
+                streams: running as u64,
+            });
+        }
+    }
+
+    /// A stream ended: the versions nothing reads any more are swept; under the
+    /// shared-directory variant the next queued follower's stream starts
+    /// instead, as built.
+    async fn ended(&self, streams: &mut Streams) {
+        if self.config.variant == Variant::SharedSnapshotDir {
+            if streams.outbound.is_empty()
+                && let Some((to, index, term)) = streams.backlog.pop()
+            {
+                self.open(streams, to, index, term).await;
+            }
+        } else {
+            self.sweep(streams).await;
+        }
+    }
+
+    /// Deletes the versions that are neither the record's nor read by a stream,
+    /// tracing each ([`sweep_versions`]).
+    async fn sweep(&self, streams: &Streams) {
+        sweep_versions(
+            &self.env,
+            self.id,
+            &self.store,
+            &self.engine_dir,
+            &streams.readers,
+        )
+        .await;
+    }
+}
+
+/// Deletes the checkpoint versions under `engine_dir` that are neither the
+/// record's nor read by a stream — `readers` counts the streams on each — and
+/// traces each as [`TraceEvent::RaftSnapshotDeleted`] (PROPOSED(D-043)). A sweep
+/// that fails leaves its versions for the next.
+async fn sweep_versions<E: Environment>(
+    env: &E,
+    id: ServerId,
+    store: &RaftStore<E>,
+    engine_dir: &Path,
+    readers: &BTreeMap<PathBuf, usize>,
+) {
+    if let Ok(deleted) = snapshot::sweep_versions(env, store, engine_dir, readers).await {
+        for (last_index, take) in deleted {
+            env.trace(TraceEvent::RaftSnapshotDeleted {
+                server: id.0,
+                last_index,
+                take,
+            });
+        }
+    }
+}
+
 /// The `snapshot` task (RAFT.md §3): streams checkpoints to followers on the
-/// leader's behalf, one chunk outstanding and resumed from the last acknowledged
-/// offset after loss; assembles and verifies arriving streams on a follower; the
-/// only task that touches checkpoint directories.
+/// leader's behalf, one chunk outstanding per stream and resumed from the last
+/// acknowledged offset after loss; assembles and verifies arriving streams on a
+/// follower; the only task that touches checkpoint directories. One stream per
+/// designated follower, serviced as its acknowledgements and timeouts come,
+/// never behind another's (PROPOSED(D-043)).
 #[expect(clippy::too_many_arguments, reason = "the task's whole world")]
 async fn snapshot_task<E: Environment>(
     env: E,
@@ -885,14 +1126,25 @@ async fn snapshot_task<E: Environment>(
 ) {
     let server = id.0;
     let chunk_timeout = Duration::from_nanos(config.tick_nanos * config.election_ticks.0 / 2);
+    let shared = config.variant == Variant::SharedSnapshotDir;
     let mut assembler = Assembler::new(env.clone(), &engine_dir, config.variant);
     let mut staged: Option<Staged> = None;
-    let mut outbound: Option<Outbound> = None;
-    let mut backlog: Vec<ServerId> = Vec::new();
+    let streamer = Streamer {
+        env: env.clone(),
+        id,
+        sock: sock.clone(),
+        addrs: addrs.clone(),
+        store: store.clone(),
+        config: config.clone(),
+        engine_dir: engine_dir.clone(),
+        inbox: inbox.clone(),
+        chunk_timeout,
+    };
+    let mut streams = Streams::default();
     loop {
-        let item = if let Some(out) = &outbound {
+        let item = if let Some(deadline) = streams.deadline() {
             let pop = pin!(snaps.pop());
-            let timer = pin!(env.clock().sleep_until(out.deadline));
+            let timer = pin!(env.clock().sleep_until(deadline));
             match race(&env, pop, timer).await {
                 Either::Left(Some(item)) => Some(item),
                 Either::Left(None) => return,
@@ -905,39 +1157,29 @@ async fn snapshot_task<E: Environment>(
             }
         };
         let Some(item) = item else {
-            // The chunk timed out: resend from where the receiver last stood,
-            // the resumption of RAFT.md §1, or give the stream up.
-            let out = outbound.as_mut().expect("a stream timed out");
-            out.resends += 1;
-            if out.resends > CHUNK_RESENDS {
-                inbox.push(Event::StreamFailed {
-                    to: out.sender.to,
-                    retake: false,
-                });
-                outbound = None;
-            } else {
-                env.trace(TraceEvent::RaftSnapshotResumed {
-                    server,
-                    to: out.sender.to.0,
-                    offset: out.sender.position_offset(config.snapshot_chunk),
-                });
-                send_chunk(&env, &sock, &addrs, id, &config, out, chunk_timeout).await;
+            // A chunk timed out: resend from where its receiver last stood, the
+            // resumption of RAFT.md §1, or give that stream up. Every stream
+            // past its deadline is serviced here, none behind another's.
+            let now = env.clock().now();
+            let mut ended = false;
+            for to in streams.due(now) {
+                let out = streams.outbound.get_mut(&to).expect("a due stream");
+                out.resends += 1;
+                if out.resends > CHUNK_RESENDS {
+                    inbox.push(Event::StreamFailed { to, retake: false });
+                    streams.end(to);
+                    ended = true;
+                } else {
+                    env.trace(TraceEvent::RaftSnapshotResumed {
+                        server,
+                        to: to.0,
+                        offset: out.sender.position_offset(config.snapshot_chunk),
+                    });
+                    send_chunk(&env, &sock, &addrs, id, &config, out, chunk_timeout).await;
+                }
             }
-            if outbound.is_none()
-                && let Some(to) = backlog.pop()
-            {
-                outbound = start_stream(
-                    &env,
-                    &store,
-                    id,
-                    to,
-                    &sock,
-                    &addrs,
-                    &config,
-                    chunk_timeout,
-                    &inbox,
-                )
-                .await;
+            if ended {
+                streamer.ended(&mut streams).await;
             }
             continue;
         };
@@ -945,27 +1187,21 @@ async fn snapshot_task<E: Environment>(
             Snap::Action(SnapshotAction::Take) => {
                 // Takes run in the apply task; the server routes them there.
             }
-            Snap::Action(SnapshotAction::Install { to, .. }) => {
-                if outbound.as_ref().is_some_and(|out| out.sender.to == to) || backlog.contains(&to)
-                {
+            Snap::Taken => {
+                if !shared {
+                    streamer.sweep(&streams).await;
+                }
+            }
+            Snap::Action(SnapshotAction::Install { to, index, term }) => {
+                if streams.has(to) {
                     continue;
                 }
-                if outbound.is_some() {
-                    backlog.push(to);
+                if shared && !streams.outbound.is_empty() {
+                    // As built: one stream per leader, the rest queued behind it.
+                    streams.backlog.push((to, index, term));
                     continue;
                 }
-                outbound = start_stream(
-                    &env,
-                    &store,
-                    id,
-                    to,
-                    &sock,
-                    &addrs,
-                    &config,
-                    chunk_timeout,
-                    &inbox,
-                )
-                .await;
+                streamer.open(&mut streams, to, index, term).await;
             }
             Snap::Chunk {
                 from,
@@ -1086,20 +1322,24 @@ async fn snapshot_task<E: Environment>(
                         ..
                     },
             } => {
-                let Some(out) = &mut outbound else { continue };
+                // The stream to this follower, if one runs (PROPOSED(D-043)).
+                let Some(out) = streams.outbound.get_mut(&from) else {
+                    continue;
+                };
                 if out.sender.to != from
                     || out.sender.last_index != last_index
                     || out.sender.last_term != last_term
                 {
                     continue;
                 }
+                let mut ended = false;
                 match status {
                     SnapshotStatus::Installed => {
                         inbox.push(Event::StreamDone {
                             to: from,
                             index: last_index,
                         });
-                        outbound = None;
+                        ended = true;
                     }
                     SnapshotStatus::Restart => {
                         out.restarts += 1;
@@ -1108,7 +1348,7 @@ async fn snapshot_task<E: Environment>(
                                 to: from,
                                 retake: true,
                             });
-                            outbound = None;
+                            ended = true;
                         } else {
                             out.sender.restart();
                             out.resends = 0;
@@ -1131,21 +1371,9 @@ async fn snapshot_task<E: Environment>(
                         }
                     }
                 }
-                if outbound.is_none()
-                    && let Some(to) = backlog.pop()
-                {
-                    outbound = start_stream(
-                        &env,
-                        &store,
-                        id,
-                        to,
-                        &sock,
-                        &addrs,
-                        &config,
-                        chunk_timeout,
-                        &inbox,
-                    )
-                    .await;
+                if ended {
+                    streams.end(from);
+                    streamer.ended(&mut streams).await;
                 }
             }
             Snap::Chunk { .. } | Snap::Ack { .. } => {}
@@ -1153,52 +1381,70 @@ async fn snapshot_task<E: Environment>(
     }
 }
 
-/// Opens a stream of the recorded checkpoint to `to` and sends its first chunk;
-/// reports a failure to the core instead when there is no streamable checkpoint.
-#[expect(clippy::too_many_arguments, reason = "the task's whole world")]
+/// Opens a stream of the checkpoint at (`index`, `term`) to `to` and sends its
+/// first chunk; reports a failure to the core instead when there is no
+/// streamable checkpoint. The correct server opens the newest *complete* version
+/// of that index, [`snapshot::find_version`], and is pinned to it for the
+/// stream's life (PROPOSED(D-043)); [`Variant::SharedSnapshotDir`] opens whatever
+/// directory the record names, as built — which a take in flight may still be
+/// writing, since the record precedes the checkpoint (D-036).
 async fn start_stream<E: Environment>(
-    env: &E,
-    store: &Arc<RaftStore<E>>,
-    id: ServerId,
+    task: &Streamer<E>,
     to: ServerId,
-    sock: &Arc<<E::Net as Network>::Socket>,
-    addrs: &Arc<BTreeMap<ServerId, SocketAddr>>,
-    config: &RaftConfig,
-    chunk_timeout: Duration,
-    inbox: &Queue<Event>,
+    index: Index,
+    term: Term,
 ) -> Option<Outbound> {
-    let record = match store.snapshot_record().await {
-        Ok(Some(record)) if record.taken && !record.dir.is_empty() => record,
-        _ => {
-            // No checkpoint of our own to stream: ask for a fresh take.
-            inbox.push(Event::StreamFailed { to, retake: true });
-            return None;
+    let env = &task.env;
+    let (dir, last_index, last_term) = if task.config.variant == Variant::SharedSnapshotDir {
+        match task.store.snapshot_record().await {
+            Ok(Some(record)) if record.taken && !record.dir.is_empty() => (
+                PathBuf::from(&record.dir),
+                record.last_index,
+                record.last_term,
+            ),
+            _ => {
+                // No checkpoint of our own to stream: ask for a fresh take.
+                task.inbox.push(Event::StreamFailed { to, retake: true });
+                return None;
+            }
+        }
+    } else {
+        match snapshot::find_version(env, &task.engine_dir, index).await {
+            Ok(Some((dir, _))) => (dir, index, term),
+            _ => {
+                // No complete version of that index: the take is still in
+                // flight, a crash cut it short, or the record is an install's.
+                // Ask for a take; the `raft` loop waits out one in flight.
+                task.inbox.push(Event::StreamFailed { to, retake: true });
+                return None;
+            }
         }
     };
-    let sender = Sender::open(
-        env,
-        Path::new(&record.dir),
-        to,
-        record.last_index,
-        record.last_term,
-        store.term(),
-    )
-    .await;
+    let sender = Sender::open(env, &dir, to, last_index, last_term, task.store.term()).await;
     match sender {
         Ok(sender) => {
             let mut out = Outbound {
                 sender,
-                deadline: env.clock().now() + chunk_timeout,
+                deadline: env.clock().now() + task.chunk_timeout,
                 resends: 0,
                 restarts: 0,
             };
-            send_chunk(env, sock, addrs, id, config, &mut out, chunk_timeout).await;
+            send_chunk(
+                env,
+                &task.sock,
+                &task.addrs,
+                task.id,
+                &task.config,
+                &mut out,
+                task.chunk_timeout,
+            )
+            .await;
             Some(out)
         }
         Err(_) => {
             // The recorded checkpoint is unusable (a crash between the record
             // and the checkpoint leaves one): take a fresh one.
-            inbox.push(Event::StreamFailed { to, retake: true });
+            task.inbox.push(Event::StreamFailed { to, retake: true });
             None
         }
     }
@@ -1395,6 +1641,13 @@ struct Server<E: Environment> {
     /// Reads waiting on the core, by the id handed to it.
     reads: BTreeMap<u64, (SocketAddr, Request)>,
     next_read: u64,
+    /// A take is with the `apply` task: a stream that finds no usable version
+    /// meanwhile waits for it rather than asking for another (PROPOSED(D-043)).
+    take_in_flight: bool,
+    /// The recorded checkpoint was found unusable: the next take the core asks
+    /// for is a [`Job::Retake`], a fresh version even at the record's index
+    /// (PROPOSED(D-043)).
+    fresh_take: bool,
 }
 
 /// How many proposals a server remembers against duplicates.
@@ -1500,7 +1753,18 @@ impl<E: Environment> Server<E> {
                     self.answer_read(id, Reply::NotLeader { leader: None })
                         .await;
                 }
-                Output::Snapshot(SnapshotAction::Take) => self.jobs.push(Job::Take),
+                Output::Snapshot(SnapshotAction::Take) => {
+                    // A fresh version when the recorded one was found unusable,
+                    // the recorded one otherwise at its own index (PROPOSED(D-043)).
+                    let job = if self.fresh_take {
+                        Job::Retake
+                    } else {
+                        Job::Take
+                    };
+                    self.fresh_take = false;
+                    self.take_in_flight = true;
+                    self.jobs.push(job);
+                }
                 Output::Snapshot(action) => self.snaps.push(Snap::Action(action)),
                 Output::Trace(event) => self.env.trace(event),
             }
