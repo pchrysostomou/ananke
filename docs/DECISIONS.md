@@ -1805,10 +1805,38 @@ for staging damage costs a re-seed even when the store directory already holds
 the adopted store — a crash after the switch and before the staging is retired,
 with rot on the staging `CURRENT` — priced in, a two-per-cent roll inside a
 window of a few milliseconds. A store from before the marker is marked at its
-next open. Every sweep schedule now ends with an isolation, an install and a
-crash storm on the receiver, about a second of run per seed. `Sim::durable_names`
-joins `durable_contents` as a harness accessor. Every site is marked
-`PROPOSED(D-041)`.
+next open. One sweep schedule in four now ends with an isolation, an install and
+a crash storm on the receiver; the other three are as cheap as they were.
+
+That share is an amendment to what this entry first said, and the sweep's cost
+is why. The storm rode every schedule as written, and waiting for an install and
+then crashing the receiver some two dozen times with a restart each is by a wide
+margin the most expensive fault a schedule carries: it took the raft test
+binary's thousand seeds from 667 s to 2218 s, and `scripts/premerge.sh` from
+about thirteen minutes to forty, well past the quarter of an hour that tier
+exists for (D-040). The share is drawn from the fault's own `"adoption-crash"`
+stream (`raft::ADOPTION_STORM_IN`), so no other arm's dice moved with it, and
+the crash count on a seed that draws the storm is unchanged; the price is paid
+in catch rate, and it is paid about in proportion. `AdoptionAsBuilt` was caught
+on 23 of 100 release seeds and 270 of 1000 with the storm everywhere; on one
+seed in four it is caught on 8 of 100, the fault is drawn on 26 of those 100
+seeds, and the sweep still counts 851 adoptions, so `Coverage::assert_complete`'s
+`adoptions` and `adoption_crash_faults` both still hold at the hundred-seed
+tier.
+
+One trade was needed, and it is a tier rather than a dice roll. At 8 of 100 the
+catch is 0 of the gate's 20 seeds — three seeds in four never roll the rot's
+dice at all — so `a_server_whose_adoption_is_as_built_is_caught` asserts the
+catch at the hundred-seed tier and asserts at every tier that the fault fired:
+the storm drawn on some seed, and adoptions under it for the storm to crash
+into. That is the shape D-044 already gives `RefusalNotDurable`, which is caught
+on 3 of 100. The alternative — raising the crash count on the seeds that draw
+the storm until the gate catches it again — buys a gate signal with the very
+cost this amendment exists to remove, and the gate's twenty seeds were never the
+tier that owned this catch.
+
+`Sim::durable_names` joins `durable_contents` as a harness accessor. Every site
+is marked `PROPOSED(D-041)`.
 
 ---
 

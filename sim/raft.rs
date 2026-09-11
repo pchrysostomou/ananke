@@ -315,7 +315,10 @@ pub enum Fault {
     /// is that many rolls of the rot's dice. If no install completes within
     /// [`INSTALL_WAIT_BUDGET`], no crash fires and the fault was an isolation.
     /// Drawn from its own `moirae_sched` stream ("adoption-crash"), never
-    /// lengthening the shared schedule stream or the install crash's (D-031).
+    /// lengthening the shared schedule stream or the install crash's (D-031),
+    /// and drawn on one seed in [`ADOPTION_STORM_IN`] rather than on every
+    /// schedule: the storm is the most expensive fault the sweep carries and the
+    /// share is what keeps `scripts/premerge.sh` inside its quarter of an hour.
     CrashAdopting {
         /// The follower isolated and then crashed mid-adoption; the leader's
         /// neighbour if it leads when the fault starts.
@@ -388,6 +391,17 @@ pub const INSTALL_WAIT_BUDGET: Duration = Duration::from_millis(4000);
 /// a memtable before crashing it anyway. A server fills a sixteen-kilobyte
 /// memtable about every two seconds at the sweep's write rate. PROPOSED(D-044).
 pub const FLUSH_WAIT_BUDGET: Duration = Duration::from_millis(2500);
+
+/// One seed in this many draws a [`Fault::CrashAdopting`] storm, from the
+/// fault's own `moirae_sched` stream ("adoption-crash"). D-041 appended the
+/// storm to every schedule and the sweep paid for it: the raft test binary's
+/// thousand seeds went from 667 s to 2218 s and `scripts/premerge.sh` from about
+/// thirteen minutes to forty, over the fifteen-minute target of the tier
+/// (D-040). The crash count on a seed that draws the storm is unchanged, so what
+/// the share costs is the catch rate — roughly a quarter of what it was — and
+/// what it buys back is three quarters of the seeds at their old price.
+/// PROPOSED(D-041).
+pub const ADOPTION_STORM_IN: u64 = 4;
 
 /// The longest a [`Fault::CrashAdopting`] waits, after the install's completion
 /// or a restart, for the adoption's first durable change to the store directory
@@ -527,19 +541,28 @@ impl Schedule {
             gaps.push(ms(&mut snap, 450, 700));
         }
         // A crash storm aimed at the adoption that follows a completed install,
-        // on every seed, appended after the install crash: its window is a
-        // two-per-cent roll of the disk's dice per crash, so every seed rolls
-        // sixteen to thirty-two times. Its own stream, so neither the shared
-        // "schedule" draws nor the install crash's move when this arm changes
-        // (D-031). PROPOSED(D-041).
+        // on one seed in [`ADOPTION_STORM_IN`], appended after the install
+        // crash: its window is a two-per-cent roll of the disk's dice per crash,
+        // so a seed that draws the storm rolls sixteen to thirty-two times. The
+        // share is the arm's price. Waiting for an install, then some two dozen
+        // aimed crashes with a restart each, is the most expensive fault a
+        // schedule carries, and on every seed it took the raft binary's thousand
+        // seeds from 667 s to 2218 s and `scripts/premerge.sh` from about
+        // thirteen minutes to forty, well past the fifteen that tier exists for;
+        // a quarter of the seeds keeps the catch and gives the other three
+        // quarters their old cost back. Drawn from this arm's own stream, so
+        // neither the shared "schedule" draws nor the install crash's move when
+        // the share changes (D-031). PROPOSED(D-041).
         let mut adopt = moirae_sched::stream(seed, "adoption-crash");
-        faults.push(Fault::CrashAdopting {
-            server: 1 + adopt.below(SERVERS),
-            isolate: ms(&mut adopt, 700, 1100),
-            down: ms(&mut adopt, 10, 40),
-            crashes: 16 + adopt.below(17),
-        });
-        gaps.push(ms(&mut adopt, 450, 700));
+        if adopt.below(ADOPTION_STORM_IN) == 0 {
+            faults.push(Fault::CrashAdopting {
+                server: 1 + adopt.below(SERVERS),
+                isolate: ms(&mut adopt, 700, 1100),
+                down: ms(&mut adopt, 10, 40),
+                crashes: 16 + adopt.below(17),
+            });
+            gaps.push(ms(&mut adopt, 450, 700));
+        }
         // A crash storm aimed at the laundering window of a refusal, on every
         // seed, appended last: the adoption storm before it is where the disk's
         // rot turns into refusals, and a server left refused by it takes this
