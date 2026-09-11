@@ -42,7 +42,12 @@
 //! rejection whose hint asks from index 1, the ask no follower with a log makes, so
 //! the leader designates it snapshot-fed and streams; once the install completes
 //! the server runs on the re-seeded store, quarantined for good
-//! (PROPOSED(D-035)): the lost state may have included its vote.
+//! (PROPOSED(D-035)): the lost state may have included its vote. Every
+//! AppendEntries and InstallSnapshot response carries the store's incarnation
+//! number, stamped on the way out like the clock — 0 while refused, a fresh one
+//! on the re-seeded store — so a leader that matched entries on the lost store
+//! forgets them rather than probing above a log that no longer has them
+//! (PROPOSED(D-042)).
 //!
 //! A client request becomes a proposal. A server that is not the leader answers
 //! [`Reply::NotLeader`] at once. The leader remembers the request against the index
@@ -81,7 +86,9 @@ use crate::core::{Input, Output, Raft, RaftConfig, SnapshotAction, Variant};
 use crate::message::{Frame, Message, SnapshotStatus};
 use crate::queue::Queue;
 use crate::snapshot::{self, Assembler, Feed, Repair, Sender, Staged};
-use crate::store::{LostState, RaftStore, Recovered, mark_store, refuse_lost_store};
+use crate::store::{
+    FIRST_INCARNATION, LostState, RaftStore, Recovered, mark_store, refuse_lost_store,
+};
 use crate::types::{Configuration, Entry, Index, Payload, ServerId, Term};
 
 /// What one server needs to run.
@@ -127,8 +134,13 @@ enum Event {
     Taken { index: Index, term: Term },
     /// The `apply` task could not complete a take.
     TakeFailed,
-    /// The `snapshot` task streamed a snapshot to `to`, which installed it.
-    StreamDone { to: ServerId, index: Index },
+    /// The `snapshot` task streamed a snapshot to `to`, which installed it and
+    /// answered with the incarnation of the store it runs on now.
+    StreamDone {
+        to: ServerId,
+        index: Index,
+        incarnation: u64,
+    },
     /// The `snapshot` task gave up streaming to `to`; with `retake` the
     /// checkpoint itself is unusable.
     StreamFailed { to: ServerId, retake: bool },
@@ -183,7 +195,10 @@ fn lock_pending(pending: &Pending) -> std::sync::MutexGuard<'_, BTreeMap<Index, 
 }
 
 /// Sends `message` to `to`, stamping the clock where the lease reads it: `sent` on
-/// an AppendEntries, `local` on its response (RAFT.md §1).
+/// an AppendEntries, `local` on its response (RAFT.md §1); and stamping
+/// `incarnation`, the sender's store incarnation, on an AppendEntries or
+/// InstallSnapshot response (RAFT.md §3, PROPOSED(D-042)) — 0 from a refused
+/// server, which has no store.
 async fn send_message<E: Environment>(
     env: &E,
     sock: &<E::Net as Network>::Socket,
@@ -191,10 +206,21 @@ async fn send_message<E: Environment>(
     from: ServerId,
     to: ServerId,
     mut message: Message,
+    incarnation: u64,
 ) {
     match &mut message {
         Message::AppendEntries { sent, .. } => *sent = now_nanos(env),
-        Message::AppendEntriesResponse { local, .. } => *local = now_nanos(env),
+        Message::AppendEntriesResponse {
+            local,
+            incarnation: mine,
+            ..
+        } => {
+            *local = now_nanos(env);
+            *mine = incarnation;
+        }
+        Message::InstallSnapshotResponse {
+            incarnation: mine, ..
+        } => *mine = incarnation,
         _ => {}
     }
     if let Some(addr) = addrs.get(&to) {
@@ -484,6 +510,7 @@ async fn incarnation<E: Environment>(
         term: core.term(),
         applied,
         last_index: core.last_index(),
+        incarnation: store.incarnation(),
     });
     env.trace(TraceEvent::RaftTerm {
         server,
@@ -556,9 +583,20 @@ async fn incarnation<E: Environment>(
                 None,
                 None,
             ),
-            Some(Event::StreamDone { to, index }) => {
-                (Input::SnapshotInstalled { to, index }, None, None, None)
-            }
+            Some(Event::StreamDone {
+                to,
+                index,
+                incarnation,
+            }) => (
+                Input::SnapshotInstalled {
+                    to,
+                    index,
+                    incarnation,
+                },
+                None,
+                None,
+                None,
+            ),
             Some(Event::StreamFailed { to, retake }) => {
                 (Input::SnapshotFailed { to, retake }, None, None, None)
             }
@@ -746,6 +784,10 @@ async fn install_decision<E: Environment>(
             // history: the vote its lost state may have held is still unknown.
             // PROPOSED(D-035): re-seeded servers are quarantined from voting for good.
             quarantined: core.quarantined(),
+            // An install into a live store keeps its incarnation: the kept tail
+            // is everything acknowledged past the snapshot, so nothing a leader
+            // matched is lost. PROPOSED(D-042): store incarnations.
+            incarnation: node.store.incarnation(),
         }));
     }
     loop {
@@ -1031,7 +1073,7 @@ async fn snapshot_task<E: Environment>(
                 if store.applied() >= last_index {
                     // Everything the snapshot carries is already here: say so.
                     let message = snapshot::installed(store.term(), (last_index, last_term));
-                    send_message(&env, &sock, &addrs, id, from, message).await;
+                    send_message(&env, &sock, &addrs, id, from, message, store.incarnation()).await;
                     continue;
                 }
                 if staged.is_some() {
@@ -1047,11 +1089,13 @@ async fn snapshot_task<E: Environment>(
                     Ok(Feed::Ack { file, offset }) => {
                         let message =
                             snapshot::ack(store.term(), (last_index, last_term), file, offset);
-                        send_message(&env, &sock, &addrs, id, from, message).await;
+                        send_message(&env, &sock, &addrs, id, from, message, store.incarnation())
+                            .await;
                     }
                     Ok(Feed::Restart) => {
                         let message = snapshot::start_over(store.term(), (last_index, last_term));
-                        send_message(&env, &sock, &addrs, id, from, message).await;
+                        send_message(&env, &sock, &addrs, id, from, message, store.incarnation())
+                            .await;
                     }
                     Ok(Feed::Staged(ready)) => {
                         inbox.push(Event::SnapshotReady {
@@ -1063,7 +1107,8 @@ async fn snapshot_task<E: Environment>(
                     Err(_) => {
                         assembler.abandon().await;
                         let message = snapshot::start_over(store.term(), (last_index, last_term));
-                        send_message(&env, &sock, &addrs, id, from, message).await;
+                        send_message(&env, &sock, &addrs, id, from, message, store.incarnation())
+                            .await;
                     }
                 }
             }
@@ -1098,13 +1143,15 @@ async fn snapshot_task<E: Environment>(
                             learners: config.learners.iter().map(|s| s.0).collect(),
                         });
                         let message = snapshot::installed(repair.term, identity);
-                        send_message(&env, &sock, &addrs, id, to, message).await;
+                        send_message(&env, &sock, &addrs, id, to, message, store.incarnation())
+                            .await;
                         inbox.push(Event::SnapshotFinished { reinstall: true });
                     }
                     Err(_) => {
                         assembler.abandon().await;
                         let message = snapshot::start_over(repair.term, identity);
-                        send_message(&env, &sock, &addrs, id, to, message).await;
+                        send_message(&env, &sock, &addrs, id, to, message, store.incarnation())
+                            .await;
                         inbox.push(Event::SnapshotFinished { reinstall: false });
                     }
                 }
@@ -1113,7 +1160,16 @@ async fn snapshot_task<E: Environment>(
                 let Some(ready) = staged.take() else { continue };
                 let message =
                     snapshot::installed(store.term(), (ready.last_index, ready.last_term));
-                send_message(&env, &sock, &addrs, id, ready.from, message).await;
+                send_message(
+                    &env,
+                    &sock,
+                    &addrs,
+                    id,
+                    ready.from,
+                    message,
+                    store.incarnation(),
+                )
+                .await;
                 assembler.abandon().await;
                 inbox.push(Event::SnapshotFinished { reinstall: false });
             }
@@ -1126,6 +1182,7 @@ async fn snapshot_task<E: Environment>(
                         file,
                         offset,
                         status,
+                        incarnation,
                         ..
                     },
             } => {
@@ -1141,6 +1198,7 @@ async fn snapshot_task<E: Environment>(
                         inbox.push(Event::StreamDone {
                             to: from,
                             index: last_index,
+                            incarnation,
                         });
                         outbound = None;
                     }
@@ -1258,7 +1316,8 @@ async fn send_chunk<E: Environment>(
     chunk_timeout: Duration,
 ) {
     if let Ok(message) = out.sender.chunk(env, config.snapshot_chunk).await {
-        send_message(env, sock, addrs, id, out.sender.to, message).await;
+        // A chunk is no response: nothing to stamp.
+        send_message(env, sock, addrs, id, out.sender.to, message, 0).await;
     }
     out.deadline = env.clock().now() + chunk_timeout;
 }
@@ -1268,7 +1327,9 @@ async fn send_chunk<E: Environment>(
 /// follower with a log makes, so the leader designates it snapshot-fed — and
 /// assembles the stream that follows. It grants nothing and answers nothing else.
 /// When the install completes, the staged store is a complete install carrying the
-/// quarantine flag (PROPOSED(D-035)), and the caller adopts it.
+/// quarantine flag (PROPOSED(D-035)) and a fresh store incarnation
+/// (PROPOSED(D-042)), and the caller adopts it. Its answers carry incarnation 0
+/// until then: a refused server has no store.
 async fn reseed<E: Environment>(
     env: &E,
     id: ServerId,
@@ -1291,7 +1352,9 @@ async fn reseed<E: Environment>(
                 term, prev_index, ..
             } => {
                 // The re-seed ask: reject with a hint of 1, echo 0 so no lease
-                // promise is ever measured from this server (RAFT.md §3).
+                // promise is ever measured from this server (RAFT.md §3), and
+                // incarnation 0, no store, so a leader that matched entries on
+                // the lost one forgets them (PROPOSED(D-042)).
                 let message = Message::AppendEntriesResponse {
                     term,
                     success: false,
@@ -1300,8 +1363,9 @@ async fn reseed<E: Environment>(
                     hint: 1,
                     echo: 0,
                     local: 0,
+                    incarnation: 0,
                 };
-                send_message(env, sock, addrs, id, from, message).await;
+                send_message(env, sock, addrs, id, from, message, 0).await;
             }
             Message::InstallSnapshot {
                 term,
@@ -1321,22 +1385,30 @@ async fn reseed<E: Environment>(
                 match fed {
                     Ok(Feed::Ack { file, offset }) => {
                         let message = snapshot::ack(term, (last_index, last_term), file, offset);
-                        send_message(env, sock, addrs, id, from, message).await;
+                        send_message(env, sock, addrs, id, from, message, 0).await;
                     }
                     Ok(Feed::Restart) => {
                         let message = snapshot::start_over(term, (last_index, last_term));
-                        send_message(env, sock, addrs, id, from, message).await;
+                        send_message(env, sock, addrs, id, from, message, 0).await;
                     }
                     Ok(Feed::Staged(ready)) => {
                         // No store survived, so there is nothing of our own to
                         // carry over: term from the stream, no vote, no tail,
                         // and the quarantine flag for the vote the lost state
-                        // may have held (PROPOSED(D-035)).
+                        // may have held (PROPOSED(D-035)). The store's
+                        // incarnation is drawn afresh: the number the lost
+                        // store carried is gone with it, and what matters is
+                        // that no leader has recorded this one against a match
+                        // index the rebuilt log cannot honour. Never the first
+                        // incarnation, which every fresh store starts at
+                        // (PROPOSED(D-042)).
+                        let incarnation = env.rng().next_u64().max(FIRST_INCARNATION + 1);
                         let repair = Repair {
                             term: ready.term,
                             vote: None,
                             tail: Vec::new(),
                             quarantined: true,
+                            incarnation,
                         };
                         let identity = (ready.last_index, ready.last_term);
                         let sender = ready.from;
@@ -1348,21 +1420,25 @@ async fn reseed<E: Environment>(
                                     last_term: identity.1,
                                     taken: false,
                                 });
+                                // The answer names the store this server runs
+                                // on from here: the leader records it and
+                                // forgets the old one's progress at once.
                                 let message = snapshot::installed(repair.term, identity);
-                                send_message(env, sock, addrs, id, sender, message).await;
+                                send_message(env, sock, addrs, id, sender, message, incarnation)
+                                    .await;
                                 return Next::Reinstall;
                             }
                             Err(_) => {
                                 assembler.abandon().await;
                                 let message = snapshot::start_over(repair.term, identity);
-                                send_message(env, sock, addrs, id, sender, message).await;
+                                send_message(env, sock, addrs, id, sender, message, 0).await;
                             }
                         }
                     }
                     Err(_) => {
                         assembler.abandon().await;
                         let message = snapshot::start_over(term, (last_index, last_term));
-                        send_message(env, sock, addrs, id, from, message).await;
+                        send_message(env, sock, addrs, id, from, message, 0).await;
                     }
                 }
             }
@@ -1444,9 +1520,19 @@ struct Server<E: Environment> {
 const PROPOSED_REMEMBERED: usize = 4096;
 
 impl<E: Environment> Server<E> {
-    /// Sends a message, stamping the clock where the lease reads it.
+    /// Sends a message, stamping the clock where the lease reads it and the
+    /// store's incarnation on a response (PROPOSED(D-042)).
     async fn send(&self, to: ServerId, message: Message) {
-        send_message(&self.env, &self.sock, &self.addrs, self.id, to, message).await;
+        send_message(
+            &self.env,
+            &self.sock,
+            &self.addrs,
+            self.id,
+            to,
+            message,
+            self.store.incarnation(),
+        )
+        .await;
     }
 
     /// Answers the client that asked for read `id`, if it is still waiting.

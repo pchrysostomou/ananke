@@ -736,6 +736,7 @@ fn a_higher_term_steps_a_leader_down_and_a_stale_response_is_ignored() {
                 hint: 0,
                 echo: 0,
                 local: 0,
+                incarnation: 0,
             },
         },
     );
@@ -814,6 +815,7 @@ fn a_replayed_success_response_does_not_move_match_index_back() {
                 hint: 0,
                 echo: 0,
                 local: 0,
+                incarnation: 0,
             },
         },
     );
@@ -829,6 +831,99 @@ fn a_replayed_success_response_does_not_move_match_index_back() {
         "replication goes on from where it was"
     );
     invariants::all(&cluster.events).unwrap();
+}
+
+/// Store incarnations (RAFT.md §3, PROPOSED(D-042)): a follower that answers
+/// with an incarnation other than the one the leader recorded runs on a rebuilt
+/// store, whose log may have lost entries it once acknowledged. The leader
+/// forgets what it knew of the follower and the probe resumes from the answer's
+/// hint, below the stale match index; the commit index, already earned, stays.
+/// The leader as built keeps the match, and since a probe never reaches below
+/// it, sends nothing the rebuilt log could accept.
+#[test]
+fn a_follower_with_a_new_incarnation_is_probed_from_its_hint() {
+    for variant in [Variant::Correct, Variant::IgnoreIncarnation] {
+        let members = vec![s(1), s(2), s(3)];
+        let mut cluster = Cluster::new(&members, &config(variant), &[]);
+        cluster.elect(s(1));
+        for i in 0..5 {
+            cluster.propose(s(1), &format!("c{i}"));
+        }
+        for _ in 0..6 {
+            cluster.tick(s(1), 2);
+            cluster.settle();
+        }
+        assert_eq!(cluster.commit(s(1)), 6);
+        let term = cluster.term(s(1));
+        // Server 2 acknowledged everything through 6 on the incarnation the
+        // harness stamps, 0. It now answers as a re-seeded store whose log ends
+        // at 2: a rejection of the probe at 6, hint 3, a new incarnation.
+        let outputs = cluster.step(
+            s(1),
+            Input::Message {
+                now: 0,
+                from: s(2),
+                message: Message::AppendEntriesResponse {
+                    term,
+                    success: false,
+                    prev_index: 6,
+                    match_index: 0,
+                    hint: 3,
+                    echo: 0,
+                    local: 0,
+                    incarnation: 7,
+                },
+            },
+        );
+        let probes: Vec<Index> = outputs
+            .iter()
+            .filter_map(|output| match output {
+                Output::Send {
+                    to,
+                    message: Message::AppendEntries { prev_index, .. },
+                } if *to == s(2) => Some(*prev_index),
+                _ => None,
+            })
+            .collect();
+        let reset = cluster.events.iter().any(|event| {
+            matches!(
+                event,
+                TraceEvent::RaftProgressReset {
+                    server: 1,
+                    follower: 2,
+                    incarnation: 7
+                }
+            )
+        });
+        assert_eq!(
+            cluster.commit(s(1)),
+            6,
+            "what was committed stays committed"
+        );
+        if variant == Variant::Correct {
+            assert!(reset, "the leader forgot the follower's progress");
+            assert_eq!(
+                probes,
+                vec![2],
+                "the probe resumes from the hint, not the stale match: {outputs:?}"
+            );
+        } else {
+            assert!(!reset, "the leader as built forgets nothing");
+            assert!(
+                probes.is_empty(),
+                "the leader as built probes only above its stale match: {outputs:?}"
+            );
+        }
+        // Replication goes on: the harness's server 2 still holds the log and
+        // answers the probe on its own incarnation, so the leader settles again.
+        cluster.propose(s(1), "after");
+        for _ in 0..4 {
+            cluster.tick(s(1), 2);
+            cluster.settle();
+        }
+        assert_eq!(cluster.commit(s(1)), 7);
+        invariants::all(&cluster.events).unwrap();
+    }
 }
 
 /// Pre-vote (thesis §9.6): a server cut off from a working leader does not raise its

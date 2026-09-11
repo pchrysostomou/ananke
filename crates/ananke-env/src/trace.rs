@@ -468,6 +468,13 @@ pub enum TraceEvent {
         applied: u64,
         /// The last log index on disk.
         last_index: u64,
+        /// The store's incarnation number: 1 for a store started fresh, a fresh
+        /// value on every store a re-seed rebuilt (RAFT.md §3). A leader that
+        /// sees a follower answer with a different one forgets what it knew of
+        /// the follower's log.
+        // PROPOSED(D-042): store incarnations, so a leader forgets what a
+        // re-seeded follower forgot.
+        incarnation: u64,
     },
     /// A Raft leader proposed a client's request as a log entry (RAFT.md §4): the
     /// link from an operation of the history to the entry that carries it, so an
@@ -547,6 +554,21 @@ pub enum TraceEvent {
     RaftAdopted {
         /// The server.
         server: u64,
+    },
+    /// A Raft leader forgot what it knew of a follower's log: the follower
+    /// answered with a store incarnation other than the one the leader had
+    /// recorded for it, so its log may have lost entries it once acknowledged
+    /// (a re-seed, RAFT.md §3), and the leader's match index, next index,
+    /// pipeline, probe and snapshot designation for it start over.
+    // PROPOSED(D-042): store incarnations, so a leader forgets what a re-seeded
+    // follower forgot.
+    RaftProgressReset {
+        /// The leader.
+        server: u64,
+        /// The follower whose progress was reset.
+        follower: u64,
+        /// The incarnation the follower answered with.
+        incarnation: u64,
     },
     /// A client operation started (RAFT.md §2): the invocation end of one operation
     /// of the linearizability history. Its time is the record's.

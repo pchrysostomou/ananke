@@ -86,6 +86,16 @@ pub enum Variant {
     /// variant.
     // PROPOSED(D-041): the crash-safe adoption and the store identity marker.
     AdoptionAsBuilt,
+    /// The leader ignores the store incarnation its followers answer with
+    /// (RAFT.md §3): the leader as built before D-042. A follower re-seeded
+    /// from a snapshot comes back with a log shorter than what it had
+    /// acknowledged, the leader's match index for it is monotone by design
+    /// (D-026) and its probe never goes below the match, so every rejection is
+    /// discarded, the follower is never designated snapshot-fed and never
+    /// counted again — until the leader changes. With the other follower
+    /// unavailable, commits stall: the sweep's liveness check.
+    // PROPOSED(D-042): store incarnations.
+    IgnoreIncarnation,
 }
 
 /// The core's parameters.
@@ -226,6 +236,10 @@ pub enum Input {
         to: ServerId,
         /// The snapshot's last index.
         index: Index,
+        /// The store incarnation the follower's `Installed` answer carried: a
+        /// fresh one when the install re-seeded a refused server (RAFT.md §3).
+        // PROPOSED(D-042): store incarnations.
+        incarnation: u64,
     },
     /// The snapshot task gave up streaming to `to`: a timeout, a lost leadership,
     /// or a checkpoint the receiver's checks refused. With `retake` the checkpoint
@@ -363,6 +377,8 @@ struct Ack {
     hint: Index,
     echo: u64,
     local: u64,
+    /// The responder's store incarnation (PROPOSED(D-042)).
+    incarnation: u64,
     now: u64,
 }
 
@@ -465,6 +481,12 @@ struct Progress {
     needs_snapshot: bool,
     /// Ticks since the follower last answered anything.
     quiet_ticks: u64,
+    /// The store incarnation the follower last answered with, once it has
+    /// answered (RAFT.md §3): an answer carrying a different one means the
+    /// follower runs on a rebuilt store whose log may have lost entries it once
+    /// acknowledged, and everything above starts over.
+    // PROPOSED(D-042): store incarnations.
+    incarnation: Option<u64>,
 }
 
 /// One server's protocol state.
@@ -818,7 +840,11 @@ impl Raft {
                 self.serve_reads();
             }
             Input::SnapshotTaken { index, term } => self.on_snapshot_taken(index, term),
-            Input::SnapshotInstalled { to, index } => self.on_snapshot_installed(to, index),
+            Input::SnapshotInstalled {
+                to,
+                index,
+                incarnation,
+            } => self.on_snapshot_installed(to, index, incarnation),
             Input::SnapshotFailed { to, retake } => self.on_snapshot_failed(to, retake),
             Input::Message { from, message, now } => self.on_message(from, message, now),
         }
@@ -1291,6 +1317,7 @@ impl Raft {
                         installing: false,
                         needs_snapshot: false,
                         quiet_ticks: 0,
+                        incarnation: None,
                     },
                 )
             })
@@ -1402,12 +1429,53 @@ impl Raft {
         self.maybe_compact();
     }
 
+    /// Records the store incarnation `from` answered with and, when it differs
+    /// from the one recorded, forgets the follower's progress (RAFT.md §3): a
+    /// store a re-seed rebuilt may have lost entries the follower once
+    /// acknowledged, and `matched` is monotone by design (D-026) with the probe
+    /// never reaching below it, so a leader that kept it could never probe the
+    /// rebuilt log — every rejection would be discarded and the follower never
+    /// counted again. The match index, next index, pipeline, probe and snapshot
+    /// designation start over as they do when a leader takes office; the answer
+    /// is then processed as usual and the normal probe walks back from its hint.
+    /// A stream in flight is left to the snapshot task, which ends it either way.
+    /// The first answer seen only records. Returns whether progress was reset.
+    /// [`Variant::IgnoreIncarnation`] records and never resets: the leader as
+    /// built before this rule.
+    // PROPOSED(D-042): store incarnations.
+    fn note_incarnation(&mut self, from: ServerId, incarnation: u64) -> bool {
+        let last = self.last_index();
+        let Some(progress) = self.progress.get_mut(&from) else {
+            return false;
+        };
+        let changed = progress.incarnation.is_some_and(|seen| seen != incarnation);
+        progress.incarnation = Some(incarnation);
+        if !changed || self.config.variant == Variant::IgnoreIncarnation {
+            return false;
+        }
+        progress.matched = 0;
+        progress.next = last + 1;
+        progress.inflight.clear();
+        progress.probe = None;
+        progress.needs_snapshot = false;
+        self.trace(TraceEvent::RaftProgressReset {
+            server: self.id.0,
+            follower: from.0,
+            incarnation,
+        });
+        true
+    }
+
     /// The snapshot task streamed a snapshot to `to`, which runs on it now: its
     /// match is at least the snapshot's last index.
-    fn on_snapshot_installed(&mut self, to: ServerId, index: Index) {
+    fn on_snapshot_installed(&mut self, to: ServerId, index: Index, incarnation: u64) {
         if self.role != Role::Leader {
             return;
         }
+        // The install may have built a new store, a re-seed's: what was known of
+        // the old one is forgotten before the install's match is recorded.
+        // PROPOSED(D-042): store incarnations.
+        self.note_incarnation(to, incarnation);
         let Some(progress) = self.progress.get_mut(&to) else {
             return;
         };
@@ -1555,6 +1623,7 @@ impl Raft {
                             installing: false,
                             needs_snapshot: false,
                             quiet_ticks: 0,
+                            incarnation: None,
                         },
                     );
                     tracked.insert(
@@ -1841,6 +1910,7 @@ impl Raft {
                                     hint: 0,
                                     echo,
                                     local: 0,
+                                    incarnation: 0,
                                 },
                             );
                         }
@@ -1883,6 +1953,7 @@ impl Raft {
                 hint,
                 echo,
                 local,
+                incarnation,
                 ..
             } => self.on_append_entries_response(
                 from,
@@ -1893,6 +1964,7 @@ impl Raft {
                     hint,
                     echo,
                     local,
+                    incarnation,
                     now,
                 },
             ),
@@ -2034,6 +2106,7 @@ impl Raft {
                         hint: 0,
                         echo,
                         local: 0,
+                        incarnation: 0,
                     },
                 );
                 return;
@@ -2076,6 +2149,7 @@ impl Raft {
                     hint,
                     echo,
                     local: 0,
+                    incarnation: 0,
                 },
             );
             return;
@@ -2124,6 +2198,7 @@ impl Raft {
                 hint: 0,
                 echo,
                 local: 0,
+                incarnation: 0,
             },
         );
     }
@@ -2144,8 +2219,15 @@ impl Raft {
             hint,
             echo,
             local,
+            incarnation,
             now,
         } = ack;
+        // An answer from a store other than the one recorded: what was known of
+        // the follower's log is forgotten first, and the answer then processed
+        // as usual — a rejection's hint is where the rebuilt log ends, and the
+        // probe resumes from there rather than from the stale match.
+        // PROPOSED(D-042): store incarnations.
+        let reset = self.note_incarnation(from, incarnation);
         let Some(progress) = self.progress.get_mut(&from) else {
             return;
         };
@@ -2214,7 +2296,11 @@ impl Raft {
             progress.probe = Some(progress.next - 1);
             progress.inflight.clear();
         }
-        self.replicate(from, false);
+        // After a reset the next index sits at the leader's end, where a
+        // successful answer leaves nothing to send: an empty probe goes at once,
+        // as a heartbeat would, so the rebuilt log is found within a round trip
+        // rather than at the next heartbeat tick (PROPOSED(D-042)).
+        self.replicate(from, reset);
     }
 
     /// Advances the commit index to the highest entry of the current term on a

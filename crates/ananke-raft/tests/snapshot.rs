@@ -195,6 +195,7 @@ fn a_leader_feeds_the_snapshot_when_a_follower_falls_below_the_prefix() {
     let outputs = leader.step(Input::SnapshotInstalled {
         to: s(2),
         index: 10,
+        incarnation: 0,
     });
     let resumed = sends(&outputs);
     assert!(
@@ -683,6 +684,7 @@ fn an_install_carries_the_receivers_identity_and_is_adopted_at_open() {
                 vote: Some(ServerId(3)),
                 tail: vec![entry(1, 6, "tail6"), entry(1, 7, "tail7")],
                 quarantined: true,
+                incarnation: 9,
             };
             assembler.finish(&staged, &repair).await.unwrap();
             assert!(adopt_staged(&env, Path::new("/follower")).await.unwrap());
@@ -697,6 +699,11 @@ fn an_install_carries_the_receivers_identity_and_is_adopted_at_open() {
             let (store, recovered) = RaftStore::open(engine.clone(), &recovery).await.unwrap();
             assert_eq!(store.term(), 7);
             assert_eq!(store.vote(), Some(ServerId(3)));
+            assert_eq!(
+                store.incarnation(),
+                9,
+                "the repair's incarnation, not the leader's (PROPOSED(D-042))"
+            );
             assert_eq!(store.applied(), 5);
             assert_eq!((store.first_index(), store.last_index()), (6, 7));
             assert_eq!(
@@ -860,6 +867,9 @@ fn a_crash_inside_the_adoption_leaves_a_store_and_the_next_start_adopts() {
                     vote: Some(ServerId(3)),
                     tail: Vec::new(),
                     quarantined: false,
+                    // The receiver's own, as an install into a live store carries
+                    // (PROPOSED(D-042)).
+                    incarnation: 1,
                 };
                 assembler.finish(&staged, &repair).await.unwrap();
             })
@@ -961,6 +971,9 @@ fn a_damaged_staging_current_is_refused_and_not_swept() {
                 vote: Some(ServerId(3)),
                 tail: Vec::new(),
                 quarantined: false,
+                // The receiver's own, as an install into a live store carries
+                // (PROPOSED(D-042)).
+                incarnation: 1,
             };
             assembler.finish(&staged, &repair).await.unwrap();
             let staging = staging_dir(Path::new("/follower"));
@@ -1064,6 +1077,9 @@ fn an_abandoned_staging_keeps_its_current_so_no_start_opens_the_old_store() {
                 vote: Some(ServerId(3)),
                 tail: Vec::new(),
                 quarantined: false,
+                // The receiver's own, as an install into a live store carries
+                // (PROPOSED(D-042)).
+                incarnation: 1,
             };
             assembler.finish(&staged, &repair).await.unwrap();
             let staging = staging_dir(Path::new("/follower"));

@@ -20,6 +20,7 @@
 //! | `0 / 0 / hard` | `term: u64 \| vote: u64 (u64::MAX for none)` |
 //! | `0 / 0 / applied` | `applied: u64` |
 //! | `0 / 0 / reseeded` | present on a store a re-seed rebuilt (RAFT.md §3) |
+//! | `0 / 0 / incarnation` | `incarnation: u64`: 1 for a store started fresh, a fresh value on every store a re-seed rebuilt |
 //! | `0 / 1 / <index: u64 BE>` | `term: u64 \| payload` |
 //! | `0 / 2 / config` | `index: u64 \| configuration` |
 //! | `0 / 3 / snapshot` | the last snapshot's index, term, configuration, checkpoint directory |
@@ -112,6 +113,22 @@ pub(crate) fn snapshot_key() -> Bytes {
 pub(crate) fn quarantine_key() -> Bytes {
     key(RAFT_TENANT, META_TABLE, b"reseeded")
 }
+
+/// The store's incarnation number (RAFT.md §3): written as 1 at a fresh store's
+/// first open, and by an install's repair — carried forward on an install into a
+/// live store, drawn afresh for a re-seed, whose predecessor's value is lost with
+/// the rest of the refused store. Followers answer with it so a leader can tell a
+/// rebuilt store, whose log may have lost acknowledged entries, from the one it
+/// recorded a match index for.
+// PROPOSED(D-042): store incarnations, so a leader forgets what a re-seeded
+// follower forgot.
+pub(crate) fn incarnation_key() -> Bytes {
+    key(RAFT_TENANT, META_TABLE, b"incarnation")
+}
+
+/// The incarnation of a store started fresh.
+// PROPOSED(D-042): store incarnations.
+pub const FIRST_INCARNATION: u64 = 1;
 
 fn bad(what: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, what.to_owned())
@@ -477,6 +494,10 @@ pub struct RaftStore<E: Environment> {
     last_index: AtomicU64,
     /// The applied index on disk, written by [`apply`](Self::apply) only.
     applied: AtomicU64,
+    /// The store's incarnation number: fixed for the life of the store, since
+    /// only an install's repair writes it, and that builds a new store.
+    // PROPOSED(D-042): store incarnations.
+    incarnation: u64,
 }
 
 impl<E: Environment> RaftStore<E> {
@@ -515,6 +536,19 @@ impl<E: Environment> RaftStore<E> {
             Some(bytes) => Some(decode_snapshot_record(bytes)?),
         };
         let quarantined = engine.get(&quarantine_key()).await?.is_some();
+        // The incarnation number: a fresh store starts at the first and writes
+        // it here, synced, so every store carries the key explicitly; an
+        // installed store carries the one its repair wrote.
+        // PROPOSED(D-042): store incarnations.
+        let incarnation = match engine.get(&incarnation_key()).await? {
+            Some(bytes) => decode_incarnation(bytes)?,
+            None => {
+                let mut first = WriteBatch::new();
+                first.put(incarnation_key(), encode_incarnation(FIRST_INCARNATION));
+                engine.write(first, true).await?;
+                FIRST_INCARNATION
+            }
+        };
         let snap_index = record.as_ref().map_or(0, |r| r.last_index);
         let snapshot = engine.snapshot();
         let start = key(RAFT_TENANT, LOG_TABLE, &[]);
@@ -567,6 +601,7 @@ impl<E: Environment> RaftStore<E> {
                 first_index: AtomicU64::new(snap_index + 1),
                 last_index: AtomicU64::new(last_index),
                 applied: AtomicU64::new(applied),
+                incarnation,
             },
             Recovered {
                 log,
@@ -595,6 +630,14 @@ impl<E: Environment> RaftStore<E> {
     #[must_use]
     pub fn applied(&self) -> Index {
         self.applied.load(Ordering::Acquire)
+    }
+
+    /// The store's incarnation number (RAFT.md §3): what this server's
+    /// AppendEntries and InstallSnapshot responses carry.
+    // PROPOSED(D-042): store incarnations.
+    #[must_use]
+    pub fn incarnation(&self) -> u64 {
+        self.incarnation
     }
 
     /// The first log index on disk: one past the snapshot's last.
@@ -750,6 +793,21 @@ pub(crate) fn encode_applied(applied: Index) -> Bytes {
 fn decode_applied(mut bytes: Bytes) -> io::Result<Index> {
     if bytes.len() != 8 {
         return Err(bad("applied index value"));
+    }
+    Ok(bytes.get_u64_le())
+}
+
+/// The value under the incarnation key.
+// PROPOSED(D-042): store incarnations.
+pub(crate) fn encode_incarnation(incarnation: u64) -> Bytes {
+    let mut out = BytesMut::with_capacity(8);
+    out.put_u64_le(incarnation);
+    out.freeze()
+}
+
+fn decode_incarnation(mut bytes: Bytes) -> io::Result<u64> {
+    if bytes.len() != 8 {
+        return Err(bad("incarnation value"));
     }
     Ok(bytes.get_u64_le())
 }
