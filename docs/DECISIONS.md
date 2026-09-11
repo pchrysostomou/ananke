@@ -1669,4 +1669,147 @@ a function of the trace alone. The site is marked `PROPOSED(D-039)`.
 
 ---
 
+## PROPOSED D-041 — The staged install is adopted crash-safely, a damaged install is refused, and a marked store never opens fresh
+
+**Context.** The ten-thousand-seed nightly (run 34496762339), seed 6325: server 1
+finished installing a snapshot at index 129 at 5.7711 s and the schedule crashed
+it forty-one milliseconds later, inside the adoption. The simulator's confession
+at the crash: bit rot on `/raft/install/CURRENT` and lost directory entries for
+`/raft/000001.sst` to `000004.sst` — the tables the adoption had just copied
+into the store directory, not yet `sync_dir`'d. On restart the engine wrote an
+empty first manifest, recovered no log, and the server restated `RaftRecovered
+{term 0, applied 0, last_index 0}`: a fresh store, not a refusal. It joined term
+5 and was re-installed at 6.3584 s, and committed-entries-stay reported the
+truncation from index 1 against a commit index of 119. A voter that held term 5
+and a hundred and nineteen committed entries forgot everything, which is the
+state D-022 and D-025 exist to refuse. Three holes lined up in
+`snapshot.rs::adopt_staged` as built under PROPOSED D-038: the old store's
+`CURRENT` and files were removed *before* the staged copies and their directory
+entries were durable, so the point of no return preceded the durability of the
+new files; a staging `CURRENT` that exists but does not parse was treated as
+debris of an install that never finished and swept, which after the old store
+was gone deleted the only copy; and the engine's rule (D-024) refuses a missing
+`CURRENT` only while manifests or tables remain, so a directory emptied past
+that opened fresh.
+
+**Decision.** Four parts, each site marked `PROPOSED(D-041)`.
+
+*The order.* The adoption copies first and switches last, the way every store
+switch is made (D-024). The staged manifest is decoded and every table it lists
+must be in the staging directory; then each staged table is copied into the
+store directory and synced, and the manifest is written with the copies'
+numbers, each file synced and the directory synced; then `CURRENT` is switched
+to the copied manifest, tmp-and-rename and `sync_dir`, the commit point; only
+then are the old store's files — everything of the store proper listed before
+the copies began, log segments included — removed and the directory synced; and
+last the staging directory's own `CURRENT` is removed, synced, and its files
+swept, as before. Until the switch is durable the old `CURRENT` names the old
+store, whole; a crash anywhere before the staging `CURRENT` is gone re-runs the
+adoption on the same staged bytes; no directory rename is needed. Names cannot
+be reused: the staged store's numbers are the leader's checkpoint's, tables
+from 1 and a manifest of 1 or 2, and collide with the receiver's almost always,
+so the copies go under numbers past everything on disk — each table at the
+highest table number on disk plus its staged number, the manifest one past the
+highest manifest, `next_sst` shifted alike, the manifest rewritten to say so.
+A re-run after a crash lists the earlier copies with the old store and numbers
+past them; they go with the old files at the end, or as orphans at the engine's
+next open. A completed adoption traces `RaftAdopted`.
+
+*Damage.* A staging directory with no `CURRENT` at all is an install that never
+finished and is swept. One whose `CURRENT` exists but does not parse, names a
+manifest that is missing or does not decode, or lists a table that is not
+there, is damage: the adoption refuses with `LostState` carrying a `Damage`
+reason and touches nothing, the server traces `RaftRefused` and waits in
+re-seed mode for a leader's stream, the way a store whose recovery lost state
+does. The assembler's own sweep (`Assembler::abandon`, on an identity change or
+an install the server decided against) now leaves a `CURRENT` where it is,
+damaged or not: only the next completed install's own `CURRENT` replaces it
+(tmp-and-rename), so no start in between finds an unfinished install, sweeps
+it, and opens the old store the acknowledged install superseded.
+
+*The marker.* A Raft store directory carries `RAFT-STORE`, a small file written
+once the engine and the store have opened successfully — a fresh directory at
+its first open, a store from before the marker at its next — synced, with the
+directory synced after, and never removed: it is not a store file to the
+adoption, and the engine's orphan sweep knows only tables, manifests and
+`CURRENT.tmp`. Before the engine opens, a directory that carries the marker and
+no `CURRENT` that parses is refused with `LostState` (`MarkedCurrentMissing`,
+`MarkedCurrentUnreadable`): it was a store, so it is a lost one, never a fresh
+one. The as-built variant neither checks nor writes it, so its disk sees exactly
+the operations the nightly's did.
+
+*The variant and its fault.* `Variant::AdoptionAsBuilt` is the adoption as
+built: the old store removed first, the copies synced after, a damaged staging
+`CURRENT` swept, no marker. `Fault::CrashAdopting` aims at it, on every seed,
+drawn from its own stream (D-031): the install crash's setup, then, once the
+receiver traces the install complete, a crash the moment the adoption's first
+change to the store directory is durable — read from the simulated disk's
+durable namespace (`Sim::durable_names`), the old store's files all gone or a
+copied file's entry synced in, whichever the adoption does first — repeated
+sixteen to thirty-two times, each restart re-running the adoption the crash
+interrupted. For the crash-safe order the first durable change is a copy synced
+in with the old store whole; for the as-built order it is the old store gone
+with the copies' entries pending, and a crash there whose bit rot lands on the
+staging `CURRENT` — one block, two per cent per crash — restarts the server on
+a fresh store. Thirty-two crashes are thirty-two rolls of the disk's dice. Seed 6325
+is pinned in the gate (`seed_6325_which_the_nightly_found_stays_green`).
+
+**What the sweep found.** At a hundred seeds, release, `AdoptionAsBuilt` is
+caught on 23 of 100, every catch the nightly's signature,
+committed-entries-stay reporting a truncation from index 1; at the gate's
+twenty, on 2 of 20. The correct server passes all hundred. The rate is
+the rot's: a crash aimed at the window converts a live rot on the staging
+`CURRENT` into a fresh store about five times in six, so each aimed crash is
+worth a little under two per cent, and the storm's size is what sets the rate.
+A first cut drawn on half the seeds, crashing six to twelve times, caught 1 of
+20 and 6 of 100; on every seed with eight to sixteen crashes, 0 of 20 and 10 of
+100, the gate's twenty seeds being the twenty they are; sixteen to thirty-two
+put it at 2 of 20 and 23 of 100. A crash at a fixed delay after the install's
+completion, the obvious first aim, lands in the copy phase far less often, since
+the adoption's opening reads and the old store's removal take a variable dozen
+disk operations first. The simulator's rot rolls over unlinked inodes too, so a
+`BlockRotted` on the staging `CURRENT` in a trace is not always a live one:
+every retired install leaves a ghost with that path, and most of the rots the
+first measurements counted were ghosts. And a correct-server failure during
+development, seed 96: a crash rotted the staged manifest, the next start
+refused it as damage, correctly, and the leader's re-seed stream began; the
+assembler's sweep at the stream's start removed the damaged `CURRENT` with the
+files, the fault's next crash landed mid-stream, and the start after it found a
+staging directory with no `CURRENT`, swept it as an install that never
+finished, passed the marker check on the old store's valid `CURRENT`, and
+opened the old store — a rollback to applied 252 on a log compacted at 228,
+past an install the server had acknowledged, which state machine safety
+reported since the refusal had reset the server's floor. That is the
+`abandon` rule above: after a refusal a server comes back only through an
+install, which is what the checker models.
+
+**Alternatives.** Renaming the staging directory into place: not modelled
+(D-024). Copying under the staged names after checking for collisions: they
+collide almost always. Verifying every staged table's checksum before adopting:
+the assembler verified them at the finish and the engine verifies them at the
+open, and a table rotted since is a refusal either way. Removing the old
+store's `CURRENT` when the adoption refuses damaged staging, so the marker
+refuses every start until an install is adopted: it destroys a store to express
+what the kept staging `CURRENT` already expresses, and loses the adopted store
+in the window after the switch and before the staging is retired. Teaching the
+checker to accept a restatement from an older store after a refusal: it would
+accept exactly the rollback D-022 refuses. A marker key inside the store rather
+than a file: the failure is a directory emptied past the store. Aiming the
+adoption crash by a trace event at the adoption's start rather than by the
+disk: the copy phase begins a variable dozen disk operations later, and the
+window is the copy phase.
+
+**Consequences.** An adoption costs the same one copy, plus the renumbering;
+the copies of an interrupted adoption are garbage until the next open. A refusal
+for staging damage costs a re-seed even when the store directory already holds
+the adopted store — a crash after the switch and before the staging is retired,
+with rot on the staging `CURRENT` — priced in, a two-per-cent roll inside a
+window of a few milliseconds. A store from before the marker is marked at its
+next open. Every sweep schedule now ends with an isolation, an install and a
+crash storm on the receiver, about a second of run per seed. `Sim::durable_names`
+joins `durable_contents` as a harness accessor. Every site is marked
+`PROPOSED(D-041)`.
+
+---
+
 _Next entry: D-040. Add one before implementing anything not covered above._

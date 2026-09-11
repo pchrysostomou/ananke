@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use ananke_env::{ClientOp, DropReason, TraceEvent};
 use ananke_raft::core::Variant;
+use ananke_raft::store::STORE_MARKER;
 use ananke_sim::raft::DRIFT_BOUND_PPM;
 use ananke_sim::raft::{self, Fault};
 use ananke_sim::{seeds, sweep, verdict, write_trace};
@@ -52,6 +53,24 @@ fn seeds_164_and_385_which_the_first_nightly_found_stay_green() {
 #[test]
 fn seed_7381_which_the_first_nightly_found_stays_green() {
     raft::run(7381, Variant::Correct).check().unwrap();
+}
+
+/// The ten-thousand-seed nightly's seed 6325 (run 34496762339): server 1 finished
+/// installing a snapshot at index 129 and the schedule crashed it forty-one
+/// milliseconds later, inside the adoption's copy. The adoption as built had
+/// removed the old store's `CURRENT` and files before the copies' directory
+/// entries were synced, so the crash lost the copied tables; its bit rot landed
+/// on the staging directory's `CURRENT`, which the next start swept as debris —
+/// the only copy left; and the engine, finding nothing on disk, opened a fresh
+/// store. A voter holding term 5 and a hundred and nineteen committed entries
+/// restated term 0, applied 0, and committed-entries-stay reported the
+/// truncation from index 1. The adoption now copies and syncs first and switches
+/// `CURRENT` last, a damaged staging `CURRENT` is refused rather than swept, and
+/// a directory carrying the store marker never opens fresh (PROPOSED D-041).
+/// Stays in the gate.
+#[test]
+fn seed_6325_which_the_nightly_found_stays_green() {
+    raft::run(6325, Variant::Correct).check().unwrap();
 }
 
 /// The positive control: the correct server satisfies every property on every
@@ -129,6 +148,21 @@ fn a_server_that_resets_its_timer_on_any_message_is_caught() {
 #[test]
 fn a_server_that_installs_without_current_last_is_caught() {
     is_caught(Variant::SnapshotWithoutCurrentLast);
+}
+
+/// The adoption as built under D-038 (PROPOSED D-041): the old store's `CURRENT`
+/// and files removed before the staged copies' directory entries are synced, a
+/// staging `CURRENT` that does not parse swept as debris, and no store marker to
+/// refuse the emptied directory. Its window is a crash inside the copy whose bit
+/// rot lands on the staging `CURRENT` — one block, two per cent per crash — with
+/// none of the copies' entries surviving, after which the server restarts on a
+/// fresh store and committed-entries-stay reports the truncation from index 1.
+/// The crash-mid-adoption fault aims every crash at that window and rolls the
+/// rot's dice several times per seed; the rate is printed, and the pair rule
+/// holds because the correct server passes the same seeds above.
+#[test]
+fn a_server_whose_adoption_is_as_built_is_caught() {
+    is_caught(Variant::AdoptionAsBuilt);
 }
 
 /// Lease safety under drift (RAFT.md §2, invariant 6): on every seed where the
@@ -239,6 +273,9 @@ struct Coverage {
     reseeded: usize,
     reseed_completions: u64,
     install_crash_faults: usize,
+    adoption_crash_faults: usize,
+    adoptions: usize,
+    marker_refusals: usize,
     bit_rot: usize,
     torn_writes: usize,
     puts: u64,
@@ -342,6 +379,21 @@ impl Coverage {
             .iter()
             .filter(|f| matches!(f, Fault::CrashInstalling { .. }))
             .count();
+        // PROPOSED(D-041): the crash-mid-adoption fault, the adoptions it and the
+        // installs produce, and the refusals the store marker made where the
+        // engine alone would have opened a fresh store.
+        self.adoption_crash_faults += report
+            .schedule
+            .faults
+            .iter()
+            .filter(|f| matches!(f, Fault::CrashAdopting { .. }))
+            .count();
+        self.adoptions += report.count(|e| matches!(e, TraceEvent::RaftAdopted { .. }));
+        self.marker_refusals += report
+            .refused
+            .iter()
+            .filter(|(_, reason)| reason.contains(STORE_MARKER))
+            .count();
         self.bit_rot += report.count(|e| matches!(e, TraceEvent::BlockRotted { .. }));
         self.torn_writes += report.count(|e| matches!(e, TraceEvent::WriteTorn { .. }));
         for op in &report.history.ops {
@@ -385,6 +437,10 @@ impl Coverage {
             ("snapshots taken", self.snapshots_taken as u64),
             ("log compactions", self.compactions as u64),
             ("crash-mid-install faults", self.install_crash_faults as u64),
+            (
+                "crash-mid-adoption faults",
+                self.adoption_crash_faults as u64,
+            ),
             ("commits", self.commits as u64),
             ("applies", self.applies as u64),
             ("bit rot", self.bit_rot as u64),
@@ -427,6 +483,12 @@ impl Coverage {
             assert!(
                 self.reseed_completions > 0,
                 "no refused server was ever re-seeded and applying again: {self:?}"
+            );
+            // PROPOSED(D-041): every install is adopted at the next start, so a
+            // hundred seeds that install also adopt.
+            assert!(
+                self.adoptions > 0,
+                "the sweep never saw a staged install adopted: {self:?}"
             );
         }
         assert!(

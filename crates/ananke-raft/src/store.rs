@@ -47,10 +47,12 @@
 //! responses, until a snapshot re-seeds it.
 
 use std::io;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use ananke_env::{Environment, WalStop, WalStopReason};
+use ananke_env::{Environment, File, FileSystem, OpenOptions, WalStop, WalStopReason};
+use ananke_storage::manifest;
 use ananke_storage::{Engine, EngineRecovery, WriteBatch};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
@@ -135,6 +137,66 @@ pub struct LostState {
     /// on its first seed, a rotted block under a flushed record with acknowledged
     /// records after it (D-026).
     pub covered_stops: Vec<WalStop>,
+    /// Damage found before the engine opened: a store directory that is not a
+    /// whole store any more, or a completed install whose commit point rotted.
+    /// Set on its own, with every field above empty.
+    // PROPOSED(D-041): the crash-safe adoption and the store identity marker.
+    pub damaged: Option<Damage>,
+}
+
+/// What was found wrong with a store directory before the engine opened, each a
+/// refusal ([`LostState`]) rather than a fresh start or a sweep: a directory that
+/// carries the store marker ([`STORE_MARKER`]) once held a Raft store and its
+/// state, term and vote included, is gone with its `CURRENT`; and a staging
+/// directory whose `CURRENT` exists is a completed install, the only copy of a
+/// state the leader may have compacted past, so a `CURRENT` that does not parse
+/// is damage, never debris (RAFT.md §3, D-022).
+// PROPOSED(D-041): the crash-safe adoption and the store identity marker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Damage {
+    /// The staging directory's `CURRENT` exists but does not parse.
+    StagingCurrentUnreadable,
+    /// The manifest the staging directory's `CURRENT` names is missing or does
+    /// not decode.
+    StagingManifestUnreadable,
+    /// A table the staged manifest lists is not in the staging directory.
+    StagingTableMissing(u64),
+    /// The directory carries the store marker but no `CURRENT`.
+    MarkedCurrentMissing,
+    /// The directory carries the store marker and a `CURRENT` that does not
+    /// parse.
+    MarkedCurrentUnreadable,
+}
+
+impl std::fmt::Display for Damage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Damage::StagingCurrentUnreadable => {
+                write!(
+                    f,
+                    "the staging directory's CURRENT exists but cannot be read"
+                )
+            }
+            Damage::StagingManifestUnreadable => write!(
+                f,
+                "the manifest the staging directory's CURRENT names is missing or cannot be read"
+            ),
+            Damage::StagingTableMissing(n) => write!(
+                f,
+                "table {n:06}, which the staged manifest lists, is missing from the staging directory"
+            ),
+            Damage::MarkedCurrentMissing => {
+                write!(
+                    f,
+                    "the directory carries the {STORE_MARKER} marker but no CURRENT"
+                )
+            }
+            Damage::MarkedCurrentUnreadable => write!(
+                f,
+                "the directory carries the {STORE_MARKER} marker and a CURRENT that cannot be read"
+            ),
+        }
+    }
 }
 
 impl LostState {
@@ -152,6 +214,7 @@ impl LostState {
             head_gap: recovery.wal.head_gap,
             log_stop,
             covered_stops: recovery.wal.covered_stops.iter().map(|c| c.stop).collect(),
+            damaged: None,
         };
         (!lost.dropped.is_empty()
             || lost.fallback_from.is_some()
@@ -161,16 +224,41 @@ impl LostState {
         .then_some(lost)
     }
 
+    /// The refusal for damage found before the engine opened: nothing recovered,
+    /// since nothing was opened.
+    // PROPOSED(D-041): the crash-safe adoption and the store identity marker.
+    #[must_use]
+    pub fn from_damage(damage: Damage) -> Self {
+        Self {
+            dropped: Vec::new(),
+            fallback_from: None,
+            head_gap: None,
+            log_stop: None,
+            covered_stops: Vec::new(),
+            damaged: Some(damage),
+        }
+    }
+
     /// The refusal an I/O error carries, if it is one.
     #[must_use]
     pub fn from_io(error: &io::Error) -> Option<LostState> {
         error.get_ref()?.downcast_ref::<LostState>().cloned()
     }
+
+    /// This refusal as the `InvalidData` error [`RaftStore::open`] and the
+    /// adoption fail with, which [`from_io`](Self::from_io) reads back.
+    // PROPOSED(D-041): the crash-safe adoption and the store identity marker.
+    pub(crate) fn into_io(self) -> io::Error {
+        io::Error::new(io::ErrorKind::InvalidData, self)
+    }
 }
 
 impl std::fmt::Display for LostState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "the engine's recovery lost state:")?;
+        match self.damaged {
+            Some(damage) => write!(f, "the store is damaged: {damage}")?,
+            None => write!(f, "the engine's recovery lost state:")?,
+        }
         if !self.dropped.is_empty() {
             write!(f, " dropped tables {:?}", self.dropped)?;
         }
@@ -206,6 +294,102 @@ impl std::fmt::Display for LostState {
 }
 
 impl std::error::Error for LostState {}
+
+/// The store identity marker: a file of this name in the engine directory,
+/// written once the engine has opened a genuinely fresh directory for the first
+/// time and never removed — not by an adoption, which deletes only the store's
+/// own files, nor by the engine's orphan sweep, which knows only tables,
+/// manifests and `CURRENT.tmp`. Before the engine opens, a directory that carries
+/// the marker but no valid `CURRENT` is refused with [`LostState`]: it once held a
+/// Raft store, so it is a lost store, never a fresh one (RAFT.md §3, D-022). The
+/// engine's own rule (D-024) refuses a missing `CURRENT` only while manifests or
+/// tables remain; a directory emptied past that opened fresh, which is how the
+/// nightly's seed 6325 turned a voter with a hundred and nineteen committed
+/// entries into a blank one.
+// PROPOSED(D-041): the crash-safe adoption and the store identity marker.
+pub const STORE_MARKER: &str = "RAFT-STORE";
+
+/// The marker's path under `engine_dir`.
+// PROPOSED(D-041): the crash-safe adoption and the store identity marker.
+#[must_use]
+pub fn marker_path(engine_dir: &Path) -> PathBuf {
+    engine_dir.join(STORE_MARKER)
+}
+
+/// Reads a whole file, or `None` if it does not exist.
+async fn read_whole<E: Environment>(env: &E, path: &Path) -> io::Result<Option<Bytes>> {
+    let file = match env.fs().open(path, OpenOptions::new().read(true)).await {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let size = file.size().await?;
+    let size = usize::try_from(size).map_err(|_| bad("file too large"))?;
+    Ok(Some(file.read_at(0, size).await?))
+}
+
+/// Whether `engine_dir` carries the store marker.
+async fn marked<E: Environment>(env: &E, engine_dir: &Path) -> io::Result<bool> {
+    match env
+        .fs()
+        .open(&marker_path(engine_dir), OpenOptions::new().read(true))
+        .await
+    {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+/// The check before the engine opens: a directory that carries the store marker
+/// ([`STORE_MARKER`]) must hold a `CURRENT` that parses, or it is a lost store.
+/// A directory without the marker passes, whatever else it holds: the engine
+/// decides whether that is a fresh store or one it refuses (D-024).
+///
+/// # Errors
+///
+/// `InvalidData` carrying a [`LostState`] with [`Damage::MarkedCurrentMissing`]
+/// or [`Damage::MarkedCurrentUnreadable`]; otherwise the filesystem's.
+// PROPOSED(D-041): the crash-safe adoption and the store identity marker.
+pub async fn refuse_lost_store<E: Environment>(env: &E, engine_dir: &Path) -> io::Result<()> {
+    if !marked(env, engine_dir).await? {
+        return Ok(());
+    }
+    match read_whole(env, &manifest::current_path(engine_dir)).await? {
+        None => Err(LostState::from_damage(Damage::MarkedCurrentMissing).into_io()),
+        Some(bytes) if manifest::parse_current(&bytes).is_none() => {
+            Err(LostState::from_damage(Damage::MarkedCurrentUnreadable).into_io())
+        }
+        Some(_) => Ok(()),
+    }
+}
+
+/// Writes the store marker ([`STORE_MARKER`]) into `engine_dir`, synced, with the
+/// directory synced after, unless it is already there. Called only after the
+/// engine and the store have opened successfully, so a directory is marked as a
+/// store once it has been one: a fresh directory at its first open, or a store
+/// from before the marker existed at its next.
+///
+/// # Errors
+///
+/// The filesystem's.
+// PROPOSED(D-041): the crash-safe adoption and the store identity marker.
+pub async fn mark_store<E: Environment>(env: &E, engine_dir: &Path) -> io::Result<()> {
+    if marked(env, engine_dir).await? {
+        return Ok(());
+    }
+    let fs = env.fs();
+    let file = fs
+        .open(
+            &marker_path(engine_dir),
+            OpenOptions::new().write(true).create(true),
+        )
+        .await?;
+    file.write_at(0, Bytes::from_static(b"ananke raft store\n"))
+        .await?;
+    file.sync().await?;
+    fs.sync_dir(engine_dir).await
+}
 
 /// The last snapshot, as `0 / 3 / snapshot` records it (RAFT.md §3): written into
 /// the live store before its checkpoint is taken, so the checkpoint carries its own

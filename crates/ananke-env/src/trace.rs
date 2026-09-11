@@ -538,6 +538,16 @@ pub enum TraceEvent {
         /// The offset within the current file the stream resumed from.
         offset: u64,
     },
+    /// A Raft server adopted a completed snapshot install at its start (RAFT.md
+    /// §1): the staged store was copied into the server's store directory and
+    /// its `CURRENT` switched to it, and the incarnation that follows runs on the
+    /// installed state. The switch is the store's point of no return, so it is
+    /// traced like every other store switch (D-024).
+    // PROPOSED(D-041): the crash-safe adoption and the store identity marker.
+    RaftAdopted {
+        /// The server.
+        server: u64,
+    },
     /// A client operation started (RAFT.md §2): the invocation end of one operation
     /// of the linearizability history. Its time is the record's.
     ClientInvoke {
