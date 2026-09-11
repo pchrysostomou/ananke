@@ -487,6 +487,19 @@ impl Sim {
         st.fs.get(&node)?.durable_contents(path).map(<[u8]>::to_vec)
     }
 
+    /// The file names durably in directory `dir` on `node`'s disk: the entries a
+    /// crash right now would keep, the way [`durable_contents`](Self::durable_contents)
+    /// is the bytes it would keep. Empty for a directory that does not exist.
+    // PROPOSED(D-041): the crash-safe adoption and the store identity marker.
+    #[must_use]
+    pub fn durable_names(&self, node: NodeId, dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let st = self.shared.lock();
+        st.fs
+            .get(&node)
+            .map(|fs| fs.durable_names(dir))
+            .unwrap_or_default()
+    }
+
     /// A copy of the trace so far.
     #[must_use]
     pub fn trace(&self) -> Vec<TraceRecord> {

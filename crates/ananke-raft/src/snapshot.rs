@@ -35,12 +35,40 @@
 //!
 //! [`adopt_staged`] is the switch, run at every server start before the engine
 //! opens: a staging directory with a valid `CURRENT` wins over the old store. The
-//! old store's `CURRENT` is removed first, then its files, then the staged files
-//! are copied over with `CURRENT` again last, and only then the staging
-//! directory's own `CURRENT` is removed — so a crash at any point either re-runs
-//! the adoption or has already retired the staging directory, and the operation is
-//! idempotent without directory renames, which the fault model does not have
-//! (D-024, PROPOSED(D-038)).
+//! staged tables and manifest are copied into the store directory first, under
+//! numbers above everything already there so no copy lands on a file the old
+//! store still needs, each synced and the directory synced; then `CURRENT` is
+//! switched to the copied manifest, tmp-and-rename, the commit point of every
+//! store switch; only then are the old store's files removed, and last the
+//! staging directory's own `CURRENT` — so until the switch is durable the old
+//! store is whole and opens, a crash anywhere before the staging `CURRENT` is
+//! gone re-runs the adoption on the same staged bytes (earlier copies become
+//! orphans the engine's open removes), and no directory rename is needed, which
+//! the fault model does not have (D-024, PROPOSED(D-038), PROPOSED(D-041)). A
+//! staging directory with no `CURRENT` at all is an install that never finished
+//! and is swept; one whose `CURRENT` exists but does not parse is damage, refused
+//! with [`LostState`] and never swept, since the staged store may be the only
+//! copy of a state the leader has compacted past — and the assembler's own
+//! sweep ([`Assembler::abandon`]) leaves a `CURRENT` alone for the same reason,
+//! so a start during the re-seed that follows a refusal refuses again rather
+//! than opening the old store the acknowledged install superseded.
+//! [`Variant::AdoptionAsBuilt`] is the adoption as it was built under D-038: the
+//! old store removed first and the copies synced after, and a damaged staging
+//! `CURRENT` swept as debris — the nightly's seed 6325, where a crash inside the
+//! copy rotted the staging `CURRENT` and the server came back on a fresh store.
+//!
+//! Every take is a *version*: it goes to its own directory, [`version_dir`],
+//! `snap-<index>-<take>`, numbered by the store's take counter, which the record
+//! carries (PROPOSED(D-043)). A stream pins the version it opened for its whole
+//! life — a resend after loss resumes on it, and a newer take, at the same index
+//! or a later one, never touches it. [`find_version`] is what a stream opens: the
+//! newest *complete* version at the index the core asked for, complete meaning
+//! the checkpoint's own `CURRENT` is there, since the record precedes the
+//! checkpoint (D-036) and may name a take still in flight. [`sweep_versions`]
+//! deletes the versions that are neither the record's nor pinned by a stream.
+//! The as-built behaviour, one mutable directory per index rewritten by each
+//! take, is kept as [`Variant::SharedSnapshotDir`] through [`checkpoint_dir`] and
+//! [`take`].
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
@@ -55,7 +83,7 @@ use bytes::{Bytes, BytesMut};
 
 use crate::core::Variant;
 use crate::message::{Message, SnapshotStatus};
-use crate::store::{self, RaftStore, SnapshotRecord};
+use crate::store::{self, Damage, LostState, RaftStore, SnapshotRecord};
 use crate::types::{Configuration, Entry, Index, Payload, ServerId, Term};
 
 /// The staging directory, a well-known path under the server's data directory
@@ -67,10 +95,136 @@ pub fn staging_dir(engine_dir: &Path) -> PathBuf {
 
 /// The directory a checkpoint taken at `index` goes to, under the server's data
 /// directory. Never removed once a stream may have read from it; the snapshot
-/// record names the one in force.
+/// record names the one in force. One directory per index, rewritten by every
+/// take at that index: the behaviour as built, which
+/// [`Variant::SharedSnapshotDir`] keeps; the correct server takes into
+/// [`version_dir`] (PROPOSED(D-043)).
 #[must_use]
 pub fn checkpoint_dir(engine_dir: &Path, index: Index) -> PathBuf {
     engine_dir.join(format!("snap-{index}"))
+}
+
+/// The directory of the `take`th checkpoint this store took, at `index`, under
+/// the server's data directory: `snap-<index>-<take>`. Two takes at one index
+/// are two directories, and a stream that opened one reads it untouched for its
+/// whole life (PROPOSED(D-043)).
+#[must_use]
+pub fn version_dir(engine_dir: &Path, index: Index, take: u64) -> PathBuf {
+    engine_dir.join(format!("snap-{index}-{take}"))
+}
+
+/// The (index, take) a checkpoint directory's name says, if it is one: the
+/// versioned `snap-<index>-<take>`, or the shared `snap-<index>` as take 0.
+#[must_use]
+pub fn parse_version(name: &str) -> Option<(Index, u64)> {
+    let rest = name.strip_prefix("snap-")?;
+    match rest.split_once('-') {
+        Some((index, take)) => Some((index.parse().ok()?, take.parse().ok()?)),
+        None => Some((rest.parse().ok()?, 0)),
+    }
+}
+
+/// Whether the checkpoint in `dir` is complete: its `CURRENT` is there and
+/// parses. The engine writes a checkpoint's `CURRENT` last and synced (D-024),
+/// and the record names the directory before the checkpoint is written (D-036),
+/// so the record may name a take still in flight, or one a crash cut short; a
+/// stream must open neither.
+///
+/// # Errors
+///
+/// The filesystem's, other than a missing file.
+pub async fn checkpoint_complete<E: Environment>(env: &E, dir: &Path) -> io::Result<bool> {
+    Ok(match read_whole(env, &manifest::current_path(dir)).await? {
+        Some(bytes) => manifest::parse_current(&bytes).is_some(),
+        None => false,
+    })
+}
+
+/// The newest complete version of the checkpoint at `index` under `engine_dir`,
+/// with its take number: what a stream to a follower opens (PROPOSED(D-043)).
+/// None when no complete version of that index exists — the take is in flight,
+/// a crash cut it short, or the record is an install's — and the caller should
+/// ask for a fresh take.
+///
+/// # Errors
+///
+/// The filesystem's, listing the data directory.
+pub async fn find_version<E: Environment>(
+    env: &E,
+    engine_dir: &Path,
+    index: Index,
+) -> io::Result<Option<(PathBuf, u64)>> {
+    let mut takes: Vec<u64> = env
+        .fs()
+        .read_dir(engine_dir)
+        .await?
+        .iter()
+        .filter_map(|name| parse_version(name.to_str()?))
+        .filter(|&(i, _)| i == index)
+        .map(|(_, take)| take)
+        .collect();
+    takes.sort_unstable_by(|a, b| b.cmp(a));
+    for take in takes {
+        let dir = if take == 0 {
+            checkpoint_dir(engine_dir, index)
+        } else {
+            version_dir(engine_dir, index, take)
+        };
+        if checkpoint_complete(env, &dir).await? {
+            return Ok(Some((dir, take)));
+        }
+    }
+    Ok(None)
+}
+
+/// Deletes every version under `engine_dir` that is neither the record's nor
+/// pinned, and returns the (index, take) of each (PROPOSED(D-043)). `pinned`
+/// counts the streams reading each directory; a directory with a reader stays.
+/// The directories are listed *before* the record is read: a take writes its
+/// record before it creates its directory (D-036), so a directory the listing
+/// saw and the record does not name is an old version, never one in flight. The
+/// filesystem has no directory removal (D-024), so a version is deleted by
+/// removing its files, and a directory already empty is not a version.
+///
+/// # Errors
+///
+/// The filesystem's or the engine's, reading the record; a file that could not
+/// be removed is left for the next sweep.
+pub async fn sweep_versions<E: Environment>(
+    env: &E,
+    store: &RaftStore<E>,
+    engine_dir: &Path,
+    pinned: &BTreeMap<PathBuf, usize>,
+) -> io::Result<Vec<(Index, u64)>> {
+    let fs = env.fs();
+    let names = fs.read_dir(engine_dir).await?;
+    let current = store
+        .snapshot_record()
+        .await?
+        .map(|record| record.dir)
+        .unwrap_or_default();
+    let mut deleted = Vec::new();
+    for name in names {
+        let Some(version) = name.to_str().and_then(parse_version) else {
+            continue;
+        };
+        let dir = engine_dir.join(&name);
+        if dir.display().to_string() == current || pinned.get(&dir).is_some_and(|&n| n > 0) {
+            continue;
+        }
+        let Ok(files) = fs.read_dir(&dir).await else {
+            continue;
+        };
+        if files.is_empty() {
+            continue;
+        }
+        for file in files {
+            let _ = fs.remove_file(&dir.join(file)).await;
+        }
+        let _ = fs.sync_dir(&dir).await;
+        deleted.push(version);
+    }
+    Ok(deleted)
 }
 
 fn bad(what: &str) -> io::Error {
@@ -135,15 +289,166 @@ fn valid_name(name: &[u8]) -> bool {
 }
 
 /// Adopts a completed install at the staging path, if there is one: the switch of
-/// RAFT.md §1, run before the engine opens (PROPOSED(D-038)). Returns whether a
-/// store was adopted. An incomplete staging directory (no valid `CURRENT`) is
-/// swept away instead. See the module documentation for the crash-safety order.
+/// RAFT.md §1, run before the engine opens (PROPOSED(D-038)), in the crash-safe
+/// order of PROPOSED(D-041). Returns whether a store was adopted. A staging
+/// directory with no `CURRENT` at all is an install that never finished and is
+/// swept away instead; one whose `CURRENT` exists but does not parse is damage
+/// and refused. See the module documentation for the order.
 ///
 /// # Errors
 ///
-/// The filesystem's, while replacing the old store; the caller should not open
-/// the engine after one.
+/// `InvalidData` carrying a [`LostState`] when the staging directory is damaged
+/// — its `CURRENT` or the manifest it names cannot be read, or a table it lists
+/// is missing — with nothing touched: the caller should refuse the store the way
+/// it refuses one whose recovery lost state. Otherwise the filesystem's, while
+/// replacing the old store; the caller should not open the engine after one.
 pub async fn adopt_staged<E: Environment>(env: &E, engine_dir: &Path) -> io::Result<bool> {
+    adopt_staged_under(env, engine_dir, Variant::Correct).await
+}
+
+/// [`adopt_staged`] under `variant`: [`Variant::AdoptionAsBuilt`] runs the
+/// adoption as it was built under D-038, which the sweep must catch (RAFT.md §5);
+/// every other variant runs the crash-safe order.
+///
+/// # Errors
+///
+/// As [`adopt_staged`].
+// PROPOSED(D-041): the crash-safe adoption and the store identity marker.
+pub async fn adopt_staged_under<E: Environment>(
+    env: &E,
+    engine_dir: &Path,
+    variant: Variant,
+) -> io::Result<bool> {
+    if variant == Variant::AdoptionAsBuilt {
+        return adopt_staged_as_built(env, engine_dir).await;
+    }
+    let fs = env.fs();
+    let staging = staging_dir(engine_dir);
+    let Ok(names) = fs.read_dir(&staging).await else {
+        return Ok(false);
+    };
+    let Some(current) = read_whole(env, &manifest::current_path(&staging)).await? else {
+        // No CURRENT at all: an install that never finished. Sweep it so the
+        // next stream starts clean, and the old store stays in force.
+        for name in &names {
+            let _ = fs.remove_file(&staging.join(name)).await;
+        }
+        let _ = fs.sync_dir(&staging).await;
+        return Ok(false);
+    };
+    // A CURRENT that exists is a completed install, and one that does not parse
+    // is damage: refused, and nothing here is touched.
+    let Some(number) = manifest::parse_current(&current) else {
+        return Err(LostState::from_damage(Damage::StagingCurrentUnreadable).into_io());
+    };
+    let staged = match read_whole(env, &manifest::manifest_path(&staging, number)).await? {
+        Some(bytes) => Manifest::decode(&bytes)
+            .map_err(|_| LostState::from_damage(Damage::StagingManifestUnreadable).into_io())?,
+        None => return Err(LostState::from_damage(Damage::StagingManifestUnreadable).into_io()),
+    };
+    for meta in &staged.ssts {
+        if !names
+            .iter()
+            .any(|n| manifest::sst_of(n) == Some(meta.number))
+        {
+            return Err(LostState::from_damage(Damage::StagingTableMissing(meta.number)).into_io());
+        }
+    }
+    // The old store's files, listed before anything is copied, and the numbers
+    // the copies go under: every staged table one past the highest table on
+    // disk and up, the manifest one past the highest manifest, so no copy lands
+    // on a file the old store still needs. The staged store's own numbers are
+    // the leader's and collide with the receiver's freely. A re-run after a
+    // crash lists the earlier copies too and numbers past them; they become
+    // orphans the engine's open removes.
+    let old = fs.read_dir(engine_dir).await?;
+    let sst_base = old
+        .iter()
+        .filter_map(|n| manifest::sst_of(n))
+        .max()
+        .unwrap_or(0);
+    let manifest_number = old
+        .iter()
+        .filter_map(|n| manifest::manifest_of(n))
+        .max()
+        .unwrap_or(0)
+        + 1;
+    let mut ssts = Vec::with_capacity(staged.ssts.len());
+    for meta in &staged.ssts {
+        let bytes = read_whole(env, &manifest::sst_path(&staging, meta.number))
+            .await?
+            .ok_or_else(|| {
+                LostState::from_damage(Damage::StagingTableMissing(meta.number)).into_io()
+            })?;
+        let number = sst_base + meta.number;
+        write_file(env, &manifest::sst_path(engine_dir, number), &bytes, true).await?;
+        ssts.push(SstMeta {
+            number,
+            ..meta.clone()
+        });
+    }
+    let adopted = Manifest {
+        number: manifest_number,
+        next_sst: sst_base + staged.next_sst,
+        flushed_seq: staged.flushed_seq,
+        ssts,
+    };
+    write_file(
+        env,
+        &manifest::manifest_path(engine_dir, adopted.number),
+        &adopted.encode(),
+        true,
+    )
+    .await?;
+    fs.sync_dir(engine_dir).await?;
+    // The switch: CURRENT tmp-and-rename, the commit point of every store switch
+    // (D-024). Until this is durable the old CURRENT names the old store, whole.
+    write_file(
+        env,
+        &manifest::current_tmp_path(engine_dir),
+        &manifest::encode_current(adopted.number),
+        true,
+    )
+    .await?;
+    fs.rename(
+        &manifest::current_tmp_path(engine_dir),
+        &manifest::current_path(engine_dir),
+    )
+    .await?;
+    fs.sync_dir(engine_dir).await?;
+    // The old store's files, only now: everything of the store proper that was
+    // on disk before the copies, none of which shares a name with a copy. Their
+    // log segments go with them; the adopted store starts with an empty log.
+    for name in &old {
+        let Some(text) = name.to_str() else { continue };
+        if text != "CURRENT" && is_store_file(text) {
+            let _ = fs.remove_file(&engine_dir.join(name)).await;
+        }
+    }
+    fs.sync_dir(engine_dir).await?;
+    // The point of no return: without its CURRENT the staging directory never
+    // wins again, so the adopted store's own writes are safe from a replay.
+    fs.remove_file(&manifest::current_path(&staging)).await?;
+    fs.sync_dir(&staging).await?;
+    for name in &names {
+        if name.to_str() != Some("CURRENT") {
+            let _ = fs.remove_file(&staging.join(name)).await;
+        }
+    }
+    let _ = fs.sync_dir(&staging).await;
+    Ok(true)
+}
+
+/// The adoption as built under D-038, kept as [`Variant::AdoptionAsBuilt`] for
+/// the sweep to catch (RAFT.md §5): the old store's `CURRENT` goes first, then
+/// its files, then the staged files are copied with `CURRENT` last, and a
+/// staging `CURRENT` that does not parse is swept as debris. Between the old
+/// store's removal and the sync of the copies' directory entries the staged
+/// store is the only copy; a crash there whose bit rot lands on the staging
+/// `CURRENT` leaves nothing, and the next open — with no marker to say the
+/// directory was a store — is a fresh one (the nightly's seed 6325).
+// PROPOSED(D-041): the crash-safe adoption and the store identity marker.
+async fn adopt_staged_as_built<E: Environment>(env: &E, engine_dir: &Path) -> io::Result<bool> {
     let fs = env.fs();
     let staging = staging_dir(engine_dir);
     let Ok(names) = fs.read_dir(&staging).await else {
@@ -205,7 +510,11 @@ pub async fn adopt_staged<E: Environment>(env: &E, engine_dir: &Path) -> io::Res
 /// checkpoint is written to `dir`, so the checkpoint's copy of the record precedes
 /// the checkpoint's `CURRENT` (RAFT.md §1, D-024). The caller must be the `apply`
 /// task with no apply in flight, so `index` is exactly what the checkpoint
-/// captures (PROPOSED(D-036)). Any earlier attempt at `dir` is swept first.
+/// captures (PROPOSED(D-036)). Any earlier attempt at `dir` is swept first — a
+/// stream reading `dir` is scrambled by that, which is the as-built behaviour
+/// [`Variant::SharedSnapshotDir`] keeps; the correct server takes through
+/// [`take_version`] (PROPOSED(D-043)). The record's take counter advances here
+/// too, so the numbering of versions is monotone whichever way a take went.
 ///
 /// # Errors
 ///
@@ -218,6 +527,54 @@ pub async fn take<E: Environment>(
     index: Index,
     term: Term,
     config: &Configuration,
+) -> io::Result<()> {
+    let number = next_take(store).await?;
+    take_numbered(env, store, dir, index, term, config, number).await
+}
+
+/// Takes a snapshot at `index` into its own version directory under
+/// `engine_dir`, [`version_dir`] numbered by the store's take counter, and
+/// returns that directory (PROPOSED(D-043)). Two takes at one index are two
+/// directories, so a stream pinned to the earlier one reads it untouched. The
+/// order is [`take`]'s: the record, naming the directory and the new count,
+/// synced first; then the checkpoint.
+///
+/// # Errors
+///
+/// The engine's or the filesystem's, as for [`take`].
+pub async fn take_version<E: Environment>(
+    env: &E,
+    store: &RaftStore<E>,
+    engine_dir: &Path,
+    index: Index,
+    term: Term,
+    config: &Configuration,
+) -> io::Result<PathBuf> {
+    let number = next_take(store).await?;
+    let dir = version_dir(engine_dir, index, number);
+    take_numbered(env, store, &dir, index, term, config, number).await?;
+    Ok(dir)
+}
+
+/// The next take number: one past the record's count, one for a store that
+/// never took (PROPOSED(D-043)).
+async fn next_take<E: Environment>(store: &RaftStore<E>) -> io::Result<u64> {
+    Ok(store
+        .snapshot_record()
+        .await?
+        .map_or(0, |record| record.take)
+        + 1)
+}
+
+/// The take itself, numbered: see [`take`].
+async fn take_numbered<E: Environment>(
+    env: &E,
+    store: &RaftStore<E>,
+    dir: &Path,
+    index: Index,
+    term: Term,
+    config: &Configuration,
+    number: u64,
 ) -> io::Result<()> {
     let fs = env.fs();
     if let Ok(names) = fs.read_dir(dir).await {
@@ -233,6 +590,7 @@ pub async fn take<E: Environment>(
             config: config.clone(),
             dir: dir.display().to_string(),
             taken: true,
+            take: number,
         })
         .await?;
     store.engine().checkpoint(dir).await?;
@@ -358,6 +716,14 @@ impl Sender {
         self.file >= self.files.len()
     }
 
+    /// The checkpoint directory this stream is pinned to (PROPOSED(D-043)): the
+    /// one it opened, read for its whole life, and what a reader count keeps
+    /// from being swept meanwhile.
+    #[must_use]
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
     /// The offset of the chunk [`chunk`](Self::chunk) would send: what a
     /// resumption trace reports.
     #[must_use]
@@ -409,6 +775,12 @@ pub struct Repair {
     /// then grants no vote, no pre-vote and no lease promise on it, for good.
     // PROPOSED(D-035): re-seeded servers are quarantined from voting for good.
     pub quarantined: bool,
+    /// The incarnation number the staged store carries (RAFT.md §3): the
+    /// receiver's own on an install into a live store, and a fresh one on a
+    /// re-seed, so a leader that recorded a match index against the lost store
+    /// forgets it.
+    // PROPOSED(D-042): store incarnations.
+    pub incarnation: u64,
 }
 
 /// A verified, fully-assembled stream, ready for [`Assembler::finish`].
@@ -694,6 +1066,13 @@ impl<E: Environment> Assembler<E> {
             config: staged.config.clone(),
             dir: String::new(),
             taken: false,
+            // The receiver's versions start over on the installed store. A
+            // later take may then share a name with a directory the receiver
+            // took before — a re-seeded server's lost store may have taken at
+            // the very index it takes at again — which is harmless because the
+            // next incarnation empties every directory its record does not
+            // name before any task of it runs (PROPOSED(D-043)).
+            take: 0,
         };
         let mut writes: BTreeMap<Bytes, Value> = BTreeMap::new();
         writes.insert(
@@ -738,6 +1117,13 @@ impl<E: Environment> Assembler<E> {
         } else {
             writes.insert(store::quarantine_key(), Value::Tombstone);
         }
+        // The incarnation key, for the same reason: the streamed checkpoint
+        // carries the leader's number, and the receiver's own must win.
+        // PROPOSED(D-042): store incarnations.
+        writes.insert(
+            store::incarnation_key(),
+            Value::Live(store::encode_incarnation(repair.incarnation)),
+        );
         for entry in &repair.tail {
             writes.insert(
                 store::log_key(entry.index),
@@ -808,13 +1194,23 @@ impl<E: Environment> Assembler<E> {
         Ok(())
     }
 
-    /// Drops the stream and sweeps the staging directory: a failed verify, an
-    /// identity change, or an install the server decided against.
+    /// Drops the stream and sweeps the staging directory's files: a failed
+    /// verify, an identity change, or an install the server decided against. A
+    /// `CURRENT` there is left where it is: it is a completed install, one the
+    /// server acknowledged and its next start adopts, or a damaged one its next
+    /// start refuses — and either way only the next completed install's own
+    /// `CURRENT` replaces it, so no start in between finds an unfinished install
+    /// and falls back to the old store, which the acknowledged install
+    /// superseded (PROPOSED(D-041)).
     pub async fn abandon(&mut self) {
         self.stream = None;
         let fs = self.env.fs();
         if let Ok(names) = fs.read_dir(&self.staging).await {
             for name in names {
+                // PROPOSED(D-041): the acknowledged install's commit point stays.
+                if name.to_str() == Some("CURRENT") {
+                    continue;
+                }
                 let _ = fs.remove_file(&self.staging.join(name)).await;
             }
             let _ = fs.sync_dir(&self.staging).await;
@@ -832,6 +1228,7 @@ pub fn ack(term: Term, staged: (Index, Term), file: Bytes, offset: u64) -> Messa
         file,
         offset,
         status: SnapshotStatus::More,
+        incarnation: 0,
     }
 }
 
@@ -845,6 +1242,7 @@ pub fn installed(term: Term, staged: (Index, Term)) -> Message {
         file: Bytes::new(),
         offset: 0,
         status: SnapshotStatus::Installed,
+        incarnation: 0,
     }
 }
 
@@ -858,5 +1256,6 @@ pub fn start_over(term: Term, staged: (Index, Term)) -> Message {
         file: Bytes::new(),
         offset: 0,
         status: SnapshotStatus::Restart,
+        incarnation: 0,
     }
 }

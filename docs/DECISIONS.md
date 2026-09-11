@@ -1237,7 +1237,7 @@ core routes the snapshot to its own task, so the timer check, which read only
 AppendEntries as a reset, saw a gap that the server never had. It now counts an
 InstallSnapshot from a leader of the server's term or later as a reset too. The
 hundred-seed runs never reached a follower that far behind under a compacting
-leader; ten thousand did, which is what ten thousand are for.
+leader; ten thousand did, which is what ten thousand are for. Seed 7381 of the same run was the checker's snapshot floor: it only ever rose, so a refused server re-seeded from a snapshot older than its lost store's kept the lost store's floor and its applied entries read as covered rather than held; an installed snapshot now sets the floor exactly.
 
 **Alternatives.** Multiple chunks in flight: resumption bookkeeping for a
 pipeline, for a path whose cost is the checkpoint, not the round trips.
@@ -1669,4 +1669,430 @@ a function of the trace alone. The site is marked `PROPOSED(D-039)`.
 
 ---
 
-_Next entry: D-040. Add one before implementing anything not covered above._
+## PROPOSED D-041 — The staged install is adopted crash-safely, a damaged install is refused, and a marked store never opens fresh
+
+**Context.** The ten-thousand-seed nightly (run 34496762339), seed 6325: server 1
+finished installing a snapshot at index 129 at 5.7711 s and the schedule crashed
+it forty-one milliseconds later, inside the adoption. The simulator's confession
+at the crash: bit rot on `/raft/install/CURRENT` and lost directory entries for
+`/raft/000001.sst` to `000004.sst` — the tables the adoption had just copied
+into the store directory, not yet `sync_dir`'d. On restart the engine wrote an
+empty first manifest, recovered no log, and the server restated `RaftRecovered
+{term 0, applied 0, last_index 0}`: a fresh store, not a refusal. It joined term
+5 and was re-installed at 6.3584 s, and committed-entries-stay reported the
+truncation from index 1 against a commit index of 119. A voter that held term 5
+and a hundred and nineteen committed entries forgot everything, which is the
+state D-022 and D-025 exist to refuse. Three holes lined up in
+`snapshot.rs::adopt_staged` as built under PROPOSED D-038: the old store's
+`CURRENT` and files were removed *before* the staged copies and their directory
+entries were durable, so the point of no return preceded the durability of the
+new files; a staging `CURRENT` that exists but does not parse was treated as
+debris of an install that never finished and swept, which after the old store
+was gone deleted the only copy; and the engine's rule (D-024) refuses a missing
+`CURRENT` only while manifests or tables remain, so a directory emptied past
+that opened fresh.
+
+**Decision.** Four parts, each site marked `PROPOSED(D-041)`.
+
+*The order.* The adoption copies first and switches last, the way every store
+switch is made (D-024). The staged manifest is decoded and every table it lists
+must be in the staging directory; then each staged table is copied into the
+store directory and synced, and the manifest is written with the copies'
+numbers, each file synced and the directory synced; then `CURRENT` is switched
+to the copied manifest, tmp-and-rename and `sync_dir`, the commit point; only
+then are the old store's files — everything of the store proper listed before
+the copies began, log segments included — removed and the directory synced; and
+last the staging directory's own `CURRENT` is removed, synced, and its files
+swept, as before. Until the switch is durable the old `CURRENT` names the old
+store, whole; a crash anywhere before the staging `CURRENT` is gone re-runs the
+adoption on the same staged bytes; no directory rename is needed. Names cannot
+be reused: the staged store's numbers are the leader's checkpoint's, tables
+from 1 and a manifest of 1 or 2, and collide with the receiver's almost always,
+so the copies go under numbers past everything on disk — each table at the
+highest table number on disk plus its staged number, the manifest one past the
+highest manifest, `next_sst` shifted alike, the manifest rewritten to say so.
+A re-run after a crash lists the earlier copies with the old store and numbers
+past them; they go with the old files at the end, or as orphans at the engine's
+next open. A completed adoption traces `RaftAdopted`.
+
+*Damage.* A staging directory with no `CURRENT` at all is an install that never
+finished and is swept. One whose `CURRENT` exists but does not parse, names a
+manifest that is missing or does not decode, or lists a table that is not
+there, is damage: the adoption refuses with `LostState` carrying a `Damage`
+reason and touches nothing, the server traces `RaftRefused` and waits in
+re-seed mode for a leader's stream, the way a store whose recovery lost state
+does. The assembler's own sweep (`Assembler::abandon`, on an identity change or
+an install the server decided against) now leaves a `CURRENT` where it is,
+damaged or not: only the next completed install's own `CURRENT` replaces it
+(tmp-and-rename), so no start in between finds an unfinished install, sweeps
+it, and opens the old store the acknowledged install superseded.
+
+*The marker.* A Raft store directory carries `RAFT-STORE`, a small file written
+once the engine and the store have opened successfully — a fresh directory at
+its first open, a store from before the marker at its next — synced, with the
+directory synced after, and never removed: it is not a store file to the
+adoption, and the engine's orphan sweep knows only tables, manifests and
+`CURRENT.tmp`. Before the engine opens, a directory that carries the marker and
+no `CURRENT` that parses is refused with `LostState` (`MarkedCurrentMissing`,
+`MarkedCurrentUnreadable`): it was a store, so it is a lost one, never a fresh
+one. The as-built variant neither checks nor writes it, so its disk sees exactly
+the operations the nightly's did.
+
+*The variant and its fault.* `Variant::AdoptionAsBuilt` is the adoption as
+built: the old store removed first, the copies synced after, a damaged staging
+`CURRENT` swept, no marker. `Fault::CrashAdopting` aims at it, on every seed,
+drawn from its own stream (D-031): the install crash's setup, then, once the
+receiver traces the install complete, a crash the moment the adoption's first
+change to the store directory is durable — read from the simulated disk's
+durable namespace (`Sim::durable_names`), the old store's files all gone or a
+copied file's entry synced in, whichever the adoption does first — repeated
+sixteen to thirty-two times, each restart re-running the adoption the crash
+interrupted. For the crash-safe order the first durable change is a copy synced
+in with the old store whole; for the as-built order it is the old store gone
+with the copies' entries pending, and a crash there whose bit rot lands on the
+staging `CURRENT` — one block, two per cent per crash — restarts the server on
+a fresh store. Thirty-two crashes are thirty-two rolls of the disk's dice. Seed 6325
+is pinned in the gate (`seed_6325_which_the_nightly_found_stays_green`).
+
+**What the sweep found.** At a hundred seeds, release, `AdoptionAsBuilt` is
+caught on 23 of 100, every catch the nightly's signature,
+committed-entries-stay reporting a truncation from index 1; at the gate's
+twenty, on 2 of 20. The correct server passes all hundred. The rate is
+the rot's: a crash aimed at the window converts a live rot on the staging
+`CURRENT` into a fresh store about five times in six, so each aimed crash is
+worth a little under two per cent, and the storm's size is what sets the rate.
+A first cut drawn on half the seeds, crashing six to twelve times, caught 1 of
+20 and 6 of 100; on every seed with eight to sixteen crashes, 0 of 20 and 10 of
+100, the gate's twenty seeds being the twenty they are; sixteen to thirty-two
+put it at 2 of 20 and 23 of 100. A crash at a fixed delay after the install's
+completion, the obvious first aim, lands in the copy phase far less often, since
+the adoption's opening reads and the old store's removal take a variable dozen
+disk operations first. The simulator's rot rolls over unlinked inodes too, so a
+`BlockRotted` on the staging `CURRENT` in a trace is not always a live one:
+every retired install leaves a ghost with that path, and most of the rots the
+first measurements counted were ghosts. And a correct-server failure during
+development, seed 96: a crash rotted the staged manifest, the next start
+refused it as damage, correctly, and the leader's re-seed stream began; the
+assembler's sweep at the stream's start removed the damaged `CURRENT` with the
+files, the fault's next crash landed mid-stream, and the start after it found a
+staging directory with no `CURRENT`, swept it as an install that never
+finished, passed the marker check on the old store's valid `CURRENT`, and
+opened the old store — a rollback to applied 252 on a log compacted at 228,
+past an install the server had acknowledged, which state machine safety
+reported since the refusal had reset the server's floor. That is the
+`abandon` rule above: after a refusal a server comes back only through an
+install, which is what the checker models.
+
+**Alternatives.** Renaming the staging directory into place: not modelled
+(D-024). Copying under the staged names after checking for collisions: they
+collide almost always. Verifying every staged table's checksum before adopting:
+the assembler verified them at the finish and the engine verifies them at the
+open, and a table rotted since is a refusal either way. Removing the old
+store's `CURRENT` when the adoption refuses damaged staging, so the marker
+refuses every start until an install is adopted: it destroys a store to express
+what the kept staging `CURRENT` already expresses, and loses the adopted store
+in the window after the switch and before the staging is retired. Teaching the
+checker to accept a restatement from an older store after a refusal: it would
+accept exactly the rollback D-022 refuses. A marker key inside the store rather
+than a file: the failure is a directory emptied past the store. Aiming the
+adoption crash by a trace event at the adoption's start rather than by the
+disk: the copy phase begins a variable dozen disk operations later, and the
+window is the copy phase.
+
+**Consequences.** An adoption costs the same one copy, plus the renumbering;
+the copies of an interrupted adoption are garbage until the next open. A refusal
+for staging damage costs a re-seed even when the store directory already holds
+the adopted store — a crash after the switch and before the staging is retired,
+with rot on the staging `CURRENT` — priced in, a two-per-cent roll inside a
+window of a few milliseconds. A store from before the marker is marked at its
+next open. Every sweep schedule now ends with an isolation, an install and a
+crash storm on the receiver, about a second of run per seed. `Sim::durable_names`
+joins `durable_contents` as a harness accessor. Every site is marked
+`PROPOSED(D-041)`.
+
+---
+
+## PROPOSED D-042 — Store incarnations: a leader forgets what a re-seeded follower forgot
+
+**Context.** The ten-thousand-seed nightly (run 34496762339), seed 5909: server 3
+was refused at 9.80 s and re-seeded five times, at 10.10, 10.47, 10.85, 13.27 and
+16.18 s. It had acknowledged index 333 at 13.86 s and the leader had pipelined
+334..408 to it when it crashed; after the last re-seed its log ended at 333, since
+the checkpoint a leader feeds is the last one it took, which can sit well below
+what the follower acknowledged after it. A leader's `matched` for a follower is
+monotone by design (D-026: a stale or duplicated response can only propose a
+value already passed), an install's completion raises it and never lowers it, and
+the probe rule is `next = hint.max(1).max(matched + 1)`: a leader whose `matched`
+stands above a follower's log end can never probe below it. Every rejection walks
+the probe back to `matched`, the follower rejects that too, and it is never
+counted for a commit again nor re-designated snapshot-fed, since every answer
+keeps it from going quiet — until the leader changes. The same `matched` keeps a
+refused follower from ever being re-seeded by the leader that matched it: its
+rejections ask from index 1 but reject a probe at `matched`, never at index 0,
+so the re-seed ask of D-037 is never heard, and only a designation earned by
+silence while it was down ever streams to it. Stage E's re-seed (D-030, D-035)
+broke the assumption behind monotone `matched`: a follower can now legitimately
+lose entries it acknowledged. Seed 5909's wedge also involves the snapshot
+streams (D-043); this entry closes the `matched` half of it.
+
+**Decision.** Three parts.
+
+*The store.* Every Raft store carries an incarnation number under
+`0 / 0 / incarnation`, beside `hard` and `applied`: written as 1 at a fresh
+store's first open, synced, so every store carries the key explicitly; and by an
+install's repair, with the rest of the staged store's tenant 0, before the staged
+`CURRENT` (D-038) — carried forward unchanged on an install into a live store,
+whose kept tail is everything acknowledged past the snapshot, and drawn afresh on
+a re-seed. It is not the lost store's number plus one: at a refusal the engine is
+dropped and only its directory reaches the re-seed path, and a number read from a
+store the engine refused would not be trusted anyway — a recovery that fell back
+to an older manifest could read the leader's checkpointed value, and its successor
+could then collide with what a leader had already recorded. The re-seed draws the
+number from the environment's rng, never 1, and the leader compares for
+inequality only: no order is assumed of it. The store's `RaftRecovered`
+restatement carries it.
+
+*The wire.* `AppendEntriesResponse` and `InstallSnapshotResponse` carry the
+responder's incarnation, stamped by the server on the way out like the clock, an
+additive field on the frame that the studio decoder shows. A refused server,
+which has no store, stamps 0 on the rejections it answers with; the re-seed's
+`Installed` answer carries the incarnation of the store the install built.
+
+*The leader.* `Progress` records the incarnation a follower last answered with;
+the first answer seen only records. An answer whose incarnation differs from the
+record resets the follower's progress before the answer is otherwise processed —
+`matched = 0`, `next` at the leader's last index plus one, the pipeline, the
+probe and any snapshot-feed designation cleared, traced `RaftProgressReset` — so
+a rejection's hint is where the rebuilt log ends, and the normal probe walks back
+from it rather than from the stale match. After a reset an empty probe goes at
+once, as a heartbeat would, so a successful answer that leaves nothing to send
+still finds the rebuilt log within a round trip. An install's completion resets
+the same way before the install's match is recorded. A stream in flight is left
+to the snapshot task, which ends it either way; the quiet count and the lease
+state are untouched, since the follower just answered. A refused server's 0 is
+a change like any other, so its first rejection walks the probe to index 0,
+where the leader either feeds the snapshot outright, the probe being below its
+compacted prefix, or hears the rejection at index 0 that D-037 designates on: a
+refused follower is re-seeded by the leader that matched it, whatever it was
+matched at. `Variant::IgnoreIncarnation` records and never resets: the leader
+as built. The sweep does not catch it — on 0 of 100 release seeds, by
+construction rather than by chance. The wedge stalls a commit only while the
+third server is unavailable; after the last heal every fault has healed or
+restarted, so a server is unavailable then only by refusal, and a refused
+server beside a re-seeded one is the configuration D-035's carve-out withholds
+the liveness bound from (`majority_up`: two impaired servers of three); and
+were the bound asked there, the leader as built re-seeds the refused server
+too, when it was designated while down, and commits with it inside the bound.
+The variant and its sweep test ship as the pair rule asks, the test ignored
+with that reason rather than weakened, until the sweep can see the wedge: a
+liveness ask when a leader in force at the last heal has a commit majority
+among the servers that are up, quarantined ones included, and a schedule that
+refuses a second follower under that leader — seed 5909's shape — which only
+the disk model's rot produces and no driver can aim.
+
+**Alternatives.** Letting a rejection lower `matched`: any stale or duplicated
+rejection could then walk a live follower's match back and re-send what it
+holds, the flood D-026's probe rule exists to prevent, and a rejection from the
+old store would still walk it to the wrong place. Designating a follower
+snapshot-fed whenever a probe repeats: hides the wedge behind a second stream of
+the same snapshot, which the same `matched` wedges on again. Incrementing the lost
+store's number: unreadable at the refusal, and not to be trusted if read. A
+number the leader stamps on the stream: a field on a request the snapshot streams
+carry (D-043's ground), and a leader that took over mid-stream would stamp from
+no record. The shape itself is the usual one — etcd's raft and raft-rs reset a
+follower's `Progress` when a leader takes office; a store that can lose
+acknowledged entries needs the same reset when the store changes, which is what
+the number makes visible.
+
+**Consequences.** A leader forgets a follower's progress once per refusal and
+once per re-seed, at the price of a probe walk from its own end. A rejection
+stamped 0 that is delayed past the install is a change too: the leader resets,
+the rejection asks from index 1, the follower is designated and offered the same
+snapshot, and its answer that everything is already there resets it back — a
+round trip, not a stall. The rule is inequality, so a success from the dead
+store delayed past the rebuilt store's first answer would set `matched` from the
+dead store until the next answer resets it again: a window one message delay
+long against a whole re-seed. A total order on incarnations, or a per-follower
+set of retired ones, would drop such an answer instead, and is the step to take
+if a sweep ever finds that window. A store started fresh on a wiped directory
+carries 1 again, the number the leader may have recorded for the store that was
+wiped: a wipe is outside the fault model (D-012), and a wiped server is a new
+member for the membership path, not a re-seed. `RaftRecovered` gains a field,
+`RaftProgressReset` is new, and the sweep counts the resets and requires one
+wherever it saw a refusal. Seed 5909 needs D-043 as well and is pinned by
+neither; the core-level scenario is in `crates/ananke-raft/tests/paper.rs`. Every
+site is marked `PROPOSED(D-042)`.
+
+---
+
+## PROPOSED D-043 — Snapshot takes are versioned directories, a stream pins one, and a leader streams to every designated follower at once
+
+**Context.** The ten-thousand-seed nightly (run 34496762339), seed 5909: the
+leader's last commit was 329 at 13.43 s and nothing committed for the remaining
+5.4 s of the run. Server 2 had been snapshot-fed since 7.46 s — 744
+`InstallSnapshot` chunks, the stream resumed from offset 0 six times — and at the
+end the receiver was still acknowledging `000005.sst` while the sender was on
+`000010.sst`. The first of those restarts follows the leader re-taking the *same*
+snapshot 329 five times within a hundred milliseconds (checkpoint versions 779 to
+783, every one into `/raft/snap-329`), rewriting the directory under the stream.
+Server 3, refused and re-seeded, was designated snapshot-fed and received
+nothing: the `snapshot` task streams to one follower at a time, its stream waited
+behind server 2's never-ending one, and a designated follower gets no entries —
+every heartbeat rejected with hint 334, two hundred and four times. Neither
+follower could be counted; the leader lost its quorum at 13.99 s, won term 11 at
+14.76 s and was no better off. The liveness check reported it.
+
+As built (D-030, PROPOSED D-036, D-038): every take at an index writes
+`snap-<index>`, sweeping whatever was there; the record under `0 / 3 / snapshot`
+is written before the checkpoint, so it can name a directory still being
+written; the task keeps one outbound stream and a queue of followers behind it;
+and no checkpoint directory is ever deleted, the backlog line D-038 left. The
+mechanism behind the five re-takes is the record's head start: a threshold take
+wrote the record naming the directory it was about to write; an `Install` for
+another follower read the record, opened an empty or partial directory, and
+reported the checkpoint unusable; the core cleared both its checkpoint and its
+pending take, and the next heartbeat asked again — a second take at the same
+index queued behind the first, into the same directory, and so on. RAFT.md §1
+gives the stream its resumption and the leader its threshold rule; it does not
+say where a take goes, what a stream reads while the next take lands, when a
+directory may go, or how many followers a leader feeds at once.
+
+**Decision.** Six parts, every site marked `PROPOSED(D-043)`.
+
+*Versioned takes.* Every take goes to its own directory,
+`snapshot::version_dir`, `snap-<index>-<take>`, numbered by a per-store take
+counter the record carries (`SnapshotRecord::take`, eight more bytes in the
+value): the counter is read from the record and advanced by every take, so a
+restart continues the numbering, and two takes at one index are two directories.
+An install's repair writes the counter as zero, so a name can recur on a
+re-seeded server whose lost store had taken at the very index it takes at
+again; that is harmless because the sweep below empties every directory the
+record does not name before the incarnation's tasks run, and a take clears its
+directory before writing anyway. `snapshot::take` keeps its signature and its
+sweep-and-rewrite of an explicit directory, which the variant uses; the correct
+server takes through `snapshot::take_version`.
+
+*A stream pins a version.* A stream reads the directory it opened for its whole
+life: a resend after loss resumes on it, and a newer take, at the same index or
+a later one, never touches it. What it opens is `snapshot::find_version`, the
+newest *complete* version of the index the core asked for — complete meaning
+the checkpoint's own `CURRENT` is there, since the engine writes it last and
+synced (D-024) and the record precedes the checkpoint (D-036), so the record may
+name a take still in flight or one a crash cut short. The conservative option,
+taken: a leader that has taken a newer snapshot keeps streaming the pinned one
+to completion. The stream's identity on the wire is (sender, leader term, last
+index, last term), which cannot tell two takes at one index apart; switching
+versions mid-stream would let the receiver resume across them, and a deliberate
+restart at offset 0 under the same identity is read by the assembler as a
+duplicate of a file already done. Both need the codec, which D-042 owns. The
+cost is one more install where the leader compacted past the pinned index while
+the stream ran: the follower installs the older snapshot, is found below the
+prefix, and is fed the newer one.
+
+*Deletion.* `snapshot::sweep_versions` deletes every version that is neither the
+record's nor read by a stream; the `snapshot` task keeps a reader count per
+directory (`Streams::readers`), incremented when a stream opens and released
+when it ends. The directories are listed *before* the record is read: a take
+writes its record before it creates its directory, so a directory the listing
+saw and the record does not name is an old version, never one in flight. The
+filesystem has no directory removal (D-024), so a version is deleted by
+removing its files and an empty directory is not a version. The sweep runs at
+every incarnation's start, in `incarnation` before its tasks are spawned — a
+fresh incarnation reads none of its predecessor's versions, an installed
+store's record names none, and running it before any task can take is what
+keeps a recurring name from ever naming a directory with files in it — then in
+the `snapshot` task after every completed take and after every stream ends;
+each deletion is `RaftSnapshotDeleted`. This closes the checkpoint-directory GC
+that D-030 and D-038 left to the backlog.
+
+*One stream per designated follower.* The task keeps `Streams::outbound`, a
+stream per follower, and services them all: the chunk timer is the earliest
+deadline among them, every stream past its deadline is resent or given up in
+the same pass, and an acknowledgement finds its own stream by sender. A
+designated follower is never queued behind another's stream. Each opening is
+traced `RaftSnapshotStreams` with the count in flight.
+
+*The guard, and the retake gate.* A take that would not advance the index is a
+second version of the same state, so the `apply` task answers a plain
+`Job::Take` at the record's own index with the recorded version when it is
+complete, traced `RaftSnapshotReused`, and takes a fresh version otherwise. A
+take the core asks for after a checkpoint was found unusable — a stream that
+could not open one, a receiver that refused one twice, a take that failed — is
+a `Job::Retake`, a fresh version even at the record's index, since the recorded
+one is the one found wanting. And a stream that finds no complete version while
+a take is already in flight reports its failure without `retake`: the core then
+asks the stream again on the next heartbeat and finds the take landed, where a
+retake would have cleared the pending take and queued a second one at the same
+index behind it — the cascade of seed 5909. Recorded honestly: by construction
+the correct server's plain takes always advance the index — the threshold take
+requires the applied index past the last take, and the on-demand take only runs
+with no checkpoint at all — so the guard is a belt whose count the sweep
+reports; the two gates are what stop the waste.
+
+*The variant.* `Variant::SharedSnapshotDir` is the server as built: one
+directory per index through `checkpoint_dir` and `take`, one stream at a time
+with the queue behind it, the record's directory opened whatever its state, and
+a retake asked whenever a stream fails for want of a checkpoint. The sweep runs
+it beside the correct server and reports its catch rate, how many of its
+catches were the liveness check's, and on how many seeds the fault fired — a
+take at the index already taken, into the directory a stream may be reading,
+which the test folds from the trace and asserts at every tier, so a sweep that
+passes is known to have injected the fault. The catch itself is asserted at the
+nightly's tier, ten thousand seeds, the only tier that ever produced it: this
+is the server whose hundred seeds CI passed when it merged.
+
+**What the sweep found.** The hundred-seed release run: the correct server
+passes all hundred, with 2905 snapshots taken, 1279 installed, 4696 streams
+resumed, 2540 versions deleted by the sweep, 70 stream openings that made two
+streams run at once, and no take answered by the recorded version — the guard
+never fired, as the construction above predicts; the slowest write after a heal
+took 375 ms against the 2 s bound. `SharedSnapshotDir` is caught on 0 of 100
+seeds, and on 0 of 1000 at the pre-merge tier, while the fault fired — a take at
+the index already taken, into the shared directory — on 8 of the gate's 20 seeds
+and 51 of the 100. That is the expected shape, not a surprise: the
+variant is the server that passed CI's hundred seeds when it merged, and the
+catch took the nightly's ten thousand, once. As built, cb15eb1 still fails seed
+5909 on this machine with `liveness: no client write completed after the last
+heal at 16.114 s`; on this branch the same seed passes under both the correct
+server and the variant, because the record's value is eight bytes longer on
+every take, which moves the engine's flushes and with them the checkpoints'
+file sets, so no schedule on this branch replays the nightly's. The variant is
+therefore asserted caught only at the nightly's tier, `ANANKE_SEEDS` of ten
+thousand or more, and asserted to have fired at every tier; a nightly that
+does not catch it is a hole in the sweep to be reported, not a variant to
+delete (RAFT.md §5).
+
+**Alternatives.** Carrying the take number on the wire, so a stream could switch
+to a newer version by restarting under a new identity: a codec field, D-042's
+territory, for a switch nothing needs. Deriving the take number from the
+directory listing instead of the record: a scan at every take, and a crash
+between a listing and a checkpoint leaves the numbering to the next scan; the
+record is already synced before every checkpoint. Deleting versions eagerly at
+the next take: D-030 rejected it for the stream still reading. Keeping the
+core's pending take across a retake, in `core.rs`: the same effect, kept out to
+leave the core to D-042's Progress reset; the server-side gate sees the same
+events. Round-robin over one stream at a time: a stream that never ends still
+starves the rest, and RAFT.md §3 gives the task no reason to hold one back.
+Directory removal in the filesystem model: D-024's decision, out of scope.
+
+**Consequences.** Three trace events (`RaftSnapshotDeleted`,
+`RaftSnapshotReused`, `RaftSnapshotStreams`) and their moirae lines; the snapshot
+record's value grows by eight bytes, with no released store to migrate. A
+leader's data directory holds the record's version plus whatever streams still
+read, and nothing else after the next sweep; a follower sweeps its old versions
+at its next start. Every stream costs one chunk in flight, so a leader feeding
+two followers has two. Seed 5909 needs this entry and D-042 together and is
+pinned by whoever merges both. The nightly is the one tier that asserts the
+variant caught, so a nightly whose ten thousand seeds never catch it goes red on
+that test until the sweep learns to aim at the shape — a targeted fault in the
+manner of `CrashInstalling` (D-030), left for the sweep's owner since the shape
+needs a re-take under a running stream and a second designated follower at
+once, which no driver-side fault forces directly. `sim/tests/raft.rs` counts versions deleted,
+takes reused and streams at once, and `crates/ananke-raft/tests/snapshot.rs`
+shows two takes at one index as two directories, a stream completing under a
+newer take where the shared directory's does not, the sweep sparing the pinned
+and the recorded versions, and two designated followers streamed to at once.
+
+---
+
+_Next entry: D-044. Add one before implementing anything not covered above._

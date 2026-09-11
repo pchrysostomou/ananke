@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use ananke_env::{ClientOp, DropReason, TraceEvent};
 use ananke_raft::core::Variant;
+use ananke_raft::store::STORE_MARKER;
 use ananke_sim::raft::DRIFT_BOUND_PPM;
 use ananke_sim::raft::{self, Fault};
 use ananke_sim::{seeds, sweep, verdict, write_trace};
@@ -42,6 +43,59 @@ fn seeds_164_and_385_which_the_first_nightly_found_stay_green() {
     for seed in [164, 385] {
         raft::run(seed, Variant::Correct).check().unwrap();
     }
+}
+
+/// The ten-thousand-seed nightly's seed 7381: a refused server re-seeded from a
+/// snapshot older than the one its lost store had, then applying entries past it.
+/// The checker's snapshot floor only ever rose, so the lost store's floor outlived
+/// it and the applied entries read as covered rather than held. An installed
+/// snapshot now sets the floor exactly (D-030). Stays in the gate.
+#[test]
+fn seed_7381_which_the_first_nightly_found_stays_green() {
+    raft::run(7381, Variant::Correct).check().unwrap();
+}
+
+/// The ten-thousand-seed nightly's seed 6325 (run 34496762339): server 1 finished
+/// installing a snapshot at index 129 and the schedule crashed it forty-one
+/// milliseconds later, inside the adoption's copy. The adoption as built had
+/// removed the old store's `CURRENT` and files before the copies' directory
+/// entries were synced, so the crash lost the copied tables; its bit rot landed
+/// on the staging directory's `CURRENT`, which the next start swept as debris —
+/// the only copy left; and the engine, finding nothing on disk, opened a fresh
+/// store. A voter holding term 5 and a hundred and nineteen committed entries
+/// restated term 0, applied 0, and committed-entries-stay reported the
+/// truncation from index 1. The adoption now copies and syncs first and switches
+/// `CURRENT` last, a damaged staging `CURRENT` is refused rather than swept, and
+/// a directory carrying the store marker never opens fresh (PROPOSED D-041).
+/// Stays in the gate.
+#[test]
+fn seed_6325_which_the_nightly_found_stays_green() {
+    raft::run(6325, Variant::Correct).check().unwrap();
+}
+
+/// The ten-thousand-seed nightly's seed 5909 (run 34496762339): the leader's last
+/// commit was 329 at 13.43 s and nothing committed for the remaining 5.4 s of the
+/// run. Server 2 had been snapshot-fed since 7.46 s — 744 chunks, the stream
+/// restarted from offset 0 six times — because the leader re-took the same
+/// snapshot 329 five times into the one directory that stream was reading, so
+/// sender and receiver never stood on the same file again; and server 3, refused
+/// and re-seeded, was designated snapshot-fed and received nothing, its stream
+/// queued behind server 2's never-ending one, while the leader's match index for
+/// it stood above its rebuilt log, so every heartbeat it answered was rejected
+/// and it was never counted. With neither follower countable the commit froze,
+/// and the liveness check reported it. Takes are now versioned directories, a
+/// stream pins the one it opened, and every designated follower is streamed to
+/// at once (PROPOSED D-043), and a follower's store incarnation resets what the
+/// leader knew of its log (PROPOSED D-042). Said plainly: the fixed tree's
+/// schedule for this seed diverges from the nightly's trace — the snapshot record
+/// grew by eight bytes, which moves the engine's flushes and with them every
+/// checkpoint, and D-041 appends a crash storm to every schedule — so this pin
+/// holds the seed green rather than replaying the failure; the shape itself is
+/// carried by `SharedSnapshotDir` and `IgnoreIncarnation` below. Stays in the
+/// gate.
+#[test]
+fn seed_5909_which_the_nightly_found_stays_green() {
+    raft::run(5909, Variant::Correct).check().unwrap();
 }
 
 /// The positive control: the correct server satisfies every property on every
@@ -119,6 +173,114 @@ fn a_server_that_resets_its_timer_on_any_message_is_caught() {
 #[test]
 fn a_server_that_installs_without_current_last_is_caught() {
     is_caught(Variant::SnapshotWithoutCurrentLast);
+}
+
+/// The adoption as built under D-038 (PROPOSED D-041): the old store's `CURRENT`
+/// and files removed before the staged copies' directory entries are synced, a
+/// staging `CURRENT` that does not parse swept as debris, and no store marker to
+/// refuse the emptied directory. Its window is a crash inside the copy whose bit
+/// rot lands on the staging `CURRENT` — one block, two per cent per crash — with
+/// none of the copies' entries surviving, after which the server restarts on a
+/// fresh store and committed-entries-stay reports the truncation from index 1.
+/// The crash-mid-adoption fault aims every crash at that window and rolls the
+/// rot's dice several times per seed; the rate is printed, and the pair rule
+/// holds because the correct server passes the same seeds above.
+#[test]
+fn a_server_whose_adoption_is_as_built_is_caught() {
+    is_caught(Variant::AdoptionAsBuilt);
+}
+
+/// The leader that ignores the store incarnation its followers answer with
+/// (RAFT.md §3, PROPOSED(D-042)): a follower refused for lost state and re-seeded
+/// from a snapshot comes back below the match index the leader recorded for it,
+/// the match is monotone and the probe never reaches below it, so every answer
+/// is discarded and the follower is never counted again while that leader leads.
+/// Only with the third server unavailable at the same time does that stall a
+/// commit, and the sweep as written cannot see it: caught on 0 of 100 release
+/// seeds, by construction rather than by chance. After the last heal every
+/// fault has healed or restarted, so a server is unavailable then only by
+/// refusal, and a refused server beside a re-seeded one is exactly the
+/// configuration `Report::majority_up` withholds the liveness bound from
+/// (PROPOSED D-035's carve-out); and were the bound asked there, the leader as
+/// built re-seeds the refused server too, when it was designated while down,
+/// and commits with it inside the bound. Seeing the wedge needs a liveness ask
+/// when a leader in force at the last heal has a commit majority among the
+/// servers that are up, quarantined ones included, and a schedule that refuses
+/// a second follower under that leader — seed 5909's shape — which the disk
+/// model's rot draws on its own and no driver can aim. Until then the test is
+/// ignored, not weakened: `--ignored` runs it and prints the rate. The pair
+/// rule's other half holds, since the correct server passes the same seeds.
+#[test]
+#[ignore = "the sweep's liveness bound is withheld from the one configuration the wedge stalls (PROPOSED D-042): 0 of 100 release seeds"]
+fn a_leader_that_ignores_incarnations_is_caught() {
+    is_caught(Variant::IgnoreIncarnation);
+}
+
+/// The leader as built before PROPOSED D-043: one mutable checkpoint directory per
+/// index, rewritten by every take at that index under whatever stream reads it,
+/// and one snapshot stream at a time, every other designated follower queued
+/// behind it. A retake at the index a stream is reading scrambles that stream,
+/// which never completes, and the follower queued behind it gets neither the
+/// stream nor entries; with both followers uncountable the leader loses its
+/// quorum and nothing commits, which the liveness check reports (nightly run
+/// 34496762339, seed 5909). This is the server whose hundred seeds CI passed when
+/// it merged: the catch took the nightly's ten thousand, once, so it is asserted
+/// at that tier and reported at every tier, with how many were the liveness
+/// check's. What every tier must see is the fault firing — a take at the index
+/// already taken, into the directory a stream may be reading — so that a sweep
+/// that passes is known to have injected it. The pair rule holds because the
+/// correct server passes the same seeds.
+#[test]
+fn a_leader_that_shares_one_snapshot_directory_and_streams_one_follower_at_a_time_is_caught() {
+    let outcomes: Vec<(Option<String>, bool)> = sweep(seeds(), |seed| {
+        let report = raft::run(seed, Variant::SharedSnapshotDir);
+        (report.check().err(), retook_at_one_index(&report))
+    });
+    let caught: Vec<&String> = outcomes.iter().filter_map(|(v, _)| v.as_ref()).collect();
+    let fired = outcomes.iter().filter(|(_, fired)| *fired).count();
+    let liveness = caught.iter().filter(|v| v.contains("liveness")).count();
+    eprintln!(
+        "SharedSnapshotDir: caught on {} of {} seeds, {liveness} by the liveness check, re-took at an index already taken on {fired} seeds, first: {}",
+        caught.len(),
+        seeds(),
+        caught.first().map_or("", |v| v.as_str())
+    );
+    assert!(
+        fired > 0,
+        "SharedSnapshotDir never re-took at an index already taken: the fault was not injected"
+    );
+    if seeds() >= 10_000 {
+        assert!(!caught.is_empty(), "SharedSnapshotDir was never caught");
+    }
+}
+
+/// Whether some server took a snapshot at the index it had already taken: the
+/// re-take that, as built, sweeps and rewrites the shared directory under any
+/// stream reading it (PROPOSED D-043). A restart re-states the record's snapshot
+/// right after its `RaftTruncate`; that is the disk's picture, not a take.
+fn retook_at_one_index(report: &raft::Report) -> bool {
+    let mut last_take: BTreeMap<u64, u64> = BTreeMap::new();
+    let mut restating: BTreeSet<u64> = BTreeSet::new();
+    for event in report.events() {
+        match event {
+            TraceEvent::RaftTruncate { server, .. } => {
+                restating.insert(server);
+            }
+            TraceEvent::RaftSnapshot {
+                server,
+                last_index,
+                taken: true,
+                ..
+            } => {
+                if !restating.remove(&server) && last_take.get(&server) == Some(&last_index) {
+                    return true;
+                }
+                last_take.insert(server, last_index);
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 /// Lease safety under drift (RAFT.md §2, invariant 6): on every seed where the
@@ -225,10 +387,17 @@ struct Coverage {
     snapshots_taken: usize,
     snapshots_installed: usize,
     snapshot_resumes: usize,
+    snapshot_versions_deleted: usize,
+    snapshot_takes_reused: usize,
+    snapshot_streams_at_once: usize,
     compactions: usize,
     reseeded: usize,
     reseed_completions: u64,
+    progress_resets: usize,
     install_crash_faults: usize,
+    adoption_crash_faults: usize,
+    adoptions: usize,
+    marker_refusals: usize,
     bit_rot: usize,
     torn_writes: usize,
     puts: u64,
@@ -323,14 +492,39 @@ impl Coverage {
             report.count(|e| matches!(e, TraceEvent::RaftSnapshot { taken: false, .. }));
         self.snapshot_resumes +=
             report.count(|e| matches!(e, TraceEvent::RaftSnapshotResumed { .. }));
+        // PROPOSED(D-043): versions swept, takes answered by the recorded
+        // version, and leaders streaming to more than one follower at once.
+        self.snapshot_versions_deleted +=
+            report.count(|e| matches!(e, TraceEvent::RaftSnapshotDeleted { .. }));
+        self.snapshot_takes_reused +=
+            report.count(|e| matches!(e, TraceEvent::RaftSnapshotReused { .. }));
+        self.snapshot_streams_at_once += report.count(
+            |e| matches!(e, TraceEvent::RaftSnapshotStreams { streams, .. } if *streams > 1),
+        );
         self.compactions += report.count(|e| matches!(e, TraceEvent::RaftCompacted { .. }));
         self.reseeded += report.count(|e| matches!(e, TraceEvent::RaftReseeded { .. }));
         self.reseed_completions += u64::from(reseed_completed(report));
+        self.progress_resets += report.count(|e| matches!(e, TraceEvent::RaftProgressReset { .. }));
         self.install_crash_faults += report
             .schedule
             .faults
             .iter()
             .filter(|f| matches!(f, Fault::CrashInstalling { .. }))
+            .count();
+        // PROPOSED(D-041): the crash-mid-adoption fault, the adoptions it and the
+        // installs produce, and the refusals the store marker made where the
+        // engine alone would have opened a fresh store.
+        self.adoption_crash_faults += report
+            .schedule
+            .faults
+            .iter()
+            .filter(|f| matches!(f, Fault::CrashAdopting { .. }))
+            .count();
+        self.adoptions += report.count(|e| matches!(e, TraceEvent::RaftAdopted { .. }));
+        self.marker_refusals += report
+            .refused
+            .iter()
+            .filter(|(_, reason)| reason.contains(STORE_MARKER))
             .count();
         self.bit_rot += report.count(|e| matches!(e, TraceEvent::BlockRotted { .. }));
         self.torn_writes += report.count(|e| matches!(e, TraceEvent::WriteTorn { .. }));
@@ -375,6 +569,10 @@ impl Coverage {
             ("snapshots taken", self.snapshots_taken as u64),
             ("log compactions", self.compactions as u64),
             ("crash-mid-install faults", self.install_crash_faults as u64),
+            (
+                "crash-mid-adoption faults",
+                self.adoption_crash_faults as u64,
+            ),
             ("commits", self.commits as u64),
             ("applies", self.applies as u64),
             ("bit rot", self.bit_rot as u64),
@@ -417,6 +615,19 @@ impl Coverage {
             assert!(
                 self.reseed_completions > 0,
                 "no refused server was ever re-seeded and applying again: {self:?}"
+            );
+            // PROPOSED(D-041): every install is adopted at the next start, so a
+            // hundred seeds that install also adopt.
+            assert!(
+                self.adoptions > 0,
+                "the sweep never saw a staged install adopted: {self:?}"
+            );
+            // A refused server answers from no store, and a leader that had
+            // matched entries on the lost one forgets them (PROPOSED(D-042)):
+            // with refusals seen, so is the reset.
+            assert!(
+                self.progress_resets > 0,
+                "no leader ever forgot a re-seeded follower's progress: {self:?}"
             );
         }
         assert!(

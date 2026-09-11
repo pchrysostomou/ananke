@@ -78,16 +78,19 @@ impl Logs {
                     }
                 }
                 let floor = self.floor.entry(*server).or_default();
-                if *last_index >= floor.0 {
-                    *floor = (*last_index, *last_term);
-                }
                 if !taken {
                     // Installed: the store is the leader's checkpoint now, and the
                     // log prefix the snapshot covers is gone with the old store.
+                    // The floor is exactly the snapshot's, lower or higher than
+                    // before: a re-seeded server's earlier floor belonged to the
+                    // store it lost (the nightly's seed 7381, D-030).
+                    *floor = (*last_index, *last_term);
                     self.logs
                         .entry(*server)
                         .or_default()
                         .retain(|&index, _| index > *last_index);
+                } else if *last_index >= floor.0 {
+                    *floor = (*last_index, *last_term);
                 }
             }
             _ => {}

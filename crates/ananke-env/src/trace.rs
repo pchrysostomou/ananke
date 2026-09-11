@@ -468,6 +468,13 @@ pub enum TraceEvent {
         applied: u64,
         /// The last log index on disk.
         last_index: u64,
+        /// The store's incarnation number: 1 for a store started fresh, a fresh
+        /// value on every store a re-seed rebuilt (RAFT.md §3). A leader that
+        /// sees a follower answer with a different one forgets what it knew of
+        /// the follower's log.
+        // PROPOSED(D-042): store incarnations, so a leader forgets what a
+        // re-seeded follower forgot.
+        incarnation: u64,
     },
     /// A Raft leader proposed a client's request as a log entry (RAFT.md §4): the
     /// link from an operation of the history to the entry that carries it, so an
@@ -537,6 +544,63 @@ pub enum TraceEvent {
         to: u64,
         /// The offset within the current file the stream resumed from.
         offset: u64,
+    },
+    /// A Raft server adopted a completed snapshot install at its start (RAFT.md
+    /// §1): the staged store was copied into the server's store directory and
+    /// its `CURRENT` switched to it, and the incarnation that follows runs on the
+    /// installed state. The switch is the store's point of no return, so it is
+    /// traced like every other store switch (D-024).
+    // PROPOSED(D-041): the crash-safe adoption and the store identity marker.
+    RaftAdopted {
+        /// The server.
+        server: u64,
+    },
+    /// A Raft leader forgot what it knew of a follower's log: the follower
+    /// answered with a store incarnation other than the one the leader had
+    /// recorded for it, so its log may have lost entries it once acknowledged
+    /// (a re-seed, RAFT.md §3), and the leader's match index, next index,
+    /// pipeline, probe and snapshot designation for it start over.
+    // PROPOSED(D-042): store incarnations, so a leader forgets what a re-seeded
+    // follower forgot.
+    RaftProgressReset {
+        /// The leader.
+        server: u64,
+        /// The follower whose progress was reset.
+        follower: u64,
+        /// The incarnation the follower answered with.
+        incarnation: u64,
+    },
+    /// A Raft server deleted an old version of a snapshot: a checkpoint directory
+    /// that is no longer the record's and that no stream reads (PROPOSED(D-043)).
+    RaftSnapshotDeleted {
+        /// The server.
+        server: u64,
+        /// The version's last applied index.
+        last_index: u64,
+        /// The version's take number.
+        take: u64,
+    },
+    /// A Raft leader was asked for a checkpoint at the index its record already
+    /// names, and answered with the recorded version instead of taking a second
+    /// one of the same state (PROPOSED(D-043)).
+    RaftSnapshotReused {
+        /// The server.
+        server: u64,
+        /// The version's last applied index.
+        last_index: u64,
+        /// The version's take number.
+        take: u64,
+    },
+    /// A Raft leader opened a snapshot stream to a follower (PROPOSED(D-043)):
+    /// `streams` is how many streams it now services at once, each pinned to
+    /// the version it opened.
+    RaftSnapshotStreams {
+        /// The leader.
+        server: u64,
+        /// The follower the new stream feeds.
+        to: u64,
+        /// Streams in flight from this leader, the new one included.
+        streams: u64,
     },
     /// A client operation started (RAFT.md §2): the invocation end of one operation
     /// of the linearizability history. Its time is the record's.

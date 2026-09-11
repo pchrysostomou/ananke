@@ -575,6 +575,17 @@ impl NodeFs {
         self.inode(*id).ok().map(|inode| inode.durable.as_slice())
     }
 
+    /// For tests and the harness: the file names in directory `dir` right now, in
+    /// the durable namespace — the entries a crash right now would keep.
+    // PROPOSED(D-041): the crash-safe adoption and the store identity marker.
+    pub(super) fn durable_names(&self, dir: &Path) -> Vec<PathBuf> {
+        self.durable_entries
+            .keys()
+            .filter(|path| path.parent() == Some(dir))
+            .filter_map(|path| path.file_name().map(PathBuf::from))
+            .collect()
+    }
+
     /// The §1.3 directory-entry loss model: per directory, a random prefix of the
     /// operations since its last `sync_dir` survives; the rest are reported and gone.
     /// Afterwards the node sees exactly the durable namespace.

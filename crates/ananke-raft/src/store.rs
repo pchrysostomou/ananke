@@ -20,6 +20,7 @@
 //! | `0 / 0 / hard` | `term: u64 \| vote: u64 (u64::MAX for none)` |
 //! | `0 / 0 / applied` | `applied: u64` |
 //! | `0 / 0 / reseeded` | present on a store a re-seed rebuilt (RAFT.md §3) |
+//! | `0 / 0 / incarnation` | `incarnation: u64`: 1 for a store started fresh, a fresh value on every store a re-seed rebuilt |
 //! | `0 / 1 / <index: u64 BE>` | `term: u64 \| payload` |
 //! | `0 / 2 / config` | `index: u64 \| configuration` |
 //! | `0 / 3 / snapshot` | the last snapshot's index, term, configuration, checkpoint directory |
@@ -47,10 +48,12 @@
 //! responses, until a snapshot re-seeds it.
 
 use std::io;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use ananke_env::{Environment, WalStop, WalStopReason};
+use ananke_env::{Environment, File, FileSystem, OpenOptions, WalStop, WalStopReason};
+use ananke_storage::manifest;
 use ananke_storage::{Engine, EngineRecovery, WriteBatch};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
@@ -111,6 +114,22 @@ pub(crate) fn quarantine_key() -> Bytes {
     key(RAFT_TENANT, META_TABLE, b"reseeded")
 }
 
+/// The store's incarnation number (RAFT.md §3): written as 1 at a fresh store's
+/// first open, and by an install's repair — carried forward on an install into a
+/// live store, drawn afresh for a re-seed, whose predecessor's value is lost with
+/// the rest of the refused store. Followers answer with it so a leader can tell a
+/// rebuilt store, whose log may have lost acknowledged entries, from the one it
+/// recorded a match index for.
+// PROPOSED(D-042): store incarnations, so a leader forgets what a re-seeded
+// follower forgot.
+pub(crate) fn incarnation_key() -> Bytes {
+    key(RAFT_TENANT, META_TABLE, b"incarnation")
+}
+
+/// The incarnation of a store started fresh.
+// PROPOSED(D-042): store incarnations.
+pub const FIRST_INCARNATION: u64 = 1;
+
 fn bad(what: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, what.to_owned())
 }
@@ -135,6 +154,66 @@ pub struct LostState {
     /// on its first seed, a rotted block under a flushed record with acknowledged
     /// records after it (D-026).
     pub covered_stops: Vec<WalStop>,
+    /// Damage found before the engine opened: a store directory that is not a
+    /// whole store any more, or a completed install whose commit point rotted.
+    /// Set on its own, with every field above empty.
+    // PROPOSED(D-041): the crash-safe adoption and the store identity marker.
+    pub damaged: Option<Damage>,
+}
+
+/// What was found wrong with a store directory before the engine opened, each a
+/// refusal ([`LostState`]) rather than a fresh start or a sweep: a directory that
+/// carries the store marker ([`STORE_MARKER`]) once held a Raft store and its
+/// state, term and vote included, is gone with its `CURRENT`; and a staging
+/// directory whose `CURRENT` exists is a completed install, the only copy of a
+/// state the leader may have compacted past, so a `CURRENT` that does not parse
+/// is damage, never debris (RAFT.md §3, D-022).
+// PROPOSED(D-041): the crash-safe adoption and the store identity marker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Damage {
+    /// The staging directory's `CURRENT` exists but does not parse.
+    StagingCurrentUnreadable,
+    /// The manifest the staging directory's `CURRENT` names is missing or does
+    /// not decode.
+    StagingManifestUnreadable,
+    /// A table the staged manifest lists is not in the staging directory.
+    StagingTableMissing(u64),
+    /// The directory carries the store marker but no `CURRENT`.
+    MarkedCurrentMissing,
+    /// The directory carries the store marker and a `CURRENT` that does not
+    /// parse.
+    MarkedCurrentUnreadable,
+}
+
+impl std::fmt::Display for Damage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Damage::StagingCurrentUnreadable => {
+                write!(
+                    f,
+                    "the staging directory's CURRENT exists but cannot be read"
+                )
+            }
+            Damage::StagingManifestUnreadable => write!(
+                f,
+                "the manifest the staging directory's CURRENT names is missing or cannot be read"
+            ),
+            Damage::StagingTableMissing(n) => write!(
+                f,
+                "table {n:06}, which the staged manifest lists, is missing from the staging directory"
+            ),
+            Damage::MarkedCurrentMissing => {
+                write!(
+                    f,
+                    "the directory carries the {STORE_MARKER} marker but no CURRENT"
+                )
+            }
+            Damage::MarkedCurrentUnreadable => write!(
+                f,
+                "the directory carries the {STORE_MARKER} marker and a CURRENT that cannot be read"
+            ),
+        }
+    }
 }
 
 impl LostState {
@@ -152,6 +231,7 @@ impl LostState {
             head_gap: recovery.wal.head_gap,
             log_stop,
             covered_stops: recovery.wal.covered_stops.iter().map(|c| c.stop).collect(),
+            damaged: None,
         };
         (!lost.dropped.is_empty()
             || lost.fallback_from.is_some()
@@ -161,16 +241,41 @@ impl LostState {
         .then_some(lost)
     }
 
+    /// The refusal for damage found before the engine opened: nothing recovered,
+    /// since nothing was opened.
+    // PROPOSED(D-041): the crash-safe adoption and the store identity marker.
+    #[must_use]
+    pub fn from_damage(damage: Damage) -> Self {
+        Self {
+            dropped: Vec::new(),
+            fallback_from: None,
+            head_gap: None,
+            log_stop: None,
+            covered_stops: Vec::new(),
+            damaged: Some(damage),
+        }
+    }
+
     /// The refusal an I/O error carries, if it is one.
     #[must_use]
     pub fn from_io(error: &io::Error) -> Option<LostState> {
         error.get_ref()?.downcast_ref::<LostState>().cloned()
     }
+
+    /// This refusal as the `InvalidData` error [`RaftStore::open`] and the
+    /// adoption fail with, which [`from_io`](Self::from_io) reads back.
+    // PROPOSED(D-041): the crash-safe adoption and the store identity marker.
+    pub(crate) fn into_io(self) -> io::Error {
+        io::Error::new(io::ErrorKind::InvalidData, self)
+    }
 }
 
 impl std::fmt::Display for LostState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "the engine's recovery lost state:")?;
+        match self.damaged {
+            Some(damage) => write!(f, "the store is damaged: {damage}")?,
+            None => write!(f, "the engine's recovery lost state:")?,
+        }
         if !self.dropped.is_empty() {
             write!(f, " dropped tables {:?}", self.dropped)?;
         }
@@ -207,6 +312,102 @@ impl std::fmt::Display for LostState {
 
 impl std::error::Error for LostState {}
 
+/// The store identity marker: a file of this name in the engine directory,
+/// written once the engine has opened a genuinely fresh directory for the first
+/// time and never removed — not by an adoption, which deletes only the store's
+/// own files, nor by the engine's orphan sweep, which knows only tables,
+/// manifests and `CURRENT.tmp`. Before the engine opens, a directory that carries
+/// the marker but no valid `CURRENT` is refused with [`LostState`]: it once held a
+/// Raft store, so it is a lost store, never a fresh one (RAFT.md §3, D-022). The
+/// engine's own rule (D-024) refuses a missing `CURRENT` only while manifests or
+/// tables remain; a directory emptied past that opened fresh, which is how the
+/// nightly's seed 6325 turned a voter with a hundred and nineteen committed
+/// entries into a blank one.
+// PROPOSED(D-041): the crash-safe adoption and the store identity marker.
+pub const STORE_MARKER: &str = "RAFT-STORE";
+
+/// The marker's path under `engine_dir`.
+// PROPOSED(D-041): the crash-safe adoption and the store identity marker.
+#[must_use]
+pub fn marker_path(engine_dir: &Path) -> PathBuf {
+    engine_dir.join(STORE_MARKER)
+}
+
+/// Reads a whole file, or `None` if it does not exist.
+async fn read_whole<E: Environment>(env: &E, path: &Path) -> io::Result<Option<Bytes>> {
+    let file = match env.fs().open(path, OpenOptions::new().read(true)).await {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let size = file.size().await?;
+    let size = usize::try_from(size).map_err(|_| bad("file too large"))?;
+    Ok(Some(file.read_at(0, size).await?))
+}
+
+/// Whether `engine_dir` carries the store marker.
+async fn marked<E: Environment>(env: &E, engine_dir: &Path) -> io::Result<bool> {
+    match env
+        .fs()
+        .open(&marker_path(engine_dir), OpenOptions::new().read(true))
+        .await
+    {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+/// The check before the engine opens: a directory that carries the store marker
+/// ([`STORE_MARKER`]) must hold a `CURRENT` that parses, or it is a lost store.
+/// A directory without the marker passes, whatever else it holds: the engine
+/// decides whether that is a fresh store or one it refuses (D-024).
+///
+/// # Errors
+///
+/// `InvalidData` carrying a [`LostState`] with [`Damage::MarkedCurrentMissing`]
+/// or [`Damage::MarkedCurrentUnreadable`]; otherwise the filesystem's.
+// PROPOSED(D-041): the crash-safe adoption and the store identity marker.
+pub async fn refuse_lost_store<E: Environment>(env: &E, engine_dir: &Path) -> io::Result<()> {
+    if !marked(env, engine_dir).await? {
+        return Ok(());
+    }
+    match read_whole(env, &manifest::current_path(engine_dir)).await? {
+        None => Err(LostState::from_damage(Damage::MarkedCurrentMissing).into_io()),
+        Some(bytes) if manifest::parse_current(&bytes).is_none() => {
+            Err(LostState::from_damage(Damage::MarkedCurrentUnreadable).into_io())
+        }
+        Some(_) => Ok(()),
+    }
+}
+
+/// Writes the store marker ([`STORE_MARKER`]) into `engine_dir`, synced, with the
+/// directory synced after, unless it is already there. Called only after the
+/// engine and the store have opened successfully, so a directory is marked as a
+/// store once it has been one: a fresh directory at its first open, or a store
+/// from before the marker existed at its next.
+///
+/// # Errors
+///
+/// The filesystem's.
+// PROPOSED(D-041): the crash-safe adoption and the store identity marker.
+pub async fn mark_store<E: Environment>(env: &E, engine_dir: &Path) -> io::Result<()> {
+    if marked(env, engine_dir).await? {
+        return Ok(());
+    }
+    let fs = env.fs();
+    let file = fs
+        .open(
+            &marker_path(engine_dir),
+            OpenOptions::new().write(true).create(true),
+        )
+        .await?;
+    file.write_at(0, Bytes::from_static(b"ananke raft store\n"))
+        .await?;
+    file.sync().await?;
+    fs.sync_dir(engine_dir).await
+}
+
 /// The last snapshot, as `0 / 3 / snapshot` records it (RAFT.md §3): written into
 /// the live store before its checkpoint is taken, so the checkpoint carries its own
 /// identity before its `CURRENT`; written by an install's repair with the identity
@@ -224,6 +425,13 @@ pub struct SnapshotRecord {
     pub dir: String,
     /// Whether the snapshot was taken here rather than installed.
     pub taken: bool,
+    /// The store's take counter as of this record: every take numbers its own
+    /// directory with the next count, so two takes at one index are two
+    /// directories and a restart continues the numbering. Zero for a store that
+    /// never took one, and after an install, whose versions start over; a name
+    /// that recurs after an install is an empty directory by then, swept before
+    /// the incarnation's tasks run. PROPOSED(D-043).
+    pub take: u64,
 }
 
 /// What [`RaftStore::open`] found beside the store itself.
@@ -244,6 +452,8 @@ pub(crate) fn encode_snapshot_record(record: &SnapshotRecord) -> Bytes {
     out.put_u64_le(record.last_index);
     out.put_u64_le(record.last_term);
     out.put_u8(u8::from(record.taken));
+    // PROPOSED(D-043): the take counter rides between the flag and the directory.
+    out.put_u64_le(record.take);
     out.put_u32_le(u32::try_from(record.dir.len()).expect("directory fits u32"));
     out.put_slice(record.dir.as_bytes());
     put_payload(&mut out, &Payload::Config(record.config.clone()));
@@ -251,7 +461,7 @@ pub(crate) fn encode_snapshot_record(record: &SnapshotRecord) -> Bytes {
 }
 
 pub(crate) fn decode_snapshot_record(mut bytes: Bytes) -> io::Result<SnapshotRecord> {
-    if bytes.len() < 21 {
+    if bytes.len() < 29 {
         return Err(bad("snapshot record"));
     }
     let last_index = bytes.get_u64_le();
@@ -261,6 +471,7 @@ pub(crate) fn decode_snapshot_record(mut bytes: Bytes) -> io::Result<SnapshotRec
         1 => true,
         _ => return Err(bad("snapshot record malformed")),
     };
+    let take = bytes.get_u64_le();
     let len = bytes.get_u32_le() as usize;
     if bytes.len() < len {
         return Err(bad("snapshot record torn"));
@@ -278,6 +489,7 @@ pub(crate) fn decode_snapshot_record(mut bytes: Bytes) -> io::Result<SnapshotRec
         config,
         dir,
         taken,
+        take,
     })
 }
 
@@ -293,6 +505,10 @@ pub struct RaftStore<E: Environment> {
     last_index: AtomicU64,
     /// The applied index on disk, written by [`apply`](Self::apply) only.
     applied: AtomicU64,
+    /// The store's incarnation number: fixed for the life of the store, since
+    /// only an install's repair writes it, and that builds a new store.
+    // PROPOSED(D-042): store incarnations.
+    incarnation: u64,
 }
 
 impl<E: Environment> RaftStore<E> {
@@ -331,6 +547,19 @@ impl<E: Environment> RaftStore<E> {
             Some(bytes) => Some(decode_snapshot_record(bytes)?),
         };
         let quarantined = engine.get(&quarantine_key()).await?.is_some();
+        // The incarnation number: a fresh store starts at the first and writes
+        // it here, synced, so every store carries the key explicitly; an
+        // installed store carries the one its repair wrote.
+        // PROPOSED(D-042): store incarnations.
+        let incarnation = match engine.get(&incarnation_key()).await? {
+            Some(bytes) => decode_incarnation(bytes)?,
+            None => {
+                let mut first = WriteBatch::new();
+                first.put(incarnation_key(), encode_incarnation(FIRST_INCARNATION));
+                engine.write(first, true).await?;
+                FIRST_INCARNATION
+            }
+        };
         let snap_index = record.as_ref().map_or(0, |r| r.last_index);
         let snapshot = engine.snapshot();
         let start = key(RAFT_TENANT, LOG_TABLE, &[]);
@@ -383,6 +612,7 @@ impl<E: Environment> RaftStore<E> {
                 first_index: AtomicU64::new(snap_index + 1),
                 last_index: AtomicU64::new(last_index),
                 applied: AtomicU64::new(applied),
+                incarnation,
             },
             Recovered {
                 log,
@@ -411,6 +641,14 @@ impl<E: Environment> RaftStore<E> {
     #[must_use]
     pub fn applied(&self) -> Index {
         self.applied.load(Ordering::Acquire)
+    }
+
+    /// The store's incarnation number (RAFT.md §3): what this server's
+    /// AppendEntries and InstallSnapshot responses carry.
+    // PROPOSED(D-042): store incarnations.
+    #[must_use]
+    pub fn incarnation(&self) -> u64 {
+        self.incarnation
     }
 
     /// The first log index on disk: one past the snapshot's last.
@@ -566,6 +804,21 @@ pub(crate) fn encode_applied(applied: Index) -> Bytes {
 fn decode_applied(mut bytes: Bytes) -> io::Result<Index> {
     if bytes.len() != 8 {
         return Err(bad("applied index value"));
+    }
+    Ok(bytes.get_u64_le())
+}
+
+/// The value under the incarnation key.
+// PROPOSED(D-042): store incarnations.
+pub(crate) fn encode_incarnation(incarnation: u64) -> Bytes {
+    let mut out = BytesMut::with_capacity(8);
+    out.put_u64_le(incarnation);
+    out.freeze()
+}
+
+fn decode_incarnation(mut bytes: Bytes) -> io::Result<u64> {
+    if bytes.len() != 8 {
+        return Err(bad("incarnation value"));
     }
     Ok(bytes.get_u64_le())
 }
