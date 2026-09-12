@@ -55,6 +55,16 @@ Deferred ideas are GitHub issues labelled by phase; [docs/BACKLOG.md](docs/BACKL
   test (`Journal::sync_dir_on_rotate`, the WAL's variants), a scenario `Report::check`
   that expects different things of each, and a sweep test that asserts both. Ship the
   correct default.
+- **A pinned seed asserts its mechanism, never just green.** A test that pins a seed a
+  sweep found must assert the specific thing the seed was pinned for: that the
+  buggy variant still fails it with the violation it was pinned for, and that the
+  correct server's trace still reaches the situation the fix handles; or, when a
+  later change has moved the seed's schedule away from that situation, that the
+  situation is absent — asserted, with the reason in the comment — so the day the
+  schedule reaches it again the test says so and the pin can be upgraded. A bare
+  `check().unwrap()` on a pinned seed proves only that the seed is green. A seed's
+  schedule moves whenever a fault arm is added, a record changes size or a draw
+  changes, so a pin that asserts only green silently stops meaning anything.
 - **Every published crate carries copies of `LICENSE-MIT` and `LICENSE-APACHE`** in
   its own directory (copies, not symlinks) so `cargo package` bundles them.
 - **Prefer boring, well-documented Rust.** This is a project meant to be read.
