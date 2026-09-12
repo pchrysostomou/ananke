@@ -1976,25 +1976,69 @@ member for the membership path, not a re-seed. `RaftRecovered` gains a field,
 wherever it saw a refusal. The core-level scenario is in
 `crates/ananke-raft/tests/paper.rs`.
 
-Seed 5909 is now pinned under each variant alone, and what the pin records is
-that it passes under each: on this tree `raft::run(5909, IgnoreIncarnation)`
-and `raft::run(5909, SharedSnapshotDir)` both check clean, and so does the
-correct server. That is a structural limit of the variant mechanism, not a gap
-in the seed. The nightly's wedge needed both bugs at once — with D-043's fix in
-place the pinned stream completes and the cluster commits through the follower
-being fed, though the leader's `matched` for the re-seeded one is stale, and
-with this entry's fix in place the re-seeded follower's incarnation resets that
-`matched` and the cluster commits through it, though the other follower's
-stream is scrambled — and `Variant` is a single enum on `RaftConfig`, so no run
-of the sweep can put both in one server. A variant that is both would be a new
-known-buggy server and a new decision; it is not taken here, and it is what a
-future entry would have to argue for. The seed's schedule has diverged as well,
-several times over: this entry's own eight-byte record change moved every
-checkpoint, and D-041, D-044 and the re-take arm have each re-drawn the fault
-list since, so seed 5909 on this tree draws neither a snapshot crash nor an
-adoption storm nor a re-take arm at all. The pin is worth keeping as a seed
-held green and worth nothing as a replay, and it says so. Every site is marked
-`PROPOSED(D-042)`.
+**Amended under PROPOSED D-045.** `Variant` is a set now, so the run this entry
+said no sweep could make — one server carrying this bug *and* D-043's at once —
+is a run the sweep makes. Four things it settles.
+
+*Neither fix alone was the fix for 5909.* The nightly's wedge needed both of its
+conditions at once, because a leader needs only *one* countable follower for a
+majority: this entry's stale `matched` for the re-seeded follower, *and* D-043's
+never-completing stream to the other one. Each entry removes one of the two, and
+removing either is enough for the cluster to commit — with D-043's fix the
+pinned stream completes and the cluster commits through the follower being fed
+though `matched` for the re-seeded one is stale; with this entry's fix the
+incarnation resets that `matched` and the cluster commits through the re-seeded
+follower though the other's stream is scrambled. So neither entry is *the* fix
+for 5909, and neither claims to be. **The combined variant
+`{IgnoreIncarnation, SharedSnapshotDir}` is the negative control for that
+wedge**; each single variant is the control for its own half and never was a
+control for the whole.
+
+*Seed 5909 itself still does not reach the wedge, under the pair as under each
+single.* Measured on this tree in release: `raft::run(5909, Variants::of(&[
+IgnoreIncarnation, SharedSnapshotDir]))` checks clean, exactly as both singles
+and the correct server do. That is a seed whose schedule has moved, not a bug
+that has gone: this entry's own eight-byte record change moved every checkpoint,
+and D-041, D-044 and the re-take arm have each re-drawn every seed's fault list
+since, so 5909 on this tree draws neither a snapshot crash nor an adoption storm
+nor a re-take arm at all, and no leader ever re-takes under a running stream on
+it whatever bugs it carries. The pin stays a seed held green and is still worth
+nothing as a replay.
+
+*The set bought no new catch at the thousand-seed tier, and that is reported
+rather than dressed up.* Swept over seeds 0..1000 in release, all three servers
+on every seed: the pair is caught on **1 of 1000** — seed 680, by the liveness
+check — `IgnoreIncarnation` alone on **0 of 1000**, `SharedSnapshotDir` alone on
+**1 of 1000**, and that is the same seed 680 with the byte-identical message
+(`no client write completed after the last heal at 28.683 s`). Seeds where the
+pair is caught and *neither* single is: **0 of 1000**. So the
+combined variant is not yet shown to catch anything the stream half does not
+catch alone, and the negative control it provides for 5909's shape is a
+mechanism that now exists and a claim the sweep has not yet been able to
+discharge at the tiers run here — which is the honest reading and the one
+recorded. The reason it is hard is D-043's own: the wedge needs a stream that
+*never completes*, which needs a take to land on the very directory a live
+stream has open, and that coincidence is what is rare; once it happens the
+stream half alone already stalls the commit, and this entry's stale `matched`
+has nothing left to add.
+
+*`IgnoreIncarnation` alone stays a coverage claim — defence in depth, and the
+owner's decision.* Measured over a thousand release seeds on this tree: caught
+on **0 of 1000**, with **0** progress resets, and the precondition the wedge is
+built on — a refused follower re-seeded and applying again — reached on **637 of
+1000**, where the correct server needs a reset per refusal and this leader
+traces none. Once D-043 holds, this bug on its own is **a delay, not a wedge**:
+the stream to the other follower completes, that follower is countable within an
+install, and the leader commits through it while the stale `matched` for the
+re-seeded one costs that follower a probe walk rather than the cluster a commit.
+It is kept because the day something else makes the second follower uncountable
+— another bug, another fault arm, a schedule nobody has drawn — the stale
+`matched` is a wedge again, and because the fix is cheap while its absence is
+invisible until then. The variant ships and its test is not ignored (CLAUDE.md);
+what it asserts is what is true of it, and the rate is printed at every tier so
+the day it stops being zero is visible.
+
+Every site is marked `PROPOSED(D-042)`.
 
 ---
 
@@ -2217,6 +2261,30 @@ reaching its stream — and a nightly whose ten thousand seeds never catch it is
 still a hole in the sweep to report rather than a variant to delete (RAFT.md §5),
 the more so because this branch has re-drawn every schedule again.
 
+**Amended under PROPOSED D-045.** `Variant` is a set now, so the sweep can run
+one server carrying this entry's bug and D-042's at once, which is what the
+nightly's seed 5909 was. Neither fix alone was the fix for 5909: the wedge
+needed both of its necessary conditions — a stream that never completes to one
+follower (this entry) and a stale `matched` for the other, re-seeded one (D-042)
+— because a leader needs only one countable follower for a majority, so either
+fix alone lets the cluster commit and either variant alone leaves a cluster that
+recovers. **The combined variant `{IgnoreIncarnation, SharedSnapshotDir}` is the
+negative control for that wedge**; this entry's variant is the control for the
+stream half of it and never was a control for the whole.
+
+What the pair measures on this tree is reported as measured. Over seeds 0..1000
+in release the pair is caught on 1 of 1000 and this entry's variant alone on 1
+of 1000, and it is the *same* seed 680 with the byte-identical liveness message;
+`IgnoreIncarnation` alone is caught on 0 of 1000; and the seeds where the pair
+is caught and neither single is number 0 of 1000. That is
+consistent with this entry's own account of why the catch is rare: the wedge
+needs a stream that never completes, which needs a take to land on the very
+directory a live stream has open, and once that coincidence happens the stream
+half alone already stalls the commit for longer than the bound, leaving D-042's
+stale `matched` nothing to add. The pair costs the sweep nothing it was not
+already paying and is the only run that can ever be the nightly's server; it
+stays, and its rate is reported beside this entry's own.
+
 ---
 
 ## PROPOSED D-044 — A refusal is durable, and a refused engine does no work
@@ -2386,4 +2454,267 @@ still quiesced: a variant turns off its own fix and no other.
 
 ---
 
-_Next entry: D-045. Add one before implementing anything not covered above._
+## PROPOSED D-045 — A variant is a set
+
+**Context.** Round two's finding, recorded at the end of PROPOSED D-042 and in
+PROPOSED D-043: the nightly's seed 5909 (run 34496762339) wedged the cluster
+because *two* bugs held at once — the leader's `matched` for a re-seeded
+follower stood above its rebuilt log (D-042) and the snapshot stream to the
+other follower never completed (D-043) — and either fix alone removes one of
+the two necessary conditions, because a leader needs only *one* countable
+follower for a majority. `Variant` was a single enum on `RaftConfig`, so no run
+of the sweep could put both bugs in one server. The sweep therefore had a
+negative control for each half of that wedge and none for the wedge itself, and
+both round-two entries had to record the gap as a structural limit of the
+mechanism rather than close it. The owner's decision after that finding, which
+this entry records: `Variant` becomes a set.
+
+**Decision.** Five parts, every site marked `PROPOSED(D-045)`.
+
+*The vocabulary stays.* `Variant` remains what it was: the enum of single bugs,
+one arm per rule broken, each with its reference and its `PROPOSED(D-0xx)`
+marker. No variant's meaning changes here, and no variant is added or removed.
+`Variant::BUGS` lists the buggy arms in declaration order — `Variant::Correct`
+is not among them, because the correct server is the *absence* of every bug
+rather than a bug of its own — and `Variant::bit` maps each arm to a distinct
+bit by an exhaustive match, so a variant added later does not compile until it
+has been given one.
+
+*The set.* `Variants(u32)`: a `Copy` bitmask struct with `Variants::correct()`,
+`of(&[Variant])`, `contains(Variant)`, `with(Variant)`, `is_correct()`, `len`,
+`is_empty` and `iter`, all but `iter` `const`. The empty set is the correct
+server, so `Variants::default()` is correct and a `RaftConfig::default()`
+carries no bug. Asking a set whether it `contains(Variant::Correct)` asks
+whether it is empty: `Variant::Correct` contributes no bit, so it is the only
+answer consistent with `Variants::of(&[Variant::Correct])` being the correct
+server, and it is the conservative one — it can never report a bug that is not
+there. A bitmask rather than a collection because this is read on a path the
+core walks every step: no allocation, no hashing, `Copy` so the server's tasks
+each hold their own, and deterministic by construction. `HashSet` is banned
+outside `ananke-env` anyway (D-014), and a `BTreeSet<Variant>` would cost an
+allocation and a `Clone` for a set that never exceeds a handful of members.
+
+*The composition.* A set turns off exactly the fixes of its members and no
+others: every `contains` site reads one variant's bit and nothing else, so a
+server carrying two bugs is the server carrying each of them, with no third
+behaviour introduced between them. That is the conservative reading and the
+only one the existing sites support — each was already written as "this variant
+turns off its own fix and no other" (D-044) — and it is what makes the pair a
+negative control for the wedge rather than a new server to be argued for.
+
+*The config and its sites.* `RaftConfig::variant: Variant` becomes
+`RaftConfig::variants: Variants`, and every comparison — `core.rs`, `node.rs`,
+`snapshot.rs` — becomes `variants.contains(Variant::X)`, `!= ` becoming
+`!...contains(...)`. The `Server` and `Assembler` fields and the `apply` task's
+parameter follow the config's type. Nothing is serialized: the bits appear on
+no wire frame and in no trace event, so the numbering is an implementation
+detail free to change with the enum.
+
+*The call sites.* `sim::raft::run`, `run_with`, `node_config`, their
+`sim::membership` twins, `snapshot::Assembler::new`, `adopt_staged_under` and
+the core tests' `config` helpers take `impl Into<Variants>`, and
+`From<Variant> for Variants` converts, so the roughly thirty existing
+`raft::run(seed, Variant::Correct)` call sites compile unchanged and a single
+variant stays as short to write as it was. `Report::variant` becomes
+`Report::variants`, and `Variants`' `Debug` is written by hand rather than
+derived, because the sweep's rate lines print it: `Correct` for the empty set,
+`{IgnoreIncarnation, SharedSnapshotDir}` for a pair.
+
+**Alternatives.** *A combined variant enum arm* — one `Variant` arm meaning
+both bugs. It is the smallest change and it was rejected: every pair worth
+testing needs its own arm, which is quadratic in a list already fourteen long,
+each arm must be threaded through every `==` site it participates in, and each
+would be a new known-buggy server to document rather than a composition of two
+documented ones. *A second config flag* beside `variant`, holding an optional
+extra variant: it makes two the maximum by construction, leaves two fields that
+can disagree about the same bug, and asks every site which of them to read.
+*A `Vec<Variant>` or `BTreeSet<Variant>` on the config*: the same expressiveness
+as the bitmask, at an allocation and a `Clone` per server and a linear scan on a
+path walked every step, with `HashSet` banned outside `ananke-env` (D-014).
+*Leaving it alone and recording the gap*, which is what round two did: it is
+honest, and it leaves the sweep without a negative control for a wedge that has
+already happened once in a nightly.
+
+**Consequences.** `RaftConfig` gains a renamed field: `variant: Variant` becomes
+`variants: Variants`, which every construction of a config outside a
+`..RaftConfig::default()` must follow, and `Report::variant` becomes
+`Report::variants` for both scenarios. Nothing else about any server changes.
+The bits reach no wire frame and no trace event, so no trace hash moves and no
+schedule is re-drawn by this entry — the check that says so is that the numbers
+this branch measures for the existing variants are the numbers round two
+measured: `IgnoreIncarnation` reaches its precondition on 637 of 1000 release
+seeds and traces 0 progress resets, and `SharedSnapshotDir` is caught on seed
+680 alone of the first thousand, both unchanged. A variant added later does not
+compile until `Variant::bit` and `Variant::BUGS` have been given it, which is
+the point of the exhaustive match; the set is a `u32`, so the vocabulary may
+reach thirty-two arms before the width is a decision to revisit.
+
+What the mechanism bought, measured rather than assumed, is one run that could
+not be made before and can be made now — a server carrying `IgnoreIncarnation`
+and `SharedSnapshotDir` at once, the server the nightly's seed 5909 was — and
+the honest report of what that run does at the tiers run here. Seed 5909 itself
+passes under the pair, as it does under each single and under the correct
+server, because its schedule has moved several times since the nightly (D-042's
+amendment). Over seeds 0..1000 in release the pair is caught on 1 of 1000, seed
+680 by the liveness check; `SharedSnapshotDir` alone is caught on the same seed
+with the byte-identical message; `IgnoreIncarnation` alone on none; and the
+seeds where the pair is caught and neither single is number 0 of 1000. So
+this entry ships a mechanism and a negative control that the
+sweep has not yet been able to distinguish from its stream half, and says so:
+the set is the thing that makes the distinction *askable*, and the question is
+now asked at every tier and printed, where before it could not be posed at all.
+The combined variant is pinned on the seed the sweep does catch it on rather
+than asserted over a sweep tier, so no tier is made flaky by it, and the pair
+rule holds on that seed as everywhere: the correct server passes it.
+
+Three questions the documents did not answer, taken conservatively and recorded
+here. A set containing `Variant::Correct` is the correct server rather than a
+server with an extra bug, and `contains(Variant::Correct)` answers whether the
+set is empty: the only reading under which `Correct` keeps meaning "no bug", and
+the one that can never report a bug that is not there. A set's behaviour is the
+conjunction of its members' and nothing more — each `contains` site reads one
+bit — so composing two variants introduces no third server to document. And the
+bit numbering is an implementation detail, because it is persisted nowhere; if
+it ever reaches a trace or a frame, that is a new decision.
+
+---
+
+## PROPOSED D-046 — The sweep's safety re-check keeps its state
+
+**Context.** `sim/raft.rs`'s `advance` runs a seed in fifty-millisecond slices and,
+every tenth slice, ran every safety fold over the trace from its first record:
+
+```rust
+let events: Vec<TraceEvent> = sim.trace().into_iter().map(|r| r.event).collect();
+let verdict = invariants::all(&events)
+    .and_then(|()| invariants::commit_majority(&events, SERVERS as usize));
+```
+
+Each look copied the whole trace — tens of thousands of `TraceRecord`s with their
+message payloads — and rebuilt every check's state from nothing: the log of every
+server, the leaders per term, the committed set, the applied map, the snapshot
+floors, the configuration in force. A run that looks L times at a trace that grows
+to N records pays O(L·N), and L grows with the run, so a seed's checking cost is
+quadratic in its length. `invariants::all` multiplied the constant: six checks, four
+of which replay the logs, replayed them four times per look, and `commit_majority`
+a fifth.
+
+The measurement on `main` at 37e3bad: the raft test binary took **1647.92 s at a
+thousand seeds** and `scripts/premerge.sh` **29 minutes**, against a 667 s binary
+before the stage-E snapshot work, which lengthened runs and so lengthened every
+look; attribution at a hundred seeds put about 62% of the cost in the storm-free
+sweep, whose dominant frames were `Vec<TraceRecord>::clone`, the drops of those
+clones, and `Logs::replay` (issue #25).
+
+Nothing in the checks needs the rebuild. RAFT.md §2 states log matching
+inductively — the check at an append reads the logs as they stand, and no earlier
+append is re-examined — and every other check is a left fold over the events with
+no lookahead. The state of a check after k events is all it needs to consume event
+k+1.
+
+**Decision.** `invariants::Checker` is every check of the module with the state of
+each kept across calls: `Checker::new(servers)`, `push(&TraceEvent)`,
+`extend(events)` and `verdict()`. `advance` keeps one checker per run and feeds it
+`Sim::trace_from(checked)` — the records since its last look (D-044) — so a look
+costs its own new events and a run costs its trace once. The membership scenario's
+`advance` does the same.
+
+*One implementation.* `all` and `commit_majority` keep their signatures and their
+meaning and are now the checker driven over the events and asked for one verdict, so
+there is one fold per check in the workspace and no second copy to drift. The
+checker also replays the logs once for the four checks that read them instead of
+once each, and follows who leads once for the three checks that ask.
+
+*A verdict per check, latched.* Each check holds `None` until its first violation
+and its message afterwards, and consumes no further events once it has one: a fold
+returns at its first violation, so no later event can change its answer.
+`verdict()` reports the first violation in the order `all` ran the checks, the
+commit-majority check last, which is what `all(events).and_then(|()|
+commit_majority(events, servers))` reported. This is why `push` returns nothing: a
+slice of events has no verdict of its own, since `all` reports the first violation
+in *its* order of the checks and not the earliest violation in the trace — an
+election safety violation at the last event outranks a log matching violation at the
+first — and only a look at every check at once can answer. A replay error, which
+`Logs::replay` raises for two snapshots that disagree at one index, is the first
+violation of every check that reads the logs and is recorded as such in each.
+
+*The equivalence test.* `the_incremental_checker_agrees_with_the_fold_over_the_whole
+_trace` runs a hundred seeds — the gate's twenty at the gate's tier — and, at eight
+prefixes of each run's trace, compares the verdict of a checker fed that trace in
+chunks of 37 events against `all` and `commit_majority` folded over the whole prefix
+from the first record: the same `Ok` or `Err`, and when `Err`, the same words. A
+quarter of the seeds run each of `TruncateOnEveryAppend`, `SendBeforePersist` and
+`CountOlderTermForCommit`, whose violations three different checks report, and the
+test asserts that some compared prefix was in violation, so a comparison that agreed
+only on `Ok` fails rather than passes.
+
+*Three other whole-trace scans per slice.* `install_landing` and `install_completed`
+copied the whole trace every five milliseconds of their watch and looked at its
+tail; they now read `trace_from` like `stream_opened` and `flush_in_flight` already
+did (D-044). `leader_now`, which every fault round asks for the latest `RaftLeader`,
+copied the whole trace to read backwards over it; it now reads back over the tail in
+windows that double until one holds a leader, which is the same answer.
+
+**Alternatives.** Checking only at the end of a run: a violation would be reported
+at the end of a trace rather than near the event that caused it, the run would keep
+going after it and the runaway a buggy variant produces would be bounded only by the
+trace cap, which is the reason the periodic check exists. Checking a sample of the
+slices, or raising `CHECK_EVERY`: it buys a constant factor and keeps the quadratic,
+and it moves a violation's report further from its cause. Keeping the folds and
+copying the trace once per run instead of once per look: the copy is only part of
+the cost, the replays are the rest. Keeping the old folds as a second implementation
+for the equivalence test to compare against: two implementations of a safety check
+is how one of them comes to be wrong, and the comparison against the folds as they
+stood at 37e3bad was run once, over a hundred seeds and twelve variants at eight
+prefixes each, before this branch's first commit rather than for ever after. An
+incremental `leader_completeness` that stops re-scanning the committed set at every
+election, and an incremental `change_complete` in the membership driver: both are
+linear in the run rather than in the slice, neither showed in the profile, and this
+entry is about the quadratic.
+
+**Consequences.** The raft test binary at a thousand seeds falls from **1647.92 s
+to 327.57 s** on the same machine, five times faster, and `scripts/premerge.sh`
+from **29 minutes to 7 minutes 26 seconds**, under the fifteen the owner asked for;
+every sweep is green at a thousand seeds and every variant is caught at its
+established rate, the rates identical to the run before. (The binary's figure is
+the one the premerge's own run reports too, 333.62 s; a third measurement said
+946.98 s and was taken while another agent's sweep had the eight-core machine at a
+load average of fifty, which is what a sweep measured on a busy laptop looks like.)
+A `sample` profile of the binary at three hundred seeds, 184 938 busy samples of
+396 029, says what the remaining time is:
+
+| what | share of busy samples |
+| --- | --- |
+| the allocator | 24.4% |
+| the simulator and the server under it, everything not named below | 33.9% |
+| `std::path` comparison, the simulated filesystem's `BTreeMap<PathBuf, _>` | 11.5% |
+| `moirae_trace` JSON and `core::fmt`, the run's JSONL export | 6.9% |
+| `memmove`/`memcpy`/`memset`/`memcmp` | 7.4% |
+| `Sim::trace_from` | 4.6% |
+| `Report::check`'s own scans and the linearizability search | 4.6% |
+| **`invariants::Checker`** | **3.9%** |
+| `Vec<TraceRecord>::clone`, the copies that remain | 2.7% |
+
+What is left is the simulation, not the checking. Two costs this entry does not
+touch and that the next measurement should look at, both outside issue #25: every
+run builds its moirae JSONL export whether or not it is written, which is the 6.9%
+of `moirae_trace` and most of the `core::fmt` beside it; and
+`Report::isolation_keeps_the_term` scans the whole trace once per isolation at the
+end of every run, a linear scan of a time-ordered trace that a binary search on
+`TraceRecord::at` would bound (5442 samples on its own). Both want a backlog issue,
+not a widening of this one.
+
+The checker is public API: `invariants::Checker`, with `new`, `push`, `extend` and
+`verdict`. Every check stays a function of the trace alone, so a failing seed still
+replays in the studio and the pinned seeds' message fragments still hold. A run now
+holds one checker's state for its whole length — the logs, the applied map and the
+committed set, which the old folds built and dropped at every look — so a seed's
+peak memory is a little higher and its allocation rate much lower. `Report::check`
+still folds `all` and `commit_majority` from the first record at the end of every
+run, over the whole trace, which is a second opinion on the incremental verdict on
+every seed of every sweep: an incremental checker that missed a violation would be
+caught there, on every seed, as a run that passed the slices and failed at the end.
+
+---
+
+_Next entry: D-047. Add one before implementing anything not covered above._

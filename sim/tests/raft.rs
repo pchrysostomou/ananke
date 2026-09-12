@@ -9,7 +9,8 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use ananke_env::{ClientOp, DropReason, TraceEvent};
-use ananke_raft::core::Variant;
+use ananke_raft::core::{Variant, Variants};
+use ananke_raft::invariants::{self, Checker};
 use ananke_raft::store::STORE_MARKER;
 use ananke_sim::raft::DRIFT_BOUND_PPM;
 use ananke_sim::raft::{self, Fault};
@@ -98,9 +99,11 @@ fn seed_5909_which_the_nightly_found_stays_green() {
     raft::run(5909, Variant::Correct).check().unwrap();
 }
 
-/// Seed 5909 under each of the two variants whose bugs wedged it, pinned to what
-/// it actually does on this tree, which is pass. That is the finding, not an
-/// oversight, and it is a structural one.
+/// Seed 5909 under each of the two variants whose bugs wedged it, and under both
+/// of them at once, pinned to what it actually does on this tree, which is pass.
+/// That is the finding. Round two could only report it of the two variants
+/// separately and had to record the pair as a run the mechanism could not make;
+/// PROPOSED D-045 makes it, and the answer is the same.
 ///
 /// The nightly's wedge needed both bugs at once: the leader re-took the same
 /// snapshot 329 into the one directory server 2's stream was reading, so that
@@ -111,33 +114,104 @@ fn seed_5909_which_the_nightly_found_stays_green() {
 /// completes and the cluster commits through server 2 though the leader's
 /// `matched` for server 3 is stale, and with D-042's fix in place server 3's
 /// incarnation resets that `matched` and the cluster commits through server 3
-/// though server 2's stream is scrambled. `Variant` is a single enum on
-/// `RaftConfig`, so no run of this sweep can put both bugs in one server; a
-/// variant that is both would be a new known-buggy server and a new decision,
-/// which this branch does not take (see PROPOSED D-042 and D-043's amended
-/// Consequences).
+/// though server 2's stream is scrambled. So a server carrying one of the two
+/// bugs is not the server the nightly caught, and the run that is — one
+/// carrying both — is `Variants::of(&[IgnoreIncarnation, SharedSnapshotDir])`,
+/// which `Variant` as a single enum on `RaftConfig` could not express (PROPOSED
+/// D-045's Context).
 ///
-/// The schedule is a second, independent reason not to read this as a
-/// reproduction. The nightly's trace for 5909 is already unreachable on this
-/// branch — D-043 grew the snapshot record by eight bytes, which moves every
-/// flush and every checkpoint's file set — and D-041, D-044 and this branch's
-/// own arm have each re-drawn the fault list since. On this tree seed 5909 draws
-/// three Figure 8 drivers, two crashes, an isolation and the refusal storm, and
-/// neither a snapshot-crash nor an adoption storm nor a re-take arm at all. So
-/// this is a pin that holds a seed green, worth keeping as the nightly's seed
-/// and worth nothing as a replay. The shapes themselves are carried by the
-/// variants' own sweep tests below, and what those can and cannot see is
-/// recorded there.
+/// It can be expressed now, and seed 5909 still passes it. The reason is the
+/// schedule, which is the second and independent reason this seed was never
+/// going to replay. The nightly's trace for 5909 has been unreachable on this
+/// branch since D-043 grew the snapshot record by eight bytes, which moves every
+/// flush and every checkpoint's file set, and D-041, D-044 and the re-take arm
+/// have each re-drawn the fault list since. On this tree seed 5909 draws three
+/// Figure 8 drivers, two crashes, an isolation and the refusal storm, and
+/// neither a snapshot-crash nor an adoption storm nor a re-take arm at all — so
+/// the leader never re-takes under a running stream here whatever bugs it
+/// carries, and there is no wedge for the pair to reach.
+///
+/// So this stays a pin that holds a seed green, worth keeping as the nightly's
+/// seed and worth nothing as a replay. The replay is the pinned seed below,
+/// which the pair does wedge and neither single does.
 #[test]
-fn seed_5909_passes_under_each_variant_alone_which_is_the_finding() {
-    for variant in [Variant::IgnoreIncarnation, Variant::SharedSnapshotDir] {
-        let report = raft::run(5909, variant);
+fn seed_5909_passes_under_both_bugs_together_which_is_the_finding() {
+    for variants in [
+        Variants::from(Variant::IgnoreIncarnation),
+        Variants::from(Variant::SharedSnapshotDir),
+        Variants::of(&[Variant::IgnoreIncarnation, Variant::SharedSnapshotDir]),
+    ] {
+        let report = raft::run(5909, variants);
         assert_eq!(
             report.check().err(),
             None,
-            "seed 5909 under {variant:?} no longer passes: the pin's story is out of date"
+            "seed 5909 under {variants:?} no longer passes: the pin's story is out of date"
         );
     }
+}
+
+/// The combined variant pinned on the seed the sweep does catch it on — seed 680
+/// — and, said plainly, what that seed does not show.
+///
+/// Seed 5909 is the wedge this pair exists for and no longer reaches it (above),
+/// so the pin stands in for it: this is the seed of the first thousand on which
+/// a server carrying `{IgnoreIncarnation, SharedSnapshotDir}` is caught, by the
+/// liveness check, `no client write completed after the last heal at 28.683 s`.
+/// That is a real catch of a real wedge and the pair rule holds on it: the
+/// correct server passes the same seed.
+///
+/// **It is not a seed that needs both bugs.** `SharedSnapshotDir` alone is
+/// caught on seed 680 too, with the byte-identical message, which this test
+/// asserts rather than glosses: the wedge here is the stream half's on its own.
+/// Swept over seeds 0..1000 in release, the pair is caught on 1 of 1000 (this
+/// seed), `SharedSnapshotDir` alone on 1 of 1000 (this seed), `IgnoreIncarnation`
+/// alone on 0 of 1000, and the seeds where the pair is caught and *neither*
+/// single is number 0 of 1000. So what PROPOSED D-045 has
+/// demonstrated is that the run can now be made and what it does can now be
+/// asked; it has not yet demonstrated a wedge that needs both bugs, and this
+/// comment does not claim one.
+///
+/// Why that is hard is PROPOSED D-043's own account: the wedge needs a stream
+/// that *never completes*, which needs a take to land on the very directory a
+/// live stream has open — and once that coincidence happens the stream half
+/// alone already stalls the commit past the bound, leaving D-042's stale
+/// `matched` nothing to add. A seed that needs both would be one where the
+/// stream recovers but the re-seeded follower is uncountable at the same moment.
+/// The day one is found it belongs here beside this seed.
+#[test]
+fn seed_680_pins_the_combined_variant_and_the_stream_half_alone_catches_it_too() {
+    let both = Variants::of(&[Variant::IgnoreIncarnation, Variant::SharedSnapshotDir]);
+    let paired = raft::run(680, both)
+        .check()
+        .expect_err("seed 680 under {both:?} no longer reproduces: the pin's story is out of date");
+    assert!(
+        paired.contains("liveness"),
+        "seed 680 under {both:?} is caught, but not by the liveness check: {paired}"
+    );
+
+    // The honest half of the pin: the stream bug alone reaches the same wedge on
+    // this seed, so 680 is not evidence that the pair is needed.
+    let stream_only = raft::run(680, Variant::SharedSnapshotDir)
+        .check()
+        .expect_err(
+            "SharedSnapshotDir alone no longer catches seed 680: the pin's story is out of date",
+        );
+    assert_eq!(
+        paired, stream_only,
+        "the pair and the stream half alone no longer fail seed 680 the same way: \
+         the pair may now be buying a catch of its own, which is worth recording"
+    );
+
+    // And the other half alone reaches nothing, here as everywhere.
+    assert_eq!(
+        raft::run(680, Variant::IgnoreIncarnation).check().err(),
+        None,
+        "IgnoreIncarnation alone now catches seed 680: the pin's story is out of date"
+    );
+
+    // The pair rule (CLAUDE.md): the correct server passes the seed its buggy
+    // siblings fail.
+    raft::run(680, Variant::Correct).check().unwrap();
 }
 
 /// The thousand-seed premerge's seed 687: server 3's engine open dropped SST 1 —
@@ -186,19 +260,21 @@ fn the_correct_server_passes_every_seed() {
 }
 
 /// The negative controls: each known bug is caught on some seed, and the rate is
-/// reported.
-fn is_caught(variant: Variant) {
-    let caught: Vec<String> = sweep(seeds(), |seed| raft::run(seed, variant).check().err())
+/// reported. Takes a set, so a pair of bugs is asked the same question as one
+/// (PROPOSED(D-045)); the sweep's own list is all single variants.
+fn is_caught(variants: impl Into<Variants>) {
+    let variants = variants.into();
+    let caught: Vec<String> = sweep(seeds(), |seed| raft::run(seed, variants).check().err())
         .into_iter()
         .flatten()
         .collect();
     eprintln!(
-        "{variant:?}: caught on {} of {} seeds, first: {}",
+        "{variants:?}: caught on {} of {} seeds, first: {}",
         caught.len(),
         seeds(),
         caught.first().map_or("", String::as_str)
     );
-    assert!(!caught.is_empty(), "{variant:?} was never caught");
+    assert!(!caught.is_empty(), "{variants:?} was never caught");
 }
 
 #[test]
@@ -1114,4 +1190,90 @@ impl MembershipCoverage {
             }
         }
     }
+}
+
+/// How many seeds the incremental checker is compared over: the hundred the owner
+/// asked for at CI's tier and above, and the gate's twenty at the gate, which is a
+/// twentieth more runs than the gate's raft sweeps already do (PROPOSED D-046).
+fn compared_seeds() -> u64 {
+    seeds().min(100)
+}
+
+/// The servers the comparison runs, one per seed in turn: the correct one, and
+/// three known-buggy ones whose violations three different checks report, so that
+/// the comparison sees `Err` verdicts and the words of their messages and not only
+/// `Ok`.
+const COMPARED: [Variant; 4] = [
+    Variant::Correct,
+    Variant::TruncateOnEveryAppend,
+    Variant::SendBeforePersist,
+    Variant::CountOlderTermForCommit,
+];
+
+/// How many prefixes of a run's trace the two are compared over, the whole trace
+/// being the last of them.
+const PREFIXES: usize = 8;
+
+/// How many events are pushed into the incremental checker at a time: a prime, so
+/// that no prefix the comparison looks at is a boundary the checker was fed on.
+const CHUNK: usize = 37;
+
+/// One run's comparison: at every prefix, the verdict of a checker fed the trace in
+/// chunks against the verdict of the folds over that whole prefix from the first
+/// record — the same `Ok` or `Err` and, when `Err`, the same words. `Ok(true)` if
+/// some prefix was in violation, so the sweep can say the comparison saw one.
+fn compare(seed: u64, variant: Variant, events: &[TraceEvent]) -> Result<bool, String> {
+    let servers = raft::SERVERS as usize;
+    let mut checker = Checker::new(servers);
+    let mut fed = 0;
+    let mut violated = false;
+    for step in 1..=PREFIXES {
+        let stop = events.len() * step / PREFIXES;
+        while fed < stop {
+            let next = (fed + CHUNK).min(stop);
+            checker.extend(&events[fed..next]);
+            fed = next;
+        }
+        let incremental = checker.verdict();
+        let whole = invariants::all(&events[..stop])
+            .and_then(|()| invariants::commit_majority(&events[..stop], servers));
+        violated |= whole.is_err();
+        if incremental != whole {
+            return Err(format!(
+                "seed {seed}: under {variant:?}, over the first {stop} of {} records, the incremental checker said {incremental:?} and the fold over the whole prefix said {whole:?}",
+                events.len()
+            ));
+        }
+    }
+    Ok(violated)
+}
+
+/// The equivalence the sweep's incremental checking rests on (issue #25, PROPOSED
+/// D-046): a checker fed a run's records in chunks as they arrive says exactly what
+/// the folds say over the whole trace from the first record — the same verdict, and
+/// when it is a violation, the same message, at every prefix and on every seed. The
+/// sweep stops a run at the first violation and the pinned seeds assert fragments of
+/// these messages, so a checker that agreed only on `Ok` would be no checker at all;
+/// a quarter of the seeds run each known-buggy server that the checks catch
+/// directly, and the count of prefixes found in violation is printed so a run that
+/// compared nothing but `Ok` is visible.
+#[test]
+fn the_incremental_checker_agrees_with_the_fold_over_the_whole_trace() {
+    let compared = compared_seeds();
+    let outcomes = sweep(compared, |seed| {
+        let variant = COMPARED[seed as usize % COMPARED.len()];
+        compare(seed, variant, &raft::run(seed, variant).events())
+    });
+    let violated = outcomes.iter().filter(|o| matches!(o, Ok(true))).count();
+    eprintln!(
+        "Incremental checker: {compared} seeds compared at {PREFIXES} prefixes each, {violated} of them with a violation to agree on"
+    );
+    let verdicts: Vec<Result<(), String>> = outcomes.into_iter().map(|o| o.map(|_| ())).collect();
+    if let Err(mismatch) = verdict(&verdicts) {
+        panic!("{mismatch}");
+    }
+    assert!(
+        violated > 0,
+        "no compared seed reached a violation: the comparison saw only Ok verdicts"
+    );
 }

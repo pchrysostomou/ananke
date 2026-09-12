@@ -81,7 +81,7 @@ use ananke_storage::sst::{SstReader, SstWriter};
 use ananke_storage::{Value, ikey};
 use bytes::{Bytes, BytesMut};
 
-use crate::core::Variant;
+use crate::core::{Variant, Variants};
 use crate::message::{Message, SnapshotStatus};
 use crate::store::{self, Damage, LostState, RaftStore, SnapshotRecord};
 use crate::types::{Configuration, Entry, Index, Payload, ServerId, Term};
@@ -303,10 +303,10 @@ fn valid_name(name: &[u8]) -> bool {
 /// it refuses one whose recovery lost state. Otherwise the filesystem's, while
 /// replacing the old store; the caller should not open the engine after one.
 pub async fn adopt_staged<E: Environment>(env: &E, engine_dir: &Path) -> io::Result<bool> {
-    adopt_staged_under(env, engine_dir, Variant::Correct).await
+    adopt_staged_under(env, engine_dir, Variants::correct()).await
 }
 
-/// [`adopt_staged`] under `variant`: [`Variant::AdoptionAsBuilt`] runs the
+/// [`adopt_staged`] under `variants`: [`Variant::AdoptionAsBuilt`] runs the
 /// adoption as it was built under D-038, which the sweep must catch (RAFT.md §5);
 /// every other variant runs the crash-safe order.
 ///
@@ -314,12 +314,13 @@ pub async fn adopt_staged<E: Environment>(env: &E, engine_dir: &Path) -> io::Res
 ///
 /// As [`adopt_staged`].
 // PROPOSED(D-041): the crash-safe adoption and the store identity marker.
+// PROPOSED(D-045): a variant is a set.
 pub async fn adopt_staged_under<E: Environment>(
     env: &E,
     engine_dir: &Path,
-    variant: Variant,
+    variants: impl Into<Variants>,
 ) -> io::Result<bool> {
-    if variant == Variant::AdoptionAsBuilt {
+    if variants.into().contains(Variant::AdoptionAsBuilt) {
         return adopt_staged_as_built(env, engine_dir).await;
     }
     let fs = env.fs();
@@ -456,6 +457,7 @@ pub async fn adopt_staged_under<E: Environment>(
 /// `CURRENT` leaves nothing, and the next open — with no marker to say the
 /// directory was a store — is a fresh one (the nightly's seed 6325).
 // PROPOSED(D-041): the crash-safe adoption and the store identity marker.
+// PROPOSED(D-045): a variant is a set.
 async fn adopt_staged_as_built<E: Environment>(env: &E, engine_dir: &Path) -> io::Result<bool> {
     let fs = env.fs();
     let staging = staging_dir(engine_dir);
@@ -847,17 +849,18 @@ struct Stream {
 pub struct Assembler<E: Environment> {
     env: E,
     staging: PathBuf,
-    variant: Variant,
+    variants: Variants,
     stream: Option<Stream>,
 }
 
 impl<E: Environment> Assembler<E> {
     /// An assembler staging under `engine_dir` (see [`staging_dir`]).
-    pub fn new(env: E, engine_dir: &Path, variant: Variant) -> Self {
+    // PROPOSED(D-045): a variant is a set.
+    pub fn new(env: E, engine_dir: &Path, variants: impl Into<Variants>) -> Self {
         Self {
             env,
             staging: staging_dir(engine_dir),
-            variant,
+            variants: variants.into(),
             stream: None,
         }
     }
@@ -932,7 +935,7 @@ impl<E: Environment> Assembler<E> {
         if is_current {
             stream.current_file.extend_from_slice(&data);
         }
-        if !is_current || self.variant == Variant::SnapshotWithoutCurrentLast {
+        if !is_current || self.variants.contains(Variant::SnapshotWithoutCurrentLast) {
             // The buggy variant writes the streamed CURRENT straight to disk: the
             // staging directory then looks complete before the repair is durable,
             // and a crash mid-install adopts the leader's state (RAFT.md §5).

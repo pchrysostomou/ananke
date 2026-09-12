@@ -56,7 +56,8 @@
 //! which the commit-by-current-term fold reports.
 //!
 //! Every fault-model test runs a known-buggy variant beside the correct one
-//! (CLAUDE.md): each [`Variant`] of RAFT.md §5 that this stage ships must be caught
+//! (CLAUDE.md): each [`Variant`](ananke_raft::core::Variant) of RAFT.md §5 that
+//! this stage ships must be caught
 //! by one of these checks on some seed, and the correct server must pass every seed.
 //!
 //! The disk honours `fsync` here (`p_durable = 1`): a disk that acknowledges a sync
@@ -84,7 +85,7 @@ use ananke_env::{
 };
 use ananke_raft::apply::{Command, Outcome};
 use ananke_raft::client::{Reply, Request, Response};
-use ananke_raft::core::{RaftConfig, Variant};
+use ananke_raft::core::{RaftConfig, Variants};
 use ananke_raft::message::{self, Frame, Message};
 use ananke_raft::{NodeConfig, ServerId, invariants, run as run_server};
 use ananke_storage::EngineConfig;
@@ -851,8 +852,10 @@ type SharedStats = Arc<Mutex<ClientStats>>;
 pub struct Report {
     /// The seed.
     pub seed: u64,
-    /// Which server ran.
-    pub variant: Variant,
+    /// Which server ran: the set of known bugs it carried, empty for the correct
+    /// one (PROPOSED D-045).
+    // PROPOSED(D-045): a variant is a set.
+    pub variants: Variants,
     /// How the run was scheduled (D-016).
     pub policy: Policy,
     /// The faults it ran.
@@ -1229,9 +1232,13 @@ pub fn config(seed: u64, schedule: &Schedule) -> SimConfig {
     config
 }
 
-/// The server configuration for `id` under `variant`.
+/// The server configuration for `id` under `variants`: the set of known bugs
+/// this server carries, which a single [`Variant`](ananke_raft::core::Variant)
+/// converts into (PROPOSED D-045).
+// PROPOSED(D-045): a variant is a set.
 #[must_use]
-pub fn node_config(id: u64, variant: Variant) -> NodeConfig {
+pub fn node_config(id: u64, variants: impl Into<Variants>) -> NodeConfig {
+    let variants = variants.into();
     let mut engine = EngineConfig::new(PathBuf::from(DIR));
     engine.memtable_bytes = 16 * 1024;
     engine.segment_bytes = 16 * 1024;
@@ -1260,7 +1267,7 @@ pub fn node_config(id: u64, variant: Variant) -> NodeConfig {
         // install takes many chunks, so resumption under drops actually happens
         // (RAFT.md §1, stage E).
         raft: RaftConfig {
-            variant,
+            variants,
             tick_nanos: u64::try_from(TICK.as_nanos()).expect("small"),
             drift_bound_ppm: DRIFT_BOUND_PPM,
             snapshot_threshold: 12,
@@ -1272,24 +1279,42 @@ pub fn node_config(id: u64, variant: Variant) -> NodeConfig {
     }
 }
 
-fn spawn_server(sim: &Sim, id: u64, variant: Variant) {
+fn spawn_server(sim: &Sim, id: u64, variants: Variants) {
     let env = sim.env(node_of_server(id));
     let inner = env.clone();
     env.spawn("raft", async move {
-        let _ = run_server(inner, node_config(id, variant)).await;
+        let _ = run_server(inner, node_config(id, variants)).await;
     });
 }
 
 /// The leader in force: the server of the latest `RaftLeader` event, or server 1.
+///
+/// Read back over the trace's tail in windows rather than over a copy of the whole
+/// trace (PROPOSED D-046): a fault round asks this of a trace that only grows, and
+/// the answer is almost always within the last few hundred records. A window that
+/// holds no `RaftLeader` doubles until the trace is exhausted, so the answer is the
+/// whole trace's either way.
 pub(crate) fn leader_now(sim: &Sim) -> u64 {
-    sim.trace()
-        .iter()
-        .rev()
-        .find_map(|r| match r.event {
-            TraceEvent::RaftLeader { server, .. } => Some(server),
-            _ => None,
-        })
-        .unwrap_or(1)
+    let len = sim.trace_len();
+    let mut window = 256;
+    loop {
+        let from = len.saturating_sub(window);
+        let found = sim
+            .trace_from(from)
+            .iter()
+            .rev()
+            .find_map(|r| match r.event {
+                TraceEvent::RaftLeader { server, .. } => Some(server),
+                _ => None,
+            });
+        if let Some(server) = found {
+            return server;
+        }
+        if from == 0 {
+            return 1;
+        }
+        window *= 2;
+    }
 }
 
 fn to_command(op: &ClientOp) -> Command {
@@ -1552,15 +1577,21 @@ async fn spread<E: Environment>(env: E, n: u64, target: u64, count: u64) {
     }
 }
 
-/// Runs the scenario for `seed` with the schedule drawn from it.
+/// Runs the scenario for `seed` with the schedule drawn from it, under the set
+/// of bugs `variants` — a single [`Variant`](ananke_raft::core::Variant) or a
+/// [`Variants`] of several
+/// (PROPOSED D-045).
+// PROPOSED(D-045): a variant is a set.
 #[must_use]
-pub fn run(seed: u64, variant: Variant) -> Report {
-    run_with(seed, Schedule::draw(seed), variant)
+pub fn run(seed: u64, variants: impl Into<Variants>) -> Report {
+    run_with(seed, Schedule::draw(seed), variants)
 }
 
 /// Runs the scenario for `seed` with an explicit schedule.
+// PROPOSED(D-045): a variant is a set.
 #[must_use]
-pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
+pub fn run_with(seed: u64, schedule: Schedule, variants: impl Into<Variants>) -> Report {
+    let variants = variants.into();
     let mut sim = Sim::new(config(seed, &schedule));
     let servers: Vec<NodeId> = (0..SERVERS as usize)
         .map(|i| sim.add_node_with_clock(schedule.skews[i], schedule.drifts[i]))
@@ -1569,7 +1600,7 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
     let admin = sim.add_node();
     let stats: Vec<SharedStats> = (0..CLIENTS).map(|_| SharedStats::default()).collect();
     for id in 1..=SERVERS {
-        spawn_server(&sim, id, variant);
+        spawn_server(&sim, id, variants);
     }
     for (i, &node) in clients.iter().enumerate() {
         let env = sim.env(node);
@@ -1593,7 +1624,7 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
     advance(&mut sim, schedule.warmup, &mut watch);
     let restart = |sim: &mut Sim, server: u64| {
         sim.restart(node_of_server(server));
-        spawn_server(sim, server, variant);
+        spawn_server(sim, server, variants);
     };
     // The lease trials: the operator hands leadership to the slowest clock, which
     // leads for a while and is then cut off with client 1; twice, so the variant's
@@ -1955,7 +1986,7 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
     }
     Report {
         seed,
-        variant,
+        variants,
         policy: sim.policy(),
         schedule,
         jsonl: sim
@@ -1974,17 +2005,35 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
 }
 
 /// What the sliced advance watches for.
-#[derive(Default)]
 struct Watch {
     slices: u32,
     stopped: Option<String>,
+    /// The safety checks, one checker for the whole run with the state of each
+    /// check kept across looks, so a look costs only the records since the last
+    /// one (PROPOSED D-046).
+    checker: invariants::Checker,
+    /// How many trace records the checker has been fed.
+    checked: usize,
+}
+
+impl Default for Watch {
+    fn default() -> Self {
+        Self {
+            slices: 0,
+            stopped: None,
+            checker: invariants::Checker::new(SERVERS as usize),
+            checked: 0,
+        }
+    }
 }
 
 /// Advances the run in small slices until `victim` receives the final chunk of a
 /// snapshot stream, or [`INSTALL_WAIT_BUDGET`] runs out: the moment
-/// [`Fault::CrashInstalling`] aims its crash at. The safety folds are skipped
-/// inside the small slices — the next ordinary [`advance`] runs them over
-/// everything — but the trace cap still stops a runaway.
+/// [`Fault::CrashInstalling`] aims its crash at. The safety checks are skipped
+/// inside the small slices — the next ordinary [`advance`] feeds them everything
+/// since its last look — but the trace cap still stops a runaway. The watch reads
+/// the records since its own last look rather than a copy of the whole trace, for
+/// the reason the checker keeps its state (PROPOSED D-046).
 fn install_landing(sim: &mut Sim, watch: &mut Watch, victim: u64) -> bool {
     if watch.stopped.is_some() {
         return false;
@@ -1995,7 +2044,7 @@ fn install_landing(sim: &mut Sim, watch: &mut Watch, victim: u64) -> bool {
     // must not draw the crash. Sends are scanned a slice further back, so a
     // chunk sent just before the watch began still decodes when it lands.
     let mut scanned = sim.trace_len();
-    for record in sim.trace().iter().rev().take(2000) {
+    for record in sim.trace_from(scanned.saturating_sub(2000)).iter().rev() {
         if let TraceEvent::MessageSent { id, payload, .. } = &record.event {
             payloads.entry(*id).or_insert_with(|| payload.clone());
         }
@@ -2012,8 +2061,9 @@ fn install_landing(sim: &mut Sim, watch: &mut Watch, victim: u64) -> bool {
             ));
             return false;
         }
-        let records = sim.trace();
-        for record in &records[scanned..] {
+        let records = sim.trace_from(scanned);
+        scanned += records.len();
+        for record in &records {
             match &record.event {
                 TraceEvent::MessageSent { id, payload, .. } => {
                     payloads.insert(*id, payload.clone());
@@ -2030,7 +2080,6 @@ fn install_landing(sim: &mut Sim, watch: &mut Watch, victim: u64) -> bool {
                 _ => {}
             }
         }
-        scanned = records.len();
     }
     false
 }
@@ -2041,8 +2090,9 @@ fn install_landing(sim: &mut Sim, watch: &mut Watch, victim: u64) -> bool {
 /// out: the moment [`Fault::CrashAdopting`] measures its crash from. Only records
 /// from here on count: the victim was not restarted since the heal, so no
 /// restart's restatement can stand in for the completion. As with
-/// [`install_landing`], the safety folds are skipped inside the small slices and
-/// the trace cap still stops a runaway. PROPOSED(D-041).
+/// [`install_landing`], the safety checks are skipped inside the small slices, the
+/// watch reads only the records since its last look (PROPOSED D-046) and the trace
+/// cap still stops a runaway. PROPOSED(D-041).
 fn install_completed(sim: &mut Sim, watch: &mut Watch, victim: u64) -> bool {
     if watch.stopped.is_some() {
         return false;
@@ -2061,8 +2111,9 @@ fn install_completed(sim: &mut Sim, watch: &mut Watch, victim: u64) -> bool {
             ));
             return false;
         }
-        let records = sim.trace();
-        if records[scanned..].iter().any(|r| {
+        let records = sim.trace_from(scanned);
+        scanned += records.len();
+        if records.iter().any(|r| {
             matches!(
                 &r.event,
                 TraceEvent::RaftSnapshot {
@@ -2074,7 +2125,6 @@ fn install_completed(sim: &mut Sim, watch: &mut Watch, victim: u64) -> bool {
         }) {
             return true;
         }
-        scanned = records.len();
     }
     false
 }
@@ -2254,10 +2304,18 @@ fn adoption_change(sim: &mut Sim, watch: &mut Watch, victim: u64) {
 }
 
 /// Runs the simulation for `duration` in slices of [`SLICE`], running the safety
-/// folds over the trace so far every [`CHECK_EVERY`] slices and stopping at the first
-/// violation, or at [`TRACE_CAP`] records. A buggy server can make the cluster do
-/// unbounded work, a follower that truncates on every append re-fetching its tail
-/// forever, and a run must still end with a verdict.
+/// checks every [`CHECK_EVERY`] slices and stopping at the first violation, or at
+/// [`TRACE_CAP`] records. A buggy server can make the cluster do unbounded work, a
+/// follower that truncates on every append re-fetching its tail forever, and a run
+/// must still end with a verdict.
+///
+/// One [`invariants::Checker`] serves the whole run and is fed only the records
+/// since the last look, so a look costs its own new events and a run costs its
+/// trace once rather than once per look (PROPOSED D-046). What it reports is what
+/// folding every check over the whole trace reports, in the same words:
+/// `the_incremental_checker_agrees_with_the_fold_over_the_whole_trace` asserts it
+/// over a hundred seeds, and [`Report::check`] folds from the first record again at
+/// the end of every run.
 fn advance(sim: &mut Sim, duration: Duration, watch: &mut Watch) {
     if watch.stopped.is_some() {
         return;
@@ -2277,10 +2335,10 @@ fn advance(sim: &mut Sim, duration: Duration, watch: &mut Watch) {
             return;
         }
         if watch.slices.is_multiple_of(CHECK_EVERY) {
-            let events: Vec<TraceEvent> = sim.trace().into_iter().map(|r| r.event).collect();
-            let verdict = invariants::all(&events)
-                .and_then(|()| invariants::commit_majority(&events, SERVERS as usize));
-            if let Err(violation) = verdict {
+            let records = sim.trace_from(watch.checked);
+            watch.checked += records.len();
+            watch.checker.extend(records.iter().map(|r| &r.event));
+            if let Err(violation) = watch.checker.verdict() {
                 watch.stopped = Some(format!("{violation} (at {:?})", sim.now()));
                 return;
             }

@@ -22,7 +22,9 @@
 //! effectively starts at the heal. The bound is chosen so the correct server
 //! never trips it (RAFT.md §5); the nightly's ten thousand seeds will tighten it.
 //!
-//! The pair rule (CLAUDE.md): [`Variant::SingleMajorityInJointConsensus`] must be
+//! The pair rule (CLAUDE.md):
+//! [`Variant::SingleMajorityInJointConsensus`](ananke_raft::core::Variant::SingleMajorityInJointConsensus)
+//! must be
 //! caught here on some seeds and the correct server must pass every one.
 
 use std::collections::BTreeSet;
@@ -36,7 +38,7 @@ use ananke_env::sim::{Sim, SimConfig, TraceRecord};
 use ananke_env::{Clock, Either, Environment, Instant, Network, NodeId, Socket, TraceEvent, race};
 use ananke_raft::apply::Command;
 use ananke_raft::client::{Reply, Request, Response};
-use ananke_raft::core::{RaftConfig, Variant};
+use ananke_raft::core::{RaftConfig, Variants};
 use ananke_raft::message;
 use ananke_raft::{NodeConfig, ServerId, invariants, run as run_server};
 use ananke_storage::EngineConfig;
@@ -190,10 +192,12 @@ pub fn config(seed: u64, schedule: &Schedule) -> SimConfig {
     config
 }
 
-/// The server configuration for `id` under `variant`: the address book holds
+/// The server configuration for `id` under `variants`: the address book holds
 /// all five servers, and only servers 1 through 3 start with voters.
+// PROPOSED(D-045): a variant is a set.
 #[must_use]
-pub fn node_config(id: u64, variant: Variant) -> NodeConfig {
+pub fn node_config(id: u64, variants: impl Into<Variants>) -> NodeConfig {
+    let variants = variants.into();
     let mut engine = EngineConfig::new(PathBuf::from(DIR));
     engine.memtable_bytes = 16 * 1024;
     engine.segment_bytes = 16 * 1024;
@@ -211,7 +215,7 @@ pub fn node_config(id: u64, variant: Variant) -> NodeConfig {
         },
         // One entry per message, as the sweep runs (D-026, issue #22).
         raft: RaftConfig {
-            variant,
+            variants,
             max_batch: 1,
             tick_nanos: u64::try_from(TICK.as_nanos()).expect("small"),
             drift_bound_ppm: DRIFT_BOUND_PPM,
@@ -222,11 +226,11 @@ pub fn node_config(id: u64, variant: Variant) -> NodeConfig {
     }
 }
 
-fn spawn_server(sim: &Sim, id: u64, variant: Variant) {
+fn spawn_server(sim: &Sim, id: u64, variants: Variants) {
     let env = sim.env(NodeId::new(u32::try_from(id).expect("small")));
     let inner = env.clone();
     env.spawn("raft", async move {
-        let _ = run_server(inner, node_config(id, variant)).await;
+        let _ = run_server(inner, node_config(id, variants)).await;
     });
 }
 
@@ -237,8 +241,9 @@ type SharedStats = Arc<Mutex<ClientStats>>;
 pub struct Report {
     /// The seed.
     pub seed: u64,
-    /// Which server ran.
-    pub variant: Variant,
+    /// Which server ran: the set of known bugs it carried (PROPOSED D-045).
+    // PROPOSED(D-045): a variant is a set.
+    pub variants: Variants,
     /// How the run was scheduled (D-016).
     pub policy: Policy,
     /// The plan it ran.
@@ -385,10 +390,25 @@ impl Report {
 }
 
 /// What the sliced advance watches for, as the sweep's does.
-#[derive(Default)]
 struct Watch {
     slices: u32,
     stopped: Option<String>,
+    /// The safety checks, one checker for the whole run with the state of each
+    /// check kept across looks, as the sweep's advance does (PROPOSED D-046).
+    checker: invariants::Checker,
+    /// How many trace records the checker has been fed.
+    checked: usize,
+}
+
+impl Default for Watch {
+    fn default() -> Self {
+        Self {
+            slices: 0,
+            stopped: None,
+            checker: invariants::Checker::new(INITIAL_VOTERS as usize),
+            checked: 0,
+        }
+    }
 }
 
 /// The run under way: the simulator and what the driver tracks about it.
@@ -425,11 +445,10 @@ impl Driver {
                 return;
             }
             if self.watch.slices.is_multiple_of(crate::raft::CHECK_EVERY) {
-                let events: Vec<TraceEvent> =
-                    self.sim.trace().into_iter().map(|r| r.event).collect();
-                let verdict = invariants::all(&events)
-                    .and_then(|()| invariants::commit_majority(&events, INITIAL_VOTERS as usize));
-                if let Err(violation) = verdict {
+                let records = self.sim.trace_from(self.watch.checked);
+                self.watch.checked += records.len();
+                self.watch.checker.extend(records.iter().map(|r| &r.event));
+                if let Err(violation) = self.watch.checker.verdict() {
                     self.watch.stopped = Some(format!("{violation} (at {:?})", self.sim.now()));
                     return;
                 }
@@ -594,15 +613,19 @@ impl Driver {
     }
 }
 
-/// Runs the scenario for `seed` with the schedule drawn from it.
+/// Runs the scenario for `seed` with the schedule drawn from it, under the set
+/// of bugs `variants` (PROPOSED D-045).
+// PROPOSED(D-045): a variant is a set.
 #[must_use]
-pub fn run(seed: u64, variant: Variant) -> Report {
-    run_with(seed, Schedule::draw(seed), variant)
+pub fn run(seed: u64, variants: impl Into<Variants>) -> Report {
+    run_with(seed, Schedule::draw(seed), variants)
 }
 
 /// Runs the scenario for `seed` with an explicit schedule.
+// PROPOSED(D-045): a variant is a set.
 #[must_use]
-pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
+pub fn run_with(seed: u64, schedule: Schedule, variants: impl Into<Variants>) -> Report {
+    let variants = variants.into();
     let mut sim = Sim::new(config(seed, &schedule));
     let servers: Vec<NodeId> = (0..SERVERS as usize)
         .map(|i| sim.add_node_with_clock(schedule.skews[i], schedule.drifts[i]))
@@ -611,7 +634,7 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
     let admin = sim.add_node();
     let stats: Vec<SharedStats> = (0..CLIENTS).map(|_| SharedStats::default()).collect();
     for id in 1..=SERVERS {
-        spawn_server(&sim, id, variant);
+        spawn_server(&sim, id, variants);
     }
     for (i, &node) in clients.iter().enumerate() {
         let env = sim.env(node);
@@ -654,7 +677,7 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
     }
     Report {
         seed,
-        variant,
+        variants,
         policy: driver.sim.policy(),
         schedule,
         jsonl: driver

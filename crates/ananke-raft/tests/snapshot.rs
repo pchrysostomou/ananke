@@ -16,7 +16,9 @@ use std::time::Duration;
 use ananke_env::sim::{Sim, SimConfig, SimEnv};
 use ananke_env::{Environment, File, FileSystem, OpenOptions, TraceEvent};
 use ananke_raft::apply::{Command, apply_command, user_key};
-use ananke_raft::core::{Input, Output, Persist, Raft, RaftConfig, Role, SnapshotAction, Variant};
+use ananke_raft::core::{
+    Input, Output, Persist, Raft, RaftConfig, Role, SnapshotAction, Variant, Variants,
+};
 use ananke_raft::message::Message;
 use ananke_raft::snapshot::{Assembler, Feed, Repair, Sender, adopt_staged, staging_dir, take};
 use ananke_raft::store::{
@@ -1562,7 +1564,7 @@ fn addr(n: u64) -> SocketAddr {
 
 /// A server of a five-voter cluster with a small snapshot threshold, so a
 /// follower cut off for a moment falls behind it.
-fn cluster_config(id: u64, variant: Variant) -> NodeConfig {
+fn cluster_config(id: u64, variants: impl Into<Variants>) -> NodeConfig {
     let mut engine = EngineConfig::new(PathBuf::from("/raft"));
     engine.memtable_bytes = 4096;
     engine.segment_bytes = 4096;
@@ -1575,7 +1577,7 @@ fn cluster_config(id: u64, variant: Variant) -> NodeConfig {
         raft: RaftConfig {
             snapshot_threshold: 4,
             snapshot_chunk: 512,
-            variant,
+            variants: variants.into(),
             ..RaftConfig::default()
         },
         engine,
