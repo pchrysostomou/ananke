@@ -822,17 +822,15 @@ fn a_leader_that_ignores_incarnations_never_forgets_and_the_sweep_cannot_see_it(
 /// took, which is the index the running stream is reading. The arm rides one
 /// seed in four and got as far as the stream on 14 of 100 release seeds.
 ///
-/// It moves the variant from uncatchable at the pre-merge tier to catchable
-/// there, and no further: 0 of 100 release seeds, 1 of 1000 — seed 680, by the
-/// liveness check, `no client write completed after the last heal at 28.683 s`,
-/// which is seed 5909's shape again, though not built by this arm: seed 680 does
-/// not draw it, and its re-takes are the server's own
+/// It has not been shown to make the variant catchable at any tier: 0 of 100
+/// release seeds, 1 of 1000 — seed 680, by the liveness check, `no client write
+/// completed after the last heal at 28.683 s` — and that one catch is not this
+/// arm's: seed 680 does not draw it, and its re-takes are the server's own
 /// (`seed_680_pins_the_combined_variant_and_the_stream_half_alone_catches_it_too`).
-/// D-043 recorded 0 of
-/// 1000 before this arm existed, so a tier that never caught it now does, about
-/// once.
+/// The arm reached a live stream on 151 of 1000 seeds and caught none of them.
 ///
-/// Why only about once is worth writing down, because it is not a matter of
+/// Why the arm reaches the shape without catching it is worth writing down,
+/// because it is not a matter of
 /// running more seeds at the hundred tier. A leader needs *one* countable
 /// follower for a majority, and on this sweep an install is over in about a
 /// hundred and fifty milliseconds — the state machine is small and a checkpoint

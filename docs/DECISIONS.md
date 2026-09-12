@@ -2011,9 +2011,11 @@ single.* Measured on this tree in release: `raft::run(5909, Variants::of(&[
 IgnoreIncarnation, SharedSnapshotDir]))` checks clean, exactly as both singles
 and the correct server do. That is a seed whose schedule has moved, not a bug
 that has gone: this entry's own eight-byte record change moved every checkpoint,
-and D-041, D-044 and the re-take arm have each re-drawn every seed's fault list
-since, so 5909 on this tree draws neither a snapshot crash nor an adoption storm
-nor a re-take arm at all, and no re-take on it scrambles a running stream
+and D-041, D-044 and the re-take arm have each appended a fault arm drawn from a
+stream of its own since, which leaves the shared draws in place — 5909's fault
+times match the nightly's through 16.114 s — but lengthens every run and so moves
+every seed's interleaving and who leads; and 5909 on this tree draws neither a
+snapshot crash nor an adoption storm nor a re-take arm at all, and no re-take on it scrambles a running stream
 whatever bugs it carries: under `SharedSnapshotDir`, alone or in the pair, the
 leader re-takes once under a live stream, to a follower that had already
 installed that snapshot. The pin stays a seed held green and is still worth
@@ -2060,16 +2062,20 @@ Every site is marked `PROPOSED(D-042)`.
 
 **Context.** The ten-thousand-seed nightly (run 34496762339), seed 5909: the
 leader's last commit was 329 at 13.43 s and nothing committed for the remaining
-5.4 s of the run. Server 2 had been snapshot-fed since 7.46 s — 744
-`InstallSnapshot` chunks, the stream resumed from offset 0 six times — and at the
-end the receiver was still acknowledging `000005.sst` while the sender was on
-`000010.sst`. The first of those restarts follows the leader re-taking the *same*
-snapshot 329 five times within a hundred milliseconds (checkpoint versions 779 to
-783, every one into `/raft/snap-329`), rewriting the directory under the stream.
+5.4 s of the run. Server 2 was fed snapshot 329 from 13.872 s — 735
+`InstallSnapshot` chunks, the stream resumed from offset 0 fifteen times — and at
+the end the receiver was still acknowledging `000005.sst` while the sender was on
+`000010.sst`. The first eight resumes, from 13.92 s, came while a partition had
+server 2 cut off (13.386 to 14.322 s). The leader, which had first taken 329 at
+13.893 s, then re-took the *same* snapshot five times in a hundred and ten
+milliseconds (checkpoint versions 779 to 783, 15.261 to 15.370 s, every one into
+`/raft/snap-329`), rewriting the directory under the stream; the resume at
+15.409 s follows them, and the stream never completed.
 Server 3, refused and re-seeded, was designated snapshot-fed and received
 nothing: the `snapshot` task streams to one follower at a time, its stream waited
 behind server 2's never-ending one, and a designated follower gets no entries —
-every heartbeat rejected with hint 334, two hundred and four times. Neither
+every heartbeat rejected with hint 334, three hundred and two times from its
+leader's election at 14.757 s. Neither
 follower could be counted; the leader lost its quorum at 13.99 s, won term 11 at
 14.76 s and was no better off. The liveness check reported it.
 
@@ -2234,14 +2240,18 @@ its applied index stands still at the index it last took, which is the index
 the running stream is reading. It reaches that state on 14 of 100 release
 seeds, and the sweep asserts at every tier that it did.
 
-It moves the variant from uncatchable at the pre-merge tier to catchable there,
-and no further. Measured on this branch: 0 of 100 release seeds, and 1 of 1000 —
-seed 680, by the liveness check, `no client write completed after the last heal
-at 28.683 s`, which is this entry's own wedge assembled by a driver rather than
-waited for. This entry recorded 0 of 1000 before the arm existed, so the tier
-that pays for the pre-merge run now catches it, about once.
+It has not been shown to make the variant catchable at any tier. Measured on this
+branch: 0 of 100 release seeds, and 1 of 1000 — seed 680, by the liveness check,
+`no client write completed after the last heal at 28.683 s`. That catch is not
+the arm's: seed 680 draws no re-take arm (its faults are an isolation, a Figure 8
+driver, a one-way block, the adoption storm and the refusal storm), and its
+re-takes are the server's own. The arm reached a live stream on 151 of 1000
+seeds and caught none of them. This entry recorded 0 of 1000 before the arm
+existed; the one catch since came from how that round moved seed 680's
+interleaving, not from the arm.
 
-Why only about once is structural rather than statistical. A leader needs *one*
+Why the arm reaches the shape without catching it is structural rather than
+statistical. A leader needs *one*
 countable follower for a majority, and on this sweep an install is over in about
 a hundred and fifty milliseconds, since the state machine is small and a
 checkpoint of it is a couple of dozen chunks. The moment the fed follower's
@@ -2273,7 +2283,7 @@ tier on a single observation would make that tier flaky. The firing is asserted
 at every tier on both counts — a re-take at an index already taken, and the arm
 reaching its stream — and a nightly whose ten thousand seeds never catch it is
 still a hole in the sweep to report rather than a variant to delete (RAFT.md §5),
-the more so because this branch has re-drawn every schedule again.
+the more so because this branch has moved every seed's interleaving again.
 
 **Amended under PROPOSED D-045.** `Variant` is a set now, so the sweep can run
 one server carrying this entry's bug and D-042's at once, which is what the
