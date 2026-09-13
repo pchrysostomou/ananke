@@ -1489,8 +1489,11 @@ impl Report {
     /// it inside the window by durability time and before it by decision time.
     /// Each carries how many messages from a server were delivered to the isolated
     /// one in `(from, until]`: a rise with none there was caused by nothing that
-    /// reached it while it was cut off. Isolations the pre-vote check skips are
-    /// skipped here too, so this is exactly what the durability-time check reads
+    /// reached it while it was cut off. Each also carries the messages from a server
+    /// delivered to it at the instant its step was decided, as (sender, kind, term):
+    /// what the step can have taken, so a pin can tie the decision time to its cause
+    /// and not only place it before the window. Isolations the pre-vote check skips
+    /// are skipped here too, so this is exactly what the durability-time check reads
     /// as a rise and the decision-time check does not.
     ///
     /// On the trace seed 1885 failed with (run 34711427220, 14c3e17): server 1's
@@ -1500,6 +1503,26 @@ impl Report {
     // PROPOSED(D-047): every trace record carries its decision time and its durability time.
     #[must_use]
     pub fn isolation_term_straddles(&self) -> Vec<TermStraddle> {
+        let sent: BTreeMap<ananke_env::MessageId, SentMessage> = self
+            .raft_messages()
+            .into_iter()
+            .map(|m| (m.id, m))
+            .collect();
+        let delivered_at = |server: u64, at: Instant| -> Vec<(u64, &'static str, u64)> {
+            self.records
+                .iter()
+                .filter(|r| r.at == at)
+                .filter_map(|r| match &r.event {
+                    TraceEvent::MessageDelivered { id, to, .. }
+                        if server_of(*to) == Some(server) =>
+                    {
+                        sent.get(id)
+                            .map(|m| (m.from, m.message.kind(), m.message.term()))
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
         let mut straddles = Vec::new();
         for &(server, from, until) in &self.isolations {
             if self.reseeding_during(server, from, until) {
@@ -1542,6 +1565,7 @@ impl Report {
                         decided: record.decided,
                         at: record.at,
                         deliveries,
+                        causes: delivered_at(server, record.decided),
                     });
                 }
                 previous = *term;
@@ -1906,10 +1930,19 @@ impl Report {
     #[must_use]
     pub fn leader_at_last_heal(&self) -> Option<(u64, u64)> {
         let mut leader = None;
-        // PROPOSED(D-047): decided by the heal. A server's leadership records come
-        // from one task's steps in sequence, so their decision times keep their
-        // record order, and a crash is recorded as it happens.
-        for record in self.records.iter().filter(|r| r.decided <= self.last_heal) {
+        // PROPOSED(D-047): decided by the heal, folded in decision order; stable, so
+        // ties keep record order. One server's leadership records keep their record
+        // order under decision time, but two servers' need not: a leader elected
+        // first can be traced after its successor, whose persist was shorter, and a
+        // fold in record order would then end on the superseded one. A crash is
+        // recorded as it happens.
+        let mut decided: Vec<&TraceRecord> = self
+            .records
+            .iter()
+            .filter(|r| r.decided <= self.last_heal)
+            .collect();
+        decided.sort_by_key(|record| record.decided);
+        for record in decided {
             match &record.event {
                 TraceEvent::RaftLeader { server, term, .. } => leader = Some((*server, *term)),
                 TraceEvent::RaftTerm { server, role, .. }
@@ -2126,7 +2159,7 @@ impl Report {
 /// A term rise that straddles the start of its server's isolation
 /// ([`Report::isolation_term_straddles`]).
 // PROPOSED(D-047): every trace record carries its decision time and its durability time.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TermStraddle {
     /// The isolated server.
     pub server: u64,
@@ -2147,6 +2180,9 @@ pub struct TermStraddle {
     pub at: Instant,
     /// Messages from a server delivered to it in `(from, until]`.
     pub deliveries: usize,
+    /// The messages from a server delivered to it at `decided`, as (sender, kind,
+    /// term): what the step that raised the term can have taken.
+    pub causes: Vec<(u64, &'static str, u64)>,
 }
 
 /// An installed snapshot below the floor a server's snapshots had reached

@@ -67,8 +67,8 @@ fn the_seed_42_trace_is_written_for_the_studio() {
 /// On the trace the seed failed with, which carries no decision times, the
 /// predicate still finds its one gap, and the reset that ended it, a granted vote,
 /// was traced 30.4 ms after the gap was flagged: no persist could have put its
-/// decision before the flag, a vote's lag being at most 4.9 ms on this tree's
-/// traces.
+/// decision before the flag, a vote's lag being at most 6.89 ms over the correct
+/// server's first 3 000 seeds on this tree.
 #[test]
 fn seed_164_which_a_local_ten_thousand_seed_run_found_stays_green() {
     let report = raft::run(164, Variant::Correct);
@@ -612,10 +612,16 @@ fn seed_687_which_the_premerge_found_stays_green() {
 #[test]
 fn seed_1885_which_the_nightly_failed_on_a_trace_timestamp_passes_by_decision_time() {
     let report = raft::run(1885, Variant::Correct);
-    assert_rise_straddles_the_isolation(
+    let straddle = assert_rise_straddles_the_isolation(
         &report,
         (1, 8, 10, "follower"),
         "pre-vote: server 1 raised its term from 8 to 10 while isolated from Instant(15.203s) to Instant(17.112s)",
+    );
+    assert_eq!(
+        straddle.causes,
+        [(2, "request-vote", 10)],
+        "seed 1885: the rise was not decided at the delivery of server 2's RequestVote of term \
+         10, so its decision time is not that message's step: {straddle:?}"
     );
     report.check().unwrap();
 }
@@ -629,10 +635,16 @@ fn seed_1885_which_the_nightly_failed_on_a_trace_timestamp_passes_by_decision_ti
 #[test]
 fn seed_2023_which_the_nightly_failed_on_a_trace_timestamp_passes_by_decision_time() {
     let report = raft::run(2023, Variant::Correct);
-    assert_rise_straddles_the_isolation(
+    let straddle = assert_rise_straddles_the_isolation(
         &report,
         (1, 13, 14, "follower"),
         "pre-vote: server 1 raised its term from 13 to 14 while isolated from Instant(19.22s) to Instant(20.822s)",
+    );
+    assert_eq!(
+        straddle.causes,
+        [(3, "append-entries", 14)],
+        "seed 2023: the rise was not decided at the delivery of server 3's AppendEntries of term \
+         14, so its decision time is not that message's step: {straddle:?}"
     );
     report.check().unwrap();
 }
@@ -731,6 +743,10 @@ fn the_nightlys_eleven_variant_catches_of_the_trace_timestamp_gap_are_not_catche
             !verdict.as_ref().is_some_and(|v| v.contains("pre-vote")),
             "seed {seed} under {variant:?} still reports a pre-vote violation: {verdict:?}"
         );
+        assert_eq!(
+            verdict, &None,
+            "seed {seed} under {variant:?}: the run no longer passes the check outright"
+        );
     }
 }
 
@@ -739,12 +755,13 @@ fn the_nightlys_eleven_variant_catches_of_the_trace_timestamp_gap_are_not_catche
 /// (server, term before, term after, role) — decided before the isolation began and
 /// traced inside it, with no message from a server delivered to that server in the
 /// window; the pre-vote check by durability time fails with `original`, the
-/// nightly's message, and the same check by decision time passes.
+/// nightly's message, and the same check by decision time passes. Returns the
+/// straddle, so a pin can tie its decision time to the message the step took.
 fn assert_rise_straddles_the_isolation(
     report: &raft::Report,
     rise: (u64, u64, u64, &str),
     original: &str,
-) {
+) -> raft::TermStraddle {
     let (seed, variants) = (report.seed, report.variants);
     let straddles = report.isolation_term_straddles();
     let [straddle] = straddles.as_slice() else {
@@ -796,6 +813,7 @@ fn assert_rise_straddles_the_isolation(
         Ok(()),
         "seed {seed} under {variants:?}: the pre-vote check by decision time fails"
     );
+    straddle.clone()
 }
 
 /// The positive control: the correct server satisfies every property on every

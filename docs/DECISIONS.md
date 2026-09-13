@@ -2903,7 +2903,7 @@ signature change of public functions for records no check reads by time.
 | Pre-vote: the skip for a refusal, re-seed or install in the window | same | durability | stands in for a restatement landing in the window, which is traced after the event it looks for is durable |
 | Timers fire | `Report::timers_fire`, `Report::replay_timers` | **decision** | whether a server campaigned in time is when it decided to; the records are replayed in decision order, so no bound is measured past a reset the server had already made |
 | Seeds 164's and 385's predicates | `snapshot_fed_timer_gaps`, `timer_gaps_rescued_by_restatement` | **decision** | the same replay as the check, so the two cannot drift apart |
-| The leader in force at the last heal | `Report::leader_at_last_heal` | **decision** | who led by the heal is what the servers had decided by it |
+| The leader in force at the last heal | `Report::leader_at_last_heal` | **decision** | who led by the heal is what the servers had decided by it; folded in decision order, since two servers' elections can be traced in the other order (on `SharedSnapshotDir` seed 367, term 2's leader was decided 0.6 ms before term 3's and traced 1.7 ms after it) |
 | Liveness: the first write after the last heal | `time_to_write_after_heal`, both scenarios | one time, or durability | a client's return, or an abandoned write closed at its durable apply |
 | Availability gap | `membership::Report::longest_completion_gap` | one time, or durability | the same history |
 | A majority up, a change completed | `majority_up`, `change_complete` | record order | no time read |
@@ -2940,11 +2940,15 @@ approved.
 — the isolated server's one term rise has `decided < from <= at <= until`, with no
 server-to-server delivery to it in `(from, until]` — the check by durability time
 failing with the nightly's message word for word, the same check by decision time
-passing, and `check()` passing. Measured on this tree: seed 1885's rise to term 10
+passing, and `check()` passing. Each also ties the decision time to its cause: the
+one message from a server delivered to server 1 at the rise's decision instant is
+the term-raising message — server 2's RequestVote of term 10 on 1885, server 3's
+AppendEntries of term 14 on 2023 — so a stamp taken anywhere else before the window
+fails the pin. Measured on this tree: seed 1885's rise to term 10
 decided 2.531 ms before the partition and traced 48 µs after it; seed 2023's to
 term 14, 2.121 ms before and 671 µs after. One test runs the eleven variant pairs and
-asserts the same of each and that none reports a pre-vote violation; every one of
-the eleven now passes `check()` outright. Their steps were decided 0.262 (1252),
+asserts the same straddle of each, that none reports a pre-vote violation, and that
+every one of the eleven now passes `check()` outright. Their steps were decided 0.262 (1252),
 1.718 (2509), 1.993 (3087), 0.312 (5990), 2.198 (1176), 0.666 (2407), 0.275 (3863),
 0.653 (4713), 1.533 (6691), 0.596 (9670) and 1.372 ms (5203, the candidacy) before
 their isolations. Seeds 164, 385 and 7381 are re-verified: each pin passes on this
@@ -2958,7 +2962,7 @@ predicates still fire — seed 164's one gap from 12.9405 s flagged at 13.3397 s
 21 chunks, seed 385's from 14.0308 s flagged at 14.3350 s — and neither could have
 been moved by stamps: the reset that ended 164's gap, a granted vote, was traced
 30.4 ms after the flag, against a largest lag between a vote's decision and its
-record of 4.9 ms on six of this tree's traces, and 385's, a pre-vote campaign, 22.9
+record of 6.89 ms over the correct server's first 3 000 seeds, and 385's, a pre-vote campaign, 22.9
 ms after the flag, and a pre-vote campaign persists nothing and carries no separate
 decision time. Seed 7381's predicates are a fold over record order and still find
 the index-65 replay under a floor of 128 on its original trace.
@@ -3013,9 +3017,12 @@ inside the window and would still be flagged by the pre-vote check with no deliv
 in the window; none of the thirteen is that case, and closing it would take the
 causal matching rejected above. The timer check's resets for a campaign, a granted
 vote or a step-down now land at the step rather than after its persist, which makes
-the check stricter by that persist, at most 4.9 ms on the traces measured, and more
-lenient by never measuring a bound past a reset already decided; no seed of the
-hundred moved either way. And RealEnv's stamps are the process's monotonic clock,
+the check stricter by that persist, at most 6.91 ms (a term record; 6.89 ms for a
+vote) over the correct server's first 3 000 seeds, and more lenient by never
+measuring a bound past a reset already decided. No seed of the hundred moved either
+way; over those 3 000 seeds the gap lists are identical under both times, and under
+`ResetTimerOnAnyRpc` 27 of 400 seeds show a gap whose start or flag moved by at most
+about 3 ms, none gaining or losing a gap. And RealEnv's stamps are the process's monotonic clock,
 comparable only within one process, which is all a log line needs.
 
 ---
