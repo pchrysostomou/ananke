@@ -833,7 +833,7 @@ fn a_replayed_success_response_does_not_move_match_index_back() {
     invariants::all(&cluster.events).unwrap();
 }
 
-/// Store incarnations (RAFT.md §3, PROPOSED(D-042)): a follower that answers
+/// Store incarnations (RAFT.md §3, D-042): a follower that answers
 /// with an incarnation other than the one the leader recorded runs on a rebuilt
 /// store, whose log may have lost entries it once acknowledged. The leader
 /// forgets what it knew of the follower and the probe resumes from the answer's

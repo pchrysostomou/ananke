@@ -36,7 +36,9 @@ pub trait Environment: Send + Sync + 'static {
     fn rng(&self) -> &Self::Rng;        // the node's protocol stream (D-017)
     fn sched_rng(&self) -> &Self::Rng;  // the node's scheduling stream; what `race` draws from (D-017)
     fn spawn<F: Future<Output = ()> + Send + 'static>(&self, name: &'static str, f: F) -> TaskHandle;
-    fn trace(&self, event: TraceEvent);
+    fn trace(&self, event: TraceEvent);                             // decided now (D-047)
+    fn decision(&self) -> Decision;                                 // a stamp of the moment a step decides (D-047)
+    fn trace_decided(&self, decided: Decision, event: TraceEvent);  // recorded now, decided at `decided` (D-047)
 }
 ```
 
@@ -57,6 +59,13 @@ pub trait Rng: Send + Sync + 'static { fn fill_bytes(&self, dest: &mut [u8]); /*
 `ananke-env` also exports `DetHashMap` / `DetHashSet`, hash maps whose hasher is seeded
 from `Environment::rng()` at construction (D-014). `std::collections::HashMap` and
 `HashSet` are banned outside `ananke-env`.
+
+`Decision` is an `ananke-env` stamp, opaque outside it: under `SimEnv`, global virtual
+time, never a node's skewed and drifting clock (§1.2); under `RealEnv`, the process's
+monotonic clock, the one `clock()` reads. Taking one reads the time and nothing else,
+so it moves no schedule. A node traces what a step
+did once it is durable, with the stamp taken when the step was taken, so its records
+carry both times (§1.5, D-047).
 
 Two implementations:
 
@@ -111,6 +120,15 @@ survives 10k random seeds here, it is likely correct on real disks.
   namespaced `ananke.*`; ananke-specific payloads (range id, term, log index, txn id in
   later phases) travel as `range`, `term`, `index`, `txn` fields in `msg`, `log.data`
   and `state.patch`, so a filter can carve a per-range trace before the studio sees it.
+- A record carries two times (D-047). Its durability time, `TraceRecord::at` and the
+  line's `t`, is when it was recorded, which for a node's step is once what the step
+  did is durable (D-026). Its decision time, `TraceRecord::decided`, is when the step
+  that produced it was taken, at or before `t`. The export writes it as `decidedNs` in
+  `log.data`, and only where it differs from `t`, so a trace whose records are all
+  decided as they are recorded exports byte for byte as before and no moirae format
+  version moves; sends, deliveries, drops and faults are recorded as they happen and
+  never carry it. A check about why a server did something reads the decision time; a
+  check about what was durable when reads the durability time or the records' order.
 - Trace must be stable: a bug reproduced from seed `s` in version `v` must still reproduce
   in `v` given the same seed. CI pins the FNV-1a hash of each scenario's trace, and a
   `Verify` writer replays a recording with its seed and stops at the first divergent
@@ -213,6 +231,13 @@ Raft as in the extended paper (Ongaro 2014), with:
   the hard version).
 - **Snapshots** via `Engine::checkpoint`, streamed in chunks, resumable.
 - **Batching + pipelining** of AppendEntries.
+- **Lost-state recovery**: a server whose store lost state is refused, durably and with
+  its engine doing no further work, until a leader re-seeds it from a snapshot; a
+  directory that held a store never opens as a fresh one (D-026, D-030, D-041, D-044).
+  A server on a re-seeded store, or on any store later installed over it, never grants
+  a vote or a pre-vote, never campaigns and never promises a lease, since the lost
+  state may have held a vote (D-035); and a re-seeded store carries a fresh
+  incarnation, which makes a leader forget that follower's progress (D-042).
 
 State machine is the storage engine from Phase 1; the Raft log itself is also stored
 in the engine under a reserved tenant id.

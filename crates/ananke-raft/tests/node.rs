@@ -322,7 +322,7 @@ fn a_server_whose_store_lost_state_asks_to_be_reseeded_and_grants_nothing() {
     assert_eq!(raft_events_of_one, 0, "the refused server stepped its core");
 }
 
-/// A refusal is durable and the refused engine does no work (PROPOSED D-044).
+/// A refusal is durable and the refused engine does no work (D-044).
 /// The same store as above — two hundred entries, a table flushed, the table
 /// then lost — and the server that refuses it records the loss in the store's
 /// marker before it traces the refusal, writes nothing over it afterwards, and

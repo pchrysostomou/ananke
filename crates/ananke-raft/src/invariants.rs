@@ -20,7 +20,7 @@
 //!
 //! A sweep that folds every check over the whole trace every few slices pays for
 //! the whole trace at every look, and a run costs time quadratic in its length
-//! (issue #25, PROPOSED D-046). [`Checker`] is the same folds with their state kept
+//! (issue #25, D-046). [`Checker`] is the same folds with their state kept
 //! across calls — the reconstructed logs, the leaders per term, the committed set,
 //! the applied map, the snapshot floors, the configuration in force — so a slice
 //! costs only its own new events. It is the one implementation: every function in
@@ -225,7 +225,7 @@ struct Verdicts {
 }
 
 /// Every check of this module, folded over the events it is given, with the state
-/// of each kept across calls (PROPOSED D-046): feeding a run's new events costs
+/// of each kept across calls (D-046): feeding a run's new events costs
 /// only those events, where folding from the first record costs the run's whole
 /// trace at every look. Feeding it one event at a time, a slice at a time or a
 /// whole trace at once gives the same verdict, which the sweep's

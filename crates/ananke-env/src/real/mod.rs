@@ -132,12 +132,12 @@ impl Environment for RealEnv {
         emit(event);
     }
 
-    // PROPOSED(D-047): the real monotonic clock, from the environment's epoch.
+    // D-047: the real monotonic clock, from the environment's epoch.
     fn decision(&self) -> Decision {
         Decision::at(self.inner.clock.now())
     }
 
-    // PROPOSED(D-047): the log line carries the decision beside the event.
+    // D-047: the log line carries the decision beside the event.
     fn trace_decided(&self, decided: Decision, event: TraceEvent) {
         let decided_ns = decided.instant().as_nanos();
         tracing::debug!(target: "ananke::trace", decided_ns, ?event);

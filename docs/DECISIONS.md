@@ -909,6 +909,15 @@ refused server stays down for the rest of a run until stage E, and liveness is a
 only while a majority is up. The checker's budget is a knob the correct server must
 never hit; a seed that does is a sweep problem to fix, not a pass.
 
+**Superseded in part by D-047.** A trace record's time is no longer read as when
+the thing it reports happened. A record carries its decision time, when the step
+behind it was taken, beside its durability time, when what it reports was durable:
+a check about why a server acted — the pre-vote isolation check, the timer check,
+the leader in force at the last heal — reads the decision time, and a check about
+what was durable reads the durability time or the records' order. The order of
+execution above stands: a step's trace events follow its persist, so the trace
+says what is durable.
+
 ---
 
 ## D-027 — The WAL record header carries its own checksum
@@ -1401,9 +1410,7 @@ parallelism already was. One dependency, `rayon`, used in one file.
 
 ---
 
-## PROPOSED — needs approval
-
-## PROPOSED D-032 — Learner catch-up state is leader-local and volatile
+## D-032 — Learner catch-up state is leader-local and volatile
 
 **Context.** RAFT.md §1 has servers being added catch up as learners before
 the joint entry exists, but does not say where the catch-up state lives. A
@@ -1427,7 +1434,9 @@ future the accept does not control.
 request's `Done`; the membership scenario's driver retries, and an operator
 must too. Configuration entries always carry empty learner lists in stage D.
 
-## PROPOSED D-033 — A server that is not a voter of its configuration in force does not campaign
+---
+
+## D-033 — A server that is not a voter of its configuration in force does not campaign
 
 **Context.** The thesis makes learners non-voting (§4.2.1) and discusses
 disruptive removed servers (§4.2.3); the stage D brief requires a server with
@@ -1455,7 +1464,7 @@ no liveness is lost that the thesis' rules would have kept.
 
 ---
 
-## PROPOSED D-035 — A re-seeded server never votes again on that store
+## D-035 — A re-seeded server never votes again on that store
 
 **Context.** RAFT.md §3: a server whose store lost state is refused and re-seeded
 with a snapshot from the leader (stage E). The lost state may have included the
@@ -1505,11 +1514,11 @@ servers still form a majority, and a re-seeded server otherwise counts as up,
 since it commits and applies. The quarantine sticks to the store's history:
 any later install carries it forward, and the repair tombstones the key
 otherwise so the leader's own tenant 0 cannot quarantine a receiver. Every
-affected site is marked `PROPOSED(D-035)`.
+affected site is marked `D-035`.
 
 ---
 
-## PROPOSED D-036 — The snapshot's metadata is made exact by taking it in the apply task
+## D-036 — The snapshot's metadata is made exact by taking it in the apply task
 
 **Context.** RAFT.md §1: a snapshot's identity — index, term, configuration — is
 written into the checkpoint's reserved tenant *before* the checkpoint's `CURRENT`.
@@ -1539,11 +1548,23 @@ copy" without opening the copy, which is a second store open per take.
 that as apply latency, not a fault. A crash between the record and the checkpoint
 leaves a record naming a directory that is incomplete: it never touches the
 store's own correctness, and a stream that trips on it fails with a retake, which
-takes a fresh checkpoint. Every affected site is marked `PROPOSED(D-036)`.
+takes a fresh checkpoint. Every affected site is marked `D-036`.
+
+**Superseded in part by D-043.** The Consequences' account of a stream that trips
+on an incomplete directory — it fails with a retake, which takes a fresh
+checkpoint — did not hold while every take at an index wrote into one directory.
+On the nightly's seed 5909 (run 34496762339) the retake was the fault: the leader
+re-took snapshot 329 five times in a hundred and ten milliseconds, checkpoint
+versions 779 to 783 from 15.261 to 15.370 s, every one into `/raft/snap-329`
+under a stream that never completed. D-043 gives every take its own
+`snap-<index>-<take>` directory, pins a stream to the newest complete version for
+its whole life, and keeps a stream that finds no complete version while a take is
+in flight from asking for a retake. The take in the apply task, with the record
+before the checkpoint, stands, and D-043's versions rely on it.
 
 ---
 
-## PROPOSED D-037 — When an unresponsive follower stops blocking compaction
+## D-037 — When an unresponsive follower stops blocking compaction
 
 **Context.** RAFT.md §1: the log compacts to a snapshot only once every
 follower's match is past it, *or the follower is a learner being replaced by the
@@ -1573,11 +1594,23 @@ untestable in a sweep that must exercise the path on random schedules.
 while the leader outruns it by more than the threshold is fed a snapshot on heal
 rather than the log, which costs a stream where a shorter partition would have
 cost a scan. The sweep's `snapshot_threshold` is set low so this happens on real
-schedules. The site is marked `PROPOSED(D-037)`.
+schedules. The site is marked `D-037`.
+
+**Amended under D-042.** The immediate trigger above cannot fire while a leader's
+`matched` for a refused follower stands above 0: the probe never walks below
+`matched`, so the follower never rejects an append at index 1, and that leader
+re-seeds it only through a designation earned by silence while it was down.
+D-042's store incarnations make the trigger reachable. A refused server answers
+with incarnation 0, the change resets the follower's progress to `matched = 0` and
+clears any designation, and the probe walks to index 0, where the leader either
+feeds the snapshot outright or hears the rejection of an append at index 1
+(`prev_index` 0) that this entry designates on. A designation is cleared by a
+successful append acknowledgement, as above, by a completed install, and by an
+incarnation change.
 
 ---
 
-## PROPOSED D-038 — The staged install commits by CURRENT-last and is adopted by copy at open
+## D-038 — The staged install commits by CURRENT-last and is adopted by copy at open
 
 **Context.** RAFT.md §1 fixes what an install must do; D-024 fixes the atomicity
 anchor (`CURRENT` last is the store's commit point) and rules out directory
@@ -1624,14 +1657,32 @@ switch, and moves the variant off the `CURRENT`-last rule RAFT.md names.
 **Consequences.** An install costs one extra copy of the store at the next open.
 Old checkpoint directories (`snap-<index>`) are never deleted, since a stream may
 still be reading one: garbage until a GC exists, recorded as a backlog line. The
-sites are marked `PROPOSED(D-038)`.
+sites are marked `D-038`.
+
+**Superseded in part by D-041 and D-043.** The adoption order above — the old
+store's `CURRENT` deleted first, then its files, then the copy — lost a store on
+the nightly's seed 6325 (run 34496762339): the schedule crashed server 1
+forty-one milliseconds after it finished installing snapshot 129, inside the
+adoption, and it restarted on a fresh store, restating term 0, applied 0 and last
+index 0. D-041 replaces the order with copy and sync first, the `CURRENT` switch
+as the commit point, then the old files' removal, and the removal of the staging
+directory's own `CURRENT` last, as before; refuses a damaged staging `CURRENT`
+rather than sweeping it; and adds the `RAFT-STORE` marker. The
+Consequences' old checkpoint directories that are never deleted are replaced by
+D-043's sweep, which deletes every version the record does not name and no stream
+reads. And the repair list in *Repair, then CURRENT* is short of what the repair
+writes: it also writes the receiver's `0 / 2 / config` key (D-029) and D-042's
+`0 / 0 / incarnation`, and the quarantine flag is not written only on a re-seed
+but carried forward whenever the receiver's history was ever re-seeded and
+tombstoned otherwise (D-030, D-035).
 
 ---
 
-## PROPOSED D-039 — A completed snapshot install counts as the leader's contact for the timer check
+## D-039 — A completed snapshot install counts as the leader's contact for the timer check
 
 **Context.** Local ten-thousand-seed runs, on 1373601 and then on f54b468, not
-the GitHub nightly, produced the sweep's first two correct-server failures, both
+the GitHub nightly, produced the raft sweep's first two correct-server failures at
+ten thousand seeds, both
 from the timers-fire check (RAFT.md §2, moirae rule 5: a follower that hears from
 no leader of its term and grants no vote for two maximum election timeouts must
 have campaigned), and both against a follower being fed a snapshot. Seed 164: a
@@ -1667,11 +1718,17 @@ just installed the leader's snapshot has just heard from it.
 **Consequences.** An install that takes longer than the bound with no
 completion in the window would still trip the check, which is the right
 sensitivity to keep: the sweep should see an install that slow. The check stays
-a function of the trace alone. The site is marked `PROPOSED(D-039)`.
+a function of the trace alone. The site is marked `D-039`.
+
+**See D-048.** The account of seed 164 this Context builds on is D-048's. D-030's
+stanza, which the Context names as seed 164's fix, still gives the account written
+before the audit — the nightly's seed, two hundred entries behind, the leader
+reaching it, the sweep's first correct-server failure — and D-048 supersedes that
+account; the fix stands.
 
 ---
 
-## PROPOSED D-041 — The staged install is adopted crash-safely, a damaged install is refused, and a marked store never opens fresh
+## D-041 — The staged install is adopted crash-safely, a damaged install is refused, and a marked store never opens fresh
 
 **Context.** The ten-thousand-seed nightly (run 34496762339), seed 6325: server 1
 finished installing a snapshot at index 129 at 5.7711 s and the schedule crashed
@@ -1685,7 +1742,7 @@ empty first manifest, recovered no log, and the server restated `RaftRecovered
 truncation from index 1 against a commit index of 119. A voter that held term 5
 and a hundred and nineteen committed entries forgot everything, which is the
 state D-022 and D-025 exist to refuse. Three holes lined up in
-`snapshot.rs::adopt_staged` as built under PROPOSED D-038: the old store's
+`snapshot.rs::adopt_staged` as built under D-038: the old store's
 `CURRENT` and files were removed *before* the staged copies and their directory
 entries were durable, so the point of no return preceded the durability of the
 new files; a staging `CURRENT` that exists but does not parse was treated as
@@ -1694,7 +1751,7 @@ was gone deleted the only copy; and the engine's rule (D-024) refuses a missing
 `CURRENT` only while manifests or tables remain, so a directory emptied past
 that opened fresh.
 
-**Decision.** Four parts, each site marked `PROPOSED(D-041)`.
+**Decision.** Four parts, each site marked `D-041`.
 
 *The order.* The adoption copies first and switches last, the way every store
 switch is made (D-024). The staged manifest is decoded and every table it lists
@@ -1742,8 +1799,10 @@ the operations the nightly's did.
 
 *The variant and its fault.* `Variant::AdoptionAsBuilt` is the adoption as
 built: the old store removed first, the copies synced after, a damaged staging
-`CURRENT` swept, no marker. `Fault::CrashAdopting` aims at it, on every seed,
-drawn from its own stream (D-031): the install crash's setup, then, once the
+`CURRENT` swept, no marker. `Fault::CrashAdopting` aims at it, on every seed as
+first written here and on one seed in four since the amendment in the
+Consequences below, drawn from its own stream (D-031): the install crash's setup,
+then, once the
 receiver traces the install complete, a crash the moment the adoption's first
 change to the store directory is durable — read from the simulated disk's
 durable namespace (`Sim::durable_names`), the old store's files all gone or a
@@ -1822,9 +1881,10 @@ the crash count on a seed that draws the storm is unchanged; the price is paid
 in catch rate, and it is paid about in proportion. `AdoptionAsBuilt` was caught
 on 23 of 100 release seeds and 270 of 1000 with the storm everywhere; on one
 seed in four it is caught on 8 of 100, the fault is drawn on 26 of those 100
-seeds, and the sweep still counts 851 adoptions, so `Coverage::assert_complete`'s
-`adoptions` and `adoption_crash_faults` both still hold at the hundred-seed
-tier.
+seeds, and the sweep still counts 813 adoptions (re-measured on ec2ecc4 at a
+hundred release seeds, two independent re-runs agreeing), so
+`Coverage::assert_complete`'s `adoptions` and `adoption_crash_faults` both still
+hold at the hundred-seed tier.
 
 One trade was needed, and it is a tier rather than a dice roll. At 8 of 100 the
 catch is 0 of the gate's 20 seeds — three seeds in four never roll the rot's
@@ -1842,7 +1902,7 @@ measurement says where the rest of the time is. On this machine the raft test
 binary's thousand seeds now take 1648 s — down from 2218 s with the storm
 everywhere, a quarter off — but `scripts/premerge.sh` runs that binary and the
 others, so the tier is still over its quarter of an hour. Attributed at a
-hundred seeds, where the same binary takes 146.0 s: without PROPOSED D-043's
+hundred seeds, where the same binary takes 146.0 s: without D-043's
 re-take arm 138.6 s, without the adoption storm as well 99.1 s, and without
 D-044's refusal storm on top of that 90.5 s. So the storm at one seed in four is
 27 per cent of the binary, the refusal storm 6 per cent and the re-take arm 5 per
@@ -1854,11 +1914,11 @@ getting the tier back under fifteen minutes is a separate piece of work on what
 the base run itself costs, and it is not this entry's to do.
 
 `Sim::durable_names` joins `durable_contents` as a harness accessor. Every site
-is marked `PROPOSED(D-041)`.
+is marked `D-041`.
 
 ---
 
-## PROPOSED D-042 — Store incarnations: a leader forgets what a re-seeded follower forgot
+## D-042 — Store incarnations: a leader forgets what a re-seeded follower forgot
 
 **Context.** The ten-thousand-seed nightly (run 34496762339), seed 5909: server 3
 was refused at 9.80 s and re-seeded five times, at 10.10, 10.47, 10.85, 13.27 and
@@ -1874,9 +1934,10 @@ the probe back to `matched`, the follower rejects that too, and it is never
 counted for a commit again nor re-designated snapshot-fed, since every answer
 keeps it from going quiet — until the leader changes. The same `matched` keeps a
 refused follower from ever being re-seeded by the leader that matched it: its
-rejections ask from index 1 but reject a probe at `matched`, never at index 0,
-so the re-seed ask of D-037 is never heard, and only a designation earned by
-silence while it was down ever streams to it. Stage E's re-seed (D-030, D-035)
+rejections ask from index 1 but reject a probe at `matched`, never an append at
+index 1 (`prev_index` 0), so the re-seed ask of D-037 is never heard, and only a
+designation earned by silence while it was down ever streams to it. Stage E's
+re-seed (D-030, D-035)
 broke the assumption behind monotone `matched`: a follower can now legitimately
 lose entries it acknowledged. Measured on the nightly's trace since, seed 5909's
 wedge was not this hazard but the snapshot streams' (D-043) alone: its leader in
@@ -1922,11 +1983,13 @@ to the snapshot task, which ends it either way; the quiet count and the lease
 state are untouched, since the follower just answered. A refused server's 0 is
 a change like any other, so its first rejection walks the probe to index 0,
 where the leader either feeds the snapshot outright, the probe being below its
-compacted prefix, or hears the rejection at index 0 that D-037 designates on: a
+compacted prefix, or hears the rejection of an append at index 1 (`prev_index` 0)
+that D-037 designates on: a
 refused follower is re-seeded by the leader that matched it, whatever it was
 matched at. `Variant::IgnoreIncarnation` records and never resets: the leader
-as built. The sweep does not catch it — on 0 of 100 release seeds, by
-construction rather than by chance. The wedge stalls a commit only while the
+as built. At a hundred release seeds the sweep catches it on 0 of 100; what ten
+thousand seeds caught, and why, is at the end of this entry. The wedge stalls a
+commit only while the
 third server is unavailable; after the last heal every fault has healed or
 restarted, so a server is unavailable then only by refusal, and a refused
 server beside a re-seeded one is the configuration D-035's carve-out withholds
@@ -1939,15 +2002,14 @@ included, and a schedule that refuses a second follower under that leader, which
 only the disk model's rot produces and no driver can aim.
 
 The variant and its sweep test ship as the pair rule asks, and the test is not
-ignored: a variant that cannot be caught is a hole in the sweep to be named,
+ignored: a variant the sweep does not catch is a hole in the sweep to be named,
 not a test to be skipped (CLAUDE.md). It asserts instead what is true of this
 leader and what a sweep that could not tell the two leaders apart would fail —
 that the leader as built never forgets a follower's progress, tracing no
 `RaftProgressReset` on any seed, where the correct server's own sweep requires
 one wherever it saw a refusal — and that the sweep reaches the state the wedge
 is built on: a refused follower re-seeded and applying again, on 67 of 100
-release seeds. The catch rate is printed at every tier, so the day it stops
-being zero is visible.
+release seeds. The catch rate is printed at every tier.
 
 **Alternatives.** Letting a rejection lower `matched`: any stale or duplicated
 rejection could then walk a live follower's match back and re-send what it
@@ -1981,7 +2043,7 @@ member for the membership path, not a re-seed. `RaftRecovered` gains a field,
 wherever it saw a refusal. The core-level scenario is in
 `crates/ananke-raft/tests/paper.rs`.
 
-**Amended under PROPOSED D-045.** `Variant` is a set now, so the run this entry
+**Amended under D-045.** `Variant` is a set now, so the run this entry
 said no sweep could make — one server carrying this bug *and* D-043's at once —
 is a run the sweep makes. Four things it settles.
 
@@ -2038,8 +2100,8 @@ stream has open, and that coincidence is what is rare; once it happens the
 stream half alone already stalls the commit, and this entry's stale `matched`
 has nothing left to add.
 
-*`IgnoreIncarnation` alone stays a coverage claim — defence in depth, and the
-owner's decision.* Measured over a thousand release seeds on this tree: caught
+*`IgnoreIncarnation` stays in the sweep — defence in depth, and the owner's
+decision.* Measured over a thousand release seeds on this tree: caught
 on **0 of 1000**, with **0** progress resets, and the precondition the wedge is
 built on — a refused follower re-seeded and applying again — reached on **637 of
 1000**, where the correct server needs a reset per refusal and this leader
@@ -2051,24 +2113,28 @@ It is kept because the day something else makes the second follower uncountable
 — another bug, another fault arm, a schedule nobody has drawn — the stale
 `matched` is a wedge again, and because the fix is cheap while its absence is
 invisible until then. The variant ships and its test is not ignored (CLAUDE.md);
-what it asserts is what is true of it, and the rate is printed at every tier so
-the day it stops being zero is visible.
+what it asserts is what is true of it, and the rate is printed at every tier.
 
-At the nightly's ten thousand seeds (run 34711427220, on 14c3e17) it printed a
-catch on 4 of 10 000 — seeds 1252, 2509, 3087 and 5990 — and not one of the four
-is this bug. Every one is the pre-vote isolation check reading a trace
-timestamp: the isolated server's term rise was adopted from a message delivered
+At the nightly's ten thousand seeds (run 34711427220, on 14c3e17) it was caught
+on 4 of 10 000 — seeds 1252, 2509, 3087 and 5990 — each a pre-vote isolation
+straddle: the isolated server's term rise was adopted from a message delivered
 before the isolation began, between 0.31 and 16.57 ms before it, and traced
 after, once its persist was durable, with no message reaching the server inside
 the window. That is the gap that failed the correct server itself on seeds 1885
-and 2023 of the same run. So the claim stands as written: this bug has not been
-caught for its own mechanism at any tier, and the four catches are the checker's.
+and 2023 of the same run. At ten thousand seeds after D-047 (runs 34731272921 on
+bd93ed3 and 34749071877 on 9b5995d) it was caught on 0 of 10 000, and the second
+run's per-seed report named exactly those four as the catches reading decision
+time removed. D-047 moved no schedule — every trace it compared with a tree
+before it is byte-identical once `decidedNs` is removed — so the drop from 4 to 0
+is itself evidence that the four were timing artefacts, as D-047 had measured each
+directly
+(`the_nightlys_eleven_variant_catches_of_the_trace_timestamp_gap_are_not_catches`).
 
-Every site is marked `PROPOSED(D-042)`.
+Every site is marked `D-042`.
 
 ---
 
-## PROPOSED D-043 — Snapshot takes are versioned directories, a stream pins one, and a leader streams to every designated follower at once
+## D-043 — Snapshot takes are versioned directories, a stream pins one, and a leader streams to every designated follower at once
 
 **Context.** The ten-thousand-seed nightly (run 34496762339), seed 5909: the
 leader's last commit was 329 at 13.43 s and nothing committed for the remaining
@@ -2089,7 +2155,7 @@ leader's election at 14.757 s. Neither
 follower could be counted; the leader lost its quorum at 13.99 s, won term 11 at
 14.76 s and was no better off. The liveness check reported it.
 
-As built (D-030, PROPOSED D-036, D-038): every take at an index writes
+As built (D-030, D-036, D-038): every take at an index writes
 `snap-<index>`, sweeping whatever was there; the record under `0 / 3 / snapshot`
 is written before the checkpoint, so it can name a directory still being
 written; the task keeps one outbound stream and a queue of followers behind it;
@@ -2104,7 +2170,7 @@ gives the stream its resumption and the leader its threshold rule; it does not
 say where a take goes, what a stream reads while the next take lands, when a
 directory may go, or how many followers a leader feeds at once.
 
-**Decision.** Six parts, every site marked `PROPOSED(D-043)`.
+**Decision.** Six parts, every site marked `D-043`.
 
 *Versioned takes.* Every take goes to its own directory,
 `snapshot::version_dir`, `snap-<index>-<take>`, numbered by a per-store take
@@ -2188,7 +2254,8 @@ passes is known to have injected the fault. The catch itself is asserted at the
 nightly's tier, ten thousand seeds, the only tier that ever produced it: this
 is the server whose hundred seeds CI passed when it merged.
 
-**What the sweep found.** The hundred-seed release run: the correct server
+**What the sweep found.** The hundred-seed release run, as recorded in 1bafacb:
+the correct server
 passes all hundred, with 2905 snapshots taken, 1279 installed, 4696 streams
 resumed, 2540 versions deleted by the sweep, 70 stream openings that made two
 streams run at once, and no take answered by the recorded version — the guard
@@ -2229,8 +2296,8 @@ leader's data directory holds the record's version plus whatever streams still
 read, and nothing else after the next sweep; a follower sweeps its old versions
 at its next start. Every stream costs one chunk in flight, so a leader feeding
 two followers has two. Seed 5909 is pinned under this entry's variant and
-D-042's alike, and passes under each: see D-042's Consequences for why one
-enum cannot carry both bugs. `sim/tests/raft.rs` counts versions deleted, takes
+D-042's alike, and passes under each: see D-045 for why one enum could not
+carry both bugs. `sim/tests/raft.rs` counts versions deleted, takes
 reused and streams at once, and `crates/ananke-raft/tests/snapshot.rs` shows
 two takes at one index as two directories, a stream completing under a newer
 take where the shared directory's does not, the sweep sparing the pinned and
@@ -2278,7 +2345,8 @@ index, a stream in flight, and every take asked for landing at that index) but
 cannot force, since those paths are the receiver's refusals and the network's
 duplicates rather than anything a partition, block or crash schedules. The
 re-take at an index already taken happens often on its own, on 48 of 100 seeds
-and 532 of 1000, and is harmless every time, because no stream had that directory
+(173c84f) and 532 of 1000 (78a3711's pre-merge run, on 173c84f's code), and is
+harmless every time, because no stream had that directory
 open.
 
 Two ways past that were weighed and not taken. Filling the state machine until an
@@ -2305,9 +2373,10 @@ after its persist with no message reaching the server in the window — the gap
 that failed the correct server on seeds 1885 and 2023 of the same run: seeds
 1176, 2407, 3863, 4713, 5203, 6691 and 9670. Two are the linearizability checker
 running out of its search budget, on seeds 1262 and 7222, which is not a proven
-violation. The test's ten-thousand-seed assertion counts all thirteen.
+violation. The test's ten-thousand-seed assertion counted all thirteen; D-047
+changed it to assert, at that tier, that the liveness check caught the variant.
 
-**Amended under PROPOSED D-045.** `Variant` is a set now, so the sweep can run
+**Amended under D-045.** `Variant` is a set now, so the sweep can run
 one server carrying this entry's bug and D-042's at once, which is what the
 nightly's seed 5909 was. This entry's fix alone was the fix for 5909. Round two
 read the wedge as needing a stale `matched` for the re-seeded follower (D-042)
@@ -2337,7 +2406,7 @@ stays, and its rate is reported beside this entry's own.
 
 ---
 
-## PROPOSED D-044 — A refusal is durable, and a refused engine does no work
+## D-044 — A refusal is durable, and a refused engine does no work
 
 **Context.** The thousand-seed premerge, seed 687: server 3's engine open dropped
 SST 1 — it held sequence numbers 1..98 of the state machine — and
@@ -2366,7 +2435,7 @@ but its log does not hold index 1* — the rule that a `RaftRecovered` may not
 follow a `RaftRefused` without an install between them, which is the right rule.
 
 Two flaws behind it. **A refusal is not durable**: it lives only in the running
-process, and PROPOSED D-041's marker says a directory *was* a store, not that the
+process, and D-041's marker says a directory *was* a store, not that the
 store *lost state*, so the next start decides afresh on whatever it finds. And
 **a refused engine keeps running**: its flusher, its compaction and the
 log-segment deletion that follows a flush are all still on, and the first of them
@@ -2374,7 +2443,7 @@ writes over the very hole the recovery reported. RAFT.md §3 says a refused serv
 "participates in nothing"; it says nothing about the engine underneath it, and
 nothing about a refusal outliving the process that made it.
 
-**Decision.** Four parts, every site marked `PROPOSED(D-044)`.
+**Decision.** Four parts, every site marked `D-044`.
 
 *The mark.* D-041's `RAFT-STORE` marker gains a second form. A whole store's
 marker holds one line, `ananke raft store`; a lost store's holds `ananke raft
@@ -2439,11 +2508,12 @@ for it. The grace is the second measurement: the laundering flush itself takes
 those fifteen milliseconds, and a crash two milliseconds after the refusal kills
 it half-done, which leaves the store visibly damaged and the bug invisible.
 
-**What the sweep found.** At a hundred seeds, release, `RefusalNotDurable` is
-caught on 2 of 100, both the premerge's signature — *state machine safety: server
-1 recovered an applied index of 551 but its log does not hold index 1* on the
-first — and the fault is seen firing, a crash landing on a refused server, on 67
-of those hundred seeds; at the gate's twenty it is caught on 1 of 20. The correct
+**What the sweep found.** At a hundred seeds, release, on cf11ddc, when D-041's
+adoption storm still rode every seed, `RefusalNotDurable` is caught on 2 of 100,
+both the premerge's signature — *state machine safety: server 1 recovered an
+applied index of 551 but its log does not hold index 1* on the first — and the
+fault is seen firing, a crash landing on a refused server, on 67 of those hundred
+seeds; at the gate's twenty it is caught on 1 of 20. The correct
 server passes all hundred of both sweeps, and its coverage over them counts 851
 refusals, 77 engines quiesced, 41 refusals the store's own lost mark made, and
 687 crashes landing on a refused server. The rate is the conjunction's: a crash
@@ -2460,7 +2530,7 @@ laundering flush half-done, and a store the crash interrupts stays visibly
 damaged — which is what set the grace at sixty milliseconds and up. Because the
 conjunction is thin, the variant test asserts the catch at the hundred-seed tier
 and reports the rate at every tier, the way `SharedSnapshotDir` is asserted at the
-nightly's (PROPOSED D-043); what every tier asserts is that the fault fired.
+nightly's (D-043); what every tier asserts is that the fault fired.
 
 **Alternatives.** A mark inside the store, under tenant 0: the engine is the
 damaged thing, and writing the refusal through it is writing through the hole.
@@ -2494,7 +2564,9 @@ adoption's switch and the marker it writes next leaves the adopted store behind 
 lost mark and costs another install, a window of one file write. A quiesced
 engine keeps a store that is bigger than it needs to be: the memtables it
 replayed are never written down and its log segments are never deleted, until an
-install replaces the directory. `Sim` gains no accessor; `TraceEvent` gains
+install replaces the directory. `Sim` gains one accessor, `trace_from`, a copy
+of the records from an index on, through which the crash aimed at a flush watches
+the trace; `TraceEvent` gains
 `EngineQuiesced`, and the moirae bridge a line for it. Every schedule now ends
 with a crash storm aimed at a flush, three to five crashes and up to two and a
 half seconds of waiting each, which lengthens a seed's run; the correct server
@@ -2504,10 +2576,10 @@ still quiesced: a variant turns off its own fix and no other.
 
 ---
 
-## PROPOSED D-045 — A variant is a set
+## D-045 — A variant is a set
 
-**Context.** Round two's reading, recorded at the end of PROPOSED D-042 and in
-PROPOSED D-043, was that the nightly's seed 5909 (run 34496762339) wedged the
+**Context.** Round two's reading, recorded at the end of D-042 and in
+D-043, was that the nightly's seed 5909 (run 34496762339) wedged the
 cluster because *two* bugs held at once — the leader's `matched` for a
 re-seeded follower standing above its rebuilt log (D-042) and the snapshot
 stream to the other follower never completing (D-043) — so that either fix
@@ -2526,10 +2598,10 @@ recorded that as a structural limit of the mechanism rather than close it. The
 owner's decision after round two, which this entry records: `Variant` becomes a
 set.
 
-**Decision.** Five parts, every site marked `PROPOSED(D-045)`.
+**Decision.** Five parts, every site marked `D-045`.
 
 *The vocabulary stays.* `Variant` remains what it was: the enum of single bugs,
-one arm per rule broken, each with its reference and its `PROPOSED(D-0xx)`
+one arm per rule broken, each with its reference and its `D-0xx`
 marker. No variant's meaning changes here, and no variant is added or removed.
 `Variant::BUGS` lists the buggy arms in declaration order — `Variant::Correct`
 is not among them, because the correct server is the *absence* of every bug
@@ -2636,7 +2708,7 @@ it ever reaches a trace or a frame, that is a new decision.
 
 ---
 
-## PROPOSED D-046 — The sweep's safety re-check keeps its state
+## D-046 — The sweep's safety re-check keeps its state
 
 **Context.** `sim/raft.rs`'s `advance` runs a seed in fifty-millisecond slices and,
 every tenth slice, ran every safety fold over the trace from its first record:
@@ -2707,10 +2779,11 @@ only on `Ok` fails rather than passes.
 
 *Three other whole-trace scans per slice.* `install_landing` and `install_completed`
 copied the whole trace every five milliseconds of their watch and looked at its
-tail; they now read `trace_from` like `stream_opened` and `flush_in_flight` already
-did (D-044). `leader_now`, which every fault round asks for the latest `RaftLeader`,
-copied the whole trace to read backwards over it; it now reads back over the tail in
-windows that double until one holds a leader, which is the same answer.
+tail; they now read `trace_from` like `flush_in_flight` (D-044) and `stream_opened`
+(D-043's re-take arm) already did. `leader_now`, which every fault round asks for
+the latest `RaftLeader`, copied the whole trace to read backwards over it; it now
+reads back over the tail in windows that double until one holds a leader, which is
+the same answer.
 
 **Alternatives.** Checking only at the end of a run: a violation would be reported
 at the end of a trace rather than near the event that caused it, the run would keep
@@ -2774,7 +2847,7 @@ caught there, on every seed, as a run that passed the slices and failed at the e
 
 ---
 
-## PROPOSED D-047 — Every trace record carries its decision time and its durability time
+## D-047 — Every trace record carries its decision time and its durability time
 
 **Context.** The ten-thousand-seed nightly (run 34711427220, on `main` at 14c3e17)
 failed the correct server on seeds 1885 and 2023 with *pre-vote: server 1 raised
@@ -2804,7 +2877,7 @@ window, and every trace regenerates byte-identically from 14c3e17.
 What this entry does **not** close, said plainly: seeds 164, 385 and 7381. Those
 were gaps in the checker's *rules* — the timer check not counting an
 InstallSnapshot as a leader's contact (164, D-030's stanza), not knowing that an
-install's switch starts a fresh timer (385, PROPOSED D-039), and the snapshot floor
+install's switch starts a fresh timer (385, D-039), and the snapshot floor
 never coming back down on a re-seed (7381, D-030's stanza) — each already closed by
 its own rule and asserted by the pinned-seed audit's predicates. A record carrying
 two times would not have prevented any of them: none was a record read at the
@@ -2817,7 +2890,7 @@ time when the step that produced the event was taken: its **decision time**, at 
 before `at`, and equal to it for every record traced as it happens. A check about
 why a server did something, and so about what it could have known by then, reads
 the decision time; a check about what was durable when reads the durability time or
-the records' order. Every site is marked `PROPOSED(D-047)`.
+the records' order. Every site is marked `D-047`.
 
 *The environment.* A node's own clock is skewed and drifting, so the stamp comes
 from the environment: `Environment::decision(&self) -> Decision`, an opaque `Copy`
@@ -2871,7 +2944,7 @@ Examined and decided as they are traced, each with its reason:
   them as sites. They report state that was durable before the incarnation began,
   nothing a step of it decided, and the incarnation starts where they are traced:
   nothing awaits between them and the loop arming its first tick, which is where the
-  new core's election timer really starts counting — the moment PROPOSED D-039's
+  new core's election timer really starts counting — the moment D-039's
   arm of the timer check reads them as. The version sweep's await before them decides
   nothing they report. A stamp taken when the core was restored, before that await,
   would put the fresh timer earlier than the server has it and make the timer check
@@ -3061,17 +3134,18 @@ So on the tier the gap was found on, reading decision time removed only catches 
 gap and added none, and the correct server passes every seed. Two limits of that
 evidence: the sweep asserts a removed pre-vote catch shares its run with a straddle
 rather than matching the two, which the printed report does for all 27; and a removed
-timer catch is printed, not asserted.
+timer catch is printed, not asserted. Asserting both is issue #33.
 
 Three open points besides the two sites above. A term-raising message delivered
 before an isolation but *stepped* inside it — queued behind a persist — is decided
 inside the window and would still be flagged by the pre-vote check with no delivery
-in the window; closing it would take the causal matching rejected above. The
-nearest measured case is the two above, queued behind an install and stepped just
-before the window; no run of the correct server at ten thousand seeds was flagged by
-the check by decision time, so none reached it. The timer check's resets for a campaign, a granted
-vote or a step-down now land at the step rather than after its persist, which makes
-the check stricter by that persist, at most 6.91 ms (a term record; 6.89 ms for a
+in the window; closing it would take the causal matching rejected above, and it is
+open as issue #32. The nearest measured case is the two above, queued behind an
+install and stepped just before the window; no run of the correct server at ten
+thousand seeds was flagged by the check by decision time, so none reached it. The
+timer check's resets for a campaign, a granted vote or a step-down now land at the
+step rather than after its persist, which makes the check stricter by that
+persist, at most 6.91 ms (a term record; 6.89 ms for a
 vote) over the correct server's first 3 000 seeds, and more lenient by never
 measuring a bound past a reset already decided. No seed of the hundred moved either
 way; over those 3 000 seeds the gap lists are identical under both times, and under
@@ -3082,4 +3156,74 @@ monotonic clock, comparable only within one process, which is all a log line nee
 
 ---
 
-_Next entry: D-048. Add one before implementing anything not covered above._
+## D-048 — D-030's account of seeds 164 and 7381 is superseded by the record
+
+**Context.** D-030's *What the sweep found before it passed* gives seed 164 as "the
+ten-thousand-seed nightly, seed 164, the first correct-server failure the sweep
+ever produced": a follower "two hundred entries behind", flagged by the timer check
+"while the leader was reaching it every few milliseconds". It gives seed 7381 as
+"of the same run". The pinned-seed audit (7e5fbd4, 60a0f33) measured seed 164 on
+the trace it failed with, and D-039's Context and the seed's pin carry what it
+found. D-030, the entry that recorded the seed, does not, and an accepted entry is
+superseded, not edited.
+
+*Where the seeds came from.* Seed 164 came from a local ten-thousand-seed run on
+1373601 (the same tree as 48e5276), Run 1 of the overnight session in
+`docs/OVERNIGHT.md`, not from the GitHub nightly. Seed 7381 was not of that run: it
+came from the nightly, run 34496762339 on ea6fe7d, one of that run's three failing
+seeds with 5909 and 6325.
+
+*Which failure it was.* Not the first correct-server failure the sweep ever
+produced: D-026 records seeds 42, 2, 38 and 16 from stage B, and D-030's own
+stanza seeds 9, 8 and 60. It was the raft sweep's first correct-server failure at
+ten thousand seeds; the nightly's runs on `main` through stage C, 34020438211 on
+10809b3 and 34453669517 on 9084c13 among them, passed the correct server at that
+tier.
+
+*How far behind.* Server 2 had appended through index 208 when server 3, leading
+term 12 with its log through 276 and its snapshot at 210, began feeding it
+`InstallSnapshot` chunks at 11.854 s: about sixty-eight entries behind, not two
+hundred.
+
+*What reached it.* The gap the timer check flagged on server 2 ran from 12.9405 s
+and was flagged at 13.3397 s, against a 399.19 ms bound. Nobody led in it: server 3
+had lost its quorum at 12.936 s and was pre-voting, with no leader in the cluster,
+and the 21 chunks server 2 received in the gap came from server 3 after it lost
+its quorum, the deposed leader's leftover stream. No leader was reaching server 2
+in the stretch the check flagged.
+
+**Decision.** The account above supersedes D-030's account of seed 164 — where it
+came from, which failure it was, how far behind the follower was and what reached
+it — and D-030's "of the same run" for seed 7381. D-030's text is not edited and
+carries no pointer: the supersession is recorded here, in the later entry, as
+D-021, D-022 and D-023 record theirs. No rule changes: the timer check's
+InstallSnapshot arm, D-039's restatement arm and the exact snapshot floor D-030
+records for seed 7381 stand as built.
+
+**Alternatives.** Editing D-030's stanza in place: accepted text is superseded, not
+rewritten, and the owner ruled so for this stanza. A forward pointer on D-030: an
+edit to accepted text as well; the one pointer added to an entry that was already
+accepted, D-026's, is the one D-047's own text promised on its approval, and the
+pointers on D-036 to D-039 were added as those entries were accepted. Leaving the
+correction where the audit put it, in D-039's Context and the pin: the log would
+hold two accounts of one seed with nothing in the entry that recorded it saying
+which stands.
+
+**Consequences.** D-039 points here. The code agrees with this entry on where each
+seed came from, how far behind server 2 was and what reached it: the comments on
+`seed_164_which_a_local_ten_thousand_seed_run_found_stays_green` and
+`seed_7381_which_the_first_nightly_found_stays_green` in `sim/tests/raft.rs`, and
+`Report::snapshot_fed_timer_gaps` and the replay's InstallSnapshot arm in
+`sim/raft.rs`. Two phrases there are looser than this entry. Seed 164's comment
+calls it the first correct-server failure a ten-thousand-seed run produced, without
+"of the raft sweep": the engine sweep's `the_correct_engine_passes_every_seed` had
+failed at ten thousand seeds on 2026-09-05, in run 33967250798 on 5112a8b. And seed
+7381's test name calls run 34496762339 the first nightly, though the nightlies on
+`main` named above ran before it. `docs/OVERNIGHT.md`'s copy of the account is
+corrected in place, with a note pointing here. Seed 164's schedule has since moved
+away from the situation — a different leader is elected after its 9.691 s
+partition — and its pin asserts the situation absent.
+
+---
+
+_Next entry: D-049. Add one before implementing anything not covered above._

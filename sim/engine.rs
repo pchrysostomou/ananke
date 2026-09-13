@@ -1140,7 +1140,7 @@ fn open(
         level_base_bytes: schedule.level_base_bytes,
         sst_bytes: schedule.sst_bytes,
         background_compaction: true,
-        // PROPOSED(D-044): the engine sweep judges every recovery by its oracle
+        // D-044: the engine sweep judges every recovery by its oracle
         // and runs on past a loss, so it keeps flushing.
         quiesce_on_loss: false,
     };
@@ -1246,7 +1246,7 @@ fn check_checkpoint(
         level_base_bytes: schedule.level_base_bytes,
         sst_bytes: schedule.sst_bytes,
         background_compaction: false,
-        // PROPOSED(D-044): a checkpoint is opened to be read, not written to.
+        // D-044: a checkpoint is opened to be read, not written to.
         quiesce_on_loss: false,
     };
     env.clone().spawn("checkpoint-check", async move {

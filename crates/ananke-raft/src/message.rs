@@ -101,7 +101,7 @@ pub enum Message {
         /// forgets what it knew of the follower's log, since a re-seeded store
         /// may have lost entries the follower once acknowledged. The server
         /// stamps it on the way out, like `local`.
-        // PROPOSED(D-042): store incarnations.
+        // D-042: store incarnations.
         incarnation: u64,
     },
     /// The leader asks the receiver to start an election at once, without a
@@ -155,7 +155,7 @@ pub enum Message {
         /// [`AppendEntriesResponse`](Message::AppendEntriesResponse): on an
         /// `Installed` answer from a re-seed, the incarnation of the store the
         /// install built. The server stamps it on the way out.
-        // PROPOSED(D-042): store incarnations.
+        // D-042: store incarnations.
         incarnation: u64,
     },
 }
@@ -957,7 +957,7 @@ mod tests {
 
     /// The studio sees the responder's store incarnation on an AppendEntries
     /// response, so a re-seeded follower's answers can be told from its old
-    /// store's (PROPOSED(D-042)).
+    /// store's (D-042).
     #[test]
     fn the_studio_sees_the_incarnation_on_an_append_response() {
         let frame = Frame {

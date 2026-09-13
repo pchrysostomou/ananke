@@ -46,7 +46,7 @@
 //! `ananke` object records the version, the policy, the fault configuration as
 //! integers, each node's clock skew and drift, and the address table.
 //!
-//! `t` is a record's durability time, when it was traced (PROPOSED D-047). A record
+//! `t` is a record's durability time, when it was traced (D-047). A record
 //! whose step was decided earlier — a term adopted, persisted and traced when the
 //! sync returned — carries its decision time as `decidedNs`, global virtual time in
 //! nanoseconds, inside its `log` line's `data`, which moirae leaves open (moirae SPEC
@@ -252,7 +252,7 @@ fn convert(
     // Every record below except the partition ones is recorded with its node; 0 never
     // occurs and would be visible in the studio as an unknown lane if it did.
     let node = record.node.map_or(0, NodeId::get);
-    // PROPOSED(D-047): the decision time, inside `data`, only when it is not `t`.
+    // D-047: the decision time, inside `data`, only when it is not `t`.
     let decided = (record.decided != record.at).then(|| int(record.decided.as_nanos()));
     let log = |event: &str, data: Option<Json>| {
         let data = match (data, decided.clone()) {
@@ -559,7 +559,7 @@ fn convert(
             "ananke.engine.open-refused",
             Some(Json::obj(vec![("reason", Json::str(reason))])),
         ),
-        // PROPOSED(D-044): a refused engine does no work.
+        // D-044: a refused engine does no work.
         TraceEvent::EngineQuiesced { dir, reason } => log(
             "ananke.engine.quiesced",
             Some(Json::obj(vec![
@@ -795,7 +795,7 @@ fn convert(
             "ananke.raft.reseeded",
             Some(Json::obj(vec![("server", int(*server))])),
         ),
-        // PROPOSED(D-041): the crash-safe adoption and the store identity marker.
+        // D-041: the crash-safe adoption and the store identity marker.
         TraceEvent::RaftAdopted { server } => log(
             "ananke.raft.adopted",
             Some(Json::obj(vec![("server", int(*server))])),
@@ -808,7 +808,7 @@ fn convert(
                 ("offset", int(*offset)),
             ])),
         ),
-        // PROPOSED(D-042): store incarnations.
+        // D-042: store incarnations.
         TraceEvent::RaftProgressReset {
             server,
             follower,
@@ -821,7 +821,7 @@ fn convert(
                 ("incarnation", int(*incarnation)),
             ])),
         ),
-        // PROPOSED(D-043): snapshot versions and the streams pinned to them.
+        // D-043: snapshot versions and the streams pinned to them.
         TraceEvent::RaftSnapshotDeleted {
             server,
             last_index,
@@ -1128,7 +1128,7 @@ mod tests {
 
     /// One node that takes a term, waits out a sync, and traces the term after it:
     /// with a decision stamp taken before the wait when `stamped`, decided now when
-    /// not. PROPOSED(D-047).
+    /// not. (D-047).
     fn decided_scenario(stamped: bool) -> Sim {
         let mut config = SimConfig::new(5);
         config.fs.latency_min = Duration::from_millis(2);
@@ -1166,7 +1166,7 @@ mod tests {
         sim
     }
 
-    /// PROPOSED(D-047): a record traced after a wait carries the time its step
+    /// D-047: a record traced after a wait carries the time its step
     /// decided, and the export writes it as `decidedNs` inside `data`, after the
     /// event's own fields; a record decided as it is recorded writes nothing new;
     /// and taking a stamp moves nothing — the two runs agree on every record's time,

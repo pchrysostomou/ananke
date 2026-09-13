@@ -194,7 +194,7 @@ pub fn config(seed: u64, schedule: &Schedule) -> SimConfig {
 
 /// The server configuration for `id` under `variants`: the address book holds
 /// all five servers, and only servers 1 through 3 start with voters.
-// PROPOSED(D-045): a variant is a set.
+// D-045: a variant is a set.
 #[must_use]
 pub fn node_config(id: u64, variants: impl Into<Variants>) -> NodeConfig {
     let variants = variants.into();
@@ -241,8 +241,8 @@ type SharedStats = Arc<Mutex<ClientStats>>;
 pub struct Report {
     /// The seed.
     pub seed: u64,
-    /// Which server ran: the set of known bugs it carried (PROPOSED D-045).
-    // PROPOSED(D-045): a variant is a set.
+    /// Which server ran: the set of known bugs it carried (D-045).
+    // D-045: a variant is a set.
     pub variants: Variants,
     /// How the run was scheduled (D-016).
     pub policy: Policy,
@@ -394,7 +394,7 @@ struct Watch {
     slices: u32,
     stopped: Option<String>,
     /// The safety checks, one checker for the whole run with the state of each
-    /// check kept across looks, as the sweep's advance does (PROPOSED D-046).
+    /// check kept across looks, as the sweep's advance does (D-046).
     checker: invariants::Checker,
     /// How many trace records the checker has been fed.
     checked: usize,
@@ -560,7 +560,7 @@ impl Driver {
     /// Drives one change to completion: the request, the partition drawn for it
     /// with the leader on the minority side, the heal, and up to [`ATTEMPTS`]
     /// fresh requests should the partition have killed the change (a leadership
-    /// change abandons the catch-up phase, PROPOSED D-032).
+    /// change abandons the catch-up phase, D-032).
     fn drive_change(&mut self, voters: &[u64], phase: &Phase) -> bool {
         for attempt in 0..ATTEMPTS {
             if self.watch.stopped.is_some() {
@@ -614,15 +614,15 @@ impl Driver {
 }
 
 /// Runs the scenario for `seed` with the schedule drawn from it, under the set
-/// of bugs `variants` (PROPOSED D-045).
-// PROPOSED(D-045): a variant is a set.
+/// of bugs `variants` (D-045).
+// D-045: a variant is a set.
 #[must_use]
 pub fn run(seed: u64, variants: impl Into<Variants>) -> Report {
     run_with(seed, Schedule::draw(seed), variants)
 }
 
 /// Runs the scenario for `seed` with an explicit schedule.
-// PROPOSED(D-045): a variant is a set.
+// D-045: a variant is a set.
 #[must_use]
 pub fn run_with(seed: u64, schedule: Schedule, variants: impl Into<Variants>) -> Report {
     let variants = variants.into();

@@ -138,7 +138,7 @@ pub struct EngineConfig {
     /// refuses such a store (`ananke-raft`'s `RaftStore::open`) sets this; a
     /// caller that allows fallbacks and head gaps means to keep running and
     /// leaves it off.
-    // PROPOSED(D-044): a durable refusal, and a refused engine that does no work.
+    // D-044: a durable refusal, and a refused engine that does no work.
     pub quiesce_on_loss: bool,
 }
 
@@ -162,7 +162,7 @@ impl EngineConfig {
             level_base_bytes: 256 << 20,
             sst_bytes: 64 << 20,
             background_compaction: true,
-            // PROPOSED(D-044): off by default, so an engine whose caller allows
+            // D-044: off by default, so an engine whose caller allows
             // fallbacks and head gaps keeps the behaviour it had.
             quiesce_on_loss: false,
         }
@@ -405,7 +405,7 @@ pub(crate) struct Shared<E: Environment> {
     flusher: Mutex<Flusher>,
     /// Set once the engine is quiesced: no flush, no compaction, no log segment
     /// deleted, from the next step on. It is never unset.
-    // PROPOSED(D-044): a durable refusal, and a refused engine that does no work.
+    // D-044: a durable refusal, and a refused engine that does no work.
     quiesced: AtomicBool,
     /// One flush or compaction at a time (D-023).
     turnstile: Turnstile,
@@ -534,7 +534,7 @@ impl EngineRecovery {
     /// This is the engine's own name for what `ananke-raft`'s `LostState`
     /// refuses a Raft store for, so the two can never disagree, and what
     /// [`EngineConfig::quiesce_on_loss`] starts an engine quiesced for.
-    // PROPOSED(D-044): a durable refusal, and a refused engine that does no work.
+    // D-044: a durable refusal, and a refused engine that does no work.
     #[must_use]
     pub fn lost_writes(&self) -> bool {
         !self.dropped.is_empty()
@@ -953,7 +953,7 @@ impl<E: Environment> Engine<E> {
             wal: recovery,
             replayed,
         };
-        // PROPOSED(D-044): an engine whose recovery lost writes in the middle of
+        // D-044: an engine whose recovery lost writes in the middle of
         // the state starts quiesced when the caller asked for it, the flusher
         // never spawned: the flush of the memtable this open just replayed would
         // write a manifest without the dropped table and delete the log segments
@@ -1101,7 +1101,7 @@ impl<E: Environment> Engine<E> {
     ///
     /// The filesystem's, or a table's `InvalidData`.
     pub async fn compact_once(&self) -> io::Result<Option<Compaction>> {
-        // PROPOSED(D-044): a quiesced engine does no work, this trigger included.
+        // D-044: a quiesced engine does no work, this trigger included.
         if self.quiesced() {
             return Ok(None);
         }
@@ -1123,13 +1123,13 @@ impl<E: Environment> Engine<E> {
     ///
     /// Writes are not refused: a caller that quiesces has no use for them, and
     /// the log still takes them. Reads keep working from what is in memory.
-    // PROPOSED(D-044): a durable refusal, and a refused engine that does no work.
+    // D-044: a durable refusal, and a refused engine that does no work.
     pub fn quiesce(&self) {
         self.shared.quiesce("the store was refused for lost state");
     }
 
     /// Whether the engine is quiesced.
-    // PROPOSED(D-044): a durable refusal, and a refused engine that does no work.
+    // D-044: a durable refusal, and a refused engine that does no work.
     #[must_use]
     pub fn quiesced(&self) -> bool {
         self.shared.quiesced.load(Ordering::SeqCst)
@@ -1254,7 +1254,7 @@ impl<E: Environment> Drop for Engine<E> {
 impl<E: Environment> Shared<E> {
     /// Quiesces the engine and wakes the flusher, which stops at its check. The
     /// first call traces it; later ones do nothing.
-    // PROPOSED(D-044): a durable refusal, and a refused engine that does no work.
+    // D-044: a durable refusal, and a refused engine that does no work.
     fn quiesce(&self, reason: &'static str) {
         if self.quiesced.swap(true, Ordering::SeqCst) {
             return;
@@ -1539,7 +1539,7 @@ impl<E: Environment> Future for NextImmutable<'_, E> {
 /// and the log grows.
 async fn flusher<E: Environment>(shared: Arc<Shared<E>>) {
     while let Some(memtable) = NextImmutable(&shared).await {
-        // PROPOSED(D-044): a quiesced engine does no work. The flush that
+        // D-044: a quiesced engine does no work. The flush that
         // follows a recovery which lost state is the one that launders the
         // loss away — a manifest without the dropped table, and the log
         // segments that held the records deleted — so the task stops here and

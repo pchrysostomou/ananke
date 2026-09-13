@@ -75,7 +75,7 @@ pub enum Variant {
     /// the server's business (`snapshot.rs`); the core ignores this variant.
     SnapshotWithoutCurrentLast,
     /// The adoption of a staged install as it was built under D-038, before
-    /// PROPOSED(D-041): the old store's `CURRENT` and files are removed before
+    /// D-041: the old store's `CURRENT` and files are removed before
     /// the staged copies and their directory entries are durable, a staging
     /// `CURRENT` that exists but does not parse is swept as debris, and a store
     /// directory emptied that way opens as a fresh store, since nothing marks it
@@ -85,7 +85,7 @@ pub enum Variant {
     /// reports at the restatement (the nightly's seed 6325). The adoption is the
     /// server's business (`snapshot.rs`, `node.rs`); the core ignores this
     /// variant.
-    // PROPOSED(D-041): the crash-safe adoption and the store identity marker.
+    // D-041: the crash-safe adoption and the store identity marker.
     AdoptionAsBuilt,
     /// The leader ignores the store incarnation its followers answer with
     /// (RAFT.md §3): the leader as built before D-042. A follower re-seeded
@@ -95,12 +95,12 @@ pub enum Variant {
     /// discarded, the follower is never designated snapshot-fed and never
     /// counted again — until the leader changes. With the other follower
     /// unavailable, commits stall: the sweep's liveness check.
-    // PROPOSED(D-042): store incarnations.
+    // D-042: store incarnations.
     IgnoreIncarnation,
     /// The leader's snapshot takes share one mutable directory per index,
     /// rewritten by every take under whatever stream is reading it, and the
     /// leader streams to one designated follower at a time, every other one
-    /// queued behind it: the behaviour as built before PROPOSED D-043. A take
+    /// queued behind it: the behaviour as built before D-043. A take
     /// at an index already recorded — the retake a failed stream asks for —
     /// sweeps the directory a running stream reads, so sender and receiver fall
     /// out of step and the stream never completes; a second designated follower
@@ -111,7 +111,7 @@ pub enum Variant {
     /// `node.rs`); the core ignores this variant.
     SharedSnapshotDir,
     /// A refusal that lives only in the running process, and a refused engine
-    /// that keeps working: the server as built before PROPOSED D-044. Nothing
+    /// that keeps working: the server as built before D-044. Nothing
     /// records the loss in the store directory, so the next start decides afresh
     /// on whatever the refused engine has since made of the disk; and that
     /// engine, opened on a recovery which dropped a table, still flushes the
@@ -124,7 +124,7 @@ pub enum Variant {
     /// it recovered (the thousand-seed premerge, seed 687). The marker and the
     /// quiesce are the server's business (`store.rs`, `node.rs`,
     /// `ananke-storage`); the core ignores this variant.
-    // PROPOSED(D-044): a durable refusal, and a refused engine that does no work.
+    // D-044: a durable refusal, and a refused engine that does no work.
     RefusalNotDurable,
 }
 
@@ -132,7 +132,7 @@ impl Variant {
     /// Every buggy variant, in declaration order: the vocabulary a [`Variants`]
     /// set is drawn from. [`Variant::Correct`] is not a member — it is the
     /// absence of all of them — so this is what [`Variants`]'s `Debug` walks.
-    // PROPOSED(D-045): a variant is a set.
+    // D-045: a variant is a set.
     pub const BUGS: &'static [Variant] = &[
         Variant::SendBeforePersist,
         Variant::ApplyBeforeCommit,
@@ -153,7 +153,7 @@ impl Variant {
     /// This variant's bit in a [`Variants`] set. [`Variant::Correct`] owns no
     /// bit: the correct server is the empty set. The match is exhaustive on
     /// purpose, so a new variant does not compile until it has a bit.
-    // PROPOSED(D-045): a variant is a set.
+    // D-045: a variant is a set.
     const fn bit(self) -> u32 {
         match self {
             Variant::Correct => 0,
@@ -175,7 +175,7 @@ impl Variant {
     }
 }
 
-/// Which known bugs one server carries at once (PROPOSED D-045): a set of
+/// Which known bugs one server carries at once (D-045): a set of
 /// [`Variant`]s, held as a bitmask so it is `Copy`, cheap and deterministic —
 /// no hashing and no allocation on a path every step of the core walks.
 ///
@@ -183,8 +183,8 @@ impl Variant {
 /// [`Variants::is_correct`] asks whether the set is empty. The set exists so the
 /// sweep can run a server carrying two bugs at once, which a single-enum
 /// `Variant` could not. It was built on the reading that the nightly's seed 5909
-/// needed a stale `matched` for a re-seeded follower (PROPOSED D-042) and a
-/// never-completing snapshot stream to the other follower (PROPOSED D-043)
+/// needed a stale `matched` for a re-seeded follower (D-042) and a
+/// never-completing snapshot stream to the other follower (D-043)
 /// together; measured on that trace since, the wedge was D-043's alone — the
 /// leader in force had rebuilt its progress at `matched: 0`, and the second
 /// follower was queued behind the scrambled stream — so no wedge that needs two
@@ -211,7 +211,7 @@ impl Variant {
 /// assert!(Variants::default().is_correct());
 /// assert_eq!(format!("{:?}", Variants::default()), "Correct");
 /// ```
-// PROPOSED(D-045): a variant is a set.
+// D-045: a variant is a set.
 #[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Variants(u32);
 
@@ -288,7 +288,7 @@ impl From<Variant> for Variants {
 
 /// Readable, because the sweep's rate lines print it: `Correct` for the empty
 /// set, `{IgnoreIncarnation, SharedSnapshotDir}` for a pair.
-// PROPOSED(D-045): a variant is a set.
+// D-045: a variant is a set.
 impl fmt::Debug for Variants {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.is_correct() {
@@ -335,8 +335,8 @@ pub struct RaftConfig {
     /// must stay under `ananke_env::MAX_FRAME_LEN` with the frame's own fields.
     pub snapshot_chunk: usize,
     /// Which core to run: the set of bugs this server carries, empty for the
-    /// correct one (PROPOSED D-045).
-    // PROPOSED(D-045): a variant is a set.
+    /// correct one (D-045).
+    // D-045: a variant is a set.
     pub variants: Variants,
 }
 
@@ -447,7 +447,7 @@ pub enum Input {
         index: Index,
         /// The store incarnation the follower's `Installed` answer carried: a
         /// fresh one when the install re-seeded a refused server (RAFT.md §3).
-        // PROPOSED(D-042): store incarnations.
+        // D-042: store incarnations.
         incarnation: u64,
     },
     /// The snapshot task gave up streaming to `to`: a timeout, a lost leadership,
@@ -586,7 +586,7 @@ struct Ack {
     hint: Index,
     echo: u64,
     local: u64,
-    /// The responder's store incarnation (PROPOSED(D-042)).
+    /// The responder's store incarnation (D-042).
     incarnation: u64,
     now: u64,
 }
@@ -636,7 +636,7 @@ impl Guard {
 /// (RAFT.md §1): the servers being added catch up as non-voting learners first
 /// (thesis §4.2.1). The state is leader-local and volatile: a leadership change or
 /// a step-down abandons the change, the operator sees no joint entry in the trace
-/// and asks again. PROPOSED(D-032): the catch-up phase is not replicated.
+/// and asks again. D-032: the catch-up phase is not replicated.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Change {
     /// The voters the operator asked for.
@@ -694,7 +694,7 @@ struct Progress {
     /// answered (RAFT.md §3): an answer carrying a different one means the
     /// follower runs on a rebuilt store whose log may have lost entries it once
     /// acknowledged, and everything above starts over.
-    // PROPOSED(D-042): store incarnations.
+    // D-042: store incarnations.
     incarnation: Option<u64>,
 }
 
@@ -742,7 +742,7 @@ pub struct Raft {
     /// have included a vote, so it grants no vote and no pre-vote, never
     /// campaigns, and makes no lease promise, for the rest of its life on that
     /// store. It still replicates, applies and counts for commit majorities.
-    // PROPOSED(D-035): re-seeded servers are quarantined from voting for good.
+    // D-035: re-seeded servers are quarantined from voting for good.
     quarantined: bool,
     commit: Index,
     applied: Index,
@@ -1373,7 +1373,7 @@ impl Raft {
                 // A snapshot when the log has outgrown the last one (RAFT.md §1).
                 // A fresh leader holds off for two minimum election timeouts: its
                 // first duty is its no-op and its followers, and a checkpoint
-                // stalls applies for its duration (D-030, PROPOSED(D-036)); a
+                // stalls applies for its duration (D-030, D-036); a
                 // follower that needs the snapshot sooner gets one on demand
                 // through `replicate`.
                 if self.leader_ticks >= 2 * self.config.election_ticks.0
@@ -1389,7 +1389,7 @@ impl Raft {
                 // follower far behind and quiet for two minimum election timeouts
                 // no longer blocks compaction; when it comes back it is fed the
                 // snapshot, since its entries are gone.
-                // PROPOSED(D-037): the compaction trigger for unresponsive followers.
+                // D-037: the compaction trigger for unresponsive followers.
                 let threshold = self.config.snapshot_threshold;
                 let quiet = 2 * self.config.election_ticks.0;
                 let last = self.last_index();
@@ -1437,7 +1437,7 @@ impl Raft {
                     // A quarantined server never campaigns: leading takes a vote
                     // for itself, and it grants none (RAFT.md §3).
                     if self.quarantined || !self.membership.is_voter(self.id) {
-                        // PROPOSED(D-033): a server that is not a voter of the
+                        // D-033: a server that is not a voter of the
                         // configuration in force does not campaign. A learner, a
                         // server with no configuration yet, and a removed server
                         // cannot win (thesis §4.2.1) and would only knock.
@@ -1654,7 +1654,7 @@ impl Raft {
     /// The first answer seen only records. Returns whether progress was reset.
     /// [`Variant::IgnoreIncarnation`] records and never resets: the leader as
     /// built before this rule.
-    // PROPOSED(D-042): store incarnations.
+    // D-042: store incarnations.
     fn note_incarnation(&mut self, from: ServerId, incarnation: u64) -> bool {
         let last = self.last_index();
         let Some(progress) = self.progress.get_mut(&from) else {
@@ -1686,7 +1686,7 @@ impl Raft {
         }
         // The install may have built a new store, a re-seed's: what was known of
         // the old one is forgotten before the install's match is recorded.
-        // PROPOSED(D-042): store incarnations.
+        // D-042: store incarnations.
         self.note_incarnation(to, incarnation);
         let Some(progress) = self.progress.get_mut(&to) else {
             return;
@@ -2447,7 +2447,7 @@ impl Raft {
         // the follower's log is forgotten first, and the answer then processed
         // as usual — a rejection's hint is where the rebuilt log ends, and the
         // probe resumes from there rather than from the stale match.
-        // PROPOSED(D-042): store incarnations.
+        // D-042: store incarnations.
         let reset = self.note_incarnation(from, incarnation);
         let Some(progress) = self.progress.get_mut(&from) else {
             return;
@@ -2520,7 +2520,7 @@ impl Raft {
         // After a reset the next index sits at the leader's end, where a
         // successful answer leaves nothing to send: an empty probe goes at once,
         // as a heartbeat would, so the rebuilt log is found within a round trip
-        // rather than at the next heartbeat tick (PROPOSED(D-042)).
+        // rather than at the next heartbeat tick (D-042).
         self.replicate(from, reset);
     }
 
@@ -2570,7 +2570,7 @@ mod tests {
     use super::{RaftConfig, Variant, Variants};
 
     /// Every variant owns a bit of its own, and `Correct` owns none: the set is
-    /// exactly as expressive as the vocabulary (PROPOSED D-045).
+    /// exactly as expressive as the vocabulary (D-045).
     #[test]
     fn every_bug_has_its_own_bit_and_correct_has_none() {
         assert_eq!(Variant::Correct.bit(), 0);
@@ -2651,7 +2651,7 @@ mod tests {
         assert_eq!(pair.len(), 2);
     }
 
-    /// The rate lines print it, so it reads (PROPOSED D-045).
+    /// The rate lines print it, so it reads (D-045).
     #[test]
     fn the_debug_reads() {
         assert_eq!(format!("{:?}", Variants::correct()), "Correct");

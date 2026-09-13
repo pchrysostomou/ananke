@@ -705,7 +705,7 @@ fn an_install_carries_the_receivers_identity_and_is_adopted_at_open() {
             assert_eq!(
                 store.incarnation(),
                 9,
-                "the repair's incarnation, not the leader's (PROPOSED(D-042))"
+                "the repair's incarnation, not the leader's (D-042)"
             );
             assert_eq!(store.applied(), 5);
             assert_eq!((store.first_index(), store.last_index()), (6, 7));
@@ -838,7 +838,7 @@ async fn open_follower(env: &SimEnv) -> Result<(bool, Term, Option<ServerId>), S
     Ok((adopted, store.term(), store.vote()))
 }
 
-/// The crash-safe adoption (PROPOSED D-041): a completed install at `/follower`
+/// The crash-safe adoption (D-041): a completed install at `/follower`
 /// is adopted while the disk takes its time, and the node crashes partway — at a
 /// different point on every seed. Whatever the point, what is durable afterwards
 /// is a store: either the old store's `CURRENT` still naming the old manifest
@@ -871,7 +871,7 @@ fn a_crash_inside_the_adoption_leaves_a_store_and_the_next_start_adopts() {
                     tail: Vec::new(),
                     quarantined: false,
                     // The receiver's own, as an install into a live store carries
-                    // (PROPOSED(D-042)).
+                    // (D-042).
                     incarnation: 1,
                 };
                 assembler.finish(&staged, &repair).await.unwrap();
@@ -954,7 +954,7 @@ fn a_crash_inside_the_adoption_leaves_a_store_and_the_next_start_adopts() {
 }
 
 /// A staging directory whose `CURRENT` exists but does not parse is damage, not
-/// debris (PROPOSED D-041): the adoption refuses it with `LostState`, sweeps
+/// debris (D-041): the adoption refuses it with `LostState`, sweeps
 /// nothing, and the old store is untouched; the same for a `CURRENT` naming a
 /// manifest that is not there. Only a staging directory with no `CURRENT` at
 /// all is swept.
@@ -975,7 +975,7 @@ fn a_damaged_staging_current_is_refused_and_not_swept() {
                 tail: Vec::new(),
                 quarantined: false,
                 // The receiver's own, as an install into a live store carries
-                // (PROPOSED(D-042)).
+                // (D-042).
                 incarnation: 1,
             };
             assembler.finish(&staged, &repair).await.unwrap();
@@ -1057,7 +1057,7 @@ fn a_damaged_staging_current_is_refused_and_not_swept() {
     });
 }
 
-/// The assembler's own sweep never removes a `CURRENT` (PROPOSED D-041): a
+/// The assembler's own sweep never removes a `CURRENT` (D-041): a
 /// completed install abandoned before its adoption — a chunk of another stream
 /// arriving first, or the re-seed stream that follows a refusal of a damaged
 /// one — loses its files but keeps its commit point, so the next start refuses
@@ -1081,7 +1081,7 @@ fn an_abandoned_staging_keeps_its_current_so_no_start_opens_the_old_store() {
                 tail: Vec::new(),
                 quarantined: false,
                 // The receiver's own, as an install into a live store carries
-                // (PROPOSED(D-042)).
+                // (D-042).
                 incarnation: 1,
             };
             assembler.finish(&staged, &repair).await.unwrap();
@@ -1137,7 +1137,7 @@ fn an_abandoned_staging_keeps_its_current_so_no_start_opens_the_old_store() {
     });
 }
 
-/// The store marker (PROPOSED D-041): a fresh directory opens as a fresh store
+/// The store marker (D-041): a fresh directory opens as a fresh store
 /// and is marked at its first open; a marked directory that has lost its
 /// `CURRENT` — even one the engine alone would open fresh again, nothing else
 /// remaining — is refused as a lost store, and so is one whose `CURRENT` does
@@ -1303,7 +1303,7 @@ fn an_identity_change_restarts_the_staging() {
     });
 }
 
-// --- PROPOSED D-043: versioned takes, pinned streams, the sweep, and a stream per follower ---
+// --- D-043: versioned takes, pinned streams, the sweep, and a stream per follower ---
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -1658,7 +1658,7 @@ fn two_designated_followers(seed: u64, variant: Variant) -> Vec<TraceEvent> {
 }
 
 /// Two designated followers are streamed to at once and both install
-/// (PROPOSED(D-043)); the server as built streams to one at a time, so its
+/// (D-043); the server as built streams to one at a time, so its
 /// second follower waits behind the first, and at this scale still completes —
 /// the sweep's seed 5909 is where the first stream never ends.
 #[test]
@@ -1694,7 +1694,7 @@ fn two_designated_followers_are_streamed_at_once_and_both_install() {
     assert_eq!(most_at_once, 1, "as built, one stream at a time");
 }
 
-/// A refusal is durable (PROPOSED D-044): the store directory's marker records
+/// A refusal is durable (D-044): the store directory's marker records
 /// that this store lost state, with the reason, and every open after it refuses
 /// on the mark alone — across the restart, and however whole the store on disk
 /// looks by then. The engine is shown opening the same directory happily, which
@@ -1758,7 +1758,7 @@ fn a_refusal_is_recorded_in_the_store_and_refuses_every_later_open() {
     });
 }
 
-/// An install clears the lost mark (PROPOSED D-044): the adoption writes the
+/// An install clears the lost mark (D-044): the adoption writes the
 /// marker fresh the moment the installed store is the one in force, so the store
 /// that lost state is refused until an install replaces it and not one open
 /// after.
