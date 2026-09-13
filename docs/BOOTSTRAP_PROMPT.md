@@ -146,7 +146,10 @@ _Update this section at the end of every session._
   variant catches of the same trace-timestamp gap, are pinned for that reason;
   seeds 164, 385 and 7381 were rule gaps this does not bear on. No schedule moved
   (the echo golden hash is unchanged and the raft traces differ only by the new
-  field), and every 100-seed rate is unchanged.
+  field), and every 100-seed rate is unchanged. At ten thousand seeds (runs
+  34731272921 and 34749071877) every test passed and reading decision time removed
+  28 catches and added none: 27 pre-vote straddles and one timer catch whose granted
+  vote was traced past the bound, each named in D-047.
 - Stage A, B, C record: A: the
   pure core, the codec with the studio decoder, the state under tenant 0 with the
   applied index in the batch and a refusal of any recovery that lost state, the four

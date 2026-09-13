@@ -3022,31 +3022,63 @@ Unchanged too: `SendBeforePersist` 10 000, `TruncateOnEveryAppend` 9 995,
 all 5 023 revoked, and the three engine variants' rates. **Four rates fell that the
 thirteen seeds do not account for**: `ResetTimerOnAnyRpc` 3 462, from 3 470;
 `AdoptionAsBuilt` 646, from 651; `ApplyBeforeCommit` 8 902, from 8 903; and
-`SnapshotWithoutCurrentLast` 3 303, from 3 304 — fifteen seeds. The run printed only
-each variant's first catch, so which seeds these are, and whether each was a catch by
-the pre-vote or timer check reading a durability time, was not measured. Every
-variant sweep now also reports, per seed, the catches reading decision time removed
-and the catches it added (`Report::moved_by_decision_time`, which derives the verdict
-by durability time from the check's own without re-running the linearizability
-search), and asserts that every pre-vote catch it removed is a term rise straddling an
-isolation's start — the only way reading a rise earlier can remove one. A timer catch
-removed is printed with the flagged server's decisions straddling the flag. The
-pinned straddles assert that report names each of them. The fifteen are for the next
-ten-thousand-seed run to name; until it does, they are an open point of this entry.
+`SnapshotWithoutCurrentLast` 3 303, from 3 304 — fifteen seeds. That run printed only
+each variant's first catch. Every sweep of the raft scenario now also reports, per
+seed, the catches reading decision time removed and the catches it added
+(`Report::moved_by_decision_time`, which derives the verdict by durability time from
+the check's own without re-running the linearizability search), and asserts that every
+pre-vote catch it removed is on a run with a term rise straddling an isolation's
+start — the only way reading a rise earlier can remove one. A timer catch removed is
+printed with the flagged server's decisions straddling the flag. The pinned straddles
+assert that report names each of them.
+
+*The second ten thousand* (nightly run 34749071877, on `9b5995d`) passed with every
+rate as above, and the report named what moved: **28 catches removed, 0 added**, the
+same on every sweep. The correct server's 2 (1885, 2023), `IgnoreIncarnation`'s 4 and
+`SharedSnapshotDir`'s 7 are the thirteen. The fifteen are `ResetTimerOnAnyRpc` 2627,
+4426, 4814, 5051, 5153, 5879, 5918 and 6717; `AdoptionAsBuilt` 1929, 2578, 2698, 5859
+and 9557; `SnapshotWithoutCurrentLast` 2305; and `ApplyBeforeCommit` 6366. Of the 28:
+
+- **27 are pre-vote catches, every one this entry's straddle**: the isolated server's
+  term rise decided 11.7 µs to 2.53 ms before the isolation began, traced 48 µs to
+  3.36 ms after it, and no message from a server delivered to it in the window. In 25
+  the decision instant is the delivery of the message that carries the new term — a
+  RequestVote or an AppendEntries of that term for a follower, a PreVoteResponse for
+  the two candidacies (5203, 2578) and for one step-down (6366, from 11 to 13). In the
+  other 2 (`SharedSnapshotDir` 3863, `IgnoreIncarnation` 1252, measured on their
+  traces) the decision instant is a re-seed install's completion: the new incarnation's
+  first step took an AppendEntries of the new term that had been delivered 2.48 ms and
+  16.31 ms earlier and waited in the inbox behind the install, and its restatement is
+  traced at that same instant, before the window, so the pre-vote check's skip does
+  not apply.
+- **1 is a timer catch**, `ResetTimerOnAnyRpc` 5153, measured on its trace: server 2,
+  pre-candidate at 7.8649 s, granted server 3's RequestVote of term 7 at its delivery at
+  8.262757 s, inside its bound; the vote and its term were durable and traced at
+  8.265322 s, the first record past the bound, which is where the check by durability
+  time flagged it. The check's own rule counts a granted vote as a reset.
+
+So on the tier the gap was found on, reading decision time removed only catches of the
+gap and added none, and the correct server passes every seed. Two limits of that
+evidence: the sweep asserts a removed pre-vote catch shares its run with a straddle
+rather than matching the two, which the printed report does for all 27; and a removed
+timer catch is printed, not asserted.
 
 Three open points besides the two sites above. A term-raising message delivered
 before an isolation but *stepped* inside it — queued behind a persist — is decided
 inside the window and would still be flagged by the pre-vote check with no delivery
-in the window; none of the thirteen is that case, and closing it would take the
-causal matching rejected above. The timer check's resets for a campaign, a granted
+in the window; closing it would take the causal matching rejected above. The
+nearest measured case is the two above, queued behind an install and stepped just
+before the window; no run of the correct server at ten thousand seeds was flagged by
+the check by decision time, so none reached it. The timer check's resets for a campaign, a granted
 vote or a step-down now land at the step rather than after its persist, which makes
 the check stricter by that persist, at most 6.91 ms (a term record; 6.89 ms for a
 vote) over the correct server's first 3 000 seeds, and more lenient by never
 measuring a bound past a reset already decided. No seed of the hundred moved either
 way; over those 3 000 seeds the gap lists are identical under both times, and under
 `ResetTimerOnAnyRpc` 27 of 400 seeds show a gap whose start or flag moved by at most
-about 3 ms, none gaining or losing a gap. And RealEnv's stamps are the process's monotonic clock,
-comparable only within one process, which is all a log line needs.
+about 3 ms, none gaining or losing a gap; at ten thousand seeds the report above
+removed one timer catch and added none. And RealEnv's stamps are the process's
+monotonic clock, comparable only within one process, which is all a log line needs.
 
 ---
 
