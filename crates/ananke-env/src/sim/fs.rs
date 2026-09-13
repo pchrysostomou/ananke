@@ -577,7 +577,7 @@ impl NodeFs {
 
     /// For tests and the harness: the file names in directory `dir` right now, in
     /// the durable namespace — the entries a crash right now would keep.
-    // PROPOSED(D-041): the crash-safe adoption and the store identity marker.
+    // D-041: the crash-safe adoption and the store identity marker.
     pub(super) fn durable_names(&self, dir: &Path) -> Vec<PathBuf> {
         self.durable_entries
             .keys()

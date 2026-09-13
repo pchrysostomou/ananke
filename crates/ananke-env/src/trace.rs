@@ -37,17 +37,18 @@ impl fmt::Display for MessageId {
 /// When a step took the decision whose events it traces: an opaque stamp from
 /// [`Environment::decision`](crate::Environment::decision), handed back to
 /// [`Environment::trace_decided`](crate::Environment::trace_decided) once the
-/// events may be recorded (PROPOSED D-047).
+/// events may be recorded (D-047).
 ///
 /// A node traces a step's events only once what they report is durable (D-026), so
 /// the time a record is written is its *durability* time, and the step that produced
 /// it may have been taken well before: a term adopted from a message, persisted, and
 /// traced when the sync returned. The stamp carries the *decision* time across that
-/// wait. It is global virtual time under the simulator and the real monotonic clock
-/// under [`RealEnv`](crate::RealEnv), never a node's own clock, which is skewed and
-/// drifting; that is why the environment issues it and why it is opaque. Taking one
-/// reads the time and nothing else: no await, no poll, no draw.
-// PROPOSED(D-047): every trace record carries its decision time and its durability time.
+/// wait. Under the simulator it is global virtual time, never a node's own clock,
+/// which is skewed and drifting; that is why the environment issues it and why it is
+/// opaque. Under [`RealEnv`](crate::RealEnv) it is the monotonic clock the node's
+/// `clock()` reads. Taking one reads the time and nothing else: no await, no poll, no
+/// draw.
+// D-047: every trace record carries its decision time and its durability time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Decision(Instant);
 
@@ -299,8 +300,8 @@ pub enum TraceEvent {
     /// of the state is itself the damaged thing, and a flush of what that
     /// recovery replayed would rewrite the manifest without the dropped table
     /// and delete the log segments that held its records — the loss laundered
-    /// away (PROPOSED D-044).
-    // PROPOSED(D-044): a durable refusal, and a refused engine that does no work.
+    /// away (D-044).
+    // D-044: a durable refusal, and a refused engine that does no work.
     EngineQuiesced {
         /// The store directory.
         dir: PathBuf,
@@ -514,7 +515,7 @@ pub enum TraceEvent {
         /// value on every store a re-seed rebuilt (RAFT.md §3). A leader that
         /// sees a follower answer with a different one forgets what it knew of
         /// the follower's log.
-        // PROPOSED(D-042): store incarnations, so a leader forgets what a
+        // D-042: store incarnations, so a leader forgets what a
         // re-seeded follower forgot.
         incarnation: u64,
     },
@@ -592,7 +593,7 @@ pub enum TraceEvent {
     /// its `CURRENT` switched to it, and the incarnation that follows runs on the
     /// installed state. The switch is the store's point of no return, so it is
     /// traced like every other store switch (D-024).
-    // PROPOSED(D-041): the crash-safe adoption and the store identity marker.
+    // D-041: the crash-safe adoption and the store identity marker.
     RaftAdopted {
         /// The server.
         server: u64,
@@ -602,7 +603,7 @@ pub enum TraceEvent {
     /// recorded for it, so its log may have lost entries it once acknowledged
     /// (a re-seed, RAFT.md §3), and the leader's match index, next index,
     /// pipeline, probe and snapshot designation for it start over.
-    // PROPOSED(D-042): store incarnations, so a leader forgets what a re-seeded
+    // D-042: store incarnations, so a leader forgets what a re-seeded
     // follower forgot.
     RaftProgressReset {
         /// The leader.
@@ -613,7 +614,7 @@ pub enum TraceEvent {
         incarnation: u64,
     },
     /// A Raft server deleted an old version of a snapshot: a checkpoint directory
-    /// that is no longer the record's and that no stream reads (PROPOSED(D-043)).
+    /// that is no longer the record's and that no stream reads (D-043).
     RaftSnapshotDeleted {
         /// The server.
         server: u64,
@@ -624,7 +625,7 @@ pub enum TraceEvent {
     },
     /// A Raft leader was asked for a checkpoint at the index its record already
     /// names, and answered with the recorded version instead of taking a second
-    /// one of the same state (PROPOSED(D-043)).
+    /// one of the same state (D-043).
     RaftSnapshotReused {
         /// The server.
         server: u64,
@@ -633,7 +634,7 @@ pub enum TraceEvent {
         /// The version's take number.
         take: u64,
     },
-    /// A Raft leader opened a snapshot stream to a follower (PROPOSED(D-043)):
+    /// A Raft leader opened a snapshot stream to a follower (D-043):
     /// `streams` is how many streams it now services at once, each pinned to
     /// the version it opened.
     RaftSnapshotStreams {

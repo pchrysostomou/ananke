@@ -109,7 +109,7 @@ pub(crate) fn snapshot_key() -> Bytes {
 
 /// The re-seed quarantine flag: present on a store rebuilt from a snapshot after a
 /// refusal (RAFT.md §3), durable so a later clean restart keeps the suppression.
-// PROPOSED(D-035): re-seeded servers are quarantined from voting for good.
+// D-035: re-seeded servers are quarantined from voting for good.
 pub(crate) fn quarantine_key() -> Bytes {
     key(RAFT_TENANT, META_TABLE, b"reseeded")
 }
@@ -120,14 +120,14 @@ pub(crate) fn quarantine_key() -> Bytes {
 /// the rest of the refused store. Followers answer with it so a leader can tell a
 /// rebuilt store, whose log may have lost acknowledged entries, from the one it
 /// recorded a match index for.
-// PROPOSED(D-042): store incarnations, so a leader forgets what a re-seeded
+// D-042: store incarnations, so a leader forgets what a re-seeded
 // follower forgot.
 pub(crate) fn incarnation_key() -> Bytes {
     key(RAFT_TENANT, META_TABLE, b"incarnation")
 }
 
 /// The incarnation of a store started fresh.
-// PROPOSED(D-042): store incarnations.
+// D-042: store incarnations.
 pub const FIRST_INCARNATION: u64 = 1;
 
 fn bad(what: &str) -> io::Error {
@@ -157,12 +157,12 @@ pub struct LostState {
     /// Damage found before the engine opened: a store directory that is not a
     /// whole store any more, or a completed install whose commit point rotted.
     /// Set on its own, with every field above empty.
-    // PROPOSED(D-041): the crash-safe adoption and the store identity marker.
+    // D-041: the crash-safe adoption and the store identity marker.
     pub damaged: Option<Damage>,
     /// What the store's marker says was lost, when the refusal is
     /// [`Damage::MarkedLost`]: the reason the refusal that marked it recorded,
     /// word for word, so a refusal outlives the process that made it.
-    // PROPOSED(D-044): a durable refusal, and a refused engine that does no work.
+    // D-044: a durable refusal, and a refused engine that does no work.
     pub lost_mark: Option<String>,
 }
 
@@ -173,7 +173,7 @@ pub struct LostState {
 /// directory whose `CURRENT` exists is a completed install, the only copy of a
 /// state the leader may have compacted past, so a `CURRENT` that does not parse
 /// is damage, never debris (RAFT.md §3, D-022).
-// PROPOSED(D-041): the crash-safe adoption and the store identity marker.
+// D-041: the crash-safe adoption and the store identity marker.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Damage {
     /// The staging directory's `CURRENT` exists but does not parse.
@@ -190,7 +190,7 @@ pub enum Damage {
     MarkedCurrentUnreadable,
     /// The store's marker says this store lost state: a refusal wrote it before
     /// it traced anything, and only an install replaces it.
-    // PROPOSED(D-044): a durable refusal, and a refused engine that does no work.
+    // D-044: a durable refusal, and a refused engine that does no work.
     MarkedLost,
 }
 
@@ -245,14 +245,14 @@ impl LostState {
             lost_mark: None,
         };
         // The engine's own rule for a hole in the middle of the state
-        // (PROPOSED(D-044)), so the fields above and the engine's decision to
+        // (D-044), so the fields above and the engine's decision to
         // start such an open quiesced can never disagree.
         recovery.lost_writes().then_some(lost)
     }
 
     /// The refusal for damage found before the engine opened: nothing recovered,
     /// since nothing was opened.
-    // PROPOSED(D-041): the crash-safe adoption and the store identity marker.
+    // D-041: the crash-safe adoption and the store identity marker.
     #[must_use]
     pub fn from_damage(damage: Damage) -> Self {
         Self {
@@ -270,7 +270,7 @@ impl LostState {
     /// wrote it gave, read back at an open that may be days and several
     /// processes later. Only an install replaces the store and with it the
     /// marker (RAFT.md §3).
-    // PROPOSED(D-044): a durable refusal, and a refused engine that does no work.
+    // D-044: a durable refusal, and a refused engine that does no work.
     #[must_use]
     pub fn from_mark(reason: String) -> Self {
         Self {
@@ -287,7 +287,7 @@ impl LostState {
 
     /// This refusal as the `InvalidData` error [`RaftStore::open`] and the
     /// adoption fail with, which [`from_io`](Self::from_io) reads back.
-    // PROPOSED(D-041): the crash-safe adoption and the store identity marker.
+    // D-041: the crash-safe adoption and the store identity marker.
     pub(crate) fn into_io(self) -> io::Error {
         io::Error::new(io::ErrorKind::InvalidData, self)
     }
@@ -299,7 +299,7 @@ impl std::fmt::Display for LostState {
             Some(damage) => write!(f, "the store is damaged: {damage}")?,
             None => write!(f, "{LOST_STATE}:")?,
         }
-        // PROPOSED(D-044): the reason the refusal that marked the store gave,
+        // D-044: the reason the refusal that marked the store gave,
         // carried word for word so the story survives the restart that reads it.
         if let Some(reason) = &self.lost_mark {
             write!(f, ", recorded at the refusal: {reason}")?;
@@ -352,25 +352,25 @@ impl std::error::Error for LostState {}
 /// nightly's seed 6325 turned a voter with a hundred and nineteen committed
 /// entries into a blank one.
 ///
-/// The marker also carries the refusal itself (PROPOSED(D-044)): a store whose
+/// The marker also carries the refusal itself (D-044): a store whose
 /// recovery lost state is marked lost, with the reason, before the server traces
 /// anything, and every open after that refuses on the mark alone until an
 /// install replaces the store. A refusal that lives only in the running process
 /// is undone by the next restart, which is how the premerge's seed 687 let a
 /// voter with a hole in its state machine rejoin.
-// PROPOSED(D-041): the crash-safe adoption and the store identity marker.
+// D-041: the crash-safe adoption and the store identity marker.
 pub const STORE_MARKER: &str = "RAFT-STORE";
 
 /// How a refusal's reason begins when the engine opened and its recovery lost
 /// writes, as opposed to a store found damaged before the engine could open
 /// (`the store is damaged: ...`, which a marked-lost re-refusal also says). Only
 /// an engine that opened has a replayed memtable to flush over the loss
-/// (PROPOSED D-044), so the sweep's predicate for seed 687's shape reads the
+/// (D-044), so the sweep's predicate for seed 687's shape reads the
 /// refusal by this prefix.
 pub const LOST_STATE: &str = "the engine's recovery lost state";
 
 /// The marker's path under `engine_dir`.
-// PROPOSED(D-041): the crash-safe adoption and the store identity marker.
+// D-041: the crash-safe adoption and the store identity marker.
 #[must_use]
 pub fn marker_path(engine_dir: &Path) -> PathBuf {
     engine_dir.join(STORE_MARKER)
@@ -389,16 +389,16 @@ async fn read_whole<E: Environment>(env: &E, path: &Path) -> io::Result<Option<B
 }
 
 /// What a whole store's marker holds.
-// PROPOSED(D-044): a durable refusal, and a refused engine that does no work.
+// D-044: a durable refusal, and a refused engine that does no work.
 const MARKER_WHOLE: &[u8] = b"ananke raft store\n";
 
 /// What a lost store's marker starts with; the refusal's reason follows, on one
 /// line of its own.
-// PROPOSED(D-044): a durable refusal, and a refused engine that does no work.
+// D-044: a durable refusal, and a refused engine that does no work.
 const MARKER_LOST: &[u8] = b"ananke raft store lost\n";
 
 /// What `engine_dir`'s marker says.
-// PROPOSED(D-044): a durable refusal, and a refused engine that does no work.
+// D-044: a durable refusal, and a refused engine that does no work.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Marker {
     /// No marker: the directory has never opened as a store.
@@ -413,7 +413,7 @@ enum Marker {
 /// store's is a lost one: the marker is written in place, so a write that a
 /// crash cut short leaves a file that is neither, and the store it stands for is
 /// the one the refusal was writing about (RAFT.md §3, D-022).
-// PROPOSED(D-044): a durable refusal, and a refused engine that does no work.
+// D-044: a durable refusal, and a refused engine that does no work.
 async fn marker<E: Environment>(env: &E, engine_dir: &Path) -> io::Result<Marker> {
     let Some(bytes) = read_whole(env, &marker_path(engine_dir)).await? else {
         return Ok(Marker::Absent);
@@ -437,7 +437,7 @@ async fn marker<E: Environment>(env: &E, engine_dir: &Path) -> io::Result<Marker
 ///
 /// A lost mark outlives the process that wrote it and every restart after it,
 /// so a store refused once is refused at every open until an install replaces
-/// it and writes the marker fresh (PROPOSED(D-044)). Without it the refusal
+/// it and writes the marker fresh (D-044). Without it the refusal
 /// lived only in the running server, and a store the refused engine had since
 /// flushed into self-consistency opened clean at the next start: the premerge's
 /// seed 687.
@@ -447,8 +447,8 @@ async fn marker<E: Environment>(env: &E, engine_dir: &Path) -> io::Result<Marker
 /// `InvalidData` carrying a [`LostState`] with [`Damage::MarkedLost`],
 /// [`Damage::MarkedCurrentMissing`] or [`Damage::MarkedCurrentUnreadable`];
 /// otherwise the filesystem's.
-// PROPOSED(D-041): the crash-safe adoption and the store identity marker.
-// PROPOSED(D-044): a durable refusal, and a refused engine that does no work.
+// D-041: the crash-safe adoption and the store identity marker.
+// D-044: a durable refusal, and a refused engine that does no work.
 pub async fn refuse_lost_store<E: Environment>(env: &E, engine_dir: &Path) -> io::Result<()> {
     match marker(env, engine_dir).await? {
         Marker::Absent => return Ok(()),
@@ -470,12 +470,12 @@ pub async fn refuse_lost_store<E: Environment>(env: &E, engine_dir: &Path) -> io
 /// has been one — a fresh directory at its first open, or a store from before
 /// the marker existed at its next — and by the adoption of an installed
 /// snapshot, which replaces the store and with it whatever the marker said
-/// about the one before (PROPOSED(D-044)).
+/// about the one before (D-044).
 ///
 /// # Errors
 ///
 /// The filesystem's.
-// PROPOSED(D-041): the crash-safe adoption and the store identity marker.
+// D-041: the crash-safe adoption and the store identity marker.
 pub async fn mark_store<E: Environment>(env: &E, engine_dir: &Path) -> io::Result<()> {
     if marker(env, engine_dir).await? == Marker::Whole {
         return Ok(());
@@ -492,7 +492,7 @@ pub async fn mark_store<E: Environment>(env: &E, engine_dir: &Path) -> io::Resul
 /// # Errors
 ///
 /// The filesystem's.
-// PROPOSED(D-044): a durable refusal, and a refused engine that does no work.
+// D-044: a durable refusal, and a refused engine that does no work.
 pub async fn mark_store_lost<E: Environment>(
     env: &E,
     engine_dir: &Path,
@@ -508,7 +508,7 @@ pub async fn mark_store_lost<E: Environment>(
 /// Writes the marker's content in place, truncating what was there, synced, with
 /// the directory synced after. A crash part way leaves a marker that is neither
 /// form, which reads as a lost store.
-// PROPOSED(D-044): a durable refusal, and a refused engine that does no work.
+// D-044: a durable refusal, and a refused engine that does no work.
 async fn write_marker<E: Environment>(
     env: &E,
     engine_dir: &Path,
@@ -548,7 +548,7 @@ pub struct SnapshotRecord {
     /// directories and a restart continues the numbering. Zero for a store that
     /// never took one, and after an install, whose versions start over; a name
     /// that recurs after an install is an empty directory by then, swept before
-    /// the incarnation's tasks run. PROPOSED(D-043).
+    /// the incarnation's tasks run. (D-043).
     pub take: u64,
 }
 
@@ -561,7 +561,7 @@ pub struct Recovered {
     pub snapshot: Option<SnapshotRecord>,
     /// Whether this store was rebuilt by a re-seed: the server must grant no vote,
     /// no pre-vote and no lease promise on it, ever (RAFT.md §3).
-    // PROPOSED(D-035): re-seeded servers are quarantined from voting for good.
+    // D-035: re-seeded servers are quarantined from voting for good.
     pub quarantined: bool,
 }
 
@@ -570,7 +570,7 @@ pub(crate) fn encode_snapshot_record(record: &SnapshotRecord) -> Bytes {
     out.put_u64_le(record.last_index);
     out.put_u64_le(record.last_term);
     out.put_u8(u8::from(record.taken));
-    // PROPOSED(D-043): the take counter rides between the flag and the directory.
+    // D-043: the take counter rides between the flag and the directory.
     out.put_u64_le(record.take);
     out.put_u32_le(u32::try_from(record.dir.len()).expect("directory fits u32"));
     out.put_slice(record.dir.as_bytes());
@@ -625,7 +625,7 @@ pub struct RaftStore<E: Environment> {
     applied: AtomicU64,
     /// The store's incarnation number: fixed for the life of the store, since
     /// only an install's repair writes it, and that builds a new store.
-    // PROPOSED(D-042): store incarnations.
+    // D-042: store incarnations.
     incarnation: u64,
 }
 
@@ -668,7 +668,7 @@ impl<E: Environment> RaftStore<E> {
         // The incarnation number: a fresh store starts at the first and writes
         // it here, synced, so every store carries the key explicitly; an
         // installed store carries the one its repair wrote.
-        // PROPOSED(D-042): store incarnations.
+        // D-042: store incarnations.
         let incarnation = match engine.get(&incarnation_key()).await? {
             Some(bytes) => decode_incarnation(bytes)?,
             None => {
@@ -763,7 +763,7 @@ impl<E: Environment> RaftStore<E> {
 
     /// The store's incarnation number (RAFT.md §3): what this server's
     /// AppendEntries and InstallSnapshot responses carry.
-    // PROPOSED(D-042): store incarnations.
+    // D-042: store incarnations.
     #[must_use]
     pub fn incarnation(&self) -> u64 {
         self.incarnation
@@ -927,7 +927,7 @@ fn decode_applied(mut bytes: Bytes) -> io::Result<Index> {
 }
 
 /// The value under the incarnation key.
-// PROPOSED(D-042): store incarnations.
+// D-042: store incarnations.
 pub(crate) fn encode_incarnation(incarnation: u64) -> Bytes {
     let mut out = BytesMut::with_capacity(8);
     out.put_u64_le(incarnation);

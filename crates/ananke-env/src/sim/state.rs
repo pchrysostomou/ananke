@@ -128,8 +128,8 @@ impl State {
         self.record_decided(node, now, event);
     }
 
-    /// Records `event` as decided at `decided`, at or before now (PROPOSED D-047).
-    // PROPOSED(D-047): every trace record carries its decision time and its durability time.
+    /// Records `event` as decided at `decided`, at or before now (D-047).
+    // D-047: every trace record carries its decision time and its durability time.
     pub(super) fn record_decided(
         &mut self,
         node: Option<NodeId>,

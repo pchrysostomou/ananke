@@ -169,14 +169,14 @@ impl SimConfig {
 pub struct TraceRecord {
     /// Global virtual time when the event was recorded: its durability time, since a
     /// node traces what a step did once it is durable (D-026). A check about what was
-    /// durable when reads this, or the records' order (PROPOSED D-047).
+    /// durable when reads this, or the records' order (D-047).
     pub at: Instant,
     /// Global virtual time when the step that produced the event took it: its
     /// decision time, at or before `at`, and equal to it for every event recorded
     /// as it happens — sends, deliveries, drops, faults, and whatever a node traces
     /// with [`Environment::trace`]. A check about why a server did something, and
-    /// so about what it could have known by then, reads this (PROPOSED D-047).
-    // PROPOSED(D-047): every trace record carries its decision time and its durability time.
+    /// so about what it could have known by then, reads this (D-047).
+    // D-047: every trace record carries its decision time and its durability time.
     pub decided: Instant,
     /// The node the event belongs to; `None` for the simulator itself.
     pub node: Option<NodeId>,
@@ -499,7 +499,7 @@ impl Sim {
     /// The file names durably in directory `dir` on `node`'s disk: the entries a
     /// crash right now would keep, the way [`durable_contents`](Self::durable_contents)
     /// is the bytes it would keep. Empty for a directory that does not exist.
-    // PROPOSED(D-041): the crash-safe adoption and the store identity marker.
+    // D-041: the crash-safe adoption and the store identity marker.
     #[must_use]
     pub fn durable_names(&self, node: NodeId, dir: &std::path::Path) -> Vec<std::path::PathBuf> {
         let st = self.shared.lock();
@@ -524,7 +524,7 @@ impl Sim {
     /// A copy of the records from `from` on, and nothing before them: what a
     /// driver watching the run for an event needs, without copying the whole
     /// trace at every look. A `from` past the end gives nothing.
-    // PROPOSED(D-044): the crash aimed at a flush in flight watches the trace in
+    // D-044: the crash aimed at a flush in flight watches the trace in
     // quarter-millisecond slices, and a whole-trace copy each time is the run's
     // cost, not the watch's.
     #[must_use]
@@ -718,13 +718,13 @@ impl Environment for SimEnv {
         self.shared.lock().record(Some(self.node), event);
     }
 
-    // PROPOSED(D-047): global virtual time, read under the lock and nothing else —
+    // D-047: global virtual time, read under the lock and nothing else —
     // no timer, no poll, no draw — so a stamp moves no schedule.
     fn decision(&self) -> Decision {
         Decision::at(self.shared.lock().now)
     }
 
-    // PROPOSED(D-047): every trace record carries its decision time and its durability time.
+    // D-047: every trace record carries its decision time and its durability time.
     fn trace_decided(&self, decided: Decision, event: TraceEvent) {
         self.shared
             .lock()

@@ -170,7 +170,7 @@ pub fn burst_addr(n: u64) -> SocketAddr {
 
 /// The filling client's address for the schedule's `n`th
 /// [`Fault::RetakeUnderStream`] (1-based): its own socket per driver, like the
-/// burst client's. PROPOSED(D-043).
+/// burst client's. (D-043).
 #[must_use]
 pub fn spread_addr(n: u64) -> SocketAddr {
     SocketAddr::from(([10, 0, 4, u8::try_from(n).expect("small")], 7000))
@@ -302,7 +302,7 @@ pub enum Fault {
         /// How long the receiver stays down.
         down: Duration,
     },
-    /// A crash aimed at the adoption of a completed install (PROPOSED(D-041)).
+    /// A crash aimed at the adoption of a completed install (D-041).
     /// The same setup as [`Fault::CrashInstalling`] — `server` isolated for
     /// `isolate` so the leader feeds it a snapshot on heal — but the run then
     /// waits for the receiver to trace the install complete (`RaftSnapshot {
@@ -342,7 +342,7 @@ pub enum Fault {
         crashes: u64,
     },
     /// A crash storm aimed at the window a refusal has to be laundered in
-    /// (PROPOSED(D-044)). Each round waits for `server` to rotate a memtable it
+    /// (D-044). Each round waits for `server` to rotate a memtable it
     /// has not finished flushing and crashes it there: until that flush switches
     /// `CURRENT`, the manifest in force is the older one, so the log tail is two
     /// memtables and the open after the crash replays enough to fill a memtable
@@ -392,7 +392,7 @@ pub enum Fault {
         /// How many times it is crashed.
         crashes: u64,
     },
-    /// The shape PROPOSED D-043 named and left to the sweep's owner: a leader
+    /// The shape D-043 named and left to the sweep's owner: a leader
     /// re-taking a snapshot while a stream to a designated follower is in
     /// flight, with a second designated follower behind it.
     ///
@@ -415,7 +415,7 @@ pub enum Fault {
     /// 0, and a stream that restarts twice is given up with `retake`, which
     /// clears the leader's checkpoint and asks for the take that scrambles the
     /// next one. The correct server takes into a new numbered version and the
-    /// stream reads the version it pinned untouched (PROPOSED(D-043)). Third,
+    /// stream reads the version it pinned untouched (D-043). Third,
     /// the cut-off follower heals having itself fallen behind and gone quiet, so
     /// it too is designated: as built it waits in the backlog behind a stream
     /// that never ends and is fed nothing, while the correct server streams to
@@ -424,7 +424,7 @@ pub enum Fault {
     /// settle later — which is seed 5909's wedge, assembled rather than waited
     /// for. Drawn from its own `moirae_sched` stream ("retake-stream"), never
     /// lengthening the shared schedule stream or any other arm's (D-031).
-    /// PROPOSED(D-043).
+    /// (D-043).
     RetakeUnderStream {
         /// The follower isolated and then fed the snapshot; the leader's
         /// neighbour if it leads when the fault starts.
@@ -458,7 +458,7 @@ pub const INSTALL_WAIT_BUDGET: Duration = Duration::from_millis(4000);
 /// timeouts of quiet and the stream opens on the next heartbeat after the heal,
 /// so a stream that is coming has come well inside this; the budget is shorter
 /// than [`INSTALL_WAIT_BUDGET`] because it waits for the stream's *opening*, not
-/// for a chunk of it to land. PROPOSED(D-043).
+/// for a chunk of it to land. (D-043).
 pub const STREAM_WAIT_BUDGET: Duration = Duration::from_millis(2500);
 
 /// One seed in this many draws a [`Fault::RetakeUnderStream`], from the fault's
@@ -467,12 +467,12 @@ pub const STREAM_WAIT_BUDGET: Duration = Duration::from_millis(2500);
 /// seconds of virtual time — which is why it is not on every schedule; a quarter
 /// of the seeds is what the catch rate at the hundred-seed tier needs and what
 /// `scripts/premerge.sh`'s quarter of an hour affords beside the adoption
-/// storm's own quarter. PROPOSED(D-043).
+/// storm's own quarter. (D-043).
 pub const RETAKE_STREAM_IN: u64 = 4;
 
 /// The longest a [`Fault::CrashRefused`] waits for its victim to begin flushing
 /// a memtable before crashing it anyway. A server fills a sixteen-kilobyte
-/// memtable about every two seconds at the sweep's write rate. PROPOSED(D-044).
+/// memtable about every two seconds at the sweep's write rate. (D-044).
 pub const FLUSH_WAIT_BUDGET: Duration = Duration::from_millis(2500);
 
 /// One seed in this many draws a [`Fault::CrashAdopting`] storm, from the
@@ -483,14 +483,14 @@ pub const FLUSH_WAIT_BUDGET: Duration = Duration::from_millis(2500);
 /// (D-040). The crash count on a seed that draws the storm is unchanged, so what
 /// the share costs is the catch rate — roughly a quarter of what it was — and
 /// what it buys back is three quarters of the seeds at their old price.
-/// PROPOSED(D-041).
+/// (D-041).
 pub const ADOPTION_STORM_IN: u64 = 4;
 
 /// The longest a [`Fault::CrashAdopting`] waits, after the install's completion
 /// or a restart, for the adoption's first durable change to the store directory
 /// before crashing the server anyway. An adoption reaches that change within a
 /// few dozen disk operations, tens of milliseconds at the sweep's latencies; a
-/// restart that is refused instead makes no change at all. PROPOSED(D-041).
+/// restart that is refused instead makes no change at all. (D-041).
 pub const ADOPTION_WAIT_BUDGET: Duration = Duration::from_millis(100);
 
 /// How long a [`Fault::CrashAdopting`] waits after a restart that finds no store
@@ -498,7 +498,7 @@ pub const ADOPTION_WAIT_BUDGET: Duration = Duration::from_millis(100);
 /// entry lost at the crash before — since then the adoption's first durable
 /// change would be its copies synced in, past the window that matters; the
 /// crash lands in the adoption's opening reads and first copies instead.
-/// PROPOSED(D-041).
+/// (D-041).
 const EMPTY_STORE_DELAY: Duration = Duration::from_millis(3);
 
 /// One lease trial; two open every schedule, see the module documentation.
@@ -526,7 +526,7 @@ const BURST: u64 = 98 << 32;
 /// hundred-odd pending operations a burst leaves cost it nothing.
 const BURST_KEY: &[u8] = b"burst";
 /// The base of the filling clients' process ids in the trace, one per
-/// [`Fault::RetakeUnderStream`]. PROPOSED(D-043).
+/// [`Fault::RetakeUnderStream`]. (D-043).
 const SPREAD: u64 = 97 << 32;
 /// How many bytes each filling put carries. The state machine the clients build
 /// on their own is two keys of a dozen bytes, so a checkpoint of it is one chunk
@@ -534,7 +534,7 @@ const SPREAD: u64 = 97 << 32;
 /// kilobytes is a checkpoint of a couple of dozen chunks, which is long enough
 /// for a stream to still be running when the next take lands and long enough for
 /// the network's drops and duplicates to make a receiver ask to start over.
-/// PROPOSED(D-043).
+/// (D-043).
 const SPREAD_VALUE_BYTES: usize = 400;
 
 /// The fault schedule of one run, in global virtual time.
@@ -646,7 +646,7 @@ impl Schedule {
         // a quarter of the seeds keeps the catch and gives the other three
         // quarters their old cost back. Drawn from this arm's own stream, so
         // neither the shared "schedule" draws nor the install crash's move when
-        // the share changes (D-031). PROPOSED(D-041).
+        // the share changes (D-031). (D-041).
         let mut adopt = moirae_sched::stream(seed, "adoption-crash");
         if adopt.below(ADOPTION_STORM_IN) == 0 {
             faults.push(Fault::CrashAdopting {
@@ -661,7 +661,7 @@ impl Schedule {
         // seed, appended last: the adoption storm before it is where the disk's
         // rot turns into refusals, and a server left refused by it takes this
         // storm's crashes straight away. Its own stream, so no other arm's dice
-        // move when this one changes (D-031). PROPOSED(D-044).
+        // move when this one changes (D-031). (D-044).
         let mut refused = moirae_sched::stream(seed, "refusal-crash");
         faults.push(Fault::CrashRefused {
             server: 1 + refused.below(SERVERS),
@@ -675,7 +675,7 @@ impl Schedule {
         // builds is the last thing standing when the liveness window opens: a
         // crash that came after it would restart a server, and a new leader's
         // progress reset is exactly what undoes the wedge. Its own stream, so no
-        // other arm's dice move when this one changes (D-031). PROPOSED(D-043).
+        // other arm's dice move when this one changes (D-031). (D-043).
         let mut retake = moirae_sched::stream(seed, "retake-stream");
         if retake.below(RETAKE_STREAM_IN) == 0 {
             faults.push(Fault::RetakeUnderStream {
@@ -808,7 +808,7 @@ impl Schedule {
                         + INSTALL_WAIT_BUDGET
                         + (ADOPTION_WAIT_BUDGET + *down) * u32::try_from(*crashes).expect("small")
                 }
-                // PROPOSED(D-044): two crashes a round, either side of the
+                // D-044: two crashes a round, either side of the
                 // catch-up, or one after the grace when the victim is refused.
                 Fault::CrashRefused {
                     down,
@@ -816,7 +816,7 @@ impl Schedule {
                     crashes,
                     ..
                 } => (FLUSH_WAIT_BUDGET + *grace + *down) * u32::try_from(*crashes).expect("small"),
-                // PROPOSED(D-043): the fill, the isolation, the wait for the
+                // D-043: the fill, the isolation, the wait for the
                 // stream, the freeze behind it and the hold after it.
                 Fault::RetakeUnderStream {
                     settle,
@@ -855,8 +855,8 @@ pub struct Report {
     /// The seed.
     pub seed: u64,
     /// Which server ran: the set of known bugs it carried, empty for the correct
-    /// one (PROPOSED D-045).
-    // PROPOSED(D-045): a variant is a set.
+    /// one (D-045).
+    // D-045: a variant is a set.
     pub variants: Variants,
     /// How the run was scheduled (D-016).
     pub policy: Policy,
@@ -876,7 +876,7 @@ pub struct Report {
     /// How many [`Fault::RetakeUnderStream`] arms got as far as a stream: the
     /// arm's aim is a leader re-taking under a running stream, and a run where
     /// the follower it isolated was caught up by entries instead never held a
-    /// stream to re-take under. What the sweep asserts fired. PROPOSED(D-043).
+    /// stream to re-take under. What the sweep asserts fired. (D-043).
     pub aimed_streams: usize,
     /// Servers refused at a restart, with the reason.
     pub refused: Vec<(u64, String)>,
@@ -956,7 +956,7 @@ impl Report {
     /// Whether a majority that can still elect a leader was running at the end:
     /// liveness needs one. A refused server is down until a snapshot re-seeds it,
     /// which its restatement's `RaftRecovered` says (RAFT.md §3) — but a re-seeded
-    /// server never votes again (PROPOSED(D-035)), so while it counts for commits
+    /// server never votes again (D-035), so while it counts for commits
     /// it cannot help elect, and a cluster whose impaired servers reach half has
     /// no leader to wait for: a refused server can only be re-seeded *by* a
     /// leader, so the deadlock is real and priced into D-035, not a liveness
@@ -1054,13 +1054,13 @@ impl Report {
         }
     }
 
-    /// Whether reading records by decision time (PROPOSED D-047) moved this run's
+    /// Whether reading records by decision time (D-047) moved this run's
     /// verdict, given `verdict`, the result [`Report::check`] returned: the check
     /// as it stood reads the pre-vote and timer checks' records by durability time,
     /// and every other check is the same under both. Worked out from `verdict`
     /// without running the checks that do not move — the linearizability search
     /// above all — so a sweep can report, on every seed, what the entry changed.
-    // PROPOSED(D-047): every trace record carries its decision time and its durability time.
+    // D-047: every trace record carries its decision time and its durability time.
     #[must_use]
     pub fn moved_by_decision_time(&self, verdict: &Result<(), String>) -> Option<Moved> {
         let live = self.uniform() && self.majority_up();
@@ -1103,8 +1103,8 @@ impl Report {
     }
 
     /// The records of `server` decided before `at` and traced at or after it: the
-    /// decisions a timer-check flag at `at` can straddle (PROPOSED D-047).
-    // PROPOSED(D-047): every trace record carries its decision time and its durability time.
+    /// decisions a timer-check flag at `at` can straddle (D-047).
+    // D-047: every trace record carries its decision time and its durability time.
     #[must_use]
     pub fn decisions_straddling(&self, server: u64, at: Instant) -> Vec<&TraceRecord> {
         self.records
@@ -1122,7 +1122,7 @@ impl Report {
     /// carried, which is no election of the isolated server's (RAFT.md §3).
     ///
     /// The check is about why the server's term moved, so it reads each term
-    /// record by the time its step decided it (PROPOSED D-047):
+    /// record by the time its step decided it (D-047):
     /// [`Report::isolation_keeps_the_term_by`] under [`RecordTime::Decided`].
     fn isolation_keeps_the_term(&self) -> Result<(), String> {
         self.isolation_keeps_the_term_by(RecordTime::Decided)
@@ -1130,7 +1130,7 @@ impl Report {
 
     /// The pre-vote check with the server's term records read by `time`: under
     /// [`RecordTime::Decided`] the check [`Report::check`] makes, and under
-    /// [`RecordTime::Durable`] the check as it stood before PROPOSED D-047, word
+    /// [`RecordTime::Durable`] the check as it stood before D-047, word
     /// for word. One function for both, so the two cannot drift apart and a pinned
     /// seed can show the gap and the fix side by side.
     ///
@@ -1144,7 +1144,7 @@ impl Report {
     ///
     /// The first isolation whose server's term differs at its heal from its term at
     /// its start, read by `time`.
-    // PROPOSED(D-047): every trace record carries its decision time and its durability time.
+    // D-047: every trace record carries its decision time and its durability time.
     pub fn isolation_keeps_the_term_by(&self, time: RecordTime) -> Result<(), String> {
         for &(server, from, until) in &self.isolations {
             if self.reseeding_during(server, from, until) {
@@ -1201,18 +1201,18 @@ impl Report {
     /// leader campaigns within [`TIMER_TIMEOUTS`] maximum election timeouts of the
     /// last AppendEntries it received from a leader of its term or later, the last
     /// vote it granted, or its start. A re-seeded server is exempt: it never
-    /// campaigns on that store, by design (RAFT.md §3, PROPOSED(D-035)). The first
+    /// campaigns on that store, by design (RAFT.md §3, D-035). The first
     /// gap [`Report::replay_timers`] finds under every reset arm is the violation.
     ///
     /// Whether a server campaigned in time is about when it decided to, so the
-    /// replay reads every record by its decision time (PROPOSED D-047).
+    /// replay reads every record by its decision time (D-047).
     fn timers_fire(&self) -> Result<(), String> {
         self.timers_fire_by(RecordTime::Decided)
     }
 
     /// The timer check with the records read by `time`: under
-    /// [`RecordTime::Durable`], the check as it stood before PROPOSED D-047.
-    // PROPOSED(D-047): every trace record carries its decision time and its durability time.
+    /// [`RecordTime::Durable`], the check as it stood before D-047.
+    // D-047: every trace record carries its decision time and its durability time.
     fn timers_fire_by(&self, time: RecordTime) -> Result<(), String> {
         let mut first = None;
         self.replay_timers(TimerResets::ALL, time, |gap| {
@@ -1240,7 +1240,7 @@ impl Report {
     /// the first gap; the pinned seeds' predicates are the same replay with an arm
     /// switched off, so the check and the predicates cannot drift apart.
     ///
-    /// The records are replayed in the order of `time` (PROPOSED D-047), ties kept
+    /// The records are replayed in the order of `time` (D-047), ties kept
     /// in record order, and each is at its `time`. By durability time that is the
     /// trace's own order. By decision time it is the order the servers decided in:
     /// a campaign, a granted vote or a step-down traced after its persist resets a
@@ -1268,7 +1268,7 @@ impl Report {
         let mut terms: BTreeMap<u64, u64> = BTreeMap::new();
         let mut clocks = TimerClocks::default();
         let mut reported: BTreeMap<u64, Instant> = BTreeMap::new();
-        // PROPOSED(D-047): the replay's order; stable, so ties keep record order.
+        // D-047: the replay's order; stable, so ties keep record order.
         let mut order: Vec<&TraceRecord> = self.records.iter().collect();
         order.sort_by_key(|record| time.of(record));
         for record in order {
@@ -1311,7 +1311,7 @@ impl Report {
                         }
                     }
                 }
-                // PROPOSED(D-039): a completed snapshot install re-states the server
+                // D-039: a completed snapshot install re-states the server
                 // and rebuilds its incarnation with a fresh election timer. The
                 // install was the leader's doing and the server was busy finishing
                 // it, so the restatement counts as the leader's contact here. A crash
@@ -1394,12 +1394,12 @@ impl Report {
     }
 }
 
-/// Which of a record's two times a check reads (PROPOSED D-047). A node traces a
+/// Which of a record's two times a check reads (D-047). A node traces a
 /// step's events once what they report is durable (D-026), so a record's
 /// [`TraceRecord::at`] is when it became durable and its
 /// [`TraceRecord::decided`] when the step that produced it was taken; for every
 /// record traced as it happens the two are one instant.
-// PROPOSED(D-047): every trace record carries its decision time and its durability time.
+// D-047: every trace record carries its decision time and its durability time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RecordTime {
     /// When the step was taken: for a check about why a server did something, and
@@ -1412,7 +1412,7 @@ pub enum RecordTime {
 
 /// How reading records by decision time moved one run's verdict
 /// ([`Report::moved_by_decision_time`]).
-// PROPOSED(D-047): every trace record carries its decision time and its durability time.
+// D-047: every trace record carries its decision time and its durability time.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Moved {
     /// The run passes, and by durability time it failed with this violation.
@@ -1444,7 +1444,7 @@ pub struct TimerResets {
     /// later (D-030's stanza, added on f54b468 for seed 164).
     pub install_snapshot: bool,
     /// An install's restatement, `RaftRecovered` on a server that never went down
-    /// (PROPOSED D-039, for seed 385).
+    /// (D-039, for seed 385).
     pub restatement: bool,
 }
 
@@ -1460,7 +1460,7 @@ impl TimerResets {
         install_snapshot: false,
         restatement: false,
     };
-    /// Every arm but PROPOSED D-039's: the check as it stood on f54b468.
+    /// Every arm but D-039's: the check as it stood on f54b468.
     pub const WITHOUT_RESTATEMENT: Self = Self {
         install_snapshot: true,
         restatement: false,
@@ -1512,7 +1512,7 @@ impl TimerClocks {
 impl Report {
     /// Every gap the timer check's replay finds with the arms `resets` names
     /// switched on, one per stretch past a server's bound, reading every record by
-    /// its decision time as the check does (PROPOSED D-047). Under
+    /// its decision time as the check does (D-047). Under
     /// [`TimerResets::ALL`] this is empty exactly when the check's timer rule
     /// passes.
     #[must_use]
@@ -1521,8 +1521,8 @@ impl Report {
     }
 
     /// [`Report::timer_gaps`] with the records read by `time`: under
-    /// [`RecordTime::Durable`], the replay as it stood before PROPOSED D-047.
-    // PROPOSED(D-047): every trace record carries its decision time and its durability time.
+    /// [`RecordTime::Durable`], the replay as it stood before D-047.
+    // D-047: every trace record carries its decision time and its durability time.
     #[must_use]
     pub fn timer_gaps_by(&self, resets: TimerResets, time: RecordTime) -> Vec<TimerGap> {
         let mut gaps = Vec::new();
@@ -1535,7 +1535,7 @@ impl Report {
 
     /// Seed 164's situation: a follower past its timer bound on AppendEntries alone
     /// while `InstallSnapshot` chunks of its term kept arriving — the gaps of the
-    /// replay with neither the InstallSnapshot arm nor PROPOSED D-039's
+    /// replay with neither the InstallSnapshot arm nor D-039's
     /// restatement arm, that hold at least one such chunk. On the trace seed 164
     /// failed with (1373601) this is one gap: server 2 from 12.9405 s, flagged at
     /// 13.3397 s against a 399.19 ms bound, with 21 chunks in it. That gap also
@@ -1551,7 +1551,7 @@ impl Report {
 
     /// Seed 385's situation: a follower past its timer bound that an install's
     /// restatement inside the stretch would have reset — the gaps of the replay
-    /// with every arm but PROPOSED D-039's that hold at least one restatement on
+    /// with every arm but D-039's that hold at least one restatement on
     /// the server while it was up. When [`Report::check`] passes, every gap of
     /// that replay is one of these, since a stretch without a restatement is
     /// flagged by the check itself. On the trace seed 385 failed with (f54b468)
@@ -1566,7 +1566,7 @@ impl Report {
     }
 
     /// Seeds 1885's and 2023's situation, and the nightly's eleven variant catches
-    /// of the same shape (PROPOSED D-047): a term rise of an isolated server that
+    /// of the same shape (D-047): a term rise of an isolated server that
     /// straddles the isolation's start — its step decided before `from` and its
     /// record traced at or after `from`, by `until` — so the pre-vote check reads
     /// it inside the window by durability time and before it by decision time.
@@ -1583,7 +1583,7 @@ impl Report {
     /// term 10, decided at the step that took a RequestVote delivered at 15.2005 s,
     /// traced at 15.2030 s when its persist was durable, 48 µs after a partition
     /// that began at 15.2030 s, with no delivery to it until 17.112 s.
-    // PROPOSED(D-047): every trace record carries its decision time and its durability time.
+    // D-047: every trace record carries its decision time and its durability time.
     #[must_use]
     pub fn isolation_term_straddles(&self) -> Vec<TermStraddle> {
         let sent: BTreeMap<ananke_env::MessageId, SentMessage> = self
@@ -1753,7 +1753,7 @@ impl Report {
     }
 
     /// Every window between a completed snapshot install and the adoption that
-    /// puts it in service (PROPOSED D-041), with the first crash that landed inside
+    /// puts it in service (D-041), with the first crash that landed inside
     /// it: opened by an installed `RaftSnapshot`, closed by the server's
     /// `RaftAdopted`, `RaftRecovered` (a tree without adoption, or a restart's
     /// restatement) or `RaftRefused` (a damaged staging store). A restart's
@@ -1913,7 +1913,7 @@ impl Report {
     /// sent to it; after it, a chunk at the index sent to it — with no other stream
     /// opened to that follower in between, and no `Installed` answer from the
     /// follower at the index in between. A tree that traces no openings (before
-    /// PROPOSED D-043) is read by its chunks alone. Whether the stream survived is
+    /// D-043) is read by its chunks alone. Whether the stream survived is
     /// `installed_after`: a re-take the follower still installs after was harmless
     /// to it, and one it never installs after is the scrambled stream of D-043. The
     /// re-take with no stream under it, the common and harmless kind, is not here.
@@ -2009,11 +2009,11 @@ impl Report {
     /// The leader in force at the last heal, as (server, term): the last to be
     /// elected at or before it that had not stepped down or crashed by then. Who
     /// led is a question of what the servers had decided by the heal, so an
-    /// election or a step-down is read by its decision time (PROPOSED D-047).
+    /// election or a step-down is read by its decision time (D-047).
     #[must_use]
     pub fn leader_at_last_heal(&self) -> Option<(u64, u64)> {
         let mut leader = None;
-        // PROPOSED(D-047): decided by the heal, folded in decision order; stable, so
+        // D-047: decided by the heal, folded in decision order; stable, so
         // ties keep record order. One server's leadership records keep their record
         // order under decision time, but two servers' need not: a leader elected
         // first can be traced after its successor, whose persist was shorter, and a
@@ -2080,7 +2080,7 @@ impl Report {
         answered.difference(&counted).copied().collect()
     }
 
-    /// A leader's stale progress for a refused `follower` (PROPOSED D-042's
+    /// A leader's stale progress for a refused `follower` (D-042's
     /// hazard): the first refusal of the follower after which the leader it last
     /// answered with success, in that answer's term, sent it at least one
     /// AppendEntries and every one at or above the match index that answer
@@ -2161,7 +2161,7 @@ impl Report {
         None
     }
 
-    /// PROPOSED D-042's fix at work on `follower`: its first refusal, then the
+    /// D-042's fix at work on `follower`: its first refusal, then the
     /// first progress reset of it by a leader after that, then its first re-seed
     /// after the reset, as their times.
     #[must_use]
@@ -2187,7 +2187,7 @@ impl Report {
         Some((refused, reset, reseeded))
     }
 
-    /// The duplicate-file loop of a stream under one identity (PROPOSED D-043's
+    /// The duplicate-file loop of a stream under one identity (D-043's
     /// Decision): how many deliveries to `follower`, after `since`, of a chunk at
     /// offset 0 from `leader` the follower answered — its next answer to the
     /// leader — with `More` naming a different file. That is a file the receiver
@@ -2241,7 +2241,7 @@ impl Report {
 
 /// A term rise that straddles the start of its server's isolation
 /// ([`Report::isolation_term_straddles`]).
-// PROPOSED(D-047): every trace record carries its decision time and its durability time.
+// D-047: every trace record carries its decision time and its durability time.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TermStraddle {
     /// The isolated server.
@@ -2401,8 +2401,8 @@ pub fn config(seed: u64, schedule: &Schedule) -> SimConfig {
 
 /// The server configuration for `id` under `variants`: the set of known bugs
 /// this server carries, which a single [`Variant`](ananke_raft::core::Variant)
-/// converts into (PROPOSED D-045).
-// PROPOSED(D-045): a variant is a set.
+/// converts into (D-045).
+// D-045: a variant is a set.
 #[must_use]
 pub fn node_config(id: u64, variants: impl Into<Variants>) -> NodeConfig {
     let variants = variants.into();
@@ -2457,7 +2457,7 @@ fn spawn_server(sim: &Sim, id: u64, variants: Variants) {
 /// The leader in force: the server of the latest `RaftLeader` event, or server 1.
 ///
 /// Read back over the trace's tail in windows rather than over a copy of the whole
-/// trace (PROPOSED D-046): a fault round asks this of a trace that only grows, and
+/// trace (D-046): a fault round asks this of a trace that only grows, and
 /// the answer is almost always within the last few hundred records. A window that
 /// holds no `RaftLeader` doubles until the trace is exhausted, so the answer is the
 /// whole trace's either way.
@@ -2705,7 +2705,7 @@ async fn burst<E: Environment>(env: E, n: u64, target: u64, count: u64) {
     }
 }
 
-/// The re-take driver's filling puts (PROPOSED(D-043)): `count` puts of
+/// The re-take driver's filling puts (D-043): `count` puts of
 /// [`SPREAD_VALUE_BYTES`] bytes each, every one on its own key, fired at server
 /// `target` without awaiting replies as the schedule's `n`th driver. They are
 /// there for their size, not their outcome: the state machine the two clients
@@ -2747,15 +2747,15 @@ async fn spread<E: Environment>(env: E, n: u64, target: u64, count: u64) {
 /// Runs the scenario for `seed` with the schedule drawn from it, under the set
 /// of bugs `variants` — a single [`Variant`](ananke_raft::core::Variant) or a
 /// [`Variants`] of several
-/// (PROPOSED D-045).
-// PROPOSED(D-045): a variant is a set.
+/// (D-045).
+// D-045: a variant is a set.
 #[must_use]
 pub fn run(seed: u64, variants: impl Into<Variants>) -> Report {
     run_with(seed, Schedule::draw(seed), variants)
 }
 
 /// Runs the scenario for `seed` with an explicit schedule.
-// PROPOSED(D-045): a variant is a set.
+// D-045: a variant is a set.
 #[must_use]
 pub fn run_with(seed: u64, schedule: Schedule, variants: impl Into<Variants>) -> Report {
     let variants = variants.into();
@@ -2918,7 +2918,7 @@ pub fn run_with(seed: u64, schedule: Schedule, variants: impl Into<Variants>) ->
                 down,
                 crashes,
             } => {
-                // PROPOSED(D-041): the install crash's setup, then the crashes
+                // D-041: the install crash's setup, then the crashes
                 // aimed at the adoption the completed install starts, each at the
                 // adoption's first durable change to the store directory.
                 let leader = leader_now(&sim);
@@ -2955,7 +2955,7 @@ pub fn run_with(seed: u64, schedule: Schedule, variants: impl Into<Variants>) ->
                 grace,
                 crashes,
             } => {
-                // PROPOSED(D-044): each round crashes the victim inside a flush
+                // D-044: each round crashes the victim inside a flush
                 // it has begun and not finished, so a restart that is refused
                 // replays more than a memtable and the engine as built flushes
                 // over the loss; a victim already sitting refused is crashed
@@ -2992,7 +2992,7 @@ pub fn run_with(seed: u64, schedule: Schedule, variants: impl Into<Variants>) ->
                 freeze,
                 hold,
             } => {
-                // PROPOSED(D-043): a state machine worth streaming, then the
+                // D-043: a state machine worth streaming, then the
                 // install crash's setup, then the freeze that holds the leader's
                 // applied index at the index the running stream is reading, then
                 // both followers designated at once. See the fault's own
@@ -3177,7 +3177,7 @@ struct Watch {
     stopped: Option<String>,
     /// The safety checks, one checker for the whole run with the state of each
     /// check kept across looks, so a look costs only the records since the last
-    /// one (PROPOSED D-046).
+    /// one (D-046).
     checker: invariants::Checker,
     /// How many trace records the checker has been fed.
     checked: usize,
@@ -3200,7 +3200,7 @@ impl Default for Watch {
 /// inside the small slices — the next ordinary [`advance`] feeds them everything
 /// since its last look — but the trace cap still stops a runaway. The watch reads
 /// the records since its own last look rather than a copy of the whole trace, for
-/// the reason the checker keeps its state (PROPOSED D-046).
+/// the reason the checker keeps its state (D-046).
 fn install_landing(sim: &mut Sim, watch: &mut Watch, victim: u64) -> bool {
     if watch.stopped.is_some() {
         return false;
@@ -3258,8 +3258,8 @@ fn install_landing(sim: &mut Sim, watch: &mut Watch, victim: u64) -> bool {
 /// from here on count: the victim was not restarted since the heal, so no
 /// restart's restatement can stand in for the completion. As with
 /// [`install_landing`], the safety checks are skipped inside the small slices, the
-/// watch reads only the records since its last look (PROPOSED D-046) and the trace
-/// cap still stops a runaway. PROPOSED(D-041).
+/// watch reads only the records since its last look (D-046) and the trace
+/// cap still stops a runaway. (D-041).
 fn install_completed(sim: &mut Sim, watch: &mut Watch, victim: u64) -> bool {
     if watch.stopped.is_some() {
         return false;
@@ -3302,7 +3302,7 @@ fn install_completed(sim: &mut Sim, watch: &mut Watch, victim: u64) -> bool {
 /// applied index at. Only openings from here on count — the victim was cut off
 /// until the heal just before, so no earlier stream of the run can stand in for
 /// this one. As with [`install_landing`], the safety folds are skipped inside
-/// the small slices and the trace cap still stops a runaway. PROPOSED(D-043).
+/// the small slices and the trace cap still stops a runaway. (D-043).
 fn stream_opened(sim: &mut Sim, watch: &mut Watch, victim: u64) -> bool {
     if watch.stopped.is_some() {
         return false;
@@ -3339,7 +3339,7 @@ fn stream_opened(sim: &mut Sim, watch: &mut Watch, victim: u64) -> bool {
 /// for lost state: refused ([`TraceEvent::RaftRefused`]) with no restatement
 /// since, however long ago, since a refused server comes back only through an
 /// install (RAFT.md §3). What [`Fault::CrashRefused`] asks of its victim before
-/// each round. PROPOSED(D-044).
+/// each round. (D-044).
 fn refreshed_refused(sim: &Sim, scanned: &mut usize, refused: &mut BTreeSet<u64>) {
     let records = sim.trace_from(*scanned);
     *scanned += records.len();
@@ -3364,9 +3364,9 @@ fn refreshed_refused(sim: &Sim, scanned: &mut usize, refused: &mut BTreeSet<u64>
 /// tail of two memtables rather than one, and the open after it replays enough
 /// to fill a memtable and rotate it. That rotation is what gives the engine as
 /// built something to flush over a refusal with, which is the laundering
-/// PROPOSED D-044 stops. The safety folds are skipped inside the small slices,
+/// D-044 stops. The safety folds are skipped inside the small slices,
 /// as in [`install_landing`], and the trace cap still stops a runaway.
-/// PROPOSED(D-044).
+/// (D-044).
 fn flush_in_flight(sim: &mut Sim, watch: &mut Watch, victim: u64) {
     if watch.stopped.is_some() {
         return;
@@ -3411,7 +3411,7 @@ fn flush_in_flight(sim: &mut Sim, watch: &mut Watch, victim: u64) {
 
 /// A name the store proper is made of, as the adoption sees it: `CURRENT`, a
 /// table, a log segment or a manifest — not the marker, not a checkpoint or the
-/// staging directory. PROPOSED(D-041).
+/// staging directory. (D-041).
 fn store_name(name: &std::path::Path) -> bool {
     name.to_str().is_some_and(|n| {
         n == "CURRENT" || n.ends_with(".sst") || n.ends_with(".wal") || n.starts_with("MANIFEST-")
@@ -3426,7 +3426,7 @@ fn store_name(name: &std::path::Path) -> bool {
 /// durable at all, which only the as-built adoption leaves behind, is given
 /// [`EMPTY_STORE_DELAY`] instead. The safety folds are skipped inside the small
 /// slices, as in [`install_landing`], and the trace cap still stops a runaway.
-/// PROPOSED(D-041).
+/// (D-041).
 fn adoption_change(sim: &mut Sim, watch: &mut Watch, victim: u64) {
     if watch.stopped.is_some() {
         return;
@@ -3478,7 +3478,7 @@ fn adoption_change(sim: &mut Sim, watch: &mut Watch, victim: u64) {
 ///
 /// One [`invariants::Checker`] serves the whole run and is fed only the records
 /// since the last look, so a look costs its own new events and a run costs its
-/// trace once rather than once per look (PROPOSED D-046). What it reports is what
+/// trace once rather than once per look (D-046). What it reports is what
 /// folding every check over the whole trace reports, in the same words:
 /// `the_incremental_checker_agrees_with_the_fold_over_the_whole_trace` asserts it
 /// over a hundred seeds, and [`Report::check`] folds from the first record again at

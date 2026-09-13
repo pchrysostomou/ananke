@@ -1101,7 +1101,7 @@ fn a_checkpoint_opens_fresh_at_its_version() {
     );
 }
 
-/// A quiesced engine does no work (PROPOSED D-044). An open whose recovery lost
+/// A quiesced engine does no work (D-044). An open whose recovery lost
 /// writes in the middle of the state — here a table the manifest lists that
 /// cannot be read, with records past it in the log — starts quiesced when the
 /// caller asked for it: the flusher is never spawned, so the memtable the
