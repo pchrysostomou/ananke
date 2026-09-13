@@ -2054,6 +2054,16 @@ invisible until then. The variant ships and its test is not ignored (CLAUDE.md);
 what it asserts is what is true of it, and the rate is printed at every tier so
 the day it stops being zero is visible.
 
+At the nightly's ten thousand seeds (run 34711427220, on 14c3e17) it printed a
+catch on 4 of 10 000 — seeds 1252, 2509, 3087 and 5990 — and not one of the four
+is this bug. Every one is the pre-vote isolation check reading a trace
+timestamp: the isolated server's term rise was adopted from a message delivered
+before the isolation began, between 0.31 and 16.57 ms before it, and traced
+after, once its persist was durable, with no message reaching the server inside
+the window. That is the gap that failed the correct server itself on seeds 1885
+and 2023 of the same run. So the claim stands as written: this bug has not been
+caught for its own mechanism at any tier, and the four catches are the checker's.
+
 Every site is marked `PROPOSED(D-042)`.
 
 ---
@@ -2284,6 +2294,18 @@ at every tier on both counts — a re-take at an index already taken, and the ar
 reaching its stream — and a nightly whose ten thousand seeds never catch it is
 still a hole in the sweep to report rather than a variant to delete (RAFT.md §5),
 the more so because this branch has moved every seed's interleaving again.
+
+*At the nightly's ten thousand.* Run 34711427220, on 14c3e17, printed this
+variant caught on 13 of 10 000 seeds, which is not thirteen catches of this bug.
+Four are the liveness check, the wedge this entry is about: seeds 680, 2013,
+9445 and 9993. Seven are the pre-vote isolation check reading a trace timestamp
+— a term rise adopted from a message delivered before the isolation began, or on
+seed 5203 a candidacy decided on a pre-vote answer delivered before it, traced
+after its persist with no message reaching the server in the window — the gap
+that failed the correct server on seeds 1885 and 2023 of the same run: seeds
+1176, 2407, 3863, 4713, 5203, 6691 and 9670. Two are the linearizability checker
+running out of its search budget, on seeds 1262 and 7222, which is not a proven
+violation. The test's ten-thousand-seed assertion counts all thirteen.
 
 **Amended under PROPOSED D-045.** `Variant` is a set now, so the sweep can run
 one server carrying this entry's bug and D-042's at once, which is what the

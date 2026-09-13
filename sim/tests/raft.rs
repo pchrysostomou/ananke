@@ -773,6 +773,12 @@ fn a_server_whose_refusal_is_not_durable_is_caught() {
 /// wedge is built on, a refused follower re-seeded and applying again. A sweep
 /// that could not distinguish the two leaders at all would fail here. The catch
 /// rate is printed at every tier so the day it stops being zero is visible.
+///
+/// At the nightly's ten thousand (run 34711427220) it printed 4 of 10 000, and
+/// every one was the pre-vote isolation check's trace-timing gap — a term rise
+/// adopted from a message delivered before the isolation began and traced after
+/// it, the gap that failed the correct server on seeds 1885 and 2023 — not this
+/// bug.
 #[test]
 fn a_leader_that_ignores_incarnations_never_forgets_and_the_sweep_cannot_see_it() {
     let outcomes: Vec<(Option<String>, usize, bool)> = sweep(seeds(), |seed| {
@@ -856,6 +862,12 @@ fn a_leader_that_ignores_incarnations_never_forgets_and_the_sweep_cannot_see_it(
 /// flaky; the rates are printed at every tier so the day the rate is worth an
 /// assertion is visible. The pair rule holds because the correct server passes
 /// the same seeds.
+///
+/// The nightly's ten thousand (run 34711427220) printed 13: 4 by the liveness
+/// check, the wedge itself; 7 by the pre-vote isolation check's trace-timing
+/// gap, the one that failed the correct server on seeds 1885 and 2023; and 2 by
+/// the linearizability checker exhausting its search budget, which proves
+/// nothing. The assertion below counts all thirteen.
 #[test]
 fn a_leader_that_shares_one_snapshot_directory_and_streams_one_follower_at_a_time_is_caught() {
     let outcomes: Vec<(Option<String>, bool, usize)> = sweep(seeds(), |seed| {
