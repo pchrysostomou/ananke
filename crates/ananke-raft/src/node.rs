@@ -82,6 +82,15 @@
 //! the first. The sweep found exactly that on its first seed (D-026). A server keeps
 //! the index and term of every request it proposed while the entry is in its log,
 //! and a request it has already proposed is not proposed again.
+//!
+//! Every event is traced once what it reports is durable, so a record's time is its
+//! durability time; the moment the step behind it was taken travels beside it as a
+//! decision stamp (PROPOSED(D-047)). The `raft` loop stamps each `core.step` and
+//! traces that step's events with the stamp after the persist; the `apply` task
+//! stamps each entry as it takes it and each take as it takes the job; the
+//! `snapshot` task stamps a timeout pass, a stream's opening and the install it is
+//! handed; re-seed mode stamps the stream it has staged; and a refusal is stamped
+//! when the open returns it, before the lost mark is written.
 
 use std::collections::BTreeMap;
 use std::io;
@@ -91,7 +100,9 @@ use std::pin::pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use ananke_env::{Clock, Either, Environment, Instant, Network, Rng, Socket, TraceEvent, race};
+use ananke_env::{
+    Clock, Decision, Either, Environment, Instant, Network, Rng, Socket, TraceEvent, race,
+};
 use ananke_storage::{Engine, EngineConfig};
 
 use crate::apply::{Command, Outcome, apply_command, user_key};
@@ -345,16 +356,22 @@ pub async fn run<E: Environment>(env: E, config: NodeConfig) -> io::Result<()> {
         let adopted = match snapshot::adopt_staged_under(&env, &engine.dir, raft.variants).await {
             Ok(adopted) => adopted,
             Err(error) if LostState::from_io(&error).is_some() => {
+                // PROPOSED(D-047): refused when the adoption returned the damage,
+                // before the mark's write and sync.
+                let refused = env.decision();
                 // PROPOSED(D-044): the loss is recorded in the store directory
                 // before anything else, so the store this server was running on
                 // — which the damaged install superseded and which a sweep of
                 // the staging would otherwise let it fall back to — is refused
                 // at every open until an install replaces it.
                 record_loss(&env, server, durable_refusal, &engine.dir, &error).await?;
-                env.trace(TraceEvent::RaftRefused {
-                    server,
-                    reason: error.to_string(),
-                });
+                env.trace_decided(
+                    refused,
+                    TraceEvent::RaftRefused {
+                        server,
+                        reason: error.to_string(),
+                    },
+                );
                 match reseed(&env, id, &sock, &addrs, &raft, &engine.dir, &inbox).await {
                     Next::Closed => return Ok(()),
                     Next::Reinstall => continue,
@@ -369,6 +386,11 @@ pub async fn run<E: Environment>(env: E, config: NodeConfig) -> io::Result<()> {
             }
         };
         if adopted {
+            // PROPOSED(D-047), an open point: the adoption decides to adopt inside
+            // `adopt_staged_under`, once it has read the staged CURRENT and
+            // manifest, and does the copies in the same call, so no stamp taken
+            // out here could be that decision's; it is traced as decided when it
+            // is recorded, which no earlier time is provably.
             env.trace(TraceEvent::RaftAdopted { server });
         }
         // PROPOSED(D-041): a directory that carries the store marker but no valid
@@ -405,15 +427,21 @@ pub async fn run<E: Environment>(env: E, config: NodeConfig) -> io::Result<()> {
         let (store, recovered) = match opened {
             Ok(opened) => opened,
             Err(error) => {
+                // PROPOSED(D-047): refused when the open returned the loss, before
+                // the mark's write and sync.
+                let refused = env.decision();
                 // PROPOSED(D-044): before the trace, before the re-seed, before
                 // anything that can be interrupted: the store directory itself
                 // records that this store lost state, so a restart cannot find
                 // it whole again.
                 record_loss(&env, server, durable_refusal, &engine.dir, &error).await?;
-                env.trace(TraceEvent::RaftRefused {
-                    server,
-                    reason: error.to_string(),
-                });
+                env.trace_decided(
+                    refused,
+                    TraceEvent::RaftRefused {
+                        server,
+                        reason: error.to_string(),
+                    },
+                );
                 // Re-seed mode (RAFT.md §3): the store is gone; wait for a
                 // leader's snapshot to rebuild it, taking part in nothing else.
                 match reseed(&env, id, &sock, &addrs, &raft, &engine.dir, &inbox).await {
@@ -571,6 +599,12 @@ async fn incarnation<E: Environment>(
     // crash but not yet traced would otherwise be missing from it. A snapshot the
     // store records is re-stated the same way: it sets the applied floor and stands
     // in for the log prefix it replaced (RAFT.md §2).
+    //
+    // PROPOSED(D-047): the restatement is decided as it is traced. It reports state
+    // that was durable before this incarnation began, nothing a step of it decided,
+    // and the incarnation starts here: nothing awaits between these records and the
+    // loop arming its first tick, which is where the new core's election timer
+    // really starts counting. The sweep's await above decides nothing they report.
     env.trace(TraceEvent::RaftTruncate {
         server,
         from_index: core.last_index() + 1,
@@ -790,6 +824,9 @@ async fn incarnation<E: Environment>(
                 }
             }
         };
+        // PROPOSED(D-047): the step's decision time. Its events are traced after
+        // the persist it asks for, which is their durability time, with this stamp.
+        let decided = env.decision();
         let outputs = core.step(input);
         if let Some(id) = read
             && let Some(leader) = outputs.iter().find_map(|output| match output {
@@ -831,13 +868,16 @@ async fn incarnation<E: Environment>(
                 }
                 None => {
                     let (index, term) = (core.last_index(), core.term());
-                    env.trace(TraceEvent::RaftProposed {
-                        server,
-                        client: request.client,
-                        seq: request.seq,
-                        index,
-                        term,
-                    });
+                    env.trace_decided(
+                        decided,
+                        TraceEvent::RaftProposed {
+                            server,
+                            client: request.client,
+                            seq: request.seq,
+                            index,
+                            term,
+                        },
+                    );
                     lock_pending(&node.pending).insert(
                         index,
                         Waiting {
@@ -856,7 +896,7 @@ async fn incarnation<E: Environment>(
                 }
             }
         }
-        node.execute(&core, outputs).await?;
+        node.execute(&core, outputs, decided).await?;
     };
     node.jobs.close();
     snaps.close();
@@ -883,8 +923,10 @@ async fn install_decision<E: Environment>(
             None => return Ok(Some(Next::Closed)),
             Some(Event::ApplyClosed) => break,
             Some(Event::Applied(index)) => {
+                // PROPOSED(D-047): this step's decision time, as in the loop.
+                let decided = node.env.decision();
                 let outputs = core.step(Input::Applied(index));
-                node.execute(core, outputs).await?;
+                node.execute(core, outputs, decided).await?;
             }
             Some(_) => {}
         }
@@ -987,6 +1029,9 @@ fn spawn_apply<E: Environment>(
         // (RAFT.md §1, D-029).
         let mut config = config;
         while let Some(job) = jobs.pop().await {
+            // PROPOSED(D-047): a take is decided when the task takes the job; the
+            // record, the checkpoint and the trace follow.
+            let taken_job = env.decision();
             let fresh = matches!(job, Job::Retake);
             let entries = match job {
                 Job::Entries(entries) => entries,
@@ -1023,11 +1068,14 @@ fn spawn_apply<E: Environment>(
                             _ => None,
                         };
                         if let Some(record) = recorded {
-                            env.trace(TraceEvent::RaftSnapshotReused {
-                                server,
-                                last_index: record.last_index,
-                                take: record.take,
-                            });
+                            env.trace_decided(
+                                taken_job,
+                                TraceEvent::RaftSnapshotReused {
+                                    server,
+                                    last_index: record.last_index,
+                                    take: record.take,
+                                },
+                            );
                             inbox.push(Event::Taken {
                                 index: record.last_index,
                                 term: record.last_term,
@@ -1047,12 +1095,15 @@ fn spawn_apply<E: Environment>(
                     };
                     match taken {
                         Ok(()) => {
-                            env.trace(TraceEvent::RaftSnapshot {
-                                server,
-                                last_index: applied,
-                                last_term: applied_term,
-                                taken: true,
-                            });
+                            env.trace_decided(
+                                taken_job,
+                                TraceEvent::RaftSnapshot {
+                                    server,
+                                    last_index: applied,
+                                    last_term: applied_term,
+                                    taken: true,
+                                },
+                            );
                             inbox.push(Event::Taken {
                                 index: applied,
                                 term: applied_term,
@@ -1074,6 +1125,10 @@ fn spawn_apply<E: Environment>(
                     });
                     return;
                 }
+                // PROPOSED(D-047): the apply is decided when the task takes the
+                // entry; it is traced once its batch, with the applied index, is
+                // durable.
+                let took = env.decision();
                 let command = match &entry.payload {
                     Payload::Command(bytes) => Command::decode(bytes.clone()).ok(),
                     Payload::Noop | Payload::Config(_) => None,
@@ -1093,12 +1148,15 @@ fn spawn_apply<E: Environment>(
                 if let Payload::Config(new_config) = &entry.payload {
                     config = new_config.clone();
                 }
-                env.trace(TraceEvent::RaftApply {
-                    server,
-                    index: entry.index,
-                    entry_term: entry.term,
-                    hash: entry.payload.hash(),
-                });
+                env.trace_decided(
+                    took,
+                    TraceEvent::RaftApply {
+                        server,
+                        index: entry.index,
+                        entry_term: entry.term,
+                        hash: entry.payload.hash(),
+                    },
+                );
                 let waiting = lock_pending(&pending).remove(&entry.index);
                 if let Some(waiting) = waiting
                     && waiting.term == entry.term
@@ -1206,13 +1264,20 @@ impl<E: Environment> Streamer<E> {
     /// its first chunk ([`start_stream`]), pinning the version it opened, and
     /// traces how many streams now run.
     async fn open(&self, streams: &mut Streams, to: ServerId, index: Index, term: Term) {
+        // PROPOSED(D-047): the stream is decided when the task acts on the core's
+        // install; the lookups and the first chunk that follow decide only whether
+        // there is a checkpoint to stream.
+        let decided = self.env.decision();
         if let Some(out) = start_stream(self, to, index, term).await {
             let running = streams.open(out);
-            self.env.trace(TraceEvent::RaftSnapshotStreams {
-                server: self.id.0,
-                to: to.0,
-                streams: running as u64,
-            });
+            self.env.trace_decided(
+                decided,
+                TraceEvent::RaftSnapshotStreams {
+                    server: self.id.0,
+                    to: to.0,
+                    streams: running as u64,
+                },
+            );
         }
     }
 
@@ -1258,6 +1323,10 @@ async fn sweep_versions<E: Environment>(
 ) {
     if let Ok(deleted) = snapshot::sweep_versions(env, store, engine_dir, readers).await {
         for (last_index, take) in deleted {
+            // PROPOSED(D-047), an open point: which versions go is decided inside
+            // the sweep, after its listing and its read of the record, so no stamp
+            // taken out here could be the decision's own; the deletion is traced as
+            // decided when it is recorded, which no earlier time is provably.
             env.trace(TraceEvent::RaftSnapshotDeleted {
                 server: id.0,
                 last_index,
@@ -1322,6 +1391,9 @@ async fn snapshot_task<E: Environment>(
             // resumption of RAFT.md §1, or give that stream up. Every stream
             // past its deadline is serviced here, none behind another's.
             let now = env.clock().now();
+            // PROPOSED(D-047): every resend of this pass is decided here, though
+            // each after the first is traced behind the sends before it.
+            let pass = env.decision();
             let mut ended = false;
             for to in streams.due(now) {
                 let out = streams.outbound.get_mut(&to).expect("a due stream");
@@ -1331,11 +1403,14 @@ async fn snapshot_task<E: Environment>(
                     streams.end(to);
                     ended = true;
                 } else {
-                    env.trace(TraceEvent::RaftSnapshotResumed {
-                        server,
-                        to: to.0,
-                        offset: out.sender.position_offset(config.snapshot_chunk),
-                    });
+                    env.trace_decided(
+                        pass,
+                        TraceEvent::RaftSnapshotResumed {
+                            server,
+                            to: to.0,
+                            offset: out.sender.position_offset(config.snapshot_chunk),
+                        },
+                    );
                     send_chunk(&env, &sock, &addrs, id, &config, out, chunk_timeout).await;
                 }
             }
@@ -1425,6 +1500,10 @@ async fn snapshot_task<E: Environment>(
                 }
             }
             Snap::Finish(repair) => {
+                // PROPOSED(D-047): the install is decided when the task takes the
+                // `raft` loop's repair; the staged store's repair and its CURRENT
+                // are durable when it is traced.
+                let installing = env.decision();
                 let Some(ready) = staged.take() else { continue };
                 let identity = (ready.last_index, ready.last_term);
                 let to = ready.from;
@@ -1433,27 +1512,33 @@ async fn snapshot_task<E: Environment>(
                         // The install exists (RAFT.md §1): say so, and let the
                         // server switch. The restatement on the adopted store
                         // re-traces the snapshot as the disk's picture.
-                        env.trace(TraceEvent::RaftSnapshot {
-                            server,
-                            last_index: identity.0,
-                            last_term: identity.1,
-                            taken: false,
-                        });
+                        env.trace_decided(
+                            installing,
+                            TraceEvent::RaftSnapshot {
+                                server,
+                                last_index: identity.0,
+                                last_term: identity.1,
+                                taken: false,
+                            },
+                        );
                         let config = &ready.config;
-                        env.trace(TraceEvent::RaftConfig {
-                            server,
-                            index: identity.0,
-                            old: config.voters.iter().map(|s| s.0).collect(),
-                            new: config
-                                .new_voters
-                                .as_ref()
-                                .unwrap_or(&config.voters)
-                                .iter()
-                                .map(|s| s.0)
-                                .collect(),
-                            joint: config.new_voters.is_some(),
-                            learners: config.learners.iter().map(|s| s.0).collect(),
-                        });
+                        env.trace_decided(
+                            installing,
+                            TraceEvent::RaftConfig {
+                                server,
+                                index: identity.0,
+                                old: config.voters.iter().map(|s| s.0).collect(),
+                                new: config
+                                    .new_voters
+                                    .as_ref()
+                                    .unwrap_or(&config.voters)
+                                    .iter()
+                                    .map(|s| s.0)
+                                    .collect(),
+                                joint: config.new_voters.is_some(),
+                                learners: config.learners.iter().map(|s| s.0).collect(),
+                            },
+                        );
                         let message = snapshot::installed(repair.term, identity);
                         send_message(&env, &sock, &addrs, id, to, message, store.incarnation())
                             .await;
@@ -1715,6 +1800,10 @@ async fn reseed<E: Environment>(
                         send_message(env, sock, addrs, id, from, message, 0).await;
                     }
                     Ok(Feed::Staged(ready)) => {
+                        // PROPOSED(D-047): the re-seed's install is decided once
+                        // the whole stream is staged; the repair and the staged
+                        // CURRENT follow before it is traced.
+                        let installing = env.decision();
                         // No store survived, so there is nothing of our own to
                         // carry over: term from the stream, no vote, no tail,
                         // and the quarantine flag for the vote the lost state
@@ -1737,12 +1826,15 @@ async fn reseed<E: Environment>(
                         let sender = ready.from;
                         match assembler.finish(&ready, &repair).await {
                             Ok(()) => {
-                                env.trace(TraceEvent::RaftSnapshot {
-                                    server: id.0,
-                                    last_index: identity.0,
-                                    last_term: identity.1,
-                                    taken: false,
-                                });
+                                env.trace_decided(
+                                    installing,
+                                    TraceEvent::RaftSnapshot {
+                                        server: id.0,
+                                        last_index: identity.0,
+                                        last_term: identity.1,
+                                        taken: false,
+                                    },
+                                );
                                 // The answer names the store this server runs
                                 // on from here: the leader records it and
                                 // forgets the old one's progress at once.
@@ -1893,7 +1985,16 @@ impl<E: Environment> Server<E> {
     /// sends that depend on it, the apply, the trace. Under
     /// [`Variant::SendBeforePersist`] the sends go first; the trace events still
     /// follow the persist, so the trace says what is durable.
-    async fn execute(&mut self, core: &Raft, outputs: Vec<Output>) -> io::Result<()> {
+    ///
+    /// The trace events carry `decided`, the stamp taken at the step that produced
+    /// them (PROPOSED(D-047)): each record's own time is when it became durable, and
+    /// the stamp is when the step took it.
+    async fn execute(
+        &mut self,
+        core: &Raft,
+        outputs: Vec<Output>,
+        decided: Decision,
+    ) -> io::Result<()> {
         let send_first = self.variants.contains(Variant::SendBeforePersist);
         if send_first {
             for output in &outputs {
@@ -1972,7 +2073,8 @@ impl<E: Environment> Server<E> {
                     self.jobs.push(job);
                 }
                 Output::Snapshot(action) => self.snaps.push(Snap::Action(action)),
-                Output::Trace(event) => self.env.trace(event),
+                // PROPOSED(D-047): decided at the step, traced now.
+                Output::Trace(event) => self.env.trace_decided(decided, event),
             }
         }
         Ok(())

@@ -45,6 +45,16 @@
 //! `ananke.net.unmapped` log line, since moirae has no lane for it. The header's
 //! `ananke` object records the version, the policy, the fault configuration as
 //! integers, each node's clock skew and drift, and the address table.
+//!
+//! `t` is a record's durability time, when it was traced (PROPOSED D-047). A record
+//! whose step was decided earlier — a term adopted, persisted and traced when the
+//! sync returned — carries its decision time as `decidedNs`, global virtual time in
+//! nanoseconds, inside its `log` line's `data`, which moirae leaves open (moirae SPEC
+//! §5); `data` is made an object holding only that field when the event has none.
+//! The field is written only when the two times differ, so a trace whose records are
+//! all decided as they are recorded exports byte for byte as it did before, and no
+//! moirae format version moves. Sends, deliveries, drops and faults are recorded as
+//! they happen and never carry it.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -242,7 +252,18 @@ fn convert(
     // Every record below except the partition ones is recorded with its node; 0 never
     // occurs and would be visible in the studio as an unknown lane if it did.
     let node = record.node.map_or(0, NodeId::get);
+    // PROPOSED(D-047): the decision time, inside `data`, only when it is not `t`.
+    let decided = (record.decided != record.at).then(|| int(record.decided.as_nanos()));
     let log = |event: &str, data: Option<Json>| {
+        let data = match (data, decided.clone()) {
+            (data, None) => data,
+            (Some(Json::Object(mut fields)), Some(decided)) => {
+                fields.push(("decidedNs".to_owned(), decided));
+                Some(Json::Object(fields))
+            }
+            (None, Some(decided)) => Some(Json::obj(vec![("decidedNs", decided)])),
+            (Some(other), Some(_)) => Some(other),
+        };
         Some(Event::Log {
             t,
             node,
@@ -1103,6 +1124,95 @@ mod tests {
             sim.verify_moirae(&extended, &export),
             Err(Error::Divergence { .. })
         ));
+    }
+
+    /// One node that takes a term, waits out a sync, and traces the term after it:
+    /// with a decision stamp taken before the wait when `stamped`, decided now when
+    /// not. PROPOSED(D-047).
+    fn decided_scenario(stamped: bool) -> Sim {
+        let mut config = SimConfig::new(5);
+        config.fs.latency_min = Duration::from_millis(2);
+        config.fs.latency_max = Duration::from_millis(2);
+        let mut sim = Sim::new(config);
+        let node = sim.add_node();
+        let env = sim.env(node);
+        env.clone().spawn("raft", async move {
+            env.clock().sleep(Duration::from_millis(3)).await;
+            let decided = env.decision();
+            let file = env
+                .fs()
+                .open(
+                    Path::new("/hard"),
+                    OpenOptions::new().write(true).create(true),
+                )
+                .await
+                .unwrap();
+            file.write_at(0, Bytes::from_static(b"term 7"))
+                .await
+                .unwrap();
+            file.sync().await.unwrap();
+            let event = TraceEvent::RaftTerm {
+                server: 1,
+                term: 7,
+                role: "follower",
+            };
+            if stamped {
+                env.trace_decided(decided, event);
+            } else {
+                env.trace(event);
+            }
+        });
+        sim.run_until(Instant::from_nanos(50_000_000));
+        sim
+    }
+
+    /// PROPOSED(D-047): a record traced after a wait carries the time its step
+    /// decided, and the export writes it as `decidedNs` inside `data`, after the
+    /// event's own fields; a record decided as it is recorded writes nothing new;
+    /// and taking a stamp moves nothing — the two runs agree on every record's time,
+    /// node and event, and their exports differ by that one field.
+    #[test]
+    fn a_decided_record_carries_its_decision_time_and_exports_it_only_when_it_differs() {
+        let (stamped, plain) = (decided_scenario(true), decided_scenario(false));
+        let term = |sim: &Sim| {
+            sim.trace()
+                .into_iter()
+                .find(|r| matches!(r.event, TraceEvent::RaftTerm { .. }))
+                .expect("the term is traced")
+        };
+        let (s, p) = (term(&stamped), term(&plain));
+        assert_eq!(s.decided, Instant::from_nanos(3_000_000));
+        assert!(s.at > s.decided, "the sync took time: {s:?}");
+        assert_eq!(p.decided, p.at, "trace() is decided now");
+        assert_eq!((s.at, s.node, &s.event), (p.at, p.node, &p.event));
+        let strip = |sim: &Sim| -> Vec<(Instant, Option<NodeId>, TraceEvent)> {
+            sim.trace()
+                .into_iter()
+                .map(|r| (r.at, r.node, r.event))
+                .collect()
+        };
+        assert_eq!(strip(&stamped), strip(&plain), "a stamp moves no schedule");
+        let differing: Vec<TraceRecord> = stamped
+            .trace()
+            .into_iter()
+            .filter(|r| r.decided != r.at)
+            .collect();
+        assert_eq!(
+            differing.len(),
+            1,
+            "only the stamped record differs: {differing:?}"
+        );
+
+        let export = Export::new(&bytes_decoder);
+        let (s_jsonl, p_jsonl) = (
+            stamped.to_moirae(&export).unwrap(),
+            plain.to_moirae(&export).unwrap(),
+        );
+        let field = "\"event\":\"ananke.raft.term\",\"data\":{\"server\":1,\"term\":7,\"role\":\"follower\",\"decidedNs\":3000000}";
+        assert!(s_jsonl.contains(field), "{s_jsonl}");
+        assert!(!p_jsonl.contains("decidedNs"), "{p_jsonl}");
+        assert_eq!(s_jsonl.replace(",\"decidedNs\":3000000", ""), p_jsonl);
+        stamped.verify_moirae(&s_jsonl, &export).unwrap();
     }
 
     #[test]

@@ -21,7 +21,7 @@ pub use self::fs::{RealFile, RealFs};
 pub use self::net::{RealNet, RealSocket, SEND_QUEUE_LEN};
 pub use self::rng::RealRng;
 use crate::task::TaskControl;
-use crate::{Environment, TaskHandle, TaskId, TraceEvent};
+use crate::{Clock, Decision, Environment, TaskHandle, TaskId, TraceEvent};
 
 /// The production [`Environment`]: a tokio runtime, the real disk, OS entropy and the
 /// system clock.
@@ -130,6 +130,17 @@ impl Environment for RealEnv {
 
     fn trace(&self, event: TraceEvent) {
         emit(event);
+    }
+
+    // PROPOSED(D-047): the real monotonic clock, from the environment's epoch.
+    fn decision(&self) -> Decision {
+        Decision::at(self.inner.clock.now())
+    }
+
+    // PROPOSED(D-047): the log line carries the decision beside the event.
+    fn trace_decided(&self, decided: Decision, event: TraceEvent) {
+        let decided_ns = decided.instant().as_nanos();
+        tracing::debug!(target: "ananke::trace", decided_ns, ?event);
     }
 }
 

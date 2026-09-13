@@ -40,7 +40,7 @@ pub use self::fs::{SimFile, SimFs};
 pub use self::net::{SimNet, SimRecv, SimSocket};
 pub use self::rng::SimRng;
 use self::state::{BoxFuture, Shared, SimTask, State};
-use crate::{Environment, Instant, NodeId, TaskHandle, TraceEvent, WallTime};
+use crate::{Decision, Environment, Instant, NodeId, TaskHandle, TraceEvent, WallTime};
 
 /// Network fault injection (SPEC.md §1.4).
 #[derive(Clone, Debug)]
@@ -167,8 +167,17 @@ impl SimConfig {
 /// One trace entry: when, on which node, what.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TraceRecord {
-    /// Global virtual time when the event was recorded.
+    /// Global virtual time when the event was recorded: its durability time, since a
+    /// node traces what a step did once it is durable (D-026). A check about what was
+    /// durable when reads this, or the records' order (PROPOSED D-047).
     pub at: Instant,
+    /// Global virtual time when the step that produced the event took it: its
+    /// decision time, at or before `at`, and equal to it for every event recorded
+    /// as it happens — sends, deliveries, drops, faults, and whatever a node traces
+    /// with [`Environment::trace`]. A check about why a server did something, and
+    /// so about what it could have known by then, reads this (PROPOSED D-047).
+    // PROPOSED(D-047): every trace record carries its decision time and its durability time.
+    pub decided: Instant,
     /// The node the event belongs to; `None` for the simulator itself.
     pub node: Option<NodeId>,
     /// The event.
@@ -707,5 +716,18 @@ impl Environment for SimEnv {
 
     fn trace(&self, event: TraceEvent) {
         self.shared.lock().record(Some(self.node), event);
+    }
+
+    // PROPOSED(D-047): global virtual time, read under the lock and nothing else —
+    // no timer, no poll, no draw — so a stamp moves no schedule.
+    fn decision(&self) -> Decision {
+        Decision::at(self.shared.lock().now)
+    }
+
+    // PROPOSED(D-047): every trace record carries its decision time and its durability time.
+    fn trace_decided(&self, decided: Decision, event: TraceEvent) {
+        self.shared
+            .lock()
+            .record_decided(Some(self.node), decided.instant(), event);
     }
 }
