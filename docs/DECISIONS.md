@@ -2774,4 +2774,250 @@ caught there, on every seed, as a run that passed the slices and failed at the e
 
 ---
 
-_Next entry: D-047. Add one before implementing anything not covered above._
+## PROPOSED D-047 — Every trace record carries its decision time and its durability time
+
+**Context.** The ten-thousand-seed nightly (run 34711427220, on `main` at 14c3e17)
+failed the correct server on seeds 1885 and 2023 with *pre-vote: server 1 raised
+its term ... while isolated*. Both windows came from `Fault::RetakeUnderStream`, but
+the race is general: every isolating fault takes `from = sim.now()` and partitions
+at that instant. In both, a term-raising message reached server 1 just before the
+partition; the server adopted the term and persisted it; and because the node
+traces a step's events only after its persist is durable (D-026: "the trace events
+still follow the persist, so the trace says what is durable"), the `RaftTerm`
+record is stamped just inside the window. Zero messages reached the server inside
+the window. The protocol held; the check read the trace timestamp as the moment of
+the rise.
+
+The same gap produced 11 of the 17 catches the nightly printed for two variants:
+
+| Seed | Variant | Rise traced after `from` | Cause, delivered before `from` |
+|---|---|---|---|
+| 1885 | Correct | +48 µs, follower | RequestVote t10 from 2, 2.53 ms before |
+| 2023 | Correct | +671 µs, follower | AppendEntries t14 from 3, 2.12 ms before |
+| 1252, 2509, 3087, 5990 | IgnoreIncarnation | +434 to +1600 µs, follower | RequestVote or AppendEntries, 0.31 to 16.57 ms before |
+| 1176, 2407, 3863, 4713, 6691, 9670 | SharedSnapshotDir | +662 to +2753 µs, follower | RequestVote or AppendEntries, 0.60 to 2.75 ms before |
+| 5203 | SharedSnapshotDir | +656 µs, **candidate** | a granting PreVoteResponse t12 from 1, 1.37 ms before — a candidacy decided before the window |
+
+Every row: zero server-to-server deliveries to the isolated server inside the
+window, and every trace regenerates byte-identically from 14c3e17.
+
+What this entry does **not** close, said plainly: seeds 164, 385 and 7381. Those
+were gaps in the checker's *rules* — the timer check not counting an
+InstallSnapshot as a leader's contact (164, D-030's stanza), not knowing that an
+install's switch starts a fresh timer (385, PROPOSED D-039), and the snapshot floor
+never coming back down on a re-seed (7381, D-030's stanza) — each already closed by
+its own rule and asserted by the pinned-seed audit's predicates. A record carrying
+two times would not have prevented any of them: none was a record read at the
+wrong one of its times.
+
+**Decision.** A record's time is two times. `TraceRecord::at` stays what it was,
+global virtual time when the event was recorded, which is when what it reports was
+durable: its **durability time**. `TraceRecord::decided` is new, global virtual
+time when the step that produced the event was taken: its **decision time**, at or
+before `at`, and equal to it for every record traced as it happens. A check about
+why a server did something, and so about what it could have known by then, reads
+the decision time; a check about what was durable when reads the durability time or
+the records' order. Every site is marked `PROPOSED(D-047)`.
+
+*The environment.* A node's own clock is skewed and drifting, so the stamp comes
+from the environment: `Environment::decision(&self) -> Decision`, an opaque `Copy`
+stamp — global virtual time under `SimEnv`, the real monotonic clock under
+`RealEnv` — and `Environment::trace_decided(&self, decided: Decision, event)`.
+`trace(event)` stays and means decided now. Taking a stamp reads the time under the
+simulator's lock and nothing else: no await, no poll, no draw. That it moves no
+schedule is measured, not assumed. The echo scenario's pinned body hash
+(`sim/tests/echo.rs`, `GOLDEN`, `19f19201df99a799`) is unchanged. The raft trace of
+seed 42 from this tree is the one from 5624f24, the tree before this entry, byte
+for byte once the new field is removed: 100 992 lines each, 4 744 of them carrying
+the field and no other line differing. The traces of seeds 1885 and 2023 from this
+tree are the nightly's from 14c3e17 in the same sense: 82 827 lines with 3 322
+carrying the field, and 96 023 lines with 3 904. Under `RealEnv` the log line
+carries `decided_ns` beside the event.
+
+*The export.* A `log` line's `data` is an open object (moirae SPEC §5), so the
+decision time is written there, as `decidedNs` after the event's own fields, and
+only when it differs from `t`. Nothing else in the export moves: `t` is the
+durability time, a trace whose records are all decided as recorded exports byte for
+byte as before, and no moirae format version changes. Sends, deliveries, drops and
+faults are recorded as they happen and never carry it.
+
+*The sites in `ananke-raft`'s `node.rs`.* Stamped:
+
+- the `raft` loop in `incarnation`: a stamp immediately before every `core.step`;
+  that step's `Output::Trace` events are traced with it by `Server::execute`, after
+  the persist, the sends and the reads that follow, and so is the step's
+  `RaftProposed`;
+- `install_decision`: the `Input::Applied` steps it takes while quiescing the
+  `apply` task, the same way;
+- the `apply` task: `RaftApply` stamped as the task takes each entry, before its
+  synced batch; `RaftSnapshot { taken: true }` and `RaftSnapshotReused` stamped as
+  it takes the take job, before the record read, the record and the checkpoint;
+- the `snapshot` task: `RaftSnapshotStreams` stamped at the start of
+  `Streamer::open`, before the version lookup, the sender's open and the first
+  chunk; every `RaftSnapshotResumed` of a timeout pass stamped at the pass's start,
+  each after the first traced behind the resends before it; the install's
+  `RaftSnapshot { taken: false }` and `RaftConfig` stamped when the task takes the
+  `raft` loop's `Snap::Finish`, before the repair and the staged `CURRENT`;
+- re-seed mode: the install's `RaftSnapshot { taken: false }` stamped when the whole
+  stream is staged, before the repair;
+- `run`: both `RaftRefused` sites stamped when the open or the adoption returns the
+  loss, before `record_loss` writes and syncs the lost mark.
+
+Examined and decided as they are traced, each with its reason:
+
+- *the restart and install restatements* in `incarnation` — `RaftTruncate`, the
+  restated `RaftSnapshot`, `RaftReseeded`, the `RaftAppend`s, `RaftConfig`,
+  `RaftRecovered`, `RaftTerm`. This refines the integrator's design, which named
+  them as sites. They report state that was durable before the incarnation began,
+  nothing a step of it decided, and the incarnation starts where they are traced:
+  nothing awaits between them and the loop arming its first tick, which is where the
+  new core's election timer really starts counting — the moment PROPOSED D-039's
+  arm of the timer check reads them as. The version sweep's await before them decides
+  nothing they report. A stamp taken when the core was restored, before that await,
+  would put the fresh timer earlier than the server has it and make the timer check
+  stricter than the protocol by the sweep's disk time;
+- `RaftSnapshotResumed` on an acknowledgement and `RaftInboxDropped` in the `net`
+  task: no await between the decision and the record;
+- `RaftServerFailed`: the failure is known when the await that fails returns;
+- the `core.step(Input::Applied(..))` at an incarnation's start, whose outputs are
+  discarded and trace nothing.
+
+Two open points, taken conservatively: `RaftAdopted` and `RaftSnapshotDeleted` are
+decided inside `adopt_staged_under` and `snapshot::sweep_versions`, after reads those
+helpers make and in the same calls that do the work, so no stamp taken outside them
+could be the decision's own. They are recorded as decided when traced, since no
+earlier time is provably theirs; a stamp returned from inside the helpers is a
+signature change of public functions for records no check reads by time.
+`ananke-storage` traces as its events happen and is untouched.
+
+*The classification.* Every check and predicate that reads a record's time:
+
+| Check | Where | Reads | Why |
+|---|---|---|---|
+| Election safety, log matching, leader completeness, state machine safety with its `RaftRecovered` accounting and snapshot floor, committed entries stay, commit by current term | `invariants::all`, `invariants::Checker` | record order | folds over what became durable, in the order it did; a restatement accounts for what was durable at a crash |
+| Commit by majority | `invariants::commit_majority` | record order | an entry counts as held by a server once its `RaftAppend` is traced, which is after the persist: durable on a majority when committed |
+| The sliced re-check (D-046) | `advance` in `sim/raft.rs` and `sim/membership.rs` | record order | the same folds, and its equivalence test compares events |
+| Linearizability: invocations and returns | `lin::History::from_trace` | one time | the clients trace as it happens |
+| Linearizability: an abandoned operation returns at its entry's apply | `lin::History::from_trace` | durability | when the effect was durable, the latest it can have become visible: the conservative upper bound; its decision time could end the operation before a read that could still miss it |
+| Pre-vote: the term at an isolation's start and at its heal | `Report::isolation_keeps_the_term` | **decision** | why the term moved: a rise decided before the isolation is not the isolated server's election |
+| Pre-vote: the skip for a refusal, re-seed or install in the window | same | durability | stands in for a restatement landing in the window, which is traced after the event it looks for is durable |
+| Timers fire | `Report::timers_fire`, `Report::replay_timers` | **decision** | whether a server campaigned in time is when it decided to; the records are replayed in decision order, so no bound is measured past a reset the server had already made |
+| Seeds 164's and 385's predicates | `snapshot_fed_timer_gaps`, `timer_gaps_rescued_by_restatement` | **decision** | the same replay as the check, so the two cannot drift apart |
+| The leader in force at the last heal | `Report::leader_at_last_heal` | **decision** | who led by the heal is what the servers had decided by it |
+| Liveness: the first write after the last heal | `time_to_write_after_heal`, both scenarios | one time, or durability | a client's return, or an abandoned write closed at its durable apply |
+| Availability gap | `membership::Report::longest_completion_gap` | one time, or durability | the same history |
+| A majority up, a change completed | `majority_up`, `change_complete` | record order | no time read |
+| Seed 7381's predicates | `floor_lowering_installs`, `recoveries_under_a_lost_floor` | record order | the floor fold reads no time; the time reported is the record's |
+| Seed 6325's adoption windows | `adoption_windows` | durability | a crash inside the disk work between an install being durable and its adoption being durable |
+| Seed 687's restarts | `restarts_after_lost_state_refusal` | record order | a restart after the refusal as recorded |
+| Snapshot takes | `snapshot_takes` | durability | pairs a take's record with the checkpoint written at the same recorded instant |
+| Re-takes under streams | `retakes_under_streams` | durability, record order | a take as recorded against chunks sent and openings as recorded, the order the audit measured in |
+| Uncounted followers, the duplicate-chunk loop | `uncounted_after_heal`, `duplicate_chunk_loop` | one time | sends and deliveries |
+| Stale progress; refusal, reset, re-seed | `stale_progress`, `refusal_reset_reseed` | record order, durability | a refusal as recorded against the messages after it; the reset answers a rejection the refused server sends only after its refusal is recorded |
+| The pin helpers | `assert_stream_wedge`, `crashes_while_refused`, `retook_at_one_index`, `reseed_completed`, `Coverage` in `sim/tests/raft.rs` | durability, record order | what the audit measured, as recorded |
+
+The fault drivers — `leader_now`, `install_landing`, `install_completed`,
+`stream_opened`, `refreshed_refused`, `flush_in_flight`, `adoption_change` — read
+records' presence and order, never a time, and steer the schedule; they are
+unchanged. Two refinements of the integrator's reading, with their reasons: the
+pre-vote skip reads the durability time, above, so the check by durability time is
+the check as it stood word for word; and `leader_at_last_heal`, a pinned-seed
+predicate, is causality and reads decision time.
+
+The pre-vote check and the timer replay each take the time they read as a
+parameter, `sim::raft::RecordTime`: `Report::isolation_keeps_the_term_by` and
+`Report::timer_gaps_by`. The check `Report::check` makes is the decision-time
+instance; the durability-time instance is the check as it stood. A pinned seed
+shows both.
+
+*The supersession.* This entry supersedes the part of D-026 on which a check may
+read a trace record's timestamp as when the thing it reports happened. The trace
+still says what is durable, through `at`; D-026's order of execution is unchanged.
+D-026 itself is not edited; its forward pointer is added when this entry is
+approved.
+
+*The pins.* Seeds 1885 and 2023 are new pinned tests asserting the straddle itself
+— the isolated server's one term rise has `decided < from <= at <= until`, with no
+server-to-server delivery to it in `(from, until]` — the check by durability time
+failing with the nightly's message word for word, the same check by decision time
+passing, and `check()` passing. Measured on this tree: seed 1885's rise to term 10
+decided 2.531 ms before the partition and traced 48 µs after it; seed 2023's to
+term 14, 2.121 ms before and 671 µs after. One test runs the eleven variant pairs and
+asserts the same of each and that none reports a pre-vote violation; every one of
+the eleven now passes `check()` outright. Their steps were decided 0.262 (1252),
+1.718 (2509), 1.993 (3087), 0.312 (5990), 2.198 (1176), 0.666 (2407), 0.275 (3863),
+0.653 (4713), 1.533 (6691), 0.596 (9670) and 1.372 ms (5203, the candidacy) before
+their isolations. Seeds 164, 385 and 7381 are re-verified: each pin passes on this
+tree, and each comment says in a sentence why this entry does not bear on it. A
+port of the replay over the JSONL, reading `decidedNs`, gives on this tree's traces
+what the Rust gives — no gap under either reading — and the audit's figures in the
+164 and 385 comments (a 161.6 ms longest AppendEntries-less stretch holding a chunk;
+a 167.1 ms, 55.3 % stretch across a restatement) are the same under decision time.
+On the traces the seeds originally failed with, which carry no decision times, both
+predicates still fire — seed 164's one gap from 12.9405 s flagged at 13.3397 s with
+21 chunks, seed 385's from 14.0308 s flagged at 14.3350 s — and neither could have
+been moved by stamps: the reset that ended 164's gap, a granted vote, was traced
+30.4 ms after the flag, against a largest lag between a vote's decision and its
+record of 4.9 ms on six of this tree's traces, and 385's, a pre-vote campaign, 22.9
+ms after the flag, and a pre-vote campaign persists nothing and carries no separate
+decision time. Seed 7381's predicates are a fold over record order and still find
+the index-65 replay under a floor of 128 on its original trace.
+
+**Alternatives.** *Checker-side causal matching of each rise to the delivery that
+caused it*: the checker would re-implement the core's term rule and the inbox —
+which message a step took, behind which persist, past which drops and duplicates —
+as a second implementation to drift from the first, and would still not know when
+the step was taken; the server knows that, so the server says it. *Recording an
+isolation's `from` only once the victim has no step in flight*: a fault driver
+waiting on the server's internals is a fault model of the implementation rather
+than of the world (D-012), it moves every seed's isolation instants and with them
+every schedule, and it hides the race from the checker instead of letting the check
+see both times. *A top-level moirae field*: a format-version bump in moirae and a
+new `moirae-trace` release for ananke to consume, and publishing is not open to this
+branch; the checks read `TraceRecord`, not the export, so nothing is bought by it.
+*Stamping the restatements when the core is restored*: see the sites above — it
+would place the fresh timer earlier than the server has it. *Tracing before the
+persist*: it would make the trace say what is intended rather than what is durable,
+which commit by majority and `SendBeforePersist`'s catch depend on.
+
+**Consequences.** `Environment` gains two required methods, and both
+implementations carry them; `TraceRecord` gains a field; the raft scenario's JSONL
+gains `decidedNs` on the records of every persisted step, while the echo, WAL and
+engine traces are unchanged. The pre-vote check and the timer check read decision
+time, so the class of 1885 and 2023 — a rise decided before an isolation and traced
+inside it — and the eleven variant catches of it are no longer catches.
+
+At a hundred release seeds every rate is the rate of the tree before this entry
+(5624f24), and no rate changed: `NoPreVote` 100 of 100, now also counted by the
+pre-vote check, 100 of 100 — its rises are its own campaigns, decided inside the
+isolation — `SendBeforePersist` 100, `TruncateOnEveryAppend` 100,
+`ApplyBeforeCommit` 87, `CountOlderTermForCommit` 52, `SnapshotWithoutCurrentLast`
+36, `ResetTimerOnAnyRpc` 33, `SingleMajorityInJointConsensus` 29, `AdoptionAsBuilt`
+8, `RefusalNotDurable` 3, `IgnoreIncarnation` 0 and `SharedSnapshotDir` 0, the lease
+trials' 52 exceeded seeds with 8 stale reads caught without the guard, and the
+correct server's coverage and the membership scenario's field for field. The
+incremental checker's equivalence test and the parallel driver's trace-identity test
+pass. None of the thirteen seeds lies in the first hundred, which is why no rate
+moved there.
+
+`SharedSnapshotDir`'s ten-thousand-seed assertion counted every catch, the
+seven timing artefacts and two linearizability budget exhaustions (seeds 1262 and
+7222, which prove nothing) among them. It now asserts at that tier that the
+liveness check — the wedge itself — caught it, and prints the catches by check at
+every tier. By the nightly's numbers that tier should show 4 by liveness and the 2
+exhaustions; that is expected, not measured on this tree.
+
+Three open points besides the two sites above. A term-raising message delivered
+before an isolation but *stepped* inside it — queued behind a persist — is decided
+inside the window and would still be flagged by the pre-vote check with no delivery
+in the window; none of the thirteen is that case, and closing it would take the
+causal matching rejected above. The timer check's resets for a campaign, a granted
+vote or a step-down now land at the step rather than after its persist, which makes
+the check stricter by that persist, at most 4.9 ms on the traces measured, and more
+lenient by never measuring a bound past a reset already decided; no seed of the
+hundred moved either way. And RealEnv's stamps are the process's monotonic clock,
+comparable only within one process, which is all a log line needs.
+
+---
+
+_Next entry: D-048. Add one before implementing anything not covered above._

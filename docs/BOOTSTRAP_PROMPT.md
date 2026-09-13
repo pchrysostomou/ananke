@@ -137,6 +137,16 @@ _Update this section at the end of every session._
   absence and say why. Seed 5909's wedge was measured to be D-043's alone, with
   no stale `matched`; PROPOSED D-039, D-042, D-043 and D-045 carry the factual
   corrections.
+- Decision and durability times (2026-09-13), branch `phase-2-d047` stacked on
+  `phase-2-pinned-audit`, unpushed: PROPOSED D-047. Every trace record carries the
+  time its step was decided beside the time it was traced (`TraceRecord::decided`,
+  `Environment::decision` / `trace_decided`, `decidedNs` in a moirae `log` line's
+  data), and the pre-vote and timer checks read decision time. The nightly
+  34711427220's correct-server failures on seeds 1885 and 2023, and its eleven
+  variant catches of the same trace-timestamp gap, are pinned for that reason;
+  seeds 164, 385 and 7381 were rule gaps this does not bear on. No schedule moved
+  (the echo golden hash is unchanged and the raft traces differ only by the new
+  field), and every 100-seed rate is unchanged.
 - Stage A, B, C record: A: the
   pure core, the codec with the studio decoder, the state under tenant 0 with the
   applied index in the batch and a refusal of any recovery that lost state, the four

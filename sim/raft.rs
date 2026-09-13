@@ -1056,34 +1056,40 @@ impl Report {
     /// which the server was refused, re-seeded or finished installing a snapshot
     /// is skipped: an install's restatement re-states the term the stream
     /// carried, which is no election of the isolated server's (RAFT.md §3).
+    ///
+    /// The check is about why the server's term moved, so it reads each term
+    /// record by the time its step decided it (PROPOSED D-047):
+    /// [`Report::isolation_keeps_the_term_by`] under [`RecordTime::Decided`].
     fn isolation_keeps_the_term(&self) -> Result<(), String> {
+        self.isolation_keeps_the_term_by(RecordTime::Decided)
+    }
+
+    /// The pre-vote check with the server's term records read by `time`: under
+    /// [`RecordTime::Decided`] the check [`Report::check`] makes, and under
+    /// [`RecordTime::Durable`] the check as it stood before PROPOSED D-047, word
+    /// for word. One function for both, so the two cannot drift apart and a pinned
+    /// seed can show the gap and the fix side by side.
+    ///
+    /// Only the term records move with `time`. The skip reads the durability time
+    /// under both: it stands in for an install's or a re-seed's restatement landing
+    /// inside the window, which is traced when the new incarnation starts, after
+    /// the event the skip looks for is durable, so when that event was *recorded*
+    /// is the nearer bound on where the restatement lands.
+    ///
+    /// # Errors
+    ///
+    /// The first isolation whose server's term differs at its heal from its term at
+    /// its start, read by `time`.
+    // PROPOSED(D-047): every trace record carries its decision time and its durability time.
+    pub fn isolation_keeps_the_term_by(&self, time: RecordTime) -> Result<(), String> {
         for &(server, from, until) in &self.isolations {
-            let reseeding = self.records.iter().any(|r| {
-                r.at >= from
-                    && r.at <= until
-                    && matches!(&r.event,
-                        TraceEvent::RaftRefused { server: s, .. }
-                        | TraceEvent::RaftReseeded { server: s }
-                        | TraceEvent::RaftSnapshot { server: s, taken: false, .. }
-                        if *s == server)
-            });
-            if reseeding {
+            if self.reseeding_during(server, from, until) {
                 continue;
             }
-            let term_at = |at: Instant| {
-                self.records
-                    .iter()
-                    .filter(|r| r.at <= at)
-                    .filter_map(|r| match &r.event {
-                        TraceEvent::RaftTerm {
-                            server: s, term, ..
-                        } if *s == server => Some(*term),
-                        _ => None,
-                    })
-                    .last()
-                    .unwrap_or(0)
-            };
-            let (before, after) = (term_at(from), term_at(until));
+            let (before, after) = (
+                self.term_by(server, time, from),
+                self.term_by(server, time, until),
+            );
             if after != before {
                 return Err(format!(
                     "pre-vote: server {server} raised its term from {before} to {after} while isolated from {from:?} to {until:?}"
@@ -1093,15 +1099,52 @@ impl Report {
         Ok(())
     }
 
+    /// Whether `server` was refused, re-seeded or finished installing a snapshot
+    /// while isolated from `from` to `until`, by when those records were traced:
+    /// the pre-vote check's skip.
+    fn reseeding_during(&self, server: u64, from: Instant, until: Instant) -> bool {
+        self.records.iter().any(|r| {
+            r.at >= from
+                && r.at <= until
+                && matches!(&r.event,
+                    TraceEvent::RaftRefused { server: s, .. }
+                    | TraceEvent::RaftReseeded { server: s }
+                    | TraceEvent::RaftSnapshot { server: s, taken: false, .. }
+                    if *s == server)
+        })
+    }
+
+    /// `server`'s term at `at`: its last `RaftTerm` whose `time` is at or before
+    /// `at`, 0 before any. A server's term records come from one task's steps in
+    /// sequence, each decided after the one before was traced, so their decision
+    /// times rise with their order just as their durability times do, and the last
+    /// such record is the latest either way.
+    fn term_by(&self, server: u64, time: RecordTime, at: Instant) -> u64 {
+        self.records
+            .iter()
+            .filter(|r| time.of(r) <= at)
+            .filter_map(|r| match &r.event {
+                TraceEvent::RaftTerm {
+                    server: s, term, ..
+                } if *s == server => Some(*term),
+                _ => None,
+            })
+            .last()
+            .unwrap_or(0)
+    }
+
     /// Election timers fire (moirae rule 5): a running server that is not the
     /// leader campaigns within [`TIMER_TIMEOUTS`] maximum election timeouts of the
     /// last AppendEntries it received from a leader of its term or later, the last
     /// vote it granted, or its start. A re-seeded server is exempt: it never
     /// campaigns on that store, by design (RAFT.md §3, PROPOSED(D-035)). The first
     /// gap [`Report::replay_timers`] finds under every reset arm is the violation.
+    ///
+    /// Whether a server campaigned in time is about when it decided to, so the
+    /// replay reads every record by its decision time (PROPOSED D-047).
     fn timers_fire(&self) -> Result<(), String> {
         let mut first = None;
-        self.replay_timers(TimerResets::ALL, |gap| {
+        self.replay_timers(TimerResets::ALL, RecordTime::Decided, |gap| {
             first = Some(gap);
             ControlFlow::Break(())
         });
@@ -1125,7 +1168,21 @@ impl Report {
     /// [`Report::timers_fire`] is this replay under [`TimerResets::ALL`], stopped at
     /// the first gap; the pinned seeds' predicates are the same replay with an arm
     /// switched off, so the check and the predicates cannot drift apart.
-    fn replay_timers(&self, resets: TimerResets, mut gap: impl FnMut(TimerGap) -> ControlFlow<()>) {
+    ///
+    /// The records are replayed in the order of `time` (PROPOSED D-047), ties kept
+    /// in record order, and each is at its `time`. By durability time that is the
+    /// trace's own order. By decision time it is the order the servers decided in:
+    /// a campaign, a granted vote or a step-down traced after its persist resets a
+    /// server's clock at its step, and is replayed before any record decided later,
+    /// so no bound is measured past a reset the server had already made. Records
+    /// recorded as they happen — deliveries, sends, crashes, restatements — have one
+    /// time and the same place under both.
+    fn replay_timers(
+        &self,
+        resets: TimerResets,
+        time: RecordTime,
+        mut gap: impl FnMut(TimerGap) -> ControlFlow<()>,
+    ) {
         // A server measures its timeout by its own clock: a slow one takes longer
         // in global time, and the bound scales with its rate.
         let bound_for = |server: u64| -> Duration {
@@ -1140,8 +1197,11 @@ impl Report {
         let mut terms: BTreeMap<u64, u64> = BTreeMap::new();
         let mut clocks = TimerClocks::default();
         let mut reported: BTreeMap<u64, Instant> = BTreeMap::new();
-        for record in &self.records {
-            let at = record.at;
+        // PROPOSED(D-047): the replay's order; stable, so ties keep record order.
+        let mut order: Vec<&TraceRecord> = self.records.iter().collect();
+        order.sort_by_key(|record| time.of(record));
+        for record in order {
+            let at = time.of(record);
             match &record.event {
                 TraceEvent::RaftReseeded { server } => {
                     reseeded.insert(*server);
@@ -1263,6 +1323,33 @@ impl Report {
     }
 }
 
+/// Which of a record's two times a check reads (PROPOSED D-047). A node traces a
+/// step's events once what they report is durable (D-026), so a record's
+/// [`TraceRecord::at`] is when it became durable and its
+/// [`TraceRecord::decided`] when the step that produced it was taken; for every
+/// record traced as it happens the two are one instant.
+// PROPOSED(D-047): every trace record carries its decision time and its durability time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecordTime {
+    /// When the step was taken: for a check about why a server did something, and
+    /// so about what it could have known when it did.
+    Decided,
+    /// When the record was traced, which is when what it reports was durable: for a
+    /// check about what was durable when.
+    Durable,
+}
+
+impl RecordTime {
+    /// `record`'s time of this kind.
+    #[must_use]
+    pub fn of(self, record: &TraceRecord) -> Instant {
+        match self {
+            Self::Decided => record.decided,
+            Self::Durable => record.at,
+        }
+    }
+}
+
 /// Which reset arms of the timer check's replay are switched on
 /// ([`Report::timer_gaps`]). An AppendEntries from a leader of the server's term or
 /// later, a granted vote, a campaign, a start and a leader's step-down always
@@ -1341,13 +1428,22 @@ impl TimerClocks {
 /// and the day it comes back the pin says so.
 impl Report {
     /// Every gap the timer check's replay finds with the arms `resets` names
-    /// switched on, one per stretch past a server's bound. Under
+    /// switched on, one per stretch past a server's bound, reading every record by
+    /// its decision time as the check does (PROPOSED D-047). Under
     /// [`TimerResets::ALL`] this is empty exactly when the check's timer rule
     /// passes.
     #[must_use]
     pub fn timer_gaps(&self, resets: TimerResets) -> Vec<TimerGap> {
+        self.timer_gaps_by(resets, RecordTime::Decided)
+    }
+
+    /// [`Report::timer_gaps`] with the records read by `time`: under
+    /// [`RecordTime::Durable`], the replay as it stood before PROPOSED D-047.
+    // PROPOSED(D-047): every trace record carries its decision time and its durability time.
+    #[must_use]
+    pub fn timer_gaps_by(&self, resets: TimerResets, time: RecordTime) -> Vec<TimerGap> {
         let mut gaps = Vec::new();
-        self.replay_timers(resets, |gap| {
+        self.replay_timers(resets, time, |gap| {
             gaps.push(gap);
             ControlFlow::Continue(())
         });
@@ -1384,6 +1480,74 @@ impl Report {
             .into_iter()
             .filter(|gap| gap.restatements > 0)
             .collect()
+    }
+
+    /// Seeds 1885's and 2023's situation, and the nightly's eleven variant catches
+    /// of the same shape (PROPOSED D-047): a term rise of an isolated server that
+    /// straddles the isolation's start — its step decided before `from` and its
+    /// record traced at or after `from`, by `until` — so the pre-vote check reads
+    /// it inside the window by durability time and before it by decision time.
+    /// Each carries how many messages from a server were delivered to the isolated
+    /// one in `(from, until]`: a rise with none there was caused by nothing that
+    /// reached it while it was cut off. Isolations the pre-vote check skips are
+    /// skipped here too, so this is exactly what the durability-time check reads
+    /// as a rise and the decision-time check does not.
+    ///
+    /// On the trace seed 1885 failed with (run 34711427220, 14c3e17): server 1's
+    /// term 10, decided at the step that took a RequestVote delivered at 15.2005 s,
+    /// traced at 15.2030 s when its persist was durable, 48 µs after a partition
+    /// that began at 15.2030 s, with no delivery to it until 17.112 s.
+    // PROPOSED(D-047): every trace record carries its decision time and its durability time.
+    #[must_use]
+    pub fn isolation_term_straddles(&self) -> Vec<TermStraddle> {
+        let mut straddles = Vec::new();
+        for &(server, from, until) in &self.isolations {
+            if self.reseeding_during(server, from, until) {
+                continue;
+            }
+            let mut previous = 0;
+            for record in &self.records {
+                let TraceEvent::RaftTerm {
+                    server: s,
+                    term,
+                    role,
+                } = &record.event
+                else {
+                    continue;
+                };
+                if *s != server {
+                    continue;
+                }
+                if record.decided < from
+                    && from <= record.at
+                    && record.at <= until
+                    && *term != previous
+                {
+                    let deliveries = self
+                        .records
+                        .iter()
+                        .filter(|r| r.at > from && r.at <= until)
+                        .filter(|r| {
+                            matches!(&r.event, TraceEvent::MessageDelivered { from: f, to, .. }
+                                if server_of(*to) == Some(server) && server_of(*f).is_some())
+                        })
+                        .count();
+                    straddles.push(TermStraddle {
+                        server,
+                        from,
+                        until,
+                        before: previous,
+                        term: *term,
+                        role,
+                        decided: record.decided,
+                        at: record.at,
+                        deliveries,
+                    });
+                }
+                previous = *term;
+            }
+        }
+        straddles
     }
 
     /// Every installed snapshot that put a server's snapshot floor below one its
@@ -1736,11 +1900,16 @@ impl Report {
     }
 
     /// The leader in force at the last heal, as (server, term): the last to be
-    /// elected at or before it that had not stepped down or crashed by then.
+    /// elected at or before it that had not stepped down or crashed by then. Who
+    /// led is a question of what the servers had decided by the heal, so an
+    /// election or a step-down is read by its decision time (PROPOSED D-047).
     #[must_use]
     pub fn leader_at_last_heal(&self) -> Option<(u64, u64)> {
         let mut leader = None;
-        for record in self.records.iter().take_while(|r| r.at <= self.last_heal) {
+        // PROPOSED(D-047): decided by the heal. A server's leadership records come
+        // from one task's steps in sequence, so their decision times keep their
+        // record order, and a crash is recorded as it happens.
+        for record in self.records.iter().filter(|r| r.decided <= self.last_heal) {
             match &record.event {
                 TraceEvent::RaftLeader { server, term, .. } => leader = Some((*server, *term)),
                 TraceEvent::RaftTerm { server, role, .. }
@@ -1952,6 +2121,32 @@ impl Report {
         }
         looped
     }
+}
+
+/// A term rise that straddles the start of its server's isolation
+/// ([`Report::isolation_term_straddles`]).
+// PROPOSED(D-047): every trace record carries its decision time and its durability time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TermStraddle {
+    /// The isolated server.
+    pub server: u64,
+    /// When the isolation began.
+    pub from: Instant,
+    /// When it healed.
+    pub until: Instant,
+    /// The server's term on its term record before the rise.
+    pub before: u64,
+    /// The term it rose to.
+    pub term: u64,
+    /// The role the rise put it in: `follower` for a term adopted from a message,
+    /// `candidate` for a campaign.
+    pub role: &'static str,
+    /// When the step that raised it was taken: before `from`.
+    pub decided: Instant,
+    /// When the rise was traced, once durable: in `[from, until]`.
+    pub at: Instant,
+    /// Messages from a server delivered to it in `(from, until]`.
+    pub deliveries: usize,
 }
 
 /// An installed snapshot below the floor a server's snapshots had reached
