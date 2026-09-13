@@ -101,44 +101,44 @@ ananke/
 
 _Update this section at the end of every session._
 
-- Phase: 2 CODE-COMPLETE on branch `phase-2-overnight` (2026-09-09), not tagged and
-  not merged to main: stages D and E of RAFT.md's order and issue #22 landed there
-  overnight (D-029, D-030, D-031), every commit gated, the correct server green on
-  100 release seeds of both sweeps with all nine sweep-tested variants caught.
+- Phase: 2 CODE-COMPLETE, not tagged. Overnight (2026-09-09), branch
+  `phase-2-overnight`, merged to main as PR #24: stages D and E of RAFT.md's order
+  and issue #22 landed (D-029, D-030, D-031), every commit gated, the correct server
+  green on 100 release seeds of both sweeps with all nine sweep-tested variants
+  caught.
   D: joint consensus with learners first, the configuration in force from the log
   with the `0/2/config` key, one change in flight, the 3→5→3-under-partition
   scenario (worst availability gap 469 ms against the 2 s bound),
   `SingleMajorityInJointConsensus` caught 28/100. E: snapshots as resumable chunked
   streams of `Engine::checkpoint`, the compacted log in the core, the staged
   install committing by CURRENT-last, LostState-refused servers re-seeded under a
-  durable vote quarantine (PROPOSED D-035), `SnapshotWithoutCurrentLast` caught
+  durable vote quarantine (D-035), `SnapshotWithoutCurrentLast` caught
   26/100. #22: the Figure 8 driver, `CountOlderTermForCommit` caught 42/100 with
   `max_batch` at its default (was 0/100 batched). Local 10k runs on 1373601 and
   f54b468 found two correct-server false positives of the timer check against
-  snapshot-fed followers (seeds 164 and 385, both pinned; D-030 and PROPOSED D-039); the
-  clean 10k verdict is the GitHub nightly's to give — the sweeps now run their
-  seeds in parallel and in four tiers, 20 / 100 / 1000 (`scripts/premerge.sh`) /
-  10 000 on GitHub only (D-040). Before the tag: review the seven PROPOSED
-  entries at the bottom of DECISIONS.md, that verdict, the devlog draft
-  (`docs/devlog/02-phase-2.md`), and `docs/OVERNIGHT.md` for the session's full
-  record; the branch is unpushed (no credentials on the machine).
+  snapshot-fed followers (seeds 164 and 385, both pinned; D-030 and D-039). The
+  sweeps now run their seeds in parallel and in four tiers, 20 / 100 / 1000
+  (`scripts/premerge.sh`) / 10 000 on GitHub only (D-040). `docs/OVERNIGHT.md` is
+  the session's full record.
   Before Phase 4: issue #21, client sessions.
-- Nightly follow-up (2026-09-11), branch `integrate-fixes`: the ten-thousand-seed
-  nightly's three failing seeds, 5909, 6325 and 7381, are fixed on this branch as
-  PROPOSED D-041 (the crash-safe adoption and the store marker), D-042 (store
-  incarnations) and D-043 (versioned snapshot takes, pinned streams, a stream per
-  designated follower) plus a checker fix (an installed snapshot sets the floor
-  exactly, D-030), each seed pinned in the gate, pending review and the nightly.
-- Pinned-seed audit (2026-09-12), branch `phase-2-pinned-audit` off main at
-  `14c3e17`, unpushed: CLAUDE.md now requires a pinned seed to assert its
+- Nightly follow-up (2026-09-11), merged to main as PR #27: the ten-thousand-seed
+  nightly's three failing seeds were fixed and pinned in the gate — 6325 by D-041
+  (the crash-safe adoption and the store marker), 5909 by D-043 (versioned snapshot
+  takes, pinned streams, a stream per designated follower), 7381 by a checker fix
+  (an installed snapshot sets the floor exactly, D-030) — with D-042 (store
+  incarnations) beside them. Then on main: D-044, a refusal is durable and a refused
+  engine does no work (PR #28), and D-045, a variant is a set, with D-046, the
+  sweep's safety re-check keeps its state (PR #29).
+- Pinned-seed audit (2026-09-12), PR #30, branch `phase-2-pinned-audit` off main at
+  `14c3e17`: CLAUDE.md now requires a pinned seed to assert its
   mechanism, never just green. Every pinned seed (164, 385, 680, 687, 5909, 6325,
   7381) asserts it through trace predicates on `sim::raft::Report`; 680 and the
   D-042 reset on 5909 reach their situation today, and the rest assert its
   absence and say why. Seed 5909's wedge was measured to be D-043's alone, with
-  no stale `matched`; PROPOSED D-039, D-042, D-043 and D-045 carry the factual
+  no stale `matched`; D-039, D-042, D-043 and D-045 carry the factual
   corrections.
-- Decision and durability times (2026-09-13), branch `phase-2-d047` stacked on
-  `phase-2-pinned-audit`, unpushed: PROPOSED D-047. Every trace record carries the
+- Decision and durability times (2026-09-13), PR #31, branch `phase-2-d047` stacked
+  on `phase-2-pinned-audit`: D-047. Every trace record carries the
   time its step was decided beside the time it was traced (`TraceRecord::decided`,
   `Environment::decision` / `trace_decided`, `decidedNs` in a moirae `log` line's
   data), and the pre-vote and timer checks read decision time. The nightly
@@ -150,6 +150,17 @@ _Update this section at the end of every session._
   34731272921 and 34749071877) every test passed and reading decision time removed
   28 catches and added none: 27 pre-vote straddles and one timer catch whose granted
   vote was traced past the bound, each named in D-047.
+- Decided (2026-09-13), branch `phase-2-decided` at the tip of `phase-2-d047`, so
+  carrying the commits of PRs #30 and #31: the owner approved every PROPOSED entry
+  — D-032, D-033, D-035 to D-039 and D-041 to D-047; D-034 was never used — some
+  with amendments, and each is now a decided entry, its code markers reading
+  `D-0xx`. D-030's account of seed 164 is superseded by D-048, not edited: a local
+  run, the follower about sixty-eight entries behind, no leader in the stretch the
+  check flagged. RAFT.md §3 now says what a refused server does: it binds its
+  socket and rejects every AppendEntries, grants and serves nothing, and takes only
+  its own re-seed (D-030, D-037, D-042). D-047 keeps its two limits of evidence and
+  its three open points stated, citing issues #33 and #32. The devlog,
+  `docs/devlog/02-phase-2.md`, is rewritten from its draft. Not merged.
 - Stage A, B, C record: A: the
   pure core, the codec with the studio decoder, the state under tenant 0 with the
   applied index in the batch and a refusal of any recovery that lost state, the four
@@ -190,9 +201,15 @@ _Update this section at the end of every session._
      (one laptop disk, 2026-09-05). Met in the shape the flag exists for.
 - Last tag: v0.2.0. `ananke`, `ananke-env` and `ananke-storage` 0.2.0 on crates.io.
   Devlog: `docs/devlog/01-phase-1.md`.
-- Next concrete task: review the overnight branch — the PROPOSED entries
-  (D-032..D-038), the devlog draft, the nightly's numbers — then merge, tag and
-  publish Phase 2 per D-011, and file the backlog issues OVERNIGHT.md lists.
+- Next concrete task: the ten-thousand-seed run on `phase-2-decided`, then the
+  owner's review and merge, the nightly green on `main`, and Phase 2's tag and
+  crates.io publish per D-011. Open follow-ups: issue #32 (the pre-vote check: a
+  message delivered before an isolation but stepped inside it) and issue #33
+  (assert the timer catches that decision time removes, not only print them).
+  Still unfiled from OVERNIGHT.md's backlog candidates: membership changes and
+  snapshots on one schedule, a studio metric for stream health, RAFT.md §5's
+  Figure 8 driver touch-up, and an operator mechanism to retire a removed server.
+  Issues #22 (D-031) and #25 (D-046) are resolved on `main` and still open.
 - Fault-model tests follow the CLAUDE.md pattern: a known-buggy variant the sweep
   must catch beside the correct one it must pass (`Journal::sync_dir_on_rotate`,
   `wal::Variant`).
