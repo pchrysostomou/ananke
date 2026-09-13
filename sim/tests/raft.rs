@@ -13,7 +13,7 @@ use ananke_raft::core::{Variant, Variants};
 use ananke_raft::invariants::{self, Checker};
 use ananke_raft::store::{LOST_STATE, STORE_MARKER};
 use ananke_sim::raft::DRIFT_BOUND_PPM;
-use ananke_sim::raft::{self, Fault};
+use ananke_sim::raft::{self, Fault, Moved, RecordTime, TimerResets};
 use ananke_sim::{seeds, sweep, verdict, write_trace};
 
 /// Two runs with the same seed produce byte-identical traces.
@@ -58,6 +58,17 @@ fn the_seed_42_trace_is_written_for_the_studio() {
 /// bound. The day [`raft::Report::snapshot_fed_timer_gaps`] is not empty, the seed
 /// reaches the situation again and the pin should assert it: those gaps present,
 /// and the check green.
+///
+/// PROPOSED D-047 does not bear on this seed: its failure was a gap in the timer
+/// check's rules — no reset for an InstallSnapshot — which neither of a record's two
+/// times supplies. The replay now reads records by decision time, which moves only
+/// the resets a server makes at a step — a campaign, a granted vote, a step-down —
+/// earlier, by the persist each waited on. The numbers above are the same under it.
+/// On the trace the seed failed with, which carries no decision times, the
+/// predicate still finds its one gap, and the reset that ended it, a granted vote,
+/// was traced 30.4 ms after the gap was flagged: no persist could have put its
+/// decision before the flag, a vote's lag being at most 6.89 ms over the correct
+/// server's first 3 000 seeds on this tree.
 #[test]
 fn seed_164_which_a_local_ten_thousand_seed_run_found_stays_green() {
     let report = raft::run(164, Variant::Correct);
@@ -93,6 +104,16 @@ fn seed_164_which_a_local_ten_thousand_seed_run_found_stays_green() {
 /// green, [`raft::Report::timer_gaps_rescued_by_restatement`] is every gap of that
 /// replay; the day it is not empty the seed reaches the situation again, and the
 /// pin should assert it: those gaps present, and the check green.
+///
+/// PROPOSED D-047 does not bear on this seed: its failure was the timer check not
+/// knowing that an install's switch starts a fresh timer — a missing rule — which
+/// neither of a record's two times supplies. The restatement that rule reads is
+/// traced as the new incarnation starts and has one time. The replay now reads
+/// records by decision time; the numbers above are the same under it. On the trace
+/// the seed failed with, which carries no decision times, the predicate still finds
+/// its one gap, and the reset that ended it, the pre-candidate campaign, was traced
+/// 22.9 ms after the gap was flagged; a pre-vote campaign persists nothing and is
+/// traced as its step is taken.
 #[test]
 fn seed_385_which_a_local_ten_thousand_seed_run_found_stays_green() {
     let report = raft::run(385, Variant::Correct);
@@ -130,6 +151,11 @@ fn seed_385_which_a_local_ten_thousand_seed_run_found_stays_green() {
 /// situation again and the pin should be re-audited; the day
 /// [`raft::Report::recoveries_under_a_lost_floor`] is not empty, it should assert
 /// the mechanism: that replay present, and the check green.
+///
+/// PROPOSED D-047 does not bear on this seed: its failure was the checker's floor
+/// never coming back down on a re-seed, a gap in a fold that reads records in
+/// order and no time at all, so neither of a record's two times could have
+/// prevented it; both predicates are the same fold and unchanged.
 #[test]
 fn seed_7381_which_the_first_nightly_found_stays_green() {
     let report = raft::run(7381, Variant::Correct);
@@ -563,20 +589,256 @@ fn seed_687_which_the_premerge_found_stays_green() {
     }
 }
 
+/// Seed 1885 of the ten-thousand-seed nightly (run 34711427220, on 14c3e17): the
+/// correct server failed with *pre-vote: server 1 raised its term from 8 to 10
+/// while isolated from 15.203 s to 17.112 s*. The protocol held. Server 2's
+/// RequestVote of term 10 was delivered to server 1 at 15.200469 s, and server 1's
+/// step took it there — adopting term 10 and granting the vote — 2.53 ms before a
+/// `Fault::RetakeUnderStream` partition cut it off at 15.203 s. The step's persist
+/// became durable 48 µs after the partition, and because a node traces a step's
+/// events only once they are durable (D-026), the `RaftTerm` record landed inside
+/// the window. No message from a server reached server 1 until the heal. The check
+/// read the record's time as the moment of the rise.
+///
+/// Every record now carries both times (PROPOSED D-047): `at`, when it was traced
+/// and so when what it reports was durable, and `decided`, when the step behind it
+/// was taken. The pre-vote check is about why a term moved, so it reads the
+/// decision time. The test asserts the mechanism, not just green: the rise straddles
+/// the isolation's start — decided before it, traced inside it — with no delivery to
+/// the server in the window; the check by durability time still fails with the
+/// nightly's message word for word; the same check by decision time passes; and so
+/// does the whole check. The schedule is the nightly's: this tree's trace of the
+/// seed is the nightly's byte for byte once the new `decidedNs` fields are removed.
+#[test]
+fn seed_1885_which_the_nightly_failed_on_a_trace_timestamp_passes_by_decision_time() {
+    let report = raft::run(1885, Variant::Correct);
+    let straddle = assert_rise_straddles_the_isolation(
+        &report,
+        (1, 8, 10, "follower"),
+        "pre-vote: server 1 raised its term from 8 to 10 while isolated from Instant(15.203s) to Instant(17.112s)",
+    );
+    assert_eq!(
+        straddle.causes,
+        [(2, "request-vote", 10)],
+        "seed 1885: the rise was not decided at the delivery of server 2's RequestVote of term \
+         10, so its decision time is not that message's step: {straddle:?}"
+    );
+    report.check().unwrap();
+}
+
+/// Seed 2023 of the same nightly, the same gap: the correct server failed with
+/// *pre-vote: server 1 raised its term from 13 to 14 while isolated from 19.22 s to
+/// 20.822 s*. Server 3's AppendEntries of term 14 was delivered to server 1 and
+/// stepped at 19.217879 s, 2.12 ms before the partition; the adopted term was
+/// durable and traced 671 µs inside the window, and nothing from a server reached
+/// server 1 until the heal. The test asserts what seed 1885's does (PROPOSED D-047).
+#[test]
+fn seed_2023_which_the_nightly_failed_on_a_trace_timestamp_passes_by_decision_time() {
+    let report = raft::run(2023, Variant::Correct);
+    let straddle = assert_rise_straddles_the_isolation(
+        &report,
+        (1, 13, 14, "follower"),
+        "pre-vote: server 1 raised its term from 13 to 14 while isolated from Instant(19.22s) to Instant(20.822s)",
+    );
+    assert_eq!(
+        straddle.causes,
+        [(3, "append-entries", 14)],
+        "seed 2023: the rise was not decided at the delivery of server 3's AppendEntries of term \
+         14, so its decision time is not that message's step: {straddle:?}"
+    );
+    report.check().unwrap();
+}
+
+/// The nightly's eleven variant catches of the same gap (run 34711427220): four of
+/// `IgnoreIncarnation`'s and seven of `SharedSnapshotDir`'s, every one the pre-vote
+/// check reading a trace timestamp and none either bug. Ten are a term adopted from
+/// a RequestVote or an AppendEntries whose step came before the isolation and whose
+/// record came after it; seed 5203's is a candidacy, decided on a granting
+/// PreVoteResponse before the isolation and traced, with its persisted term and
+/// vote, inside it. No message from a server reached the isolated server inside the
+/// window on any of them. Each is asserted for that reason (PROPOSED D-047): the
+/// straddle, no delivery in the window, the durability-time check failing with the
+/// nightly's message, and the decision-time check passing. None of the eleven now
+/// reports a pre-vote violation; each run's verdict is printed.
+#[test]
+fn the_nightlys_eleven_variant_catches_of_the_trace_timestamp_gap_are_not_catches() {
+    type Pair = (u64, Variant, (u64, u64, u64, &'static str), &'static str);
+    let pairs: [Pair; 11] = [
+        (
+            1252,
+            Variant::IgnoreIncarnation,
+            (3, 10, 11, "follower"),
+            "pre-vote: server 3 raised its term from 10 to 11 while isolated from Instant(20.16625s) to Instant(22.33725s)",
+        ),
+        (
+            2509,
+            Variant::IgnoreIncarnation,
+            (1, 12, 13, "follower"),
+            "pre-vote: server 1 raised its term from 12 to 13 while isolated from Instant(14.859s) to Instant(16.412s)",
+        ),
+        (
+            3087,
+            Variant::IgnoreIncarnation,
+            (3, 10, 11, "follower"),
+            "pre-vote: server 3 raised its term from 10 to 11 while isolated from Instant(17.701s) to Instant(20.034s)",
+        ),
+        (
+            5990,
+            Variant::IgnoreIncarnation,
+            (1, 11, 12, "follower"),
+            "pre-vote: server 1 raised its term from 11 to 12 while isolated from Instant(14.448s) to Instant(16.741s)",
+        ),
+        (
+            1176,
+            Variant::SharedSnapshotDir,
+            (3, 14, 15, "follower"),
+            "pre-vote: server 3 raised its term from 14 to 15 while isolated from Instant(18.29s) to Instant(20.536s)",
+        ),
+        (
+            2407,
+            Variant::SharedSnapshotDir,
+            (3, 10, 11, "follower"),
+            "pre-vote: server 3 raised its term from 10 to 11 while isolated from Instant(15.314s) to Instant(17.394s)",
+        ),
+        (
+            3863,
+            Variant::SharedSnapshotDir,
+            (2, 10, 11, "follower"),
+            "pre-vote: server 2 raised its term from 10 to 11 while isolated from Instant(18.222s) to Instant(20.706s)",
+        ),
+        (
+            4713,
+            Variant::SharedSnapshotDir,
+            (3, 13, 14, "follower"),
+            "pre-vote: server 3 raised its term from 13 to 14 while isolated from Instant(18.797s) to Instant(20.433s)",
+        ),
+        (
+            5203,
+            Variant::SharedSnapshotDir,
+            (2, 11, 12, "candidate"),
+            "pre-vote: server 2 raised its term from 11 to 12 while isolated from Instant(12.369s) to Instant(13.319s)",
+        ),
+        (
+            6691,
+            Variant::SharedSnapshotDir,
+            (1, 13, 14, "follower"),
+            "pre-vote: server 1 raised its term from 13 to 14 while isolated from Instant(17.298s) to Instant(18.322s)",
+        ),
+        (
+            9670,
+            Variant::SharedSnapshotDir,
+            (3, 12, 13, "follower"),
+            "pre-vote: server 3 raised its term from 12 to 13 while isolated from Instant(26.809s) to Instant(29.254s)",
+        ),
+    ];
+    let verdicts = sweep(pairs.len() as u64, |i| {
+        let (seed, variant, rise, original) = pairs[usize::try_from(i).expect("small")];
+        let report = raft::run(seed, variant);
+        assert_rise_straddles_the_isolation(&report, rise, original);
+        (seed, variant, report.check().err())
+    });
+    for (seed, variant, verdict) in &verdicts {
+        eprintln!("seed {seed} under {variant:?}: {verdict:?}");
+        assert!(
+            !verdict.as_ref().is_some_and(|v| v.contains("pre-vote")),
+            "seed {seed} under {variant:?} still reports a pre-vote violation: {verdict:?}"
+        );
+        assert_eq!(
+            verdict, &None,
+            "seed {seed} under {variant:?}: the run no longer passes the check outright"
+        );
+    }
+}
+
+/// The trace-timestamp gap on one run (PROPOSED D-047): the run holds exactly one
+/// term rise that straddles the start of its server's isolation — `rise` names its
+/// (server, term before, term after, role) — decided before the isolation began and
+/// traced inside it, with no message from a server delivered to that server in the
+/// window; the pre-vote check by durability time fails with `original`, the
+/// nightly's message, and the same check by decision time passes. Returns the
+/// straddle, so a pin can tie its decision time to the message the step took.
+fn assert_rise_straddles_the_isolation(
+    report: &raft::Report,
+    rise: (u64, u64, u64, &str),
+    original: &str,
+) -> raft::TermStraddle {
+    let (seed, variants) = (report.seed, report.variants);
+    let straddles = report.isolation_term_straddles();
+    let [straddle] = straddles.as_slice() else {
+        panic!(
+            "seed {seed} under {variants:?} no longer has exactly one term rise straddling an \
+             isolation's start: {straddles:?}; re-audit the pin"
+        );
+    };
+    assert_eq!(
+        (
+            straddle.server,
+            straddle.before,
+            straddle.term,
+            straddle.role
+        ),
+        rise,
+        "seed {seed} under {variants:?} straddles with another rise: {straddle:?}"
+    );
+    assert!(
+        straddle.decided < straddle.from
+            && straddle.from <= straddle.at
+            && straddle.at <= straddle.until,
+        "seed {seed} under {variants:?}: the rise does not straddle the isolation: {straddle:?}"
+    );
+    assert_eq!(
+        straddle.deliveries, 0,
+        "seed {seed} under {variants:?}: a server's message reached the isolated server in the \
+         window, so the rise may be the protocol's: {straddle:?}"
+    );
+    eprintln!(
+        "seed {seed} under {variants:?}: server {} term {} -> {} ({}) decided {:?} before the \
+         isolation at {:?}, traced {:?} after it",
+        straddle.server,
+        straddle.before,
+        straddle.term,
+        straddle.role,
+        straddle.from.duration_since(straddle.decided),
+        straddle.from,
+        straddle.at.duration_since(straddle.from)
+    );
+    assert_eq!(
+        report.isolation_keeps_the_term_by(RecordTime::Durable),
+        Err(original.to_owned()),
+        "seed {seed} under {variants:?}: the pre-vote check by durability time no longer fails \
+         the way the nightly did"
+    );
+    assert_eq!(
+        report.isolation_keeps_the_term_by(RecordTime::Decided),
+        Ok(()),
+        "seed {seed} under {variants:?}: the pre-vote check by decision time fails"
+    );
+    assert_eq!(
+        report.moved_by_decision_time(&report.check()),
+        Some(Moved::Lost(original.to_owned())),
+        "seed {seed} under {variants:?}: the sweeps' report of what decision time moved does not \
+         name this run as the catch it removed"
+    );
+    straddle.clone()
+}
+
 /// The positive control: the correct server satisfies every property on every
 /// seed, and the sweep reached the states that matter.
 #[test]
 fn the_correct_server_passes_every_seed() {
     let coverage = Mutex::new(Coverage::default());
+    let moved = Mutex::new(MovedSeeds::default());
     let verdicts = sweep(seeds(), |seed| {
         let report = raft::run(seed, Variant::Correct);
         coverage.lock().unwrap().add(&report);
-        report
-            .check()
-            .inspect_err(|_| write_trace(&format!("raft-{seed}"), &report.jsonl))
+        checked(&report, &moved).map_or(Ok(()), |violation| {
+            write_trace(&format!("raft-{seed}"), &report.jsonl);
+            Err(violation)
+        })
     });
     let coverage = coverage.into_inner().unwrap();
     eprintln!("Correct: {coverage:?}");
+    print_moved("Correct", moved);
     if let Err(violation) = verdict(&verdicts) {
         panic!("{violation}");
     }
@@ -588,7 +850,8 @@ fn the_correct_server_passes_every_seed() {
 /// (PROPOSED(D-045)); the sweep's own list is all single variants.
 fn is_caught(variants: impl Into<Variants>) {
     let variants = variants.into();
-    let caught: Vec<String> = sweep(seeds(), |seed| raft::run(seed, variants).check().err())
+    let moved = Mutex::new(MovedSeeds::default());
+    let caught: Vec<String> = sweep(seeds(), |seed| checked(&raft::run(seed, variants), &moved))
         .into_iter()
         .flatten()
         .collect();
@@ -598,12 +861,133 @@ fn is_caught(variants: impl Into<Variants>) {
         seeds(),
         caught.first().map_or("", String::as_str)
     );
+    print_moved(&format!("{variants:?}"), moved);
     assert!(!caught.is_empty(), "{variants:?} was never caught");
 }
 
+/// What reading records by decision time (PROPOSED D-047) moved over one sweep:
+/// a line per seed whose catch it removed and per seed whose catch it added.
+#[derive(Default)]
+struct MovedSeeds {
+    removed: Vec<(u64, String)>,
+    added: Vec<(u64, String)>,
+}
+
+/// `report`'s violation, if any, with what PROPOSED D-047 moved on the run noted in
+/// `moved`. Reading a rise earlier can remove a pre-vote catch only where the rise
+/// was decided before an isolation's start and traced after it, so a removed
+/// pre-vote catch without such a straddle is a fault in the reasoning and fails the
+/// sweep. A removed timer catch is noted with the decisions of the flagged server
+/// that straddle the flag, the way a timer catch can be removed.
+fn checked(report: &raft::Report, moved: &Mutex<MovedSeeds>) -> Option<String> {
+    let (seed, variants) = (report.seed, report.variants);
+    let verdict = report.check();
+    match report.moved_by_decision_time(&verdict) {
+        Some(Moved::Lost(was)) if was.starts_with("pre-vote: ") => {
+            let straddles = report.isolation_term_straddles();
+            assert!(
+                !straddles.is_empty(),
+                "seed {seed} under {variants:?}: decision time removed the catch `{was}`, but no \
+                 term rise straddles an isolation's start"
+            );
+            let straddles: Vec<String> = straddles
+                .iter()
+                .map(|s| {
+                    format!(
+                        "server {} {}->{} ({}) decided {:?} before, traced {:?} after, {} in-window deliveries, at the decision {:?}",
+                        s.server,
+                        s.before,
+                        s.term,
+                        s.role,
+                        s.from.duration_since(s.decided),
+                        s.at.duration_since(s.from),
+                        s.deliveries,
+                        s.causes
+                    )
+                })
+                .collect();
+            moved
+                .lock()
+                .unwrap()
+                .removed
+                .push((seed, format!("{was} [{}]", straddles.join("; "))));
+        }
+        Some(Moved::Lost(was)) => {
+            let straddling: Vec<String> = report
+                .timer_gaps_by(TimerResets::ALL, RecordTime::Durable)
+                .first()
+                .map(|gap| {
+                    report
+                        .decisions_straddling(gap.server, gap.at)
+                        .iter()
+                        .map(|r| {
+                            let event = format!("{:?}", r.event);
+                            let name = event.split([' ', '{', '(']).next().unwrap_or("");
+                            format!(
+                                "{name} decided {:?} before the flag, traced {:?} after",
+                                gap.at.duration_since(r.decided),
+                                r.at.duration_since(gap.at)
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            moved
+                .lock()
+                .unwrap()
+                .removed
+                .push((seed, format!("{was} [straddling the flag: {straddling:?}]")));
+        }
+        Some(Moved::Gained(now)) => moved.lock().unwrap().added.push((seed, now)),
+        None => {}
+    }
+    verdict.err()
+}
+
+/// Prints what PROPOSED D-047 moved over a sweep, fifty lines of each at most.
+fn print_moved(name: &str, moved: Mutex<MovedSeeds>) {
+    let mut moved = moved.into_inner().unwrap();
+    moved.removed.sort();
+    moved.added.sort();
+    eprintln!(
+        "{name}: decision time (PROPOSED D-047) removed {} catches and added {}",
+        moved.removed.len(),
+        moved.added.len()
+    );
+    for (seed, line) in moved.removed.iter().take(50) {
+        eprintln!("  removed: seed {seed}: {line}");
+    }
+    for (seed, line) in moved.added.iter().take(50) {
+        eprintln!("  added: seed {seed}: {line}");
+    }
+}
+
+/// The server without pre-vote campaigns on its own timer while it is cut off, so
+/// its term rises are decided inside the isolation, and the pre-vote check, which
+/// reads a rise by its decision time (PROPOSED D-047), must still see them. The
+/// catches are counted by that check, not by whichever check a run failed first.
 #[test]
 fn a_server_without_pre_vote_is_caught() {
-    is_caught(Variant::NoPreVote);
+    let moved = Mutex::new(MovedSeeds::default());
+    let caught: Vec<String> = sweep(seeds(), |seed| {
+        checked(&raft::run(seed, Variant::NoPreVote), &moved)
+    })
+    .into_iter()
+    .flatten()
+    .collect();
+    let by_pre_vote = caught.iter().filter(|v| v.contains(": pre-vote: ")).count();
+    eprintln!(
+        "{:?}: caught on {} of {} seeds, {by_pre_vote} by the pre-vote check, first: {}",
+        Variants::from(Variant::NoPreVote),
+        caught.len(),
+        seeds(),
+        caught.first().map_or("", String::as_str)
+    );
+    print_moved("NoPreVote", moved);
+    assert!(
+        by_pre_vote > 0,
+        "NoPreVote was never caught by the pre-vote check reading decision time"
+    );
 }
 
 #[test]
@@ -664,6 +1048,7 @@ fn a_server_that_installs_without_current_last_is_caught() {
 /// holds because the correct server passes the same seeds above.
 #[test]
 fn a_server_whose_adoption_is_as_built_is_caught() {
+    let moved = Mutex::new(MovedSeeds::default());
     let outcomes: Vec<(Option<String>, bool, usize)> = sweep(seeds(), |seed| {
         let report = raft::run(seed, Variant::AdoptionAsBuilt);
         let stormed = report
@@ -672,7 +1057,7 @@ fn a_server_whose_adoption_is_as_built_is_caught() {
             .iter()
             .any(|f| matches!(f, Fault::CrashAdopting { .. }));
         let adoptions = report.count(|e| matches!(e, TraceEvent::RaftAdopted { .. }));
-        (report.check().err(), stormed, adoptions)
+        (checked(&report, &moved), stormed, adoptions)
     });
     let caught: Vec<&String> = outcomes.iter().filter_map(|(v, _, _)| v.as_ref()).collect();
     let stormed = outcomes.iter().filter(|(_, s, _)| *s).count();
@@ -683,6 +1068,7 @@ fn a_server_whose_adoption_is_as_built_is_caught() {
         seeds(),
         caught.first().map_or("", |v| v.as_str())
     );
+    print_moved("AdoptionAsBuilt", moved);
     assert!(
         stormed > 0,
         "the adoption crash storm was drawn on no seed: the fault was not injected"
@@ -715,9 +1101,10 @@ fn a_server_whose_adoption_is_as_built_is_caught() {
 /// the correct server passes the same seeds above.
 #[test]
 fn a_server_whose_refusal_is_not_durable_is_caught() {
+    let moved = Mutex::new(MovedSeeds::default());
     let outcomes: Vec<(Option<String>, usize)> = sweep(seeds(), |seed| {
         let report = raft::run(seed, Variant::RefusalNotDurable);
-        (report.check().err(), crashes_while_refused(&report))
+        (checked(&report, &moved), crashes_while_refused(&report))
     });
     let caught: Vec<&String> = outcomes.iter().filter_map(|(v, _)| v.as_ref()).collect();
     let fired = outcomes.iter().filter(|(_, hits)| *hits > 0).count();
@@ -727,6 +1114,7 @@ fn a_server_whose_refusal_is_not_durable_is_caught() {
         seeds(),
         caught.first().map_or("", |v| v.as_str())
     );
+    print_moved("RefusalNotDurable", moved);
     assert!(
         fired > 0,
         "no crash ever landed on a refused server: the fault was not injected"
@@ -778,14 +1166,16 @@ fn a_server_whose_refusal_is_not_durable_is_caught() {
 /// every one was the pre-vote isolation check's trace-timing gap — a term rise
 /// adopted from a message delivered before the isolation began and traced after
 /// it, the gap that failed the correct server on seeds 1885 and 2023 — not this
-/// bug.
+/// bug. PROPOSED D-047 closes that gap, and the four are pinned as not catches in
+/// `the_nightlys_eleven_variant_catches_of_the_trace_timestamp_gap_are_not_catches`.
 #[test]
 fn a_leader_that_ignores_incarnations_never_forgets_and_the_sweep_cannot_see_it() {
+    let moved = Mutex::new(MovedSeeds::default());
     let outcomes: Vec<(Option<String>, usize, bool)> = sweep(seeds(), |seed| {
         let report = raft::run(seed, Variant::IgnoreIncarnation);
         let resets = report.count(|e| matches!(e, TraceEvent::RaftProgressReset { .. }));
         let reseeded = reseed_completed(&report);
-        (report.check().err(), resets, reseeded)
+        (checked(&report, &moved), resets, reseeded)
     });
     let caught: Vec<&String> = outcomes.iter().filter_map(|(v, _, _)| v.as_ref()).collect();
     let resets: usize = outcomes.iter().map(|(_, r, _)| *r).sum();
@@ -796,6 +1186,7 @@ fn a_leader_that_ignores_incarnations_never_forgets_and_the_sweep_cannot_see_it(
         seeds(),
         caught.first().map_or("", |v| v.as_str())
     );
+    print_moved("IgnoreIncarnation", moved);
     assert_eq!(
         resets, 0,
         "the leader that ignores incarnations reset a follower's progress: the variant was not injected"
@@ -867,13 +1258,19 @@ fn a_leader_that_ignores_incarnations_never_forgets_and_the_sweep_cannot_see_it(
 /// check, the wedge itself; 7 by the pre-vote isolation check's trace-timing
 /// gap, the one that failed the correct server on seeds 1885 and 2023; and 2 by
 /// the linearizability checker exhausting its search budget, which proves
-/// nothing. The assertion below counts all thirteen.
+/// nothing. The assertion used to count all thirteen. PROPOSED D-047 closes the
+/// seven — the pre-vote check reads a rise by its decision time, and
+/// `the_nightlys_eleven_variant_catches_of_the_trace_timestamp_gap_are_not_catches`
+/// pins them — and a budget exhaustion is no evidence of the bug, so the
+/// ten-thousand-seed assertion now counts only the liveness check's catches, which
+/// are the wedge, and the catches are printed by check.
 #[test]
 fn a_leader_that_shares_one_snapshot_directory_and_streams_one_follower_at_a_time_is_caught() {
+    let moved = Mutex::new(MovedSeeds::default());
     let outcomes: Vec<(Option<String>, bool, usize)> = sweep(seeds(), |seed| {
         let report = raft::run(seed, Variant::SharedSnapshotDir);
         (
-            report.check().err(),
+            checked(&report, &moved),
             retook_at_one_index(&report),
             report.aimed_streams,
         )
@@ -881,13 +1278,23 @@ fn a_leader_that_shares_one_snapshot_directory_and_streams_one_follower_at_a_tim
     let caught: Vec<&String> = outcomes.iter().filter_map(|(v, _, _)| v.as_ref()).collect();
     let fired = outcomes.iter().filter(|(_, fired, _)| *fired).count();
     let aimed = outcomes.iter().filter(|(_, _, aimed)| *aimed > 0).count();
-    let liveness = caught.iter().filter(|v| v.contains("liveness")).count();
+    let liveness = caught.iter().filter(|v| v.contains(": liveness: ")).count();
+    // PROPOSED(D-047): the catches by check, the name a violation starts with.
+    let mut by_check: BTreeMap<&str, usize> = BTreeMap::new();
+    for violation in &caught {
+        let check = violation
+            .split_once(": ")
+            .and_then(|(_, rest)| rest.split_once(':'))
+            .map_or(violation.as_str(), |(check, _)| check);
+        *by_check.entry(check).or_default() += 1;
+    }
     eprintln!(
-        "SharedSnapshotDir: caught on {} of {} seeds, {liveness} by the liveness check, re-took at an index already taken on {fired} seeds, the aimed re-take arm reached its stream on {aimed} seeds, first: {}",
+        "SharedSnapshotDir: caught on {} of {} seeds, {liveness} by the liveness check, by check {by_check:?}, re-took at an index already taken on {fired} seeds, the aimed re-take arm reached its stream on {aimed} seeds, first: {}",
         caught.len(),
         seeds(),
         caught.first().map_or("", |v| v.as_str())
     );
+    print_moved("SharedSnapshotDir", moved);
     assert!(
         fired > 0,
         "SharedSnapshotDir never re-took at an index already taken: the fault was not injected"
@@ -897,7 +1304,10 @@ fn a_leader_that_shares_one_snapshot_directory_and_streams_one_follower_at_a_tim
         "the aimed re-take arm never reached a stream: the shape it exists to build was never built"
     );
     if seeds() >= 10_000 {
-        assert!(!caught.is_empty(), "SharedSnapshotDir was never caught");
+        assert!(
+            liveness > 0,
+            "SharedSnapshotDir's wedge was never caught by the liveness check; by check: {by_check:?}"
+        );
     }
 }
 

@@ -124,8 +124,26 @@ impl State {
     }
 
     pub(super) fn record(&mut self, node: Option<NodeId>, event: TraceEvent) {
+        let now = self.now;
+        self.record_decided(node, now, event);
+    }
+
+    /// Records `event` as decided at `decided`, at or before now (PROPOSED D-047).
+    // PROPOSED(D-047): every trace record carries its decision time and its durability time.
+    pub(super) fn record_decided(
+        &mut self,
+        node: Option<NodeId>,
+        decided: Instant,
+        event: TraceEvent,
+    ) {
+        debug_assert!(
+            decided <= self.now,
+            "a decision at {decided:?} traced at {:?} comes from the future",
+            self.now
+        );
         self.trace.push(TraceRecord {
             at: self.now,
+            decided: decided.min(self.now),
             node,
             event,
         });

@@ -50,5 +50,6 @@ pub use rng::Rng;
 pub use task::{TaskHandle, TaskId};
 pub use time::{Instant, WallTime, WallTimeOutOfRange};
 pub use trace::{
-    ClientOp, ClientResult, DirEntryOp, DropReason, MessageId, TraceEvent, WalStop, WalStopReason,
+    ClientOp, ClientResult, Decision, DirEntryOp, DropReason, MessageId, TraceEvent, WalStop,
+    WalStopReason,
 };

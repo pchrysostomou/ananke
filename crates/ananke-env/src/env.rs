@@ -2,7 +2,7 @@
 
 use std::future::Future;
 
-use crate::{Clock, FileSystem, Network, Rng, TaskHandle, TraceEvent};
+use crate::{Clock, Decision, FileSystem, Network, Rng, TaskHandle, TraceEvent};
 
 /// Everything non-deterministic a node can do.
 ///
@@ -42,6 +42,18 @@ pub trait Environment: Clone + Send + Sync + 'static {
         name: &'static str,
         f: F,
     ) -> TaskHandle;
-    /// Records `event` in the run's trace.
+    /// Records `event` in the run's trace, decided now: its decision time and its
+    /// durability time are the same instant (PROPOSED D-047).
     fn trace(&self, event: TraceEvent);
+    /// A stamp of the moment a step takes a decision whose events it will trace
+    /// later, once they are durable (PROPOSED D-047). Global virtual time under the
+    /// simulator, the real monotonic clock under `RealEnv`; never this node's own
+    /// clock. It reads the time and nothing else, so taking one moves no schedule.
+    // PROPOSED(D-047): every trace record carries its decision time and its durability time.
+    fn decision(&self) -> Decision;
+    /// Records `event` in the run's trace as decided at `decided`: the record's time
+    /// is still now, its durability time, and `decided` travels beside it
+    /// (PROPOSED D-047). `trace(event)` means `trace_decided(decision(), event)`.
+    // PROPOSED(D-047): every trace record carries its decision time and its durability time.
+    fn trace_decided(&self, decided: Decision, event: TraceEvent);
 }

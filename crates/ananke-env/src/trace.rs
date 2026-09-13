@@ -34,6 +34,35 @@ impl fmt::Display for MessageId {
     }
 }
 
+/// When a step took the decision whose events it traces: an opaque stamp from
+/// [`Environment::decision`](crate::Environment::decision), handed back to
+/// [`Environment::trace_decided`](crate::Environment::trace_decided) once the
+/// events may be recorded (PROPOSED D-047).
+///
+/// A node traces a step's events only once what they report is durable (D-026), so
+/// the time a record is written is its *durability* time, and the step that produced
+/// it may have been taken well before: a term adopted from a message, persisted, and
+/// traced when the sync returned. The stamp carries the *decision* time across that
+/// wait. It is global virtual time under the simulator and the real monotonic clock
+/// under [`RealEnv`](crate::RealEnv), never a node's own clock, which is skewed and
+/// drifting; that is why the environment issues it and why it is opaque. Taking one
+/// reads the time and nothing else: no await, no poll, no draw.
+// PROPOSED(D-047): every trace record carries its decision time and its durability time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Decision(Instant);
+
+impl Decision {
+    /// A stamp for `at`, on whichever clock the environment issuing it runs.
+    pub(crate) const fn at(at: Instant) -> Self {
+        Self(at)
+    }
+
+    /// The time the stamp holds.
+    pub(crate) const fn instant(self) -> Instant {
+        self.0
+    }
+}
+
 /// A state transition worth seeing in the moirae studio.
 ///
 /// The environment stamps each event with the node and the time it was recorded, so
