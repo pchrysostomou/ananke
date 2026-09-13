@@ -1028,26 +1028,90 @@ impl Report {
             return fail(violation);
         }
         if self.uniform() && self.majority_up() {
-            let bound = election_max() * LIVENESS_TIMEOUTS;
-            match self.time_to_write_after_heal() {
-                Some(took) if took <= bound => {}
-                Some(took) => {
-                    return fail(format!(
-                        "liveness: the first client write after the last heal took {took:?}, over {bound:?}"
-                    ));
-                }
-                None => {
-                    return fail(format!(
-                        "liveness: no client write completed after the last heal at {:?}",
-                        self.last_heal
-                    ));
-                }
+            if let Err(violation) = self.liveness() {
+                return fail(violation);
             }
             if let Err(violation) = self.timers_fire() {
                 return fail(violation);
             }
         }
         Ok(())
+    }
+
+    /// Liveness: on a uniform run with a majority up, a client write completes
+    /// within [`LIVENESS_TIMEOUTS`] maximum election timeouts of the last heal.
+    fn liveness(&self) -> Result<(), String> {
+        let bound = election_max() * LIVENESS_TIMEOUTS;
+        match self.time_to_write_after_heal() {
+            Some(took) if took <= bound => Ok(()),
+            Some(took) => Err(format!(
+                "liveness: the first client write after the last heal took {took:?}, over {bound:?}"
+            )),
+            None => Err(format!(
+                "liveness: no client write completed after the last heal at {:?}",
+                self.last_heal
+            )),
+        }
+    }
+
+    /// Whether reading records by decision time (PROPOSED D-047) moved this run's
+    /// verdict, given `verdict`, the result [`Report::check`] returned: the check
+    /// as it stood reads the pre-vote and timer checks' records by durability time,
+    /// and every other check is the same under both. Worked out from `verdict`
+    /// without running the checks that do not move — the linearizability search
+    /// above all — so a sweep can report, on every seed, what the entry changed.
+    // PROPOSED(D-047): every trace record carries its decision time and its durability time.
+    #[must_use]
+    pub fn moved_by_decision_time(&self, verdict: &Result<(), String>) -> Option<Moved> {
+        let live = self.uniform() && self.majority_up();
+        let by_durability = |from_pre_vote: bool| -> Result<(), String> {
+            if from_pre_vote {
+                self.isolation_keeps_the_term_by(RecordTime::Durable)?;
+                if live {
+                    self.liveness()?;
+                }
+            }
+            if live {
+                self.timers_fire_by(RecordTime::Durable)?;
+            }
+            Ok(())
+        };
+        match verdict {
+            Ok(()) => by_durability(true).err().map(Moved::Lost),
+            Err(violation) => {
+                let what = violation
+                    .split_once(": ")
+                    .map_or(violation.as_str(), |(_, what)| what);
+                let from_pre_vote = what.starts_with("pre-vote: ");
+                if !from_pre_vote && !what.starts_with("timers: ") {
+                    return None;
+                }
+                // A run that failed the timer check passed the pre-vote check by
+                // decision time; by durability time it may fail there instead.
+                if !from_pre_vote
+                    && self
+                        .isolation_keeps_the_term_by(RecordTime::Durable)
+                        .is_err()
+                {
+                    return None;
+                }
+                by_durability(from_pre_vote)
+                    .is_ok()
+                    .then(|| Moved::Gained(what.to_owned()))
+            }
+        }
+    }
+
+    /// The records of `server` decided before `at` and traced at or after it: the
+    /// decisions a timer-check flag at `at` can straddle (PROPOSED D-047).
+    // PROPOSED(D-047): every trace record carries its decision time and its durability time.
+    #[must_use]
+    pub fn decisions_straddling(&self, server: u64, at: Instant) -> Vec<&TraceRecord> {
+        self.records
+            .iter()
+            .filter(|r| r.node.is_some_and(|node| u64::from(node.get()) == server))
+            .filter(|r| r.decided < at && at <= r.at)
+            .collect()
     }
 
     /// Pre-vote (thesis §9.6): a server that receives nothing does not raise its
@@ -1143,8 +1207,15 @@ impl Report {
     /// Whether a server campaigned in time is about when it decided to, so the
     /// replay reads every record by its decision time (PROPOSED D-047).
     fn timers_fire(&self) -> Result<(), String> {
+        self.timers_fire_by(RecordTime::Decided)
+    }
+
+    /// The timer check with the records read by `time`: under
+    /// [`RecordTime::Durable`], the check as it stood before PROPOSED D-047.
+    // PROPOSED(D-047): every trace record carries its decision time and its durability time.
+    fn timers_fire_by(&self, time: RecordTime) -> Result<(), String> {
         let mut first = None;
-        self.replay_timers(TimerResets::ALL, RecordTime::Decided, |gap| {
+        self.replay_timers(TimerResets::ALL, time, |gap| {
             first = Some(gap);
             ControlFlow::Break(())
         });
@@ -1337,6 +1408,18 @@ pub enum RecordTime {
     /// When the record was traced, which is when what it reports was durable: for a
     /// check about what was durable when.
     Durable,
+}
+
+/// How reading records by decision time moved one run's verdict
+/// ([`Report::moved_by_decision_time`]).
+// PROPOSED(D-047): every trace record carries its decision time and its durability time.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Moved {
+    /// The run passes, and by durability time it failed with this violation.
+    Lost(String),
+    /// The run fails with this pre-vote or timer violation, and by durability time
+    /// it passed.
+    Gained(String),
 }
 
 impl RecordTime {

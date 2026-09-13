@@ -3008,8 +3008,31 @@ moved there.
 seven timing artefacts and two linearizability budget exhaustions (seeds 1262 and
 7222, which prove nothing) among them. It now asserts at that tier that the
 liveness check — the wedge itself — caught it, and prints the catches by check at
-every tier. By the nightly's numbers that tier should show 4 by liveness and the 2
-exhaustions; that is expected, not measured on this tree.
+every tier.
+
+*At ten thousand seeds* (nightly run 34731272921, on `bd93ed3`, this entry's second
+commit) every test passed. Against the nightly on `main` at 14c3e17 (run
+34711427220): the correct server passed every seed, where that run failed it on
+1885 and 2023; `IgnoreIncarnation` 0 catches, from 4; `SharedSnapshotDir` 6, from
+13 — 4 by liveness and 2 by linearizability, the counts the earlier run's
+breakdown gave for those checks — so the seven pre-vote artefacts are gone; `NoPreVote` 9 999, unchanged, all 9 999 by the pre-vote check.
+Unchanged too: `SendBeforePersist` 10 000, `TruncateOnEveryAppend` 9 995,
+`CountOlderTermForCommit` 4 413, `SingleMajorityInJointConsensus` 2 720,
+`RefusalNotDurable` 132, the lease trials' 472 stale reads in 5 023 exceeded seeds,
+all 5 023 revoked, and the three engine variants' rates. **Four rates fell that the
+thirteen seeds do not account for**: `ResetTimerOnAnyRpc` 3 462, from 3 470;
+`AdoptionAsBuilt` 646, from 651; `ApplyBeforeCommit` 8 902, from 8 903; and
+`SnapshotWithoutCurrentLast` 3 303, from 3 304 — fifteen seeds. The run printed only
+each variant's first catch, so which seeds these are, and whether each was a catch by
+the pre-vote or timer check reading a durability time, was not measured. Every
+variant sweep now also reports, per seed, the catches reading decision time removed
+and the catches it added (`Report::moved_by_decision_time`, which derives the verdict
+by durability time from the check's own without re-running the linearizability
+search), and asserts that every pre-vote catch it removed is a term rise straddling an
+isolation's start — the only way reading a rise earlier can remove one. A timer catch
+removed is printed with the flagged server's decisions straddling the flag. The
+pinned straddles assert that report names each of them. The fifteen are for the next
+ten-thousand-seed run to name; until it does, they are an open point of this entry.
 
 Three open points besides the two sites above. A term-raising message delivered
 before an isolation but *stepped* inside it — queued behind a persist — is decided

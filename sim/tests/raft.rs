@@ -13,7 +13,7 @@ use ananke_raft::core::{Variant, Variants};
 use ananke_raft::invariants::{self, Checker};
 use ananke_raft::store::{LOST_STATE, STORE_MARKER};
 use ananke_sim::raft::DRIFT_BOUND_PPM;
-use ananke_sim::raft::{self, Fault, RecordTime};
+use ananke_sim::raft::{self, Fault, Moved, RecordTime, TimerResets};
 use ananke_sim::{seeds, sweep, verdict, write_trace};
 
 /// Two runs with the same seed produce byte-identical traces.
@@ -813,6 +813,12 @@ fn assert_rise_straddles_the_isolation(
         Ok(()),
         "seed {seed} under {variants:?}: the pre-vote check by decision time fails"
     );
+    assert_eq!(
+        report.moved_by_decision_time(&report.check()),
+        Some(Moved::Lost(original.to_owned())),
+        "seed {seed} under {variants:?}: the sweeps' report of what decision time moved does not \
+         name this run as the catch it removed"
+    );
     straddle.clone()
 }
 
@@ -821,15 +827,18 @@ fn assert_rise_straddles_the_isolation(
 #[test]
 fn the_correct_server_passes_every_seed() {
     let coverage = Mutex::new(Coverage::default());
+    let moved = Mutex::new(MovedSeeds::default());
     let verdicts = sweep(seeds(), |seed| {
         let report = raft::run(seed, Variant::Correct);
         coverage.lock().unwrap().add(&report);
-        report
-            .check()
-            .inspect_err(|_| write_trace(&format!("raft-{seed}"), &report.jsonl))
+        checked(&report, &moved).map_or(Ok(()), |violation| {
+            write_trace(&format!("raft-{seed}"), &report.jsonl);
+            Err(violation)
+        })
     });
     let coverage = coverage.into_inner().unwrap();
     eprintln!("Correct: {coverage:?}");
+    print_moved("Correct", moved);
     if let Err(violation) = verdict(&verdicts) {
         panic!("{violation}");
     }
@@ -841,7 +850,8 @@ fn the_correct_server_passes_every_seed() {
 /// (PROPOSED(D-045)); the sweep's own list is all single variants.
 fn is_caught(variants: impl Into<Variants>) {
     let variants = variants.into();
-    let caught: Vec<String> = sweep(seeds(), |seed| raft::run(seed, variants).check().err())
+    let moved = Mutex::new(MovedSeeds::default());
+    let caught: Vec<String> = sweep(seeds(), |seed| checked(&raft::run(seed, variants), &moved))
         .into_iter()
         .flatten()
         .collect();
@@ -851,7 +861,105 @@ fn is_caught(variants: impl Into<Variants>) {
         seeds(),
         caught.first().map_or("", String::as_str)
     );
+    print_moved(&format!("{variants:?}"), moved);
     assert!(!caught.is_empty(), "{variants:?} was never caught");
+}
+
+/// What reading records by decision time (PROPOSED D-047) moved over one sweep:
+/// a line per seed whose catch it removed and per seed whose catch it added.
+#[derive(Default)]
+struct MovedSeeds {
+    removed: Vec<(u64, String)>,
+    added: Vec<(u64, String)>,
+}
+
+/// `report`'s violation, if any, with what PROPOSED D-047 moved on the run noted in
+/// `moved`. Reading a rise earlier can remove a pre-vote catch only where the rise
+/// was decided before an isolation's start and traced after it, so a removed
+/// pre-vote catch without such a straddle is a fault in the reasoning and fails the
+/// sweep. A removed timer catch is noted with the decisions of the flagged server
+/// that straddle the flag, the way a timer catch can be removed.
+fn checked(report: &raft::Report, moved: &Mutex<MovedSeeds>) -> Option<String> {
+    let (seed, variants) = (report.seed, report.variants);
+    let verdict = report.check();
+    match report.moved_by_decision_time(&verdict) {
+        Some(Moved::Lost(was)) if was.starts_with("pre-vote: ") => {
+            let straddles = report.isolation_term_straddles();
+            assert!(
+                !straddles.is_empty(),
+                "seed {seed} under {variants:?}: decision time removed the catch `{was}`, but no \
+                 term rise straddles an isolation's start"
+            );
+            let straddles: Vec<String> = straddles
+                .iter()
+                .map(|s| {
+                    format!(
+                        "server {} {}->{} ({}) decided {:?} before, traced {:?} after, {} in-window deliveries, at the decision {:?}",
+                        s.server,
+                        s.before,
+                        s.term,
+                        s.role,
+                        s.from.duration_since(s.decided),
+                        s.at.duration_since(s.from),
+                        s.deliveries,
+                        s.causes
+                    )
+                })
+                .collect();
+            moved
+                .lock()
+                .unwrap()
+                .removed
+                .push((seed, format!("{was} [{}]", straddles.join("; "))));
+        }
+        Some(Moved::Lost(was)) => {
+            let straddling: Vec<String> = report
+                .timer_gaps_by(TimerResets::ALL, RecordTime::Durable)
+                .first()
+                .map(|gap| {
+                    report
+                        .decisions_straddling(gap.server, gap.at)
+                        .iter()
+                        .map(|r| {
+                            let event = format!("{:?}", r.event);
+                            let name = event.split([' ', '{', '(']).next().unwrap_or("");
+                            format!(
+                                "{name} decided {:?} before the flag, traced {:?} after",
+                                gap.at.duration_since(r.decided),
+                                r.at.duration_since(gap.at)
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            moved
+                .lock()
+                .unwrap()
+                .removed
+                .push((seed, format!("{was} [straddling the flag: {straddling:?}]")));
+        }
+        Some(Moved::Gained(now)) => moved.lock().unwrap().added.push((seed, now)),
+        None => {}
+    }
+    verdict.err()
+}
+
+/// Prints what PROPOSED D-047 moved over a sweep, fifty lines of each at most.
+fn print_moved(name: &str, moved: Mutex<MovedSeeds>) {
+    let mut moved = moved.into_inner().unwrap();
+    moved.removed.sort();
+    moved.added.sort();
+    eprintln!(
+        "{name}: decision time (PROPOSED D-047) removed {} catches and added {}",
+        moved.removed.len(),
+        moved.added.len()
+    );
+    for (seed, line) in moved.removed.iter().take(50) {
+        eprintln!("  removed: seed {seed}: {line}");
+    }
+    for (seed, line) in moved.added.iter().take(50) {
+        eprintln!("  added: seed {seed}: {line}");
+    }
 }
 
 /// The server without pre-vote campaigns on its own timer while it is cut off, so
@@ -860,8 +968,9 @@ fn is_caught(variants: impl Into<Variants>) {
 /// catches are counted by that check, not by whichever check a run failed first.
 #[test]
 fn a_server_without_pre_vote_is_caught() {
+    let moved = Mutex::new(MovedSeeds::default());
     let caught: Vec<String> = sweep(seeds(), |seed| {
-        raft::run(seed, Variant::NoPreVote).check().err()
+        checked(&raft::run(seed, Variant::NoPreVote), &moved)
     })
     .into_iter()
     .flatten()
@@ -874,6 +983,7 @@ fn a_server_without_pre_vote_is_caught() {
         seeds(),
         caught.first().map_or("", String::as_str)
     );
+    print_moved("NoPreVote", moved);
     assert!(
         by_pre_vote > 0,
         "NoPreVote was never caught by the pre-vote check reading decision time"
@@ -938,6 +1048,7 @@ fn a_server_that_installs_without_current_last_is_caught() {
 /// holds because the correct server passes the same seeds above.
 #[test]
 fn a_server_whose_adoption_is_as_built_is_caught() {
+    let moved = Mutex::new(MovedSeeds::default());
     let outcomes: Vec<(Option<String>, bool, usize)> = sweep(seeds(), |seed| {
         let report = raft::run(seed, Variant::AdoptionAsBuilt);
         let stormed = report
@@ -946,7 +1057,7 @@ fn a_server_whose_adoption_is_as_built_is_caught() {
             .iter()
             .any(|f| matches!(f, Fault::CrashAdopting { .. }));
         let adoptions = report.count(|e| matches!(e, TraceEvent::RaftAdopted { .. }));
-        (report.check().err(), stormed, adoptions)
+        (checked(&report, &moved), stormed, adoptions)
     });
     let caught: Vec<&String> = outcomes.iter().filter_map(|(v, _, _)| v.as_ref()).collect();
     let stormed = outcomes.iter().filter(|(_, s, _)| *s).count();
@@ -957,6 +1068,7 @@ fn a_server_whose_adoption_is_as_built_is_caught() {
         seeds(),
         caught.first().map_or("", |v| v.as_str())
     );
+    print_moved("AdoptionAsBuilt", moved);
     assert!(
         stormed > 0,
         "the adoption crash storm was drawn on no seed: the fault was not injected"
@@ -989,9 +1101,10 @@ fn a_server_whose_adoption_is_as_built_is_caught() {
 /// the correct server passes the same seeds above.
 #[test]
 fn a_server_whose_refusal_is_not_durable_is_caught() {
+    let moved = Mutex::new(MovedSeeds::default());
     let outcomes: Vec<(Option<String>, usize)> = sweep(seeds(), |seed| {
         let report = raft::run(seed, Variant::RefusalNotDurable);
-        (report.check().err(), crashes_while_refused(&report))
+        (checked(&report, &moved), crashes_while_refused(&report))
     });
     let caught: Vec<&String> = outcomes.iter().filter_map(|(v, _)| v.as_ref()).collect();
     let fired = outcomes.iter().filter(|(_, hits)| *hits > 0).count();
@@ -1001,6 +1114,7 @@ fn a_server_whose_refusal_is_not_durable_is_caught() {
         seeds(),
         caught.first().map_or("", |v| v.as_str())
     );
+    print_moved("RefusalNotDurable", moved);
     assert!(
         fired > 0,
         "no crash ever landed on a refused server: the fault was not injected"
@@ -1056,11 +1170,12 @@ fn a_server_whose_refusal_is_not_durable_is_caught() {
 /// `the_nightlys_eleven_variant_catches_of_the_trace_timestamp_gap_are_not_catches`.
 #[test]
 fn a_leader_that_ignores_incarnations_never_forgets_and_the_sweep_cannot_see_it() {
+    let moved = Mutex::new(MovedSeeds::default());
     let outcomes: Vec<(Option<String>, usize, bool)> = sweep(seeds(), |seed| {
         let report = raft::run(seed, Variant::IgnoreIncarnation);
         let resets = report.count(|e| matches!(e, TraceEvent::RaftProgressReset { .. }));
         let reseeded = reseed_completed(&report);
-        (report.check().err(), resets, reseeded)
+        (checked(&report, &moved), resets, reseeded)
     });
     let caught: Vec<&String> = outcomes.iter().filter_map(|(v, _, _)| v.as_ref()).collect();
     let resets: usize = outcomes.iter().map(|(_, r, _)| *r).sum();
@@ -1071,6 +1186,7 @@ fn a_leader_that_ignores_incarnations_never_forgets_and_the_sweep_cannot_see_it(
         seeds(),
         caught.first().map_or("", |v| v.as_str())
     );
+    print_moved("IgnoreIncarnation", moved);
     assert_eq!(
         resets, 0,
         "the leader that ignores incarnations reset a follower's progress: the variant was not injected"
@@ -1150,10 +1266,11 @@ fn a_leader_that_ignores_incarnations_never_forgets_and_the_sweep_cannot_see_it(
 /// are the wedge, and the catches are printed by check.
 #[test]
 fn a_leader_that_shares_one_snapshot_directory_and_streams_one_follower_at_a_time_is_caught() {
+    let moved = Mutex::new(MovedSeeds::default());
     let outcomes: Vec<(Option<String>, bool, usize)> = sweep(seeds(), |seed| {
         let report = raft::run(seed, Variant::SharedSnapshotDir);
         (
-            report.check().err(),
+            checked(&report, &moved),
             retook_at_one_index(&report),
             report.aimed_streams,
         )
@@ -1177,6 +1294,7 @@ fn a_leader_that_shares_one_snapshot_directory_and_streams_one_follower_at_a_tim
         seeds(),
         caught.first().map_or("", |v| v.as_str())
     );
+    print_moved("SharedSnapshotDir", moved);
     assert!(
         fired > 0,
         "SharedSnapshotDir never re-took at an index already taken: the fault was not injected"
