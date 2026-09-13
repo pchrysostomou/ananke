@@ -16,7 +16,7 @@ moirae changes.
 | `8b79ca8` | merge of stage D onto the batched sweep |
 | `c9fc814` `75e24fc` `101db4e` `51754ad` | stage E: snapshots — compacted log, codec, the snapshot task, streaming and the staged install, the re-seeded server, the quarantine, snapshot-aware invariants (D-030) |
 | `1373601` | merge of stage E onto D+#22: nine files reconciled; the install repair now writes `0/2/config` (proven by a negative control); two latent composition bugs fixed (the truncation revert floor on a compacted log; the take-record's configuration following applied `Config` entries) |
-| `f54b468` | raft sweep: an InstallSnapshot resets the timer check — the nightly's seed 164 (D-030 stanza) |
+| `f54b468` | raft sweep: an InstallSnapshot resets the timer check — seed 164 of a local ten-thousand-seed run (D-030 stanza) |
 | `74b93c5` | raft sweep: seed 385, the install's restatement resets the timer check (PROPOSED D-039); seeds 164 and 385 pinned; this record, the devlog draft and BOOTSTRAP's status committed |
 | (this commit) | sim: seeds in parallel through `ananke_sim::sweep` with its proof test, the four tiers with `scripts/premerge.sh`, the nightly's `--nocapture` (D-040); the 1000-seed numbers |
 
@@ -61,18 +61,32 @@ outside C_new, worst completion gap 469 ms against the 2 s bound, slowest write
 after a heal 617 ms. The main sweep at 1000: 4820 partitions, 3165 crashes, 1143
 Figure 8 drivers, 580 refusals, 17 046 lease revocations, 104 174 lease reads.
 
-**Nightly at 10 000 seeds — two runs so far, both red on the correct server,
+**Local runs at 10 000 seeds — two runs so far, both red on the correct server,
 both false positives of one check; the third run is pending (numbers below are
 still the 100-seed ones).**
 
+> Corrected 2026-09-13: runs 1 and 2 were local ten-thousand-seed runs on this
+> machine, not the GitHub nightly, so seeds 164 and 385 are local finds, here, in
+> *What landed* and in the seed table below. The GitHub nightly's ten thousand
+> seeds on `ea6fe7d` (run 34496762339) failed on seeds 5909, 6325 and 7381. Seed
+> 164's follower was about sixty-eight entries behind, not two hundred, and no
+> leader was reaching it in the stretch the check flagged; nor was it the first
+> correct-server failure (seeds 9 and 60 below came before it). The footer line
+> under *Every PROPOSED entry* now gives the next free number as it stood.
+> `1373601`, `f54b468` and `74b93c5` exist only in the local clone; the same trees
+> on `main` are `48e5276`, `635aea0` and `7e0792f`. See D-048.
+
 - Run 1 (`1373601`, 2h45m awake): 15 of 16 suites green; the correct server
-  failed at **seed 164** — the timers-fire check flagged a follower two hundred
-  entries behind a compacting leader, fed only by `InstallSnapshot` chunks, as
-  starved; the leader was reaching it every few milliseconds and a leader was
-  elected 40 ms after the flag. Checker gap: the check counted only
-  `AppendEntries` as the leader's contact. Fixed in `f54b468` (D-030 stanza),
-  verified on seeds 0–199. Every variant test passed at 10k, but their rates
-  were swallowed by cargo's output capture (`nightly.yml` lacks `--nocapture`).
+  failed at **seed 164** — the timers-fire check flagged as starved a follower
+  about sixty-eight entries behind a compacting leader (appended through 208, the
+  leader's log through 276), fed only by `InstallSnapshot` chunks; no leader was
+  reaching it in the stretch the check flagged — the 21 chunks in it, from
+  12.9405 s, were the leftover stream of server 3, which had lost its quorum at
+  12.936 s — and a leader was elected 40 ms after the flag. Checker gap: the
+  check counted only `AppendEntries` as the leader's contact. Fixed in `f54b468`
+  (D-030 stanza), verified on seeds 0–199. Every variant test passed at 10k, but
+  their rates were swallowed by cargo's output capture (`nightly.yml` lacks
+  `--nocapture`).
 - Run 2 (`f54b468`): the correct server failed at **seed 385**, the sibling
   case — a follower cut off alone mid-install, whose install completion rebuilt
   its core with a fresh timer (stage E's incarnation switch), campaigning 25 ms
@@ -128,10 +142,12 @@ still the 100-seed ones).**
 - **D-039** — for the timer check, a completed snapshot install counts as the
   leader's contact (the install was leader-initiated and the server was busy
   finishing it): the install's `RaftRecovered` restatement resets the check's
-  clock like a crash restart's. From the nightly's seed 385; protocol unchanged.
+  clock like a crash restart's. From seed 385 of a local ten-thousand-seed run;
+  protocol unchanged.
 
-D-034 is an unused number (allocation gap between parallel branches); the footer
-says next entry D-040. Every PROPOSED site is marked `// PROPOSED(D-0xx)` in code.
+D-034 is an unused number (allocation gap between parallel branches); the next
+entry is D-041, though the footer, not moved when D-040 was added, read D-040. Every
+PROPOSED site is marked `// PROPOSED(D-0xx)` in code.
 Nothing was recorded as decided: D-029/D-030/D-031 record only what RAFT.md already
 approves plus as-built detail and what the sweep found, per the house convention.
 
@@ -150,8 +166,8 @@ approves plus as-built detail and what the sweep found, per the house convention
 | stage E, seed 60 (100-seed) | **Double outage**: rot-refused server + quarantined server = no electable majority; liveness failed with no code bug; investigation exposed two quarantine hygiene bugs (install cleared it; leader's checkpointed flag could quarantine a healthy receiver) | Liveness asked only of electable majorities; quarantine sticks to store history and is tombstoned in the repair (`51754ad`); devlog bug #3 |
 | E-merge (by review) | Truncation reverted config to the *initial* configuration on a compacted log; take-records carried a spawn-time-frozen configuration | Both fixed in `1373601` |
 | merge negative control | Install repair without the `0/2/config` write: every installed store refused at open | The required fix, with a test that fails without it |
-| **nightly, seed 164** | First correct-server failure ever: the timer check read a snapshot-fed follower as starved; `InstallSnapshot` was not counted as the leader's contact | Checker fix `f54b468`, D-030 stanza; pinned |
-| **nightly, seed 385** | Its sibling: a follower alone mid-install, the install's incarnation switch reset its timer, campaigned 25 ms past the bound | Checker models the switch — PROPOSED D-039; pinned |
+| **local 10k run, seed 164** | The first correct-server failure a ten-thousand-seed run of the raft sweep produced: the timer check read a snapshot-fed follower as starved; `InstallSnapshot` was not counted as the leader's contact | Checker fix `f54b468`, D-030 stanza; pinned |
+| **local 10k run, seed 385** | Its sibling: a follower alone mid-install, the install's incarnation switch reset its timer, campaigned 25 ms past the bound | Checker models the switch — PROPOSED D-039; pinned |
 
 ## What was NOT done, and why
 
