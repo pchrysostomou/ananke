@@ -72,6 +72,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
+use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::pin::pin;
 use std::sync::{Arc, Mutex};
@@ -87,6 +88,7 @@ use ananke_raft::apply::{Command, Outcome};
 use ananke_raft::client::{Reply, Request, Response};
 use ananke_raft::core::{RaftConfig, Variants};
 use ananke_raft::message::{self, Frame, Message};
+use ananke_raft::store::LOST_STATE;
 use ananke_raft::{NodeConfig, ServerId, invariants, run as run_server};
 use ananke_storage::EngineConfig;
 use bytes::Bytes;
@@ -1095,8 +1097,35 @@ impl Report {
     /// leader campaigns within [`TIMER_TIMEOUTS`] maximum election timeouts of the
     /// last AppendEntries it received from a leader of its term or later, the last
     /// vote it granted, or its start. A re-seeded server is exempt: it never
-    /// campaigns on that store, by design (RAFT.md §3, PROPOSED(D-035)).
+    /// campaigns on that store, by design (RAFT.md §3, PROPOSED(D-035)). The first
+    /// gap [`Report::replay_timers`] finds under every reset arm is the violation.
     fn timers_fire(&self) -> Result<(), String> {
+        let mut first = None;
+        self.replay_timers(TimerResets::ALL, |gap| {
+            first = Some(gap);
+            ControlFlow::Break(())
+        });
+        match first {
+            None => Ok(()),
+            Some(TimerGap {
+                server, since, at, ..
+            }) => Err(format!(
+                "timers: server {server} heard from no leader of its term and granted no vote since {since:?} and had not campaigned by {at:?}"
+            )),
+        }
+    }
+
+    /// The timer check's replay, with the reset arms `resets` names switched on,
+    /// handing `gap` every stretch in which a running follower went past its bound:
+    /// once per stretch, at the first record past the bound, in record order. The
+    /// replay's state goes on past a reported gap exactly as if nothing had been
+    /// reported, so a gap closes only when the server is reset, campaigns, leads,
+    /// is re-seeded or crashes. `gap` returning `Break` stops the replay.
+    ///
+    /// [`Report::timers_fire`] is this replay under [`TimerResets::ALL`], stopped at
+    /// the first gap; the pinned seeds' predicates are the same replay with an arm
+    /// switched off, so the check and the predicates cannot drift apart.
+    fn replay_timers(&self, resets: TimerResets, mut gap: impl FnMut(TimerGap) -> ControlFlow<()>) {
         // A server measures its timeout by its own clock: a slow one takes longer
         // in global time, and the bound scales with its rate.
         let bound_for = |server: u64| -> Duration {
@@ -1109,7 +1138,8 @@ impl Report {
         let mut leaders: BTreeSet<u64> = BTreeSet::new();
         let mut reseeded: BTreeSet<u64> = BTreeSet::new();
         let mut terms: BTreeMap<u64, u64> = BTreeMap::new();
-        let mut last_reset: BTreeMap<u64, Instant> = BTreeMap::new();
+        let mut clocks = TimerClocks::default();
+        let mut reported: BTreeMap<u64, Instant> = BTreeMap::new();
         for record in &self.records {
             let at = record.at;
             match &record.event {
@@ -1127,20 +1157,27 @@ impl Report {
                     // next index has fallen below the leader's compacted prefix
                     // (RAFT.md §1). The core routes the snapshot to its own task, but
                     // the follower is hearing from the leader all the same, and its
-                    // incarnation's timer stays fresh across the install; a follower
-                    // caught up only by a long train of snapshots would otherwise be
-                    // read as starved though a leader is feeding it every few
-                    // milliseconds. The nightly's seed 164 was exactly that.
+                    // incarnation's timer stays fresh across the install. The chunk
+                    // counts by its term, not by who sends it: seed 164, found by a
+                    // local ten-thousand-seed run on 1373601, was a follower whose
+                    // chunks kept arriving from a deposed leader after it lost its
+                    // quorum, with no leader in the cluster at all
+                    // (`Report::snapshot_fed_timer_gaps`).
                     if let Some(server) = server_of(*to)
                         && let Some(payload) = payloads.get(id)
                         && let Ok(frame) = Frame::decode(payload.clone())
-                        && matches!(
-                            frame.message,
-                            Message::AppendEntries { .. } | Message::InstallSnapshot { .. }
-                        )
                         && frame.message.term() >= terms.get(&server).copied().unwrap_or(0)
                     {
-                        last_reset.insert(server, at);
+                        match frame.message {
+                            Message::AppendEntries { .. } => clocks.reset(server, at),
+                            Message::InstallSnapshot { .. } if resets.install_snapshot => {
+                                clocks.reset(server, at);
+                            }
+                            Message::InstallSnapshot { .. } => {
+                                *clocks.installs.entry(server).or_default() += 1;
+                            }
+                            _ => {}
+                        }
                     }
                 }
                 // PROPOSED(D-039): a completed snapshot install re-states the server
@@ -1148,17 +1185,23 @@ impl Report {
                 // install was the leader's doing and the server was busy finishing
                 // it, so the restatement counts as the leader's contact here. A crash
                 // restart re-states the same way and is reset below when its RaftTerm
-                // re-admits it; this arm is for the server that never went down. The
-                // nightly's seed 385: cut off alone mid-install, it campaigned a
-                // hundred milliseconds after the switch and twenty-five past the bound.
+                // re-admits it; this arm is for the server that never went down. Seed
+                // 385, found by a local ten-thousand-seed run on f54b468: cut off
+                // alone mid-install, it campaigned a hundred milliseconds after the
+                // switch and twenty-five past the bound
+                // (`Report::timer_gaps_rescued_by_restatement`).
                 TraceEvent::RaftRecovered { server, .. } if up.contains(server) => {
-                    last_reset.insert(*server, at);
+                    if resets.restatement {
+                        clocks.reset(*server, at);
+                    } else {
+                        *clocks.restatements.entry(*server).or_default() += 1;
+                    }
                 }
                 TraceEvent::RaftTerm { server, term, role } => {
                     terms.insert(*server, *term);
                     if !up.contains(server) {
                         up.insert(*server);
-                        last_reset.insert(*server, at);
+                        clocks.reset(*server, at);
                     }
                     match *role {
                         "leader" => {
@@ -1166,13 +1209,13 @@ impl Report {
                         }
                         "pre-candidate" | "candidate" => {
                             leaders.remove(server);
-                            last_reset.insert(*server, at);
+                            clocks.reset(*server, at);
                         }
                         _ => {
                             // A leader that steps down starts counting from here:
                             // its timer meant nothing while it led.
                             if leaders.remove(server) {
-                                last_reset.insert(*server, at);
+                                clocks.reset(*server, at);
                             }
                         }
                     }
@@ -1186,7 +1229,7 @@ impl Report {
                     pre: false,
                     ..
                 } => {
-                    last_reset.insert(*server, at);
+                    clocks.reset(*server, at);
                 }
                 TraceEvent::NodeCrashed { node } => {
                     let server = u64::from(node.get());
@@ -1199,16 +1242,826 @@ impl Report {
                 if leaders.contains(server) || reseeded.contains(server) {
                     continue;
                 }
-                let since = last_reset.get(server).copied().unwrap_or(at);
-                if at.duration_since(since) > bound_for(*server) {
-                    return Err(format!(
-                        "timers: server {server} heard from no leader of its term and granted no vote since {since:?} and had not campaigned by {at:?}"
-                    ));
+                let since = clocks.last_reset.get(server).copied().unwrap_or(at);
+                if at.duration_since(since) > bound_for(*server)
+                    && reported.get(server) != Some(&since)
+                {
+                    reported.insert(*server, since);
+                    let found = TimerGap {
+                        server: *server,
+                        since,
+                        at,
+                        installs: clocks.installs.get(server).copied().unwrap_or(0),
+                        restatements: clocks.restatements.get(server).copied().unwrap_or(0),
+                    };
+                    if gap(found).is_break() {
+                        return;
+                    }
                 }
             }
         }
-        Ok(())
     }
+}
+
+/// Which reset arms of the timer check's replay are switched on
+/// ([`Report::timer_gaps`]). An AppendEntries from a leader of the server's term or
+/// later, a granted vote, a campaign, a start and a leader's step-down always
+/// reset the clock; these two are the arms added after the check first stood,
+/// each for a seed a ten-thousand-seed run found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TimerResets {
+    /// An `InstallSnapshot` chunk delivered from a server of the receiver's term or
+    /// later (D-030's stanza, added on f54b468 for seed 164).
+    pub install_snapshot: bool,
+    /// An install's restatement, `RaftRecovered` on a server that never went down
+    /// (PROPOSED D-039, for seed 385).
+    pub restatement: bool,
+}
+
+impl TimerResets {
+    /// Every arm: the check [`Report::check`] makes.
+    pub const ALL: Self = Self {
+        install_snapshot: true,
+        restatement: true,
+    };
+    /// Neither arm: the check as it stood on 1373601, which read only
+    /// AppendEntries as a leader's contact.
+    pub const APPEND_ENTRIES_ONLY: Self = Self {
+        install_snapshot: false,
+        restatement: false,
+    };
+    /// Every arm but PROPOSED D-039's: the check as it stood on f54b468.
+    pub const WITHOUT_RESTATEMENT: Self = Self {
+        install_snapshot: true,
+        restatement: false,
+    };
+}
+
+/// One stretch in which a running follower, neither leading nor re-seeded, went
+/// past its timer bound in the timer check's replay ([`Report::timer_gaps`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TimerGap {
+    /// The server.
+    pub server: u64,
+    /// Its clock's last reset under the replay's arms.
+    pub since: Instant,
+    /// The first record past its bound: where the check would have reported it.
+    pub at: Instant,
+    /// `InstallSnapshot` chunks of the server's term or later delivered to it in
+    /// `(since, at]` that did not reset its clock: zero when that arm is on.
+    pub installs: usize,
+    /// Install restatements on it, while it was up, in `(since, at]` that did not
+    /// reset its clock: zero when that arm is on.
+    pub restatements: usize,
+}
+
+/// The per-server clocks of the timer replay, and what arrived since each reset
+/// that the replay's arms did not count as one.
+#[derive(Default)]
+struct TimerClocks {
+    last_reset: BTreeMap<u64, Instant>,
+    installs: BTreeMap<u64, usize>,
+    restatements: BTreeMap<u64, usize>,
+}
+
+impl TimerClocks {
+    fn reset(&mut self, server: u64, at: Instant) {
+        self.last_reset.insert(server, at);
+        self.installs.remove(&server);
+        self.restatements.remove(&server);
+    }
+}
+
+/// The trace predicates the pinned seeds assert (CLAUDE.md: a pinned seed asserts
+/// its mechanism, never just green). Each names the situation a seed was pinned
+/// for as a function of the trace alone — [`Report::records`], with server-to-server
+/// payloads decoded by [`Frame::decode`], and [`Report::schedule`] and
+/// [`Report::last_heal`] where it says so — so a pin can assert that its seed
+/// still reaches the situation, or that the seed's schedule has moved away from it
+/// and the day it comes back the pin says so.
+impl Report {
+    /// Every gap the timer check's replay finds with the arms `resets` names
+    /// switched on, one per stretch past a server's bound. Under
+    /// [`TimerResets::ALL`] this is empty exactly when the check's timer rule
+    /// passes.
+    #[must_use]
+    pub fn timer_gaps(&self, resets: TimerResets) -> Vec<TimerGap> {
+        let mut gaps = Vec::new();
+        self.replay_timers(resets, |gap| {
+            gaps.push(gap);
+            ControlFlow::Continue(())
+        });
+        gaps
+    }
+
+    /// Seed 164's situation: a follower past its timer bound on AppendEntries alone
+    /// while `InstallSnapshot` chunks of its term kept arriving — the gaps of the
+    /// replay with neither the InstallSnapshot arm nor PROPOSED D-039's
+    /// restatement arm, that hold at least one such chunk. On the trace seed 164
+    /// failed with (1373601) this is one gap: server 2 from 12.9405 s, flagged at
+    /// 13.3397 s against a 399.19 ms bound, with 21 chunks in it. That gap also
+    /// holds a restatement (13.1429 s), so D-039's arm alone would have silenced it
+    /// too: no seed-164 predicate isolates the InstallSnapshot arm.
+    #[must_use]
+    pub fn snapshot_fed_timer_gaps(&self) -> Vec<TimerGap> {
+        self.timer_gaps(TimerResets::APPEND_ENTRIES_ONLY)
+            .into_iter()
+            .filter(|gap| gap.installs > 0)
+            .collect()
+    }
+
+    /// Seed 385's situation: a follower past its timer bound that an install's
+    /// restatement inside the stretch would have reset — the gaps of the replay
+    /// with every arm but PROPOSED D-039's that hold at least one restatement on
+    /// the server while it was up. When [`Report::check`] passes, every gap of
+    /// that replay is one of these, since a stretch without a restatement is
+    /// flagged by the check itself. On the trace seed 385 failed with (f54b468)
+    /// this is one gap: server 1 from 14.0308 s, restated at 14.2596 s, flagged at
+    /// 14.3350 s against a 302.26 ms bound.
+    #[must_use]
+    pub fn timer_gaps_rescued_by_restatement(&self) -> Vec<TimerGap> {
+        self.timer_gaps(TimerResets::WITHOUT_RESTATEMENT)
+            .into_iter()
+            .filter(|gap| gap.restatements > 0)
+            .collect()
+    }
+
+    /// Every installed snapshot that put a server's snapshot floor below one its
+    /// snapshots had already reached: where the checker's floor rule as built on
+    /// ea6fe7d — a floor that only rose — and the rule since (an install sets the
+    /// floor exactly, D-030) first disagree. Seed 7381's precondition: a refused
+    /// server re-seeded from a leader snapshot older than its lost store's. On the
+    /// trace seed 7381 failed with there are three, all server 2 at index 58 under
+    /// a floor of 128 (7.951 s, then two restatements of the same install).
+    #[must_use]
+    pub fn floor_lowering_installs(&self) -> Vec<FloorLowering> {
+        self.fold_floors().0
+    }
+
+    /// Seed 7381's situation: a restatement whose recovered applied index makes
+    /// state machine safety replay an index inside `(exact floor, risen floor]` —
+    /// covered by the floor that only rose, held or not by the log under the exact
+    /// one, so the two rules give that index different answers. On the trace seed
+    /// 7381 failed with this is server 2 at 8.2896 s, index 65, exact floor 58,
+    /// risen floor 128.
+    #[must_use]
+    pub fn recoveries_under_a_lost_floor(&self) -> Vec<LostFloorReplay> {
+        self.fold_floors().1
+    }
+
+    /// The fold behind the two floor predicates: per server the floor as it only
+    /// rises (`high`), the floor as an install sets it exactly (`exact`), and the
+    /// checker's last applied index.
+    fn fold_floors(&self) -> (Vec<FloorLowering>, Vec<LostFloorReplay>) {
+        let mut high: BTreeMap<u64, u64> = BTreeMap::new();
+        let mut exact: BTreeMap<u64, u64> = BTreeMap::new();
+        let mut applied: BTreeMap<u64, u64> = BTreeMap::new();
+        let mut lowered = Vec::new();
+        let mut replays = Vec::new();
+        for record in &self.records {
+            match &record.event {
+                TraceEvent::RaftSnapshot {
+                    server,
+                    last_index,
+                    taken,
+                    ..
+                } => {
+                    let risen = high.entry(*server).or_default();
+                    if !taken && *last_index < *risen {
+                        lowered.push(FloorLowering {
+                            server: *server,
+                            at: record.at,
+                            last_index: *last_index,
+                            floor: *risen,
+                        });
+                    }
+                    *risen = (*risen).max(*last_index);
+                    let set = exact.entry(*server).or_default();
+                    if *taken {
+                        *set = (*set).max(*last_index);
+                    } else {
+                        *set = *last_index;
+                        let last = applied.entry(*server).or_default();
+                        *last = (*last).max(*last_index);
+                    }
+                }
+                TraceEvent::RaftApply { server, index, .. } => {
+                    applied.insert(*server, *index);
+                }
+                TraceEvent::RaftRefused { server, .. } => {
+                    applied.remove(server);
+                }
+                TraceEvent::RaftRecovered {
+                    server,
+                    applied: through,
+                    ..
+                } => {
+                    let from = applied.get(server).copied().unwrap_or(0) + 1;
+                    let (risen, set) = (
+                        high.get(server).copied().unwrap_or(0),
+                        exact.get(server).copied().unwrap_or(0),
+                    );
+                    let (first, last) = (from.max(set + 1), (*through).min(risen));
+                    if risen > set && first <= last {
+                        replays.push(LostFloorReplay {
+                            server: *server,
+                            at: record.at,
+                            exact: set,
+                            risen,
+                            indices: (first, last),
+                        });
+                    }
+                    if *through >= from {
+                        applied.insert(*server, *through);
+                    }
+                }
+                _ => {}
+            }
+        }
+        (lowered, replays)
+    }
+
+    /// Every window between a completed snapshot install and the adoption that
+    /// puts it in service (PROPOSED D-041), with the first crash that landed inside
+    /// it: opened by an installed `RaftSnapshot`, closed by the server's
+    /// `RaftAdopted`, `RaftRecovered` (a tree without adoption, or a restart's
+    /// restatement) or `RaftRefused` (a damaged staging store). A restart's
+    /// restatement opens and closes at one instant; those are left out. Seed 6325's
+    /// situation is a window with a crash: on the trace it failed with, server 1
+    /// installed index 129 at 5.7711 s and was crashed at 5.8120 s, inside the copy.
+    #[must_use]
+    pub fn adoption_windows(&self) -> Vec<AdoptionWindow> {
+        let mut open: BTreeMap<u64, usize> = BTreeMap::new();
+        let mut windows: Vec<AdoptionWindow> = Vec::new();
+        for record in &self.records {
+            match &record.event {
+                TraceEvent::RaftSnapshot {
+                    server,
+                    taken: false,
+                    ..
+                } if !open.contains_key(server) => {
+                    open.insert(*server, windows.len());
+                    windows.push(AdoptionWindow {
+                        server: *server,
+                        installed: record.at,
+                        closed: None,
+                        crashed: None,
+                    });
+                }
+                TraceEvent::RaftAdopted { server }
+                | TraceEvent::RaftRecovered { server, .. }
+                | TraceEvent::RaftRefused { server, .. } => {
+                    if let Some(window) = open.remove(server) {
+                        windows[window].closed = Some(record.at);
+                    }
+                }
+                TraceEvent::NodeCrashed { node } => {
+                    if let Some(&window) = open.get(&u64::from(node.get())) {
+                        windows[window].crashed.get_or_insert(record.at);
+                    }
+                }
+                _ => {}
+            }
+        }
+        windows.retain(|w| w.crashed.is_some() || w.closed != Some(w.installed));
+        windows
+    }
+
+    /// Seed 687's situation: every restart of a server that was refused because its
+    /// engine opened and lost state ([`LOST_STATE`]), with no install replacing that
+    /// store in between — no installed `RaftSnapshot`, `RaftAdopted` or
+    /// `RaftRecovered` on it — as (server, refused, restarted). A refusal for a
+    /// store damaged before the engine opened is not counted: that engine never
+    /// ran, so there is nothing it could have flushed over the loss. On the trace
+    /// seed 687 failed with this is (3, 7.9209 s, 13.5320 s), and the restart
+    /// opened clean on the laundered store.
+    #[must_use]
+    pub fn restarts_after_lost_state_refusal(&self) -> Vec<(u64, Instant, Instant)> {
+        let mut refused: BTreeMap<u64, Instant> = BTreeMap::new();
+        let mut restarts = Vec::new();
+        for record in &self.records {
+            match &record.event {
+                TraceEvent::RaftRefused { server, reason } if reason.starts_with(LOST_STATE) => {
+                    refused.entry(*server).or_insert(record.at);
+                }
+                TraceEvent::RaftSnapshot {
+                    server,
+                    taken: false,
+                    ..
+                }
+                | TraceEvent::RaftAdopted { server }
+                | TraceEvent::RaftRecovered { server, .. } => {
+                    refused.remove(server);
+                }
+                TraceEvent::NodeRestarted { node } => {
+                    let server = u64::from(node.get());
+                    if let Some(&at) = refused.get(&server) {
+                        restarts.push((server, at, record.at));
+                    }
+                }
+                _ => {}
+            }
+        }
+        restarts
+    }
+
+    /// Every message one server sent another, decoded, with the index of its
+    /// record: what the stream predicates read.
+    fn raft_messages(&self) -> Vec<SentMessage> {
+        self.records
+            .iter()
+            .enumerate()
+            .filter_map(|(index, record)| match &record.event {
+                TraceEvent::MessageSent {
+                    id,
+                    from,
+                    to,
+                    payload,
+                } => {
+                    let (from, to) = (server_of(*from)?, server_of(*to)?);
+                    let frame = Frame::decode(payload.clone()).ok()?;
+                    Some(SentMessage {
+                        id: *id,
+                        record: index,
+                        at: record.at,
+                        from,
+                        to,
+                        message: frame.message,
+                    })
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Every snapshot a server took: a checkpoint written on its node and, at the
+    /// same instant, its `RaftSnapshot` with `taken` set. A restart's restatement
+    /// of the record's snapshot writes no checkpoint and is not a take.
+    #[must_use]
+    pub fn snapshot_takes(&self) -> Vec<SnapshotTake> {
+        let mut written: BTreeMap<u64, (Instant, PathBuf)> = BTreeMap::new();
+        let mut takes = Vec::new();
+        for (index, record) in self.records.iter().enumerate() {
+            match &record.event {
+                TraceEvent::CheckpointWritten { dir, .. } => {
+                    if let Some(node) = record.node {
+                        written.insert(u64::from(node.get()), (record.at, dir.clone()));
+                    }
+                }
+                TraceEvent::RaftSnapshot {
+                    server,
+                    last_index,
+                    taken: true,
+                    ..
+                } => {
+                    if let Some((at, dir)) = written.remove(server)
+                        && at == record.at
+                    {
+                        takes.push(SnapshotTake {
+                            server: *server,
+                            index: *last_index,
+                            dir,
+                            at,
+                            record: index,
+                        });
+                    }
+                }
+                TraceEvent::NodeCrashed { node } => {
+                    written.remove(&u64::from(node.get()));
+                }
+                _ => {}
+            }
+        }
+        takes
+    }
+
+    /// Every take at an index its server had already taken at, that landed under a
+    /// live stream of a snapshot at that index to some follower. Live means the
+    /// stream showed itself on both sides of the take: before it, the stream's
+    /// opening to that follower (`RaftSnapshotStreams`) or a chunk at the index
+    /// sent to it; after it, a chunk at the index sent to it — with no other stream
+    /// opened to that follower in between, and no `Installed` answer from the
+    /// follower at the index in between. A tree that traces no openings (before
+    /// PROPOSED D-043) is read by its chunks alone. Whether the stream survived is
+    /// `installed_after`: a re-take the follower still installs after was harmless
+    /// to it, and one it never installs after is the scrambled stream of D-043. The
+    /// re-take with no stream under it, the common and harmless kind, is not here.
+    #[must_use]
+    pub fn retakes_under_streams(&self) -> Vec<RetakeUnderStream> {
+        let messages = self.raft_messages();
+        let openings: Vec<(usize, Instant, u64, u64)> = self
+            .records
+            .iter()
+            .enumerate()
+            .filter_map(|(index, r)| match &r.event {
+                TraceEvent::RaftSnapshotStreams { server, to, .. } => {
+                    Some((index, r.at, *server, *to))
+                }
+                _ => None,
+            })
+            .collect();
+        let takes = self.snapshot_takes();
+        let mut retakes = Vec::new();
+        for (n, take) in takes.iter().enumerate() {
+            let earlier: Vec<&SnapshotTake> = takes[..n]
+                .iter()
+                .filter(|t| t.server == take.server && t.index == take.index)
+                .collect();
+            if earlier.is_empty() {
+                continue;
+            }
+            let same_dir = earlier.iter().any(|t| t.dir == take.dir);
+            let chunk = |m: &SentMessage, follower: u64| {
+                m.from == take.server
+                    && m.to == follower
+                    && matches!(m.message, Message::InstallSnapshot { last_index, .. }
+                        if last_index == take.index)
+            };
+            let installed = |m: &SentMessage, follower: u64| {
+                m.from == follower
+                    && m.to == take.server
+                    && matches!(m.message, Message::InstallSnapshotResponse {
+                        last_index,
+                        status: message::SnapshotStatus::Installed,
+                        ..
+                    } if last_index == take.index)
+            };
+            for follower in (1..=SERVERS).filter(|&f| f != take.server) {
+                let Some(after) = messages
+                    .iter()
+                    .find(|m| m.record > take.record && chunk(m, follower))
+                else {
+                    continue;
+                };
+                // The stream's last sign of life before the take, as (record, time).
+                let opened = openings
+                    .iter()
+                    .rev()
+                    .find(|&&(record, _, server, to)| {
+                        record < take.record && server == take.server && to == follower
+                    })
+                    .map(|&(record, at, ..)| (record, at));
+                let sent = messages
+                    .iter()
+                    .rev()
+                    .find(|m| m.record < take.record && chunk(m, follower))
+                    .map(|m| (m.record, m.at));
+                let Some((since, before)) = opened.max(sent) else {
+                    continue;
+                };
+                let reopened = openings.iter().any(|&(_, at, server, to)| {
+                    server == take.server && to == follower && before < at && at <= after.at
+                });
+                let installed_between = messages
+                    .iter()
+                    .any(|m| m.record > since && m.record < after.record && installed(m, follower));
+                if reopened || installed_between {
+                    continue;
+                }
+                retakes.push(RetakeUnderStream {
+                    leader: take.server,
+                    follower,
+                    index: take.index,
+                    same_dir,
+                    before,
+                    retook: take.at,
+                    after: after.at,
+                    installed_after: messages
+                        .iter()
+                        .any(|m| m.record > take.record && installed(m, follower)),
+                });
+            }
+        }
+        retakes
+    }
+
+    /// The leader in force at the last heal, as (server, term): the last to be
+    /// elected at or before it that had not stepped down or crashed by then.
+    #[must_use]
+    pub fn leader_at_last_heal(&self) -> Option<(u64, u64)> {
+        let mut leader = None;
+        for record in self.records.iter().take_while(|r| r.at <= self.last_heal) {
+            match &record.event {
+                TraceEvent::RaftLeader { server, term, .. } => leader = Some((*server, *term)),
+                TraceEvent::RaftTerm { server, role, .. }
+                    if *role != "leader" && leader.is_some_and(|(s, _)| s == *server) =>
+                {
+                    leader = None;
+                }
+                TraceEvent::NodeCrashed { node }
+                    if leader.is_some_and(|(s, _)| s == u64::from(node.get())) =>
+                {
+                    leader = None;
+                }
+                _ => {}
+            }
+        }
+        leader
+    }
+
+    /// The followers the leader in force at the last heal could never count after
+    /// it: each answered that leader's AppendEntries in its term at least once
+    /// after the heal, never with success, and never answered a stream of it with
+    /// `Installed`. Seed 5909's wedge had both followers here — on the trace it
+    /// failed with, server 2 behind a scrambled stream and server 3 queued behind
+    /// that stream — and a leader needs only one countable follower to commit.
+    #[must_use]
+    pub fn uncounted_after_heal(&self) -> BTreeSet<u64> {
+        let Some((leader, term)) = self.leader_at_last_heal() else {
+            return BTreeSet::new();
+        };
+        let mut answered: BTreeSet<u64> = BTreeSet::new();
+        let mut counted: BTreeSet<u64> = BTreeSet::new();
+        for m in self.raft_messages() {
+            if m.at < self.last_heal || m.to != leader || m.message.term() != term {
+                continue;
+            }
+            match m.message {
+                Message::AppendEntriesResponse { success, .. } => {
+                    answered.insert(m.from);
+                    if success {
+                        counted.insert(m.from);
+                    }
+                }
+                Message::InstallSnapshotResponse {
+                    status: message::SnapshotStatus::Installed,
+                    ..
+                } => {
+                    counted.insert(m.from);
+                }
+                _ => {}
+            }
+        }
+        answered.difference(&counted).copied().collect()
+    }
+
+    /// A leader's stale progress for a refused `follower` (PROPOSED D-042's
+    /// hazard): the first refusal of the follower after which the leader it last
+    /// answered with success, in that answer's term, sent it at least one
+    /// AppendEntries and every one at or above the match index that answer
+    /// acknowledged, while the follower rejected at least one and accepted none,
+    /// the leader never reset its progress and the follower was never re-seeded.
+    /// The leader as built (`IgnoreIncarnation`) leaves exactly that; the correct
+    /// leader resets at the follower's first answer after the refusal.
+    #[must_use]
+    pub fn stale_progress(&self, follower: u64) -> Option<StaleProgress> {
+        let messages = self.raft_messages();
+        for (index, record) in self.records.iter().enumerate() {
+            if !matches!(&record.event, TraceEvent::RaftRefused { server, .. } if *server == follower)
+            {
+                continue;
+            }
+            let Some((leader, term, matched)) = messages
+                .iter()
+                .rev()
+                .filter(|m| m.record < index && m.from == follower)
+                .find_map(|m| match m.message {
+                    Message::AppendEntriesResponse {
+                        term,
+                        success: true,
+                        match_index,
+                        ..
+                    } => Some((m.to, term, match_index)),
+                    _ => None,
+                })
+            else {
+                continue;
+            };
+            let forgotten = self.records[index..].iter().any(|r| match &r.event {
+                TraceEvent::RaftProgressReset {
+                    server,
+                    follower: f,
+                    ..
+                } => *server == leader && *f == follower,
+                TraceEvent::RaftReseeded { server } => *server == follower,
+                _ => false,
+            });
+            if forgotten {
+                continue;
+            }
+            let (mut probes, mut rejections, mut below, mut accepted) = (0, 0, false, false);
+            for m in messages.iter().filter(|m| m.record > index) {
+                match m.message {
+                    Message::AppendEntries {
+                        term: t,
+                        prev_index,
+                        ..
+                    } if m.from == leader && m.to == follower && t == term => {
+                        probes += 1;
+                        below |= prev_index < matched;
+                    }
+                    Message::AppendEntriesResponse {
+                        term: t, success, ..
+                    } if m.from == follower && m.to == leader && t == term => {
+                        if success {
+                            accepted = true;
+                        } else {
+                            rejections += 1;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if probes > 0 && rejections > 0 && !below && !accepted {
+                return Some(StaleProgress {
+                    leader,
+                    term,
+                    matched,
+                    refused: record.at,
+                    probes,
+                    rejections,
+                });
+            }
+        }
+        None
+    }
+
+    /// PROPOSED D-042's fix at work on `follower`: its first refusal, then the
+    /// first progress reset of it by a leader after that, then its first re-seed
+    /// after the reset, as their times.
+    #[must_use]
+    pub fn refusal_reset_reseed(&self, follower: u64) -> Option<(Instant, Instant, Instant)> {
+        let at = |from: Instant, f: &dyn Fn(&TraceEvent) -> bool| {
+            self.records
+                .iter()
+                .find(|r| r.at >= from && f(&r.event))
+                .map(|r| r.at)
+        };
+        let refused = at(
+            Instant::ZERO,
+            &|e| matches!(e, TraceEvent::RaftRefused { server, .. } if *server == follower),
+        )?;
+        let reset = at(
+            refused,
+            &|e| matches!(e, TraceEvent::RaftProgressReset { follower: f, .. } if *f == follower),
+        )?;
+        let reseeded = at(
+            reset,
+            &|e| matches!(e, TraceEvent::RaftReseeded { server } if *server == follower),
+        )?;
+        Some((refused, reset, reseeded))
+    }
+
+    /// The duplicate-file loop of a stream under one identity (PROPOSED D-043's
+    /// Decision): how many deliveries to `follower`, after `since`, of a chunk at
+    /// offset 0 from `leader` the follower answered — its next answer to the
+    /// leader — with `More` naming a different file. That is a file the receiver
+    /// had already assembled under the stream's identity, so it points the sender
+    /// back at the file before, whose acknowledgement sends the same chunk again,
+    /// and every `More` keeps the stream from timing out.
+    #[must_use]
+    pub fn duplicate_chunk_loop(&self, leader: u64, follower: u64, since: Instant) -> usize {
+        let chunks: BTreeMap<ananke_env::MessageId, Bytes> = self
+            .raft_messages()
+            .into_iter()
+            .filter_map(|m| match m.message {
+                Message::InstallSnapshot {
+                    file, offset: 0, ..
+                } if m.from == leader && m.to == follower => Some((m.id, file)),
+                _ => None,
+            })
+            .collect();
+        let mut pending: Option<&Bytes> = None;
+        let mut looped = 0;
+        for record in self.records.iter().filter(|r| r.at > since) {
+            match &record.event {
+                TraceEvent::MessageDelivered { id, .. } if chunks.contains_key(id) => {
+                    pending = chunks.get(id);
+                }
+                TraceEvent::MessageSent {
+                    from, to, payload, ..
+                } if server_of(*from) == Some(follower) && server_of(*to) == Some(leader) => {
+                    if let Some(file) = pending
+                        && let Ok(Frame {
+                            message:
+                                Message::InstallSnapshotResponse {
+                                    file: answered,
+                                    status: message::SnapshotStatus::More,
+                                    ..
+                                },
+                            ..
+                        }) = Frame::decode(payload.clone())
+                        && answered != *file
+                    {
+                        looped += 1;
+                    }
+                    pending = None;
+                }
+                _ => {}
+            }
+        }
+        looped
+    }
+}
+
+/// An installed snapshot below the floor a server's snapshots had reached
+/// ([`Report::floor_lowering_installs`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FloorLowering {
+    /// The server.
+    pub server: u64,
+    /// When it installed.
+    pub at: Instant,
+    /// The installed snapshot's last index: the exact floor from here.
+    pub last_index: u64,
+    /// The highest snapshot index it had before: the floor that only rose.
+    pub floor: u64,
+}
+
+/// A restatement that replays applied indices between the exact floor and the
+/// risen one ([`Report::recoveries_under_a_lost_floor`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LostFloorReplay {
+    /// The server.
+    pub server: u64,
+    /// The restatement's time.
+    pub at: Instant,
+    /// The floor as the last install set it.
+    pub exact: u64,
+    /// The floor as it only rose.
+    pub risen: u64,
+    /// The first and last replayed index inside `(exact, risen]`.
+    pub indices: (u64, u64),
+}
+
+/// A completed install and its adoption ([`Report::adoption_windows`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AdoptionWindow {
+    /// The server.
+    pub server: u64,
+    /// When the install completed.
+    pub installed: Instant,
+    /// When the window closed, if it did before the run ended.
+    pub closed: Option<Instant>,
+    /// The first crash of the server inside the window, if one landed there.
+    pub crashed: Option<Instant>,
+}
+
+/// One message between servers, decoded ([`Report::raft_messages`]).
+struct SentMessage {
+    id: ananke_env::MessageId,
+    record: usize,
+    at: Instant,
+    from: u64,
+    to: u64,
+    message: Message,
+}
+
+/// One snapshot taken ([`Report::snapshot_takes`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SnapshotTake {
+    /// The server.
+    pub server: u64,
+    /// The snapshot's last index.
+    pub index: u64,
+    /// The checkpoint directory it wrote.
+    pub dir: PathBuf,
+    /// When.
+    pub at: Instant,
+    /// The index of its `RaftSnapshot` record in [`Report::records`].
+    pub record: usize,
+}
+
+/// A re-take under a live stream ([`Report::retakes_under_streams`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RetakeUnderStream {
+    /// The server that took, and was streaming.
+    pub leader: u64,
+    /// The follower the stream fed.
+    pub follower: u64,
+    /// The index taken again.
+    pub index: u64,
+    /// Whether the take wrote a directory an earlier take at the index had
+    /// written: the shared directory of `SharedSnapshotDir`, rewritten under the
+    /// stream reading it.
+    pub same_dir: bool,
+    /// The stream's last sign of life before the take: its opening, or a chunk
+    /// at the index sent to the follower.
+    pub before: Instant,
+    /// The take.
+    pub retook: Instant,
+    /// The stream's first chunk sent after it.
+    pub after: Instant,
+    /// Whether the follower ever answered `Installed` at the index after the take.
+    pub installed_after: bool,
+}
+
+/// A leader's stale progress for a refused follower ([`Report::stale_progress`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StaleProgress {
+    /// The leader.
+    pub leader: u64,
+    /// Its term.
+    pub term: u64,
+    /// The match index the follower last acknowledged to it before the refusal.
+    pub matched: u64,
+    /// The refusal.
+    pub refused: Instant,
+    /// The leader's AppendEntries to the follower after the refusal, all at or
+    /// above `matched`.
+    pub probes: usize,
+    /// The follower's rejections of them.
+    pub rejections: usize,
 }
 
 /// The simulator configuration for `seed` and `schedule`.

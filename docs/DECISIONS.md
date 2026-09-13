@@ -1630,14 +1630,16 @@ sites are marked `PROPOSED(D-038)`.
 
 ## PROPOSED D-039 — A completed snapshot install counts as the leader's contact for the timer check
 
-**Context.** The ten-thousand-seed nightly produced the sweep's first two
-correct-server failures, both from the timers-fire check (RAFT.md §2, moirae rule
-5: a follower that hears from no leader of its term and grants no vote for two
-maximum election timeouts must have campaigned), and both against a follower
-being fed a snapshot. Seed 164: a follower two hundred entries behind a leader
-whose log was compacted past it, reached only by a train of `InstallSnapshot`
-chunks the check did not read as contact, since the core routes them to the
-snapshot task; that half is a plain checker gap, fixed in D-030's stanza. Seed
+**Context.** Local ten-thousand-seed runs, on 1373601 and then on f54b468, not
+the GitHub nightly, produced the sweep's first two correct-server failures, both
+from the timers-fire check (RAFT.md §2, moirae rule 5: a follower that hears from
+no leader of its term and grants no vote for two maximum election timeouts must
+have campaigned), and both against a follower being fed a snapshot. Seed 164: a
+follower about sixty-eight entries behind a leader whose log was compacted past
+it, fed a train of `InstallSnapshot` chunks that went on arriving after that
+leader lost its quorum, with no leader in the cluster, and that the check did not
+read as contact, since the core routes them to the snapshot task; that half is a
+plain checker gap, fixed in D-030's stanza. Seed
 385: a follower cut off alone by a partition mid-install spent two hundred and
 twenty-five milliseconds finishing the install locally — verifying the staged
 tables, repairing tenant 0, switching stores — after which the incarnation
@@ -1876,8 +1878,12 @@ rejections ask from index 1 but reject a probe at `matched`, never at index 0,
 so the re-seed ask of D-037 is never heard, and only a designation earned by
 silence while it was down ever streams to it. Stage E's re-seed (D-030, D-035)
 broke the assumption behind monotone `matched`: a follower can now legitimately
-lose entries it acknowledged. Seed 5909's wedge also involves the snapshot
-streams (D-043); this entry closes the `matched` half of it.
+lose entries it acknowledged. Measured on the nightly's trace since, seed 5909's
+wedge was not this hazard but the snapshot streams' (D-043) alone: its leader in
+force was elected after server 3's last acknowledgement and rebuilt its progress
+at `matched: 0`, and server 3 was uncounted because it was queued behind the
+other follower's stream (the amendment below). The hazard this entry closes is
+real all the same; seed 5909 was not an instance of it.
 
 **Decision.** Three parts.
 
@@ -1929,9 +1935,8 @@ were the bound asked there, the leader as built re-seeds the refused server
 too, when it was designated while down, and commits with it inside the bound.
 Seeing the wedge would need a liveness ask when a leader in force at the last
 heal has a commit majority among the servers that are up, quarantined ones
-included, and a schedule that refuses a second follower under that leader —
-seed 5909's shape — which only the disk model's rot produces and no driver can
-aim.
+included, and a schedule that refuses a second follower under that leader, which
+only the disk model's rot produces and no driver can aim.
 
 The variant and its sweep test ship as the pair rule asks, and the test is not
 ignored: a variant that cannot be caught is a hole in the sweep to be named,
@@ -1980,29 +1985,40 @@ wherever it saw a refusal. The core-level scenario is in
 said no sweep could make — one server carrying this bug *and* D-043's at once —
 is a run the sweep makes. Four things it settles.
 
-*Neither fix alone was the fix for 5909.* The nightly's wedge needed both of its
-conditions at once, because a leader needs only *one* countable follower for a
-majority: this entry's stale `matched` for the re-seeded follower, *and* D-043's
-never-completing stream to the other one. Each entry removes one of the two, and
-removing either is enough for the cluster to commit — with D-043's fix the
-pinned stream completes and the cluster commits through the follower being fed
-though `matched` for the re-seeded one is stale; with this entry's fix the
-incarnation resets that `matched` and the cluster commits through the re-seeded
-follower though the other's stream is scrambled. So neither entry is *the* fix
-for 5909, and neither claims to be. **The combined variant
-`{IgnoreIncarnation, SharedSnapshotDir}` is the negative control for that
-wedge**; each single variant is the control for its own half and never was a
-control for the whole.
+*D-043's fix was the fix for 5909; this entry's was not.* Round two read the
+nightly's wedge as needing both conditions at once — this entry's stale
+`matched` for the re-seeded follower and D-043's never-completing stream to the
+other — each fix removing one. Measured on the nightly's trace since, no stale
+`matched` occurred in it: the term-11 leader was elected at 14.757 s, after
+server 3's last acknowledgement, and a new leader rebuilds every follower's
+progress at `matched: 0` (ea6fe7d, `become_leader`); server 3 then sent that
+leader 302 rejections, every one with hint 334, and not one success, and
+received no `InstallSnapshot` chunk. It went uncounted because it was designated
+snapshot-fed and queued behind server 2's never-completing stream — the shared
+directory scrambling that stream, and one stream per leader — which are both
+D-043's bugs. So D-043 alone explains 5909, as seed 680 agrees, where
+`SharedSnapshotDir` alone fails exactly as the pair does. This entry's fix
+remains sound, and today's correct run of seed 5909 exercises its reset —
+server 3 refused, then its progress reset at 18.698 s, then re-seeded — but it
+was not the fix for 5909. **The combined variant
+`{IgnoreIncarnation, SharedSnapshotDir}` is the negative control for a wedge
+that needs both bugs**, which a leader needing only *one* countable follower
+makes possible and no trace has yet shown; each single variant is the control
+for its own half.
 
 *Seed 5909 itself still does not reach the wedge, under the pair as under each
 single.* Measured on this tree in release: `raft::run(5909, Variants::of(&[
 IgnoreIncarnation, SharedSnapshotDir]))` checks clean, exactly as both singles
 and the correct server do. That is a seed whose schedule has moved, not a bug
 that has gone: this entry's own eight-byte record change moved every checkpoint,
-and D-041, D-044 and the re-take arm have each re-drawn every seed's fault list
-since, so 5909 on this tree draws neither a snapshot crash nor an adoption storm
-nor a re-take arm at all, and no leader ever re-takes under a running stream on
-it whatever bugs it carries. The pin stays a seed held green and is still worth
+and D-041, D-044 and the re-take arm have each appended a fault arm drawn from a
+stream of its own since, which leaves the shared draws in place — 5909's fault
+times match the nightly's through 16.114 s — but lengthens every run and so moves
+every seed's interleaving and who leads; and 5909 on this tree draws neither a
+snapshot crash nor an adoption storm nor a re-take arm at all, and no re-take on it scrambles a running stream
+whatever bugs it carries: under `SharedSnapshotDir`, alone or in the pair, the
+leader re-takes once under a live stream, to a follower that had already
+installed that snapshot. The pin stays a seed held green and is still worth
 nothing as a replay.
 
 *The set bought no new catch at the thousand-seed tier, and that is reported
@@ -2013,7 +2029,7 @@ check — `IgnoreIncarnation` alone on **0 of 1000**, `SharedSnapshotDir` alone 
 (`no client write completed after the last heal at 28.683 s`). Seeds where the
 pair is caught and *neither* single is: **0 of 1000**. So the
 combined variant is not yet shown to catch anything the stream half does not
-catch alone, and the negative control it provides for 5909's shape is a
+catch alone, and the negative control it provides for a wedge of both bugs is a
 mechanism that now exists and a claim the sweep has not yet been able to
 discharge at the tiers run here — which is the honest reading and the one
 recorded. The reason it is hard is D-043's own: the wedge needs a stream that
@@ -2038,6 +2054,16 @@ invisible until then. The variant ships and its test is not ignored (CLAUDE.md);
 what it asserts is what is true of it, and the rate is printed at every tier so
 the day it stops being zero is visible.
 
+At the nightly's ten thousand seeds (run 34711427220, on 14c3e17) it printed a
+catch on 4 of 10 000 — seeds 1252, 2509, 3087 and 5990 — and not one of the four
+is this bug. Every one is the pre-vote isolation check reading a trace
+timestamp: the isolated server's term rise was adopted from a message delivered
+before the isolation began, between 0.31 and 16.57 ms before it, and traced
+after, once its persist was durable, with no message reaching the server inside
+the window. That is the gap that failed the correct server itself on seeds 1885
+and 2023 of the same run. So the claim stands as written: this bug has not been
+caught for its own mechanism at any tier, and the four catches are the checker's.
+
 Every site is marked `PROPOSED(D-042)`.
 
 ---
@@ -2046,16 +2072,20 @@ Every site is marked `PROPOSED(D-042)`.
 
 **Context.** The ten-thousand-seed nightly (run 34496762339), seed 5909: the
 leader's last commit was 329 at 13.43 s and nothing committed for the remaining
-5.4 s of the run. Server 2 had been snapshot-fed since 7.46 s — 744
-`InstallSnapshot` chunks, the stream resumed from offset 0 six times — and at the
-end the receiver was still acknowledging `000005.sst` while the sender was on
-`000010.sst`. The first of those restarts follows the leader re-taking the *same*
-snapshot 329 five times within a hundred milliseconds (checkpoint versions 779 to
-783, every one into `/raft/snap-329`), rewriting the directory under the stream.
+5.4 s of the run. Server 2 was fed snapshot 329 from 13.872 s — 735
+`InstallSnapshot` chunks, the stream resumed from offset 0 fifteen times — and at
+the end the receiver was still acknowledging `000005.sst` while the sender was on
+`000010.sst`. The first eight resumes, from 13.92 s, came while a partition had
+server 2 cut off (13.386 to 14.322 s). The leader, which had first taken 329 at
+13.893 s, then re-took the *same* snapshot five times in a hundred and ten
+milliseconds (checkpoint versions 779 to 783, 15.261 to 15.370 s, every one into
+`/raft/snap-329`), rewriting the directory under the stream; the resume at
+15.409 s follows them, and the stream never completed.
 Server 3, refused and re-seeded, was designated snapshot-fed and received
 nothing: the `snapshot` task streams to one follower at a time, its stream waited
 behind server 2's never-ending one, and a designated follower gets no entries —
-every heartbeat rejected with hint 334, two hundred and four times. Neither
+every heartbeat rejected with hint 334, three hundred and two times from its
+leader's election at 14.757 s. Neither
 follower could be counted; the leader lost its quorum at 13.99 s, won term 11 at
 14.76 s and was no better off. The liveness check reported it.
 
@@ -2220,14 +2250,18 @@ its applied index stands still at the index it last took, which is the index
 the running stream is reading. It reaches that state on 14 of 100 release
 seeds, and the sweep asserts at every tier that it did.
 
-It moves the variant from uncatchable at the pre-merge tier to catchable there,
-and no further. Measured on this branch: 0 of 100 release seeds, and 1 of 1000 —
-seed 680, by the liveness check, `no client write completed after the last heal
-at 28.683 s`, which is this entry's own wedge assembled by a driver rather than
-waited for. This entry recorded 0 of 1000 before the arm existed, so the tier
-that pays for the pre-merge run now catches it, about once.
+It has not been shown to make the variant catchable at any tier. Measured on this
+branch: 0 of 100 release seeds, and 1 of 1000 — seed 680, by the liveness check,
+`no client write completed after the last heal at 28.683 s`. That catch is not
+the arm's: seed 680 draws no re-take arm (its faults are an isolation, a Figure 8
+driver, a one-way block, the adoption storm and the refusal storm), and its
+re-takes are the server's own. The arm reached a live stream on 151 of 1000
+seeds and caught none of them. This entry recorded 0 of 1000 before the arm
+existed; the one catch since came from how that round moved seed 680's
+interleaving, not from the arm.
 
-Why only about once is structural rather than statistical. A leader needs *one*
+Why the arm reaches the shape without catching it is structural rather than
+statistical. A leader needs *one*
 countable follower for a majority, and on this sweep an install is over in about
 a hundred and fifty milliseconds, since the state machine is small and a
 checkpoint of it is a couple of dozen chunks. The moment the fed follower's
@@ -2259,18 +2293,34 @@ tier on a single observation would make that tier flaky. The firing is asserted
 at every tier on both counts — a re-take at an index already taken, and the arm
 reaching its stream — and a nightly whose ten thousand seeds never catch it is
 still a hole in the sweep to report rather than a variant to delete (RAFT.md §5),
-the more so because this branch has re-drawn every schedule again.
+the more so because this branch has moved every seed's interleaving again.
+
+*At the nightly's ten thousand.* Run 34711427220, on 14c3e17, printed this
+variant caught on 13 of 10 000 seeds, which is not thirteen catches of this bug.
+Four are the liveness check, the wedge this entry is about: seeds 680, 2013,
+9445 and 9993. Seven are the pre-vote isolation check reading a trace timestamp
+— a term rise adopted from a message delivered before the isolation began, or on
+seed 5203 a candidacy decided on a pre-vote answer delivered before it, traced
+after its persist with no message reaching the server in the window — the gap
+that failed the correct server on seeds 1885 and 2023 of the same run: seeds
+1176, 2407, 3863, 4713, 5203, 6691 and 9670. Two are the linearizability checker
+running out of its search budget, on seeds 1262 and 7222, which is not a proven
+violation. The test's ten-thousand-seed assertion counts all thirteen.
 
 **Amended under PROPOSED D-045.** `Variant` is a set now, so the sweep can run
 one server carrying this entry's bug and D-042's at once, which is what the
-nightly's seed 5909 was. Neither fix alone was the fix for 5909: the wedge
-needed both of its necessary conditions — a stream that never completes to one
-follower (this entry) and a stale `matched` for the other, re-seeded one (D-042)
-— because a leader needs only one countable follower for a majority, so either
-fix alone lets the cluster commit and either variant alone leaves a cluster that
-recovers. **The combined variant `{IgnoreIncarnation, SharedSnapshotDir}` is the
-negative control for that wedge**; this entry's variant is the control for the
-stream half of it and never was a control for the whole.
+nightly's seed 5909 was. This entry's fix alone was the fix for 5909. Round two
+read the wedge as needing a stale `matched` for the re-seeded follower (D-042)
+beside the stream that never completed; measured on the nightly's trace since,
+there was no stale `matched` — the term-11 leader had rebuilt its progress at
+`matched: 0` — and both followers were uncounted by this entry's two bugs:
+server 2 behind the stream the shared directory scrambled, and server 3
+designated snapshot-fed and queued behind that stream in the one-stream backlog
+(D-042's amendment has the numbers). Seed 680 agrees: this entry's variant alone
+fails it exactly as the pair does. So this entry's variant is the control for
+the wedge 5909 was, and **the combined variant `{IgnoreIncarnation,
+SharedSnapshotDir}` is the negative control for a wedge that needs both bugs**,
+which no trace has yet shown.
 
 What the pair measures on this tree is reported as measured. Over seeds 0..1000
 in release the pair is caught on 1 of 1000 and this entry's variant alone on 1
@@ -2456,18 +2506,25 @@ still quiesced: a variant turns off its own fix and no other.
 
 ## PROPOSED D-045 — A variant is a set
 
-**Context.** Round two's finding, recorded at the end of PROPOSED D-042 and in
-PROPOSED D-043: the nightly's seed 5909 (run 34496762339) wedged the cluster
-because *two* bugs held at once — the leader's `matched` for a re-seeded
-follower stood above its rebuilt log (D-042) and the snapshot stream to the
-other follower never completed (D-043) — and either fix alone removes one of
-the two necessary conditions, because a leader needs only *one* countable
-follower for a majority. `Variant` was a single enum on `RaftConfig`, so no run
-of the sweep could put both bugs in one server. The sweep therefore had a
-negative control for each half of that wedge and none for the wedge itself, and
-both round-two entries had to record the gap as a structural limit of the
-mechanism rather than close it. The owner's decision after that finding, which
-this entry records: `Variant` becomes a set.
+**Context.** Round two's reading, recorded at the end of PROPOSED D-042 and in
+PROPOSED D-043, was that the nightly's seed 5909 (run 34496762339) wedged the
+cluster because *two* bugs held at once — the leader's `matched` for a
+re-seeded follower standing above its rebuilt log (D-042) and the snapshot
+stream to the other follower never completing (D-043) — so that either fix
+alone would remove one of two necessary conditions, a leader needing only *one*
+countable follower for a majority. Measured on the nightly's trace since, that
+premise is wrong: the leader in force held no stale `matched`, having been
+elected after the re-seeded follower's last acknowledgement and rebuilt its
+progress at `matched: 0`, and that follower was uncounted because it was
+designated snapshot-fed and queued behind the scrambled stream, so D-043's two
+bugs explain 5909 on their own (the amendments to D-042 and D-043). What the
+premise exposed stands regardless: `Variant` was a single enum on `RaftConfig`,
+so no run of the sweep could put two bugs in one server, and a wedge that does
+need two — which the one-countable-follower arithmetic makes possible — had no
+negative control and could not even be asked about. Both round-two entries
+recorded that as a structural limit of the mechanism rather than close it. The
+owner's decision after round two, which this entry records: `Variant` becomes a
+set.
 
 **Decision.** Five parts, every site marked `PROPOSED(D-045)`.
 
@@ -2532,8 +2589,8 @@ can disagree about the same bug, and asks every site which of them to read.
 as the bitmask, at an allocation and a `Clone` per server and a linear scan on a
 path walked every step, with `HashSet` banned outside `ananke-env` (D-014).
 *Leaving it alone and recording the gap*, which is what round two did: it is
-honest, and it leaves the sweep without a negative control for a wedge that has
-already happened once in a nightly.
+honest, and it leaves the sweep without a negative control for a wedge of two
+bugs, which round two believed had already happened once in a nightly.
 
 **Consequences.** `RaftConfig` gains a renamed field: `variant: Variant` becomes
 `variants: Variants`, which every construction of a config outside a

@@ -297,7 +297,7 @@ impl std::fmt::Display for LostState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.damaged {
             Some(damage) => write!(f, "the store is damaged: {damage}")?,
-            None => write!(f, "the engine's recovery lost state:")?,
+            None => write!(f, "{LOST_STATE}:")?,
         }
         // PROPOSED(D-044): the reason the refusal that marked the store gave,
         // carried word for word so the story survives the restart that reads it.
@@ -360,6 +360,14 @@ impl std::error::Error for LostState {}
 /// voter with a hole in its state machine rejoin.
 // PROPOSED(D-041): the crash-safe adoption and the store identity marker.
 pub const STORE_MARKER: &str = "RAFT-STORE";
+
+/// How a refusal's reason begins when the engine opened and its recovery lost
+/// writes, as opposed to a store found damaged before the engine could open
+/// (`the store is damaged: ...`, which a marked-lost re-refusal also says). Only
+/// an engine that opened has a replayed memtable to flush over the loss
+/// (PROPOSED D-044), so the sweep's predicate for seed 687's shape reads the
+/// refusal by this prefix.
+pub const LOST_STATE: &str = "the engine's recovery lost state";
 
 /// The marker's path under `engine_dir`.
 // PROPOSED(D-041): the crash-safe adoption and the store identity marker.

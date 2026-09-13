@@ -180,12 +180,15 @@ impl Variant {
 /// no hashing and no allocation on a path every step of the core walks.
 ///
 /// The empty set is the correct server, so [`Variants::default`] is correct and
-/// [`Variants::is_correct`] asks whether the set is empty. The reason the set
-/// exists is that some wedges need two bugs at once: the nightly's seed 5909
+/// [`Variants::is_correct`] asks whether the set is empty. The set exists so the
+/// sweep can run a server carrying two bugs at once, which a single-enum
+/// `Variant` could not. It was built on the reading that the nightly's seed 5909
 /// needed a stale `matched` for a re-seeded follower (PROPOSED D-042) and a
 /// never-completing snapshot stream to the other follower (PROPOSED D-043)
-/// together, and a single-enum `Variant` could carry only one of the two, so
-/// the sweep had no negative control for that wedge.
+/// together; measured on that trace since, the wedge was D-043's alone — the
+/// leader in force had rebuilt its progress at `matched: 0`, and the second
+/// follower was queued behind the scrambled stream — so no wedge that needs two
+/// bugs has yet been seen, and the set is what lets the sweep ask for one.
 ///
 /// A single variant stays ergonomic: `From<Variant>` converts, and every entry
 /// point that takes a server's bugs takes `impl Into<Variants>`, so

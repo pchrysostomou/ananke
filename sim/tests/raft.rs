@@ -11,7 +11,7 @@ use std::time::Duration;
 use ananke_env::{ClientOp, DropReason, TraceEvent};
 use ananke_raft::core::{Variant, Variants};
 use ananke_raft::invariants::{self, Checker};
-use ananke_raft::store::STORE_MARKER;
+use ananke_raft::store::{LOST_STATE, STORE_MARKER};
 use ananke_sim::raft::DRIFT_BOUND_PPM;
 use ananke_sim::raft::{self, Fault};
 use ananke_sim::{seeds, sweep, verdict, write_trace};
@@ -32,28 +32,120 @@ fn the_seed_42_trace_is_written_for_the_studio() {
     report.check().unwrap();
 }
 
-/// The first correct-server failures the ten-thousand-seed nightly ever produced,
-/// both the timer check misreading a follower being fed a snapshot: seed 164, a
-/// follower two hundred entries behind a compacting leader, fed by a train of
-/// InstallSnapshot chunks the check did not count as the leader's contact; seed
-/// 385, a follower cut off alone mid-install, campaigning a hundred milliseconds
-/// after the install's restatement rebuilt its core with a fresh timer and
-/// twenty-five past the bound (D-030, PROPOSED D-039). Both stay in the gate.
+/// Seed 164, found by a local ten-thousand-seed run on 1373601: the first
+/// correct-server failure a ten-thousand-seed run produced, and a gap in the timer
+/// check rather than in the server. Server 2 was about sixty-eight entries behind
+/// when server 3, leading term 12 with its log through index 276 and its snapshot
+/// at 210, began feeding it `InstallSnapshot` chunks at 11.854 s: it had appended
+/// through 208. At 13.340 s the check flagged it for 399.26 ms without an
+/// AppendEntries or a granted vote, against its 399.19 ms bound. Nobody led in
+/// that stretch: server 3 had lost its quorum at 12.936 s and was pre-voting, and
+/// the 21 chunks server 2 received in it were that deposed leader's leftover
+/// stream. The check read only AppendEntries as contact; it now counts an
+/// InstallSnapshot of the receiver's term or later as a reset too, by its term
+/// and not by who sent it (D-030's stanza, f54b468). The same stretch also holds
+/// an install's restatement, at 13.143 s, so PROPOSED D-039's later arm alone
+/// would have silenced it as well: no predicate on this seed isolates the
+/// InstallSnapshot arm.
+///
+/// Today the seed does not reach that situation, and the test asserts so. The
+/// fault list is the same through the 9.691 s partition, but the run elects a
+/// different leader after it, so the leader-relative faults that follow hit other
+/// servers: server 2 finishes its install before the 12.541 s partition (adopted
+/// at 11.760 s), and that partition isolates server 2 itself, where no chunk
+/// reaches it. The longest AppendEntries-less stretch that holds an
+/// InstallSnapshot is 161.6 ms, server 3's from 11.822 s, against its 394 ms
+/// bound. The day [`raft::Report::snapshot_fed_timer_gaps`] is not empty, the seed
+/// reaches the situation again and the pin should assert it: those gaps present,
+/// and the check green.
 #[test]
-fn seeds_164_and_385_which_the_first_nightly_found_stay_green() {
-    for seed in [164, 385] {
-        raft::run(seed, Variant::Correct).check().unwrap();
-    }
+fn seed_164_which_a_local_ten_thousand_seed_run_found_stays_green() {
+    let report = raft::run(164, Variant::Correct);
+    report.check().unwrap();
+    let gaps = report.snapshot_fed_timer_gaps();
+    assert!(
+        gaps.is_empty(),
+        "seed 164 reaches a snapshot-fed timer gap again — a follower past its bound on \
+         AppendEntries alone while InstallSnapshot chunks of its term arrive: {gaps:?}; \
+         pin the mechanism: those gaps present and the check green"
+    );
 }
 
-/// The ten-thousand-seed nightly's seed 7381: a refused server re-seeded from a
-/// snapshot older than the one its lost store had, then applying entries past it.
-/// The checker's snapshot floor only ever rose, so the lost store's floor outlived
-/// it and the applied entries read as covered rather than held. An installed
-/// snapshot now sets the floor exactly (D-030). Stays in the gate.
+/// Seed 385, found by a local ten-thousand-seed run on f54b468: server 1, cut off
+/// alone by the partition at 14.035 s while it finished installing snapshot 329 —
+/// its last chunk arrived at 14.020 s and the leader's last AppendEntries at
+/// 14.031 s — completed the install locally, and the install's restatement at
+/// 14.260 s rebuilt its core with a fresh election timer, so it campaigned at
+/// 14.358 s: 98 ms after the restatement, 327 ms after the leader's last contact
+/// and 25 ms past its 302 ms bound. The check did not know that the restatement
+/// resets the timer; it now counts one on a server that never went down as the
+/// leader's contact (PROPOSED D-039).
+///
+/// Today the seed does not reach that situation, and the test asserts so. The
+/// partition comes at the same instant and isolates server 1 alone as before, but
+/// the log history before it has moved: leader 3 compacted only through 324, at
+/// 13.677 s, so server 1 was kept current by AppendEntries, through index 336 by
+/// 14.029 s, and had no install in flight — no chunk was sent to it between
+/// 13.152 s and 14.667 s. It pre-voted at 14.159 s, 131.6 ms after the leader's
+/// last AppendEntries at 14.027 s, 43.5 % of its bound, with no restatement
+/// between. The check without D-039's arm flags nothing on the whole run, and its
+/// closest stretch across a restatement is 167.1 ms, 55.3 % of the bound. With the check
+/// green, [`raft::Report::timer_gaps_rescued_by_restatement`] is every gap of that
+/// replay; the day it is not empty the seed reaches the situation again, and the
+/// pin should assert it: those gaps present, and the check green.
+#[test]
+fn seed_385_which_a_local_ten_thousand_seed_run_found_stays_green() {
+    let report = raft::run(385, Variant::Correct);
+    report.check().unwrap();
+    let gaps = report.timer_gaps_rescued_by_restatement();
+    assert!(
+        gaps.is_empty(),
+        "seed 385 reaches an install's restatement inside a follower's timer window again, \
+         with the campaign after the bound: {gaps:?}; pin the mechanism: those gaps present \
+         and the check green"
+    );
+}
+
+/// The ten-thousand-seed nightly's seed 7381, on ea6fe7d: server 2 held snapshots
+/// through index 128 when it was crashed at 6.304 s, leading term 7, by a Figure 8
+/// driver. Its restart was refused at 6.641 s, `MANIFEST-000005` unreadable, and
+/// the leader re-seeded it from snapshot 58, the newest that leader had and below
+/// the floor the lost store had reached. It appended past 58 and applied through
+/// 64, was crashed again at 8.068 s, and on restart its restatement recovered an
+/// applied index of 65. The checker's snapshot floor only ever rose, so it still
+/// stood at the lost store's 128 and read index 65 as covered by it rather than
+/// held by the log, and state machine safety reported that the log did not hold
+/// it. An installed snapshot now sets the floor exactly (D-030, cb15eb1).
+///
+/// Today the seed does not reach that situation, and the test asserts so: no
+/// restatement replays an index between the exact floor and the risen one, and no
+/// install lowers a floor at all, which is the only way the two rules ever
+/// disagree. The Figure 8 driver's crash lands at the same instant on the leader
+/// in force, which is server 3 this time and restarts clean. The run's only
+/// refusal is server 2's at 12.585 s, a missing log head, with its floor at 251,
+/// and the leader re-seeds it from snapshot 312, above that floor. So the two
+/// floor rules agree at every event, the seed would pass the old checker too, and
+/// this pin holds the seed green without exercising the fix. The day
+/// [`raft::Report::floor_lowering_installs`] is not empty, the seed is near the
+/// situation again and the pin should be re-audited; the day
+/// [`raft::Report::recoveries_under_a_lost_floor`] is not empty, it should assert
+/// the mechanism: that replay present, and the check green.
 #[test]
 fn seed_7381_which_the_first_nightly_found_stays_green() {
-    raft::run(7381, Variant::Correct).check().unwrap();
+    let report = raft::run(7381, Variant::Correct);
+    report.check().unwrap();
+    let replays = report.recoveries_under_a_lost_floor();
+    assert!(
+        replays.is_empty(),
+        "seed 7381 replays a recovered applied index under a lost floor again: {replays:?}; \
+         pin the mechanism: that replay present and the check green"
+    );
+    let lowered = report.floor_lowering_installs();
+    assert!(
+        lowered.is_empty(),
+        "seed 7381 installs a snapshot below a floor its server had reached, where the old \
+         floor rule and the exact one part: {lowered:?}; re-audit the pin"
+    );
 }
 
 /// The ten-thousand-seed nightly's seed 6325 (run 34496762339): server 1 finished
@@ -68,72 +160,125 @@ fn seed_7381_which_the_first_nightly_found_stays_green() {
 /// truncation from index 1. The adoption now copies and syncs first and switches
 /// `CURRENT` last, a damaged staging `CURRENT` is refused rather than swept, and
 /// a directory carrying the store marker never opens fresh (PROPOSED D-041).
-/// Stays in the gate.
+///
+/// Today the seed does not reach that situation, under the correct server or the
+/// adoption as built, and the test asserts both. The crash that hit the nightly's
+/// adoption was no aimed fault but the schedule's first, `Crash { server: 1 }` for
+/// 312 ms, half a second after the second lease trial heals, and it still fires;
+/// the seed draws neither the adoption crash storm nor the crash aimed at an
+/// install. What moved is the install it hit. On the nightly's trace the leader
+/// took a newer snapshot, 129 over 120, while the stream ran, and the stream
+/// started over on it, so the install finished 459 ms after that heal; today one
+/// take feeds the stream in seven chunks, with no take during it, and the install
+/// finishes 182 ms after the heal under the correct server and 208 ms as built. So the crash lands 318 ms
+/// and 292 ms after the install, and 262 ms and 230 ms after the adoption had
+/// already closed. No crash lands inside any of the correct run's 12 adoption
+/// windows or the variant's 9, and the variant passes the seed. The day
+/// [`raft::Report::adoption_windows`] shows a crash inside one, the pin should
+/// assert the mechanism: under `AdoptionAsBuilt` the truncation from index 1
+/// reported, and under the correct server the adoption re-run or the staging
+/// store refused, and the check green.
 #[test]
 fn seed_6325_which_the_nightly_found_stays_green() {
-    raft::run(6325, Variant::Correct).check().unwrap();
+    for variant in [Variant::Correct, Variant::AdoptionAsBuilt] {
+        let report = raft::run(6325, variant);
+        let windows = report.adoption_windows();
+        assert!(
+            !windows.is_empty(),
+            "seed 6325 under {variant:?} adopts no install at all: the absence below means nothing"
+        );
+        let crashed: Vec<_> = windows.iter().filter(|w| w.crashed.is_some()).collect();
+        assert!(
+            crashed.is_empty(),
+            "seed 6325 under {variant:?} crashes a server inside an adoption again: {crashed:?}; \
+             pin the mechanism rather than the green"
+        );
+        assert_eq!(
+            report.check().err(),
+            None,
+            "seed 6325 under {variant:?} no longer passes: re-audit the pin"
+        );
+    }
 }
 
-/// The ten-thousand-seed nightly's seed 5909 (run 34496762339): the leader's last
-/// commit was 329 at 13.43 s and nothing committed for the remaining 5.4 s of the
-/// run. Server 2 had been snapshot-fed since 7.46 s — 744 chunks, the stream
-/// restarted from offset 0 six times — because the leader re-took the same
-/// snapshot 329 five times into the one directory that stream was reading, so
-/// sender and receiver never stood on the same file again; and server 3, refused
-/// and re-seeded, was designated snapshot-fed and received nothing, its stream
-/// queued behind server 2's never-ending one, while the leader's match index for
-/// it stood above its rebuilt log, so every heartbeat it answered was rejected
-/// and it was never counted. With neither follower countable the commit froze,
-/// and the liveness check reported it. Takes are now versioned directories, a
-/// stream pins the one it opened, and every designated follower is streamed to
-/// at once (PROPOSED D-043), and a follower's store incarnation resets what the
-/// leader knew of its log (PROPOSED D-042). Said plainly: the fixed tree's
-/// schedule for this seed diverges from the nightly's trace — the snapshot record
-/// grew by eight bytes, which moves the engine's flushes and with them every
-/// checkpoint, and D-041 appends a crash storm to every schedule — so this pin
-/// holds the seed green rather than replaying the failure; the shape itself is
-/// carried by `SharedSnapshotDir` and `IgnoreIncarnation` below. Stays in the
-/// gate.
+/// Seed 5909's wedge, the nightly's (run 34496762339, on ea6fe7d), and what the
+/// correct server does with the seed today.
+///
+/// On the nightly's trace the leader's last commit was 329 at 13.43 s, and
+/// nothing committed for the remaining 5.4 s of the run. Leader 1 had been
+/// streaming snapshot 329 to server 2 since 13.872 s; between 15.261 s and
+/// 15.370 s it re-took the same snapshot five times into `/raft/snap-329`, the
+/// one directory that stream was reading, and the stream never completed — from
+/// 15.361 s the leader sent `000010.sst` at offset 0 seven hundred times while
+/// server 2 kept asking for `000005.sst` — so server 2 was never counted. Server
+/// 3, refused and re-seeded, with a log ending at the 333 it had acknowledged, was
+/// designated snapshot-fed and queued behind that never-completing stream: it
+/// received no chunk, and every one of its 302 answers to the term-11 leader was
+/// a rejection with hint 334. It was not a stale match index: that leader was
+/// elected at 14.757 s, after server 3's last acknowledgement, and a new leader's
+/// progress starts at `matched: 0`. So PROPOSED D-043's two bugs — the shared
+/// directory scrambling the stream and one stream per leader queuing the other
+/// follower behind it — explain the wedge on their own, and PROPOSED D-042's stale
+/// `matched` did not occur in it. Takes are now versioned directories, a stream
+/// pins the one it opened, and every designated follower is streamed to at once
+/// (D-043). D-042 is a sound fix of its own, and today's correct run exercises it,
+/// but it was not the fix for 5909.
+///
+/// Today's run does not replay the wedge. The fault times are the nightly's
+/// through the restart at 16.114 s, but leadership resolves differently, so the
+/// crashes and isolations aimed at a leader or its neighbour hit other servers,
+/// and D-044's refusal storm adds crashes of server 3 after that. The correct
+/// server re-takes no index at all here. What the test asserts is what the run
+/// does reach, and what it does not. It reaches D-042's reset: server 3 is
+/// refused at 18.696 s, the leader resets its progress at 18.698 s, and it is
+/// re-seeded at 18.970 s. It does not reach the wedge's shape: no re-take lands
+/// under a live stream and scrambles it, and no two followers go uncounted after
+/// the last heal.
 #[test]
 fn seed_5909_which_the_nightly_found_stays_green() {
-    raft::run(5909, Variant::Correct).check().unwrap();
+    let report = raft::run(5909, Variant::Correct);
+    report.check().unwrap();
+    assert!(
+        report.refusal_reset_reseed(3).is_some(),
+        "seed 5909 no longer refuses server 3, resets the leader's progress for it and \
+         re-seeds it: the D-042 path this pin asserts is gone; re-audit the pin"
+    );
+    assert_no_stream_wedge(&report);
 }
 
-/// Seed 5909 under each of the two variants whose bugs wedged it, and under both
-/// of them at once, pinned to what it actually does on this tree, which is pass.
-/// That is the finding. Round two could only report it of the two variants
-/// separately and had to record the pair as a run the mechanism could not make;
-/// PROPOSED D-045 makes it, and the answer is the same.
+/// Seed 5909 under each of the two variants PROPOSED D-045's Context names, and
+/// under both of them at once, pinned to what it does on this tree, which is
+/// pass, and to why.
 ///
-/// The nightly's wedge needed both bugs at once: the leader re-took the same
-/// snapshot 329 into the one directory server 2's stream was reading, so that
-/// stream never completed, *and* the leader's `matched` for the re-seeded server
-/// 3 stood above its rebuilt log, so server 3 was never counted either. Neither
-/// half stalls a commit on its own, because a leader needs only one countable
-/// follower for a majority: with D-043's fix in place the pinned stream
-/// completes and the cluster commits through server 2 though the leader's
-/// `matched` for server 3 is stale, and with D-042's fix in place server 3's
-/// incarnation resets that `matched` and the cluster commits through server 3
-/// though server 2's stream is scrambled. So a server carrying one of the two
-/// bugs is not the server the nightly caught, and the run that is — one
-/// carrying both — is `Variants::of(&[IgnoreIncarnation, SharedSnapshotDir])`,
-/// which `Variant` as a single enum on `RaftConfig` could not express (PROPOSED
-/// D-045's Context).
+/// The Context's premise was that the nightly's wedge needed both bugs, a stale
+/// `matched` (D-042) beside a never-completing stream (D-043). Measured on the
+/// nightly's trace it did not: the wedge was D-043's alone, as the test above
+/// says, and seed 680 below agrees, where `SharedSnapshotDir` alone fails exactly
+/// as the pair does. The variant set still makes the pair a run the sweep can ask
+/// about, and this seed is asked.
 ///
-/// It can be expressed now, and seed 5909 still passes it. The reason is the
-/// schedule, which is the second and independent reason this seed was never
-/// going to replay. The nightly's trace for 5909 has been unreachable on this
-/// branch since D-043 grew the snapshot record by eight bytes, which moves every
-/// flush and every checkpoint's file set, and D-041, D-044 and the re-take arm
-/// have each re-drawn the fault list since. On this tree seed 5909 draws three
-/// Figure 8 drivers, two crashes, an isolation and the refusal storm, and
-/// neither a snapshot-crash nor an adoption storm nor a re-take arm at all — so
-/// the leader never re-takes under a running stream here whatever bugs it
-/// carries, and there is no wedge for the pair to reach.
+/// On this tree no run of the seed has two uncounted followers, and each variant
+/// reaches only its own half, harmlessly:
 ///
-/// So this stays a pin that holds a seed green, worth keeping as the nightly's
-/// seed and worth nothing as a replay. The replay is the pinned seed below,
-/// which the pair does wedge and neither single does.
+/// - under `IgnoreIncarnation` the leader's progress for server 3 goes stale — its
+///   last success acknowledged 572 at 18.626 s, it is refused at 18.696 s, and the
+///   leader's 826 AppendEntries after that never probe below 572 while server 3
+///   rejects 814 of them and accepts none — but server 1 is countable and no
+///   re-take happens at all;
+/// - under `SharedSnapshotDir` leader 2 opens a stream of snapshot 395 to server 3
+///   at 15.051 s and re-takes 395 into `/raft/snap-395` at 15.071 s, under that
+///   live stream, and it is harmless: server 3 already held 395 and answered
+///   `Installed` at 15.109 s, three times, all dropped because its sends were
+///   blocked until 15.406 s, and no follower goes uncounted after the heal;
+/// - under the pair both happen, one after the other and to the same follower:
+///   the harmless re-take at 15.071 s, then stale progress for server 3 — its
+///   last success acknowledged 416 at 15.971 s, it is refused at 16.128 s, and
+///   558 AppendEntries at or above 416 draw 543 rejections — while server 1 stays
+///   countable.
+///
+/// The leader in force at the last heal commits within 21 to 45 ms of it under
+/// each. The test asserts each half where its variant carries it, and the wedge's
+/// shape absent in every run.
 #[test]
 fn seed_5909_passes_under_both_bugs_together_which_is_the_finding() {
     for variants in [
@@ -147,37 +292,89 @@ fn seed_5909_passes_under_both_bugs_together_which_is_the_finding() {
             None,
             "seed 5909 under {variants:?} no longer passes: the pin's story is out of date"
         );
+        assert_no_stream_wedge(&report);
+        if variants.contains(Variant::IgnoreIncarnation) {
+            assert!(
+                report.stale_progress(3).is_some(),
+                "seed 5909 under {variants:?} no longer leaves the leader's progress for the \
+                 refused server 3 stale: re-audit the pin"
+            );
+        }
+        if variants.contains(Variant::SharedSnapshotDir) {
+            assert!(
+                !report.retakes_under_streams().is_empty(),
+                "seed 5909 under {variants:?} no longer re-takes under a live stream: \
+                 re-audit the pin"
+            );
+        }
     }
 }
 
+/// The shape of seed 5909's wedge, asserted absent: no re-take lands under a live
+/// stream that the follower then never installs, and the leader in force at the
+/// last heal has at most one follower it could never count after it.
+fn assert_no_stream_wedge(report: &raft::Report) {
+    let seed = report.seed;
+    let variants = report.variants;
+    let scrambling: Vec<_> = report
+        .retakes_under_streams()
+        .into_iter()
+        .filter(|retake| !retake.installed_after)
+        .collect();
+    assert!(
+        scrambling.is_empty(),
+        "seed {seed} under {variants:?} re-takes under a live stream that never completes after \
+         it: {scrambling:?}; the wedge's stream half is back, so pin it"
+    );
+    let uncounted = report.uncounted_after_heal();
+    assert!(
+        uncounted.len() < 2,
+        "seed {seed} under {variants:?} leaves followers {uncounted:?} uncounted after the last \
+         heal: the wedge is back, so pin it"
+    );
+}
+
 /// The combined variant pinned on the seed the sweep does catch it on — seed 680
-/// — and, said plainly, what that seed does not show.
+/// — and, said plainly, what that seed does and does not show.
 ///
-/// Seed 5909 is the wedge this pair exists for and no longer reaches it (above),
-/// so the pin stands in for it: this is the seed of the first thousand on which
-/// a server carrying `{IgnoreIncarnation, SharedSnapshotDir}` is caught, by the
-/// liveness check, `no client write completed after the last heal at 28.683 s`.
-/// That is a real catch of a real wedge and the pair rule holds on it: the
-/// correct server passes the same seed.
+/// It is the seed of the first thousand on which a server carrying
+/// `{IgnoreIncarnation, SharedSnapshotDir}` is caught, by the liveness check: no
+/// client write completed after the last heal at 28.683 s, which is the refusal
+/// storm's fifth restart of server 3. The correct server passes it. The seed does
+/// not need both bugs: `SharedSnapshotDir` alone is caught with the byte-identical
+/// message, and `IgnoreIncarnation` alone passes. Swept over seeds 0..1000 in
+/// release, the pair is caught on 1 of 1000 (this seed), `SharedSnapshotDir` alone
+/// on 1 of 1000 (this seed), `IgnoreIncarnation` alone on 0 of 1000, and no seed
+/// catches the pair without a single. Nor was a wedge that needs both ever seen:
+/// seed 5909's was D-043's alone (above).
 ///
-/// **It is not a seed that needs both bugs.** `SharedSnapshotDir` alone is
-/// caught on seed 680 too, with the byte-identical message, which this test
-/// asserts rather than glosses: the wedge here is the stream half's on its own.
-/// Swept over seeds 0..1000 in release, the pair is caught on 1 of 1000 (this
-/// seed), `SharedSnapshotDir` alone on 1 of 1000 (this seed), `IgnoreIncarnation`
-/// alone on 0 of 1000, and the seeds where the pair is caught and *neither*
-/// single is number 0 of 1000. So what PROPOSED D-045 has
-/// demonstrated is that the run can now be made and what it does can now be
-/// asked; it has not yet demonstrated a wedge that needs both bugs, and this
-/// comment does not claim one.
+/// What wedges it is D-043's bugs, and the test asserts the mechanism on the
+/// `SharedSnapshotDir` run. Leader 1 wins term 10 at 8.407 s and never commits
+/// again; the last commit on any server is at 7.653 s. Server 3's
+/// acknowledgements of the leader's first entry were all dropped by the Figure 8
+/// driver's blocks and server 2 is behind the leader's snapshot, so the leader
+/// designates both to be fed one. The seed draws no re-take arm; the server re-takes on
+/// its own, twenty times into `/raft/snap-187` between 8.595 s and 10.454 s, five
+/// of them under a live stream (9.563, 10.091, 10.359, 10.407 and 10.454 s). The
+/// three streams those land under open half-written directories and fail. The
+/// fourth, to server 2 at 10.699 s, has no take under it and still never
+/// completes: server 2 kept a partial `000005.sst` from an earlier stream under
+/// the same identity, so the whole file's first chunk reads as a duplicate and is
+/// answered `More` for `000004.sst`, 8739 times until the run ends, and every
+/// `More` keeps the stream from timing out — the duplicate hazard D-043 names.
+/// Server 3 waits behind it in the one-stream backlog, and both followers go
+/// uncounted after the heal.
 ///
-/// Why that is hard is PROPOSED D-043's own account: the wedge needs a stream
-/// that *never completes*, which needs a take to land on the very directory a
-/// live stream has open — and once that coincidence happens the stream half
-/// alone already stalls the commit past the bound, leaving D-042's stale
-/// `matched` nothing to add. A seed that needs both would be one where the
-/// stream recovers but the re-seeded follower is uncountable at the same moment.
-/// The day one is found it belongs here beside this seed.
+/// Why the pair adds nothing here: no server on this seed is ever refused or
+/// re-seeded, and every store keeps incarnation 1, so `IgnoreIncarnation` has
+/// nothing to ignore and the pair's trace is byte for byte the single's.
+///
+/// And what the correct server's pass is not: it never re-takes an index on this
+/// seed — its run diverges from the variant's within the first 25 ms — so it is
+/// the pair rule holding, not evidence that versioned directories and pinned
+/// streams rescued a re-take here. The test asserts that too, so the day the
+/// correct server re-takes on this seed the pin can say whether the stream
+/// survived it.
 #[test]
 fn seed_680_pins_the_combined_variant_and_the_stream_half_alone_catches_it_too() {
     let both = Variants::of(&[Variant::IgnoreIncarnation, Variant::SharedSnapshotDir]);
@@ -191,16 +388,16 @@ fn seed_680_pins_the_combined_variant_and_the_stream_half_alone_catches_it_too()
 
     // The honest half of the pin: the stream bug alone reaches the same wedge on
     // this seed, so 680 is not evidence that the pair is needed.
-    let stream_only = raft::run(680, Variant::SharedSnapshotDir)
-        .check()
-        .expect_err(
-            "SharedSnapshotDir alone no longer catches seed 680: the pin's story is out of date",
-        );
+    let stream = raft::run(680, Variant::SharedSnapshotDir);
+    let stream_only = stream.check().expect_err(
+        "SharedSnapshotDir alone no longer catches seed 680: the pin's story is out of date",
+    );
     assert_eq!(
         paired, stream_only,
         "the pair and the stream half alone no longer fail seed 680 the same way: \
          the pair may now be buying a catch of its own, which is worth recording"
     );
+    assert_stream_wedge(&stream);
 
     // And the other half alone reaches nothing, here as everywhere.
     assert_eq!(
@@ -210,33 +407,160 @@ fn seed_680_pins_the_combined_variant_and_the_stream_half_alone_catches_it_too()
     );
 
     // The pair rule (CLAUDE.md): the correct server passes the seed its buggy
-    // siblings fail.
-    raft::run(680, Variant::Correct).check().unwrap();
+    // siblings fail — without ever meeting a re-take on it.
+    let correct = raft::run(680, Variant::Correct);
+    correct.check().unwrap();
+    let takes = correct.snapshot_takes();
+    let retaken: Vec<_> = takes
+        .iter()
+        .enumerate()
+        .filter(|(n, take)| {
+            takes[..*n]
+                .iter()
+                .any(|t| t.server == take.server && t.index == take.index)
+        })
+        .map(|(_, take)| take)
+        .collect();
+    assert!(
+        retaken.is_empty(),
+        "the correct server now re-takes an index on seed 680: {retaken:?}; the pin can now \
+         assert whether its stream survived the re-take"
+    );
 }
 
-/// The thousand-seed premerge's seed 687: server 3's engine open dropped SST 1 —
-/// it held sequence numbers 1..98 of the state machine — and the store was
-/// refused with `LostState { dropped: [1] }`, traced at 7.9209 s as RAFT.md §3
-/// and D-025 require. Seven milliseconds later the refused server's own engine
-/// flushed the memtable the recovery had replayed: table 4, then manifest 5
-/// listing tables 2, 3 and 4 with table 1 forgotten, `CURRENT` switched to it,
-/// and log segment 2 deleted. The evidence of the loss was laundered away. No
-/// leader existed for the next 5.4 s, so no re-seed came; the schedule crashed
-/// server 3 at 13.32 s and restarted it at 13.53 s, the open found a
-/// self-consistent store, removed `000001.sst` as an orphan and opened clean —
-/// `RaftRecovered { applied: 185, last_index: 189 }`, no refusal and no install
-/// — and a voter with a hole in its state machine rejoined and began pre-voting.
-/// State machine safety reported the restatement whose log does not hold the
-/// index 1 it claimed to have applied. A refusal is now recorded in the store's
-/// marker before anything else and refuses every later open until an install
-/// replaces the store, and the refused engine is quiesced (PROPOSED D-044). Said plainly: the fixed tree's schedule
-/// for this seed diverges from the premerge's — D-044 appends a crash aimed at
-/// refused servers to every schedule, which moves every seed's interleaving — so
-/// this pin holds the seed green rather than replaying the failure; the shape
-/// itself is carried by `RefusalNotDurable` below. Stays in the gate.
+/// The stream half of the wedge on seed 680 under `SharedSnapshotDir`, from the
+/// trace: the last leader re-takes into its own snapshot directory under a live
+/// stream; its last stream, opened before the heal, never installs; nothing
+/// commits after the first such re-take; the last stream is stuck in the
+/// duplicate-file loop; and both followers go uncounted after the heal.
+fn assert_stream_wedge(report: &raft::Report) {
+    let leader = report
+        .records
+        .iter()
+        .rev()
+        .find_map(|r| match &r.event {
+            TraceEvent::RaftLeader { server, .. } => Some(*server),
+            _ => None,
+        })
+        .expect("seed 680 elects a leader");
+    let scrambling: Vec<_> = report
+        .retakes_under_streams()
+        .into_iter()
+        .filter(|r| r.leader == leader && r.same_dir && !r.installed_after)
+        .collect();
+    let first = scrambling.first().unwrap_or_else(|| {
+        panic!(
+            "seed 680's last leader {leader} no longer re-takes into its own snapshot directory \
+             under a live stream: the wedge's cause has moved; re-audit the pin"
+        )
+    });
+    let (opened, follower) = report
+        .records
+        .iter()
+        .rev()
+        .find_map(|r| match &r.event {
+            TraceEvent::RaftSnapshotStreams { server, to, .. } if *server == leader => {
+                Some((r.at, *to))
+            }
+            _ => None,
+        })
+        .expect("seed 680's leader opens a stream");
+    assert!(
+        opened < report.last_heal,
+        "seed 680's last stream opens after the last heal, so its never installing says nothing"
+    );
+    assert!(
+        !report.records.iter().any(|r| r.at > opened
+            && matches!(
+                r.event,
+                TraceEvent::RaftSnapshot { server, taken: false, .. } if server == follower
+            )),
+        "seed 680's last stream, to server {follower} at {opened:?}, now installs: re-audit the pin"
+    );
+    assert!(
+        !report
+            .records
+            .iter()
+            .any(|r| r.at >= first.retook && matches!(r.event, TraceEvent::RaftCommit { .. })),
+        "seed 680 commits after the first re-take under a live stream at {:?}: re-audit the pin",
+        first.retook
+    );
+    let looped = report.duplicate_chunk_loop(leader, follower, opened);
+    assert!(
+        looped >= 1000,
+        "seed 680's last stream is answered with More naming another file only {looped} times: \
+         the duplicate-file loop that keeps it alive is gone; re-audit the pin"
+    );
+    let uncounted = report.uncounted_after_heal();
+    assert_eq!(
+        uncounted.len(),
+        2,
+        "seed 680 no longer leaves both followers uncounted after the heal: {uncounted:?}"
+    );
+}
+
+/// The thousand-seed premerge's seed 687, on b0e13e8: server 3's engine open
+/// dropped SST 1 — it held sequence numbers 1..98 of the state machine — and the
+/// store was refused with `LostState { dropped: [1] }`, traced at 7.9209 s as
+/// RAFT.md §3 and D-025 require. Seven milliseconds later the refused server's own
+/// engine flushed the memtable the recovery had replayed: table 4, then manifest 5
+/// listing tables 2, 3 and 4 with table 1 forgotten, `CURRENT` switched to it, and
+/// log segment 2 deleted. The evidence of the loss was laundered away. No leader
+/// existed for the next 5.4 s, so no re-seed came; the schedule crashed server 3
+/// at 13.32 s and restarted it at 13.53 s, the open found a self-consistent store,
+/// removed `000001.sst` as an orphan and opened clean — `RaftRecovered { applied:
+/// 185, last_index: 189 }`, no refusal and no install — and a voter with a hole in
+/// its state machine rejoined and began pre-voting. State machine safety reported
+/// the restatement whose log does not hold the index 1 it claimed to have applied.
+/// A refusal is now recorded in the store's marker before anything else and
+/// refuses every later open until an install replaces the store, and the refused
+/// engine is quiesced (PROPOSED D-044).
+///
+/// Today the seed does not reach that situation, under the correct server or the
+/// refusal as built, and the test asserts both. Not because D-044's aimed crash
+/// re-drew the schedule: `Fault::CrashRefused` is drawn from its own stream and
+/// appended last, it first fires at 15.141 s, after the premerge's violation at
+/// 13.932 s, and every fault through 13.532 s is at the instant it was. What moved
+/// is the disk. The traces first differ at 5.416 s, where server 2's adoption
+/// finishes 3.7 ms later — consistent with D-044 rewriting the store marker there
+/// — and the bit rot a crash draws block by block over a node's files then lands
+/// elsewhere: at 7.566 s it rots a checkpoint's copy, `snap-125-6/000001.sst`,
+/// instead of the live `000001.sst`, and server 3 recovers clean. No engine that
+/// opened is refused for lost state anywhere in the run. Its one refusal is
+/// server 3's at 15.424 s, for an unreadable `MANIFEST-000009`: a store damaged
+/// before its engine opened, with no engine to flush anything, and it is re-seeded
+/// (adopted at 15.624 s) before its next crash at 17.902 s. `RefusalNotDurable`
+/// passes the seed the same way (adopted at 15.600 s, crashed at 17.627 s); that
+/// variant's own sweep test catches the shape on other seeds. The day
+/// [`raft::Report::restarts_after_lost_state_refusal`] is not empty, the pin
+/// should assert the mechanism: under `RefusalNotDurable` state machine safety
+/// reporting the recovered applied index, and under the correct server the
+/// restart refused on the store's lost mark and the check green.
 #[test]
 fn seed_687_which_the_premerge_found_stays_green() {
-    raft::run(687, Variant::Correct).check().unwrap();
+    for variant in [Variant::Correct, Variant::RefusalNotDurable] {
+        let report = raft::run(687, variant);
+        let restarts = report.restarts_after_lost_state_refusal();
+        assert!(
+            restarts.is_empty(),
+            "seed 687 under {variant:?} restarts a server refused for lost state before an \
+             install replaced its store, as (server, refused, restarted): {restarts:?}; pin the \
+             mechanism rather than the green"
+        );
+        assert!(
+            !report.has(|e| matches!(
+                e,
+                TraceEvent::RaftRefused { reason, .. } if reason.starts_with(LOST_STATE)
+            )),
+            "seed 687 under {variant:?} refuses a store whose opened engine lost state again: \
+             the refused engine's quiesce is reachable here; re-audit the pin"
+        );
+        assert_eq!(
+            report.check().err(),
+            None,
+            "seed 687 under {variant:?} no longer passes: re-audit the pin"
+        );
+    }
 }
 
 /// The positive control: the correct server satisfies every property on every
@@ -437,8 +761,9 @@ fn a_server_whose_refusal_is_not_durable_is_caught() {
 /// and commits with it inside the bound. Seeing the wedge needs a liveness ask
 /// when a leader in force at the last heal has a commit majority among the
 /// servers that are up, quarantined ones included, and a schedule that refuses a
-/// second follower under that leader — seed 5909's shape — which the disk
-/// model's rot draws on its own and no driver can aim.
+/// second follower under that leader, which the disk model's rot draws on its own
+/// and no driver can aim. Seed 5909 was not that shape: its wedge was
+/// PROPOSED D-043's alone (`seed_5909_which_the_nightly_found_stays_green`).
 ///
 /// What the test asserts is what is true and what the pair rule can still be
 /// held to here: the variant is really the leader as built, which the trace says
@@ -448,6 +773,12 @@ fn a_server_whose_refusal_is_not_durable_is_caught() {
 /// wedge is built on, a refused follower re-seeded and applying again. A sweep
 /// that could not distinguish the two leaders at all would fail here. The catch
 /// rate is printed at every tier so the day it stops being zero is visible.
+///
+/// At the nightly's ten thousand (run 34711427220) it printed 4 of 10 000, and
+/// every one was the pre-vote isolation check's trace-timing gap — a term rise
+/// adopted from a message delivered before the isolation began and traced after
+/// it, the gap that failed the correct server on seeds 1885 and 2023 — not this
+/// bug.
 #[test]
 fn a_leader_that_ignores_incarnations_never_forgets_and_the_sweep_cannot_see_it() {
     let outcomes: Vec<(Option<String>, usize, bool)> = sweep(seeds(), |seed| {
@@ -497,14 +828,15 @@ fn a_leader_that_ignores_incarnations_never_forgets_and_the_sweep_cannot_see_it(
 /// took, which is the index the running stream is reading. The arm rides one
 /// seed in four and got as far as the stream on 14 of 100 release seeds.
 ///
-/// It moves the variant from uncatchable at the pre-merge tier to catchable
-/// there, and no further: 0 of 100 release seeds, 1 of 1000 — seed 680, by the
-/// liveness check, `no client write completed after the last heal at 28.683 s`,
-/// which is seed 5909's shape reproduced by construction. D-043 recorded 0 of
-/// 1000 before this arm existed, so a tier that never caught it now does, about
-/// once.
+/// It has not been shown to make the variant catchable at any tier: 0 of 100
+/// release seeds, 1 of 1000 — seed 680, by the liveness check, `no client write
+/// completed after the last heal at 28.683 s` — and that one catch is not this
+/// arm's: seed 680 does not draw it, and its re-takes are the server's own
+/// (`seed_680_pins_the_combined_variant_and_the_stream_half_alone_catches_it_too`).
+/// The arm reached a live stream on 151 of 1000 seeds and caught none of them.
 ///
-/// Why only about once is worth writing down, because it is not a matter of
+/// Why the arm reaches the shape without catching it is worth writing down,
+/// because it is not a matter of
 /// running more seeds at the hundred tier. A leader needs *one* countable
 /// follower for a majority, and on this sweep an install is over in about a
 /// hundred and fifty milliseconds — the state machine is small and a checkpoint
@@ -530,6 +862,12 @@ fn a_leader_that_ignores_incarnations_never_forgets_and_the_sweep_cannot_see_it(
 /// flaky; the rates are printed at every tier so the day the rate is worth an
 /// assertion is visible. The pair rule holds because the correct server passes
 /// the same seeds.
+///
+/// The nightly's ten thousand (run 34711427220) printed 13: 4 by the liveness
+/// check, the wedge itself; 7 by the pre-vote isolation check's trace-timing
+/// gap, the one that failed the correct server on seeds 1885 and 2023; and 2 by
+/// the linearizability checker exhausting its search budget, which proves
+/// nothing. The assertion below counts all thirteen.
 #[test]
 fn a_leader_that_shares_one_snapshot_directory_and_streams_one_follower_at_a_time_is_caught() {
     let outcomes: Vec<(Option<String>, bool, usize)> = sweep(seeds(), |seed| {

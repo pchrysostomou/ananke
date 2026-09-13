@@ -113,9 +113,9 @@ _Update this section at the end of every session._
   install committing by CURRENT-last, LostState-refused servers re-seeded under a
   durable vote quarantine (PROPOSED D-035), `SnapshotWithoutCurrentLast` caught
   26/100. #22: the Figure 8 driver, `CountOlderTermForCommit` caught 42/100 with
-  `max_batch` at its default (was 0/100 batched). The 10k nightly found two
-  correct-server false positives of the timer check against snapshot-fed
-  followers (seeds 164 and 385, both pinned; D-030 and PROPOSED D-039); the
+  `max_batch` at its default (was 0/100 batched). Local 10k runs on 1373601 and
+  f54b468 found two correct-server false positives of the timer check against
+  snapshot-fed followers (seeds 164 and 385, both pinned; D-030 and PROPOSED D-039); the
   clean 10k verdict is the GitHub nightly's to give — the sweeps now run their
   seeds in parallel and in four tiers, 20 / 100 / 1000 (`scripts/premerge.sh`) /
   10 000 on GitHub only (D-040). Before the tag: review the seven PROPOSED
@@ -129,6 +129,14 @@ _Update this section at the end of every session._
   incarnations) and D-043 (versioned snapshot takes, pinned streams, a stream per
   designated follower) plus a checker fix (an installed snapshot sets the floor
   exactly, D-030), each seed pinned in the gate, pending review and the nightly.
+- Pinned-seed audit (2026-09-12), branch `phase-2-pinned-audit` off main at
+  `14c3e17`, unpushed: CLAUDE.md now requires a pinned seed to assert its
+  mechanism, never just green. Every pinned seed (164, 385, 680, 687, 5909, 6325,
+  7381) asserts it through trace predicates on `sim::raft::Report`; 680 and the
+  D-042 reset on 5909 reach their situation today, and the rest assert its
+  absence and say why. Seed 5909's wedge was measured to be D-043's alone, with
+  no stale `matched`; PROPOSED D-039, D-042, D-043 and D-045 carry the factual
+  corrections.
 - Stage A, B, C record: A: the
   pure core, the codec with the studio decoder, the state under tenant 0 with the
   applied index in the batch and a refusal of any recovery that lost state, the four
