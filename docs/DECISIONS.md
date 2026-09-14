@@ -3565,4 +3565,140 @@ scenario's golden hash is unchanged, `19f19201df99a799`.
 
 ---
 
-_Next entry: D-050. Add one before implementing anything not covered above._
+## PROPOSED D-050 — A term's record carries when the message its step took was received
+
+**Context.** Issue #32, the open point D-047 left. The pre-vote check reads a term
+change by its decision time, the moment the step that took it was taken, so a change
+decided before an isolation and traced inside it is not the isolated server's
+election. A term-raising message can also be *delivered* before an isolation and
+*stepped* inside it: the `raft` task is still awaiting a persist when the message
+arrives, or finishing an install, and the message waits in the inbox. That step is
+decided inside the window, no message reaches the server in the window, and the check
+by decision time flags the correct server. D-047 rejected the checker-side repair,
+matching each rise to the delivery that caused it, because the checker would
+re-implement the core's term rule and the inbox. The issue asked for a trace fact the
+server already knows, or a measured argument that the case cannot arise, and in
+either case a seed that reaches the shape and asserts the verdict for its reason.
+
+No correct-server seed of the ten-thousand-seed nightlies was flagged this way. The
+case is still reachable: it needs the server busy when the message arrives, where
+D-047's straddle needs only the step's own persist to span the isolation's start, so
+it is rarer, and the directed scenario below reaches it on 23 of the first 100 seeds.
+An argument that it cannot arise would be false.
+
+**Decision.** The server records the fact on the record the check reads. Every site
+is marked `PROPOSED(D-050)`.
+
+*The fact.* `TraceEvent::RaftTerm` gains `received: Option<Decision>`: when the peer's
+message that the step behind the record took reached the server. The `net` task takes
+a decision stamp (D-047) as it receives each frame, before admitting it to the inbox,
+and the inbox event carries it; the `raft` loop remembers the stamp of the message a
+step takes and `Server::execute` sets it on the `RaftTerm` events that step outputs.
+A step whose input is no peer's message — a tick, a completion, re-seed progress —
+and the restatement at an incarnation's start carry `None`, and so does everything
+the core emits, since the core has no clock. The simulator's harness reads it as
+`TraceRecord::received`, global virtual time at or before the record's decision
+time; `Decision` stays opaque to the code under test. The moirae export writes
+`receivedNs` in the line's `data`, after the event's own fields and before
+`decidedNs`, and only where it differs from the decision time, as `decidedNs` is
+written only where that differs from `t`.
+
+*The check.* `Report::check`'s pre-vote check is `isolation_keeps_the_term_by_cause`:
+the check by decision time, except that an isolation is not flagged when every change
+of its server's term decided in `(from, until]` carries a receipt at or before `from`.
+It is that check's verdict with one named excuse, so it flags nothing the check by
+decision time does not. A campaign takes no message and carries no receipt, so a
+term the isolated server raised on its own timer is flagged as before, whatever else
+changed its term in the same window. `isolation_keeps_its_term_by` and
+`isolation_keeps_its_term_by_cause` give one isolation's verdict, and
+`isolation_received_straddles` is the predicate: each change received by an
+isolation's start and decided inside it, with the messages from a server delivered to
+the isolated one at the receipt and the count delivered in the window.
+`isolation_keeps_the_term_by` under either `RecordTime` is unchanged, and so is
+`moved_by_decision_time`, which now compares the check by durability time with this
+one; the sweeps' assertion on a removed pre-vote catch accepts a change received
+before the isolation beside D-047's straddle.
+
+*The scenario.* `Fault::IsolateOnTermRaise`, never drawn by `Schedule::draw`, and
+`Schedule::term_raise_behind_a_step(tries)`: no lease trial, true clocks, and `tries`
+rounds, each asking the leader to hand over to the follower after it, whose campaign
+sends the third server a RequestVote of a higher term; the run advances in slices of
+10 µs until a message from a server carrying a term above the third server's last
+traced one is delivered to it, and cuts that server off alone at the slice's end for
+300 ms. A slice ends with nothing runnable, so an idle `raft` task has already taken
+the message before the isolation, which is D-047's straddle, and a busy one takes it
+inside the window, which is this entry's. With eight rounds, measured in release:
+the shape on 5 of 20 seeds and 23 of 100, 8 changes in 136 isolations and 28 in 706,
+beside 122 and 648 of D-047's straddles. The test
+`a_term_change_stepped_inside_an_isolation_from_a_message_received_before_it_is_excused`
+asserts at every tier that the correct
+server passes the whole check on every seed, that the shape is reached on some seed,
+and, for every change it finds, the reason: received by the start and decided inside,
+no message from a server delivered in the window, a message of the new term from
+another server delivered at the receipt, and the check by decision time flagging the
+isolation while this check does not. Seed 4 is pinned with its numbers: server 1's
+RequestVote of term 5 received by server 2 at 3.679125915 s, the isolation from
+3.67913 s, server 2's step 2.176899 ms into it, the check by decision time flagging
+*pre-vote: server 2 raised its term from 4 to 5 while isolated from Instant(3.67913s)
+to Instant(3.97913s)* and the check passing. The pair: `NoPreVote` on the same
+schedule is caught by this check on 20 of 20 and 100 of 100 seeds.
+
+*No schedule moved.* The stamp reads the time under the simulator's lock and nothing
+else, as D-047's does. The echo scenario's pinned body hash is unchanged,
+`19f19201df99a799`. Eighteen raft traces from this tree are the traces of 94c6a54,
+the tree before this entry, byte for byte once `receivedNs` is removed, and no other
+line differs: the correct server's seeds 42 (100 992 lines, 0 carrying the field),
+1885 (82 827, 0), 2023 (96 023, 0), 0 (75 713, 1), 1 (66 093, 2), 2 (100 144, 1), 3
+(106 255, 3), 5 (84 420, 1), 7 (100 326, 1), 11 (80 543, 0) and 13 (35 916, 0), and
+`IgnoreIncarnation` 1252 (97 128, 2), `SharedSnapshotDir` 3863 (92 102, 1) and 680
+(184 526, 0), `ResetTimerOnAnyRpc` 5153 (66 379, 0), `ApplyBeforeCommit` 6366 (75 642,
+2), `SnapshotWithoutCurrentLast` 2305 (100 722, 0) and `AdoptionAsBuilt` 1929 (85 694,
+0). Seeds 42, 1885 and 2023 have the line counts D-047 measured.
+
+*A correction to D-047's measurement.* D-047 gave the two straddles decided at a
+re-seed install's completion, `SharedSnapshotDir` 3863 and `IgnoreIncarnation` 1252,
+as a new incarnation's first step taking an AppendEntries of the new term delivered
+2.48 ms and 16.31 ms earlier. The receipt on their records says otherwise. On 3863
+server 2's change to term 11, decided at 18.221725074 s, took the AppendEntries
+received at 18.081057713 s, 140.67 ms before; on 1252 server 3's change to term 11,
+decided at 20.165988416 s, took the one received at 20.021554524 s, 144.43 ms before.
+The inbox is first in, first out, and each server installed into a live store, where
+`install_decision` drops what it pops while it waits for the install (D-030): the
+first message of the new term to arrive after the install finished is the one the
+first step takes. The 2.48 ms and 16.31 ms are the time from the *last* such delivery
+before the step, which is what matching deliveries by hand found. Neither verdict
+moves, since both steps were decided before their isolations; the correction is to
+which message caused them, and it is the failure D-047 predicted for checker-side
+matching. D-047's text is not edited.
+
+**Alternatives.** *A measured argument that the case cannot arise*: it can, above.
+*Checker-side matching of each change to a delivery*: rejected by D-047, and the
+correction above is that approach getting a cause wrong. *A third time on every
+`TraceRecord`, through a new `Environment` method*: a change to SPEC §1.1's
+interface and both environments for one field one check reads; the fact belongs to
+one event. *The delivery's `MessageId` on the record*: `Socket::recv` does not return
+the id, so a P0 interface change, and the delivery is the network's fact where the
+receipt is the server's. *An extra record per stepped message*: the traces would
+differ by more than a field, and every schedule's record count would move. *Exposing
+`Decision`'s instant to all code*: the stamp is opaque so that nothing under test can
+compare it with a node's clock; the harness reads it through the record. *Writing
+`receivedNs` on every message-caused term record*: most records would change for no
+reader; where the receipt is the decision time it says nothing the line does not.
+*Excusing by the receipt alone, reading every term record by `received` or else its
+decision time*: those times are not monotone in record order — a campaign stepped
+before an older message waiting in the inbox — so the term at an instant read that way
+could hide a campaign inside the window; an excuse on the decision-time verdict
+cannot.
+
+**Consequences.** `TraceEvent::RaftTerm` gains a field, which every construction
+names; `TraceRecord` gains `received()`; the `raft` task's inbox events carry a stamp;
+the raft scenario's JSONL gains `receivedNs` on the term records whose message waited
+for its step; `Fault` gains an arm and `Schedule` a constructor that no sweep draws.
+The echo, WAL and engine traces are unchanged. The check can only remove pre-vote
+catches, never add one. On approval, D-047 gains a forward pointer to this entry and
+SPEC §1.5's export paragraph a sentence on `receivedNs`; RAFT.md §2 and §3 describe it
+now, marked proposed. Issue #32 closes with this entry's approval.
+
+---
+
+_Next entry: D-051. Add one before implementing anything not covered above._

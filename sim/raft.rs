@@ -446,7 +446,47 @@ pub enum Fault {
         /// The quiet after that follower heals, with both designated.
         hold: Duration,
     },
+    /// Issue #32's shape, aimed rather than waited for (D-050): a message that
+    /// raises a server's term delivered before an isolation begins and taken by a
+    /// step inside it, because the server's `raft` task was still awaiting a
+    /// persist when the message arrived. Each of `tries` rounds asks the leader in
+    /// force to hand over to the follower after it (leadership transfer, thesis
+    /// §3.10), whose campaign sends the third server a RequestVote of a higher
+    /// term; the run advances in slices of [`TERM_RAISE_STEP`] until a message from
+    /// a server carrying a term above the third server's last traced term is
+    /// delivered to it, or [`TERM_RAISE_WAIT_BUDGET`] runs out, and cuts that server
+    /// off alone at the slice's end for `isolate`, then leaves `quiet` before the
+    /// next round. A slice ends with nothing runnable, so a `raft` task that was idle
+    /// has already taken the message, before the isolation, and one that was busy
+    /// takes it inside the window: the shape. Never drawn by [`Schedule::draw`], so
+    /// no sweep schedule moves; the directed scenario
+    /// [`Schedule::term_raise_behind_a_step`] is its one user.
+    // PROPOSED(D-050): a term's record carries when the message its step took was
+    // received.
+    IsolateOnTermRaise {
+        /// How many rounds.
+        tries: u64,
+        /// How long each isolation lasts.
+        isolate: Duration,
+        /// The quiet after each round.
+        quiet: Duration,
+    },
 }
+
+/// The slice [`Fault::IsolateOnTermRaise`] advances in while it waits for a
+/// term-raising delivery: a tenth of the sweep disk's fastest operation, so an
+/// isolation begins well inside any persist that was running at the delivery.
+/// (D-050).
+pub const TERM_RAISE_STEP: Duration = Duration::from_micros(10);
+
+/// The longest a [`Fault::IsolateOnTermRaise`] round waits for a term-raising
+/// delivery after asking for the transfer. A transfer's campaign reaches the
+/// other follower within a few network delays. (D-050).
+pub const TERM_RAISE_WAIT_BUDGET: Duration = Duration::from_millis(300);
+
+/// The first sequence number and admin socket a [`Fault::IsolateOnTermRaise`]
+/// round's transfer request uses, past the lease trials' two. (D-050).
+const TERM_RAISE_ADMIN: u64 = 3;
 
 /// The longest a [`Fault::CrashInstalling`] waits for an install to stream
 /// before giving up and doing nothing.
@@ -742,6 +782,29 @@ impl Schedule {
         }
     }
 
+    /// The directed schedule for issue #32's shape (D-050): after the warmup,
+    /// no lease trial and one [`Fault::IsolateOnTermRaise`] of `tries` rounds, each
+    /// isolation 300 ms and each quiet 500 ms, then the liveness window. Every clock
+    /// runs true, so a transfer goes where it is asked.
+    // PROPOSED(D-050): a term's record carries when the message its step took was
+    // received.
+    #[must_use]
+    pub fn term_raise_behind_a_step(tries: u64) -> Self {
+        Self {
+            warmup: Duration::from_millis(1200),
+            trials: Vec::new(),
+            faults: vec![Fault::IsolateOnTermRaise {
+                tries,
+                isolate: Duration::from_millis(300),
+                quiet: Duration::from_millis(500),
+            }],
+            gaps: vec![Duration::from_millis(500)],
+            settle: election_max() * LIVENESS_TIMEOUTS + Duration::from_millis(200),
+            drifts: vec![0; SERVERS as usize],
+            skews: vec![0; SERVERS as usize],
+        }
+    }
+
     /// The server with the slowest clock, 1-based.
     #[must_use]
     pub fn slowest(&self) -> u64 {
@@ -825,6 +888,15 @@ impl Schedule {
                     hold,
                     ..
                 } => *settle + *isolate + STREAM_WAIT_BUDGET + *freeze + *hold,
+                // PROPOSED(D-050): a round's wait, isolation and quiet.
+                Fault::IsolateOnTermRaise {
+                    tries,
+                    isolate,
+                    quiet,
+                } => {
+                    (TERM_RAISE_WAIT_BUDGET + *isolate + *quiet)
+                        * u32::try_from(*tries).expect("small")
+                }
             })
             .sum();
         let trials: Duration = self
@@ -1060,6 +1132,9 @@ impl Report {
     /// and every other check is the same under both. Worked out from `verdict`
     /// without running the checks that do not move — the linearizability search
     /// above all — so a sweep can report, on every seed, what the entry changed.
+    /// The pre-vote check `verdict` comes from also excuses a term change taken
+    /// from a message received before the isolation (D-050), so a catch removed
+    /// here is removed by either reading.
     // D-047: every trace record carries its decision time and its durability time.
     #[must_use]
     pub fn moved_by_decision_time(&self, verdict: &Result<(), String>) -> Option<Moved> {
@@ -1122,10 +1197,97 @@ impl Report {
     /// carried, which is no election of the isolated server's (RAFT.md §3).
     ///
     /// The check is about why the server's term moved, so it reads each term
-    /// record by the time its step decided it (D-047):
-    /// [`Report::isolation_keeps_the_term_by`] under [`RecordTime::Decided`].
+    /// record by the time its step decided it (D-047), and a term change whose
+    /// step took a message the server had received by the isolation's start is
+    /// that message's doing, however long the message waited for the step (D-050):
+    /// [`Report::isolation_keeps_the_term_by_cause`].
     fn isolation_keeps_the_term(&self) -> Result<(), String> {
-        self.isolation_keeps_the_term_by(RecordTime::Decided)
+        self.isolation_keeps_the_term_by_cause()
+    }
+
+    /// The pre-vote check [`Report::check`] makes: the check by decision time,
+    /// [`Report::isolation_keeps_the_term_by`] under [`RecordTime::Decided`], except
+    /// that an isolation is not flagged when every change of its server's term
+    /// decided inside the window was taken from a peer's message the server had
+    /// received by the window's start ([`TraceRecord::received`]). The server knows
+    /// when it received the message and says so on the record, so the check asks
+    /// whether the cause arrived before the window without modelling the inbox a
+    /// message waits in behind a persist or an install.
+    ///
+    /// It flags nothing the check by decision time does not: it is that check's
+    /// verdict with a named excuse. A change of term decided inside the window by
+    /// the server's own timer — a campaign — carries no receipt and is flagged as
+    /// before, whatever else changed the term in the same window.
+    ///
+    /// # Errors
+    ///
+    /// The first isolation the check by decision time flags whose term changes
+    /// inside the window are not all taken from messages received by its start, in
+    /// that check's words.
+    // PROPOSED(D-050): a term's record carries when the message its step took was
+    // received.
+    pub fn isolation_keeps_the_term_by_cause(&self) -> Result<(), String> {
+        self.isolations
+            .iter()
+            .try_for_each(|&(server, from, until)| {
+                self.isolation_keeps_its_term_by_cause(server, from, until)
+            })
+    }
+
+    /// [`Report::isolation_keeps_the_term_by_cause`] on one isolation: `server` cut
+    /// off from `from` to `until`, one of [`Report::isolations`].
+    ///
+    /// # Errors
+    ///
+    /// The isolation's violation, in the check's words.
+    // PROPOSED(D-050): a term's record carries when the message its step took was
+    // received.
+    pub fn isolation_keeps_its_term_by_cause(
+        &self,
+        server: u64,
+        from: Instant,
+        until: Instant,
+    ) -> Result<(), String> {
+        let verdict = self.isolation_keeps_its_term_by(RecordTime::Decided, server, from, until);
+        if verdict.is_ok() {
+            return verdict;
+        }
+        let changes = self.term_changes_decided_in(server, from, until);
+        let caused_before = !changes.is_empty()
+            && changes
+                .iter()
+                .all(|r| r.received().is_some_and(|received| received <= from));
+        if caused_before { Ok(()) } else { verdict }
+    }
+
+    /// `server`'s term records decided in `(from, until]` that change its term from
+    /// the term record before them, in record order.
+    // PROPOSED(D-050): a term's record carries when the message its step took was
+    // received.
+    fn term_changes_decided_in(
+        &self,
+        server: u64,
+        from: Instant,
+        until: Instant,
+    ) -> Vec<&TraceRecord> {
+        let mut previous = 0;
+        let mut changes = Vec::new();
+        for record in &self.records {
+            let TraceEvent::RaftTerm {
+                server: s, term, ..
+            } = &record.event
+            else {
+                continue;
+            };
+            if *s != server {
+                continue;
+            }
+            if *term != previous && from < record.decided && record.decided <= until {
+                changes.push(record);
+            }
+            previous = *term;
+        }
+        changes
     }
 
     /// The pre-vote check with the server's term records read by `time`: under
@@ -1146,19 +1308,37 @@ impl Report {
     /// its start, read by `time`.
     // D-047: every trace record carries its decision time and its durability time.
     pub fn isolation_keeps_the_term_by(&self, time: RecordTime) -> Result<(), String> {
-        for &(server, from, until) in &self.isolations {
-            if self.reseeding_during(server, from, until) {
-                continue;
-            }
-            let (before, after) = (
-                self.term_by(server, time, from),
-                self.term_by(server, time, until),
-            );
-            if after != before {
-                return Err(format!(
-                    "pre-vote: server {server} raised its term from {before} to {after} while isolated from {from:?} to {until:?}"
-                ));
-            }
+        self.isolations
+            .iter()
+            .try_for_each(|&(server, from, until)| {
+                self.isolation_keeps_its_term_by(time, server, from, until)
+            })
+    }
+
+    /// [`Report::isolation_keeps_the_term_by`] on one isolation: `server` cut off
+    /// from `from` to `until`, one of [`Report::isolations`].
+    ///
+    /// # Errors
+    ///
+    /// The isolation's violation, in the check's words.
+    pub fn isolation_keeps_its_term_by(
+        &self,
+        time: RecordTime,
+        server: u64,
+        from: Instant,
+        until: Instant,
+    ) -> Result<(), String> {
+        if self.reseeding_during(server, from, until) {
+            return Ok(());
+        }
+        let (before, after) = (
+            self.term_by(server, time, from),
+            self.term_by(server, time, until),
+        );
+        if after != before {
+            return Err(format!(
+                "pre-vote: server {server} raised its term from {before} to {after} while isolated from {from:?} to {until:?}"
+            ));
         }
         Ok(())
     }
@@ -1328,7 +1508,9 @@ impl Report {
                         *clocks.restatements.entry(*server).or_default() += 1;
                     }
                 }
-                TraceEvent::RaftTerm { server, term, role } => {
+                TraceEvent::RaftTerm {
+                    server, term, role, ..
+                } => {
                     terms.insert(*server, *term);
                     if !up.contains(server) {
                         up.insert(*server);
@@ -1617,6 +1799,7 @@ impl Report {
                     server: s,
                     term,
                     role,
+                    ..
                 } = &record.event
                 else {
                     continue;
@@ -1649,6 +1832,94 @@ impl Report {
                         at: record.at,
                         deliveries,
                         causes: delivered_at(server, record.decided),
+                    });
+                }
+                previous = *term;
+            }
+        }
+        straddles
+    }
+
+    /// Issue #32's situation (D-050): a change of an isolated server's term whose
+    /// step was decided inside the isolation, in `(from, until]`, and took a
+    /// peer's message the server had received by the isolation's start — a message
+    /// that waited in the inbox behind a persist or an install. The check by
+    /// decision time reads the change inside the window; the check
+    /// [`Report::check`] makes excuses it. Each carries the messages from a server
+    /// delivered to the isolated one at the instant it received the message, as
+    /// (sender, kind, term), so a pin can tie the receipt to the message and not
+    /// only place it before the window, and how many messages from a server were
+    /// delivered to it in `(from, until]`. Isolations the pre-vote check skips are
+    /// skipped here too.
+    // PROPOSED(D-050): a term's record carries when the message its step took was
+    // received.
+    #[must_use]
+    pub fn isolation_received_straddles(&self) -> Vec<ReceivedStraddle> {
+        let sent: BTreeMap<ananke_env::MessageId, SentMessage> = self
+            .raft_messages()
+            .into_iter()
+            .map(|m| (m.id, m))
+            .collect();
+        let mut straddles = Vec::new();
+        for &(server, from, until) in &self.isolations {
+            if self.reseeding_during(server, from, until) {
+                continue;
+            }
+            let mut previous = 0;
+            for record in &self.records {
+                let TraceEvent::RaftTerm {
+                    server: s,
+                    term,
+                    role,
+                    ..
+                } = &record.event
+                else {
+                    continue;
+                };
+                if *s != server {
+                    continue;
+                }
+                if let Some(received) = record.received()
+                    && received <= from
+                    && from < record.decided
+                    && record.decided <= until
+                    && *term != previous
+                {
+                    let deliveries = self
+                        .records
+                        .iter()
+                        .filter(|r| r.at > from && r.at <= until)
+                        .filter(|r| {
+                            matches!(&r.event, TraceEvent::MessageDelivered { from: f, to, .. }
+                                if server_of(*to) == Some(server) && server_of(*f).is_some())
+                        })
+                        .count();
+                    let causes = self
+                        .records
+                        .iter()
+                        .filter(|r| r.at == received)
+                        .filter_map(|r| match &r.event {
+                            TraceEvent::MessageDelivered { id, to, .. }
+                                if server_of(*to) == Some(server) =>
+                            {
+                                sent.get(id)
+                                    .map(|m| (m.from, m.message.kind(), m.message.term()))
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    straddles.push(ReceivedStraddle {
+                        server,
+                        from,
+                        until,
+                        before: previous,
+                        term: *term,
+                        role,
+                        received,
+                        decided: record.decided,
+                        at: record.at,
+                        deliveries,
+                        causes,
                     });
                 }
                 previous = *term;
@@ -2519,6 +2790,37 @@ pub struct TermStraddle {
     pub deliveries: usize,
     /// The messages from a server delivered to it at `decided`, as (sender, kind,
     /// term): what the step that raised the term can have taken.
+    pub causes: Vec<(u64, &'static str, u64)>,
+}
+
+/// A change of an isolated server's term decided inside the isolation from a
+/// message received before it ([`Report::isolation_received_straddles`]).
+// PROPOSED(D-050): a term's record carries when the message its step took was
+// received.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReceivedStraddle {
+    /// The isolated server.
+    pub server: u64,
+    /// When the isolation began.
+    pub from: Instant,
+    /// When it healed.
+    pub until: Instant,
+    /// The server's term on its term record before the change.
+    pub before: u64,
+    /// The term it changed to.
+    pub term: u64,
+    /// The role the change put it in.
+    pub role: &'static str,
+    /// When the server received the message the step took: at or before `from`.
+    pub received: Instant,
+    /// When the step was taken: in `(from, until]`.
+    pub decided: Instant,
+    /// When the change was traced, once durable.
+    pub at: Instant,
+    /// Messages from a server delivered to it in `(from, until]`.
+    pub deliveries: usize,
+    /// The messages from a server delivered to it at `received`, as (sender, kind,
+    /// term): what the step can have taken.
     pub causes: Vec<(u64, &'static str, u64)>,
 }
 
@@ -3542,6 +3844,56 @@ pub fn run_with(seed: u64, schedule: Schedule, variants: impl Into<Variants>) ->
                 advance(&mut sim, *steer, &mut watch);
                 sim.heal();
             }
+            Fault::IsolateOnTermRaise {
+                tries,
+                isolate,
+                quiet,
+            } => {
+                // PROPOSED(D-050): a transfer's campaign raises the third
+                // server's term, and the isolation starts at the end of the slice
+                // its message was delivered in, inside whatever persist the
+                // server was running.
+                for n in 0..*tries {
+                    if watch.stopped.is_some() {
+                        break;
+                    }
+                    let leader = leader_now(&sim);
+                    let target = leader % SERVERS + 1;
+                    let third = target % SERVERS + 1;
+                    {
+                        let env = sim.env(admin);
+                        let inner = env.clone();
+                        let seq = TERM_RAISE_ADMIN + n;
+                        env.spawn("admin", async move {
+                            let Ok(sock) = inner.net().bind(admin_addr(seq)).await else {
+                                return;
+                            };
+                            let request = Request {
+                                client: ADMIN,
+                                seq,
+                                command: Command::Transfer { to: target },
+                            };
+                            let _ = sock.send(server_addr(leader), request.encode()).await;
+                        });
+                    }
+                    if term_raise_delivered(&mut sim, &mut watch, third) {
+                        let side = vec![servers[third as usize - 1]];
+                        let rest: Vec<NodeId> = servers
+                            .iter()
+                            .chain(clients.iter())
+                            .chain(std::iter::once(&admin))
+                            .copied()
+                            .filter(|n| *n != side[0])
+                            .collect();
+                        let from = sim.now();
+                        sim.partition(&side, &rest);
+                        advance(&mut sim, *isolate, &mut watch);
+                        sim.heal();
+                        isolations.push((third, from, sim.now()));
+                    }
+                    advance(&mut sim, *quiet, &mut watch);
+                }
+            }
         }
         last_heal = sim.now();
         advance(&mut sim, *gap, &mut watch);
@@ -3744,6 +4096,74 @@ fn stream_opened(sim: &mut Sim, watch: &mut Watch, victim: u64) -> bool {
             )
         }) {
             return true;
+        }
+    }
+    false
+}
+
+/// Advances the run in slices of [`TERM_RAISE_STEP`] until a message from a server
+/// carrying a term above `victim`'s last traced term is delivered to `victim`, or
+/// [`TERM_RAISE_WAIT_BUDGET`] runs out: the moment [`Fault::IsolateOnTermRaise`]
+/// cuts it off at. A term the victim adopted but has not yet traced still reads as
+/// above, which costs a round its aim and nothing else. As with [`install_landing`],
+/// the safety folds are skipped inside the small slices, the watch reads only the
+/// records since its last look (D-046) and the trace cap still stops a runaway.
+// PROPOSED(D-050): a term's record carries when the message its step took was
+// received.
+fn term_raise_delivered(sim: &mut Sim, watch: &mut Watch, victim: u64) -> bool {
+    if watch.stopped.is_some() {
+        return false;
+    }
+    let mut term = sim
+        .trace()
+        .iter()
+        .rev()
+        .find_map(|r| match &r.event {
+            TraceEvent::RaftTerm { server, term, .. } if *server == victim => Some(*term),
+            _ => None,
+        })
+        .unwrap_or(0);
+    let mut payloads: BTreeMap<ananke_env::MessageId, Bytes> = BTreeMap::new();
+    let mut scanned = sim.trace_len();
+    for record in sim.trace_from(scanned.saturating_sub(2000)).iter().rev() {
+        if let TraceEvent::MessageSent { id, payload, .. } = &record.event {
+            payloads.entry(*id).or_insert_with(|| payload.clone());
+        }
+    }
+    let mut waited = Duration::ZERO;
+    while waited < TERM_RAISE_WAIT_BUDGET {
+        sim.run_for(TERM_RAISE_STEP);
+        waited += TERM_RAISE_STEP;
+        let len = sim.trace_len();
+        if len > TRACE_CAP {
+            watch.stopped = Some(format!(
+                "runaway: {len} trace records by {:?}, over the cap of {TRACE_CAP}",
+                sim.now()
+            ));
+            return false;
+        }
+        let records = sim.trace_from(scanned);
+        scanned += records.len();
+        for record in &records {
+            match &record.event {
+                TraceEvent::MessageSent { id, payload, .. } => {
+                    payloads.insert(*id, payload.clone());
+                }
+                TraceEvent::RaftTerm {
+                    server, term: now, ..
+                } if *server == victim => term = *now,
+                TraceEvent::MessageDelivered { id, from, to, .. }
+                    if server_of(*to) == Some(victim) && server_of(*from).is_some() =>
+                {
+                    if let Some(payload) = payloads.get(id)
+                        && let Ok(frame) = Frame::decode(payload.clone())
+                        && frame.message.term() > term
+                    {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
         }
     }
     false

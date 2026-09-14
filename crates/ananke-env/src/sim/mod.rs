@@ -184,6 +184,24 @@ pub struct TraceRecord {
     pub event: TraceEvent,
 }
 
+impl TraceRecord {
+    /// When the peer's message that the step behind this record took reached its
+    /// node, in global virtual time, for a record that says: a term change taken
+    /// from a message ([`TraceEvent::RaftTerm`]'s `received`). At or before
+    /// [`decided`](Self::decided); `None` for every other record. The stamp is opaque
+    /// to the code under test (D-047) and read here, by the harness, like the
+    /// record's two times.
+    // PROPOSED(D-050): a term's record carries when the message its step took was
+    // received.
+    #[must_use]
+    pub fn received(&self) -> Option<Instant> {
+        match &self.event {
+            TraceEvent::RaftTerm { received, .. } => received.map(Decision::instant),
+            _ => None,
+        }
+    }
+}
+
 /// What the moirae export reads: the configuration, the policy, each node's clock, every
 /// address ever bound, and the records.
 pub(crate) struct Snapshot {

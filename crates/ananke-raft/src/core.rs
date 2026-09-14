@@ -1333,6 +1333,9 @@ impl Raft {
             server: self.id.0,
             term: self.term,
             role: role.name(),
+            // The core has no clock: the server says when the message this step
+            // took was received, as it traces the step (D-050).
+            received: None,
         });
     }
 
