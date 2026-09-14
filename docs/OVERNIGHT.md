@@ -61,6 +61,11 @@ outside C_new, worst completion gap 469 ms against the 2 s bound, slowest write
 after a heal 617 ms. The main sweep at 1000: 4820 partitions, 3165 crashes, 1143
 Figure 8 drivers, 580 refusals, 17 046 lease revocations, 104 174 lease reads.
 
+> Noted 2026-09-14: the 469 ms is this session's thousand-seed figure. At ten
+> thousand seeds the worst completion gap is 549.359683 ms (nightly runs
+> 34749071877 and 34769934684), and SPEC §3 now states the criterion as the
+> ten-timeout bound the check asserts.
+
 **Local runs at 10 000 seeds — two runs so far, both red on the correct server,
 both false positives of one check; the third run is pending (numbers below are
 still the 100-seed ones).**

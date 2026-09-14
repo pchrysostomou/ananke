@@ -4,17 +4,18 @@ ananke is a distributed SQL database written in Rust, built so that every failur
 can have is reproducible. Every source of non-determinism the code touches, disk,
 network, clock, randomness and task scheduling, goes through one `Environment` trait.
 The same code that runs on real machines runs inside a deterministic simulator that
-injects torn writes, lost fsyncs, bit rot, lost directory entries, dropped and delayed
-messages, partitions, clock skew and crashes, under a seed. A bug found on seed 420 is
-seed 420 forever: it replays byte for byte, its trace opens in a visual studio, and it
-becomes a regression test. The simulator's traces and scheduling policies come from
-[moirae](https://github.com/pchrysostomou/moirae), a deterministic-simulation-testing
-framework with a trace replay studio; ananke is moirae's largest consumer and moirae is
-ananke's test harness.
+injects torn writes, lost fsyncs, bit rot, lost directory entries, dropped, duplicated
+and delayed messages, partitions, one-way blocks, clock skew and drift, and crashes,
+under a seed. A failing seed replays byte for byte on the tree that found it, its trace
+opens in a visual studio, and it becomes a regression test that asserts the mechanism it
+was pinned for, since a seed's schedule moves when the code does. The simulator's traces
+and scheduling policies come from [moirae](https://github.com/pchrysostomou/moirae), a
+deterministic-simulation-testing framework with a trace replay studio; ananke is
+moirae's largest consumer and moirae is ananke's test harness.
 
-The project is early. Phase 0 (the runtime and the simulator) is released; Phase 1 (the
-storage engine) is in progress; everything above it is design only. The status table
-below says exactly where things stand.
+Phase 0 (the runtime and the simulator) and Phase 1 (the storage engine) are released.
+Phase 2 (Raft) is complete and waiting for its tag. Everything above it, sharding,
+transactions and SQL, is design only. The tables below say exactly where things stand.
 
 ## Architecture
 
@@ -22,8 +23,8 @@ below says exactly where things stand.
 flowchart LR
   subgraph node["one ananke node (crates/)"]
     direction TB
-    sql["ananke-sql<br/>parser, planner, executor"] --> txn["ananke-txn<br/>MVCC, transactions"]
-    txn --> shard["ananke-shard<br/>ranges, multi-raft"]
+    sql["ananke-sql (planned)<br/>parser, planner, executor"] --> txn["ananke-txn (planned)<br/>MVCC, transactions"]
+    txn --> shard["ananke-shard (planned)<br/>ranges, multi-raft"]
     shard --> raft["ananke-raft<br/>consensus"]
     raft --> storage["ananke-storage<br/>WAL, memtable, SSTables"]
     storage --> env["ananke-env<br/>Environment: clock, fs, net, rng, spawn"]
@@ -37,55 +38,16 @@ flowchart LR
   wtrace --> trace
 ```
 
-Solid today: `ananke-env`, `ananke-storage` up to the memtable, the simulator and the
-bridge. The rest exists as sections of the [SPEC](docs/SPEC.md).
-
-**ananke-env** (released, [crates.io](https://crates.io/crates/ananke-env)). The
-`Environment` trait: `Clock`, `FileSystem` with positional I/O and explicit `sync` and
-`sync_dir`, a message-oriented `Network`, `Rng`, and `spawn`. Two implementations:
-`RealEnv` on tokio, and `Sim` / `SimEnv`, a single-threaded deterministic executor with
-a virtual clock, per-node clock skew and drift, an in-memory network with drops,
-delays, partitions and one-way blocks, an in-memory disk with the whole fault model of
-SPEC §1.3, and a poll budget that turns a busy loop into a failing test. Task order is
-chosen per seed by moirae's uniform or PCT scheduler; every random stream is derived
-from the seed by name. A run's trace exports as a moirae format v2 trace.
-
-**ananke-storage** (in progress). A write-ahead log: segmented, append-only, records
-framed as `len | crc32c | seq | payload`, group commit through one writer task, recovery
-that stops at the first torn record, bad checksum or gap in the numbering and cuts what
-follows. A memtable: a skiplist holding every write since the last flush under its
-key and log sequence number, newest first, applied in sequence order once the log has
-acknowledged. An engine that puts the log in front of the memtable, rotates full
-memtables into an immutable queue, and flushes them to SSTables: 4 KiB blocks with
-prefix-compressed keys and a CRC each, a bloom filter, an index and a versioned
-footer, under a manifest that `CURRENT` names. A store whose `CURRENT` or manifest
-cannot be read is refused, or with an option falls back to the newest older manifest
-whose every table is intact. Log segments are deleted once a
-manifest covers their records; a log whose head is missing is refused rather than
-replayed past. Reads and scans take a
-snapshot, a sequence number, and see the newest write at or below it through one
-merge over every memtable and table. Leveled compaction, levels 0 to 6 at size ratio
-10, merges tables down one level at a time under the same manifest order, drops
-writes no live snapshot can see and tombstones with nothing older below, and runs
-in the flusher's task after each flush or by a manual trigger. Planned in this
-phase: the rest of the `Engine` API.
-
-**ananke-raft, ananke-shard, ananke-txn, ananke-sql** (planned). Raft with pre-vote,
-leader leases bounded by the clock drift the simulator will violate on purpose, joint
-consensus; ranges over multi-raft; snapshot isolation across shards; a SQL layer. None
-of this code exists yet. The design is in [SPEC §3 to §6](docs/SPEC.md).
-
-**ananke-server** (Phase 0 protocol only). The node binary. Today it runs the echo
-protocol from `sim/echo.rs` on real sockets, the same code the simulator runs, plus a
-small checksummed journal that exists so the disk faults have something to bite.
+The design of each layer is a section of the [SPEC](docs/SPEC.md); Raft's is
+[RAFT.md](docs/RAFT.md).
 
 ## How simulation works
 
 Every crate is generic over `E: Environment`. Nothing else in the workspace may call
 `std::time`, `std::fs`, `std::net`, tokio's I/O or timers, `rand`, or spawn a thread:
-clippy's `disallowed-methods` list in `clippy.toml` and a textual second check in CI
-enforce it. Time is `ananke_env::Instant`; hash maps are seeded from the environment's
-random stream so iteration order is part of the seed.
+clippy's `disallowed-methods` list in `clippy.toml` and a textual second check,
+`scripts/check-direct-io.sh`, enforce it. Time is `ananke_env::Instant`; hash maps are
+seeded from the environment's random stream, so iteration order is part of the seed.
 
 Under `Sim`, a scenario adds nodes, spawns their tasks on `sim.env(node)`, and drives
 virtual time with `run_for`, `run_steps`, `crash`, `restart`, `partition` and `heal`.
@@ -94,13 +56,13 @@ The disk model (SPEC §1.3): a write is visible at once and durable only after `
 random prefix of the pending writes survives, the next may survive as a torn prefix,
 one bit per block flips with probability `p_bitrot`, and a random prefix of each
 directory's unsynced creates, removes and renames survives. The network model (SPEC
-§1.4): drops, duplicates that take a delay of their own, delays, symmetric partitions and one-way blocks. The scheduler picks
-which runnable task to poll next, uniformly or with probabilistic concurrency testing,
-per seed.
+§1.4): drops, duplicates with a delay of their own, delays, symmetric partitions and
+one-way blocks. The scheduler picks which runnable task to poll next, uniformly or with
+probabilistic concurrency testing, per seed.
 
 Every state transition that matters is a trace event. This is what the echo scenario's
-seed 42 records when node 3 crashes at 1.1 seconds, from
-`sim/out/echo-42.jsonl`, the fixture the moirae studio's tests pin:
+seed 42 records when node 3 crashes at 1.1 seconds, from `sim/out/echo-42.jsonl`, the
+trace whose hash `sim/tests/echo.rs` pins:
 
 ```jsonl
 {"t":1100000000,"seq":969,"kind":"log","node":3,"event":"ananke.fs.bit-rot","data":{"path":"/echo/journal.prev","block":0,"offset":212,"bit":4}}
@@ -112,91 +74,180 @@ seed 42 records when node 3 crashes at 1.1 seconds, from
 ```
 
 One bit of the node's rotated journal flipped, the last record of its current journal
-lost two of its sixteen bytes, and the rename and create of its last rotation were
-never synced and did not survive: after the restart the node finds `journal.prev`
-with a corrupt record and no `journal` at all. The scenario's checks know exactly
-which of those outcomes the model allows for the journal variant that skips
-`sync_dir`, and that the variant that syncs must never lose an entry.
+lost two of its sixteen bytes, and the rename and create of its last rotation were never
+synced and did not survive. In the Raft scenario a record can also carry `decidedNs`,
+the time the step that produced it was decided, where that came before what it reports
+was durable (D-047).
 
-Every fault-model test runs that pair: a known-buggy variant the sweep must catch and
-a correct one it must pass, under the same seeds. The write-ahead log ships with three
-deliberate bugs (no `sync_dir` on rotation, no checksum at recovery, acknowledge before
-sync) and the engine with one (apply to the memtable before the log); each is caught
-on most seeds, and the correct code passes ten thousand.
+Every fault-model test runs a pair: a known-buggy variant the sweep must catch and the
+correct code it must pass, under the same seeds. The write-ahead log carries three
+deliberate bugs, the engine three, and the Raft core fourteen, thirteen of them with a
+sweep of their own ([RAFT.md §5](docs/RAFT.md)); each sweep prints its catch rates.
 
 ## Status
 
-| Phase | Deliverable | State |
+| Component | State today | Version, tag |
 |---|---|---|
-| 0 | `Environment`, `RealEnv`, `SimEnv`, the fault model, the moirae bridge | Done. Tagged `v0.1.0`; `ananke-env` 0.1.0 on crates.io; [devlog](docs/devlog/00-phase-0.md) |
-| 1 | Storage engine | Done. Tagged `v0.2.0`; `ananke-storage` 0.2.0 on crates.io; [devlog](docs/devlog/01-phase-1.md). WAL (D-018, D-019), memtable and engine (D-020, D-021), SSTables with the manifest and log truncation (D-022), versions, snapshots, scans and leveled compaction (D-023), write batches, unsynced writes and checkpoints (D-024) |
-| 2 | Raft | In progress. The core, codec, state in the engine and log invariants (D-025); the server, the key-value store, the linearizability checker and the sweep with six caught variants (D-026); read-index and lease reads with the drift guard, check quorum and leadership transfer (D-028); membership and snapshots next |
-| 3 | Multi-raft sharding | Not started |
-| 4 | Transactions | Not started |
-| 5 | SQL | Not started |
-| 6 | Security: mTLS, encryption at rest, RBAC, audit log | Not started |
-| 7 | External verification: Jepsen-style harness, fuzzing | Not started |
+| `ananke-env` | Released. The `Environment` trait (`Clock`, `FileSystem` with explicit `sync` and `sync_dir`, a message-oriented `Network`, `Rng`, `spawn`); `RealEnv` on tokio; `Sim` / `SimEnv` with the §1.3 disk and §1.4 network fault models, per-node clock skew and drift, and a poll budget; the moirae format v2 export. Since 0.2.0, unreleased: message duplication, the Raft trace events, and a record's decision time beside its durability time (D-047) | 0.1.0 (`v0.1.0`) and 0.2.0 (`v0.2.0`) on crates.io |
+| `ananke-storage` | Released. The WAL, memtable, SSTables under a manifest, log truncation, versions, snapshots, scans, leveled compaction, write batches, unsynced writes and checkpoints (D-018 to D-024). Since 0.2.0, unreleased: the WAL record header carries its own checksum, a format change (D-027), and a refused engine does no work (D-044) | 0.2.0 (`v0.2.0`) on crates.io |
+| `ananke-raft` | Complete, pending the Phase 2 tag. A pure protocol core with pre-vote, read-index and lease reads with a drift guard, check quorum, leadership transfer, joint-consensus membership changes with learners, and snapshots streamed as resumable chunks of an engine checkpoint; its state in the storage engine; the server as `raft`, `net`, `apply` and `snapshot` tasks; a single-shard key-value store; lost-state refusal and re-seeding (D-025 to D-047). It runs under the simulator; no binary runs it on real sockets yet | Not released; not on crates.io |
+| `ananke-server` | The node binary, Phase 0 protocol only: `ananke-server echo` runs the echo protocol on `RealEnv`, the same code the simulator runs, with a checksummed journal | `publish = false` |
+| `ananke-sim` (`sim/`) | The scenarios `echo`, `wal`, `engine`, `raft` and `membership`, the linearizability checker `lin.rs`, and the parallel sweep driver (D-040) | `publish = false` |
+| `ananke` | A placeholder reserving the name | 0.1.0 and 0.2.0 on crates.io |
+| `ananke-shard`, `ananke-txn`, `ananke-sql` | Planned for Phases 3, 4 and 5. No code exists | None |
 
-Sweeps run `ANANKE_SEEDS` consecutive seeds per scenario: 20 at the pre-commit gate,
-100 in CI on every push, 10 000 every night in release mode with failing traces
-uploaded as artifacts, plus a nightly run of the engine sweep with level limits small
-enough for compaction to reach level 3.
+## Phases
 
-## Bugs the simulator has found so far
+| Phase | Name | Exit criteria, in brief ([SPEC](docs/SPEC.md)) | State |
+|---|---|---|---|
+| 0 | Deterministic runtime (§1) | The echo protocol under partitions with its trace open in the studio; byte-identical traces for one seed, checked in CI; clippy's `disallowed-methods` for all direct I/O | Released, `v0.1.0`. [Devlog](docs/devlog/00-phase-0.md) |
+| 1 | Storage engine (§2) | Random operations and crash points recover to the model's state; 10k seeds green nightly; over 200k writes/s single-threaded as a sanity number | Released, `v0.2.0`. Nightly run 33986588539 on `85b78df`; 299 169 writes/s in unsynced batches of a hundred. [Devlog](docs/devlog/01-phase-1.md) |
+| 2 | Raft (§3) | The five invariants across 10k seeds under the network and disk fault model; 3 → 5 → 3 under partition completes both ways with no gap in completed client operations over ten maximum election timeouts; a devlog post showing a real bug and its trace | Complete, pending its tag. Green at 10 000 seeds in nightly runs 34749071877 on `9b5995d` and 34769934684 on `dc603ea`, with the disk honouring `fsync` (D-026; lost syncs are issue #23); worst membership gap 549.359683 ms against the 2 s bound. Merged to `main` as PR #34; not tagged or published. [Devlog](docs/devlog/02-phase-2.md) |
+| 3 | Multi-raft sharding (§4) | Linearizability across split, merge and rebalance under faults; a 1000-range cluster stays balanced within 10% after node add and remove | Planned |
+| 4 | Transactions (§5) | elle reports no snapshot-isolation anomalies over simulation traces; an injected bug is caught within 100 seeds | Planned |
+| 5 | SQL (§6) | A sqllogictest subset passes; `psql` connects and runs the demo schema | Planned |
+| 6 | Security (§7) | A threat model reviewed against STRIDE; no plaintext user data recoverable from a dumped node disk; the audit chain verifies and a tampered entry is detected | Planned |
+| 7 | External verification (§8) | No exit criteria stated; the section names a Jepsen suite against a real five-node deployment, fuzzing targets and a 24-hour chaos simulation | Planned |
+
+## Bugs the simulator has found
+
+### Phase 1: the storage engine ([devlog](docs/devlog/01-phase-1.md))
 
 - **A hole in the log after a lost fsync** (seed 59, [D-019](docs/DECISIONS.md)). The
-  sync covering the last two records of a segment was lost, the log rotated, the next
-  segment's syncs were honoured, and the crash dropped the pending tail. Recovery read
-  the short segment to its clean end and went on: records 1 to 61, then 63 onward, every
-  checksum valid. Records now carry their sequence number and recovery stops at a gap.
-- **A stale read after out-of-order application** (seed 420, [D-021](docs/DECISIONS.md)).
-  Two writes to one key acknowledged in the same group were applied by their callers
-  newer-first; the memtable rotated between them, and the older write landed in the
-  newer memtable and shadowed the newer one. Found by the first nightly run; writes now
-  apply in sequence order.
-- **An oracle that never saw a lost sync** ([commit 5112a8b](https://github.com/pchrysostomou/ananke/commit/5112a8b)).
-  The harness's model of what the disk owed hard-coded one scenario's directory, so in
-  the engine scenario no sync was ever counted as lost and no bit rot ever matched a
-  stop. The correct engine failed its own sweep, which is how the harness bug surfaced.
+  sync covering the last two records of a segment was lost, the log rotated, and the
+  crash dropped the tail. Recovery read records 1 to 61, then 63 onward, every checksum
+  valid. Records now carry their sequence number and recovery stops at a gap.
+- **An older write shadowed a newer one** (seed 420, [D-021](docs/DECISIONS.md)). Two
+  writes to one key acknowledged in one group were applied newer-first, the memtable
+  rotated between them, and a read returned a value two writes old. Found by the first
+  nightly run; writes now apply in sequence order.
 - **A flipped bit that named an older manifest** ([D-022](docs/DECISIONS.md)). Bit rot
-  turned the `000007` in `CURRENT` into `000003`, the name of a manifest that still
-  existed. Recovery took that manifest as the one in force and removed four newer
-  tables as orphans. `CURRENT` now carries the crc32c of the name it holds, and a
-  `CURRENT` that fails it counts as unreadable and refuses the store.
+  turned `000007` in `CURRENT` into `000003`, a manifest that still existed, and
+  recovery removed four newer tables as orphans. `CURRENT` now carries a crc32c.
+- **A cut that came back** (seed 191, `29f70f8`, D-022). Discarding a log by cutting its
+  first segment to nothing lost that cut's sync, and at the next crash the old records
+  came back numbered as current. The discard now removes the segment files.
 - **A fallback onto deleted tables** (seed 44, [D-022](docs/DECISIONS.md)). `CURRENT`
-  and the two newest manifests were damaged at one crash. Recovery fell back to the
-  newest readable manifest, whose tables a later compaction had deleted, and the
-  store came back empty. Recovery now refuses a store whose `CURRENT` or manifest
-  cannot be read, and with fallback allowed uses only a manifest whose every table is
-  intact.
+  and the two newest manifests were damaged at one crash; recovery fell back to a
+  manifest whose tables a later compaction had deleted, and the store came back empty.
+  Recovery now refuses such a store, or with fallback allowed uses only a manifest whose
+  every table is intact.
+- **The oracle's own bugs.** The harness's model of what the disk owed hard-coded one
+  scenario's directory (`5112a8b`); at seed 7218 it went on treating a segment whose
+  deletion the crash had undone as deleted; at seed 1953 it had no notion of a manifest
+  write still in flight; and at seed 6771 it took the first write of a reused manifest
+  number for the file on disk (`85b78df`). The engine was right each time.
 
-## Quick start
+### Phase 2: Raft ([devlog](docs/devlog/02-phase-2.md))
+
+While the sweep was being built:
+
+- **The network wrote twice** (seed 42, [D-026](docs/DECISIONS.md)). A client request
+  the network duplicated was proposed twice by the leader and a compare-and-set applied
+  twice; the linearizability checker named the key. Leaders now deduplicate by client
+  and sequence number while the entry is in the log. On the same seed, a rotted block
+  under a record the tables already covered made recovery skip the rest of a segment;
+  that stop is now a refusal.
+- **A rotted length read as a torn tail** (seed 16, [D-027](docs/DECISIONS.md)). Bit
+  rot in a synced record's length looked like a write torn at a crash, and a server's
+  applied index went from 81 back to 68. The record header now carries its own checksum.
+
+Found by the tiers above CI's hundred seeds, four real server bugs, three out of the
+nightly's ten thousand (run 34496762339) and the fourth out of the thousand-seed
+premerge once those were fixed:
+
+- **An adoption that was not crash-safe** (seed 6325, [D-041](docs/DECISIONS.md)). The
+  adoption of a staged snapshot install removed the old store before the copies were
+  durable and swept a staging `CURRENT` damaged by bit rot as debris, and the emptied
+  directory opened as a fresh store: a crash inside the adoption left a voter that
+  remembered nothing.
+- **Two snapshot-stream bugs** (seed 5909, [D-043](docs/DECISIONS.md)). Re-takes of a
+  snapshot at one index wrote one shared directory under a stream still reading it, so
+  the stream never completed; and a leader streamed to one follower at a time, so the
+  other designated follower waited behind it. No client write completed after the last
+  heal.
+- **A refusal that did not survive a restart, and a refused engine that kept working**
+  (seed 687, [D-044](docs/DECISIONS.md), the thousand-seed premerge). A server refused
+  its store for lost state, but the refusal lived only in the process, and its engine
+  flushed, rewrote the manifest without the lost table and deleted the log segment that
+  held the evidence. The next restart opened clean, a voter with a hole in its state
+  machine.
+
+Every other seed the ten thousand failed the correct server on was the checker:
+
+- **Rules the checker lacked.** Seed 164, from a local ten-thousand-seed run on
+  `1373601` (the tree of `48e5276`): the timer check read only AppendEntries as contact, and flagged a follower
+  receiving InstallSnapshot chunks of its term (D-030's rule; its account is
+  [D-048](docs/DECISIONS.md)). Seed 385, from a local run on `f54b468` (`635aea0`): a follower
+  campaigned 25 ms past its bound after an install rebuilt its core with a fresh timer,
+  which the check did not model ([D-039](docs/DECISIONS.md)). Seed 7381, from nightly
+  run 34496762339: the snapshot floor only ever rose, so a server re-seeded from an
+  older snapshot was held to its lost store's floor; an installed snapshot now sets it
+  exactly (D-030, provenance in D-048).
+- **Durability time read as decision time** (seeds 1885 and 2023,
+  [D-047](docs/DECISIONS.md)). Nightly run 34711427220 on `14c3e17` failed the correct
+  server on both. A RequestVote of term 10 reached server 1 2.530703 ms before an
+  isolation began, and the term rise, traced once its persist was durable, was stamped
+  48.446 µs inside the window; the pre-vote check read that as a rise while isolated.
+  Every record now carries its decision time beside its durability time, and a check
+  about why a server acted reads the former. At ten thousand seeds, in runs 34749071877
+  and 34769934684, that removed 28 catches and added none: the two correct-server
+  failures, and 26 catches that had inflated known-buggy variants' rates
+  (`ResetTimerOnAnyRpc` 8, `SharedSnapshotDir` 7, `AdoptionAsBuilt` 5,
+  `IgnoreIncarnation` 4, `SnapshotWithoutCurrentLast` 1, `ApplyBeforeCommit` 1).
+
+## How to run
 
 ```sh
 git clone https://github.com/pchrysostomou/ananke && cd ananke
-rustup toolchain install          # installs the toolchain pinned in rust-toolchain.toml
-cargo build --workspace
+rustup toolchain install     # the toolchain pinned in rust-toolchain.toml
 
-scripts/gate.sh                   # rustfmt, clippy, the direct-I/O check, docs, every test; 20 seeds per sweep
-ANANKE_SEEDS=500 cargo test --release -p ananke-sim --test engine    # a longer sweep of the engine
-
-# The three-process echo cluster on real sockets:
-cargo run -p ananke-server -- echo --listen 127.0.0.1:7001 --peers 127.0.0.1:7002,127.0.0.1:7003 --duration-secs 3
+scripts/gate.sh              # rustfmt, clippy, the direct-I/O check, docs, every test and doctest
+scripts/premerge.sh          # every sweep at 1000 seeds in release, catch rates printed
 ```
 
-The echo, WAL and engine tests write their seed-42 traces to `sim/out/*.jsonl`. To open
-one in the moirae studio:
+`scripts/gate.sh` precedes every commit. The sweeps run seeds `0..ANANKE_SEEDS` in
+parallel ([D-040](docs/DECISIONS.md)), in four tiers: 20 at the gate, 100 in CI on pull
+requests and pushes to `main`, 1000 under `scripts/premerge.sh` on your machine before a
+merge, and 10 000 in the nightly workflow on GitHub, the only place ten thousand run,
+which also sweeps the engine at a thousand seeds with levels small enough for compaction
+to reach level 3. Any tier can be run by hand:
 
 ```sh
-npx moirae replay sim/out/engine-42.jsonl
+ANANKE_SEEDS=500 cargo test --release -p ananke-sim --test engine
+cargo test --release -p ananke-sim --test raft membership -- --nocapture   # prints MembershipCoverage
+```
+
+A sweep writes each failing seed's trace to `sim/out/<scenario>-<seed>.jsonl`
+(`write_trace` in `sim/lib.rs`), and the nightly uploads those as artifacts. A seed runs
+the same whichever thread runs it, so to replay one on its own, call its scenario with
+it, as the pinned seeds in `sim/tests/raft.rs` do:
+
+```rust
+let report = ananke_sim::raft::run(5909, ananke_raft::core::Variant::Correct);
+ananke_sim::write_trace("raft-5909", &report.jsonl); // sim/out/raft-5909.jsonl
+report.check().unwrap();
+```
+
+```sh
+cargo test --release -p ananke-sim --test raft seed_5909   # the pins for one seed
+cargo test -p ananke-sim --test raft the_seed_42_trace_is_written_for_the_studio
+npx moirae replay sim/out/raft-42.jsonl                    # open a trace in the moirae studio
+```
+
+The three-process echo cluster on real sockets:
+
+```sh
+cargo run -p ananke-server -- echo --listen 127.0.0.1:7001 --peers 127.0.0.1:7002,127.0.0.1:7003 --duration-secs 3
 ```
 
 ## Further reading
 
 - [docs/SPEC.md](docs/SPEC.md): what each phase builds and how.
+- [docs/RAFT.md](docs/RAFT.md): the Raft variant, its invariants and how the trace checks each, and the known-buggy variants.
 - [docs/DECISIONS.md](docs/DECISIONS.md): why this over that, one entry per decision, never deleted.
-- [docs/BACKLOG.md](docs/BACKLOG.md): where deferred ideas live, which is the issue tracker, by phase.
 - [docs/devlog/](docs/devlog/): one post per phase.
+- [docs/BACKLOG.md](docs/BACKLOG.md): where deferred ideas live, which is the issue tracker, by phase.
 - [CONTRIBUTING.md](CONTRIBUTING.md): the working agreements, for anyone sending a change.
 - [CLAUDE.md](CLAUDE.md): the same agreements as an agent session reads them.
 - [moirae](https://github.com/pchrysostomou/moirae): the simulation framework and studio; `moirae-trace` and `moirae-sched` on crates.io.

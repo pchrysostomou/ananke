@@ -108,7 +108,8 @@ _Update this section at the end of every session._
   caught.
   D: joint consensus with learners first, the configuration in force from the log
   with the `0/2/config` key, one change in flight, the 3→5→3-under-partition
-  scenario (worst availability gap 469 ms against the 2 s bound),
+  scenario (worst availability gap 469 ms against the 2 s bound at 1000 seeds;
+  549.36 ms at 10 000, as SPEC §3 now states the criterion),
   `SingleMajorityInJointConsensus` caught 28/100. E: snapshots as resumable chunked
   streams of `Engine::checkpoint`, the compacted log in the core, the staged
   install committing by CURRENT-last, LostState-refused servers re-seeded under a
@@ -201,15 +202,21 @@ _Update this section at the end of every session._
      (one laptop disk, 2026-09-05). Met in the shape the flag exists for.
 - Last tag: v0.2.0. `ananke`, `ananke-env` and `ananke-storage` 0.2.0 on crates.io.
   Devlog: `docs/devlog/01-phase-1.md`.
-- Next concrete task: the ten-thousand-seed run on `phase-2-decided`, then the
-  owner's review and merge, the nightly green on `main`, and Phase 2's tag and
-  crates.io publish per D-011. Open follow-ups: issue #32 (the pre-vote check: a
+- Merged (2026-09-13): PRs #30, #31 and #34; `main` at cd411b4 has dc603ea's tree,
+  green at ten thousand seeds on `dc603ea` (run 34769934684). SPEC §3's membership
+  criterion is now worded as the ten-timeout bound the check asserts, with the
+  measured worst gap of 549.359683 ms.
+- Next concrete task: the ten-thousand-seed run on `main` (34839613587), which is
+  the tag's evidence, then Phase 2's tag and crates.io publish per D-011. D-049 (a
+  refused follower counts for check quorum only while its re-seed stream makes
+  progress; `RefusedCountsForQuorum`) is in progress on `phase-2-d049` and lands on
+  top with its own run. Open follow-ups: issue #32 (the pre-vote check: a
   message delivered before an isolation but stepped inside it) and issue #33
   (assert the timer catches that decision time removes, not only print them).
   Still unfiled from OVERNIGHT.md's backlog candidates: membership changes and
   snapshots on one schedule, a studio metric for stream health, RAFT.md §5's
   Figure 8 driver touch-up, and an operator mechanism to retire a removed server.
-  Issues #22 (D-031) and #25 (D-046) are resolved on `main` and still open.
+  Issues #22 (D-031) and #25 (D-046) are closed with their resolving commits.
 - Fault-model tests follow the CLAUDE.md pattern: a known-buggy variant the sweep
   must catch beside the correct one it must pass (`Journal::sync_dir_on_rotate`,
   `wal::Variant`).
