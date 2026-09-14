@@ -3628,8 +3628,8 @@ traced one is delivered to it, and cuts that server off alone at the slice's end
 300 ms. A slice ends with nothing runnable, so an idle `raft` task has already taken
 the message before the isolation, which is D-047's straddle, and a busy one takes it
 inside the window, which is this entry's. With eight rounds, measured in release:
-the shape on 5 of 20 seeds and 23 of 100, 8 changes in 136 isolations and 28 in 706,
-beside 122 and 648 of D-047's straddles. The test
+the shape on 5 of 20 seeds, 23 of 100 and 299 of 1 000, 8 changes in 136 isolations,
+28 in 706 and 358 in 7 036, beside 122, 648 and 6 403 of D-047's straddles. The test
 `a_term_change_stepped_inside_an_isolation_from_a_message_received_before_it_is_excused`
 asserts at every tier that the correct
 server passes the whole check on every seed, that the shape is reached on some seed,
@@ -3641,7 +3641,7 @@ RequestVote of term 5 received by server 2 at 3.679125915 s, the isolation from
 3.67913 s, server 2's step 2.176899 ms into it, the check by decision time flagging
 *pre-vote: server 2 raised its term from 4 to 5 while isolated from Instant(3.67913s)
 to Instant(3.97913s)* and the check passing. The pair: `NoPreVote` on the same
-schedule is caught by this check on 20 of 20 and 100 of 100 seeds.
+schedule is caught by this check on 20 of 20, 100 of 100 and 1 000 of 1 000 seeds.
 
 *No schedule moved.* The stamp reads the time under the simulator's lock and nothing
 else, as D-047's does. The echo scenario's pinned body hash is unchanged,
@@ -3695,7 +3695,10 @@ names; `TraceRecord` gains `received()`; the `raft` task's inbox events carry a 
 the raft scenario's JSONL gains `receivedNs` on the term records whose message waited
 for its step; `Fault` gains an arm and `Schedule` a constructor that no sweep draws.
 The echo, WAL and engine traces are unchanged. The check can only remove pre-vote
-catches, never add one. On approval, D-047 gains a forward pointer to this entry and
+catches, never add one. At a thousand seeds (`scripts/premerge.sh` on dbaec73, this
+entry's and D-051's commits, against 94c6a54's) every sweep passed with every rate
+and coverage field unchanged, and every sweep reported 0 catches removed and 0 added;
+the new tests' lines are the only new lines. On approval, D-047 gains a forward pointer to this entry and
 SPEC §1.5's export paragraph a sentence on `receivedNs`; RAFT.md §2 and §3 describe it
 now, marked proposed. Issue #32 closes with this entry's approval.
 
@@ -3761,7 +3764,9 @@ tier*: a removal the gate's twenty seeds see is a removal, and the assertions co
 replay per removed catch, which is rare.
 
 **Consequences.** A removed catch without its reason fails whichever sweep sees it,
-at any tier, including the nightly. D-047's two limits of evidence are closed on
+at any tier, including the nightly. No seed of the first thousand has a removed catch
+under any variant, so the premerge exercises the assertions only through this test;
+the nightly's ten thousand are where the sweeps meet them. D-047's two limits of evidence are closed on
 approval, when D-047 gains its forward pointer; issue #33 closes with it.
 
 ---
