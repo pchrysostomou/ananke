@@ -1049,6 +1049,11 @@ the lease-safety test reports, at every seed count, how many seeds exceeded the
 bound and, of those, how many the guard revoked on and how many read stale without
 it.
 
+**Superseded in part by D-049.** Check quorum no longer counts every response since
+the last check. A refused server's rejection, stamped store incarnation 0, counts
+only in a window in which a chunk of the leader's re-seed stream to that server was
+acknowledged; every other response counts as above.
+
 ---
 
 ## D-029 — Joint-consensus membership changes: the configuration in force, learners first, and one change in flight
@@ -3189,6 +3194,13 @@ about 3 ms, none gaining or losing a gap; at ten thousand seeds the report above
 removed one timer catch and added none. And RealEnv's stamps are the process's
 monotonic clock, comparable only within one process, which is all a log line needs.
 
+**Superseded in part by D-049.** Two of the eleven variant pairs the pin runs,
+`IgnoreIncarnation` on seeds 2509 and 5990, no longer reach the straddle. On each,
+D-049's check quorum steps the leader down before the isolation the straddle was at,
+leaving uncounted a refused follower that D-042's bug keeps it from re-seeding, and the
+run after that step-down is another run; the pin asserts the straddle absent and names
+the step-down. The other nine are asserted as above.
+
 ---
 
 ## D-048 — D-030's account of seeds 164 and 7381 is superseded by the record
@@ -3269,4 +3281,254 @@ rewritten.
 
 ---
 
-_Next entry: D-049. Add one before implementing anything not covered above._
+## D-049 — Check quorum counts a refused follower only while its re-seed progresses
+
+**Context.** Check quorum (D-028, RAFT.md §1) steps a leader down when a minimum
+election timeout passes without answers from a majority, so that a leader cut off from
+its followers stops serving. As built it counted any AppendEntries response of the
+leader's term, whether the entries fitted or not (moirae rule 5). Stage E made one such
+answer different in kind. A refused server (D-030, RAFT.md §3) has no store: it answers
+every AppendEntries, whatever its term and entries, with a rejection carrying echo 0 and
+store incarnation 0 (D-042), and it goes on answering whatever becomes of its re-seed.
+So a leader whose other follower was away kept its office on a refused follower's
+rejections for as long as its re-seed stream to that follower stayed stalled — chunks
+lost, a checkpoint the receiver cannot use, a stream not yet opened — though that
+follower counts for no commit until its install completes. The answers check quorum
+counted no longer said that the leader could reach a majority it could commit with.
+
+The owner decided the rule below. The alternative weighed beside it was to count nothing
+from a refused follower.
+
+**Decision.** A refused follower's rejection counts for check quorum only while the
+leader's re-seed stream to that follower has had a chunk acknowledged within the
+check-quorum window. With no re-seed progress in the window the follower does not count,
+and a leader whose majority needed it steps down. Every site is marked `D-049`.
+
+*The rule in the core.* `Progress` keeps three marks for the window since the last
+check: whether the follower answered from a store (`active`: any AppendEntries response
+but a rejection stamped incarnation 0), whether it answered as a refused server does
+(`refused_answered`: such a rejection), and whether the stream to it had a chunk
+acknowledged (`stream_acked`). The check, `heard_this_window`, counts a follower with the
+first, or with the second beside the third, and clears all three. The window is D-028's,
+`election_ticks.0` ticks of the leader's clock. `RaftQuorumLost` gains `uncounted`, the
+followers that answered in the window only as refused servers and were not counted,
+which the moirae line carries only when it is not empty. A quarantined follower (D-035)
+answers from its store, with echo 0 and its own incarnation, and counts as any follower
+does: the rule is about the refused server's rejection alone.
+
+*The signal.* Chunk acknowledgements go to the `snapshot` task, not the core (RAFT.md
+§1), so the core had no evidence of re-seed progress. The task now marks a follower when
+an acknowledgement takes that follower's stream past the furthest point any
+acknowledgement had taken it, in a set it shares with the `raft` loop. The loop takes the
+set before every tick and steps `Input::SnapshotAcked { to }` into the core for each
+follower in it, each step with its own decision stamp (D-047). The install's answer
+already reaches the core as `Input::SnapshotInstalled`, and marks the stream acknowledged
+too. A mark is a lock and an insert: no event on the inbox, no task woken that would not
+have woken anyway.
+
+*The variants.* `Variant::RefusedCountsForQuorum` counts a refused follower's rejection
+whatever the stream does: the leader as built. `Variant::RefusedNeverCounts` counts
+nothing from a refused follower: the rejected alternative. In one set, the first's
+counting wins.
+
+*The scenario.* `sim/quorum.rs` asks two halves on every seed at every tier, of three
+servers and two clients. A leader takes three hundred puts of 400 bytes, so its
+checkpoint streams in many chunks; a follower is crashed and restarted with its store
+directory's marker saying the store lost state (D-044), so its open is refused on the
+mark on every seed; and the moment the leader opens its re-seed stream to it, the
+leader's other follower is cut off for 1.5 s, fifteen windows. In the *blocked* half the
+same instant puts a path-MTU black hole of 1 024 bytes on the leader-to-refused
+direction, which loses every chunk and passes the heartbeats and their rejections; the
+leader must step down within two windows and three ticks of the cut, by its own clock —
+an acknowledgement in flight at the cut can make the next window count the follower, a
+tick for its delivery and one for the tick that hands it to the core, and one more for
+the check's own — naming the refused follower in `uncounted`. In the *open* half the
+stream runs; the leader must keep its office until the refused follower starts on the
+store its re-seed built, and then commit an entry of its term past its commit index at
+the cut, with no step-down before that commit. Both halves check the invariants, commit
+by majority and linearizability over the trace. The scenario drops no message at random
+and rots no block, since a stream that stalls on loss for a window is a step-down the
+rule asks for; schedules every seed uniformly, since both halves are claims about time
+(D-016); and runs on a disk that takes no time, for the reason under *What the scenario
+found*. `RefusedCountsForQuorum` keeps its office through the blocked half's whole hold,
+and `RefusedNeverCounts` steps down mid-re-seed in the open half and, the re-seeded
+server never voting and the other follower away, commits nothing after the install.
+Measured in release: the correct leader passes both halves on 100 of 100 seeds and on
+1 000 of 1 000, stepping down in the blocked half at most 2.000 windows after the cut at
+a hundred seeds and 2.057 at a thousand, and in the open half seeing the refused
+follower re-seeded at most 7.09 and 7.35 windows after the cut and committing through it
+at most 12.51 and 14.26; `RefusedCountsForQuorum` is caught on 100 of 100 and 1 000 of
+1 000, and `RefusedNeverCounts` on 100 of 100 and 1 000 of 1 000, stepping down at most
+1.995 windows after the cut. Each test asserts the catch on every seed at every tier.
+`crates/ananke-raft/tests/paper.rs` states the rule against the bare core: progress every
+window keeps the office, none steps down within two windows naming the follower,
+progress in one window does not carry into the next, acknowledgements with no rejection
+count nothing, a quarantined follower counts, and each variant does what it names.
+
+*The simulator.* `Sim::limit_frames(from, to, max_len)` loses every frame longer than
+`max_len` bytes on that direction of a link, at its send and at its delivery, until the
+next heal: `LinkLimited` and `LinkUnlimited`, each loss `MessageDropped` with
+`DropReason::Oversized`, and in the moirae export `ananke.link.limited`, `.unlimited` and
+the drop reason `oversized`. A blocked direction could not have blocked the stream alone:
+blocking leader to follower loses the heartbeats and with them the rejections, and
+blocking follower to leader loses the rejections. SPEC §1.4 gains the fault.
+
+*Choices made in implementation.* The owner fixed the rule and left these open; each took
+the conservative reading, for these reasons. **A chunk acknowledged** is an
+acknowledgement that takes the stream past the furthest point any acknowledgement had
+taken that stream: a duplicate, the answer a resend gets and ground covered again after a
+restart are not progress, since none brings the install nearer than it was. **A restart
+from offset 0** does not lower that point, so a stream the receiver started over is
+progress again only once it passes where it had been. A stream opened afresh starts its
+own count: the leader gives a stream up after eight resends fifty milliseconds apart with
+nothing acknowledged, over four windows, by which time a leader that needed the follower
+has already stepped down. **The `Installed` answer counts** as a chunk's acknowledgement:
+it is the receiver's answer to the final chunk, and a checkpoint that fits in one chunk
+has no other, so leaving it out would make every one-chunk re-seed the rejected
+alternative. **The window** is check quorum's own and discrete: the rejection and the
+progress must fall in the same window, and progress does not carry into the next.
+**Progress alone is not an answer**: the rule counts the rejection, so a window with
+acknowledgements and no rejection does not count the follower. **The rejected
+alternative became a variant**, `RefusedNeverCounts`, which the open half catches:
+without a server that fails the open half, nothing shows that half can fail (the pair
+rule, CLAUDE.md). **The random sweep gets no trace check.** A check reading deliveries
+could flag only a leader in office more than three windows after its majority last
+counted — the check's own window, one more for where the leader's windows fall, and one
+for a delivery's way to the core — and at a thousand seeds the correct server's sweep
+left a leader's majority needing a refused follower for more than two windows in 2 of
+1 385 completed re-seeds, and stepped a leader down for such a follower once (seed 350,
+below): too rare for `RefusedCountsForQuorum` to be caught there, and a check would
+assert only what the directed scenario asserts on every seed. **The signal is a shared
+mark, not an inbox event**: an event for each acknowledgement would wake the `raft` task
+on every stream of every seed and move every schedule with a stream in it, where the mark
+moves only the schedules the rule itself changes.
+
+**What the scenario found.** On the sweep's own disk, every operation taking a tenth of a
+millisecond to two, the open half fails on most seeds under the correct server and under
+`RefusedCountsForQuorum` alike: 87 of 100 seeds under each, the same 87, and 827 of 1 000
+under each. Under the leader as built 87 and 822 of those were a step-down with nothing
+uncounted, and under the correct leader 86 and 812, with 1 and 14 naming the refused
+follower where the stream itself stalled for a window on the slow disk. A refused server
+answers nothing at all while it verifies the stream it staged, repairs it, adopts the
+install and opens the store it built: its re-seed loop is busy, and the heartbeats wait
+for the next incarnation. On that disk the silence outlasts a window. On seed 0 the
+refused follower's last rejection reached the leader 75.6 ms after the cut, its
+`Installed` answer at 135.7 ms, its adoption was traced at 197.8 ms and the first answer
+from the re-seeded store arrived at 267.7 ms; the leader stepped down at 219.2 ms with
+nothing uncounted. No way of counting a refused follower's answers covers a follower that
+sends none, so the leader loses its office in that silence under the rule as built, the
+rule decided and the rule rejected, and with the re-seeded server never voting nothing
+commits until the other follower returns. That is the re-seed's own cost, not this rule's:
+the halves are asked on a disk that takes no time, and
+`on_the_sweeps_disk_the_install_silence_deposes_the_leader_under_either_count` prints the
+figures above and asserts from a hundred seeds that the silence still deposes the leader
+as built.
+
+**Alternatives.** *Nothing from a refused follower counts.* Rejected, because it leaves a
+cluster leaderless mid-re-seed whenever the leader's other follower is away. The figures
+are measured on this tree; the earlier throwaway script's were not used. The measure is
+`raft::Report::reseed_episodes`, which the correct server's sweep prints as `re-seed
+episodes (D-049)`:
+`ANANKE_SEEDS=1000 cargo test --release -p ananke-sim --test raft the_correct_server_passes_every_seed -- --nocapture`.
+An episode runs from the first rejection stamped incarnation 0 that a follower answered a
+leader with in its term to that follower's `Installed` answer, or to the end of the
+leader's tenure. Each completed episode is measured as if the other follower had been
+away for the whole of it, against twenty evenly spaced placements of the leader's
+check-quorum windows, since where its windows fall is its own ticks' business: the share
+of placements in which a window lying inside the episode finds nothing to count is the
+chance the leader would have stepped down in it, and the sum of those shares is the
+expected number of step-downs. Over 1 000 seeds, 1 420 episodes, 1 385 of them completed,
+with a median length of 2.56 windows and a longest of 56.6: counting nothing from the
+refused follower, an expected 1 167.75 of the 1 385 re-seeds would have lost the leader,
+and 934 certainly, being longer than two windows, which holds a whole one; under the rule
+decided, an expected 248.25, certainly in the 3 whose stream took over two windows to be
+acknowledged at all and the 120 with a gap over two windows between acknowledgements;
+under the rule as built, an expected 100.50. Over 100 seeds: 149 episodes, 144 completed,
+median 2.62 windows and longest 27.4; expected step-downs 124.15 counting nothing, 102
+certain; 28.15 under the rule decided, with 0 and 16 certain; 12.40 as built. So the
+rejected rule loses the leader on some five re-seeds in six whenever the other follower is
+away for them, and the decided one on some one in six, where the rule as built loses it
+on one in fourteen, in windows in which even a rejection did not arrive. That the cost
+needs the other follower away is the configuration's, not the sweep's: this sweep left a
+leader's majority needing the refused follower for more than two windows in 2 of the
+1 385 completed re-seeds (seeds 194 and 263, both kept by the rule decided), and in 0 of
+the 144 at a hundred seeds; the directed scenario builds it on every seed.
+
+*A progress horizon longer than the window* — an earlier prototype counted progress for
+forty-five ticks — keeps a leader through a stalled stream for up to four windows more:
+not the rule. *An acknowledgement counting as an answer on its own*: the rule counts the
+rejection. *Counting the `Installed` answer as contact through the adoption that follows*:
+a leader kept in office through a silence by an answer that came before it, the rule
+stretched past its text, and a way of hiding the silence's cost measured above. *An inbox
+event for each acknowledgement*, and *a trace check on the random sweep*: above.
+*Leaving the refusal to the disk's rot*: a refusal left to rot lands on some seeds and not
+others, and each half is asserted on every seed.
+
+**Consequences.** What the rule gives up: a leader kept alive by a re-seed stream is a
+leader that cannot commit until the install completes. With its other follower away it
+holds its office while the stream runs and serves no write, and its clients wait on it
+rather than being told to look elsewhere; in the open half the install and the first
+commit through the re-seeded follower came up to 7.35 and 14.26 windows after the cut at
+a thousand seeds. And a leader whose stream stalls for a window, or has not yet opened,
+steps down, where the leader as built stayed in office: with the re-seeded server never
+voting (D-035), no leader forms until the other follower returns — the expected 248.25
+against 100.50 above.
+
+`Progress` carries two more flags, the core one more input, `RaftQuorumLost` one more
+field and the simulator one more fault; the `snapshot` task and the `raft` loop share a
+set of followers. Nothing moves on a run whose leader never leaves a refused follower
+uncounted. Measured against the tree before this entry (`origin/main`, cd411b4, whose
+code is dc603ea's), every trace of the correct server over the first hundred seeds is
+byte-identical, and so is every pinned seed's trace under the server its pin runs, but
+two: `IgnoreIncarnation` on seeds 2509 and 5990. Over a thousand seeds, per seed, the
+traces that differ are exactly the runs with a step-down leaving a refused follower
+uncounted: 1 of 1 000 under the correct server, 64 under `IgnoreIncarnation`, 6 under
+`SharedSnapshotDir`; in each, the first differing record is that step-down.
+
+The rates and coverage, against the hundred-seed run of cd411b4 and the thousand-seed
+premerge of dc603ea: at a hundred seeds every rate and every coverage field is unchanged
+but one, `IgnoreIncarnation`'s refused follower re-seeded and applying again on 69 seeds,
+from 67; the correct server's coverage gains `step_downs_uncounting_refused: 0`. At a
+thousand seeds every catch rate is unchanged. Three things moved, each by a seed the rule
+stepped a leader down on. The correct server's coverage moved by seed 350 alone: leader 3
+of term 8 had server 1 silent in the adoption of a live-store install and server 2
+refused at 16.417 s after a crash of the refusal storm; server 2's first refused rejection
+arrived at 16.429 s, before the leader had opened a stream to it, and the check at
+16.431 s stepped the leader down with server 2 uncounted, where the leader as built kept
+its office. From that step-down the run differs, and it passes: `quorum_losses` 4 720
+from 4 719, `step_downs_uncounting_refused` 1, and — the rest of that run — `duplicates`
+442 693 from 442 742, `drops` 479 548 from 479 593, `commits` 1 015 357 from 1 015 410,
+`applies` 1 380 651 from 1 380 708, `snapshots_taken` 38 439 from 38 440,
+`snapshot_resumes` 65 114 from 65 115, `snapshot_versions_deleted` 34 941 from 34 942,
+`snapshot_streams_at_once` 695 from 696, `compactions` 35 381 from 35 383,
+`progress_resets` 2 403 from 2 404, `puts` 299 858 from 299 870, `deletes` 81 026 from
+81 030, `cas` 121 271 from 121 273, `completed` 798 296 from 798 313, `abandoned`
+146 185 from 146 168 and `redirected` 393 135 from 393 017; every other field is
+unchanged. `IgnoreIncarnation`'s re-seeded follower applying again rose to 649 from 637:
+its leader keeps a stale match for a refused follower and so never re-seeds it (D-042),
+and with the other follower away its check quorum now steps it down, on 64 seeds; a new
+leader rebuilds its progress at `matched: 0` and re-seeds the follower, which it did on 15
+of those seeds that had no completed re-seed before, and 3 lost theirs. Its catch stays 0
+with 0 progress resets. `SharedSnapshotDir`'s aimed re-take arm reached its stream on 152
+seeds, from 151, on seed 648 of its 6 moved seeds; its catch stays 1, seed 680, and its
+re-takes at an index already taken 532. The membership scenario, the lease trials, the
+incremental checker's equivalence, the engine and WAL sweeps and every other variant's
+rate and coverage are unchanged, and the scenario tests and the sweep-disk measurement are
+new lines.
+
+The pinned seeds: every pin passes at twenty, a hundred and a thousand seeds. Seeds 42,
+164, 385, 7381, 6325 (correct and `AdoptionAsBuilt`), 5909 (correct, each of its two
+variants and the pair), 680 (correct, each single and the pair), 687 (correct and
+`RefusalNotDurable`), 1885, 2023, and the eleven variant straddles but two, run
+byte-identical traces, so each pin's mechanism assertion holds as it was audited. The two
+are `IgnoreIncarnation`'s seeds 2509 and 5990 in
+`the_nightlys_eleven_variant_catches_of_the_trace_timestamp_gap_are_not_catches`: on
+2509 leader 2 of term 12 steps down at 14.547925798 s leaving server 3 uncounted, on 5990
+leader 3 of term 11 at 13.944738313 s leaving server 2, each before the isolation its
+straddle was at, and neither run reaches a straddle now. The pin asserts the straddle
+absent and that step-down as the reason, and D-047 carries the forward pointer. The echo
+scenario's golden hash is unchanged, `19f19201df99a799`.
+
+---
+
+_Next entry: D-050. Add one before implementing anything not covered above._

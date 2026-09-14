@@ -4,7 +4,7 @@ _Status: approved 2026-09-05, with the lease section rewritten as approved. Each
 implementation stage turns its part into a DECISIONS.md entry as it lands: A and B on
 2026-09-05 and 2026-09-06 (D-025, D-026, D-027), C on 2026-09-06 (D-028), D on
 2026-09-08 (D-029, with D-032 and D-033), E on 2026-09-09 (D-030, with D-035 to
-D-038); the entries since are D-039 and D-041 to D-047. This document describes the
+D-038); the entries since are D-039 and D-041 to D-049. This document describes the
 server as those entries leave it._
 
 **A stated assumption.** Raft's safety argument here assumes the disk is honest about
@@ -72,7 +72,8 @@ install into a live store, and drawn afresh, never 1, for a store a re-seed rebu
 `AppendEntriesResponse` and `InstallSnapshotResponse` carry the responder's, 0 from a
 refused server, which has no store. A leader records the number each follower's
 `AppendEntriesResponse` carries, and the one an `Installed` answer carries; chunk
-acknowledgements go to the snapshot task, which does not read the number. The first
+acknowledgements go to the snapshot task, which does not read the number and tells the
+core only that a stream progressed (D-049). The first
 answer only records. An answer carrying a different one resets that follower's progress before the answer is otherwise processed —
 `match_index` to 0, `next_index` to one past the leader's last index, the pipeline, the
 probe and any snapshot designation cleared, traced `RaftProgressReset` — and the leader
@@ -197,7 +198,12 @@ last file rather than from zero. Eight resends give the stream up; a receiver th
 to start over has the stream restarted from its first byte, twice, and at the third
 such ask the leader counts the checkpoint as unusable. A stream's identity is its
 sender, the leader's term and the snapshot's last index and term, and a change of any
-of them, a new leader's stream included, starts the receiver's staging over (D-030). A
+of them, a new leader's stream included, starts the receiver's staging over (D-030). An
+acknowledgement that takes a stream past the furthest point any acknowledgement had
+taken it is that stream's progress, and the task marks the follower for the core, which
+reads the marks before each tick; a duplicate, the answer a resend gets and ground a
+restart covers again are not progress, and the `Installed` answer, which acknowledges
+the final chunk, is (D-049). A
 stream opens the newest complete version of the index the core asked for — complete
 meaning the checkpoint's own `CURRENT` is there, since the record precedes the
 checkpoint and may name a take still in flight — and reads that version for its whole
@@ -257,10 +263,20 @@ nothing compares timestamps from two nodes except the lease guard above, which i
 built to. Check quorum runs on the leader's ticks: every minimum election timeout it
 asks whether a majority answered since the last time, and steps down
 (`RaftQuorumLost`) if not, so a leader on the wrong side of a partition stops serving
-within two of them. A server whose timer fires while it cannot lead — not a voter of
-its configuration in force (D-033), or on a re-seeded store (D-035) — draws a new
-timeout and stays a follower. A server that switches to an installed store starts its
-new incarnation with a freshly drawn timeout, as a restart does (D-039).
+within two of them. A follower that answered from a store counts. A refused server's
+rejection (§3) counts only in a window in which a chunk of the leader's re-seed stream
+to it was acknowledged, the `Installed` answer included: a refused server answers every
+AppendEntries whatever becomes of its re-seed, so its rejections say it is alive, not
+that the leader is getting anywhere with it. A leader whose majority needs a refused
+follower whose stream made no progress in a window steps down, naming the follower in
+the step-down's `uncounted`; and a leader kept in office by a re-seed stream cannot
+commit through that follower until its install completes (D-049). A refused server
+answers nothing at all while it verifies, repairs and adopts the install it staged, so a
+leader whose majority needs it can lose its office in that silence under any counting,
+which is the re-seed's own cost (D-049). A server whose timer fires while it cannot lead
+— not a voter of its configuration in force (D-033), or on a re-seeded store (D-035) —
+draws a new timeout and stays a follower. A server that switches to an installed store
+starts its new incarnation with a freshly drawn timeout, as a restart does (D-039).
 
 ## 2. The five invariants and how the trace checks each
 
@@ -280,7 +296,7 @@ events, each recorded with its node and two times (D-047):
 | `RaftSnapshot` | a snapshot is taken or installed | `last_index`, `last_term`, `taken` |
 | `RaftRead` | a read is served | `index`, `lease` |
 | `RaftLeaseRevoked` | the guard revoked a lease | `follower`, `offset_moved` |
-| `RaftQuorumLost` | a leader stepped down for want of a majority | `term` |
+| `RaftQuorumLost` | a leader stepped down for want of a majority | `term`, `uncounted`: the refused followers whose rejections went uncounted for want of re-seed progress (D-049) |
 | `RaftTransfer` | a leader sent TimeoutNow | `to` |
 | `RaftRecovered` | a server starts on what its store held | `term`, `applied`, `last_index`, `incarnation` |
 | `RaftProposed` | a leader made a client's request an entry | `client`, `seq`, `index`, `term` |
@@ -422,7 +438,8 @@ sim/lin.rs          the linearizability checker
 
 **The pure core.** `core.rs` is a state machine with no I/O, in the shape of raft-rs's
 `RawNode`: `Raft::step(&mut self, input) -> Outputs`, where an input is a message from
-a peer, a tick, a proposal, a read request or a completed persist or apply, and the
+a peer, a tick, a proposal, a read request, a completed persist or apply, or a snapshot
+stream's progress or end, and the
 outputs are a list of `Send(to, Message)`, `Persist(PersistBatch)`, `Apply(through:
 Index)`, `ReadReady(request, index)` and `Snapshot(take | install)`. The core is where
 Figure 2 lives and where the paper's scenarios are unit tests without a simulator. It
@@ -485,7 +502,9 @@ is before it adopts an install or opens its store, and it answers every AppendEn
 whatever its term and entries, with a rejection carrying the request's term and
 previous index, a hint of 1, an echo of zero, so no lease promise or read confirmation
 is measured from it, and store incarnation 0, since it has no store (D-042). That
-rejection is how a leader learns the server needs a re-seed. A leader that recorded
+rejection is how a leader learns the server needs a re-seed. It is a sign of life and
+not of a store: check quorum counts it only in a window in which a chunk of the
+leader's stream to the server was acknowledged (§1, D-049). A leader that recorded
 another incarnation for it forgets its progress (§1, D-042), and the hint moves the
 leader's next index for it back to 1: a leader whose log is compacted then feeds it the
 snapshot (§1), and one whose log is not sends an AppendEntries whose previous index is
@@ -568,12 +587,15 @@ across leaders need client sessions (thesis §6.3), issue #21.
 proposal), so that rule 3 and D1 are testable. A per-scenario clock configuration that
 sets drift beyond `drift_bound` for the lease runs. Nothing else for the faults:
 partitions, delay, loss, crashes with the disk model, and crashes between polls are
-already there. The sweep later needed three more things of the environment: a read of
+already there. The sweep later needed four more things of the environment: a read of
 the simulated disk's durable namespace, `Sim::durable_names`, which aims a crash at an
 adoption's first durable change (D-041); a copy of the trace from a given record on,
 `Sim::trace_from`, which lets a fault driver and the incremental checker read only the
-records since their last look (D-044, D-046); and a decision time on every trace
-record beside its durability time (§2, D-047).
+records since their last look (D-044, D-046); a decision time on every trace
+record beside its durability time (§2, D-047); and a frame-length limit on one direction
+of a link, `Sim::limit_frames`, a path-MTU black hole that loses a stream's chunks and
+passes its heartbeats and their rejections, which the check-quorum re-seed scenario
+blocks a stream with (D-049).
 
 ## 4. The linearizability checker
 
@@ -631,10 +653,15 @@ other variant must be caught by the named check on some seeds, at every tier unl
 window is thinner than the gate's twenty seeds show: `AdoptionAsBuilt` and
 `RefusalNotDurable` assert their catch from the hundred-seed tier (D-041, D-044), and
 `SharedSnapshotDir` asserts its liveness catch only at the nightly's ten thousand
-(D-043, D-047); each of their tests asserts at every tier that its fault fired. `IgnoreIncarnation`'s test asserts at every tier
-that the variant was injected and, from a hundred seeds, that the sweep reached the
-state its wedge is built on (D-042). Each test prints its catch rate. A variant the
-sweep does not catch is a hole in the sweep, not a variant to delete.
+(D-043, D-047); each of their tests asserts at every tier that its fault fired.
+`RefusedCountsForQuorum` and `RefusedNeverCounts` are caught by the directed re-seed
+scenario, `sim/quorum.rs`, which builds their situation on every seed and is asserted to
+catch each on every seed at every tier; the random sweep reaches it too rarely to
+catch either, once in a thousand seeds (D-049).
+`IgnoreIncarnation`'s test asserts at every tier that the variant was injected and, from
+a hundred seeds, that the sweep reached the state its wedge is built on (D-042). Each
+test prints its catch rate. A variant the sweep does not catch is a hole in the sweep,
+not a variant to delete.
 
 | Variant | The rule it breaks | What catches it | Needs |
 |---|---|---|---|
@@ -654,6 +681,8 @@ sweep does not catch is a hole in the sweep, not a variant to delete.
 | `IgnoreIncarnation` | §1: a leader forgets a follower's progress when its store incarnation changes (D-042); the variant records the incarnation and never resets | the liveness check, were the wedge to stall a commit where the bound is asked (the configuration under Needs is not): a re-seeded follower below the match its leader recorded is never counted again while that leader leads. Caught on 4 of 10 000 seeds before D-047 (nightly run 34711427220) and on 0 of 10 000 after it (runs 34731272921 and 34749071877); D-047 moved no schedule, so the drop is itself evidence that the four were timing artefacts of the pre-vote check, as D-047 measured each directly | a follower refused and re-seeded below the match its leader recorded, while the third server is unavailable; after the last heal a server is unavailable only by refusal, and a refused server beside a re-seeded one is where §2 does not ask the liveness bound (D-035) |
 | `SharedSnapshotDir` | §1: every take its own version, a stream pinned to one, and a stream to every designated follower at once (D-043); the variant rewrites one directory per index under whatever stream reads it and streams to one follower at a time | the liveness check: a take lands on the directory a live stream reads, that stream never completes, and a second designated follower waits behind it with no entries, so neither follower counts and nothing commits. Only the liveness check's catches count: a linearizability search that exhausts its budget proves nothing (D-047) | a take at an index a live stream is reading, which no fault forces; `Fault::RetakeUnderStream`, on one seed in four, builds the shape around it: a designated follower's stream running while the leader's other follower is cut off |
 | `RefusalNotDurable` | §3: a refusal is marked in the store directory before anything else, and a refused engine does no work (D-044); the variant keeps the refusal in the process alone and its engine flushing | state machine safety: a server restarts on a store its refused engine flushed into self-consistency, a `RaftRecovered` after a `RaftRefused` with no install between, whose applied index its log does not hold | `Fault::CrashRefused`, on every seed: three to five rounds, each crashing the victim inside a memtable flush it has begun or, when it already sits refused, sixty to a hundred and sixty milliseconds into the round, and restarting it (D-044) |
+| `RefusedCountsForQuorum` | §1: a refused follower's rejection counts for check quorum only in a window in which the leader's re-seed stream to it had a chunk acknowledged (D-049); the variant counts it whatever the stream does, the leader as built | the re-seed scenario's blocked half: with the leader's other follower cut off and the stream to the refused one lost to a path-MTU black hole, the leader keeps its office through the whole hold where the correct leader steps down within two windows and three ticks | a follower refused and being re-seeded while the leader's other follower is away, which `sim/quorum.rs` builds on every seed: the refusal made by the store's lost mark at a restart, the other follower cut off the moment the leader opens the stream |
+| `RefusedNeverCounts` | the same rule from the other side: nothing from a refused follower counts, the alternative D-049 rejected | the re-seed scenario's open half: the leader steps down mid-re-seed and, the re-seeded server never voting (D-035) and the other follower away, commits nothing after the install, where the correct leader keeps its office and commits | the same, with the stream open, on a disk that takes no time, since on the sweep's the refused server's silence while it repairs and adopts deposes the leader under any counting |
 
 The checks about time in §2 are bounds, not properties: a client write within ten
 maximum election timeouts of the last heal, and an election within two of a server's

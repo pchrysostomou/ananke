@@ -1566,30 +1566,31 @@ struct Coverage {
 }
 
 /// The re-seed episodes the correct server's sweep ran (D-049,
-/// `raft::Report::reseed_episodes`): the evidence D-049 records against
-/// counting nothing from a refused follower. Every figure but the first two is a
-/// count of completed episodes with a stretch longer than two check-quorum windows
-/// of the leader's clock, which holds a whole window: a stretch in which a leader
-/// whose majority needed the refused follower would have stepped down.
+/// `raft::Report::reseed_episodes`): the evidence D-049 records against counting
+/// nothing from a refused follower. Every figure is over completed episodes, as if
+/// the leader's other follower had been away for each. The expected step-downs are
+/// sums of each episode's share of window placements that find a window with
+/// nothing to count; the counts over two windows are stretches that hold a whole
+/// window whatever the placement.
 #[derive(Debug, Default)]
 struct ReseedEpisodes {
     episodes: usize,
     completed: usize,
-    /// The whole episode: where counting nothing from the follower deposes.
+    expected_step_downs_as_built: f64,
+    expected_step_downs_correct: f64,
+    expected_step_downs_counting_nothing: f64,
+    /// The whole episode over two windows: certain to depose a leader counting
+    /// nothing from the follower.
     longer_than_two_windows: usize,
-    /// The wait for the stream's first acknowledgement: where the correct leader
-    /// deposes too, having no progress to count.
+    /// The wait for the stream's first acknowledgement over two windows: certain
+    /// to depose the correct leader too.
     waiting_for_the_stream_over_two_windows: usize,
-    /// A gap between two acknowledgements: where the correct leader deposes
-    /// mid-stream.
+    /// A gap between two acknowledgements over two windows: certain to depose the
+    /// correct leader mid-stream.
     progress_gap_over_two_windows: usize,
-    /// No other server answering from a store: where this sweep actually left the
-    /// leader's majority needing the refused follower.
+    /// No other server answering from a store for over two windows: where this
+    /// sweep itself left a leader's majority needing the refused follower.
     only_contact_over_two_windows: usize,
-    /// Of those, the episodes whose whole stretch of progress, the wait included,
-    /// stayed within one window: where the correct leader kept an office a leader
-    /// counting nothing from the follower would have lost.
-    only_contact_over_two_windows_kept_by_progress: usize,
     median_length_windows: f64,
     longest_length_windows: f64,
 }
@@ -1604,16 +1605,14 @@ impl ReseedEpisodes {
             }
             self.completed += 1;
             lengths.push(episode.length_windows);
+            self.expected_step_downs_as_built += episode.deposed_as_built;
+            self.expected_step_downs_correct += episode.deposed_correct;
+            self.expected_step_downs_counting_nothing += episode.deposed_counting_nothing;
             self.longer_than_two_windows += usize::from(episode.length_windows > 2.0);
             self.waiting_for_the_stream_over_two_windows +=
                 usize::from(episode.before_stream_windows > 2.0);
             self.progress_gap_over_two_windows += usize::from(episode.progress_gap_windows > 2.0);
-            if episode.only_contact_windows > 2.0 {
-                self.only_contact_over_two_windows += 1;
-                self.only_contact_over_two_windows_kept_by_progress += usize::from(
-                    episode.before_stream_windows <= 1.0 && episode.progress_gap_windows <= 1.0,
-                );
-            }
+            self.only_contact_over_two_windows += usize::from(episode.only_contact_windows > 2.0);
         }
     }
 

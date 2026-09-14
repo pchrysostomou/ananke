@@ -2087,24 +2087,29 @@ impl Report {
     /// first: its step-down, its crash, or its election in a later term. Messages
     /// are read in the order they were delivered to the leader, at their delivery.
     ///
-    /// Each episode's figures are in check-quorum windows of the leader's clock
-    /// (its minimum election timeout at its own rate), and each is a stretch in
-    /// which some counting rule hears nothing from the refused follower, so that a
-    /// stretch longer than two windows holds a whole window and deposes a leader
-    /// whose majority needs that follower: the whole episode, for a leader that
-    /// counts nothing from a refused follower; the wait for the stream's first
-    /// acknowledgement and the longest gap between two of its acknowledgements, the
-    /// install's answer included, for the correct leader. And one stretch that is
-    /// not a rule's but the run's: the longest in which no other server answered the
-    /// leader from a store, the refused follower being its only contact.
+    /// Each episode is measured against three ways of counting the refused
+    /// follower for check quorum, as if the leader's other follower had been away
+    /// for the whole episode: the leader as built, which counts its rejections; the
+    /// correct leader, which counts a rejection only in a window in which a chunk
+    /// of the stream was acknowledged, the install's answer included; and a leader
+    /// counting nothing from it. For each, the share of [`EPISODE_PHASES`] evenly
+    /// spaced placements of the leader's check-quorum windows in which some window
+    /// lying wholly inside the episode would have found nothing to count — the
+    /// chance the leader would have stepped down in it, since where its windows
+    /// fall is its own ticks' business. Windows are the minimum election timeout by
+    /// the leader's clock. Beside those, the stretches the three differ on, in
+    /// windows: the episode's length, the wait for the stream's first
+    /// acknowledgement, the longest gap between two acknowledgements; and one that
+    /// is the run's rather than a rule's, the longest stretch in which no other
+    /// server answered the leader from a store, the refused follower being its only
+    /// contact.
     #[must_use]
     pub fn reseed_episodes(&self) -> Vec<ReseedEpisode> {
         struct Open {
             term: u64,
             start: Instant,
-            first_ack: Option<Instant>,
-            last_ack: Option<Instant>,
-            progress_gap: Duration,
+            rejections: Vec<Instant>,
+            acks: Vec<Instant>,
             last_other: Instant,
             only_contact: Duration,
         }
@@ -2113,18 +2118,46 @@ impl Report {
             .into_iter()
             .map(|m| (m.id, m))
             .collect();
-        let windows = |leader: u64, global: Duration| -> f64 {
+        let rate = |leader: u64| -> f64 {
             let ppm = self.schedule.drifts[usize::try_from(leader - 1).expect("a server")];
-            global.as_secs_f64() * (1.0 + ppm as f64 / 1_000_000.0) / ELECTION_MIN.as_secs_f64()
+            1.0 + ppm as f64 / 1_000_000.0
         };
         let close = |episodes: &mut Vec<ReseedEpisode>,
                      (leader, follower): (u64, u64),
                      episode: Open,
                      end: Instant,
                      completed: bool| {
-            let only_contact = episode
-                .only_contact
-                .max(end.duration_since(episode.last_other));
+            let windows = |d: Duration| d.as_secs_f64() * rate(leader) / ELECTION_MIN.as_secs_f64();
+            let window = ELECTION_MIN.div_f64(rate(leader));
+            let within = |at: &[Instant], from: Instant, to: Instant| {
+                let first = at.partition_point(|&t| t < from);
+                at.get(first).is_some_and(|&t| t < to)
+            };
+            let deposed = |counts: &dyn Fn(bool, bool) -> bool| -> f64 {
+                let mut deposed = 0u32;
+                for phase in 0..EPISODE_PHASES {
+                    let mut check = episode.start
+                        + window.mul_f64(f64::from(phase) / f64::from(EPISODE_PHASES))
+                        + window;
+                    while check <= end {
+                        let from = check - window;
+                        let rejected = within(&episode.rejections, from, check);
+                        let acked = within(&episode.acks, from, check);
+                        if !counts(rejected, acked) {
+                            deposed += 1;
+                            break;
+                        }
+                        check += window;
+                    }
+                }
+                f64::from(deposed) / f64::from(EPISODE_PHASES)
+            };
+            let gaps = episode
+                .acks
+                .windows(2)
+                .map(|pair| pair[1].duration_since(pair[0]))
+                .max()
+                .unwrap_or(Duration::ZERO);
             episodes.push(ReseedEpisode {
                 leader,
                 term: episode.term,
@@ -2132,16 +2165,24 @@ impl Report {
                 start: episode.start,
                 end,
                 completed,
-                length_windows: windows(leader, end.duration_since(episode.start)),
+                length_windows: windows(end.duration_since(episode.start)),
                 before_stream_windows: windows(
-                    leader,
                     episode
-                        .first_ack
+                        .acks
+                        .first()
+                        .copied()
                         .unwrap_or(end)
                         .duration_since(episode.start),
                 ),
-                progress_gap_windows: windows(leader, episode.progress_gap),
-                only_contact_windows: windows(leader, only_contact),
+                progress_gap_windows: windows(gaps),
+                only_contact_windows: windows(
+                    episode
+                        .only_contact
+                        .max(end.duration_since(episode.last_other)),
+                ),
+                deposed_as_built: deposed(&|rejected, _| rejected),
+                deposed_correct: deposed(&|rejected, acked| rejected && acked),
+                deposed_counting_nothing: deposed(&|_, _| false),
             });
         };
         let mut tenures: BTreeMap<u64, u64> = BTreeMap::new();
@@ -2150,9 +2191,7 @@ impl Report {
         for record in &self.records {
             let ended = match &record.event {
                 TraceEvent::RaftLeader { server, term, .. } => {
-                    let ended = tenures.insert(*server, *term).map(|_| *server);
-                    tenures.insert(*server, *term);
-                    ended
+                    tenures.insert(*server, *term).map(|_| *server)
                 }
                 TraceEvent::RaftTerm { server, role, .. } if *role != "leader" => {
                     tenures.remove(server).map(|_| *server)
@@ -2188,15 +2227,17 @@ impl Report {
                     ..
                 } if *answered == term => {
                     if !*success && *incarnation == 0 {
-                        open.entry((m.to, m.from)).or_insert(Open {
-                            term,
-                            start: at,
-                            first_ack: None,
-                            last_ack: None,
-                            progress_gap: Duration::ZERO,
-                            last_other: at,
-                            only_contact: Duration::ZERO,
-                        });
+                        open.entry((m.to, m.from))
+                            .or_insert(Open {
+                                term,
+                                start: at,
+                                rejections: Vec::new(),
+                                acks: Vec::new(),
+                                last_other: at,
+                                only_contact: Duration::ZERO,
+                            })
+                            .rejections
+                            .push(at);
                         continue;
                     }
                     for ((leader, follower), episode) in &mut open {
@@ -2216,11 +2257,7 @@ impl Report {
                     let Some(episode) = open.get_mut(&key) else {
                         continue;
                     };
-                    if let Some(last) = episode.last_ack {
-                        episode.progress_gap = episode.progress_gap.max(at.duration_since(last));
-                    }
-                    episode.first_ack.get_or_insert(at);
-                    episode.last_ack = Some(at);
+                    episode.acks.push(at);
                     if *status == message::SnapshotStatus::Installed {
                         let episode = open.remove(&key).expect("an open episode");
                         close(&mut episodes, key, episode, at, true);
@@ -2512,8 +2549,13 @@ pub struct RetakeUnderStream {
     pub installed_after: bool,
 }
 
+/// How many placements of a leader's check-quorum windows
+/// [`Report::reseed_episodes`] tries on each episode.
+pub const EPISODE_PHASES: u32 = 20;
+
 /// One re-seed episode a leader ran ([`Report::reseed_episodes`], D-049). The
-/// figures are in check-quorum windows of the leader's clock.
+/// stretches are in check-quorum windows of the leader's clock; the shares are of
+/// [`EPISODE_PHASES`] placements of those windows.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ReseedEpisode {
     /// The leader.
@@ -2528,8 +2570,7 @@ pub struct ReseedEpisode {
     pub end: Instant,
     /// Whether the install's answer ended it.
     pub completed: bool,
-    /// From the first refused rejection to the end: what a leader that counts
-    /// nothing from a refused follower hears nothing from it in.
+    /// From the first refused rejection to the end.
     pub length_windows: f64,
     /// From the first refused rejection to the stream's first acknowledgement, or
     /// to the end when none came.
@@ -2540,6 +2581,15 @@ pub struct ReseedEpisode {
     /// The longest stretch in which no other server answered the leader from a
     /// store.
     pub only_contact_windows: f64,
+    /// The share of placements in which a leader counting the refused follower's
+    /// rejections, as built, would have found a window inside the episode with
+    /// nothing to count.
+    pub deposed_as_built: f64,
+    /// The same for the correct leader, which counts a rejection only beside an
+    /// acknowledgement in its window.
+    pub deposed_correct: f64,
+    /// The same for a leader counting nothing from a refused follower.
+    pub deposed_counting_nothing: f64,
 }
 
 /// A leader's stale progress for a refused follower ([`Report::stale_progress`]).
