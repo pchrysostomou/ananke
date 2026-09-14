@@ -3701,4 +3701,69 @@ now, marked proposed. Issue #32 closes with this entry's approval.
 
 ---
 
-_Next entry: D-051. Add one before implementing anything not covered above._
+## PROPOSED D-051 — A removed catch is asserted against the isolation or the flag it names
+
+**Context.** Issue #33, D-047's two limits of evidence. Every raft sweep reports, per
+seed, the catches that reading decision time removed (`Report::moved_by_decision_time`).
+For a removed pre-vote catch the sweep asserted only that the run held *some* term
+rise straddling *some* isolation's start; for a removed timer catch it asserted
+nothing and printed the flagged server's decisions straddling the flag. The one timer
+catch the nightlies removed, `ResetTimerOnAnyRpc` on seed 5153, was checked by hand.
+
+**Decision.** Both are assertions in `sim/tests/raft.rs`'s `checked`, which every raft
+sweep runs at every tier, the nightly's ten thousand included. Every site is marked
+`PROPOSED(D-051)`.
+
+*A removed pre-vote catch.* Its words name an isolation. `Report::isolation_named_by`
+finds the isolation whose own verdict under the check by durability time is those
+words exactly (`Report::isolation_keeps_its_term_by`, one isolation's verdict), and
+the sweep asserts a term change of that server straddling that isolation's start —
+decided before `from` and traced in `[from, until]` (D-047,
+`isolation_term_straddles`), or received by `from` and decided in `(from, until]`
+(D-050, `isolation_received_straddles`) — with the same server, `from` and `until`. A
+removed catch whose words name no isolation fails the sweep too.
+
+*A removed timer catch.* It must be the timer replay's first gap by durability time,
+in its words (`TimerGap::violation`, which the check now formats through), and the
+flagged server must have a record that the replay by decision time counts as a reset
+of its clock, decided at or before the flag and traced at or after it, and traced
+later than it was decided (`Report::timer_resets_straddling`). The replay now hands
+each reset it makes, with its record, to a callback (`Report::timer_resets_by`), so
+the assertion reads the check's own resets rather than a list kept beside it.
+
+*Choices the issue left.* **Traced at or after the flag**, not strictly after: the flag
+is the first record past the bound, and a reset traced at the same instant later in
+record order is replayed after it by durability time — seed 5153's granted vote is
+exactly that, traced 0 ns after the flag. **Traced later than decided**: a reset whose
+two times are one instant is replayed at the same place under both readings and cannot
+have moved the verdict. **Only resets the replay counts**: the issue's list, a
+campaign, a granted vote, a step-down, an AppendEntries of the server's term, is what
+the replay counts; a term adopted as a follower is not a reset, so on seed 5153 the
+straddling `RaftTerm` the old print showed is not the reason and the `RaftVote` is.
+
+*The evidence.* `the_nightlies_removed_catches_meet_the_sweeps_assertions` runs the 28
+pairs that nightly runs 34749071877 and 34852980174 printed as removed — 27 pre-vote
+catches and seed 5153's timer catch — through `checked` on this tree, with the
+nightlies' words. 26 are removed here in those words, each matched as above and each
+run passing the check; the timer catch is matched to server 2's granted vote, decided
+2.564751 ms before the flag and traced at it. `IgnoreIncarnation` 2509 and 5990 are in
+the first run only and no longer reach their catch since D-049's step-down (D-047's
+amendment); the test asserts that neither removes it, so the day either does, the
+assertion runs on it. Both assertions were seen to bite: comparing against another
+isolation fails all 25 pre-vote pairs, and requiring a reset traced strictly after the
+flag fails seed 5153.
+
+**Alternatives.** *Parsing the isolation's instants out of the words*: `Instant`'s
+`Debug` is a display format, and matching the isolation by its own verdict needs no
+parse. *Keeping a second list of resets beside the replay*: two copies of the rule
+drift apart, the fault D-046 and D-047 each avoid. *Asserting only at the nightly's
+tier*: a removal the gate's twenty seeds see is a removal, and the assertions cost a
+replay per removed catch, which is rare.
+
+**Consequences.** A removed catch without its reason fails whichever sweep sees it,
+at any tier, including the nightly. D-047's two limits of evidence are closed on
+approval, when D-047 gains its forward pointer; issue #33 closes with it.
+
+---
+
+_Next entry: D-052. Add one before implementing anything not covered above._

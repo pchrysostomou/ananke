@@ -1395,18 +1395,16 @@ impl Report {
     // D-047: every trace record carries its decision time and its durability time.
     fn timers_fire_by(&self, time: RecordTime) -> Result<(), String> {
         let mut first = None;
-        self.replay_timers(TimerResets::ALL, time, |gap| {
-            first = Some(gap);
-            ControlFlow::Break(())
-        });
-        match first {
-            None => Ok(()),
-            Some(TimerGap {
-                server, since, at, ..
-            }) => Err(format!(
-                "timers: server {server} heard from no leader of its term and granted no vote since {since:?} and had not campaigned by {at:?}"
-            )),
-        }
+        self.replay_timers(
+            TimerResets::ALL,
+            time,
+            |gap| {
+                first = Some(gap);
+                ControlFlow::Break(())
+            },
+            |_, _| {},
+        );
+        first.map_or(Ok(()), |gap| Err(gap.violation()))
     }
 
     /// The timer check's replay, with the reset arms `resets` names switched on,
@@ -1428,11 +1426,17 @@ impl Report {
     /// so no bound is measured past a reset the server had already made. Records
     /// recorded as they happen — deliveries, sends, crashes, restatements — have one
     /// time and the same place under both.
-    fn replay_timers(
-        &self,
+    ///
+    /// `reset` is handed every reset of a server's clock the replay makes, with the
+    /// record that made it, in the replay's order (issue #33).
+    // PROPOSED(D-051): a removed catch is asserted against the isolation or the flag it
+    // names.
+    fn replay_timers<'a>(
+        &'a self,
         resets: TimerResets,
         time: RecordTime,
         mut gap: impl FnMut(TimerGap) -> ControlFlow<()>,
+        mut reset: impl FnMut(u64, &'a TraceRecord),
     ) {
         // A server measures its timeout by its own clock: a slow one takes longer
         // in global time, and the bound scales with its rate.
@@ -1551,6 +1555,9 @@ impl Report {
                 }
                 _ => {}
             }
+            for server in clocks.reset_now.drain(..) {
+                reset(server, record);
+            }
             for server in &up {
                 if leaders.contains(server) || reseeded.contains(server) {
                     continue;
@@ -1667,6 +1674,19 @@ pub struct TimerGap {
     pub restatements: usize,
 }
 
+impl TimerGap {
+    /// The timer check's words for this gap.
+    #[must_use]
+    // PROPOSED(D-051): a removed catch is asserted against the isolation or the flag it
+    // names.
+    pub fn violation(&self) -> String {
+        format!(
+            "timers: server {} heard from no leader of its term and granted no vote since {:?} and had not campaigned by {:?}",
+            self.server, self.since, self.at
+        )
+    }
+}
+
 /// The per-server clocks of the timer replay, and what arrived since each reset
 /// that the replay's arms did not count as one.
 #[derive(Default)]
@@ -1674,6 +1694,8 @@ struct TimerClocks {
     last_reset: BTreeMap<u64, Instant>,
     installs: BTreeMap<u64, usize>,
     restatements: BTreeMap<u64, usize>,
+    /// The servers the record being replayed reset, for the replay's `reset`.
+    reset_now: Vec<u64>,
 }
 
 impl TimerClocks {
@@ -1681,6 +1703,7 @@ impl TimerClocks {
         self.last_reset.insert(server, at);
         self.installs.remove(&server);
         self.restatements.remove(&server);
+        self.reset_now.push(server);
     }
 }
 
@@ -1708,11 +1731,76 @@ impl Report {
     #[must_use]
     pub fn timer_gaps_by(&self, resets: TimerResets, time: RecordTime) -> Vec<TimerGap> {
         let mut gaps = Vec::new();
-        self.replay_timers(resets, time, |gap| {
-            gaps.push(gap);
-            ControlFlow::Continue(())
-        });
+        self.replay_timers(
+            resets,
+            time,
+            |gap| {
+                gaps.push(gap);
+                ControlFlow::Continue(())
+            },
+            |_, _| {},
+        );
         gaps
+    }
+
+    /// Every reset of a server's election clock that the timer check's replay makes
+    /// with the arms `resets` names and the records read by `time`, as (server, the
+    /// record that reset it), in the replay's order (issue #33).
+    #[must_use]
+    // PROPOSED(D-051): a removed catch is asserted against the isolation or the flag it
+    // names.
+    pub fn timer_resets_by(
+        &self,
+        resets: TimerResets,
+        time: RecordTime,
+    ) -> Vec<(u64, &TraceRecord)> {
+        let mut found = Vec::new();
+        self.replay_timers(
+            resets,
+            time,
+            |_| ControlFlow::Continue(()),
+            |server, record| found.push((server, record)),
+        );
+        found
+    }
+
+    /// How a timer catch the check by durability time made at `flag` on `server`
+    /// can have been removed by reading decision time (D-047, issue #33): the
+    /// records the check's replay by decision time counts as a reset of `server`'s
+    /// clock, decided at or before the flag and traced at or after it, later than
+    /// they were decided. By durability time each is replayed past the flag, so the
+    /// flag stood; by decision time each resets the clock by the flag. A removed
+    /// timer catch with none of these was removed for a reason the entry does not
+    /// give.
+    #[must_use]
+    // PROPOSED(D-051): a removed catch is asserted against the isolation or the flag it
+    // names.
+    pub fn timer_resets_straddling(&self, server: u64, flag: Instant) -> Vec<&TraceRecord> {
+        self.timer_resets_by(TimerResets::ALL, RecordTime::Decided)
+            .into_iter()
+            .filter(|&(s, r)| s == server && r.decided <= flag && flag <= r.at && r.decided < r.at)
+            .map(|(_, r)| r)
+            .collect()
+    }
+
+    /// The isolation a pre-vote violation of the check by `time` names: the first of
+    /// [`Report::isolations`] whose own verdict under that check is `violation`,
+    /// word for word (issue #33).
+    #[must_use]
+    // PROPOSED(D-051): a removed catch is asserted against the isolation or the flag it
+    // names.
+    pub fn isolation_named_by(
+        &self,
+        time: RecordTime,
+        violation: &str,
+    ) -> Option<(u64, Instant, Instant)> {
+        self.isolations
+            .iter()
+            .copied()
+            .find(|&(server, from, until)| {
+                self.isolation_keeps_its_term_by(time, server, from, until)
+                    .is_err_and(|e| e == violation)
+            })
     }
 
     /// Seed 164's situation: a follower past its timer bound on AppendEntries alone
