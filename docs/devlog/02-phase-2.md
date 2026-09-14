@@ -19,13 +19,16 @@ duplication, reordering, delay, clock skew and drift, partitions, one-way blocks
 crashes with the disk fault model, the disk honouring `fsync` as Raft's safety argument
 assumes (D-026), checked against the log invariants of the
 paper's Figure 3, folds of the rules behind them, lease safety under drift, and a
-Wing-Gong linearizability checker over the clients' history. The core carries fourteen
-deliberately broken variants, thirteen of them with a sweep of their own.
+Wing-Gong linearizability checker over the clients' history. The core carries sixteen
+deliberately broken variants: thirteen with a sweep of their own, D-049's two with a
+directed scenario that builds their situation on every seed, and one checked against the
+bare core.
 
 This post is about what the sweep taught me about itself: the thousand-seed tier went
 green and ten thousand found what it could not reach; pinned seeds went on passing after
 they had stopped reaching anything; a family of catches was the checker reading a
-record's durability time as its decision time; and my diagnosis of one seed was wrong.
+record's durability time as its decision time; my diagnosis of one seed was wrong; and
+when an argument changed a rule of check quorum, the sweep measured how far it held.
 
 ## Seed 42: the network wrote twice
 
@@ -187,9 +190,10 @@ success. It went uncounted for the reason D-043's Context had already given, des
 snapshot-fed and queued behind server 2's scrambled stream, so D-043's two bugs alone
 explain 5909 and the stale `matched` was a second cause that never occurred. Seed 680
 agrees: `SharedSnapshotDir` alone fails it with the byte-identical message the pair gives.
-Over seeds 0..999 in release the pair is caught on 1 of 1000, seed 680,
+Before D-049, over seeds 0..999 in release, the pair was caught on 1 of 1000, seed 680,
 `SharedSnapshotDir` alone on the same seed, `IgnoreIncarnation` alone on 0, and the pair
-on 0 seeds that neither single catches. The pair has no sweep and has not run at ten
+on 0 seeds that neither single catches; D-049 has moved some of those schedules since, and
+only seed 680 has been re-checked. The pair has no sweep and has not run at ten
 thousand.
 
 The diagnosis was mine, and the error was one of method: I read the trace for a story that
@@ -207,22 +211,74 @@ reaches the stale state and its pin asserts it; no seed has failed on it. D-045'
 stands because before it no run could put two bugs in one server; at a thousand seeds it
 has not yet caught anything a single variant misses.
 
+## D-049: a rule changed by an argument, then measured
+
+Check quorum steps a leader down when a minimum election timeout passes without answers
+from a majority, and a refused server, having no store, rejects every AppendEntries
+whatever becomes of its re-seed. The question raised was a three-server cluster: a leader
+with one follower refused and the other cut off stays leader on those rejections while it
+cannot commit. The owner's first instruction was that "a refused follower's rejections
+must NOT count toward check quorum — it cannot help commit anything, so counting it lets a
+leader keep leadership it cannot use." I pushed back with a three-server case from the
+other side. Counting nothing steps down, mid-stream, a leader that is re-seeding a refused
+follower while the third server is away; a re-seeded server never votes (D-035), so nobody
+can be elected until the third server returns. (The re-seed scenario later showed the
+install itself still completes; what stops is every commit.) The session I made that case
+in left no transcript, and this is the owner's account of it; D-049 records the case as
+the owner's reason for rejecting the first rule. The owner withdrew it and approved the
+one D-049 records: a refused follower's rejection counts only while the leader's re-seed
+stream to it has had a chunk acknowledged within the window. The rule changed there, on
+the argument.
+
+What the argument could not say was how often it was right, and D-049's first version
+said more than its measure did. The measure, `Report::reseed_episodes`, re-measured from
+the tree with an earlier throwaway script's numbers discarded, scores every completed
+re-seed in the correct server's sweep as if the third server had been away for the whole
+of it. Over the 1 372 at a thousand seeds, counting nothing would have deposed the leader
+before the install on an expected 84.4 %, 69.0 % certainly, the decided rule on 23.9 % and
+the leader as built on 7.3 %; over 13 435 at ten thousand (run 34852980174), 84.0 %,
+23.9 % and 7.9 %. Carried on through the adoption, the same measure gives 98.0 %, 91.9 %
+and 91.2 % (97.3 %, 91.2 % and 90.5 % at ten thousand): a refused server answers nothing
+while it verifies, repairs and adopts, 115 to 373 ms over a thousand seeds of the re-seed
+scenario on the sweep's disk against a 100 ms window, and that silence deposes the leader
+on 91 % to 98 % of those re-seeds whichever way its answers are counted. That is issue
+#37. The first version of D-049 counted acknowledgements the leader does not count as
+progress, which put the decided rule at about 18 % where the corrected measure gives
+23.9 %; it stopped the measure at the `Installed` answer; and it put the case against
+counting nothing as holding whenever the other follower is away. An independent verifier
+found all three, and the entry was corrected before it merged. What changed the decision was an argument about a case. What made it a
+decision the project can stand behind was the measurement: it says the argument holds
+during the stream, by how much, and how little of that survives the adoption.
+
 ## What the sweep is now
 
-Run 34749071877, on `9b5995d`; the code on this branch differs from it only in comments,
-two message strings, one test name and docs. The correct server passed all 10 000 seeds
-through 53 953 partitions, 113 224 crashes, 31 580 refusals, 188 189 snapshot installs
-and 10 148 606 commits. The variants: `SendBeforePersist` 10 000, `NoPreVote` 9 999,
-`TruncateOnEveryAppend` 9 995, `ApplyBeforeCommit` 8 902, `CountOlderTermForCommit`
-4 413, `ResetTimerOnAnyRpc` 3 462, `SnapshotWithoutCurrentLast` 3 303,
-`SingleMajorityInJointConsensus` 2 720, `AdoptionAsBuilt` 646, `RefusalNotDurable` 132,
-and `SharedSnapshotDir` 6, 4 by liveness and 2 linearizability searches out of budget,
-which prove nothing. `IgnoreIncarnation` is caught on 0, with its precondition reached on
-6 257 seeds, and its sweep asserts the bug is injected. Drift exceeded 1000 ppm on 5 023
-seeds; the lease guard revoked on all of them, and without it a stale read was served on
-472. The Phase 1 variants in the same run: `NoWalBeforeMemtable` 9 825,
+Run 34885583684, on `4044b7b`, the release commit. The correct server passed all 10 000
+seeds through 53 953 partitions, 113 246 crashes, 31 593 refusals, 188 206 snapshot
+installs and 10 149 501 commits. The variants: `SendBeforePersist` 10 000, `NoPreVote`
+9 999, `TruncateOnEveryAppend` 9 995, `ApplyBeforeCommit` 8 902,
+`CountOlderTermForCommit` 4 415, `ResetTimerOnAnyRpc` 3 465, `SnapshotWithoutCurrentLast`
+3 302, `SingleMajorityInJointConsensus` 2 720, `AdoptionAsBuilt` 646, `RefusalNotDurable`
+133, and `SharedSnapshotDir` 6, 4 by liveness and 2 linearizability searches out of
+budget on seeds 1262 and 7222, which prove nothing.
+`IgnoreIncarnation` is caught on 0, with its precondition reached on 6 353 seeds, and its
+sweep asserts the bug is injected. `RefusedCountsForQuorum` is caught on all 10 000 seeds
+of the re-seed scenario's blocked half, where the stream to the refused follower is lost,
+and `RefusedNeverCounts` on all 10 000 of its open half, where the stream runs; the
+correct leader passes both halves on every seed. Drift exceeded 1000 ppm on 5 023 seeds;
+the lease guard revoked on all of them, and without it a stale read was served on 472.
+The Phase 1 variants in the same run: `NoWalBeforeMemtable` 9 825,
 `ReleaseBeforeManifest` 6 482, `DeleteBeforeManifest` 5 893, `AckBeforeSync` 10 000,
 `NoChecksum` 9 744, `NoSyncDir` 9 150.
+
+Before D-049, run 34749071877 on `9b5995d` counted 113 224 crashes, 31 580 refusals,
+188 189 installs and 10 148 606 commits, caught `CountOlderTermForCommit` on 4 413,
+`ResetTimerOnAnyRpc` on 3 462, `SnapshotWithoutCurrentLast` on 3 303 and
+`RefusalNotDurable` on 132, and reached `IgnoreIncarnation`'s precondition on 6 257; every
+other figure above but D-049's two variants was the same, `SharedSnapshotDir`'s two
+exhausted searches on the same seeds included. Reading
+decision time removed 26 catches on the release commit where it had removed 28: on
+`IgnoreIncarnation`'s seeds 2509 and 5990, D-049's check quorum steps the leader down
+before the isolation the straddle was at, and their pin asserts the straddle absent.
 
 A thousand seeds, the tier a branch merges on, took 7 min 26 s when D-046 made the safety
 re-check incremental, down from 29 minutes. Ten thousand run nightly on GitHub.
@@ -236,26 +292,34 @@ SPEC §3 names three.
   [run 34749071877](https://github.com/pchrysostomou/ananke/actions/runs/34749071877)
   on `9b5995d`, and on run 34731272921 on `bd93ed3` before it, with one exception to
   "full": the disk honours `fsync` (D-026). Torn writes, bit rot and lost directory
-  entries stay on; lost syncs are issue #23. Main was green again at ten thousand seeds
-  on `cd411b4` (run 34839613587), and with D-049 on `a8656e8` (run 34852980174).
+  entries stay on; lost syncs are issue #23. At ten thousand seeds `main` was green again
+  on `cd411b4` (run 34839613587) and with D-049 on `a8656e8` (run 34852980174), the tree
+  of `main` at `94c6a54`; the release commit, `4044b7b`, is green too (run 34885583684).
 - **Membership change from 3 → 5 → 3 nodes under partition.** Met as SPEC §3 now words
   it. The criterion first asked for no availability loss beyond one election timeout,
   which was an aim, not a bound: under drops, delays, pre-vote rounds, split votes and a
   leader stepping down outside C_new, a change of leader is not bounded by one timeout.
-  The check asserts what the correct server holds on every seed, ten maximum election
-  timeouts, 2 s (D-029). The change completes both ways on all 10 000 seeds, and the
-  worst gap is 549.36 ms.
+  The check asserts the bound the correct server holds: no gap between completed client
+  operations, the time inside the partition windows taken out, longer than ten maximum
+  election timeouts, 2 s, on every uniformly scheduled seed (D-016, D-029). The change
+  completes both ways on all 10 000 seeds, and the worst gap over the 5 000 uniformly
+  scheduled ones is 549.36 ms, in runs 34749071877 and 34885583684.
 - **Devlog post showing a real bug found and its trace.** This post. The failing traces
   of 5909, 6325 and 7381 are run 34496762339's artifacts, kept until 2026-12-09.
 
 ## What is open
 
+- **Issue #37.** A refused server answers nothing while it verifies, repairs and adopts
+  its re-seed, so a leader whose majority needs it usually steps down, on 91 % to 98 % of
+  re-seeds whichever way its answers are counted, and with the re-seeded server never
+  voting nothing commits until the third server returns. D-049 measured that cost; nothing removes it yet.
 - **Issue #32.** A term-raising message delivered before an isolation but stepped inside
   it, behind a persist or an install, is decided inside the window, and the pre-vote
   check would still flag it. No correct-server seed of the ten thousand has.
 - **Issue #33.** A timer catch that decision time removes is printed, not asserted, and a
   removed pre-vote catch is asserted only to share its run with a straddle, not matched
-  to its own isolation. Seed 5153 was checked by hand.
+  to its own isolation. Seed 5153 was checked by hand. PR #41, not merged, proposes D-050
+  and D-051 for this issue and #32; neither is decided.
 - **Issue #23.** The sweep's disk honours `fsync` because Raft's safety argument assumes
   it, and a refused server waits for a snapshot. Protocol-aware recovery (Alagappan et
   al.) would repair a store from the other replicas instead.
