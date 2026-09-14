@@ -918,6 +918,16 @@ what was durable reads the durability time or the records' order. The order of
 execution above stands: a step's trace events follow its persist, so the trace
 says what is durable.
 
+**Superseded in part by D-030.** The refused server above, which "never binds its
+socket, and takes part in nothing" until stage E re-seeds it, is not the server
+stage E built. Under D-030 a refused server runs in re-seed mode (RAFT.md §3): it
+binds its socket and answers every AppendEntries with a rejection asking from
+index 1, the ask on which a leader designates it snapshot-fed (D-037's trigger);
+it grants nothing, serves nothing, and takes only its own re-seed, the
+`InstallSnapshot` stream it assembles and installs. The refusal stands: every way
+of losing state listed above is still a `LostState` refusal traced `RaftRefused`,
+and D-044 makes it durable.
+
 ---
 
 ## D-027 — The WAL record header carries its own checksum
@@ -1262,6 +1272,17 @@ Applies stall for the duration of a take (D-036). Checkpoint directories
 accumulate until a GC exists. The re-seed path makes a refusal recoverable, at
 the price of a quarantined voter (D-035), and the sweep asserts a refused server
 comes back and applies again across a hundred seeds.
+
+**Superseded in part by D-048.** The account above of seed 164, and of where seed
+7381 came from, is D-048's. Seed 164 came from a local ten-thousand-seed run on
+1373601, not the GitHub nightly, and was the raft sweep's first correct-server
+failure at ten thousand seeds, not the first the sweep ever produced; server 2 was
+about sixty-eight entries behind, not two hundred; and no leader was reaching it in
+the stretch the check flagged: server 3 had lost its quorum at 12.936 s, and the 21
+chunks server 2 received in that stretch were the deposed leader's leftover stream.
+Seed 7381 was not of the same run: it came from the nightly, run 34496762339 on
+ea6fe7d. The rules this stanza records stand as built: the timer check's
+InstallSnapshot arm and the exact snapshot floor.
 
 ---
 
@@ -2706,6 +2727,20 @@ bit — so composing two variants introduces no third server to document. And th
 bit numbering is an implementation detail, because it is persisted nowhere; if
 it ever reaches a trace or a frame, that is a new decision.
 
+**Correction.** The Consequences' "the question is now asked at every tier and
+printed" does not hold, and did not at 42ab4b5, the commit that wrote it. The pair
+`{IgnoreIncarnation, SharedSnapshotDir}` has no sweep: in `sim/tests/raft.rs`
+`Variants::of` appears only in two pinned seeds,
+`seed_680_pins_the_combined_variant_and_the_stream_half_alone_catches_it_too`,
+which asserts the pair's liveness catch on seed 680 and that `SharedSnapshotDir`
+alone fails the seed with the byte-identical message, and
+`seed_5909_passes_under_both_bugs_together_which_is_the_finding`, which asserts
+the pair passes seed 5909. No tier sweeps the pair or prints a rate for it: every
+tier, the nightly's ten thousand included, runs it on those two seeds alone. The
+next sentence above, that the combined variant is pinned rather than asserted
+over a sweep tier, is the accurate one, and RAFT.md §5 states it that way. The
+mechanism and the pins stand.
+
 ---
 
 ## D-046 — The sweep's safety re-check keeps its state
@@ -3223,6 +3258,14 @@ failed at ten thousand seeds on 2026-09-05, in run 33967250798 on 5112a8b. And s
 corrected in place, with a note pointing here. Seed 164's schedule has since moved
 away from the situation — a different leader is elected after its 9.691 s
 partition — and its pin asserts the situation absent.
+
+**Superseded in part by the owner's ruling of 2026-09-14.** The Decision's "carries
+no pointer" and the Alternatives' rejection of a forward pointer on D-030 no longer
+hold. The owner ruled that an accepted entry superseded in part gets a forward
+pointer, never an edit, and D-030 now carries one pointing here, as D-026 carries
+one to D-030 and D-045 a correction of its own Consequences. The account of seeds
+164 and 7381 above stands, and so does the rule that accepted text is not
+rewritten.
 
 ---
 

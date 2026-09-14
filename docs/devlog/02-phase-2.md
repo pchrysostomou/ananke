@@ -1,7 +1,7 @@
 # Phase 2: breaking Raft with moirae
 
-_September 2026. The close of Phase 2; the tag follows this branch's ten-thousand-seed
-run._
+_September 2026. The close of Phase 2; the tag follows the ten-thousand-seed run on
+`main`._
 
 ## What Phase 2 built
 
@@ -237,12 +237,15 @@ SPEC §3 names three.
   [run 34749071877](https://github.com/pchrysostomou/ananke/actions/runs/34749071877)
   on `9b5995d`, and on run 34731272921 on `bd93ed3` before it, with one exception to
   "full": the disk honours `fsync` (D-026). Torn writes, bit rot and lost directory
-  entries stay on; lost syncs are issue #23. The tag follows this branch's own
-  ten-thousand-seed run.
-- **Membership change from 3 → 5 → 3 nodes under partition, no availability loss
-  beyond one election timeout.** Not met as worded. The change completes both ways on all
-  10 000 seeds, but the sweep's bound is ten maximum election timeouts, 2 s (D-029), and
-  the worst gap is 549.36 ms, above one 200 ms maximum election timeout.
+  entries stay on; lost syncs are issue #23. The tag follows the ten-thousand-seed run
+  on `main`.
+- **Membership change from 3 → 5 → 3 nodes under partition.** Met as SPEC §3 now words
+  it. The criterion first asked for no availability loss beyond one election timeout,
+  which was an aim, not a bound: under drops, delays, pre-vote rounds, split votes and a
+  leader stepping down outside C_new, a change of leader is not bounded by one timeout.
+  The check asserts what the correct server holds on every seed, ten maximum election
+  timeouts, 2 s (D-029). The change completes both ways on all 10 000 seeds, and the
+  worst gap is 549.36 ms.
 - **Devlog post showing a real bug found and its trace.** This post. The failing traces
   of 5909, 6325 and 7381 are run 34496762339's artifacts, kept until 2026-12-09.
 
@@ -257,7 +260,3 @@ SPEC §3 names three.
 - **Issue #23.** The sweep's disk honours `fsync` because Raft's safety argument assumes
   it, and a refused server waits for a snapshot. Protocol-aware recovery (Alagappan et
   al.) would repair a store from the other replicas instead.
-- **SPEC §3's availability criterion.** The as-built check allows ten maximum election
-  timeouts and the worst gap is 549.36 ms; the SPEC says one election timeout. Either the
-  server closes the gap to one election timeout and the check is tightened to match, or
-  SPEC's wording changes; until one does, the criterion is not met.

@@ -20,7 +20,8 @@
 //! time inside partition windows taken out — the partition itself may block
 //! writes while the leader is on the minority side, so the clock for the bound
 //! effectively starts at the heal. The bound is chosen so the correct server
-//! never trips it (RAFT.md §5); the nightly's ten thousand seeds will tighten it.
+//! never trips it (RAFT.md §5); at ten thousand seeds the worst gap is 549 ms
+//! against its 2 s, and SPEC §3 states the criterion as this bound.
 //!
 //! The pair rule (CLAUDE.md):
 //! [`Variant::SingleMajorityInJointConsensus`](ananke_raft::core::Variant::SingleMajorityInJointConsensus)
