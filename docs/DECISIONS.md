@@ -3849,6 +3849,55 @@ JavaScript reader keeps exact, which the export already writes as strings for ev
 integer field, and a decoder returning a non-object, which the raft decoder never does.
 `Report::jsonl` is a method on the three reports; the other scenarios are unchanged.
 
+*Two more, measured on the tree with the export lazy.* A second `sample` profile of the
+raft binary at 300 seeds, 690 528 busy samples, had no export left in it and put
+`std::path` comparisons at 8.16% inclusive and the pre-vote check at 6.12%, with
+`Report::moved_by_decision_time` at 3.04%. Who the path comparisons belong to was read
+from the call graph: 79% of them are the sweep's own adoption-crash watch
+(`adoption_change`, D-041), which every 250 µs of a storm reads the victim's durable
+namespace (`Sim::durable_names`), builds a set of its store's names and compares it
+with the set it started from; the filesystem's own lookups (`NodeFs::open`,
+`sync_dir`, `rename`) are under 6% of them and `snapshot::sweep_versions` about 8%.
+And the pre-vote check, which D-050 runs three ways on every run — by cause in the
+check, by durability time in `moved_by_decision_time`, per isolation in `checked` —
+scanned the whole trace twice for every isolation and once more for its skip.
+
+- **The adoption watch reads a version first.** `Sim::durable_version(node)` is a
+  counter the simulated disk moves at every `sync_dir` that makes a directory
+  operation durable and at every crash, the only two things that change the durable
+  namespace. The watch reads the namespace again only when the counter has moved:
+  between two equal counts the namespace is the one it last read, which did not end
+  the watch, so every storm crashes at the very slice it did.
+- **The pre-vote check reads its records from one pass.** `Report::pre_vote_records`
+  keeps, in record order, the term records and the records the skip looks for — a
+  few hundred of a trace's tens of thousands — and the check over all isolations,
+  its per-isolation forms and the straddle predicates read those. Every verdict is
+  the one the full scan gave, since the helpers matched nothing else.
+
+Each was timed on the raft test binary alone at a thousand seeds, one after the
+other with the load average sampled: the tree with the export lazy **353.17 s**
+(2 465.98 s user, mean load 16.07); with the adoption watch gated **320.61 s** (2 212.80
+s user, load 16.07), 9.2% less; with the pre-vote records as well **287.46 s** (1 997.17 s
+user, load 11.69), 10.3% less again. Each is some 33 s, about 7% of the premerge.
+A second run of the first binary at a mean load of 50.62, another agent's sweep
+beside it, took 545.34 s and is not used. The traces are byte-identical: 49 traces from
+this tree and from dbaec73 — the raft scenario's seeds 0 to 39 under the correct
+server, ten of which (1, 3, 5, 6, 9, 11, 16, 25, 31, 33) draw the adoption storm,
+seed 41 under `AdoptionAsBuilt`, which draws it too, seed 6325 under the correct
+server and `AdoptionAsBuilt`, 687 under `RefusalNotDurable`, 1885 and 2023, and the
+membership and quorum scenarios' seed 0.
+
+What the second profile leaves, each under 5% of the premerge and so left as it is,
+with its share of the raft binary's busy samples: `leader_now` 4.54%, most of it the
+copies `Sim::trace_from` makes as it reads back over the tail; the refused-server
+watch (`refreshed_refused`), which re-reads the trace from its first record at each
+crash storm, about 0.9%; the incremental checker 5.37%, which D-046 made linear; and
+the allocator, 18.64% inclusive but spread over the simulation itself — the storage
+engine's blocks, the simulator's timers and the trace records — with no single caller
+that a change could take out. In the engine binary, which is not the raft binary's,
+`Model::state_after` and the `memcmp` under it are about 23% of its busy samples, some
+17 s of its 75 s and about 4% of the premerge.
+
 ---
 
 _Next entry: D-053. Add one before implementing anything not covered above._

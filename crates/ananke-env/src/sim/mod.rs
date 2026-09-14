@@ -550,6 +550,20 @@ impl Sim {
             .unwrap_or_default()
     }
 
+    /// A number that moves whenever `node`'s durable namespace, what
+    /// [`durable_names`](Self::durable_names) reads, may have changed: at every
+    /// `sync_dir` that makes a directory operation durable and at every crash. Equal
+    /// numbers mean equal namespaces, so a watch polling the namespace need read it
+    /// again only when the number has moved. Reading it reads a counter and nothing
+    /// else.
+    // PROPOSED(D-052): the harness's watch of the durable namespace reads a version
+    // first.
+    #[must_use]
+    pub fn durable_version(&self, node: NodeId) -> u64 {
+        let st = self.shared.lock();
+        st.fs.get(&node).map_or(0, |fs| fs.durable_version())
+    }
+
     /// A copy of the trace so far.
     #[must_use]
     pub fn trace(&self) -> Vec<TraceRecord> {

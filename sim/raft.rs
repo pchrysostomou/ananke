@@ -1244,10 +1244,11 @@ impl Report {
     // PROPOSED(D-050): a term's record carries when the message its step took was
     // received.
     pub fn isolation_keeps_the_term_by_cause(&self) -> Result<(), String> {
+        let records = self.pre_vote_records();
         self.isolations
             .iter()
             .try_for_each(|&(server, from, until)| {
-                self.isolation_keeps_its_term_by_cause(server, from, until)
+                Self::keeps_its_term_by_cause(&records, server, from, until)
             })
     }
 
@@ -1265,11 +1266,24 @@ impl Report {
         from: Instant,
         until: Instant,
     ) -> Result<(), String> {
-        let verdict = self.isolation_keeps_its_term_by(RecordTime::Decided, server, from, until);
+        Self::keeps_its_term_by_cause(&self.pre_vote_records(), server, from, until)
+    }
+
+    /// [`Report::isolation_keeps_its_term_by_cause`] over `records`, the
+    /// [`Report::pre_vote_records`].
+    // PROPOSED(D-052): the pre-vote check reads its records from one pass over the
+    // trace.
+    fn keeps_its_term_by_cause(
+        records: &[&TraceRecord],
+        server: u64,
+        from: Instant,
+        until: Instant,
+    ) -> Result<(), String> {
+        let verdict = Self::keeps_its_term_by(records, RecordTime::Decided, server, from, until);
         if verdict.is_ok() {
             return verdict;
         }
-        let changes = self.term_changes_decided_in(server, from, until);
+        let changes = Self::term_changes_decided_in(records, server, from, until);
         let caused_before = !changes.is_empty()
             && changes
                 .iter()
@@ -1277,19 +1291,42 @@ impl Report {
         if caused_before { Ok(()) } else { verdict }
     }
 
+    /// The records the pre-vote check and its predicates read, in record order:
+    /// every term record, and every record the check's skip looks for. The trace
+    /// holds tens of thousands of records and these a few hundred, so a check over
+    /// every isolation passes over the trace once and reads each isolation from
+    /// these alone; filtering to the kinds the helpers match keeps every answer.
+    // PROPOSED(D-052): the pre-vote check reads its records from one pass over the
+    // trace.
+    fn pre_vote_records(&self) -> Vec<&TraceRecord> {
+        self.records
+            .iter()
+            .filter(|r| {
+                matches!(
+                    &r.event,
+                    TraceEvent::RaftTerm { .. }
+                        | TraceEvent::RaftRefused { .. }
+                        | TraceEvent::RaftReseeded { .. }
+                        | TraceEvent::RaftSnapshot { taken: false, .. }
+                )
+            })
+            .collect()
+    }
+
     /// `server`'s term records decided in `(from, until]` that change its term from
-    /// the term record before them, in record order.
+    /// the term record before them, in record order, from `records`, the
+    /// [`Report::pre_vote_records`].
     // PROPOSED(D-050): a term's record carries when the message its step took was
     // received.
-    fn term_changes_decided_in(
-        &self,
+    fn term_changes_decided_in<'a>(
+        records: &[&'a TraceRecord],
         server: u64,
         from: Instant,
         until: Instant,
-    ) -> Vec<&TraceRecord> {
+    ) -> Vec<&'a TraceRecord> {
         let mut previous = 0;
         let mut changes = Vec::new();
-        for record in &self.records {
+        for &record in records {
             let TraceEvent::RaftTerm {
                 server: s, term, ..
             } = &record.event
@@ -1325,10 +1362,11 @@ impl Report {
     /// its start, read by `time`.
     // D-047: every trace record carries its decision time and its durability time.
     pub fn isolation_keeps_the_term_by(&self, time: RecordTime) -> Result<(), String> {
+        let records = self.pre_vote_records();
         self.isolations
             .iter()
             .try_for_each(|&(server, from, until)| {
-                self.isolation_keeps_its_term_by(time, server, from, until)
+                Self::keeps_its_term_by(&records, time, server, from, until)
             })
     }
 
@@ -1345,12 +1383,26 @@ impl Report {
         from: Instant,
         until: Instant,
     ) -> Result<(), String> {
-        if self.reseeding_during(server, from, until) {
+        Self::keeps_its_term_by(&self.pre_vote_records(), time, server, from, until)
+    }
+
+    /// [`Report::isolation_keeps_its_term_by`] over `records`, the
+    /// [`Report::pre_vote_records`].
+    // PROPOSED(D-052): the pre-vote check reads its records from one pass over the
+    // trace.
+    fn keeps_its_term_by(
+        records: &[&TraceRecord],
+        time: RecordTime,
+        server: u64,
+        from: Instant,
+        until: Instant,
+    ) -> Result<(), String> {
+        if Self::reseeding_during(records, server, from, until) {
             return Ok(());
         }
         let (before, after) = (
-            self.term_by(server, time, from),
-            self.term_by(server, time, until),
+            Self::term_by(records, server, time, from),
+            Self::term_by(records, server, time, until),
         );
         if after != before {
             return Err(format!(
@@ -1362,9 +1414,14 @@ impl Report {
 
     /// Whether `server` was refused, re-seeded or finished installing a snapshot
     /// while isolated from `from` to `until`, by when those records were traced:
-    /// the pre-vote check's skip.
-    fn reseeding_during(&self, server: u64, from: Instant, until: Instant) -> bool {
-        self.records.iter().any(|r| {
+    /// the pre-vote check's skip; from `records`, the [`Report::pre_vote_records`].
+    fn reseeding_during(
+        records: &[&TraceRecord],
+        server: u64,
+        from: Instant,
+        until: Instant,
+    ) -> bool {
+        records.iter().any(|r| {
             r.at >= from
                 && r.at <= until
                 && matches!(&r.event,
@@ -1379,9 +1436,10 @@ impl Report {
     /// `at`, 0 before any. A server's term records come from one task's steps in
     /// sequence, each decided after the one before was traced, so their decision
     /// times rise with their order just as their durability times do, and the last
-    /// such record is the latest either way.
-    fn term_by(&self, server: u64, time: RecordTime, at: Instant) -> u64 {
-        self.records
+    /// such record is the latest either way. From `records`, the
+    /// [`Report::pre_vote_records`].
+    fn term_by(records: &[&TraceRecord], server: u64, time: RecordTime, at: Instant) -> u64 {
+        records
             .iter()
             .filter(|r| time.of(r) <= at)
             .filter_map(|r| match &r.event {
@@ -1390,7 +1448,7 @@ impl Report {
                 } if *s == server => Some(*term),
                 _ => None,
             })
-            .last()
+            .next_back()
             .unwrap_or(0)
     }
 
@@ -1873,6 +1931,7 @@ impl Report {
     // D-047: every trace record carries its decision time and its durability time.
     #[must_use]
     pub fn isolation_term_straddles(&self) -> Vec<TermStraddle> {
+        let pre_vote = self.pre_vote_records();
         let sent: BTreeMap<ananke_env::MessageId, SentMessage> = self
             .raft_messages()
             .into_iter()
@@ -1895,7 +1954,7 @@ impl Report {
         };
         let mut straddles = Vec::new();
         for &(server, from, until) in &self.isolations {
-            if self.reseeding_during(server, from, until) {
+            if Self::reseeding_during(&pre_vote, server, from, until) {
                 continue;
             }
             let mut previous = 0;
@@ -1960,6 +2019,7 @@ impl Report {
     // received.
     #[must_use]
     pub fn isolation_received_straddles(&self) -> Vec<ReceivedStraddle> {
+        let pre_vote = self.pre_vote_records();
         let sent: BTreeMap<ananke_env::MessageId, SentMessage> = self
             .raft_messages()
             .into_iter()
@@ -1967,7 +2027,7 @@ impl Report {
             .collect();
         let mut straddles = Vec::new();
         for &(server, from, until) in &self.isolations {
-            if self.reseeding_during(server, from, until) {
+            if Self::reseeding_during(&pre_vote, server, from, until) {
                 continue;
             }
             let mut previous = 0;
@@ -4377,6 +4437,10 @@ fn adoption_change(sim: &mut Sim, watch: &mut Watch, victim: u64) {
             .collect()
     };
     let before = durable(sim);
+    // PROPOSED(D-052): the namespace is read again only once it may have changed;
+    // between two equal versions it is the namespace this watch last looked at,
+    // which did not end the watch.
+    let mut seen = sim.durable_version(node);
     let step = Duration::from_micros(250);
     let budget = if before.is_empty() {
         EMPTY_STORE_DELAY
@@ -4398,6 +4462,11 @@ fn adoption_change(sim: &mut Sim, watch: &mut Watch, victim: u64) {
         if before.is_empty() {
             continue;
         }
+        let version = sim.durable_version(node);
+        if version == seen {
+            continue;
+        }
+        seen = version;
         let now = durable(sim);
         let old_gone = before.iter().all(|n| !now.contains(n));
         let new_synced = now.iter().any(|n| !before.contains(n));
