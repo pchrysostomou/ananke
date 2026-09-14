@@ -443,8 +443,22 @@ impl Sim {
         }
     }
 
-    /// Removes every block: `PartitionHealed` for a symmetric partition in force, then
-    /// one `LinkUnblocked` per individually blocked direction.
+    /// Loses every frame longer than `max_len` bytes from `from` to `to`, at its send
+    /// and at its delivery, while shorter frames pass, until the next
+    /// [`heal`](Self::heal): a path-MTU black hole, the network fault that loses a
+    /// stream's large chunks while its small heartbeats and their answers get
+    /// through. Each loss is `MessageDropped` with [`DropReason::Oversized`](crate::DropReason::Oversized); the
+    /// limit is recorded as `LinkLimited`. A second call on the same direction
+    /// replaces the bound. (D-049).
+    pub fn limit_frames(&mut self, from: NodeId, to: NodeId, max_len: usize) {
+        let mut st = self.shared.lock();
+        st.fabric.limited.insert((from, to), max_len);
+        st.record(Some(from), TraceEvent::LinkLimited { from, to, max_len });
+    }
+
+    /// Removes every block and every frame-length limit: `PartitionHealed` for a
+    /// symmetric partition in force, then one `LinkUnblocked` per individually
+    /// blocked direction, then one `LinkUnlimited` per limited direction.
     pub fn heal(&mut self) {
         let mut st = self.shared.lock();
         st.fabric.heal();
@@ -454,6 +468,11 @@ impl Sim {
         let links = std::mem::take(&mut st.fabric.links);
         for (from, to) in links {
             st.record(Some(from), TraceEvent::LinkUnblocked { from, to });
+        }
+        // D-049: a frame-length limit lasts until the heal, like a block.
+        let limited = std::mem::take(&mut st.fabric.limited);
+        for (from, to) in limited.into_keys() {
+            st.record(Some(from), TraceEvent::LinkUnlimited { from, to });
         }
     }
 

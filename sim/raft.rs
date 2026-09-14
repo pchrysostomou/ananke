@@ -2080,6 +2080,260 @@ impl Report {
         answered.difference(&counted).copied().collect()
     }
 
+    /// Every re-seed episode a leader ran (D-049): from the first rejection
+    /// stamped store incarnation 0 — a refused server's (RAFT.md §3) — that a
+    /// follower answered a leader with in its term, to that follower's `Installed`
+    /// answer, or to the end of the leader's tenure when the install did not come
+    /// first: its step-down, its crash, or its election in a later term. A
+    /// completed episode is followed on through the adoption, to the follower's
+    /// first AppendEntries response of the term from the store the install built,
+    /// or to the tenure's end if that comes first. Messages are read in the order
+    /// they were delivered to the leader, at their delivery.
+    ///
+    /// Re-seed progress is what the leader's code counts, reconstructed from the
+    /// trace ([`StreamProgress`]): an acknowledgement of the stream the leader has
+    /// open to the follower that takes it past the furthest point any
+    /// acknowledgement had taken that stream, and the `Installed` answer; a stream
+    /// opened afresh (`RaftSnapshotStreams`) starts its own count, and a stream the
+    /// receiver asked to start over a third time is given up. A delivery's time
+    /// stands for the moment the leader's core sees it: a rejection is stepped as
+    /// it arrives, and an acknowledgement is taken at the leader's next tick, the
+    /// tick whose check can read it, so attributing both to the window their
+    /// delivery falls in is what the check does, up to the time the message waits
+    /// to be processed.
+    ///
+    /// Each measure is scored against three ways of counting the refused follower
+    /// for check quorum, as if the leader's other follower had been away for the
+    /// whole of it: the leader as built, which counts its rejections; the correct
+    /// leader, which counts a rejection only in a window with re-seed progress; and
+    /// a leader counting nothing from it. For each, the share of
+    /// [`EPISODE_PHASES`] evenly spaced placements of the leader's check-quorum
+    /// windows in which some window lying wholly inside the stretch would have
+    /// found nothing to count — the chance the leader would have stepped down in
+    /// it, since where its windows fall is its own ticks' business. Windows are the
+    /// minimum election timeout by the leader's clock. No placement counts the
+    /// follower's answers from its new store, since the stretch through adoption
+    /// ends at the first. Beside those, the stretches the three differ on, in
+    /// windows: the episode's length, the wait for the first progress, the longest
+    /// gap between two progress marks; and one that is the run's rather than a
+    /// rule's, the longest stretch in which no other server answered the leader
+    /// from a store, the refused follower being its only contact.
+    #[must_use]
+    pub fn reseed_episodes(&self) -> Vec<ReseedEpisode> {
+        struct Open {
+            leader: u64,
+            follower: u64,
+            term: u64,
+            start: Instant,
+            rejections: Vec<Instant>,
+            progress: Vec<Instant>,
+            last_other: Instant,
+            only_contact: Duration,
+            installed: Option<Instant>,
+        }
+        let rate = |leader: u64| -> f64 {
+            let ppm = self.schedule.drifts[usize::try_from(leader - 1).expect("a server")];
+            1.0 + ppm as f64 / 1_000_000.0
+        };
+        let score = |episode: &Open, end: Instant, completed: bool| -> ReseedEpisode {
+            let leader = episode.leader;
+            let windows = |d: Duration| d.as_secs_f64() * rate(leader) / ELECTION_MIN.as_secs_f64();
+            let window = ELECTION_MIN.div_f64(rate(leader));
+            let within = |at: &[Instant], from: Instant, to: Instant| {
+                let first = at.partition_point(|&t| t < from);
+                at.get(first).is_some_and(|&t| t < to)
+            };
+            let deposed = |until: Instant, counts: &dyn Fn(bool, bool) -> bool| -> f64 {
+                let mut deposed = 0u32;
+                for phase in 0..EPISODE_PHASES {
+                    let offset = window.mul_f64(f64::from(phase) / f64::from(EPISODE_PHASES));
+                    let mut check = episode.start + offset + window;
+                    while check <= until {
+                        let from = check - window;
+                        let rejected = within(&episode.rejections, from, check);
+                        let progressed = within(&episode.progress, from, check);
+                        if !counts(rejected, progressed) {
+                            deposed += 1;
+                            break;
+                        }
+                        check += window;
+                    }
+                }
+                f64::from(deposed) / f64::from(EPISODE_PHASES)
+            };
+            let installed = episode.installed.unwrap_or(end);
+            let stream = |counts: &dyn Fn(bool, bool) -> bool| deposed(installed, counts);
+            let through = |counts: &dyn Fn(bool, bool) -> bool| deposed(end, counts);
+            let as_built = |rejected: bool, _: bool| rejected;
+            let correct = |rejected: bool, progressed: bool| rejected && progressed;
+            let nothing = |_: bool, _: bool| false;
+            let before_install: Vec<Instant> = episode
+                .progress
+                .iter()
+                .copied()
+                .filter(|&t| t <= installed)
+                .collect();
+            ReseedEpisode {
+                leader,
+                term: episode.term,
+                follower: episode.follower,
+                start: episode.start,
+                end: installed,
+                completed: episode.installed.is_some(),
+                answered_from_store: completed,
+                through_adoption_end: end,
+                length_windows: windows(installed.duration_since(episode.start)),
+                adoption_windows: windows(end.duration_since(installed)),
+                before_stream_windows: windows(
+                    before_install
+                        .first()
+                        .copied()
+                        .unwrap_or(installed)
+                        .duration_since(episode.start),
+                ),
+                progress_gap_windows: windows(
+                    before_install
+                        .windows(2)
+                        .map(|pair| pair[1].duration_since(pair[0]))
+                        .max()
+                        .unwrap_or(Duration::ZERO),
+                ),
+                only_contact_windows: windows(
+                    episode
+                        .only_contact
+                        .max(installed.duration_since(episode.last_other)),
+                ),
+                deposed_as_built: stream(&as_built),
+                deposed_correct: stream(&correct),
+                deposed_counting_nothing: stream(&nothing),
+                deposed_as_built_through_adoption: through(&as_built),
+                deposed_correct_through_adoption: through(&correct),
+                deposed_counting_nothing_through_adoption: through(&nothing),
+            }
+        };
+        let mut progress = StreamProgress::default();
+        let mut tenures: BTreeMap<u64, u64> = BTreeMap::new();
+        let mut open: BTreeMap<(u64, u64), Open> = BTreeMap::new();
+        let mut sent: BTreeMap<ananke_env::MessageId, (u64, u64, Message)> = BTreeMap::new();
+        let mut episodes = Vec::new();
+        for record in &self.records {
+            let at = record.at;
+            let ended = match &record.event {
+                TraceEvent::RaftLeader { server, term, .. } => {
+                    tenures.insert(*server, *term).map(|_| *server)
+                }
+                TraceEvent::RaftTerm { server, role, .. } if *role != "leader" => {
+                    tenures.remove(server).map(|_| *server)
+                }
+                TraceEvent::NodeCrashed { node } => {
+                    let server = u64::from(node.get());
+                    progress.crashed(server);
+                    tenures.remove(&server).map(|_| server)
+                }
+                TraceEvent::RaftSnapshotStreams { server, to, .. } => {
+                    progress.opened(*server, *to);
+                    None
+                }
+                TraceEvent::MessageSent {
+                    id,
+                    from,
+                    to,
+                    payload,
+                } => {
+                    if let (Some(from), Some(to), Ok(frame)) = (
+                        server_of(*from),
+                        server_of(*to),
+                        Frame::decode(payload.clone()),
+                    ) {
+                        progress.sent(from, to, &frame.message);
+                        sent.insert(*id, (from, to, frame.message));
+                    }
+                    None
+                }
+                _ => None,
+            };
+            if let Some(leader) = ended {
+                let keys: Vec<(u64, u64)> =
+                    open.keys().filter(|(l, _)| *l == leader).copied().collect();
+                for key in keys {
+                    let episode = open.remove(&key).expect("an open episode");
+                    episodes.push(score(&episode, at, false));
+                }
+                continue;
+            }
+            let TraceEvent::MessageDelivered { id, .. } = &record.event else {
+                continue;
+            };
+            let Some((from, to, message)) = sent.get(id) else {
+                continue;
+            };
+            let (from, to) = (*from, *to);
+            if progress.delivered(from, to, message)
+                && let Some(episode) = open.get_mut(&(to, from))
+            {
+                episode.progress.push(at);
+                if matches!(
+                    message,
+                    Message::InstallSnapshotResponse {
+                        status: message::SnapshotStatus::Installed,
+                        ..
+                    }
+                ) && episode.installed.is_none()
+                {
+                    episode.installed = Some(at);
+                }
+            }
+            let Some(&term) = tenures.get(&to) else {
+                continue;
+            };
+            let Message::AppendEntriesResponse {
+                term: answered,
+                success,
+                incarnation,
+                ..
+            } = message
+            else {
+                continue;
+            };
+            if *answered != term {
+                continue;
+            }
+            if !*success && *incarnation == 0 {
+                open.entry((to, from))
+                    .or_insert(Open {
+                        leader: to,
+                        follower: from,
+                        term,
+                        start: at,
+                        rejections: Vec::new(),
+                        progress: Vec::new(),
+                        last_other: at,
+                        only_contact: Duration::ZERO,
+                        installed: None,
+                    })
+                    .rejections
+                    .push(at);
+                continue;
+            }
+            if let Some(episode) = open.get(&(to, from))
+                && episode.installed.is_some()
+            {
+                let episode = open.remove(&(to, from)).expect("an open episode");
+                episodes.push(score(&episode, at, true));
+                continue;
+            }
+            for ((leader, follower), episode) in &mut open {
+                if *leader == to && *follower != from && episode.installed.is_none() {
+                    episode.only_contact = episode
+                        .only_contact
+                        .max(at.duration_since(episode.last_other));
+                    episode.last_other = at;
+                }
+            }
+        }
+        episodes
+    }
+
     /// A leader's stale progress for a refused `follower` (D-042's
     /// hazard): the first refusal of the follower after which the leader it last
     /// answered with success, in that answer's term, sent it at least one
@@ -2358,6 +2612,166 @@ pub struct RetakeUnderStream {
     pub after: Instant,
     /// Whether the follower ever answered `Installed` at the index after the take.
     pub installed_after: bool,
+}
+
+/// How many placements of a leader's check-quorum windows
+/// [`Report::reseed_episodes`] tries on each episode.
+pub const EPISODE_PHASES: u32 = 20;
+
+/// The re-seed progress a leader's code counts (D-049), reconstructed from the
+/// trace for [`Report::reseed_episodes`]: per leader and follower, the stream the
+/// leader's `snapshot` task has open, the furthest point any acknowledgement took
+/// it, and how many times its receiver asked to start over.
+///
+/// A stream opens at `RaftSnapshotStreams` and ends at its `Installed` answer, at
+/// the third ask to start over, or with its leader's crash. An acknowledgement is
+/// the stream's when it names the snapshot the leader's chunks to that follower
+/// last named. Its position is the file it names and the offset in it, a file
+/// counting as done once the offset reaches the size the leader's chunks gave it;
+/// files order by name, as the checkpoint's directory listing orders them for the
+/// leader's `Sender`. One thing the code does is left out: a stream given up
+/// after eight resends with nothing acknowledged is not closed here, and an
+/// acknowledgement arriving after that and before a new stream opens would be
+/// counted — the receiver acknowledges only chunks, and none has been sent to it
+/// for the four hundred milliseconds of resends.
+#[derive(Debug, Default)]
+pub struct StreamProgress {
+    /// (leader, follower) → the stream open: the furthest position and the asks
+    /// to start over.
+    streams: BTreeMap<(u64, u64), ((Bytes, u64), u32)>,
+    /// (leader, follower) → the snapshot the leader's last chunk to it named.
+    identity: BTreeMap<(u64, u64), (u64, u64)>,
+    /// (leader, follower, last index, last term, file) → its size.
+    sizes: BTreeMap<(u64, u64, u64, u64, Bytes), u64>,
+}
+
+impl StreamProgress {
+    /// `leader` opened a stream to `follower`: it starts from its first byte.
+    pub fn opened(&mut self, leader: u64, follower: u64) {
+        self.streams
+            .insert((leader, follower), ((Bytes::new(), 0), 0));
+    }
+
+    /// `server` crashed: its streams are gone.
+    pub fn crashed(&mut self, server: u64) {
+        self.streams.retain(|(leader, _), _| *leader != server);
+    }
+
+    /// `from` sent `message` to `to`: a chunk names its snapshot and its file's size.
+    pub fn sent(&mut self, from: u64, to: u64, message: &Message) {
+        if let Message::InstallSnapshot {
+            last_index,
+            last_term,
+            file,
+            total,
+            ..
+        } = message
+        {
+            self.identity.insert((from, to), (*last_index, *last_term));
+            self.sizes
+                .insert((from, to, *last_index, *last_term, file.clone()), *total);
+        }
+    }
+
+    /// `message` from `from` was delivered to `to`: whether it is re-seed progress
+    /// the leader `to` counts.
+    pub fn delivered(&mut self, from: u64, to: u64, message: &Message) -> bool {
+        let Message::InstallSnapshotResponse {
+            last_index,
+            last_term,
+            file,
+            offset,
+            status,
+            ..
+        } = message
+        else {
+            return false;
+        };
+        if self.identity.get(&(to, from)) != Some(&(*last_index, *last_term)) {
+            return false;
+        }
+        let Some((furthest, restarts)) = self.streams.get_mut(&(to, from)) else {
+            return false;
+        };
+        match status {
+            message::SnapshotStatus::Installed => {
+                self.streams.remove(&(to, from));
+                true
+            }
+            message::SnapshotStatus::Restart => {
+                *restarts += 1;
+                if *restarts > 2 {
+                    self.streams.remove(&(to, from));
+                }
+                false
+            }
+            message::SnapshotStatus::More => {
+                let done = self
+                    .sizes
+                    .get(&(to, from, *last_index, *last_term, file.clone()))
+                    .is_some_and(|&size| *offset >= size);
+                let position = (file.clone(), if done { u64::MAX } else { *offset });
+                if !file.is_empty() && position > *furthest {
+                    *furthest = position;
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+    }
+}
+
+/// One re-seed episode a leader ran ([`Report::reseed_episodes`], D-049). The
+/// stretches are in check-quorum windows of the leader's clock; the shares are of
+/// [`EPISODE_PHASES`] placements of those windows.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ReseedEpisode {
+    /// The leader.
+    pub leader: u64,
+    /// Its term.
+    pub term: u64,
+    /// The refused follower.
+    pub follower: u64,
+    /// The first refused rejection delivered to the leader in the tenure.
+    pub start: Instant,
+    /// The follower's `Installed` answer, or the tenure's end.
+    pub end: Instant,
+    /// Whether the install's answer ended it.
+    pub completed: bool,
+    /// Whether the follower then answered the leader from its new store in the
+    /// tenure.
+    pub answered_from_store: bool,
+    /// That answer, or the tenure's end; `end` for an episode that did not complete.
+    pub through_adoption_end: Instant,
+    /// From the first refused rejection to `end`.
+    pub length_windows: f64,
+    /// From `end` to `through_adoption_end`: the verification's answer to the
+    /// adoption's first answer.
+    pub adoption_windows: f64,
+    /// From the first refused rejection to the stream's first progress, or to
+    /// `end` when none came.
+    pub before_stream_windows: f64,
+    /// The longest gap between two consecutive progress marks up to `end`.
+    pub progress_gap_windows: f64,
+    /// The longest stretch up to `end` in which no other server answered the
+    /// leader from a store.
+    pub only_contact_windows: f64,
+    /// Up to `end`: the share of placements in which a leader counting the refused
+    /// follower's rejections, as built, would have found a window with nothing to
+    /// count.
+    pub deposed_as_built: f64,
+    /// The same for the correct leader, which counts a rejection only beside
+    /// re-seed progress in its window.
+    pub deposed_correct: f64,
+    /// The same for a leader counting nothing from a refused follower.
+    pub deposed_counting_nothing: f64,
+    /// The three shares again, up to `through_adoption_end`.
+    pub deposed_as_built_through_adoption: f64,
+    /// See [`ReseedEpisode::deposed_as_built_through_adoption`].
+    pub deposed_correct_through_adoption: f64,
+    /// See [`ReseedEpisode::deposed_as_built_through_adoption`].
+    pub deposed_counting_nothing_through_adoption: f64,
 }
 
 /// A leader's stale progress for a refused follower ([`Report::stale_progress`]).
@@ -2713,7 +3127,7 @@ async fn burst<E: Environment>(env: E, n: u64, target: u64, count: u64) {
 /// whose install is over in a round trip, and nothing can be aimed at a stream
 /// that short. Each key is written once and never read, so the checker's
 /// per-key search sees one put that always applies, as [`burst`]'s do.
-async fn spread<E: Environment>(env: E, n: u64, target: u64, count: u64) {
+pub(crate) async fn spread<E: Environment>(env: E, n: u64, target: u64, count: u64) {
     let Ok(sock) = env.net().bind(spread_addr(n)).await else {
         return;
     };

@@ -126,6 +126,29 @@ pub enum Variant {
     /// `ananke-storage`); the core ignores this variant.
     // D-044: a durable refusal, and a refused engine that does no work.
     RefusalNotDurable,
+    /// A refused follower's rejection counts for check quorum whatever the
+    /// leader's re-seed stream to it does: the leader as built before D-049. A
+    /// refused server answers every AppendEntries (RAFT.md §3), so with the
+    /// leader's other follower away a leader whose stream to the refused one has
+    /// stalled keeps its office on answers that can never make a commit, and
+    /// nobody else can be elected while it holds it. The directed re-seed scenario
+    /// blocks the stream and catches the leader that does not step down. The
+    /// counting is the core's; the stream's acknowledgements reach it from the
+    /// server (`node.rs`).
+    // D-049: a refused follower counts for check quorum only while its re-seed
+    // stream progresses.
+    RefusedCountsForQuorum,
+    /// Nothing from a refused follower counts for check quorum, however its
+    /// re-seed stream progresses: the alternative D-049 rejected. With the
+    /// leader's other follower away, the leader steps down mid-re-seed at the
+    /// first window it hears only from the follower it is re-seeding, and since a
+    /// re-seeded server never votes (D-035) no leader can be elected until the
+    /// third server returns. The directed re-seed scenario leaves the stream open
+    /// and catches the leader that steps down before the install completes. In a
+    /// set with [`Variant::RefusedCountsForQuorum`], that variant's counting wins.
+    // D-049: a refused follower counts for check quorum only while its re-seed
+    // stream progresses.
+    RefusedNeverCounts,
 }
 
 impl Variant {
@@ -148,6 +171,8 @@ impl Variant {
         Variant::IgnoreIncarnation,
         Variant::SharedSnapshotDir,
         Variant::RefusalNotDurable,
+        Variant::RefusedCountsForQuorum,
+        Variant::RefusedNeverCounts,
     ];
 
     /// This variant's bit in a [`Variants`] set. [`Variant::Correct`] owns no
@@ -171,6 +196,8 @@ impl Variant {
             Variant::IgnoreIncarnation => 1 << 11,
             Variant::SharedSnapshotDir => 1 << 12,
             Variant::RefusalNotDurable => 1 << 13,
+            Variant::RefusedCountsForQuorum => 1 << 14,
+            Variant::RefusedNeverCounts => 1 << 15,
         }
     }
 }
@@ -459,6 +486,16 @@ pub enum Input {
         /// Whether the checkpoint is unusable.
         retake: bool,
     },
+    /// The snapshot task's stream to `to` had a chunk acknowledged that took it
+    /// past the furthest point it had reached: the re-seed progress check quorum
+    /// asks of a refused follower (D-049). The install's own answer arrives as
+    /// [`Input::SnapshotInstalled`] and counts the same way.
+    // D-049: a refused follower counts for check quorum only while its re-seed
+    // stream progresses.
+    SnapshotAcked {
+        /// The follower.
+        to: ServerId,
+    },
 }
 
 /// A change to persistent state: what must be durable before anything after it.
@@ -676,8 +713,20 @@ struct Progress {
     /// The latest `sent` the follower acknowledged: its promise not to vote runs
     /// from there (RAFT.md §1).
     promise: Option<u64>,
-    /// Whether the follower answered since the last quorum check.
+    /// Whether the follower answered since the last quorum check from a store: any
+    /// AppendEntries response but a refused server's rejection.
     active: bool,
+    /// Whether the follower answered since the last quorum check as a refused
+    /// server does, with a rejection stamped store incarnation 0 (RAFT.md §3). That
+    /// answer counts for check quorum only beside `stream_acked`.
+    // D-049: a refused follower counts for check quorum only while its re-seed
+    // stream progresses.
+    refused_answered: bool,
+    /// Whether the snapshot stream to the follower had a chunk acknowledged since
+    /// the last quorum check ([`Input::SnapshotAcked`], or the install's answer).
+    // D-049: a refused follower counts for check quorum only while its re-seed
+    // stream progresses.
+    stream_acked: bool,
     /// The drift guard.
     guard: Guard,
     /// The snapshot task is streaming a snapshot to this follower: no entries go
@@ -1055,6 +1104,7 @@ impl Raft {
                 incarnation,
             } => self.on_snapshot_installed(to, index, incarnation),
             Input::SnapshotFailed { to, retake } => self.on_snapshot_failed(to, retake),
+            Input::SnapshotAcked { to } => self.on_snapshot_acked(to),
             Input::Message { from, message, now } => self.on_message(from, message, now),
         }
         self.finish()
@@ -1413,20 +1463,18 @@ impl Raft {
                 self.quorum_elapsed += 1;
                 if self.quorum_elapsed >= self.config.election_ticks.0 {
                     self.quorum_elapsed = 0;
-                    let mut heard: Vec<ServerId> = self
-                        .progress
-                        .iter()
-                        .filter(|(_, p)| p.active)
-                        .map(|(&s, _)| s)
-                        .collect();
+                    let (mut heard, uncounted) = self.heard_this_window();
                     heard.push(self.id);
                     for progress in self.progress.values_mut() {
                         progress.active = false;
+                        progress.refused_answered = false;
+                        progress.stream_acked = false;
                     }
                     if !self.membership.has_majority(&heard) {
                         self.trace(TraceEvent::RaftQuorumLost {
                             server: self.id.0,
                             term: self.term,
+                            uncounted,
                         });
                         self.become_follower(self.term, None);
                     }
@@ -1450,6 +1498,41 @@ impl Raft {
                 }
             }
         }
+    }
+
+    /// The followers check quorum counts for the window since the last check, and
+    /// the refused followers it did not count (RAFT.md §1). A follower that
+    /// answered from a store counts. A refused follower's rejection counts only
+    /// when the leader's re-seed stream to it had a chunk acknowledged in the same
+    /// window: a refused server answers every AppendEntries whatever becomes of
+    /// its re-seed, so its rejections alone say it is alive, not that the leader
+    /// is getting anywhere with it, and a leader kept in office by them while its
+    /// other followers are away could hold the office for as long as the stream
+    /// stays stalled with no commit possible and no election either.
+    /// [`Variant::RefusedCountsForQuorum`] counts every rejection, the leader as
+    /// built; [`Variant::RefusedNeverCounts`] counts none, the alternative D-049
+    /// rejected.
+    // D-049: a refused follower counts for check quorum only while its re-seed
+    // stream progresses.
+    fn heard_this_window(&self) -> (Vec<ServerId>, Vec<u64>) {
+        let variants = self.config.variants;
+        let mut heard = Vec::new();
+        let mut uncounted = Vec::new();
+        for (&follower, progress) in &self.progress {
+            let refused_counts = if variants.contains(Variant::RefusedCountsForQuorum) {
+                progress.refused_answered
+            } else if variants.contains(Variant::RefusedNeverCounts) {
+                false
+            } else {
+                progress.refused_answered && progress.stream_acked
+            };
+            if progress.active || refused_counts {
+                heard.push(follower);
+            } else if progress.refused_answered {
+                uncounted.push(follower.0);
+            }
+        }
+        (heard, uncounted)
     }
 
     /// Starts a pre-vote round (thesis §9.6): no term change until a majority says
@@ -1525,6 +1608,8 @@ impl Raft {
                         probe: None,
                         promise: None,
                         active: false,
+                        refused_answered: false,
+                        stream_acked: false,
                         guard: Guard::default(),
                         installing: false,
                         needs_snapshot: false,
@@ -1693,6 +1778,12 @@ impl Raft {
         };
         progress.installing = false;
         progress.needs_snapshot = false;
+        // The install's answer is the acknowledgement of the stream's final chunk
+        // (RAFT.md §1): re-seed progress for this window's check quorum, as a
+        // chunk's is. A checkpoint that fits in one chunk has no other.
+        // D-049: a refused follower counts for check quorum only while its re-seed
+        // stream progresses.
+        progress.stream_acked = true;
         progress.matched = progress.matched.max(index);
         progress.next = progress.next.max(progress.matched + 1);
         progress.probe = None;
@@ -1713,6 +1804,23 @@ impl Raft {
         }
         if let Some(progress) = self.progress.get_mut(&to) {
             progress.installing = false;
+        }
+    }
+
+    /// The snapshot task's stream to `to` had a chunk acknowledged past the
+    /// furthest point it had reached: re-seed progress, which lets a refused
+    /// follower's rejections in this window count for check quorum. Whether the
+    /// stream is still the one this leader asked for does not matter: any stream
+    /// the follower is acknowledging brings its install nearer, and the mark lives
+    /// only until the window's check.
+    // D-049: a refused follower counts for check quorum only while its re-seed
+    // stream progresses.
+    fn on_snapshot_acked(&mut self, to: ServerId) {
+        if self.role != Role::Leader {
+            return;
+        }
+        if let Some(progress) = self.progress.get_mut(&to) {
+            progress.stream_acked = true;
         }
     }
 
@@ -1831,6 +1939,8 @@ impl Raft {
                             probe: None,
                             promise: None,
                             active: false,
+                            refused_answered: false,
+                            stream_acked: false,
                             guard: Guard::default(),
                             installing: false,
                             needs_snapshot: false,
@@ -2457,8 +2567,17 @@ impl Raft {
         // timer on the request either way (moirae rule 5). An echo of zero is a
         // quarantined follower's (RAFT.md §3): a sign of life, never a promise and
         // never a read's confirmation, since it grants votes to nobody and a vote
-        // majority need not cross it.
-        progress.active = true;
+        // majority need not cross it. A rejection stamped incarnation 0 is a
+        // refused server's, which has no store: a sign of life that check quorum
+        // counts only beside re-seed progress in the same window. A quarantined
+        // follower answers from its store, with its own incarnation, and counts.
+        // D-049: a refused follower counts for check quorum only while its re-seed
+        // stream progresses.
+        if !success && incarnation == 0 {
+            progress.refused_answered = true;
+        } else {
+            progress.active = true;
+        }
         progress.quiet_ticks = 0;
         if echo != 0 {
             progress.promise = progress.promise.max(Some(echo));

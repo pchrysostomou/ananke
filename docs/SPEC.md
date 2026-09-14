@@ -102,6 +102,8 @@ survives 10k random seeds here, it is likely correct on real disks.
 
 - Message drop, duplicate, reorder, delay (per-link distributions).
 - **Partitions**: arbitrary node subsets, symmetric or asymmetric, time-bounded.
+- **Frame-length limits** on one direction of a link, time-bounded: frames longer than
+  the bound are lost and shorter ones pass, as on a path-MTU black hole (D-049).
 - **Slow links** and **bandwidth caps**.
 - **Node crash/restart** with the filesystem fault model applied at crash.
 - Byzantine faults are **out of scope** (we assume crash-stop + authenticated links).

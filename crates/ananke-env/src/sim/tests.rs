@@ -322,6 +322,73 @@ fn partitions_drop_with_reason_and_heal() {
     );
 }
 
+/// A frame-length limit on one direction is a path-MTU black hole (D-049): frames
+/// over the bound are lost at the send and in flight, shorter ones pass, the other
+/// direction is untouched, and the heal lifts it. Every loss and the limit itself
+/// are traced.
+#[test]
+fn a_frame_length_limit_loses_long_frames_only_until_the_heal() {
+    let mut sim = Sim::new(SimConfig::new(4));
+    let (a, b) = (sim.add_node(), sim.add_node());
+    let received: Log<(std::net::SocketAddr, usize)> = log();
+    for (node, port) in [(a, 1), (b, 2)] {
+        let r = received.clone();
+        let env = sim.env(node);
+        env.clone().spawn("receiver", async move {
+            let sock = env.net().bind(addr(port)).await.unwrap();
+            loop {
+                let (from, bytes) = sock.recv().await.unwrap();
+                r.lock().unwrap().push((from, bytes.len()));
+            }
+        });
+    }
+    let send = |sim: &Sim, node: NodeId, from: u16, to: u16, len: usize| {
+        let env = sim.env(node);
+        env.clone().spawn("sender", async move {
+            let sock = env.net().bind(addr(from)).await.unwrap();
+            sock.send(addr(to), Bytes::from(vec![0u8; len]))
+                .await
+                .unwrap();
+        });
+    };
+    // In flight when the limit lands: lost at its delivery.
+    send(&sim, a, 11, 2, 64);
+    sim.run_until(Instant::from_nanos(1));
+    sim.limit_frames(a, b, 32);
+    sim.run_until(Instant::from_nanos(100_000_000));
+    send(&sim, a, 12, 2, 16);
+    send(&sim, a, 13, 2, 64);
+    send(&sim, b, 14, 1, 64);
+    sim.run_until(Instant::from_nanos(200_000_000));
+    let mut got = received.lock().unwrap().clone();
+    got.sort_unstable();
+    assert_eq!(got, vec![(addr(12), 16), (addr(14), 64)]);
+    sim.heal();
+    send(&sim, a, 15, 2, 64);
+    sim.run_until(Instant::from_nanos(300_000_000));
+    assert!(received.lock().unwrap().contains(&(addr(15), 64)));
+    let ev = events(&sim);
+    let oversized = ev
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                TraceEvent::MessageDropped {
+                    reason: DropReason::Oversized,
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(oversized, 2, "the frame in flight and the one sent after");
+    assert!(ev.contains(&TraceEvent::LinkLimited {
+        from: a,
+        to: b,
+        max_len: 32
+    }));
+    assert!(ev.contains(&TraceEvent::LinkUnlimited { from: a, to: b }));
+}
+
 #[test]
 fn injected_drops_lose_everything_at_probability_one() {
     let mut config = SimConfig::new(9);
