@@ -726,6 +726,16 @@ impl Sender {
         self.file >= self.files.len()
     }
 
+    /// Where the last acknowledgement put the stream, as (file position, offset):
+    /// the next byte the receiver wants, `(files, 0)` once everything was
+    /// acknowledged, and `(0, 0)` again after a [`restart`](Self::restart). The
+    /// `snapshot` task compares it with the furthest point the stream had reached,
+    /// which is what re-seed progress means for check quorum (D-049).
+    #[must_use]
+    pub fn acknowledged(&self) -> (usize, u64) {
+        (self.file, self.offset)
+    }
+
     /// The checkpoint directory this stream is pinned to (D-043): the
     /// one it opened, read for its whole life, and what a reader count keeps
     /// from being swept meanwhile.

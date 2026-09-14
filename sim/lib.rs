@@ -22,6 +22,7 @@ pub mod engine;
 pub mod lin;
 pub mod membership;
 pub mod parallel;
+pub mod quorum;
 pub mod raft;
 pub mod wal;
 

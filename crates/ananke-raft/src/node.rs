@@ -92,7 +92,7 @@
 //! handed; re-seed mode stamps the stream it has staged; and a refusal is stamped
 //! when the open returns it, before the lost mark is written.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -228,6 +228,25 @@ fn lock_pending(pending: &Pending) -> std::sync::MutexGuard<'_, BTreeMap<Index, 
     pending
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The followers whose snapshot stream had a chunk acknowledged past the furthest
+/// point it had reached, marked by the `snapshot` task and taken by the `raft` loop
+/// before each tick, whose check quorum reads them (D-049). A mark is a lock
+/// and an insert, never an event on the inbox, so no task wakes that would not
+/// have woken anyway and a run whose leader never counts a refused follower's
+/// answers steps its cores exactly as it did before.
+// D-049: a refused follower counts for check quorum only while its re-seed stream
+// progresses.
+type StreamAcks = Arc<Mutex<BTreeSet<ServerId>>>;
+
+/// Takes every follower marked in `acks` since the last take, in id order.
+fn take_stream_acks(acks: &StreamAcks) -> BTreeSet<ServerId> {
+    std::mem::take(
+        &mut *acks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    )
 }
 
 /// Sends `message` to `to`, stamping the clock where the lease reads it: `sent` on
@@ -555,6 +574,7 @@ async fn incarnation<E: Environment>(
     let jobs: Queue<Job> = Queue::new();
     let snaps: Queue<Snap> = Queue::new();
     let pending: Pending = Arc::default();
+    let stream_acks: StreamAcks = Arc::default();
 
     // D-043: the checkpoint versions the record does not name are old
     // ones — a predecessor incarnation's, or a leader's from before this store
@@ -591,6 +611,7 @@ async fn incarnation<E: Environment>(
             engine_dir.clone(),
             inbox.clone(),
             snaps.clone(),
+            stream_acks.clone(),
         ),
     );
 
@@ -691,7 +712,18 @@ async fn incarnation<E: Environment>(
             }
         };
         let (input, request, read, change) = match event {
-            None => (Input::Tick, None, None, None),
+            None => {
+                // The re-seed progress the `snapshot` task saw since the last
+                // tick, stepped before the tick whose check quorum may read it.
+                // D-049: a refused follower counts for check quorum only while
+                // its re-seed stream progresses.
+                for to in take_stream_acks(&stream_acks) {
+                    let decided = env.decision();
+                    let outputs = core.step(Input::SnapshotAcked { to });
+                    node.execute(&core, outputs, decided).await?;
+                }
+                (Input::Tick, None, None, None)
+            }
             Some(Event::Message { from, message }) => match message {
                 // Snapshot streaming is the snapshot task's (RAFT.md §3).
                 Message::InstallSnapshot { .. } => {
@@ -1182,6 +1214,11 @@ struct Outbound {
     deadline: Instant,
     resends: u32,
     restarts: u32,
+    /// The furthest point any acknowledgement has taken this stream, as (file
+    /// position, offset): an acknowledgement past it is re-seed progress. A
+    /// restart from the first byte does not lower it, so ground covered again is
+    /// not progress until the stream passes where it had been (D-049).
+    furthest: (usize, u64),
 }
 
 /// How many times one chunk is resent before the stream is given up.
@@ -1353,6 +1390,7 @@ async fn snapshot_task<E: Environment>(
     engine_dir: PathBuf,
     inbox: Queue<Event>,
     snaps: Queue<Snap>,
+    stream_acks: StreamAcks,
 ) {
     let server = id.0;
     let chunk_timeout = Duration::from_nanos(config.tick_nanos * config.election_ticks.0 / 2);
@@ -1625,6 +1663,20 @@ async fn snapshot_task<E: Environment>(
                                 offset,
                             });
                         }
+                        // Re-seed progress for the core's check quorum: only an
+                        // acknowledgement past the furthest point this stream had
+                        // reached, never a duplicate, a resumption or ground a
+                        // restart covers again.
+                        // D-049: a refused follower counts for check quorum only
+                        // while its re-seed stream progresses.
+                        let reached = out.sender.acknowledged();
+                        if reached > out.furthest {
+                            out.furthest = reached;
+                            stream_acks
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .insert(from);
+                        }
                         out.resends = 0;
                         if out.sender.at_end() {
                             out.deadline = env.clock().now() + chunk_timeout;
@@ -1691,6 +1743,7 @@ async fn start_stream<E: Environment>(
                 deadline: env.clock().now() + task.chunk_timeout,
                 resends: 0,
                 restarts: 0,
+                furthest: (0, 0),
             };
             send_chunk(
                 env,

@@ -3,7 +3,8 @@
 //! `send` decides the message's fate immediately: dropped for a partition or by the
 //! random drop probability, otherwise queued for delivery after a random delay in the
 //! configured range. Different delays reorder messages. Partitions are checked again at
-//! delivery, so a message in flight when a partition starts is lost.
+//! delivery, so a message in flight when a partition starts is lost; so are frame-length
+//! limits, the path-MTU black hole a scenario can put on one direction of a link (D-049).
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
@@ -45,6 +46,9 @@ pub(super) struct Fabric {
     pub(super) active_partition: Option<Vec<Vec<NodeId>>>,
     /// Link directions blocked individually, as recorded in the trace.
     pub(super) links: BTreeSet<(NodeId, NodeId)>,
+    /// Link directions that lose every frame longer than a bound, a path-MTU black
+    /// hole, until the next heal (D-049).
+    pub(super) limited: BTreeMap<(NodeId, NodeId), usize>,
     /// Every address ever bound and the node that bound it, for the moirae export.
     pub(super) known: BTreeMap<SocketAddr, NodeId>,
     next_socket: u64,
@@ -78,6 +82,12 @@ impl Fabric {
 
     pub(super) fn heal(&mut self) {
         self.blocked.clear();
+    }
+
+    /// Whether a frame of `len` bytes from `from` to `to` is longer than the limit
+    /// on that direction, if it carries one (D-049).
+    pub(super) fn is_oversized(&self, from: NodeId, to: NodeId, len: usize) -> bool {
+        self.limited.get(&(from, to)).is_some_and(|&max| len > max)
     }
 
     pub(super) fn remove_node_sockets(&mut self, node: NodeId) {
@@ -146,19 +156,26 @@ impl State {
                 payload: msg.clone(),
             },
         );
-        if let Some(to_node) = self.fabric.sockets.get(&to).map(|s| s.node)
-            && self.fabric.is_blocked(node, to_node)
-        {
-            self.record(
-                Some(node),
-                TraceEvent::MessageDropped {
-                    id,
-                    from,
-                    to,
-                    reason: DropReason::Partitioned,
-                },
-            );
-            return Ok(());
+        if let Some(to_node) = self.fabric.sockets.get(&to).map(|s| s.node) {
+            let reason = if self.fabric.is_blocked(node, to_node) {
+                Some(DropReason::Partitioned)
+            } else if self.fabric.is_oversized(node, to_node, msg.len()) {
+                Some(DropReason::Oversized)
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                self.record(
+                    Some(node),
+                    TraceEvent::MessageDropped {
+                        id,
+                        from,
+                        to,
+                        reason,
+                    },
+                );
+                return Ok(());
+            }
         }
         let p_drop = self.config.net.p_drop;
         if self.net_stream.chance(p_drop) {
@@ -232,14 +249,21 @@ impl State {
             );
             return;
         };
-        if self.fabric.is_blocked(from_node, to_node) {
+        let reason = if self.fabric.is_blocked(from_node, to_node) {
+            Some(DropReason::Partitioned)
+        } else if self.fabric.is_oversized(from_node, to_node, msg.len()) {
+            Some(DropReason::Oversized)
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
             self.record(
                 Some(from_node),
                 TraceEvent::MessageDropped {
                     id,
                     from,
                     to,
-                    reason: DropReason::Partitioned,
+                    reason,
                 },
             );
             return;

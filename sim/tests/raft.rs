@@ -660,6 +660,20 @@ fn seed_2023_which_the_nightly_failed_on_a_trace_timestamp_passes_by_decision_ti
 /// straddle, no delivery in the window, the durability-time check failing with the
 /// nightly's message, and the decision-time check passing. None of the eleven now
 /// reports a pre-vote violation; each run's verdict is printed.
+///
+/// Two of the eleven, `IgnoreIncarnation`'s seeds 2509 and 5990, no longer reach
+/// the straddle, and the pin asserts its absence with the reason (D-049). On
+/// both, the leader under D-042's bug keeps a stale match for a follower refused
+/// for lost state, so it never re-seeds it, and with the third server away its
+/// check quorum, which counts a refused follower's rejections only beside re-seed
+/// progress, steps it down — seed 2509's leader 2 of term 12 at 14.547925798 s
+/// leaving server 3 uncounted, seed 5990's leader 3 of term 11 at 13.944738313 s
+/// leaving server 2 — where the leader before D-049 kept its office on those
+/// rejections. That step-down is the first record in which either trace differs
+/// from the tree before D-049, and it comes before the isolation the straddle was
+/// at (14.859 s and 14.448 s), so the run after it is another run. The day a
+/// straddle returns on either, the absence assertion fails and the pin can be
+/// upgraded back.
 #[test]
 fn the_nightlys_eleven_variant_catches_of_the_trace_timestamp_gap_are_not_catches() {
     type Pair = (u64, Variant, (u64, u64, u64, &'static str), &'static str);
@@ -731,10 +745,46 @@ fn the_nightlys_eleven_variant_catches_of_the_trace_timestamp_gap_are_not_catche
             "pre-vote: server 3 raised its term from 12 to 13 while isolated from Instant(26.809s) to Instant(29.254s)",
         ),
     ];
+    // D-049: (seed, the step-down that moved the schedule: server, term,
+    // the follower left uncounted, when, in nanoseconds of global time).
+    const MOVED: [(u64, (u64, u64, u64, u64)); 2] = [
+        (2509, (2, 12, 3, 14_547_925_798)),
+        (5990, (3, 11, 2, 13_944_738_313)),
+    ];
     let verdicts = sweep(pairs.len() as u64, |i| {
         let (seed, variant, rise, original) = pairs[usize::try_from(i).expect("small")];
         let report = raft::run(seed, variant);
-        assert_rise_straddles_the_isolation(&report, rise, original);
+        match MOVED.iter().find(|(moved, _)| *moved == seed) {
+            Some(&(_, (server, term, follower, nanos))) => {
+                assert_eq!(
+                    report.isolation_term_straddles(),
+                    Vec::new(),
+                    "seed {seed} under {variant:?} straddles an isolation again: upgrade the pin"
+                );
+                let first = report.records.iter().find_map(|r| match &r.event {
+                    TraceEvent::RaftQuorumLost {
+                        server,
+                        term,
+                        uncounted,
+                    } if !uncounted.is_empty() => Some((*server, *term, uncounted.clone(), r.at)),
+                    _ => None,
+                });
+                assert_eq!(
+                    first,
+                    Some((
+                        server,
+                        term,
+                        vec![follower],
+                        ananke_env::Instant::from_nanos(nanos)
+                    )),
+                    "seed {seed} under {variant:?}: the step-down that moved the schedule is not \
+                     the one recorded"
+                );
+            }
+            None => {
+                assert_rise_straddles_the_isolation(&report, rise, original);
+            }
+        }
         (seed, variant, report.check().err())
     });
     for (seed, variant, verdict) in &verdicts {
@@ -827,10 +877,16 @@ fn assert_rise_straddles_the_isolation(
 #[test]
 fn the_correct_server_passes_every_seed() {
     let coverage = Mutex::new(Coverage::default());
+    let episodes = Mutex::new((ReseedEpisodes::default(), Vec::new()));
     let moved = Mutex::new(MovedSeeds::default());
     let verdicts = sweep(seeds(), |seed| {
         let report = raft::run(seed, Variant::Correct);
         coverage.lock().unwrap().add(&report);
+        {
+            let mut episodes = episodes.lock().unwrap();
+            let (counts, lengths) = &mut *episodes;
+            counts.add(&report, lengths);
+        }
         checked(&report, &moved).map_or(Ok(()), |violation| {
             write_trace(&format!("raft-{seed}"), &report.jsonl);
             Err(violation)
@@ -838,6 +894,9 @@ fn the_correct_server_passes_every_seed() {
     });
     let coverage = coverage.into_inner().unwrap();
     eprintln!("Correct: {coverage:?}");
+    let (mut episodes, lengths) = episodes.into_inner().unwrap();
+    episodes.finish(lengths);
+    eprintln!("Correct: re-seed episodes (D-049): {episodes:?}");
     print_moved("Correct", moved);
     if let Err(violation) = verdict(&verdicts) {
         panic!("{violation}");
@@ -1493,6 +1552,9 @@ struct Coverage {
     lost_mark_refusals: usize,
     bit_rot: usize,
     torn_writes: usize,
+    // D-049: check-quorum step-downs that left a refused follower's
+    // rejections uncounted for want of re-seed progress.
+    step_downs_uncounting_refused: usize,
     puts: u64,
     gets: u64,
     deletes: u64,
@@ -1501,6 +1563,68 @@ struct Coverage {
     abandoned: u64,
     redirected: u64,
     slowest_write_after_heal: Duration,
+}
+
+/// The re-seed episodes the correct server's sweep ran (D-049,
+/// `raft::Report::reseed_episodes`): the evidence D-049 records against
+/// counting nothing from a refused follower. Every figure but the first two is a
+/// count of completed episodes with a stretch longer than two check-quorum windows
+/// of the leader's clock, which holds a whole window: a stretch in which a leader
+/// whose majority needed the refused follower would have stepped down.
+#[derive(Debug, Default)]
+struct ReseedEpisodes {
+    episodes: usize,
+    completed: usize,
+    /// The whole episode: where counting nothing from the follower deposes.
+    longer_than_two_windows: usize,
+    /// The wait for the stream's first acknowledgement: where the correct leader
+    /// deposes too, having no progress to count.
+    waiting_for_the_stream_over_two_windows: usize,
+    /// A gap between two acknowledgements: where the correct leader deposes
+    /// mid-stream.
+    progress_gap_over_two_windows: usize,
+    /// No other server answering from a store: where this sweep actually left the
+    /// leader's majority needing the refused follower.
+    only_contact_over_two_windows: usize,
+    /// Of those, the episodes whose whole stretch of progress, the wait included,
+    /// stayed within one window: where the correct leader kept an office a leader
+    /// counting nothing from the follower would have lost.
+    only_contact_over_two_windows_kept_by_progress: usize,
+    median_length_windows: f64,
+    longest_length_windows: f64,
+}
+
+impl ReseedEpisodes {
+    /// Adds `report`'s episodes, and each completed one's length to `lengths`.
+    fn add(&mut self, report: &raft::Report, lengths: &mut Vec<f64>) {
+        for episode in report.reseed_episodes() {
+            self.episodes += 1;
+            if !episode.completed {
+                continue;
+            }
+            self.completed += 1;
+            lengths.push(episode.length_windows);
+            self.longer_than_two_windows += usize::from(episode.length_windows > 2.0);
+            self.waiting_for_the_stream_over_two_windows +=
+                usize::from(episode.before_stream_windows > 2.0);
+            self.progress_gap_over_two_windows += usize::from(episode.progress_gap_windows > 2.0);
+            if episode.only_contact_windows > 2.0 {
+                self.only_contact_over_two_windows += 1;
+                self.only_contact_over_two_windows_kept_by_progress += usize::from(
+                    episode.before_stream_windows <= 1.0 && episode.progress_gap_windows <= 1.0,
+                );
+            }
+        }
+    }
+
+    /// Sets the median and the longest of the completed episodes' `lengths`.
+    fn finish(&mut self, mut lengths: Vec<f64>) {
+        lengths.sort_by(f64::total_cmp);
+        if let Some(&longest) = lengths.last() {
+            self.longest_length_windows = longest;
+            self.median_length_windows = lengths[lengths.len() / 2];
+        }
+    }
 }
 
 /// Whether some refused server came back (RAFT.md §3): a `RaftRefused`, then a
@@ -1644,6 +1768,9 @@ impl Coverage {
             .count();
         self.bit_rot += report.count(|e| matches!(e, TraceEvent::BlockRotted { .. }));
         self.torn_writes += report.count(|e| matches!(e, TraceEvent::WriteTorn { .. }));
+        self.step_downs_uncounting_refused += report.count(
+            |e| matches!(e, TraceEvent::RaftQuorumLost { uncounted, .. } if !uncounted.is_empty()),
+        );
         for op in &report.history.ops {
             match op.op {
                 ClientOp::Put { .. } => self.puts += 1,
@@ -2025,4 +2152,208 @@ fn the_incremental_checker_agrees_with_the_fold_over_the_whole_trace() {
         violated > 0,
         "no compared seed reached a violation: the comparison saw only Ok verdicts"
     );
+}
+
+// --- The check-quorum re-seed scenario (RAFT.md §1 and §3, D-049) ---
+
+use ananke_sim::quorum::{self, Disk, Half};
+
+/// One half of the re-seed scenario over the sweep's seeds under `variant`: every
+/// seed's violation, if it has one, and the figures the tests print.
+fn quorum_sweep(variant: Variant, half: Half) -> (Vec<String>, QuorumFigures) {
+    let figures = Mutex::new(QuorumFigures::default());
+    let violations: Vec<String> = sweep(seeds(), |seed| {
+        let report = quorum::run(seed, variant, half);
+        figures.lock().unwrap().add(&report);
+        report.check().err().inspect(|_| {
+            if variant == Variant::Correct {
+                write_trace(&format!("quorum-{half:?}-{seed}"), &report.jsonl);
+            }
+        })
+    })
+    .into_iter()
+    .flatten()
+    .collect();
+    (violations, figures.into_inner().unwrap())
+}
+
+/// What one half of the re-seed scenario saw over a sweep, in check-quorum windows
+/// of the leader's clock where it is a time.
+#[derive(Debug, Default)]
+struct QuorumFigures {
+    seeds: u64,
+    step_downs: u64,
+    step_downs_naming_the_refused: u64,
+    slowest_step_down_windows: f64,
+    reseeded: u64,
+    slowest_reseed_windows: f64,
+    commits_after_install: u64,
+    slowest_commit_windows: f64,
+    chunk_acks: usize,
+    refused_rejections: usize,
+    oversized: usize,
+}
+
+impl QuorumFigures {
+    fn add(&mut self, report: &quorum::Report) {
+        self.seeds += 1;
+        let (Some(cast), Some(hold), Some((cut, _))) = (report.cast, report.hold(), report.cut)
+        else {
+            return;
+        };
+        let window = report.global(cast.leader, raft::ELECTION_MIN).as_secs_f64();
+        let windows = |at: ananke_env::Instant| at.duration_since(cut).as_secs_f64() / window;
+        if let Some((at, uncounted)) = &hold.quorum_lost {
+            self.step_downs += 1;
+            self.step_downs_naming_the_refused += u64::from(uncounted.contains(&cast.refused));
+            self.slowest_step_down_windows = self.slowest_step_down_windows.max(windows(*at));
+        }
+        if let Some(at) = hold.reseeded {
+            self.reseeded += 1;
+            self.slowest_reseed_windows = self.slowest_reseed_windows.max(windows(at));
+        }
+        if let Some(at) = hold.commit_after_install {
+            self.commits_after_install += 1;
+            self.slowest_commit_windows = self.slowest_commit_windows.max(windows(at));
+        }
+        self.chunk_acks += hold.chunk_acks;
+        self.refused_rejections += hold.refused_rejections;
+        self.oversized += hold.oversized;
+    }
+}
+
+/// The directed scenario's positive control (D-049): on every seed, with a
+/// follower refused and being re-seeded and the leader's other follower cut off,
+/// the correct leader steps down within two check-quorum windows of its re-seed
+/// stream being blocked, naming the refused follower as the answer it did not
+/// count; and with the stream open it keeps its office through the install and
+/// commits through the re-seeded follower after it.
+#[test]
+fn the_correct_leader_steps_down_on_a_blocked_reseed_and_commits_through_an_open_one() {
+    for half in [Half::Blocked, Half::Open] {
+        let (violations, figures) = quorum_sweep(Variant::Correct, half);
+        eprintln!(
+            "Correct {half:?}: {} of {} seeds failed, {figures:?}, first: {}",
+            violations.len(),
+            seeds(),
+            violations.first().map_or("", String::as_str)
+        );
+        assert!(violations.is_empty(), "{}", violations[0]);
+        match half {
+            Half::Blocked => assert_eq!(figures.step_downs_naming_the_refused, figures.seeds),
+            Half::Open => assert_eq!(figures.commits_after_install, figures.seeds),
+        }
+    }
+}
+
+/// The leader as built (`RefusedCountsForQuorum`, D-049): a refused
+/// follower's rejections count for check quorum whatever becomes of the re-seed
+/// stream to it, so with the stream blocked and the other follower cut off the
+/// leader keeps its office for the whole hold, where the correct leader above steps
+/// down within two windows. The open half asks nothing of it that the correct
+/// leader's does not already show, so only the blocked half runs.
+#[test]
+fn a_leader_that_counts_a_refused_followers_rejections_whatever_its_stream_does_is_caught() {
+    let (caught, figures) = quorum_sweep(Variant::RefusedCountsForQuorum, Half::Blocked);
+    eprintln!(
+        "{:?} Blocked: caught on {} of {} seeds, {figures:?}, first: {}",
+        Variants::from(Variant::RefusedCountsForQuorum),
+        caught.len(),
+        seeds(),
+        caught.first().map_or("", String::as_str)
+    );
+    assert!(
+        figures.oversized > 0,
+        "no chunk was lost to the limit: the block was not injected"
+    );
+    assert_eq!(
+        caught.len() as u64,
+        seeds(),
+        "RefusedCountsForQuorum was not caught on every seed: {caught:?}"
+    );
+    assert!(
+        caught
+            .iter()
+            .all(|v| v.contains(": check quorum: ") && v.contains("kept its office")),
+        "caught by something other than the kept office: {caught:?}"
+    );
+}
+
+/// The rejected alternative (`RefusedNeverCounts`, D-049): nothing from a
+/// refused follower counts for check quorum, so with the stream open and the other
+/// follower cut off the leader steps down mid-re-seed, and with the re-seeded server
+/// never voting (D-035) nothing commits after the install, where the correct leader
+/// above keeps its office and commits. Only the open half runs: blocked, this leader
+/// steps down as the correct one does.
+#[test]
+fn a_leader_that_counts_nothing_from_a_refused_follower_is_caught() {
+    let (caught, figures) = quorum_sweep(Variant::RefusedNeverCounts, Half::Open);
+    eprintln!(
+        "{:?} Open: caught on {} of {} seeds, {figures:?}, first: {}",
+        Variants::from(Variant::RefusedNeverCounts),
+        caught.len(),
+        seeds(),
+        caught.first().map_or("", String::as_str)
+    );
+    assert_eq!(
+        caught.len() as u64,
+        seeds(),
+        "RefusedNeverCounts was not caught on every seed: {caught:?}"
+    );
+}
+
+/// What the scenario's instant disk leaves out (D-049), measured rather than
+/// assumed: on the sweep's disk a refused server's verification, repair and
+/// adoption take over a check-quorum window, it answers nothing at all meanwhile,
+/// and a leader whose majority needs it steps down in that silence whichever way
+/// it counts a refused follower's rejections. So the open half is asked on the
+/// instant disk, and here, on the sweep's, the leader as built — which never leaves
+/// a rejection uncounted, as asserted — is asserted from a hundred seeds to lose
+/// office in the silence on some seed, so the day the silence is gone this test
+/// says so. The correct leader's figures are printed beside it: it loses
+/// office on the same kind of seed, and a step-down naming the refused follower is
+/// one where the stream itself stalled for a window on the disk.
+#[test]
+fn on_the_sweeps_disk_the_install_silence_deposes_the_leader_under_either_count() {
+    for variant in [Variant::RefusedCountsForQuorum, Variant::Correct] {
+        let outcomes: Vec<(bool, Option<Vec<u64>>)> = sweep(seeds(), |seed| {
+            let report = quorum::run_on(seed, variant, Half::Open, Disk::Sweep);
+            let lost = report
+                .hold()
+                .and_then(|hold| hold.quorum_lost)
+                .map(|(_, uncounted)| uncounted);
+            (report.check().is_err(), lost)
+        });
+        let failed: Vec<&Option<Vec<u64>>> = outcomes
+            .iter()
+            .filter(|(f, _)| *f)
+            .map(|(_, l)| l)
+            .collect();
+        let silent = failed
+            .iter()
+            .filter(|l| l.as_ref().is_some_and(Vec::is_empty))
+            .count();
+        let named = failed
+            .iter()
+            .filter(|l| l.as_ref().is_some_and(|u| !u.is_empty()))
+            .count();
+        eprintln!(
+            "{:?} Open on the sweep's disk: failed on {} of {} seeds, {silent} by a step-down with nothing uncounted, {named} by one naming the refused follower",
+            Variants::from(variant),
+            failed.len(),
+            seeds()
+        );
+        if variant == Variant::RefusedCountsForQuorum {
+            assert_eq!(
+                named, 0,
+                "the leader as built named an uncounted follower: the variant was not injected"
+            );
+            if seeds() >= 100 {
+                assert!(
+                    silent > 0,
+                    "the install silence deposed no leader: the instant disk may no longer be needed"
+                );
+            }
+        }
+    }
 }

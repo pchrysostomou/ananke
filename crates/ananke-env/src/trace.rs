@@ -498,6 +498,10 @@ pub enum TraceEvent {
         server: u64,
         /// The term it led.
         term: u64,
+        /// The followers that answered in the window only as refused servers, with
+        /// no chunk of the leader's re-seed stream to them acknowledged in it, and
+        /// so were not counted (D-049); empty when no answer went uncounted.
+        uncounted: Vec<u64>,
     },
     /// A Raft server started on what its store held: the term, the applied index
     /// and the last log index it resumes from. An apply durable at a crash but not
@@ -711,6 +715,25 @@ pub enum TraceEvent {
         /// The receiver.
         to: NodeId,
     },
+    /// From now until the next heal, frames longer than `max_len` bytes from one
+    /// node to another are lost while shorter ones pass: a path-MTU black hole,
+    /// which loses a snapshot stream's chunks and lets its heartbeats through
+    /// (D-049).
+    LinkLimited {
+        /// Frames from this node...
+        from: NodeId,
+        /// ...to this node...
+        to: NodeId,
+        /// ...longer than this many bytes are dropped.
+        max_len: usize,
+    },
+    /// A link direction's frame-length limit was lifted.
+    LinkUnlimited {
+        /// The sender.
+        from: NodeId,
+        /// The receiver.
+        to: NodeId,
+    },
 }
 
 /// A key-value operation as a client issues it (RAFT.md §4): the single-key
@@ -854,4 +877,7 @@ pub enum DropReason {
     Injected,
     /// No socket is bound at the destination.
     Unreachable,
+    /// The link direction loses frames longer than a limit, and this one was
+    /// (D-049).
+    Oversized,
 }

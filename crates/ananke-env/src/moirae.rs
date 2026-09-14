@@ -8,10 +8,11 @@
 //! |------------------------------------------|-----------------------------------------------|
 //! | `MessageSent`                            | `send` with `msgId` and the decoded payload   |
 //! | `MessageDelivered`                       | `deliver`, with `dup` for a duplicate's second copy |
-//! | `MessageDropped`                         | `drop` with `loss`, `partition`, `crashed` or `queue-full` |
+//! | `MessageDropped`                         | `drop` with `loss`, `partition`, `crashed`, `queue-full` or `oversized` |
 //! | `NodeCrashed` / `NodeRestarted`          | `fault` `crash` (no field lists) / `restart`  |
 //! | `PartitionStarted` / `PartitionHealed`   | `fault` `partition` / `heal`                  |
 //! | `LinkBlocked` / `LinkUnblocked`          | `log` `ananke.link.blocked` / `.unblocked`    |
+//! | `LinkLimited` / `LinkUnlimited`          | `log` `ananke.link.limited` / `.unlimited`    |
 //! | `TaskSpawned` / `TaskPolled` / `TaskCompleted` | `log` `ananke.task.*`; polls are optional |
 //! | `PollBudgetExceeded`                     | `log` `ananke.task.budget-exceeded`           |
 //! | `FsyncLost` / `WriteTorn`                | `log` `ananke.fs.fsync-lost` / `.write-torn`  |
@@ -338,6 +339,7 @@ fn convert(
                 DropReason::Partitioned => "partition",
                 DropReason::Unreachable => "crashed",
                 DropReason::QueueFull => "queue-full",
+                DropReason::Oversized => "oversized",
             }
             .to_owned(),
         }),
@@ -724,13 +726,22 @@ fn convert(
             "ananke.raft.transfer",
             Some(Json::obj(vec![("server", int(*server)), ("to", int(*to))])),
         ),
-        TraceEvent::RaftQuorumLost { server, term } => log(
-            "ananke.raft.quorum-lost",
-            Some(Json::obj(vec![
-                ("server", int(*server)),
-                ("term", int(*term)),
-            ])),
-        ),
+        TraceEvent::RaftQuorumLost {
+            server,
+            term,
+            uncounted,
+        } => {
+            let mut fields = vec![("server", int(*server)), ("term", int(*term))];
+            // D-049: written only when a refused follower went uncounted, so a
+            // step-down the rule did not touch exports as it did before.
+            if !uncounted.is_empty() {
+                fields.push((
+                    "uncounted",
+                    Json::Array(uncounted.iter().map(|&s| int(s)).collect()),
+                ));
+            }
+            log("ananke.raft.quorum-lost", Some(Json::obj(fields)))
+        }
         TraceEvent::RaftRecovered {
             server,
             term,
@@ -950,6 +961,25 @@ fn convert(
             t,
             node: from.get(),
             event: "ananke.link.unblocked".to_owned(),
+            data: Some(Json::obj(vec![
+                ("from", node_json(*from)),
+                ("to", node_json(*to)),
+            ])),
+        }),
+        TraceEvent::LinkLimited { from, to, max_len } => Some(Event::Log {
+            t,
+            node: from.get(),
+            event: "ananke.link.limited".to_owned(),
+            data: Some(Json::obj(vec![
+                ("from", node_json(*from)),
+                ("to", node_json(*to)),
+                ("maxLen", int(u64::try_from(*max_len).unwrap_or(u64::MAX))),
+            ])),
+        }),
+        TraceEvent::LinkUnlimited { from, to } => Some(Event::Log {
+            t,
+            node: from.get(),
+            event: "ananke.link.unlimited".to_owned(),
             data: Some(Json::obj(vec![
                 ("from", node_json(*from)),
                 ("to", node_json(*to)),

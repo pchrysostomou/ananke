@@ -1197,6 +1197,185 @@ fn check_quorum_steps_a_leader_down_that_hears_from_no_majority() {
     );
 }
 
+/// A leader of three whose server 3 is away and whose server 2 answers every
+/// heartbeat as a refused server does (RAFT.md §3) — a rejection with hint 1, echo
+/// 0 and store incarnation 0 — or, with `incarnation` above 0, as a quarantined
+/// server on its own store does; ticked for `ticks` ticks or until it stops
+/// leading, with the snapshot stream to server 2 acknowledged at the ticks
+/// `acked` says. The harness stands in for server 2, so nothing else answers.
+fn leader_beside_a_follower_answering_as(
+    variants: impl Into<Variants>,
+    incarnation: u64,
+    answers: bool,
+    acked: impl Fn(u64) -> bool,
+    ticks: u64,
+) -> Cluster {
+    let members = vec![s(1), s(2), s(3)];
+    let mut cluster = Cluster::new(&members, &config(variants), &[]);
+    cluster.elect(s(1));
+    cluster.settle();
+    cluster.isolate(s(3), &members);
+    cluster.down.push(s(2));
+    for tick in 0..ticks {
+        cluster.tick(s(1), 1);
+        let term = cluster.term(s(1));
+        for (from, to, message) in std::mem::take(&mut cluster.inbox) {
+            if let (true, Message::AppendEntries { prev_index, .. }) =
+                (answers && from == s(1) && to == s(2), message)
+            {
+                let now = cluster.local_clock(s(1));
+                cluster.step(
+                    s(1),
+                    Input::Message {
+                        from: s(2),
+                        message: Message::AppendEntriesResponse {
+                            term,
+                            success: false,
+                            prev_index,
+                            match_index: 0,
+                            hint: 1,
+                            echo: 0,
+                            local: 0,
+                            incarnation,
+                        },
+                        now,
+                    },
+                );
+            }
+        }
+        cluster.inbox.clear();
+        if acked(tick) {
+            cluster.step(s(1), Input::SnapshotAcked { to: s(2) });
+        }
+        if cluster.role(s(1)) != Role::Leader {
+            break;
+        }
+    }
+    cluster
+}
+
+/// The `uncounted` of server 1's check-quorum step-down, if it stepped down.
+fn quorum_lost(cluster: &Cluster) -> Option<Vec<u64>> {
+    cluster.events.iter().find_map(|event| match event {
+        TraceEvent::RaftQuorumLost {
+            server: 1,
+            uncounted,
+            ..
+        } => Some(uncounted.clone()),
+        _ => None,
+    })
+}
+
+/// Check quorum beside a refused follower (RAFT.md §1 and §3, D-049): a refused
+/// follower's rejection counts only in a window in which the leader's re-seed
+/// stream to it had a chunk acknowledged. With the other follower away, a leader
+/// whose stream makes progress every window keeps its office; one whose stream
+/// makes none steps down within two windows, naming the follower it did not
+/// count; progress in one window does not carry into the next; and progress with
+/// no answer is no answer. A quarantined follower, echo 0 on its own store, is
+/// not a refused one and counts as any follower does. The leader as built
+/// (`RefusedCountsForQuorum`) keeps its office on the rejections alone; the
+/// rejected alternative (`RefusedNeverCounts`) steps down though the stream
+/// progresses.
+#[test]
+fn a_refused_followers_rejections_count_for_check_quorum_only_beside_reseed_progress() {
+    let windows = config(Variant::Correct).election_ticks.0;
+    let every = |_: u64| true;
+    let never = |_: u64| false;
+
+    let progressing =
+        leader_beside_a_follower_answering_as(Variant::Correct, 0, true, every, 5 * windows);
+    assert_eq!(
+        progressing.role(s(1)),
+        Role::Leader,
+        "the stream progresses every window"
+    );
+    assert_eq!(quorum_lost(&progressing), None);
+
+    let stalled =
+        leader_beside_a_follower_answering_as(Variant::Correct, 0, true, never, 5 * windows);
+    assert_eq!(stalled.role(s(1)), Role::Follower, "no progress, no count");
+    assert_eq!(
+        quorum_lost(&stalled),
+        Some(vec![2]),
+        "the step-down names the uncounted follower"
+    );
+
+    let first_window_only = leader_beside_a_follower_answering_as(
+        Variant::Correct,
+        0,
+        true,
+        |tick| tick < windows / 2,
+        5 * windows,
+    );
+    assert_eq!(
+        first_window_only.role(s(1)),
+        Role::Follower,
+        "progress does not carry over"
+    );
+    assert_eq!(quorum_lost(&first_window_only), Some(vec![2]));
+
+    let silent =
+        leader_beside_a_follower_answering_as(Variant::Correct, 0, false, every, 5 * windows);
+    assert_eq!(
+        silent.role(s(1)),
+        Role::Follower,
+        "progress alone is no answer"
+    );
+    assert_eq!(
+        quorum_lost(&silent),
+        Some(Vec::new()),
+        "nothing answered, so nothing went uncounted"
+    );
+
+    let quarantined =
+        leader_beside_a_follower_answering_as(Variant::Correct, 5, true, never, 5 * windows);
+    assert_eq!(
+        quarantined.role(s(1)),
+        Role::Leader,
+        "a quarantined follower answers from its store"
+    );
+
+    let as_built = leader_beside_a_follower_answering_as(
+        Variant::RefusedCountsForQuorum,
+        0,
+        true,
+        never,
+        5 * windows,
+    );
+    assert_eq!(
+        as_built.role(s(1)),
+        Role::Leader,
+        "the leader as built counts the rejections alone"
+    );
+
+    let never_counts = leader_beside_a_follower_answering_as(
+        Variant::RefusedNeverCounts,
+        0,
+        true,
+        every,
+        5 * windows,
+    );
+    assert_eq!(
+        never_counts.role(s(1)),
+        Role::Follower,
+        "the rejected alternative counts nothing"
+    );
+    assert_eq!(quorum_lost(&never_counts), Some(vec![2]));
+
+    for cluster in [
+        &progressing,
+        &stalled,
+        &first_window_only,
+        &silent,
+        &quarantined,
+        &as_built,
+        &never_counts,
+    ] {
+        invariants::all(&cluster.events).unwrap();
+    }
+}
+
 /// The vote rule behind the lease (RAFT.md §1, thesis §6.4.1): a follower that has
 /// heard from its leader within the minimum election timeout ignores a vote
 /// request, term and all; once it has not, it grants one.

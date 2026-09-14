@@ -2080,6 +2080,158 @@ impl Report {
         answered.difference(&counted).copied().collect()
     }
 
+    /// Every re-seed episode a leader ran (D-049): from the first rejection
+    /// stamped store incarnation 0 — a refused server's (RAFT.md §3) — that a
+    /// follower answered a leader with in its term, to that follower's `Installed`
+    /// answer, or to the end of the leader's tenure when the install did not come
+    /// first: its step-down, its crash, or its election in a later term. Messages
+    /// are read in the order they were delivered to the leader, at their delivery.
+    ///
+    /// Each episode's figures are in check-quorum windows of the leader's clock
+    /// (its minimum election timeout at its own rate), and each is a stretch in
+    /// which some counting rule hears nothing from the refused follower, so that a
+    /// stretch longer than two windows holds a whole window and deposes a leader
+    /// whose majority needs that follower: the whole episode, for a leader that
+    /// counts nothing from a refused follower; the wait for the stream's first
+    /// acknowledgement and the longest gap between two of its acknowledgements, the
+    /// install's answer included, for the correct leader. And one stretch that is
+    /// not a rule's but the run's: the longest in which no other server answered the
+    /// leader from a store, the refused follower being its only contact.
+    #[must_use]
+    pub fn reseed_episodes(&self) -> Vec<ReseedEpisode> {
+        struct Open {
+            term: u64,
+            start: Instant,
+            first_ack: Option<Instant>,
+            last_ack: Option<Instant>,
+            progress_gap: Duration,
+            last_other: Instant,
+            only_contact: Duration,
+        }
+        let sent: BTreeMap<ananke_env::MessageId, SentMessage> = self
+            .raft_messages()
+            .into_iter()
+            .map(|m| (m.id, m))
+            .collect();
+        let windows = |leader: u64, global: Duration| -> f64 {
+            let ppm = self.schedule.drifts[usize::try_from(leader - 1).expect("a server")];
+            global.as_secs_f64() * (1.0 + ppm as f64 / 1_000_000.0) / ELECTION_MIN.as_secs_f64()
+        };
+        let close = |episodes: &mut Vec<ReseedEpisode>,
+                     (leader, follower): (u64, u64),
+                     episode: Open,
+                     end: Instant,
+                     completed: bool| {
+            let only_contact = episode
+                .only_contact
+                .max(end.duration_since(episode.last_other));
+            episodes.push(ReseedEpisode {
+                leader,
+                term: episode.term,
+                follower,
+                start: episode.start,
+                end,
+                completed,
+                length_windows: windows(leader, end.duration_since(episode.start)),
+                before_stream_windows: windows(
+                    leader,
+                    episode
+                        .first_ack
+                        .unwrap_or(end)
+                        .duration_since(episode.start),
+                ),
+                progress_gap_windows: windows(leader, episode.progress_gap),
+                only_contact_windows: windows(leader, only_contact),
+            });
+        };
+        let mut tenures: BTreeMap<u64, u64> = BTreeMap::new();
+        let mut open: BTreeMap<(u64, u64), Open> = BTreeMap::new();
+        let mut episodes = Vec::new();
+        for record in &self.records {
+            let ended = match &record.event {
+                TraceEvent::RaftLeader { server, term, .. } => {
+                    let ended = tenures.insert(*server, *term).map(|_| *server);
+                    tenures.insert(*server, *term);
+                    ended
+                }
+                TraceEvent::RaftTerm { server, role, .. } if *role != "leader" => {
+                    tenures.remove(server).map(|_| *server)
+                }
+                TraceEvent::NodeCrashed { node } => {
+                    let server = u64::from(node.get());
+                    tenures.remove(&server).map(|_| server)
+                }
+                _ => None,
+            };
+            if let Some(leader) = ended {
+                let keys: Vec<(u64, u64)> =
+                    open.keys().filter(|(l, _)| *l == leader).copied().collect();
+                for key in keys {
+                    let episode = open.remove(&key).expect("an open episode");
+                    close(&mut episodes, key, episode, record.at, false);
+                }
+                continue;
+            }
+            let TraceEvent::MessageDelivered { id, .. } = &record.event else {
+                continue;
+            };
+            let Some(m) = sent.get(id) else { continue };
+            let Some(&term) = tenures.get(&m.to) else {
+                continue;
+            };
+            let at = record.at;
+            match &m.message {
+                Message::AppendEntriesResponse {
+                    term: answered,
+                    success,
+                    incarnation,
+                    ..
+                } if *answered == term => {
+                    if !*success && *incarnation == 0 {
+                        open.entry((m.to, m.from)).or_insert(Open {
+                            term,
+                            start: at,
+                            first_ack: None,
+                            last_ack: None,
+                            progress_gap: Duration::ZERO,
+                            last_other: at,
+                            only_contact: Duration::ZERO,
+                        });
+                        continue;
+                    }
+                    for ((leader, follower), episode) in &mut open {
+                        if *leader == m.to && *follower != m.from {
+                            episode.only_contact = episode
+                                .only_contact
+                                .max(at.duration_since(episode.last_other));
+                            episode.last_other = at;
+                        }
+                    }
+                }
+                Message::InstallSnapshotResponse { status, .. } => {
+                    let key = (m.to, m.from);
+                    if *status == message::SnapshotStatus::Restart {
+                        continue;
+                    }
+                    let Some(episode) = open.get_mut(&key) else {
+                        continue;
+                    };
+                    if let Some(last) = episode.last_ack {
+                        episode.progress_gap = episode.progress_gap.max(at.duration_since(last));
+                    }
+                    episode.first_ack.get_or_insert(at);
+                    episode.last_ack = Some(at);
+                    if *status == message::SnapshotStatus::Installed {
+                        let episode = open.remove(&key).expect("an open episode");
+                        close(&mut episodes, key, episode, at, true);
+                    }
+                }
+                _ => {}
+            }
+        }
+        episodes
+    }
+
     /// A leader's stale progress for a refused `follower` (D-042's
     /// hazard): the first refusal of the follower after which the leader it last
     /// answered with success, in that answer's term, sent it at least one
@@ -2358,6 +2510,36 @@ pub struct RetakeUnderStream {
     pub after: Instant,
     /// Whether the follower ever answered `Installed` at the index after the take.
     pub installed_after: bool,
+}
+
+/// One re-seed episode a leader ran ([`Report::reseed_episodes`], D-049). The
+/// figures are in check-quorum windows of the leader's clock.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ReseedEpisode {
+    /// The leader.
+    pub leader: u64,
+    /// Its term.
+    pub term: u64,
+    /// The refused follower.
+    pub follower: u64,
+    /// The first refused rejection delivered to the leader in the tenure.
+    pub start: Instant,
+    /// The follower's `Installed` answer, or the tenure's end.
+    pub end: Instant,
+    /// Whether the install's answer ended it.
+    pub completed: bool,
+    /// From the first refused rejection to the end: what a leader that counts
+    /// nothing from a refused follower hears nothing from it in.
+    pub length_windows: f64,
+    /// From the first refused rejection to the stream's first acknowledgement, or
+    /// to the end when none came.
+    pub before_stream_windows: f64,
+    /// The longest gap between two consecutive acknowledgements of the stream, the
+    /// install's answer included.
+    pub progress_gap_windows: f64,
+    /// The longest stretch in which no other server answered the leader from a
+    /// store.
+    pub only_contact_windows: f64,
 }
 
 /// A leader's stale progress for a refused follower ([`Report::stale_progress`]).
@@ -2713,7 +2895,7 @@ async fn burst<E: Environment>(env: E, n: u64, target: u64, count: u64) {
 /// whose install is over in a round trip, and nothing can be aimed at a stream
 /// that short. Each key is written once and never read, so the checker's
 /// per-key search sees one put that always applies, as [`burst`]'s do.
-async fn spread<E: Environment>(env: E, n: u64, target: u64, count: u64) {
+pub(crate) async fn spread<E: Environment>(env: E, n: u64, target: u64, count: u64) {
     let Ok(sock) = env.net().bind(spread_addr(n)).await else {
         return;
     };
