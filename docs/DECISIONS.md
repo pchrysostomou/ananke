@@ -3395,10 +3395,10 @@ rule, CLAUDE.md). **The random sweep gets no trace check.** A check reading deli
 could flag only a leader in office more than three windows after its majority last
 counted — the check's own window, one more for where the leader's windows fall, and one
 for a delivery's way to the core — and at a thousand seeds the correct server's sweep
-left a leader's majority needing a refused follower for more than two windows in 2 of
-1 385 completed re-seeds, and stepped a leader down for such a follower once (seed 350,
-below): too rare for `RefusedCountsForQuorum` to be caught there, and a check would
-assert only what the directed scenario asserts on every seed. **The signal is a shared
+left a leader's majority needing a refused follower for more than two windows before the
+install in 2 of 1 372 completed re-seeds, and stepped a leader down for such a follower
+once (seed 350, below): too rare for `RefusedCountsForQuorum` to be caught there, and a
+check would assert only what the directed scenario asserts on every seed. **The signal is a shared
 mark, not an inbox event**: an event for each acknowledgement would wake the `raft` task
 on every stream of every seed and move every schedule with a stream in it, where the mark
 moves only the schedules the rule itself changes.
@@ -3406,53 +3406,84 @@ moves only the schedules the rule itself changes.
 **What the scenario found.** On the sweep's own disk, every operation taking a tenth of a
 millisecond to two, the open half fails on most seeds under the correct server and under
 `RefusedCountsForQuorum` alike: 87 of 100 seeds under each, the same 87, and 827 of 1 000
-under each. Under the leader as built 87 and 822 of those were a step-down with nothing
-uncounted, and under the correct leader 86 and 812, with 1 and 14 naming the refused
-follower where the stream itself stalled for a window on the slow disk. A refused server
-answers nothing at all while it verifies the stream it staged, repairs it, adopts the
-install and opens the store it built: its re-seed loop is busy, and the heartbeats wait
-for the next incarnation. On that disk the silence outlasts a window. On seed 0 the
-refused follower's last rejection reached the leader 75.6 ms after the cut, its
-`Installed` answer at 135.7 ms, its adoption was traced at 197.8 ms and the first answer
+under each. Under the leader as built, 87 and 822 of those were a step-down with nothing
+uncounted, none named the refused follower, and 5 at a thousand seeds were no step-down
+at all — the leader kept its office and the re-seed did not finish within the hold, on
+seeds 117, 186, 204, 408 and 445. Under the correct leader 86 and 812 were a step-down with
+nothing uncounted, 1 and 14 named the refused follower, where the stream itself stalled
+for a window on the slow disk, and 1 at a thousand, seed 408, was no step-down. A refused
+server answers nothing at all while it verifies the stream it staged, repairs it, adopts
+the install and opens the store it built: its re-seed loop is busy, and the heartbeats
+wait for the next incarnation. Measured over the thousand seeds of that half, the same
+under both leaders, from the final chunk's delivery to the `Installed` answer's (the
+verification and the repair) took a median 58.1 ms, from the `Installed` answer to
+`RaftAdopted` 59.0 ms, and from `RaftAdopted` to `RaftReseeded` 65.2 ms; the whole
+silence, from the refused follower's last rejection to its first answer from the new
+store, took 115.2 ms to 373.4 ms, median 185.6 ms, against a window of 100 ms by the
+leader's clock. On seed 0 the last rejection reached the leader 75.6 ms after the cut, the
+`Installed` answer at 135.7 ms, the adoption was traced at 197.8 ms and the first answer
 from the re-seeded store arrived at 267.7 ms; the leader stepped down at 219.2 ms with
 nothing uncounted. No way of counting a refused follower's answers covers a follower that
 sends none, so the leader loses its office in that silence under the rule as built, the
-rule decided and the rule rejected, and with the re-seeded server never voting nothing
-commits until the other follower returns. That is the re-seed's own cost, not this rule's:
-the halves are asked on a disk that takes no time, and
+rule decided and the rule rejected alike, and with the re-seeded server never voting
+nothing commits until the other follower returns. That is the re-seed's own cost, not
+this rule's: the halves are asked on a disk that takes no time, and
 `on_the_sweeps_disk_the_install_silence_deposes_the_leader_under_either_count` prints the
-figures above and asserts from a hundred seeds that the silence still deposes the leader
-as built.
+figures above, with the seeds that did not step down, and asserts from a hundred seeds
+that the silence still deposes the leader as built.
 
-**Alternatives.** *Nothing from a refused follower counts.* Rejected, because it leaves a
-cluster leaderless mid-re-seed whenever the leader's other follower is away. The figures
-are measured on this tree; the earlier throwaway script's were not used. The measure is
-`raft::Report::reseed_episodes`, which the correct server's sweep prints as `re-seed
-episodes (D-049)`:
+**Alternatives.** *Nothing from a refused follower counts.* Rejected. The owner's reason
+was that it would leave a cluster leaderless mid-re-seed whenever the third server is
+away; measured, that holds on most re-seeds and not on all, and most of the rule's
+advantage over it is during the stream, since both lose the leader in the silence after
+it on the sweep's disk. The figures are measured on this tree; the earlier throwaway
+script's were not used. The measure is `raft::Report::reseed_episodes`, which the correct
+server's sweep prints as `re-seed episodes (D-049)`:
 `ANANKE_SEEDS=1000 cargo test --release -p ananke-sim --test raft the_correct_server_passes_every_seed -- --nocapture`.
 An episode runs from the first rejection stamped incarnation 0 that a follower answered a
 leader with in its term to that follower's `Installed` answer, or to the end of the
-leader's tenure. Each completed episode is measured as if the other follower had been
-away for the whole of it, against twenty evenly spaced placements of the leader's
+leader's tenure; a completed episode is followed on through the adoption to the
+follower's first answer from its new store, or to the tenure's end if that comes first.
+Re-seed progress in it is what the leader's code counts, reconstructed from the trace: an
+acknowledgement that takes the stream the leader has open past the furthest point it had
+reached, and the `Installed` answer, with a freshly opened stream starting its own count
+(`raft::StreamProgress`). Each completed episode is measured as if the other follower had
+been away for the whole of it, against twenty evenly spaced placements of the leader's
 check-quorum windows, since where its windows fall is its own ticks' business: the share
-of placements in which a window lying inside the episode finds nothing to count is the
-chance the leader would have stepped down in it, and the sum of those shares is the
-expected number of step-downs. Over 1 000 seeds, 1 420 episodes, 1 385 of them completed,
-with a median length of 2.56 windows and a longest of 56.6: counting nothing from the
-refused follower, an expected 1 167.75 of the 1 385 re-seeds would have lost the leader,
-and 934 certainly, being longer than two windows, which holds a whole one; under the rule
-decided, an expected 248.25, certainly in the 3 whose stream took over two windows to be
-acknowledged at all and the 120 with a gap over two windows between acknowledgements;
-under the rule as built, an expected 100.50. Over 100 seeds: 149 episodes, 144 completed,
-median 2.62 windows and longest 27.4; expected step-downs 124.15 counting nothing, 102
-certain; 28.15 under the rule decided, with 0 and 16 certain; 12.40 as built. So the
-rejected rule loses the leader on some five re-seeds in six whenever the other follower is
-away for them, and the decided one on some one in six, where the rule as built loses it
-on one in fourteen, in windows in which even a rejection did not arrive. That the cost
-needs the other follower away is the configuration's, not the sweep's: this sweep left a
-leader's majority needing the refused follower for more than two windows in 2 of the
-1 385 completed re-seeds (seeds 194 and 263, both kept by the rule decided), and in 0 of
-the 144 at a hundred seeds; the directed scenario builds it on every seed.
+of placements in which a window lying inside the stretch finds nothing to count is the
+chance the leader would have stepped down in it; the sum of those shares is the expected
+number of step-downs, and an episode in which every placement finds one is a certain
+step-down.
+
+Over 1 000 seeds, 1 407 episodes, 1 372 of them completed, with a median length to the
+install of 2.56 windows and a longest of 56.6; 1 299 of those reached an answer from the
+new store within the tenure, and the rest are measured to the tenure's end, the adoption
+stretch a median 1.50 windows and a longest 24.6.
+
+| Counting the refused follower | expected, to `Installed` | certain | expected, through adoption | certain |
+|---|---|---|---|---|
+| nothing (rejected) | 1 158.05 (84.4 %) | 947 (69.0 %) | 1 344.10 (98.0 %) | 1 329 (96.9 %) |
+| rejection beside progress (decided) | 327.40 (23.9 %) | 215 (15.7 %) | 1 261.30 (91.9 %) | 1 047 (76.3 %) |
+| every rejection (as built) | 100.30 (7.3 %) | 45 (3.3 %) | 1 251.80 (91.2 %) | 1 026 (74.8 %) |
+
+Over 100 seeds, 148 episodes and 143 completed (138 reaching a store answer), median 2.60
+windows and longest 27.4 to the install: to `Installed`, expected 123.15 counting nothing
+(103 certain), 37.05 decided (26), 12.40 as built (6); through adoption, 140.90 (140),
+133.05 (112) and 131.60 (107).
+
+So, with the third server away for a re-seed, counting nothing would have deposed the
+leader before the install completed on an expected 84 % of re-seeds, 69 % certainly,
+where the decided rule would on 24 %, 16 % certainly: 830.65 fewer expected step-downs in
+1 372, which is where the rule earns its keep. Carried through the adoption the gap is
+82.80 expected step-downs, 6.0 points of 1 372 — 98.0 % against 91.9 % — because on the
+sweep's disk the adoption's silence deposes the leader under every rule, the rule as built
+included at 91.2 %. The decided rule's own cost over the rule as built is 227.10 expected
+step-downs to the install, windows in which a rejection arrived but no acknowledgement
+moved the stream, and 9.50 through adoption. That the cost needs the other follower away
+is the configuration's, not the sweep's: this sweep left a leader's majority needing the
+refused follower for more than two windows before the install in 2 of the 1 372 completed
+re-seeds, seeds 194 and 263, and in 0 of the 143 at a hundred seeds; the directed scenario
+builds it on every seed.
 
 *A progress horizon longer than the window* — an earlier prototype counted progress for
 forty-five ticks — keeps a leader through a stalled stream for up to four windows more:
@@ -3469,10 +3500,13 @@ leader that cannot commit until the install completes. With its other follower a
 holds its office while the stream runs and serves no write, and its clients wait on it
 rather than being told to look elsewhere; in the open half the install and the first
 commit through the re-seeded follower came up to 7.35 and 14.26 windows after the cut at
-a thousand seeds. And a leader whose stream stalls for a window, or has not yet opened,
-steps down, where the leader as built stayed in office: with the re-seeded server never
-voting (D-035), no leader forms until the other follower returns — the expected 248.25
-against 100.50 above.
+a thousand seeds. And a leader whose stream fails to move in a window, or has not yet
+opened, steps down, where the leader as built stayed in office: with the re-seeded server
+never voting (D-035), no leader forms until the other follower returns — an expected
+327.40 step-downs to the install against 100.30 as built over the 1 372 re-seeds above.
+Neither rule keeps the leader through the adoption's silence on the sweep's disk: through
+it, the three rules lose the leader on 91 % to 98 % of those re-seeds, and a leader kept
+in office by its stream still steps down when its follower goes silent to install.
 
 `Progress` carries two more flags, the core one more input, `RaftQuorumLost` one more
 field and the simulator one more fault; the `snapshot` task and the `raft` loop share a

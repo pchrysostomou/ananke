@@ -877,7 +877,7 @@ fn assert_rise_straddles_the_isolation(
 #[test]
 fn the_correct_server_passes_every_seed() {
     let coverage = Mutex::new(Coverage::default());
-    let episodes = Mutex::new((ReseedEpisodes::default(), Vec::new()));
+    let episodes = Mutex::new((ReseedEpisodes::default(), EpisodeLengths::default()));
     let moved = Mutex::new(MovedSeeds::default());
     let verdicts = sweep(seeds(), |seed| {
         let report = raft::run(seed, Variant::Correct);
@@ -1568,61 +1568,96 @@ struct Coverage {
 /// The re-seed episodes the correct server's sweep ran (D-049,
 /// `raft::Report::reseed_episodes`): the evidence D-049 records against counting
 /// nothing from a refused follower. Every figure is over completed episodes, as if
-/// the leader's other follower had been away for each. The expected step-downs are
-/// sums of each episode's share of window placements that find a window with
-/// nothing to count; the counts over two windows are stretches that hold a whole
-/// window whatever the placement.
+/// the leader's other follower had been away for each, measured twice: up to the
+/// follower's `Installed` answer, and through the adoption to its first answer
+/// from the new store. An expected count sums each episode's share of window
+/// placements that find a window with nothing to count; a certain count is of the
+/// episodes where every placement does.
 #[derive(Debug, Default)]
 struct ReseedEpisodes {
     episodes: usize,
     completed: usize,
-    expected_step_downs_as_built: f64,
-    expected_step_downs_correct: f64,
-    expected_step_downs_counting_nothing: f64,
-    /// The whole episode over two windows: certain to depose a leader counting
-    /// nothing from the follower.
-    longer_than_two_windows: usize,
-    /// The wait for the stream's first acknowledgement over two windows: certain
-    /// to depose the correct leader too.
-    waiting_for_the_stream_over_two_windows: usize,
-    /// A gap between two acknowledgements over two windows: certain to depose the
-    /// correct leader mid-stream.
-    progress_gap_over_two_windows: usize,
-    /// No other server answering from a store for over two windows: where this
-    /// sweep itself left a leader's majority needing the refused follower.
+    to_installed: RuleCounts,
+    /// Of the completed episodes, those whose follower answered the leader from
+    /// its new store within the tenure; the rest are measured to the tenure's end.
+    answered_from_store: usize,
+    through_adoption: RuleCounts,
+    /// No other server answering from a store for over two windows before the
+    /// install: where this sweep itself left a leader's majority needing the
+    /// refused follower.
     only_contact_over_two_windows: usize,
     median_length_windows: f64,
     longest_length_windows: f64,
+    median_adoption_windows: f64,
+    longest_adoption_windows: f64,
+}
+
+/// Expected and certain step-downs under the three ways of counting.
+#[derive(Debug, Default)]
+struct RuleCounts {
+    expected_counting_nothing: f64,
+    certain_counting_nothing: usize,
+    expected_correct: f64,
+    certain_correct: usize,
+    expected_as_built: f64,
+    certain_as_built: usize,
+}
+
+impl RuleCounts {
+    fn add(&mut self, nothing: f64, correct: f64, as_built: f64) {
+        self.expected_counting_nothing += nothing;
+        self.certain_counting_nothing += usize::from(nothing >= 1.0);
+        self.expected_correct += correct;
+        self.certain_correct += usize::from(correct >= 1.0);
+        self.expected_as_built += as_built;
+        self.certain_as_built += usize::from(as_built >= 1.0);
+    }
+}
+
+/// The completed episodes' lengths, up to the install and through the adoption.
+#[derive(Default)]
+struct EpisodeLengths {
+    stream: Vec<f64>,
+    adoption: Vec<f64>,
 }
 
 impl ReseedEpisodes {
-    /// Adds `report`'s episodes, and each completed one's length to `lengths`.
-    fn add(&mut self, report: &raft::Report, lengths: &mut Vec<f64>) {
+    /// Adds `report`'s episodes, and each completed one's lengths to `lengths`.
+    fn add(&mut self, report: &raft::Report, lengths: &mut EpisodeLengths) {
         for episode in report.reseed_episodes() {
             self.episodes += 1;
             if !episode.completed {
                 continue;
             }
             self.completed += 1;
-            lengths.push(episode.length_windows);
-            self.expected_step_downs_as_built += episode.deposed_as_built;
-            self.expected_step_downs_correct += episode.deposed_correct;
-            self.expected_step_downs_counting_nothing += episode.deposed_counting_nothing;
-            self.longer_than_two_windows += usize::from(episode.length_windows > 2.0);
-            self.waiting_for_the_stream_over_two_windows +=
-                usize::from(episode.before_stream_windows > 2.0);
-            self.progress_gap_over_two_windows += usize::from(episode.progress_gap_windows > 2.0);
+            lengths.stream.push(episode.length_windows);
+            lengths.adoption.push(episode.adoption_windows);
+            self.to_installed.add(
+                episode.deposed_counting_nothing,
+                episode.deposed_correct,
+                episode.deposed_as_built,
+            );
+            self.answered_from_store += usize::from(episode.answered_from_store);
+            self.through_adoption.add(
+                episode.deposed_counting_nothing_through_adoption,
+                episode.deposed_correct_through_adoption,
+                episode.deposed_as_built_through_adoption,
+            );
             self.only_contact_over_two_windows += usize::from(episode.only_contact_windows > 2.0);
         }
     }
 
-    /// Sets the median and the longest of the completed episodes' `lengths`.
-    fn finish(&mut self, mut lengths: Vec<f64>) {
-        lengths.sort_by(f64::total_cmp);
-        if let Some(&longest) = lengths.last() {
-            self.longest_length_windows = longest;
-            self.median_length_windows = lengths[lengths.len() / 2];
-        }
+    /// Sets the medians and the longest of the completed episodes' `lengths`.
+    fn finish(&mut self, lengths: EpisodeLengths) {
+        let median_and_longest = |mut all: Vec<f64>| {
+            all.sort_by(f64::total_cmp);
+            all.last()
+                .map_or((0.0, 0.0), |&longest| (all[all.len() / 2], longest))
+        };
+        (self.median_length_windows, self.longest_length_windows) =
+            median_and_longest(lengths.stream);
+        (self.median_adoption_windows, self.longest_adoption_windows) =
+            median_and_longest(lengths.adoption);
     }
 }
 
@@ -2311,36 +2346,43 @@ fn a_leader_that_counts_nothing_from_a_refused_follower_is_caught() {
 /// office in the silence on some seed, so the day the silence is gone this test
 /// says so. The correct leader's figures are printed beside it: it loses
 /// office on the same kind of seed, and a step-down naming the refused follower is
-/// one where the stream itself stalled for a window on the disk.
+/// one where the stream itself stalled for a window on the disk. A failure with no
+/// step-down is a seed whose re-seed did not finish within the hold on that disk,
+/// printed with its seed.
 #[test]
 fn on_the_sweeps_disk_the_install_silence_deposes_the_leader_under_either_count() {
     for variant in [Variant::RefusedCountsForQuorum, Variant::Correct] {
-        let outcomes: Vec<(bool, Option<Vec<u64>>)> = sweep(seeds(), |seed| {
+        let outcomes: Vec<(u64, bool, Option<Vec<u64>>)> = sweep(seeds(), |seed| {
             let report = quorum::run_on(seed, variant, Half::Open, Disk::Sweep);
             let lost = report
                 .hold()
                 .and_then(|hold| hold.quorum_lost)
                 .map(|(_, uncounted)| uncounted);
-            (report.check().is_err(), lost)
+            (seed, report.check().is_err(), lost)
         });
-        let failed: Vec<&Option<Vec<u64>>> = outcomes
-            .iter()
-            .filter(|(f, _)| *f)
-            .map(|(_, l)| l)
-            .collect();
+        let failed: Vec<&(u64, bool, Option<Vec<u64>>)> =
+            outcomes.iter().filter(|(_, f, _)| *f).collect();
         let silent = failed
             .iter()
-            .filter(|l| l.as_ref().is_some_and(Vec::is_empty))
+            .filter(|(_, _, l)| l.as_ref().is_some_and(Vec::is_empty))
             .count();
         let named = failed
             .iter()
-            .filter(|l| l.as_ref().is_some_and(|u| !u.is_empty()))
+            .filter(|(_, _, l)| l.as_ref().is_some_and(|u| !u.is_empty()))
             .count();
+        // A failure with no step-down: the leader kept its office and the re-seed
+        // did not finish within the hold.
+        let unfinished: Vec<u64> = failed
+            .iter()
+            .filter(|(_, _, l)| l.is_none())
+            .map(|(seed, _, _)| *seed)
+            .collect();
         eprintln!(
-            "{:?} Open on the sweep's disk: failed on {} of {} seeds, {silent} by a step-down with nothing uncounted, {named} by one naming the refused follower",
+            "{:?} Open on the sweep's disk: failed on {} of {} seeds, {silent} by a step-down with nothing uncounted, {named} by one naming the refused follower, {} with no step-down {unfinished:?}",
             Variants::from(variant),
             failed.len(),
-            seeds()
+            seeds(),
+            unfinished.len()
         );
         if variant == Variant::RefusedCountsForQuorum {
             assert_eq!(
