@@ -3563,6 +3563,71 @@ straddle was at, and neither run reaches a straddle now. The pin asserts the str
 absent and that step-down as the reason, and D-047 carries the forward pointer. The echo
 scenario's golden hash is unchanged, `19f19201df99a799`.
 
+*At ten thousand seeds* (nightly run 34852980174, on a8656e8, the tree `main` has at
+94c6a54), every test passed.
+
+- **The scenario.** The correct server passed both halves on all 10 000 seeds.
+  - Blocked: every leader stepped down naming the refused follower, the slowest after 2.057
+    windows.
+  - Open: every re-seed completed and committed, the slowest re-seed after 7.87 windows and
+    the slowest commit after 14.78.
+  - `RefusedCountsForQuorum` was caught on the blocked half on 10 000 of 10 000: no
+    step-down.
+  - `RefusedNeverCounts` was caught on the open half on 10 000 of 10 000: every seed stepped
+    down naming the refused follower, the slowest after 1.999 windows.
+- **On the sweep's disk.** The open half failed on 8 377 of 10 000 under both leaders.
+  - As built: 8 311 by a step-down with nothing uncounted, 66 with no step-down.
+  - Correct: 8 182 by a step-down with nothing uncounted, 162 naming the refused follower,
+    33 with no step-down.
+- **The re-seed episodes.** 13 738 episodes, 13 435 completed and 12 900 answered from
+  their new store. Expected step-downs to `Installed`: counting nothing 11 286.3 (84.0 %;
+  9 218 certain), the decided rule 3 212.5 (23.9 %; 2 176), as built 1 066.1 (7.9 %; 563).
+  Through adoption: 13 067.0 (97.3 %; 12 904), 12 253.7 (91.2 %; 10 114) and 12 161.6
+  (90.5 %; 9 926). A leader's majority needed the refused follower for more than two
+  windows before the install in 38 completed re-seeds. These are the thousand seeds'
+  proportions to within a point.
+
+Against the ten-thousand-seed run of cd411b4 (run 34839613587), four catch rates moved:
+- `CountOlderTermForCommit` 4 415 from 4 413: caught now on seeds 4025, 5860 and 9983, no
+  longer on 7830;
+- `ResetTimerOnAnyRpc` 3 465 from 3 462: newly on 1677, 4245 and 9765;
+- `RefusalNotDurable` 133 from 132: newly on 4734;
+- `SnapshotWithoutCurrentLast` 3 302 from 3 303: no longer on 1537.
+
+`AdoptionAsBuilt`, `SharedSnapshotDir` (6, by the same checks) and `IgnoreIncarnation` (0)
+kept their rates, and the membership scenario and the lease trials' stale-read counts are
+unchanged. Coverage moved too:
+- `IgnoreIncarnation`'s re-seeded-and-applying count is 6 353, from 6 257, and its
+  decision-time report removes 2 catches, from 4: seeds 2509 and 5990 no longer straddle,
+  as their pins assert;
+- `SharedSnapshotDir`'s aimed arm reached its stream on 1 472 seeds, from 1 470, and it
+  re-took at an index already taken on 5 292, from 5 293;
+- `AdoptionAsBuilt` counts 84 582 adoptions under its storm, from 84 578;
+- the correct server's coverage gains `step_downs_uncounting_refused` 39, with
+  `quorum_losses` 46 706 from 46 683 and the fields of those runs after their step-downs
+  shifted, `commits` 10 149 501 from 10 148 606 among them.
+
+Each move was checked seed by seed. Two temporary branches off cd411b4 and a8656e8
+(runs 34885298800 and 34885317292) printed every seed's trace hash and verdict for the
+correct server and the seven variants above. Their catch counts reproduce both nightlies'
+exactly. 983 seed and server pairs differ:
+
+| Server | Differing seeds |
+|---|---|
+| correct | 39 |
+| `IgnoreIncarnation` | 697 |
+| `RefusalNotDurable` | 63 |
+| `SharedSnapshotDir` | 50 |
+| `ResetTimerOnAnyRpc` | 45 |
+| `AdoptionAsBuilt` | 33 |
+| `SnapshotWithoutCurrentLast` | 32 |
+| `CountOlderTermForCommit` | 24 |
+
+Each of the 983 was re-run on both trees. In every one, the first record that differs is
+an `ananke.raft.quorum-lost` on this entry's tree naming a refused follower uncounted, at a
+point where the tree before it has no step-down. The nine catch changes are among them, and
+no verdict changed on a seed whose trace did not.
+
 ---
 
 _Next entry: D-050. Add one before implementing anything not covered above._
