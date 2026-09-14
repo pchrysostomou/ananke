@@ -207,7 +207,7 @@ _Update this section at the end of every session._
   criterion is now worded as the ten-timeout bound the check asserts, with the
   measured worst gap of 549.359683 ms.
 - Phase 2 backlog (2026-09-14/15), branch `phase-2-backlog` off `main` at 94c6a54, not
-  merged, every commit gated, four PROPOSED entries awaiting the owner. Issue #32:
+  merged, every commit gated, three PROPOSED entries (D-050, D-051, D-052) awaiting the owner. Issue #32:
   D-050, a term record carries when the message its step took was received
   (`receivedNs`), and the pre-vote check excuses a change taken from a message received
   before the isolation; a directed scenario (`Fault::IsolateOnTermRaise`) reaches the
@@ -229,11 +229,18 @@ _Update this section at the end of every session._
   runs. Performance: D-052. Measured first (`sample`); the per-run JSONL export was
   27.24% of the raft binary and is now written when asked for; the adoption-crash watch
   (79% of the path comparisons) reads a durable-namespace version first; the pre-vote
-  check reads one pass. `scripts/premerge.sh` at 1 000 seeds, warm build: 573.15 s
-  before, 449.89 s with the export lazy; the raft binary 353.17 s, 320.61 s, 287.46 s
-  across the three changes. The allocator is spread over the simulation with no single
+  check reads one pass. `scripts/premerge.sh` at 1 000 seeds, warm build: 547.55 s on
+  dbaec73 (mean load 11.20), 449.89 s with the export lazy (load 11.81), 374.64 s on the
+  final tree 1ef6d7e (load 13.90); the raft binary 353.17 s, 320.61 s, 287.46 s across
+  the three changes. (A first before-figure of 573.15 s was taken at load 15.98 and is
+  not used.) The allocator is spread over the simulation with no single
   caller to take out, and `leader_now` (4.54%) and the engine model (about 4% of the
-  premerge) were left under the 5% bar.
+  premerge) were left under the 5% bar. Review of PR #41 (0ed490a and the docs commit
+  after it): D-051's timer assertion now reads the reason off both replays at the flag
+  record (a reset, the flag record or the server's status moved), exact for any trace;
+  D-047's straddle reads `decided <= from < at`; the directed term-raise sweeps go
+  through `checked`; D-050's rule is restated for candidacies stepped from a
+  PreVoteResponse or TimeoutNow; D-052's figures compare equal loads.
 - Next concrete task: the ten-thousand-seed run on `main` (34839613587), which is
   the tag's evidence, then Phase 2's tag and crates.io publish per D-011. D-049 (a
   refused follower counts for check quorum only while its re-seed stream makes

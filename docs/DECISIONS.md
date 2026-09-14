@@ -3840,10 +3840,14 @@ profile had left: the allocator, the simulated filesystem's path comparisons and
 per-run JSONL export. The owner asked for those to be measured before anything
 changed. Measured on this branch at dbaec73, the tree before this entry, on the
 eight-core laptop, with `scripts/premerge.sh` run after a warm build (`cargo test
---release --no-run` first, so the wall time is the tests'): **573.15 s** real, 3 925.74 s
-user, the raft test binary 475.57 s of it, the engine binary 75.75 s; the machine's
-one-minute load average, sampled every 15 s over the run, averaged 15.98 (the premerge's
-own threads included). The rates of that run are the rates of 94c6a54's thousand-seed
+--release --no-run` first, so the wall time is the tests'): 573.15 s real, 3 925.74 s
+user, the raft test binary 475.57 s of it, the engine binary 75.75 s, with the machine's
+one-minute load average, sampled every 15 s over the run, at 15.98 (the premerge's own
+threads included). That first figure is not used for the saving below: another
+agent's sweep shared the machine for part of it, and its load is not the load the
+later runs had. Re-measured the same way at a mean load of 11.20 — the machine idle
+but for the premerge — dbaec73's premerge took **547.55 s** real, 3 852.04 s user, the
+raft binary 452.11 s. The rates of these runs are the rates of 94c6a54's thousand-seed
 premerge, the new tests' lines aside.
 
 *The profile.* `sample` (the tool D-046 used), at one sample per millisecond on every
@@ -3888,9 +3892,10 @@ engine binary, the largest of them, spends 3.55% of its busy samples in
 2.7 s of its 75 s and under 1% of the premerge, which is not worth a change.
 
 **What it bought.** `scripts/premerge.sh` at a thousand seeds, measured the same way:
-**449.89 s** real, from 573.15 s, **21.5%** less; 3 113.34 s user, from 3 925.74 s,
-20.7% less; the raft binary 352.48 s, from 475.57 s. The load average over the run was
-11.81. Every sweep passed with every rate unchanged. The traces are byte-identical: 24
+**449.89 s** real at a mean load of 11.81, against dbaec73's 547.55 s at 11.20, **17.8%**
+less; 3 113.34 s user, against 3 852.04 s, 19.2% less; the raft binary 352.48 s, against
+452.11 s. (A first figure of 21.5%, against the 573.15 s taken at a load of 15.98, mixed
+loads and is withdrawn.) Every sweep passed with every rate unchanged. The traces are byte-identical: 24
 traces written by this tree through `Report::jsonl()` and by dbaec73 through the field
 — the raft scenario's seeds 0 to 7, 42 and 1885 under the correct server, 680 under
 `SharedSnapshotDir`, 1252 under `IgnoreIncarnation`, 5153 under `ResetTimerOnAnyRpc`,
@@ -3911,9 +3916,15 @@ writing it for the seeds nobody reads is the whole of the saving.
 **Consequences.** A sweep no longer exports every seed's trace, so a trace that could
 not be written as moirae v2 would now surface only when it is written — a failing
 seed, or a test that hashes a trace — rather than as a panic at the end of the run
-that made it. The export's only failures are integers and times beyond what a
-JavaScript reader keeps exact, which the export already writes as strings for every
-integer field, and a decoder returning a non-object, which the raft decoder never does.
+that made it. In `moirae-trace` 0.0.2 that cannot happen to these scenarios: the only
+error a `Collect` sink returns for a well-formed stream of events is `NotAnObject`, for a
+`send` line's `msg`, a `state` line's `patch` or a `log` line's `data` that is not a
+JSON object (the header errors cannot arise, since the export writes the header once,
+first), and integers never fail — the writer emits one past 2^53 as a decimal string.
+The raft, membership and quorum scenarios decode payloads with `message::studio`, which
+returns an object for every payload, a malformed one included, and every `data` the
+export builds is an object. (This paragraph first gave integers beyond what a
+JavaScript reader keeps exact as a failure; they are not one.)
 `Report::jsonl` is a method on the three reports; the other scenarios are unchanged.
 
 *Two more, measured on the tree with the export lazy.* A second `sample` profile of the
@@ -3953,6 +3964,12 @@ server, ten of which (1, 3, 5, 6, 9, 11, 16, 25, 31, 33) draw the adoption storm
 seed 41 under `AdoptionAsBuilt`, which draws it too, seed 6325 under the correct
 server and `AdoptionAsBuilt`, 687 under `RefusalNotDurable`, 1885 and 2023, and the
 membership and quorum scenarios' seed 0.
+
+*The premerge with all three.* `scripts/premerge.sh` at a thousand seeds on 1ef6d7e,
+measured the same way: **374.64 s** real at a mean load of 13.90, 2 579.53 s user, the raft
+binary 278.88 s, against dbaec73's 547.55 s at 11.20: **31.6%** less wall time, on a
+machine loaded a little more than the run it is compared with. Every sweep passed with
+every rate and coverage field unchanged.
 
 What the second profile leaves, each under 5% of the premerge and so left as it is,
 with its share of the raft binary's busy samples: `leader_now` 4.54%, most of it the
