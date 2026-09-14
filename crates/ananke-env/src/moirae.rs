@@ -67,7 +67,7 @@ use std::net::SocketAddr;
 
 use moirae_trace::{Cause, Collect, Error, Event, Header, Json, Sink, TimeUnit, Verify, Writer};
 
-use crate::sim::{Sim, Snapshot, TraceRecord};
+use crate::sim::{RunHeader, Sim, TraceRecord};
 use crate::{ClientOp, ClientResult, DirEntryOp, DropReason, NodeId, TraceEvent, WalStopReason};
 
 /// Turns a message payload into the `msg` object of a `send` line: an object whose
@@ -133,7 +133,7 @@ impl Sim {
     /// A seed, time or integer beyond what a JavaScript reader keeps exact, or a decoder
     /// that returned something other than an object.
     pub fn to_moirae(&self, export: &Export<'_>) -> Result<String, Error> {
-        Ok(write(&self.snapshot(), export, Collect::default())?.jsonl())
+        self.run_header().to_moirae(&self.trace(), export)
     }
 
     /// Replays the export against a recorded trace and stops at the first line that
@@ -146,7 +146,12 @@ impl Sim {
     /// [`Error::LongerThanRecording`]; a recording longer than this trace is reported as
     /// a divergence at the first missing line.
     pub fn verify_moirae(&self, recorded: &str, export: &Export<'_>) -> Result<(), Error> {
-        let sink = write(&self.snapshot(), export, Verify::against(recorded))?;
+        let sink = write(
+            &self.run_header(),
+            &self.trace(),
+            export,
+            Verify::against(recorded),
+        )?;
         if sink.complete() {
             Ok(())
         } else {
@@ -159,17 +164,35 @@ impl Sim {
     }
 }
 
-fn write<S: Sink>(snapshot: &Snapshot, export: &Export<'_>, sink: S) -> Result<S, Error> {
+impl RunHeader {
+    /// `records`, a run's trace or a prefix of it, as moirae JSONL, format v2, under
+    /// this run's header: the bytes [`Sim::to_moirae`] writes for the same records.
+    ///
+    /// # Errors
+    ///
+    /// As [`Sim::to_moirae`].
+    // PROPOSED(D-052): a scenario's moirae JSONL is written when it is asked for.
+    pub fn to_moirae(&self, records: &[TraceRecord], export: &Export<'_>) -> Result<String, Error> {
+        Ok(write(self, records, export, Collect::default())?.jsonl())
+    }
+}
+
+fn write<S: Sink>(
+    run: &RunHeader,
+    records: &[TraceRecord],
+    export: &Export<'_>,
+    sink: S,
+) -> Result<S, Error> {
     let mut w = Writer::new(sink);
-    w.header(&header(snapshot))?;
-    for (node, _, _) in &snapshot.clocks {
+    w.header(&header(run))?;
+    for (node, _, _) in &run.clocks {
         w.emit(&Event::Init {
             t: 0,
             node: node.get(),
         })?;
     }
-    let addrs: BTreeMap<SocketAddr, NodeId> = snapshot.addrs.iter().copied().collect();
-    for record in &snapshot.records {
+    let addrs: BTreeMap<SocketAddr, NodeId> = run.addrs.iter().copied().collect();
+    for record in records {
         if let Some(event) = convert(record, &addrs, export) {
             w.emit(&event)?;
         }
@@ -177,8 +200,8 @@ fn write<S: Sink>(snapshot: &Snapshot, export: &Export<'_>, sink: S) -> Result<S
     Ok(w.into_sink())
 }
 
-fn header(snapshot: &Snapshot) -> Header {
-    let c = &snapshot.config;
+fn header(run: &RunHeader) -> Header {
+    let c = &run.config;
     let ppm = |p: f64| Json::Int((p * 1_000_000.0).round() as i64);
     let ns = |d: std::time::Duration| Json::Int(i64::try_from(d.as_nanos()).unwrap_or(i64::MAX));
     let config = Json::obj(vec![
@@ -193,7 +216,7 @@ fn header(snapshot: &Snapshot) -> Header {
             Json::Int(i64::try_from(c.run_length_hint).unwrap_or(i64::MAX)),
         ),
     ]);
-    let clocks = snapshot
+    let clocks = run
         .clocks
         .iter()
         .map(|(node, skew, drift)| {
@@ -204,7 +227,7 @@ fn header(snapshot: &Snapshot) -> Header {
             ])
         })
         .collect();
-    let addrs = snapshot
+    let addrs = run
         .addrs
         .iter()
         .map(|(addr, node)| {
@@ -216,14 +239,14 @@ fn header(snapshot: &Snapshot) -> Header {
         .collect();
     Header {
         seed: c.seed,
-        nodes: u32::try_from(snapshot.clocks.len()).expect("node count fits u32"),
+        nodes: u32::try_from(run.clocks.len()).expect("node count fits u32"),
         unit: TimeUnit::Ns,
         network: None,
         extra: vec![(
             "ananke".to_owned(),
             Json::obj(vec![
                 ("version", Json::str(env!("CARGO_PKG_VERSION"))),
-                ("policy", Json::str(&snapshot.policy.name())),
+                ("policy", Json::str(&run.policy.name())),
                 ("config", config),
                 ("clocks", Json::Array(clocks)),
                 ("addrs", Json::Array(addrs)),

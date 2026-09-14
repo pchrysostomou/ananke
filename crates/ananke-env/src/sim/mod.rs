@@ -202,14 +202,18 @@ impl TraceRecord {
     }
 }
 
-/// What the moirae export reads: the configuration, the policy, each node's clock, every
-/// address ever bound, and the records.
-pub(crate) struct Snapshot {
+/// What the moirae export reads of a run besides its records: the configuration,
+/// the policy, each node's clock and every address ever bound. Taken from a [`Sim`]
+/// once a run is over, it writes that run's JSONL later, from the records the caller
+/// kept, and only if anyone asks for it ([`RunHeader::to_moirae`], D-052); the bytes
+/// are the ones [`Sim::to_moirae`] writes.
+// PROPOSED(D-052): a scenario's moirae JSONL is written when it is asked for.
+#[derive(Clone, Debug)]
+pub struct RunHeader {
     pub(crate) config: SimConfig,
     pub(crate) policy: Policy,
     pub(crate) clocks: Vec<(NodeId, i64, i64)>,
     pub(crate) addrs: Vec<(std::net::SocketAddr, NodeId)>,
-    pub(crate) records: Vec<TraceRecord>,
 }
 
 /// A simulation: the executor, the clock, the fabric, the disks and the trace.
@@ -574,10 +578,13 @@ impl Sim {
             .unwrap_or_default()
     }
 
-    /// Everything the moirae export needs, copied out from under the lock.
-    pub(crate) fn snapshot(&self) -> Snapshot {
+    /// Everything the moirae export needs besides the records, copied out from under
+    /// the lock: with [`Sim::trace`], what [`Sim::to_moirae`] writes.
+    // PROPOSED(D-052): a scenario's moirae JSONL is written when it is asked for.
+    #[must_use]
+    pub fn run_header(&self) -> RunHeader {
         let st = self.shared.lock();
-        Snapshot {
+        RunHeader {
             config: st.config.clone(),
             policy: st.policy,
             clocks: st
@@ -586,7 +593,6 @@ impl Sim {
                 .map(|(id, n)| (*id, n.skew_nanos, n.drift_ppm))
                 .collect(),
             addrs: st.fabric.known.iter().map(|(a, n)| (*a, *n)).collect(),
-            records: st.trace.clone(),
         }
     }
 

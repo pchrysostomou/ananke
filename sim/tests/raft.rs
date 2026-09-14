@@ -21,14 +21,14 @@ use ananke_sim::{seeds, sweep, verdict, write_trace};
 fn same_seed_gives_byte_identical_trace() {
     let first = raft::run(42, Variant::Correct);
     let second = raft::run(42, Variant::Correct);
-    assert_eq!(first.jsonl.as_bytes(), second.jsonl.as_bytes());
+    assert_eq!(first.jsonl().as_bytes(), second.jsonl().as_bytes());
 }
 
 /// The seed-42 trace is written for the studio.
 #[test]
 fn the_seed_42_trace_is_written_for_the_studio() {
     let report = raft::run(42, Variant::Correct);
-    write_trace("raft-42", &report.jsonl);
+    write_trace("raft-42", &report.jsonl());
     report.check().unwrap();
 }
 
@@ -1110,7 +1110,7 @@ fn a_term_change_stepped_inside_an_isolation_from_a_message_received_before_it_i
         }
         let verdict = report.check();
         if verdict.is_err() {
-            write_trace(&format!("raft-term-raise-{seed}"), &report.jsonl);
+            write_trace(&format!("raft-term-raise-{seed}"), &report.jsonl());
         }
         let first = received.first().map(|s| {
             format!(
@@ -1309,7 +1309,7 @@ fn the_correct_server_passes_every_seed() {
             counts.add(&report, lengths);
         }
         checked(&report, &moved).map_or(Ok(()), |violation| {
-            write_trace(&format!("raft-{seed}"), &report.jsonl);
+            write_trace(&format!("raft-{seed}"), &report.jsonl());
             Err(violation)
         })
     });
@@ -2403,7 +2403,7 @@ use ananke_sim::membership;
 fn the_membership_scenario_has_byte_identical_traces_for_one_seed() {
     let first = membership::run(7, Variant::Correct);
     let second = membership::run(7, Variant::Correct);
-    assert_eq!(first.jsonl.as_bytes(), second.jsonl.as_bytes());
+    assert_eq!(first.jsonl().as_bytes(), second.jsonl().as_bytes());
 }
 
 /// The positive control: the correct server passes 3 → 5 → 3 under partition on
@@ -2416,7 +2416,7 @@ fn the_correct_server_passes_the_membership_scenario_on_every_seed() {
         coverage.lock().unwrap().add(&report);
         report
             .check()
-            .inspect_err(|_| write_trace(&format!("membership-{seed}"), &report.jsonl))
+            .inspect_err(|_| write_trace(&format!("membership-{seed}"), &report.jsonl()))
     });
     let coverage = coverage.into_inner().unwrap();
     eprintln!("Membership: {coverage:?}");
@@ -2674,7 +2674,7 @@ fn quorum_sweep(variant: Variant, half: Half) -> (Vec<String>, QuorumFigures) {
         figures.lock().unwrap().add(&report);
         report.check().err().inspect(|_| {
             if variant == Variant::Correct {
-                write_trace(&format!("quorum-{half:?}-{seed}"), &report.jsonl);
+                write_trace(&format!("quorum-{half:?}-{seed}"), &report.jsonl());
             }
         })
     })

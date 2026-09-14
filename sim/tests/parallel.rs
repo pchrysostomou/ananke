@@ -32,9 +32,9 @@ fn a_seed_inside_the_driver_gives_the_sequential_trace() {
     });
     assert_eq!(together[2], alone, "engine");
 
-    let alone = trace_hash(&raft::run(42, RaftVariant::Correct).jsonl);
+    let alone = trace_hash(&raft::run(42, RaftVariant::Correct).jsonl());
     let together = sweep(4, |seed| {
-        trace_hash(&raft::run(40 + seed, RaftVariant::Correct).jsonl)
+        trace_hash(&raft::run(40 + seed, RaftVariant::Correct).jsonl())
     });
     assert_eq!(together[2], alone, "raft");
 }

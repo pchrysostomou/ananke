@@ -3766,4 +3766,89 @@ approval, when D-047 gains its forward pointer; issue #33 closes with it.
 
 ---
 
-_Next entry: D-052. Add one before implementing anything not covered above._
+## PROPOSED D-052 — A scenario's moirae JSONL is written when it is asked for
+
+**Context.** D-046 left `scripts/premerge.sh` at 7 minutes 26 seconds and named what its
+profile had left: the allocator, the simulated filesystem's path comparisons and the
+per-run JSONL export. The owner asked for those to be measured before anything
+changed. Measured on this branch at dbaec73, the tree before this entry, on the
+eight-core laptop, with `scripts/premerge.sh` run after a warm build (`cargo test
+--release --no-run` first, so the wall time is the tests'): **573.15 s** real, 3 925.74 s
+user, the raft test binary 475.57 s of it, the engine binary 75.75 s; the machine's
+one-minute load average, sampled every 15 s over the run, averaged 15.98 (the premerge's
+own threads included). The rates of that run are the rates of 94c6a54's thousand-seed
+premerge, the new tests' lines aside.
+
+*The profile.* `sample` (the tool D-046 used), at one sample per millisecond on every
+thread, of the raft test binary at 300 seeds, all its tests: 931 025 busy samples.
+Self time, by what the frame is:
+
+| what | share of busy samples |
+| --- | --- |
+| the allocator (`libsystem_malloc`) | 23.75% |
+| `std::path`, the simulated filesystem's `BTreeMap<PathBuf, _>` keys | 9.24% |
+| the simulator | 8.52% |
+| the sweep's end-of-run checks and predicates (`sim/raft.rs`, `lin.rs`) | 8.39% |
+| the storage engine | 6.82% |
+| `moirae_trace`, the JSONL export | 6.73% |
+| trace record copies and drops | 6.56% |
+| `memmove`/`memset` | 6.39% |
+| the Raft server and core | 4.10% |
+| `invariants::Checker` | 3.27% |
+| `core::fmt` | 2.90% |
+
+Self time hides who allocates and copies. Counted inclusively from the call graph,
+`Sim::to_moirae` was **27.24%** of the binary's busy samples: every run of the raft,
+membership and quorum scenarios writes its whole trace as JSONL — a `Json` object per
+record, a formatted line, a copy of the trace to write it from — into
+`Report::jsonl`, and the string is read only when a seed fails and its trace is
+written out, or by the few tests that hash a trace. Beside it: `Sim::poll`, the
+simulation itself, 30.57%; the end-of-run `Report::check` 8.15%; `std::path`
+comparisons 6.05%; the pre-vote check 4.29%; `Sim::trace_from` 4.31%; `leader_now`
+3.31%.
+
+**Decision.** A scenario's report keeps what the export needs and writes the JSONL
+when it is asked for. `Sim::run_header` copies out what the export reads besides the
+records — the configuration, the policy, each node's clock, every address ever
+bound — as `sim::RunHeader`, and `RunHeader::to_moirae(records, export)` writes the
+bytes `Sim::to_moirae` writes for the same records, through the same code:
+`Sim::to_moirae` is now `run_header().to_moirae(&trace(), export)`. The raft,
+membership and quorum `Report`s replace `pub jsonl: String` with `pub run: RunHeader`
+and `Report::jsonl()`, which writes from `records`. Every site is marked
+`PROPOSED(D-052)`. The echo, WAL and engine scenarios keep their eager field: the
+engine binary, the largest of them, spends 3.55% of its busy samples in
+`Sim::to_moirae` (a `sample` profile at a thousand seeds, 453 852 busy samples), about
+2.7 s of its 75 s and under 1% of the premerge, which is not worth a change.
+
+**What it bought.** `scripts/premerge.sh` at a thousand seeds, measured the same way:
+**449.89 s** real, from 573.15 s, **21.5%** less; 3 113.34 s user, from 3 925.74 s,
+20.7% less; the raft binary 352.48 s, from 475.57 s. The load average over the run was
+11.81. Every sweep passed with every rate unchanged. The traces are byte-identical: 24
+traces written by this tree through `Report::jsonl()` and by dbaec73 through the field
+— the raft scenario's seeds 0 to 7, 42 and 1885 under the correct server, 680 under
+`SharedSnapshotDir`, 1252 under `IgnoreIncarnation`, 5153 under `ResetTimerOnAnyRpc`,
+3 under `NoPreVote`, 9 under `AdoptionAsBuilt` and 11 under `RefusalNotDurable`; the
+membership scenario's seeds 0 to 2 and seed 3 under `SingleMajorityInJointConsensus`;
+the quorum scenario's open half on seeds 0 and 1 and blocked half on seed 0 and on seed
+1 under `RefusedCountsForQuorum` — equal byte for byte, and the gate's trace-identity
+and pinned-hash tests pass.
+
+**Alternatives.** *Exporting into a sink that only validates*: it builds the same `Json`
+objects and formats the same lines, which is the cost. *Keeping the `Sim` in the report
+to export later*: a finished run's tasks, futures and disks held for as long as the
+report lives, where the header is a few hundred bytes. *Making the export itself
+faster*: the export is moirae's format through `moirae-trace`, published from the
+moirae repo, and it is still paid in full by every seed that is written out; not
+writing it for the seeds nobody reads is the whole of the saving.
+
+**Consequences.** A sweep no longer exports every seed's trace, so a trace that could
+not be written as moirae v2 would now surface only when it is written — a failing
+seed, or a test that hashes a trace — rather than as a panic at the end of the run
+that made it. The export's only failures are integers and times beyond what a
+JavaScript reader keeps exact, which the export already writes as strings for every
+integer field, and a decoder returning a non-object, which the raft decoder never does.
+`Report::jsonl` is a method on the three reports; the other scenarios are unchanged.
+
+---
+
+_Next entry: D-053. Add one before implementing anything not covered above._

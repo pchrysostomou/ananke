@@ -35,7 +35,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ananke_env::moirae::Export;
-use ananke_env::sim::{Sim, SimConfig, TraceRecord};
+use ananke_env::sim::{RunHeader, Sim, SimConfig, TraceRecord};
 use ananke_env::{Clock, Either, Environment, Instant, Network, NodeId, Socket, TraceEvent, race};
 use ananke_raft::apply::Command;
 use ananke_raft::client::{Reply, Request, Response};
@@ -251,8 +251,10 @@ pub struct Report {
     pub schedule: Schedule,
     /// The trace as records.
     pub records: Vec<TraceRecord>,
-    /// The trace as moirae JSONL.
-    pub jsonl: String,
+    /// What the moirae export needs besides [`Report::records`]:
+    /// [`Report::jsonl`] writes the trace from the two when it is asked for.
+    // PROPOSED(D-052): a scenario's moirae JSONL is written when it is asked for.
+    pub run: RunHeader,
     /// The partitions made, as (from, until).
     pub partitions: Vec<(Instant, Instant)>,
     /// When the last partition healed.
@@ -270,6 +272,21 @@ pub struct Report {
 }
 
 impl Report {
+    /// The trace as moirae JSONL, written from [`Report::records`] under the run's
+    /// header now, when it is asked for, rather than at the end of every run; the
+    /// bytes are the ones the simulator's own export writes (D-052).
+    ///
+    /// # Panics
+    ///
+    /// If the trace does not export to moirae v2.
+    // PROPOSED(D-052): a scenario's moirae JSONL is written when it is asked for.
+    #[must_use]
+    pub fn jsonl(&self) -> String {
+        self.run
+            .to_moirae(&self.records, &Export::new(&message::studio))
+            .expect("the membership trace exports to moirae v2")
+    }
+
     /// The events, without their times.
     #[must_use]
     pub fn events(&self) -> Vec<TraceEvent> {
@@ -681,10 +698,7 @@ pub fn run_with(seed: u64, schedule: Schedule, variants: impl Into<Variants>) ->
         variants,
         policy: driver.sim.policy(),
         schedule,
-        jsonl: driver
-            .sim
-            .to_moirae(&Export::new(&message::studio))
-            .expect("the membership trace exports to moirae v2"),
+        run: driver.sim.run_header(),
         records,
         partitions: driver.partitions,
         last_heal: driver.last_heal,

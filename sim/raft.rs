@@ -79,7 +79,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ananke_env::moirae::Export;
-use ananke_env::sim::{Sim, SimConfig, TraceRecord};
+use ananke_env::sim::{RunHeader, Sim, SimConfig, TraceRecord};
 use ananke_env::{
     ClientOp, ClientResult, Clock, Either, Environment, Instant, Network, NodeId, Rng, Socket,
     TraceEvent, race,
@@ -936,8 +936,10 @@ pub struct Report {
     pub schedule: Schedule,
     /// The trace as records.
     pub records: Vec<TraceRecord>,
-    /// The trace as moirae JSONL.
-    pub jsonl: String,
+    /// What the moirae export needs besides [`Report::records`]:
+    /// [`Report::jsonl`] writes the trace from the two when it is asked for.
+    // PROPOSED(D-052): a scenario's moirae JSONL is written when it is asked for.
+    pub run: RunHeader,
     /// When the last fault healed or the last crashed server restarted.
     pub last_heal: Instant,
     /// Every isolation of one server: (server, from, until).
@@ -962,6 +964,21 @@ pub struct Report {
 }
 
 impl Report {
+    /// The trace as moirae JSONL, written from [`Report::records`] under the run's
+    /// header now, when it is asked for, rather than at the end of every run; the
+    /// bytes are the ones the simulator's own export writes (D-052).
+    ///
+    /// # Panics
+    ///
+    /// If the trace does not export to moirae v2.
+    // PROPOSED(D-052): a scenario's moirae JSONL is written when it is asked for.
+    #[must_use]
+    pub fn jsonl(&self) -> String {
+        self.run
+            .to_moirae(&self.records, &Export::new(&message::studio))
+            .expect("the raft trace exports to moirae v2")
+    }
+
     /// Whether some pair of servers' clocks drifted apart faster than the lease
     /// assumes on this seed.
     #[must_use]
@@ -4010,9 +4027,7 @@ pub fn run_with(seed: u64, schedule: Schedule, variants: impl Into<Variants>) ->
         variants,
         policy: sim.policy(),
         schedule,
-        jsonl: sim
-            .to_moirae(&Export::new(&message::studio))
-            .expect("the raft trace exports to moirae v2"),
+        run: sim.run_header(),
         records,
         last_heal,
         isolations,
