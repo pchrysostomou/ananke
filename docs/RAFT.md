@@ -407,8 +407,12 @@ had already made. A term-raising message delivered before an isolation but stepp
 inside it, queued behind a persist or an install, is decided inside the window, so the
 term record also says when the server received the message its step took (D-050,
 proposed, issue #32): the pre-vote check does not flag an isolation whose every term
-change decided inside it was taken from a message received by its start. A campaign
-takes no message and carries no receipt, so the check flags it as before.
+change decided inside it was taken from a message received by its start. A change from
+a step that took no peer's message — a campaign on the server's own timer without
+pre-vote, a restatement, a completion — carries no receipt and is flagged as before; a
+candidacy stepped from a granting PreVoteResponse, or from a TimeoutNow, carries the
+receipt of that message and is excused when it was received by the isolation's start,
+like any change a message caused.
 
 The pair rule holds for each: a buggy variant in §5 fails each check, and the correct
 variant passes every seed. Every check is a function of the trace alone, so a failing

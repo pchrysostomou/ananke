@@ -3607,9 +3607,15 @@ written only where that differs from `t`.
 the check by decision time, except that an isolation is not flagged when every change
 of its server's term decided in `(from, until]` carries a receipt at or before `from`.
 It is that check's verdict with one named excuse, so it flags nothing the check by
-decision time does not. A campaign takes no message and carries no receipt, so a
-term the isolated server raised on its own timer is flagged as before, whatever else
-changed its term in the same window. `isolation_keeps_its_term_by` and
+decision time does not. A change from a step that took no peer's message — a
+campaign on the server's own timer without pre-vote, a restatement, a completion —
+carries no receipt and is flagged as before, whatever else changed its term in the
+same window. With pre-vote a term rises in the step that takes the granting
+`PreVoteResponse`, or the `TimeoutNow` of a transfer, and that step carries the
+message's receipt: such a candidacy, received by `from`, is excused like any change a
+message caused, since what decided the election reached the server before it was cut
+off. (This paragraph first said that a campaign takes no message and carries no
+receipt, which holds only for a campaign without pre-vote; reworded after review.) `isolation_keeps_its_term_by` and
 `isolation_keeps_its_term_by_cause` give one isolation's verdict, and
 `isolation_received_straddles` is the predicate: each change received by an
 isolation's start and decided inside it, with the messages from a server delivered to
@@ -3713,36 +3719,81 @@ rise straddling *some* isolation's start; for a removed timer catch it asserted
 nothing and printed the flagged server's decisions straddling the flag. The one timer
 catch the nightlies removed, `ResetTimerOnAnyRpc` on seed 5153, was checked by hand.
 
-**Decision.** Both are assertions in `sim/tests/raft.rs`'s `checked`, which every raft
-sweep runs at every tier, the nightly's ten thousand included. Every site is marked
-`PROPOSED(D-051)`.
+**Decision.** Both are assertions in `sim/tests/raft.rs`'s `checked`, which the raft
+scenario's sweeps — the correct server's, every variant's, and D-050's directed
+term-raise sweep with its `NoPreVote` pair — run on every seed at every tier, the
+nightly's ten thousand included. The pinned-seed tests call `Report::check` directly
+and assert their own mechanism. Every site is marked `PROPOSED(D-051)`.
 
 *A removed pre-vote catch.* Its words name an isolation. `Report::isolation_named_by`
 finds the isolation whose own verdict under the check by durability time is those
 words exactly (`Report::isolation_keeps_its_term_by`, one isolation's verdict), and
 the sweep asserts a term change of that server straddling that isolation's start —
-decided before `from` and traced in `[from, until]` (D-047,
+decided at or before `from` and traced in `(from, until]` (D-047,
 `isolation_term_straddles`), or received by `from` and decided in `(from, until]`
 (D-050, `isolation_received_straddles`) — with the same server, `from` and `until`. A
 removed catch whose words name no isolation fails the sweep too.
 
-*A removed timer catch.* It must be the timer replay's first gap by durability time,
-in its words (`TimerGap::violation`, which the check now formats through), and the
-flagged server must have a record that the replay by decision time counts as a reset
-of its clock, decided at or before the flag and traced at or after it, and traced
-later than it was decided (`Report::timer_resets_straddling`). The replay now hands
-each reset it makes, with its record, to a callback (`Report::timer_resets_by`), so
-the assertion reads the check's own resets rather than a list kept beside it.
+The boundaries are the two readings' own: by durability time a term record is before
+the window when traced at or before `from`, by decision time when decided at or before
+it. D-047's predicate first read `decided < from <= at`, which misses a change decided
+at the very instant the isolation began and traced after it — a step the simulator
+polls at `from` after the partition, which the check by decision time places before the
+window — and counts one traced at `from`, which neither reading places inside it.
+Amended after review. With it the assertion is exact: a server's term records have
+decision and durability times that both rise with their order, and its terms rise along
+them outside a re-seed's restatement, which the check skips; so if the check by
+durability time finds the term at `until` different from the term at `from` and the check
+by decision time does not, some record changes the term with `decided <= from < at <=
+until` (the last record traced by `from` and the last decided by it bound the records
+between them, and the terms from there to the last decided by `until` are one), and if
+the check by cause excuses a window the check by decision time flags, every change
+decided in it is a received straddle.
 
-*Choices the issue left.* **Traced at or after the flag**, not strictly after: the flag
-is the first record past the bound, and a reset traced at the same instant later in
-record order is replayed after it by durability time — seed 5153's granted vote is
-exactly that, traced 0 ns after the flag. **Traced later than decided**: a reset whose
-two times are one instant is replayed at the same place under both readings and cannot
-have moved the verdict. **Only resets the replay counts**: the issue's list, a
-campaign, a granted vote, a step-down, an AppendEntries of the server's term, is what
-the replay counts; a term adopted as a follower is not a reset, so on seed 5153 the
-straddling `RaftTerm` the old print showed is not the reason and the `RaftVote` is.
+*A removed timer catch.* It must be the timer replay's first gap by durability time,
+in its words (`TimerGap::violation`, which the check formats through), and
+`Report::timer_removal` must give its reason, read off the two replays at the gap's
+flag record `X` (`TimerGap::record`, its index in the trace). The replay takes a probe
+(a record and a server) and returns that server's state once the record was replayed
+and checked: running, leading, re-seeded, its clock's last reset and the record that
+made it, and whether it was flagged there. By durability time the flagged server is at
+`X` a running follower last reset at `gap.since`, more than its bound before `X`. By
+decision time the replay does not flag it at `X` exactly when it is leading, down or
+re-seeded there, or its last reset `S'` is within the bound of `X`'s decision time. Each
+case is a reason with the record that makes it, and every reason found is returned:
+
+- **`StatusMoved`**: the server leads, is down or is re-seeded at `X` by decision time.
+  Its status records (its `RaftTerm`s and `RaftLeader`s, its `RaftReseeded`, its
+  crashes) come from its own `raft` task in sequence with rising decision times, so
+  each reading replays a prefix of them before `X`, and the status differs only when
+  some status record is before `X` under one reading and after it under the other;
+  that record is the reason.
+- **`ResetMovedBack`**: `S'` is later than `gap.since`. The record behind `S'` is after
+  `X` in the trace's order and was decided before it was traced: had it been before `X`
+  the durability replay would have reset the clock there too, since a reset under the
+  decision order is a reset under the trace's (a delivery counts against a term no
+  higher, and every other reset reads the server's own records, whose order both
+  readings share).
+- **`FlagMovedBack`**: `X`, read by its decision time, is within the bound of
+  `gap.since`; `X` was then decided before it was traced.
+
+So every removal has a reason and every reason names a record whose two times place it
+differently against `X`: the assertion cannot fail on a removal decision time makes,
+and it fails on anything else — a gap the durability replay does not make at `X`, one
+the decision replay makes there too, a reason without its record.
+
+The first form of this assertion required a reset of the flagged server decided at or
+before the flag instant and traced at or after it. Review found it inexact, and it was:
+it is `ResetMovedBack` alone. A record decided before the bound and traced past it can
+be the flag itself (`FlagMovedBack`), with the server's next reset decided after the
+flag; and a leadership decided before the flag and traced after it is no reset
+(`StatusMoved`). In the simulator's traces the first record at any instant is
+`TimeAdvanced`, decided as it is recorded, so the durability replay's flag record is
+always one and `FlagMovedBack` does not arise there, but `StatusMoved` can: a candidate
+that runs past its bound without campaigning again — a server that resets its timer on
+any message — and wins with the step traced past the flag. Unit tests in `sim/raft.rs`
+build each shape from records written by hand and assert the reason given, and a gap
+both readings make, for which none is.
 
 *The evidence.* `the_nightlies_removed_catches_meet_the_sweeps_assertions` runs the 28
 pairs that nightly runs 34749071877 and 34852980174 printed as removed — 27 pre-vote
@@ -3754,7 +3805,16 @@ the first run only and no longer reach their catch since D-049's step-down (D-04
 amendment); the test asserts that neither removes it, so the day either does, the
 assertion runs on it. Both assertions were seen to bite: comparing against another
 isolation fails all 25 pre-vote pairs, and requiring a reset traced strictly after the
-flag fails seed 5153.
+flag fails seed 5153, whose reason is `ResetMovedBack`, the granted vote.
+
+*Where the assertions meet real removals.* No seed of the random sweep's first
+thousand, under any variant, has a removed catch. D-050's directed term-raise schedule
+has one on almost every seed, and its sweeps go through `checked`: the correct server's
+removes a pre-vote catch on 20 of 20, 100 of 100 and 1 000 of 1 000 seeds, each matched to a
+straddle of the isolation it names (D-047's or D-050's), and its `NoPreVote` pair, whose
+runs fail the pre-vote check, removes none. None of those is a timer catch, since a run
+reports the first check it fails by durability time and the pre-vote check comes first;
+the timer assertion meets real removals only in the nightly, seed 5153 so far.
 
 **Alternatives.** *Parsing the isolation's instants out of the words*: `Instant`'s
 `Debug` is a display format, and matching the isolation by its own verdict needs no
@@ -3764,10 +3824,12 @@ tier*: a removal the gate's twenty seeds see is a removal, and the assertions co
 replay per removed catch, which is rare.
 
 **Consequences.** A removed catch without its reason fails whichever sweep sees it,
-at any tier, including the nightly. No seed of the first thousand has a removed catch
-under any variant, so the premerge exercises the assertions only through this test;
-the nightly's ten thousand are where the sweeps meet them. D-047's two limits of evidence are closed on
-approval, when D-047 gains its forward pointer; issue #33 closes with it.
+at any tier, including the nightly. `TimerGap` gains its flag record's index, the timer
+replay a probe, and `Report` `timer_removal`, `isolation_named_by` and one isolation's
+verdicts; `timer_resets_by` and `timer_resets_straddling`, the first form's helpers, are
+gone. D-047's straddle predicate reads `decided <= from < at`. D-047's two limits of
+evidence are closed on approval, when D-047 gains its forward pointer; issue #33 closes
+with it.
 
 ---
 

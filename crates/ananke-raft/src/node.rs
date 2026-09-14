@@ -693,7 +693,8 @@ async fn incarnation<E: Environment>(
         server,
         term: core.term(),
         role: "follower",
-        // A restatement: no message's step (D-050).
+        // PROPOSED(D-050): a term's record carries when the message its step
+        // took was received; a restatement is no message's step.
         received: None,
     });
     let mut node = Server {
@@ -740,6 +741,8 @@ async fn incarnation<E: Environment>(
                 for to in take_stream_acks(&stream_acks) {
                     let decided = env.decision();
                     let outputs = core.step(Input::SnapshotAcked { to });
+                    // PROPOSED(D-050): re-seed progress is no peer's message
+                    // on the inbox, so the step carries no receipt.
                     node.execute(&core, outputs, decided, None).await?;
                 }
                 (Input::Tick, None, None, None)
@@ -985,6 +988,8 @@ async fn install_decision<E: Environment>(
                 // D-047: this step's decision time, as in the loop.
                 let decided = node.env.decision();
                 let outputs = core.step(Input::Applied(index));
+                // PROPOSED(D-050): a completion is no peer's message, so the
+                // step carries no receipt.
                 node.execute(core, outputs, decided, None).await?;
             }
             Some(_) => {}
@@ -1950,6 +1955,8 @@ fn admit<E: Environment>(
     inbox: &Queue<Event>,
     capacity: usize,
     frame: Frame,
+    // PROPOSED(D-050): when the `net` task received the frame, carried on the
+    // inbox event to the step that takes it.
     received: Decision,
 ) {
     let is_message = |event: &Event| matches!(event, Event::Message { .. });

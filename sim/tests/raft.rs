@@ -1098,6 +1098,10 @@ const TERM_RAISE_TRIES: u64 = 8;
 /// count is printed.
 #[test]
 fn a_term_change_stepped_inside_an_isolation_from_a_message_received_before_it_is_excused() {
+    // PROPOSED(D-051): on this schedule most runs hold a catch reading decision
+    // time removes, so each run goes through the sweeps' `checked` and its
+    // assertions meet hundreds of real removals at every tier.
+    let moved = Mutex::new(MovedSeeds::default());
     let per_seed = sweep(seeds(), |seed| {
         let report = raft::run_with(
             seed,
@@ -1108,7 +1112,7 @@ fn a_term_change_stepped_inside_an_isolation_from_a_message_received_before_it_i
         for s in &received {
             assert_received_straddle(&report, s);
         }
-        let verdict = report.check();
+        let verdict = checked(&report, &moved).map_or(Ok(()), Err);
         if verdict.is_err() {
             write_trace(&format!("raft-term-raise-{seed}"), &report.jsonl());
         }
@@ -1153,6 +1157,7 @@ fn a_term_change_stepped_inside_an_isolation_from_a_message_received_before_it_i
     {
         eprintln!("  {line}");
     }
+    print_moved("Correct on the term-raise schedule", moved);
     let failures: Vec<&String> = per_seed
         .iter()
         .filter_map(|(.., verdict)| verdict.as_ref().err())
@@ -1222,27 +1227,65 @@ fn seed_4_of_the_term_raise_schedule_steps_a_message_received_before_its_isolati
 }
 
 /// The pair of the test above (D-050): the server without pre-vote, on the same
-/// directed schedule, campaigns on its own timer while cut off. Its rises carry no
-/// receipt, so the check by cause must still flag them on some seed; a check that
-/// excused everything would pass here.
+/// directed schedule, campaigns on its own timer while cut off, and a campaign on a
+/// timer takes no peer's message, so its term change carries no receipt and the
+/// check by cause must still flag it on some seed; a check that excused everything
+/// would pass here. (A candidacy stepped from a granting PreVoteResponse or a
+/// TimeoutNow does carry one, and is excused when that message was received by the
+/// isolation's start, like any change a message caused.)
+///
+/// Every window the check by decision time flags whose term changes include one
+/// received by the isolation's start and one that is not must be flagged by the
+/// check by cause too, which is the "every" of D-050's excuse; the
+/// count of such windows is printed. Each run also goes through the sweeps'
+/// `checked`, so its removed catches meet D-051's assertions.
 #[test]
 fn a_server_without_pre_vote_is_caught_on_the_term_raise_schedule() {
-    let caught = sweep(seeds(), |seed| {
+    let moved = Mutex::new(MovedSeeds::default());
+    let per_seed = sweep(seeds(), |seed| {
         let report = raft::run_with(
             seed,
             raft::Schedule::term_raise_behind_a_step(TERM_RAISE_TRIES),
             Variant::NoPreVote,
         );
-        report.isolation_keeps_the_term_by_cause().err()
-    })
-    .into_iter()
-    .flatten()
-    .count();
+        let _ = checked(&report, &moved);
+        // PROPOSED(D-050): the excuse needs every change received by the start.
+        let mut mixed = 0;
+        for &(server, from, until) in &report.isolations {
+            let changes = report.isolation_term_changes(server, from, until);
+            let before = changes
+                .iter()
+                .filter(|r| r.received().is_some_and(|received| received <= from))
+                .count();
+            // Only a window the check by decision time flags consults the excuse;
+            // one the pre-vote check skips, for an install inside it, does not.
+            if before > 0
+                && before < changes.len()
+                && report
+                    .isolation_keeps_its_term_by(RecordTime::Decided, server, from, until)
+                    .is_err()
+            {
+                mixed += 1;
+                assert!(
+                    report
+                        .isolation_keeps_its_term_by_cause(server, from, until)
+                        .is_err(),
+                    "seed {seed}: server {server}'s window from {from:?} to {until:?} has a change \
+                     received before it beside one that was not, and is excused: {changes:?}"
+                );
+            }
+        }
+        (report.isolation_keeps_the_term_by_cause().is_err(), mixed)
+    });
+    let caught = per_seed.iter().filter(|(caught, _)| *caught).count();
+    let mixed: usize = per_seed.iter().map(|(_, mixed)| mixed).sum();
     eprintln!(
         "NoPreVote on the term-raise schedule: caught by the pre-vote check on {caught} of {} \
-         seeds",
+         seeds; {mixed} windows mixed a change received before the isolation with one that was \
+         not, each flagged",
         seeds()
     );
+    print_moved("NoPreVote on the term-raise schedule", moved);
     assert!(
         caught > 0,
         "NoPreVote was never caught on the term-raise schedule"
@@ -1359,13 +1402,14 @@ struct MovedSeeds {
 ///
 /// A removed pre-vote catch names an isolation — its server, `from` and `until` —
 /// and that isolation must hold a term change of its server that straddles its
-/// start: decided before it and traced inside it (D-047), or received before it and
-/// decided inside it (D-050). A straddle on some other isolation of the run is not
-/// the reason. A removed timer catch is the replay's first gap by durability time,
-/// and the flagged server must have a record the replay by decision time counts as
-/// a reset, decided at or before the flag and traced at or after it: the one way
-/// reading decision time moves a reset back past a flag. Anything else is a fault
-/// in the reasoning and fails the sweep.
+/// start: decided at or before it and traced inside it (D-047), or received at or
+/// before it and decided inside it (D-050). A straddle on some other isolation of the
+/// run is not the reason. A removed timer catch is the replay's first gap by
+/// durability time, and [`raft::Report::timer_removal`] must give its reason, read
+/// off the two replays at the gap's flag record: a reset of the server moved back
+/// past it, the flag record itself moved back within the bound, or the server's
+/// status there moved. Every removal has one of these, so anything else is a fault in
+/// the reasoning and fails the sweep.
 // PROPOSED(D-051): a removed catch is asserted against the isolation or the flag it
 // names.
 fn checked(report: &raft::Report, moved: &Mutex<MovedSeeds>) -> Option<String> {
@@ -1445,30 +1489,37 @@ fn checked(report: &raft::Report, moved: &Mutex<MovedSeeds>) -> Option<String> {
                      is not the timer replay's first gap by durability time"
                 );
             };
-            let straddling: Vec<String> = report
-                .timer_resets_straddling(gap.server, gap.at)
+            // PROPOSED(D-051): the reason is read off the two replays at the flag
+            // record, and every removal has one.
+            let reasons = report.timer_removal(&gap).unwrap_or_else(|why| {
+                panic!(
+                    "seed {seed} under {variants:?}: decision time removed the timer catch `{was}` \
+                     for no reason the replays show: {why}"
+                )
+            });
+            let reasons: Vec<String> = reasons
                 .iter()
-                .map(|r| {
+                .map(|reason| {
+                    let (what, index) = match *reason {
+                        raft::TimerRemoval::ResetMovedBack { reset } => ("reset moved back", reset),
+                        raft::TimerRemoval::FlagMovedBack { flag } => ("flag moved back", flag),
+                        raft::TimerRemoval::StatusMoved { record } => ("status moved", record),
+                    };
+                    let r = &report.records[index];
                     let event = format!("{:?}", r.event);
                     let name = event.split([' ', '{', '(']).next().unwrap_or("");
                     format!(
-                        "{name} decided {:?} before the flag, traced {:?} after",
+                        "{what}: {name} decided {:?} before the flag, traced {:?} after",
                         gap.at.duration_since(r.decided),
                         r.at.duration_since(gap.at)
                     )
                 })
                 .collect();
-            assert!(
-                !straddling.is_empty(),
-                "seed {seed} under {variants:?}: decision time removed the timer catch `{was}`, but \
-                 no reset of server {} that the replay counts was decided by the flag and traced \
-                 after it",
-                gap.server
-            );
-            moved.lock().unwrap().removed.push((
-                seed,
-                format!("{was} [resets straddling the flag: {straddling:?}]"),
-            ));
+            moved
+                .lock()
+                .unwrap()
+                .removed
+                .push((seed, format!("{was} [{}]", reasons.join("; "))));
         }
         Some(Moved::Gained(now)) => moved.lock().unwrap().added.push((seed, now)),
         None => {}
