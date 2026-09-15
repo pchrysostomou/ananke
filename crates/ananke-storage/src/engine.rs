@@ -539,6 +539,12 @@ pub(crate) struct Shared<E: Environment> {
     /// Writes appended and not yet applied, by sequence number: each record's
     /// writes in order.
     pending: Mutex<BTreeMap<Seq, Vec<(Bytes, Value)>>>,
+    /// Held by whoever is applying pending writes, so that two callers on
+    /// different threads never apply out of sequence order: a record popped by one
+    /// is applied before the next is popped (D-021). The install's split of the
+    /// memtables at its number relies on it (D-054).
+    // PROPOSED(D-054): applies are serialised.
+    apply_order: Mutex<()>,
     /// The highest sequence number applied: what a read without a snapshot reads at,
     /// and what a new snapshot pins. Writes apply in order (D-021), so everything at
     /// or below it is visible.
@@ -685,7 +691,10 @@ pub struct Engine<E: Environment> {
 
 /// A point in the engine's history: reads at it see every write numbered at or
 /// below its version and nothing newer, and compaction keeps the versions it needs
-/// until it is dropped.
+/// until it is dropped. The one exception is a span an install or a range delete
+/// replaced once the snapshot was taken: from the install's switch on, a read at
+/// a version below the install's number sees the span as empty, and one at or above
+/// it sees the installed span (D-054).
 pub struct Snapshot<E: Environment> {
     shared: Arc<Shared<E>>,
     version: Seq,
@@ -1054,6 +1063,7 @@ impl<E: Environment> Engine<E> {
             compact_pointer: Mutex::new(vec![None; LEVELS]),
             next_memtable: AtomicU64::new(2),
             pending: Mutex::new(BTreeMap::new()),
+            apply_order: Mutex::new(()),
             visible: AtomicU64::new(flushed_seq),
             snapshots: Mutex::new(BTreeMap::new()),
             install: Mutex::new(None),
@@ -1138,7 +1148,9 @@ impl<E: Environment> Engine<E> {
         }
     }
 
-    /// A snapshot at the newest write applied.
+    /// A snapshot at the newest write applied. An install or a range delete that
+    /// switches while it is held replaces its span's history under it: see
+    /// [`Snapshot`] (D-054).
     #[must_use]
     pub fn snapshot(&self) -> Snapshot<E> {
         let version = self.shared.visible.load(Ordering::Acquire);
@@ -1160,7 +1172,9 @@ impl<E: Environment> Engine<E> {
             .await
     }
 
-    /// The value under `key` as of `snapshot`, if it is present.
+    /// The value under `key` as of `snapshot`, if it is present: the newest write at
+    /// or below its version, unless an install or a range delete of a span holding
+    /// `key` has switched since the snapshot was taken (D-054; see [`Snapshot`]).
     ///
     /// # Errors
     ///
@@ -1171,7 +1185,9 @@ impl<E: Environment> Engine<E> {
 
     /// Every present key in `range` as of `snapshot`, in key order, with its value:
     /// one merge over every memtable and table, taking the newest write per key at
-    /// or below the snapshot.
+    /// or below the snapshot. A scan reads the tables in service when it starts to
+    /// the end; one that starts after an install or a range delete switched reads
+    /// the replaced span as [`Snapshot`] says (D-054).
     ///
     /// # Errors
     ///
@@ -1540,7 +1556,9 @@ impl<E: Environment> Engine<E> {
     /// installed tables at level 0 sealed near `sst_bytes`, and switches to the
     /// manifest listing the result, with `flushed_seq` at least the install's
     /// number; then it deletes the tables taken out and the log segments at or below
-    /// the number. Holds the turnstile from the flush to the deletion.
+    /// the number. Holds the turnstile from the flush to the deletion. Everything
+    /// after the numbering runs in a task the engine spawns, so dropping the returned
+    /// future, or not polling it, leaves the install to finish.
     ///
     /// One install runs at a time. An install of an empty `source` is a delete of
     /// the span. A snapshot older than the install reads the span as empty once the
@@ -1572,7 +1590,7 @@ impl<E: Environment> Engine<E> {
     ) -> SpanInstall {
         let refused = |why: InstallRefused| SpanInstall {
             seq: None,
-            future: Box::pin(async move { Err(why.into_io()) }),
+            state: InstallState::Refused(Some(why.into_io())),
         };
         if range.start >= range.end {
             return refused(InstallRefused::EmptySpan);
@@ -1605,13 +1623,31 @@ impl<E: Environment> Engine<E> {
             seq,
         };
         let shared = self.shared.clone();
-        SpanInstall {
-            seq: Some(seq),
-            future: Box::pin(async move {
-                let _hold = hold;
+        // PROPOSED(D-054): the install runs in a task of its own, so a caller that
+        // drops its future or leaves it unpolled cannot stop it half-way, with a
+        // manifest written under the next number and never switched to.
+        let slot: Arc<Mutex<InstallSlot>> = Arc::default();
+        let done = slot.clone();
+        self.shared.env.spawn("span-install", async move {
+            let result = async {
                 marker.await?;
                 shared.install_span(seq, range, source, delete).await
-            }),
+            }
+            .await;
+            // The flusher may go on before the caller learns the outcome.
+            drop(hold);
+            let waker = {
+                let mut done = lock(&done);
+                done.result = Some(result);
+                done.waker.take()
+            };
+            if let Some(waker) = waker {
+                waker.wake();
+            }
+        });
+        SpanInstall {
+            seq: Some(seq),
+            state: InstallState::Running(slot),
         }
     }
 
@@ -1700,6 +1736,8 @@ impl<E: Environment> Shared<E> {
     /// Applies every pending write up to and including `seq`, oldest first: the log
     /// acknowledged `seq`, so all of them are durable.
     fn apply_through(&self, seq: Seq) {
+        // PROPOSED(D-054): one applier at a time, so the pop order is the apply order.
+        let _order = lock(&self.apply_order);
         loop {
             let next = {
                 let mut pending = lock(&self.pending);
@@ -2168,11 +2206,27 @@ impl<E: Environment> std::fmt::Debug for SpanSource<E> {
 }
 
 /// An install on its way: numbered at once, and resolving once the switch that
-/// makes it the state is durable, or with the refusal.
+/// makes it the state is durable, or with the refusal. The install runs in a task
+/// of the engine's own; dropping this, or never polling it, leaves it to finish.
 // PROPOSED(D-054): the live install of a span, in one manifest switch.
 pub struct SpanInstall {
     seq: Option<Seq>,
-    future: Pin<Box<dyn Future<Output = io::Result<InstallInfo>> + Send>>,
+    state: InstallState,
+}
+
+/// Where an install stands for its caller.
+enum InstallState {
+    /// Refused before it was numbered; the error until it is taken.
+    Refused(Option<io::Error>),
+    /// Running in its task, which leaves the outcome here.
+    Running(Arc<Mutex<InstallSlot>>),
+}
+
+/// The outcome an install's task leaves for its caller.
+#[derive(Default)]
+struct InstallSlot {
+    result: Option<io::Result<InstallInfo>>,
+    waker: Option<Waker>,
 }
 
 impl SpanInstall {
@@ -2196,12 +2250,26 @@ impl Future for SpanInstall {
     type Output = io::Result<InstallInfo>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<InstallInfo>> {
-        self.future.as_mut().poll(cx)
+        let gone = || io::Error::other("the install was polled after it resolved");
+        match &mut self.state {
+            InstallState::Refused(error) => Poll::Ready(Err(error.take().unwrap_or_else(gone))),
+            InstallState::Running(slot) => {
+                let mut slot = lock(slot);
+                match slot.result.take() {
+                    Some(result) => Poll::Ready(result),
+                    None => {
+                        slot.waker = Some(cx.waker().clone());
+                        Poll::Pending
+                    }
+                }
+            }
+        }
     }
 }
 
-/// Marks the install in progress for as long as its future lives, and lets the
-/// flusher at the memtables it held back once the future is done or dropped.
+/// Marks the install in progress for as long as its task runs, and lets the flusher
+/// at the memtables it held back once the task has switched, failed, or been
+/// dropped with its node.
 // PROPOSED(D-054): the live install of a span, in one manifest switch.
 struct InstallHold<E: Environment> {
     shared: Arc<Shared<E>>,

@@ -4214,6 +4214,25 @@ nothing an engine did before an install reads differently.
 `a_rewritten_level_0_table_does_not_hide_a_newer_write` (tests/engine.rs) builds the case
 and reads the old value under the old order.
 
+*The install's own task.* The work after the install is numbered, from waiting for its
+record to deleting what it took out, runs in a task the engine spawns through
+`Environment::spawn` (`span-install`), and `SpanInstall` only waits for the outcome the
+task leaves. A caller that drops the future, or never polls it, cannot stop the install
+between writing its manifest and switching to it, which would leave a manifest file
+under the next number that the next flush's `create_new` then fails on for good, and
+cannot hold the flusher back by not polling. The task lets the flusher go before it
+tells the caller.
+
+*Applies in order.* The split of the memtables at `S` rests on D-021's rule that
+writes apply in sequence order: every record below `S` applied before `S`, and `S`'s
+rotation before any record above it. `apply_through` popped a record under the pending
+lock and applied it after letting the lock go, so on a runtime with more than one
+thread two callers could apply out of order; under the simulator, which polls one task
+at a time with no await inside an apply, they could not. Applies are now serialised by
+a lock of their own (`apply_order`), held from the first pop to the last apply, which
+changes nothing a simulated run does. The same race was open to the flush's rotation
+before this entry.
+
 *One at a time, and refusals.* A second install while one is in progress is refused
 (`InProgress`), as are a span with no key (`EmptySpan`), a source with a key outside the
 span (`OutsideSpan`) and a quiesced engine (`Quiesced`, D-044). A refusal before the
