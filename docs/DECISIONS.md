@@ -4900,16 +4900,25 @@ schedules, each asserting its mechanism or, with the reason, its absence:
 **Measured.** On the tree with the queue, in release: the correct server passes every
 seed of `sim/raft.rs`, `sim/membership.rs` and `sim/quorum.rs` at 20, 100 and 1000, and
 the raft sweep's coverage prints `queue_drops: 0` over the correct server's thousand seeds.
-Rates at 1000 against the same tree without the queue (268cf58): `ApplyBeforeCommit` 882
-(891), `CountOlderTermForCommit` 454 (463), `ResetTimerOnAnyRpc` 336 (352),
-`SnapshotWithoutCurrentLast` 336 (340), `AdoptionAsBuilt` 77 (57), `RefusalNotDurable` 16
-(14), `SharedSnapshotDir` 2 (1), `SingleMajorityInJointConsensus` 288 (275),
-`IgnoreIncarnation` 0 (0), and `SendBeforePersist`, `TruncateOnEveryAppend`, `NoPreVote`,
-`RefusedCountsForQuorum` and `RefusedNeverCounts` on every seed as before; the lease trial
-revoked on all 503 seeds beyond the drift bound and caught 41 stale reads. With D-058's
-membership scenario under it, the correct server passes that scenario on every seed at 20,
-100 and 1000 with a joining server fed a snapshot on every one (83, 479 and 4 755 installs),
-and `SingleMajorityInJointConsensus` is caught on 8 of 20, 31 of 100 and 296 of 1000.
+The raft sweep's rates at 1000 seeds are compared with 268cf58, the lane's base before
+D-057 and D-058, which change neither the raft scenario nor its server:
+`ApplyBeforeCommit` 882 (891), `CountOlderTermForCommit` 454 (463), `ResetTimerOnAnyRpc`
+336 (352), `SnapshotWithoutCurrentLast` 336 (340), `AdoptionAsBuilt` 77 (57),
+`RefusalNotDurable` 16 (14), `SharedSnapshotDir` 2 (1), `IgnoreIncarnation` 0 (0), and
+`SendBeforePersist`, `TruncateOnEveryAppend`, `NoPreVote`, `RefusedCountsForQuorum` and
+`RefusedNeverCounts` on every seed as before; the lease trial revoked on all 503 seeds
+beyond the drift bound and caught 41 stale reads (49). Every change is the moved schedule's
+draw and within the binomial spread of the rate the nightly measured. `AdoptionAsBuilt`'s
+storm is drawn on the same 260 seeds on both trees, and at its ten-thousand-seed rate, 646 of
+10 000 (6.46 %, D-047, DECISIONS.md:3144), a thousand seeds catch 64.6 on average with a
+standard deviation of 7.8: 57 is one below the mean and 77 1.6 above. The lease trials'
+rate, 472 stale reads in 5 023 exceeded seeds at ten thousand (9.4 %), gives 47.3 of 503 with
+a deviation of 6.5: 49 and 41 are each within one. The membership scenario is compared with
+the lane's tip without the queue, 9432fed: its correct server passes every seed at 20, 100 and
+1000 with a joining server fed a snapshot in its learner phase on every one (59, 377 and
+3 957 installs; 63, 388 and 4 056 without the queue), no refusal and no fallback, and
+`SingleMajorityInJointConsensus` is caught on 8 of 20, 31 of 100 and 296 of 1000 (6, 35 and
+301 without the queue).
 
 **The tier of `RefusalNotDurable`'s catch: the owner's decision of 2026-09-15.** This part
 is decided; the queue model above stays proposed. `RefusalNotDurable`'s test asserted its
@@ -4957,6 +4966,18 @@ replace `Partitioned` and `Unreachable` drops with frames delivered late, a chan
 would change what a crash does to frames already sent, which the fault model has always
 delivered. *A faster default*: ten gigabits would queue less; a gigabit, the slowest common
 server link, is the conservative choice.
+
+*Where the model still differs from `RealEnv`, not changed here.* `RealEnv`'s task pops a
+frame as soon as its connection's write returns, and a write returns once the bytes are in
+the kernel's send buffer, not on the wire; the simulator has no such buffer and drains only
+at the link's rate, so a burst to one destination fills its queue sooner than `RealEnv`'s,
+and the simulator drops earlier — the conservative direction, since a drop is what the
+protocol must survive. Two omissions point the other way, and are smaller wherever a backlog
+outgrows the send buffer: the simulator does not count `RealEnv`'s 12-byte frame header, a
+4-byte length and an 8-byte message id, over a fifth of a 53-byte heartbeat (SHARD.md §4's 61 less the range id), nor
+the hello frame at each connection's start; and it has no connect or reconnect delay, during
+which `RealEnv`'s queue does not drain at all. So the claim is that the simulator's queue
+drops no later than `RealEnv`'s for a sustained backlog, not for every burst.
 
 **Consequences.** No Phase 2 scenario sends one destination fast enough to fill a queue,
 so queue-full drops wait for Stage B's batch frames, where many ranges share a socket. Any

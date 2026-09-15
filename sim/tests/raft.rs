@@ -1000,10 +1000,15 @@ fn the_nightlys_eleven_variant_catches_of_the_trace_timestamp_gap_are_not_catche
 /// catch named still comes, on the same server at the same instants (seeds 5203, 6691,
 /// 5051, 5879, 6717 and 2578), and the server keeps its term through it; on the other
 /// 21 pre-vote catches the leader-relative fault lands elsewhere (on three, 4814, 5918
-/// and 6366, at the same instant on another server), and seed 5153's
-/// timer gap is gone with its schedule. (Before D-056, 26 of the 28 were removed here
-/// in the nightlies' words; `IgnoreIncarnation` on seeds 2509 and 5990 had moved under
-/// D-049.)
+/// and 6366, at the same instant on another server). Seed 5153's timer gap is gone with
+/// its schedule: the timer replay by durability time finds no gap on the run, which is
+/// asserted. Every run passes the check but one: seed 6717 under `ResetTimerOnAnyRpc`
+/// is caught by the timer check, server 3 having heard from no leader of its term since
+/// 4.465 s and not campaigned by 4.866 s — the variant's own bug, a timer reset by a
+/// message that is no leader's contact, caught on a schedule D-056 moved, and not a
+/// catch decision time removes, as `checked` asserts. That catch is asserted too.
+/// (Before D-056, 26 of the 28 were removed here in the nightlies' words and passed;
+/// `IgnoreIncarnation` on seeds 2509 and 5990 had moved under D-049.)
 #[test]
 // PROPOSED(D-051): a removed catch is asserted against the isolation or the flag it
 // names.
@@ -1163,9 +1168,21 @@ fn the_nightlies_removed_catches_meet_the_sweeps_assertions() {
         let moved = Mutex::new(MovedSeeds::default());
         let verdict = checked(&report, &moved);
         let moved = moved.into_inner().unwrap();
-        (seed, variant, was, verdict, moved.removed, moved.added)
+        // D-056: seed 5153's timer gap, asserted gone by the replay by durability time.
+        let durable_gaps = report
+            .timer_gaps_by(TimerResets::ALL, RecordTime::Durable)
+            .len();
+        (
+            seed,
+            variant,
+            was,
+            verdict,
+            moved.removed,
+            moved.added,
+            durable_gaps,
+        )
     });
-    for (seed, variant, was, verdict, removed, added) in &runs {
+    for (seed, variant, was, verdict, removed, added, durable_gaps) in &runs {
         for (_, line) in removed {
             eprintln!("seed {seed} under {variant:?}: removed: {line}");
         }
@@ -1181,6 +1198,27 @@ fn the_nightlies_removed_catches_meet_the_sweeps_assertions() {
              assert it removed, and the run passing"
         );
         eprintln!("seed {seed} under {variant:?}: {verdict:?}");
+        if *seed == 5153 {
+            assert_eq!(
+                *durable_gaps, 0,
+                "seed 5153 under {variant:?}: the timer replay by durability time finds a gap \
+                 again: re-audit the pin"
+            );
+        }
+        if (*seed, *variant) == (6717, Variant::ResetTimerOnAnyRpc) {
+            assert!(
+                verdict.as_ref().is_some_and(|v| v.starts_with(
+                    "seed 6717: timers: server 3 heard from no leader of its term and granted no vote"
+                )),
+                "seed 6717 under {variant:?} is no longer caught by the timer check on server 3: \
+                 {verdict:?}; re-audit the pin"
+            );
+        } else {
+            assert_eq!(
+                verdict, &None,
+                "seed {seed} under {variant:?}: the run no longer passes the check"
+            );
+        }
     }
 }
 
@@ -2027,10 +2065,10 @@ fn a_server_whose_refusal_is_not_durable_is_caught() {
     // queue, which moved every schedule, the catch is 16 of the first thousand seeds,
     // none of them below seed 100 (the first is 119). At the nightly's rate, 1.32 %,
     // a hundred seeds catch none about one time in four (0.9868^100 = 0.26) and the
-    // gate's twenty three times in four, so the assertion there would fail a tree with
-    // nothing wrong on the draw alone; a thousand miss about once in six hundred thousand
-    // (0.9868^1000 = 1.7e-6). Seed 119, the first catch of the thousand, is pinned
-    // with its mechanism at every tier:
+    // gate's twenty three times in four, so the assertion there would fail a tree
+    // with nothing wrong on the draw alone; a thousand miss about once in six hundred
+    // thousand (0.9868^1000 = 1.7e-6). Seed 119, the first catch of the thousand, is
+    // pinned with its mechanism at every tier:
     // `seed_119_pins_the_refusal_that_is_not_durable_which_a_hundred_seeds_can_miss`.
     if seeds() >= 1000 {
         assert!(!caught.is_empty(), "RefusalNotDurable was never caught");
@@ -2038,24 +2076,24 @@ fn a_server_whose_refusal_is_not_durable_is_caught() {
 }
 
 /// Seed 119, pinned by the owner's decision of 2026-09-15 (D-056): the first seed of
-/// the first thousand on which `RefusalNotDurable` is caught, on the tree with the
-/// send queue. The catch is 16 of those thousand, none below seed 100, and the
-/// nightly's last measure, before D-056, was 132 of ten thousand, at which a hundred
-/// seeds catch none about one time in four; so the sweep asserts the catch only from
-/// the thousand-seed tier, and this pin keeps the variant's catch, with its
-/// mechanism, at every tier, the gate's and CI's included.
+/// the first thousand on which `RefusalNotDurable` is caught, on the tree with the send
+/// queue. The catch is 16 of those thousand, none below seed 100, and the nightly's
+/// last measure, before D-056, was 132 of ten thousand, at which a hundred seeds catch
+/// none about one time in four; so the sweep asserts the catch only from the
+/// thousand-seed tier, and this pin keeps the variant's catch, with its mechanism, at
+/// every tier, the gate's and CI's included.
 ///
 /// As built, read off the trace: `Fault::CrashRefused` crashes server 3 (server 2
 /// leads, so its neighbour is the victim) four times. The first, at 11.147 s, lands
-/// inside a flush, and its restart is refused for the log's missing head and
-/// re-seeded. The second, at 12.769 s, lands inside a flush with its bit rot on
-/// tables 29 and 31, which the manifest lists: the open drops both and server 3 is
-/// refused for lost state at 12.835 s. The third, at 12.836 s, lands on the refused
-/// server, whose next open is refused again at 12.891 s; this time the refused
-/// engine, not quiesced, flushes what the recovery replayed — manifest 11 listing
-/// tables 30 and 32 only, `CURRENT` switched to it, log segments 1 and 2 deleted —
-/// and the loss is laundered. The fourth, at 12.989 s, comes the fault's grace, 136
-/// ms, after that refused restart; its open finds a self-consistent store, removes tables 29 and 31 as orphans and
+/// inside a flush, and its restart is refused for the log's missing head and re-seeded.
+/// The second, at 12.769 s, lands inside a flush with its bit rot on tables 29 and 31,
+/// which the manifest lists: the open drops both and server 3 is refused for lost state
+/// at 12.835 s. The third, at 12.836 s, lands on the refused server, whose next open is
+/// refused again at 12.891 s; this time the refused engine, not quiesced, flushes what
+/// the recovery replayed — manifest 11 listing tables 30 and 32 only, `CURRENT`
+/// switched to it, log segments 1 and 2 deleted — and the loss is laundered. The
+/// fourth, at 12.989 s, comes the fault's grace, 136 ms, after that refused restart;
+/// its open finds a self-consistent store, removes tables 29 and 31 as orphans and
 /// recovers clean at 13.070 s with an applied index of 330, before a leader's install
 /// is adopted at 13.432 s. State machine safety reports that restatement, whose log
 /// does not hold the index 1 it claims to have applied. That is seed 687's premerge
@@ -2064,14 +2102,14 @@ fn a_server_whose_refusal_is_not_durable_is_caught() {
 /// The correct server's run is the variant's up to server 3's first refusal, which it
 /// records in the store's marker before tracing it (D-044): the mark's write and sync
 /// put its `RaftRefused` at 11.208 s against the variant's 11.203 s, and the run's
-/// schedule differs from there on. On that schedule the fault still fires as aimed — its three later
-/// rounds crash server 3 inside a flush, at 13.044, 13.106 and 13.168 s — but none of
-/// their bit rot lands on a table an open reads, so no open drops a table, server 3 is
-/// never refused for lost state and no crash lands on a refused server; the run
-/// passes. The situation the fix handles is absent here, asserted, with that reason;
-/// the correct server's quiesce and durable refusal are pinned on seed 687, where its
-/// schedule reaches them, and this pin runs its seed 119 at every tier, where the
-/// correct server's sweep reaches that seed only from the thousand-seed tier.
+/// schedule differs from there on. On that schedule the fault still fires as aimed —
+/// its three later rounds crash server 3 inside a flush, at 13.044, 13.106 and 13.168 s
+/// — but none of their bit rot lands on a table an open reads, so no open drops a
+/// table, server 3 is never refused for lost state and no crash lands on a refused
+/// server; the run passes. The situation the fix handles is absent here, asserted, with
+/// that reason; the correct server's quiesce and durable refusal are pinned on seed
+/// 687, where its schedule reaches them, and this pin runs its seed 119 at every tier,
+/// where the correct server's sweep reaches that seed only from the thousand-seed tier.
 #[test]
 fn seed_119_pins_the_refusal_that_is_not_durable_which_a_hundred_seeds_can_miss() {
     use ananke_env::NodeId;
