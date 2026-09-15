@@ -432,12 +432,20 @@ fn a_seek_that_counts_tombstones_is_caught() {
 /// A kept number can also equal the number of a later local write of the same key,
 /// and two writes under one internal key stop the variant's next compaction at the
 /// table writer's order assertion: the engine itself refuses the state the bug
-/// made. Such a seed counts as caught, and the test prints how many there were.
+/// made. Such a seed counts as caught, apart from the oracle's catches, and only a
+/// panic with that assertion's message does: any other panic fails the test. The
+/// oracle's own catches are asserted non-empty.
 // PROPOSED(D-054): the installed sequence numbers are the install's.
 #[test]
 fn an_install_that_keeps_its_sources_numbers_is_caught() {
-    let outcomes: Vec<Option<(String, bool)>> = sweep(high_rate_share(), |seed| {
-        std::panic::catch_unwind(|| {
+    /// The table writer's assertion a kept number trips (`SstWriter::add`).
+    const ORDER: &str = "SSTable writes must be added in internal-key order";
+    enum Catch {
+        Oracle(String),
+        Order,
+    }
+    let outcomes: Vec<Option<Catch>> = sweep(high_rate_share(), |seed| {
+        let run = std::panic::catch_unwind(|| {
             engine::run_with(
                 seed,
                 engine::Schedule::install(),
@@ -445,24 +453,42 @@ fn an_install_that_keeps_its_sources_numbers_is_caught() {
             )
             .check()
             .err()
-            .map(|violation| (violation, false))
-        })
-        .unwrap_or_else(|_| Some((format!("seed {seed}: the engine panicked"), true)))
+        });
+        match run {
+            Ok(violation) => violation.map(Catch::Oracle),
+            Err(payload) => {
+                let message = payload
+                    .downcast_ref::<&str>()
+                    .copied()
+                    .or_else(|| payload.downcast_ref::<String>().map(String::as_str));
+                if message == Some(ORDER) {
+                    Some(Catch::Order)
+                } else {
+                    std::panic::resume_unwind(payload)
+                }
+            }
+        }
     });
-    let caught: Vec<&(String, bool)> = outcomes.iter().flatten().collect();
-    let panicked = caught.iter().filter(|(_, p)| *p).count();
+    let oracle: Vec<&str> = outcomes
+        .iter()
+        .filter_map(|o| match o {
+            Some(Catch::Oracle(v)) => Some(v.as_str()),
+            _ => None,
+        })
+        .collect();
+    let order = outcomes
+        .iter()
+        .filter(|o| matches!(o, Some(Catch::Order)))
+        .count();
     eprintln!(
-        "InstallKeepsSourceNumbers: caught on {} of {} seeds, {panicked} of them by the engine's own assertion, first: {}",
-        caught.len(),
+        "InstallKeepsSourceNumbers: caught on {} of {} seeds by the oracle and {order} by the table writer's order assertion, first: {}",
+        oracle.len(),
         high_rate_share(),
-        caught
-            .iter()
-            .find(|(_, p)| !*p)
-            .map_or("", |(v, _)| v.as_str())
+        oracle.first().copied().unwrap_or("")
     );
     assert!(
-        !caught.is_empty(),
-        "InstallKeepsSourceNumbers was never caught"
+        !oracle.is_empty(),
+        "the oracle never caught InstallKeepsSourceNumbers"
     );
 }
 

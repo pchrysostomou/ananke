@@ -4403,8 +4403,9 @@ some manifest was written, fallback or not; the simulator never loses a director
 a correct engine deletes a table only after the switch that stops listing it. Now such a
 table is excused only by this open's explained fallback, or by the earlier open's under the
 same manifest in force, which dropped it for that fallback and whose manifest nothing has
-replaced since; otherwise the check reports *table N, which manifest M lists, was deleted
-before its manifest was in force*. The mutation the old excuse hid, a compaction that
+replaced since (clauses the second review showed could never fire, and which are gone;
+below); otherwise the check reports *table N, which manifest M lists, was deleted before
+its manifest was in force*. The mutation the old excuse hid, a compaction that
 writes its manifest, deletes its inputs and only then switches `CURRENT`, was run once
 against both oracles: the old one caught it on 0 of 20 and 0 of 100 seeds, the tightened
 one on 6 of 20 and 30 of 100, the first at seed 1: *table 37 at level 2 covering 373..=444,
@@ -4412,6 +4413,46 @@ which manifest 40 lists, was deleted before its manifest was in force*. **No cor
 seed turned red under the tightened oracle**: every correct test of the engine binary
 passes at 20, 100 and 1000 seeds, and so does the Phase 1 schedule alone
 (`Schedule::phase_1()`) at 1000.
+
+*What the second review found in the oracle.* Two more gaps in the dropped-table
+check, and two clauses of the first tightening that could never fire.
+- **A fault on a table's contents excused its deletion.** The check asked whether any
+  sync of the table's file had been lost, or bit rot had hit it, anywhere in the trace,
+  before it asked whether the engine had deleted it. A table the engine deleted and the
+  open found *missing* was excused so, though a lost sync or bit rot explains a table
+  *unreadable* or *corrupt*, not a file whose deletion the trace shows and whose
+  directory entry a sync made durable. Now the reason is the one this open gave in
+  `SstDropped`, and a table dropped as missing that the engine deleted is judged as
+  deleted, whatever faults its contents met.
+- **A reused number carried its first life's deletion.** A fallback can hand out a
+  table number again, and the mirror's set of deleted tables was by number across the
+  whole trace, so a second table under a number could be taken for the first's
+  deletion. A table written again now leaves that set, and its first life's finished
+  compaction inputs, as the log's betrayed-sync set already did.
+- **The fallback and carry-over clauses could not fire.** The first review excused a
+  deleted table by this open's explained fallback, or by an earlier open's under the
+  same manifest. But an open that falls back never reports a dropped table: it uses only
+  a manifest whose every table is there (D-022), which the pin on seed 44 asserts. So
+  the fallback clause never met a dropped table, and the carry-over only ever carried
+  what the fallback clause gave it. Both are deleted, and so is the carried state.
+
+No correct-engine seed turned red: every correct test of the engine binary passes at
+20, 100 and 1000 seeds with every coverage and outcome field unchanged. The only rates
+that moved are `DeleteBeforeManifest`'s, whose deletions a contents fault had forgiven:
+12 of 20, 67 of 100 and 647 of 1000, from 11, 66 and 645. The mutations were run against
+the oracle before the second review's tightening and after it, each as the correct
+engine's checks over a scratch copy of the tree:
+
+| mutation | schedule | 20 | 100 | 1000 |
+| --- | --- | --- | --- | --- |
+| a compaction writes its manifest, deletes its inputs, then switches | default | 7 → 7 | 29 → 30 | 258 → 280 |
+| an install writes its manifest, deletes the tables it took out, then switches | `install()` | 8 → 10 | 34 → 40 | 405 → 442 |
+
+The first catch of each is the deleted-table check: at seed 1, *table 11 at level 0
+covering 83..=107, which manifest 11 lists, was deleted before its manifest was in
+force*, and at seed 2, *table 68 at level 2 covering 728..=841, which manifest 65 lists,
+was deleted before its manifest was in force*. The compaction mutation's rates differ
+from the first review's (6 of 20, 30 of 100) because every schedule has moved since.
 
 *Measured after review.* On the tree of the review's fixes to D-054 — the tightened
 oracle, the install's own task, the store further along and the observed numbers — in
@@ -4432,7 +4473,11 @@ and 559 of 1000; `InstallKeepsSourceNumbers` on 20 of 20, 98 of 100 and 975 of 1
 at seed 0: *the install at record 125 is in force (manifest 11) but its table 15 carries
 records 174..=179, not the install's number*. At one seed of the thousand a kept number equalled a later
 local write's under the same key and the variant's own compaction stopped at the table
-writer's order assertion, which the test counts as caught and prints.
+writer's order assertion, which the test counts as caught and prints. Since the second
+review that count is kept apart from the oracle's, only a panic whose message is that
+assertion's counts, any other panic fails the test, and the oracle's own catches are what
+the test asserts: 20 of 20, 98 of 100 and 974 of 1000 by the oracle, and at a thousand
+one more by the assertion.
 `SpanCheckpointUnsynced` is caught on 17 of 20, 81 of 100 and 816 of 1000, down from 19,
 95 and 940: half the sources are now the store further along, which the harness writes and
 syncs itself, so only the other half are the engine's span checkpoints that can show it.
@@ -4664,7 +4709,8 @@ test runs no install, so its schedule did not move: its numbers above stand, and
 The default sweep's three Phase 1 variants on the moved schedules (the install's task and
 the store further along both draw and write): `NoWalBeforeMemtable`,
 `ReleaseBeforeManifest` and `DeleteBeforeManifest` are caught on 20, 10 and 11 of 20, 99,
-51 and 66 of 100, and 985, 602 and 645 of 1000. `ReleaseBeforeManifest` fell, from 645 on
+51 and 66 of 100, and 985, 602 and 645 of 1000; the second review's tightening of the
+oracle (D-054) moves `DeleteBeforeManifest` to 12, 67 and 647 and nothing else. `ReleaseBeforeManifest` fell, from 645 on
 the same oracle a schedule earlier to 602, though crashes with a memtable mid-flush did
 not (6 061 then, 6 109 now, at a thousand seeds). Its catch needs a crash between its early
 release and its manifest with the released segments' records still owed and no fault

@@ -444,6 +444,10 @@ impl Mirror {
                     max_seq,
                     ..
                 } => {
+                    // PROPOSED(D-054): a number written again is a new table, which
+                    // its first life's deletion says nothing about.
+                    mirror.deleted.remove(number);
+                    mirror.finished_inputs.remove(number);
                     // A flushed table holds what every record in its range left in
                     // the memtable: its last write per key.
                     let writes: BTreeSet<(Bytes, u64)> = (*first_seq..=*max_seq)
@@ -466,6 +470,9 @@ impl Mirror {
                     );
                 }
                 TraceEvent::SstWritten { number, level, .. } => {
+                    // PROPOSED(D-054): a number written again is a new table.
+                    mirror.deleted.remove(number);
+                    mirror.finished_inputs.remove(number);
                     // A compaction's output: filled in when the compaction finishes.
                     mirror.tables.insert(
                         *number,
@@ -903,11 +910,6 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
     let mut base = 0;
     let mut epoch_start = 0;
     let mut previous_manifest: Option<(u64, u64)> = None;
-    // PROPOSED(D-054): tables the open dropped because the engine had deleted them
-    // after a manifest a fallback then abandoned, with the fallback's excuse and the
-    // manifest that was in force: the next open under the same manifest drops them
-    // again, with no fallback of its own to explain it.
-    let mut carried_drops: (u64, BTreeMap<u64, Excuse>) = (0, BTreeMap::new());
     let mut refused = None;
     let (mut checkpoints_verified, mut checkpoints_damaged) = (0u64, 0u64);
     let mut span_checkpoints_verified = 0u64;
@@ -1187,29 +1189,34 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
             .flatten()
             .copied()
             .collect();
-        // A dropped table: its sync was lost or bit rot hit it; or it is missing
-        // because the engine deleted it once no manifest in force listed it, as a
-        // compaction's input or as an orphan, and a fallback, this epoch's or an
-        // earlier one's, went back to a manifest that did. A table deleted before
-        // its manifest stopped listing it is the bug.
+        // A dropped table: its sync was lost or bit rot hit it. A table the engine
+        // deleted and this open found missing is neither: a correct engine deletes
+        // a table only once a durable switch stops listing it, and an open that
+        // falls back never reports a dropped table, choosing a manifest whose every
+        // table is there. So a missing table the trace shows deleted is the bug,
+        // whatever faults its contents met, and the reason this open gave is what
+        // says it is missing.
         let mut table_why: BTreeMap<u64, Excuse> = BTreeMap::new();
         for meta in &recovery.dropped {
             let path = manifest::sst_path(dir, meta.number);
-            let deleted = mirror.deleted.contains(&meta.number);
-            let why = if all_synced.sst_betrayed.contains(&meta.number) {
+            let reason = records[before_open..]
+                .iter()
+                .find_map(|r| match &r.event {
+                    TraceEvent::SstDropped { number, reason, .. } if *number == meta.number => {
+                        Some(*reason)
+                    }
+                    _ => None,
+                })
+                .unwrap_or("?");
+            // PROPOSED(D-054): a deleted table found missing is not excused by a
+            // fault on its contents.
+            let deleted = reason == "missing" && mirror.deleted.contains(&meta.number);
+            let why = if deleted {
+                None
+            } else if all_synced.sst_betrayed.contains(&meta.number) {
                 Some(Excuse::LostFsync)
             } else if rotted(&all, &path) {
                 Some(Excuse::BitRot)
-            } else if deleted {
-                // PROPOSED(D-054): a table the manifest in force lists and the engine
-                // deleted is gone for a fallback's fault, this open's, or an earlier
-                // open's under the same manifest; never on its own, since a correct
-                // engine deletes a table only once a switch stops listing it.
-                fallback_why.or_else(|| {
-                    (carried_drops.0 == recovery.manifest)
-                        .then(|| carried_drops.1.get(&meta.number).copied())
-                        .flatten()
-                })
             } else {
                 None
             };
@@ -1219,23 +1226,11 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
                 }
                 None if verdict.is_ok() && deleted => {
                     verdict = Err(format!(
-                        "table {} at level {} covering {}..={}, which manifest {} lists, was deleted before its manifest was in force, and no fallback explains it",
+                        "table {} at level {} covering {}..={}, which manifest {} lists, was deleted before its manifest was in force",
                         meta.number, meta.level, meta.first_seq, meta.max_seq, recovery.manifest
                     ));
                 }
                 None if verdict.is_ok() => {
-                    let reason = records
-                        .iter()
-                        .rev()
-                        .find_map(|r| match &r.event {
-                            TraceEvent::SstDropped { number, reason, .. }
-                                if *number == meta.number =>
-                            {
-                                Some(*reason)
-                            }
-                            _ => None,
-                        })
-                        .unwrap_or("?");
                     verdict = Err(format!(
                         "table {} at level {} covering {}..={} was dropped ({reason}) without a fault",
                         meta.number, meta.level, meta.first_seq, meta.max_seq
@@ -1597,21 +1592,6 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
             }
         }
         previous_manifest = Some((recovery.manifest, recovery.flushed_seq));
-        // PROPOSED(D-054): the drops a fallback explained, for the next open under
-        // the same manifest.
-        let deleted_drops: BTreeMap<u64, Excuse> = recovery
-            .dropped
-            .iter()
-            .filter(|m| mirror.deleted.contains(&m.number))
-            .filter_map(|m| table_why.get(&m.number).map(|why| (m.number, *why)))
-            .collect();
-        carried_drops = if carried_drops.0 == recovery.manifest {
-            let mut kept = carried_drops.1;
-            kept.extend(deleted_drops);
-            (recovery.manifest, kept)
-        } else {
-            (recovery.manifest, deleted_drops)
-        };
         base = end;
         {
             let mut m = lock(&model);
