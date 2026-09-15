@@ -4630,10 +4630,27 @@ them. `Schedule::phase_1()` runs none of it and is the schedule every seed ran b
 part of the entry, and each primitive's own schedule is `phase_1()` with that primitive.
 The two seeds the sweep pins keep the Phase 1 schedule, on which each was found: seed 420
 and seed 44 in both its modes. Re-audited: each run's moirae trace hashes the same on
-268cf58, the tree before D-054, on 7e3d25d, D-054's commit, and on this tree with
-`Schedule::phase_1()` (`a858ef4b153bf4c6`, `dabd6adfaee000f5` and, refusing fallbacks,
-`977a703fb51c96e8`), so neither schedule moved and seed 44's assertions of its fallbacks
-still bite on the run they were written for.
+268cf58, the tree before D-054, on 7e3d25d, D-054's commit, and with `Schedule::phase_1()`
+on the tree committed as 9eb28e4, this part's commit (`a858ef4b153bf4c6`,
+`dabd6adfaee000f5` and, refusing fallbacks, `977a703fb51c96e8`), so neither schedule moved
+and seed 44's assertions of its fallbacks still bite on the run they were written for.
+
+*Re-audited after both reviews.* Four of the review fixes' commit messages say no pinned
+trace hash moves: 86d9cc2, 447a9e9, 01ef12c and 3787528. None had a run behind it when
+it was written; each claim was reasoned from what the commit changed. The harness was run
+afterwards, over an archive of each commit, and on every commit since the one before them:
+9eb28e4, 86d9cc2, 447a9e9, 01ef12c, 3787528, a759732, d672fec and 44db7c6, the last with
+code. On all eight, seeds 420 and 44 in both modes hash `a858ef4b153bf4c6`,
+`dabd6adfaee000f5` and `977a703fb51c96e8`, and the raft, membership and quorum scenarios'
+seed 42 hash `5a858d67288924ec`, `34f120f8565660e1` and `ea7f7371d5c8cda4`, as on 268cf58
+and 9eb28e4 before. So the four claims hold, now with a run behind them. The same run
+hashes the default schedule's seed 42 as a control, since that run installs and deletes
+spans in each tree's own engine and must move when the engine's schedule does:
+`9aaa19e003755c18` on 9eb28e4 and 86d9cc2, `1906280227f47acc` on 447a9e9, whose spawned
+task draws from the stream, and `1c3d09e48dbca635` on 01ef12c, whose store further along
+draws and writes. It stays `1c3d09e48dbca635` on 3787528, a759732, d672fec and 44db7c6,
+whose messages say they move no schedule or no trace: the claims of a759732 and d672fec
+were likewise reasoned, not run, when written, and on this seed the run agrees.
 
 *Measured*, in release beside another lane's builds (load averages 10 to 47),
 `cargo test -p ananke-sim --release --test engine` at each tier: the correct engine
@@ -4710,9 +4727,10 @@ The default sweep's three Phase 1 variants on the moved schedules (the install's
 the store further along both draw and write): `NoWalBeforeMemtable`,
 `ReleaseBeforeManifest` and `DeleteBeforeManifest` are caught on 20, 10 and 11 of 20, 99,
 51 and 66 of 100, and 985, 602 and 645 of 1000; the second review's tightening of the
-oracle (D-054) moves `DeleteBeforeManifest` to 12, 67 and 647 and nothing else. `ReleaseBeforeManifest` fell, from 645 on
-the same oracle a schedule earlier to 602, though crashes with a memtable mid-flush did
-not (6 061 then, 6 109 now, at a thousand seeds). Its catch needs a crash between its early
+oracle (D-054) moves `DeleteBeforeManifest` to 12, 67 and 647 and nothing else.
+`ReleaseBeforeManifest` fell, from 645 on the same oracle a schedule earlier to 602,
+though crashes with a memtable mid-flush did not (6 061 then, 6 109 now, at a thousand
+seeds). Its catch needs a crash between its early
 release and its manifest with the released segments' records still owed and no fault
 explaining their loss, and every schedule move reshuffles which seeds meet all three; the
 difference was not traced seed by seed, and it stays caught on some seed at every tier.
@@ -4724,7 +4742,8 @@ walking recovered engines.
 *Deep levels.* `Schedule::deep()` is the default schedule with small level limits, so it
 moved with the default. At a thousand deep seeds, as the nightly runs them, every seed
 passes, and compaction wrote from level 2 or deeper in 10 132 rounds on 268cf58, in 11 599
-on 9eb28e4's schedules and in 11 609 on this tree, reaching level 3 each time. Its reach
+on 9eb28e4's schedules and in 11 609 on the tree committed as 3787528, reaching level 3
+each time. Its reach
 did not drop, so `deep()` stays on the default schedule rather than on `phase_1()`.
 
 *What review found in the cost.* Review found the engine binary's cost grown several
@@ -4741,7 +4760,8 @@ four in five since half the sources became the store further along, and at a sha
 twenty it still expects sixteen. `InstallInTwoSwitches`, caught on about one seed in two,
 and the three Phase 1 variants, whose tests D-052 measured, run every seed as before.
 
-`scripts/premerge.sh` at a thousand seeds on this tree, measured as D-052 measured it (a
+`scripts/premerge.sh` at a thousand seeds on the tree committed as 3787528, measured as
+D-052 measured it (a
 warm build first, no other lane building at its start or its end, the one-minute load
 sampled every 15 s): **540.37 s** real at a mean load of 17.64, 3 914.07 s user, the raft
 binary, which this entry does not touch, 306.86 s and the engine binary 213.06 s, against
