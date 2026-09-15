@@ -1049,14 +1049,21 @@ fn a_range_stream_is_derived_from_the_seed_and_its_name() {
 }
 
 /// Taking a range's stream and drawing from it perturbs no other stream (D-017,
-/// D-057): the node's protocol and scheduling streams, another node's protocol stream
-/// and another range's stream draw exactly what they draw when no such stream is
-/// taken, however the takes and draws interleave with theirs.
+/// D-057), node-wide or run-wide. The node's protocol and scheduling streams, another
+/// node's, and another range's draw exactly what they draw when no such stream is
+/// taken, however the takes and draws interleave with theirs; a node added after the
+/// takes draws the same clock skew and drift from the run's `clock` stream; and a
+/// scenario with drops, duplicates and random delays, whose task takes and draws range
+/// streams in one run and not the other, records the same trace, so the `net` and
+/// `sched` streams and the scheduler's choices did not move either.
 // PROPOSED(D-057): a named stream per node and range through the environment.
 #[test]
 fn taking_a_range_stream_perturbs_no_other_stream() {
     let run = |take: bool| {
-        let mut sim = Sim::new(SimConfig::new(11));
+        let mut config = SimConfig::new(11);
+        config.clock.max_skew = ms(50);
+        config.clock.max_drift_ppm = 500;
+        let mut sim = Sim::new(config);
         let (a, b) = (sim.add_node(), sim.add_node());
         let (env_a, env_b) = (sim.env(a), sim.env(b));
         let other = env_a.range_rng(2);
@@ -1073,11 +1080,72 @@ fn taking_a_range_stream_perturbs_no_other_stream() {
             seen.push(env_a.rng().next_u64());
             seen.push(env_a.sched_rng().next_u64());
             seen.push(env_b.rng().next_u64());
+            seen.push(env_b.sched_rng().next_u64());
             seen.push(other.next_u64());
         }
-        seen
+        let c = sim.add_node();
+        let clock = {
+            let st = sim.shared.lock();
+            let node = &st.nodes[&c];
+            (node.skew_nanos, node.drift_ppm)
+        };
+        (seen, clock)
     };
-    assert_eq!(run(false), run(true));
+    let (quiet, taken) = (run(false), run(true));
+    assert_ne!(quiet.1, (0, 0), "the clock faults drew nothing to compare");
+    assert_eq!(quiet, taken);
+
+    let trace = |take: bool| {
+        let mut config = SimConfig::new(12);
+        config.net.p_drop = 0.3;
+        config.net.p_duplicate = 0.2;
+        config.net.delay_min = ms(0);
+        config.net.delay_max = ms(10);
+        let mut sim = Sim::new(config);
+        let (a, b) = (sim.add_node(), sim.add_node());
+        let env_b = sim.env(b);
+        env_b.clone().spawn("receiver", async move {
+            let sock = env_b.net().bind(addr(2)).await.unwrap();
+            loop {
+                let (from, msg) = sock.recv().await.unwrap();
+                sock.send(from, msg).await.unwrap();
+            }
+        });
+        let env_a = sim.env(a);
+        env_a.clone().spawn("sender", async move {
+            let sock = env_a.net().bind(addr(1)).await.unwrap();
+            for n in 0..30u32 {
+                sock.send(addr(2), Bytes::copy_from_slice(&n.to_be_bytes()))
+                    .await
+                    .unwrap();
+                env_a.clock().sleep(ms(1)).await;
+            }
+        });
+        let env_r = sim.env(a);
+        env_r.clone().spawn("ranges", async move {
+            for range in 0..10 {
+                if take {
+                    env_r.range_rng(range).next_u64();
+                    env_r.range_rng(7).next_u64();
+                }
+                env_r.clock().sleep(ms(2)).await;
+            }
+        });
+        sim.run_until(Instant::from_nanos(200_000_000));
+        sim.trace()
+    };
+    let (quiet, taken) = (trace(false), trace(true));
+    assert!(
+        quiet.iter().any(|r| matches!(
+            r.event,
+            TraceEvent::MessageDropped {
+                reason: DropReason::Injected,
+                ..
+            }
+        )),
+        "the scenario dropped nothing, so the net stream was not exercised"
+    );
+    assert_eq!(quiet, taken);
 }
 
 /// A node's stream for a range is one stream however it is reached: every handle to

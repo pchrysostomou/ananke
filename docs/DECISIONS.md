@@ -4167,8 +4167,12 @@ the simulator keeps it. Those are proposed here.
 The simulator's tests hold it: the same seed, node and range give the same draws, and
 another range, node or seed other draws, which are moirae's derivation for the name;
 taking range streams and drawing from them, interleaved, leaves the node's protocol and
-scheduling streams, another node's and another range's exactly as they draw without; and
-every handle continues one stream (crates/ananke-env/src/sim/tests.rs). Under `RealEnv`
+scheduling streams, another node's and another range's exactly as they draw without, a
+node added after the takes draws the same clock skew and drift, and a scenario with
+drops, duplicates and random delays whose task takes range streams in one run only
+records the same trace (a draw from the `clock` or the `net` stream added to the
+derivation fails it); and every handle continues one stream
+(crates/ananke-env/src/sim/tests.rs). Under `RealEnv`
 two draws differ (crates/ananke-env/tests/real_env.rs).
 
 **Alternatives.** *A label* (`stream(&self, label)`): general enough for the rebalancer's
