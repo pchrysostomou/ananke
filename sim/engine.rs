@@ -135,9 +135,10 @@ impl Default for Schedule {
 }
 
 impl Schedule {
-    /// The live install's crash test (Q2, D-054): the default workload with a task
-    /// that checkpoints random spans and installs each over its span a little
-    /// later, and every crash aimed at an install.
+    /// The live install's crash test (Q2, D-054): the Phase 1 workload with a task
+    /// that checkpoints random spans, of this store or of a second store further
+    /// along, and installs each over its span a little later, and every crash
+    /// aimed at an install.
     // PROPOSED(D-054): the live install's crash test.
     #[must_use]
     pub fn install() -> Self {

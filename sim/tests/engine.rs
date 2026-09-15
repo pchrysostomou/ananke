@@ -338,7 +338,7 @@ fn the_range_delete_crash_test_passes_every_seed() {
 // PROPOSED(D-055): the range delete's crash test.
 #[test]
 fn a_range_delete_that_skips_the_memtables_is_caught() {
-    let caught: Vec<String> = sweep(seeds(), |seed| {
+    let caught: Vec<String> = sweep(high_rate_share(), |seed| {
         engine::run_with(
             seed,
             engine::Schedule::range_delete(),
@@ -353,7 +353,7 @@ fn a_range_delete_that_skips_the_memtables_is_caught() {
     eprintln!(
         "RangeDeleteSkipsMemtables: caught on {} of {} seeds, first: {}",
         caught.len(),
-        seeds(),
+        high_rate_share(),
         caught.first().map_or("", String::as_str)
     );
     assert!(
@@ -401,7 +401,7 @@ fn the_seek_crash_test_passes_every_seed() {
 // PROPOSED(D-055): the bounded seek's crash test.
 #[test]
 fn a_seek_that_counts_tombstones_is_caught() {
-    let caught: Vec<String> = sweep(seeds(), |seed| {
+    let caught: Vec<String> = sweep(high_rate_share(), |seed| {
         engine::run_with(
             seed,
             engine::Schedule::seek(),
@@ -416,7 +416,7 @@ fn a_seek_that_counts_tombstones_is_caught() {
     eprintln!(
         "SeekCountsTombstones: caught on {} of {} seeds, first: {}",
         caught.len(),
-        seeds(),
+        high_rate_share(),
         caught.first().map_or("", String::as_str)
     );
     assert!(!caught.is_empty(), "SeekCountsTombstones was never caught");
@@ -436,7 +436,7 @@ fn a_seek_that_counts_tombstones_is_caught() {
 // PROPOSED(D-054): the installed sequence numbers are the install's.
 #[test]
 fn an_install_that_keeps_its_sources_numbers_is_caught() {
-    let outcomes: Vec<Option<(String, bool)>> = sweep(seeds(), |seed| {
+    let outcomes: Vec<Option<(String, bool)>> = sweep(high_rate_share(), |seed| {
         std::panic::catch_unwind(|| {
             engine::run_with(
                 seed,
@@ -454,7 +454,7 @@ fn an_install_that_keeps_its_sources_numbers_is_caught() {
     eprintln!(
         "InstallKeepsSourceNumbers: caught on {} of {} seeds, {panicked} of them by the engine's own assertion, first: {}",
         caught.len(),
-        seeds(),
+        high_rate_share(),
         caught
             .iter()
             .find(|(_, p)| !*p)
@@ -466,6 +466,16 @@ fn an_install_that_keeps_its_sources_numbers_is_caught() {
     );
 }
 
+/// The seeds a variant caught on at least four seeds in five runs: a tenth of the
+/// tier, and never fewer than twenty or the tier itself. At those rates a share of
+/// twenty still expects sixteen catches or more, and a premerge share of a hundred
+/// eighty or more, while the engine binary's cost stays near what the sweep's other
+/// tests make it.
+// PROPOSED(D-055): the high-rate variants run a share of the seeds.
+fn high_rate_share() -> u64 {
+    (seeds() / 10).max(seeds().min(20))
+}
+
 /// The span checkpoint's known-buggy engine beside the same crash test (D-054): a
 /// checkpoint of a span whose tables are not synced before the manifest and
 /// `CURRENT` that name them is caught when a crash leaves one of them short and
@@ -473,7 +483,7 @@ fn an_install_that_keeps_its_sources_numbers_is_caught() {
 // PROPOSED(D-054): the checkpoint of a span, which the live install installs from.
 #[test]
 fn a_span_checkpoint_without_syncs_is_caught() {
-    let caught: Vec<String> = sweep(seeds(), |seed| {
+    let caught: Vec<String> = sweep(high_rate_share(), |seed| {
         engine::run_with(
             seed,
             engine::Schedule::install(),
@@ -488,7 +498,7 @@ fn a_span_checkpoint_without_syncs_is_caught() {
     eprintln!(
         "SpanCheckpointUnsynced: caught on {} of {} seeds, first: {}",
         caught.len(),
-        seeds(),
+        high_rate_share(),
         caught.first().map_or("", String::as_str)
     );
     assert!(

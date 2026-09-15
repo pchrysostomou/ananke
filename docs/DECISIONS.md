@@ -4434,9 +4434,22 @@ the span from it: the leader would stream a whole store for one range.
 **Consequences.** An install forces a flush of the memtables at or below its number,
 before its own switch; rewrites every table that straddles the span's edges; and copies
 the source into the engine, since the simulator's filesystem has no links (D-024). The
-flusher waits behind an install in progress, so memtables pile up for its length. A
-refused install can still take a sequence number. A snapshot is not stable across an
-install of the span it reads. `TraceEvent::SpanInstalled` is new, with the moirae line
+flusher waits behind an install in progress, so memtables pile up for its length. The
+install holds the turnstile from its flush of the memtables at or below its number to
+its deletion of the tables it took out, so no flush, compaction or checkpoint of any
+span runs on the engine meanwhile: with one engine per node (Q2), an install of one
+range stalls every range's flushes and compactions for its length, as a checkpoint
+already does (SHARD.md §11, storage 6). A refused install can still take a sequence
+number. A snapshot is not stable across an install of the span it reads, so **Stage B
+holds no snapshot across an install of the span it reads**: the node's one apply task
+(Q14) takes no snapshot of a range it is installing, and a read served at one version
+(SHARD.md §11, raft 15) is not served from a range while its install runs. An install
+refused as `InProgress` changes nothing and may be asked for again; the engine does not
+queue it. Installs and range deletes (D-055) share the rule, and Stage B's apply task,
+the one caller that installs or deletes a range (Q14), serialises them, so it never
+meets `InProgress`; any other caller retries after the install in progress resolves.
+D-055 puts the install, the span checkpoint, the range delete and the seek on the engine
+sweep's default schedule. `TraceEvent::SpanInstalled` is new, with the moirae line
 `ananke.engine.span-installed`. The engine sweep's default schedule runs no install, span
 checkpoint or variant of this entry, so its seeds' schedules and its three variants'
 rates are unchanged by this entry (below); the change to level 0's read order and the
@@ -4568,6 +4581,75 @@ them are now seeks (199 599), and 4 481 checkpoints opened fresh after a crash w
 did, the span checkpoints among them; beside those, 4 806 installs, 4 098 range deletes,
 7 817 span checkpoints and 76 453 seeks walking recovered engines, every seed passing.
 
+*After review.* Independent review of 9eb28e4 changed what these numbers stand on, and
+they are measured again on the tree of its fixes (D-054 records the oracle's two tightened
+excuses, the install's own task, the store further along and the observed numbers). The
+correct engine passes every seed of the range delete's test, the seek's and the default
+sweep at 20, 100 and 1000. The range delete's crash test, with the crashes before a
+delete's switch split as D-054 splits an install's:
+
+| tier | deletes asked / resolved | crashes aimed | in force after a crash (resolved / not) | not in force: before the record was durable / between replacement and switch / otherwise / resolved, a fault | span keys written after a delete, checked | reads left unjudged |
+| --- | --- | --- | --- | --- | --- | --- |
+| 20 | 388 / 285 | 150 | 264 / 14 | 2 / 13 / 71 / 16 | 5 444 | 4 018 |
+| 100 | 1 997 / 1 507 | 748 | 1 342 / 46 | 11 / 68 / 357 / 137 | 25 890 | 20 047 |
+| 1000 | 19 950 / 15 205 | 7 414 | 13 334 / 456 | 154 / 659 / 3 374 / 1 497 | 259 253 | 202 429 |
+
+`RangeDeleteSkipsMemtables` is caught on 15 of 20, 89 of 100 and 933 of 1000, the first now
+at seed 0 by the direct check of Q2's criterion: *the install at record 22 is in force
+(manifest 11) but table 8 still holds the write of k40 at record 11: a mixture*. The seek's
+test runs no install, so its schedule did not move: its numbers above stand, and
+`SeekCountsTombstones` is still caught on 20 of 20, 98 of 100 and 972 of 1000.
+
+The default sweep's three Phase 1 variants on the moved schedules (the install's task and
+the store further along both draw and write): `NoWalBeforeMemtable`,
+`ReleaseBeforeManifest` and `DeleteBeforeManifest` are caught on 20, 10 and 11 of 20, 99,
+51 and 66 of 100, and 985, 602 and 645 of 1000. `ReleaseBeforeManifest` fell, from 645 on
+the same oracle a schedule earlier to 602, though crashes with a memtable mid-flush did
+not (6 061 then, 6 109 now, at a thousand seeds). Its catch needs a crash between its early
+release and its manifest with the released segments' records still owed and no fault
+explaining their loss, and every schedule move reshuffles which seeds meet all three; the
+difference was not traced seed by seed, and it stays caught on some seed at every tier.
+Coverage at a thousand seeds: 66 992 tables written, 14 815 compactions, 1 327 crashes
+inside a compaction, 1 858 whole-store checkpoints opened fresh after a crash, 8 130 span
+checkpoints taken, 5 806 installs, 3 998 range deletes, 196 205 seeks and 75 602 seeks
+walking recovered engines.
+
+*Deep levels.* `Schedule::deep()` is the default schedule with small level limits, so it
+moved with the default. At a thousand deep seeds, as the nightly runs them, every seed
+passes, and compaction wrote from level 2 or deeper in 10 132 rounds on 268cf58, in 11 599
+on 9eb28e4's schedules and in 11 609 on this tree, reaching level 3 each time. Its reach
+did not drop, so `deep()` stays on the default schedule rather than on `phase_1()`.
+
+*What review found in the cost.* Review found the engine binary's cost grown several
+times over by this entry and D-054, much of it variants caught on nearly every seed and
+swept over every seed. The four caught on four seeds in five or more,
+`SpanCheckpointUnsynced`, `SeekCountsTombstones`, `RangeDeleteSkipsMemtables` and
+`InstallKeepsSourceNumbers`, now run a share of the tier's seeds,
+`max(seeds / 10, min(seeds, 20))`: twenty at the gate, twenty in CI, a hundred at the
+premerge and a thousand at the nightly. Each still asserts a catch at every tier. A share
+is the tier's first seeds, so its rates are the ones measured above at that many seeds: at
+twenty 17, 20, 15 and 20; at a hundred 81, 98, 89 and 98 (the premerge below printed the
+same); at a thousand 816, 972, 933 and 975. `SpanCheckpointUnsynced` is the lowest, about
+four in five since half the sources became the store further along, and at a share of
+twenty it still expects sixteen. `InstallInTwoSwitches`, caught on about one seed in two,
+and the three Phase 1 variants, whose tests D-052 measured, run every seed as before.
+
+`scripts/premerge.sh` at a thousand seeds on this tree, measured as D-052 measured it (a
+warm build first, no other lane building at its start or its end, the one-minute load
+sampled every 15 s): **540.37 s** real at a mean load of 17.64, 3 914.07 s user, the raft
+binary, which this entry does not touch, 306.86 s and the engine binary 213.06 s, against
+**374.64 s** at 13.90 on 1ef6d7e: 44% more wall time, most of it the engine binary. The
+engine binary on 268cf58, whose engine sweep is 1ef6d7e's, took 72.51 s at a thousand
+seeds on the same laptop the same day, so it now costs 2.94 times as much.
+
+*The nightly.* On 1ef6d7e (run 34901799989) the engine binary took 1 346.89 s at ten
+thousand seeds and the whole `cargo test` step 2 h 1 min 15 s, against the job's
+300-minute timeout. Scaled by the same ratio, the engine binary would take about 3 958 s,
+some 44 minutes more, and the step about 2 h 45 min, a little over half the timeout. The
+scaling overstates the deep-levels test, which runs a thousand deep seeds at every nightly,
+took 11.38 s of them on this laptop, and whose rounds rose by a seventh (above), not by the
+sweep's ratio; it leaves out what the other Stage A lanes add.
+
 **Alternatives.** Range tombstones, as RocksDB's `DeleteRange`: no forced flush and no
 rewrite, but a new kind of write that the memtable, the table format (a version bump), the
 merge, every read, compaction and its truncation at table boundaries, and the oracle would
@@ -4585,8 +4667,12 @@ and 44 keep the schedule they were found on. The gate's engine tests take longer
 stays as it was; a seek costs what the part of a scan it walks
 costs, and no more than `limit` live keys past the deleted ones it passes over. A range
 delete costs what an install costs: a flush of the memtables at or below it and a rewrite
-of every table straddling the span's edges. Neither primitive's own commit moved a
-seed's schedule; the sweep's did.
+of every table straddling the span's edges, all under the turnstile, so no flush,
+compaction or checkpoint runs on the engine meanwhile, and it shares the install's
+`InProgress` rule: Stage B's one apply task serialises installs and range deletes, and any
+other caller retries (D-054). A snapshot is not stable across a range delete of the span it
+reads either, and Stage B holds none across one (D-054). Neither primitive's own commit
+moved a seed's schedule; the sweep's did.
 
 ---
 
