@@ -1418,3 +1418,59 @@ fn an_install_is_refused_when_it_cannot_be_made() {
         })
     });
 }
+
+/// The bounded, ordered seek (D-055, SHARD.md §11 storage 2): the first `limit`
+/// present keys at or after a start and below an end, at a snapshot, in key order.
+/// A deleted key is passed over and does not count; a write after the snapshot is
+/// not seen; a limit of one is the first key at or after the start.
+// PROPOSED(D-055): the bounded, ordered seek.
+#[test]
+fn a_bounded_seek_returns_the_first_live_keys_from_its_start() {
+    let mut sim = Sim::new(SimConfig::new(37));
+    let node = sim.add_node();
+    on_node(&mut sim, node, |env| {
+        Box::pin(async move {
+            let (db, _) = Engine::open(env.clone(), config(400)).await.unwrap();
+            fill(&db, 0..120, 20).await;
+            // Some keys deleted outright, in the memtable over older tables.
+            for k in [4, 5, 6, 9] {
+                db.delete(Bytes::from(format!("k{k:03}"))).await.unwrap();
+            }
+            env.clock().sleep(Duration::from_millis(1)).await;
+            let snapshot = db.snapshot();
+            let live = |from: u32| -> Vec<Bytes> {
+                (from..20)
+                    .filter(|k| ![4, 5, 6, 9].contains(k) && expected(*k, 120, 20).is_some())
+                    .map(|k| Bytes::from(format!("k{k:03}")))
+                    .collect()
+            };
+            let got = db
+                .seek(b"k003"..b"k020", 3, &snapshot)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|(k, _)| k)
+                .collect::<Vec<_>>();
+            assert_eq!(got, live(3).into_iter().take(3).collect::<Vec<_>>());
+            assert!(!got.contains(&b("k004")), "a deleted key does not count");
+            let first = db.seek(b"k0045"..b"k020", 1, &snapshot).await.unwrap();
+            assert_eq!(
+                first.first().map(|(k, _)| k.clone()),
+                live(5).first().cloned()
+            );
+            assert!(
+                db.seek(b"k000"..b"k020", 0, &snapshot)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            // Past the range's end nothing, and a write after the snapshot unseen.
+            db.put(b("k0035"), b("later")).await.unwrap();
+            let bounded = db.seek(b"k003"..b"k004", 5, &snapshot).await.unwrap();
+            assert!(bounded.iter().all(|(k, _)| k == "k003"), "{bounded:?}");
+            let fresh = db.snapshot();
+            let seen = db.seek(b"k0031"..b"k020", 1, &fresh).await.unwrap();
+            assert_eq!(seen.first().map(|(k, _)| k.clone()), Some(b("k0035")));
+        })
+    });
+}

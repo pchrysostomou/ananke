@@ -5,7 +5,8 @@
 //! the manifest names its table and the one whose compaction deletes its inputs
 //! before the manifest stops naming them. The live install's crash test (Q2, D-054)
 //! runs the same scenario with installs, beside the install that switches twice and
-//! the span checkpoint that does not sync its tables.
+//! the span checkpoint that does not sync its tables; the bounded seek's (D-055)
+//! beside the seek that counts tombstones.
 
 use std::sync::Mutex;
 
@@ -259,6 +260,66 @@ fn an_install_in_two_switches_is_caught() {
         caught.first().map_or("", String::as_str)
     );
     assert!(!caught.is_empty(), "InstallInTwoSwitches was never caught");
+}
+
+/// The bounded seek's crash test (D-055): half the readers' scans are seeks of one
+/// to six keys at a snapshot, which must be the first keys the model holds in the
+/// range, and every recovery is walked by seeks of three keys at a time, which must
+/// be the model's state. The correct engine passes every seed, and the sweep is seen
+/// to make seeks that stop at their limit and walks after a crash.
+// PROPOSED(D-055): the bounded seek's crash test.
+#[test]
+fn the_seek_crash_test_passes_every_seed() {
+    let totals = Mutex::new((0u64, 0u64, 0u64));
+    let verdicts = sweep(seeds(), |seed| {
+        let report = engine::run_with(seed, engine::Schedule::seek(), Variant::Correct);
+        {
+            let mut t = totals.lock().unwrap();
+            t.0 += report.seeks.0;
+            t.1 += report.seeks.1;
+            t.2 += report.recovery_seeks;
+        }
+        report.check().map_err(|violation| {
+            write_trace(&format!("engine-seek-{seed}"), &report.jsonl);
+            format!("seed {seed}: {violation}")
+        })
+    });
+    let (seeks, limited, walks) = totals.into_inner().unwrap();
+    eprintln!(
+        "seek, Correct: {seeks} live seeks, {limited} of them stopped at their limit, {walks} seeks walking a recovered engine"
+    );
+    if let Err(violation) = verdict(&verdicts) {
+        panic!("{violation}");
+    }
+    assert!(limited > 0, "no seek stopped at its limit");
+    assert!(walks > 0, "no recovered engine was walked by seeks");
+}
+
+/// The bounded seek's known-buggy engine beside it (D-055): a seek that counts a
+/// deleted key against its limit returns fewer keys than the range holds, and is
+/// caught by the same crash test on some seed at every tier.
+// PROPOSED(D-055): the bounded seek's crash test.
+#[test]
+fn a_seek_that_counts_tombstones_is_caught() {
+    let caught: Vec<String> = sweep(seeds(), |seed| {
+        engine::run_with(
+            seed,
+            engine::Schedule::seek(),
+            Variant::SeekCountsTombstones,
+        )
+        .check()
+        .err()
+    })
+    .into_iter()
+    .flatten()
+    .collect();
+    eprintln!(
+        "SeekCountsTombstones: caught on {} of {} seeds, first: {}",
+        caught.len(),
+        seeds(),
+        caught.first().map_or("", String::as_str)
+    );
+    assert!(!caught.is_empty(), "SeekCountsTombstones was never caught");
 }
 
 /// The span checkpoint's known-buggy engine beside the same crash test (D-054): a

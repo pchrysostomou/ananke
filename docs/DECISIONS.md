@@ -4334,4 +4334,57 @@ below.
 
 ---
 
-_Next entry: D-055. Add one before implementing anything not covered above._
+## PROPOSED D-055 — The bounded seek, the range delete as an install of nothing, and the engine sweep with all four primitives
+
+**Context.** Stage A's item 7 (SHARD.md §12) asks for the engine's other primitives, each
+with its own crash test and its own engine variant caught on some seed at every tier: a
+bounded, ordered seek (§11, storage 2), a range delete (storage 3), and the checkpoint of a
+span if the live install did not build it, which it did (D-054). And it asks for
+`sim/engine.rs`'s workload extended with all four, the correct engine passing every seed,
+and `NoWalBeforeMemtable`, `ReleaseBeforeManifest` and `DeleteBeforeManifest` still
+caught. `scan` returned every key of a span, with no limit and no "first key at or after
+`k`" (engine.rs, `scan`); a meta lookup, the first record whose end key is above `k`
+(§1), and a split key chosen from a range's keys (Q18) need one. SHARD.md does not settle
+the primitives' shapes, so each is proposed, one commit each, and this entry grows with
+them. Every site is marked `PROPOSED(D-055)`.
+
+**Decision.** *The seek.* `Engine::seek(range, limit, snapshot)` returns the first
+`limit` present keys at or after `range.start` and below `range.end` as of the snapshot,
+in key order, with their values: the one merge `scan` walks, stopped once `limit` keys
+are found. A deleted key is passed over and does not count, so a seek returns fewer than
+`limit` keys only when the range holds no more. The first key at or after `k` is
+`seek(k..end, 1)`, and a range is paged by seeking again from just past the last key
+returned. It walks forward only: nothing SHARD.md asks for walks backward, and a reverse
+seek needs a backward merge over memtables and blocks, which is an issue to file rather
+than code for this stage. `Variant::SeekCountsTombstones` counts a deleted key against
+the limit.
+
+*The seek's crash test.* `Schedule::seek()`: the engine sweep's workload with half the
+readers' scans made bounded seeks of one to six keys at a snapshot, each of which must be
+the first keys the model holds in the range at that version, and every recovery walked
+by seeks of three keys at a time, each from just past the last key the one before
+returned, which must be the model's state, beside the reads and the scan the state check
+made already. A seek whose first keys touch the span of an install in progress is not
+judged, since which keys fill its limit depends on the span (D-054).
+
+*Measured*, in release beside another lane's builds (load averages 10 to 47),
+`cargo test -p ananke-sim --release --test engine` at each tier: the correct engine
+passes every seed of `Schedule::seek()`, with 3 836 live seeks at twenty seeds, 2 589 of
+them stopping at their limit, and 1 643 seeks walking recovered engines; at a hundred,
+19 492, 13 261 and 8 199. `SeekCountsTombstones` is caught on 20 of 20 and 98 of 100, the
+first at seed 0: *seek of 1 of k15..k30 at version 17 saw 0 keys but the model has 1*. The
+thousand-seed figures land with the sweep's part of this entry.
+
+**Alternatives.** A seek that counts deleted keys toward its limit: a meta lookup of one
+record could come back empty with records past a deleted one, which is the variant. A
+limit on entries read rather than keys returned: a caller could not tell a short range
+from a range of tombstones. A reverse seek now: no consumer in Phase 3.
+
+**Consequences.** `scan` stays as it was; a seek costs what the part of a scan it walks
+costs, and no more than `limit` live keys past the deleted ones it passes over. The
+engine sweep's default schedule does not seek until the sweep's commit of this entry, so
+this commit moves no seed's schedule.
+
+---
+
+_Next entry: D-056. Add one before implementing anything not covered above._

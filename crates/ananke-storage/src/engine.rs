@@ -43,6 +43,8 @@
 //! leaves the span as it was or as installed, and a later write to the span is newer
 //! than every installed one.
 //!
+//! [`Engine::seek`] is a scan bounded by a count (D-055).
+//!
 //! The [`Variant`]s for the crash sweep: [`Variant::Correct`];
 //! [`Variant::NoWalBeforeMemtable`], which applies and acknowledges a write before
 //! the log has it; [`Variant::ReleaseBeforeManifest`], which releases a memtable
@@ -51,7 +53,8 @@
 //! [`Variant::InstallInTwoSwitches`], whose install takes the span out with one
 //! manifest switch and puts the installed tables in with another; and
 //! [`Variant::SpanCheckpointUnsynced`], whose checkpoint of a span does not sync its
-//! tables.
+//! tables; and [`Variant::SeekCountsTombstones`], whose bounded seek counts deleted
+//! keys against its limit.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
@@ -108,6 +111,10 @@ pub enum Variant {
     /// `CURRENT` names tables that came back empty or short.
     // PROPOSED(D-054): the checkpoint of a span, which the live install installs from.
     SpanCheckpointUnsynced,
+    /// A bounded seek counts a deleted key against its limit, so it can return
+    /// fewer keys than asked for while more lie in the range.
+    // PROPOSED(D-055): the bounded, ordered seek.
+    SeekCountsTombstones,
 }
 
 /// How to open an [`Engine`].
@@ -1450,6 +1457,59 @@ impl<E: Environment> Engine<E> {
             )));
         }
         Ok(SpanSource { tables })
+    }
+
+    /// The first `limit` present keys at or after `range.start` and below
+    /// `range.end` as of `snapshot`, in key order, with their values: the walk
+    /// [`scan`](Self::scan) makes, stopped once `limit` keys are found (SHARD.md
+    /// §11, storage 2). A deleted key is passed over and does not count, so a seek
+    /// returns fewer than `limit` keys only when the range holds no more. The first
+    /// key at or after `k` is `seek(k..end, 1, snapshot)`.
+    ///
+    /// # Errors
+    ///
+    /// A table read's error.
+    // PROPOSED(D-055): the bounded, ordered seek.
+    pub async fn seek(
+        &self,
+        range: Range<&[u8]>,
+        limit: usize,
+        snapshot: &Snapshot<E>,
+    ) -> io::Result<Vec<(Bytes, Bytes)>> {
+        let mut out = Vec::new();
+        if limit == 0 {
+            return Ok(out);
+        }
+        let mut merge = self.shared.merge_all();
+        merge.seek(&ikey::lower_bound(range.start)).await?;
+        let mut last_user: Option<Bytes> = None;
+        let mut counted = 0;
+        while let Some((key, value)) = merge.next().await? {
+            let (user, seq) = ikey::decode(&key)?;
+            if user[..] >= *range.end {
+                break;
+            }
+            if seq > snapshot.version || last_user.as_ref() == Some(&user) {
+                continue;
+            }
+            last_user = Some(user.clone());
+            match value {
+                Value::Live(bytes) => {
+                    out.push((user, bytes));
+                    counted += 1;
+                }
+                Value::Tombstone => {
+                    if self.shared.config.variant == Variant::SeekCountsTombstones {
+                        // The bug: a deleted key uses up the limit.
+                        counted += 1;
+                    }
+                }
+            }
+            if counted >= limit {
+                break;
+            }
+        }
+        Ok(out)
     }
 
     /// Installs `source` over the span `range` while the engine runs: every write

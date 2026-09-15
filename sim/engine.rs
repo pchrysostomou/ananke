@@ -19,7 +19,8 @@
 //! checkpoints random spans and installs each over its span a little later, every
 //! crash is aimed at an install, and each recovery must bring every span back as it
 //! was or as installed, never a mixture, with every write after an install read over
-//! it.
+//! it. With [`Schedule::seek`] it is the bounded seek's (D-055): the readers seek, and
+//! every recovery is walked by seeks.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -89,6 +90,10 @@ pub struct Schedule {
     /// How long after an install's replacement is written a crash aimed at its
     /// switch may land.
     pub switch_window: Duration,
+    /// Whether the readers make bounded seeks, and every recovery is walked by
+    /// seeks of a few keys at a time (D-055).
+    // PROPOSED(D-055): the bounded seek's crash test.
+    pub seeks: bool,
 }
 
 impl Default for Schedule {
@@ -114,6 +119,7 @@ impl Default for Schedule {
             aim_at_installs: false,
             install_window: Duration::from_millis(12),
             switch_window: Duration::from_millis(3),
+            seeks: false,
         }
     }
 }
@@ -128,6 +134,17 @@ impl Schedule {
         Self {
             installs: true,
             aim_at_installs: true,
+            ..Self::default()
+        }
+    }
+
+    /// The bounded seek's crash test (D-055): the default workload with readers that
+    /// seek, and every recovery walked by seeks.
+    // PROPOSED(D-055): the bounded seek's crash test.
+    #[must_use]
+    pub fn seek() -> Self {
+        Self {
+            seeks: true,
             ..Self::default()
         }
     }
@@ -249,6 +266,13 @@ pub struct Model {
     /// Live reads of a key an install had installed, after it resolved, that a
     /// later write had overwritten, and that agreed with the model.
     pub reads_over_installs: u64,
+    /// Bounded seeks made during the run, and of those, ones that stopped at their
+    /// limit with more keys in the range (D-055).
+    pub seeks: u64,
+    /// See `seeks`.
+    pub seeks_limited: u64,
+    /// Bounded seeks that walked a recovered engine.
+    pub recovery_seeks: u64,
 }
 
 impl Model {
@@ -737,6 +761,10 @@ pub struct Report {
     pub reads_over_installs: u64,
     /// What became of the installs.
     pub install_outcomes: InstallOutcomes,
+    /// Bounded seeks during the run, and those that stopped at their limit (D-055).
+    pub seeks: (u64, u64),
+    /// Bounded seeks that walked a recovered engine.
+    pub recovery_seeks: u64,
     /// The whole trace.
     pub records: Vec<TraceRecord>,
     /// The trace as moirae JSONL.
@@ -1381,7 +1409,9 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
                 let n = end.min(m.ops.len());
                 m.state_after(n)
             };
-            if let Err(violation) = check_state(&mut sim, node, &db, expected, end) {
+            if let Err(violation) =
+                check_state(&mut sim, node, &db, expected, end, schedule.seeks, &model)
+            {
                 verdict = Err(match recovery.wal.head_gap {
                     Some((expected, found)) => format!(
                         "after a missing head (expected record {expected}, found {found}) the state is not the manifest's prefix: {violation}"
@@ -1502,6 +1532,10 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
             m.reads_over_installs,
         )
     };
+    let (seeks, recovery_seeks) = {
+        let m = lock(&model);
+        ((m.seeks, m.seeks_limited), m.recovery_seeks)
+    };
     Report {
         seed,
         variant,
@@ -1519,6 +1553,8 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
         span_checkpoints,
         reads_over_installs,
         install_outcomes,
+        seeks,
+        recovery_seeks,
         jsonl: sim
             .to_moirae(&Export::new(&bytes_decoder))
             .expect("the engine trace exports to moirae v2"),
@@ -1615,8 +1651,11 @@ fn check_state(
     db: &Db,
     expected: BTreeMap<Bytes, Value>,
     end: usize,
+    seeks: bool,
+    model: &SharedModel,
 ) -> Result<(), String> {
     let env = sim.env(node);
+    let model = model.clone();
     let out: Arc<Mutex<Option<Vec<String>>>> = Arc::default();
     let o = out.clone();
     let db = db.clone();
@@ -1650,6 +1689,38 @@ fn check_state(
                 scanned.len(),
                 want.len()
             ));
+        }
+        // PROPOSED(D-055): and walked by bounded seeks of three keys, each starting
+        // just past the last key the one before returned.
+        if seeks {
+            let mut walked: Vec<(Bytes, Bytes)> = Vec::new();
+            let mut from = key(0);
+            loop {
+                let page = db
+                    .seek(&from[..]..&key(KEYS)[..], 3, &snapshot)
+                    .await
+                    .expect("tables read");
+                lock(&model).recovery_seeks += 1;
+                let Some((last, _)) = page.last() else {
+                    break;
+                };
+                let mut next = last.to_vec();
+                next.push(0);
+                from = Bytes::from(next);
+                let full = page.len() == 3;
+                walked.extend(page);
+                if !full {
+                    break;
+                }
+            }
+            if walked != want {
+                violations.push(format!(
+                    "after recovering through record {end}, seeks of three at version {} walked {} keys but the model has {}",
+                    snapshot.version(),
+                    walked.len(),
+                    want.len()
+                ));
+            }
         }
         *o.lock().unwrap_or_else(PoisonError::into_inner) = Some(violations);
     });
@@ -1975,6 +2046,7 @@ fn spawn_clients(sim: &Sim, node: NodeId, db: Db, schedule: &Schedule, model: &S
             }
         });
     }
+    let seeks = schedule.seeks;
     for _ in 0..schedule.readers {
         let (env, db, model) = (sim.env(node), db.clone(), model.clone());
         env.clone().spawn("reader", async move {
@@ -1982,6 +2054,14 @@ fn spawn_clients(sim: &Sim, node: NodeId, db: Db, schedule: &Schedule, model: &S
                 // Every other read is a scan at a snapshot: the engine's version pins
                 // exactly which ops the model folds, so the answer is exact.
                 if env.rng().below(2) == 0 {
+                    // PROPOSED(D-055): with seeks on, half of those are bounded seeks
+                    // of one to six keys, which must be the first keys the scan
+                    // would have returned.
+                    let limit = if seeks && env.rng().below(2) == 0 {
+                        Some(usize::try_from(1 + env.rng().below(6)).expect("fits"))
+                    } else {
+                        None
+                    };
                     let lo = env.rng().below(KEYS);
                     let hi = lo + env.rng().below(KEYS - lo + 1);
                     let snapshot = db.snapshot();
@@ -1995,29 +2075,44 @@ fn spawn_clients(sim: &Sim, node: NodeId, db: Db, schedule: &Schedule, model: &S
                             .as_ref()
                             .is_none_or(|(start, end)| !(start <= k && k < end))
                     };
-                    let want: Vec<(Bytes, Bytes)> = {
+                    let mut want: Vec<(Bytes, Bytes)> = {
                         let m = lock(&model);
                         let n = usize::try_from(snapshot.version()).expect("fits");
                         m.state_after(n.min(m.ops.len()))
                             .into_iter()
-                            .filter(|(k, _)| *k >= key(lo) && *k < key(hi) && judged(k))
+                            .filter(|(k, _)| *k >= key(lo) && *k < key(hi))
                             .filter_map(|(k, v)| v.live().map(|v| (k, v)))
                             .collect()
                     };
-                    let got: Vec<(Bytes, Bytes)> = db
-                        .scan(&key(lo)[..]..&key(hi)[..], &snapshot)
-                        .await
-                        .expect("tables read")
-                        .into_iter()
-                        .filter(|(k, _)| judged(k))
-                        .collect();
+                    let got: Vec<(Bytes, Bytes)> = match limit {
+                        None => db.scan(&key(lo)[..]..&key(hi)[..], &snapshot).await,
+                        Some(limit) => {
+                            let got = db.seek(&key(lo)[..]..&key(hi)[..], limit, &snapshot).await;
+                            want.truncate(limit);
+                            got
+                        }
+                    }
+                    .expect("tables read");
+                    // A seek whose first keys include the span of an install in
+                    // progress is not judged at all: which keys fill its limit
+                    // depends on the span.
+                    let span_touched = installing.is_some() && got.iter().chain(&want).any(|(k, _)| !judged(k));
+                    let skip = limit.is_some() && span_touched;
+                    let got: Vec<(Bytes, Bytes)> = got.into_iter().filter(|(k, _)| judged(k)).collect();
+                    let want: Vec<(Bytes, Bytes)> = want.into_iter().filter(|(k, _)| judged(k)).collect();
                     {
                         let mut m = lock(&model);
                         m.reads += 1;
-                        m.scans += 1;
-                        if got != want {
+                        if let Some(limit) = limit {
+                            m.seeks += 1;
+                            m.seeks_limited += u64::from(got.len() == limit);
+                        } else {
+                            m.scans += 1;
+                        }
+                        if got != want && !skip {
                             m.read_violations.push(format!(
-                                "scan of k{lo:02}..k{hi:02} at version {} saw {} keys but the model has {}: {:?} against {:?}",
+                                "{} of k{lo:02}..k{hi:02} at version {} saw {} keys but the model has {}: {:?} against {:?}",
+                                limit.map_or_else(|| "scan".to_owned(), |l| format!("seek of {l}")),
                                 snapshot.version(),
                                 got.len(),
                                 want.len(),
