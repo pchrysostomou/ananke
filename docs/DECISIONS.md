@@ -4205,8 +4205,8 @@ entry reverts to (D-029, D-030), had only unit tests. Q34 settles that the scena
 extended. It does not settle how a snapshot feed is made certain on every seed, and a
 lower threshold alone does not make it: only a leader compacts (D-030), a leader elected
 from followers holds a whole log, and such a leader catches an empty learner up with
-entries from index 1. Measured on the tree of this entry with the threshold lowered and
-nothing else changed, 37 of the first 1 000 seeds fed no joining server a snapshot.
+entries from index 1. With the threshold lowered and the grow asked as before, 39 of the
+first 1 000 seeds feed no joining server a snapshot in its learner phase.
 
 **Decision.** Every site is marked `PROPOSED(D-058)`.
 
@@ -4221,48 +4221,105 @@ nothing else changed, 37 of the first 1 000 seeds fed no joining server a snapsh
   servers 4 and 5 up has a compacted prefix, and their first rejection, asking from index
   1, lands below it: they are fed a snapshot. When no compacted leader appears within the
   budget the request goes to the leader in force, so a seed without a snapshot feed is
-  reported rather than hidden. The shrink is asked as before. `Schedule::total` counts the
-  wait.
-- `Report::changes` is the stretch from the grow's first request to the end of the
-  shrink's drive, and `Report::snapshot_fed_joiners` every snapshot a server outside the
-  initial configuration installed in it. The correct server's sweep fails any seed with
-  none, and its coverage counts them, the leaders' compactions, and asserts a feed on
-  every seed; the variant's sweep prints how many of its runs had one.
+  reported rather than hidden; `Report::compaction_fallbacks` counts those requests and
+  `Report::compaction_waited` the time waited. The shrink is asked as before.
+- `Schedule::total`, the run-length hint's estimate (D-016), does not count the wait. It is
+  at most 300 ms of a run over the first 1 000 seeds (a mean of 3.85 ms, no fallback),
+  where counting its budget, eight seconds over four attempts, would have lowered PCT's
+  change-point rate on every run for time no run spends.
+- `Report::snapshot_fed_joiners` is every snapshot a joining server installed in its
+  learner phase: from the operator's first request for the grow (`Report::grow`) until the
+  first joint configuration naming that server in `new` takes effect on any server, or,
+  when none does, until the driver stops driving the grow. Installs after that — by a voter
+  of the joint or new configuration, in the transfer's wait, the shrink or the settle — are
+  not counted, nor an install's restatement at its adoption. The correct server's sweep
+  fails any seed with none and its coverage asserts one on every seed; the variant's sweep
+  prints how many of its runs had one; the coverage prints the seeds with a fallback.
+- The run's check fails on any `RaftRefused` whose reason does not start with
+  `LOST_STATE`. No crash is scheduled here, so a refusal can only come from an install's
+  adoption, and a configuration key its repair wrote out of step with the log refuses the
+  store at the open (store.rs) and puts the server in re-seed mode, which traces no
+  failure and whose re-seed install would otherwise count as a feed. The coverage counts
+  adoptions and refusals by the reason's first clause and asserts, at every tier, that none
+  is for anything but lost state.
 
-**What the extension found.** No bug in the Phase 2 code it reaches, at 20, 100 and 1 000
-seeds in release: the correct server passes every seed, and every seed feeds a joining
-server a snapshot — 79 installs at 20 seeds, 473 at 100, 4 879 at 1 000, with 14 606
-compactions. Every one of those installs ends in the joining server's adoption and a new
-incarnation whose open checks the configuration key its repair wrote against the log
-(D-029); none was refused or failed. The revert floor is reached: of the 69 configuration
-reverts over 1 000 seeds, 44 re-state the configuration of a server's compacted or installed
-prefix and 24 the initial configuration, and no truncation reaches at or below a server's
-prefix. `SingleMajorityInJointConsensus` is caught on 6 of 20, 35 of 100 and 301 of 1 000
-seeds (275 of 1 000 before).
+**What the extension found.** No bug in the Phase 2 code it was aimed at, and one trace
+inconsistency in the install path, returned to the owner unfixed:
 
-The scenario's coverage at 1 000 seeds against the tree before it (268cf58): grows and
-shrinks completed on every seed both times; joint configurations taken 10 728 (10 663);
-new configurations taken 22 841 (9 760), since an install's restatement re-states the
-configuration it carries; learners promoted 2 524 (2 470); configuration reverts 69 (709);
-elections while joint 33 (51); step-downs of a leader outside `C_new` 411 (435); completed
-operations 348 690 (287 719); worst completion gap 352.96 ms (382.24 ms); slowest first
-write after the last heal 471.89 ms (450.07 ms). The fall in reverts comes with the threshold,
-not the operator's aim: with the threshold lowered and the grow asked as before the runs
-show 79. Both membership tests at 1 000 seeds take 14.0 s against 10.4 s before (release, the
-machine's load about 10).
+- At 20, 100 and 1 000 seeds in release the correct server passes every seed, every seed
+  feeds a joining server a snapshot in its learner phase (63, 388 and 4 056 installs), and
+  no operator request fell back (the longest wait 300 ms). Every install is adopted — 109,
+  651 and 6 557 adoptions — and the open after each checks the configuration key its repair
+  wrote against the log; no store is refused and no server fails.
+- The key repair's non-trivial branch is not reached. An install keeps a tail of the
+  receiver's log only when the receiver holds the snapshot's last index with its term, and
+  a server is fed a snapshot here because its log ends below the leader's prefix: over
+  1 000 seeds no install kept a tail, so none wrote the key from a configuration entry in a
+  tail. Every install wrote the snapshot's own configuration.
+- The core's revert floor is not reached either. No truncation in a running core restored
+  a compacted or installed prefix's configuration over 1 000 seeds, on this tree, on
+  268cf58, or with the threshold alone. What the coverage's `reverts_to_a_prefix` counts, 4 at
+  100 seeds and 44 at 1 000, asserted from 100, are installs whose snapshot's configuration
+  is older than the receiver's in force, which take the receiver back to the installed
+  prefix. Issue #46's second item needs a follower that installs and then appends and
+  truncates a configuration entry above its prefix; this scenario does not build it, and
+  that is a question for the owner.
+- The install's `RaftConfig` (node.rs, `Snap::Finish`) writes the configuration's voters
+  into `new` when it is not joint, where `TraceEvent::RaftConfig` documents `new` as empty
+  outside a joint configuration and the core and the restatement write it empty; the same
+  configuration is traced two ways within one install. The checks read `new` only when
+  `joint` is set, so no verdict depends on it; the studio shows it. Not fixed here.
+- `SingleMajorityInJointConsensus` is caught on 6 of 20, 35 of 100 and 301 of 1 000 seeds
+  (275 of 1 000 on 268cf58).
 
-**Alternatives.** *The threshold alone*: 37 seeds in 1 000 without a feed, so not every seed.
+The coverage at 1 000 seeds against 268cf58: grows and shrinks completed on every seed both
+times; joint configurations taken 10 729 (10 663); new configurations taken 22 861 (9 760),
+since each install traces its snapshot's configuration and its adoption re-states it;
+learners promoted 2 524 (2 470); elections while joint 33 (51); step-downs of a leader outside
+`C_new` 412 (435); completed operations 348 849 (287 719); worst completion gap 352.96 ms
+(382.24 ms); slowest first write after the last heal 471.89 ms (450.07 ms); configuration
+reverts 69 (709). The reverts fall because installs now take conflicting configuration
+entries out of force where truncations did. On 268cf58, 717 configuration entries a server
+held in force had another term in the committed log at that index, and 709 of them left
+force by a truncation, each a revert. On this tree 780 did: 25 by a truncation, 746 by an
+install, and 9 not before the run ended. Of those 746, 44 took the receiver to an older
+configuration and count as reverts, and 702 took it to a newer one, which the counter,
+comparing indices, does not see as leaving an entry out of force. The threshold alone gives
+79 reverts (29 truncations, 50 installs).
+
+Timings, the two membership tests at 1 000 seeds in release, another agent's sweeps sharing
+the machine: on a563205, the commit before this review's changes, 26.0 s with the one-minute
+load at 18.4 and falling at its start, and 14.0 s at 10.1 to 11.6, against 10.4 s on 268cf58
+at 9.8 to 10.1; on this tree 26.2 s at a mean load of 84.0 over six samples, against 19.7 s on
+268cf58 at 79.6 over four. The load moves these more than the change does.
+
+Every figure above has its command and output in the lane's scratchpad, `scratchpad stage-a/n/audit-d058`:
+`run-audit.sh` runs them all; `membership-{20,100,1000}.log` and `membership-1000-268cf58.log`
+are the tests' coverage and timings with their load samples; `feeds-new.log` and
+`feeds-threshold-alone.log` are the learner-phase feeds, fallbacks and waits
+(`zz_m5_new.rs`); `traces-new.log`, `traces-threshold-alone.log` and
+`traces-268cf58.log` are the reverts, truncations, installs, tails, refusals and conflicting
+configuration entries (`zz_m5_trace.rs`).
+
+**Alternatives.** *The threshold alone*: 39 seeds in 1 000 without a learner-phase feed.
 *Crashing or isolating a joining server until its leader compacts past it*: a second fault
 in a scenario about membership under partition, and D-037's designation would feed it
 only after two quiet election timeouts. *Asserting the feed only on seeds that reach it*: the
 issue asks it of every seed, as §10's *every seed* standard does of a directed shape.
-*Directing the shrink too*: no server joins in the shrink.
+*Counting any install by a joining server during 3 → 5 → 3*: it counts voters fed after the
+change, which the exit criterion does not ask for. *Directing the shrink too*: no server
+joins in the shrink.
 
 **Consequences.** The scenario's schedule moved: a lower threshold changes every
-membership run from its first checkpoint on. Its only pinned assertions are the sweep's
-and the variant's, both re-run above. `sim/move.rs` can rely on the interaction having
-run on one group. If a seed at ten thousand exhausts the wait or reaches a leader that has
-not compacted, the correct server's sweep names it.
+membership run from its first checkpoint on, and the run-length hint no longer counts a
+wait. Its pinned assertions are the sweep's and the variant's, both re-run above. The worst
+completion gap of 549.359683 ms that SPEC §3, RAFT.md §1 and the scenario's module comment
+cite was measured at ten thousand seeds before this change; the next ten-thousand-seed
+nightly re-measures it on the moved schedule, and those three places are marked as measured
+before D-058. `sim/move.rs` can rely on a learner fed by snapshot during a change on one group,
+not on the key repair's tail branch or the truncation revert floor, which this scenario does
+not reach. If a seed at ten thousand exhausts the wait, reaches a leader that has not
+compacted, or refuses a store, the correct server's sweep names it.
 
 ---
 

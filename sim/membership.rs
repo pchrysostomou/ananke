@@ -19,7 +19,9 @@
 //! compacted since it took office, and of that leader alone, following no hint: the
 //! empty servers 4 and 5 are then behind its compacted prefix from the start, and the
 //! first leader to catch them up as learners feeds them a snapshot. Every seed is asked
-//! to show one ([`Report::snapshot_fed_joiners`]).
+//! to show one in a joiner's learner phase ([`Report::snapshot_fed_joiners`]), and a
+//! refusal for anything but lost state fails the run, so a configuration key an
+//! install's repair wrote out of step with its log cannot pass as a re-seed.
 //!
 //! The checks are the sweep's (RAFT.md §2): the log invariants and rule folds,
 //! commit majority against the configuration in force, linearizability, and, on
@@ -28,8 +30,9 @@
 //! time inside partition windows taken out — the partition itself may block
 //! writes while the leader is on the minority side, so the clock for the bound
 //! effectively starts at the heal. The bound is chosen so the correct server
-//! never trips it (RAFT.md §5); at ten thousand seeds the worst gap is 549 ms
-//! against its 2 s, and SPEC §3 states the criterion as this bound.
+//! never trips it (RAFT.md §5); at ten thousand seeds, on the schedule before D-058's
+//! snapshots, the worst gap was 549 ms against its 2 s, and SPEC §3 states the
+//! criterion as this bound.
 //!
 //! The pair rule (CLAUDE.md):
 //! [`Variant::SingleMajorityInJointConsensus`](ananke_raft::core::Variant::SingleMajorityInJointConsensus)
@@ -49,6 +52,7 @@ use ananke_raft::apply::Command;
 use ananke_raft::client::{Reply, Request, Response};
 use ananke_raft::core::{RaftConfig, Variants};
 use ananke_raft::message;
+use ananke_raft::store::LOST_STATE;
 use ananke_raft::{NodeConfig, ServerId, invariants, run as run_server};
 use ananke_storage::EngineConfig;
 use moirae_sched::Policy;
@@ -69,7 +73,7 @@ pub const SNAPSHOT_CHUNK: usize = 4096;
 /// How long the operator waits, at most, for a leader that has compacted since it took
 /// office before it asks for the grow: a fresh leader's first take waits two minimum
 /// election timeouts (D-030), and the client writes fill a threshold of 12 in well under
-/// a second.
+/// a second. [`Schedule::total`] leaves the wait out (D-058).
 // PROPOSED(D-058): the membership scenario past the snapshot threshold.
 const COMPACTION_WAIT_BUDGET: Duration = Duration::from_millis(2000);
 
@@ -171,7 +175,10 @@ impl Schedule {
     }
 
     /// A generous bound on the run's virtual duration, for the run-length hint:
-    /// the changes' polls end early when a change completes.
+    /// the changes' polls end early when a change completes. The operator's wait for a
+    /// compacted leader is not counted: measured, it is a few milliseconds of a run, and
+    /// counting its budget would lower PCT's change-point rate on every run for time no
+    /// run spends (D-058).
     #[must_use]
     pub fn total(&self) -> Duration {
         let budget = POLL * POLL_BUDGET * ATTEMPTS;
@@ -182,7 +189,6 @@ impl Schedule {
             + self.shrink.for_
             + TRANSFER_WAIT
             + budget * 2
-            + COMPACTION_WAIT_BUDGET * ATTEMPTS
             + self.settle
     }
 }
@@ -291,9 +297,16 @@ pub struct Report {
     /// Whether {1, 2, 3} took effect again the same way, after the grow.
     pub shrink_completed: bool,
     /// When the operator first asked for the grow, and when the driver stopped driving
-    /// the shrink: the stretch of 3 → 5 → 3.
+    /// it, completed or not.
     // PROPOSED(D-058): the membership scenario past the snapshot threshold.
-    pub changes: Option<(Instant, Instant)>,
+    pub grow: Option<(Instant, Instant)>,
+    /// How many times the operator found no leader that had compacted since it took
+    /// office within the two-second budget and asked the leader in force instead.
+    // PROPOSED(D-058): the membership scenario past the snapshot threshold.
+    pub compaction_fallbacks: u32,
+    /// How long the operator waited, in all, for a compacted leader.
+    // PROPOSED(D-058): the membership scenario past the snapshot threshold.
+    pub compaction_waited: Duration,
     /// Why the run stopped early, if it did.
     pub stopped: Option<String>,
     /// The clients' history.
@@ -335,17 +348,36 @@ impl Report {
         self.policy == Policy::Uniform
     }
 
-    /// Every snapshot a server outside the initial configuration installed during
-    /// 3 → 5 → 3 ([`Report::changes`]), as (server, when it completed, the snapshot's last
-    /// index): a learner or joining voter fed by snapshot, what issue #46 asks every seed
-    /// to show. An install's restatement at the adoption that follows it is the same
-    /// snapshot and is not counted again.
+    /// Every snapshot a server joining the configuration installed while it was a
+    /// learner, as (server, when the install completed, the snapshot's last index): what
+    /// issue #46 asks every seed to show, a learner fed by a snapshot during a change.
+    /// A joiner's learner phase runs from the operator's first request for the grow
+    /// ([`Report::grow`]) until the first joint configuration naming it in `new` takes
+    /// effect on any server — the entry that ends the catch-up (D-029, D-032) — or, when
+    /// none ever does, until the driver stopped driving the grow. Installs after that,
+    /// by a voter of the joint or new configuration, in the transfer's wait, the shrink or
+    /// the settle, are not counted; nor is an install's restatement at the adoption that
+    /// follows it, which is the same snapshot.
     // PROPOSED(D-058): the membership scenario past the snapshot threshold.
     #[must_use]
     pub fn snapshot_fed_joiners(&self) -> Vec<(u64, Instant, u64)> {
-        let Some((from, until)) = self.changes else {
+        let Some((from, grow_end)) = self.grow else {
             return Vec::new();
         };
+        let learner_until = |joiner: u64| {
+            self.records
+                .iter()
+                .find_map(|r| match &r.event {
+                    TraceEvent::RaftConfig {
+                        joint: true, new, ..
+                    } if r.at >= from && new.contains(&joiner) => Some(r.at),
+                    _ => None,
+                })
+                .unwrap_or(grow_end)
+        };
+        let until: Vec<(u64, Instant)> = (INITIAL_VOTERS + 1..=SERVERS)
+            .map(|joiner| (joiner, learner_until(joiner)))
+            .collect();
         let mut joiners: Vec<(u64, Instant, u64)> = Vec::new();
         for record in &self.records {
             if let TraceEvent::RaftSnapshot {
@@ -354,9 +386,9 @@ impl Report {
                 taken: false,
                 ..
             } = record.event
-                && server > INITIAL_VOTERS
-                && record.at >= from
-                && record.at <= until
+                && until
+                    .iter()
+                    .any(|&(joiner, end)| joiner == server && record.at >= from && record.at < end)
                 && !joiners
                     .iter()
                     .any(|&(s, _, index)| s == server && index == last_index)
@@ -433,6 +465,19 @@ impl Report {
         }) {
             return fail(format!("server {} failed: {}", failed.0, failed.1));
         }
+        // PROPOSED(D-058): no crash is scheduled here, so a store refused at an open is
+        // an install's adoption gone wrong — a configuration key its repair wrote out
+        // of step with the log refuses the store and puts the server in re-seed mode,
+        // which is not a failure — unless the refusal is for state lost below the
+        // store, which fails nothing of the protocol's.
+        if let Some((server, reason)) = self.records.iter().find_map(|r| match &r.event {
+            TraceEvent::RaftRefused { server, reason } if !reason.starts_with(LOST_STATE) => {
+                Some((server, reason))
+            }
+            _ => None,
+        }) {
+            return fail(format!("server {server} refused its store: {reason}"));
+        }
         // Completion and availability are liveness: asked only of seeds the
         // scheduler cannot starve (D-016).
         if self.uniform() {
@@ -489,6 +534,10 @@ struct Leadership {
     scanned: usize,
     leader: Option<u64>,
     compacted: bool,
+    /// Requests that found no compacted leader in time.
+    fallbacks: u32,
+    /// Time spent waiting for one.
+    waited: Duration,
 }
 
 impl Default for Watch {
@@ -543,7 +592,7 @@ impl Driver {
     /// Waits, in slices and at most [`COMPACTION_WAIT_BUDGET`], for a leader that has
     /// compacted since it took office, and returns it; when none appears in time, the
     /// leader in force, so that the seed's missing snapshot is reported rather than
-    /// hidden.
+    /// hidden. Every fallback and every slice waited is counted in the report.
     // PROPOSED(D-058): the membership scenario past the snapshot threshold.
     fn await_compacted_leader(&mut self) -> u64 {
         let mut waited = Duration::ZERO;
@@ -552,10 +601,12 @@ impl Driver {
                 return leader;
             }
             if waited >= COMPACTION_WAIT_BUDGET || self.watch.stopped.is_some() {
+                self.leadership.fallbacks += 1;
                 return leader_now(&self.sim);
             }
             self.advance(SLICE);
             waited += SLICE;
+            self.leadership.waited += SLICE;
         }
     }
 
@@ -806,6 +857,7 @@ pub fn run_with(seed: u64, schedule: Schedule, variants: impl Into<Variants>) ->
     driver.advance(schedule.warmup);
     let grow_requested = driver.sim.now();
     let grow_completed = driver.drive_change(&[1, 2, 3, 4, 5], &schedule.grow, true);
+    let grow = Some((grow_requested, driver.sim.now()));
     if let Some(to) = schedule.transfer_to
         && grow_completed
         && driver.watch.stopped.is_none()
@@ -814,7 +866,6 @@ pub fn run_with(seed: u64, schedule: Schedule, variants: impl Into<Variants>) ->
         driver.advance(TRANSFER_WAIT);
     }
     let shrink_completed = driver.drive_change(&[1, 2, 3], &schedule.shrink, false);
-    let changes = Some((grow_requested, driver.sim.now()));
     if driver.watch.stopped.is_none() {
         driver.advance(schedule.settle);
     }
@@ -838,7 +889,9 @@ pub fn run_with(seed: u64, schedule: Schedule, variants: impl Into<Variants>) ->
         last_heal: driver.last_heal,
         grow_completed,
         shrink_completed,
-        changes,
+        grow,
+        compaction_fallbacks: driver.leadership.fallbacks,
+        compaction_waited: driver.leadership.waited,
         stopped: driver.watch.stopped,
         history,
         clients: clients_total,

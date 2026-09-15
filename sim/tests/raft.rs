@@ -2459,8 +2459,9 @@ fn the_membership_scenario_has_byte_identical_traces_for_one_seed() {
 
 /// The positive control: the correct server passes 3 → 5 → 3 under partition on
 /// every seed, and the runs reached the states that matter. On every seed a server
-/// joining the configuration is fed a snapshot during the changes (issue #46), which
-/// the sweep asserts seed by seed.
+/// joining the configuration is fed a snapshot while it is a learner (issue #46), which
+/// the sweep asserts seed by seed; a store refused for anything but lost state fails
+/// the run's own check.
 #[test]
 fn the_correct_server_passes_the_membership_scenario_on_every_seed() {
     let coverage = Mutex::new(MembershipCoverage::default());
@@ -2474,7 +2475,7 @@ fn the_correct_server_passes_the_membership_scenario_on_every_seed() {
                 if report.snapshot_fed_joiners().is_empty() {
                     Err(format!(
                         "seed {seed}: no server joining the configuration installed a snapshot \
-                         during 3 → 5 → 3"
+                         in its learner phase"
                     ))
                 } else {
                     Ok(())
@@ -2536,11 +2537,27 @@ struct MembershipCoverage {
     redirected: u64,
     worst_completion_gap: Duration,
     slowest_write_after_heal: Duration,
-    // PROPOSED(D-058): snapshots installed by joining servers during the changes, the
-    // seeds that had one, and the leaders' compactions.
+    // PROPOSED(D-058): snapshots installed by joining servers in their learner phase,
+    // the seeds that had one, the leaders' compactions, and the seeds whose operator
+    // found no compacted leader in time and the longest wait for one.
     snapshot_fed_joiners: usize,
     seeds_with_a_snapshot_fed_joiner: u64,
     compactions: usize,
+    seeds_with_a_compaction_fallback: u64,
+    longest_compaction_wait: Duration,
+    // PROPOSED(D-058): adoptions, and refusals by the reason's first clause, of which
+    // only lost state may appear: a configuration key an install's repair wrote out of
+    // step with its log refuses the store at the adoption's open.
+    adoptions: usize,
+    refusals: BTreeMap<String, usize>,
+    // PROPOSED(D-058): reverts that restore a server's compacted or installed prefix's
+    // configuration, and of those the ones a truncation in the running core made (the
+    // core's revert floor); installs that kept a tail of the receiver's log, and those
+    // whose tail carried a configuration entry (the key repair's non-trivial branch).
+    reverts_to_a_prefix: usize,
+    truncation_reverts_to_a_prefix: usize,
+    installs_keeping_a_tail: usize,
+    installs_whose_tail_carries_a_configuration: usize,
 }
 
 impl MembershipCoverage {
@@ -2550,6 +2567,8 @@ impl MembershipCoverage {
         self.snapshot_fed_joiners += joiners.len();
         self.seeds_with_a_snapshot_fed_joiner += u64::from(!joiners.is_empty());
         self.compactions += report.count(|e| matches!(e, TraceEvent::RaftCompacted { .. }));
+        self.seeds_with_a_compaction_fallback += u64::from(report.compaction_fallbacks > 0);
+        self.longest_compaction_wait = self.longest_compaction_wait.max(report.compaction_waited);
         self.uniform_seeds += u64::from(report.uniform());
         self.grows_completed += u64::from(report.grow_completed);
         self.shrinks_completed += u64::from(report.shrink_completed);
@@ -2569,8 +2588,66 @@ impl MembershipCoverage {
         let mut in_force: BTreeMap<u64, (u64, bool)> = BTreeMap::new();
         let mut leading: BTreeSet<u64> = BTreeSet::new();
         let mut promoted: BTreeSet<(u64, u64)> = BTreeSet::new();
+        // PROPOSED(D-058): per server, its compacted or installed prefix, the kind of its
+        // last Raft record, and, from an adoption to its recovery, the restated
+        // snapshot's index.
+        let mut prefix: BTreeMap<u64, u64> = BTreeMap::new();
+        let mut after_truncate: BTreeSet<u64> = BTreeSet::new();
+        let mut restating: BTreeMap<u64, Option<u64>> = BTreeMap::new();
         for event in report.events() {
+            let truncated = match &event {
+                TraceEvent::RaftTruncate { server, .. } => Some((*server, true)),
+                TraceEvent::RaftSnapshot { server, .. }
+                | TraceEvent::RaftAppend { server, .. }
+                | TraceEvent::RaftConfig { server, .. }
+                | TraceEvent::RaftCompacted { server, .. }
+                | TraceEvent::RaftAdopted { server }
+                | TraceEvent::RaftRecovered { server, .. } => Some((*server, false)),
+                _ => None,
+            };
+            let followed_truncate = truncated.is_some_and(|(s, _)| after_truncate.contains(&s));
+            match truncated {
+                Some((s, true)) => {
+                    after_truncate.insert(s);
+                }
+                Some((s, false)) => {
+                    after_truncate.remove(&s);
+                }
+                None => {}
+            }
             match event {
+                TraceEvent::RaftCompacted { server, through } => {
+                    prefix.insert(server, through);
+                }
+                TraceEvent::RaftSnapshot {
+                    server,
+                    last_index,
+                    taken: false,
+                    ..
+                } => {
+                    if followed_truncate && let Some(slot) = restating.get_mut(&server) {
+                        *slot = Some(last_index);
+                    }
+                    prefix.insert(server, last_index);
+                }
+                TraceEvent::RaftAdopted { server } => {
+                    self.adoptions += 1;
+                    restating.insert(server, None);
+                }
+                TraceEvent::RaftRecovered {
+                    server,
+                    applied,
+                    last_index,
+                    ..
+                } => {
+                    if restating.remove(&server).is_some() && last_index > applied {
+                        self.installs_keeping_a_tail += 1;
+                    }
+                }
+                TraceEvent::RaftRefused { reason, .. } => {
+                    let clause = reason.split(':').next().unwrap_or_default().to_owned();
+                    *self.refusals.entry(clause).or_default() += 1;
+                }
                 TraceEvent::RaftConfig {
                     server,
                     index,
@@ -2596,6 +2673,15 @@ impl MembershipCoverage {
                         && index < previous
                     {
                         self.config_reverts += 1;
+                        if index > 0 && prefix.get(&server) == Some(&index) {
+                            self.reverts_to_a_prefix += 1;
+                            self.truncation_reverts_to_a_prefix += usize::from(followed_truncate);
+                        }
+                    }
+                    if let Some(Some(snapshot)) = restating.get(&server)
+                        && index > *snapshot
+                    {
+                        self.installs_whose_tail_carries_a_configuration += 1;
                     }
                     in_force.insert(server, (index, joint));
                 }
@@ -2637,7 +2723,16 @@ impl MembershipCoverage {
         }
         assert_eq!(
             self.seeds_with_a_snapshot_fed_joiner, seeds,
-            "a membership run fed no joining server a snapshot: {self:?}"
+            "a membership run fed no joining server a snapshot in its learner phase: {self:?}"
+        );
+        // PROPOSED(D-058): every seed adopts installs, and none is refused for anything
+        // but lost state, which each run's check also fails.
+        assert!(self.adoptions > 0, "no install was adopted: {self:?}");
+        assert!(
+            self.refusals
+                .keys()
+                .all(|clause| clause.starts_with(LOST_STATE)),
+            "a membership run refused a store for something other than lost state: {self:?}"
         );
         // Rarer states need the partition to land inside a narrow phase of the
         // change: twenty seeds cannot promise them; a hundred can.
@@ -2649,6 +2744,12 @@ impl MembershipCoverage {
                     self.step_downs_outside_new as u64,
                 ),
                 ("configuration reverts", self.config_reverts as u64),
+                // PROPOSED(D-058): an install whose snapshot's configuration is older
+                // than the receiver's, taking the receiver back to the installed prefix.
+                (
+                    "reverts to a compacted or installed prefix",
+                    self.reverts_to_a_prefix as u64,
+                ),
             ] {
                 assert!(seen > 0, "the membership runs never saw {what}: {self:?}");
             }
