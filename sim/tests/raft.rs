@@ -2458,7 +2458,9 @@ fn the_membership_scenario_has_byte_identical_traces_for_one_seed() {
 }
 
 /// The positive control: the correct server passes 3 → 5 → 3 under partition on
-/// every seed, and the runs reached the states that matter.
+/// every seed, and the runs reached the states that matter. On every seed a server
+/// joining the configuration is fed a snapshot during the changes (issue #46), which
+/// the sweep asserts seed by seed.
 #[test]
 fn the_correct_server_passes_the_membership_scenario_on_every_seed() {
     let coverage = Mutex::new(MembershipCoverage::default());
@@ -2467,6 +2469,17 @@ fn the_correct_server_passes_the_membership_scenario_on_every_seed() {
         coverage.lock().unwrap().add(&report);
         report
             .check()
+            // PROPOSED(D-058): a joining server fed by snapshot, on every seed.
+            .and_then(|()| {
+                if report.snapshot_fed_joiners().is_empty() {
+                    Err(format!(
+                        "seed {seed}: no server joining the configuration installed a snapshot \
+                         during 3 → 5 → 3"
+                    ))
+                } else {
+                    Ok(())
+                }
+            })
             .inspect_err(|_| write_trace(&format!("membership-{seed}"), &report.jsonl()))
     });
     let coverage = coverage.into_inner().unwrap();
@@ -2478,19 +2491,22 @@ fn the_correct_server_passes_the_membership_scenario_on_every_seed() {
 }
 
 /// The negative control: a server that counts one merged majority while joint
-/// (thesis §4.3) is caught by the membership scenario's checks on some seed.
+/// (thesis §4.3) is caught by the membership scenario's checks on some seed. How many
+/// of its runs fed a joining server a snapshot is printed beside the rate.
 #[test]
 fn a_server_that_counts_one_majority_in_joint_consensus_is_caught() {
-    let caught: Vec<String> = sweep(seeds(), |seed| {
-        membership::run(seed, Variant::SingleMajorityInJointConsensus)
-            .check()
-            .err()
-    })
-    .into_iter()
-    .flatten()
-    .collect();
+    let outcomes: Vec<(Option<String>, bool)> = sweep(seeds(), |seed| {
+        let report = membership::run(seed, Variant::SingleMajorityInJointConsensus);
+        (
+            report.check().err(),
+            !report.snapshot_fed_joiners().is_empty(),
+        )
+    });
+    let fed = outcomes.iter().filter(|(_, fed)| *fed).count();
+    let caught: Vec<String> = outcomes.into_iter().filter_map(|(v, _)| v).collect();
     eprintln!(
-        "SingleMajorityInJointConsensus: caught on {} of {} seeds, first: {}",
+        "SingleMajorityInJointConsensus: caught on {} of {} seeds, a joining server fed a \
+         snapshot on {fed}, first: {}",
         caught.len(),
         seeds(),
         caught.first().map_or("", String::as_str)
@@ -2520,11 +2536,20 @@ struct MembershipCoverage {
     redirected: u64,
     worst_completion_gap: Duration,
     slowest_write_after_heal: Duration,
+    // PROPOSED(D-058): snapshots installed by joining servers during the changes, the
+    // seeds that had one, and the leaders' compactions.
+    snapshot_fed_joiners: usize,
+    seeds_with_a_snapshot_fed_joiner: u64,
+    compactions: usize,
 }
 
 impl MembershipCoverage {
     fn add(&mut self, report: &membership::Report) {
         self.seeds += 1;
+        let joiners = report.snapshot_fed_joiners();
+        self.snapshot_fed_joiners += joiners.len();
+        self.seeds_with_a_snapshot_fed_joiner += u64::from(!joiners.is_empty());
+        self.compactions += report.count(|e| matches!(e, TraceEvent::RaftCompacted { .. }));
         self.uniform_seeds += u64::from(report.uniform());
         self.grows_completed += u64::from(report.grow_completed);
         self.shrinks_completed += u64::from(report.shrink_completed);
@@ -2606,9 +2631,14 @@ impl MembershipCoverage {
             ("partitions", self.partitions as u64),
             ("completed operations", self.completed),
             ("uniformly scheduled seeds", self.uniform_seeds),
+            ("log compactions", self.compactions as u64),
         ] {
             assert!(seen > 0, "the membership runs never saw {what}: {self:?}");
         }
+        assert_eq!(
+            self.seeds_with_a_snapshot_fed_joiner, seeds,
+            "a membership run fed no joining server a snapshot: {self:?}"
+        );
         // Rarer states need the partition to land inside a narrow phase of the
         // change: twenty seeds cannot promise them; a hundred can.
         if seeds >= 100 {

@@ -4188,4 +4188,78 @@ this entry is what it switches to.
 
 ---
 
-_Next entry: D-058. Add one before implementing anything not covered above._
+## PROPOSED D-058 — The membership scenario past the snapshot threshold
+
+**Context.** Issue #46 and SHARD.md's Q34, approved: extend `sim/membership.rs` past the
+snapshot threshold before `sim/move.rs`, so that during 3 → 5 → 3 a learner or joining
+voter is fed by a snapshot, asserted per seed; the correct server passes every seed and
+`SingleMajorityInJointConsensus` is still caught on some seed at every tier. The scenario
+ran `RaftConfig`'s default threshold of 4 096 entries and never crossed it
+(OVERNIGHT.md:188-191), so the two pieces of Phase 2 code the issue names, the
+configuration key an install's repair writes and the floor a truncated configuration
+entry reverts to (D-029, D-030), had only unit tests. Q34 settles that the scenario is
+extended. It does not settle how a snapshot feed is made certain on every seed, and a
+lower threshold alone does not make it: only a leader compacts (D-030), a leader elected
+from followers holds a whole log, and such a leader catches an empty learner up with
+entries from index 1. Measured on the tree of this entry with the threshold lowered and
+nothing else changed, 37 of the first 1 000 seeds fed no joining server a snapshot.
+
+**Decision.** Every site is marked `PROPOSED(D-058)`.
+
+- The membership servers run the raft sweep's `snapshot_threshold` of 12 and
+  `snapshot_chunk` of 4 096, so leaders take checkpoints and compact routinely.
+- The operator asks for the grow only of a leader that has compacted since it took
+  office — its `RaftCompacted` after its `RaftLeader` in the trace — waiting for one in
+  slices for at most two seconds, and asks that leader alone: a request that finds it no
+  longer leading ends there rather than following the hint, and the driver's next attempt
+  waits for a compacted leader again. A learner's catch-up starts only when a leader
+  accepts the request, and is the leader's alone (D-032), so the first leader to catch
+  servers 4 and 5 up has a compacted prefix, and their first rejection, asking from index
+  1, lands below it: they are fed a snapshot. When no compacted leader appears within the
+  budget the request goes to the leader in force, so a seed without a snapshot feed is
+  reported rather than hidden. The shrink is asked as before. `Schedule::total` counts the
+  wait.
+- `Report::changes` is the stretch from the grow's first request to the end of the
+  shrink's drive, and `Report::snapshot_fed_joiners` every snapshot a server outside the
+  initial configuration installed in it. The correct server's sweep fails any seed with
+  none, and its coverage counts them, the leaders' compactions, and asserts a feed on
+  every seed; the variant's sweep prints how many of its runs had one.
+
+**What the extension found.** No bug in the Phase 2 code it reaches, at 20, 100 and 1 000
+seeds in release: the correct server passes every seed, and every seed feeds a joining
+server a snapshot — 79 installs at 20 seeds, 473 at 100, 4 879 at 1 000, with 14 606
+compactions. Every one of those installs ends in the joining server's adoption and a new
+incarnation whose open checks the configuration key its repair wrote against the log
+(D-029); none was refused or failed. The revert floor is reached: of the 69 configuration
+reverts over 1 000 seeds, 44 re-state the configuration of a server's compacted or installed
+prefix and 24 the initial configuration, and no truncation reaches at or below a server's
+prefix. `SingleMajorityInJointConsensus` is caught on 6 of 20, 35 of 100 and 301 of 1 000
+seeds (275 of 1 000 before).
+
+The scenario's coverage at 1 000 seeds against the tree before it (268cf58): grows and
+shrinks completed on every seed both times; joint configurations taken 10 728 (10 663);
+new configurations taken 22 841 (9 760), since an install's restatement re-states the
+configuration it carries; learners promoted 2 524 (2 470); configuration reverts 69 (709);
+elections while joint 33 (51); step-downs of a leader outside `C_new` 411 (435); completed
+operations 348 690 (287 719); worst completion gap 352.96 ms (382.24 ms); slowest first
+write after the last heal 471.89 ms (450.07 ms). The fall in reverts comes with the threshold,
+not the operator's aim: with the threshold lowered and the grow asked as before the runs
+show 79. Both membership tests at 1 000 seeds take 14.0 s against 10.4 s before (release, the
+machine's load about 10).
+
+**Alternatives.** *The threshold alone*: 37 seeds in 1 000 without a feed, so not every seed.
+*Crashing or isolating a joining server until its leader compacts past it*: a second fault
+in a scenario about membership under partition, and D-037's designation would feed it
+only after two quiet election timeouts. *Asserting the feed only on seeds that reach it*: the
+issue asks it of every seed, as §10's *every seed* standard does of a directed shape.
+*Directing the shrink too*: no server joins in the shrink.
+
+**Consequences.** The scenario's schedule moved: a lower threshold changes every
+membership run from its first checkpoint on. Its only pinned assertions are the sweep's
+and the variant's, both re-run above. `sim/move.rs` can rely on the interaction having
+run on one group. If a seed at ten thousand exhausts the wait or reaches a leader that has
+not compacted, the correct server's sweep names it.
+
+---
+
+_Next entry: D-059. Add one before implementing anything not covered above._

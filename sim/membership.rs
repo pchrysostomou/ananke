@@ -13,6 +13,14 @@
 //! back to {1, 2, 3} under another partition; a leader outside `C_new` completing
 //! that change steps down.
 //!
+//! Membership changes and snapshots run on one schedule (issue #46, PROPOSED D-058).
+//! The servers run the sweep's snapshot threshold of 12, so leaders take checkpoints
+//! and compact routinely, and the operator asks for the grow only of a leader that has
+//! compacted since it took office, and of that leader alone, following no hint: the
+//! empty servers 4 and 5 are then behind its compacted prefix from the start, and the
+//! first leader to catch them up as learners feeds them a snapshot. Every seed is asked
+//! to show one ([`Report::snapshot_fed_joiners`]).
+//!
 //! The checks are the sweep's (RAFT.md §2): the log invariants and rule folds,
 //! commit majority against the configuration in force, linearizability, and, on
 //! uniformly scheduled seeds, liveness after the last heal and the availability
@@ -50,6 +58,20 @@ use crate::raft::{
     CLIENTS, ClientStats, DIR, DRIFT_BOUND_PPM, LIVENESS_TIMEOUTS, SLICE, TICK, admin_addr, client,
     election_max, leader_now, server_addr,
 };
+
+/// The raft sweep's snapshot threshold, which the membership servers run too, so that
+/// leaders compact routinely and a server joining empty is fed a snapshot (D-030).
+// PROPOSED(D-058): the membership scenario past the snapshot threshold.
+pub const SNAPSHOT_THRESHOLD: u64 = 12;
+/// The raft sweep's chunk size: an install takes several chunks.
+// PROPOSED(D-058): the membership scenario past the snapshot threshold.
+pub const SNAPSHOT_CHUNK: usize = 4096;
+/// How long the operator waits, at most, for a leader that has compacted since it took
+/// office before it asks for the grow: a fresh leader's first take waits two minimum
+/// election timeouts (D-030), and the client writes fill a threshold of 12 in well under
+/// a second.
+// PROPOSED(D-058): the membership scenario past the snapshot threshold.
+const COMPACTION_WAIT_BUDGET: Duration = Duration::from_millis(2000);
 
 /// How many server nodes run, servers 4 and 5 outside the initial configuration.
 pub const SERVERS: u64 = 5;
@@ -160,6 +182,7 @@ impl Schedule {
             + self.shrink.for_
             + TRANSFER_WAIT
             + budget * 2
+            + COMPACTION_WAIT_BUDGET * ATTEMPTS
             + self.settle
     }
 }
@@ -215,11 +238,15 @@ pub fn node_config(id: u64, variants: impl Into<Variants>) -> NodeConfig {
             Vec::new()
         },
         // One entry per message, as the sweep runs (D-026, issue #22).
+        // PROPOSED(D-058): the sweep's snapshot threshold and chunk, so membership
+        // changes and snapshots run on one schedule (issue #46).
         raft: RaftConfig {
             variants,
             max_batch: 1,
             tick_nanos: u64::try_from(TICK.as_nanos()).expect("small"),
             drift_bound_ppm: DRIFT_BOUND_PPM,
+            snapshot_threshold: SNAPSHOT_THRESHOLD,
+            snapshot_chunk: SNAPSHOT_CHUNK,
             ..RaftConfig::default()
         },
         engine,
@@ -263,6 +290,10 @@ pub struct Report {
     pub grow_completed: bool,
     /// Whether {1, 2, 3} took effect again the same way, after the grow.
     pub shrink_completed: bool,
+    /// When the operator first asked for the grow, and when the driver stopped driving
+    /// the shrink: the stretch of 3 → 5 → 3.
+    // PROPOSED(D-058): the membership scenario past the snapshot threshold.
+    pub changes: Option<(Instant, Instant)>,
     /// Why the run stopped early, if it did.
     pub stopped: Option<String>,
     /// The clients' history.
@@ -302,6 +333,38 @@ impl Report {
     #[must_use]
     pub fn uniform(&self) -> bool {
         self.policy == Policy::Uniform
+    }
+
+    /// Every snapshot a server outside the initial configuration installed during
+    /// 3 → 5 → 3 ([`Report::changes`]), as (server, when it completed, the snapshot's last
+    /// index): a learner or joining voter fed by snapshot, what issue #46 asks every seed
+    /// to show. An install's restatement at the adoption that follows it is the same
+    /// snapshot and is not counted again.
+    // PROPOSED(D-058): the membership scenario past the snapshot threshold.
+    #[must_use]
+    pub fn snapshot_fed_joiners(&self) -> Vec<(u64, Instant, u64)> {
+        let Some((from, until)) = self.changes else {
+            return Vec::new();
+        };
+        let mut joiners: Vec<(u64, Instant, u64)> = Vec::new();
+        for record in &self.records {
+            if let TraceEvent::RaftSnapshot {
+                server,
+                last_index,
+                taken: false,
+                ..
+            } = record.event
+                && server > INITIAL_VOTERS
+                && record.at >= from
+                && record.at <= until
+                && !joiners
+                    .iter()
+                    .any(|&(s, _, index)| s == server && index == last_index)
+            {
+                joiners.push((server, record.at, last_index));
+            }
+        }
+        joiners
     }
 
     /// How long after the last heal the first client write completed, if one did.
@@ -418,6 +481,16 @@ struct Watch {
     checked: usize,
 }
 
+/// What the driver has read of leadership from the trace: the latest leader, and
+/// whether it has compacted its log since it took office.
+// PROPOSED(D-058): the membership scenario past the snapshot threshold.
+#[derive(Default)]
+struct Leadership {
+    scanned: usize,
+    leader: Option<u64>,
+    compacted: bool,
+}
+
 impl Default for Watch {
     fn default() -> Self {
         Self {
@@ -439,9 +512,53 @@ struct Driver {
     partitions: Vec<(Instant, Instant)>,
     last_heal: Instant,
     admin_seq: u64,
+    leadership: Leadership,
 }
 
 impl Driver {
+    /// The leader in force, if it has compacted its log since it took office: the
+    /// leader the operator asks for the grow, whose learners start behind its
+    /// compacted prefix.
+    // PROPOSED(D-058): the membership scenario past the snapshot threshold.
+    fn compacted_leader(&mut self) -> Option<u64> {
+        let records = self.sim.trace_from(self.leadership.scanned);
+        self.leadership.scanned += records.len();
+        for record in &records {
+            match record.event {
+                TraceEvent::RaftLeader { server, .. } => {
+                    self.leadership.leader = Some(server);
+                    self.leadership.compacted = false;
+                }
+                TraceEvent::RaftCompacted { server, .. }
+                    if self.leadership.leader == Some(server) =>
+                {
+                    self.leadership.compacted = true;
+                }
+                _ => {}
+            }
+        }
+        self.leadership.leader.filter(|_| self.leadership.compacted)
+    }
+
+    /// Waits, in slices and at most [`COMPACTION_WAIT_BUDGET`], for a leader that has
+    /// compacted since it took office, and returns it; when none appears in time, the
+    /// leader in force, so that the seed's missing snapshot is reported rather than
+    /// hidden.
+    // PROPOSED(D-058): the membership scenario past the snapshot threshold.
+    fn await_compacted_leader(&mut self) -> u64 {
+        let mut waited = Duration::ZERO;
+        loop {
+            if let Some(leader) = self.compacted_leader() {
+                return leader;
+            }
+            if waited >= COMPACTION_WAIT_BUDGET || self.watch.stopped.is_some() {
+                return leader_now(&self.sim);
+            }
+            self.advance(SLICE);
+            waited += SLICE;
+        }
+    }
+
     /// Advances in slices with the safety folds run over the trace so far, the
     /// way the sweep does, so a violating variant stops with a verdict.
     fn advance(&mut self, duration: Duration) {
@@ -476,11 +593,13 @@ impl Driver {
 
     /// Asks the leader in force for a change to `voters`, from a fresh operator
     /// socket, following NotLeader hints and retrying until a server accepts —
-    /// asking again for the same voters is idempotent (D-029).
-    fn request_change(&mut self, voters: &[u64]) {
+    /// asking again for the same voters is idempotent (D-029). Given `only`, asks that
+    /// server alone, retrying it and following no hint, so that no other leader starts
+    /// the change on this request.
+    fn request_change(&mut self, voters: &[u64], only: Option<u64>) {
         self.admin_seq += 1;
         let seq = self.admin_seq;
-        let first = leader_now(&self.sim);
+        let first = only.unwrap_or_else(|| leader_now(&self.sim));
         let env = self.sim.env(self.admin);
         let inner = env.clone();
         let voters = voters.to_vec();
@@ -525,7 +644,13 @@ impl Driver {
                 }
                 match reply {
                     Some(Reply::Outcome(_)) => return,
+                    // PROPOSED(D-058): a request for one server alone ends where that
+                    // server is not the leader; the driver asks again.
+                    Some(Reply::NotLeader { .. }) if only.is_some() => return,
                     Some(Reply::NotLeader { leader: Some(l) }) => target = l.0,
+                    None if only.is_some() => {
+                        inner.clock().sleep(Duration::from_millis(25)).await;
+                    }
                     Some(Reply::NotLeader { leader: None }) | None => {
                         inner.clock().sleep(Duration::from_millis(25)).await;
                         target = target % SERVERS + 1;
@@ -578,13 +703,19 @@ impl Driver {
     /// Drives one change to completion: the request, the partition drawn for it
     /// with the leader on the minority side, the heal, and up to [`ATTEMPTS`]
     /// fresh requests should the partition have killed the change (a leadership
-    /// change abandons the catch-up phase, D-032).
-    fn drive_change(&mut self, voters: &[u64], phase: &Phase) -> bool {
+    /// change abandons the catch-up phase, D-032). When `snapshot_fed`, every request
+    /// goes to a leader that has compacted since it took office, and to it alone.
+    fn drive_change(&mut self, voters: &[u64], phase: &Phase, snapshot_fed: bool) -> bool {
         for attempt in 0..ATTEMPTS {
             if self.watch.stopped.is_some() {
                 return false;
             }
-            self.request_change(voters);
+            // PROPOSED(D-058): the grow is asked of a compacted leader alone.
+            let only = snapshot_fed.then(|| self.await_compacted_leader());
+            if self.watch.stopped.is_some() {
+                return false;
+            }
+            self.request_change(voters, only);
             if attempt == 0 {
                 self.advance(phase.after);
                 if self.watch.stopped.is_some() {
@@ -670,9 +801,11 @@ pub fn run_with(seed: u64, schedule: Schedule, variants: impl Into<Variants>) ->
         partitions: Vec::new(),
         last_heal,
         admin_seq: 0,
+        leadership: Leadership::default(),
     };
     driver.advance(schedule.warmup);
-    let grow_completed = driver.drive_change(&[1, 2, 3, 4, 5], &schedule.grow);
+    let grow_requested = driver.sim.now();
+    let grow_completed = driver.drive_change(&[1, 2, 3, 4, 5], &schedule.grow, true);
     if let Some(to) = schedule.transfer_to
         && grow_completed
         && driver.watch.stopped.is_none()
@@ -680,7 +813,8 @@ pub fn run_with(seed: u64, schedule: Schedule, variants: impl Into<Variants>) ->
         driver.transfer(to);
         driver.advance(TRANSFER_WAIT);
     }
-    let shrink_completed = driver.drive_change(&[1, 2, 3], &schedule.shrink);
+    let shrink_completed = driver.drive_change(&[1, 2, 3], &schedule.shrink, false);
+    let changes = Some((grow_requested, driver.sim.now()));
     if driver.watch.stopped.is_none() {
         driver.advance(schedule.settle);
     }
@@ -704,6 +838,7 @@ pub fn run_with(seed: u64, schedule: Schedule, variants: impl Into<Variants>) ->
         last_heal: driver.last_heal,
         grow_completed,
         shrink_completed,
+        changes,
         stopped: driver.watch.stopped,
         history,
         clients: clients_total,
