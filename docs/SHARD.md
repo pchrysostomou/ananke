@@ -1,9 +1,12 @@
 # SHARD.md — ananke's ranges and multi-raft
 
-_Status: proposed 2026-09-14, on branch `phase-3-design`. Nothing here is decided until
-the owner approves it; the questions in §13 are open, and wherever the text depends on
-one it names it, as (Q20). Once approved, each implementation stage turns its part into
-a DECISIONS.md entry as it lands, numbered from the footer's next free entry then._
+_Status: proposed 2026-09-14; approved by the owner on 2026-09-15. §13 records the
+approved answer to each of its questions, and wherever the text rests on one it names
+it, as (Q20). Each implementation stage turns its part into a DECISIONS.md entry as it
+lands, numbered from the footer's next free entry then; no entry is written by the
+approval itself. §12's order of work is superseded by the stage plan proposed
+separately, which is not approved. The choices listed at the end of §13, under "Added in
+writing the approvals up", are not approved either._
 
 **A stated assumption.** Phase 3 has no transactions: Percolator is Phase 4 (D-006, SPEC
 §5). Every "atomic" below is one engine `WriteBatch` on one node (D-024), written by the
@@ -13,32 +16,37 @@ precondition at apply, where every replica sees the same state. RAFT.md's own
 assumption, a disk honest about `fsync`, holds for every group, and the sweeps keep
 `p_durable = 1` for the same reason (D-026).
 
-**What this document does not inherit.** Checking the documents against the tree found
-four things. Phase 2 is merged and not tagged, and a phase is done only when tagged
-(D-011; BOOTSTRAP_PROMPT.md:209-212). RAFT.md §4 describes `Scan(range)` and a scan
+**What this document does not inherit.** Phase 2 is released: tagged `v0.3.0` on
+0d30df5, with `ananke-raft` published at 0.3.0 (D-011; BOOTSTRAP_PROMPT.md:209-212).
+Checking RAFT.md against the tree found three places where it describes what the code
+lacks. RAFT.md §4 describes `Scan(range)` and a scan
 check; `ClientOp` has `Put`, `Get`, `Delete` and `Cas` only
 (crates/ananke-env/src/trace.rs:742-770) and `sim/lin.rs` checks single keys
 (sim/lin.rs:15-24, 212-238). RAFT.md §5 lists `VoteBeforePersist` and
 `ApplyNotAtomicWithIndex`; `Variant::BUGS` has sixteen arms and neither
 (crates/ananke-raft/src/core.rs:159-176). RAFT.md §3 gives the frame as `kind | term |
 from` and lists `src/read.rs`; the code writes `kind | from | term`
-(crates/ananke-raft/src/message.rs:4, 383-385) and has no `read.rs`. This document cites
-the code where the two differ (Q1). Paths below are relative to the repository root;
-`core.rs`, `node.rs`, `store.rs`, `apply.rs`, `client.rs`, `message.rs`, `types.rs`,
-`snapshot.rs` and `invariants.rs` are in `crates/ananke-raft/src/`, `engine.rs`,
-`wal.rs` and `manifest.rs` in `crates/ananke-storage/src/`, `trace.rs` and `moirae.rs`
-in `crates/ananke-env/src/`.
+(crates/ananke-raft/src/message.rs:4, 383-385) and has no `read.rs`. The first Phase 3
+commit corrects RAFT.md at each of them, with forward pointers as D-048 did, removing
+`Scan` and its check from RAFT.md §4 with a pointer to SPEC §6 (Q1, Q35); until then
+this document cites the code where the two differ. Paths below are relative to the
+repository root; `core.rs`, `node.rs`, `store.rs`, `apply.rs`, `client.rs`,
+`message.rs`, `types.rs`, `snapshot.rs` and `invariants.rs` are in
+`crates/ananke-raft/src/`, `engine.rs`, `wal.rs` and `manifest.rs` in
+`crates/ananke-storage/src/`, `trace.rs` and `moirae.rs` in `crates/ananke-env/src/`.
 
 Sources of truth, in order: SPEC §4, which fixes the outline; RAFT.md and the entries it
 names, for everything inside one Raft group, which this document changes only where it
-says so and asks; the paper and the thesis as RAFT.md cites them. SPEC §4 names "the
+says so; the paper and the thesis as RAFT.md cites them. SPEC §4 names "the
 Spanner/CockroachDB pattern" (SPEC.md:287-288); for mechanisms it does not spell out,
 CockroachDB's range design is the reference — descriptors with a generation, meta
 records keyed by a range's end key, a subsume that freezes the right-hand range before a
 merge, replicas that exist before they hold data, a snapshot refused when it overlaps
 another replica, removed replicas collected by consulting a newer descriptor. A borrowed
-mechanism is named as borrowed and is a proposal here, not a source. Where this document
-and SPEC disagree, SPEC wins until the owner approves the change (Q20).
+mechanism is named as borrowed and holds here by its approved answer in §13, not as a
+source. Where this document and SPEC disagree, SPEC wins. The approval amends SPEC §4 in
+one place, in SPEC's own text: 10 000 ranges is a non-goal of Phase 3 (Q12). The right
+half's "term 1" stands as SPEC says it (Q20).
 
 ## 1. Ranges, descriptors and the meta range
 
@@ -50,6 +58,20 @@ range at any applied state of that range. Tenant 0 holds each replica's own Raft
 key carries a version, so every encoded key is a boundary; once Phase 4 writes the
 `!version` suffix (D-023), a split key must carry no suffix, so the versions of one user
 key never straddle two ranges.
+
+**The layout (Q5).** Tenant 0 holds a table per range: a replica's Raft state is keyed
+`0 / <range: u64 BE> / <purpose> / name`, where `<purpose>` takes the place RAFT.md §3's
+table id has today (`0 / 0 / hard`, `0 / 1 / <index>`, `0 / 3 / snapshot`,
+store.rs:65-127), so a replica's whole Raft state, its descriptor beside it, is the one
+key interval under `0 / <range>`. Tenant 1 is the system tenant: it holds the root's and
+the meta range's records, and later Phase 5's catalog (SPEC.md:346). User tenants start
+at 2; today's user data, tenant 1 (apply.rs:23-24), moves to tenant 2. A range may span
+tenants for now. This breaks 0.3.0's on-disk format, on three conditions: the on-disk
+format version is bumped; a store in the old format is refused at open with an error naming
+both format versions, never misread; and the break is recorded in the implementing
+DECISIONS.md entry and in the release notes of the release that ships it. The reason is
+the owner's: 0.x is a release with no users, and the correctness of the layout outlives
+it.
 
 **The descriptor.** Every range has one:
 
@@ -86,29 +108,27 @@ it over every write.
 
 **Where descriptors live.** In two places, of which one is the authority (Q3):
 
-- *Range-local.* Every replica holds its range's descriptor under tenant 0, beside the
-  range's Raft state (key layout Q5), written in the same batch as the apply that
-  changes it: a split, a subsume, a merge, the apply of a `C_new`. A replica serves,
-  applies and answers `RangeMismatch` from this copy alone (§3). By state machine safety
-  every replica of a range holds the same descriptor at the same applied index, and
-  check 7 of §8 folds that.
+- *Range-local.* Every replica holds its range's descriptor under tenant 0, in its
+  range's table beside the range's Raft state (Q5), written in the same batch as the
+  apply that changes it: a split, a subsume, a merge, the apply of a `C_new`. A replica
+  serves, applies and answers `RangeMismatch` from this copy alone (§3). By state machine
+  safety every replica of a range holds the same descriptor at the same applied index,
+  and check 7 of §8 folds that.
 - *Meta.* The meta range holds a record per descriptor it has been told, for addressing.
   It is written after the change it records, by a request to another Raft group, so it
   may lag; it never goes back.
 
 The two cannot be atomic with each other without a transaction spanning two groups, and
-Phase 3 has none (D-006). The draft makes the range-local copy the authority and meta an
-index that lags and self-corrects; the other options are a commit protocol between two
-groups built for Phase 3 alone, or meta as the authority with a range reading it before
-serving (Q3).
+Phase 3 has none (D-006). The range-local copy is the authority, and meta is an index
+that lags and self-corrects (Q3).
 
 **The meta range's state machine.** It applies one command, `MetaUpdate { descriptors
 }`. For each descriptor `d` in it, every maximal sub-interval of `d`'s span that meta
 names by a record of lower generation, or names by nothing, is from then on named by `d`
-restricted to it; a sub-interval named at a higher generation is left alone. In the
-draft, records live under the meta span keyed by their end key, each carrying its
-start, range, generation and voters, and a record partly overwritten is cut at `d`'s
-boundaries in the same batch; the key (end or start) and the cut are Q4. The state after
+restricted to it; a sub-interval named at a higher generation is left alone. Records
+live under the meta span, in the system tenant (Q5), keyed by their end key, each
+carrying its start, range, generation and voters, and a record partly overwritten is cut
+at `d`'s boundaries in the same batch (Q4). The state after
 applying a set of updates is a maximum by generation per key and does not depend on
 their order, so a `MetaUpdate` may be sent any number of times by
 any holder of a real descriptor: a resend whose answer was lost changes nothing, and
@@ -121,19 +141,20 @@ both halves at a split, the merged range at a merge, the new voters after a `C_n
 and the node that sent it resends until the meta range's leader acknowledges it, whether
 or not it still leads the range (Q3). A leader also sends its
 range's descriptor when it takes office, which repairs an update lost with a leader that
-crashed between its apply and its send (whether repair also runs on a timer is Q3). A
+crashed between its apply and its send; a periodic repair is a later parameter (Q3). A
 record may name a range that no longer exists or replicas that no longer hold it; a
 client routed by it is answered `RangeMismatch` with better descriptors (§3). Check 16
 folds the meta range.
 
 **Addressing (SPEC §4).** SPEC says range 0 is found through configuration and the meta
-range through range 0 (SPEC.md:287-288). The draft assumes two groups (Q4): range 0, the
-root, holds the meta range's descriptor, the range-id counter (§5) and the node records
-(§2, Q8); range 1 is the meta range and holds the records of every other range; neither
-splits nor merges in Phase 3. A record is about 190 bytes for keys of up to 64 bytes and
-three voters, so ten thousand ranges are about 2 MB of meta, a small part of one 64 MiB
-memtable (engine.rs:154), and one range holds it. Where the root and meta spans sit in
-the keyspace is Q5.
+range through range 0 (SPEC.md:287-288). There are two groups (Q4): range 0, the root,
+holds the meta range's descriptor, the range-id counter and each node's lease of a block
+of ids (§5, Q17) and the node records (§2, Q8); range 1 is the meta range and holds the
+records of every other range; neither splits nor merges in Phase 3. Both spans lie in
+the system tenant, tenant 1 (Q5). A record is about 190 bytes for keys of up to 64 bytes
+and three voters, so ten thousand ranges would be about 2 MB of meta, a small part of
+one 64 MiB memtable (engine.rs:154), and one range would hold it; that is arithmetic
+about the layout, and 10 000 ranges is a non-goal of Phase 3 (Q12).
 
 ## 2. Bootstrapping
 
@@ -148,15 +169,16 @@ and nothing else.
 batch before its tasks run, the same initial state, computed from configuration alone
 (Q7):
 
-- range 0, the root span, range 1, the meta span, and range 2, the rest of the keyspace,
-  each at generation 1 with the bootstrap nodes as voters, a hard state of term 0 and no
-  vote, an applied index of 0 and its configuration at index 0. This ties the number of
-  bootstrap nodes to the replication factor: §7's moves are one-for-one and never
-  change a range's voter count, so five bootstrap nodes would leave every range at five
-  voters for good. The draft requires as many bootstrap nodes as the replication factor,
-  three (Q7, Q32);
-- in range 0's state, range 1's descriptor, the range-id counter at 3 and one node
-  record per bootstrap node;
+- range 0, the root span, and range 1, the meta span, both in the system tenant, and
+  range 2, the rest of the keyspace (Q5), each at generation 1 with the bootstrap nodes
+  as voters, a hard state of term 0 and no vote, an applied index of 0 and its
+  configuration at index 0. This ties the number of bootstrap nodes to the replication
+  factor: §7's moves are one-for-one and never change a range's voter count, so five
+  bootstrap nodes would leave every range at five voters for good. There are exactly as
+  many bootstrap nodes as the replication factor, three (Q7, Q32);
+- in range 0's state, range 1's descriptor, the range-id counter at 3 with no block
+  leased (§5, Q17), one node record per bootstrap node, and a digest of the bootstrap
+  configuration (Q7);
 - in range 1's state, the meta record for range 2.
 
 This is `initial_voters` generalised: a fresh store starts with what configuration says,
@@ -167,6 +189,13 @@ DECISIONS.md:1105-1110). The trace already allows a configuration at index 0
 of `1..=servers` (invariants.rs:289-295), and `MetaApplied { index: 0 }` for range 1's
 record of range 2, which gives check 16 its first record.
 
+**A bootstrap node whose disk was replaced.** It looks fresh too, writes the initial
+state again with no vote recorded, and can vote a second time in a term its old disk
+voted in. D-041's `RAFT-STORE` marker was on the lost disk, and D-042 leaves a wiped
+server outside Phase 2's model (DECISIONS.md:2064-2067). This is not accepted silently:
+it is issue #43, which asks for a rule that tells such a node from one bootstrapping a
+new cluster (Q7).
+
 **A node that joins.** It starts with no ranges and knows range 0's addresses. It is
 added by an operator's `AddNode`, a write to range 0 (Q8); the rebalancer then moves
 replicas to it (§7). It creates a replica when a leader's message first names a range it
@@ -174,12 +203,13 @@ does not host, uninitialised until a split or a snapshot gives it state (§5).
 
 **A client's first request.** A cache miss reads range 1's descriptor from range 0 and
 then the record for the key from range 1, each a read served by that range's leader by
-read-index or lease (RAFT.md §1). Whether these lookups enter the history is Q36; they
-are advisory either way (§3).
+read-index or lease (RAFT.md §1). These lookups stay out of the linearizability history
+(Q36) and are advisory (§3).
 
 **What bootstrap does not cover.** Range 0's own replicas are fixed by configuration. If
-the rebalancer may move range 0 or range 1, clients and joining nodes need another way
-to find range 0; the draft does not move either (Q9).
+the rebalancer moved range 0 or range 1, clients and joining nodes would need another
+way to find range 0; so ranges 0 and 1 stay fixed on the bootstrap nodes, and a
+bootstrap node is never removed (Q9).
 
 ## 3. Routing and the client cache
 
@@ -198,11 +228,11 @@ the client's, in three places:
    every other it holds that contains the key — at a split, the right half it created in
    the same apply. Nothing is proposed.
 2. *At a read's serving.* The core hands a read ready at an index and the server serves
-   it from applied state (node.rs:2092-2115); the server checks the key against the
+   it from applied state (node.rs:2131-2150); the server checks the key against the
    descriptor at the applied index it serves at, so a split or subsume applied between
    receipt and serving answers `RangeMismatch`. A get never enters the log (RAFT.md §3),
    so this is its last check. Today the server reads the engine's latest state with no
-   version pinned (`engine().get`, node.rs:2099) while the `apply` task keeps writing, so
+   version pinned (`engine().get`, node.rs:2139) while the `apply` task keeps writing, so
    "the applied index it serves at" is not yet defined: the value, the descriptor and the
    applied index must be read at one engine version (§11, raft item 15).
 3. *At apply.* A command whose key lies outside the span of the descriptor in force
@@ -219,30 +249,36 @@ safety for writes. The read check is safety for reads.
 
 **What `RangeMismatch` guarantees.** A write answered `RangeMismatch` did not take
 effect: refused at receipt, it was never proposed; refused at apply, its entry applied
-as nothing on every replica. The client may send it again as the same operation, the
-same `(client, seq)`, to the range the descriptors name (Q10). A write that gets no
+as nothing on every replica. The client sends it again to the range the descriptors
+name, under a fresh sequence number that the history pairs with the original's (§9), and
+the leader keeps its record of the original (Q10). A write that gets no
 answer is abandoned as pending, as today (D-026; client.rs:12-19), because a retry
 across that ambiguity is a second write until client sessions exist, issue #21 (Q11).
 The history treats `RangeMismatch` as it treats `NotLeader`: followed inside the client,
 never a return (§9).
 
 **Duplicates across ranges.** A leader's record of what it proposed, by `(client, seq)`,
-is per server and per log (node.rs:1978-1995, RAFT.md §3). Because a request names its
+is per server and per log (node.rs:952-957, 2031, RAFT.md §3). Because a request names its
 range, a copy the network delivers to another range's leader is refused at receipt and
 never proposed there, and a range's map needs no knowledge of another's.
 
-A resend after a definite `RangeMismatch` is meant to be a new proposal whose earlier
-copy applied as nothing, but the map as built does not always let it be one. A leader
-skips a request whose `(client, seq)` it recorded while that entry is still in its log,
-and answers it only "when that entry applies, once" (node.rs:843-849). Suppose a write
-is refused at apply in P after a split, R later merges back into P, and the client
-follows R's `RangeMismatch` back to P. If P's leader has not changed and the entry is
-not compacted, it finds the record, proposes nothing, and never answers; the client
-abandons a write that never took effect. The draft has the leader forget a record once
-its entry applies with an effect other than `applied` (§8), which the `apply` task
-reports back with the outcome: a copy that applied as nothing took no effect, so
-proposing the resend cannot apply one operation twice. The alternative is a resend under
-a fresh `seq`, which the history must then pair with the first (Q10).
+**Why a resend takes a fresh `seq` (Q10).** A leader skips a request whose `(client,
+seq)` it recorded while that entry is still in its log, and answers it only "when that
+entry applies, once" (node.rs:873-879). Suppose a write is refused at apply in P after a
+split, R later merges back into P, and the client follows R's `RangeMismatch` back to P.
+Resent under the same `seq` to a leader of P that has not changed, with the entry not
+compacted, it finds the record, proposes nothing and never answers, and the client
+abandons a write that never took effect. Having the leader forget a record once its
+entry applies with an effect other than `applied` opens a worse hole, which review
+found: the refused write, forgotten, is resent and applied in R; R merges back into P;
+and a delayed network copy of the original reaches P's leader, which no longer
+remembers it and proposes it; it applies, and one operation has taken effect twice. That
+hole is the same class as the duplicate proposal seed 42 found in Phase 2, a request the
+network duplicated proposed twice and a compare-and-set applied twice (D-026,
+DECISIONS.md:872-876). So
+the leader keeps its record of the original, which goes on deduplicating copies of it
+as D-026 does (DECISIONS.md:856-857), and the resend goes under a fresh `seq`, which the
+history pairs with the original's (§9).
 
 **The client cache.** An ordered map from end key to descriptor, with a leader hint per
 range. It merges by the generation rule of §1: a descriptor learned replaces the cached
@@ -268,10 +304,15 @@ rotation reach the new ones, and `RangeMismatch` with the new voters corrects th
 
 ## 4. Multi-raft: one ticker, batched frames, and what breaks at 1 000 and 10 000 ranges
 
+Phase 3 builds batching per peer and proves it at 1 000 ranges. 10 000 ranges is an
+explicit non-goal of Phase 3, and SPEC §4 says so (Q12). The figures below for 10 000
+ranges are arithmetic from today's constants, kept as the analysis behind that
+decision; nothing in Phase 3 promises that 10 000 ranges run.
+
 **Today's unit is a group.** One server is one Raft group. `run` binds one socket and
-spawns `net` (node.rs:304-346), `apply` (node.rs:1056) and `snapshot` (node.rs:602-603),
+spawns `net` (node.rs:349, 357), `apply` (node.rs:1088) and `snapshot` (node.rs:617-618),
 and runs the `raft` loop itself, racing its inbox against one `sleep_until` per tick
-(node.rs:700-713); its engine spawns a `flusher` (engine.rs:969) and a `wal-writer`
+(node.rs:718-728); its engine spawns a `flusher` (engine.rs:969) and a `wal-writer`
 (wal.rs:647). Each `run` takes its own listen address and engine directory
 (`NodeConfig`, node.rs:122-142), so N groups in one process are N `run` calls, each with
 all of that. Nothing on the wire, in the store or in the trace names a group: a frame is
@@ -301,11 +342,11 @@ largest arm is a `Configuration` of three vectors (types.rs:23-30, 67-88), about
 88 bytes by its field types (not measured), plus the command's 64 heap bytes, so at
 least 152 bytes, and on a follower the command is a slice of its whole AppendEntries
 frame (message.rs:324), which it keeps alive. 4096 such entries are at least 608 KiB. A
-leader remembers up to 4096 proposals (node.rs:1995). A snapshot chunk is 256 KiB
+leader remembers up to 4096 proposals (node.rs:2031). A snapshot chunk is 256 KiB
 (core.rs:382), one outstanding per
 stream, and a leader streams to every designated follower at once (D-043). The sweep's
 inbox holds 128 messages (sim/raft.rs:2859) and drops the oldest heartbeat of any sender
-first (node.rs:1918-1962). `RealEnv` queues 1024 frames per destination
+first (node.rs:1952-1999). `RealEnv` queues 1024 frames per destination
 (crates/ananke-env/src/real/net.rs:30); `SimEnv` bounds nothing
 (crates/ananke-env/src/sim/net.rs:271-275). A frame is at most 16 MiB
 (crates/ananke-env/src/net.rs:25). Every frame the simulator carries is a `MessageSent`
@@ -314,8 +355,8 @@ record holding its payload and a `MessageDelivered` record
 400 000 records (`TRACE_CAP`, sim/raft.rs:136).
 
 The tables assume three replicas per range, leaders spread evenly, and ranges with no
-client load; a per-node figure assumes ten nodes (the balance scenario's node count is
-Q30). A loaded case follows the tables. Nothing below is measured.
+client load; a per-node figure assumes ten nodes, the balance scenario's count (Q30). A
+loaded case follows the tables. Nothing below is measured.
 
 **Today's shape at scale**, R ranges as R groups of three `run` calls:
 
@@ -333,46 +374,78 @@ Q30). A loaded case follows the tables. Nothing below is measured.
 At 1 000 ranges this shape does not fit a process, and a sweep run reaches `TRACE_CAP`
 within one virtual second of idle heartbeats.
 
-**The proposed unit is a node.** A node owns the tasks, the socket and the engine, and
-hosts many groups (Q2, Q14):
+**The unit is a node.** A node owns the tasks, the socket and the engine, and hosts many
+groups (Q2, Q14):
 
-- One socket. `net` decodes a frame into messages each tagged with its range, and the
-  inbox's policy applies per message (its capacity is Q14).
+- One socket. `net` decodes a frame into messages each tagged with its range. One inbox
+  per node takes them, bounded in bytes, with admission in constant or logarithmic time
+  (Q14; §11, raft item 11).
 - One `raft` task holding every core on the node, keyed by range, driven by one ticker:
-  each tick steps a `Tick` into every core (unless ranges quiesce, Q12), and each
-  message steps into its range's core. After a round — a tick's steps, or the messages
-  drained since the last round — the task gathers every `Persist` of the round into one
-  `WriteBatch` with `sync: true`, awaits it, and only then hands the round's `Send`s to
-  a per-peer outbox, flushed at the end of the round as one frame per peer and cut under
-  `MAX_FRAME_LEN`. A core whose step emitted a `Persist` steps nothing more in that
-  round, so no step of a core runs on state its own disk does not yet hold. Figure 2's
-  discipline (RAFT.md §1) holds per group: no message of a round leaves before every
-  persist of the round is durable. The price is that one group's sends wait on other
-  groups' persists in the same round, including the sends of a core that persisted
-  nothing. Each step still stamps its own decision time (D-047). This is not the order
-  RAFT.md §3 and D-026 fix — the `raft` task "executes every output in order, awaiting
-  each `Persist` before the `Send`s that follow it" (RAFT.md:551-554;
-  DECISIONS.md:831-832) — under which a send that precedes a persist, or belongs to a
-  step that persisted nothing, leaves at once. One task or one per range, a round's
-  persists merged or awaited per core, the flush per round, per tick or on a timer, and
-  the rule that a core stops stepping after a persist are Q41.
-- One `apply` task taking each range's applies and snapshot takes in turn, and one
-  `snapshot` task whose streams are keyed by range and follower (Q14). Under D-036 a
-  take is a job between two applies and "applies wait behind the take" (RAFT.md:177-181),
-  so with one `apply` task per node one range's take stalls every range's applies on the
-  node. The `snapshot` task sends its chunks on its own socket handle, as today
-  (node.rs:602-611), in frames of their own and not through the per-peer outbox; the
-  draft keeps that (Q41), so a chunk never shares a frame with a heartbeat.
-- One engine, each range's Raft state under tenant 0 keyed by range (Q2, Q5). The WAL
-  writer already shares one fsync among everything queued (wal.rs:14-20, D-018).
-- A core's private generator is seeded from the node's protocol stream when its
-  incarnation starts (node.rs:551, core.rs:932). With many cores on a node a core's seed
-  depends on how many drew before it, so a split would move every later range's election
-  timeouts, which D-017 exists to prevent (DECISIONS.md:336-341). The draft derives a
-  stream per node and range, `n{id}/r{range}/protocol` (Q13).
+  each tick steps a `Tick` into every core, and each message steps into its range's
+  core. A round is a tick's steps, or the messages drained since the last round. The
+  task keeps the order RAFT.md §3 and D-026 fix for a step's outputs — the `raft` task
+  "executes every output in order, awaiting each `Persist` before the `Send`s that
+  follow it" and traces a step's events once they are durable (RAFT.md:558-560;
+  DECISIONS.md:831-834) — per core, and needs no superseding entry (Q41). In each round
+  it:
+  - flushes, before the round's sync, every send RAFT.md §3 already lets leave early:
+    the sends that precede a core's `Persist`, and all sends of a core that persisted
+    nothing. A step's `Persist` is the first of its outputs (`finish`,
+    core.rs:1277-1300), so the sends that precede one are those of the core's earlier
+    steps in the round;
+  - submits the round's persists together, so the WAL writer's group commit syncs them
+    once (wal.rs:16-20, D-018);
+  - flushes each persisting core's later sends when that core's own persist resolves,
+    and steps that core no further until then.
 
-**Heartbeats (SPEC.md:289-290).** SPEC asks that ten thousand ranges not mean ten
-thousand heartbeat streams. Three ways, not exclusive (Q12):
+  The order covers every output, not only sends. Every output that follows a core's
+  `Persist` — its sends, `Apply`, `ReadReady` and `ReadDropped`, snapshot actions and
+  the step's trace events — is executed only when that core's own persist resolves, as
+  `execute` handles each of them only after `store.persist(..)` returns today
+  (node.rs:2083-2180). Before the sync go only the outputs that precede a core's
+  `Persist` and all outputs of a core that persisted nothing. An `Apply` handed out
+  early would let the `apply` task make an applied index durable above the durable log,
+  since a follower's step appends entries and pushes `Apply` for them in one step
+  (core.rs:2514-2522) and the apply job is built from the core's memory
+  (node.rs:2062-2071); a trace event handed out early would put a `RaftAppend` or
+  `RaftCommit` in the trace before it is durable, which D-026 keeps from happening even
+  under `SendBeforePersist`, "so the trace says what is durable" (DECISIONS.md:832-834).
+
+  A message for a core whose persist is outstanding is still taken from the inbox, and
+  is held for that core, counted against the node's byte bound (Q14); a tick that
+  falls due meanwhile is held as one tick. Once the persist resolves, the held messages
+  and ticks are stepped in the order they arrived or fell due, every missed tick
+  stepped, none collapsed, as today's loop steps each tick it missed while `execute`
+  awaited a persist (node.rs:718-728). Sends leave through a per-peer outbox, one frame
+  per peer per flush, cut under `MAX_FRAME_LEN`. Figure 2's discipline (RAFT.md §1)
+  holds per group: no output of a core is executed before a persist that precedes it
+  in that core's outputs is durable, and no step of a core runs on state its own disk
+  does not yet hold. No output of a core that persisted nothing waits on a sync. Each
+  step still stamps its own decision time (D-047).
+- One `apply` task per node, applying every range's entries, snapshot takes and
+  structural batches one at a time; if that is too slow, several ranges' ready applies
+  are grouped into one synced batch inside that task, never more tasks (Q14). Under
+  D-036 a take is a job between two applies and "applies wait behind the take"
+  (RAFT.md:177-181), so one range's take stalls every range's applies on the node. One
+  `snapshot` task whose streams are keyed by range and follower, with per-node caps on
+  the streams received and assembled, one assembly per (range, sender), and no per-node
+  cap on streams sent that would stop a leader feeding all of a range's designated
+  followers at once (Q14; D-043). The `snapshot` task sends its chunks on its own socket
+  handle, as today (node.rs:617-630), in frames of their own and not through the
+  per-peer outbox (Q41), so a chunk never shares a frame with a heartbeat.
+- One engine, each range's Raft state under tenant 0 in a table of its own (Q2, Q5).
+- A core's private generator is seeded from the node's protocol stream when its
+  incarnation starts (node.rs:566, core.rs:932). With many cores on a node a core's seed
+  would depend on how many drew before it, so a split would move every later range's
+  election timeouts, which D-017 exists to prevent (DECISIONS.md:336-341). Each core
+  draws instead from a named stream per node and range, `n{id}/r{range}/protocol`,
+  through a new `Environment` method, decided before the stage that first pins Phase 3
+  seeds (Q13).
+
+**Heartbeats (SPEC.md:289-295).** SPEC asked that ten thousand ranges not mean ten
+thousand heartbeat streams; as amended with this approval it keeps the shared ticker and
+the batcher per peer pair and makes 10 000 ranges a non-goal of Phase 3 (Q12). There are
+three ways to share heartbeats, not exclusive, and Phase 3 builds only the first:
 
 - *Batching*: every group's AppendEntries and response stays as it is, many to a frame.
   The lease's `sent`, `echo` and `local` (RAFT.md §1, as built, D-028), read-index
@@ -399,20 +472,26 @@ thousand heartbeat streams. Three ways, not exclusive (Q12):
   a dead leader needs a signal the tree does not have; CockroachDB uses a node-liveness
   record for it.
 
-The draft assumes batching alone and says below where that stops holding.
+Coalescing and quiescence get their own decision in a later phase, and no lease or
+check-quorum redesign happens inside Phase 3 (Q12). The rest of this section says where
+batching alone stops holding.
 
-**The proposed shape at scale**, batching only. The ranges led on node `a` with a
+**The shape at scale**, batching only. The ranges led on node `a` with a
 follower on node `b` number 2R / (N(N − 1)) for N nodes: 22 at 1 000 ranges and 222 at
 10 000 on ten nodes. A leader heartbeats on one phase of the two-tick interval, set by
 when it took office, and nothing assigns phases, so all of a pair's ranges may share one.
-With the draft's flush at the end of each round (Q41), a tick's round sends each ordered
+Under Q41's round, a round flushes once before its sync and again as each persisting
+core's persist resolves. A round in which no core persists flushes once, and an idle
+step persists nothing (core.rs:1278-1298), so an idle tick's round sends each ordered
 pair at most one heartbeat frame; the responses to one arriving frame leave in one frame
 if one round drains the whole frame, and in several if the inbox splits it across drain
-rounds, which the 128-message inbox against 200 arrivals a tick at 1 000 ranges can do.
-So an ordered pair carries one heartbeat frame and one response frame per tick, 200
-frames per second, 18 000 over ten nodes, whatever the range count, only while frames
-are drained whole; a flush per tick would make that a bound. A range id adds 8 bytes to
-each message (Q10): 61 and 74 bytes.
+rounds, which an inbox of the sweep's 128 messages against 200 arrivals a tick at 1 000
+ranges can do. So an idle ordered pair carries one heartbeat frame and one response
+frame per tick, 200 frames per second, 18 000 over ten nodes, whatever the range count,
+only while frames are drained whole. A round with persists adds, per peer, a frame for
+each later flush that has sends for it; how many flushes that is depends on how the
+group commit resolves the round's persists, which the node's stage measures. A range id
+adds 8 bytes to each message (Q10): 61 and 74 bytes.
 
 | | 1 000 ranges | 10 000 ranges |
 |---|---|---|
@@ -433,34 +512,44 @@ each message (Q10): 61 and 74 bytes.
 
 The tree has no measurement of a core step's cost. If a step costs `c`, an idle tick
 costs 500 `c` at 1 000 ranges and 5 000 `c` at 10 000, and the task falls behind its
-ticker once that and the round's sync exceed a tick of 10 ms: at 10 000 ranges, once `c`
-passes 2 µs with no sync at all. That budget is an assumption the node's first stage must
-measure.
+ticker once that exceeds a tick of 10 ms: at 10 000 ranges, once `c` passes 2 µs. That
+budget is an assumption the node's first stage must measure.
 
-**The loaded case.** Suppose some ranges on a node take writes, enough that every round
-on the node has at least one `Persist`. Then under the round every round waits for one
-synced batch, and every co-hosted range's heartbeats and responses leave only after it,
-whether or not their own range wrote anything. The delay each round adds is one sync:
-100 µs to 2 ms per disk operation on the sweep's disk (sim/raft.rs:2807-2808); the tree
-records no real disk's `fsync` latency, and a shared or failing disk can take far longer.
-The delay is the same at 1 000 ranges as at 10 000; what grows with ranges is how many
-groups it lands on. Against it: heartbeats every 20 ms and a minimum election timeout of
-100 ms (core.rs:373-377); a lease promise measured from `sent` and so shortened by any
-delay after the request is built (RAFT.md:126-137); check quorum every minimum election
-timeout; and the drift guard's window of 400 ms (core.rs:379), whose fastest response per
-window absorbs the delay only if some round in the window synced quickly. A sync of a few
-milliseconds costs little. A sync longer than about 80 ms, a minimum election timeout
-less a heartbeat interval, is to every range led on that node what a crash is: their
-followers' timers fire together.
+**The loaded case.** Suppose some ranges on a node take writes. Under Q41's round a
+core's sends wait only on its own persist: the sends of a core that persisted nothing,
+and the sends that precede a persist, leave before the round's sync, as RAFT.md §3 lets
+them today. A core that persisted sends nothing more and steps nothing more, ticks
+included, until its persist resolves. The round's persists share one sync through group
+commit (wal.rs:16-20), so a persisting core waits on a sync that carries other ranges'
+writes too, but a range that persisted nothing waits on no sync. The WAL writer takes
+everything queued as one group and syncs it once, so records queued while it syncs form
+the next group (wal.rs:16-20); since the task goes on stepping cores that persisted
+nothing while a sync is outstanding, a later round's persists can be submitted behind
+it. So the delay syncs add to a persisting range is up to two syncs, the one in progress
+when its persist was submitted and its own group's, each 100 µs to 2 ms per disk
+operation on the sweep's disk (sim/raft.rs:2807-2808); the tree records no real disk's
+`fsync` latency, and a shared or failing disk can take far longer. The delay is the same
+at 1 000 ranges as at 10 000; what grows with ranges is how many groups persist while
+one slow sync is outstanding. Against it: heartbeats every 20 ms and a minimum election timeout of 100 ms
+(core.rs:373-377); a lease promise measured from `sent` and so shortened by any delay
+after the request is built (RAFT.md:126-137); check quorum every minimum election
+timeout; and the drift guard's window of 400 ms (core.rs:379), whose fastest response
+per window absorbs the delay only if some persist in the window resolved quickly. A sync
+of a few milliseconds costs little. A sync longer than about 80 ms, a minimum election
+timeout less a heartbeat interval, is to every range led on that node that persisted
+while it was outstanding what a crash is: its leader steps no tick and sends no
+heartbeat, and its followers' timers fire together. A range led on that node that
+persisted nothing keeps heartbeating.
 
 **What breaks at 1 000 ranges**, batching only:
 
 - Nothing on the wire or in the process while idle: 13.5 MB/s over the cluster and
   50 000 core steps per second per node.
-- Under load, a slow sync on one node: one sync past about 80 ms starts about 100
-  elections, one per range the node leads, and every leader elsewhere whose majority
-  needs that node's responses waits with them; check quorum steps down any whose other
-  follower is also slow.
+- Under load, a slow sync on one node: one sync past about 80 ms starts an election in
+  every range the node leads that persisted while the sync was outstanding, up to about
+  100, and every leader elsewhere whose majority needs that node's responses for a range
+  that persisted waits with them; check quorum steps down any whose other follower is
+  also slow.
 - The sweep's trace. Ten nodes' frames alone are up to 36 000 records a second, so an
   assumed 20 s run passes 400 000 records at any range count once every pair carries
   traffic; 270 MB of payload sits in `Sim`'s trace and is copied at the end
@@ -469,68 +558,109 @@ followers' timers fire together.
   (DECISIONS.md:2856-2866).
 - The inbox. 200 messages a tick against a capacity of 128: unless the `raft` task
   drains it within the tick, the policy drops the oldest heartbeat of any range
-  (node.rs:1918-1962), which costs a follower its timer reset and a leader a promise.
+  (node.rs:1952-1999), which costs a follower its timer reset and a leader a promise.
   Each admission also scans the whole queue, once to count its messages and up to twice
-  to find a victim (node.rs:1933-1950; queue.rs:103-110 in `crates/ananke-raft/src/`),
-  so a tick's admissions cost arrivals × capacity (§11, raft item 11).
+  to find a victim (node.rs:1968-1990; queue.rs:103-110 in `crates/ananke-raft/src/`),
+  so a tick's admissions cost arrivals × capacity; the node's inbox is bounded in bytes
+  and admits in constant or logarithmic time (Q14; §11, raft item 11).
 - PCT's hint. It counts one poll per node per millisecond
   (crates/ananke-env/src/sim/mod.rs:155-164), which sets the change-point rate (D-016,
   DECISIONS.md:314-318); a node's work grows with its ranges and the hint does not.
 - Recovery. With one engine per node (Q2) a lost table refuses every replica on the node
-  (store.rs:648-650; engine.rs:1127-1136): 300 re-seeds, each a stream from its own
-  leader, up to 300 × 256 KiB = 75 MiB of chunks outstanding toward one node, and the
-  install silence D-049 measured at a median of 185.6 ms (DECISIONS.md:3414-3433) falls
-  on every range with a replica there at once (Q15). As built the 300 streams cannot run
-  at once: a node's receiver stages under one directory and holds one stream, and a chunk
-  of another identity abandons the stream in progress (snapshot.rs:92-94, 859-915), so
-  they restart each other until §11's raft item 14 keys staging by range.
+  (store.rs:648-650; engine.rs:1127-1136; Q15): 300 re-seeds, each a stream from its own
+  leader, up to 300 × 256 KiB = 75 MiB of chunks outstanding toward one node, less where
+  the node's cap on streams received holds some back (Q14), and the install silence
+  D-049 measured at a median of 185.6 ms (DECISIONS.md:3414-3433) falls on every range
+  with a replica there. As built the 300 streams cannot run at once: a node's receiver
+  stages under one directory and holds one stream, and a chunk of another identity
+  abandons the stream in progress (snapshot.rs:92-94, 859-915), so they restart each
+  other until §11's raft item 14 keys staging by range.
 - Quarantine. Each of those 300 replicas is then on a re-seeded store and never votes
   again (D-035; RAFT.md:523-528). Once two nodes have each lost a table, the ranges with
   replicas on both, 8 of every 120 placements of three replicas on ten nodes, about 67,
   have one replica that can vote: each can keep a leader it has and cannot elect one, and
-  those whose leader was on either refused node have none. Until the rebalancer moves
-  quarantined replicas off (Q33), that is permanent.
+  those whose leader was on either refused node have none. The rebalancer moves
+  quarantined replicas off (Q33), but a move needs the range's leader: a range with two
+  quarantined replicas and no leader can neither elect nor be moved. That is not
+  accepted silently; it is issue #44 (Q33).
 - A node's crash starts about 100 elections, one per range it led, within one election
   timeout.
 - Follower logs. A node's 200 follower replicas compact only by install (above), so under
   steady writes their in-memory logs grow until something re-seeds them (§11, raft
   item 13).
 
-**What breaks at 10 000 ranges**, batching only:
+**What breaks at 10 000 ranges**, batching only, and why 10 000 ranges is a non-goal of
+Phase 3 (Q12):
 
 - The wire and the CPU of ranges with nothing to do: 135 MB/s over the cluster and
-  500 000 core steps a second per idle node. This is the cost SPEC's sentence names, and
-  batching does not remove it: coalescing halves the bytes, to about 65 MB/s, and leaves
-  the steps; quiescence removes both for quiesced ranges and needs a liveness signal
-  (Q12).
+  500 000 core steps a second per idle node. This is the cost SPEC's first wording named,
+  and batching does not remove it: coalescing halves the bytes, to about 65 MB/s, and
+  leaves the steps; quiescence removes both for quiesced ranges and needs a liveness
+  signal. Neither is built in Phase 3 (Q12).
 - The `raft` task's tick: 5 000 steps per 10 ms tick while idle, more than it can take
   at a step cost above 2 µs.
-- Under load, a slow sync on one node: one sync past about 80 ms starts about 1 000
-  elections.
-- The inbox: 2 000 messages a tick, each admission a scan of the queue.
+- Under load, a slow sync on one node: one sync past about 80 ms starts an election in
+  every range the node leads that persisted while it was outstanding, up to about
+  1 000.
+- The inbox: 2 000 messages a tick, each admission a scan of the queue as built.
 - A node refusal: 3 000 re-seed streams toward one node, up to 3 000 × 256 KiB =
   750 MiB of chunks outstanding; a node crash: 1 000 elections.
 - Quarantine: after two nodes have each lost a table, about 667 ranges with one replica
-  that can vote, unable to elect a leader (Q33).
+  that can vote, unable to elect a leader, and those with no leader unable to be moved
+  (Q33, issue #44).
 - In-memory logs: about 594 MiB per node for its leader replicas at the snapshot
   threshold, and its 2 000 follower replicas' logs unbounded under writes.
 - The simulator: 2.7 GB of payload per run. SPEC asks the simulator for 1 000 ranges
-  (SPEC.md:303); 10 000 stays a statement about the design and not a scenario (Q39).
+  (SPEC.md:308); no scenario runs 10 000 (Q12).
 
 ## 5. Split
 
 **The proposal (SPEC §4: "leader proposes split at key `k`").** The parent range P,
 `[start, end)` at generation g, is split by its leader, asked by an operator's
-`Command::Split { key }`, by a size threshold, or by the sweep's driver (Q18). The
-leader first takes a range id for the right half from the counter in range 0, a
-compare-and-set on one key in another group; an id taken and never used is a gap and
-harmless (Q17). It then checks, for liveness only: `start < key < end`, P's descriptor
-`Live`, the configuration in force plain and committed, and no change in flight,
-catch-up included (Q23; one change in flight, DECISIONS.md:1099-1104). It proposes
-`Split { key, right }`, an entry like any client command: an arm of `Command`
-(apply.rs:35-77) the state machine applies, not a `Payload` kind, since the protocol has
-no need to know it (types.rs:21-30). The left half keeps P's id and the right half takes
-the new one (Q19).
+`Command::Split { key }` or by the sweep's driver; size-triggered splits wait for the
+span size estimate (Q18; §11, storage 7). The leader first takes a range id for the
+right half from its node's block (Q17). It then checks, for liveness only:
+`start < key < end`, P's descriptor `Live`, the configuration in force plain and
+committed, and no change in flight, catch-up included (Q23; one change in flight,
+DECISIONS.md:1099-1104). It proposes `Split { key, right }`, an entry like any client
+command: an arm of `Command` (apply.rs:35-77) the state machine applies, not a `Payload`
+kind, since the protocol has no need to know it (types.rs:21-30). The left half keeps
+P's id and the right half takes the new one (Q19).
+
+**Range ids, leased in blocks (Q17).** Range 0 holds a u64 counter and, beside it, a
+lease record per node naming the block of ids last granted to that node. A node asks for
+a refill when the ids left in its block fall to the refill threshold, and a split takes
+the next id from its node's block with no write to range 0. So range 0's availability
+gates refilling a block, not performing a split: a split never waits on range 0 while
+its node's block holds an id. The block size and the refill threshold are tunable
+(Q17). What is kept is that no id is ever taken twice, and three rules keep it:
+
+- *Blocks are disjoint.* A refill is one command to range 0 carrying the asking node
+  and its run nonce (below). Its apply grants the block that starts at the counter,
+  records that block and the nonce in the node's lease record, and advances the counter
+  past the block, in one batch, and traces `RangeIdsLeased` (§8). The counter only
+  rises and every replica of range 0 applies the same entries, so each block is granted
+  once and shares no id with any other. A copy of a refill that applies again grants a
+  second block, which is only a gap; so a refill whose answer was lost may be sent
+  again, which D-026's rule against resending a write (DECISIONS.md:852-854) does not
+  forbid, for the reason §1 gives for `MetaUpdate`: the second effect harms nothing.
+- *A node takes ids only from a block of its current run.* At every start a node draws
+  a run nonce from its generator, as a re-seed draws a store incarnation (node.rs:1902),
+  and every refill it sends carries it. It adopts a block only from a grant carrying its
+  current nonce, whether the grant is the refill's answer or read back from its lease
+  record after an answer was lost, and adopts each block at most once in a run. A grant
+  made before a restart, delivered late by the network or read from the lease record,
+  carries another run's nonce and is never adopted.
+- *A node's position in a block is volatile.* It takes the ids of an adopted block in
+  order, each once, from memory, and writes nothing about its position; a restart
+  abandons the rest of every block the node held.
+
+An id taken and never used — by a split that fails, a block a node stopped using, a
+second grant, or a block abandoned at a restart — is a gap and harmless (Q17). The three
+rules are this document's: Q17's answer states the guarantee, not how it is kept. Check
+18 of §8 folds the guarantee, and §10's `IdBlockResumed` breaks the second rule. What a
+split does on a node whose block has run out while range 0 was unavailable is not
+settled by Q17's answer, and the stage that builds the lease states it.
 
 **The apply.** Every replica of P applies the split at the same index `s` and re-checks
 there what the leader checked, against state every replica shares: the key inside the
@@ -541,14 +671,12 @@ nothing. Otherwise one synced batch on each replica holds:
 - P's applied index, `s`;
 - P's descriptor, `[start, key)` at generation g + 1;
 - the right half R's descriptor, `[key, end)` at generation g + 1, P's voters, `Live`;
-- R's Raft state under R's own keys: a hard state with no vote and the term of Q20; an
-  applied index of `s`; a snapshot record of last index `s`, the last term of Q20 and
-  P's configuration at `s`, naming no checkpoint; the configuration key; and, under
-  Q26's draft of an incarnation and a quarantine flag per replica, copies of those of
-  P's replica on this node (under the per-node-store option there are no such keys);
-- no user key. With one engine per node R's data is already where it is (Q2). With an
-  engine per replica, R's data would have to be copied into a new engine, which no batch
-  can be atomic with (§11).
+- R's Raft state in R's own table under tenant 0 (Q5): a hard state of current term 1
+  and no vote (Q20); an applied index of `s`; a snapshot record of last index `s`, last
+  term 1 and P's configuration at `s`, naming no checkpoint; the configuration key; and
+  an incarnation drawn fresh for R's replica, with no quarantine flag, since a split does
+  not copy P's quarantine to R (Q26);
+- no user key: with one engine per node R's data is already where it is (Q2).
 
 R's Raft state is written only on a node that is a voter of P's configuration at `s`. A
 replica of P that is not — a learner P's leader is catching up (D-032), which replays `s`
@@ -573,63 +701,66 @@ apply is (RAFT.md §3); a crash after it restarts both replicas from their keys.
 |---|---|---|
 | span | `[start, key)` | `[key, end)` |
 | generation | g + 1 | g + 1 |
-| Raft group, log, term, vote | P's, unchanged | a new group; nothing in the log above `s`; term and floor term per Q20; no vote |
+| Raft group, log, term, vote | P's, unchanged | a new group; nothing in the log above `s`; current term 1 and a floor of `(s, 1)` (Q20); no vote |
 | leader | P's | none until elected (Q21) |
 | lease | P's leader keeps it; a read for a right-half key is refused at serving (§3) | none; a new leader serves by read-index for two guard windows before its lease (RAFT.md:131-133) |
 | configuration | P's; a change catching up on P's leader stays P's (D-032) | P's plain configuration at `s`, no learners |
 | data | `[start, key)`, in place | `[key, end)`, in place (Q2) |
 | applied index | `s` | `s`, recorded as its snapshot, as SPEC says |
-| snapshot record | P's last take, which covers P's whole span | the floor at `s`, with no checkpoint behind it: the first stream asks for a take (node.rs:1722-1735) |
-| proposals remembered (node.rs:1978-1995) | P's; entries above `s` for right-half keys apply as nothing (§3) | none |
+| snapshot record | P's last take, which covers P's whole span | the floor at `s`, with no checkpoint behind it: the first stream asks for a take (node.rs:1759-1766) |
+| proposals remembered (node.rs:952-957, 2031) | P's; entries above `s` for right-half keys apply as nothing (§3) | none |
 | pending reads | right-half keys refused at serving | none |
-| store incarnation (D-042), quarantine (D-035) | P's replica's | copied from P's replica on the same node (Q26) |
+| store incarnation (D-042), quarantine (D-035) | P's replica's | an incarnation drawn fresh; no quarantine: P's replica's is not copied (Q26) |
 | meta record | P's until the leader's update | none until then; P's record still names R's span at generation g, so meta has no gap (§1) |
 
-The quarantine copy is conservative. A replica is quarantined because its store lost a
-vote in some term of its group (D-035); a re-seed of P before the split lost nothing of
-R, which did not exist. Q15's draft refuses a whole node at a loss and re-seeds each of
-its replicas from its own leader, so each re-seeded replica draws its own incarnation
-and carries its own quarantine flag; that is why Q26's draft keeps both per replica, and
-why a split copies them. Kept per node store instead, a node that lost one table would be
-quarantined in every range for good, replicas added later included (§4).
+The quarantine is not copied (Q26). A replica is quarantined because its store may have
+lost a vote in some term of its group (D-035). R is a new group whose terms start at 1
+at the split's apply, and no store held a vote of R's before that apply, so a re-seed of
+P's replica before the split lost nothing of R's. Q15 refuses a whole node at a loss and
+re-seeds each of its replicas from its own leader, so each re-seeded replica draws its
+own incarnation and carries its own quarantine flag; that is why both are per replica
+(Q26). Kept per node store, a node that lost one table would be quarantined in every
+range for good, replicas added later included (§4). A merge does not take R's quarantine
+either (§6).
 
 **How the new group starts.** On each replica at its own apply of `s`, with no message
 between replicas. Every replica of R starts from the same state, since each applied the
 same entry at the same index. SPEC says the new group "starts at term 1 with the
-parent's applied index recorded as its snapshot" (SPEC.md:291-293). Each replica's
+parent's applied index recorded as its snapshot" (SPEC.md:296-298). Each replica's
 applied index when it applies the split is `s` itself, so "the parent's applied index"
 is unambiguous. "Term 1" is not: a snapshot records an index and the term of the entry
 there (RAFT.md §1; the record under `0 / 3 / snapshot`, RAFT.md §3), the split entry's
 term `t_s` is whatever term P's leader proposed it in, and a server's current term is
 never below the last term in its log (paper Figure 2: a server that sees a higher term
 adopts it). A floor at `(s, t_s)` under a current term of 1 is a state no Raft server
-reaches. The options (Q20): (a) R's current term and floor term both `t_s`; (b) current
-term 1 and a floor of `(s, 0)`; (c) fixed constants for both, as CockroachDB starts
-every right-hand range at the same index and term. The draft assumes (a): it keeps every
-invariant RAFT.md states and asks nothing new of `restore_compacted`. If approved, (a)
-would supersede SPEC's "term 1" (Q20); until then SPEC's words stand. Option (b) keeps
-SPEC's words and asks the core to accept a floor of term 0 above index 0, a state no code
-path has been read for.
+reaches. So R starts at current term 1, with no vote and a floor of `(s, 1)`, which keeps
+SPEC's "term 1" with no superseding entry (Q20). R's floor term is not `t_s`: R is a new
+group, the floor is compared only against R's own terms, and a current term of 1 is not
+below a floor term of 1. The floor is the same on every replica of R, since each writes
+it from the same entry.
 
 R has no leader at birth, so its keys are unavailable until some replica's election
-timer fires, 100 to 200 ms, and the pre-vote and vote rounds after it. The draft has the
-replica of R on the node whose replica of P is leader at the apply start its pre-vote at
-once instead of waiting for its timer. That first pre-vote usually fails: it reaches the
-other replicas of P within a disk operation or two of the leader's apply, while they
+timer fires, 100 to 200 ms, and the pre-vote and vote rounds after it. The replica of R
+on the node whose replica of P led at the split's apply starts its pre-vote at once
+instead of waiting for its timer (Q21). That first pre-vote usually fails: it reaches
+the other replicas of P within a disk operation or two of the leader's apply, while they
 learn that `s` committed only from P's next AppendEntries, up to a heartbeat interval
 later, and until each applies `s` its R is a placeholder, which grants no pre-vote
-(below). So the draft repeats the pre-vote every heartbeat interval until R has a leader
-or the replica's own timer fires; a pre-vote changes no term, so a repeat disturbs
-nothing. A pre-vote that reaches an initialised replica of R is granted, since no
-replica of R has heard from a leader of R (RAFT.md §1, pre-vote) (Q21).
+(below). So it repeats the pre-vote every heartbeat interval until it hears from a
+leader of R or its own timer fires; a pre-vote changes no term, so a repeat disturbs
+nothing. The other replicas of R wait for their timers. A pre-vote that reaches an
+initialised replica of R is granted, since no replica of R has heard from a leader of R
+(RAFT.md §1, pre-vote) (Q21).
 
 **The uninitialised replica (Q22).** A node can receive R's messages before it holds R:
 its replica of P lags behind `s`, or R is being moved to it (§7). The node creates a
 placeholder for R with no descriptor, no span and no Raft state, and traces
-`RangeReplicaCreated`. In the draft a placeholder grants no vote or pre-vote,
-acknowledges no append, and takes only a snapshot the overlap rule below allows; it
-becomes a replica at its node's apply of `s` or at such an install. It cannot vote
-twice, because it never votes.
+`RangeReplicaCreated`. A placeholder grants no vote or pre-vote, acknowledges nothing,
+and takes only a snapshot the overlap rule below allows; it becomes a replica at its
+node's apply of `s` or at such an install. It cannot vote twice, because it never votes.
+This departs from D-033, under which a server with no configuration grants votes "by the
+usual rules" (RAFT.md:163-168), for placeholders only, and has its own DECISIONS.md
+entry (Q22).
 
 A placeholder must still ask for its snapshot, and silence does not ask. A leader adds a
 learner at `next = last + 1` (core.rs:1930-1937) and feeds a snapshot only to a follower
@@ -637,22 +768,20 @@ designated snapshot-fed or whose `next` is at or below the compacted prefix
 (core.rs:2071); designation needs the follower more than `snapshot_threshold` entries
 behind its match and quiet for two minimum election timeouts (core.rs:1446-1455;
 RAFT.md:250-257). A silent placeholder of a range whose last index is at most 4096 is
-never fed, and any other waits at least two minimum election timeouts. The draft has a
-placeholder answer every AppendEntries as a refused server does (RAFT.md:501-511): a
+never fed, and any other waits at least two minimum election timeouts. A placeholder
+therefore answers every AppendEntries as a refused server does (RAFT.md:501-511): a
 rejection with a hint of 1, an echo of zero and store incarnation 0. The hint moves the
 leader's `next` for it to 1, which feeds it the snapshot once the log is compacted and
 otherwise draws the previous-index-0 rejection that designates it (D-037). Its answers
 count for nothing in a lease or read-index round, as a zero echo does, and for check
 quorum only as D-049 counts a refused server's (Q22). A placeholder on a node whose P
 still covers its span has its install refused by the overlap rule until P moves on, so
-such an answer can start streams that are refused; that cost is part of Q22.
+such an answer can start streams that are refused; that cost is accepted with Q22.
 
 R can still elect: R's voters are P's, P's leader keeps bringing P's replicas up to date,
 and each of them applies `s`. The exception is a
 replica of P removed before it applied `s`: its node's R is then initialised only by a
-snapshot, after the stale P is collected (Q27). The alternative is a placeholder that
-votes with a hard state it persists, as CockroachDB's uninitialised replicas do; the
-split's apply must then keep that vote.
+snapshot, after the stale P is collected (Q27).
 
 **The overlap rule (Q27).** A snapshot is installed on a node only if its span overlaps
 no other initialised replica there; otherwise it is refused and asked for again later.
@@ -661,16 +790,15 @@ that still covers `[key, end)` applies P's entries below `s`, which write right-
 keys over the newer state R's snapshot put there (§10, `SnapshotOverlapsReplica`). The
 same rule refuses P's pre-split snapshot, whose span is P's whole span, on a node where
 R is initialised; P's leader must then stream a newer one. How the refusal reaches the
-leader, and what the leader does, are new protocol steps that RAFT.md does not settle.
+leader, and what the leader does, are new protocol steps RAFT.md does not have (Q27).
 Today a retake starts only on the sender's side, when the leader finds no complete
-version to stream (`StreamFailed { retake: true }`, node.rs:1710-1735), and a receiver's
+version to stream (`StreamFailed { retake: true }`, node.rs:1737-1798), and a receiver's
 ask to start over marks a checkpoint unusable only at its third ask (RAFT.md:195-199).
-The draft adds an install answer, `Overlaps`, on which the leader ends the stream and,
-after a minimum election timeout, streams again: from a fresh take if its checkpoint lies
-below the last split or merge its range applied, since only a newer snapshot can stop
-overlapping, and otherwise from the same checkpoint, since the overlap is the receiver's
-to clear. The alternatives are to reuse the start-over ask, or an immediate retake at
-every refusal (Q27). A snapshot that installs onto a replica that is already
+An install is refused with a new answer, `Overlaps`, on which the leader ends the stream
+and, after a minimum election timeout, streams again: from a fresh take if its
+checkpoint lies below the last split or merge its range applied, since only a newer
+snapshot can stop overlapping, and otherwise from the same checkpoint, since the overlap
+is the receiver's to clear (Q27). A snapshot that installs onto a replica that is already
 initialised, P's post-split snapshot onto a lagging P for instance, changes that
 replica's descriptor and is traced as a `RangeDescriptor` at the snapshot's last index
 (§8). A node's replica of P that already applied past a snapshot answers it installed
@@ -684,9 +812,10 @@ then no replica of P is there to apply `s`. The apply asserts it.
 - Atomic, on each replica, in the apply batch of `s`: P's applied index, both
   descriptors, and R's Raft state. With one engine per node that is the whole split
   (Q2).
-- Not atomic, and safe by order and by the checks of §3: the id taken from range 0,
-  before and in another group; R's core and its first election, after, volatile, and
-  restarted from the batch at a crash; the meta update, after, idempotent, and repaired
+- Not atomic, and safe by order and by the checks of §3: the id taken from the node's
+  block, before, and the block's refill, earlier and in range 0 (Q17); R's core and its
+  first election, after, volatile, and restarted from the batch at a crash; the meta
+  update, after, idempotent, and repaired
   when a leader takes office (§1); every client's cache.
 - Across replicas nothing needs to be atomic: each applies `s` to the same state.
 - Split with the descriptor update is the atomicity §10's `SplitNotAtomicWithDescriptor`
@@ -700,8 +829,8 @@ g_R, merge into L only if: L's end is R's start; both descriptors are `Live`; th
 configurations in force on both are plain, with the same voters and no learners; and
 neither has a split or a change in flight. *Identical* means the same voter set in the
 configuration each range has committed, and no joint configuration or learner on either.
-SPEC's "two-phase with a subsume command" leaves the phases to this document; the draft
-uses three entries and an abort (Q24).
+SPEC's "two-phase with a subsume command" leaves the phases to this document, which uses
+three entries and an abort (Q24).
 
 **The coordinator.** L's leader, asked by the rebalancer or an operator's
 `Command::Merge { right }` (Q24, Q25). It reads R's descriptor from R's leader, not from
@@ -767,8 +896,9 @@ synced batch holds:
 - L's descriptor, `[a, b)` at generation max(g_L', g_R) + 1, where g_L' is L's
   generation at `m`, `Live`;
 - the deletion of R's descriptor and Raft state on this node: its hard state, applied
-  index, log keys, configuration key, snapshot record, and under Q26's draft its
-  incarnation and quarantine flag, a range delete the engine lacks (§11);
+  index, log keys, configuration key, snapshot record, incarnation and quarantine flag
+  (Q26), which is the one key interval of R's table under tenant 0 (Q5), a range delete
+  the engine lacks (§11);
 - no user key: R's data is already where L now serves it (Q2).
 
 The node stops R's core and traces, in this order, `RangeMerged`, `RangeRemoved { cause:
@@ -776,7 +906,7 @@ merged }` for R and `RangeDescriptor` for L at `m`, then the entry's `RaftApply`
 
 **A replica that fails only its own node's check.** The coordinator's wait excludes it,
 with one exception: a node whose replicas are re-seeded between the wait and its apply of
-`m`, as Q15's draft re-seeds every replica of a node that lost a table, can replay `m`
+`m`, as Q15 re-seeds every replica of a node that lost a table, can replay `m`
 from L's log with its R uninitialised or below `f`. Such a replica of L does not apply
 `m`: it stops applying L at `m − 1`, traces `RangeMergeStalled`, and waits for a snapshot
 of L at or above `m` (Q24). This is not RAFT.md §3's refusal and borrows none of it:
@@ -787,12 +917,11 @@ volatile that a restart needs: restarted, it re-applies up to `m − 1` and stal
 To be fed, it answers L's AppendEntries as a placeholder does (§5), with a rejection
 hinting index 1, an echo of zero and incarnation 0, and grants no vote while it waits.
 The snapshot's span `[a, b)` overlaps this node's replica of R where that replica is
-initialised below `f`; the draft makes the one exception to the overlap rule here: a
-snapshot of L at or above `m` replaces the replica of R that L's log merged at `m`
-(Q27). The alternatives, in Q24: refuse the whole node as RAFT.md §3 refuses a store,
-which under Q2's draft quarantines every replica on it (D-035) although nothing was lost;
-or have the coordinator wait again, after a re-seed, before a node applies `m`, which
-no entry can make a node do.
+initialised below `f`; the one exception to the overlap rule is made here: a snapshot
+of L at or above `m` replaces the replica of R that L's log merged at `m` (Q27). The
+stall is chosen over refusing the whole node as RAFT.md §3 refuses a store, which with
+one engine per node would quarantine every replica on it (D-035) although nothing was
+lost (Q24).
 
 **Abort and unfreeze.** The coordinator proposes `MergeAbort { right: R, begun: h }` to L
 when `Subsume` applied as nothing (R's generation or voters had changed), or when the
@@ -841,7 +970,7 @@ until R's leader's bounded ask unfreezes it, which costs availability, not safet
 | snapshot record | L's last take, whose checkpoint covers `[a, k)` below `m`; a follower fed it replays `m`, and passes step 3's own-node check only if its node's R has applied `f`, so L's leader takes a fresh one after `m` rather than stream the old one (Q24) | deleted |
 | proposals remembered | L's | dropped; a request naming R finds no replica and is answered `RangeMismatch` (§3) |
 | pending reads | L's | refused at the freeze |
-| incarnation (D-042), quarantine (D-035) | L's replica's (Q26) | deleted, under Q26's draft of per-replica keys |
+| incarnation (D-042), quarantine (D-035) | L's replica's; R's quarantine is not taken (Q26) | deleted with R's other keys (Q26) |
 | meta record | L's leader sends `[a, b)` at the new generation, which overrides R's record (§1) | overridden |
 
 **What is atomic with what.** Atomic, on each replica: `MergeBegin` in L's apply batch;
@@ -858,28 +987,32 @@ range has no data for `[k, b)`: it answers reads there from an empty span, and l
 writes build on nothing. On a node with a replica of R and none of L, the frozen data
 has no successor and the replica is never collected. Moves (§7) make replica sets
 differ, so ranges are first brought to the same replicas by moves; CockroachDB's merge
-queue relocates the right-hand range's replicas before it merges. Whether the
-coordinator or the rebalancer does that is Q24. §10's `MergeDivergentReplicas` is the
+queue relocates the right-hand range's replicas before it merges. Here the rebalancer
+does that, not the coordinator (Q24). §10's `MergeDivergentReplicas` is the
 merge that skips the voter-set checks.
 
 ## 7. Rebalancing
 
 **Who decides (SPEC §4: "background task on a leaseholder-elected node").**
 "Leaseholder" is not a term the tree defines; the only lease in RAFT.md is a Raft
-leader's read lease (RAFT.md §1). The draft runs the rebalancer on the node whose
-replica of range 0 leads, for as long as it leads (Q29). Two rebalancers at once — an
-old leader of range 0 not yet deposed beside a new one — cost liveness, not safety:
-every move is a change on the moved range's leader, one change is in flight per group,
-and a request for different voters while one is under way is refused (D-029,
+leader's read lease (RAFT.md §1). The rebalancer runs on the node whose replica of
+range 0 leads, for as long as it leads (Q29). Two rebalancers at once — an old leader of
+range 0 not yet deposed beside a new one — cost liveness, not safety: every move is a
+change on the moved range's leader, one change is in flight per group, and a request
+for different voters while one is under way is refused (D-029,
 DECISIONS.md:1099-1104). The rebalancer's state is volatile; a new one starts by
-reading.
+reading descriptors, and treats a move it did not start as in flight until it is done
+or until the move bound passes, when it traces the move abandoned (Q29).
 
 **What it optimises (SPEC §4: "range count and leader count").** For each node in range
 0's node records (Q8), the replicas it holds and the ranges it leads. The goal is SPEC's
-"within 10%"; Q30's draft measures each node's two counts against their means, and what
-the 10 % is measured against, and by when, is Q30. How a step chooses its move is not
-settled by SPEC, which names only what is balanced (SPEC.md:296-297); one step of the
-draft's policy, every choice in it Q42:
+"within 10%": each node's replica count and leader count, separately, within 10 % of
+their means over live nodes, quarantined replicas counted apart, asserted after a bound
+from the last add or remove (Q30). How a step chooses its move is not settled by SPEC,
+which names only what is balanced (SPEC.md:301-302). Phase 3 starts with the policy
+below, each choice in it a parameter fixed once `sim/balance.rs` has measured move counts
+and convergence; any random tie-break draws from a named rebalancer stream (Q42, D-017).
+One step:
 
 - Replicas: take the node holding the most and the node holding the fewest; choose the
   range with the lowest id that has a replica on the first and none on the second, is
@@ -891,9 +1024,10 @@ draft's policy, every choice in it Q42:
 - A node being removed (Q8) has every replica moved off, and a quarantined replica is
   moved off its node (Q33), before any other move.
 
-At most a fixed number of moves are in flight across the cluster and one per range
-(Q30). The draft learns replica sets from meta, which lags by one update, and each
-node's counts by asking the node, answered from its memory, not from a Raft write (Q31).
+At most four moves are in flight across the cluster and one per range (Q30). The
+rebalancer learns replica sets from meta, which lags by one update, and each node's
+replica, leader and quarantined counts by asking the node, answered from its memory, not
+from a Raft write; a move's completion it reads from the moved range's leader (Q31).
 
 **A move, made safe by joint consensus (SPEC §4: "Uses joint consensus per move").**
 Moving range X's replica from node `s` to node `d` is one change: the rebalancer sends
@@ -914,7 +1048,8 @@ where a single failure stops it; that is §10's `RemoveBeforeCaughtUp`. The step
    timeout marks `d` caught up (`note_learner_round`, core.rs:2002-2026; RAFT.md §1).
    Caught up means a matched log index, not an applied one; a learner fed a snapshot
    counts once an append after its install succeeds within a round (core.rs:1766-1796,
-   2600-2620). Whether a move also waits for `d` to apply is Q28.
+   2600-2620). That is D-029's round as built (RAFT.md:153-156), and a move adds no
+   applied-index or install gate to it (Q28).
 3. The joint entry, and once it commits, `C_new` (`after_commit`, core.rs:2033-2058).
    While joint, commits and elections need majorities of both voter sets
    (`Configuration::has_majority`, types.rs:121-127). A leader outside `C_new` steps
@@ -927,15 +1062,14 @@ where a single failure stops it; that is §10's `RemoveBeforeCaughtUp`. The step
    `C_new` restores its right to campaign (D-033; RAFT.md:163-168). A replica emptied
    early is a placeholder on its node, which a leader of X re-seeds (§5); the install
    carries the stream's term and no vote (RAFT.md:518-519), so the replica could grant a
-   second vote in a term it had voted in. The draft has `s`'s replica, after ten maximum
-   election timeouts with no message from a leader of X, ask the leader meta names for
-   X's descriptor, and collect itself on such proof; CockroachDB's replica GC consults a
-   newer descriptor the same way. The silence's length and whom the replica asks, meta's
-   leader for X or the last leader of X it heard from, are Q27. §10's
-   `GcBeforeRemovalCommitted` collects it early.
+   second vote in a term it had voted in. After ten maximum election timeouts with no
+   message from a leader of X, `s`'s replica asks the leader meta names for X for X's
+   descriptor, and collects itself on such proof; CockroachDB's replica GC consults a
+   newer descriptor the same way. The ten timeouts are unmeasured and open to change
+   (Q27). §10's `GcBeforeRemovalCommitted` collects it early.
 6. The rebalancer learns completion by reading X's descriptor from X's leader. `Change`
    is answered `Done` on accept and its completion shows only as configuration entries
-   (node.rs:818-826, 868-886; D-029). A leadership change before the joint entry
+   (node.rs:848-856, 902-915; D-029). A leadership change before the joint entry
    abandons the change (D-032); a rebalancer that still finds the old voters at the old
    generation after a bound traces the move `abandoned` and may begin it again, and a
    request for the voters already under way or in force is answered `Done` and proposes
@@ -948,8 +1082,9 @@ phases `begun`, `done` and `abandoned` (§8).
 compacted log crosses the membership path and the snapshot path together. Phase 2 has
 exercised them apart: "the main sweep never proposes `Change`; the membership scenario
 never crosses the snapshot threshold. The interaction … is unit-tested only"
-(OVERNIGHT.md:188-191). Whether Phase 2's scenarios cover it before Phase 3 depends on
-it is Q34.
+(OVERNIGHT.md:188-191). `sim/membership.rs` is extended past the snapshot threshold
+before `sim/move.rs` is built, filed first as issue #46 under the rule against widening
+a phase (Q34).
 
 **Quarantined replicas.** A replica on a store a re-seed rebuilt never votes again
 (D-035). D-035 rejected replacing such a server by a membership change because the
@@ -957,15 +1092,18 @@ recovery path then had no membership machinery and needed an operator per refusa
 (DECISIONS.md:1522-1524). Phase 3 has both, and needs them: with Q15's whole-node
 refusal a node that loses one table has every replica re-seeded and quarantined, and
 once two nodes have, the ranges with replicas on both can keep a leader they have and
-cannot elect one (§4). The draft's rebalancer moves quarantined replicas off, one per
-range at a time, before any balancing move, and counts a node's quarantined replicas
-apart from the rest (Q33).
+cannot elect one (§4). The rebalancer moves quarantined replicas off, one per range at
+a time, before any balancing move, and counts a node's quarantined replicas apart from
+the rest (Q33). A move is a change on the range's leader, so a range with two
+quarantined replicas and no leader can neither elect nor be moved; that is not accepted
+silently, and is issue #44 (Q33).
 
 **Node add and remove (SPEC exit criterion 2).** A node is added by `AddNode` and
-removed by `RemoveNode`, operator writes to range 0 (Q8); a removed node is drained by
-moves before it is expected to stop. A node that crashes and stays down is not detected
-by the draft: the rebalancer counts it and its replicas until an operator removes it
-(Q8).
+removed by `RemoveNode`, operator writes to range 0 carrying the node's id and address
+(Q8); a removed node is drained by moves before it stops. A node that crashes and stays
+down is not detected in Phase 3: the rebalancer counts it and its replicas until an
+operator removes it (Q8). A bootstrap node is never removed, and the exit criterion's
+add and remove use non-bootstrap nodes (Q9).
 
 ## 8. The invariants and how the trace checks each
 
@@ -983,26 +1121,28 @@ Changes to existing events, each recorded with its node and two times as today (
 |---|---|
 | every `Raft*` event about a replica | gains `range`; the events about a node's store are below the table |
 | `RaftApply` | gains `key` for a single-key command, and `effect`: `applied` for a client command executed within its range's span, whatever it wrote — a `Cas` whose compare failed returns `Swapped(false)` and writes nothing (apply.rs:260-267) and is `applied`; `out_of_span` or `frozen` for a client command refused at apply (§3); `took` for a range command (§5, §6) that took effect; `aborted` for a `Merge` that applied as an abort; `refused` for a range command whose re-check failed and that applied as nothing; `none` for a no-op or a configuration entry |
-| `RaftRead` | moves from the core, which traces it when a read is confirmed (core.rs:1175, 1202), before the server holds the key or has served anything, to the server where it serves (node.rs:2092-2110); keeps `index` and `lease`, and gains `key` and `applied`, the applied index of the engine version it was served from (§3) |
+| `RaftRead` | moves from the core, which traces it when a read is confirmed (core.rs:1175, 1202), before the server holds the key or has served anything, to the server where it serves (node.rs:2131-2150); keeps `index` and `lease`, and gains `key` and `applied`, the applied index of the engine version it was served from (§3) |
 | `RaftProposed` | gains `range` (with every `Raft*` event), which the history's closure needs (§9) |
 | `ClientInvoke`, `ClientReturn` | unchanged: the history knows no ranges (§9) |
 
-**Events about a node's store.** Under Q2's draft several existing events describe the
-node's one engine, not a replica. `RaftRefused`, `RaftAdopted` and `RaftServerFailed`
-stay per node and carry no range. A node's `RaftRefused` clears, for every range, what
-checks 2 to 4 hold for that node, as a server's clears it today (invariants.rs:557-559,
-595-597), and every span check 8 holds for the node; every replica on the node counts as
-refused in the per-range majority rule below. `RaftRecovered`, `RaftReseeded` and
-`RaftProgressReset` are per replica and gain `range`, and `RaftRecovered`'s
-`incarnation` is the replica's under Q26's draft. A replica's re-seed install traces
-`RangeCreated { cause: snapshot }` on its node, which restarts that replica's floors in
-checks 2 to 4. How a refused node's per-range installs become one engine again is Q15.
+**Events about a node's store.** With one engine per node (Q2) several existing events
+describe the node's engine, not a replica. `RaftRefused`, `RaftAdopted` and
+`RaftServerFailed` stay per node and carry no range. A node's `RaftRefused` clears, for
+every range, what checks 2 to 4 hold for that node, as a server's clears it today
+(invariants.rs:557-559, 595-597), and every span check 8 holds for the node; every
+replica on the node counts as refused in the per-range majority rule below.
+`RaftRecovered`, `RaftReseeded` and `RaftProgressReset` are per replica and gain
+`range`, and `RaftRecovered`'s `incarnation` is the replica's (Q26). A replica's re-seed
+install traces `RangeCreated { cause: snapshot }` on its node, which restarts that
+replica's floors in checks 2 to 4. A refused node re-seeds into a fresh engine in a new
+directory, opened at once, each range installed live as its stream completes (Q15; §11,
+storage 8).
 
 New events:
 
 | Event | When | Fields |
 |---|---|---|
-| `RangeCreated` | a replica of a range is initialised: at bootstrap, at a split's apply, at an install on a node that held no initialised replica of the range | `range`, `cause`, `parent`, `start`, `end`, `generation`, `voters`, `floor_index`, `floor_term` |
+| `RangeCreated` | a replica of a range is initialised: at bootstrap, at a split's apply, at an install on a node that held no initialised replica of the range | `range`, `cause`, `parent`, `start`, `end`, `generation`, `voters`, `floor_index`, `floor_term`, and `incarnation`, the replica's, drawn at this creation (Q26) |
 | `RangeDescriptor` | a replica's descriptor changes at an apply; an install onto an initialised replica changes it (with `applied` the snapshot's last index); or it is restated at its node's start | `range`, `index`, `applied`, `start`, `end`, `generation`, `voters`, `state` |
 | `RangesRestated` | a node has restated every replica it holds | `ranges` |
 | `RangeReplicaCreated` | a node made a placeholder for a range it does not hold (§5) | `range` |
@@ -1012,14 +1152,16 @@ New events:
 | `RangeMergeAborted` | a replica of L applied a `MergeAbort`, or a `Merge` whose shared checks failed, that moved L from `Merging` with `begun` to `Live`; never for one that applied as nothing | `range`, `right`, `begun`, `index` |
 | `RangeMergeStalled` | a replica of L stopped at `m − 1` on its own node's check (§6) | `range`, `right`, `index` |
 | `RangeUnfrozen` | a replica of R applied an `Unfreeze` that took effect | `range`, `from`, `begun`, `subsumed`, the index of the `Subsume` it ends, and `index` |
-| `RangeRemoved` | a replica's state was deleted | `range`, `generation`, `cause`: `merged` or `collected` |
+| `RangeRemoved` | a replica's state was deleted | `range`, `generation`, `incarnation`, the replica's (Q26), `cause`: `merged` or `collected` |
+| `RaftMatchStarted` | a leader's `matched` for a follower rose for the first time under the store incarnation the follower's answer carried: the first rise after the leader recorded that incarnation, whether as its first record or by a change (D-042) | `range`, `follower`, `incarnation`, `matched` |
 | `RaftLearnerRound` | a leader ended a catch-up round for a learner (§7) | `range`, `learner`, `from_index`, `to_index`, `ticks`, `caught_up` |
 | `RaftChangeAccepted` | a leader accepted a `Change` | `range`, `voters`, `applied`, `term` |
 | `RangeMismatchSent` | a server answered `RangeMismatch` | `range`, `client`, `seq`, `at`: `receipt`, `read` or `apply`, `descriptors` as (range, generation) |
 | `MetaApplied` | a replica of the meta range applied a `MetaUpdate`, and at bootstrap for range 1's initial record (index 0) | `index`, and per descriptor `range`, `start`, `end`, `generation`, `voters` and the sub-intervals it won |
 | `RebalanceMove` | the rebalancer began a move, saw it done, or gave it up | `range`, `from`, `to`, `phase` |
 | `NodeAdded`, `NodeRemoved` | a replica of range 0 applied an operator's `AddNode` or `RemoveNode` | `node` |
-| `ClientSend` | a client sent an operation's request | `client`, `seq`, `range`, `generation`, `to` |
+| `RangeIdsLeased` | a replica of range 0 applied a refill of a node's block of range ids (§5, Q17) | `node`, `run`, the nonce the refill carried, `first`, `last`, the block's first and last id, and `index` |
+| `ClientSend` | a client sent an operation's request | `client`, `seq`, `range`, `generation`, `to`, and `invoked`, the `seq` of the operation's `ClientInvoke`, which differs from `seq` on a resend after a definite `RangeMismatch` (Q10, §9) |
 | `ClientMismatch` | a client received `RangeMismatch` | `client`, `seq`, `descriptors` as (range, generation, start, end) |
 
 At a node's start every replica restates its log, as a server does today before
@@ -1034,7 +1176,8 @@ merge's `RangeMerged`, R's `RangeRemoved { cause: merged }`, L's `RangeDescripto
 The checks run where RAFT.md §2's do: the folds in one incremental checker, fed the
 records since its last look every ten slices of fifty milliseconds and stopping the run
 at its first violation, and re-run over the whole trace at the end (D-046); the rest in
-`sim/` at the end. Which crate holds the folds is Q40. RAFT.md §2's checks carry over
+`sim/` at the end. Checks 1 to 4 live in `ananke-raft`, over a generic group key, and
+checks 7 to 22 in `ananke-shard` (Q40). RAFT.md §2's checks carry over
 with their state keyed by range first:
 
 1. **Election safety**, from a map of (range, term) to server. Today the key is the term
@@ -1159,14 +1302,21 @@ when its consequence lands.
     first apply of each (range, index). At a split of P at `s` with key `k`, where P's
     descriptor before `s` is `[x, y)` at g: P's value at `s` is `[x, k)` at g + 1 with
     P's voters, and R's `RangeCreated { cause: split }` is `[k, y)` at g + 1 with the
-    voters of P's plain configuration in force at `s` and floor index `s`. At a merge of
+    voters of P's plain configuration in force at `s`, floor index `s` and floor term 1
+    (Q20). At a merge of
     R into L at `m`: L's value at `m` is `[L's start, R's end at f)` at max(g_L', g_R) +
     1 with L's voters. At any other change of a range's value at index `i`: the span is
     unchanged; the generation rises by exactly one where the entry at `i` is a plain
     configuration following a joint one, and the voters then equal that configuration's;
     anywhere else generation and voters are unchanged and only the state moves, along
     `Live`→`Merging`→`Live` or `Live`→`Subsumed`→`Live`. Installs and restatements are
-    check 7's. Cheap, exact.
+    check 7's. And the right half's id is fresh (Q17, §5): folding also `RangeIdsLeased`
+    by the first apply of each of range 0's indices, and check 1's map, no two
+    `RangeIdsLeased` grant a common id; at the first apply of a split of P that took
+    effect, with `right` R, no `RangeCreated` of R and no `RangeSplit` whose `range` or
+    `right` is R was traced before that split's first `RangeSplit`, and R lies in a
+    block a `RangeIdsLeased` traced before it granted to the node that led P in the
+    split entry's term. Cheap, exact.
 19. **The ranges tile the keyspace.** Fold check 7's map, in record order by first apply:
     the latest value of every range, with a range dropped at the first `RangeMerged` that
     names it as `right` until a later new value of it is traced. After every event no two
@@ -1188,6 +1338,62 @@ when its consequence lands.
     descriptor at its `applied` is `Merging` or `Subsumed`, or whose leader has traced no
     `RaftApply` of an entry of its own term, is a violation. Cheap, exact.
 
+**The re-add window: a named sweep assertion, the "wrong if" of Q26.** A replica is
+(range, node) and `ServerId` stays the node (Q26), so a range collected from a node and
+later added back to it is one identity with a new incarnation. D-042's rule is
+inequality, so "a success from the dead store delayed past the rebuilt store's first
+answer would set `matched` from the dead store until the next answer resets it again: a
+window one message delay long" (DECISIONS.md:2059-2062). On a re-add the dead store is
+the collected replica. The design is wrong if a sweep ever uses that window:
+
+- *Events.* `RangeRemoved { cause: collected }` and `RangeCreated` per node; each
+  leader's `RaftLeader`, `RaftConfig` and `RaftChangeAccepted`; `RaftMatchStarted`; and
+  `RaftProgressReset` to recognise the shape; in record order.
+- *State.* Per (range, node), the incarnation of every replica of that range on that node
+  that was collected, from each `RangeRemoved`'s `incarnation`. Per leader of a range, a
+  server in a term, the nodes it has re-admitted to the range since their latest
+  collection from it: a leader of X re-admits `n` at its `RaftChangeAccepted` of X whose
+  `voters` include `n`, or at its `RaftLeader` of X while its configuration in force,
+  check 3's latest `RaftConfig` of that server, includes `n`, either traced after `n`'s
+  latest `RangeRemoved { cause: collected }` of X. Those are the two places a leader
+  makes fresh progress for `n` with no incarnation recorded (core.rs:1602-1624,
+  1937-1954); the first answer it then takes for `n` is only recorded
+  (core.rs:1747-1768), and a success from it sets `matched` whatever store sent it
+  (core.rs:2606-2612).
+- *Violation.* A `RaftMatchStarted { range: X, follower: n, incarnation }` from a leader
+  of X, in the term in which it re-admitted `n`, whose incarnation is one of (X, n)'s
+  collected incarnations: a leader's `matched` for the re-added replica was set from an
+  answer stamped with the collected replica's incarnation. And a `RangeCreated` of X on
+  `n` whose `incarnation` is one of them: no leader could tell the re-added replica's
+  answers from its collected predecessor's.
+
+The window opens at a leader's own re-admission of `n`, not at anything `n` traces: a
+delayed success from the collected replica can reach the leader after it has made fresh
+progress for `n` and before its first message has reached `n`, and a placeholder of X is
+also made on `n` by any stale leader's message, with no re-add at all (§5). A fresh
+incarnation (Q26) is drawn at the replica's creation from the node's generator, as a
+re-seed draws a store incarnation today, and is at least 2 (node.rs:1902; store.rs:131).
+It is never drawn from a named stream derived anew at each creation of a replica of the
+same (range, node), as §4's `n{id}/r{range}/protocol` would be: `SimEnv` derives a named
+stream from the seed and the name alone (crates/ananke-env/src/sim/state.rs:166-172), so
+a replica re-added to the node would draw its collected predecessor's number, and the
+leader, which compares incarnations for inequality only (D-042), would never reset.
+
+It is asserted on every seed of the sharded sweep. The first seed on which a leader of X
+that has re-admitted `n` traces, in that term, a `RaftMatchStarted` or a
+`RaftProgressReset` for `n` carrying a collected incarnation of (X, n) — the shape in
+which an answer of the collected replica reached a leader after the re-add, taken as a
+first record or as a change — is pinned, whether or not the assertion fails on it. A
+stale rejection taken as a first record is traced by neither event, and the re-added
+replica's next answer then shows only as a `RaftProgressReset` to its own incarnation;
+that form of the shape is not recognised.
+A failure is not a bound to widen: it is the case for which D-042 names the step to
+take, a total order on incarnations or a per-follower set of retired ones
+(DECISIONS.md:2062-2064). The assertion has no variant of its own in §10; the stage that
+adds it names the variant its incremental checker's equivalence test runs against (§11,
+raft item 12). The implementing DECISIONS.md entry states the vote argument for re-added
+replicas (Q26). Cheap, exact.
+
 The checks about time run where RAFT.md §2's do: on uniformly scheduled seeds (D-016),
 and only for a range whose replicas that are neither refused nor quarantined form a
 majority at the end of the run (RAFT.md:370-377), now asked per range rather than per
@@ -1196,19 +1402,24 @@ completes within ten maximum election timeouts; today the check takes one minimu
 every write (sim/raft.rs:990-998), which a wedged range beside a live one would pass, so
 it is asked per key. After the last heal, meta names every key's current descriptor
 within a bound; a move the rebalancer began is traced done or abandoned within a bound;
-a subsumed range is merged or unfrozen within a bound (each bound Q39).
+a subsumed range is merged or unfrozen within a bound (each bound measured on the
+correct system before it is asserted, Q39).
 
-In the balance scenario, after the last `NodeAdded` or `NodeRemoved` plus a bound (Q30),
-every node's counts are within 10 % as Q30 defines it. The fold: the nodes, from
-`NodeAdded` and `NodeRemoved`; each node's replica count, from its `RangeCreated` and
-`RangeRemoved`; each node's leader count, from the latest `RaftLeader` of every range,
-counted against the leader's node while no later `RaftTerm` of that range on that server
-ends its office; evaluated at every event from the bound's end to the run's end.
+In the balance scenario, after the last `NodeAdded` or `NodeRemoved` plus a bound set
+from the worst gap measured on the correct system plus margin (Q30), every node's
+replica count and leader count, separately, are within 10 % of their means over live
+nodes, quarantined replicas counted apart (Q30). The fold: the nodes, from `NodeAdded`
+and `NodeRemoved`; each node's replica count, from its `RangeCreated` and
+`RangeRemoved`, with a replica counted as quarantined from its `RaftReseeded`; each
+node's leader count, from the latest `RaftLeader` of every range, counted against the
+leader's node while no later `RaftTerm` of that range on that server ends its office;
+evaluated at every event from the bound's end to the run's end.
 
 In `sim/move.rs`'s shape (a), the hold check: a client write to X invoked after the
 stayer's `NodeCrashed` and before the hold ends completes before the hold ends. It reads
 `NodeCrashed`, the hold's `LinkLimited` and the heal that ends it, and `ClientInvoke` and
-`ClientReturn` for X's keys; the hold's length is Q39, and the correct system must pass
+`ClientReturn` for X's keys; the hold's length is measured on the correct system before
+it is asserted (Q39), and the correct system must pass
 it on every seed.
 
 The timer check and pre-vote's property are per (range, server): a reset is a delivered
@@ -1230,17 +1441,20 @@ Decision time and durability time (D-047) divide as in RAFT.md §2. Checks 7 to 
 event they fold is traced once its apply batch is durable. Check 20 folds `RaftVote`,
 traced once the vote is durable, as today. Check 17, check 22's `RaftChangeAccepted`
 and the rebalancer's `RebalanceMove` are traced as they happen, so their two times are
-equal. The timer check and pre-vote's property read decision time, as today.
+equal. `RaftMatchStarted` is traced by the leader's step that raised `matched`, as
+`RaftProgressReset` is, and the re-add window assertion reads record order. The timer
+check and pre-vote's property read decision time, as today.
 
 The pair rule holds for each: a variant in §10 fails each check, the balance, move,
-subsume and hold bounds included, and the correct system passes every seed. Every check
-is a function of the trace alone, so a failing seed replays in the studio with the
-check's own events on screen.
+subsume and hold bounds included, and the correct system passes every seed; the re-add
+window assertion's variant is named by its stage, as said above. Every check is a
+function of the trace alone, so a failing seed replays in the studio with the check's
+own events on screen.
 
 ## 9. The linearizability checker across split, merge and rebalance
 
 SPEC's first exit criterion is "Linearizability holds across split/merge/rebalance under
-faults" (SPEC.md:302). The checker is `sim/lin.rs` as RAFT.md §4 describes it and as
+faults" (SPEC.md:307). The checker is `sim/lin.rs` as RAFT.md §4 describes it and as
 built: a Wing-Gong search with Lowe's partitioning and memoisation, per key. What
 sharding changes is how the history is closed, and nothing about how it is searched.
 
@@ -1248,11 +1462,15 @@ sharding changes is how the history is closed, and nothing about how it is searc
 `Put`, `Get`, `Delete` and `Cas` (trace.rs:742-770), paired by `(client, seq)`
 (sim/lin.rs:70-92). A `RangeMismatch` is followed inside the client, like `NotLeader`
 (sim/raft.rs:3022-3034), and is never a return; an operation sent to three ranges
-returns once. The trace closes pending operations as today, by their entries' fate, with
-two changes. Today `RaftProposed` records `(index, term)` and `RaftApply` records the
-first apply of `(index, entry_term)` on any server (sim/lin.rs:93-109), so with several
-groups in one trace an operation proposed at `(5, 2)` in one range would be closed by
-the first apply of `(5, 2)` in any range. The closure is keyed by `(range, index,
+returns once. A write resent after a definite `RangeMismatch` goes under a fresh `seq`
+(Q10, §3), and the history pairs it with the original: each `ClientSend` names the
+`seq` of its operation's `ClientInvoke` as `invoked`, so the proposals made under every
+`seq` of one operation close that one operation, which returns once. The trace closes
+pending operations as today, by their entries' fate, with two changes. Today
+`RaftProposed` records `(index, term)` and `RaftApply` records the first apply of
+`(index, entry_term)` on any server (sim/lin.rs:93-109), so with several groups in one
+trace an operation proposed at `(5, 2)` in one range would be closed by the first apply
+of `(5, 2)` in any range. The closure is keyed by `(range, index,
 term)`. And today an applied entry took effect (sim/lin.rs:8-11); with the apply check
 of §3 an entry can apply as nothing. Only an apply whose effect is `applied` closes an
 operation, and `applied` is any client command executed within its span, whatever it
@@ -1264,7 +1482,9 @@ whose every proposal applied with another effect did not take effect and leaves 
 history, as one never proposed does (sim/lin.rs:113-131); one with a proposal never
 applied stays pending. The list of an operation's proposals is already a list
 (sim/lin.rs:68, 100-103), which a resend to a second range after a definite
-`RangeMismatch` needs.
+`RangeMismatch` needs; it is keyed by the operation's `invoked` sequence number, and a
+`RaftProposed` under a resend's `seq` joins the list of the operation that `seq`'s
+`ClientSend` names.
 
 **Partitioning, and why moving boundaries do not move it.** The KV model is a product of
 independent registers, so a history is linearizable iff each key's sub-history is
@@ -1277,17 +1497,18 @@ of one key's life as two registers, and a write to P lost at the split would be
 invisible to both. What the boundaries do touch is confined to three places: the closure
 above; multi-key reads; and meta lookups.
 
-*Multi-key reads.* Phase 3's API has none unless `Scan` is added (Q35). A scan across a
-boundary is stitched from reads of two groups at two read indices, and nothing in
-Phase 3 gives those two a common instant: a key of the first can change after its read
+*Multi-key reads.* Phase 3's API has none: there is no scan in Phase 3 (Q35). A scan
+across a boundary is stitched from reads of two groups at two read indices, and nothing
+in Phase 3 gives those two a common instant: a key of the first can change after its read
 and a key of the second before its read, and RAFT.md §4's scan check — a single time `t`
 in the scan's window at which every key's value matches its timeline — would report
 that. Without transactions (D-006) a cross-range scan cannot be promised linearizable,
-so the draft leaves `Scan` out of Phase 3 and SPEC's distributed scans with Phase 5
-(SPEC.md:345-346).
+so `Scan` stays out of Phase 3 and SPEC's distributed scans with Phase 5
+(SPEC.md:351-352), and Q1's correction removes `Scan` and its check from RAFT.md §4 with
+a pointer to SPEC §6 (Q35).
 
-*Meta lookups.* A lookup is a read of range 0 or range 1. The draft keeps lookups out of
-the history (Q36): a stale lookup is harmless by §3's design, and check 16 and the meta
+*Meta lookups.* A lookup is a read of range 0 or range 1. Lookups stay out of the
+history (Q36): a stale lookup is harmless by §3's design, and check 16 and the meta
 convergence bound of §8 are what hold the meta range to account.
 
 **Search.** Unchanged: operations sorted by invocation, state as (the set linearized,
@@ -1297,8 +1518,9 @@ reported apart from a violation and must never be reached by the correct system
 (sim/lin.rs:159, 173-189). What grows the search is concurrency and pending operations
 on one key, not the number of ranges. Splits need several keys per range, and conflicts
 need few keys per client; today's workload has two keys (sim/raft.rs:104), which one
-split leaves at one per range. The sharded workload's keys, clients and split points are
-Q39.
+split leaves at one per range. The sharded workload's keys, clients and split points
+are the sweep's to choose within Q39's budget, with seed shares sized so premerge stays
+near fifteen minutes (Q39).
 
 **What is asserted.** Every key linearizable, for the correct system on every seed,
 across the splits, merges and moves each scenario makes under its faults. Checks 7 to 22
@@ -1323,16 +1545,18 @@ term it had already voted in, and two leaders of that term accept writes; no sce
 §10 builds that sequence. So the first exit criterion's "rebalance" rests on the correct
 system passing this check on every seed across the moves it makes under faults, and the
 move variants' catches rest on checks 3, 13, 14, 15 and 21, the hold check and the move
-bound; whether to
-build a shape that carries `GcBeforeRemovalCommitted` to a client is Q39.
+bound. A shape that carries `GcBeforeRemovalCommitted` to a client through a
+re-install and a second vote is filed as issue #47 rather than built (Q39).
 
 ## 10. Buggy variants shipped from day one
 
 Each is a variant on the layer whose rule it breaks, and each breaks one rule with a
 reference. Variants are a set whose empty set is the correct system, and a set turns off
-exactly its members' fixes (D-045); whether Phase 3's live in `ananke-raft`'s
-`Variants`, which has sixteen of thirty-two bits used (core.rs:159-202, 243;
-DECISIONS.md:2700-2705), or in a set of the range layer's own, is Q37. The correct
+exactly its members' fixes (D-045). Phase 3's live in a variant set of the range
+layer's own, in `ananke-shard`, carried beside `ananke-raft`'s `Variants(u32)`, which
+stays unchanged with sixteen of thirty-two bits used (core.rs:159-202, 243;
+DECISIONS.md:2700-2705); Phase 2 variants re-asserted on the new node keep their bits
+(Q37). The correct
 system must pass every seed. Each variant must be caught by the named check on some
 seeds. None of the rates below is measured, so no tier is claimed yet: a variant whose
 situation a directed scenario builds on every seed is asserted caught on every seed at
@@ -1342,19 +1566,23 @@ directed shape reaches only on some seeds, is asserted at the tier its measured 
 supports, and the arm's firing is asserted at every tier (D-041, D-043, D-044;
 RAFT.md:651-656).
 
-Every Phase 2 variant is re-asserted on the node of §4, with its combined persist and
-batched frames, to the standard its Phase 2 test asserts and no stronger, on the same
-arm or directed scenario run with several ranges per node: the sweep variants on the
+Every Phase 2 variant is re-asserted on the node of §4, with its per-core persist order
+and batched frames (Q41), to the standard its Phase 2 test asserts and no stronger, at
+the tier each uses today (Q39), on the same arm or directed scenario run with several
+ranges per node: the sweep variants on the
 raft sweep's arms; `RefusedCountsForQuorum` and `RefusedNeverCounts` on a sharded
 `sim/quorum.rs`, since the random sweep reaches their situation once in a thousand seeds
 (RAFT.md:657-660); `SharedSnapshotDir` at the nightly tier only (RAFT.md:655-656);
 `IgnoreIncarnation` as an injection-and-reach assertion, since it is caught on 0 of
 10 000 seeds (RAFT.md:681); and the pair `{IgnoreIncarnation, SharedSnapshotDir}` on its
-pinned seed (RAFT.md:648-651). `SendBeforePersist` against a round's single synced batch
-matters most (Q39). A variant the sweep does not catch is a hole in the sweep, not a
-variant to delete.
+pinned seed (RAFT.md:648-651). `SendBeforePersist` against the round of §4 matters
+most: a send that follows a core's persist leaves when that persist resolves, and the
+variant sends it first (Q41). A variant the sweep does not catch is a hole in the sweep,
+not a variant to delete.
 
-The scenarios and arms the table names (their shapes, node counts and shares are Q39):
+The scenarios and arms the table names. Directed scenarios take the fault subsets they
+need, every bound and hold is measured on the correct system before it is asserted, and
+seed shares are sized so premerge stays near fifteen minutes (Q39):
 
 - `sim/shard.rs`, the sharded sweep: five nodes, three of them bootstrap nodes, ranges
   made by splits its driver draws, merges and moves drawn by the same driver, several
@@ -1363,7 +1591,8 @@ The scenarios and arms the table names (their shapes, node counts and shares are
   requires of every new arm (DECISIONS.md:1380-1383):
   - `Fault::MetaReorder` (stream `meta-reorder`): at a split of a range led on node `a`,
     a one-way block from `a` to the meta range's leader's node
-    (crates/ananke-env/src/sim/mod.rs:437-444) for a fixed hold (Q39); during the hold
+    (crates/ananke-env/src/sim/mod.rs:437-444) for a fixed hold, measured on the correct
+  system before it is asserted (Q39); during the hold
     the arm transfers the left half's leadership to a replica on a third node `c`
     (`TimeoutNow`, D-028) and the driver splits the left half again through `c`, whose
     updates reach meta by an unblocked link. `a` keeps resending the first update until
@@ -1406,7 +1635,7 @@ The scenarios and arms the table names (their shapes, node counts and shares are
   arm learns `s` from the `RaftProposed` of the driver's split request and crashes node 4
   at its first `WalSynced` after that `RaftCommit`, stepping in 250 µs slices as the
   adoption watch does (sim/raft.rs:3850-3862), then restarts it. A
-  `RaftApply` is traced only after the whole apply has returned (node.rs:1160-1192), so
+  `RaftApply` is traced only after the whole apply has returned (node.rs:1200-1223), so
   in `SplitNotAtomicWithDescriptor` it follows both batches and cannot aim the crash; the
   first `WalSynced` is the first batch in the variant and the only one in the correct
   system. Writes to both halves resume once the victim restarts, so a restarted node
@@ -1414,9 +1643,8 @@ The scenarios and arms the table names (their shapes, node counts and shares are
   the arm fired at that sync, and prints how often the restart shows the variant's state,
   since whether the second batch is durable within one slice is the disk's draw (100 µs
   to 2 ms, sim/raft.rs:2807-2808).
-- `sim/merge.rs`, directed, every seed, five nodes, two adjacent ranges and a merge, in
-  five shapes, (a) to (c) with both ranges on nodes 1 to 3 and (d) and (e) with both on
-  all five:
+- `sim/merge.rs`, directed, every seed, four nodes, two adjacent ranges L and R, both on
+  nodes 1 to 3 as every range has three replicas (Q32), and a merge, in six shapes:
   (a) a move takes R's replica from node 3 to node 4 and the merge is proposed, which the
   correct coordinator refuses; a second move brings it back to node 3, leaving R's
   generation two above L's, and the merge is proposed again, which the correct system
@@ -1431,22 +1659,46 @@ The scenarios and arms the table names (their shapes, node counts and shares are
   span through node 2 from `f` on, while another client writes it through L; the
   scenario asserts per seed that a request naming R reached node 2 while its R was
   subsumed;
-  (d) R's leader on node 2 and the coordinator, L's leader, on node 1; node 5 crashed
-  before `Subsume` commits, so the coordinator's wait passes its bound; node 1 cut off
-  from nodes 3, 4 and 5 but not from node 2 one heartbeat interval before the wait's
-  bound ends, so the coordinator still leads when it gives up; node 5 restarted after
-  a hold. The coordinator appends `MergeAbort`, which cannot commit, and a new leader of
-  L is elected among nodes 2 to 4; R, led from node 2, still commits. The scenario
-  asserts per seed that a new leader of L took office with L `Merging`;
-  (e) `Merge` before an abort in L's log: R's leader on node 2; the coordinator on node 3
-  appends `Merge` at `m` on nodes 1, 2 and 3 and crashes before any of them learns that
-  `m` committed; node 5 is down; node 1 is elected L's leader and at once cut off from
-  nodes 3, 4 and 5 but not from node 2, so its no-op cannot commit and `m` stays
-  unapplied on it; its wait for R's replicas passes its bound and it appends `MergeAbort`
-  at `i > m`, while R, led from node 2 with node 4, still commits; after a hold the cut
-  heals and nodes 3 and 5 restart, and `m` commits and applies before `i`. The scenario
-  asserts per seed that `m` applied as a merge and `i` as nothing, and the correct run
-  that no `RangeUnfrozen` of the attempt was traced.
+  (d) the coordinator, L's leader, on node 1 and R's leader on node 2; from before
+  `Subsume` commits node 3 is cut off from node 2, so node 3's replica of R stays below
+  `f` and the coordinator's wait cannot end, while R commits through node 1 and L
+  through both. One heartbeat interval before the wait's bound ends, that cut heals,
+  node 1 is cut off from node 3, and node 2's link to node 1 is blocked one way, so the
+  coordinator hears from neither other replica of L and still leads when it gives up,
+  since check quorum ends an office only at a window with no majority heard
+  (RAFT.md:263-266). It appends `MergeAbort`, which cannot commit; R, led from node 2,
+  still commits through node 3, which catches up past `f`. Node 2 holds the abort in its
+  log, so once check quorum ends node 1's office node 2 is elected L's leader with
+  node 3's vote and commits the abort. After a hold every cut heals. The scenario
+  asserts per seed that node 1 appended `MergeAbort` while it led L and that no abort
+  of the attempt took effect before its office ended;
+  (e) `Merge` before an abort in L's log, run with the coordinator's wait bound set below
+  a minimum election timeout, so that a leader of L that hears from no other replica
+  still leads when its wait passes the bound (RAFT.md:263-266): R's leader on node 2
+  and the coordinator on node 3. Once the coordinator's wait has ended, node 3's link to
+  node 2 is blocked one way, and the coordinator appends `Merge` at `m` on nodes 1 and 3
+  and crashes before node 1 learns that `m` committed. Node 1, whose log holds `m` where
+  node 2's does not, is the only node that can be elected L's leader, and is, with
+  node 2's vote; at once node 2's link to node 1 is blocked one way, so node 1's no-op
+  cannot commit and `m` stays unapplied on it, and node 3 restarts with its links to
+  node 1 cut both ways and its block toward node 2 healed. Node 1's wait hears from no
+  replica of R but its own and passes its bound, and node 1 appends `MergeAbort` at
+  `i > m`; R, led from node 2 with node 3, still commits. After a hold the cuts between
+  nodes 1 and 3 heal, and node 2's block toward node 1 heals only once node 1 has
+  applied `m`: `m` was committed, so every later leader of L holds it and commits it,
+  and node 1's replica of R, cut off from R's leader since node 1 took office, is still
+  subsumed at `f` when node 1 applies it, so node 1's own check passes. `i` applies as
+  nothing or is truncated. The scenario asserts per seed that node 1 appended
+  `MergeAbort` above `m` and applied `m` as a merge, and the correct run that no
+  `RangeUnfrozen` of the attempt was traced;
+  (f) a new leader of L finds an attempt it did not begin: the coordinator, L's leader,
+  on node 1 and R's leader on node 2; from before `Subsume` commits node 3 is cut off
+  from node 2, so node 3's replica of R stays below `f` and the coordinator can propose
+  neither `Merge` nor, before its wait's bound, `MergeAbort`. At node 2's
+  `RangeSubsumed`, node 1 is crashed and the cut heals; node 1 restarts after a hold. A
+  new leader of L is elected from nodes 2 and 3 with L `Merging` and no entry of the
+  attempt after `MergeBegin` in L's log. The scenario asserts per seed that a new leader
+  of L took office with L `Merging`.
 - `sim/move.rs`, directed, every seed: range X, its log compacted, on nodes 1, 2 and 3,
   moved from 3 to 4, in three shapes: (a) the moment node 3 leaves the configuration in
   force on X's leader, a stayer crashes and a frame-length limit toward node 4 holds
@@ -1461,9 +1713,12 @@ The scenarios and arms the table names (their shapes, node counts and shares are
   { cause: collected }` and restarts it, asserted per seed to have fired; the catch is
   asserted on some seeds, since what the crash keeps of an unsynced write is the disk's
   draw.
-- `sim/balance.rs`: a thousand ranges made by driver splits (Q18), nodes added and
-  removed, and the balance check of §8 (its node count, faults, tier and bound Q30,
-  Q39).
+- `sim/balance.rs`: a thousand ranges made by driver splits (Q18) on ten nodes, an
+  eleventh added and a non-bootstrap node removed, under Phase 2's network faults with
+  every crash restarted, at most four moves across the cluster and one per range at
+  once, at a tier chosen by measured cost within D-040's budget (Q30). It records
+  without payloads or polls, raises its record cap, and runs the balance check of §8,
+  checks 7 to 22 and linearizability, but not the timer check (Q39).
 
 | Variant | The rule it breaks | What catches it | Needs |
 |---|---|---|---|
@@ -1476,12 +1731,13 @@ The scenarios and arms the table names (their shapes, node counts and shares are
 | `UninitialisedReplicaVotes` | §5: a placeholder grants no vote or pre-vote (Q22); the variant grants them from a placeholder, with nothing durable | check 20 at the first grant | `sim/split.rs` (ii) |
 | `PlaceholderAcknowledges` | §5: a placeholder acknowledges no append (Q22); the variant answers an AppendEntries at its `next` as matched, with nothing in any log | commit by majority, check 3: a commit counted node 4, which traced no `RaftAppend` of the entry | `sim/move.rs` (a) |
 | `SplitCreatesRightOnNonVoter` | §5: R's state is written only on a voter of P's configuration at `s`, and a learner gets a range delete; the variant writes R on every replica that applies `s` | check 8's clause that a node that is not a voter of P's configuration at `s` traces no `RangeCreated { cause: split }` of R | the sharded sweep's move just after a split |
+| `IdBlockResumed` | §5 and Q17: a node adopts only a block of range ids granted to its current run, so no id is taken twice; the variant's node adopts, at its start, the block its lease record names, whatever run it was granted to, and takes ids from that block's first | check 18 at the first apply of a split whose `right` a `RangeCreated` or `RangeSplit` named before it | the sharded sweep's crash and restart of a node that has taken an id from its block, followed by a split led from that node |
 | `MergeDivergentReplicas` | SPEC §4 and §6: identical replica sets. The variant drops every voter-set check — the coordinator's, `MergeBegin`'s and `Subsume`'s `voters` re-checks, and `Merge`'s check that L's configuration has R's voters — and keeps adjacency, the states, the wait for every replica of R and each node's own check | check 11 at the first `RangeMerged` anywhere, on a node that holds both: L's configuration at `m − 1` and R's at `f` differ. Not linearizability: each node's own check stalls a replica of L with no R and re-seeds it with the merged range's data | `sim/merge.rs` (a) |
 | `MergeBeforeRightApplied` | §6: the coordinator waits for every replica of R to apply `Subsume`, and `Merge`'s apply checks its own node's; the variant keeps every voter-set check, waits for a majority and checks nothing on the node | check 11: `right_applied` below `f`; linearizability: that node's L lacks writes R committed below `f` and serves reads without them once it leads | `sim/merge.rs` (b) |
 | `MergeTakesLeftGeneration` | §1 and §6: a merged range's generation is max(g_L', g_R) + 1; the variant gives it g_L' + 1 | check 18 at the merge's apply; check 10 at the merged range's first write to a right-span key R wrote at a higher generation; meta's convergence bound, since meta keeps R's record over the merged one | `sim/merge.rs` (a) |
 | `ServeAfterSubsume` | §6: a subsumed range serves nothing and applies nothing from `f`; the variant's R keeps serving reads and applying writes | check 9 at the first read or write on a subsumed descriptor; linearizability: a read through R returns a value L has overwritten | `sim/merge.rs` (c) |
-| `UnfreezeBeforeAbortCommitted` | §6: `Unfreeze` is proposed only once the abort has taken effect on the proposer's node, or its record has been read; the variant proposes `Unfreeze` in the round it appends `MergeAbort` | in `sim/merge.rs` (d), check 12's first clause, at the unfreeze's apply, before any abort of the attempt took effect; in (e), where the merge wins, check 12's second clause and check 19 (R and the merged L overlap), and on the seeds where both then take writes to the right span, check 10 and linearizability | `sim/merge.rs` (d) and (e) |
-| `MergeNotResumed` | §6: a new leader of L that takes office with L `Merging` asks R and completes or aborts; the variant's new leader does nothing | the bound of §8 on a subsumed range being merged or unfrozen | `sim/merge.rs` (d) |
+| `UnfreezeBeforeAbortCommitted` | §6: `Unfreeze` is proposed only once the abort has taken effect on the proposer's node, or its record has been read; the variant proposes `Unfreeze` in the round it appends `MergeAbort` | in `sim/merge.rs` (d), check 12's first clause, at the unfreeze's apply, before any abort of the attempt took effect; in (e), where the merge wins, check 12's second clause at node 1's apply of `m`, and on the seeds where both R, unfrozen on nodes 2 and 3, and the merged L then take writes to the right span, check 10 and linearizability. Check 19 sees (e) only if R traces a value after the merge, since R's unfreeze is traced before the merge that drops R from its fold | `sim/merge.rs` (d) and (e) |
+| `MergeNotResumed` | §6: a new leader of L that takes office with L `Merging` asks R and completes or aborts; the variant's new leader does nothing | the bound of §8 on a subsumed range being merged or unfrozen: no entry of the attempt follows `MergeBegin` in L's log, so R's leader's ask after its bound finds no abort record in L and nothing ends the freeze | `sim/merge.rs` (f) |
 | `ChangeWhileFrozen` | §6: a node refuses `Change` for a range that is merging or subsumed, and a leader accepts none before it has applied its term's first entry; the variant accepts one whenever its core has none in flight, as today | check 22 at the acceptance | the sharded sweep's `Change` to a range it is merging |
 | `RemoveBeforeCaughtUp` | §7 and D-029: a move is one change whose joint entry waits for the incoming replica's catch-up; the variant's rebalancer removes the outgoing replica and then adds the incoming one | check 15 at the removal's configuration; the hold check of §8: the correct move commits through the other stayer and the caught-up node 4, and the variant, on nodes 1 and 2 with one crashed, commits nothing until the crashed one restarts | `sim/move.rs` (a) |
 | `JointBeforeCaughtUp` | D-029, RAFT.md §1: learners first, the joint entry once a round to each is shorter than a minimum election timeout; the variant proposes the joint entry at once | check 13; the hold check of §8: node 4 holds nothing when the stayer crashes and its snapshot is held, so the range commits nothing where the correct move's node 4 already holds the log | `sim/move.rs` (a) |
@@ -1494,23 +1750,29 @@ The scenarios and arms the table names (their shapes, node counts and shares are
 The checks about time in §8 are bounds, not properties: chosen so the correct system
 never trips them over ten thousand seeds, as RAFT.md §5 chooses its own. A bound the
 correct system trips is a model error to fix, not a bound to widen (D-030, D-039;
-SPEC.md:270-280). Every bound this document names is Q39 until a run has measured the
-correct system against it.
+SPEC.md:270-280). Every bound this document names is measured on the correct system
+before it is asserted (Q39).
 
 ## 11. What the layers below must provide
 
 Each item is something the design above needs and the tree does not have, with where the
-tree stands. Several depend on Q2, one engine per node or one per replica; the list
-assumes one per node and says what changes otherwise.
+tree stands. A node has one engine (Q2).
 
 **Storage (`ananke-storage`).**
 
 1. *Ranges' Raft state in one engine.* The Raft keys are fixed names under tenant 0 —
    `hard`, `applied`, `reseeded`, `incarnation`, the log by index, `config`, `snapshot`
-   (store.rs:65-127) — so two groups in one engine collide on every key. The key layout
-   needs a range id (Q5). This is the Raft crate's layout on the engine's opaque keys:
-   the engine has no notion of tenant: no source file of `ananke-storage` mentions one,
-   and the encoding is built by the Raft crate (store.rs:76-83).
+   (store.rs:65-127) — so two groups in one engine collide on every key. §1's layout
+   gives each range a table under tenant 0, `0 / <range: u64 BE> / <purpose> / name`,
+   puts root and meta in system tenant 1 and moves user data from tenant 1
+   (apply.rs:23-24) to tenant 2 (Q5). This is the Raft crate's layout on the engine's
+   opaque keys: the engine has no notion of tenant: no source file of `ananke-storage`
+   mentions one, and the encoding is built by the Raft crate (store.rs:76-83). The layout
+   breaks 0.3.0's on-disk format, so the format version is bumped and a store in the old
+   format is refused at open with an error naming both versions (Q5). The format versions
+   the tree has are the engine's, 2 in the manifest and 2 in a table's footer
+   (manifest.rs:30-31; sst.rs:46-47); the store's `RAFT-STORE` marker carries none
+   (store.rs:393-398), and nothing records which key layout a store was written in.
 2. *A bounded, ordered seek.* `scan` returns every key of a span as one `Vec`, with no
    limit, no reverse and no "first key at or after `k`" (engine.rs:1051-1074);
    `RaftStore::open` already loads a whole log that way (store.rs:683-698). A meta
@@ -1531,67 +1793,79 @@ assumes one per node and says what changes otherwise.
    span's keys and add its tables in one manifest switch while the node's other ranges
    keep running, with the new tables' sequence numbers above the live engine's. An
    install today ends the server's run-loop incarnation and reopens the engine
-   (node.rs:999-1002, 494-497), which in a shared node would restart every range on it;
-   the store incarnation of D-042 is kept (node.rs:990-993).
+   (node.rs:1029-1036, 496-512), which in a shared node would restart every range on it;
+   the store incarnation of D-042 is kept (node.rs:1022-1025). **Phase 3's entry
+   criterion (Q2):** the crash test of this live install — a span's keys removed and its
+   tables added in one manifest switch, sequence numbers above the live engine's — is
+   written and green before any split code. One engine per node is wrong if that install
+   cannot be made crash-safe.
 6. *A checkpoint that does not stall every range.* A checkpoint holds the turnstile, so
    no flush or compaction runs meanwhile (engine.rs:1150; D-024, DECISIONS.md:736-737).
    With one engine per node one range's take stalls every range's flushes, and with one
    `apply` task per node (Q14) every range's applies, which wait behind a take (D-036).
-7. *An approximate size of a span*, for a size-triggered split (Q18) and the
-   rebalancer's load (Q31). Tables carry their key bounds and sizes (manifest.rs:40-58);
-   nothing sums them over a span.
+7. *An approximate size of a span*, for the size-triggered splits that wait for it
+   (Q18); the rebalancer reads counts, not sizes (Q31). Tables carry their key bounds
+   and sizes (manifest.rs:40-58); nothing sums them over a span.
 8. *Loss attributed below the engine, or not.* A dropped table, a fallback, a head gap
    or a stopped log refuses the whole store (store.rs:644-650) and quiesces the whole
    engine (engine.rs:1127-1136; D-022, D-044). With one engine per node, one lost table
    refuses every replica on the node. Whether a loss can be attributed to the ranges
    whose keys the lost table covered — its `first_key` and `last_key` are all the engine
-   records of it (manifest.rs:54-57) — is Q15. Under Q15's draft the node is refused
-   whole: its marker says lost (D-044) and its engine is quiesced, so no range's re-seed
-   can install into that engine. What the node re-seeds into is not provided: a fresh
-   engine adopted at a start once every range's install has staged, or a fresh engine
-   opened at once with each range installed live (item 5) as its stream completes, which
-   must square with D-041's rule that a directory that held a store never opens fresh.
-   Either needs a durable per-replica mark of which ranges are still refused on the new
-   engine, which nothing has today (Q15). §6's stalled replica is not a refusal and needs
-   none of this.
+   records of it (manifest.rs:54-57) — is not used in Phase 3: the node is refused whole
+   (Q15). Its marker says lost (D-044) and its engine is quiesced, so no range's re-seed
+   can install into that engine. The node re-seeds into a fresh engine in a new
+   directory beside the refused one, which stays marked lost and quiesced, so D-041's
+   rule that a directory that held a store never opens fresh holds; the fresh engine is
+   opened at once, each range installed live (item 5) as its stream completes, and a
+   durable per-replica refused mark is written into the new engine before it serves
+   (Q15). None of these exists today: not the new directory beside a refused one, not
+   the live install, not the mark. Issue #45 records when whole-node refusal is to be
+   revisited: if losses in a shared engine turn out to be mostly attributable table
+   drops. §6's stalled replica is not a refusal and needs none of this.
 
-With one engine per replica, items 1, 4, 5, 6 and 8 reduce to what exists, and in their
-place: split and merge must copy data between engines, which no batch can be atomic
-with, and memory and tasks grow with replicas (§4).
-
-**Raft (`ananke-raft`, or the range layer above it, Q40).**
+**Raft (`ananke-raft`) and the range layer (`ananke-shard`).** Q40 divides them:
+`ananke-shard` holds §4's node (tasks, round, batch frames, inbox), descriptors, split
+and merge, the meta state machine, the rebalancer, the range client, checks 7 to 22 and
+the range variants; `ananke-raft` keeps the core, the codec, the store, parameterised by
+a key prefix, snapshots, refusal and adoption, checks 1 to 4 over a generic group key,
+and its Phase 2 variants, and never names a descriptor or a span.
 
 1. *A range on every frame and every client message.* A frame is `kind | from | term |
    fields` (message.rs:1-8, 381-385); a request is `client | seq | command` and a reply
    `Outcome` or `NotLeader` (client.rs:39-59). The batch frame of §4 and a studio
    decoder that yields several messages per frame (`studio`, message.rs:659) are new.
 2. *A node that runs many groups.* `run` is one group: one socket, one core, one ticker
-   (node.rs:304-346, 700-713). §4's node steps many cores on one ticker, gathers a
-   round's persists into one synced batch before any of the round's sends — `execute`
-   awaits one persist per step today (node.rs:2045-2090), the order RAFT.md §3 and D-026
-   fix — keeps a core that persisted from stepping again in the round, flushes a
-   per-peer outbox at the end of each round, and leaves snapshot chunks in frames of
-   their own (Q41).
+   (node.rs:315-357, 718-728). §4's node steps many cores on one ticker and keeps each
+   core's order of outputs as `execute` keeps one core's today, awaiting each persist
+   before the outputs that follow it (node.rs:2073-2180, the outputs handled in order at
+   2098-2178; RAFT.md §3, D-026): it flushes before the round's sync the sends RAFT.md
+   §3 lets leave early, submits the round's persists together for one group-commit sync,
+   executes every output that follows a persisting core's `Persist` — sends, `Apply`,
+   `ReadReady` and `ReadDropped`, snapshot actions and trace events — only when that
+   core's own persist resolves, holds that core's messages and ticks until then, and
+   leaves snapshot chunks in frames of their own (Q41).
 3. *Commands for ranges.* `Command` is `Put`, `Delete`, `Cas`, `Get`, `Transfer`,
    `Change` (apply.rs:35-77); §5 to §7 add `Split`, `MergeBegin`, `Subsume`, `Merge`,
-   `MergeAbort`, `Unfreeze`, `MetaUpdate`, `AddNode`, `RemoveNode`, and the lookups
+   `MergeAbort`, `Unfreeze`, `MetaUpdate`, `AddNode`, `RemoveNode`, a refill of a node's
+   block of range ids carrying the node and its run nonce, whose apply traces
+   `RangeIdsLeased` (§5, Q17), and the lookups
    `Descriptor`, `Applied` and `Summary`, which are reads.
 4. *Descriptors in apply.* `apply_command` writes the command and the applied index in
    one batch and checks no key against anything (apply.rs:244-274). §3's apply check,
    the `effect` it traces, and §5's and §6's batches go there.
 5. *`RangeMismatch`* beside `NotLeader` (client.rs:50-59), and §3's checks at receipt
-   and at a read's serving (node.rs:827-841, 2092-2115).
+   and at a read's serving (node.rs:838-887, 2131-2150).
 6. *A group started from a floor with no checkpoint.* `Raft::restore_compacted` takes a
    snapshot index, term and configuration (core.rs:867-942); a stream to a follower that
    finds no complete checkpoint at the recorded index asks for a take
-   (node.rs:1722-1735). Both exist; a split-born range relies on them together.
+   (node.rs:1759-1766). Both exist; a split-born range relies on them together.
 7. *Placeholders and collection.* A server not in any configuration sits quiet only if
    its process runs (node.rs:130-135); nothing creates a replica for a range a node does
    not host on first contact, and nothing removes one (D-029: removed servers "are never
    told to shut down", DECISIONS.md:1157-1159).
 8. *A completion signal for changes, and a guard on accepting them.* `Change` is answered
    `Done` on accept and completion is visible only as configuration entries
-   (node.rs:818-826, 868-886; D-029). The rebalancer reads descriptors instead (§7),
+   (node.rs:848-856, 902-915; D-029). The rebalancer reads descriptors instead (§7),
    which item 4 provides. A leader accepts a change today whenever its core has none in
    flight (DECISIONS.md:1099-1104); §6 adds that it accepts none from the moment it
    proposes `MergeBegin`, none before it has applied its own term's first entry, and
@@ -1600,20 +1874,23 @@ with, and memory and tasks grow with replicas (§4).
 9. *The learner round in the trace.* `note_learner_round` marks a learner caught up
    (core.rs:2002-2026) and traces nothing; check 13 needs `RaftLearnerRound`.
 10. *A seed per range.* A core's generator is seeded from the node's protocol stream at
-    its incarnation's start (node.rs:551, core.rs:932); §4 and Q13.
+    its incarnation's start (node.rs:566, core.rs:932); §4 and Q13.
 11. *An inbox for many ranges.* One inbox bounded by message count, dropping the oldest
-    heartbeat of any sender first (node.rs:1918-1962), 128 in the sweep
+    heartbeat of any sender first (node.rs:1952-1999), 128 in the sweep
     (sim/raft.rs:2859), against §4's 200 and 2 000 arrivals a tick (Q14). Its admission
     scans the queue on every arriving message: `count` is a linear filter and
-    `remove_first` a linear search, called up to twice (node.rs:1933-1950;
-    `queue.rs:103-110`), so a tick costs arrivals × capacity. Before its capacity grows
-    with ranges it needs admission in constant or logarithmic time, with a kept count of
-    messages and an index of heartbeats by sender and range.
+    `remove_first` a linear search, called up to twice (node.rs:1968-1990;
+    `queue.rs:103-110`), so a tick costs arrivals × capacity. The node's inbox is one per
+    node, bounded in bytes, with admission in constant or logarithmic time (Q14), which
+    needs a kept size and an index of heartbeats by sender and range.
 12. *The checker keyed by range.* `invariants::Checker` keys every map by server, term
     or index (invariants.rs:253-282) and takes `1..=servers` as the first configuration
-    (invariants.rs:289-295); §8's checks 1 to 4 need range keys and `RangeCreated`, and
-    checks 7 to 22 are new, each under the incremental checker's equivalence test with a
-    variant that trips it (sim/tests/raft.rs:2105-2189).
+    (invariants.rs:289-295); §8's checks 1 to 4 need a group key and `RangeCreated`, and
+    checks 7 to 22 and the re-add window assertion are new, each under the incremental
+    checker's equivalence test with a variant that trips it (sim/tests/raft.rs:2105-2189).
+    The assertion needs `RaftMatchStarted` from the core and `incarnation` on
+    `RangeRemoved` and `RangeCreated` (§8); today the core traces a changed incarnation
+    only when it resets progress, and a first record not at all (core.rs:1747-1768).
 13. *Follower compaction.* Only a leader compacts (core.rs:1830-1833), and a follower's
     log shrinks only by truncation or an install (core.rs:1693; store.rs:686-690), so
     with two thirds of a node's replicas followers, their logs grow without bound under
@@ -1623,7 +1900,7 @@ with, and memory and tasks grow with replicas (§4).
     directory (`install`, snapshot.rs:92-94), a version directory is named by index and
     take alone (`snap-<index>-<take>`, snapshot.rs:112-114), and one `Assembler` per
     snapshot task holds one stream, abandoning it for a chunk of another identity
-    (snapshot.rs:859-864, 906-915; node.rs:1398, 1803). `sweep_versions` deletes every
+    (snapshot.rs:859-864, 906-915; node.rs:1430, 1835). `sweep_versions` deletes every
     unpinned version directory the store's single snapshot record does not name
     (snapshot.rs:193-228). With one engine per node, two ranges' takes at one index
     collide, one range's sweep deletes other ranges' checkpoints, and §4's re-seeds
@@ -1633,7 +1910,7 @@ with, and memory and tasks grow with replicas (§4).
 15. *A read served at one version.* The core traces `RaftRead` when it confirms a read
     (core.rs:1175, 1202), holding neither the key, which stays in the server's `reads`,
     nor the applied index the read is served at; the server then serves from the
-    engine's latest state (node.rs:2092-2110). §3's read check and check 9 need the
+    engine's latest state (node.rs:2131-2150). §3's read check and check 9 need the
     value, the descriptor and the applied index read at one engine version
     (`Engine::snapshot`, `get_at`, engine.rs:1015, 1040), and the serving event traced
     by the server with that version's applied index.
@@ -1657,10 +1934,11 @@ with, and memory and tasks grow with replicas (§4).
    export line in `convert` (trace.rs:368-652; moirae.rs:277-988). Every pinned trace
    hash moves once, deliberately, with the reason in the commit (CLAUDE.md, "Every state
    transition that matters emits a trace event").
-2. *A stream per node and range*, `n{id}/r{range}/protocol`, if Q13 chooses it (D-017).
+2. *A stream per node and range*, `n{id}/r{range}/protocol` (Q13, D-017), decided before
+   the stage that first pins Phase 3 seeds.
    A node's streams are derived by `node_stream` as `n{id}/{label}`
-   (crates/ananke-env/src/sim/state.rs:159-165) and made when the node is added
-   (crates/ananke-env/src/sim/mod.rs:282-283). Protocol code reaches randomness only
+   (crates/ananke-env/src/sim/state.rs:166-172) and made once, when the node is added
+   (crates/ananke-env/src/sim/mod.rs:303-305). Protocol code reaches randomness only
    through `Environment::rng` and `sched_rng` (crates/ananke-env/src/env.rs:28-35), so a
    labelled stream per range needs a new method on the trait, implemented by `SimEnv` as
    a derived stream and by `RealEnv` from OS entropy, not a change to the simulator
@@ -1669,17 +1947,26 @@ with, and memory and tasks grow with replicas (§4).
    (DECISIONS.md:261-263); `RealEnv` has it (crates/ananke-env/src/real/net.rs:30, 133,
    208), `SimEnv` delivers into an unbounded per-socket queue
    (crates/ananke-env/src/sim/net.rs:271-275). With many ranges sharing one socket the
-   sweep would not see the drops `RealEnv` takes (Q16).
+   sweep would not see the drops `RealEnv` takes. `SimEnv` gains a bounded, drop-oldest
+   queue per (sending socket, destination) as a simulator model: a drop is traced as
+   `MessageDropped` with the queue-full reason that already exists
+   (`DropReason::QueueFull`, crates/ananke-env/src/trace.rs:881-883); the capacity is a
+   `SimConfig` setting defaulting to `RealEnv`'s 1 024 (`SEND_QUEUE_LEN`,
+   crates/ananke-env/src/real/net.rs:30); and the queue fills against a modelled
+   per-link drain rate. It lands before batching puts many ranges on one socket, and
+   moves every pinned hash once, in one commit, with the pinned seeds re-audited (Q16).
 4. *A trace a large run can hold.* Every frame is recorded with its payload
    (crates/ananke-env/src/sim/net.rs:150-158) and every poll as a record; the export
    writes one line per poll unless built `without_polls` (moirae.rs:97-106). §4's 270 MB
    of payload per run at 1 000 ranges needs a record that carries, per contained
    message, what the checks read — range, kind, term, and for an AppendEntries or a chunk
    whether it resets a timer — in place of the frame's bytes, and a cap other than
-   400 000 (sim/raft.rs:136) (Q39). Dropping payloads outright is not open: the timer
-   replay and other sweep checks decode `MessageSent` payloads with `Frame::decode`
-   (sim/raft.rs:1264-1299, 1846-1853, 2237-2246, 2470-2482, 3623-3655), and each would
-   have to change.
+   400 000 (sim/raft.rs:136). `sim/balance.rs` records without payloads or polls and
+   raises its record cap, and runs the balance check, checks 7 to 22 and linearizability,
+   which fold events, but not the timer check (Q39). Dropping payloads outright elsewhere
+   is not open: the timer replay and other sweep checks decode `MessageSent` payloads
+   with `Frame::decode` (sim/raft.rs:1264-1299, 1846-1853, 2237-2246, 2470-2482,
+   3623-3655), and each would have to change.
 5. *A run-length hint that counts work*, not nodes
    (crates/ananke-env/src/sim/mod.rs:155-164; D-016).
 6. *Nodes added to and removed from a running simulation.* `Sim::add_node` exists
@@ -1697,12 +1984,30 @@ with, and memory and tasks grow with replicas (§4).
 9. *The history's closure keyed by range and by effect.* `sim/lin.rs` closes a pending
    operation by the first `RaftApply` of its `(index, entry_term)` on any server, and
    takes every applied entry as having taken effect (sim/lin.rs:8-11, 93-109). §9 needs
-   the closure keyed by `(range, index, term)` and closing only on effect `applied`.
+   the closure keyed by `(range, index, term)` and closing only on effect `applied`, and
+   an operation's proposals gathered across the fresh sequence numbers of its resends by
+   `ClientSend`'s `invoked` (Q10).
 10. *The new scenarios' arms.* `Fault::CrashSplitting`, `Fault::MetaReorder` and
     `Fault::CrashCollecting` (§10) are new, each on its own stream (D-031), with
     `sim/shard.rs`, `sim/split.rs`, `sim/merge.rs`, `sim/move.rs` and `sim/balance.rs`.
 
-## 12. Order of work, if approved
+## 12. Order of work
+
+_Superseded by the stage plan proposed separately, which is not approved._
+
+The list below is the order this document proposed, word for word, and is not an
+approved plan. It predates the four ordering rules the approval sets, which any plan
+that replaces it must keep; the list keeps the first and not the other three:
+
+- the crash test of the live install is written and green before any split code (Q2;
+  §11, storage 5), which the list's step 2 puts before its step 5;
+- `SimEnv`'s bounded queue per destination lands before batching puts many ranges on
+  one socket (Q16; §11, env 3), which the list's step 3 does without it;
+- `sim/membership.rs` is extended past the snapshot threshold, issue #46, before
+  `sim/move.rs` is built (Q34; §7), which the list's step 6 builds with no such step
+  before it;
+- the stream per node and range is decided before the stage that first pins Phase 3
+  seeds (Q13; §11, env 2), which no step of the list names.
 
 1. The trace events and the checker keyed by range, with today's single group as one
    range: no behaviour change; the pinned hashes move once.
@@ -1726,388 +2031,392 @@ with, and memory and tasks grow with replicas (§4).
 
 Each step stops for review.
 
-## 13. Questions for approval
+## 13. Decisions
 
-Every design choice above that SPEC, RAFT.md and DECISIONS.md do not settle. Each names
-its options, the one the draft assumes where the text needs one, and why it is open.
-None is decided by this document; an approved answer becomes a DECISIONS.md entry, and
-an answer that changes SPEC §4 or RAFT.md supersedes the text it changes with a forward
-pointer, as D-048 did (DECISIONS.md:3206).
+The owner's answers to the questions this document proposed, approved on 2026-09-15, in
+the proposal's numbering. Each is marked *load-bearing*, the owner's decision with any
+amendment the owner made; *tunable*, approved as a block; or *answered by precedent*,
+settled by a rule or entry that already exists. Each answer is stated as approved, with
+its reason. None is a DECISIONS.md entry yet: each becomes one, or part of one, as the
+stage that implements it lands, and an answer that changes SPEC §4 or RAFT.md supersedes
+the text it changes with a forward pointer, as D-048 did (DECISIONS.md:3206). Issues #43
+to #47 record what an answer does not accept silently or leaves for later.
 
-**Q1. Phase 2's tag, and RAFT.md's drift, before Phase 3's code.** (a) Tag and publish
-Phase 2 per D-011, and correct RAFT.md where it describes what the code does not have
-(`Scan`, `VoteBeforePersist`, `ApplyNotAtomicWithIndex`, the frame's field order,
-`src/read.rs`), before any Phase 3 code; (b) start Phase 3's first stage beside the tag.
-Draft: (a) for code; this document is design only. Open because D-011 defines when a
-phase is done but no entry says whether the next may start before it, and the drift has
-no entry.
+**Q1. Phase 2's tag, and RAFT.md's drift.** _Tunable._ The tag is done (v0.3.0 on
+0d30df5). The first Phase 3 commit corrects RAFT.md where it describes what the code
+lacks (`Scan`, `VoteBeforePersist`, `ApplyNotAtomicWithIndex`, the frame's field order
+`kind | from | term`, `src/read.rs`), with forward pointers as D-048 did, and SHARD.md's
+stale "not tagged / unpublished" lines. Reason: Phase 2 was tagged and `ananke-raft`
+published at 0.3.0 on 2026-09-14 (BOOTSTRAP_PROMPT.md:209-212), so only the drift, which
+has no entry, remains before code relies on RAFT.md. SHARD.md's stale lines were
+corrected with the approval (the preamble).
 
-**Q2. One engine per node, or one per replica.** (a) One per node: split and merge are
-one batch and move no data, one WAL and one memtable budget per node; it needs the span
-checkpoint, live install and range delete of §11, a lost table refuses every replica on
-the node (Q15), and one range's take stalls every range's flushes (and, with one `apply`
-task, its applies, Q14). (b) One per replica, today's shape: a loss refuses one range;
-split and merge copy data with no atomic primitive, and tasks, memory and fsync streams
-grow with replicas (§4). (c) A few
-engines per node, ranges assigned to them. Draft: (a). Open because SPEC §3 puts one
-group's log in the engine (SPEC.md:244-245) and nothing covers many groups; checkpoint
-(D-024), refusal (D-044), quarantine (D-035) and incarnation (D-042) are each defined
-per store directory.
+**Q2. One engine per node.** _Load-bearing._ One engine per node. **Phase 3 entry
+criterion:** the crash test that swaps a range's data into a running engine (the live
+install: a span's keys removed and its tables added in one manifest switch, sequence
+numbers above the live engine's) is written and green before any split code. Wrong if
+that cannot be made crash-safe. Reason: split and merge are then one batch and move no
+data, with one WAL and one memtable budget per node; one engine per replica would copy
+data at every split and merge with no atomic primitive, and grow tasks, memory and fsync
+streams with replicas (§4). The price is §11's storage items 3 to 6 and a loss that
+refuses the whole node (Q15).
 
-**Q3. Which copy of a descriptor is the authority, and how meta is kept.** (a) The
-range-local copy, with meta an index merged by generation and repaired by each leader on
-taking office, with or without a periodic repair; (b) a commit protocol for Phase 3
-alone that updates a range and the meta range together; (c) meta as the authority, every
-server reading it, or holding a lease on its record, before serving. Draft: (a), repair
-on taking office only, with the node that sent an update resending it until
-acknowledged whether or not it still leads. Open because SPEC §4 says descriptors are
-"stored in a meta range" and nothing about atomicity, and cross-shard atomic commit is
-Phase 4 (D-006).
+**Q3. The authority for a descriptor.** _Load-bearing._ The range's own descriptor copy
+is the authority; the meta range is an index, merged by generation, resent until
+acknowledged, repaired by each leader on taking office; a periodic repair is a later
+parameter. Reason: the two copies cannot be atomic without a transaction spanning two
+groups, and cross-shard atomic commit is Phase 4 (D-006); a meta that lags costs a
+client a round trip, never a wrong answer (§3).
 
-**Q4. Addressing levels.** (a) Range 0 the root, holding the meta range's descriptor,
-and range 1 the meta range, neither splitting; (b) range 0 is the meta range; (c) two
-levels with a meta range that splits, as CockroachDB's meta1 and meta2. Also the meta
-record's layout: keyed by a range's end key, so a lookup is the first record above `k`,
-or by its start key, so a lookup is the last record at or below `k`; and the write rule,
-that a record a newer descriptor partly overwrites is cut at that descriptor's
-boundaries in the same batch, or left whole and resolved at lookup. Draft: (a), end
-key, cut in the batch. Open because SPEC's "range 0 is found via config, then meta range
-via range 0" (SPEC.md:287-288) implies two groups and says nothing of what else range 0
-holds or whether meta splits; ten thousand ranges fit one meta range (§1), so (a) and (b)
-both serve Phase 3.
+**Q4. Addressing levels.** _Tunable._ Range 0 the root and range 1 the meta range,
+neither splitting in Phase 3; meta records keyed by end key; a partly overwritten record
+cut in the same batch. Reason: SPEC's "range 0 is found via config, then meta range via
+range 0" implies two groups (SPEC.md:287-288), and one meta range holds every record
+Phase 3 makes (§1).
 
-**Q5. The keyspace's layout.** Which tenant holds the root and meta records (SPEC §6
-puts Phase 5's catalog "in a system tenant", SPEC.md:340; user data is tenant 1 today,
-apply.rs:23-24); how per-range Raft keys sit under tenant 0 — the range id after the
-table, `0 / t / <range: u64 BE> / name`, or a table per range; whether a range may span
-tenants. Draft: one reserved system tenant below every user tenant for root and meta,
-the range id after the table, ranges may span tenants. Open because SPEC §2.6 fixes
-`tenant | table | user_key` and RAFT.md §3's tenant-0 table is for one store. Changing
-tenant 0's keys is a format change; D-027 and D-043 each changed a format on the ground
-that no store was released (DECISIONS.md:947-950, 2317-2320), which holds while Phase 2
-is unpublished.
+**Q5. The key layout.** _Load-bearing._ The new key layout, breaking 0.3.0's on-disk
+format:
 
-**Q6. What raises a generation.** (a) Split, merge and every committed configuration
-change; (b) split and merge only, with voters versioned apart. Draft: (a), which orders
-replica sets by the same number clients and meta merge by and lets check 14 prove a
-removal committed. Open because SPEC §4 names no generation.
+- system tenant 1 holds root and meta (and later Phase 5's catalog); user tenants from
+  2, today's user data (tenant 1) moves to tenant 2;
+- per-range Raft state under tenant 0 as a table per range:
+  `0 / <range: u64 BE> / <purpose> / name`, so a replica's whole Raft state is one key
+  interval;
+- ranges may span tenants for now.
 
-**Q7. Bootstrapping a fresh cluster.** (a) Every bootstrap node writes the same initial
-state from its configuration, as `initial_voters` does today; (b) one node initialises
-on an operator's command and the others join by snapshot. And how many bootstrap nodes
-there are: exactly the replication factor, since every initial range takes the
-bootstrap nodes as voters and §7's one-for-one moves never change a voter count; or any
-number, with each initial range's voters a replication-factor-sized subset chosen by a
-stated rule. Draft: (a), and as many bootstrap nodes as the replication factor. Open
-because SPEC says only "found via config"; (a) relies on every bootstrap node being
-configured alike, which nothing checks.
+Conditions: (1) the on-disk format version is bumped; (2) a store in the old format is
+refused at open with a clear error naming the format versions, never misread; (3) the
+break is recorded in the implementing DECISIONS entry and in the release notes of the
+release that ships it. Reason: a 0.x release with no users; correctness of the layout
+outlives it. This replaces the proposal's ground, D-027's and D-043's that no store had
+been released (DECISIONS.md:947-950, 2317-2320), which 0.3.0 ended. §1 and §11,
+storage 1, carry the layout.
 
-**Q8. Nodes: membership, removal, failure.** Membership by (a) operator records in range
-0, (b) static configuration, or (c) liveness records nodes write to range 0. Removal by
-draining the node with moves. A node down for good (i) goes undetected until an operator
-removes it, or (ii) is detected by liveness and its replicas replaced. Draft: (a),
-drain, (i). Open because SPEC's exit criterion says "after node add/remove"
-(SPEC.md:303) and not how, and node identity beyond an address (D-015) is undefined.
+**Q6. What raises a generation.** _Load-bearing._ A generation is raised by splits,
+merges and every committed membership change. Reason: replica sets are then ordered by
+the same number clients and meta merge by, and check 14 can prove a removal committed
+(§7, §8).
 
-**Q9. Placement of ranges 0 and 1.** (a) Fixed on the bootstrap nodes, never moved, and
-a bootstrap node never removed; (b) movable, with range 0 found some other way than
-configuration. Draft: (a). Open because configuration is static and SPEC finds range 0
-through it, while the exit criterion's node removal may want a bootstrap node gone.
+**Q7. Bootstrapping a fresh cluster.** _Tunable._ Every bootstrap node whose store is
+fresh writes the identical initial state from configuration in one synced batch before
+its tasks run; exactly three bootstrap nodes (the replication factor); a digest of the
+bootstrap configuration recorded in range 0's initial state. **Not silently accepted:**
+a bootstrap node whose disk was replaced looks fresh and can vote twice — issue #43.
+Reason: SPEC finds range 0 through configuration and says no more; §7's one-for-one
+moves never change a voter count, so the bootstrap nodes fix every range's replication
+factor, and the digest puts the configuration every bootstrap node must share, which
+the proposal left unchecked, into range 0's state (§2).
 
-**Q10. Requests, `RangeMismatch`, retries.** A request carries (range, generation), or
-the key alone and the server chooses; `RangeMismatch` carries every descriptor the node
-holds for the key, or nothing; the checks run at receipt, serving and apply, or at fewer
-places (a receipt check alone lets a split miss proposals in flight, §3); a write
-answered `RangeMismatch` is sent again as the same operation, or abandoned; a range id
-is 8 bytes on the wire. For a resend as the same operation: the leader forgets its
-record of a `(client, seq)` once its entry applies with an effect other than `applied`,
-or the resend takes a fresh `seq` that the history pairs with the first; without one of
-them, a resend that reaches a leader still holding the earlier entry is never proposed
-nor answered (node.rs:843-849, §3). Draft: the first of each, and the leader forgets.
-Open because SPEC §4 names the error and "they refresh" and no more, and D-026 covers a
-write with no answer, not a write with a definite one.
+**Q8. Nodes: membership, removal, failure.** _Tunable._ Operator `AddNode`/`RemoveNode`
+records in range 0 carrying node id and address; a node removed by draining (moving its
+replicas off) before it stops; no automatic failure detection in Phase 3. Reason: SPEC's
+exit criterion says "after node add/remove" (SPEC.md:308) and not how; liveness records
+would bring failure detection into Phase 3 (§7).
 
-**Q11. Client sessions in Phase 3.** (a) Not in Phase 3: a write with no answer is
-abandoned, as today; (b) issue #21 brought into Phase 3, so a retry after a split, merge
-or move is safe. Draft: (a). Open because BOOTSTRAP_PROMPT.md:124 schedules issue #21
-"Before Phase 4", while splits and moves make unanswered writes more common, and the
-rule against widening a phase (CLAUDE.md) weighs against (b).
+**Q9. Placement of ranges 0 and 1.** _Tunable._ Ranges 0 and 1 fixed on the bootstrap
+nodes; a bootstrap node is never removed; the exit criterion's add and remove use
+non-bootstrap nodes. Reason: configuration is static and SPEC finds range 0 through it,
+so moving range 0 or 1, or removing a bootstrap node, would need another way to find
+range 0 (§2).
 
-**Q12. Heartbeats.** Batching, coalescing, quiescence, or a combination (§4). At 10 000
-ranges on ten nodes, idle: batching carries 135 MB/s over the cluster and steps each
-node's cores 500 000 times a second; coalescing, with the entry layout §4 assumes, about
-65 MB/s and the same steps; quiescence, nothing for the ranges it quiesces, a wake on
-their next proposal, and a liveness signal the tree does not have. Draft: batching only,
-which holds at 1 000 ranges and not at 10 000 (§4). Open because SPEC
-asks that ten thousand ranges not mean ten thousand heartbeat streams and not how, and
-coalescing and quiescence both touch the lease's per-request promise (RAFT.md §1, D-028)
-and check quorum's per-follower counting (D-049), whose arguments are made for one
-group.
+**Q10. Requests, `RangeMismatch`, retries.** _Load-bearing._ Every request carries
+(range, generation); the span is checked at arrival (advisory), at a read's serving and
+at apply (both safety); range ids are a fixed 8 bytes; `RangeMismatch` carries the
+node's descriptors for the key; a write answered `RangeMismatch` is resent under a fresh
+sequence number that the history pairs with the original, and the leader keeps (does
+not forget) its record of the original. The hole the review found — a refused write
+forgotten by the leader, resent, applied in R, then R merged back so a delayed copy of
+the original applies again — is the same class as seed 42's duplicate-proposal bug
+(D-026, DECISIONS.md:872-876), and the implementing entry says so. Reason: a receipt
+check alone lets a split miss proposals in flight, and the apply check makes
+`RangeMismatch` definite; a fresh `seq` with the original's record kept answers the
+resend without letting a copy of the original apply twice (§3, §9).
 
-**Q13. A seed per range.** (a) A named stream per node and range,
-`n{id}/r{range}/protocol`; (b) core seeds drawn from the node's protocol stream, as now.
-Draft: (a). Open because D-017 names streams per node; (b) lets a split move every later
-range's election timeouts, against D-017's purpose (DECISIONS.md:336-341), and (a) is an
-environment change: a new `Environment` method for a labelled stream, in `SimEnv` and
-`RealEnv` both (§11, env 2).
+**Q11. Client sessions in Phase 3.** _Answered by precedent._ No client sessions in
+Phase 3 (CLAUDE.md: never widen scope inside a phase; D-026). A write with no answer is
+abandoned as pending; issue #21 stays before Phase 4. The per-range layout leaves room
+for a later session table, so #21 adds keys and moves none; split and merge batches will
+need to carry it when #21 lands.
 
-**Q14. Tasks, inbox and streams on a node with many ranges.** One `apply` task per node
-or per range; an inbox per node sized by the ranges it hosts, bounded in bytes, or one
-per range; a cap on the snapshot streams one node sends or receives at once, against
-D-043's stream to every designated follower at once, and on the streams one node
-assembles at once, one per (range, sender). One `apply` task per node means one range's
-snapshot take stalls every range's applies on the node, since applies wait behind a take
-(D-036, RAFT.md:177-181). An inbox whose capacity grows with ranges also needs admission
-that does not scan the queue (§11, raft item 11). Draft: one `apply` task per node; the
-inbox and the caps are left to this question. Open because RAFT.md §3's four tasks,
-D-026's inbox and D-043's streams were built for one group.
+**Q12. Heartbeats.** _Load-bearing._ Batching per peer only, proven at 1 000 ranges.
+**10 000 ranges is an explicit non-goal of Phase 3**, not a paper claim: SPEC §4 is
+amended to say so, with the reason — at 10 000 ranges on ten idle nodes batching alone
+carries about 135 MB/s over the cluster and steps each node's cores about 500 000 times
+a second, figures derived from today's constants in §4, not measured. Coalescing and
+quiescence get their own decision in a later phase; no lease or check-quorum redesign
+inside Phase 3. Reason: both coalescing and quiescence touch the lease's per-request
+promise (RAFT.md §1, D-028) and check quorum's per-follower counting (D-049), whose
+arguments are made for one group.
 
-**Q15. A loss in a shared engine.** (a) A lost table or log record refuses the whole
-node, each replica re-seeded by its own leader; (b) only the ranges whose spans the lost
-table's key bounds, or the lost log records, touch are refused. Under (a): what the node
-re-seeds into, since its engine is quiesced (D-044) — a fresh engine adopted once every
-range's install has staged, or a fresh engine opened at once with ranges installed live
-as they arrive, against D-041's rule that a directory that held a store never opens
-fresh — and a durable mark per replica of which ranges are still refused (§11, storage
-8). And the lasting cost: every re-seeded replica is quarantined (D-035), 300 on a node
-at 1 000 ranges and 3 000 at 10 000, so once two nodes have each lost a table, about 67
-or 667 ranges can keep a leader they have and cannot elect one until Q33's moves take the
-quarantined replicas off (§4). Draft: (a), the second way back to one engine. Open
-because D-022 refuses any hole in the middle of the state and D-044 makes the refusal
-durable per directory, and neither considered a store holding several state machines.
+**Q13. A seed per range.** _Tunable._ A named stream per node and range,
+`n{id}/r{range}/protocol`, through a new `Environment` method (derived stream in
+`SimEnv`, OS entropy in `RealEnv`), decided before the stage that first pins Phase 3
+seeds. Reason: core seeds drawn from the node's protocol stream would let a split move
+every later range's election timeouts, against D-017's purpose (DECISIONS.md:336-341).
 
-**Q16. A bounded queue per destination in `SimEnv`.** Add it before one socket carries
-many ranges, or leave `SimEnv` unbounded. Draft: add it. Open because D-015 states the
-bound and only `RealEnv` implements it (§11), and adding it moves every simulation's
-drops.
+**Q14. Tasks, inbox and streams on a node.** _Load-bearing._ One apply task per node,
+applying every range's entries, snapshot takes and structural batches one at a time. If
+too slow: several ranges' ready applies grouped into one synced batch inside that task,
+never more tasks. Tunable: one inbox per node bounded in bytes with constant- or
+log-time admission; per-node caps on streams received and assembled (one assembly per
+(range, sender)); no per-node cap on streams sent that would stop a leader feeding all
+of a range's designated followers at once. Reason: one range's take then stalls every
+range's applies on the node, since applies wait behind a take (D-036,
+RAFT.md:177-181), a cost this answer accepts; an inbox whose
+capacity grows with ranges needs admission that does not scan the queue (§11, raft
+item 11), and D-043 streams to every designated follower at once.
 
-**Q17. Allocating range ids.** (a) A counter in range 0, taken by compare-and-set before
-a split; (b) an id derived from the parent's id and the split index. Draft: (a). Open
-because SPEC is silent; (a) costs a write to range 0 per split, and (b) needs no write
-but builds each id from its parent's, so ids are not one fixed-width counter.
+**Q15. A loss in a shared engine.** _Load-bearing._ Refuse the whole node on a loss in
+its shared engine. Re-seed into a fresh engine in a new directory beside the refused one
+(which stays marked lost and quiesced), opened at once, each range installed live as its
+stream completes, with a durable per-replica refused mark written into the new engine
+before it serves. Issue #45 records the "wrong if": revisit whole-node refusal if losses
+in a shared engine turn out to be mostly attributable table drops. Reason: lost log
+records cannot be attributed to ranges, so refusal per range is not safe in general
+(D-022, D-044); the cost is that every re-seeded replica is quarantined (D-035), which
+Q33's moves and issue #44 take up (§4, §11 storage 8).
 
-**Q18. What splits, where.** An operator's command; a size threshold (§11 storage 7); a
-load threshold; the sweep's driver. For the balance scenario: ranges pre-split at
-bootstrap, or made by splits under load. Draft: operator and driver only, and the
-balance scenario's ranges made by driver splits. Open because SPEC says a leader
-"proposes split at key `k`" and not why or which `k`.
+**Q16. A bounded queue per destination in `SimEnv`.** _Tunable._ Add a bounded,
+drop-oldest queue per (sending socket, destination) to `SimEnv` as a simulator model,
+traced `MessageDropped` with a queue-full reason, capacity a `SimConfig` setting
+defaulting to `RealEnv`'s 1 024, filled against a modelled per-link drain rate; landed
+before batching puts many ranges on one socket; every pinned hash moved once in one
+commit and pinned seeds re-audited. Reason: D-015 states a bound per destination and
+only `RealEnv` implements it, so with many ranges on one socket the sweep would not see
+the drops a real node takes (§11, env 3).
 
-**Q19. Which half keeps the parent's id.** The left, as CockroachDB's does, or the
-right. Draft: the left. Open because SPEC is silent, and it decides whose meta record
-and whose client caches stay right.
+**Q17. Allocating range ids.** _Load-bearing._ Range ids from a never-reused u64 counter
+in range 0, **allocated in blocks leased to each node**: a split takes the next id from
+its node's block with no write to range 0; range 0's availability gates refilling a
+block, not performing a split. An id taken and never used is a harmless gap. (The block
+size and the refill threshold are tunable.) Reason: the proposal's compare-and-set in
+range 0 before every split would make every split wait on range 0; leased blocks keep
+ids one fixed-width counter without that wait (§5).
 
-**Q20. The right half's starting term and floor.** (a) Current term and floor term both
-the split entry's term, which would supersede SPEC's "term 1"; (b) term 1 and a floor of
-`(s, 0)`, keeping SPEC's words and asking the core to accept a floor of term 0 above
-index 0, which no code path has been read for; (c) fixed constants. Draft: (a). Open
-because SPEC.md:291-293's "term 1 with the parent's applied index recorded as its
-snapshot" conflicts with a snapshot's record of an index and that entry's term (RAFT.md
-§1) unless the split entry's term is 1, and changing SPEC §4 needs an entry.
+**Q18. What splits, where.** _Tunable._ Splits by operator command and the sweep's
+driver only; the balance scenario makes its ranges by driver splits; size-triggered
+splits wait for the span size estimate. Reason: SPEC says a leader "proposes split at
+key `k`" and not why or which `k`, and the engine has no size of a span (§11,
+storage 7).
 
-**Q21. The right half's first election.** Timers only; the replica on the node whose
-parent replica leads starts its pre-vote at once and then waits for its timer; or it
-starts at once and repeats every heartbeat interval until R has a leader or its timer
-fires. The first pre-vote usually meets placeholders, which grant nothing (Q22), since
-the other replicas learn that `s` committed up to a heartbeat interval after the
-leader applies it. Draft: at once and repeated. Open because SPEC is silent; it trades up
-to an election timeout of unavailability after every split for leaders gathered on the
-parent leader's node, which the rebalancer then spreads.
+**Q19. Which half keeps the parent's id.** _Tunable._ The left half keeps P's id and
+Raft group; the right half takes the new id. Reason: as CockroachDB's does; it decides
+whose meta record and whose client caches stay right.
 
-**Q22. Uninitialised replicas.** (a) No vote, no pre-vote, no acknowledgement; (b) voting
-from a hard state they persist, as CockroachDB's do, with the split's apply keeping the
-vote. And, under (a), how a placeholder asks for its snapshot, since a silent one is never
-designated (core.rs:1446-1455, 1930-1937, 2071): it answers an AppendEntries with a
-rejection hinting index 1, an echo of zero and incarnation 0, as a refused server does
-(RAFT.md:501-511), counted for nothing in a lease or read-index round and for check
-quorum only as D-049 counts a refused server's; or a new designation trigger in the
-core. The rejection can start streams the overlap rule then refuses while the node's
-parent replica still covers the span. Draft: (a), with the rejection. Open because D-033
-has a server with no configuration grant votes "by the usual rules" (RAFT.md:163-168);
-that was written for a server with a store, and a placeholder has none, so (a) departs
-from it for placeholders.
+**Q20. The right half's starting term and floor.** _Tunable._ The right half starts at
+current term 1, no vote, floor `(s, 1)` — keeping SPEC's "term 1" with no superseding
+entry (differs from the draft's (a), which took both from the split entry's term).
+Reason: a floor at `(s, t_s)` under current term 1 is a state no Raft server reaches,
+while `(s, 1)` under term 1 is one, and it keeps SPEC.md:296-298's words without the
+floor of term 0 above index 0 that no code path has been read for (§5).
 
-**Q23. Splits, merges and configuration changes together.** A split refused at proposal
-while a change is catching up and at apply while the configuration is joint; or allowed,
-the right half inheriting a joint configuration and losing the change's volatile
-catch-up. A replica of P that is not a voter of P's configuration at `s` creating no R
-and deleting the right span's keys (§5), or creating R as a learner of R's. A leader
-accepting no `Change` before it has applied its own term's first entry, nor from the
-moment it proposes `MergeBegin` (§6), or the node reading the range's state some other
-way. Draft: refused; no R and a range delete; the first-entry rule and the refusal from
-`MergeBegin`'s proposal. Open because "one change in flight" (DECISIONS.md:1099-1104) is
-per group and silent on splits and merges, and learners appear in no configuration entry
-(D-032), so no apply can see them.
+**Q21. The right half's first election.** _Tunable._ The replica of R on the node whose
+P replica led at the split's apply starts its pre-vote at once and repeats it every
+heartbeat interval until it hears from a leader of R or its own timer fires; the others
+wait for their timers. Reason: timers alone leave R's keys unavailable for 100 to 200 ms
+after every split, and the first pre-vote usually meets placeholders (Q22), since the
+other replicas learn that `s` committed up to a heartbeat interval after the leader
+applies it; a pre-vote changes no term, so a repeat disturbs nothing (§5).
 
-**Q24. The merge protocol.** The coordinator: L's leader, or the rebalancer. Waiting for
-every replica of R at `f`, or a majority with R's data carried in the merge entry. Abort
-and unfreeze, or no abort, R frozen until the merge completes. How an attempt is named:
-by `MergeBegin`'s index `h`, carried by every later entry, or by a generation R's
-unfreeze raises. When `Unfreeze` may be proposed: once the abort has taken effect on the
-proposer's node, or on reading L's durable abort record of `h`; not once the abort is
-merely committed or applied, which a `Merge` earlier in L's log defeats (§6). Who
-unfreezes a range subsumed for an attempt whose coordinator is gone: a new leader of L on
-taking office, R's leader after a bound, or both. Range commands whose answers are lost:
-resent until their effect is read, each applying as nothing when its attempt has ended,
-which departs from D-026's rule for writes and leaves one copy, a late `Subsume`, that
-freezes R for a bound; or not resent. A replica of L whose node lacks R at `f` when it
-applies `m`, reachable when a node is re-seeded between the wait and its apply: stalls
-without refusing, answering as a placeholder until a snapshot of L at or above `m`
-replaces it; or is refused as RAFT.md §3 refuses a store, which under Q2 (a) refuses
-and quarantines every replica on the node (SPEC §3, D-044, D-035) although nothing was
-lost. L's pre-merge snapshot: not streamed after the merge, or streamed and followed by a
-re-seed. Equal replica sets before a merge: made by the rebalancer, or by the
-coordinator. Draft: L's leader, every replica, abort and unfreeze, `h`, on effect or
-record, both, resent, stall, not streamed, the rebalancer. Open because SPEC says
-"two-phase with a subsume command" and nothing more.
+**Q22. Uninitialised replicas.** _Load-bearing._ Placeholders grant no vote or pre-vote
+and acknowledge nothing; they answer AppendEntries as a refused server does (hint 1, echo
+0, incarnation 0), counted for nothing in lease or read-index rounds and for check
+quorum only as D-049 counts a refused server. Its own DECISIONS entry, departing from
+D-033 for placeholders. Reason: D-033's "usual rules" (RAFT.md:163-168) were written for
+a server with a store, and a placeholder has none to hold a vote; a silent placeholder is
+never designated for a snapshot (core.rs:1446-1455, 1930-1937, 2071), and the refused
+server's answer designates it (§5).
 
-**Q25. What merges.** An operator's command and the sweep's driver; a size threshold;
-the rebalancer merging small neighbours. Draft: operator and driver only. Open because
-SPEC is silent and the balance criterion needs no merge.
+**Q23. Splits, merges and configuration changes together.** _Load-bearing._ The strict
+rules: a split refused at proposal while a change is catching up and at apply while the
+configuration at or below the split index is joint; a replica that is not a voter of P
+at `s` creates no R and range-deletes the right span; a leader accepts no `Change` before
+it has applied its own term's first entry, nor from its proposal of `MergeBegin`, nor for
+a range that is merging or subsumed. Reason: every descriptor stays a plain committed
+voter set, which can be loosened later but not easily tightened.
 
-**Q26. Replica identity and per-replica state.** (a) A replica is (range, node),
-`ServerId` stays the node's number (types.rs:11-13), a `RangeRemoved` ends its identity
-in the trace, and a replica must be collected before its range is added back to the
-node; (b) a replica id fresh per addition. Also: incarnation and quarantine per node
-store or per replica; whether a split's right half copies the parent replica's
-quarantine (draft copies); whether a merged range takes R's. Draft: (a), per replica,
-copies, does not take R's. Open because D-042 notes that a wiped server
-is "a new member for the membership path" only as outside Phase 2's model
-(DECISIONS.md:2064-2067), and in Phase 3 removing and re-adding a replica on one node is
-a normal move. The draft keeps both per replica because Q15's draft re-seeds each
-replica of a refused node from its own leader, so each draws its own incarnation, and a
-quarantine kept per node store would leave a node that lost one table voteless in every
-range for good, replicas later moved to it included (§4, §5).
+**Q24. The merge protocol.** _Load-bearing._ The draft's merge protocol: L's leader
+coordinates; waits for every replica of R at `f`; abort and unfreeze; attempts named by
+`MergeBegin`'s index `h`, re-checked at apply; `Unfreeze` proposed only on the abort's
+effect or on reading its durable record; both a new leader of L and R's leader after a
+bound may unfreeze; range commands resent; a replica lacking R at `f` stalls without
+refusing its node; L's pre-merge snapshot not streamed after the merge; the rebalancer
+makes replica sets equal before a merge. Reason: SPEC says "two-phase with a subsume
+command" and no more; each rule closes a case §6 works through, among them a `Merge`
+earlier in L's log than an abort, which an unfreeze on the abort's mere commit would
+defeat.
 
-**Q27. Collecting removed replicas, and the overlap rule.** Collection: the replica asks
-its range's leader after silence and collects itself on a newer descriptor that excludes
-it; the leader tells removed replicas; or each node sweeps its replicas against meta. If
-the replica asks: after how long a silence (the draft's ten maximum election timeouts is
-unmeasured), and whom, the leader meta names for the range or the last leader it heard
-from. Overlap: a snapshot overlapping an initialised replica is refused and asked for
-later, or installed after deleting the overlapped replica; if refused, how the refusal
-reaches the leader (a new `Overlaps` answer, or the start-over ask of RAFT.md:195-199)
-and what the leader does (stream again after a minimum election timeout, from a fresh
-take only if its checkpoint predates its range's last split or merge; or retake at once;
-or wait for the normal threshold); and whether a snapshot of a merged L at or above `m`
-may replace the node's replica of the R it merged (§6). Draft: the replica asks, ten
-maximum election timeouts, the leader meta names; refused, `Overlaps`, stream again
-after a timeout; the merged snapshot replaces R. Open because D-029 leaves removed
-servers "never told to shut down — an operator's business, left to the backlog"
-(DECISIONS.md:1157-1159), and the mechanism is an unfiled candidate
-(BOOTSTRAP_PROMPT.md:218).
+**Q25. What merges.** _Tunable._ Merges by operator command and the sweep's driver only.
+Reason: SPEC is silent and the balance criterion needs no merge.
 
-**Q28. "Caught up" for a move.** D-029's log round as built; or also an applied index at
-or past the round's end; or also a completed install. Draft: the round as built. Open
-because D-029's round was built for the membership scenario, whose learners are never
-fed snapshots (OVERNIGHT.md:188-191), and a moved replica usually is.
+**Q26. Replica identity and per-replica state.** _Load-bearing._ A replica is (range,
+node); `ServerId` stays the node; a replica must be collected before its range is added
+back to that node; incarnation (drawn fresh at every creation) and quarantine are per
+replica; **a split does not copy P's quarantine to R** (differs from the draft); a merge
+does not take R's. **The "wrong if" is a named sweep assertion**, not prose: on every
+sweep seed, no leader's `matched` for a re-added replica is ever set from an answer
+stamped with the collected replica's incarnation (D-042's one-message window on a
+re-add), asserted and pinned when a seed reaches the shape (§8, the re-add window). The
+entry states the vote argument for re-added replicas. Reason: in Phase 3 removing and
+re-adding a replica on one node is a normal move, and Q15 re-seeds each replica of a
+refused node from its own leader, so incarnation and quarantine must be per replica; R
+is a new group, none of whose votes a re-seed of P before the split can have lost (§5).
 
-**Q29. Where the rebalancer runs.** Range 0's leader; the meta range's leader; the
-holder of a separate lease record in range 0. Draft: range 0's leader. Open because
-SPEC's "leaseholder-elected node" names a lease the tree does not define.
+**Q27. Collecting removed replicas, and the overlap rule.** _Load-bearing._ A replica
+collects itself only on a descriptor at a higher generation that excludes its node; an
+install overlapping an initialised replica is refused with a new `Overlaps` answer; the
+leader streams again after a minimum election timeout, from a fresh take only if its
+checkpoint predates the range's last split or merge; a snapshot of a merged L at or above
+`m` replaces the R it merged. Trigger as drafted (the replica asks its range's leader
+after silence, ten maximum election timeouts, unmeasured, open to change). Reason: D-029
+leaves removed servers "never told to shut down" (DECISIONS.md:1157-1159), a replica
+emptied before its removal commits could vote twice (§7), and without the overlap rule a
+lagging replica of P writes right-half keys over the newer state R's snapshot put there
+(§5).
 
-**Q30. The rebalancer's goal, and SPEC's 10 %.** Ten percent of what: each node's
-replica and leader counts against their means, or the ratio of largest to smallest.
-After how long: a bound after the last add or remove, measured on the correct system
-before it is asserted (D-039). How many nodes (§4's per-node figures assume ten), under
-which faults, at which tier (D-040), and how many moves at once. Draft: counts against
-the mean; the rest left to this question. Open because SPEC.md:303 gives the number and
-nothing else.
+**Q28. "Caught up" for a move.** _Answered by precedent._ "Caught up" for a move is
+D-029's round as built (RAFT.md:153-156): a snapshot-fed learner counts once an append
+after its install succeeds within a round; no applied-index or install gate.
 
-**Q31. What the rebalancer reads.** Replica sets from meta and counts asked of each
-node; node summaries written to range 0; or everything from meta. Draft: the first. Open
-because SPEC is silent.
+**Q29. Where the rebalancer runs.** _Tunable._ The rebalancer runs on the node whose
+replica of range 0 leads, for as long as it leads; a new leader's rebalancer reads
+descriptors and treats moves it did not start as in flight until done or until the move
+bound passes (traced abandoned). Reason: SPEC's "leaseholder-elected node" names a lease
+the tree does not define, and two rebalancers at once cost liveness, not safety, since
+one change is in flight per group (D-029, DECISIONS.md:1099-1104).
 
-**Q32. The replication factor.** Three for every range, or per range. Draft: three, with
-as many bootstrap nodes (Q7). Open because no document names one; Phase 2's scenarios run
-three and five servers, and check 15 needs a number.
+**Q30. The rebalancer's goal, and SPEC's 10 %.** _Tunable._ Each node's replica count and
+leader count, separately, within 10 % of their means over live nodes, quarantined
+replicas counted apart; asserted after a bound from the last add or remove, set from the
+worst gap measured on the correct system plus margin; ten nodes, adding an eleventh and
+removing a non-bootstrap node; Phase 2's network faults with every crash restarted; at
+most four moves across the cluster and one per range at once; tier chosen by measured
+cost within D-040's budget. Reason: SPEC.md:308 gives the number and nothing else, and a
+bound the correct system has not been measured against checks nothing (D-039).
 
-**Q33. Quarantined replicas.** The rebalancer ignores quarantine, or moves quarantined
-replicas off, which is D-035's rejected alternative made possible. Ignoring it, with
-Q15's whole-node refusal, leaves about 67 of 1 000 ranges, or 667 of 10 000, with one
-replica that can vote once two nodes have each lost a table: each can keep a leader it
-has and cannot elect one (§4). Draft: moves them off, one per range at a time, before any
-balancing move. Open because D-035 rejected replacement for want of machinery Phase 3 has
-(DECISIONS.md:1522-1524).
+**Q31. What the rebalancer reads.** _Tunable._ Replica sets from meta; each node's
+replica, leader and quarantined counts asked of the node and answered from memory; a
+move's completion read from the moved range's leader. Reason: SPEC is silent; meta lags
+by one update at most, and counts answered from memory put no write on any Raft group
+(§7).
 
-**Q34. Membership changes and snapshots on one schedule.** Extend Phase 2's membership
-scenario past the snapshot threshold first, or let `sim/move.rs` be the first schedule
-that crosses both. Draft: neither assumed. Open because the gap is recorded as an
-unfiled candidate (OVERNIGHT.md:188-191) and no entry decides it.
+**Q32. The replication factor.** _Tunable._ Three replicas for every range, three
+bootstrap nodes. Reason: no document named one; Phase 2's scenarios run three and five
+servers, and check 15 needs a number.
 
-**Q35. `Scan` in Phase 3.** No scan; a single-range scan refused with `RangeMismatch`
-across a boundary; a cross-range scan with a weaker guarantee stated. Draft: no scan.
-Open because RAFT.md §4 describes a scan the code lacks, SPEC puts distributed scans in
-Phase 5 (SPEC.md:345-346), and a cross-range scan has no linearizable form without
-transactions (§9).
+**Q33. Quarantined replicas.** _Tunable._ Move quarantined replicas off, one per range at
+a time, before any balancing move; each node's quarantined replicas counted apart. **Not
+silently accepted:** a range with two quarantined replicas and no leader cannot elect and
+cannot be moved — issue #44. Reason: D-035 rejected replacing a quarantined server for
+want of machinery Phase 3 has (DECISIONS.md:1522-1524), and with Q15's whole-node
+refusal about 67 of 1 000 ranges have one replica that can vote once two nodes have each
+lost a table (§4).
 
-**Q36. Meta lookups in the history.** Out, or in as reads checked by the search. Draft:
-out. Open because SPEC is silent; putting them in tests meta's reads, but the meta
-range's state machine is a maximum by generation, not a register (§1), so the search's
-model would need a second kind.
+**Q34. Membership changes and snapshots on one schedule.** _Tunable._ Extend
+`sim/membership.rs` past the snapshot threshold before `sim/move.rs`; file it as an
+issue first (the rule against widening a phase) — issue #46. Reason: the membership
+scenario never crosses the snapshot threshold (OVERNIGHT.md:188-191), and a moved replica
+is usually fed by snapshot, so a bug in the interaction should show on one group before
+it shows inside sharding (§7).
 
-**Q37. Where Phase 3's variants live.** More bits in `ananke-raft`'s `Variants(u32)`,
-sixteen used, which §10's twenty-three would bring to thirty-nine, past its width; a set
-of the range layer's own; or both carried together. Draft: not assumed. Open because
-D-045 fixed the width "before the width is a decision to revisit"
-(DECISIONS.md:2704-2705).
+**Q35. `Scan` in Phase 3.** _Tunable._ No scan in Phase 3; `Scan` and its check removed
+from RAFT.md §4 in Q1's correction, pointing at SPEC §6. Reason: a cross-range scan has
+no linearizable form without transactions (§9), and SPEC puts distributed scans in
+Phase 5 (SPEC.md:351-352).
 
-**Q38. The stale-descriptor variant.** Ship `TrustStaleDescriptor`, the server honouring
-the range a request names, and `ClientIgnoresMismatch`, the client resending to its old
-range; or only one. Draft: both. Open because the owner's request names the client,
-while §3's design makes a client's staleness harmless unless a server trusts it, so the
-rule whose breach reaches linearizability is the server's.
+**Q36. Meta lookups in the history.** _Tunable._ Meta lookups stay out of the
+linearizability history. Reason: the meta range's state machine is a maximum by
+generation, not a register (§1), so the search would need a second model, and check 16
+and the meta convergence bound hold meta to account (§8, §9).
 
-**Q39. Scenarios, faults, bounds and cost.** The sharded sweep's node count (five
-assumed), keys per range, clients, and split, merge and move draws; each scenario's
-faults — Phase 2's full model, or the subsets a directed scenario needs, as
-`sim/quorum.rs` chose (DECISIONS.md:3346-3353); every time bound's value, measured on
-the correct system first; the balance scenario's tier, run length, trace (payloads kept
-or not, polls exported or not, its record cap); the holds of `Fault::MetaReorder`, of
-`sim/merge.rs` (b), (d) and (e), of `sim/move.rs` (a) and of its hold check; whether
-each Phase 2 variant's re-assertion on the node of §4 runs at every tier or one, given
-that §10 holds each to its Phase 2 standard; whether to build a shape that carries
-`GcBeforeRemovalCommitted` to a client through a second vote after a re-install (§9);
-and the budget: premerge is meant to take about a quarter of an hour (D-040,
-DECISIONS.md:1417-1420), D-046 brought it to 7 minutes 26 seconds
-(DECISIONS.md:2845-2848), and every scenario of §10 adds runs per seed. Draft: five
-nodes; the rest left to this question. Open because SPEC's exit criteria name
-properties, not scenarios, and cost is a constraint the owner has enforced: the adoption
+**Q37. Where Phase 3's variants live.** _Tunable._ A variant set of the range layer's
+own, in `ananke-shard`, carried beside `ananke-raft`'s unchanged `Variants(u32)`; Phase 2
+variants re-asserted on the new node keep their bits. Reason: §10's twenty-four beside
+sixteen bits used would pass the width D-045 fixed "before the width is a decision to
+revisit" (DECISIONS.md:2704-2705), and `ananke-raft` never names a range (Q40).
+
+**Q38. The stale-descriptor variant.** _Tunable._ Ship both `TrustStaleDescriptor` and
+`ClientIgnoresMismatch`. Reason: the owner's request names the client, while §3 makes a
+client's staleness harmless unless a server trusts it, so the rule whose breach reaches
+linearizability is the server's and the owner's named case is the client's (§10).
+
+**Q39. Scenarios, faults, bounds and cost.** _Tunable._ Five nodes in the sharded sweep,
+three of them bootstrap nodes; directed scenarios take the fault subsets they need; every
+bound and hold measured on the correct system before it is asserted; Phase 2 variants
+re-asserted at the tier each uses today; `sim/balance.rs` records without payloads or
+polls, raises its record cap, runs the balance check, checks 7-22 and linearizability but
+not the timer check; the `GcBeforeRemovalCommitted`-to-a-client shape filed as an issue
+rather than built — issue #47; seed shares sized so premerge stays near fifteen minutes.
+Reason: premerge is meant to take about a quarter of an hour (D-040,
+DECISIONS.md:1417-1420), and cost is a constraint the owner has enforced: the adoption
 storm was cut to one seed in four when it took premerge from about thirteen minutes to
 forty (DECISIONS.md:1896-1913).
 
-**Q40. Crate boundaries.** `ananke-shard`, "Range management, multi-raft"
-(BOOTSTRAP_PROMPT.md:75), holds the node of §4, descriptors, split, merge, the meta
-state machine, the rebalancer and §8's new checks, with `ananke-raft` keeping the core,
-store, snapshots and a checker keyed by range; or the node that runs many groups lives
-in `ananke-raft` and `ananke-shard` holds only ranges. Draft: not assumed. Open because
-the crate does not exist yet and `run` in node.rs today is both the tasks and the group.
+**Q40. Crate boundaries.** _Tunable._ `ananke-shard` holds §4's node (tasks, round, batch
+frames, inbox), descriptors, split and merge, the meta state machine, the rebalancer, the
+range client, checks 7-22 and the range variants; `ananke-raft` keeps the core, codec,
+store (parameterised by a key prefix), snapshots, refusal and adoption, checks 1-4 over a
+generic group key, and its Phase 2 variants; it never names a descriptor or span.
+Reason: the crate does not exist yet, `run` in node.rs today is both the tasks and the
+group, and BOOTSTRAP_PROMPT.md:75 gives `ananke-shard` "Range management, multi-raft".
 
-**Q41. The node's `raft` task and its round.** One `raft` task per node holding every
-core, or one per range. A round's persists merged into one synced batch that holds every
-send of the round, or each core's persist awaited before that core's own sends, as
-RAFT.md §3 and D-026 order a step's outputs (RAFT.md:551-554; DECISIONS.md:831-832). The
-per-peer outbox flushed at the end of each round, once per tick, or on a timer. A core
-that persisted steps nothing more in the round, or steps on with its later outputs held.
-Snapshot chunks in frames of their own on the snapshot task's socket handle, as today
-(node.rs:602-611), or batched with the round's sends. Draft: one task per node, merged
-persists, a flush per round, the stop rule, chunks unbatched. Open because SPEC.md:289-290
-settles only "a shared Raft ticker and message batcher per peer pair". The merged persist
-changes RAFT.md §3's order of execution: a send that precedes a persist, or belongs to a
-core that persisted nothing, waits on every other group's persist in the round, which
-under load puts one sync's latency on every co-hosted range's heartbeats (§4). §4's
-frame counts hold only while a round drains whole frames; a flush per tick would make
-them a bound. Chunks batched with heartbeats would lose small messages with large ones
-under a frame-length limit and blur the directed scenarios of §10.
+**Q41. The node's `raft` task and its round.** _Load-bearing._ One `raft` task per node.
+In each round, flush before the sync every send RAFT.md §3 already lets leave early
+(those preceding a core's Persist, and all sends of a core that persisted nothing);
+submit the round's persists together so group commit syncs them once; flush each
+persisting core's later sends when its own persist resolves and step that core no
+further until then; snapshot chunks stay unbatched on the snapshot task's socket. This
+keeps RAFT.md §3's and D-026's per-core order with no superseding entry. Reason: the
+proposal's merged persist would have held every send of a round, those of cores that
+persisted nothing included, behind every group's persist, putting one sync's latency on
+every co-hosted range's heartbeats and superseding RAFT.md §3's order (RAFT.md:558-560;
+DECISIONS.md:831-834); chunks batched with heartbeats would lose small messages with
+large ones under a frame-length limit (§4, §10). Keeping that order covers every output
+that follows a core's `Persist`, not only its sends: its `Apply`, `ReadReady` and
+`ReadDropped`, snapshot actions and trace events also wait for that core's own persist,
+as `execute` makes them wait today (node.rs:2098-2178), and the core's messages and
+ticks are held until then (§4).
 
-**Q42. How the rebalancer chooses a move.** SPEC names what is balanced, range count and
-leader count (SPEC.md:296-297), and nothing about how. Choices: pair the node holding
-the most replicas with the node holding the fewest, or score every node pair by the
-improvement a move makes; break ties by the lowest range id, or by a draw from the
-rebalancer's stream, or by range size (§11, storage 7); transfer leaders in the same
-step as replica moves, or only once replica counts are within the band; drain a node
-being removed, and move quarantined replicas off (Q33), before any other move, or
-interleave them; and run a step always, or only while some node is outside the 10 %
-band (Q30). Draft: most to fewest, lowest id, leaders in the same step, drain and
-quarantine first, a step always. Open because the owner asked what the rebalancer
-optimises, and the draft's greedy pairing is one policy among several with different
-move counts and convergence times, none measured.
+**Q42. How the rebalancer chooses a move.** _Tunable._ Start with the draft's policy
+(most-loaded to least-loaded node, lowest range id first, leader transfers in the same
+step, drains and quarantine moves first, a step always), each choice a parameter fixed
+once `sim/balance.rs` has measured move counts and convergence; any random tie-break
+from a named rebalancer stream (D-017). Reason: SPEC names what is balanced, range count
+and leader count (SPEC.md:301-302), and not how, and the greedy pairing is one policy
+among several whose move counts and convergence times nobody has measured (§7).
+
+### Added in writing the approvals up, not yet approved
+
+Bringing the body into line with §13's answers took choices the answers do not make.
+They are written into the body so the design is complete, and each is open until the
+owner approves it, with the stage plan or on its own. None is silently decided.
+
+- **Q17's lease rules (§5).** A node's block is granted by an apply in range 0 that records
+  the block and the node's run nonce in the node's lease record; a node adopts only a
+  block granted to its current run, so a restart never resumes a partly used block; and
+  `RangeIdsLeased` traces each grant. The approval states the guarantee ("never reused",
+  leased blocks, range 0 gating only the refill); these rules are one way to keep it.
+  Still unsettled: what a split does when its node's block is exhausted and range 0
+  cannot refill it — waits, or is refused and retried.
+- **`IdBlockResumed` (§10).** A variant breaking the rule that a node adopts only a block
+  granted to its current run, caught by a clause of check 18. With it, §10 lists 24
+  range-layer variants.
+- **Q26's assertion and its events (§8).** The re-add window is stated as an unnumbered
+  named assertion over a new core event, `RaftMatchStarted`, and an `incarnation` field on
+  `RangeRemoved`; a replica's incarnation is drawn at its creation from the node's
+  generator. The approval requires a named assertion; its events and the incarnation's
+  source are this document's.
+- **Q10's pairing field (§9, §11).** The history pairs a resend with its original through
+  an `invoked` field on `ClientSend`.
+- **`sim/merge.rs` shapes (§10).** Shape (d) turned out not to catch `MergeNotResumed`, so
+  a sixth shape (f) was added and the scenario runs on four nodes. Shape (e) catches
+  `UnfreezeBeforeAbortCommitted` only if the coordinator's wait bound can be set below one
+  minimum election timeout; if the node's stage cannot set it that low, the variant is
+  caught by (d) alone. The timing of shapes (d) to (f) is argued from the protocol, not
+  measured.
+- **Missed ticks (§4).** A core held on its own persist (Q41) steps every tick it missed
+  once the persist resolves, in the order they fell due, none collapsed, as today's loop
+  does. The alternative, collapsing missed ticks into one, is open.
+- **Q27's trigger wording.** §13 quotes the approval ("its range's leader"); the body keeps
+  the proposal's "the leader meta names", since the approval said "trigger as drafted".
+  The two differ when meta lags; which one is meant is open.

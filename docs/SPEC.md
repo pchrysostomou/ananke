@@ -287,7 +287,12 @@ RAFT.md holds the invariants we check under simulation:
 - **Range descriptor** stored in a meta range (itself replicated; bootstrap range 0 is
   found via config, then meta range via range 0 — Spanner/CockroachDB pattern).
 - Each node runs many Raft groups; a shared **Raft ticker** and message batcher per
-  peer pair, so 10k ranges don't mean 10k heartbeat streams.
+  peer pair, so a node pair's heartbeats share frames instead of one stream per range.
+  **10k ranges is a non-goal of Phase 3**: at 10k ranges on ten idle nodes, batching
+  alone would carry about 135 MB/s over the cluster and step each node's cores about
+  500 000 times a second, figures derived from today's constants in SHARD.md §4, not
+  measured. Coalescing or quiescence is a later phase's decision; no lease or
+  check-quorum redesign inside Phase 3 (SHARD.md §13, Q12).
 - **Split**: leader proposes split at key `k`; on apply, both halves become live with
   the same replica set. New group starts at term 1 with the parent's applied index
   recorded as its snapshot.
@@ -301,6 +306,7 @@ RAFT.md holds the invariants we check under simulation:
 
 - Linearizability holds across split/merge/rebalance under faults.
 - 1000-range cluster in simulation stays balanced within 10% after node add/remove.
+  This is the scale Phase 3 proves; 10k ranges is not an exit criterion.
 
 ---
 
