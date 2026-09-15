@@ -5224,6 +5224,166 @@ compacted, or refuses a store, the correct server's sweep names it.
 
 ---
 
+## D-059 — A store in 0.3.0's format is refused at open, never migrated and never read
+
+**Context.** SHARD.md's Q5, approved as load-bearing: the key layout of Stage A's item 6
+breaks 0.3.0's on-disk format on three conditions, the second that a store in the old
+format is refused at open with an error naming both format versions, never misread
+(SHARD.md:71-76). The owner's addition of 2026-09-15 to Stage A's entry criteria asks,
+before the layout's code, for the decision on what becomes of a v0.3.0 store, and with it
+the test that holds it: a store written by the v0.3.0 tag's own code, kept as a fixture
+rather than made by the new code, opened by the new code and refused with that error, no
+key of it read as the new layout's (SHARD.md:2115-2122); the same test passes on the tree
+after item 6 (SHARD.md:2144-2146). Nothing records which format a store is in today. The
+engine's versions, 2 in the manifest and 2 in a table's footer, are unchanged since 0.3.0,
+and the store's `RAFT-STORE` marker carries none (SHARD.md §11, storage 1). Under the new
+layout 0.3.0's keys lie where the new code looks for nothing, so a 0.3.0 store the new code
+did not refuse would open as an empty one, as seed 6325's voter once came back blank
+(D-041).
+
+**Decision.** The owner's, given in the brief of Stage A's lane L: a store in 0.3.0's
+format is refused at open with a clear error naming its format version and the one the
+code expects. It is never migrated, and never read under the new layout.
+
+- *The versions.* 0.3.0's store, which records no version, is Raft store format 1, the
+  layout RAFT.md §3 gave at the tag. Format 2 is the one the refusing build writes and the
+  only one it opens, and the format item 6's layout will be.
+- *The refusal.* `RaftStore::open`, after the engine's recovery is checked for lost state
+  and before it reads any other key, refuses a store in any format but 2, with an
+  `InvalidData` error of its own type whose words name format 1, format 2 and 0.3.0. A
+  store that records a newer version is refused too, naming both: a build cannot read a
+  format it predates, and reading one would be the misreading Q5 forbids.
+- *Not a loss, and not replaced.* The store is whole in its own format, so the refusal is
+  not D-022's refusal of lost state. A server that finds one traces `RaftServerFailed` with
+  the refusal's words and returns it: it writes no lost mark (D-044) and does not wait in
+  re-seed mode, where a leader's snapshot would take the store's place. The store is left
+  as it was found, and what becomes of it is its operator's decision.
+
+The two things the refusal needs and SHARD.md does not settle are proposed here, and their
+code will carry `PROPOSED(D-059)`:
+
+- *Where the version lives.* Under the eight-byte key `0`, tenant 0's bytes and nothing
+  after them, as a little-endian `u64` like every other value of the store. Every key of the
+  Raft state and of the user's data starts with a tenant and a table, sixteen bytes; the
+  eight-byte key is a proper prefix of every key of tenant 0 and so falls inside no table's
+  key range, today's `0 / <table>` or item 6's `0 / <range>`. It is where both layouts look,
+  which is what lets a build see a store's format without reading any other key of it as
+  its own. An engine checkpoint copies it, so an installed snapshot carries its leader's
+  version. D-060, the layout, records it as part of the layout it versions.
+- *A fresh store or an unrecorded one.* A store without the key is fresh only when the
+  engine's recovery found no table and replayed no log record: it holds nothing that could
+  be misread, and the open writes the version. Any other store without the key is format 1
+  and refused. The version is written in the same synced batch as the fresh store's first
+  incarnation (D-042), the first write any store takes, so a crash leaves an engine that
+  holds neither or a store that holds both, never a store with keys and no version. The
+  test is the engine's own counts, which belong to no layout, rather than the absence of a
+  key of 0.3.0's.
+
+**The fixture.** `crates/ananke-raft/tests/fixtures/v0.3.0-store/store`: fifteen files,
+5 162 bytes, written by the v0.3.0 tag's code (0d30df5) and by nothing else. A program,
+`generate.rs` beside it, does what a server does, in its order: the engine opened as
+`node.rs` opens it, with a 512-byte memtable and 4 KiB log segments so the state is partly
+in tables and partly only in the log; the store opened, writing incarnation 1; the store
+marker; a persist of term 2 and a vote for server 1 with a configuration entry at index 1
+and six commands at 2 to 7; applies of 1 to 4; a snapshot taken at index 4 into
+`/raft/snap-4-1`; the log compacted to it; the apply of 5; and a persist of term 3, a vote for
+server 2 and an eighth entry. It writes under the simulator, which makes the bytes the same
+on every run and the path the snapshot record carries `/raft` rather than a directory of
+the machine that ran it, and copies the files out through `RealEnv`. It was run in the tag's
+own tree, with the tag's `Cargo.lock` and toolchain, from this repository's root:
+
+```
+git worktree add --detach <scratch>/v030 v0.3.0
+mkdir -p <scratch>/v030/crates/ananke-raft/examples
+cp crates/ananke-raft/tests/fixtures/v0.3.0-store/generate.rs \
+   <scratch>/v030/crates/ananke-raft/examples/v030_store_fixture.rs
+(cd <scratch>/v030 && CARGO_TARGET_DIR=<scratch>/target-v030 \
+   cargo run -p ananke-raft --example v030_store_fixture -- <scratch>/fixture)
+cp -R <scratch>/fixture crates/ananke-raft/tests/fixtures/v0.3.0-store/store
+git worktree remove --force <scratch>/v030
+```
+
+No tracked file of the tag's tree was changed; `--force` removes the untracked example.
+Four runs, the last of the program as committed, were identical under `diff -r`. The
+README beside the store lists what it holds under 0.3.0's keys and every file's size and
+SHA-256, and `crates/ananke-raft/tests/v030_store.rs` holds the fixture to it at the
+engine, under 0.3.0's keys spelled out byte by byte rather than through the build's
+helpers, whose layout item 6 changes: an engine whose recovery lost nothing, three tables
+and a log, the hard state, the applied index, the incarnation, the configuration key, the
+snapshot record, entries 5 to 8, the user's `a`, ten keys in all, every one sixteen bytes
+or longer, and no format version.
+
+**The test of the refusal, and why it is not in this entry's commit.** The test that holds
+the decision opens the fixture through `RaftStore::open` and asserts the refusal with both
+formats named, not as lost state; that the open wrote nothing, since the engine's sequence
+number does not move, and left every key and every file as it was; that a server started
+on it traces one `RaftServerFailed` naming both formats and no `RaftRefused`, `RaftAdopted`
+or `RaftRecovered`, and leaves every file of the fixture byte for byte as it was, beside the
+empty log segment every engine open starts; that a store the build writes records format 2
+and opens again, a store recording format 1 or 3 is refused naming both, and a store with
+keys and no version is refused as format 1; and that a crash anywhere in a fresh store's
+first open never leaves it refused for its format, beside the known-buggy order, the
+version in a second batch after the incarnation, which the same crashes catch.
+
+It cannot land on the tree of this entry, the lane's part 1, without moving every Raft
+scenario's schedule. The store this tree writes is byte for byte the store 0.3.0 writes,
+since neither the store nor the engine changed after the tag, so the only way to refuse the
+fixture and still open this tree's stores is for every fresh store to write something new;
+and the check reads a key before anything else. The simulated disk draws on both: a file's
+size enters the crash model's torn-write and bit-rot draws, and every read and write draws
+its latency from the disk's stream. Measured on the change, with the test and the check as
+described: every one of the forty-four pinned `raft::run`s of `sim/tests/raft.rs` has a
+different sequence of Raft, client, crash and partition records, and so does seed 4 of the
+term-raise schedule. At the gate's 20 seeds the correct server's sweeps, the membership and
+quorum scenarios and every variant's sweep pass, and nine pinned tests fail: seeds 7381 and
+6325 now meet the floor lowering and the crash inside an adoption they asserted absent;
+seeds 1885 and 2023, and seed 4 of the term-raise schedule, no longer straddle an
+isolation; the removed catches' test fails at its first seed, 1885, and the eleven variant
+catches' test fails; 5909 under `IgnoreIncarnation` no longer leaves the leader's progress
+for the refused server stale; and 680's pair no longer reproduces. Landing it needs the
+re-audit of every pinned seed, the work `SimEnv`'s queue commit (SHARD.md §12, Stage A item
+3), held to follow this tree, has done on this tree's schedules and would have to do again
+on the change's. The order is returned to the integrator.
+
+**Alternatives.**
+
+- *Migrating 0.3.0's store to the new layout*: the owner's decision rules it out; 0.x has
+  no users (Q5).
+- *Treating the refusal as lost state*: the server would mark the store lost and re-seed,
+  so the next leader's snapshot would replace a whole store its operator has not decided
+  about.
+- *The version in the `RAFT-STORE` marker*, checked before the engine opens: no table's
+  size would change. But the marker is the server's, written after the store's first open:
+  a 0.3.0 store opened through `RaftStore` alone, as a user of the published crate would,
+  has none, and a 0.3.0 server that crashed between its store's first write and its marker
+  left a store with keys and no marker; either would open under the new layout as an empty
+  store. The marker's own rule, that anything but a whole store's line reads as lost
+  (D-044), would also have to change, and its content's length still enters the crash
+  model's draws.
+- *`0 / 0 / format`, beside the hard state*: under item 6's layout the key would lie inside
+  range 0's table.
+- *A fresh store as one without an incarnation key*: it decides by a key of 0.3.0's
+  layout, which a later layout moves; the engine's counts belong to no layout.
+- *The version in a batch of its own after the first open's*: a crash between the two
+  leaves a store that lost nothing refused as format 1.
+- *Refusing only a missing or older version*: a newer one would be read by a build that
+  cannot know its layout.
+
+**Consequences.**
+
+- The engine's open runs before the check, as it runs before every store open: its
+  recovery, unchanged since 0.3.0, starts a new empty log segment and changes no key and
+  no other file. Nothing of the Raft store writes before the refusal.
+- A 0.3.0 store that its own marker already says lost state, or whose engine recovery lost
+  writes, is refused for that before its format is read, and re-seeds as D-044 has it: a
+  re-seed replaces the store with a leader's snapshot and reads no key of it.
+- Until item 6 lands, format 2's layout is 0.3.0's. Stores written between the check and
+  the layout exist only in tests and simulations, and no build between them is released.
+- The format break is recorded for the release notes with the layout, D-060 (Q5,
+  condition 3).
+
+---
+
 ## D-061 — A catch or a coverage state seen on under 5 % of seeds is asserted from the thousand-seed tier
 
 **Context.** A sweep's "caught on some seed" and a coverage counter's "seen above zero" are
