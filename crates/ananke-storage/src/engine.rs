@@ -545,7 +545,10 @@ pub(crate) struct Shared<E: Environment> {
     pub(crate) compact_pointer: Mutex<Vec<Option<Bytes>>>,
     next_memtable: AtomicU64,
     /// Writes appended and not yet applied, by sequence number: each record's
-    /// writes in order.
+    /// writes in order. A record is numbered by the log and put here under this
+    /// lock, taken before the log's own, so no one popping from it can find a
+    /// number missing below one that is here (D-021).
+    // PROPOSED(D-054): a record is numbered and pending in one step.
     pending: Mutex<BTreeMap<Seq, Vec<(Bytes, Value)>>>,
     /// Held by whoever is applying pending writes, so that two callers on
     /// different threads never apply out of sequence order: a record popped by one
@@ -1140,16 +1143,23 @@ impl<E: Environment> Engine<E> {
     /// empty batch still takes a number.
     pub fn write(&self, batch: WriteBatch, sync: bool) -> Write<E> {
         let ops = batch.ops;
-        let append = self.shared.wal.append_with(encode_batch(&ops), sync);
-        match self.shared.config.variant {
-            Variant::NoWalBeforeMemtable => {
-                // The bug: visible and acknowledged before the log has it.
-                self.shared.apply(append.seq(), ops);
-            }
-            _ => {
-                lock(&self.shared.pending).insert(append.seq(), ops);
-            }
-        }
+        let payload = encode_batch(&ops);
+        let append = if self.shared.config.variant == Variant::NoWalBeforeMemtable {
+            // The bug: visible and acknowledged before the log has it.
+            let append = self.shared.wal.append_with(payload, sync);
+            self.shared.apply(append.seq(), ops);
+            append
+        } else {
+            // PROPOSED(D-054): numbered and pending in one step. Numbered first
+            // and put in `pending` after, a record could be synced and still
+            // missing from the map when another thread applied through a later
+            // record, and land after it: in the memtable past an install's split,
+            // under a manifest whose `flushed_seq` said it was flushed.
+            let mut pending = lock(&self.shared.pending);
+            let append = self.shared.wal.append_with(payload, sync);
+            pending.insert(append.seq(), ops);
+            append
+        };
         Write {
             shared: self.shared.clone(),
             append,

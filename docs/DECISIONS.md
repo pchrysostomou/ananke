@@ -526,6 +526,13 @@ until then the order rule is smaller and does not change the memtable's shape.
 Found by the nightly on its first run, at seed 420: twenty seeds at the gate and a
 hundred in CI had not reached the interleaving, which is what ten thousand are for.
 
+**Completed by PROPOSED D-054.** The rule above assumes every write numbered below an
+acknowledged one is already in the map. On a runtime with more than one thread it was
+not: the log numbered a record before the engine put it in the map, and applying popped
+and applied under different locks. D-054's *Applies in order* names both windows; a
+record is now numbered and put in the map under the map's lock, and applies are
+serialised.
+
 ---
 
 ## D-022 — SSTables, the manifest, the flush order, log truncation, and what the sweep excuses
@@ -4225,13 +4232,38 @@ tells the caller.
 
 *Applies in order.* The split of the memtables at `S` rests on D-021's rule that
 writes apply in sequence order: every record below `S` applied before `S`, and `S`'s
-rotation before any record above it. `apply_through` popped a record under the pending
-lock and applied it after letting the lock go, so on a runtime with more than one
-thread two callers could apply out of order; under the simulator, which polls one task
-at a time with no await inside an apply, they could not. Applies are now serialised by
-a lock of their own (`apply_order`), held from the first pop to the last apply, which
-changes nothing a simulated run does. The same race was open to the flush's rotation
-before this entry.
+rotation before any record above it. On a runtime with more than one thread that rule
+had two windows, and the simulator, which polls one task at a time with no await inside
+a write or an apply, reaches neither.
+
+The first: `apply_through` popped a record under the pending lock and applied it after
+letting the lock go, so two callers could apply out of order. Applies are now
+serialised by a lock of their own (`apply_order`), held from the first pop to the last
+apply.
+
+The second, found by the second review: `Engine::write` had the log number a record
+(`append_with`, under the log's state lock, which also wakes the log's writer) and put
+it in `pending` afterwards, under the pending lock. Between the two, the writer could
+sync `S - 1` and `S` together and a caller of `S` apply through it: `S - 1` was not yet
+in the map, so `S` was applied and the memtable split at it, and `S - 1` landed in the
+memtable past the split. The install's switch then set `flushed_seq` at or above `S`
+and deleted the log segments through `S`, so a crash lost `S - 1`, which had been
+acknowledged, and reads before the crash saw the span's replacement mixed with it.
+The same window let a flush's rotation fall between `S` and `S - 1`, D-021's own case.
+Now the record is numbered and put in `pending` under one lock: `write` takes the
+pending lock, has the log number the record, and inserts it before letting go. The
+lock order is `pending`, then the log's state, which `begin_install` already follows
+(the install lock, then a write), and the log's writer never takes `pending`. Whoever
+pops `S` from the map therefore finds every record below it either there or already
+popped, and the popping is serialised. Neither change moves anything a simulated run
+does, and no trace changes.
+
+Neither window is covered by a test that forces it. The first is closed by a lock held
+across the pop and the apply, and the second by a lock held across the numbering and
+the insertion: in each case the interleaving a test would force is one the code no
+longer has a point to stop at, and without a hook inside `write` or `apply_through`,
+which the engine does not carry for tests, a test on the real runtime would be a timing
+race that passes on the broken code as readily as on the fixed one.
 
 *One at a time, and refusals.* A second install while one is in progress is refused
 (`InProgress`), as are a span with no key (`EmptySpan`), a source with a key outside the
