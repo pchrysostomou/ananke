@@ -1,7 +1,6 @@
 # Phase 2: breaking Raft with moirae
 
-_September 2026. The close of Phase 2; the tag follows the ten-thousand-seed run on
-`main`._
+_September 2026. The close of Phase 2, tagged `v0.3.0`._
 
 ## What Phase 2 built
 
@@ -237,8 +236,8 @@ SPEC §3 names three.
   [run 34749071877](https://github.com/pchrysostomou/ananke/actions/runs/34749071877)
   on `9b5995d`, and on run 34731272921 on `bd93ed3` before it, with one exception to
   "full": the disk honours `fsync` (D-026). Torn writes, bit rot and lost directory
-  entries stay on; lost syncs are issue #23. The tag follows the ten-thousand-seed run
-  on `main`.
+  entries stay on; lost syncs are issue #23. Main was green again at ten thousand seeds
+  on `cd411b4` (run 34839613587), and with D-049 on `a8656e8` (run 34852980174).
 - **Membership change from 3 → 5 → 3 nodes under partition.** Met as SPEC §3 now words
   it. The criterion first asked for no availability loss beyond one election timeout,
   which was an aim, not a bound: under drops, delays, pre-vote rounds, split votes and a

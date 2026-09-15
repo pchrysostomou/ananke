@@ -12,8 +12,8 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
-ananke-env = { path = "../ananke-env", version = "0.2" }
-ananke-storage = { path = "../ananke-storage", version = "0.2" }
+ananke-env = { path = "../ananke-env", version = "0.3" }
+ananke-storage = { path = "../ananke-storage", version = "0.3" }
 bytes.workspace = true
 moirae-trace.workspace = true
 

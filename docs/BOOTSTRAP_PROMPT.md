@@ -206,6 +206,12 @@ _Update this section at the end of every session._
   green at ten thousand seeds on `dc603ea` (run 34769934684). SPEC §3's membership
   criterion is now worded as the ten-timeout bound the check asserts, with the
   measured worst gap of 549.359683 ms.
+- Released (2026-09-14): Phase 2 tagged `v0.3.0` on the merge of the release
+  commit, with `ananke`, `ananke-env`, `ananke-storage` and `ananke-raft` at 0.3.0
+  (`ananke-raft`'s first version), published by the owner. Evidence: ten thousand
+  seeds green on `cd411b4` (run 34839613587) and on `a8656e8` with D-049 (run
+  34852980174), the tree of `main` at 94c6a54; D-049's ten-thousand-seed record and
+  the version bump follow it.
 - Phase 2 backlog (2026-09-14/15), branch `phase-2-backlog` off `main` at 94c6a54, not
   merged, every commit gated, three PROPOSED entries (D-050, D-051, D-052) awaiting the owner. Issue #32:
   D-050, a term record carries when the message its step took was received
@@ -241,12 +247,11 @@ _Update this section at the end of every session._
   D-047's straddle reads `decided <= from < at`; the directed term-raise sweeps go
   through `checked`; D-050's rule is restated for candidacies stepped from a
   PreVoteResponse or TimeoutNow; D-052's figures compare equal loads.
-- Next concrete task: the ten-thousand-seed run on `main` (34839613587), which is
-  the tag's evidence, then Phase 2's tag and crates.io publish per D-011. D-049 (a
-  refused follower counts for check quorum only while its re-seed stream makes
-  progress; `RefusedCountsForQuorum`) is in progress on `phase-2-d049` and lands on
-  top with its own run. Open follow-ups: issue #32 (the pre-vote check: a
-  message delivered before an isolation but stepped inside it) and issue #33
+- Next concrete task: Phase 3 (SPEC §4), multi-raft sharding, starting with its design
+  proposal. Issue #37: a refused server's silence while it verifies, repairs and
+  adopts its re-seed deposes the leader when the third server is away.
+  Open follow-ups: issue #32 (the pre-vote check: a message delivered before an
+  isolation but stepped inside it) and issue #33
   (assert the timer catches that decision time removes, not only print them).
   Still unfiled from OVERNIGHT.md's backlog candidates: membership changes and
   snapshots on one schedule, a studio metric for stream health, RAFT.md §5's

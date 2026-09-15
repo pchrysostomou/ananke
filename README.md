@@ -13,9 +13,9 @@ and scheduling policies come from [moirae](https://github.com/pchrysostomou/moir
 deterministic-simulation-testing framework with a trace replay studio; ananke is
 moirae's largest consumer and moirae is ananke's test harness.
 
-Phase 0 (the runtime and the simulator) and Phase 1 (the storage engine) are released.
-Phase 2 (Raft) is complete and waiting for its tag. Everything above it, sharding,
-transactions and SQL, is design only. The tables below say exactly where things stand.
+Phase 0 (the runtime and the simulator), Phase 1 (the storage engine) and Phase 2 (Raft)
+are released. Everything above them, sharding, transactions and SQL, is design only. The
+tables below say exactly where things stand.
 
 ## Architecture
 
@@ -88,12 +88,12 @@ sweep of their own ([RAFT.md §5](docs/RAFT.md)); each sweep prints its catch ra
 
 | Component | State today | Version, tag |
 |---|---|---|
-| `ananke-env` | Released. The `Environment` trait (`Clock`, `FileSystem` with explicit `sync` and `sync_dir`, a message-oriented `Network`, `Rng`, `spawn`); `RealEnv` on tokio; `Sim` / `SimEnv` with the §1.3 disk and §1.4 network fault models, per-node clock skew and drift, and a poll budget; the moirae format v2 export. Since 0.2.0, unreleased: message duplication, the Raft trace events, and a record's decision time beside its durability time (D-047) | 0.1.0 (`v0.1.0`) and 0.2.0 (`v0.2.0`) on crates.io |
-| `ananke-storage` | Released. The WAL, memtable, SSTables under a manifest, log truncation, versions, snapshots, scans, leveled compaction, write batches, unsynced writes and checkpoints (D-018 to D-024). Since 0.2.0, unreleased: the WAL record header carries its own checksum, a format change (D-027), and a refused engine does no work (D-044) | 0.2.0 (`v0.2.0`) on crates.io |
-| `ananke-raft` | Complete, pending the Phase 2 tag. A pure protocol core with pre-vote, read-index and lease reads with a drift guard, check quorum, leadership transfer, joint-consensus membership changes with learners, and snapshots streamed as resumable chunks of an engine checkpoint; its state in the storage engine; the server as `raft`, `net`, `apply` and `snapshot` tasks; a single-shard key-value store; lost-state refusal and re-seeding (D-025 to D-047). It runs under the simulator; no binary runs it on real sockets yet | Not released; not on crates.io |
+| `ananke-env` | Released. The `Environment` trait (`Clock`, `FileSystem` with explicit `sync` and `sync_dir`, a message-oriented `Network`, `Rng`, `spawn`); `RealEnv` on tokio; `Sim` / `SimEnv` with the §1.3 disk and §1.4 network fault models, per-node clock skew and drift, and a poll budget; the moirae format v2 export. New in 0.3.0: message duplication, the Raft trace events, and a record's decision time beside its durability time (D-047) | 0.1.0 (`v0.1.0`), 0.2.0 (`v0.2.0`) and 0.3.0 (`v0.3.0`) on crates.io |
+| `ananke-storage` | Released. The WAL, memtable, SSTables under a manifest, log truncation, versions, snapshots, scans, leveled compaction, write batches, unsynced writes and checkpoints (D-018 to D-024). New in 0.3.0: the WAL record header carries its own checksum, a format change (D-027), and a refused engine does no work (D-044) | 0.2.0 (`v0.2.0`) and 0.3.0 (`v0.3.0`) on crates.io |
+| `ananke-raft` | Released. A pure protocol core with pre-vote, read-index and lease reads with a drift guard, check quorum, leadership transfer, joint-consensus membership changes with learners, and snapshots streamed as resumable chunks of an engine checkpoint; its state in the storage engine; the server as `raft`, `net`, `apply` and `snapshot` tasks; a single-shard key-value store; lost-state refusal and re-seeding (D-025 to D-049). It runs under the simulator; no binary runs it on real sockets yet | 0.3.0 (`v0.3.0`) on crates.io, its first version |
 | `ananke-server` | The node binary, Phase 0 protocol only: `ananke-server echo` runs the echo protocol on `RealEnv`, the same code the simulator runs, with a checksummed journal | `publish = false` |
 | `ananke-sim` (`sim/`) | The scenarios `echo`, `wal`, `engine`, `raft` and `membership`, the linearizability checker `lin.rs`, and the parallel sweep driver (D-040) | `publish = false` |
-| `ananke` | A placeholder reserving the name | 0.1.0 and 0.2.0 on crates.io |
+| `ananke` | A placeholder reserving the name | 0.1.0, 0.2.0 and 0.3.0 on crates.io |
 | `ananke-shard`, `ananke-txn`, `ananke-sql` | Planned for Phases 3, 4 and 5. No code exists | None |
 
 ## Phases
@@ -102,7 +102,7 @@ sweep of their own ([RAFT.md §5](docs/RAFT.md)); each sweep prints its catch ra
 |---|---|---|---|
 | 0 | Deterministic runtime (§1) | The echo protocol under partitions with its trace open in the studio; byte-identical traces for one seed, checked in CI; clippy's `disallowed-methods` for all direct I/O | Released, `v0.1.0`. [Devlog](docs/devlog/00-phase-0.md) |
 | 1 | Storage engine (§2) | Random operations and crash points recover to the model's state; 10k seeds green nightly; over 200k writes/s single-threaded as a sanity number | Released, `v0.2.0`. Nightly run 33986588539 on `85b78df`; 299 169 writes/s in unsynced batches of a hundred. [Devlog](docs/devlog/01-phase-1.md) |
-| 2 | Raft (§3) | The five invariants across 10k seeds under the network and disk fault model; 3 → 5 → 3 under partition completes both ways with no gap in completed client operations over ten maximum election timeouts; a devlog post showing a real bug and its trace | Complete, pending its tag. Green at 10 000 seeds in nightly runs 34749071877 on `9b5995d` and 34769934684 on `dc603ea`, with the disk honouring `fsync` (D-026; lost syncs are issue #23); worst membership gap 549.359683 ms against the 2 s bound. Merged to `main` as PR #34; not tagged or published. [Devlog](docs/devlog/02-phase-2.md) |
+| 2 | Raft (§3) | The five invariants across 10k seeds under the network and disk fault model; 3 → 5 → 3 under partition completes both ways with no gap in completed client operations over ten maximum election timeouts; a devlog post showing a real bug and its trace | Released, `v0.3.0`. Green at 10 000 seeds on `cd411b4` (nightly run 34839613587) and, with D-049's check-quorum rule, on `a8656e8` (run 34852980174), the tree `main` had before the release commit; the disk honours `fsync` (D-026; lost syncs are issue #23); worst membership gap 549.359683 ms against the 2 s bound. [Devlog](docs/devlog/02-phase-2.md) |
 | 3 | Multi-raft sharding (§4) | Linearizability across split, merge and rebalance under faults; a 1000-range cluster stays balanced within 10% after node add and remove | Planned |
 | 4 | Transactions (§5) | elle reports no snapshot-isolation anomalies over simulation traces; an injected bug is caught within 100 seeds | Planned |
 | 5 | SQL (§6) | A sqllogictest subset passes; `psql` connects and runs the demo schema | Planned |
