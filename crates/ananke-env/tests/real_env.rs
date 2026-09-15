@@ -107,6 +107,19 @@ fn filesystem_round_trip() {
     });
 }
 
+/// Under `RealEnv` a range's stream is OS entropy like every other (D-057): two draws
+/// of one range, and draws of two ranges, differ but for a 2^-64 chance each.
+// PROPOSED(D-057): a named stream per node and range through the environment.
+#[test]
+fn a_range_stream_is_os_entropy() {
+    RealEnv::run(|env| async move {
+        let one = env.range_rng(1);
+        let (a, b) = (one.next_u64(), one.next_u64());
+        assert_ne!(a, b);
+        assert_ne!(env.range_rng(2).next_u64(), env.range_rng(2).next_u64());
+    });
+}
+
 #[test]
 fn rng_draws_fresh_entropy_and_seeds_maps() {
     RealEnv::run(|env| async move {

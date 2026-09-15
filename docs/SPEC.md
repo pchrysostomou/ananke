@@ -261,11 +261,11 @@ RAFT.md holds the invariants we check under simulation:
   operations, with the time inside the partition windows taken out, is longer than ten
   maximum election timeouts, 2 s at the scenario's 200 ms maximum
   (`AVAILABILITY_TIMEOUTS`, `availability_bound()`). Both are liveness, asserted on every
-  uniformly scheduled seed (D-016). The worst gap measured is 549.359683 ms over the
-  5 000 uniformly scheduled seeds of 10 000, printed as `worst_completion_gap` by nightly
-  runs 34749071877 on `9b5995d` and 34769934684 on `dc603ea`, each of which completed
-  the change both ways on all 10 000 seeds: under three maximum election timeouts, and
-  over one.
+  uniformly scheduled seed (D-016). Measured before D-058 moved the schedule, the worst
+  gap is 549.359683 ms over the 5 000 uniformly scheduled seeds of 10 000, printed as
+  `worst_completion_gap` by nightly runs 34749071877 on `9b5995d` and 34769934684 on
+  `dc603ea`, each of which completed the change both ways on all 10 000 seeds: under
+  three maximum election timeouts, and over one.
 
   This criterion first asked for no availability loss beyond one election timeout. That
   was an aim, not a bound the scenario can assert. Under its drops, duplicates, delays,

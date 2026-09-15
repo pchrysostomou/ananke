@@ -27,6 +27,7 @@ mod state;
 #[cfg(test)]
 mod tests;
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::future::Future;
 use std::sync::Arc;
@@ -310,6 +311,7 @@ impl Sim {
                 drift_ppm,
                 protocol,
                 sched,
+                ranges: BTreeMap::new(),
             },
         );
         st.fs.entry(id).or_insert_with(fs::NodeFs::new);
@@ -756,6 +758,11 @@ impl Environment for SimEnv {
 
     fn sched_rng(&self) -> &SimRng {
         &self.sched_rng
+    }
+
+    // PROPOSED(D-057): a named stream per node and range through the environment.
+    fn range_rng(&self, range: u64) -> SimRng {
+        self.shared.lock().range_stream(self.node, range)
     }
 
     fn spawn<F: Future<Output = ()> + Send + 'static>(

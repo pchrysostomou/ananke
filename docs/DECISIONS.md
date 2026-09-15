@@ -4803,4 +4803,194 @@ moved a seed's schedule; the sweep's did.
 
 ---
 
-_Next entry: D-056. Add one before implementing anything not covered above._
+## PROPOSED D-057 — A named stream per node and range: `Environment::range_rng`
+
+**Context.** SHARD.md's Q13, approved: a named stream per node and range,
+`n{id}/r{range}/protocol`, through a new `Environment` method, derived from the seed in
+`SimEnv` and drawn from OS entropy in `RealEnv`, decided before the stage that first pins
+Phase 3 seeds. Protocol code reaches randomness only through `Environment::rng` and
+`sched_rng` (crates/ananke-env/src/env.rs), and a core's generator is seeded from the
+node's protocol stream at its incarnation's start, so with many groups on a node a split
+would move every later range's election timeouts, against D-017's purpose (SHARD.md §11,
+env 2). Q13 settles the name and the two sources. It does not settle the method's shape —
+a range id or any label — whether a call starts the stream over or continues it, or how
+the simulator keeps it. Those are proposed here.
+
+**Decision.** Every site is marked `PROPOSED(D-057)`.
+
+- `Environment::range_rng(&self, range: u64) -> Self::Rng`: this node's stream for
+  `range`. It takes the range's id rather than a label, so the one name Q13 decided is
+  the only name it can make: a label would let a caller ask for `protocol` or `sched`
+  and be handed a second generator starting where the node's own stream starts, drawing
+  the same numbers.
+- `SimEnv` derives it with `moirae_sched::stream(seed, "n{id}/r{range}/protocol")` the
+  first time the node is asked for that range and keeps it in the node's entry beside
+  `n{id}/protocol` and `n{id}/sched`. Every later call and every handle to the node
+  continues the same stream, as `rng` does, and it lives as long as the simulation, as
+  the node's other streams do, so a restarted core does not draw its last incarnation's
+  numbers again. Making it draws from no other stream.
+- `RealEnv` returns `RealRng`, OS entropy, as for every other stream.
+- Nothing calls it yet. Stage B seeds each core from it, in a commit of its own that
+  moves every election timeout (SHARD.md §12, Stage B). No trace, hash or schedule moves
+  here.
+
+The simulator's tests hold it: the same seed, node and range give the same draws, and
+another range, node or seed other draws, which are moirae's derivation for the name;
+taking range streams and drawing from them, interleaved, leaves the node's protocol and
+scheduling streams, another node's and another range's exactly as they draw without, a
+node added after the takes draws the same clock skew and drift, and a scenario with
+drops, duplicates and random delays whose task takes range streams in one run only
+records the same trace (a draw from the `clock` or the `net` stream added to the
+derivation fails it); and every handle continues one stream
+(crates/ananke-env/src/sim/tests.rs). Under `RealEnv`
+two draws differ (crates/ananke-env/tests/real_env.rs).
+
+**Alternatives.** *A label* (`stream(&self, label)`): general enough for the rebalancer's
+named stream Q42 mentions, but able to alias the node's own streams; a second kind of named
+stream can have its own method when something needs it. *A fresh stream per call*, starting
+the sequence over: two handles would draw the same numbers, and a range's core restarted at
+a new incarnation would draw its last incarnation's election timeouts again, where the node's
+protocol stream continues across incarnations today. *Seeding a range's stream from the
+node's protocol stream*: Q13's reason against it, a split moving every later range's draws.
+*Returning a reference, as `rng` does*: the simulator keeps the streams under its lock and
+cannot lend one out; a `SimRng` clone shares the stream and `RealRng` is a unit, so an owned
+handle costs nothing.
+
+**Consequences.** Both environments in the workspace implement one more method. Stage B's
+switch of each core's seed to its range's stream is the change that moves schedules, and
+this entry is what it switches to.
+
+---
+
+## PROPOSED D-058 — The membership scenario past the snapshot threshold
+
+**Context.** Issue #46 and SHARD.md's Q34, approved: extend `sim/membership.rs` past the
+snapshot threshold before `sim/move.rs`, so that during 3 → 5 → 3 a learner or joining
+voter is fed by a snapshot, asserted per seed; the correct server passes every seed and
+`SingleMajorityInJointConsensus` is still caught on some seed at every tier. The scenario
+ran `RaftConfig`'s default threshold of 4 096 entries and never crossed it
+(OVERNIGHT.md:188-191), so the two pieces of Phase 2 code the issue names, the
+configuration key an install's repair writes and the floor a truncated configuration
+entry reverts to (D-029, D-030), had only unit tests. Q34 settles that the scenario is
+extended. It does not settle how a snapshot feed is made certain on every seed, and a
+lower threshold alone does not make it: only a leader compacts (D-030), a leader elected
+from followers holds a whole log, and such a leader catches an empty learner up with
+entries from index 1. With the threshold lowered and the grow asked as before, 39 of the
+first 1 000 seeds feed no joining server a snapshot in its learner phase.
+
+**Decision.** Every site is marked `PROPOSED(D-058)`.
+
+- The membership servers run the raft sweep's `snapshot_threshold` of 12 and
+  `snapshot_chunk` of 4 096, so leaders take checkpoints and compact routinely.
+- The operator asks for the grow only of a leader that has compacted since it took
+  office — its `RaftCompacted` after its `RaftLeader` in the trace — waiting for one in
+  slices for at most two seconds, and asks that leader alone: a request that finds it no
+  longer leading ends there rather than following the hint, and the driver's next attempt
+  waits for a compacted leader again. A learner's catch-up starts only when a leader
+  accepts the request, and is the leader's alone (D-032), so the first leader to catch
+  servers 4 and 5 up has a compacted prefix, and their first rejection, asking from index
+  1, lands below it: they are fed a snapshot. When no compacted leader appears within the
+  budget the request goes to the leader in force, so a seed without a snapshot feed is
+  reported rather than hidden; `Report::compaction_fallbacks` counts those requests and
+  `Report::compaction_waited` the time waited. The shrink is asked as before.
+- `Schedule::total`, the run-length hint's estimate (D-016), does not count the wait. It is
+  at most 300 ms of a run over the first 1 000 seeds (a mean of 3.85 ms, no fallback),
+  where counting its budget, eight seconds over four attempts, would have lowered PCT's
+  change-point rate on every run for time no run spends.
+- `Report::snapshot_fed_joiners` is every snapshot a joining server installed in its
+  learner phase: from the operator's first request for the grow (`Report::grow`) until the
+  first joint configuration naming that server in `new` takes effect on any server, or,
+  when none does, until the driver stops driving the grow. Installs after that — by a voter
+  of the joint or new configuration, in the transfer's wait, the shrink or the settle — are
+  not counted, nor an install's restatement at its adoption. The correct server's sweep
+  fails any seed with none and its coverage asserts one on every seed; the variant's sweep
+  prints how many of its runs had one; the coverage prints the seeds with a fallback.
+- The run's check fails on any `RaftRefused` whose reason does not start with
+  `LOST_STATE`. No crash is scheduled here, so a refusal can only come from an install's
+  adoption, and a configuration key its repair wrote out of step with the log refuses the
+  store at the open (store.rs) and puts the server in re-seed mode, which traces no
+  failure and whose re-seed install would otherwise count as a feed. The coverage counts
+  adoptions and refusals by the reason's first clause and asserts, at every tier, that none
+  is for anything but lost state.
+
+**What the extension found.** No bug in the Phase 2 code it was aimed at, and one trace
+inconsistency in the install path, returned to the owner unfixed:
+
+- At 20, 100 and 1 000 seeds in release the correct server passes every seed, every seed
+  feeds a joining server a snapshot in its learner phase (63, 388 and 4 056 installs), and
+  no operator request fell back (the longest wait 300 ms). Every install is adopted — 109,
+  651 and 6 557 adoptions — and the open after each checks the configuration key its repair
+  wrote against the log; no store is refused and no server fails.
+- The key repair's non-trivial branch is not reached. An install keeps a tail of the
+  receiver's log only when the receiver holds the snapshot's last index with its term, and
+  a server is fed a snapshot here because its log ends below the leader's prefix: over
+  1 000 seeds no install kept a tail, so none wrote the key from a configuration entry in a
+  tail. Every install wrote the snapshot's own configuration.
+- The core's revert floor is not reached either. No truncation in a running core restored
+  a compacted or installed prefix's configuration over 1 000 seeds, on this tree, on
+  268cf58, or with the threshold alone. What the coverage's `reverts_to_a_prefix` counts, 4 at
+  100 seeds and 44 at 1 000, asserted from 100, are installs whose snapshot's configuration
+  is older than the receiver's in force, which take the receiver back to the installed
+  prefix. Issue #46's second item needs a follower that installs and then appends and
+  truncates a configuration entry above its prefix; this scenario does not build it, and
+  that is a question for the owner.
+- The install's `RaftConfig` (node.rs, `Snap::Finish`) writes the configuration's voters
+  into `new` when it is not joint, where `TraceEvent::RaftConfig` documents `new` as empty
+  outside a joint configuration and the core and the restatement write it empty; the same
+  configuration is traced two ways within one install. The checks read `new` only when
+  `joint` is set, so no verdict depends on it; the studio shows it. Not fixed here.
+- `SingleMajorityInJointConsensus` is caught on 6 of 20, 35 of 100 and 301 of 1 000 seeds
+  (275 of 1 000 on 268cf58).
+
+The coverage at 1 000 seeds against 268cf58: grows and shrinks completed on every seed both
+times; joint configurations taken 10 729 (10 663); new configurations taken 22 861 (9 760),
+since each install traces its snapshot's configuration and its adoption re-states it;
+learners promoted 2 524 (2 470); elections while joint 33 (51); step-downs of a leader outside
+`C_new` 412 (435); completed operations 348 849 (287 719); worst completion gap 352.96 ms
+(382.24 ms); slowest first write after the last heal 471.89 ms (450.07 ms); configuration
+reverts 69 (709). The reverts fall because installs now take conflicting configuration
+entries out of force where truncations did. On 268cf58, 717 configuration entries a server
+held in force had another term in the committed log at that index, and 709 of them left
+force by a truncation, each a revert. On this tree 780 did: 25 by a truncation, 746 by an
+install, and 9 not before the run ended. Of those 746, 44 took the receiver to an older
+configuration and count as reverts, and 702 took it to a newer one, which the counter,
+comparing indices, does not see as leaving an entry out of force. The threshold alone gives
+79 reverts (29 truncations, 50 installs).
+
+Timings, the two membership tests at 1 000 seeds in release, another agent's sweeps sharing
+the machine: on a563205, the commit before this review's changes, 26.0 s with the one-minute
+load at 18.4 and falling at its start, and 14.0 s at 10.1 to 11.6, against 10.4 s on 268cf58
+at 9.8 to 10.1; on this tree 26.2 s at a mean load of 84.0 over six samples, against 19.7 s on
+268cf58 at 79.6 over four. The load moves these more than the change does.
+
+Every figure above has its command and output in the lane's scratchpad, `scratchpad stage-a/n/audit-d058`:
+`run-audit.sh` runs them all; `membership-{20,100,1000}.log` and `membership-1000-268cf58.log`
+are the tests' coverage and timings with their load samples; `feeds-new.log` and
+`feeds-threshold-alone.log` are the learner-phase feeds, fallbacks and waits
+(`zz_m5_new.rs`); `traces-new.log`, `traces-threshold-alone.log` and
+`traces-268cf58.log` are the reverts, truncations, installs, tails, refusals and conflicting
+configuration entries (`zz_m5_trace.rs`).
+
+**Alternatives.** *The threshold alone*: 39 seeds in 1 000 without a learner-phase feed.
+*Crashing or isolating a joining server until its leader compacts past it*: a second fault
+in a scenario about membership under partition, and D-037's designation would feed it
+only after two quiet election timeouts. *Asserting the feed only on seeds that reach it*: the
+issue asks it of every seed, as §10's *every seed* standard does of a directed shape.
+*Counting any install by a joining server during 3 → 5 → 3*: it counts voters fed after the
+change, which the exit criterion does not ask for. *Directing the shrink too*: no server
+joins in the shrink.
+
+**Consequences.** The scenario's schedule moved: a lower threshold changes every
+membership run from its first checkpoint on, and the run-length hint no longer counts a
+wait. Its pinned assertions are the sweep's and the variant's, both re-run above. The worst
+completion gap of 549.359683 ms that SPEC §3, RAFT.md §1 and the scenario's module comment
+cite was measured at ten thousand seeds before this change; the next ten-thousand-seed
+nightly re-measures it on the moved schedule, and those three places are marked as measured
+before D-058. `sim/move.rs` can rely on a learner fed by snapshot during a change on one group,
+not on the key repair's tail branch or the truncation revert floor, which this scenario does
+not reach. If a seed at ten thousand exhausts the wait, reaches a leader that has not
+compacted, or refuses a store, the correct server's sweep names it.
+
+---
+
+_Next entry: D-059. Add one before implementing anything not covered above._

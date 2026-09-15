@@ -169,7 +169,7 @@ reverts the entry excluding it restores its right to campaign. The exit criterio
 3 → 5 → 3 under partition (SPEC §3), is a scenario in `sim/membership.rs` with a leader
 on the minority side during the change: the change completes both ways, and no gap
 between completed client operations, partition windows taken out, is longer than ten
-maximum election timeouts (D-029). The worst gap at ten thousand seeds is 549.359683 ms.
+maximum election timeouts (D-029). The worst gap at 10 000 seeds was 549.359683 ms before D-058.
 
 **Snapshots (thesis §5, SPEC §3).** A snapshot is an `Engine::checkpoint` of the state
 machine's store at an applied index, with the index, term and configuration at that
