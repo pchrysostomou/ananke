@@ -4,9 +4,11 @@ _Status: proposed 2026-09-14; approved by the owner on 2026-09-15. §13 records 
 approved answer to each of its questions, and wherever the text rests on one it names
 it, as (Q20). Each implementation stage turns its part into a DECISIONS.md entry as it
 lands, numbered from the footer's next free entry then; no entry is written by the
-approval itself. §12's stages are proposed and not approved: no implementation code
-lands until the owner approves them. The choices listed at the end of §13, under "Added in
-writing the approvals up", are not approved either._
+approval itself. §12's stages were approved by the owner on 2026-09-15 as drafted, with
+two additions: a green ten-thousand-seed nightly on a stage's branch before the stage is
+tagged, and Stage A's decision and test on a v0.3.0 store. The choices listed at the end
+of §13, under "Added in writing the approvals up", await the owner's answers, and Stage A
+starts once they are answered._
 
 **A stated assumption.** Phase 3 has no transactions: Percolator is Phase 4 (D-006, SPEC
 §5). Every "atomic" below is one engine `WriteBatch` on one node (D-024), written by the
@@ -1993,7 +1995,9 @@ and its Phase 2 variants, and never names a descriptor or a span.
 
 ## 12. Stages
 
-_Proposed 2026-09-15; not approved. No implementation code until the owner approves these stages._
+_Approved by the owner on 2026-09-15 as drafted, with two additions: the ten-thousand-seed
+nightly in every stage's exit, and Stage A's v0.3.0-store decision and test. Stage A
+starts once the choices at the end of §13 are answered._
 
 This section replaces §12's earlier order of work. It is proposed, not approved: SHARD.md's
 decisions in §13 are approved, these stages are not, and no implementation code lands
@@ -2023,6 +2027,14 @@ the stage that first pins Phase 3 seeds (Q13).
   never trips it over ten thousand seeds (§10). One scenario is excepted by name:
   `sim/balance.rs`, whose tiers are set by its measured cost (Q30) and stated under
   Stage E.
+- Before a stage is tagged, the nightly at ten thousand seeds runs on the stage's branch
+  and is green: every sweep and directed scenario the stage runs, the correct system on
+  every seed and every variant to its standard, `sim/balance.rs` at the count its
+  measured cost sets. This is the owner's addition of 2026-09-15, and it applies to every
+  stage whether or not a later stage relies on the stage's bounds: Phase 2's
+  thousand-seed tier was green on trees where ten thousand then found the adoption and
+  stream bugs of seeds 6325 and 5909 (docs/devlog/02-phase-2.md; D-041, D-043), so a
+  thousand seeds is not the evidence a stage closes on.
 - Every bound and hold is measured on the correct system before it is asserted (Q39). A
   bound the correct system trips is a model error to fix, not a bound to widen (D-030,
   D-039; §10).
@@ -2100,6 +2112,14 @@ the stage that first pins Phase 3 seeds (Q13).
 - The first commit of Phase 3 is item 1, before any code (Q1).
 - Q16's queue lands before batching puts many ranges on one socket: item 3 precedes
   Stage B's batch frames.
+- Before item 6's code, the decision on what becomes of a v0.3.0 store when the key layout
+  lands, proposed as its DECISIONS.md entry and approved: such a store is refused at open
+  with a clear error naming its format version and the one the code expects (Q5,
+  condition 2), never migrated and never read under the new layout. With it, and before
+  the layout's code, the test that holds the decision: a store written by v0.3.0's own
+  code, the tagged tree's, kept as a fixture rather than made by the new code, is opened
+  by the new code and refused with that error, and no key of it is read as the new
+  layout's. The owner's addition of 2026-09-15.
 
 **Exit criteria.**
 
@@ -2121,8 +2141,9 @@ the stage that first pins Phase 3 seeds (Q13).
   the span checkpoint and the live install in its workload, and `NoWalBeforeMemtable`,
   `ReleaseBeforeManifest` and `DeleteBeforeManifest` are still caught
   (crates/ananke-storage/src/engine.rs:69-89; sim/tests/engine.rs:174-205).
-- A store written in 0.3.0's format is refused at open, and the test asserts both version
-  numbers in the error (Q5, condition 2).
+- The v0.3.0 fixture's test passes on the tree after item 6: the store is refused at open,
+  the error names both format versions, and no key of it is read under the new layout
+  (Q5, condition 2; the entry criterion above).
 - On the tree after item 3, `sim/raft.rs`, `sim/membership.rs` and `sim/quorum.rs` pass
   every seed, every Phase 2 variant is caught to the standard listed under Stage B, and
   the raft sweep's coverage prints how many frames the queue dropped.
@@ -2155,8 +2176,9 @@ session table, so #21 adds keys and moves none (Q11), which the layout's entry s
 
 **DECISIONS.md entries.** The correction's, in item 1's commit, which its forward
 pointers name; `SimEnv`'s queue, a simulator model of D-015's bound, with the hash move
-and the re-audit (Q16); the key layout, recording 0.3.0's format break and where the
-format version lives (Q5, condition 3); the live install and its crash test, which meets
+and the re-audit (Q16); the v0.3.0-store decision, before the layout's code (the entry
+criterion above); the key layout, recording 0.3.0's format break and where the format
+version lives (Q5, condition 3); the live install and its crash test, which meets
 Q2's criterion, with its engine variant; the other primitives and their engine variants;
 the membership scenario's extension, with what it found (Q34).
 
