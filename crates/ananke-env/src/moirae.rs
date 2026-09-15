@@ -56,13 +56,18 @@
 //! all decided as they are recorded exports byte for byte as it did before, and no
 //! moirae format version moves. Sends, deliveries, drops and faults are recorded as
 //! they happen and never carry it.
+//!
+//! An `ananke.raft.term` line whose step took a peer's message that had waited for
+//! it carries `receivedNs`, global virtual time in nanoseconds when the server
+//! received that message, after the event's own fields and before `decidedNs`, and
+//! only where it differs from the decision time (D-050, proposed).
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 
 use moirae_trace::{Cause, Collect, Error, Event, Header, Json, Sink, TimeUnit, Verify, Writer};
 
-use crate::sim::{Sim, Snapshot, TraceRecord};
+use crate::sim::{RunHeader, Sim, TraceRecord};
 use crate::{ClientOp, ClientResult, DirEntryOp, DropReason, NodeId, TraceEvent, WalStopReason};
 
 /// Turns a message payload into the `msg` object of a `send` line: an object whose
@@ -128,7 +133,7 @@ impl Sim {
     /// A seed, time or integer beyond what a JavaScript reader keeps exact, or a decoder
     /// that returned something other than an object.
     pub fn to_moirae(&self, export: &Export<'_>) -> Result<String, Error> {
-        Ok(write(&self.snapshot(), export, Collect::default())?.jsonl())
+        self.run_header().to_moirae(&self.trace(), export)
     }
 
     /// Replays the export against a recorded trace and stops at the first line that
@@ -141,7 +146,12 @@ impl Sim {
     /// [`Error::LongerThanRecording`]; a recording longer than this trace is reported as
     /// a divergence at the first missing line.
     pub fn verify_moirae(&self, recorded: &str, export: &Export<'_>) -> Result<(), Error> {
-        let sink = write(&self.snapshot(), export, Verify::against(recorded))?;
+        let sink = write(
+            &self.run_header(),
+            &self.trace(),
+            export,
+            Verify::against(recorded),
+        )?;
         if sink.complete() {
             Ok(())
         } else {
@@ -154,17 +164,35 @@ impl Sim {
     }
 }
 
-fn write<S: Sink>(snapshot: &Snapshot, export: &Export<'_>, sink: S) -> Result<S, Error> {
+impl RunHeader {
+    /// `records`, a run's trace or a prefix of it, as moirae JSONL, format v2, under
+    /// this run's header: the bytes [`Sim::to_moirae`] writes for the same records.
+    ///
+    /// # Errors
+    ///
+    /// As [`Sim::to_moirae`].
+    // PROPOSED(D-052): a scenario's moirae JSONL is written when it is asked for.
+    pub fn to_moirae(&self, records: &[TraceRecord], export: &Export<'_>) -> Result<String, Error> {
+        Ok(write(self, records, export, Collect::default())?.jsonl())
+    }
+}
+
+fn write<S: Sink>(
+    run: &RunHeader,
+    records: &[TraceRecord],
+    export: &Export<'_>,
+    sink: S,
+) -> Result<S, Error> {
     let mut w = Writer::new(sink);
-    w.header(&header(snapshot))?;
-    for (node, _, _) in &snapshot.clocks {
+    w.header(&header(run))?;
+    for (node, _, _) in &run.clocks {
         w.emit(&Event::Init {
             t: 0,
             node: node.get(),
         })?;
     }
-    let addrs: BTreeMap<SocketAddr, NodeId> = snapshot.addrs.iter().copied().collect();
-    for record in &snapshot.records {
+    let addrs: BTreeMap<SocketAddr, NodeId> = run.addrs.iter().copied().collect();
+    for record in records {
         if let Some(event) = convert(record, &addrs, export) {
             w.emit(&event)?;
         }
@@ -172,8 +200,8 @@ fn write<S: Sink>(snapshot: &Snapshot, export: &Export<'_>, sink: S) -> Result<S
     Ok(w.into_sink())
 }
 
-fn header(snapshot: &Snapshot) -> Header {
-    let c = &snapshot.config;
+fn header(run: &RunHeader) -> Header {
+    let c = &run.config;
     let ppm = |p: f64| Json::Int((p * 1_000_000.0).round() as i64);
     let ns = |d: std::time::Duration| Json::Int(i64::try_from(d.as_nanos()).unwrap_or(i64::MAX));
     let config = Json::obj(vec![
@@ -188,7 +216,7 @@ fn header(snapshot: &Snapshot) -> Header {
             Json::Int(i64::try_from(c.run_length_hint).unwrap_or(i64::MAX)),
         ),
     ]);
-    let clocks = snapshot
+    let clocks = run
         .clocks
         .iter()
         .map(|(node, skew, drift)| {
@@ -199,7 +227,7 @@ fn header(snapshot: &Snapshot) -> Header {
             ])
         })
         .collect();
-    let addrs = snapshot
+    let addrs = run
         .addrs
         .iter()
         .map(|(addr, node)| {
@@ -211,14 +239,14 @@ fn header(snapshot: &Snapshot) -> Header {
         .collect();
     Header {
         seed: c.seed,
-        nodes: u32::try_from(snapshot.clocks.len()).expect("node count fits u32"),
+        nodes: u32::try_from(run.clocks.len()).expect("node count fits u32"),
         unit: TimeUnit::Ns,
         network: None,
         extra: vec![(
             "ananke".to_owned(),
             Json::obj(vec![
                 ("version", Json::str(env!("CARGO_PKG_VERSION"))),
-                ("policy", Json::str(&snapshot.policy.name())),
+                ("policy", Json::str(&run.policy.name())),
                 ("config", config),
                 ("clocks", Json::Array(clocks)),
                 ("addrs", Json::Array(addrs)),
@@ -580,14 +608,27 @@ fn convert(
             "ananke.wal.segment-deleted",
             Some(Json::obj(vec![("segment", int(*segment))])),
         ),
-        TraceEvent::RaftTerm { server, term, role } => log(
-            "ananke.raft.term",
-            Some(Json::obj(vec![
+        TraceEvent::RaftTerm {
+            server,
+            term,
+            role,
+            received,
+        } => {
+            let mut fields = vec![
                 ("server", int(*server)),
                 ("term", int(*term)),
                 ("role", Json::str(role)),
-            ])),
-        ),
+            ];
+            // PROPOSED(D-050): when the message the step took was received,
+            // written only where it is not the decision time, as `decidedNs` is
+            // written only where that is not `t`.
+            if let Some(received) = received
+                && received.instant() != record.decided
+            {
+                fields.push(("receivedNs", int(received.instant().as_nanos())));
+            }
+            log("ananke.raft.term", Some(Json::obj(fields)))
+        }
         TraceEvent::RaftVote {
             server,
             term,
@@ -1160,6 +1201,13 @@ mod tests {
     /// with a decision stamp taken before the wait when `stamped`, decided now when
     /// not. (D-047).
     fn decided_scenario(stamped: bool) -> Sim {
+        received_scenario(stamped, None)
+    }
+
+    /// [`decided_scenario`] with the wait before the step split at `receipt`'s
+    /// millisecond, where a stamp is taken, and the term's record saying so when
+    /// `receipt`'s flag is set. (D-050).
+    fn received_scenario(stamped: bool, receipt: Option<(u64, bool)>) -> Sim {
         let mut config = SimConfig::new(5);
         config.fs.latency_min = Duration::from_millis(2);
         config.fs.latency_max = Duration::from_millis(2);
@@ -1167,7 +1215,20 @@ mod tests {
         let node = sim.add_node();
         let env = sim.env(node);
         env.clone().spawn("raft", async move {
-            env.clock().sleep(Duration::from_millis(3)).await;
+            let stamp = match receipt {
+                None => {
+                    env.clock().sleep(Duration::from_millis(3)).await;
+                    None
+                }
+                Some((at, recorded)) => {
+                    env.clock().sleep(Duration::from_millis(at)).await;
+                    let stamp = env.decision();
+                    if at < 3 {
+                        env.clock().sleep(Duration::from_millis(3 - at)).await;
+                    }
+                    recorded.then_some(stamp)
+                }
+            };
             let decided = env.decision();
             let file = env
                 .fs()
@@ -1185,6 +1246,7 @@ mod tests {
                 server: 1,
                 term: 7,
                 role: "follower",
+                received: stamp,
             };
             if stamped {
                 env.trace_decided(decided, event);
@@ -1243,6 +1305,49 @@ mod tests {
         assert!(!p_jsonl.contains("decidedNs"), "{p_jsonl}");
         assert_eq!(s_jsonl.replace(",\"decidedNs\":3000000", ""), p_jsonl);
         stamped.verify_moirae(&s_jsonl, &export).unwrap();
+    }
+
+    /// PROPOSED(D-050): a term's record says when the message its step
+    /// took was received. The harness reads it through [`TraceRecord::received`];
+    /// the export writes it as `receivedNs`, after the event's own fields and before
+    /// `decidedNs`, only where it differs from the decision time; and a record that
+    /// carries none, or one received as its step decided, exports as it did.
+    #[test]
+    fn a_term_record_carries_when_its_message_was_received_and_exports_it_only_when_it_differs() {
+        let export = Export::new(&bytes_decoder);
+        let term = |sim: &Sim| {
+            sim.trace()
+                .into_iter()
+                .find(|r| matches!(r.event, TraceEvent::RaftTerm { .. }))
+                .expect("the term is traced")
+        };
+        let early = received_scenario(true, Some((1, true)));
+        let record = term(&early);
+        assert_eq!(record.received(), Some(Instant::from_nanos(1_000_000)));
+        assert_eq!(record.decided, Instant::from_nanos(3_000_000));
+        let jsonl = early.to_moirae(&export).unwrap();
+        let field = "\"data\":{\"server\":1,\"term\":7,\"role\":\"follower\",\"receivedNs\":1000000,\"decidedNs\":3000000}";
+        assert!(jsonl.contains(field), "{jsonl}");
+        let plain = received_scenario(true, Some((1, false)));
+        assert_eq!(term(&plain).received(), None);
+        assert_eq!(
+            jsonl.replace(",\"receivedNs\":1000000", ""),
+            plain.to_moirae(&export).unwrap(),
+            "the field is the only difference a stamp makes"
+        );
+        let at_the_step = received_scenario(true, Some((3, true)));
+        assert_eq!(
+            term(&at_the_step).received(),
+            Some(term(&at_the_step).decided)
+        );
+        assert!(
+            !at_the_step
+                .to_moirae(&export)
+                .unwrap()
+                .contains("receivedNs"),
+            "a message received as its step decided writes nothing new"
+        );
+        early.verify_moirae(&jsonl, &export).unwrap();
     }
 
     #[test]

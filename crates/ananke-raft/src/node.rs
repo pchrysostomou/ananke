@@ -150,7 +150,18 @@ fn now_nanos<E: Environment>(env: &E) -> u64 {
 /// What the `raft` task takes from its inbox.
 enum Event {
     /// A protocol message from a peer.
-    Message { from: ServerId, message: Message },
+    Message {
+        /// The peer.
+        from: ServerId,
+        /// The message.
+        message: Message,
+        /// The stamp the `net` task took as it received the frame. The message may
+        /// wait in the inbox behind a persist or an install before a step takes
+        /// it, and that step's term change says when its cause arrived (D-050).
+        // PROPOSED(D-050): a term's record carries when the message its step took
+        // was received.
+        received: Decision,
+    },
     /// A client's request, with where to answer.
     Request { from: SocketAddr, request: Request },
     /// The `apply` task applied through this index.
@@ -361,7 +372,11 @@ pub async fn run<E: Environment>(env: E, config: NodeConfig) -> io::Result<()> {
                 let Ok(frame) = Frame::decode(bytes) else {
                     continue;
                 };
-                admit(&env, server, &inbox, inbox_capacity, frame);
+                // PROPOSED(D-050): when the frame reached the server, a
+                // stamp that reads the time and nothing else (D-047), so it moves
+                // no schedule.
+                let received = env.decision();
+                admit(&env, server, &inbox, inbox_capacity, frame, received);
             }
             inbox.close();
         }
@@ -678,6 +693,9 @@ async fn incarnation<E: Environment>(
         server,
         term: core.term(),
         role: "follower",
+        // PROPOSED(D-050): a term's record carries when the message its step
+        // took was received; a restatement is no message's step.
+        received: None,
     });
     let mut node = Server {
         env: env.clone(),
@@ -711,6 +729,9 @@ async fn incarnation<E: Environment>(
                 }
             }
         };
+        // PROPOSED(D-050): when the peer's message this step takes was
+        // received, for the term change it may trace; none for any other input.
+        let mut received = None;
         let (input, request, read, change) = match event {
             None => {
                 // The re-seed progress the `snapshot` task saw since the last
@@ -720,11 +741,17 @@ async fn incarnation<E: Environment>(
                 for to in take_stream_acks(&stream_acks) {
                     let decided = env.decision();
                     let outputs = core.step(Input::SnapshotAcked { to });
-                    node.execute(&core, outputs, decided).await?;
+                    // PROPOSED(D-050): re-seed progress is no peer's message
+                    // on the inbox, so the step carries no receipt.
+                    node.execute(&core, outputs, decided, None).await?;
                 }
                 (Input::Tick, None, None, None)
             }
-            Some(Event::Message { from, message }) => match message {
+            Some(Event::Message {
+                from,
+                message,
+                received: at,
+            }) => match message {
                 // Snapshot streaming is the snapshot task's (RAFT.md §3).
                 Message::InstallSnapshot { .. } => {
                     node.snaps.push(Snap::Chunk { from, message });
@@ -734,16 +761,19 @@ async fn incarnation<E: Environment>(
                     node.snaps.push(Snap::Ack { from, message });
                     continue;
                 }
-                message => (
-                    Input::Message {
-                        from,
-                        message,
-                        now: now_nanos(env),
-                    },
-                    None,
-                    None,
-                    None,
-                ),
+                message => {
+                    received = Some(at);
+                    (
+                        Input::Message {
+                            from,
+                            message,
+                            now: now_nanos(env),
+                        },
+                        None,
+                        None,
+                        None,
+                    )
+                }
             },
             Some(Event::Applied(index)) => (Input::Applied(index), None, None, None),
             Some(Event::Taken { index, term }) => {
@@ -928,7 +958,7 @@ async fn incarnation<E: Environment>(
                 }
             }
         }
-        node.execute(&core, outputs, decided).await?;
+        node.execute(&core, outputs, decided, received).await?;
     };
     node.jobs.close();
     snaps.close();
@@ -958,7 +988,9 @@ async fn install_decision<E: Environment>(
                 // D-047: this step's decision time, as in the loop.
                 let decided = node.env.decision();
                 let outputs = core.step(Input::Applied(index));
-                node.execute(core, outputs, decided).await?;
+                // PROPOSED(D-050): a completion is no peer's message, so the
+                // step carries no receipt.
+                node.execute(core, outputs, decided, None).await?;
             }
             Some(_) => {}
         }
@@ -1805,7 +1837,7 @@ async fn reseed<E: Environment>(
         let Some(event) = inbox.pop().await else {
             return Next::Closed;
         };
-        let Event::Message { from, message } = event else {
+        let Event::Message { from, message, .. } = event else {
             continue;
         };
         match message {
@@ -1923,6 +1955,9 @@ fn admit<E: Environment>(
     inbox: &Queue<Event>,
     capacity: usize,
     frame: Frame,
+    // PROPOSED(D-050): when the `net` task received the frame, carried on the
+    // inbox event to the step that takes it.
+    received: Decision,
 ) {
     let is_message = |event: &Event| matches!(event, Event::Message { .. });
     let is_heartbeat = |message: &Message| matches!(message, Message::AppendEntries { entries, .. } if entries.is_empty());
@@ -1941,7 +1976,7 @@ fn admit<E: Environment>(
             )
             .or_else(|| {
                 inbox.remove_first(|event| {
-                    matches!(event, Event::Message { from: f, message }
+                    matches!(event, Event::Message { from: f, message, .. }
                         if *f == from && message.kind() == kind && !carries_entries(message))
                 })
             });
@@ -1958,6 +1993,7 @@ fn admit<E: Environment>(
     inbox.push(Event::Message {
         from: frame.from,
         message: frame.message,
+        received,
     });
 }
 
@@ -2041,12 +2077,15 @@ impl<E: Environment> Server<E> {
     ///
     /// The trace events carry `decided`, the stamp taken at the step that produced
     /// them (D-047): each record's own time is when it became durable, and
-    /// the stamp is when the step took it.
+    /// the stamp is when the step took it. A term change also carries `received`,
+    /// when the peer's message the step took reached the server, if it took one
+    /// (D-050).
     async fn execute(
         &mut self,
         core: &Raft,
         outputs: Vec<Output>,
         decided: Decision,
+        received: Option<Decision>,
     ) -> io::Result<()> {
         let send_first = self.variants.contains(Variant::SendBeforePersist);
         if send_first {
@@ -2127,7 +2166,14 @@ impl<E: Environment> Server<E> {
                 }
                 Output::Snapshot(action) => self.snaps.push(Snap::Action(action)),
                 // D-047: decided at the step, traced now.
-                Output::Trace(event) => self.env.trace_decided(decided, event),
+                Output::Trace(mut event) => {
+                    // PROPOSED(D-050): a term change says when the message
+                    // its step took was received.
+                    if let TraceEvent::RaftTerm { received: at, .. } = &mut event {
+                        *at = received;
+                    }
+                    self.env.trace_decided(decided, event);
+                }
             }
         }
         Ok(())

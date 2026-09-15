@@ -1333,6 +1333,10 @@ impl Raft {
             server: self.id.0,
             term: self.term,
             role: role.name(),
+            // PROPOSED(D-050): a term's record carries when the message its step
+            // took was received. The core has no clock: the server sets it as it
+            // traces the step.
+            received: None,
         });
     }
 

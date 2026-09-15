@@ -184,14 +184,36 @@ pub struct TraceRecord {
     pub event: TraceEvent,
 }
 
-/// What the moirae export reads: the configuration, the policy, each node's clock, every
-/// address ever bound, and the records.
-pub(crate) struct Snapshot {
+impl TraceRecord {
+    /// When the peer's message that the step behind this record took reached its
+    /// node, in global virtual time, for a record that says: a term change taken
+    /// from a message ([`TraceEvent::RaftTerm`]'s `received`). At or before
+    /// [`decided`](Self::decided); `None` for every other record. The stamp is opaque
+    /// to the code under test (D-047) and read here, by the harness, like the
+    /// record's two times.
+    // PROPOSED(D-050): a term's record carries when the message its step took was
+    // received.
+    #[must_use]
+    pub fn received(&self) -> Option<Instant> {
+        match &self.event {
+            TraceEvent::RaftTerm { received, .. } => received.map(Decision::instant),
+            _ => None,
+        }
+    }
+}
+
+/// What the moirae export reads of a run besides its records: the configuration,
+/// the policy, each node's clock and every address ever bound. Taken from a [`Sim`]
+/// once a run is over, it writes that run's JSONL later, from the records the caller
+/// kept, and only if anyone asks for it ([`RunHeader::to_moirae`], D-052); the bytes
+/// are the ones [`Sim::to_moirae`] writes.
+// PROPOSED(D-052): a scenario's moirae JSONL is written when it is asked for.
+#[derive(Clone, Debug)]
+pub struct RunHeader {
     pub(crate) config: SimConfig,
     pub(crate) policy: Policy,
     pub(crate) clocks: Vec<(NodeId, i64, i64)>,
     pub(crate) addrs: Vec<(std::net::SocketAddr, NodeId)>,
-    pub(crate) records: Vec<TraceRecord>,
 }
 
 /// A simulation: the executor, the clock, the fabric, the disks and the trace.
@@ -528,6 +550,20 @@ impl Sim {
             .unwrap_or_default()
     }
 
+    /// A number that moves whenever `node`'s durable namespace, what
+    /// [`durable_names`](Self::durable_names) reads, may have changed: at every
+    /// `sync_dir` that makes a directory operation durable and at every crash. Equal
+    /// numbers mean equal namespaces, so a watch polling the namespace need read it
+    /// again only when the number has moved. Reading it reads a counter and nothing
+    /// else.
+    // PROPOSED(D-052): the harness's watch of the durable namespace reads a version
+    // first.
+    #[must_use]
+    pub fn durable_version(&self, node: NodeId) -> u64 {
+        let st = self.shared.lock();
+        st.fs.get(&node).map_or(0, |fs| fs.durable_version())
+    }
+
     /// A copy of the trace so far.
     #[must_use]
     pub fn trace(&self) -> Vec<TraceRecord> {
@@ -556,10 +592,13 @@ impl Sim {
             .unwrap_or_default()
     }
 
-    /// Everything the moirae export needs, copied out from under the lock.
-    pub(crate) fn snapshot(&self) -> Snapshot {
+    /// Everything the moirae export needs besides the records, copied out from under
+    /// the lock: with [`Sim::trace`], what [`Sim::to_moirae`] writes.
+    // PROPOSED(D-052): a scenario's moirae JSONL is written when it is asked for.
+    #[must_use]
+    pub fn run_header(&self) -> RunHeader {
         let st = self.shared.lock();
-        Snapshot {
+        RunHeader {
             config: st.config.clone(),
             policy: st.policy,
             clocks: st
@@ -568,7 +607,6 @@ impl Sim {
                 .map(|(id, n)| (*id, n.skew_nanos, n.drift_ppm))
                 .collect(),
             addrs: st.fabric.known.iter().map(|(a, n)| (*a, *n)).collect(),
-            records: st.trace.clone(),
         }
     }
 

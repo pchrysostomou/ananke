@@ -3630,4 +3630,423 @@ no verdict changed on a seed whose trace did not.
 
 ---
 
-_Next entry: D-050. Add one before implementing anything not covered above._
+## PROPOSED D-050 — A term's record carries when the message its step took was received
+
+**Context.** Issue #32, the open point D-047 left. The pre-vote check reads a term
+change by its decision time, the moment the step that took it was taken, so a change
+decided before an isolation and traced inside it is not the isolated server's
+election. A term-raising message can also be *delivered* before an isolation and
+*stepped* inside it: the `raft` task is still awaiting a persist when the message
+arrives, or finishing an install, and the message waits in the inbox. That step is
+decided inside the window, no message reaches the server in the window, and the check
+by decision time flags the correct server. D-047 rejected the checker-side repair,
+matching each rise to the delivery that caused it, because the checker would
+re-implement the core's term rule and the inbox. The issue asked for a trace fact the
+server already knows, or a measured argument that the case cannot arise, and in
+either case a seed that reaches the shape and asserts the verdict for its reason.
+
+No correct-server seed of the ten-thousand-seed nightlies was flagged this way. The
+case is still reachable: it needs the server busy when the message arrives, where
+D-047's straddle needs only the step's own persist to span the isolation's start, so
+it is rarer, and the directed scenario below reaches it on 23 of the first 100 seeds.
+An argument that it cannot arise would be false.
+
+**Decision.** The server records the fact on the record the check reads. Every site
+is marked `PROPOSED(D-050)`.
+
+*The fact.* `TraceEvent::RaftTerm` gains `received: Option<Decision>`: when the peer's
+message that the step behind the record took reached the server. The `net` task takes
+a decision stamp (D-047) as it receives each frame, before admitting it to the inbox,
+and the inbox event carries it; the `raft` loop remembers the stamp of the message a
+step takes and `Server::execute` sets it on the `RaftTerm` events that step outputs.
+A step whose input is no peer's message — a tick, a completion, re-seed progress —
+and the restatement at an incarnation's start carry `None`, and so does everything
+the core emits, since the core has no clock. The simulator's harness reads it as
+`TraceRecord::received`, global virtual time at or before the record's decision
+time; `Decision` stays opaque to the code under test. The moirae export writes
+`receivedNs` in the line's `data`, after the event's own fields and before
+`decidedNs`, and only where it differs from the decision time, as `decidedNs` is
+written only where that differs from `t`.
+
+*The check.* `Report::check`'s pre-vote check is `isolation_keeps_the_term_by_cause`:
+the check by decision time, except that an isolation is not flagged when every change
+of its server's term decided in `(from, until]` carries a receipt at or before `from`.
+It is that check's verdict with one named excuse, so it flags nothing the check by
+decision time does not. A change from a step that took no peer's message — a
+campaign on the server's own timer without pre-vote, a restatement, a completion —
+carries no receipt and is flagged as before, whatever else changed its term in the
+same window. With pre-vote a term rises in the step that takes the granting
+`PreVoteResponse`, or the `TimeoutNow` of a transfer, and that step carries the
+message's receipt: such a candidacy, received by `from`, is excused like any change a
+message caused, since what decided the election reached the server before it was cut
+off. (This paragraph first said that a campaign takes no message and carries no
+receipt, which holds only for a campaign without pre-vote; reworded after review.) `isolation_keeps_its_term_by` and
+`isolation_keeps_its_term_by_cause` give one isolation's verdict, and
+`isolation_received_straddles` is the predicate: each change received by an
+isolation's start and decided inside it, with the messages from a server delivered to
+the isolated one at the receipt and the count delivered in the window.
+`isolation_keeps_the_term_by` under either `RecordTime` is unchanged, and so is
+`moved_by_decision_time`, which now compares the check by durability time with this
+one; the sweeps' assertion on a removed pre-vote catch accepts a change received
+before the isolation beside D-047's straddle.
+
+*The scenario.* `Fault::IsolateOnTermRaise`, never drawn by `Schedule::draw`, and
+`Schedule::term_raise_behind_a_step(tries)`: no lease trial, true clocks, and `tries`
+rounds, each asking the leader to hand over to the follower after it, whose campaign
+sends the third server a RequestVote of a higher term; the run advances in slices of
+10 µs until a message from a server carrying a term above the third server's last
+traced one is delivered to it, and cuts that server off alone at the slice's end for
+300 ms. A slice ends with nothing runnable, so an idle `raft` task has already taken
+the message before the isolation, which is D-047's straddle, and a busy one takes it
+inside the window, which is this entry's. With eight rounds, measured in release:
+the shape on 5 of 20 seeds, 23 of 100 and 299 of 1 000, 8 changes in 136 isolations,
+28 in 706 and 358 in 7 036, beside 122, 648 and 6 403 of D-047's straddles. The test
+`a_term_change_stepped_inside_an_isolation_from_a_message_received_before_it_is_excused`
+asserts at every tier that the correct
+server passes the whole check on every seed, that the shape is reached on some seed,
+and, for every change it finds, the reason: received by the start and decided inside,
+no message from a server delivered in the window, a message of the new term from
+another server delivered at the receipt, and the check by decision time flagging the
+isolation while this check does not. Seed 4 is pinned with its numbers: server 1's
+RequestVote of term 5 received by server 2 at 3.679125915 s, the isolation from
+3.67913 s, server 2's step 2.176899 ms into it, the check by decision time flagging
+*pre-vote: server 2 raised its term from 4 to 5 while isolated from Instant(3.67913s)
+to Instant(3.97913s)* and the check passing. The pair: `NoPreVote` on the same
+schedule is caught by this check on 20 of 20, 100 of 100 and 1 000 of 1 000 seeds.
+
+*No schedule moved.* The stamp reads the time under the simulator's lock and nothing
+else, as D-047's does. The echo scenario's pinned body hash is unchanged,
+`19f19201df99a799`. Eighteen raft traces from this tree are the traces of 94c6a54,
+the tree before this entry, byte for byte once `receivedNs` is removed, and no other
+line differs: the correct server's seeds 42 (100 992 lines, 0 carrying the field),
+1885 (82 827, 0), 2023 (96 023, 0), 0 (75 713, 1), 1 (66 093, 2), 2 (100 144, 1), 3
+(106 255, 3), 5 (84 420, 1), 7 (100 326, 1), 11 (80 543, 0) and 13 (35 916, 0), and
+`IgnoreIncarnation` 1252 (97 128, 2), `SharedSnapshotDir` 3863 (92 102, 1) and 680
+(184 526, 0), `ResetTimerOnAnyRpc` 5153 (66 379, 0), `ApplyBeforeCommit` 6366 (75 642,
+2), `SnapshotWithoutCurrentLast` 2305 (100 722, 0) and `AdoptionAsBuilt` 1929 (85 694,
+0). Seeds 42, 1885 and 2023 have the line counts D-047 measured.
+
+*A correction to D-047's measurement.* D-047 gave the two straddles decided at a
+re-seed install's completion, `SharedSnapshotDir` 3863 and `IgnoreIncarnation` 1252,
+as a new incarnation's first step taking an AppendEntries of the new term delivered
+2.48 ms and 16.31 ms earlier. The receipt on their records says otherwise. On 3863
+server 2's change to term 11, decided at 18.221725074 s, took the AppendEntries
+received at 18.081057713 s, 140.67 ms before; on 1252 server 3's change to term 11,
+decided at 20.165988416 s, took the one received at 20.021554524 s, 144.43 ms before.
+The inbox is first in, first out, and each server installed into a live store, where
+`install_decision` drops what it pops while it waits for the install (D-030): the
+first message of the new term to arrive after the install finished is the one the
+first step takes. The 2.48 ms and 16.31 ms are the time from the *last* such delivery
+before the step, which is what matching deliveries by hand found. Neither verdict
+moves, since both steps were decided before their isolations; the correction is to
+which message caused them, and it is the failure D-047 predicted for checker-side
+matching. D-047's text is not edited.
+
+**Alternatives.** *A measured argument that the case cannot arise*: it can, above.
+*Checker-side matching of each change to a delivery*: rejected by D-047, and the
+correction above is that approach getting a cause wrong. *A third time on every
+`TraceRecord`, through a new `Environment` method*: a change to SPEC §1.1's
+interface and both environments for one field one check reads; the fact belongs to
+one event. *The delivery's `MessageId` on the record*: `Socket::recv` does not return
+the id, so a P0 interface change, and the delivery is the network's fact where the
+receipt is the server's. *An extra record per stepped message*: the traces would
+differ by more than a field, and every schedule's record count would move. *Exposing
+`Decision`'s instant to all code*: the stamp is opaque so that nothing under test can
+compare it with a node's clock; the harness reads it through the record. *Writing
+`receivedNs` on every message-caused term record*: most records would change for no
+reader; where the receipt is the decision time it says nothing the line does not.
+*Excusing by the receipt alone, reading every term record by `received` or else its
+decision time*: those times are not monotone in record order — a campaign stepped
+before an older message waiting in the inbox — so the term at an instant read that way
+could hide a campaign inside the window; an excuse on the decision-time verdict
+cannot.
+
+**Consequences.** `TraceEvent::RaftTerm` gains a field, which every construction
+names; `TraceRecord` gains `received()`; the `raft` task's inbox events carry a stamp;
+the raft scenario's JSONL gains `receivedNs` on the term records whose message waited
+for its step; `Fault` gains an arm and `Schedule` a constructor that no sweep draws.
+The echo, WAL and engine traces are unchanged. The check can only remove pre-vote
+catches, never add one. At a thousand seeds (`scripts/premerge.sh` on dbaec73, this
+entry's and D-051's commits, against 94c6a54's) every sweep passed with every rate
+and coverage field unchanged, and every sweep reported 0 catches removed and 0 added;
+the new tests' lines are the only new lines. On approval, D-047 gains a forward pointer to this entry and
+SPEC §1.5's export paragraph a sentence on `receivedNs`; RAFT.md §2 and §3 describe it
+now, marked proposed. Issue #32 closes with this entry's approval.
+
+---
+
+## PROPOSED D-051 — A removed catch is asserted against the isolation or the flag it names
+
+**Context.** Issue #33, D-047's two limits of evidence. Every raft sweep reports, per
+seed, the catches that reading decision time removed (`Report::moved_by_decision_time`).
+For a removed pre-vote catch the sweep asserted only that the run held *some* term
+rise straddling *some* isolation's start; for a removed timer catch it asserted
+nothing and printed the flagged server's decisions straddling the flag. The one timer
+catch the nightlies removed, `ResetTimerOnAnyRpc` on seed 5153, was checked by hand.
+
+**Decision.** Both are assertions in `sim/tests/raft.rs`'s `checked`, which the raft
+scenario's sweeps — the correct server's, every variant's, and D-050's directed
+term-raise sweep with its `NoPreVote` pair — run on every seed at every tier, the
+nightly's ten thousand included. The pinned-seed tests call `Report::check` directly
+and assert their own mechanism. Every site is marked `PROPOSED(D-051)`.
+
+*A removed pre-vote catch.* Its words name an isolation. `Report::isolation_named_by`
+finds the isolation whose own verdict under the check by durability time is those
+words exactly (`Report::isolation_keeps_its_term_by`, one isolation's verdict), and
+the sweep asserts a term change of that server straddling that isolation's start —
+decided at or before `from` and traced in `(from, until]` (D-047,
+`isolation_term_straddles`), or received by `from` and decided in `(from, until]`
+(D-050, `isolation_received_straddles`) — with the same server, `from` and `until`. A
+removed catch whose words name no isolation fails the sweep too.
+
+The boundaries are the two readings' own: by durability time a term record is before
+the window when traced at or before `from`, by decision time when decided at or before
+it. D-047's predicate first read `decided < from <= at`, which misses a change decided
+at the very instant the isolation began and traced after it — a step the simulator
+polls at `from` after the partition, which the check by decision time places before the
+window — and counts one traced at `from`, which neither reading places inside it.
+Amended after review. With it the assertion is exact: a server's term records have
+decision and durability times that both rise with their order, and its terms rise along
+them outside a re-seed's restatement, which the check skips; so if the check by
+durability time finds the term at `until` different from the term at `from` and the check
+by decision time does not, some record changes the term with `decided <= from < at <=
+until` (the last record traced by `from` and the last decided by it bound the records
+between them, and the terms from there to the last decided by `until` are one), and if
+the check by cause excuses a window the check by decision time flags, every change
+decided in it is a received straddle.
+
+*A removed timer catch.* It must be the timer replay's first gap by durability time,
+in its words (`TimerGap::violation`, which the check formats through), and
+`Report::timer_removal` must give its reason, read off the two replays at the gap's
+flag record `X` (`TimerGap::record`, its index in the trace). The replay takes a probe
+(a record and a server) and returns that server's state once the record was replayed
+and checked: running, leading, re-seeded, its clock's last reset and the record that
+made it, and whether it was flagged there. By durability time the flagged server is at
+`X` a running follower last reset at `gap.since`, more than its bound before `X`. By
+decision time the replay does not flag it at `X` exactly when it is leading, down or
+re-seeded there, or its last reset `S'` is within the bound of `X`'s decision time. Each
+case is a reason with the record that makes it, and every reason found is returned:
+
+- **`StatusMoved`**: the server leads, is down or is re-seeded at `X` by decision time.
+  Its status records (its `RaftTerm`s and `RaftLeader`s, its `RaftReseeded`, its
+  crashes) come from its own `raft` task in sequence with rising decision times, so
+  each reading replays a prefix of them before `X`, and the status differs only when
+  some status record is before `X` under one reading and after it under the other;
+  that record is the reason.
+- **`ResetMovedBack`**: `S'` is later than `gap.since`. The record behind `S'` is after
+  `X` in the trace's order and was decided before it was traced: had it been before `X`
+  the durability replay would have reset the clock there too, since a reset under the
+  decision order is a reset under the trace's (a delivery counts against a term no
+  higher, and every other reset reads the server's own records, whose order both
+  readings share).
+- **`FlagMovedBack`**: `X`, read by its decision time, is within the bound of
+  `gap.since`; `X` was then decided before it was traced.
+
+So every removal has a reason and every reason names a record whose two times place it
+differently against `X`: the assertion cannot fail on a removal decision time makes,
+and it fails on anything else — a gap the durability replay does not make at `X`, one
+the decision replay makes there too, a reason without its record.
+
+The first form of this assertion required a reset of the flagged server decided at or
+before the flag instant and traced at or after it. Review found it inexact, and it was:
+it is `ResetMovedBack` alone. A record decided before the bound and traced past it can
+be the flag itself (`FlagMovedBack`), with the server's next reset decided after the
+flag; and a leadership decided before the flag and traced after it is no reset
+(`StatusMoved`). In the simulator's traces the first record at any instant is
+`TimeAdvanced`, decided as it is recorded, so the durability replay's flag record is
+always one and `FlagMovedBack` does not arise there, but `StatusMoved` can: a candidate
+that runs past its bound without campaigning again — a server that resets its timer on
+any message — and wins with the step traced past the flag. Unit tests in `sim/raft.rs`
+build each shape from records written by hand and assert the reason given, and a gap
+both readings make, for which none is.
+
+*The evidence.* `the_nightlies_removed_catches_meet_the_sweeps_assertions` runs the 28
+pairs that nightly runs 34749071877 and 34852980174 printed as removed — 27 pre-vote
+catches and seed 5153's timer catch — through `checked` on this tree, with the
+nightlies' words. 26 are removed here in those words, each matched as above and each
+run passing the check; the timer catch is matched to server 2's granted vote, decided
+2.564751 ms before the flag and traced at it. `IgnoreIncarnation` 2509 and 5990 are in
+the first run only and no longer reach their catch since D-049's step-down (D-047's
+amendment); the test asserts that neither removes it, so the day either does, the
+assertion runs on it. Both assertions were seen to bite: comparing against another
+isolation fails all 25 pre-vote pairs, and requiring a reset traced strictly after the
+flag fails seed 5153, whose reason is `ResetMovedBack`, the granted vote.
+
+*Where the assertions meet real removals.* No seed of the random sweep's first
+thousand, under any variant, has a removed catch. D-050's directed term-raise schedule
+has one on almost every seed, and its sweeps go through `checked`: the correct server's
+removes a pre-vote catch on 20 of 20, 100 of 100 and 1 000 of 1 000 seeds, each matched to a
+straddle of the isolation it names (D-047's or D-050's), and its `NoPreVote` pair, whose
+runs fail the pre-vote check, removes none. None of those is a timer catch, since a run
+reports the first check it fails by durability time and the pre-vote check comes first;
+the timer assertion meets real removals only in the nightly, seed 5153 so far.
+
+**Alternatives.** *Parsing the isolation's instants out of the words*: `Instant`'s
+`Debug` is a display format, and matching the isolation by its own verdict needs no
+parse. *Keeping a second list of resets beside the replay*: two copies of the rule
+drift apart, the fault D-046 and D-047 each avoid. *Asserting only at the nightly's
+tier*: a removal the gate's twenty seeds see is a removal, and the assertions cost a
+replay per removed catch, which is rare.
+
+**Consequences.** A removed catch without its reason fails whichever sweep sees it,
+at any tier, including the nightly. `TimerGap` gains its flag record's index, the timer
+replay a probe, and `Report` `timer_removal`, `isolation_named_by` and one isolation's
+verdicts; `timer_resets_by` and `timer_resets_straddling`, the first form's helpers, are
+gone. D-047's straddle predicate reads `decided <= from < at`. D-047's two limits of
+evidence are closed on approval, when D-047 gains its forward pointer; issue #33 closes
+with it.
+
+---
+
+## PROPOSED D-052 — A scenario's moirae JSONL is written when it is asked for
+
+**Context.** D-046 left `scripts/premerge.sh` at 7 minutes 26 seconds and named what its
+profile had left: the allocator, the simulated filesystem's path comparisons and the
+per-run JSONL export. The owner asked for those to be measured before anything
+changed. Measured on this branch at dbaec73, the tree before this entry, on the
+eight-core laptop, with `scripts/premerge.sh` run after a warm build (`cargo test
+--release --no-run` first, so the wall time is the tests'): 573.15 s real, 3 925.74 s
+user, the raft test binary 475.57 s of it, the engine binary 75.75 s, with the machine's
+one-minute load average, sampled every 15 s over the run, at 15.98 (the premerge's own
+threads included). That first figure is not used for the saving below: another
+agent's sweep shared the machine for part of it, and its load is not the load the
+later runs had. Re-measured the same way at a mean load of 11.20 — the machine idle
+but for the premerge — dbaec73's premerge took **547.55 s** real, 3 852.04 s user, the
+raft binary 452.11 s. The rates of these runs are the rates of 94c6a54's thousand-seed
+premerge, the new tests' lines aside.
+
+*The profile.* `sample` (the tool D-046 used), at one sample per millisecond on every
+thread, of the raft test binary at 300 seeds, all its tests: 931 025 busy samples.
+Self time, by what the frame is:
+
+| what | share of busy samples |
+| --- | --- |
+| the allocator (`libsystem_malloc`) | 23.75% |
+| `std::path`, the simulated filesystem's `BTreeMap<PathBuf, _>` keys | 9.24% |
+| the simulator | 8.52% |
+| the sweep's end-of-run checks and predicates (`sim/raft.rs`, `lin.rs`) | 8.39% |
+| the storage engine | 6.82% |
+| `moirae_trace`, the JSONL export | 6.73% |
+| trace record copies and drops | 6.56% |
+| `memmove`/`memset` | 6.39% |
+| the Raft server and core | 4.10% |
+| `invariants::Checker` | 3.27% |
+| `core::fmt` | 2.90% |
+
+Self time hides who allocates and copies. Counted inclusively from the call graph,
+`Sim::to_moirae` was **27.24%** of the binary's busy samples: every run of the raft,
+membership and quorum scenarios writes its whole trace as JSONL — a `Json` object per
+record, a formatted line, a copy of the trace to write it from — into
+`Report::jsonl`, and the string is read only when a seed fails and its trace is
+written out, or by the few tests that hash a trace. Beside it: `Sim::poll`, the
+simulation itself, 30.57%; the end-of-run `Report::check` 8.15%; `std::path`
+comparisons 6.05%; the pre-vote check 4.29%; `Sim::trace_from` 4.31%; `leader_now`
+3.31%.
+
+**Decision.** A scenario's report keeps what the export needs and writes the JSONL
+when it is asked for. `Sim::run_header` copies out what the export reads besides the
+records — the configuration, the policy, each node's clock, every address ever
+bound — as `sim::RunHeader`, and `RunHeader::to_moirae(records, export)` writes the
+bytes `Sim::to_moirae` writes for the same records, through the same code:
+`Sim::to_moirae` is now `run_header().to_moirae(&trace(), export)`. The raft,
+membership and quorum `Report`s replace `pub jsonl: String` with `pub run: RunHeader`
+and `Report::jsonl()`, which writes from `records`. Every site is marked
+`PROPOSED(D-052)`. The echo, WAL and engine scenarios keep their eager field: the
+engine binary, the largest of them, spends 3.55% of its busy samples in
+`Sim::to_moirae` (a `sample` profile at a thousand seeds, 453 852 busy samples), about
+2.7 s of its 75 s and under 1% of the premerge, which is not worth a change.
+
+**What it bought.** `scripts/premerge.sh` at a thousand seeds, measured the same way:
+**449.89 s** real at a mean load of 11.81, against dbaec73's 547.55 s at 11.20, **17.8%**
+less; 3 113.34 s user, against 3 852.04 s, 19.2% less; the raft binary 352.48 s, against
+452.11 s. (A first figure of 21.5%, against the 573.15 s taken at a load of 15.98, mixed
+loads and is withdrawn.) Every sweep passed with every rate unchanged. The traces are byte-identical: 24
+traces written by this tree through `Report::jsonl()` and by dbaec73 through the field
+— the raft scenario's seeds 0 to 7, 42 and 1885 under the correct server, 680 under
+`SharedSnapshotDir`, 1252 under `IgnoreIncarnation`, 5153 under `ResetTimerOnAnyRpc`,
+3 under `NoPreVote`, 9 under `AdoptionAsBuilt` and 11 under `RefusalNotDurable`; the
+membership scenario's seeds 0 to 2 and seed 3 under `SingleMajorityInJointConsensus`;
+the quorum scenario's open half on seeds 0 and 1 and blocked half on seed 0 and on seed
+1 under `RefusedCountsForQuorum` — equal byte for byte, and the gate's trace-identity
+and pinned-hash tests pass.
+
+**Alternatives.** *Exporting into a sink that only validates*: it builds the same `Json`
+objects and formats the same lines, which is the cost. *Keeping the `Sim` in the report
+to export later*: a finished run's tasks, futures and disks held for as long as the
+report lives, where the header is a few hundred bytes. *Making the export itself
+faster*: the export is moirae's format through `moirae-trace`, published from the
+moirae repo, and it is still paid in full by every seed that is written out; not
+writing it for the seeds nobody reads is the whole of the saving.
+
+**Consequences.** A sweep no longer exports every seed's trace, so a trace that could
+not be written as moirae v2 would now surface only when it is written — a failing
+seed, or a test that hashes a trace — rather than as a panic at the end of the run
+that made it. In `moirae-trace` 0.0.2 that cannot happen to these scenarios: the only
+error a `Collect` sink returns for a well-formed stream of events is `NotAnObject`, for a
+`send` line's `msg`, a `state` line's `patch` or a `log` line's `data` that is not a
+JSON object (the header errors cannot arise, since the export writes the header once,
+first), and integers never fail — the writer emits one past 2^53 as a decimal string.
+The raft, membership and quorum scenarios decode payloads with `message::studio`, which
+returns an object for every payload, a malformed one included, and every `data` the
+export builds is an object. (This paragraph first gave integers beyond what a
+JavaScript reader keeps exact as a failure; they are not one.)
+`Report::jsonl` is a method on the three reports; the other scenarios are unchanged.
+
+*Two more, measured on the tree with the export lazy.* A second `sample` profile of the
+raft binary at 300 seeds, 690 528 busy samples, had no export left in it and put
+`std::path` comparisons at 8.16% inclusive and the pre-vote check at 6.12%, with
+`Report::moved_by_decision_time` at 3.04%. Who the path comparisons belong to was read
+from the call graph: 79% of them are the sweep's own adoption-crash watch
+(`adoption_change`, D-041), which every 250 µs of a storm reads the victim's durable
+namespace (`Sim::durable_names`), builds a set of its store's names and compares it
+with the set it started from; the filesystem's own lookups (`NodeFs::open`,
+`sync_dir`, `rename`) are under 6% of them and `snapshot::sweep_versions` about 8%.
+And the pre-vote check, which D-050 runs three ways on every run — by cause in the
+check, by durability time in `moved_by_decision_time`, per isolation in `checked` —
+scanned the whole trace twice for every isolation and once more for its skip.
+
+- **The adoption watch reads a version first.** `Sim::durable_version(node)` is a
+  counter the simulated disk moves at every `sync_dir` that makes a directory
+  operation durable and at every crash, the only two things that change the durable
+  namespace. The watch reads the namespace again only when the counter has moved:
+  between two equal counts the namespace is the one it last read, which did not end
+  the watch, so every storm crashes at the very slice it did.
+- **The pre-vote check reads its records from one pass.** `Report::pre_vote_records`
+  keeps, in record order, the term records and the records the skip looks for — a
+  few hundred of a trace's tens of thousands — and the check over all isolations,
+  its per-isolation forms and the straddle predicates read those. Every verdict is
+  the one the full scan gave, since the helpers matched nothing else.
+
+Each was timed on the raft test binary alone at a thousand seeds, one after the
+other with the load average sampled: the tree with the export lazy **353.17 s**
+(2 465.98 s user, mean load 16.07); with the adoption watch gated **320.61 s** (2 212.80
+s user, load 16.07), 9.2% less; with the pre-vote records as well **287.46 s** (1 997.17 s
+user, load 11.69), 10.3% less again. Each is some 33 s, about 7% of the premerge.
+A second run of the first binary at a mean load of 50.62, another agent's sweep
+beside it, took 545.34 s and is not used. The traces are byte-identical: 49 traces from
+this tree and from dbaec73 — the raft scenario's seeds 0 to 39 under the correct
+server, ten of which (1, 3, 5, 6, 9, 11, 16, 25, 31, 33) draw the adoption storm,
+seed 41 under `AdoptionAsBuilt`, which draws it too, seed 6325 under the correct
+server and `AdoptionAsBuilt`, 687 under `RefusalNotDurable`, 1885 and 2023, and the
+membership and quorum scenarios' seed 0.
+
+*The premerge with all three.* `scripts/premerge.sh` at a thousand seeds on 1ef6d7e,
+measured the same way: **374.64 s** real at a mean load of 13.90, 2 579.53 s user, the raft
+binary 278.88 s, against dbaec73's 547.55 s at 11.20: **31.6%** less wall time, on a
+machine loaded a little more than the run it is compared with. Every sweep passed with
+every rate and coverage field unchanged.
+
+What the second profile leaves, each under 5% of the premerge and so left as it is,
+with its share of the raft binary's busy samples: `leader_now` 4.54%, most of it the
+copies `Sim::trace_from` makes as it reads back over the tail; the refused-server
+watch (`refreshed_refused`), which re-reads the trace from its first record at each
+crash storm, about 0.9%; the incremental checker 5.37%, which D-046 made linear; and
+the allocator, 18.64% inclusive but spread over the simulation itself — the storage
+engine's blocks, the simulator's timers and the trace records — with no single caller
+that a change could take out. In the engine binary, which is not the raft binary's,
+`Model::state_after` and the `memcmp` under it are about 23% of its busy samples, some
+17 s of its 75 s and about 4% of the premerge.
+
+---
+
+_Next entry: D-053. Add one before implementing anything not covered above._

@@ -119,6 +119,11 @@ pub(super) struct NodeFs {
     pending_dirs: BTreeMap<PathBuf, Vec<DirOp>>,
     inodes: BTreeMap<InodeId, Inode>,
     next_inode: InodeId,
+    /// Moves whenever `durable_entries` may have changed: a `sync_dir` that made an
+    /// operation durable, and a crash. A harness watching the durable namespace
+    /// reads it again only when this has moved.
+    // PROPOSED(D-052): the harness's watch of the durable namespace reads a version first.
+    durable_version: u64,
 }
 
 fn not_found() -> io::Error {
@@ -137,6 +142,7 @@ impl NodeFs {
             pending_dirs: BTreeMap::new(),
             inodes: BTreeMap::new(),
             next_inode: 1,
+            durable_version: 0,
         }
     }
 
@@ -271,7 +277,12 @@ impl NodeFs {
         if !self.dirs.contains(path) {
             return Err(not_found());
         }
-        for op in self.pending_dirs.remove(path).unwrap_or_default() {
+        let ops = self.pending_dirs.remove(path).unwrap_or_default();
+        if !ops.is_empty() {
+            // PROPOSED(D-052): the harness's watch of the durable namespace reads a version first.
+            self.durable_version += 1;
+        }
+        for op in ops {
             op.apply(&mut self.durable_entries);
         }
         Ok(())
@@ -586,6 +597,14 @@ impl NodeFs {
             .collect()
     }
 
+    /// For the harness: a number that moves whenever the durable namespace may have
+    /// changed, so a watch of [`durable_names`](Self::durable_names) can skip the
+    /// looks at which it cannot have.
+    // PROPOSED(D-052): the harness's watch of the durable namespace reads a version first.
+    pub(super) fn durable_version(&self) -> u64 {
+        self.durable_version
+    }
+
     /// The §1.3 directory-entry loss model: per directory, a random prefix of the
     /// operations since its last `sync_dir` survives; the rest are reported and gone.
     /// Afterwards the node sees exactly the durable namespace.
@@ -594,6 +613,8 @@ impl NodeFs {
         rng: &mut moirae_sched::Pcg32,
         events: &mut Vec<TraceEvent>,
     ) {
+        // PROPOSED(D-052): the harness's watch of the durable namespace reads a version first.
+        self.durable_version += 1;
         let pending = std::mem::take(&mut self.pending_dirs);
         for (dir, ops) in pending {
             let keep = usize::try_from(rng.below(ops.len() as u64 + 1)).unwrap_or(0);

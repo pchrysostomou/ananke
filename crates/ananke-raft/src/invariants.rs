@@ -425,7 +425,9 @@ impl Checker {
     /// Follows who leads, which three of the checks ask of every commit.
     fn track_leader(&mut self, event: &TraceEvent) {
         match event {
-            TraceEvent::RaftTerm { server, role, term } => {
+            TraceEvent::RaftTerm {
+                server, role, term, ..
+            } => {
                 if *role == "leader" {
                     self.is_leader.insert(*server, *term);
                 } else {

@@ -79,7 +79,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ananke_env::moirae::Export;
-use ananke_env::sim::{Sim, SimConfig, TraceRecord};
+use ananke_env::sim::{RunHeader, Sim, SimConfig, TraceRecord};
 use ananke_env::{
     ClientOp, ClientResult, Clock, Either, Environment, Instant, Network, NodeId, Rng, Socket,
     TraceEvent, race,
@@ -446,7 +446,47 @@ pub enum Fault {
         /// The quiet after that follower heals, with both designated.
         hold: Duration,
     },
+    /// Issue #32's shape, aimed rather than waited for (D-050): a message that
+    /// raises a server's term delivered before an isolation begins and taken by a
+    /// step inside it, because the server's `raft` task was still awaiting a
+    /// persist when the message arrived. Each of `tries` rounds asks the leader in
+    /// force to hand over to the follower after it (leadership transfer, thesis
+    /// §3.10), whose campaign sends the third server a RequestVote of a higher
+    /// term; the run advances in slices of [`TERM_RAISE_STEP`] until a message from
+    /// a server carrying a term above the third server's last traced term is
+    /// delivered to it, or [`TERM_RAISE_WAIT_BUDGET`] runs out, and cuts that server
+    /// off alone at the slice's end for `isolate`, then leaves `quiet` before the
+    /// next round. A slice ends with nothing runnable, so a `raft` task that was idle
+    /// has already taken the message, before the isolation, and one that was busy
+    /// takes it inside the window: the shape. Never drawn by [`Schedule::draw`], so
+    /// no sweep schedule moves; the directed scenario
+    /// [`Schedule::term_raise_behind_a_step`] is its one user.
+    // PROPOSED(D-050): a term's record carries when the message its step took was
+    // received.
+    IsolateOnTermRaise {
+        /// How many rounds.
+        tries: u64,
+        /// How long each isolation lasts.
+        isolate: Duration,
+        /// The quiet after each round.
+        quiet: Duration,
+    },
 }
+
+/// The slice [`Fault::IsolateOnTermRaise`] advances in while it waits for a
+/// term-raising delivery: a tenth of the sweep disk's fastest operation, so an
+/// isolation begins well inside any persist that was running at the delivery.
+/// (D-050).
+pub const TERM_RAISE_STEP: Duration = Duration::from_micros(10);
+
+/// The longest a [`Fault::IsolateOnTermRaise`] round waits for a term-raising
+/// delivery after asking for the transfer. A transfer's campaign reaches the
+/// other follower within a few network delays. (D-050).
+pub const TERM_RAISE_WAIT_BUDGET: Duration = Duration::from_millis(300);
+
+/// The first sequence number and admin socket a [`Fault::IsolateOnTermRaise`]
+/// round's transfer request uses, past the lease trials' two. (D-050).
+const TERM_RAISE_ADMIN: u64 = 3;
 
 /// The longest a [`Fault::CrashInstalling`] waits for an install to stream
 /// before giving up and doing nothing.
@@ -742,6 +782,29 @@ impl Schedule {
         }
     }
 
+    /// The directed schedule for issue #32's shape (D-050): after the warmup,
+    /// no lease trial and one [`Fault::IsolateOnTermRaise`] of `tries` rounds, each
+    /// isolation 300 ms and each quiet 500 ms, then the liveness window. Every clock
+    /// runs true, so a transfer goes where it is asked.
+    // PROPOSED(D-050): a term's record carries when the message its step took was
+    // received.
+    #[must_use]
+    pub fn term_raise_behind_a_step(tries: u64) -> Self {
+        Self {
+            warmup: Duration::from_millis(1200),
+            trials: Vec::new(),
+            faults: vec![Fault::IsolateOnTermRaise {
+                tries,
+                isolate: Duration::from_millis(300),
+                quiet: Duration::from_millis(500),
+            }],
+            gaps: vec![Duration::from_millis(500)],
+            settle: election_max() * LIVENESS_TIMEOUTS + Duration::from_millis(200),
+            drifts: vec![0; SERVERS as usize],
+            skews: vec![0; SERVERS as usize],
+        }
+    }
+
     /// The server with the slowest clock, 1-based.
     #[must_use]
     pub fn slowest(&self) -> u64 {
@@ -825,6 +888,15 @@ impl Schedule {
                     hold,
                     ..
                 } => *settle + *isolate + STREAM_WAIT_BUDGET + *freeze + *hold,
+                // PROPOSED(D-050): a round's wait, isolation and quiet.
+                Fault::IsolateOnTermRaise {
+                    tries,
+                    isolate,
+                    quiet,
+                } => {
+                    (TERM_RAISE_WAIT_BUDGET + *isolate + *quiet)
+                        * u32::try_from(*tries).expect("small")
+                }
             })
             .sum();
         let trials: Duration = self
@@ -864,8 +936,10 @@ pub struct Report {
     pub schedule: Schedule,
     /// The trace as records.
     pub records: Vec<TraceRecord>,
-    /// The trace as moirae JSONL.
-    pub jsonl: String,
+    /// What the moirae export needs besides [`Report::records`]:
+    /// [`Report::jsonl`] writes the trace from the two when it is asked for.
+    // PROPOSED(D-052): a scenario's moirae JSONL is written when it is asked for.
+    pub run: RunHeader,
     /// When the last fault healed or the last crashed server restarted.
     pub last_heal: Instant,
     /// Every isolation of one server: (server, from, until).
@@ -890,6 +964,21 @@ pub struct Report {
 }
 
 impl Report {
+    /// The trace as moirae JSONL, written from [`Report::records`] under the run's
+    /// header now, when it is asked for, rather than at the end of every run; the
+    /// bytes are the ones the simulator's own export writes (D-052).
+    ///
+    /// # Panics
+    ///
+    /// If the trace does not export to moirae v2.
+    // PROPOSED(D-052): a scenario's moirae JSONL is written when it is asked for.
+    #[must_use]
+    pub fn jsonl(&self) -> String {
+        self.run
+            .to_moirae(&self.records, &Export::new(&message::studio))
+            .expect("the raft trace exports to moirae v2")
+    }
+
     /// Whether some pair of servers' clocks drifted apart faster than the lease
     /// assumes on this seed.
     #[must_use]
@@ -1060,6 +1149,9 @@ impl Report {
     /// and every other check is the same under both. Worked out from `verdict`
     /// without running the checks that do not move — the linearizability search
     /// above all — so a sweep can report, on every seed, what the entry changed.
+    /// The pre-vote check `verdict` comes from also excuses a term change taken
+    /// from a message received before the isolation (D-050), so a catch removed
+    /// here is removed by either reading.
     // D-047: every trace record carries its decision time and its durability time.
     #[must_use]
     pub fn moved_by_decision_time(&self, verdict: &Result<(), String>) -> Option<Moved> {
@@ -1122,10 +1214,154 @@ impl Report {
     /// carried, which is no election of the isolated server's (RAFT.md §3).
     ///
     /// The check is about why the server's term moved, so it reads each term
-    /// record by the time its step decided it (D-047):
-    /// [`Report::isolation_keeps_the_term_by`] under [`RecordTime::Decided`].
+    /// record by the time its step decided it (D-047), and a term change whose
+    /// step took a message the server had received by the isolation's start is
+    /// that message's doing, however long the message waited for the step (D-050):
+    /// [`Report::isolation_keeps_the_term_by_cause`].
     fn isolation_keeps_the_term(&self) -> Result<(), String> {
-        self.isolation_keeps_the_term_by(RecordTime::Decided)
+        self.isolation_keeps_the_term_by_cause()
+    }
+
+    /// The pre-vote check [`Report::check`] makes: the check by decision time,
+    /// [`Report::isolation_keeps_the_term_by`] under [`RecordTime::Decided`], except
+    /// that an isolation is not flagged when every change of its server's term
+    /// decided inside the window was taken from a peer's message the server had
+    /// received by the window's start ([`TraceRecord::received`]). The server knows
+    /// when it received the message and says so on the record, so the check asks
+    /// whether the cause arrived before the window without modelling the inbox a
+    /// message waits in behind a persist or an install.
+    ///
+    /// It flags nothing the check by decision time does not: it is that check's
+    /// verdict with a named excuse. A change of term from a step that took no
+    /// peer's message — a campaign on the server's own timer without pre-vote, a
+    /// restatement, a completion — carries no receipt and is flagged as before,
+    /// whatever else changed the term in the same window. A candidacy stepped from a
+    /// granting `PreVoteResponse`, or from a `TimeoutNow`, carries the receipt of
+    /// that message, and is excused when it was received by the isolation's start,
+    /// like any change a message caused: the election was decided by what reached
+    /// the server before it was cut off.
+    ///
+    /// # Errors
+    ///
+    /// The first isolation the check by decision time flags whose term changes
+    /// inside the window are not all taken from messages received by its start, in
+    /// that check's words.
+    // PROPOSED(D-050): a term's record carries when the message its step took was
+    // received.
+    pub fn isolation_keeps_the_term_by_cause(&self) -> Result<(), String> {
+        let records = self.pre_vote_records();
+        self.isolations
+            .iter()
+            .try_for_each(|&(server, from, until)| {
+                Self::keeps_its_term_by_cause(&records, server, from, until)
+            })
+    }
+
+    /// [`Report::isolation_keeps_the_term_by_cause`] on one isolation: `server` cut
+    /// off from `from` to `until`, one of [`Report::isolations`].
+    ///
+    /// # Errors
+    ///
+    /// The isolation's violation, in the check's words.
+    // PROPOSED(D-050): a term's record carries when the message its step took was
+    // received.
+    pub fn isolation_keeps_its_term_by_cause(
+        &self,
+        server: u64,
+        from: Instant,
+        until: Instant,
+    ) -> Result<(), String> {
+        Self::keeps_its_term_by_cause(&self.pre_vote_records(), server, from, until)
+    }
+
+    /// [`Report::isolation_keeps_its_term_by_cause`] over `records`, the
+    /// [`Report::pre_vote_records`].
+    // PROPOSED(D-052): the pre-vote check reads its records from one pass over the
+    // trace.
+    fn keeps_its_term_by_cause(
+        records: &[&TraceRecord],
+        server: u64,
+        from: Instant,
+        until: Instant,
+    ) -> Result<(), String> {
+        let verdict = Self::keeps_its_term_by(records, RecordTime::Decided, server, from, until);
+        if verdict.is_ok() {
+            return verdict;
+        }
+        let changes = Self::term_changes_decided_in(records, server, from, until);
+        let caused_before = !changes.is_empty()
+            && changes
+                .iter()
+                .all(|r| r.received().is_some_and(|received| received <= from));
+        if caused_before { Ok(()) } else { verdict }
+    }
+
+    /// `server`'s term records decided in `(from, until]` that change its term from
+    /// the term record before them, in record order: what D-050's excuse reads for an
+    /// isolation from `from` to `until`.
+    // PROPOSED(D-050): a term's record carries when the message its step took was
+    // received.
+    #[must_use]
+    pub fn isolation_term_changes(
+        &self,
+        server: u64,
+        from: Instant,
+        until: Instant,
+    ) -> Vec<&TraceRecord> {
+        Self::term_changes_decided_in(&self.pre_vote_records(), server, from, until)
+    }
+
+    /// The records the pre-vote check and its predicates read, in record order:
+    /// every term record, and every record the check's skip looks for. The trace
+    /// holds tens of thousands of records and these a few hundred, so a check over
+    /// every isolation passes over the trace once and reads each isolation from
+    /// these alone; filtering to the kinds the helpers match keeps every answer.
+    // PROPOSED(D-052): the pre-vote check reads its records from one pass over the
+    // trace.
+    fn pre_vote_records(&self) -> Vec<&TraceRecord> {
+        self.records
+            .iter()
+            .filter(|r| {
+                matches!(
+                    &r.event,
+                    TraceEvent::RaftTerm { .. }
+                        | TraceEvent::RaftRefused { .. }
+                        | TraceEvent::RaftReseeded { .. }
+                        | TraceEvent::RaftSnapshot { taken: false, .. }
+                )
+            })
+            .collect()
+    }
+
+    /// `server`'s term records decided in `(from, until]` that change its term from
+    /// the term record before them, in record order, from `records`, the
+    /// [`Report::pre_vote_records`].
+    // PROPOSED(D-050): a term's record carries when the message its step took was
+    // received.
+    fn term_changes_decided_in<'a>(
+        records: &[&'a TraceRecord],
+        server: u64,
+        from: Instant,
+        until: Instant,
+    ) -> Vec<&'a TraceRecord> {
+        let mut previous = 0;
+        let mut changes = Vec::new();
+        for &record in records {
+            let TraceEvent::RaftTerm {
+                server: s, term, ..
+            } = &record.event
+            else {
+                continue;
+            };
+            if *s != server {
+                continue;
+            }
+            if *term != previous && from < record.decided && record.decided <= until {
+                changes.push(record);
+            }
+            previous = *term;
+        }
+        changes
     }
 
     /// The pre-vote check with the server's term records read by `time`: under
@@ -1146,28 +1382,66 @@ impl Report {
     /// its start, read by `time`.
     // D-047: every trace record carries its decision time and its durability time.
     pub fn isolation_keeps_the_term_by(&self, time: RecordTime) -> Result<(), String> {
-        for &(server, from, until) in &self.isolations {
-            if self.reseeding_during(server, from, until) {
-                continue;
-            }
-            let (before, after) = (
-                self.term_by(server, time, from),
-                self.term_by(server, time, until),
-            );
-            if after != before {
-                return Err(format!(
-                    "pre-vote: server {server} raised its term from {before} to {after} while isolated from {from:?} to {until:?}"
-                ));
-            }
+        let records = self.pre_vote_records();
+        self.isolations
+            .iter()
+            .try_for_each(|&(server, from, until)| {
+                Self::keeps_its_term_by(&records, time, server, from, until)
+            })
+    }
+
+    /// [`Report::isolation_keeps_the_term_by`] on one isolation: `server` cut off
+    /// from `from` to `until`, one of [`Report::isolations`].
+    ///
+    /// # Errors
+    ///
+    /// The isolation's violation, in the check's words.
+    pub fn isolation_keeps_its_term_by(
+        &self,
+        time: RecordTime,
+        server: u64,
+        from: Instant,
+        until: Instant,
+    ) -> Result<(), String> {
+        Self::keeps_its_term_by(&self.pre_vote_records(), time, server, from, until)
+    }
+
+    /// [`Report::isolation_keeps_its_term_by`] over `records`, the
+    /// [`Report::pre_vote_records`].
+    // PROPOSED(D-052): the pre-vote check reads its records from one pass over the
+    // trace.
+    fn keeps_its_term_by(
+        records: &[&TraceRecord],
+        time: RecordTime,
+        server: u64,
+        from: Instant,
+        until: Instant,
+    ) -> Result<(), String> {
+        if Self::reseeding_during(records, server, from, until) {
+            return Ok(());
+        }
+        let (before, after) = (
+            Self::term_by(records, server, time, from),
+            Self::term_by(records, server, time, until),
+        );
+        if after != before {
+            return Err(format!(
+                "pre-vote: server {server} raised its term from {before} to {after} while isolated from {from:?} to {until:?}"
+            ));
         }
         Ok(())
     }
 
     /// Whether `server` was refused, re-seeded or finished installing a snapshot
     /// while isolated from `from` to `until`, by when those records were traced:
-    /// the pre-vote check's skip.
-    fn reseeding_during(&self, server: u64, from: Instant, until: Instant) -> bool {
-        self.records.iter().any(|r| {
+    /// the pre-vote check's skip; from `records`, the [`Report::pre_vote_records`].
+    fn reseeding_during(
+        records: &[&TraceRecord],
+        server: u64,
+        from: Instant,
+        until: Instant,
+    ) -> bool {
+        records.iter().any(|r| {
             r.at >= from
                 && r.at <= until
                 && matches!(&r.event,
@@ -1182,9 +1456,10 @@ impl Report {
     /// `at`, 0 before any. A server's term records come from one task's steps in
     /// sequence, each decided after the one before was traced, so their decision
     /// times rise with their order just as their durability times do, and the last
-    /// such record is the latest either way.
-    fn term_by(&self, server: u64, time: RecordTime, at: Instant) -> u64 {
-        self.records
+    /// such record is the latest either way. From `records`, the
+    /// [`Report::pre_vote_records`].
+    fn term_by(records: &[&TraceRecord], server: u64, time: RecordTime, at: Instant) -> u64 {
+        records
             .iter()
             .filter(|r| time.of(r) <= at)
             .filter_map(|r| match &r.event {
@@ -1193,7 +1468,7 @@ impl Report {
                 } if *s == server => Some(*term),
                 _ => None,
             })
-            .last()
+            .next_back()
             .unwrap_or(0)
     }
 
@@ -1215,18 +1490,25 @@ impl Report {
     // D-047: every trace record carries its decision time and its durability time.
     fn timers_fire_by(&self, time: RecordTime) -> Result<(), String> {
         let mut first = None;
-        self.replay_timers(TimerResets::ALL, time, |gap| {
-            first = Some(gap);
-            ControlFlow::Break(())
-        });
-        match first {
-            None => Ok(()),
-            Some(TimerGap {
-                server, since, at, ..
-            }) => Err(format!(
-                "timers: server {server} heard from no leader of its term and granted no vote since {since:?} and had not campaigned by {at:?}"
-            )),
-        }
+        self.replay_timers(
+            TimerResets::ALL,
+            time,
+            |gap| {
+                first = Some(gap);
+                ControlFlow::Break(())
+            },
+            None,
+        );
+        first.map_or(Ok(()), |gap| Err(gap.violation()))
+    }
+
+    /// The timer check's bound for `server`: [`TIMER_TIMEOUTS`] maximum election
+    /// timeouts by its own clock, which a slow clock takes longer to measure in
+    /// global time.
+    fn timer_bound(&self, server: u64) -> Duration {
+        let ppm = self.schedule.drifts[server as usize - 1];
+        let rate = (1_000_000 + ppm) as f64 / 1_000_000.0;
+        (election_max() * TIMER_TIMEOUTS).div_f64(rate)
     }
 
     /// The timer check's replay, with the reset arms `resets` names switched on,
@@ -1248,19 +1530,23 @@ impl Report {
     /// so no bound is measured past a reset the server had already made. Records
     /// recorded as they happen — deliveries, sends, crashes, restatements — have one
     /// time and the same place under both.
+    ///
+    /// With `probe` naming a record, by its index in [`Report::records`], and a
+    /// server, the replay also returns that server's state as it stood once the
+    /// record was replayed and checked: what [`Report::timer_removal`] compares
+    /// between the two readings (issue #33).
+    // PROPOSED(D-051): a removed catch is asserted against the isolation or the flag it
+    // names.
     fn replay_timers(
         &self,
         resets: TimerResets,
         time: RecordTime,
         mut gap: impl FnMut(TimerGap) -> ControlFlow<()>,
-    ) {
+        probe: Option<(usize, u64)>,
+    ) -> Option<TimerState> {
         // A server measures its timeout by its own clock: a slow one takes longer
         // in global time, and the bound scales with its rate.
-        let bound_for = |server: u64| -> Duration {
-            let ppm = self.schedule.drifts[server as usize - 1];
-            let rate = (1_000_000 + ppm) as f64 / 1_000_000.0;
-            (election_max() * TIMER_TIMEOUTS).div_f64(rate)
-        };
+        let bound_for = |server: u64| self.timer_bound(server);
         let mut payloads: BTreeMap<ananke_env::MessageId, Bytes> = BTreeMap::new();
         let mut up: BTreeSet<u64> = BTreeSet::new();
         let mut leaders: BTreeSet<u64> = BTreeSet::new();
@@ -1268,11 +1554,13 @@ impl Report {
         let mut terms: BTreeMap<u64, u64> = BTreeMap::new();
         let mut clocks = TimerClocks::default();
         let mut reported: BTreeMap<u64, Instant> = BTreeMap::new();
+        let mut probed = None;
         // D-047: the replay's order; stable, so ties keep record order.
-        let mut order: Vec<&TraceRecord> = self.records.iter().collect();
-        order.sort_by_key(|record| time.of(record));
-        for record in order {
+        let mut order: Vec<(usize, &TraceRecord)> = self.records.iter().enumerate().collect();
+        order.sort_by_key(|(_, record)| time.of(record));
+        for (index, record) in order {
             let at = time.of(record);
+            clocks.replaying = index;
             match &record.event {
                 TraceEvent::RaftReseeded { server } => {
                     reseeded.insert(*server);
@@ -1328,7 +1616,9 @@ impl Report {
                         *clocks.restatements.entry(*server).or_default() += 1;
                     }
                 }
-                TraceEvent::RaftTerm { server, term, role } => {
+                TraceEvent::RaftTerm {
+                    server, term, role, ..
+                } => {
                     terms.insert(*server, *term);
                     if !up.contains(server) {
                         up.insert(*server);
@@ -1369,6 +1659,7 @@ impl Report {
                 }
                 _ => {}
             }
+            let mut flagged = BTreeSet::new();
             for server in &up {
                 if leaders.contains(server) || reseeded.contains(server) {
                     continue;
@@ -1378,19 +1669,34 @@ impl Report {
                     && reported.get(server) != Some(&since)
                 {
                     reported.insert(*server, since);
+                    flagged.insert(*server);
                     let found = TimerGap {
                         server: *server,
                         since,
                         at,
+                        record: index,
                         installs: clocks.installs.get(server).copied().unwrap_or(0),
                         restatements: clocks.restatements.get(server).copied().unwrap_or(0),
                     };
                     if gap(found).is_break() {
-                        return;
+                        return probed;
                     }
                 }
             }
+            if let Some((target, server)) = probe
+                && target == index
+            {
+                probed = Some(TimerState {
+                    up: up.contains(&server),
+                    leader: leaders.contains(&server),
+                    reseeded: reseeded.contains(&server),
+                    since: clocks.last_reset.get(&server).copied(),
+                    since_record: clocks.last_reset_record.get(&server).copied(),
+                    flagged: flagged.contains(&server),
+                });
+            }
         }
+        probed
     }
 }
 
@@ -1477,6 +1783,10 @@ pub struct TimerGap {
     pub since: Instant,
     /// The first record past its bound: where the check would have reported it.
     pub at: Instant,
+    /// That record's index in [`Report::records`] (issue #33).
+    // PROPOSED(D-051): a removed catch is asserted against the isolation or the flag it
+    // names.
+    pub record: usize,
     /// `InstallSnapshot` chunks of the server's term or later delivered to it in
     /// `(since, at]` that did not reset its clock: zero when that arm is on.
     pub installs: usize,
@@ -1485,21 +1795,90 @@ pub struct TimerGap {
     pub restatements: usize,
 }
 
+impl TimerGap {
+    /// The timer check's words for this gap.
+    #[must_use]
+    // PROPOSED(D-051): a removed catch is asserted against the isolation or the flag it
+    // names.
+    pub fn violation(&self) -> String {
+        format!(
+            "timers: server {} heard from no leader of its term and granted no vote since {:?} and had not campaigned by {:?}",
+            self.server, self.since, self.at
+        )
+    }
+}
+
 /// The per-server clocks of the timer replay, and what arrived since each reset
 /// that the replay's arms did not count as one.
 #[derive(Default)]
 struct TimerClocks {
     last_reset: BTreeMap<u64, Instant>,
+    /// The index in [`Report::records`] of the record behind each `last_reset`.
+    last_reset_record: BTreeMap<u64, usize>,
     installs: BTreeMap<u64, usize>,
     restatements: BTreeMap<u64, usize>,
+    /// The index of the record being replayed.
+    replaying: usize,
 }
 
 impl TimerClocks {
     fn reset(&mut self, server: u64, at: Instant) {
         self.last_reset.insert(server, at);
+        self.last_reset_record.insert(server, self.replaying);
         self.installs.remove(&server);
         self.restatements.remove(&server);
     }
+}
+
+/// One server's state in the timer check's replay once a given record was
+/// replayed and checked: what the timer check's replay returns for a probe.
+// PROPOSED(D-051): a removed catch is asserted against the isolation or the flag it
+// names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TimerState {
+    /// Running: started and not crashed since.
+    pub up: bool,
+    /// Leading, so its timer is not checked.
+    pub leader: bool,
+    /// On a re-seeded store, so its timer is not checked.
+    pub reseeded: bool,
+    /// Its clock's last reset.
+    pub since: Option<Instant>,
+    /// The index in [`Report::records`] of the record that made that reset.
+    pub since_record: Option<usize>,
+    /// Whether the replay reported a gap for it at this record.
+    pub flagged: bool,
+}
+
+/// Why a timer catch the check by durability time made is not made by decision
+/// time ([`Report::timer_removal`]): each names the record whose two times differ
+/// and so place it differently against the flag record under the two readings.
+// PROPOSED(D-051): a removed catch is asserted against the isolation or the flag it
+// names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TimerRemoval {
+    /// By decision time the server's clock was last reset, at the flag record, later
+    /// than by durability time, by this record: a reset of the server decided by the
+    /// flag record's decision and traced after the flag record.
+    ResetMovedBack {
+        /// The reset's index in [`Report::records`].
+        reset: usize,
+    },
+    /// The flag record itself, read by its decision time, is within the server's
+    /// bound of the reset the check by durability time measured from: decided at
+    /// or before that reset plus the bound, traced after it.
+    FlagMovedBack {
+        /// The flag record's index in [`Report::records`].
+        flag: usize,
+    },
+    /// By decision time the server was leading, down or on a re-seeded store at the
+    /// flag record, so its timer was not checked there, where by durability time it
+    /// was a running follower: this record of its status is replayed before the flag
+    /// record under one reading and after it under the other.
+    StatusMoved {
+        /// The status record's index in [`Report::records`].
+        record: usize,
+    },
 }
 
 /// The trace predicates the pinned seeds assert (CLAUDE.md: a pinned seed asserts
@@ -1526,11 +1905,164 @@ impl Report {
     #[must_use]
     pub fn timer_gaps_by(&self, resets: TimerResets, time: RecordTime) -> Vec<TimerGap> {
         let mut gaps = Vec::new();
-        self.replay_timers(resets, time, |gap| {
-            gaps.push(gap);
-            ControlFlow::Continue(())
-        });
+        self.replay_timers(
+            resets,
+            time,
+            |gap| {
+                gaps.push(gap);
+                ControlFlow::Continue(())
+            },
+            None,
+        );
         gaps
+    }
+
+    /// Why the check by decision time does not make `gap`, the first gap of the
+    /// timer check's replay by durability time (D-047, issue #33), derived from the
+    /// two replays themselves rather than from a list of the ways it can happen.
+    ///
+    /// Both replays are read at the gap's flag record `X`. By durability time the
+    /// flagged server is there a running follower whose clock was last reset at
+    /// `gap.since`, more than its bound before `X`. By decision time the replay does
+    /// not flag it at `X` exactly when it is leading, down or re-seeded there, or its
+    /// clock's last reset `S'` is within the bound of `X`'s decision time. So every
+    /// removal has at least one of these reasons, and each is backed by a record
+    /// whose two times place it differently against `X`:
+    ///
+    /// - [`TimerRemoval::StatusMoved`]: the server's status at `X` differs. Its
+    ///   status records — its `RaftTerm`s and `RaftLeader`s, its `RaftReseeded` and
+    ///   its crashes — come from one task in sequence, their decision times rising
+    ///   with their order, so the records either reading replays before `X` are a
+    ///   prefix of that sequence; the status differs only if the two prefixes do,
+    ///   and some status record is before `X` under one reading and after it under
+    ///   the other.
+    /// - [`TimerRemoval::ResetMovedBack`]: `S'` is later than `gap.since`. The
+    ///   record behind `S'` is replayed before `X` by decision time; had it been
+    ///   before `X` in the trace's order the replay by durability time would have
+    ///   reset the clock there too, since a reset under the decision order is a
+    ///   reset under the trace's (a delivery counts against a term no higher, and
+    ///   every other reset reads the server's own records, whose order both readings
+    ///   share); so it is after `X` in the trace's order and decided before it was
+    ///   traced.
+    /// - [`TimerRemoval::FlagMovedBack`]: `X`, read by its decision time, is within
+    ///   the bound of `gap.since`; then `X` was decided before it was traced, since
+    ///   by durability time it is past the bound.
+    ///
+    /// Every applicable reason is returned. In the simulator's traces the first
+    /// record at any instant is `TimeAdvanced`, decided as it is recorded, so the
+    /// flag record is one and `FlagMovedBack` does not arise there; it does in a
+    /// trace without those records, and the reason stays exact for any trace.
+    ///
+    /// # Errors
+    ///
+    /// When the replay by durability time does not flag `gap` at its record, when the
+    /// replay by decision time flags it there too, or when a reason's backing record
+    /// is not there: each is a fault in the reasoning, not a removal.
+    // PROPOSED(D-051): a removed catch is asserted against the isolation or the flag it
+    // names.
+    pub fn timer_removal(&self, gap: &TimerGap) -> Result<Vec<TimerRemoval>, String> {
+        let (server, flag) = (gap.server, gap.record);
+        let x = self
+            .records
+            .get(flag)
+            .ok_or_else(|| format!("the flag record {flag} is not in the trace"))?;
+        let state = |time| {
+            self.replay_timers(
+                TimerResets::ALL,
+                time,
+                |_| ControlFlow::Continue(()),
+                Some((flag, server)),
+            )
+            .ok_or_else(|| format!("the replay by {time:?} time never replayed record {flag}"))
+        };
+        let durable = state(RecordTime::Durable)?;
+        if !(durable.flagged
+            && durable.up
+            && !durable.leader
+            && !durable.reseeded
+            && durable.since == Some(gap.since))
+        {
+            return Err(format!(
+                "the replay by durability time does not flag server {server} since {:?} at record {flag}: {durable:?}",
+                gap.since
+            ));
+        }
+        let decided = state(RecordTime::Decided)?;
+        if decided.flagged {
+            return Err(format!(
+                "the replay by decision time flags server {server} at record {flag} too: {decided:?}"
+            ));
+        }
+        // Before the flag record under each reading: by index, and by decision time
+        // with ties in record order.
+        let before_by_decision =
+            |index: usize, r: &TraceRecord| (r.decided, index) < (x.decided, flag);
+        let mut reasons = Vec::new();
+        if decided.leader || decided.reseeded || !decided.up {
+            let moved = self.records.iter().enumerate().find(|&(index, r)| {
+                let status = match &r.event {
+                    TraceEvent::RaftTerm { server: s, .. }
+                    | TraceEvent::RaftLeader { server: s, .. }
+                    | TraceEvent::RaftReseeded { server: s } => *s == server,
+                    TraceEvent::NodeCrashed { node } => u64::from(node.get()) == server,
+                    _ => false,
+                };
+                status && (index < flag) != before_by_decision(index, r)
+            });
+            match moved {
+                Some((record, _)) => reasons.push(TimerRemoval::StatusMoved { record }),
+                None => {
+                    return Err(format!(
+                        "by decision time server {server} is not checked at record {flag} ({decided:?}), but no record of its status is placed differently against that record"
+                    ));
+                }
+            }
+        } else {
+            let since = decided
+                .since
+                .ok_or_else(|| format!("server {server} runs with no reset by decision time"))?;
+            if since > gap.since {
+                let reset = decided
+                    .since_record
+                    .ok_or_else(|| format!("server {server}'s reset has no record"))?;
+                let r = &self.records[reset];
+                if !(reset > flag && r.decided < r.at) {
+                    return Err(format!(
+                        "server {server}'s clock is reset later by decision time, by record {reset}, which is not a reset decided before and traced after record {flag}: {r:?}"
+                    ));
+                }
+                reasons.push(TimerRemoval::ResetMovedBack { reset });
+            }
+            if x.decided < x.at && x.decided.duration_since(gap.since) <= self.timer_bound(server) {
+                reasons.push(TimerRemoval::FlagMovedBack { flag });
+            }
+            if reasons.is_empty() {
+                return Err(format!(
+                    "by decision time server {server} is not flagged at record {flag}, but neither its reset nor the flag record moved: {decided:?}"
+                ));
+            }
+        }
+        Ok(reasons)
+    }
+
+    /// The isolation a pre-vote violation of the check by `time` names: the first of
+    /// [`Report::isolations`] whose own verdict under that check is `violation`,
+    /// word for word (issue #33).
+    #[must_use]
+    // PROPOSED(D-051): a removed catch is asserted against the isolation or the flag it
+    // names.
+    pub fn isolation_named_by(
+        &self,
+        time: RecordTime,
+        violation: &str,
+    ) -> Option<(u64, Instant, Instant)> {
+        self.isolations
+            .iter()
+            .copied()
+            .find(|&(server, from, until)| {
+                self.isolation_keeps_its_term_by(time, server, from, until)
+                    .is_err_and(|e| e == violation)
+            })
     }
 
     /// Seed 164's situation: a follower past its timer bound on AppendEntries alone
@@ -1567,9 +2099,12 @@ impl Report {
 
     /// Seeds 1885's and 2023's situation, and the nightly's eleven variant catches
     /// of the same shape (D-047): a term rise of an isolated server that
-    /// straddles the isolation's start — its step decided before `from` and its
-    /// record traced at or after `from`, by `until` — so the pre-vote check reads
-    /// it inside the window by durability time and before it by decision time.
+    /// straddles the isolation's start — its step decided at or before `from` and
+    /// its record traced after `from`, by `until` — so the pre-vote check reads it
+    /// inside the window by durability time and before it by decision time. Those
+    /// are the boundaries the two readings draw, so a catch the check by durability
+    /// time makes on an isolation and the check by decision time does not has a
+    /// straddle on that isolation, the server's terms rising along its records.
     /// Each carries how many messages from a server were delivered to the isolated
     /// one in `(from, until]`: a rise with none there was caused by nothing that
     /// reached it while it was cut off. Each also carries the messages from a server
@@ -1586,6 +2121,7 @@ impl Report {
     // D-047: every trace record carries its decision time and its durability time.
     #[must_use]
     pub fn isolation_term_straddles(&self) -> Vec<TermStraddle> {
+        let pre_vote = self.pre_vote_records();
         let sent: BTreeMap<ananke_env::MessageId, SentMessage> = self
             .raft_messages()
             .into_iter()
@@ -1608,7 +2144,7 @@ impl Report {
         };
         let mut straddles = Vec::new();
         for &(server, from, until) in &self.isolations {
-            if self.reseeding_during(server, from, until) {
+            if Self::reseeding_during(&pre_vote, server, from, until) {
                 continue;
             }
             let mut previous = 0;
@@ -1617,6 +2153,7 @@ impl Report {
                     server: s,
                     term,
                     role,
+                    ..
                 } = &record.event
                 else {
                     continue;
@@ -1624,8 +2161,13 @@ impl Report {
                 if *s != server {
                     continue;
                 }
-                if record.decided < from
-                    && from <= record.at
+                // PROPOSED(D-051): the window's boundaries as the two readings
+                // draw them — a record is before the isolation by durability time
+                // when traced at or before `from`, by decision time when decided at
+                // or before it — so this is exactly the change the two readings
+                // place on different sides of `from`.
+                if record.decided <= from
+                    && from < record.at
                     && record.at <= until
                     && *term != previous
                 {
@@ -1649,6 +2191,95 @@ impl Report {
                         at: record.at,
                         deliveries,
                         causes: delivered_at(server, record.decided),
+                    });
+                }
+                previous = *term;
+            }
+        }
+        straddles
+    }
+
+    /// Issue #32's situation (D-050): a change of an isolated server's term whose
+    /// step was decided inside the isolation, in `(from, until]`, and took a
+    /// peer's message the server had received by the isolation's start — a message
+    /// that waited in the inbox behind a persist or an install. The check by
+    /// decision time reads the change inside the window; the check
+    /// [`Report::check`] makes excuses it. Each carries the messages from a server
+    /// delivered to the isolated one at the instant it received the message, as
+    /// (sender, kind, term), so a pin can tie the receipt to the message and not
+    /// only place it before the window, and how many messages from a server were
+    /// delivered to it in `(from, until]`. Isolations the pre-vote check skips are
+    /// skipped here too.
+    // PROPOSED(D-050): a term's record carries when the message its step took was
+    // received.
+    #[must_use]
+    pub fn isolation_received_straddles(&self) -> Vec<ReceivedStraddle> {
+        let pre_vote = self.pre_vote_records();
+        let sent: BTreeMap<ananke_env::MessageId, SentMessage> = self
+            .raft_messages()
+            .into_iter()
+            .map(|m| (m.id, m))
+            .collect();
+        let mut straddles = Vec::new();
+        for &(server, from, until) in &self.isolations {
+            if Self::reseeding_during(&pre_vote, server, from, until) {
+                continue;
+            }
+            let mut previous = 0;
+            for record in &self.records {
+                let TraceEvent::RaftTerm {
+                    server: s,
+                    term,
+                    role,
+                    ..
+                } = &record.event
+                else {
+                    continue;
+                };
+                if *s != server {
+                    continue;
+                }
+                if let Some(received) = record.received()
+                    && received <= from
+                    && from < record.decided
+                    && record.decided <= until
+                    && *term != previous
+                {
+                    let deliveries = self
+                        .records
+                        .iter()
+                        .filter(|r| r.at > from && r.at <= until)
+                        .filter(|r| {
+                            matches!(&r.event, TraceEvent::MessageDelivered { from: f, to, .. }
+                                if server_of(*to) == Some(server) && server_of(*f).is_some())
+                        })
+                        .count();
+                    let causes = self
+                        .records
+                        .iter()
+                        .filter(|r| r.at == received)
+                        .filter_map(|r| match &r.event {
+                            TraceEvent::MessageDelivered { id, to, .. }
+                                if server_of(*to) == Some(server) =>
+                            {
+                                sent.get(id)
+                                    .map(|m| (m.from, m.message.kind(), m.message.term()))
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    straddles.push(ReceivedStraddle {
+                        server,
+                        from,
+                        until,
+                        before: previous,
+                        term: *term,
+                        role,
+                        received,
+                        decided: record.decided,
+                        at: record.at,
+                        deliveries,
+                        causes,
                     });
                 }
                 previous = *term;
@@ -2519,6 +3150,37 @@ pub struct TermStraddle {
     pub deliveries: usize,
     /// The messages from a server delivered to it at `decided`, as (sender, kind,
     /// term): what the step that raised the term can have taken.
+    pub causes: Vec<(u64, &'static str, u64)>,
+}
+
+/// A change of an isolated server's term decided inside the isolation from a
+/// message received before it ([`Report::isolation_received_straddles`]).
+// PROPOSED(D-050): a term's record carries when the message its step took was
+// received.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReceivedStraddle {
+    /// The isolated server.
+    pub server: u64,
+    /// When the isolation began.
+    pub from: Instant,
+    /// When it healed.
+    pub until: Instant,
+    /// The server's term on its term record before the change.
+    pub before: u64,
+    /// The term it changed to.
+    pub term: u64,
+    /// The role the change put it in.
+    pub role: &'static str,
+    /// When the server received the message the step took: at or before `from`.
+    pub received: Instant,
+    /// When the step was taken: in `(from, until]`.
+    pub decided: Instant,
+    /// When the change was traced, once durable.
+    pub at: Instant,
+    /// Messages from a server delivered to it in `(from, until]`.
+    pub deliveries: usize,
+    /// The messages from a server delivered to it at `received`, as (sender, kind,
+    /// term): what the step can have taken.
     pub causes: Vec<(u64, &'static str, u64)>,
 }
 
@@ -3542,6 +4204,56 @@ pub fn run_with(seed: u64, schedule: Schedule, variants: impl Into<Variants>) ->
                 advance(&mut sim, *steer, &mut watch);
                 sim.heal();
             }
+            Fault::IsolateOnTermRaise {
+                tries,
+                isolate,
+                quiet,
+            } => {
+                // PROPOSED(D-050): a transfer's campaign raises the third
+                // server's term, and the isolation starts at the end of the slice
+                // its message was delivered in, inside whatever persist the
+                // server was running.
+                for n in 0..*tries {
+                    if watch.stopped.is_some() {
+                        break;
+                    }
+                    let leader = leader_now(&sim);
+                    let target = leader % SERVERS + 1;
+                    let third = target % SERVERS + 1;
+                    {
+                        let env = sim.env(admin);
+                        let inner = env.clone();
+                        let seq = TERM_RAISE_ADMIN + n;
+                        env.spawn("admin", async move {
+                            let Ok(sock) = inner.net().bind(admin_addr(seq)).await else {
+                                return;
+                            };
+                            let request = Request {
+                                client: ADMIN,
+                                seq,
+                                command: Command::Transfer { to: target },
+                            };
+                            let _ = sock.send(server_addr(leader), request.encode()).await;
+                        });
+                    }
+                    if term_raise_delivered(&mut sim, &mut watch, third) {
+                        let side = vec![servers[third as usize - 1]];
+                        let rest: Vec<NodeId> = servers
+                            .iter()
+                            .chain(clients.iter())
+                            .chain(std::iter::once(&admin))
+                            .copied()
+                            .filter(|n| *n != side[0])
+                            .collect();
+                        let from = sim.now();
+                        sim.partition(&side, &rest);
+                        advance(&mut sim, *isolate, &mut watch);
+                        sim.heal();
+                        isolations.push((third, from, sim.now()));
+                    }
+                    advance(&mut sim, *quiet, &mut watch);
+                }
+            }
         }
         last_heal = sim.now();
         advance(&mut sim, *gap, &mut watch);
@@ -3570,9 +4282,7 @@ pub fn run_with(seed: u64, schedule: Schedule, variants: impl Into<Variants>) ->
         variants,
         policy: sim.policy(),
         schedule,
-        jsonl: sim
-            .to_moirae(&Export::new(&message::studio))
-            .expect("the raft trace exports to moirae v2"),
+        run: sim.run_header(),
         records,
         last_heal,
         isolations,
@@ -3749,6 +4459,74 @@ fn stream_opened(sim: &mut Sim, watch: &mut Watch, victim: u64) -> bool {
     false
 }
 
+/// Advances the run in slices of [`TERM_RAISE_STEP`] until a message from a server
+/// carrying a term above `victim`'s last traced term is delivered to `victim`, or
+/// [`TERM_RAISE_WAIT_BUDGET`] runs out: the moment [`Fault::IsolateOnTermRaise`]
+/// cuts it off at. A term the victim adopted but has not yet traced still reads as
+/// above, which costs a round its aim and nothing else. As with [`install_landing`],
+/// the safety folds are skipped inside the small slices, the watch reads only the
+/// records since its last look (D-046) and the trace cap still stops a runaway.
+// PROPOSED(D-050): a term's record carries when the message its step took was
+// received.
+fn term_raise_delivered(sim: &mut Sim, watch: &mut Watch, victim: u64) -> bool {
+    if watch.stopped.is_some() {
+        return false;
+    }
+    let mut term = sim
+        .trace()
+        .iter()
+        .rev()
+        .find_map(|r| match &r.event {
+            TraceEvent::RaftTerm { server, term, .. } if *server == victim => Some(*term),
+            _ => None,
+        })
+        .unwrap_or(0);
+    let mut payloads: BTreeMap<ananke_env::MessageId, Bytes> = BTreeMap::new();
+    let mut scanned = sim.trace_len();
+    for record in sim.trace_from(scanned.saturating_sub(2000)).iter().rev() {
+        if let TraceEvent::MessageSent { id, payload, .. } = &record.event {
+            payloads.entry(*id).or_insert_with(|| payload.clone());
+        }
+    }
+    let mut waited = Duration::ZERO;
+    while waited < TERM_RAISE_WAIT_BUDGET {
+        sim.run_for(TERM_RAISE_STEP);
+        waited += TERM_RAISE_STEP;
+        let len = sim.trace_len();
+        if len > TRACE_CAP {
+            watch.stopped = Some(format!(
+                "runaway: {len} trace records by {:?}, over the cap of {TRACE_CAP}",
+                sim.now()
+            ));
+            return false;
+        }
+        let records = sim.trace_from(scanned);
+        scanned += records.len();
+        for record in &records {
+            match &record.event {
+                TraceEvent::MessageSent { id, payload, .. } => {
+                    payloads.insert(*id, payload.clone());
+                }
+                TraceEvent::RaftTerm {
+                    server, term: now, ..
+                } if *server == victim => term = *now,
+                TraceEvent::MessageDelivered { id, from, to, .. }
+                    if server_of(*to) == Some(victim) && server_of(*from).is_some() =>
+                {
+                    if let Some(payload) = payloads.get(id)
+                        && let Ok(frame) = Frame::decode(payload.clone())
+                        && frame.message.term() > term
+                    {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    false
+}
+
 /// Reads the trace from `scanned` on into `refused`, the servers sitting refused
 /// for lost state: refused ([`TraceEvent::RaftRefused`]) with no restatement
 /// since, however long ago, since a refused server comes back only through an
@@ -3854,6 +4632,10 @@ fn adoption_change(sim: &mut Sim, watch: &mut Watch, victim: u64) {
             .collect()
     };
     let before = durable(sim);
+    // PROPOSED(D-052): the namespace is read again only once it may have changed;
+    // between two equal versions it is the namespace this watch last looked at,
+    // which did not end the watch.
+    let mut seen = sim.durable_version(node);
     let step = Duration::from_micros(250);
     let budget = if before.is_empty() {
         EMPTY_STORE_DELAY
@@ -3875,6 +4657,11 @@ fn adoption_change(sim: &mut Sim, watch: &mut Watch, victim: u64) {
         if before.is_empty() {
             continue;
         }
+        let version = sim.durable_version(node);
+        if version == seen {
+            continue;
+        }
+        seen = version;
         let now = durable(sim);
         let old_gone = before.iter().all(|n| !now.contains(n));
         let new_synced = now.iter().any(|n| !before.contains(n));
@@ -3924,5 +4711,284 @@ fn advance(sim: &mut Sim, duration: Duration, watch: &mut Watch) {
                 return;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The checks' reasoning on records written by hand: each shape a removal can
+    //! take, and the "every" in D-050's excuse.
+
+    use super::*;
+    use ananke_env::Decision;
+    use ananke_raft::core::Variant;
+
+    fn ms(n: u64) -> Instant {
+        Instant::from_nanos(n * 1_000_000)
+    }
+
+    fn record(at: Instant, decided: Instant, node: Option<u64>, event: TraceEvent) -> TraceRecord {
+        TraceRecord {
+            at,
+            decided,
+            node: node.map(|n| NodeId::new(u32::try_from(n).expect("small"))),
+            event,
+        }
+    }
+
+    fn term(server: u64, term: u64, role: &'static str, received: Option<Decision>) -> TraceEvent {
+        TraceEvent::RaftTerm {
+            server,
+            term,
+            role,
+            received,
+        }
+    }
+
+    /// A stamp at `at`, taken the only way code outside `ananke-env` can: from a
+    /// simulated node at that instant.
+    fn stamp(at: Instant) -> Decision {
+        let mut sim = Sim::new(SimConfig::new(0));
+        let node = sim.add_node();
+        sim.run_until(at);
+        sim.env(node).decision()
+    }
+
+    /// A report around `records` and `isolations`, three servers whose clocks run
+    /// true, so each server's timer bound is 400 ms.
+    fn report(records: Vec<TraceRecord>, isolations: Vec<(u64, Instant, Instant)>) -> Report {
+        let sim = Sim::new(SimConfig::new(0));
+        Report {
+            seed: 0,
+            variants: Variants::from(Variant::Correct),
+            policy: Policy::Uniform,
+            schedule: Schedule::term_raise_behind_a_step(0),
+            records,
+            run: sim.run_header(),
+            last_heal: Instant::from_nanos(0),
+            isolations,
+            trials_led_by_slowest: 0,
+            aimed_streams: 0,
+            refused: Vec::new(),
+            stopped: None,
+            history: History::default(),
+            clients: ClientStats::default(),
+        }
+    }
+
+    fn vote(server: u64) -> TraceEvent {
+        TraceEvent::RaftVote {
+            server,
+            term: 1,
+            candidate: 2,
+            granted: true,
+            pre: false,
+        }
+    }
+
+    /// The durability replay's first gap, which the decision replay must not make.
+    fn removed_gap(report: &Report) -> TimerGap {
+        assert!(report.timers_fire_by(RecordTime::Decided).is_ok());
+        let gap = report
+            .timer_gaps_by(TimerResets::ALL, RecordTime::Durable)
+            .first()
+            .copied()
+            .expect("a gap by durability time");
+        assert_eq!(
+            report.timers_fire_by(RecordTime::Durable),
+            Err(gap.violation())
+        );
+        gap
+    }
+
+    /// A reset decided before the flag record and traced after it: server 1's
+    /// granted vote, decided at 399 ms and traced at 402 ms, against a flag at 401 ms.
+    // PROPOSED(D-051): a removed catch is asserted against the isolation or the flag it
+    // names.
+    #[test]
+    fn a_timer_catch_removed_by_a_reset_decided_before_the_flag() {
+        let report = report(
+            vec![
+                record(ms(0), ms(0), Some(1), term(1, 1, "follower", None)),
+                record(
+                    ms(401),
+                    ms(401),
+                    None,
+                    TraceEvent::TimeAdvanced { to: ms(401) },
+                ),
+                record(ms(402), ms(399), Some(1), vote(1)),
+            ],
+            Vec::new(),
+        );
+        let gap = removed_gap(&report);
+        assert_eq!((gap.server, gap.since, gap.record), (1, ms(0), 1));
+        assert_eq!(
+            report.timer_removal(&gap),
+            Ok(vec![TimerRemoval::ResetMovedBack { reset: 2 }])
+        );
+    }
+
+    /// The flag record itself decided within the bound (the review's shape): a
+    /// record decided at 399 ms and traced at 401 ms, and server 1's next reset at
+    /// 500 ms, decided as it is traced, with nothing decided in between. No reset of
+    /// server 1 straddles the flag, which the assertion before this entry required.
+    // PROPOSED(D-051): a removed catch is asserted against the isolation or the flag it
+    // names.
+    #[test]
+    fn a_timer_catch_removed_by_the_flag_record_decided_within_the_bound() {
+        let report = report(
+            vec![
+                record(ms(0), ms(0), Some(1), term(1, 1, "follower", None)),
+                record(
+                    ms(401),
+                    ms(399),
+                    Some(2),
+                    TraceEvent::RaftCommit {
+                        server: 2,
+                        term: 1,
+                        index: 1,
+                    },
+                ),
+                record(ms(500), ms(500), Some(1), vote(1)),
+            ],
+            Vec::new(),
+        );
+        let gap = removed_gap(&report);
+        assert_eq!((gap.server, gap.since, gap.record), (1, ms(0), 1));
+        assert!(
+            report.records[2].decided > gap.at,
+            "the only later reset is decided after the flag"
+        );
+        assert_eq!(
+            report.timer_removal(&gap),
+            Ok(vec![TimerRemoval::FlagMovedBack { flag: 1 }])
+        );
+    }
+
+    /// Leadership decided before the flag record and traced after it, which is no
+    /// reset: server 1, a candidate since 0 ms, wins at 399 ms and is traced leading
+    /// at 402 ms, against a flag at 401 ms.
+    // PROPOSED(D-051): a removed catch is asserted against the isolation or the flag it
+    // names.
+    #[test]
+    fn a_timer_catch_removed_by_leadership_decided_before_the_flag() {
+        let report = report(
+            vec![
+                record(ms(0), ms(0), Some(1), term(1, 1, "candidate", None)),
+                record(
+                    ms(401),
+                    ms(401),
+                    None,
+                    TraceEvent::TimeAdvanced { to: ms(401) },
+                ),
+                record(
+                    ms(402),
+                    ms(399),
+                    Some(1),
+                    TraceEvent::RaftLeader {
+                        server: 1,
+                        term: 1,
+                        last_index: 0,
+                    },
+                ),
+            ],
+            Vec::new(),
+        );
+        let gap = removed_gap(&report);
+        assert_eq!((gap.server, gap.since, gap.record), (1, ms(0), 1));
+        assert_eq!(
+            report.timer_removal(&gap),
+            Ok(vec![TimerRemoval::StatusMoved { record: 2 }])
+        );
+    }
+
+    /// The other direction: a gap nothing moved is flagged under both readings, and
+    /// no reason is given for a removal that did not happen.
+    // PROPOSED(D-051): a removed catch is asserted against the isolation or the flag it
+    // names.
+    #[test]
+    fn a_timer_catch_both_readings_make_has_no_removal_reason() {
+        let report = report(
+            vec![
+                record(ms(0), ms(0), Some(1), term(1, 1, "follower", None)),
+                record(
+                    ms(401),
+                    ms(401),
+                    None,
+                    TraceEvent::TimeAdvanced { to: ms(401) },
+                ),
+                record(ms(402), ms(402), Some(1), vote(1)),
+            ],
+            Vec::new(),
+        );
+        assert!(report.timers_fire_by(RecordTime::Decided).is_err());
+        let gap = report.timer_gaps_by(TimerResets::ALL, RecordTime::Durable)[0];
+        assert!(report.timer_removal(&gap).is_err());
+    }
+
+    /// D-050's excuse needs every change of the window's term to be taken from a
+    /// message received by its start: one received before it beside a campaign with no
+    /// receipt is flagged, and the same change alone is not.
+    // PROPOSED(D-050): a term's record carries when the message its step took was
+    // received.
+    #[test]
+    fn a_window_with_one_change_received_before_it_and_one_without_is_flagged() {
+        let isolation = (1, ms(100), ms(500));
+        let received = record(
+            ms(111),
+            ms(110),
+            Some(1),
+            term(1, 2, "follower", Some(stamp(ms(90)))),
+        );
+        let campaign = record(ms(201), ms(200), Some(1), term(1, 3, "candidate", None));
+        let start = record(ms(0), ms(0), Some(1), term(1, 1, "follower", None));
+        let mixed = report(
+            vec![start.clone(), received.clone(), campaign],
+            vec![isolation],
+        );
+        assert_eq!(mixed.isolation_received_straddles().len(), 1);
+        assert_eq!(
+            mixed.isolation_keeps_the_term_by_cause(),
+            Err(
+                "pre-vote: server 1 raised its term from 1 to 3 while isolated from Instant(100ms) to Instant(500ms)"
+                    .to_owned()
+            )
+        );
+        let alone = report(vec![start, received], vec![isolation]);
+        assert!(
+            alone
+                .isolation_keeps_the_term_by(RecordTime::Decided)
+                .is_err()
+        );
+        assert_eq!(alone.isolation_keeps_the_term_by_cause(), Ok(()));
+    }
+
+    /// A change decided at the very instant an isolation began and traced after it is
+    /// before the window by decision time and inside it by durability time, so it is
+    /// a straddle: the boundaries the two readings draw (D-051).
+    // PROPOSED(D-051): a removed catch is asserted against the isolation or the flag it
+    // names.
+    #[test]
+    fn a_change_decided_at_the_isolations_start_and_traced_inside_it_straddles_it() {
+        let isolation = (1, ms(100), ms(500));
+        let report = report(
+            vec![
+                record(ms(0), ms(0), Some(1), term(1, 1, "follower", None)),
+                record(ms(102), ms(100), Some(1), term(1, 2, "follower", None)),
+            ],
+            vec![isolation],
+        );
+        assert!(
+            report
+                .isolation_keeps_the_term_by(RecordTime::Durable)
+                .is_err()
+        );
+        assert_eq!(
+            report.isolation_keeps_the_term_by(RecordTime::Decided),
+            Ok(())
+        );
+        let straddles = report.isolation_term_straddles();
+        assert_eq!(straddles.len(), 1, "{straddles:?}");
+        assert_eq!((straddles[0].decided, straddles[0].at), (ms(100), ms(102)));
     }
 }

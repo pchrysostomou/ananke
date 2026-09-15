@@ -372,6 +372,16 @@ pub enum TraceEvent {
         term: u64,
         /// The role: `follower`, `pre-candidate`, `candidate` or `leader`.
         role: &'static str,
+        /// When the peer's message that the step behind this record took reached the
+        /// server: the stamp its `net` task took as it received the frame, before the
+        /// message waited in the inbox for the step. `None` when the step's input was
+        /// no peer's message — a tick, a completion, a restatement at a start. It is
+        /// at or before the record's decision time, and it lets a check ask whether
+        /// the cause of a term change arrived before some instant without modelling
+        /// the inbox (D-050).
+        // PROPOSED(D-050): a term's record carries when the message its step took
+        // was received.
+        received: Option<Decision>,
     },
     /// A Raft server granted or refused a vote or a pre-vote.
     RaftVote {

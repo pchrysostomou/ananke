@@ -141,6 +141,13 @@ impl State {
             "a decision at {decided:?} traced at {:?} comes from the future",
             self.now
         );
+        // PROPOSED(D-050): a term's record carries when the message its step took
+        // was received, which is no later than the step.
+        debug_assert!(
+            !matches!(&event, TraceEvent::RaftTerm { received: Some(received), .. }
+                if received.instant() > decided),
+            "a message received after the step that took it: {event:?} decided at {decided:?}"
+        );
         self.trace.push(TraceRecord {
             at: self.now,
             decided: decided.min(self.now),

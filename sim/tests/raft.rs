@@ -21,14 +21,14 @@ use ananke_sim::{seeds, sweep, verdict, write_trace};
 fn same_seed_gives_byte_identical_trace() {
     let first = raft::run(42, Variant::Correct);
     let second = raft::run(42, Variant::Correct);
-    assert_eq!(first.jsonl.as_bytes(), second.jsonl.as_bytes());
+    assert_eq!(first.jsonl().as_bytes(), second.jsonl().as_bytes());
 }
 
 /// The seed-42 trace is written for the studio.
 #[test]
 fn the_seed_42_trace_is_written_for_the_studio() {
     let report = raft::run(42, Variant::Correct);
-    write_trace("raft-42", &report.jsonl);
+    write_trace("raft-42", &report.jsonl());
     report.check().unwrap();
 }
 
@@ -800,6 +800,210 @@ fn the_nightlys_eleven_variant_catches_of_the_trace_timestamp_gap_are_not_catche
     }
 }
 
+/// Issue #33: the sweeps' assertions on a removed catch, run on every catch the
+/// ten-thousand-seed nightlies removed. Runs 34749071877 (on 9b5995d) and
+/// 34852980174 (on a8656e8) printed 28 removed catches between them — 27 pre-vote
+/// catches and one timer catch, `ResetTimerOnAnyRpc` on seed 5153 — each with the
+/// words the check by durability time used, which are the words here. Each pair is
+/// run on this tree through [`checked`], whose assertions are the ones every sweep
+/// makes: a removed pre-vote catch matched to a term change straddling the start
+/// of the isolation the catch names (D-047's, or D-050's received before it), and
+/// a removed timer catch matched to a reset of the flagged server that the replay
+/// counts, decided by the flag and traced after it.
+///
+/// Two of the 28 are in the first run only: `IgnoreIncarnation` on seeds 2509 and
+/// 5990, whose schedules D-049 moved, as
+/// `the_nightlys_eleven_variant_catches_of_the_trace_timestamp_gap_are_not_catches`
+/// says; on this tree neither run has that catch to remove, which is asserted, so
+/// the day either reaches it again this test runs the assertion on it. The other
+/// 26 must be removed here in the nightlies' words, and each run must pass the
+/// check.
+#[test]
+// PROPOSED(D-051): a removed catch is asserted against the isolation or the flag it
+// names.
+fn the_nightlies_removed_catches_meet_the_sweeps_assertions() {
+    type Removed = (u64, Variant, &'static str);
+    const REMOVED: [Removed; 28] = [
+        (
+            1885,
+            Variant::Correct,
+            "pre-vote: server 1 raised its term from 8 to 10 while isolated from Instant(15.203s) to Instant(17.112s)",
+        ),
+        (
+            2023,
+            Variant::Correct,
+            "pre-vote: server 1 raised its term from 13 to 14 while isolated from Instant(19.22s) to Instant(20.822s)",
+        ),
+        (
+            1252,
+            Variant::IgnoreIncarnation,
+            "pre-vote: server 3 raised its term from 10 to 11 while isolated from Instant(20.16625s) to Instant(22.33725s)",
+        ),
+        (
+            2509,
+            Variant::IgnoreIncarnation,
+            "pre-vote: server 1 raised its term from 12 to 13 while isolated from Instant(14.859s) to Instant(16.412s)",
+        ),
+        (
+            3087,
+            Variant::IgnoreIncarnation,
+            "pre-vote: server 3 raised its term from 10 to 11 while isolated from Instant(17.701s) to Instant(20.034s)",
+        ),
+        (
+            5990,
+            Variant::IgnoreIncarnation,
+            "pre-vote: server 1 raised its term from 11 to 12 while isolated from Instant(14.448s) to Instant(16.741s)",
+        ),
+        (
+            1176,
+            Variant::SharedSnapshotDir,
+            "pre-vote: server 3 raised its term from 14 to 15 while isolated from Instant(18.29s) to Instant(20.536s)",
+        ),
+        (
+            2407,
+            Variant::SharedSnapshotDir,
+            "pre-vote: server 3 raised its term from 10 to 11 while isolated from Instant(15.314s) to Instant(17.394s)",
+        ),
+        (
+            3863,
+            Variant::SharedSnapshotDir,
+            "pre-vote: server 2 raised its term from 10 to 11 while isolated from Instant(18.222s) to Instant(20.706s)",
+        ),
+        (
+            4713,
+            Variant::SharedSnapshotDir,
+            "pre-vote: server 3 raised its term from 13 to 14 while isolated from Instant(18.797s) to Instant(20.433s)",
+        ),
+        (
+            5203,
+            Variant::SharedSnapshotDir,
+            "pre-vote: server 2 raised its term from 11 to 12 while isolated from Instant(12.369s) to Instant(13.319s)",
+        ),
+        (
+            6691,
+            Variant::SharedSnapshotDir,
+            "pre-vote: server 1 raised its term from 13 to 14 while isolated from Instant(17.298s) to Instant(18.322s)",
+        ),
+        (
+            9670,
+            Variant::SharedSnapshotDir,
+            "pre-vote: server 3 raised its term from 12 to 13 while isolated from Instant(26.809s) to Instant(29.254s)",
+        ),
+        (
+            2627,
+            Variant::ResetTimerOnAnyRpc,
+            "pre-vote: server 3 raised its term from 7 to 8 while isolated from Instant(14.425s) to Instant(16.654s)",
+        ),
+        (
+            4426,
+            Variant::ResetTimerOnAnyRpc,
+            "pre-vote: server 1 raised its term from 11 to 12 while isolated from Instant(23.3235s) to Instant(25.1915s)",
+        ),
+        (
+            4814,
+            Variant::ResetTimerOnAnyRpc,
+            "pre-vote: server 3 raised its term from 11 to 15 while isolated from Instant(12.111s) to Instant(13.177s)",
+        ),
+        (
+            5051,
+            Variant::ResetTimerOnAnyRpc,
+            "pre-vote: server 3 raised its term from 5 to 6 while isolated from Instant(9.058s) to Instant(10.103s)",
+        ),
+        (
+            5153,
+            Variant::ResetTimerOnAnyRpc,
+            "timers: server 2 heard from no leader of its term and granted no vote since Instant(7.864918384s) and had not campaigned by Instant(8.265321611s)",
+        ),
+        (
+            5879,
+            Variant::ResetTimerOnAnyRpc,
+            "pre-vote: server 2 raised its term from 11 to 12 while isolated from Instant(13.358s) to Instant(14.312s)",
+        ),
+        (
+            5918,
+            Variant::ResetTimerOnAnyRpc,
+            "pre-vote: server 3 raised its term from 7 to 8 while isolated from Instant(9.532s) to Instant(10.475s)",
+        ),
+        (
+            6717,
+            Variant::ResetTimerOnAnyRpc,
+            "pre-vote: server 3 raised its term from 7 to 9 while isolated from Instant(9.057s) to Instant(10.127s)",
+        ),
+        (
+            1929,
+            Variant::AdoptionAsBuilt,
+            "pre-vote: server 1 raised its term from 12 to 13 while isolated from Instant(17.879s) to Instant(20.093s)",
+        ),
+        (
+            2578,
+            Variant::AdoptionAsBuilt,
+            "pre-vote: server 2 raised its term from 10 to 11 while isolated from Instant(8.024s) to Instant(9.106s)",
+        ),
+        (
+            2698,
+            Variant::AdoptionAsBuilt,
+            "pre-vote: server 2 raised its term from 8 to 9 while isolated from Instant(13.667s) to Instant(15.228s)",
+        ),
+        (
+            5859,
+            Variant::AdoptionAsBuilt,
+            "pre-vote: server 2 raised its term from 10 to 11 while isolated from Instant(16.983s) to Instant(19.363s)",
+        ),
+        (
+            9557,
+            Variant::AdoptionAsBuilt,
+            "pre-vote: server 3 raised its term from 9 to 10 while isolated from Instant(15.0055s) to Instant(17.3035s)",
+        ),
+        (
+            2305,
+            Variant::SnapshotWithoutCurrentLast,
+            "pre-vote: server 2 raised its term from 7 to 8 while isolated from Instant(19.377s) to Instant(21.605s)",
+        ),
+        (
+            6366,
+            Variant::ApplyBeforeCommit,
+            "pre-vote: server 2 raised its term from 11 to 13 while isolated from Instant(9.677s) to Instant(10.784s)",
+        ),
+    ];
+    // D-049 moved these schedules away from their catch.
+    const MOVED_BY_D049: [u64; 2] = [2509, 5990];
+    let runs = sweep(REMOVED.len() as u64, |i| {
+        let (seed, variant, was) = REMOVED[usize::try_from(i).expect("small")];
+        let report = raft::run(seed, variant);
+        let moved = Mutex::new(MovedSeeds::default());
+        let verdict = checked(&report, &moved);
+        let moved = moved.into_inner().unwrap();
+        (seed, variant, was, verdict, moved.removed, moved.added)
+    });
+    for (seed, variant, was, verdict, removed, added) in &runs {
+        for (_, line) in removed {
+            eprintln!("seed {seed} under {variant:?}: removed: {line}");
+        }
+        assert_eq!(
+            added,
+            &Vec::new(),
+            "seed {seed} under {variant:?}: a catch was added"
+        );
+        let removes_it = removed.iter().any(|(_, line)| line.starts_with(was));
+        if MOVED_BY_D049.contains(seed) {
+            assert!(
+                !removes_it,
+                "seed {seed} under {variant:?} removes the nightly's catch again: upgrade the test"
+            );
+            continue;
+        }
+        assert!(
+            removes_it,
+            "seed {seed} under {variant:?}: the nightlies' removed catch `{was}` is not removed on \
+             this tree: {removed:?}"
+        );
+        assert_eq!(
+            verdict, &None,
+            "seed {seed} under {variant:?}: the run no longer passes the check"
+        );
+    }
+}
+
 /// The trace-timestamp gap on one run (D-047): the run holds exactly one
 /// term rise that straddles the start of its server's isolation — `rise` names its
 /// (server, term before, term after, role) — decided before the isolation began and
@@ -872,6 +1076,266 @@ fn assert_rise_straddles_the_isolation(
     straddle.clone()
 }
 
+/// How many rounds the directed scenario of issue #32 runs per seed (D-050).
+const TERM_RAISE_TRIES: u64 = 8;
+
+/// Issue #32, the open case of D-047, aimed at (D-050): a message raising a
+/// server's term delivered before an isolation begins and taken by a step inside
+/// it, because the server was still awaiting a persist when the message arrived.
+/// No correct-server seed of the ten-thousand-seed nightlies reached it, so the
+/// directed scenario builds it: each round a transfer's campaign sends the third
+/// server a RequestVote of a higher term, and that server is cut off the moment the
+/// message is delivered ([`Fault::IsolateOnTermRaise`]).
+///
+/// The check by decision time flags such a change, since its step is inside the
+/// window; the check [`raft::Report::check`] makes reads the receipt the server
+/// records on it and excuses it. On every seed the correct server passes the whole
+/// check, and every such change is asserted for its reason: received at or before
+/// the isolation's start and decided inside the window, no message from a server
+/// delivered to the server in the window, a message of the new term delivered to it
+/// at the receipt, and the check by decision time flagging an isolation the check by
+/// cause does not. The shape must be reached on some seed at every tier, and the
+/// count is printed.
+#[test]
+fn a_term_change_stepped_inside_an_isolation_from_a_message_received_before_it_is_excused() {
+    // PROPOSED(D-051): on this schedule most runs hold a catch reading decision
+    // time removes, so each run goes through the sweeps' `checked` and its
+    // assertions meet hundreds of real removals at every tier.
+    let moved = Mutex::new(MovedSeeds::default());
+    let per_seed = sweep(seeds(), |seed| {
+        let report = raft::run_with(
+            seed,
+            raft::Schedule::term_raise_behind_a_step(TERM_RAISE_TRIES),
+            Variant::Correct,
+        );
+        let received = report.isolation_received_straddles();
+        for s in &received {
+            assert_received_straddle(&report, s);
+        }
+        let verdict = checked(&report, &moved).map_or(Ok(()), Err);
+        if verdict.is_err() {
+            write_trace(&format!("raft-term-raise-{seed}"), &report.jsonl());
+        }
+        let first = received.first().map(|s| {
+            format!(
+                "seed {seed}: server {} {}->{} ({}) received {:?}, isolated from {:?} to {:?}, \
+                 decided {:?} into it, traced at {:?}, at the receipt {:?}",
+                s.server,
+                s.before,
+                s.term,
+                s.role,
+                s.received,
+                s.from,
+                s.until,
+                s.decided.duration_since(s.from),
+                s.at,
+                s.causes
+            )
+        });
+        (
+            first,
+            received.len(),
+            report.isolations.len(),
+            report.isolation_term_straddles().len(),
+            verdict,
+        )
+    });
+    let reached = per_seed.iter().filter(|(_, n, ..)| *n > 0).count();
+    let changes: usize = per_seed.iter().map(|(_, n, ..)| n).sum();
+    let isolations: usize = per_seed.iter().map(|(_, _, i, ..)| i).sum();
+    let decided: usize = per_seed.iter().map(|(_, _, _, d, _)| d).sum();
+    eprintln!(
+        "term raised behind a step (D-050): the shape on {reached} of {} seeds, {changes} \
+         changes in {isolations} isolations; {decided} rises decided before an isolation and \
+         traced inside it (D-047)",
+        seeds()
+    );
+    for line in per_seed
+        .iter()
+        .filter_map(|(first, ..)| first.as_ref())
+        .take(10)
+    {
+        eprintln!("  {line}");
+    }
+    print_moved("Correct on the term-raise schedule", moved);
+    let failures: Vec<&String> = per_seed
+        .iter()
+        .filter_map(|(.., verdict)| verdict.as_ref().err())
+        .collect();
+    assert!(
+        failures.is_empty(),
+        "the correct server fails: {failures:?}"
+    );
+    assert!(
+        reached > 0,
+        "no seed reached a term change stepped inside an isolation from a message received \
+         before it"
+    );
+}
+
+/// Seed 4 of the directed schedule pins the shape with its numbers (D-050).
+/// Server 1's campaign for term 5, after a round's transfer, sent server 2 a
+/// RequestVote of term 5, delivered and received at 3.679125915 s while server 2's
+/// `raft` task was awaiting a persist. The isolation began 4.085 µs later, at the
+/// end of the watch's slice, 3.67913 s, and server 2's step took the message
+/// 2.176899 ms into it: a change from term 4 to 5 decided inside the window, with
+/// no message from a server reaching server 2 until the heal at 3.97913 s. The
+/// check by decision time flags the isolation in the words below; the check by
+/// cause excuses it, since the record says the message was received before the
+/// window; and the run passes the whole check. When a change to the simulator or
+/// the server moves the seed away from the shape, this fails and names what it
+/// found instead.
+#[test]
+fn seed_4_of_the_term_raise_schedule_steps_a_message_received_before_its_isolation() {
+    let report = raft::run_with(
+        4,
+        raft::Schedule::term_raise_behind_a_step(TERM_RAISE_TRIES),
+        Variant::Correct,
+    );
+    let received = report.isolation_received_straddles();
+    let [s] = received.as_slice() else {
+        panic!(
+            "seed 4 no longer has exactly one term change received before an isolation and \
+             stepped inside it: {received:?}"
+        );
+    };
+    assert_eq!(
+        (s.server, s.before, s.term, s.role, s.causes.as_slice()),
+        (2, 4, 5, "follower", &[(1, "request-vote", 5)][..]),
+        "seed 4 steps another change: {s:?}"
+    );
+    assert_eq!(
+        (s.received, s.from, s.decided, s.until),
+        (
+            ananke_env::Instant::from_nanos(3_679_125_915),
+            ananke_env::Instant::from_nanos(3_679_130_000),
+            ananke_env::Instant::from_nanos(3_681_306_899),
+            ananke_env::Instant::from_nanos(3_979_130_000),
+        ),
+        "seed 4's receipt, isolation or step moved: {s:?}"
+    );
+    assert_received_straddle(&report, s);
+    assert_eq!(
+        report.isolation_keeps_its_term_by(RecordTime::Decided, s.server, s.from, s.until),
+        Err(
+            "pre-vote: server 2 raised its term from 4 to 5 while isolated from Instant(3.67913s) \
+             to Instant(3.97913s)"
+                .to_owned()
+        )
+    );
+    report.check().unwrap();
+}
+
+/// The pair of the test above (D-050): the server without pre-vote, on the same
+/// directed schedule, campaigns on its own timer while cut off, and a campaign on a
+/// timer takes no peer's message, so its term change carries no receipt and the
+/// check by cause must still flag it on some seed; a check that excused everything
+/// would pass here. (A candidacy stepped from a granting PreVoteResponse or a
+/// TimeoutNow does carry one, and is excused when that message was received by the
+/// isolation's start, like any change a message caused.)
+///
+/// Every window the check by decision time flags whose term changes include one
+/// received by the isolation's start and one that is not must be flagged by the
+/// check by cause too, which is the "every" of D-050's excuse; the
+/// count of such windows is printed. Each run also goes through the sweeps'
+/// `checked`, so its removed catches meet D-051's assertions.
+#[test]
+fn a_server_without_pre_vote_is_caught_on_the_term_raise_schedule() {
+    let moved = Mutex::new(MovedSeeds::default());
+    let per_seed = sweep(seeds(), |seed| {
+        let report = raft::run_with(
+            seed,
+            raft::Schedule::term_raise_behind_a_step(TERM_RAISE_TRIES),
+            Variant::NoPreVote,
+        );
+        let _ = checked(&report, &moved);
+        // PROPOSED(D-050): the excuse needs every change received by the start.
+        let mut mixed = 0;
+        for &(server, from, until) in &report.isolations {
+            let changes = report.isolation_term_changes(server, from, until);
+            let before = changes
+                .iter()
+                .filter(|r| r.received().is_some_and(|received| received <= from))
+                .count();
+            // Only a window the check by decision time flags consults the excuse;
+            // one the pre-vote check skips, for an install inside it, does not.
+            if before > 0
+                && before < changes.len()
+                && report
+                    .isolation_keeps_its_term_by(RecordTime::Decided, server, from, until)
+                    .is_err()
+            {
+                mixed += 1;
+                assert!(
+                    report
+                        .isolation_keeps_its_term_by_cause(server, from, until)
+                        .is_err(),
+                    "seed {seed}: server {server}'s window from {from:?} to {until:?} has a change \
+                     received before it beside one that was not, and is excused: {changes:?}"
+                );
+            }
+        }
+        (report.isolation_keeps_the_term_by_cause().is_err(), mixed)
+    });
+    let caught = per_seed.iter().filter(|(caught, _)| *caught).count();
+    let mixed: usize = per_seed.iter().map(|(_, mixed)| mixed).sum();
+    eprintln!(
+        "NoPreVote on the term-raise schedule: caught by the pre-vote check on {caught} of {} \
+         seeds; {mixed} windows mixed a change received before the isolation with one that was \
+         not, each flagged",
+        seeds()
+    );
+    print_moved("NoPreVote on the term-raise schedule", moved);
+    assert!(
+        caught > 0,
+        "NoPreVote was never caught on the term-raise schedule"
+    );
+}
+
+/// Asserts that `s`, a change of an isolated server's term decided inside the
+/// isolation from a message received before it, is that for the reason D-050
+/// gives: the receipt at or before the isolation's start and the step inside it;
+/// no message from a server delivered to the server in the window, so nothing it
+/// received while cut off raised the term; a message of the new term from a server
+/// delivered to it at the instant it received one, so the receipt is that
+/// message's; and the check by decision time flagging the isolation while the check
+/// by cause does not.
+fn assert_received_straddle(report: &raft::Report, s: &raft::ReceivedStraddle) {
+    let (seed, variants) = (report.seed, report.variants);
+    assert!(
+        s.received <= s.from && s.from < s.decided && s.decided <= s.until,
+        "seed {seed} under {variants:?}: not received before and decided inside: {s:?}"
+    );
+    assert_eq!(
+        s.deliveries, 0,
+        "seed {seed} under {variants:?}: a server's message reached the isolated server in the \
+         window: {s:?}"
+    );
+    assert!(
+        s.causes
+            .iter()
+            .any(|&(from, _, term)| from != s.server && term == s.term),
+        "seed {seed} under {variants:?}: no message of term {} was delivered at the receipt: {s:?}",
+        s.term
+    );
+    assert!(
+        report.isolations.contains(&(s.server, s.from, s.until)),
+        "seed {seed} under {variants:?}: not one of the run's isolations: {s:?}"
+    );
+    assert!(
+        report
+            .isolation_keeps_its_term_by(RecordTime::Decided, s.server, s.from, s.until)
+            .is_err(),
+        "seed {seed} under {variants:?}: the check by decision time does not flag the \
+         isolation: {s:?}"
+    );
+    assert_eq!(
+        report.isolation_keeps_its_term_by_cause(s.server, s.from, s.until),
+        Ok(()),
+        "seed {seed} under {variants:?}: the check by cause flags the isolation: {s:?}"
+    );
+}
+
 /// The positive control: the correct server satisfies every property on every
 /// seed, and the sweep reached the states that matter.
 #[test]
@@ -888,7 +1352,7 @@ fn the_correct_server_passes_every_seed() {
             counts.add(&report, lengths);
         }
         checked(&report, &moved).map_or(Ok(()), |violation| {
-            write_trace(&format!("raft-{seed}"), &report.jsonl);
+            write_trace(&format!("raft-{seed}"), &report.jsonl());
             Err(violation)
         })
     });
@@ -933,24 +1397,40 @@ struct MovedSeeds {
 }
 
 /// `report`'s violation, if any, with what D-047 moved on the run noted in
-/// `moved`. Reading a rise earlier can remove a pre-vote catch only where the rise
-/// was decided before an isolation's start and traced after it, so a removed
-/// pre-vote catch without such a straddle is a fault in the reasoning and fails the
-/// sweep. A removed timer catch is noted with the decisions of the flagged server
-/// that straddle the flag, the way a timer catch can be removed.
+/// `moved`, and each removed catch asserted to have been removed for a reason the
+/// entries give (issue #33), at every tier.
+///
+/// A removed pre-vote catch names an isolation — its server, `from` and `until` —
+/// and that isolation must hold a term change of its server that straddles its
+/// start: decided at or before it and traced inside it (D-047), or received at or
+/// before it and decided inside it (D-050). A straddle on some other isolation of the
+/// run is not the reason. A removed timer catch is the replay's first gap by
+/// durability time, and [`raft::Report::timer_removal`] must give its reason, read
+/// off the two replays at the gap's flag record: a reset of the server moved back
+/// past it, the flag record itself moved back within the bound, or the server's
+/// status there moved. Every removal has one of these, so anything else is a fault in
+/// the reasoning and fails the sweep.
+// PROPOSED(D-051): a removed catch is asserted against the isolation or the flag it
+// names.
 fn checked(report: &raft::Report, moved: &Mutex<MovedSeeds>) -> Option<String> {
     let (seed, variants) = (report.seed, report.variants);
     let verdict = report.check();
     match report.moved_by_decision_time(&verdict) {
         Some(Moved::Lost(was)) if was.starts_with("pre-vote: ") => {
-            let straddles = report.isolation_term_straddles();
-            assert!(
-                !straddles.is_empty(),
-                "seed {seed} under {variants:?}: decision time removed the catch `{was}`, but no \
-                 term rise straddles an isolation's start"
-            );
-            let straddles: Vec<String> = straddles
+            let Some((server, from, until)) = report.isolation_named_by(RecordTime::Durable, &was)
+            else {
+                panic!(
+                    "seed {seed} under {variants:?}: decision time removed the catch `{was}`, but no \
+                     isolation of the run is flagged in those words by durability time"
+                );
+            };
+            let named = |s: u64, f: ananke_env::Instant, u: ananke_env::Instant| {
+                (s, f, u) == (server, from, until)
+            };
+            let straddles: Vec<String> = report
+                .isolation_term_straddles()
                 .iter()
+                .filter(|s| named(s.server, s.from, s.until))
                 .map(|s| {
                     format!(
                         "server {} {}->{} ({}) decided {:?} before, traced {:?} after, {} in-window deliveries, at the decision {:?}",
@@ -964,7 +1444,34 @@ fn checked(report: &raft::Report, moved: &Mutex<MovedSeeds>) -> Option<String> {
                         s.causes
                     )
                 })
+                // D-050: a term change received before the isolation and
+                // stepped inside it is the other way the catch goes.
+                .chain(
+                    report
+                        .isolation_received_straddles()
+                        .iter()
+                        .filter(|s| named(s.server, s.from, s.until))
+                        .map(|s| {
+                            format!(
+                                "server {} {}->{} ({}) received {:?} before, decided {:?} after, {} in-window deliveries, at the receipt {:?}",
+                                s.server,
+                                s.before,
+                                s.term,
+                                s.role,
+                                s.from.duration_since(s.received),
+                                s.decided.duration_since(s.from),
+                                s.deliveries,
+                                s.causes
+                            )
+                        }),
+                )
                 .collect();
+            assert!(
+                !straddles.is_empty(),
+                "seed {seed} under {variants:?}: decision time removed the catch `{was}`, but no \
+                 term change of server {server} straddles the start of that isolation, from \
+                 {from:?} to {until:?}"
+            );
             moved
                 .lock()
                 .unwrap()
@@ -972,30 +1479,47 @@ fn checked(report: &raft::Report, moved: &Mutex<MovedSeeds>) -> Option<String> {
                 .push((seed, format!("{was} [{}]", straddles.join("; "))));
         }
         Some(Moved::Lost(was)) => {
-            let straddling: Vec<String> = report
+            let gap = report
                 .timer_gaps_by(TimerResets::ALL, RecordTime::Durable)
-                .first()
-                .map(|gap| {
-                    report
-                        .decisions_straddling(gap.server, gap.at)
-                        .iter()
-                        .map(|r| {
-                            let event = format!("{:?}", r.event);
-                            let name = event.split([' ', '{', '(']).next().unwrap_or("");
-                            format!(
-                                "{name} decided {:?} before the flag, traced {:?} after",
-                                gap.at.duration_since(r.decided),
-                                r.at.duration_since(gap.at)
-                            )
-                        })
-                        .collect()
+                .into_iter()
+                .next();
+            let Some(gap) = gap.filter(|gap| gap.violation() == was) else {
+                panic!(
+                    "seed {seed} under {variants:?}: decision time removed the catch `{was}`, which \
+                     is not the timer replay's first gap by durability time"
+                );
+            };
+            // PROPOSED(D-051): the reason is read off the two replays at the flag
+            // record, and every removal has one.
+            let reasons = report.timer_removal(&gap).unwrap_or_else(|why| {
+                panic!(
+                    "seed {seed} under {variants:?}: decision time removed the timer catch `{was}` \
+                     for no reason the replays show: {why}"
+                )
+            });
+            let reasons: Vec<String> = reasons
+                .iter()
+                .map(|reason| {
+                    let (what, index) = match *reason {
+                        raft::TimerRemoval::ResetMovedBack { reset } => ("reset moved back", reset),
+                        raft::TimerRemoval::FlagMovedBack { flag } => ("flag moved back", flag),
+                        raft::TimerRemoval::StatusMoved { record } => ("status moved", record),
+                    };
+                    let r = &report.records[index];
+                    let event = format!("{:?}", r.event);
+                    let name = event.split([' ', '{', '(']).next().unwrap_or("");
+                    format!(
+                        "{what}: {name} decided {:?} before the flag, traced {:?} after",
+                        gap.at.duration_since(r.decided),
+                        r.at.duration_since(gap.at)
+                    )
                 })
-                .unwrap_or_default();
+                .collect();
             moved
                 .lock()
                 .unwrap()
                 .removed
-                .push((seed, format!("{was} [straddling the flag: {straddling:?}]")));
+                .push((seed, format!("{was} [{}]", reasons.join("; "))));
         }
         Some(Moved::Gained(now)) => moved.lock().unwrap().added.push((seed, now)),
         None => {}
@@ -1930,7 +2454,7 @@ use ananke_sim::membership;
 fn the_membership_scenario_has_byte_identical_traces_for_one_seed() {
     let first = membership::run(7, Variant::Correct);
     let second = membership::run(7, Variant::Correct);
-    assert_eq!(first.jsonl.as_bytes(), second.jsonl.as_bytes());
+    assert_eq!(first.jsonl().as_bytes(), second.jsonl().as_bytes());
 }
 
 /// The positive control: the correct server passes 3 → 5 → 3 under partition on
@@ -1943,7 +2467,7 @@ fn the_correct_server_passes_the_membership_scenario_on_every_seed() {
         coverage.lock().unwrap().add(&report);
         report
             .check()
-            .inspect_err(|_| write_trace(&format!("membership-{seed}"), &report.jsonl))
+            .inspect_err(|_| write_trace(&format!("membership-{seed}"), &report.jsonl()))
     });
     let coverage = coverage.into_inner().unwrap();
     eprintln!("Membership: {coverage:?}");
@@ -2201,7 +2725,7 @@ fn quorum_sweep(variant: Variant, half: Half) -> (Vec<String>, QuorumFigures) {
         figures.lock().unwrap().add(&report);
         report.check().err().inspect(|_| {
             if variant == Variant::Correct {
-                write_trace(&format!("quorum-{half:?}-{seed}"), &report.jsonl);
+                write_trace(&format!("quorum-{half:?}-{seed}"), &report.jsonl());
             }
         })
     })

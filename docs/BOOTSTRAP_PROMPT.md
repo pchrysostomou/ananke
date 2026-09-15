@@ -212,6 +212,41 @@ _Update this section at the end of every session._
   seeds green on `cd411b4` (run 34839613587) and on `a8656e8` with D-049 (run
   34852980174), the tree of `main` at 94c6a54; D-049's ten-thousand-seed record and
   the version bump follow it.
+- Phase 2 backlog (2026-09-14/15), branch `phase-2-backlog` off `main` at 94c6a54, not
+  merged, every commit gated, three PROPOSED entries (D-050, D-051, D-052) awaiting the owner. Issue #32:
+  D-050, a term record carries when the message its step took was received
+  (`receivedNs`), and the pre-vote check excuses a change taken from a message received
+  before the isolation; a directed scenario (`Fault::IsolateOnTermRaise`) reaches the
+  shape on 299 of 1 000 seeds, seed 4 pinned, `NoPreVote` caught on every seed; no
+  schedule moved; the receipts correct D-047's causes for 3863 and 1252. Issue #33:
+  D-051, a removed catch is asserted against the isolation or the flag it names, at
+  every tier, and the nightlies' 28 removed catches are run through it. Issue #37 was
+  not implemented: both candidate fixes are larger than the guide allows. Answering
+  during repair and adoption with the refused rejection counts for nothing under
+  D-049's rule once the stream has ended (no acknowledgement moves it), and a leader
+  that recorded the `Installed` answer's incarnation would reset the follower's
+  progress on each incarnation-0 answer (D-042) and could re-designate and re-stream
+  it; making those answers count needs a new status on the wire and a D-049 rule with
+  its own bound. A faster adoption has to cut two phases at once, since the median
+  `Installed` to `RaftAdopted` (59.0 ms) and `RaftAdopted` to `RaftReseeded` (65.2 ms)
+  already exceed the 100 ms window together; the copy that dominates the first is what
+  D-041's crash safety rests on (a crash re-runs the adoption on the same staged bytes),
+  and the sweep of old versions in the second is what D-043 requires before any task
+  runs. Performance: D-052. Measured first (`sample`); the per-run JSONL export was
+  27.24% of the raft binary and is now written when asked for; the adoption-crash watch
+  (79% of the path comparisons) reads a durable-namespace version first; the pre-vote
+  check reads one pass. `scripts/premerge.sh` at 1 000 seeds, warm build: 547.55 s on
+  dbaec73 (mean load 11.20), 449.89 s with the export lazy (load 11.81), 374.64 s on the
+  final tree 1ef6d7e (load 13.90); the raft binary 353.17 s, 320.61 s, 287.46 s across
+  the three changes. (A first before-figure of 573.15 s was taken at load 15.98 and is
+  not used.) The allocator is spread over the simulation with no single
+  caller to take out, and `leader_now` (4.54%) and the engine model (about 4% of the
+  premerge) were left under the 5% bar. Review of PR #41 (0ed490a and the docs commit
+  after it): D-051's timer assertion now reads the reason off both replays at the flag
+  record (a reset, the flag record or the server's status moved), exact for any trace;
+  D-047's straddle reads `decided <= from < at`; the directed term-raise sweeps go
+  through `checked`; D-050's rule is restated for candidacies stepped from a
+  PreVoteResponse or TimeoutNow; D-052's figures compare equal loads.
 - Next concrete task: Phase 3 (SPEC §4), multi-raft sharding, starting with its design
   proposal. Issue #37: a refused server's silence while it verifies, repairs and
   adopts its re-seed deposes the leader when the third server is away.

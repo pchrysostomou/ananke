@@ -285,7 +285,7 @@ events, each recorded with its node and two times (D-047):
 
 | Event | When | Fields |
 |---|---|---|
-| `RaftTerm` | the current term changes | `term`, `role` |
+| `RaftTerm` | the current term changes | `term`, `role`, `received`: when the peer's message the step took reached the server, if it took one (D-050, proposed) |
 | `RaftVote` | a vote or pre-vote is granted or refused | `term`, `candidate`, `granted`, `pre` |
 | `RaftLeader` | a node becomes leader | `term`, `last_index` |
 | `RaftAppend` | an entry is written to the log | `index`, `entry_term`, `hash` of the payload |
@@ -403,9 +403,16 @@ decided on a message delivered before the isolation began and traced after it is
 the isolated server's election; its skip reads the durability time, since the
 restatement it stands in for is traced after the install is durable. The timer check
 replays the records in decision order, so no bound is measured past a reset the server
-had already made. One case is left open: a term-raising message delivered before an
-isolation but stepped inside it, queued behind a persist, is decided inside the window
-and would still be flagged by the pre-vote check (D-047, issue #32).
+had already made. A term-raising message delivered before an isolation but stepped
+inside it, queued behind a persist or an install, is decided inside the window, so the
+term record also says when the server received the message its step took (D-050,
+proposed, issue #32): the pre-vote check does not flag an isolation whose every term
+change decided inside it was taken from a message received by its start. A change from
+a step that took no peer's message — a campaign on the server's own timer without
+pre-vote, a restatement, a completion — carries no receipt and is flagged as before; a
+candidacy stepped from a granting PreVoteResponse, or from a TimeoutNow, carries the
+receipt of that message and is excused when it was received by the isolation's start,
+like any change a message caused.
 
 The pair rule holds for each: a buggy variant in §5 fails each check, and the correct
 variant passes every seed. Every check is a function of the trace alone, so a failing
@@ -553,8 +560,9 @@ waits in the inbox for the next:
   before the `Send`s that follow it. It stamps a decision time before each step of the
   core and traces the step's events with it once they are durable (§2, D-047).
 - `net`: receives frames, decodes, and hands messages to the `raft` task through a
-  bounded queue; a full queue drops the oldest heartbeat first, never an
-  `AppendEntries` with entries, and records the drop.
+  bounded queue, each with a stamp of when it was received, which a term change the
+  message causes carries (D-050, proposed); a full queue drops the oldest heartbeat
+  first, never an `AppendEntries` with entries, and records the drop.
 - `apply`: takes `Apply(through)` from the core, runs the state machine adapter one
   entry at a time, each a synced batch, and reports the applied index back; the core
   serves read-index reads only from applied state, so this task's lag is visible to

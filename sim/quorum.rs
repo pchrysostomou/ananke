@@ -40,7 +40,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ananke_env::moirae::Export;
-use ananke_env::sim::{Sim, SimConfig, TraceRecord};
+use ananke_env::sim::{RunHeader, Sim, SimConfig, TraceRecord};
 use ananke_env::{DropReason, Environment, Instant, NodeId, TraceEvent};
 use ananke_raft::core::Variants;
 use ananke_raft::message::{self, Frame, Message, SnapshotStatus};
@@ -121,8 +121,10 @@ pub struct Report {
     pub drifts: Vec<i64>,
     /// The trace as records.
     pub records: Vec<TraceRecord>,
-    /// The trace as moirae JSONL.
-    pub jsonl: String,
+    /// What the moirae export needs besides [`Report::records`]:
+    /// [`Report::jsonl`] writes the trace from the two when it is asked for.
+    // PROPOSED(D-052): a scenario's moirae JSONL is written when it is asked for.
+    pub run: RunHeader,
     /// The clients' history.
     pub history: History,
 }
@@ -268,7 +270,7 @@ pub fn run_on(seed: u64, variants: impl Into<Variants>, half: Half, disk: Disk) 
         cut: None,
         drifts,
         records: Vec::new(),
-        jsonl: String::new(),
+        run: sim.run_header(),
         history: History::default(),
     };
     sim.run_for(Duration::from_millis(1200));
@@ -320,13 +322,26 @@ pub fn run_on(seed: u64, variants: impl Into<Variants>, half: Half, disk: Disk) 
     }
     report.records = sim.trace();
     report.history = History::from_trace(&report.records);
-    report.jsonl = sim
-        .to_moirae(&Export::new(&message::studio))
-        .expect("the scenario's trace exports to moirae v2");
+    report.run = sim.run_header();
     report
 }
 
 impl Report {
+    /// The trace as moirae JSONL, written from [`Report::records`] under the run's
+    /// header now, when it is asked for, rather than at the end of every run; the
+    /// bytes are the ones the simulator's own export writes (D-052).
+    ///
+    /// # Panics
+    ///
+    /// If the trace does not export to moirae v2.
+    // PROPOSED(D-052): a scenario's moirae JSONL is written when it is asked for.
+    #[must_use]
+    pub fn jsonl(&self) -> String {
+        self.run
+            .to_moirae(&self.records, &Export::new(&message::studio))
+            .expect("the scenario's trace exports to moirae v2")
+    }
+
     /// How long `local` of `server`'s clock takes in global time, at its rate.
     #[must_use]
     pub fn global(&self, server: u64, local: Duration) -> Duration {
