@@ -4344,9 +4344,12 @@ span if the live install did not build it, which it did (D-054). And it asks for
 and `NoWalBeforeMemtable`, `ReleaseBeforeManifest` and `DeleteBeforeManifest` still
 caught. `scan` returned every key of a span, with no limit and no "first key at or after
 `k`" (engine.rs, `scan`); a meta lookup, the first record whose end key is above `k`
-(§1), and a split key chosen from a range's keys (Q18) need one. SHARD.md does not settle
-the primitives' shapes, so each is proposed, one commit each, and this entry grows with
-them. Every site is marked `PROPOSED(D-055)`.
+(§1), and a split key chosen from a range's keys (Q18) need one. Deleting a merged range's
+Raft state, a collected replica's span or the right span on a node outside the right
+half's configuration (§5) was one tombstone per key in a `WriteBatch`, each kept until it
+reaches the bottom level or no older write lies below it (compaction.rs). SHARD.md does
+not settle the primitives' shapes, so each is proposed, one commit each, and this entry
+grows with them. Every site is marked `PROPOSED(D-055)`.
 
 **Decision.** *The seek.* `Engine::seek(range, limit, snapshot)` returns the first
 `limit` present keys at or after `range.start` and below `range.end` as of the snapshot,
@@ -4367,23 +4370,62 @@ returned, which must be the model's state, beside the reads and the scan the sta
 made already. A seek whose first keys touch the span of an install in progress is not
 judged, since which keys fill its limit depends on the span (D-054).
 
+*The range delete.* `Engine::delete_range(range)` is an install of nothing over the span
+(D-054): numbered by a record of its own above every write taken, the memtables split
+there and flushed up to it, the tables holding the span's older writes taken out or
+written again without them, and one manifest switch that makes it the state, with no
+tombstone written. It shares the install's one-at-a-time rule, its refusals and what a
+snapshot sees; a write to the span after the call is newer than the delete and survives
+it. It is traced as the install it is, `SpanInstalled` with no table added.
+`Variant::RangeDeleteSkipsMemtables` takes the span's writes out of the tables but flushes
+no memtable first and leaves the manifest's `flushed_seq` where it was, so the span's
+writes still in a memtable stay readable, reach a table at the next flush, and come back
+from the log after a crash.
+
+*The range delete's crash test.* `Schedule::range_delete()`: the engine sweep's workload
+with D-054's installing task deleting a random span of one to twelve keys every one to
+five milliseconds, and every crash aimed at a delete as D-054 aims at an install. The
+oracle is the install's with nothing installed: a delete in force leaves no table in
+service and no replayed record holding a write of its span below it, a delete not in
+force holds nothing, and the state check reads the span empty but for the writes after
+the delete.
+
 *Measured*, in release beside another lane's builds (load averages 10 to 47),
 `cargo test -p ananke-sim --release --test engine` at each tier: the correct engine
 passes every seed of `Schedule::seek()`, with 3 836 live seeks at twenty seeds, 2 589 of
 them stopping at their limit, and 1 643 seeks walking recovered engines; at a hundred,
-19 492, 13 261 and 8 199. `SeekCountsTombstones` is caught on 20 of 20 and 98 of 100, the
-first at seed 0: *seek of 1 of k15..k30 at version 17 saw 0 keys but the model has 1*. The
-thousand-seed figures land with the sweep's part of this entry.
+19 492, 13 261 and 8 199; at a thousand, 196 904, 132 680 and 80 402.
+`SeekCountsTombstones` is caught on 20 of 20, 98 of 100 and 972 of 1000, the first at
+seed 0: *seek of 1 of k15..k30 at version 17 saw 0 keys but the model has 1*.
 
-**Alternatives.** A seek that counts deleted keys toward its limit: a meta lookup of one
-record could come back empty with records past a deleted one, which is the variant. A
-limit on entries read rather than keys returned: a caller could not tell a short range
-from a range of tombstones. A reverse seek now: no consumer in Phase 3.
+The correct engine passes every seed of `Schedule::range_delete()`: at twenty seeds 387
+deletes were asked for and 289 resolved, 150 crashes were aimed at one, and after them 267
+deletes that had resolved and 16 that had not were in force, 79 that had not were not, and
+13 that had resolved were lost to a fault's fallback, with 5 906 keys written after a delete
+in force checked over it; at a hundred, 1 903 and 1 448 deletes, 711 crashes aimed, 1 276
+and 44 in force, 397 and 118 not, and 24 248 keys; at a thousand, 19 767 and 15 058
+deletes, 7 363 crashes aimed, 13 189 and 456 in force, 4 148 and 1 419 not, and 255 522
+keys. `RangeDeleteSkipsMemtables` is caught on 17 of 20, 92 of 100 and 947 of 1000, the
+first at seed 0 by a live scan that saw a deleted key: *scan of k16..k42 at version 21 saw
+4 keys but the model has 3*.
+
+**Alternatives.** Range tombstones, as RocksDB's `DeleteRange`: no forced flush and no
+rewrite, but a new kind of write that the memtable, the table format (a version bump), the
+merge, every read, compaction and its truncation at table boundaries, and the oracle would
+all have to learn, when the deletes Phase 3 names are rare and whole-range. A batch of one
+tombstone per key, as today: a collected replica's span leaves a tombstone per key until
+compaction carries it to the bottom, and every scan of the span walks them. A seek that
+counts deleted keys toward its limit: a meta lookup of one record could come back empty
+with records past a deleted one, which is the variant. A limit on entries read rather
+than keys returned: a caller could not tell a short range from a range of tombstones. A
+reverse seek now: no consumer in Phase 3.
 
 **Consequences.** `scan` stays as it was; a seek costs what the part of a scan it walks
-costs, and no more than `limit` live keys past the deleted ones it passes over. The
-engine sweep's default schedule does not seek until the sweep's commit of this entry, so
-this commit moves no seed's schedule.
+costs, and no more than `limit` live keys past the deleted ones it passes over. A range
+delete costs what an install costs: a flush of the memtables at or below it and a rewrite
+of every table straddling the span's edges. The engine sweep's default schedule neither
+seeks nor deletes until the sweep's commit of this entry, so neither primitive's commit
+moves a seed's schedule.
 
 ---
 

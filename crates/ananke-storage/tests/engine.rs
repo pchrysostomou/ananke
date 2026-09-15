@@ -1474,3 +1474,68 @@ fn a_bounded_seek_returns_the_first_live_keys_from_its_start() {
         })
     });
 }
+
+/// The range delete (D-055, SHARD.md §11 storage 3): an install of nothing over the
+/// span, so its keys go with one manifest switch and no tombstone is written, every
+/// key outside it stays, a write to the span after the delete survives it, and a
+/// reopen sees the same.
+// PROPOSED(D-055): the range delete, an install of nothing.
+#[test]
+fn a_range_delete_takes_a_span_out_in_one_switch() {
+    let mut sim = Sim::new(SimConfig::new(41));
+    let node = sim.add_node();
+    let want = on_node(&mut sim, node, |env| {
+        Box::pin(async move {
+            let (db, _) = Engine::open(env.clone(), config(400)).await.unwrap();
+            fill(&db, 0..150, 20).await;
+            env.clock().sleep(Duration::from_millis(1)).await;
+            let entries_before: u64 = db.levels().iter().flatten().map(|t| t.entries).sum();
+            let removal = db.delete_range(b("k005")..b("k015"));
+            let seq = removal.seq().expect("numbered");
+            let done = removal.await.unwrap();
+            assert_eq!((done.seq, done.added, done.keys), (seq, 0, 0));
+            let entries_after: u64 = db.levels().iter().flatten().map(|t| t.entries).sum();
+            assert!(
+                entries_after < entries_before,
+                "the span's writes left the tables and nothing took their place: {entries_before} then {entries_after}"
+            );
+            db.put(b("k007"), b("after")).await.unwrap();
+            let mut want = Vec::new();
+            for k in 0..20u32 {
+                let got = db.get(format!("k{k:03}").as_bytes()).await.unwrap();
+                let expect = if (5..15).contains(&k) {
+                    (k == 7).then(|| b("after"))
+                } else {
+                    expected(k, 150, 20)
+                };
+                assert_eq!(got, expect, "k{k:03}");
+                want.push(expect);
+            }
+            want
+        })
+    });
+    let reopened = on_node(&mut sim, node, |env| {
+        Box::pin(async move {
+            let (db, _) = Engine::open(env, config(400)).await.unwrap();
+            let mut got = Vec::new();
+            for k in 0..20 {
+                got.push(db.get(format!("k{k:03}").as_bytes()).await.unwrap());
+            }
+            got
+        })
+    });
+    assert_eq!(reopened, want);
+    let switches_after_delete = sim
+        .trace()
+        .iter()
+        .skip_while(|r| !matches!(r.event, TraceEvent::SpanInstalled { .. }))
+        .take_while(|r| {
+            !matches!(
+                r.event,
+                TraceEvent::MemtableRotated { .. } | TraceEvent::NodeCrashed { .. }
+            )
+        })
+        .filter(|r| matches!(r.event, TraceEvent::CurrentSwitched { .. }))
+        .count();
+    assert!(switches_after_delete >= 1);
+}

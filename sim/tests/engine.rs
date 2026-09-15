@@ -5,8 +5,9 @@
 //! the manifest names its table and the one whose compaction deletes its inputs
 //! before the manifest stops naming them. The live install's crash test (Q2, D-054)
 //! runs the same scenario with installs, beside the install that switches twice and
-//! the span checkpoint that does not sync its tables; the bounded seek's (D-055)
-//! beside the seek that counts tombstones.
+//! the span checkpoint that does not sync its tables; the range delete's and the
+//! bounded seek's (D-055) beside the delete that forgets the memtables and the seek
+//! that counts tombstones.
 
 use std::sync::Mutex;
 
@@ -260,6 +261,89 @@ fn an_install_in_two_switches_is_caught() {
         caught.first().map_or("", String::as_str)
     );
     assert!(!caught.is_empty(), "InstallInTwoSwitches was never caught");
+}
+
+/// The range delete's crash test (D-055): a task deletes a random span now and then
+/// while the writers write every key, and every crash is aimed at a delete, under
+/// the full disk fault model. After each crash the span comes back as it was or
+/// empty, never a mixture, with every other key as the oracle says and every write
+/// after the delete read over it. The correct engine passes every seed, and the
+/// sweep is seen to crash before a delete's switch and after it.
+// PROPOSED(D-055): the range delete's crash test.
+#[test]
+fn the_range_delete_crash_test_passes_every_seed() {
+    let totals = Mutex::new((engine::InstallOutcomes::default(), 0u64, 0u64));
+    let verdicts = sweep(seeds(), |seed| {
+        let report = engine::run_with(seed, engine::Schedule::range_delete(), Variant::Correct);
+        {
+            let mut t = totals.lock().unwrap();
+            let o = report.install_outcomes;
+            t.0.aimed += o.aimed;
+            t.0.kept += o.kept;
+            t.0.crashed_after_switch += o.crashed_after_switch;
+            t.0.crashed_before_switch += o.crashed_before_switch;
+            t.0.lost_to_a_fault += o.lost_to_a_fault;
+            t.0.keys_written_after += o.keys_written_after;
+            t.1 += report.deletes_started;
+            t.2 += report.installs_completed;
+        }
+        report.check().map_err(|violation| {
+            write_trace(&format!("engine-range-delete-{seed}"), &report.jsonl);
+            format!("seed {seed}: {violation}")
+        })
+    });
+    let (outcomes, started, completed) = totals.into_inner().unwrap();
+    eprintln!(
+        "range delete, Correct: {started} deletes asked for, {completed} resolved; after the crashes: {outcomes:?}"
+    );
+    if let Err(violation) = verdict(&verdicts) {
+        panic!("{violation}");
+    }
+    assert!(outcomes.aimed > 0, "no crash was aimed at a delete");
+    assert!(
+        outcomes.crashed_before_switch > 0,
+        "no crash landed before a delete's switch: {outcomes:?}"
+    );
+    assert!(
+        outcomes.crashed_after_switch + outcomes.kept > 0,
+        "no delete was in force after a crash: {outcomes:?}"
+    );
+    assert!(
+        outcomes.keys_written_after > 0,
+        "no key written after a delete was checked after a crash: {outcomes:?}"
+    );
+}
+
+/// The range delete's known-buggy engine beside it (D-055): a delete that takes the
+/// span's writes out of the tables but leaves the memtables unflushed and the
+/// manifest's `flushed_seq` where it was, so the span's writes in a memtable stay
+/// readable and come back, is caught by the same crash test on some seed at every
+/// tier, and the rate is printed.
+// PROPOSED(D-055): the range delete's crash test.
+#[test]
+fn a_range_delete_that_skips_the_memtables_is_caught() {
+    let caught: Vec<String> = sweep(seeds(), |seed| {
+        engine::run_with(
+            seed,
+            engine::Schedule::range_delete(),
+            Variant::RangeDeleteSkipsMemtables,
+        )
+        .check()
+        .err()
+    })
+    .into_iter()
+    .flatten()
+    .collect();
+    eprintln!(
+        "RangeDeleteSkipsMemtables: caught on {} of {} seeds, first: {}",
+        caught.len(),
+        seeds(),
+        caught.first().map_or("", String::as_str)
+    );
+    assert!(
+        !caught.is_empty(),
+        "RangeDeleteSkipsMemtables was never caught"
+    );
 }
 
 /// The bounded seek's crash test (D-055): half the readers' scans are seeks of one

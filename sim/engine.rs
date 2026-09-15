@@ -19,8 +19,9 @@
 //! checkpoints random spans and installs each over its span a little later, every
 //! crash is aimed at an install, and each recovery must bring every span back as it
 //! was or as installed, never a mixture, with every write after an install read over
-//! it. With [`Schedule::seek`] it is the bounded seek's (D-055): the readers seek, and
-//! every recovery is walked by seeks.
+//! it. With [`Schedule::range_delete`] it is the range delete's crash test, the same
+//! task deleting spans instead, and with [`Schedule::seek`] the bounded seek's, the
+//! readers seeking and every recovery walked by seeks (D-055).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -90,6 +91,10 @@ pub struct Schedule {
     /// How long after an install's replacement is written a crash aimed at its
     /// switch may land.
     pub switch_window: Duration,
+    /// Whether the installing task deletes spans: on its own, every time; beside
+    /// `installs`, one time in three (D-055).
+    // PROPOSED(D-055): the range delete's crash test.
+    pub range_deletes: bool,
     /// Whether the readers make bounded seeks, and every recovery is walked by
     /// seeks of a few keys at a time (D-055).
     // PROPOSED(D-055): the bounded seek's crash test.
@@ -119,6 +124,7 @@ impl Default for Schedule {
             aim_at_installs: false,
             install_window: Duration::from_millis(12),
             switch_window: Duration::from_millis(3),
+            range_deletes: false,
             seeks: false,
         }
     }
@@ -133,6 +139,18 @@ impl Schedule {
     pub fn install() -> Self {
         Self {
             installs: true,
+            aim_at_installs: true,
+            ..Self::default()
+        }
+    }
+
+    /// The range delete's crash test (D-055): the default workload with a task that
+    /// deletes a random span now and then, and every crash aimed at a delete.
+    // PROPOSED(D-055): the range delete's crash test.
+    #[must_use]
+    pub fn range_delete() -> Self {
+        Self {
+            range_deletes: true,
             aim_at_installs: true,
             ..Self::default()
         }
@@ -266,6 +284,8 @@ pub struct Model {
     /// Live reads of a key an install had installed, after it resolved, that a
     /// later write had overwritten, and that agreed with the model.
     pub reads_over_installs: u64,
+    /// Of the installs asked for, range deletes (D-055).
+    pub deletes_started: u64,
     /// Bounded seeks made during the run, and of those, ones that stopped at their
     /// limit with more keys in the range (D-055).
     pub seeks: u64,
@@ -761,6 +781,8 @@ pub struct Report {
     pub reads_over_installs: u64,
     /// What became of the installs.
     pub install_outcomes: InstallOutcomes,
+    /// Of the installs asked for, range deletes (D-055).
+    pub deletes_started: u64,
     /// Bounded seeks during the run, and those that stopped at their limit (D-055).
     pub seeks: (u64, u64),
     /// Bounded seeks that walked a recovered engine.
@@ -1532,9 +1554,13 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
             m.reads_over_installs,
         )
     };
-    let (seeks, recovery_seeks) = {
+    let (deletes_started, seeks, recovery_seeks) = {
         let m = lock(&model);
-        ((m.seeks, m.seeks_limited), m.recovery_seeks)
+        (
+            m.deletes_started,
+            (m.seeks, m.seeks_limited),
+            m.recovery_seeks,
+        )
     };
     Report {
         seed,
@@ -1553,6 +1579,7 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
         span_checkpoints,
         reads_over_installs,
         install_outcomes,
+        deletes_started,
         seeks,
         recovery_seeks,
         jsonl: sim
@@ -1827,6 +1854,77 @@ fn check_checkpoint(
         .expect("the check completed")
 }
 
+/// Records an install or a range delete of `k{lo}..k{hi}` numbered `seq` as it is
+/// asked for: its record, which holds no write, what it installs, and its keys in
+/// flight until it resolves.
+// PROPOSED(D-054): the live install's crash test.
+fn begin_install(
+    model: &SharedModel,
+    seq: u64,
+    lo: u64,
+    hi: u64,
+    entries: BTreeMap<Bytes, Bytes>,
+    delete: bool,
+) {
+    let mut m = lock(model);
+    m.log.appended.push(engine::encode_batch(&[]));
+    m.log.acked.push(false);
+    m.log.sync_requested.push(true);
+    m.ops.push(Vec::new());
+    assert_eq!(
+        m.ops.len() as u64,
+        seq,
+        "the model and the log number the install alike"
+    );
+    m.installs.insert(
+        seq,
+        InstallRecord {
+            start: key(lo),
+            end: key(hi),
+            entries,
+            applied: false,
+        },
+    );
+    m.installing = Some((key(lo), key(hi)));
+    m.installs_started += 1;
+    m.deletes_started += u64::from(delete);
+    for i in lo..hi {
+        *m.in_flight.entry(key(i)).or_default() += 1;
+    }
+}
+
+/// Records that the install numbered `seq` resolved: acknowledged, made, and its
+/// keys newer than every write numbered below it.
+// PROPOSED(D-054): the live install's crash test.
+fn end_install(model: &SharedModel, seq: u64, lo: u64, hi: u64) {
+    let mut m = lock(model);
+    if let Some(acked) = m.log.acked.get_mut(seq as usize - 1) {
+        *acked = true;
+    }
+    let entries = m
+        .installs
+        .get_mut(&seq)
+        .map_or_else(BTreeMap::new, |install| {
+            install.applied = true;
+            install.entries.clone()
+        });
+    for i in lo..hi {
+        let k = key(i);
+        if let Some(n) = m.in_flight.get_mut(&k) {
+            *n -= 1;
+        }
+        let newer = m.committed.get(&k).is_none_or(|(s, _)| *s < seq);
+        if newer {
+            let value = entries
+                .get(&k)
+                .map_or(Value::Tombstone, |v| Value::Live(v.clone()));
+            m.committed.insert(k, (seq, value));
+        }
+    }
+    m.installing = None;
+    m.installs_completed += 1;
+}
+
 /// Starts the writers and readers; they run until the crash.
 fn spawn_clients(sim: &Sim, node: NodeId, db: Db, schedule: &Schedule, model: &SharedModel) {
     let (value_max, gap_max_us) = (schedule.value_max, schedule.gap_max_us);
@@ -1934,7 +2032,9 @@ fn spawn_clients(sim: &Sim, node: NodeId, db: Db, schedule: &Schedule, model: &S
     // the checkpoint over the span a little later, while the writers go on writing
     // every key: the install rolls the span back to the checkpoint, and every write
     // after the install's number is newer than it.
-    if schedule.installs {
+    // PROPOSED(D-055): the same task deletes spans, when the schedule asks for it.
+    if schedule.installs || schedule.range_deletes {
+        let (installs, range_deletes) = (schedule.installs, schedule.range_deletes);
         let (env, db, model) = (sim.env(node), db.clone(), model.clone());
         env.clone().spawn("installer", async move {
             loop {
@@ -1943,6 +2043,29 @@ fn spawn_clients(sim: &Sim, node: NodeId, db: Db, schedule: &Schedule, model: &S
                 let lo = env.rng().below(KEYS);
                 let hi = (lo + 1 + env.rng().below(12)).min(KEYS);
                 let (start, end) = (key(lo), key(hi));
+                let delete = match (installs, range_deletes) {
+                    (true, true) => env.rng().below(3) == 0,
+                    (false, true) => true,
+                    _ => false,
+                };
+                if delete {
+                    let removal = db.delete_range(start.clone()..end.clone());
+                    let Some(seq) = removal.seq() else {
+                        lock(&model).read_violations.push(format!(
+                            "a range delete of k{lo:02}..k{hi:02} was refused at once"
+                        ));
+                        return;
+                    };
+                    begin_install(&model, seq, lo, hi, BTreeMap::new(), true);
+                    if let Err(error) = removal.await {
+                        lock(&model)
+                            .read_violations
+                            .push(format!("the range delete at record {seq} failed: {error}"));
+                        return;
+                    }
+                    end_install(&model, seq, lo, hi);
+                    continue;
+                }
                 let n = {
                     let mut m = lock(&model);
                     m.span_checkpoints += 1;
@@ -1989,60 +2112,14 @@ fn spawn_clients(sim: &Sim, node: NodeId, db: Db, schedule: &Schedule, model: &S
                     ));
                     return;
                 };
-                {
-                    let mut m = lock(&model);
-                    m.log.appended.push(engine::encode_batch(&[]));
-                    m.log.acked.push(false);
-                    m.log.sync_requested.push(true);
-                    m.ops.push(Vec::new());
-                    assert_eq!(
-                        m.ops.len() as u64,
-                        seq,
-                        "the model and the log number the install alike"
-                    );
-                    m.installs.insert(
-                        seq,
-                        InstallRecord {
-                            start: start.clone(),
-                            end: end.clone(),
-                            entries: entries.clone(),
-                            applied: false,
-                        },
-                    );
-                    m.installing = Some((start.clone(), end.clone()));
-                    m.installs_started += 1;
-                    for i in lo..hi {
-                        *m.in_flight.entry(key(i)).or_default() += 1;
-                    }
-                }
+                begin_install(&model, seq, lo, hi, entries, false);
                 if let Err(error) = install.await {
                     lock(&model)
                         .read_violations
                         .push(format!("the install at record {seq} failed: {error}"));
                     return;
                 }
-                let mut m = lock(&model);
-                if let Some(acked) = m.log.acked.get_mut(seq as usize - 1) {
-                    *acked = true;
-                }
-                if let Some(install) = m.installs.get_mut(&seq) {
-                    install.applied = true;
-                }
-                for i in lo..hi {
-                    let k = key(i);
-                    if let Some(n) = m.in_flight.get_mut(&k) {
-                        *n -= 1;
-                    }
-                    let newer = m.committed.get(&k).is_none_or(|(s, _)| *s < seq);
-                    if newer {
-                        let value = entries
-                            .get(&k)
-                            .map_or(Value::Tombstone, |v| Value::Live(v.clone()));
-                        m.committed.insert(k, (seq, value));
-                    }
-                }
-                m.installing = None;
-                m.installs_completed += 1;
+                end_install(&model, seq, lo, hi);
             }
         });
     }

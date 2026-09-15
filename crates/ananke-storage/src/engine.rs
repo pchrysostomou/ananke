@@ -43,7 +43,9 @@
 //! leaves the span as it was or as installed, and a later write to the span is newer
 //! than every installed one.
 //!
-//! [`Engine::seek`] is a scan bounded by a count (D-055).
+//! [`Engine::seek`] is a scan bounded by a count, and [`Engine::delete_range`] an
+//! install of nothing: the span's keys go with one manifest switch and leave no
+//! tombstone (D-055).
 //!
 //! The [`Variant`]s for the crash sweep: [`Variant::Correct`];
 //! [`Variant::NoWalBeforeMemtable`], which applies and acknowledges a write before
@@ -53,8 +55,9 @@
 //! [`Variant::InstallInTwoSwitches`], whose install takes the span out with one
 //! manifest switch and puts the installed tables in with another; and
 //! [`Variant::SpanCheckpointUnsynced`], whose checkpoint of a span does not sync its
-//! tables; and [`Variant::SeekCountsTombstones`], whose bounded seek counts deleted
-//! keys against its limit.
+//! tables; [`Variant::SeekCountsTombstones`], whose bounded seek counts deleted keys
+//! against its limit; and [`Variant::RangeDeleteSkipsMemtables`], whose range delete
+//! leaves the span's writes in the memtables.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
@@ -115,6 +118,12 @@ pub enum Variant {
     /// fewer keys than asked for while more lie in the range.
     // PROPOSED(D-055): the bounded, ordered seek.
     SeekCountsTombstones,
+    /// A range delete takes the span's writes out of the tables but leaves the
+    /// memtables unflushed and the manifest's `flushed_seq` where it was: the
+    /// span's writes still in a memtable stay readable, reach a table at the next
+    /// flush, and come back from the log after a crash.
+    // PROPOSED(D-055): the range delete, an install of nothing.
+    RangeDeleteSkipsMemtables,
 }
 
 /// How to open an [`Engine`].
@@ -1540,6 +1549,27 @@ impl<E: Environment> Engine<E> {
     /// span's history, it does not add to it (D-054).
     // PROPOSED(D-054): the live install of a span, in one manifest switch.
     pub fn install_span(&self, range: Range<Bytes>, source: SpanSource<E>) -> SpanInstall {
+        self.begin_install(range, source, false)
+    }
+
+    /// Deletes every key in `range` with one manifest switch, and no tombstone: an
+    /// install of nothing over the span (SHARD.md §11, storage 3). It is numbered,
+    /// flushed and switched as [`install_span`](Self::install_span) is, and shares
+    /// its one-at-a-time rule, its refusals and what a snapshot sees; a write to
+    /// the span after the call is newer than the delete and survives it.
+    // PROPOSED(D-055): the range delete, an install of nothing.
+    pub fn delete_range(&self, range: Range<Bytes>) -> SpanInstall {
+        self.begin_install(range, SpanSource::empty(), true)
+    }
+
+    /// An install or a range delete, numbered now; see
+    /// [`install_span`](Self::install_span).
+    fn begin_install(
+        &self,
+        range: Range<Bytes>,
+        source: SpanSource<E>,
+        delete: bool,
+    ) -> SpanInstall {
         let refused = |why: InstallRefused| SpanInstall {
             seq: None,
             future: Box::pin(async move { Err(why.into_io()) }),
@@ -1580,7 +1610,7 @@ impl<E: Environment> Engine<E> {
             future: Box::pin(async move {
                 let _hold = hold;
                 marker.await?;
-                shared.install_span(seq, range, source).await
+                shared.install_span(seq, range, source, delete).await
             }),
         }
     }
@@ -1894,6 +1924,7 @@ impl<E: Environment> Shared<E> {
         seq: Seq,
         range: Range<Bytes>,
         source: SpanSource<E>,
+        delete: bool,
     ) -> io::Result<InstallInfo> {
         let _turn = self.turnstile.acquire().await;
         if self.quiesced.load(Ordering::SeqCst) {
@@ -1901,6 +1932,8 @@ impl<E: Environment> Shared<E> {
         }
         let (start, end) = (&range.start[..], &range.end[..]);
         let in_span = |user: &[u8]| start <= user && user < end;
+        // PROPOSED(D-055): the range delete's variant forgets the memtables.
+        let skip_memtables = delete && self.config.variant == Variant::RangeDeleteSkipsMemtables;
 
         // Every memtable holding writes at or below the install, flushed: the
         // active one was rotated as the install's record was applied, and the
@@ -1908,7 +1941,9 @@ impl<E: Environment> Shared<E> {
         loop {
             let head = lock(&self.tables).immutable.front().cloned();
             match head {
-                Some(memtable) if memtable.min_seq() <= seq => self.flush(&memtable).await?,
+                Some(memtable) if memtable.min_seq() <= seq && !skip_memtables => {
+                    self.flush(&memtable).await?;
+                }
                 _ => break,
             }
         }
@@ -2029,7 +2064,9 @@ impl<E: Environment> Shared<E> {
                 &removed,
                 rewritten_metas.into_iter().chain(added_metas).collect(),
             );
-            next.flushed_seq = next.flushed_seq.max(seq);
+            if !skip_memtables {
+                next.flushed_seq = next.flushed_seq.max(seq);
+            }
             self.env.trace(event(next.number));
             self.write_manifest(&next).await?;
             let mut put_in = rewritten;
@@ -2038,7 +2075,9 @@ impl<E: Environment> Shared<E> {
         }
         let manifest = lock(&self.tables).manifest.number;
         self.delete_tables(&removed).await?;
-        self.wal.delete_segments_through(seq).await?;
+        if !skip_memtables {
+            self.wal.delete_segments_through(seq).await?;
+        }
         Ok(InstallInfo {
             seq,
             manifest,
