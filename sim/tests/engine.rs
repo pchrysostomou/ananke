@@ -7,7 +7,7 @@
 //! runs the same scenario with installs, beside the install that switches twice and
 //! the span checkpoint that does not sync its tables; the range delete's and the
 //! bounded seek's (D-055) beside the delete that forgets the memtables and the seek
-//! that counts tombstones.
+//! that counts tombstones. The default schedule runs all four primitives.
 
 use std::sync::Mutex;
 
@@ -57,9 +57,16 @@ fn the_correct_engine_passes_every_seed() {
 /// their callers newer-first, the memtable rotated in between, and the older write
 /// landed in the newer memtable and shadowed the newer one. Writes now apply in
 /// sequence order (D-021); this seed stays in the gate so they keep doing so.
+///
+/// It runs the Phase 1 workload it was found in: the default schedule runs Stage A's
+/// primitives beside it since D-055, which moves every seed's schedule, and this pin
+/// is on the schedule it was found on, which that commit left as it was.
+// PROPOSED(D-055): the pins keep the schedule they were found on.
 #[test]
 fn seed_420_which_the_first_nightly_found_stays_green() {
-    engine::run(420, Variant::Correct).check().unwrap();
+    engine::run_with(420, engine::Schedule::phase_1(), Variant::Correct)
+        .check()
+        .unwrap();
 }
 
 /// The first 3000-seed sweep with compaction found this: CURRENT and the two newest
@@ -76,10 +83,12 @@ fn seed_420_which_the_first_nightly_found_stays_green() {
 #[test]
 fn seed_44_never_opens_empty_in_either_mode() {
     // The schedule the sweep ran with when it found the seed: level 1 eight times
-    // larger than the gate's.
+    // larger than the gate's, and the Phase 1 workload, without the primitives the
+    // default schedule runs since D-055.
+    // PROPOSED(D-055): the pins keep the schedule they were found on.
     let schedule = engine::Schedule {
         level_base_bytes: 8192,
-        ..engine::Schedule::default()
+        ..engine::Schedule::phase_1()
     };
     let allowed = engine::run_with(44, schedule, Variant::Correct);
     allowed.check().unwrap();
@@ -506,6 +515,11 @@ struct Coverage {
     versions_dropped: u64,
     tombstones_dropped: u64,
     crashes_mid_compaction: u32,
+    installs: u64,
+    range_deletes: u64,
+    span_checkpoints: u64,
+    seeks: u64,
+    recovery_seeks: u64,
 }
 
 impl Coverage {
@@ -597,6 +611,11 @@ impl Coverage {
             .iter()
             .filter(|e| e.recovery.wal.head_gap.is_some())
             .count() as u32;
+        self.installs += report.installs_started - report.deletes_started;
+        self.range_deletes += report.deletes_started;
+        self.span_checkpoints += report.span_checkpoints;
+        self.seeks += report.seeks.0;
+        self.recovery_seeks += report.recovery_seeks;
     }
 
     fn assert_complete(&self) {
@@ -648,6 +667,21 @@ impl Coverage {
             (
                 "tombstones dropped by compaction",
                 u32::try_from(self.tombstones_dropped).unwrap_or(u32::MAX),
+            ),
+            // PROPOSED(D-055): the sweep runs all four primitives.
+            ("installs", u32::try_from(self.installs).unwrap_or(u32::MAX)),
+            (
+                "range deletes",
+                u32::try_from(self.range_deletes).unwrap_or(u32::MAX),
+            ),
+            (
+                "span checkpoints",
+                u32::try_from(self.span_checkpoints).unwrap_or(u32::MAX),
+            ),
+            ("seeks", u32::try_from(self.seeks).unwrap_or(u32::MAX)),
+            (
+                "seeks walking a recovered engine",
+                u32::try_from(self.recovery_seeks).unwrap_or(u32::MAX),
             ),
         ] {
             assert!(seen > 0, "the sweep never saw {what}: {self:?}");

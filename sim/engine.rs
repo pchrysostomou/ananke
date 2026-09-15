@@ -19,9 +19,11 @@
 //! checkpoints random spans and installs each over its span a little later, every
 //! crash is aimed at an install, and each recovery must bring every span back as it
 //! was or as installed, never a mixture, with every write after an install read over
-//! it. With [`Schedule::range_delete`] it is the range delete's crash test, the same
-//! task deleting spans instead, and with [`Schedule::seek`] the bounded seek's, the
-//! readers seeking and every recovery walked by seeks (D-055).
+//! it. [`Schedule::range_delete`] is the range delete's crash test, the same task
+//! deleting spans instead, and [`Schedule::seek`] the bounded seek's, the readers
+//! seeking and every recovery walked by seeks (D-055). The default schedule runs all
+//! four primitives beside the Phase 1 workload; [`Schedule::phase_1`] runs none, as
+//! the sweep did before them.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -120,12 +122,13 @@ impl Default for Schedule {
             level_base_bytes: 1024,
             sst_bytes: 2048,
             allow_manifest_fallback: true,
-            installs: false,
             aim_at_installs: false,
             install_window: Duration::from_millis(12),
             switch_window: Duration::from_millis(3),
-            range_deletes: false,
-            seeks: false,
+            // PROPOSED(D-055): the engine sweep runs all four primitives.
+            installs: true,
+            range_deletes: true,
+            seeks: true,
         }
     }
 }
@@ -140,11 +143,25 @@ impl Schedule {
         Self {
             installs: true,
             aim_at_installs: true,
+            ..Self::phase_1()
+        }
+    }
+
+    /// The Phase 1 workload alone, with none of Stage A's primitives: writers,
+    /// readers that scan and read, and whole checkpoints. The schedule every seed
+    /// ran before them, which the seeds pinned then still run.
+    // PROPOSED(D-055): the engine sweep runs all four primitives.
+    #[must_use]
+    pub fn phase_1() -> Self {
+        Self {
+            installs: false,
+            range_deletes: false,
+            seeks: false,
             ..Self::default()
         }
     }
 
-    /// The range delete's crash test (D-055): the default workload with a task that
+    /// The range delete's crash test (D-055): the Phase 1 workload with a task that
     /// deletes a random span now and then, and every crash aimed at a delete.
     // PROPOSED(D-055): the range delete's crash test.
     #[must_use]
@@ -152,18 +169,18 @@ impl Schedule {
         Self {
             range_deletes: true,
             aim_at_installs: true,
-            ..Self::default()
+            ..Self::phase_1()
         }
     }
 
-    /// The bounded seek's crash test (D-055): the default workload with readers that
+    /// The bounded seek's crash test (D-055): the Phase 1 workload with readers that
     /// seek, and every recovery walked by seeks.
     // PROPOSED(D-055): the bounded seek's crash test.
     #[must_use]
     pub fn seek() -> Self {
         Self {
             seeks: true,
-            ..Self::default()
+            ..Self::phase_1()
         }
     }
 
@@ -287,7 +304,7 @@ pub struct Model {
     /// Of the installs asked for, range deletes (D-055).
     pub deletes_started: u64,
     /// Bounded seeks made during the run, and of those, ones that stopped at their
-    /// limit with more keys in the range (D-055).
+    /// limit with more keys in the range.
     pub seeks: u64,
     /// See `seeks`.
     pub seeks_limited: u64,
@@ -783,7 +800,7 @@ pub struct Report {
     pub install_outcomes: InstallOutcomes,
     /// Of the installs asked for, range deletes (D-055).
     pub deletes_started: u64,
-    /// Bounded seeks during the run, and those that stopped at their limit (D-055).
+    /// Bounded seeks during the run, and those that stopped at their limit.
     pub seeks: (u64, u64),
     /// Bounded seeks that walked a recovered engine.
     pub recovery_seeks: u64,

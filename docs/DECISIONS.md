@@ -4390,6 +4390,19 @@ service and no replayed record holding a write of its span below it, a delete no
 force holds nothing, and the state check reads the span empty but for the writes after
 the delete.
 
+*The sweep.* The default schedule of `sim/engine.rs` now runs all four primitives beside
+the Phase 1 workload: the installing task installs a checkpoint of a span two times in
+three and deletes a span the third, and the readers seek and every recovery is walked by
+seeks. Its crashes are not aimed; `Schedule::install()` and `Schedule::range_delete()` aim
+them. `Schedule::phase_1()` runs none of it and is the schedule every seed ran before this
+part of the entry, and each primitive's own schedule is `phase_1()` with that primitive.
+The two seeds the sweep pins keep the Phase 1 schedule, on which each was found: seed 420
+and seed 44 in both its modes. Re-audited: each run's moirae trace hashes the same on
+268cf58, the tree before D-054, on 7e3d25d, D-054's commit, and on this tree with
+`Schedule::phase_1()` (`a858ef4b153bf4c6`, `dabd6adfaee000f5` and, refusing fallbacks,
+`977a703fb51c96e8`), so neither schedule moved and seed 44's assertions of its fallbacks
+still bite on the run they were written for.
+
 *Measured*, in release beside another lane's builds (load averages 10 to 47),
 `cargo test -p ananke-sim --release --test engine` at each tier: the correct engine
 passes every seed of `Schedule::seek()`, with 3 836 live seeks at twenty seeds, 2 589 of
@@ -4409,6 +4422,34 @@ keys. `RangeDeleteSkipsMemtables` is caught on 17 of 20, 92 of 100 and 947 of 10
 first at seed 0 by a live scan that saw a deleted key: *scan of k16..k42 at version 21 saw
 4 keys but the model has 3*.
 
+The sweep's own tests on the default schedule, before this part of the entry (268cf58 and
+7e3d25d, identical) and after it, at each tier:
+
+| tier | correct engine | `NoWalBeforeMemtable` | `ReleaseBeforeManifest` | `DeleteBeforeManifest` |
+| --- | --- | --- | --- | --- |
+| 20 | every seed, before and after | 19 → 20 | 13 → 12 | 10 → 11 |
+| 100 | every seed, before and after | 98 → 97 | 64 → 62 | 55 → 62 |
+| 1000 | every seed, before and after | 984 → 981 | 627 → 623 | 570 → 630 |
+
+Every seed's schedule moved, since a new task draws from the node's stream and every
+install and delete writes, flushes and switches, so which seeds catch a variant changed
+and each rate is the one measured on the new schedules, not the old ones shifted. The
+correct engine's coverage at a thousand seeds says what moved. Tables written rose from
+45 781 to 64 898 and compactions from 13 375 to 14 678, since installs and deletes add
+level-0 tables and rewrites and each forces a flush; crashes landing inside a compaction
+nearly doubled, from 595 to 1 166, and `DeleteBeforeManifest`, which is caught only by a
+crash between a compaction's deletion of its inputs and its manifest, rose from 570 to
+630. Flushes rose from 31 040 to 32 297 and crashes with a memtable mid-flush from 4 369 to
+6 061, but `ReleaseBeforeManifest` did not follow, 627 to 623: its catch needs a crash
+after its early release and before the manifest, with the released segments' records
+owed and no fault explaining their loss, and the four seeds' difference was not traced
+further. `NoWalBeforeMemtable`
+is caught whenever a crash follows a write acknowledged without a sync, on nearly every
+seed on either schedule, 984 and 981. Scans fell from 395 698 to 197 937 because half of
+them are now seeks (199 599), and 4 481 checkpoints opened fresh after a crash where 2 657
+did, the span checkpoints among them; beside those, 4 806 installs, 4 098 range deletes,
+7 817 span checkpoints and 76 453 seeks walking recovered engines, every seed passing.
+
 **Alternatives.** Range tombstones, as RocksDB's `DeleteRange`: no forced flush and no
 rewrite, but a new kind of write that the memtable, the table format (a version bump), the
 merge, every read, compaction and its truncation at table boundaries, and the oracle would
@@ -4420,12 +4461,14 @@ with records past a deleted one, which is the variant. A limit on entries read r
 than keys returned: a caller could not tell a short range from a range of tombstones. A
 reverse seek now: no consumer in Phase 3.
 
-**Consequences.** `scan` stays as it was; a seek costs what the part of a scan it walks
+**Consequences.** The engine sweep's default schedule moved for every seed, and its
+three Phase 1 variants' rates with it (above); no pinned trace hash moved, and seeds 420
+and 44 keep the schedule they were found on. The gate's engine tests take longer. `scan`
+stays as it was; a seek costs what the part of a scan it walks
 costs, and no more than `limit` live keys past the deleted ones it passes over. A range
 delete costs what an install costs: a flush of the memtables at or below it and a rewrite
-of every table straddling the span's edges. The engine sweep's default schedule neither
-seeks nor deletes until the sweep's commit of this entry, so neither primitive's commit
-moves a seed's schedule.
+of every table straddling the span's edges. Neither primitive's own commit moved a
+seed's schedule; the sweep's did.
 
 ---
 
