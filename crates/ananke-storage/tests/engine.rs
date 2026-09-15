@@ -1223,3 +1223,198 @@ fn an_engine_whose_recovery_lost_writes_starts_quiesced_and_launders_nothing() {
         "the store as built opens clean, the loss laundered away"
     );
 }
+
+/// The live install (D-054, SHARD.md §11 storage 5): a checkpoint of a span holds
+/// the newest live write of each of its keys at its version and nothing outside
+/// it; installed over the span while the engine runs, it replaces the span's keys
+/// and leaves every other key as it was, with one manifest switch, and a write to
+/// the span after the install is read over it. A reopen sees the same.
+// PROPOSED(D-054): the live install of a span, in one manifest switch.
+#[test]
+fn a_span_checkpoint_installs_over_its_span_in_one_switch() {
+    let mut sim = Sim::new(SimConfig::new(23));
+    let node = sim.add_node();
+    let expected = on_node(&mut sim, node, |env| {
+        Box::pin(async move {
+            let mut c = config(400);
+            c.background_compaction = true;
+            let (db, _) = Engine::open(env.clone(), c).await.unwrap();
+            fill(&db, 0..90, 20).await;
+            env.clock().sleep(Duration::from_millis(1)).await;
+            let span = b("k005")..b("k012");
+            let info = db
+                .checkpoint_span(&span.start[..]..&span.end[..], Path::new("/stage/one"))
+                .await
+                .unwrap();
+            assert_eq!(info.version, 90);
+            // What the span held at the checkpoint, and the state after writes
+            // that follow it.
+            let at_checkpoint: Vec<Option<Bytes>> = (0..20).map(|k| expected(k, 90, 20)).collect();
+            fill(&db, 90..150, 20).await;
+            env.clock().sleep(Duration::from_millis(1)).await;
+            let source = db.open_span_source(Path::new("/stage/one")).await.unwrap();
+            let live_in_span = (5..12).filter(|&k| at_checkpoint[k].is_some()).count();
+            let (first, last) = source.key_range().expect("the span held keys");
+            assert!(
+                first >= span.start && last < span.end,
+                "{first:?}..{last:?}"
+            );
+            let install = db.install_span(span.clone(), source);
+            assert_eq!(install.seq(), Some(151), "numbered above every write taken");
+            let done = install.await.unwrap();
+            assert_eq!(done.seq, 151);
+            assert_eq!(done.keys, live_in_span as u64);
+            let mut want: Vec<Option<Bytes>> = (0..20).map(|k| expected(k, 150, 20)).collect();
+            want[5..12].clone_from_slice(&at_checkpoint[5..12]);
+            for (k, w) in want.iter().enumerate() {
+                assert_eq!(
+                    db.get(format!("k{k:03}").as_bytes()).await.unwrap(),
+                    *w,
+                    "k{k:03} after the install"
+                );
+            }
+            // A write to the span after the install is read over it.
+            let seq = db.put(b("k007"), b("after")).await.unwrap();
+            assert!(seq > done.seq);
+            want[7] = Some(b("after"));
+            assert_eq!(db.get(b"k007").await.unwrap(), Some(b("after")));
+            want
+        })
+    });
+    let trace = sim.trace();
+    let installed = trace
+        .iter()
+        .position(|r| matches!(r.event, TraceEvent::SpanInstalled { .. }))
+        .expect("the install is traced");
+    let manifest = match &trace[installed].event {
+        TraceEvent::SpanInstalled { manifest, seq, .. } => {
+            assert_eq!(*seq, 151);
+            *manifest
+        }
+        _ => unreachable!(),
+    };
+    // One switch after the replacement is written, and it is to the manifest the
+    // install named.
+    let switches: Vec<u64> = trace[installed..]
+        .iter()
+        .take_while(|r| {
+            !matches!(
+                r.event,
+                TraceEvent::WalSegmentOpened { .. } | TraceEvent::MemtableRotated { .. }
+            )
+        })
+        .filter_map(|r| match r.event {
+            TraceEvent::CurrentSwitched { manifest } => Some(manifest),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(switches.first(), Some(&manifest), "{switches:?}");
+    let reopened = on_node(&mut sim, node, |env| {
+        Box::pin(async move {
+            let (db, _) = Engine::open(env, config(400)).await.unwrap();
+            let mut got = Vec::new();
+            for k in 0..20 {
+                got.push(db.get(format!("k{k:03}").as_bytes()).await.unwrap());
+            }
+            got
+        })
+    });
+    assert_eq!(reopened, expected, "a reopen sees the install");
+}
+
+/// A table an install writes again without the span's keys gets a new, higher
+/// file number while keeping its writes' sequence numbers. Level 0 is read newest
+/// sequence number first, so an older write of a key outside the span, in the
+/// rewritten table, never hides a newer one in a table flushed after it but
+/// numbered below the rewrite (D-054). Read newest file number first, `j` would
+/// come back as its old value.
+// PROPOSED(D-054): level 0 is read newest sequence number first.
+#[test]
+fn a_rewritten_level_0_table_does_not_hide_a_newer_write() {
+    let mut sim = Sim::new(SimConfig::new(29));
+    let node = sim.add_node();
+    on_node(&mut sim, node, |env| {
+        Box::pin(async move {
+            let (db, _) = Engine::open(env.clone(), config(100)).await.unwrap();
+            let pad = |s: &str| Bytes::from(format!("{s:<40}"));
+            // Table one: j and k. Table two, flushed after it: a newer j.
+            db.put(b("j"), pad("old")).await.unwrap();
+            db.put(b("k"), pad("k")).await.unwrap();
+            env.clock().sleep(Duration::from_millis(1)).await;
+            db.put(b("j"), pad("new")).await.unwrap();
+            db.put(b("x"), pad("x")).await.unwrap();
+            env.clock().sleep(Duration::from_millis(1)).await;
+            assert_eq!(db.levels()[0].len(), 2, "{:?}", db.levels());
+            // Take k out: table one is written again, holding only the old j.
+            let done = db
+                .install_span(b("k")..b("l"), ananke_storage::SpanSource::empty())
+                .await
+                .unwrap();
+            assert_eq!((done.removed, done.rewritten, done.added), (1, 1, 0));
+            let level_0 = db.levels()[0].clone();
+            assert_eq!(level_0.len(), 2);
+            assert!(
+                level_0[1].max_seq < level_0[0].max_seq,
+                "the rewrite is numbered after the newer table: {level_0:?}"
+            );
+            assert_eq!(db.get(b"k").await.unwrap(), None);
+            assert_eq!(db.get(b"j").await.unwrap(), Some(pad("new")));
+        })
+    });
+}
+
+/// An install is refused, and the store left as it was, for a span with no key,
+/// a source holding a key outside the span, a source that is not a whole store,
+/// and while another install has not switched (D-054).
+// PROPOSED(D-054): the live install of a span, in one manifest switch.
+#[test]
+fn an_install_is_refused_when_it_cannot_be_made() {
+    use ananke_storage::{InstallRefused, SpanSource};
+    let mut sim = Sim::new(SimConfig::new(31));
+    let node = sim.add_node();
+    on_node(&mut sim, node, |env| {
+        Box::pin(async move {
+            let (db, _) = Engine::open(env.clone(), config(400)).await.unwrap();
+            fill(&db, 0..40, 20).await;
+            let refusal = |e: std::io::Error| InstallRefused::from_io(&e);
+            let empty = db.install_span(b("k")..b("k"), SpanSource::empty());
+            assert_eq!(empty.seq(), None);
+            assert_eq!(
+                empty.await.err().and_then(refusal),
+                Some(InstallRefused::EmptySpan)
+            );
+            db.checkpoint_span(b"k000"..b"k010", Path::new("/stage/wide"))
+                .await
+                .unwrap();
+            let source = db.open_span_source(Path::new("/stage/wide")).await.unwrap();
+            let outside = db.install_span(b("k002")..b("k005"), source);
+            assert_eq!(outside.seq(), None);
+            assert!(matches!(
+                outside.await.err().and_then(refusal),
+                Some(InstallRefused::OutsideSpan { .. })
+            ));
+            let missing = db.open_span_source(Path::new("/stage/none")).await;
+            assert!(matches!(
+                missing.err().and_then(refusal),
+                Some(InstallRefused::SourceDamaged(_))
+            ));
+            let first = db.install_span(b("k000")..b("k001"), SpanSource::empty());
+            assert!(first.seq().is_some());
+            let second = db.install_span(b("k002")..b("k003"), SpanSource::empty());
+            assert_eq!(second.seq(), None);
+            assert_eq!(
+                second.await.err().and_then(refusal),
+                Some(InstallRefused::InProgress)
+            );
+            first.await.unwrap();
+            assert_eq!(db.get(b"k000").await.unwrap(), None);
+            assert_eq!(db.get(b"k002").await.unwrap(), expected(2, 40, 20));
+            db.quiesce();
+            let quiesced = db.install_span(b("k002")..b("k003"), SpanSource::empty());
+            assert_eq!(
+                quiesced.await.err().and_then(refusal),
+                Some(InstallRefused::Quiesced)
+            );
+        })
+    });
+}

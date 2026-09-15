@@ -4133,4 +4133,205 @@ gains a pointer. No code, trace hash or seed schedule moves.
 
 ---
 
-_Next entry: D-054. Add one before implementing anything not covered above._
+## PROPOSED D-054 — The live install of a span: one manifest switch, numbered above the engine, from a checkpoint of the span
+
+**Context.** Q2, approved by the owner on 2026-09-15, puts every range of a node in one
+engine, and makes its entry criterion a crash test: a span's keys removed and its tables
+added in one manifest switch, the installed sequence numbers above the live engine's,
+green before any split code (SHARD.md §11 storage 5, §12 Stage A item 2 and its exit).
+Two things were missing. The only install replaced a whole store directory at the
+server's next start (crates/ananke-raft/src/snapshot.rs:305), and putting tables into a
+running engine was crate-private and knew nothing of a span (`manifest_edit`, `install`,
+engine.rs). And the only checkpoint copied the whole store (D-024), so there was nothing
+of one span to install from (storage 4). What Q2 settles, the one switch and the numbers
+above the engine's, and what the stage asks of the test, the span as it was or as
+installed, every other key unchanged, a later write read over the install, and the
+two-switch variant caught by the same test, are the owner's. How the engine keeps them
+is not settled anywhere, and is proposed here: where the number comes from, what becomes
+of the memtables and the log below it, what becomes of a table that holds keys on both
+sides of the span's edge, the order level 0 is read in, what a snapshot sees, how many
+installs run at once, and the test's shape and oracle. D-054 takes the checkpoint of a
+span, since the crash test installs from one; D-055 does not need it. Every site is
+marked `PROPOSED(D-054)`.
+
+**Decision.** *The checkpoint of a span.* `Engine::checkpoint_span(range, dir)` writes,
+under the turnstile as `checkpoint` does, the newest write at or below the newest version
+applied of every key in `[start, end)` that is present, each at its own sequence number,
+into tables at level 0 sealed near `sst_bytes` in key order, then `MANIFEST-000001`
+listing them with `flushed_seq` the version, then `CURRENT`, each synced in that order. A
+deleted key leaves nothing: the checkpoint is the span's state, not its history. A crash
+leaves a whole checkpoint or one without `CURRENT`, which nothing opens.
+
+*The source.* `Engine::open_span_source(dir)` reads `CURRENT`, the manifest it names and
+every table that lists, each opened and verified whole, and writes nothing; anything
+missing or damaged refuses it (`InstallRefused::SourceDamaged`). Any whole store whose
+keys lie inside the span is a source, a checkpoint of the span among them.
+
+*The number.* `Engine::install_span(range, source)` appends, as it is called, one log
+record of its own that holds no write (an empty batch, synced), and every installed write
+carries that record's number `S`. `SpanInstall::seq` reports it before anything is
+written, as `Write::seq` does. `S` is above every write the engine has taken, and every
+write taken after the call is above `S`: a later write to the span is newer than every
+installed one, which is what reads it over the install.
+
+*The memtables and the log below it.* The engine marks the install in progress. As `S`
+is applied the active memtable, if it holds anything, is rotated, so every memtable holds
+writes from one side of `S` only; while the install is in progress the flusher leaves
+alone every memtable whose writes are all above `S`. The install waits for its record to
+be durable, takes the turnstile and flushes every memtable holding a write at or below
+`S` itself; a memtable the flusher was handed before is no longer the queue's head when
+the flusher gets in, and it moves on. Then every write at or below `S` is in a table, and
+the manifest that makes the install the state says so: its `flushed_seq` is at least `S`,
+and recovery never replays a write of the span older than the install.
+
+*The span's writes out.* Every table in service that holds a write of the span below `S`
+is taken out: whole when every key it holds lies in the span and every write is below
+`S`, and otherwise written again at its own level, under a new number, without those
+writes, keeping every other write at its own sequence number.
+
+*The installed tables.* The source's newest write of each key, if it is live, is written
+at `S` into tables at level 0 sealed near `sst_bytes`. A key outside the span refuses the
+install (`OutsideSpan`): from the source's manifest before anything is numbered, and key
+by key as the tables are written, where the tables already written are orphans the next
+open removes.
+
+*One switch.* The next manifest lists the tables in service less those taken out, with
+the rewrites and the installed tables, and `flushed_seq` at least `S`.
+`TraceEvent::SpanInstalled` records the manifest's number, the span, `S`, the tables taken
+out, each rewrite with its original, and the installed tables with their key ranges,
+before the manifest is written, as `CompactionWritten` is (D-023); then the manifest is
+written, synced and switched to, the result put in service, and only then are the tables
+taken out deleted and the log segments at or below `S`. A crash before the switch leaves
+the old manifest, the old span and the new files as orphans; after it, the installed span.
+
+*Level 0 is read newest sequence number first.* A lookup took level 0 newest file number
+first. A rewritten level-0 table keeps its writes' numbers under a new, higher file
+number, so a key outside the span whose older write it holds would be read before a newer
+write in a table flushed after the original but numbered below the rewrite. Level 0 is now
+ordered by the highest sequence number a table holds, then its number. For flushed tables
+the two orders are one, since their sequence ranges are disjoint and numbered in order, so
+nothing an engine did before an install reads differently.
+`a_rewritten_level_0_table_does_not_hide_a_newer_write` (tests/engine.rs) builds the case
+and reads the old value under the old order.
+
+*One at a time, and refusals.* A second install while one is in progress is refused
+(`InProgress`), as are a span with no key (`EmptySpan`), a source with a key outside the
+span (`OutsideSpan`) and a quiesced engine (`Quiesced`, D-044). A refusal before the
+number is taken writes nothing; one after it leaves the install's record, which holds no
+write. An install of an empty source takes the span's keys out and puts nothing in.
+
+*What a snapshot sees.* The install replaces the span's history, it does not add to it: a
+snapshot older than `S` reads the span as empty once the switch is made, and one at or
+above `S` reads the span as it was until the switch and as installed after it. A scan
+that began before the switch reads the tables it began with to the end.
+
+*The variants.* `Variant::InstallInTwoSwitches` takes the span's writes out with one
+manifest (the rewrites in, the tables taken out out) and puts the installed tables in with
+a second; a crash between the two leaves the span as neither what it was nor what was
+installed. `Variant::SpanCheckpointUnsynced` writes a span checkpoint's tables without
+syncing them before the manifest and `CURRENT` that name them.
+
+*The crash test.* `sim/engine.rs`'s scenario with `Schedule::install()`: the default
+workload, three writers over all 48 keys and two readers, plus a task that every one to
+five milliseconds checkpoints a random span of one to twelve keys into a directory of its
+own, waits half a millisecond to three and a half more while the writers write over it,
+and installs the checkpoint over the span, rolling the span back. Every crash is aimed at
+an install, from the harness's own stream: on half the epochs at a time drawn uniformly
+from the twelve milliseconds after the next install is asked for, and on the other half
+from the three after its replacement is traced, just before its switch. The disk faults
+are the engine sweep's: lost syncs at one in five, bit rot, torn writes, lost directory
+entries and latency. The oracle is the engine sweep's (D-022, D-023, D-024) extended by
+the trace's account of each install. The mirror takes `SpanInstalled` as it takes a
+compaction: the rewrites hold their originals' writes less the span's below `S`, the
+installed tables hold the source's live keys at `S` split by their key ranges, and the
+span's writes below `S` in the tables taken out are dropped. An install is in force when
+the manifest in force is in the lineage of the one it named, which the mirror prunes on a
+fallback as it prunes compactions, and it belongs to the start of the node it was written
+in, so a later start's manifest under the same number is not its manifest. In force, its
+writes are its keys at `S`, owed like any flushed write and present only in a table,
+never by a replay, since its record holds none, and the span's writes it dropped are
+excused as a compaction's are; not in force, it holds no write. On top of every property
+the sweep had, each recovery asserts Q2's criterion directly: with an install in force no
+table in service and no replayed record holds a write of its span below `S`, and without
+it no table in service holds a write it installed. The model folds an install in force
+as the span replaced whole at `S`, so the state check reads every key of it, the later
+writes over it included, and the checkpoint of every span is opened fresh after the
+crash that follows it. During the run a live read of a span's keys and the span's part of
+a scan are not judged while its install is in progress, and once it resolves the model
+takes the install as made.
+
+**What the sweep found.** One thing, in the oracle. At seed 9 of the first twenty the
+correct engine was reported for record 527, gone with a missing log head after a
+fallback: the record was an install's that had not been in force, which holds no write,
+so no table a fallback left behind held it, the way every write of its neighbours was
+held and excused. A record holding no write now takes the excuse its neighbours take:
+past the manifest in force, up to the furthest any manifest covered, the fallback that
+explains them explains it. And one thing the span checkpoint's variant showed: the
+checkpoint check skipped any checkpoint a torn write touched, and a correct checkpoint
+syncs every file before it completes, so a crash tears one only if its sync was lost,
+which `FsyncLost` already says. At the first twenty seeds `SpanCheckpointUnsynced` was
+caught on 1, because its tables' writes were torn more often than lost whole, and every
+torn one was skipped; with a torn write alone no longer an excuse it is caught on 19 of 20.
+
+*Measured.* In release on the eight-core laptop, beside another lane's builds and
+sweeps (load averages from 4 to over 100 during the runs), `cargo test -p ananke-sim
+--release --test engine` with `ANANKE_SEEDS` at each tier:
+
+| tier | correct engine | installs asked / resolved | crashes aimed | after a crash: in force (resolved / not) | not in force (unresolved / resolved, a fault) | span keys written after an install, checked | `InstallInTwoSwitches` | `SpanCheckpointUnsynced` |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 20 | every seed | 251 / 160 | 149 | 135 / 17 | 73 / 21 | 2 804 | 7 of 20 | 19 of 20 |
+| 100 | every seed | 1 241 / 801 | 732 | 696 / 43 | 387 / 80 | 12 926 | 31 of 100 | 95 of 100 |
+| 1000 | every seed | 12 623 / 8 277 | 7 341 | 7 190 / 416 | 3 860 / 820 | 143 868 | 384 of 1000 | 940 of 1000 |
+
+At a thousand seeds 203 995 live reads of an installed key that a later write had
+overwritten agreed with the model, and 9 231 checkpoints, of spans and of the whole
+store, opened fresh after a crash and matched it. `InstallInTwoSwitches` is caught only
+where a crash lands between its two switches and no fault sends recovery to another
+manifest: at the first twenty seeds fifteen crashes landed there, and eight of them left
+nothing the oracle could hold against it: two spans with no table to take out, one
+`CURRENT` rename that survived the crash before its sync, and five fallbacks after a lost
+sync of `CURRENT` or a manifest, which excuse what the tables they passed over held. The engine sweep's own tests, on the default
+schedule, which runs none of this entry, are unchanged at every tier: the correct engine
+passes every seed with the same coverage, and `NoWalBeforeMemtable`,
+`ReleaseBeforeManifest` and `DeleteBeforeManifest` are caught on 19, 13 and 10 of 20, 98,
+64 and 55 of 100, and 984, 627 and 570 of 1000, before this entry and after it.
+
+**Alternatives.** A number per installed table carried in the manifest, as RocksDB's
+ingested files carry a global sequence number: no rewrite of the source, but a manifest
+format change and a read path that consults it; revisit when a range's snapshot is large
+enough for the copy to cost. Range tombstones in the memtables and tables instead of the
+flush and the rewrite: no forced flush, but a tombstone kind that every read, merge,
+compaction and the oracle must learn, which is the range delete's question (D-055).
+Numbering the install at its switch, with no record of its own: the number would not be
+known before the install is durable, and a number no record carries is a gap the log's
+numbering refuses (D-019). Installed tables at the bottom level: a rewritten table there
+keeps a key range that can straddle the span, and a level's tables must not overlap.
+Keeping level 0 in file-number order and compacting level 0 away before an install: a
+compaction under every install, and more writing than the rewrite. Waiting for the
+flusher to flush the memtables at or below `S` instead of flushing them under the
+turnstile: a waker the flusher would have to answer, and the same flushes. Concurrent
+installs: two pending numbers would let a memtable between them reach a table before the
+older install switches, below its installed tables in level 0; Q14's one apply task per
+node serialises installs anyway. Keeping the span's old versions for older snapshots:
+range tombstones again; the node's apply task holds no snapshot across an install of the
+span it replaces. Filtering the source to the span instead of refusing: it would drop
+keys a caller meant to install without a word. Installing a whole checkpoint and taking
+the span from it: the leader would stream a whole store for one range.
+
+**Consequences.** An install forces a flush of the memtables at or below its number,
+before its own switch; rewrites every table that straddles the span's edges; and copies
+the source into the engine, since the simulator's filesystem has no links (D-024). The
+flusher waits behind an install in progress, so memtables pile up for its length. A
+refused install can still take a sequence number. A snapshot is not stable across an
+install of the span it reads. `TraceEvent::SpanInstalled` is new, with the moirae line
+`ananke.engine.span-installed`. The engine sweep's default schedule runs no install, span
+checkpoint or variant of this entry, so its seeds' schedules and its three variants'
+rates are unchanged by this entry (below); the change to level 0's read order and the
+flusher's check move no schedule of a run with no install, and no pinned trace hash
+moves. The checkpoint check's torn-write exclusion is narrowed for every checkpoint, the
+whole-store checkpoints of D-024 included, which the correct engine passes at every tier
+below.
+
+---
+
+_Next entry: D-055. Add one before implementing anything not covered above._

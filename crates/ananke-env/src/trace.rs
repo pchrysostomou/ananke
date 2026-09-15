@@ -278,6 +278,30 @@ pub enum TraceEvent {
         /// Tombstones dropped because no older write of the key lay below.
         dropped_tombstones: u64,
     },
+    /// A span's replacement is written and synced: the tables that held the span's
+    /// writes below `seq` taken out, those that also held keys outside it rewritten
+    /// without them, and the installed tables written, every write in them at
+    /// `seq`. The manifest that makes all of it the state in one switch is written
+    /// next. Recorded before that manifest is written, like `CompactionWritten`.
+    // PROPOSED(D-054): the live install of a span, in one manifest switch.
+    SpanInstalled {
+        /// The manifest that lists the result.
+        manifest: u64,
+        /// The span's first key.
+        start: Bytes,
+        /// The key past its last.
+        end: Bytes,
+        /// The sequence number every installed write carries: the install's own log
+        /// record, above every write the engine had taken when it was asked.
+        seq: u64,
+        /// Every table taken out of service, the rewritten ones' originals included.
+        removed: Vec<u64>,
+        /// Each rewritten table: its original, its replacement, and the
+        /// replacement's first and last user key.
+        rewritten: Vec<(u64, u64, Bytes, Bytes)>,
+        /// The installed tables, each with its first and last user key.
+        added: Vec<(u64, Bytes, Bytes)>,
+    },
     /// A compaction deleted an input table once the manifest no longer listed it.
     SstDeleted {
         /// The table's number.

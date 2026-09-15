@@ -33,10 +33,25 @@
 //! unless `allow_head_gap` is set, and then the log is discarded and the tables are
 //! the state. Either way what comes back is a state that existed.
 //!
+//! A span's keys can be replaced in a running engine (D-054): [`Engine::checkpoint_span`]
+//! writes the newest live write of every key of a span as a store of its own, and
+//! [`Engine::install_span`] puts such a store in place of the span. The install takes
+//! one log record of its own, numbered above every write the engine had taken, splits
+//! the memtables there and flushes those at or below it, then writes the tables that
+//! held the span's keys again without them and the installed tables with every write
+//! at that number, and makes all of it the state with one manifest switch. A crash
+//! leaves the span as it was or as installed, and a later write to the span is newer
+//! than every installed one.
+//!
 //! The [`Variant`]s for the crash sweep: [`Variant::Correct`];
 //! [`Variant::NoWalBeforeMemtable`], which applies and acknowledges a write before
-//! the log has it; and [`Variant::ReleaseBeforeManifest`], which releases a memtable
-//! and its log segments once its table is written but before the manifest names it.
+//! the log has it; [`Variant::ReleaseBeforeManifest`], which releases a memtable
+//! and its log segments once its table is written but before the manifest names it;
+//! [`Variant::DeleteBeforeManifest`], whose compaction deletes its inputs first;
+//! [`Variant::InstallInTwoSwitches`], whose install takes the span out with one
+//! manifest switch and puts the installed tables in with another; and
+//! [`Variant::SpanCheckpointUnsynced`], whose checkpoint of a span does not sync its
+//! tables.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
@@ -83,6 +98,16 @@ pub enum Variant {
     /// A crash between leaves a manifest naming tables that are gone, and the
     /// outputs as orphans: their writes are nowhere.
     DeleteBeforeManifest,
+    /// A span's install takes the span's keys out in one manifest switch and puts
+    /// the installed tables in with a second. A crash between the two leaves the
+    /// span as neither what it was nor what was installed: empty.
+    // PROPOSED(D-054): the live install of a span, in one manifest switch.
+    InstallInTwoSwitches,
+    /// A checkpoint of a span writes its tables without syncing them before the
+    /// manifest and `CURRENT` that name them. A crash can leave a checkpoint whose
+    /// `CURRENT` names tables that came back empty or short.
+    // PROPOSED(D-054): the checkpoint of a span, which the live install installs from.
+    SpanCheckpointUnsynced,
 }
 
 /// How to open an [`Engine`].
@@ -328,7 +353,7 @@ impl WriteBatch {
     }
 }
 
-/// What [`Engine::checkpoint`] wrote.
+/// What [`Engine::checkpoint`] or [`Engine::checkpoint_span`] wrote.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CheckpointInfo {
     /// The version the checkpoint is the state at.
@@ -336,6 +361,79 @@ pub struct CheckpointInfo {
     /// Tables in it.
     pub tables: usize,
 }
+
+/// What [`Engine::install_span`] did.
+// PROPOSED(D-054): the live install of a span, in one manifest switch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InstallInfo {
+    /// The sequence number every installed write carries: the install's own log
+    /// record.
+    pub seq: Seq,
+    /// The manifest that made the install the state.
+    pub manifest: u64,
+    /// Tables taken out of service, the rewritten ones' originals included.
+    pub removed: usize,
+    /// Of those, tables written again without the span's keys.
+    pub rewritten: usize,
+    /// Installed tables.
+    pub added: usize,
+    /// Keys installed.
+    pub keys: u64,
+}
+
+/// Why [`Engine::install_span`] refused an install. Nothing in the store changed,
+/// though a refusal after the install took its number leaves its log record, which
+/// holds no write.
+// PROPOSED(D-054): the live install of a span, in one manifest switch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InstallRefused {
+    /// The span holds no key: its start is not below its end.
+    EmptySpan,
+    /// The source holds a key outside the span, which the install would have
+    /// written over a key it was not asked to replace.
+    OutsideSpan {
+        /// The smallest key the source holds.
+        first: Bytes,
+        /// The largest.
+        last: Bytes,
+    },
+    /// Another install has not switched yet: one runs at a time.
+    InProgress,
+    /// The engine is quiesced and does no work (D-044).
+    Quiesced,
+    /// The source directory is not a whole store: `CURRENT`, its manifest or a
+    /// table it lists is missing or damaged.
+    SourceDamaged(String),
+}
+
+impl InstallRefused {
+    /// The refusal an I/O error carries, if it is one.
+    #[must_use]
+    pub fn from_io(error: &io::Error) -> Option<InstallRefused> {
+        error.get_ref()?.downcast_ref::<InstallRefused>().cloned()
+    }
+
+    fn into_io(self) -> io::Error {
+        io::Error::new(io::ErrorKind::InvalidData, self)
+    }
+}
+
+impl std::fmt::Display for InstallRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            InstallRefused::EmptySpan => write!(f, "the span holds no key"),
+            InstallRefused::OutsideSpan { first, last } => write!(
+                f,
+                "the source holds keys {first:?} to {last:?}, not all inside the span"
+            ),
+            InstallRefused::InProgress => write!(f, "another install is in progress"),
+            InstallRefused::Quiesced => write!(f, "the engine is quiesced"),
+            InstallRefused::SourceDamaged(what) => write!(f, "the source is damaged: {what}"),
+        }
+    }
+}
+
+impl std::error::Error for InstallRefused {}
 
 /// Decodes a record written by [`encode_op`].
 ///
@@ -373,10 +471,17 @@ pub(crate) struct Tables<E: Environment> {
 impl<E: Environment> Tables<E> {
     /// The readers a lookup of `key` consults after the memtables: level 0 newest
     /// first, then the one table per deeper level whose range holds the key.
+    ///
+    /// Newest at level 0 is by the highest sequence number a table holds, then by
+    /// number. For flushed tables the two orders are one, since their sequence
+    /// ranges are disjoint and numbered in order; a table an install rewrote keeps
+    /// its writes' numbers under a new file number, which only the first order
+    /// still places right (D-054).
     fn readers_for(&self, key: &[u8]) -> Vec<Arc<SstReader<FileOf<E>>>> {
         let mut l0: Vec<&(SstMeta, Arc<SstReader<FileOf<E>>>)> =
             self.ssts.iter().filter(|(m, _)| m.level == 0).collect();
-        l0.sort_by_key(|(m, _)| std::cmp::Reverse(m.number));
+        // PROPOSED(D-054): level 0 is read newest sequence number first.
+        l0.sort_by_key(|(m, _)| std::cmp::Reverse((m.max_seq, m.number)));
         let mut readers: Vec<Arc<SstReader<FileOf<E>>>> =
             l0.into_iter().map(|(_, r)| r.clone()).collect();
         for level in 1..LEVELS as u8 {
@@ -424,6 +529,12 @@ pub(crate) struct Shared<E: Environment> {
     pub(crate) visible: AtomicU64,
     /// Live snapshots by sequence number, with how many pin each.
     pub(crate) snapshots: Mutex<BTreeMap<Seq, usize>>,
+    /// The sequence number of the install in progress, if one is: the active
+    /// memtable is rotated as that record is applied, so every memtable holds
+    /// writes from one side of it only, and the flusher leaves the memtables past
+    /// it alone until the install has switched.
+    // PROPOSED(D-054): the live install of a span, in one manifest switch.
+    install: Mutex<Option<Seq>>,
 }
 
 /// Why [`Engine::open`] refused a store (D-022): what is on disk cannot be trusted
@@ -929,6 +1040,7 @@ impl<E: Environment> Engine<E> {
             pending: Mutex::new(BTreeMap::new()),
             visible: AtomicU64::new(flushed_seq),
             snapshots: Mutex::new(BTreeMap::new()),
+            install: Mutex::new(None),
         });
         let mut replayed = 0;
         for (i, record) in recovery.records.iter().enumerate() {
@@ -1225,6 +1337,194 @@ impl<E: Environment> Engine<E> {
         })
     }
 
+    /// Writes the span `range` as of the newest write applied into `dir`, which must
+    /// not exist or must be empty, as a store of its own: the newest write at or
+    /// below that version of every key in the span that is present, each at its own
+    /// sequence number, in tables at level 0 sealed near `sst_bytes` and written in
+    /// key order, then a manifest listing them and `CURRENT`, each synced in that
+    /// order. Deleted keys leave nothing: the checkpoint is the span's state, not its
+    /// history. A crash leaves either a complete checkpoint or one without
+    /// `CURRENT`, which `open` and [`open_span_source`](Self::open_span_source)
+    /// refuse. Holds the turnstile, as [`checkpoint`](Self::checkpoint) does.
+    ///
+    /// # Errors
+    ///
+    /// `AlreadyExists` if `dir` is not empty; else the filesystem's.
+    // PROPOSED(D-054): the checkpoint of a span, which the live install installs from.
+    pub async fn checkpoint_span(
+        &self,
+        range: Range<&[u8]>,
+        dir: &Path,
+    ) -> io::Result<CheckpointInfo> {
+        let _turn = self.shared.turnstile.acquire().await;
+        let shared = &self.shared;
+        let fs = shared.env.fs();
+        fs.create_dir_all(dir).await?;
+        if !fs.read_dir(dir).await?.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "the checkpoint directory is not empty",
+            ));
+        }
+        let version = shared.visible.load(Ordering::Acquire);
+        let mut merge = shared.merge_all();
+        merge.seek(&ikey::lower_bound(range.start)).await?;
+        let mut listed = Vec::new();
+        let mut writer = SstWriter::new();
+        let mut last_user: Option<Bytes> = None;
+        while let Some((key, value)) = merge.next().await? {
+            let (user, seq) = ikey::decode(&key)?;
+            if user[..] >= *range.end {
+                break;
+            }
+            if seq > version || last_user.as_ref() == Some(&user) {
+                continue;
+            }
+            last_user = Some(user.clone());
+            if value == Value::Tombstone {
+                continue;
+            }
+            if writer.entries() > 0 && writer.bytes_so_far() as u64 >= shared.config.sst_bytes {
+                let number = listed.len() as u64 + 1;
+                let full = std::mem::take(&mut writer);
+                listed.push(write_level_0_table(shared, dir, number, full).await?);
+            }
+            writer.add(&user, seq, &value);
+        }
+        if writer.entries() > 0 {
+            let number = listed.len() as u64 + 1;
+            listed.push(write_level_0_table(shared, dir, number, writer).await?);
+        }
+        let manifest = Manifest {
+            number: 1,
+            next_sst: listed.len() as u64 + 1,
+            flushed_seq: version,
+            ssts: listed,
+        };
+        write_manifest_in(&shared.env, dir, &manifest, true).await?;
+        switch_current_in(&shared.env, dir, 1, true).await?;
+        shared.env.trace(TraceEvent::CheckpointWritten {
+            dir: dir.to_path_buf(),
+            version,
+            tables: manifest.ssts.len() as u64,
+        });
+        Ok(CheckpointInfo {
+            version,
+            tables: manifest.ssts.len(),
+        })
+    }
+
+    /// Reads the store in `dir` to install over a span: `CURRENT`, the manifest it
+    /// names and every table that lists, each opened and checked whole. Nothing is
+    /// written, here or in `dir`.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidData` carrying [`InstallRefused::SourceDamaged`] when `CURRENT`, its
+    /// manifest or a table is missing or damaged; else the filesystem's.
+    // PROPOSED(D-054): the live install of a span, in one manifest switch.
+    pub async fn open_span_source(&self, dir: &Path) -> io::Result<SpanSource<E>> {
+        let env = &self.shared.env;
+        let damaged = |what: String| InstallRefused::SourceDamaged(what).into_io();
+        let Some(current) = read_whole(env, &current_path(dir)).await? else {
+            return Err(damaged(format!("{} has no CURRENT", dir.display())));
+        };
+        let Some(number) = manifest::parse_current(&current) else {
+            return Err(damaged(format!(
+                "{}'s CURRENT cannot be read",
+                dir.display()
+            )));
+        };
+        let Some(manifest) = read_manifest(env, dir, number).await? else {
+            return Err(damaged(format!(
+                "{}'s MANIFEST-{number:06} cannot be read",
+                dir.display()
+            )));
+        };
+        let (tables, missing) = open_tables(env, dir, &manifest, false).await?;
+        if let Some(meta) = missing.first() {
+            return Err(damaged(format!(
+                "{}'s table {} is missing or damaged",
+                dir.display(),
+                meta.number
+            )));
+        }
+        Ok(SpanSource { tables })
+    }
+
+    /// Installs `source` over the span `range` while the engine runs: every write
+    /// of a key in the span that the engine holds is taken out, and the newest live
+    /// write of every key `source` holds put in, all in one manifest switch (SHARD.md
+    /// §11, storage 5; Q2). A crash at any point leaves the span as it was or as
+    /// installed, and every key outside it as it was.
+    ///
+    /// The install is numbered when it is asked for: one log record of its own,
+    /// holding no write, above every write the engine has taken, which
+    /// [`SpanInstall::seq`] reports at once. Every installed write carries that
+    /// number, so a write to the span after the call is newer than every installed
+    /// one and is read over it. The future then waits for the record to be durable,
+    /// flushes every memtable holding writes at or below it (the active memtable is
+    /// rotated as the record is applied, and the flusher leaves later memtables
+    /// alone until the install has switched), writes each table in service that
+    /// holds a write of the span below the number again without those writes, at
+    /// its level, or takes it out whole when every write it holds is one, writes the
+    /// installed tables at level 0 sealed near `sst_bytes`, and switches to the
+    /// manifest listing the result, with `flushed_seq` at least the install's
+    /// number; then it deletes the tables taken out and the log segments at or below
+    /// the number. Holds the turnstile from the flush to the deletion.
+    ///
+    /// One install runs at a time. An install of an empty `source` is a delete of
+    /// the span. A snapshot older than the install reads the span as empty once the
+    /// switch is made, and one at or above the install's number reads the span as it
+    /// was until the switch and as installed after it: the install replaces the
+    /// span's history, it does not add to it (D-054).
+    // PROPOSED(D-054): the live install of a span, in one manifest switch.
+    pub fn install_span(&self, range: Range<Bytes>, source: SpanSource<E>) -> SpanInstall {
+        let refused = |why: InstallRefused| SpanInstall {
+            seq: None,
+            future: Box::pin(async move { Err(why.into_io()) }),
+        };
+        if range.start >= range.end {
+            return refused(InstallRefused::EmptySpan);
+        }
+        if self.quiesced() {
+            return refused(InstallRefused::Quiesced);
+        }
+        if let Some((first, last)) = source.key_range()
+            && (first < range.start || last >= range.end)
+        {
+            return refused(InstallRefused::OutsideSpan { first, last });
+        }
+        let (marker, seq) = {
+            let mut install = lock(&self.shared.install);
+            if install.is_some() {
+                return refused(InstallRefused::InProgress);
+            }
+            let marker = self.write(WriteBatch::new(), true);
+            let seq = marker.seq();
+            *install = Some(seq);
+            (marker, seq)
+        };
+        if self.shared.config.variant == Variant::NoWalBeforeMemtable {
+            // That engine applied the record as it was written, before the install
+            // was marked: the split is made here instead.
+            self.shared.split_at_install(seq);
+        }
+        let hold = InstallHold {
+            shared: self.shared.clone(),
+            seq,
+        };
+        let shared = self.shared.clone();
+        SpanInstall {
+            seq: Some(seq),
+            future: Box::pin(async move {
+                let _hold = hold;
+                marker.await?;
+                shared.install_span(seq, range, source).await
+            }),
+        }
+    }
+
     /// The manifest in force.
     #[must_use]
     pub fn manifest(&self) -> Manifest {
@@ -1322,6 +1622,22 @@ impl<E: Environment> Shared<E> {
                 return;
             };
             self.apply(s, ops);
+            self.split_at_install(s);
+        }
+    }
+
+    /// Rotates the active memtable, if it holds anything, when `seq` is the install
+    /// in progress: every write at or below the install is then in a memtable the
+    /// install flushes, and every later one in a memtable the flusher holds back
+    /// until the install has switched.
+    // PROPOSED(D-054): the live install of a span, in one manifest switch.
+    fn split_at_install(&self, seq: Seq) {
+        if *lock(&self.install) != Some(seq) {
+            return;
+        }
+        let active = lock(&self.tables).active.clone();
+        if !active.is_empty() {
+            self.rotate(&active);
         }
     }
 
@@ -1336,9 +1652,15 @@ impl<E: Environment> Shared<E> {
         if active.bytes() <= self.config.memtable_bytes {
             return;
         }
+        self.rotate(&active);
+    }
+
+    /// Makes `active` immutable and starts a fresh memtable, unless someone else
+    /// already rotated it, and wakes the flusher.
+    fn rotate(&self, active: &Arc<Memtable>) {
         let rotated = {
             let mut tables = lock(&self.tables);
-            if !Arc::ptr_eq(&tables.active, &active) {
+            if !Arc::ptr_eq(&tables.active, active) {
                 return; // Someone else rotated it already.
             }
             let id = self.next_memtable.fetch_add(1, Ordering::Relaxed);
@@ -1394,6 +1716,32 @@ impl<E: Environment> Shared<E> {
         file.sync().await?;
         let reader = SstReader::open(file).await?;
         Ok((reader, len))
+    }
+
+    /// Flushes `memtable`, the head of the immutable queue: table, manifest,
+    /// switch, release, then the log segments the table made redundant. Call it
+    /// with the turnstile held.
+    async fn flush(&self, memtable: &Arc<Memtable>) -> io::Result<()> {
+        let (meta, reader) = self.write_sst(memtable).await?;
+        let mut next = self.manifest_edit(&[], vec![meta.clone()]);
+        next.flushed_seq = meta.max_seq;
+        let max_seq = meta.max_seq;
+        if self.config.variant == Variant::ReleaseBeforeManifest {
+            // The bug: the table is taken for durable once written. It serves
+            // reads, the memtable goes, the log segments go, and only then is
+            // the manifest written. A crash before the manifest is durable
+            // leaves the table an orphan and its records nowhere.
+            self.install(next.clone(), &[], vec![(meta, reader)]);
+            self.release(memtable);
+            self.wal.delete_segments_through(max_seq).await?;
+            self.write_manifest(&next).await?;
+        } else {
+            self.write_manifest(&next).await?;
+            self.install(next, &[], vec![(meta, reader)]);
+            self.release(memtable);
+            self.wal.delete_segments_through(max_seq).await?;
+        }
+        Ok(())
     }
 
     /// Writes `memtable` as the next table, at level 0, and syncs it.
@@ -1477,6 +1825,303 @@ impl<E: Environment> Shared<E> {
             .extend(added.into_iter().map(|(m, r)| (m, Arc::new(r))));
         tables.manifest = next;
     }
+
+    /// The install numbered `seq` of `source` over `range`, once its record is
+    /// durable: see [`Engine::install_span`].
+    // PROPOSED(D-054): the live install of a span, in one manifest switch.
+    async fn install_span(
+        &self,
+        seq: Seq,
+        range: Range<Bytes>,
+        source: SpanSource<E>,
+    ) -> io::Result<InstallInfo> {
+        let _turn = self.turnstile.acquire().await;
+        if self.quiesced.load(Ordering::SeqCst) {
+            return Err(InstallRefused::Quiesced.into_io());
+        }
+        let (start, end) = (&range.start[..], &range.end[..]);
+        let in_span = |user: &[u8]| start <= user && user < end;
+
+        // Every memtable holding writes at or below the install, flushed: the
+        // active one was rotated as the install's record was applied, and the
+        // flusher holds back every memtable after it.
+        loop {
+            let head = lock(&self.tables).immutable.front().cloned();
+            match head {
+                Some(memtable) if memtable.min_seq() <= seq => self.flush(&memtable).await?,
+                _ => break,
+            }
+        }
+
+        // The tables that hold a write of the span below the install: taken out
+        // whole when every write they hold is one, else written again at their level
+        // without those writes.
+        let in_service: Vec<(SstMeta, Arc<SstReader<FileOf<E>>>)> = lock(&self.tables).ssts.clone();
+        let mut removed = Vec::new();
+        let mut rewritten = Vec::new();
+        for (meta, reader) in &in_service {
+            if meta.first_key[..] >= *end || meta.last_key[..] < *start {
+                continue;
+            }
+            if in_span(&meta.first_key) && in_span(&meta.last_key) && meta.max_seq < seq {
+                removed.push(meta.number);
+                continue;
+            }
+            let mut writer = SstWriter::new();
+            let mut iter = reader.iter();
+            let mut dropped = false;
+            while let Some((key, value)) = iter.next().await? {
+                let (user, s) = ikey::decode(&key)?;
+                if in_span(&user) && s < seq {
+                    dropped = true;
+                } else {
+                    writer.add(&user, s, &value);
+                }
+            }
+            if !dropped {
+                continue;
+            }
+            removed.push(meta.number);
+            if writer.entries() > 0 {
+                let (rewrite, reader) = self.write_output(writer, meta.level).await?;
+                rewritten.push((meta.number, rewrite, reader));
+            }
+        }
+
+        // The installed tables: the source's newest write of each key, if it is
+        // live, at the install's number.
+        let mut merge: MergeIter<FileOf<E>> = MergeIter::new(
+            source
+                .tables
+                .iter()
+                .map(|(_, r)| Source::Sst(r.iter()))
+                .collect(),
+        );
+        let mut added = Vec::new();
+        let mut writer = SstWriter::new();
+        let mut last_user: Option<Bytes> = None;
+        let mut keys = 0;
+        while let Some((key, value)) = merge.next().await? {
+            let (user, _) = ikey::decode(&key)?;
+            if last_user.as_ref() == Some(&user) {
+                continue;
+            }
+            last_user = Some(user.clone());
+            if !in_span(&user) {
+                // The manifest's key ranges said otherwise. The tables written so
+                // far are orphans, which the next open removes.
+                return Err(InstallRefused::OutsideSpan {
+                    first: user.clone(),
+                    last: user,
+                }
+                .into_io());
+            }
+            if value == Value::Tombstone {
+                continue;
+            }
+            if writer.entries() > 0 && writer.bytes_so_far() as u64 >= self.config.sst_bytes {
+                let full = std::mem::take(&mut writer);
+                added.push(self.write_output(full, 0).await?);
+            }
+            writer.add(&user, seq, &value);
+            keys += 1;
+        }
+        if writer.entries() > 0 {
+            added.push(self.write_output(writer, 0).await?);
+        }
+
+        let traced_rewrites: Vec<(u64, u64, Bytes, Bytes)> = rewritten
+            .iter()
+            .map(|(from, m, _)| (*from, m.number, m.first_key.clone(), m.last_key.clone()))
+            .collect();
+        let traced_added: Vec<(u64, Bytes, Bytes)> = added
+            .iter()
+            .map(|(m, _)| (m.number, m.first_key.clone(), m.last_key.clone()))
+            .collect();
+        let event = |manifest: u64| TraceEvent::SpanInstalled {
+            manifest,
+            start: range.start.clone(),
+            end: range.end.clone(),
+            seq,
+            removed: removed.clone(),
+            rewritten: traced_rewrites.clone(),
+            added: traced_added.clone(),
+        };
+        let (rewrites, added_count) = (rewritten.len(), added.len());
+        let rewritten_metas: Vec<SstMeta> = rewritten.iter().map(|(_, m, _)| m.clone()).collect();
+        let added_metas: Vec<SstMeta> = added.iter().map(|(m, _)| m.clone()).collect();
+        let rewritten: Vec<(SstMeta, SstReader<FileOf<E>>)> =
+            rewritten.into_iter().map(|(_, m, r)| (m, r)).collect();
+        if self.config.variant == Variant::InstallInTwoSwitches {
+            // The bug: the span's keys go with one switch and the installed tables
+            // come with a second. A crash between the two leaves the span empty.
+            let mut first = self.manifest_edit(&removed, rewritten_metas);
+            first.flushed_seq = first.flushed_seq.max(seq);
+            self.write_manifest(&first).await?;
+            self.install(first, &removed, rewritten);
+            let mut next = self.manifest_edit(&[], added_metas);
+            next.flushed_seq = next.flushed_seq.max(seq);
+            self.env.trace(event(next.number));
+            self.write_manifest(&next).await?;
+            self.install(next, &[], added);
+        } else {
+            let mut next = self.manifest_edit(
+                &removed,
+                rewritten_metas.into_iter().chain(added_metas).collect(),
+            );
+            next.flushed_seq = next.flushed_seq.max(seq);
+            self.env.trace(event(next.number));
+            self.write_manifest(&next).await?;
+            let mut put_in = rewritten;
+            put_in.extend(added);
+            self.install(next, &removed, put_in);
+        }
+        let manifest = lock(&self.tables).manifest.number;
+        self.delete_tables(&removed).await?;
+        self.wal.delete_segments_through(seq).await?;
+        Ok(InstallInfo {
+            seq,
+            manifest,
+            removed: removed.len(),
+            rewritten: rewrites,
+            added: added_count,
+            keys,
+        })
+    }
+}
+
+/// Writes `writer` into `dir` as table `number` at level 0, synced, for a checkpoint
+/// of a span.
+async fn write_level_0_table<E: Environment>(
+    shared: &Shared<E>,
+    dir: &Path,
+    number: u64,
+    writer: SstWriter,
+) -> io::Result<SstMeta> {
+    let (first_key, last_key) = writer.key_range().expect("a table has writes");
+    let (first_seq, max_seq) = writer.seq_range().expect("a table has writes");
+    let entries = writer.entries();
+    let bytes = writer.finish();
+    let len = bytes.len() as u64;
+    let path = sst_path(dir, number);
+    if shared.config.variant == Variant::SpanCheckpointUnsynced {
+        // The bug: the table is written and never synced, though the manifest and
+        // CURRENT that name it are.
+        let file = shared
+            .env
+            .fs()
+            .open(&path, OpenOptions::new().write(true).create_new(true))
+            .await?;
+        file.write_at(0, bytes).await?;
+    } else {
+        write_file(&shared.env, &path, bytes).await?;
+    }
+    Ok(SstMeta {
+        number,
+        level: 0,
+        first_seq,
+        max_seq,
+        entries,
+        bytes: len,
+        first_key,
+        last_key,
+    })
+}
+
+/// A store read and checked whole, to install over a span with
+/// [`Engine::install_span`]: what [`Engine::checkpoint_span`] writes, or any store
+/// whose keys all lie inside the span it is installed over.
+// PROPOSED(D-054): the live install of a span, in one manifest switch.
+pub struct SpanSource<E: Environment> {
+    tables: Vec<(SstMeta, Arc<SstReader<FileOf<E>>>)>,
+}
+
+impl<E: Environment> SpanSource<E> {
+    /// A source holding nothing: installing it takes the span's keys out and puts
+    /// nothing in.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self { tables: Vec::new() }
+    }
+
+    /// The smallest and largest user key the source's tables say they hold, if
+    /// they hold any.
+    #[must_use]
+    pub fn key_range(&self) -> Option<(Bytes, Bytes)> {
+        let first = self.tables.iter().map(|(m, _)| &m.first_key).min()?;
+        let last = self.tables.iter().map(|(m, _)| &m.last_key).max()?;
+        Some((first.clone(), last.clone()))
+    }
+
+    /// Tables in the source.
+    #[must_use]
+    pub fn tables(&self) -> usize {
+        self.tables.len()
+    }
+}
+
+impl<E: Environment> std::fmt::Debug for SpanSource<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SpanSource")
+            .field("tables", &self.tables.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// An install on its way: numbered at once, and resolving once the switch that
+/// makes it the state is durable, or with the refusal.
+// PROPOSED(D-054): the live install of a span, in one manifest switch.
+pub struct SpanInstall {
+    seq: Option<Seq>,
+    future: Pin<Box<dyn Future<Output = io::Result<InstallInfo>> + Send>>,
+}
+
+impl SpanInstall {
+    /// The install's sequence number, known before anything is written; `None` when
+    /// it was refused before it took one.
+    #[must_use]
+    pub fn seq(&self) -> Option<Seq> {
+        self.seq
+    }
+}
+
+impl std::fmt::Debug for SpanInstall {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SpanInstall")
+            .field("seq", &self.seq)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Future for SpanInstall {
+    type Output = io::Result<InstallInfo>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<InstallInfo>> {
+        self.future.as_mut().poll(cx)
+    }
+}
+
+/// Marks the install in progress for as long as its future lives, and lets the
+/// flusher at the memtables it held back once the future is done or dropped.
+// PROPOSED(D-054): the live install of a span, in one manifest switch.
+struct InstallHold<E: Environment> {
+    shared: Arc<Shared<E>>,
+    seq: Seq,
+}
+
+impl<E: Environment> Drop for InstallHold<E> {
+    fn drop(&mut self) {
+        {
+            let mut install = lock(&self.shared.install);
+            if *install == Some(self.seq) {
+                *install = None;
+            }
+        }
+        let waker = lock(&self.shared.flusher).waker.take();
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
 }
 
 /// A write on its way to the log; resolves with its sequence number once durable and
@@ -1520,7 +2165,13 @@ impl<E: Environment> Future for NextImmutable<'_, E> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Arc<Memtable>>> {
         if let Some(memtable) = lock(&self.0.tables).immutable.front().cloned() {
-            return Poll::Ready(Some(memtable));
+            // PROPOSED(D-054): a memtable past an install in progress waits for its
+            // switch, so no table holding a write newer than the install is written
+            // before the installed tables are.
+            let held = lock(&self.0.install).is_some_and(|seq| memtable.min_seq() > seq);
+            if !held {
+                return Poll::Ready(Some(memtable));
+            }
         }
         let mut flusher = lock(&self.0.flusher);
         if flusher.closed {
@@ -1550,25 +2201,17 @@ async fn flusher<E: Environment>(shared: Arc<Shared<E>>) {
         let flushed = async {
             {
                 let _turn = shared.turnstile.acquire().await;
-                let (meta, reader) = shared.write_sst(&memtable).await?;
-                let mut next = shared.manifest_edit(&[], vec![meta.clone()]);
-                next.flushed_seq = meta.max_seq;
-                let max_seq = meta.max_seq;
-                if shared.config.variant == Variant::ReleaseBeforeManifest {
-                    // The bug: the table is taken for durable once written. It serves
-                    // reads, the memtable goes, the log segments go, and only then is
-                    // the manifest written. A crash before the manifest is durable
-                    // leaves the table an orphan and its records nowhere.
-                    shared.install(next.clone(), &[], vec![(meta, reader)]);
-                    shared.release(&memtable);
-                    shared.wal.delete_segments_through(max_seq).await?;
-                    shared.write_manifest(&next).await?;
-                } else {
-                    shared.write_manifest(&next).await?;
-                    shared.install(next, &[], vec![(meta, reader)]);
-                    shared.release(&memtable);
-                    shared.wal.delete_segments_through(max_seq).await?;
+                // PROPOSED(D-054): an install flushes the memtables at or below its
+                // number itself, under the turnstile; one this task was handed
+                // before that is gone from the queue's head by the time it gets in.
+                let still_head = lock(&shared.tables)
+                    .immutable
+                    .front()
+                    .is_some_and(|front| Arc::ptr_eq(front, &memtable));
+                if !still_head {
+                    return Ok(());
                 }
+                shared.flush(&memtable).await?;
             }
             if shared.config.background_compaction {
                 loop {

@@ -12,8 +12,14 @@
 //! a table or manifest gone without a fault is a bug. On top of it, the state after
 //! recovery must equal the model folded over exactly the records that survived, and
 //! every live read during the run must return what the model holds for a key with no
-//! write in flight. All three [`Variant`]s run through the same checks; the correct
+//! write in flight. Every [`Variant`] runs through the same checks; the correct
 //! engine must pass every seed and each buggy one must fail some (CLAUDE.md).
+//!
+//! With [`Schedule::install`] it is the live install's crash test (Q2, D-054): a task
+//! checkpoints random spans and installs each over its span a little later, every
+//! crash is aimed at an install, and each recovery must bring every span back as it
+//! was or as installed, never a mixture, with every write after an install read over
+//! it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -69,6 +75,20 @@ pub struct Schedule {
     /// Whether the engine may fall back to an older intact manifest when `CURRENT`
     /// or the manifest it names cannot be read; off, it refuses the store (D-022).
     pub allow_manifest_fallback: bool,
+    /// Whether a task takes checkpoints of random spans and installs each over its
+    /// span a little later, while the writers write every key (D-054).
+    // PROPOSED(D-054): the live install's crash test.
+    pub installs: bool,
+    /// Whether each crash is aimed at an install: the harness waits for one to be
+    /// asked for and crashes at a time drawn uniformly from the next
+    /// `install_window`, so a crash lands in every step of it and past its end.
+    // PROPOSED(D-054): the live install's crash test.
+    pub aim_at_installs: bool,
+    /// See `aim_at_installs`.
+    pub install_window: Duration,
+    /// How long after an install's replacement is written a crash aimed at its
+    /// switch may land.
+    pub switch_window: Duration,
 }
 
 impl Default for Schedule {
@@ -90,11 +110,28 @@ impl Default for Schedule {
             level_base_bytes: 1024,
             sst_bytes: 2048,
             allow_manifest_fallback: true,
+            installs: false,
+            aim_at_installs: false,
+            install_window: Duration::from_millis(12),
+            switch_window: Duration::from_millis(3),
         }
     }
 }
 
 impl Schedule {
+    /// The live install's crash test (Q2, D-054): the default workload with a task
+    /// that checkpoints random spans and installs each over its span a little
+    /// later, and every crash aimed at an install.
+    // PROPOSED(D-054): the live install's crash test.
+    #[must_use]
+    pub fn install() -> Self {
+        Self {
+            installs: true,
+            aim_at_installs: true,
+            ..Self::default()
+        }
+    }
+
     /// The nightly's deep-levels shape: level limits so small that a few kilobytes of
     /// live data overflow level 1 into 2 and level 2 into 3 and below, so the rounds
     /// that only deep levels take are exercised. Everything else as the default.
@@ -139,6 +176,31 @@ pub struct Checkpoint {
     pub expected: BTreeMap<Bytes, Value>,
 }
 
+/// An install the run asked for (D-054): the span, the state of the span it
+/// installs, and whether it is taken to be the state.
+// PROPOSED(D-054): the live install's crash test.
+#[derive(Clone, Debug)]
+pub struct InstallRecord {
+    /// The span's first key.
+    pub start: Bytes,
+    /// The key past its last.
+    pub end: Bytes,
+    /// The live keys the installed source holds, with their values: the span's
+    /// state at the checkpoint the install was taken from.
+    pub entries: BTreeMap<Bytes, Bytes>,
+    /// Whether the fold takes the install as made: during the run once it resolved,
+    /// and after a recovery when the manifest in force is in its lineage.
+    pub applied: bool,
+}
+
+impl InstallRecord {
+    /// Whether `key` is in the span.
+    #[must_use]
+    pub fn covers(&self, key: &[u8]) -> bool {
+        self.start[..] <= *key && *key < self.end[..]
+    }
+}
+
 /// What the writers know, on top of the log model: the ops in log order, which keys
 /// have a write in flight, the committed value per key, and which records are gone
 /// for good with an explanation.
@@ -172,6 +234,21 @@ pub struct Model {
     pub batches: u64,
     /// Writes that asked for no sync over the run.
     pub unsynced: u64,
+    /// Installs by the sequence number of their log record, which holds no write
+    /// (D-054).
+    pub installs: BTreeMap<u64, InstallRecord>,
+    /// The span of the install asked for and not yet resolved: reads of its keys
+    /// are not judged meanwhile.
+    pub installing: Option<(Bytes, Bytes)>,
+    /// Installs asked for over the run.
+    pub installs_started: u64,
+    /// Installs that resolved over the run.
+    pub installs_completed: u64,
+    /// Checkpoints of a span taken over the run.
+    pub span_checkpoints: u64,
+    /// Live reads of a key an install had installed, after it resolved, that a
+    /// later write had overwritten, and that agreed with the model.
+    pub reads_over_installs: u64,
 }
 
 impl Model {
@@ -182,6 +259,16 @@ impl Model {
         let mut state = BTreeMap::new();
         for (i, record) in self.ops[..n].iter().enumerate() {
             let seq = i as u64 + 1;
+            // PROPOSED(D-054): an install made replaces its span's keys whole.
+            if let Some(install) = self.installs.get(&seq).filter(|i| i.applied) {
+                state.retain(|key: &Bytes, _| !install.covers(key));
+                for (key, value) in &install.entries {
+                    if !self.lost_writes.contains(&(key.clone(), seq)) {
+                        state.insert(key.clone(), Value::Live(value.clone()));
+                    }
+                }
+                continue;
+            }
             for (key, value) in effective(record) {
                 if self.lost_writes.contains(&(key.clone(), seq)) {
                     continue;
@@ -234,16 +321,49 @@ pub struct Mirror {
     pending_inputs: BTreeMap<u64, Vec<u64>>,
     /// Tables the latest open dropped, out of service until the next one.
     dropped_at_open: BTreeSet<u64>,
+    /// Every install whose replacement the trace saw written, in order, less those
+    /// a fallback's lineage abandoned (D-054).
+    pub installs: Vec<InstallMirror>,
+    /// Starts of the node seen so far: an install belongs to the start it was
+    /// written in, and a manifest another start writes under its number is not
+    /// its manifest.
+    starts: u64,
+}
+
+/// What the trace says one install did (D-054).
+// PROPOSED(D-054): the live install's crash test.
+#[derive(Clone, Debug)]
+pub struct InstallMirror {
+    /// The manifest that makes it the state.
+    pub manifest: u64,
+    /// Its sequence number.
+    pub seq: u64,
+    /// The span's first key.
+    pub start: Bytes,
+    /// The key past its last.
+    pub end: Bytes,
+    /// The writes of the span below `seq` that the tables it took out held: gone
+    /// once its manifest is in force.
+    pub dropped: BTreeSet<(Bytes, u64)>,
+    /// The start of the node it was written in.
+    start_of_node: u64,
 }
 
 impl Mirror {
-    /// Mirrors `events` against `ops`.
+    /// Mirrors `events` against `ops` and the installs the run asked for.
     #[must_use]
-    pub fn build(events: &[&TraceEvent], ops: &[Record]) -> Self {
+    pub fn build(
+        events: &[&TraceEvent],
+        ops: &[Record],
+        installs: &BTreeMap<u64, InstallRecord>,
+    ) -> Self {
         let mut mirror = Self::default();
         for event in events {
             match event {
-                TraceEvent::NodeRestarted { .. } => mirror.dropped_at_open.clear(),
+                TraceEvent::NodeRestarted { .. } => {
+                    mirror.dropped_at_open.clear();
+                    mirror.starts += 1;
+                }
                 TraceEvent::SstDropped { number, .. } => {
                     mirror.dropped_at_open.insert(*number);
                 }
@@ -298,6 +418,12 @@ impl Mirror {
                     mirror.manifests.insert(*number, tables.clone());
                     mirror.compactions.retain(|(n, _)| *n < *number);
                     mirror.compactions.extend(current);
+                    // PROPOSED(D-054): an install written in another start of the
+                    // node is not this manifest's, whatever its number.
+                    let starts = mirror.starts;
+                    mirror.installs.retain(|i| {
+                        i.manifest < *number || (i.manifest == *number && i.start_of_node == starts)
+                    });
                     if let Some(inputs) = mirror.pending_inputs.remove(number) {
                         mirror.finished_inputs.extend(inputs);
                     }
@@ -310,6 +436,17 @@ impl Mirror {
                     snapshot,
                     ..
                 } => mirror.compaction(ops, *level, *manifest, inputs, outputs, *snapshot),
+                TraceEvent::SpanInstalled {
+                    manifest,
+                    start,
+                    end,
+                    seq,
+                    removed,
+                    rewritten,
+                    added,
+                } => mirror.install(
+                    installs, *manifest, start, end, *seq, removed, rewritten, added,
+                ),
                 TraceEvent::SstDeleted { number } => {
                     if mirror.finished_inputs.contains(number) {
                         mirror.deleted.insert(*number);
@@ -324,6 +461,83 @@ impl Mirror {
             }
         }
         mirror
+    }
+
+    /// An install's replacement: the rewritten tables hold their originals' writes
+    /// less the span's below the install, the installed tables hold the source's
+    /// live keys at the install's number, split by the key ranges the trace gives,
+    /// and every write of the span below it that a table taken out held is dropped.
+    // PROPOSED(D-054): the live install's crash test.
+    #[allow(clippy::too_many_arguments)]
+    fn install(
+        &mut self,
+        installs: &BTreeMap<u64, InstallRecord>,
+        manifest: u64,
+        start: &Bytes,
+        end: &Bytes,
+        seq: u64,
+        removed: &[u64],
+        rewritten: &[(u64, u64, Bytes, Bytes)],
+        added: &[(u64, Bytes, Bytes)],
+    ) {
+        let in_span = |key: &Bytes| start <= key && key < end;
+        let dropped: BTreeSet<(Bytes, u64)> = removed
+            .iter()
+            .filter_map(|t| self.tables.get(t))
+            .flat_map(|t| t.writes.iter())
+            .filter(|(key, s)| in_span(key) && *s < seq)
+            .cloned()
+            .collect();
+        for (from, to, first, last) in rewritten {
+            let (level, writes) = self.tables.get(from).map_or((0, BTreeSet::new()), |t| {
+                (
+                    t.level,
+                    t.writes
+                        .iter()
+                        .filter(|(key, s)| !(in_span(key) && *s < seq))
+                        .cloned()
+                        .collect(),
+                )
+            });
+            self.tables.insert(
+                *to,
+                TableMirror {
+                    level,
+                    first_key: first.clone(),
+                    last_key: last.clone(),
+                    writes,
+                },
+            );
+        }
+        let installed: Vec<Bytes> = installs
+            .get(&seq)
+            .map(|i| i.entries.keys().cloned().collect())
+            .unwrap_or_default();
+        for (number, first, last) in added {
+            let writes = installed
+                .iter()
+                .filter(|key| first <= *key && *key <= last)
+                .map(|key| (key.clone(), seq))
+                .collect();
+            self.tables.insert(
+                *number,
+                TableMirror {
+                    level: 0,
+                    first_key: first.clone(),
+                    last_key: last.clone(),
+                    writes,
+                },
+            );
+        }
+        self.pending_inputs.insert(manifest, removed.to_vec());
+        self.installs.push(InstallMirror {
+            manifest,
+            seq,
+            start: start.clone(),
+            end: end.clone(),
+            dropped,
+            start_of_node: self.starts,
+        });
     }
 
     /// Merges the inputs by the engine's rules and fills in the outputs.
@@ -464,6 +678,29 @@ pub struct Refusal {
     pub verdict: Result<(), String>,
 }
 
+/// What became of the installs a run asked for, judged at the recovery after the
+/// crash that followed each (D-054).
+// PROPOSED(D-054): the live install's crash test.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct InstallOutcomes {
+    /// Crashes the harness aimed at an install.
+    pub aimed: u64,
+    /// Installs that had resolved before the crash and were in force after it.
+    pub kept: u64,
+    /// Installs that had not resolved when the node crashed and were in force after
+    /// it: the crash came after the switch.
+    pub crashed_after_switch: u64,
+    /// Installs that had not resolved when the node crashed and were not in force
+    /// after it: the span came back as it was.
+    pub crashed_before_switch: u64,
+    /// Installs that had resolved and were not in force after the crash: a fault
+    /// sent recovery back to an older manifest.
+    pub lost_to_a_fault: u64,
+    /// Keys of a span an install in force covered, written again after the install
+    /// and present after the crash, which the state check read over the install.
+    pub keys_written_after: u64,
+}
+
 /// What one run produced.
 #[derive(Debug)]
 pub struct Report {
@@ -489,6 +726,17 @@ pub struct Report {
     pub checkpoints_verified: u64,
     /// Checkpoints a fault touched, not checked.
     pub checkpoints_damaged: u64,
+    /// Installs asked for (D-054).
+    pub installs_started: u64,
+    /// Installs that resolved.
+    pub installs_completed: u64,
+    /// Checkpoints of a span taken.
+    pub span_checkpoints: u64,
+    /// Live reads of an installed key that a later write had overwritten, after
+    /// the install resolved, that agreed with the model.
+    pub reads_over_installs: u64,
+    /// What became of the installs.
+    pub install_outcomes: InstallOutcomes,
     /// The whole trace.
     pub records: Vec<TraceRecord>,
     /// The trace as moirae JSONL.
@@ -567,6 +815,7 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
     let mut previous_manifest: Option<(u64, u64)> = None;
     let mut refused = None;
     let (mut checkpoints_verified, mut checkpoints_damaged) = (0u64, 0u64);
+    let mut install_outcomes = InstallOutcomes::default();
     for crash in 0..=schedule.crashes {
         let before_open = sim.trace().len();
         let dir = Path::new(DIR);
@@ -643,8 +892,11 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
         // record is present if a table in service holds it or the log replayed it;
         // every other record the tables owed needs an explanation, else it is a
         // violation.
-        let ops_now: Vec<Record> = lock(&model).ops.clone();
-        let mirror = Mirror::build(&all, &ops_now);
+        let (ops_now, installs_now): (Vec<Record>, BTreeMap<u64, InstallRecord>) = {
+            let m = lock(&model);
+            (m.ops.clone(), m.installs.clone())
+        };
+        let mirror = Mirror::build(&all, &ops_now, &installs_now);
         // What the manifest in force lists comes from the recovery, not the trace: a
         // manifest can be whole on disk without the sync that would have reported it
         // written, as CURRENT can name it without the sync that reports the switch.
@@ -657,29 +909,60 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
             .collect();
         let last_recovered = recovery.first_seq_end();
         let replayed = (recovery.flushed_seq + 1).max(recovery.wal.first_seq)..=last_recovered;
+        // PROPOSED(D-054): an install is in force when the manifest in force is in
+        // the lineage of the manifest that made it: its number at or below, and not
+        // abandoned by a fallback. Its writes are then the source's keys at its
+        // number, held by the tables it added; and the span's writes below it that
+        // the tables it took out held are gone, as a compaction's dropped writes are.
+        // An install not in force holds no write: its log record holds none.
+        let in_force: BTreeMap<u64, &InstallMirror> = mirror
+            .installs
+            .iter()
+            .filter(|i| i.manifest <= recovery.manifest)
+            .map(|i| (i.seq, i))
+            .collect();
         // A write is present if a table in service holds it or the log replayed its
-        // record; a record is present if any of its writes is.
+        // record; a record is present if any of its writes is. An install's writes
+        // are never replayed: its record holds none.
+        let held_in_service = |key: &Bytes, seq: u64| {
+            in_service.iter().any(|t| {
+                mirror
+                    .tables
+                    .get(t)
+                    .is_some_and(|t| t.writes.contains(&(key.clone(), seq)))
+            })
+        };
         let present_write = |key: &Bytes, seq: u64| {
-            (!recovery.wal.records.is_empty() && replayed.contains(&seq))
-                || in_service.iter().any(|t| {
-                    mirror
-                        .tables
-                        .get(t)
-                        .is_some_and(|t| t.writes.contains(&(key.clone(), seq)))
-                })
+            (!recovery.wal.records.is_empty()
+                && replayed.contains(&seq)
+                && !installs_now.contains_key(&seq))
+                || held_in_service(key, seq)
         };
         let writes_of = |seq: u64| -> Vec<Bytes> {
+            if let Some(install) = installs_now.get(&seq) {
+                return if in_force.contains_key(&seq) {
+                    install.entries.keys().cloned().collect()
+                } else {
+                    Vec::new()
+                };
+            }
             ops_now
                 .get(seq as usize - 1)
                 .map(|record| effective(record).into_iter().map(|(k, _)| k).collect())
                 .unwrap_or_default()
         };
-        let present = |seq: u64| writes_of(seq).iter().any(|k| present_write(k, seq));
+        // A record with no write in it, an install's not in force or holding
+        // nothing, has nothing to lose.
+        let present = |seq: u64| {
+            let writes = writes_of(seq);
+            writes.is_empty() || writes.iter().any(|k| present_write(k, seq))
+        };
         let compacted_writes: BTreeSet<(Bytes, u64)> = mirror
             .compactions
             .iter()
             .filter(|(manifest, _)| *manifest <= recovery.manifest)
             .flat_map(|(_, dropped)| dropped.iter().cloned())
+            .chain(in_force.values().flat_map(|i| i.dropped.iter().cloned()))
             .collect();
         let mut verdict = Ok(());
         let synced = syncs(&events, dir);
@@ -913,6 +1196,26 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
                 excused.insert(seq, why);
             }
         }
+        // PROPOSED(D-054): a record holding no write, an install's, is in no table,
+        // so no table a fallback left behind speaks for it; but a manifest that
+        // covered it let the log segment holding it go, as it let its neighbours'
+        // go. Past the manifest in force, up to the furthest any manifest covered,
+        // the fallback that explains its neighbours explains it.
+        if let Some(why) = fallback_why {
+            let covered = all_synced
+                .manifest_flushed
+                .values()
+                .copied()
+                .max()
+                .unwrap_or(0)
+                .max(owed_through)
+                .min(ops_now.len() as u64);
+            for seq in (recovery.flushed_seq + 1)..=covered {
+                if writes_of(seq).is_empty() {
+                    excused.entry(seq).or_insert(why);
+                }
+            }
+        }
         // After a missing head the log is discarded: nothing replays, and the state
         // must be the manifest's prefix and nothing else (D-022).
         if verdict.is_ok()
@@ -924,9 +1227,92 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
                 recovery.replayed
             ));
         }
+        // PROPOSED(D-054): Q2's criterion. A span an install covered comes back as it
+        // was or as installed, never a mixture: with the install in force no table in
+        // service and no replayed record holds a write of the span older than it, and
+        // without it no table in service holds a write it installed. What is there
+        // besides is the model's to judge, key by key, below.
+        for (&seq, install) in &installs_now {
+            let resolved = install.applied;
+            if in_force.contains_key(&seq) {
+                let stale = in_service.iter().find_map(|t| {
+                    mirror.tables.get(t).and_then(|table| {
+                        table
+                            .writes
+                            .iter()
+                            .find(|(key, s)| install.covers(key) && *s < seq)
+                            .map(|(key, s)| (*t, key.clone(), *s))
+                    })
+                });
+                let replayed_stale = (1..seq).find(|&s| {
+                    !recovery.wal.records.is_empty()
+                        && replayed.contains(&s)
+                        && writes_of(s).iter().any(|key| install.covers(key))
+                });
+                if verdict.is_ok() {
+                    if let Some((table, key, s)) = stale {
+                        verdict = Err(format!(
+                            "the install at record {seq} is in force (manifest {}) but table {table} still holds the write of {} at record {s}: a mixture",
+                            recovery.manifest,
+                            String::from_utf8_lossy(&key)
+                        ));
+                    } else if let Some(s) = replayed_stale {
+                        verdict = Err(format!(
+                            "the install at record {seq} is in force (manifest {}) but the log replayed record {s}, which writes its span: a mixture",
+                            recovery.manifest
+                        ));
+                    }
+                }
+                if seq > base as u64 {
+                    if resolved {
+                        install_outcomes.kept += 1;
+                    } else {
+                        install_outcomes.crashed_after_switch += 1;
+                    }
+                }
+            } else {
+                let installed = install.entries.keys().find(|key| held_in_service(key, seq));
+                if verdict.is_ok()
+                    && let Some(key) = installed
+                {
+                    verdict = Err(format!(
+                        "the install at record {seq} is not in force (manifest {}) but a table in service holds its write of {}: a mixture",
+                        recovery.manifest,
+                        String::from_utf8_lossy(key)
+                    ));
+                }
+                if seq > base as u64 {
+                    if resolved {
+                        install_outcomes.lost_to_a_fault += 1;
+                    } else {
+                        install_outcomes.crashed_before_switch += 1;
+                    }
+                }
+            }
+        }
         let end = usize::try_from(recovery.flushed_seq.max(last_recovered)).expect("fits");
+        // Keys of a span an install in force covers whose newest write is newer than
+        // the install: the state check below reads each over the installed version.
+        for (&seq, install) in &installs_now {
+            if !in_force.contains_key(&seq) {
+                continue;
+            }
+            let later: BTreeSet<Bytes> = ((seq + 1)..=end as u64)
+                .flat_map(|s| {
+                    writes_of(s)
+                        .into_iter()
+                        .filter(move |key| install.covers(key) && present_write(key, s))
+                })
+                .collect();
+            install_outcomes.keys_written_after += later.len() as u64;
+        }
         {
             let mut m = lock(&model);
+            // PROPOSED(D-054): the fold takes an install as made exactly when it is
+            // in force.
+            for (seq, install) in m.installs.iter_mut() {
+                install.applied = in_force.contains_key(seq);
+            }
             m.lost = (1..=end as u64).filter(|&seq| !present(seq)).collect();
             m.lost_writes = (1..=end as u64)
                 .flat_map(|seq| {
@@ -1011,10 +1397,15 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
         // a fault touched its files, which the crash's bit rot or a lost sync can.
         let pending: Vec<Checkpoint> = std::mem::take(&mut lock(&model).checkpoints);
         for checkpoint in pending {
+            // A torn write alone does not count: every file of a checkpoint is synced
+            // before the checkpoint completes, so a crash can tear one only if its
+            // sync was lost, which `FsyncLost` says, or never made, which is the bug
+            // `SpanCheckpointUnsynced` is.
+            // PROPOSED(D-054): a torn checkpoint file needs a lost sync to excuse it.
             let touched = all.iter().any(|e| match e {
-                TraceEvent::BlockRotted { path, .. }
-                | TraceEvent::FsyncLost { path }
-                | TraceEvent::WriteTorn { path, .. } => path.starts_with(&checkpoint.dir),
+                TraceEvent::BlockRotted { path, .. } | TraceEvent::FsyncLost { path } => {
+                    path.starts_with(&checkpoint.dir)
+                }
                 _ => false,
             });
             if touched {
@@ -1038,6 +1429,8 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
             m.log.sync_requested.truncate(base);
             m.log.acked.iter_mut().for_each(|a| *a = true);
             m.ops.truncate(base);
+            m.installs.retain(|&seq, _| seq <= base as u64);
+            m.installing = None;
             m.in_flight.clear();
             m.committed = m
                 .state_after(base)
@@ -1054,6 +1447,42 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
         let span = schedule.run_max.saturating_sub(schedule.run_min);
         let extra = Duration::from_nanos(harness.below(span.as_nanos() as u64 + 1));
         sim.run_for(schedule.run_min + extra);
+        // PROPOSED(D-054): the crash aimed at an install. On half the epochs anywhere
+        // from the moment the next one is asked for to past its end; on the other
+        // half from the moment its replacement is written, just before its switch,
+        // to past the switch, where a crash decides between the span as it was and
+        // as installed.
+        if schedule.aim_at_installs {
+            let deadline = sim.now() + Duration::from_millis(50);
+            let step = Duration::from_micros(50);
+            let (found, window) = if harness.below(2) == 0 {
+                let started = lock(&model).installs_started;
+                while lock(&model).installs_started == started && sim.now() < deadline {
+                    sim.run_for(step);
+                }
+                (
+                    lock(&model).installs_started > started,
+                    schedule.install_window,
+                )
+            } else {
+                let mut seen = sim.trace_len();
+                let mut found = false;
+                while !found && sim.now() < deadline {
+                    sim.run_for(step);
+                    found = sim
+                        .trace_from(seen)
+                        .iter()
+                        .any(|r| matches!(r.event, TraceEvent::SpanInstalled { .. }));
+                    seen = sim.trace_len();
+                }
+                (found, schedule.switch_window)
+            };
+            if found {
+                let window = window.as_nanos() as u64;
+                sim.run_for(Duration::from_nanos(harness.below(window + 1)));
+                install_outcomes.aimed += 1;
+            }
+        }
         // Then a few more scheduling steps, so the crash lands between two polls at
         // one instant and not only where every queue has drained.
         sim.run_steps(harness.below(64));
@@ -1063,6 +1492,15 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
     let (reads, scans, batches, unsynced, checkpoints_taken) = {
         let m = lock(&model);
         (m.reads, m.scans, m.batches, m.unsynced, m.checkpoints_taken)
+    };
+    let (installs_started, installs_completed, span_checkpoints, reads_over_installs) = {
+        let m = lock(&model);
+        (
+            m.installs_started,
+            m.installs_completed,
+            m.span_checkpoints,
+            m.reads_over_installs,
+        )
     };
     Report {
         seed,
@@ -1076,6 +1514,11 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
         checkpoints_taken,
         checkpoints_verified,
         checkpoints_damaged,
+        installs_started,
+        installs_completed,
+        span_checkpoints,
+        reads_over_installs,
+        install_outcomes,
         jsonl: sim
             .to_moirae(&Export::new(&bytes_decoder))
             .expect("the engine trace exports to moirae v2"),
@@ -1416,6 +1859,122 @@ fn spawn_clients(sim: &Sim, node: NodeId, db: Db, schedule: &Schedule, model: &S
             }
         });
     }
+    // PROPOSED(D-054): one task checkpoints a random span now and then and installs
+    // the checkpoint over the span a little later, while the writers go on writing
+    // every key: the install rolls the span back to the checkpoint, and every write
+    // after the install's number is newer than it.
+    if schedule.installs {
+        let (env, db, model) = (sim.env(node), db.clone(), model.clone());
+        env.clone().spawn("installer", async move {
+            loop {
+                let gap = 1000 + env.rng().below(4000);
+                env.clock().sleep(Duration::from_micros(gap)).await;
+                let lo = env.rng().below(KEYS);
+                let hi = (lo + 1 + env.rng().below(12)).min(KEYS);
+                let (start, end) = (key(lo), key(hi));
+                let n = {
+                    let mut m = lock(&model);
+                    m.span_checkpoints += 1;
+                    m.span_checkpoints - 1
+                };
+                let dir = PathBuf::from(format!("/stage/{n:04}"));
+                let Ok(info) = db.checkpoint_span(&start[..]..&end[..], &dir).await else {
+                    return;
+                };
+                let entries: BTreeMap<Bytes, Bytes> = {
+                    let mut m = lock(&model);
+                    let version = usize::try_from(info.version).expect("fits");
+                    let expected: BTreeMap<Bytes, Value> = m
+                        .state_after(version.min(m.ops.len()))
+                        .into_iter()
+                        .filter(|(k, _)| start <= *k && *k < end)
+                        .collect();
+                    m.checkpoints.push(Checkpoint {
+                        dir: dir.clone(),
+                        version: info.version,
+                        expected: expected.clone(),
+                    });
+                    expected
+                        .into_iter()
+                        .filter_map(|(k, v)| v.live().map(|v| (k, v)))
+                        .collect()
+                };
+                let gap = 500 + env.rng().below(3000);
+                env.clock().sleep(Duration::from_micros(gap)).await;
+                let source = match db.open_span_source(&dir).await {
+                    Ok(source) => source,
+                    Err(error) => {
+                        lock(&model).read_violations.push(format!(
+                            "the span checkpoint in {} does not read back to install: {error}",
+                            dir.display()
+                        ));
+                        return;
+                    }
+                };
+                let install = db.install_span(start.clone()..end.clone(), source);
+                let Some(seq) = install.seq() else {
+                    lock(&model).read_violations.push(format!(
+                        "an install of k{lo:02}..k{hi:02} was refused at once"
+                    ));
+                    return;
+                };
+                {
+                    let mut m = lock(&model);
+                    m.log.appended.push(engine::encode_batch(&[]));
+                    m.log.acked.push(false);
+                    m.log.sync_requested.push(true);
+                    m.ops.push(Vec::new());
+                    assert_eq!(
+                        m.ops.len() as u64,
+                        seq,
+                        "the model and the log number the install alike"
+                    );
+                    m.installs.insert(
+                        seq,
+                        InstallRecord {
+                            start: start.clone(),
+                            end: end.clone(),
+                            entries: entries.clone(),
+                            applied: false,
+                        },
+                    );
+                    m.installing = Some((start.clone(), end.clone()));
+                    m.installs_started += 1;
+                    for i in lo..hi {
+                        *m.in_flight.entry(key(i)).or_default() += 1;
+                    }
+                }
+                if let Err(error) = install.await {
+                    lock(&model)
+                        .read_violations
+                        .push(format!("the install at record {seq} failed: {error}"));
+                    return;
+                }
+                let mut m = lock(&model);
+                if let Some(acked) = m.log.acked.get_mut(seq as usize - 1) {
+                    *acked = true;
+                }
+                if let Some(install) = m.installs.get_mut(&seq) {
+                    install.applied = true;
+                }
+                for i in lo..hi {
+                    let k = key(i);
+                    if let Some(n) = m.in_flight.get_mut(&k) {
+                        *n -= 1;
+                    }
+                    let newer = m.committed.get(&k).is_none_or(|(s, _)| *s < seq);
+                    if newer {
+                        let value = entries
+                            .get(&k)
+                            .map_or(Value::Tombstone, |v| Value::Live(v.clone()));
+                        m.committed.insert(k, (seq, value));
+                    }
+                }
+                m.installing = None;
+                m.installs_completed += 1;
+            }
+        });
+    }
     for _ in 0..schedule.readers {
         let (env, db, model) = (sim.env(node), db.clone(), model.clone());
         env.clone().spawn("reader", async move {
@@ -1426,19 +1985,32 @@ fn spawn_clients(sim: &Sim, node: NodeId, db: Db, schedule: &Schedule, model: &S
                     let lo = env.rng().below(KEYS);
                     let hi = lo + env.rng().below(KEYS - lo + 1);
                     let snapshot = db.snapshot();
+                    // PROPOSED(D-054): the span of an install in progress is left out
+                    // of the comparison: it is the old span until the switch and the
+                    // installed one after, and the model learns which when it
+                    // resolves.
+                    let installing = lock(&model).installing.clone();
+                    let judged = |k: &Bytes| {
+                        installing
+                            .as_ref()
+                            .is_none_or(|(start, end)| !(start <= k && k < end))
+                    };
                     let want: Vec<(Bytes, Bytes)> = {
                         let m = lock(&model);
                         let n = usize::try_from(snapshot.version()).expect("fits");
                         m.state_after(n.min(m.ops.len()))
                             .into_iter()
-                            .filter(|(k, _)| *k >= key(lo) && *k < key(hi))
+                            .filter(|(k, _)| *k >= key(lo) && *k < key(hi) && judged(k))
                             .filter_map(|(k, v)| v.live().map(|v| (k, v)))
                             .collect()
                     };
-                    let got = db
+                    let got: Vec<(Bytes, Bytes)> = db
                         .scan(&key(lo)[..]..&key(hi)[..], &snapshot)
                         .await
-                        .expect("tables read");
+                        .expect("tables read")
+                        .into_iter()
+                        .filter(|(k, _)| judged(k))
+                        .collect();
                     {
                         let mut m = lock(&model);
                         m.reads += 1;
@@ -1481,6 +2053,15 @@ fn spawn_clients(sim: &Sim, node: NodeId, db: Db, schedule: &Schedule, model: &S
                             "live read of {} saw {got:?} but the model has {want:?}",
                             String::from_utf8_lossy(&key)
                         ));
+                    } else if got == want {
+                        // PROPOSED(D-054): a read of a key written after an install
+                        // that covered it, read over the installed version.
+                        let newest = m.committed.get(&key).map_or(0, |(s, _)| *s);
+                        let over = m
+                            .installs
+                            .iter()
+                            .any(|(&s, i)| i.applied && i.covers(&key) && s < newest);
+                        m.reads_over_installs += u64::from(over);
                     }
                 }
                 let gap = env.rng().below(gap_max_us + 1);

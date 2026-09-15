@@ -3,7 +3,9 @@
 //! mid-flush and mid-compaction; the engine that acknowledges before the log is
 //! caught, and so are the one that releases a memtable and its log segments before
 //! the manifest names its table and the one whose compaction deletes its inputs
-//! before the manifest stops naming them.
+//! before the manifest stops naming them. The live install's crash test (Q2, D-054)
+//! runs the same scenario with installs, beside the install that switches twice and
+//! the span checkpoint that does not sync its tables.
 
 use std::sync::Mutex;
 
@@ -168,6 +170,125 @@ fn the_correct_engine_passes_every_seed_with_deep_levels() {
     assert!(
         deepest >= 3,
         "compaction never reached level 3: deepest {deepest}"
+    );
+}
+
+/// Q2's criterion, the stage's gate (SHARD.md §11 storage 5, §12 Stage A; D-054):
+/// the live install's crash test. A task checkpoints random spans and installs each
+/// over its span a little later while the writers write every key, and every crash
+/// is aimed at an install, anywhere from the moment it is asked for to past its end,
+/// under the full disk fault model. After each crash the span comes back as it was
+/// or as installed, never a mixture; every key outside it as it was, bar what a
+/// fault explains; and every write to the span after the install is read over the
+/// installed version. The correct engine passes every seed, and the sweep is seen
+/// to crash before an install's switch, after it, and after writes over it.
+// PROPOSED(D-054): the live install's crash test.
+#[test]
+fn the_live_install_crash_test_passes_every_seed() {
+    let totals = Mutex::new((engine::InstallOutcomes::default(), 0u64, 0u64, 0u64, 0u64));
+    let verdicts = sweep(seeds(), |seed| {
+        let report = engine::run_with(seed, engine::Schedule::install(), Variant::Correct);
+        {
+            let mut t = totals.lock().unwrap();
+            let o = report.install_outcomes;
+            t.0.aimed += o.aimed;
+            t.0.kept += o.kept;
+            t.0.crashed_after_switch += o.crashed_after_switch;
+            t.0.crashed_before_switch += o.crashed_before_switch;
+            t.0.lost_to_a_fault += o.lost_to_a_fault;
+            t.0.keys_written_after += o.keys_written_after;
+            t.1 += report.installs_started;
+            t.2 += report.installs_completed;
+            t.3 += report.reads_over_installs;
+            t.4 += report.checkpoints_verified;
+        }
+        report.check().map_err(|violation| {
+            write_trace(&format!("engine-install-{seed}"), &report.jsonl);
+            format!("seed {seed}: {violation}")
+        })
+    });
+    let (outcomes, started, completed, reads_over, verified) = totals.into_inner().unwrap();
+    eprintln!(
+        "live install, Correct: {started} installs asked for, {completed} resolved, {reads_over} live reads over an install, {verified} checkpoints verified; after the crashes: {outcomes:?}"
+    );
+    if let Err(violation) = verdict(&verdicts) {
+        panic!("{violation}");
+    }
+    assert!(outcomes.aimed > 0, "no crash was aimed at an install");
+    assert!(
+        outcomes.crashed_before_switch > 0,
+        "no crash landed before an install's switch: {outcomes:?}"
+    );
+    assert!(
+        outcomes.crashed_after_switch + outcomes.kept > 0,
+        "no install was in force after a crash: {outcomes:?}"
+    );
+    assert!(
+        outcomes.keys_written_after > 0,
+        "no key written after an install was checked after a crash: {outcomes:?}"
+    );
+    assert!(
+        reads_over > 0,
+        "no live read of a key written after an install: {outcomes:?}"
+    );
+}
+
+/// The install's known-buggy engine beside it (CLAUDE.md's pair rule; D-054): the
+/// install that takes the span's keys out with one manifest switch and puts the
+/// installed tables in with a second is caught by the same crash test, on some seed
+/// at every tier, and the rate is printed.
+// PROPOSED(D-054): the live install's crash test.
+#[test]
+fn an_install_in_two_switches_is_caught() {
+    let caught: Vec<String> = sweep(seeds(), |seed| {
+        engine::run_with(
+            seed,
+            engine::Schedule::install(),
+            Variant::InstallInTwoSwitches,
+        )
+        .check()
+        .err()
+    })
+    .into_iter()
+    .flatten()
+    .collect();
+    eprintln!(
+        "InstallInTwoSwitches: caught on {} of {} seeds, first: {}",
+        caught.len(),
+        seeds(),
+        caught.first().map_or("", String::as_str)
+    );
+    assert!(!caught.is_empty(), "InstallInTwoSwitches was never caught");
+}
+
+/// The span checkpoint's known-buggy engine beside the same crash test (D-054): a
+/// checkpoint of a span whose tables are not synced before the manifest and
+/// `CURRENT` that name them is caught when a crash leaves one of them short and
+/// the checkpoint is opened fresh after it, on some seed at every tier.
+// PROPOSED(D-054): the checkpoint of a span, which the live install installs from.
+#[test]
+fn a_span_checkpoint_without_syncs_is_caught() {
+    let caught: Vec<String> = sweep(seeds(), |seed| {
+        engine::run_with(
+            seed,
+            engine::Schedule::install(),
+            Variant::SpanCheckpointUnsynced,
+        )
+        .check()
+        .err()
+    })
+    .into_iter()
+    .flatten()
+    .collect();
+    eprintln!(
+        "SpanCheckpointUnsynced: caught on {} of {} seeds, first: {}",
+        caught.len(),
+        seeds(),
+        caught.first().map_or("", String::as_str)
+    );
+    assert!(
+        !caught.is_empty(),
+        "SpanCheckpointUnsynced was never caught"
     );
 }
 

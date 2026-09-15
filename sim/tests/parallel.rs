@@ -32,6 +32,23 @@ fn a_seed_inside_the_driver_gives_the_sequential_trace() {
     });
     assert_eq!(together[2], alone, "engine");
 
+    // PROPOSED(D-054): the live install's crash test is the engine scenario with
+    // installs and crashes aimed at them.
+    let alone = trace_hash(
+        &engine::run_with(42, engine::Schedule::install(), engine::Variant::Correct).jsonl,
+    );
+    let together = sweep(4, |seed| {
+        trace_hash(
+            &engine::run_with(
+                40 + seed,
+                engine::Schedule::install(),
+                engine::Variant::Correct,
+            )
+            .jsonl,
+        )
+    });
+    assert_eq!(together[2], alone, "engine with installs");
+
     let alone = trace_hash(&raft::run(42, RaftVariant::Correct).jsonl());
     let together = sweep(4, |seed| {
         trace_hash(&raft::run(40 + seed, RaftVariant::Correct).jsonl())

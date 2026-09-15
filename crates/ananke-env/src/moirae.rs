@@ -26,6 +26,7 @@
 //! | `CheckpointWritten`                      | `log` `ananke.engine.checkpoint-written`      |
 //! | `SstWritten` / `SstDropped` / `SstDeleted` | `log` `ananke.sst.written` / `.dropped` / `.deleted` |
 //! | `CompactionWritten`                      | `log` `ananke.compaction.written`             |
+//! | `SpanInstalled`                          | `log` `ananke.engine.span-installed`          |
 //! | `ManifestWritten` / `CurrentSwitched` / `ManifestFallback` | `log` `ananke.manifest.written` / `.switched` / `.fallback` |
 //! | `OpenRefused` / `EngineQuiesced`         | `log` `ananke.engine.open-refused` / `.quiesced` |
 //! | `OrphanRemoved` / `WalSegmentDeleted`    | `log` `ananke.fs.orphan-removed` / `ananke.wal.segment-deleted` |
@@ -575,6 +576,59 @@ fn convert(
                 ("snapshot", int(*snapshot)),
                 ("droppedVersions", int(*dropped_versions)),
                 ("droppedTombstones", int(*dropped_tombstones)),
+            ])),
+        ),
+        // PROPOSED(D-054): the live install of a span, in one manifest switch.
+        TraceEvent::SpanInstalled {
+            manifest,
+            start,
+            end,
+            seq,
+            removed,
+            rewritten,
+            added,
+        } => log(
+            "ananke.engine.span-installed",
+            Some(Json::obj(vec![
+                ("manifest", int(*manifest)),
+                ("start", Json::str(&hex(start))),
+                ("end", Json::str(&hex(end))),
+                ("seq", int(*seq)),
+                (
+                    "removed",
+                    Json::Array(removed.iter().map(|&t| int(t)).collect()),
+                ),
+                (
+                    "rewritten",
+                    Json::Array(
+                        rewritten
+                            .iter()
+                            .map(|(from, to, first, last)| {
+                                Json::obj(vec![
+                                    ("from", int(*from)),
+                                    ("to", int(*to)),
+                                    ("firstKey", Json::str(&hex(first))),
+                                    ("lastKey", Json::str(&hex(last))),
+                                ])
+                            })
+                            .collect(),
+                    ),
+                ),
+                (
+                    "added",
+                    Json::Array(
+                        added
+                            .iter()
+                            .map(|(number, first, last)| {
+                                Json::obj(vec![
+                                    ("number", int(*number)),
+                                    ("firstKey", Json::str(&hex(first))),
+                                    ("lastKey", Json::str(&hex(last))),
+                                ])
+                            })
+                            .collect(),
+                    ),
+                ),
             ])),
         ),
         TraceEvent::SstDeleted { number } => log(
