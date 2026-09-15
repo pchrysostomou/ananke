@@ -4,8 +4,8 @@ _Status: proposed 2026-09-14; approved by the owner on 2026-09-15. §13 records 
 approved answer to each of its questions, and wherever the text rests on one it names
 it, as (Q20). Each implementation stage turns its part into a DECISIONS.md entry as it
 lands, numbered from the footer's next free entry then; no entry is written by the
-approval itself. §12's order of work is superseded by the stage plan proposed
-separately, which is not approved. The choices listed at the end of §13, under "Added in
+approval itself. §12's stages are proposed and not approved: no implementation code
+lands until the owner approves them. The choices listed at the end of §13, under "Added in
 writing the approvals up", are not approved either._
 
 **A stated assumption.** Phase 3 has no transactions: Percolator is Phase 4 (D-006, SPEC
@@ -1991,45 +1991,882 @@ and its Phase 2 variants, and never names a descriptor or a span.
     `Fault::CrashCollecting` (§10) are new, each on its own stream (D-031), with
     `sim/shard.rs`, `sim/split.rs`, `sim/merge.rs`, `sim/move.rs` and `sim/balance.rs`.
 
-## 12. Order of work
+## 12. Stages
 
-_Superseded by the stage plan proposed separately, which is not approved._
+_Proposed 2026-09-15; not approved. No implementation code until the owner approves these stages._
 
-The list below is the order this document proposed, word for word, and is not an
-approved plan. It predates the four ordering rules the approval sets, which any plan
-that replaces it must keep; the list keeps the first and not the other three:
+This section replaces §12's earlier order of work. It is proposed, not approved: SHARD.md's
+decisions in §13 are approved, these stages are not, and no implementation code lands
+until the owner approves them. A section number below, §1 to §13, is this document's,
+and a question number, Q1 to Q42, is the answer §13 records; RAFT.md's and SPEC's
+sections are named as theirs.
 
-- the crash test of the live install is written and green before any split code (Q2;
-  §11, storage 5), which the list's step 2 puts before its step 5;
-- `SimEnv`'s bounded queue per destination lands before batching puts many ranges on
-  one socket (Q16; §11, env 3), which the list's step 3 does without it;
-- `sim/membership.rs` is extended past the snapshot threshold, issue #46, before
-  `sim/move.rs` is built (Q34; §7), which the list's step 6 builds with no such step
-  before it;
-- the stream per node and range is decided before the stage that first pins Phase 3
-  seeds (Q13; §11, env 2), which no step of the list names.
+Five stages, A to E, in the shape RAFT.md §6 set for Phase 2 and D-025 to D-031 ran it:
+each stage lands with its sweep or directed scenarios, the variants they must catch and
+the gate, writes its DECISIONS.md entries as it lands, and stops for review. The stages
+are ordered by dependency: each builds only on the stages before it. Stage A, which
+knows no range, is the smallest, and C, D and E each add one mechanism to the one before.
+Stage B is larger than C and comes before it, because C to E all run on B's node; the
+owner asked for smallest first, and dependency overrides it there. The plan keeps the four ordering
+rules the approval sets: the live install's crash test before any split code (Q2),
+`SimEnv`'s bounded queue before batching (Q16), `sim/membership.rs` past the snapshot
+threshold before `sim/move.rs` (Q34, issue #46), and the stream per node and range before
+the stage that first pins Phase 3 seeds (Q13).
 
-1. The trace events and the checker keyed by range, with today's single group as one
-   range: no behaviour change; the pinned hashes move once.
-2. Storage: the range-keyed layout, the bounded seek and the range delete, each with its
-   crash test; then the span checkpoint and the live install, with the sweep of
-   Phase 1's engine extended to them.
-3. The node of §4 with static ranges made at bootstrap: the shared ticker, batched
-   frames, the round of Q41, follower compaction, snapshot files and receivers keyed by
-   range; a core step's cost measured against §4's budget; every Phase 2 variant
-   re-asserted on a run with several ranges per node, to its Phase 2 standard (§10).
-4. Descriptors, the apply check, `RangeMismatch`, the client cache, range 0 and the meta
-   range; `TrustStaleDescriptor`, `ClientIgnoresMismatch`, `MetaOverwritesByArrival`.
-5. Split, with `sim/split.rs` (i) and (ii) and its variants, `ReadCheckAtReceiptOnly`
-   among them.
-6. Placeholders, collection and moves by joint consensus, with `sim/move.rs`,
-   `Fault::CrashCollecting` and their variants; then `sim/split.rs` (iii), which moves P
-   first, with `Fault::CrashSplitting` and `SplitNotAtomicWithDescriptor`.
-7. Merge, with `sim/merge.rs` and its variants.
-8. The rebalancer and `sim/balance.rs`, with `MoveNeverRetried` and
-   `RebalancerIgnoresLeaders`; the exit criteria of SPEC §4; the devlog.
+**What every stage's exit asks.** These hold for every stage and are not repeated below.
 
-Each step stops for review.
+- `scripts/gate.sh` exits 0 on the tree of every commit (CLAUDE.md).
+- The correct system passes every seed of every sweep and directed scenario the stage
+  runs, at the gate's 20, CI's 100 and the premerge's 1 000 before the stage's merge is
+  asked, and at the nightly's 10 000 (D-040, DECISIONS.md:1417-1421) before a later stage
+  relies on a bound the stage asserts, since a bound is chosen so that the correct system
+  never trips it over ten thousand seeds (§10). One scenario is excepted by name:
+  `sim/balance.rs`, whose tiers are set by its measured cost (Q30) and stated under
+  Stage E.
+- Every bound and hold is measured on the correct system before it is asserted (Q39). A
+  bound the correct system trips is a model error to fix, not a bound to widen (D-030,
+  D-039; §10).
+- `scripts/premerge.sh` stays near fifteen minutes (Q39), the quarter of an hour D-040 set
+  (DECISIONS.md:1417-1420). The stage records its measured premerge beside the last one
+  measured, 374.64 s on 1ef6d7e (PROPOSED D-052, DECISIONS.md:4033-4035), and sizes its
+  new scenarios' seed shares to stay there, as the adoption storm's share was cut when it
+  took the premerge from about thirteen minutes to forty (DECISIONS.md:1896-1913).
+- A pinned trace hash moves only in the commit that moves it, with the reason in that
+  commit, and every pinned seed whose schedule moves is re-audited to assert its mechanism
+  or, with the reason, the situation's absence (CLAUDE.md:58-67). Each stage lists below
+  the commits that move pinned hashes or schedules.
+- Every new scenario joins `sim/tests/parallel.rs`'s determinism test (§11, env 7).
+- Every new fold runs under the incremental checker's equivalence test with a variant
+  that trips it (§11, raft 12; sim/tests/raft.rs:2685-2713). A fold built before the
+  variant that trips it runs under the test from its own stage, over the correct system
+  and that stage's variants, and is asserted against its tripping variant in the stage
+  that builds that variant. Each stage names the variant for each of its folds; a fold
+  that no variant trips is a question to the owner, not a test left without one.
+- From Stage B on, every Phase 2 variant keeps, on the node, the standard its Phase 2
+  test asserts (§10; Stage B lists them).
+- A variant of §10 is asserted to §10's standard, marked below as *every seed* or *rate*.
+  *Every seed*: a directed scenario builds the variant's situation on every seed and
+  asserts per seed that it did, and the variant is caught on every seed at every tier.
+  *Rate*: a sweep arm, or a directed shape that reaches the situation only on some seeds;
+  the arm's firing is asserted at every tier, and the catch at the tier its measured rate
+  supports. Each test prints its rate (§10; D-041, D-043, D-044, D-049).
+- A design question a stage must settle is listed under its **Questions proposed before
+  code**: proposed as a DECISIONS.md entry at the stage's start and approved before the
+  code that depends on it (CLAUDE.md:18-20). None is settled inside the stage's code and
+  recorded after it.
+
+### Stage A — The engine and the simulator made ready for ranges
+
+**Builds.** Nothing that knows a range, in this order:
+
+1. Q1's correction of RAFT.md where it describes what the code lacks: `Scan` and its
+   check removed from RAFT.md §4 with a pointer to SPEC §6 (Q35), `VoteBeforePersist`
+   and `ApplyNotAtomicWithIndex` in RAFT.md §5, the frame's field order `kind | from |
+   term` and `src/read.rs` in RAFT.md §3, each with a forward pointer as D-048 did (Q1).
+   The entry the forward pointers name lands in the same commit, so that no pointer names
+   an entry not yet written; D-030's pointer names D-048, which exists
+   (DECISIONS.md:1281). The correction moves RAFT.md's lines, and the same commit
+   re-checks SHARD.md's and this plan's citations of them.
+2. The install of a span into a live engine (§11, storage 5), with its crash test and its
+   engine variant, and before it the checkpoint of a span (storage 4) if the crash test
+   needs a checkpoint to install from. The install is an engine primitive on opaque keys
+   and does not depend on the Raft key layout (SHARD.md:1767-1769, 1788-1792). It comes
+   directly after the correction so that, if it cannot be made crash-safe, the stage
+   stops before anything that assumes one engine per node has landed, the key layout of
+   item 6 above all.
+3. `SimEnv`'s bounded, drop-oldest queue per (sending socket, destination), a drop traced
+   `MessageDropped` with `DropReason::QueueFull`, its capacity a `SimConfig` setting
+   defaulting to `RealEnv`'s 1 024, filled against a modelled per-link drain rate (Q16;
+   §11, env 3).
+4. The `Environment` method for a named stream per node and range, `n{id}/r{range}/
+   protocol`, derived in `SimEnv` and drawn from OS entropy in `RealEnv` (Q13; §11,
+   env 2). Nothing calls it until Stage B.
+5. `sim/membership.rs` extended past the snapshot threshold on today's server, issue #46
+   (Q34; §7).
+6. The key layout of Q5 (§1; §11, storage 1): the Raft store parameterised by a key
+   prefix (Q40), today's one group's Raft state in one range's table `0 / <range: u64 BE>
+   / <purpose> / name`, tenant 1 as the system tenant, user data moved from tenant 1
+   (apply.rs:23-24) to tenant 2. The on-disk format version is bumped and recorded where
+   a store's open can read it, since nothing today records which layout a store was
+   written in (§11, storage 1), and a store in 0.3.0's format is refused at open with an
+   error naming both versions.
+7. The engine's other primitives, each with its crash test and its engine variant: the
+   bounded, ordered seek (§11, storage 2), the range delete (storage 3), and the span
+   checkpoint (storage 4) if item 2 did not need it. The Phase 1 engine sweep,
+   `sim/engine.rs`, is extended to all four primitives.
+
+**Entry criteria.**
+
+- The first commit of Phase 3 is item 1, before any code (Q1).
+- Q16's queue lands before batching puts many ranges on one socket: item 3 precedes
+  Stage B's batch frames.
+
+**Exit criteria.**
+
+- Q2's criterion, which the approval calls Phase 3's entry criterion and which is Stage
+  C's entry criterion: the live install's crash test green on every seed at every tier —
+  a crash at any point of an install recovers the span as it was before the install or as
+  the installed tables, never a mixture; every key outside the span is unchanged; and a
+  write to the span after the install is read over the installed version, which the
+  installed sequence numbers above the live engine's provide (§11, storage 5). If item 2
+  cannot make the test green, the stage stops after item 2 and returns Q2 to the owner;
+  one engine per node is wrong if that install cannot be made crash-safe (Q2).
+- Each engine variant the stage adds is caught by its own primitive's crash test on some
+  seed at every tier, and the correct engine passes the same seeds, the standard the
+  engine's three variants hold today (sim/tests/engine.rs:174-205); each test prints its
+  catch rate. For the live install this is part of meeting Q2: the variant that removes
+  the span's keys and adds its tables in two manifest switches is caught by the same
+  crash test the correct install passes.
+- `sim/engine.rs`: the correct engine passes every seed with the seek, the range delete,
+  the span checkpoint and the live install in its workload, and `NoWalBeforeMemtable`,
+  `ReleaseBeforeManifest` and `DeleteBeforeManifest` are still caught
+  (crates/ananke-storage/src/engine.rs:69-89; sim/tests/engine.rs:174-205).
+- A store written in 0.3.0's format is refused at open, and the test asserts both version
+  numbers in the error (Q5, condition 2).
+- On the tree after item 3, `sim/raft.rs`, `sim/membership.rs` and `sim/quorum.rs` pass
+  every seed, every Phase 2 variant is caught to the standard listed under Stage B, and
+  the raft sweep's coverage prints how many frames the queue dropped.
+- #46: `sim/membership.rs` crosses the snapshot threshold with a learner fed by a
+  snapshot during a change, asserted per seed; the correct server passes every seed; and
+  `SingleMajorityInJointConsensus` is still caught on some seed at every tier
+  (sim/tests/raft.rs:2483-2502).
+
+**Commits that move pinned hashes or schedules.** Item 3's one commit moves every pinned
+hash (Q16), and every pinned seed in `sim/tests/raft.rs` is re-audited, the pair on seed
+680 included (Stage B says how). Item 4's commit moves none, since nothing calls the
+method. Item 6's commit changes the key every Raft store write carries and the tenant of
+every user key, and a seed's schedule moves when a record changes size
+(CLAUDE.md:66-67); the commit says whether any pinned hash moved, and re-audits every
+pinned seed whose schedule did. Item 5's commit moves the membership scenario's schedule
+and re-audits its pins.
+
+**Buggy variants it must catch.** None of §10's: none of their checks or scenarios exist
+yet. §10 names no variant for the engine's four primitives, but CLAUDE.md's pair rule
+(CLAUDE.md:50-57) still asks each crash test for a known-buggy engine beside the correct
+one, as the engine's `Variant` has for its own rules (engine.rs:69-89). The stage adds one
+per primitive — for the live install, one that removes the span's keys and adds its
+tables in two manifest switches — and names them in its entries. They belong to the
+engine's `Variant`, not to the range layer's set, and are not counted below. Phase 2's
+variants are not re-asserted on a new node here; they keep their standard across items 3
+and 6.
+
+**Issues.** Resolves #46 (Q34). Carries #21: the per-range table leaves room for a later
+session table, so #21 adds keys and moves none (Q11), which the layout's entry says.
+
+**DECISIONS.md entries.** The correction's, in item 1's commit, which its forward
+pointers name; `SimEnv`'s queue, a simulator model of D-015's bound, with the hash move
+and the re-audit (Q16); the key layout, recording 0.3.0's format break and where the
+format version lives (Q5, condition 3); the live install and its crash test, which meets
+Q2's criterion, with its engine variant; the other primitives and their engine variants;
+the membership scenario's extension, with what it found (Q34).
+
+### Stage B — The node: many groups on one socket, one ticker and one engine
+
+**Questions proposed before code.**
+
+1. *Follower compaction* (§11, raft 13). SHARD.md needs it and leaves open which of two
+   mechanisms: a follower compacts "to its own applied checkpoint, or to one its leader
+   names" (SHARD.md:1893-1897). No answer in §13 settles it. It changes RAFT.md's rule
+   that a leader compacts (RAFT.md:249; SHARD.md:334-337), so its entry supersedes that
+   text with a forward pointer, as D-048 did.
+2. *Installs on the node.* Which installs go through Stage A's live install, whether the
+   whole-store staged install adopted at the next start (RAFT.md:225-247) survives on the
+   node, what `RaftAdopted`, which §8 keeps per node (SHARD.md:1127-1129), then records,
+   and the node code path each install-path Phase 2 variant breaks (below, under the
+   variants). The plan's proposal is in the builds.
+3. *The re-seed shape's variant.* §10 names none for Q15's path. The stage proposes one
+   for the directed re-seed shape below — for example `ReseedMarkNotSynced`, which
+   writes the per-replica refused mark unsynced — with the check that catches it, outside
+   §10's count.
+
+**Builds.**
+
+- `ananke-shard` with §4's node (Q40); `ananke-raft` keeps the core, the codec, the store,
+  snapshots, refusal and adoption, and names no descriptor or span.
+- The trace of §8 (§11, env 1): `range` on every `Raft*` event about a replica and on
+  `RaftProposed`; `key` and `effect` on `RaftApply`; `RaftRead` moved to the server, which
+  reads the value and the applied index at one engine version and traces `key` and
+  `applied` (§3; §11, raft 15); every new event kind of §8 added with its export line.
+  Three of them report what the core already does and are emitted from this stage, in the
+  same commit: `RaftMatchStarted`, a leader's first rise of `matched` under a follower's
+  incarnation (§11, raft 12); `RaftLearnerRound`, a learner's catch-up round (raft 9); and
+  `RaftChangeAccepted`, a change accepted whenever the core has none in flight, as today
+  (raft 8; DECISIONS.md:1099-1104). Every other new event is emitted by the stage that
+  builds what it reports.
+- The checks keyed by range (§8; §11, raft 12): checks 1 to 4 in `ananke-raft` over a
+  generic group key, each range's first configuration taken from its `RangeCreated`;
+  check 6 per range; the history's closure keyed by `(range, index, term)` (§9; §11,
+  env 9); the timer check and pre-vote's property per (range, server); the checks about
+  time asked only of a range whose unimpaired replicas form a majority, and the write
+  bound asked per key (§8).
+- The node (§4; §11, raft 1, 2, 10, 11, 13, 14): one socket; frames tagged with an
+  8-byte range id (Q10) and cut into batch frames by a per-peer outbox under
+  `MAX_FRAME_LEN`, with a studio decoder that yields several messages per frame; one inbox
+  per node bounded in bytes with constant- or logarithmic-time admission (Q14); one `raft`
+  task stepping every core on one ticker in Q41's round, every output after a core's
+  `Persist` executed when that core's own persist resolves and its messages and ticks held
+  until then; one `apply` task (Q14); one `snapshot` task keyed by range and follower, one
+  assembly per (range, sender) under per-node receive caps, no cap on streams sent, and
+  chunks in frames of their own on its own socket handle (Q14, Q41); staging, version
+  directories and their sweep keyed by range (raft 14); follower compaction by the
+  mechanism question 1 settles; each core seeded from `n{id}/r{range}/protocol` (Q13); a
+  range on every client message.
+- Installs on the node (§11, storage 5). Every snapshot install on the node — to a
+  follower behind the compacted prefix and to each range of Q15's re-seed — is Stage A's
+  live install into the running engine. Today's install ends the server's run-loop
+  incarnation and reopens the engine, "which in a shared node would restart every range
+  on it" (SHARD.md:1793-1795), so the whole-store staged install adopted at the next
+  start (RAFT.md:225-247) is not kept for a replica's install. This is question 2's
+  proposal.
+- Ranges fixed at bootstrap from configuration, as §2 generalises `initial_voters`, each
+  traced `RangeCreated { cause: bootstrap }`. Nothing changes a descriptor and nothing
+  routes: a client takes its key's range from the scenario's fixed map.
+- A loss in the shared engine (Q15; §11, storage 8): the whole node refused; its re-seed
+  into a fresh engine in a new directory beside the refused one, which stays marked lost
+  and quiesced, opened at once, each range installed live as its stream completes, and a
+  durable per-replica refused mark written into the new engine before it serves.
+  Incarnation and quarantine are per replica (Q26), the incarnation drawn at each creation
+  of a replica from the node's generator (SHARD.md:1372-1379), and `RaftRecovered`,
+  `RaftReseeded` and `RaftProgressReset` per replica (§8).
+- A directed re-seed shape for Q15's path, which §10 does not name and none of whose parts
+  exists today (SHARD.md:1814-1821), added to §10's scenario list by this plan: three
+  servers, each hosting all four ranges of the scenario; a node refused by its store's
+  lost mark at a restart, as `sim/quorum.rs` refuses a server (D-049); the node's cap on
+  streams received set to two, below its four ranges, so that re-seeds toward it wait for
+  one another; and a crash arm on a stream of its own, `reseed-crash` (D-031), that
+  crashes the refused node after one replica's refused mark is written into the new
+  engine and before that replica answers anything other than its re-seed stream, then
+  restarts it.
+- Leader-relative fault arms choose their range from their own stream (§11, env 8).
+
+**Entry criterion.** Stage A's exit, which puts Q16's queue under the batch frames and
+Q13's method under the cores' seeds; and questions 1 to 3 approved.
+
+**Exit criteria.**
+
+- `sim/raft.rs`'s arms, `sim/membership.rs` with #46's extension, and `sim/quorum.rs`,
+  each run on the node with four ranges on every node, each range placed as today's one
+  group is (§10): the correct system passes every seed at every tier. Four is a scenario
+  parameter this plan fixes, not a measurement: enough that a frame between two nodes can
+  carry messages of several ranges each way, and more ranges than the re-seed shape's
+  receive cap of two. If the trace
+  records measured below cannot hold four ranges under `TRACE_CAP`, the count goes to the
+  owner before Stage C, and is not lowered in place.
+- Every Phase 2 variant re-asserted as listed below.
+- Checks 1 to 4 keyed by range under the equivalence test, tripped by the Phase 2
+  variants the test compares today (sim/tests/raft.rs:2685-2713).
+- The re-seed shape, *every seed* at every tier: per seed, the correct system (a) traces,
+  for each of the refused node's four ranges, its `RangeCreated { cause: snapshot }` with
+  no restart of the node between the refusal and that install other than the arm's, so
+  every range was installed live into the new directory; (b) completes every re-seed
+  stream, none abandoned for a chunk of another identity, which today restart each other
+  (SHARD.md:573-576); (c) traces each replica's refused mark durable before that replica's
+  first answer other than its re-seed stream, the event that records the mark named in the
+  node's entry; (d) after the arm's crash, restarts the replica whose mark was written as
+  refused, and re-seeds it; and (e) ends the run with the refused directory still marked
+  lost and no file in it changed after the refusal, so it never opened fresh (D-041). The
+  arm's firing is asserted on every seed. The variant approved under question 3 is caught
+  at the tier its measured rate supports, *rate*, since what a crash keeps of an unsynced
+  write is the disk's draw, as for `RemovalNotDurable` (§10).
+- Follower compaction: the largest in-memory log of any follower replica, in entries,
+  measured under `sim/raft.rs`'s client writes on the correct system and asserted on every
+  seed below a bound set from that measurement (Q39), stated in the entry as a multiple of
+  `snapshot_threshold`, 4 096 (§4). Without the change a follower's log grows without
+  bound under writes (SHARD.md:337-338).
+- Measurements, each recorded in the node's entry before a later stage relies on it:
+  - A core step's cost, idle and under the sweep's client load, measured in host time in
+    a release build, outside the simulator, whose virtual time does not measure it, on a
+    machine the entry records by processor, core count and load. At 1 000 ranges an idle
+    tick is 500 steps (SHARD.md:504), so the `raft` task keeps its 10 ms ticker only while
+    a step costs less than 20 µs, a figure computed from those constants, not measured
+    (SHARD.md:512-515). The pass bound is an idle step below 20 µs. A step at or above it
+    means one `raft` task per node, which Q41 fixes, cannot hold 1 000 ranges, and goes
+    to the owner before Stage C begins.
+  - The frames per peer in a round with persists, which §4 leaves to this stage
+    (SHARD.md:490-492).
+  - The inbox's drops under its byte bound, printed by each scenario's coverage.
+  - The inbox's admission cost: a test fills the inbox to lengths from one to its bound
+    in powers of two and counts the entries one admission examines; the count does not
+    grow with the length, or grows by at most a constant per doubling (Q14). It counts
+    work, not time, so it is deterministic.
+  - The apply lag: from a range's `RaftCommit` reaching an index on a node to that node's
+    `RaftApply` of it, per range, under the sweep's client load, in virtual time, which
+    the sweep's disk latencies drive. Q14's grouped applies are built if the median lag
+    exceeds one heartbeat interval, 20 ms (§4), a threshold this plan proposes.
+  - How long one range's take holds the node's other ranges' applies (D-036). Grouping
+    applies does not shorten a take, which holds applies whichever way they are batched;
+    this figure is recorded for §11's storage 6 and goes to the owner if it exceeds a
+    heartbeat interval.
+  - The trace records a run holds per range per virtual second, against `TRACE_CAP`
+    (sim/raft.rs:136; §4), which sizes the scenarios of Stages C to E.
+
+**Commits that move pinned hashes or schedules.** SHARD.md says the trace events of §8
+move every pinned hash once (SHARD.md:1933-1935). This plan keeps that for §8's events:
+the fields on existing events, `RaftRead`'s move and the core's three events land in one
+commit, which moves every pinned hash once. Two other commits of this stage move every
+schedule for reasons of their own, each in its own commit with its reason: the node
+itself (one socket, batch frames, Q41's round, the inbox bounded in bytes), and the switch
+of each core's seed to `n{id}/r{range}/protocol`, which moves every election timeout. Each
+of the three re-audits every pinned seed in `sim/tests/raft.rs`.
+
+**Buggy variants it must catch.** None of §10's. Phase 2's sixteen are re-asserted on the
+node, with its per-core persist order and batched frames (Q41), to the standard their
+Phase 2 tests assert and no stronger, at the tier each uses today (Q39; §10):
+
+- On `sim/raft.rs`'s arms, caught on some seed at every tier (sim/tests/raft.rs:1374-1389,
+  1553-1610): `SendBeforePersist` — against Q41's round the one that matters most, since
+  a send that follows a core's persist leaves when that persist resolves and the variant
+  sends it first (§10) — `ApplyBeforeCommit`, `NoPreVote`, also on the term-raise schedule
+  (sim/tests/raft.rs:1243), `CountOlderTermForCommit` with the Figure 8 driver (D-031),
+  `TruncateOnEveryAppend`, `ResetTimerOnAnyRpc` and `SnapshotWithoutCurrentLast`.
+- `LeaseTrustsTheClock`: at every tier some seed exceeds the drift bound, the guard
+  revokes, and the guardless server's stale read is caught (sim/tests/raft.rs:1958-2024).
+- `SingleMajorityInJointConsensus` on `sim/membership.rs`, caught on some seed at every
+  tier (sim/tests/raft.rs:2483-2502).
+- `AdoptionAsBuilt` and `RefusalNotDurable`: the fault's firing at every tier, the catch
+  from the hundred-seed tier (sim/tests/raft.rs:1633-1666, 1686-1715; D-041, D-044).
+- `IgnoreIncarnation`: an injection-and-reach assertion, the injection at every tier and
+  the reach from a hundred seeds (sim/tests/raft.rs:1756-1786; D-042).
+- `SharedSnapshotDir`: its liveness catch at the nightly's ten thousand only
+  (sim/tests/raft.rs:1852-1896; D-043).
+- `RefusedCountsForQuorum` and `RefusedNeverCounts` on a sharded `sim/quorum.rs`, caught
+  on every seed at every tier (sim/tests/raft.rs:2814-2861; D-049).
+- The pair `{IgnoreIncarnation, SharedSnapshotDir}`, pinned on seed 680, the one seed of
+  the first thousand it was caught on (RAFT.md:656-659; sim/tests/raft.rs:405; D-045).
+  Stage A's queue and this stage's node and seed switch each move its schedule, so it is
+  not asserted on seed 680 as it stands: it is re-audited under CLAUDE.md:58-67 at each
+  move. Seed 680's test asserts the wedge where the moved schedule still reaches it, or,
+  with the reason, the situation's absence; and the first thousand seeds are searched
+  again for a seed the pair is caught on, pinned as D-045 pinned 680. If none is found,
+  that goes to the owner, since the pair is Phase 2's control for a wedge that needs both
+  bugs.
+- `IndexFirstElectionRestriction` has a core-level test only
+  (crates/ananke-raft/tests/paper.rs:332); the core does not change, and the test stays
+  as it is.
+
+Question 2 names, for each Phase 2 variant on the install path, the node code path it
+breaks. The plan proposes:
+
+- `SnapshotWithoutCurrentLast` breaks "the staged `CURRENT` written last, after the
+  repair" (RAFT.md:686). On the node the commit point of an install is the live install's
+  manifest switch, and the rule becomes that the switch is made only with the range's
+  repair (RAFT.md:225-233) durable or carried in it; the variant makes the switch as the
+  stream's last chunk arrives. Its catch and need stay Phase 2's: state machine safety
+  after `Fault::CrashInstalling` crashes the follower mid-install.
+- `AdoptionAsBuilt` breaks three rules (RAFT.md:688). The first, copy and switch before
+  delete, becomes the live install's single switch, which the variant breaks by removing
+  the span's keys in a switch of their own before adding the tables. The third, a marked
+  store never opens fresh, becomes Q15's refused directory, which stays marked lost; the
+  variant neither checks nor writes the mark. The second, a damaged staging `CURRENT`
+  refused, has no path on a node that adopts no staged store at its start, and neither
+  has its need, `Fault::CrashAdopting`, which crashes "the moment the adoption's first
+  change to the store directory is durable" (RAFT.md:688). §10 requires every Phase 2
+  variant to be re-asserted, so before the node's code the stage returns `AdoptionAsBuilt`
+  to the owner with this proposal: re-asserted on the two rules that remain, under a crash
+  arm aimed at the live install's switch and at the refused directory's open, at its
+  Phase 2 tier; or §10 amended for it.
+- `RefusalNotDurable` breaks the refusal marked before anything else (RAFT.md:691). On
+  the node it is the whole node's mark in the refused directory (Q15), which the variant
+  keeps in the process alone; `Fault::CrashRefused` crashes the node as it crashes a
+  server today.
+- `IgnoreIncarnation` and `SharedSnapshotDir` break rules of the stream and the leader's
+  progress, which the node keeps per range (§11, raft 14) with the path unchanged.
+
+**Issues.** Carries #45 (Q15). The sweep's coverage counts refusals by the loss that made
+them — a dropped table, a fallback, a head gap, a stopped log (§11, storage 8) — which is
+the evidence the issue asks for.
+
+**DECISIONS.md entries.** The node: one engine per node as built (Q2), its tasks, inbox
+and streams (Q14), the crate boundary (Q40), the stream per range (Q13), Q41's round,
+which keeps RAFT.md §3's and D-026's per-core order and supersedes nothing, and Q12's
+batching per peer, with 10 000 ranges a non-goal whose §4 figures are computed from
+constants, not measured; with the four ranges per node, the step cost as measured, the
+apply lag and the take's hold. `RaftRead` moved from the core to the server, read at one
+engine version (§11, raft 15). Snapshot files and receivers keyed by range: staging,
+version directories and their sweep per range, one assembly per (range, sender), the
+receive caps (§11, raft 14; D-043). Follower compaction, superseding RAFT.md:249 with a
+forward pointer (question 1), with the follower log bound as measured. Installs on the
+node and the install-path variants (question 2). Q15's refusal and re-seed, with #45,
+per-replica incarnation and quarantine (Q26), the re-seed shape and its variant
+(question 3).
+
+### Stage C — Descriptors, routing, the meta range and split
+
+**Questions proposed before code.**
+
+1. *A split on a node whose block of range ids has run out while range 0 is
+   unavailable.* Q17's answer does not settle it, and §5 leaves it to the stage that
+   builds the lease (SHARD.md:660-662).
+2. *Check 19's variant.* §10 gives check 19 no variant that trips it: the only mention is
+   that check 19 sees `UnfreezeBeforeAbortCommitted`'s shape (e) "only if R traces a value
+   after the merge" (SHARD.md:1738). Check 19 cannot meet the rule that every new fold runs
+   under the equivalence test with a variant that trips it (SHARD.md:1885-1889) until the
+   owner chooses: a variant proposed for check 19's equivalence test alone, outside §10's
+   count; or check 19 asserted against `UnfreezeBeforeAbortCommitted` in Stage E on the
+   seeds of (e) where R traces a value after the merge, if that rate, measured, is not
+   zero; or §11's raft item 12 amended for check 19.
+
+**Builds.**
+
+- Descriptors (§1): the range-local copy, the authority, in the range's table and
+  written in the apply batch that changes it (Q3, Q5); a split raises the generation
+  (Q6).
+- Routing (§3; §11, raft 4, 5, 16): a request carries (range, generation) (Q10); the
+  checks at receipt, at a read's serving and at apply, with the apply's `effect` traced;
+  `RangeMismatch` carrying the node's descriptors for the key; a write answered
+  `RangeMismatch` resent under a fresh `seq` that `ClientSend`'s `invoked` pairs with the
+  original, the leader keeping its record of the original (Q10); a write with no answer
+  abandoned as pending (Q11); the client cache merged by generation, with lookups
+  through ranges 0 and 1 kept out of the history (Q36); the history closed only by an
+  apply whose effect is `applied`, with an operation's proposals gathered by `invoked`
+  (§9).
+- Bootstrap (§2; Q7, Q9, Q32): exactly three bootstrap nodes, each with a fresh store
+  writing the same initial state from configuration in one synced batch before its tasks
+  run — ranges 0, 1 and 2, range 0's range-id counter at 3 with no block leased, a node
+  record per bootstrap node, and a digest of the bootstrap configuration; ranges 0 and 1
+  fixed on the bootstrap nodes.
+- The root and the meta range (§1; Q3, Q4): `MetaUpdate` applied as a maximum by
+  generation, records keyed by end key in the system tenant and cut in the same batch,
+  resent until acknowledged, and sent by each leader on taking office; lookups by Stage
+  A's bounded seek.
+- Range ids leased in blocks (§5, Q17): a refill carrying the node's run nonce, traced
+  `RangeIdsLeased`, the three rules of §5, and the exhausted block's answer as question 1
+  settles it.
+- Split (§5): by operator's `Command::Split` and by the driver (Q18); the left half keeps
+  P's id (Q19); R at current term 1, no vote, floor `(s, 1)` (Q20); R's replica on the
+  node whose P led at the apply pre-votes at once and every heartbeat interval (Q21);
+  Q23's rules for a split, refused at proposal while a change is catching up and at apply
+  while the configuration at or below `s` is joint, and, on a replica that is not a voter
+  of P at `s`, no R and a range delete of the right span (Stage A); P's quarantine not
+  copied (Q26).
+- Placeholders (§5, Q22; §11, raft 7, 17): no vote or pre-vote and no acknowledgement;
+  AppendEntries answered as a refused server answers, hint 1, echo 0, incarnation 0,
+  counted for check quorum only as D-049 counts a refused server.
+- The overlap rule (§5, Q27): an install that overlaps an initialised replica is refused
+  with `Overlaps`, and the leader streams again after a minimum election timeout, from a
+  fresh take if its checkpoint predates the range's last split.
+- The range layer's variant set in `ananke-shard`, beside `ananke-raft`'s unchanged
+  `Variants(u32)` (Q37).
+- The folds: check 7; check 8's clause that no two of a node's spans overlap and its
+  clause that a voter of P at `s` that applied `s` holds R; checks 9, 10, 16, 17 and 20;
+  check 18's split and range-id clauses; check 19; and, for check 18's split clause, the
+  history per (range, index) of the configuration in force, built from each `RaftConfig`'s
+  `index`, which §8 defines under check 11 and which check 18 folds (SHARD.md:1248-1250,
+  1299-1300). Check 8's clause for a non-voter at `s` is Stage D's, and check 11 itself
+  Stage E's. With them the meta convergence bound and the timer check's skip for a
+  placeholder (§8).
+- `sim/shard.rs` (§10; Q39): five nodes, three of them bootstrap nodes, nodes 4 and 5
+  holding no replica until Stage D; its driver, on stream `shard`, draws splits and
+  leadership transfers; several clients over several keys per range; Phase 2's network and
+  disk faults; the workload's split under a pending burst of right-half writes, split
+  under a pending burst of right-half gets, and split while one client's cache names the
+  parent and another writes the right half through R; a crash and restart of a node that
+  has taken an id from its block, followed by a split led from that node; and
+  `Fault::MetaReorder` on stream `meta-reorder`.
+- `sim/split.rs` (§10), four nodes, nodes 1 to 3 the bootstrap nodes: (i) *overlap* and
+  (ii) *vote*.
+
+**Entry criteria.** Q2: the live install's crash test (Stage A) is green on the tree the
+first split commit is made on. Stage B's exit. Questions 1 and 2 approved.
+
+**Exit criteria.**
+
+- `sim/shard.rs`: the correct system passes every seed at every tier; every key
+  linearizable across every split (§9); checks 1 to 4, 6 to 10 and 16 to 20 hold.
+  `Fault::MetaReorder`'s firing is asserted at every tier, and the seeds on which meta
+  applied the second split's update before the first are printed (§10).
+- `sim/split.rs` (i) and (ii): the correct system passes every seed; per seed, in (i) a
+  chunk of R's stream reached `x` while a chunk of P's was dropped as oversized, and in
+  (ii) a pre-vote or vote request of R reached `x` before `x`'s `RangeCreated` of R (§10).
+- Measured before asserted (Q39): the meta convergence bound, `Fault::MetaReorder`'s
+  hold, and (i)'s frame-length limit.
+- The equivalence test, each fold against the variant of this stage that trips it:
+  check 8 against `SnapshotOverlapsReplica`; checks 9 and 10 against `ApplyIgnoresSpan`,
+  check 9 also against `ReadCheckAtReceiptOnly` and `TrustStaleDescriptor`; check 16
+  against `MetaOverwritesByArrival`; check 17 against `ClientIgnoresMismatch`; check 18
+  against `IdBlockResumed`; check 20 against `UninitialisedReplicaVotes`. Check 7 runs
+  under the test over the correct system and this stage's variants; no variant of this
+  stage trips it, and it is asserted against `SplitNotAtomicWithDescriptor` in Stage D,
+  which builds that variant. Check 19 runs under the test the same way, and is asserted
+  against a tripping variant as question 2 settles.
+- The first Phase 3 seeds pinned, each asserting its mechanism.
+- Phase 2's variants hold Stage B's standards.
+
+**Commits that move pinned hashes or schedules.** Each in its own commit, with its reason
+and a re-audit of every pinned seed whose schedule it moves: the commit that adds the
+generation to every client request, since a record that changes size moves schedules
+(CLAUDE.md:66-67); the commit that emits `ClientSend`, `ClientMismatch` and
+`RangeMismatchSent`, where a Phase 2 scenario's client emits them; and the bootstrap
+commit, where a Phase 2 scenario runs under ranges 0, 1 and 2 and their initial batch.
+
+**Buggy variants it must catch (8).**
+
+- `ApplyIgnoresSpan` — breaks §3's apply check, where a split takes effect for proposals
+  in flight; caught by check 9, check 10, and linearizability on some seed where a write P
+  acknowledged is missing for R's readers (§9); the sharded sweep's split under a pending
+  right-half burst; *rate*.
+- `ReadCheckAtReceiptOnly` — breaks §3's check at a read's serving; caught by check 9 at a
+  `RaftRead` whose `applied` lies at or past the split; the sharded sweep's split under
+  pending right-half gets; *rate*.
+- `TrustStaleDescriptor` — breaks §3's rule that a server checks the key against its own
+  descriptor at receipt and at serving (Q38); caught by check 9, and linearizability on
+  some seed where a read through P returns what R's writes replaced (§9); the sharded
+  sweep's split while a client's cache names the parent; *rate*.
+- `ClientIgnoresMismatch` — breaks §3's rule that a client merges a `RangeMismatch`'s
+  descriptors before it sends again (Q38); caught by check 17 and the liveness bound on
+  uniform seeds; any split with load in the sharded sweep; *rate*.
+- `SnapshotOverlapsReplica` — breaks §5's overlap rule (Q27); caught by check 8 at the
+  install's `RangeCreated { cause: snapshot }`; `sim/split.rs` (i); *every seed*.
+- `UninitialisedReplicaVotes` — breaks Q22's rule that a placeholder grants no vote or
+  pre-vote; caught by check 20; `sim/split.rs` (ii); *every seed*.
+- `IdBlockResumed` — breaks §5's rule that a node adopts only a block granted to its
+  current run (Q17); caught by check 18's range-id clause; the sharded sweep's crash and
+  restart of a node that took an id, then a split led from it; *rate*.
+- `MetaOverwritesByArrival` — breaks §1's maximum by generation; caught by check 16 and
+  the meta convergence bound; `Fault::MetaReorder`; *rate*.
+
+**Issues.** Carries #43 (Q7): the bootstrap entry states that a bootstrap node whose disk
+was replaced looks fresh, writes the initial state again and can vote twice, and that
+nothing in this stage tells it apart. Carries #21 (Q11): no client sessions; a write with
+no answer is abandoned as pending; split batches will need to carry the session table
+when #21 lands. Carries #45 (Q15): the node is still refused whole, and `sim/shard.rs`'s
+coverage counts refusals by the loss that made them under Phase 2's disk faults.
+
+**DECISIONS.md entries.** Q10's, which says that the hole review found — a refused write
+forgotten by the leader, resent, applied in R, R merged back, and a delayed copy of the
+original applied again — is the same class as seed 42's duplicate proposal (D-026,
+DECISIONS.md:872-876). Q22's own, departing from D-033 for placeholders
+(RAFT.md:163-168). Bootstrap and addressing (Q4, Q7 with #43, Q9, Q32). The meta range
+as an index of the range-local authority (Q3, Q36). Range ids leased in blocks (Q17),
+with §5's three rules marked as SHARD.md's and not Q17's, and the exhausted block's answer
+(question 1). Split (Q18 to Q21; Q23's rules for a split; Q27's overlap rule and
+`Overlaps`), keeping SPEC's "term 1" with no superseding entry (Q20), and Q26's rule that
+a split does not copy P's quarantine to R, which differs from the draft. The range
+layer's variant set beside `ananke-raft`'s unchanged `Variants(u32)`, Phase 2's variants
+keeping their bits (Q37), and both `TrustStaleDescriptor` and `ClientIgnoresMismatch`
+shipped (Q38). Check 19's variant as question 2 settles it.
+
+### Stage D — Moves by joint consensus, and collection
+
+**Questions proposed before code.**
+
+1. *The re-add window assertion's variant.* §8 leaves it to the stage that adds the
+   assertion (SHARD.md:1391-1393). The plan proposes `IncarnationFromRangeStream`, which
+   draws a replica's incarnation from a named stream derived anew at each creation of a
+   replica of the same (range, node). SHARD.md says such a stream gives a re-added replica
+   its collected predecessor's number (SHARD.md:1375-1379), so the variant trips the
+   assertion's second clause at the re-add's `RangeCreated`. It is outside §10's count.
+
+**Builds.**
+
+- The operator's `AddNode` and `RemoveNode`, writes to range 0 carrying the node's id and
+  address, traced `NodeAdded` and `NodeRemoved` (Q8); a leader reaches a non-bootstrap
+  node through its record.
+- A move (§7, steps 1 to 6): one `Change { voters: old − {s} ∪ {d} }`, never a removal and
+  then an addition; `d`'s placeholder fed a snapshot through its hint of 1 (Q22), under
+  the overlap rule; catch-up by D-029's round as built, a snapshot-fed learner counting
+  once an append after its install succeeds within a round (Q28), its `RaftLearnerRound`
+  traced since Stage B (§11, raft 9); at `C_new`'s apply the generation raised and the
+  voters recorded, and the meta update sent (Q6); completion read from the moved range's
+  leader (Q31); and the move traced `RebalanceMove` as `begun`, `done`, or `abandoned`
+  once the move bound passes, after which it may be begun again (§7, step 6). This is the
+  half of the rebalancer that carries out one move, called here by the operator and the
+  sweep's driver and in Stage E by the policy; ranges 0 and 1 are never moved (Q9).
+- Collection (§7, step 5; Q27): a replica collects itself only on a descriptor at a higher
+  generation that excludes its node, asking the leader meta names after ten maximum
+  election timeouts without a message from a leader of its range; the deletion made as a
+  synced range delete of the replica's table (Stage A), traced `RangeRemoved { cause:
+  collected }`; a node chosen as `d` only once it has collected its old replica (Q26).
+- Q23's rule on accepting a change: a leader accepts no `Change` before it has applied its
+  own term's first entry. `RaftChangeAccepted` is traced since Stage B; this stage adds
+  the guard (§11, raft 8).
+- The re-add window (§8; Q26): the named sweep assertion, over `RaftMatchStarted`
+  (Stage B) and the incarnations `RangeRemoved` and `RangeCreated` carry.
+- The folds: checks 13, 14, 15 and 21; check 22's clause on a leader's first entry; check
+  18's clause for a configuration change; check 8's clause that a node that is not a voter
+  of P at `s` traces no `RangeCreated { cause: split }` of R; the hold check and the move
+  bound; the timer check's skips for a non-voter and a removed replica (§8).
+- `sim/shard.rs` draws moves, among them a move onto a range just after a split, before
+  its log is compacted, so the incoming learner replays `s`, and a crash of a range's
+  leader while a move's learner catches up (§10). This plan adds two draws to §10's
+  workload (SHARD.md:1603-1610), which names neither: a split drawn while a move's joint
+  configuration is in force, between the joint entry's append and `C_new`'s, so that
+  Q23's refusal at apply is reached; and a move back onto a node whose replica of the
+  range was collected, so that the re-add window's shape is drawn rather than hoped for.
+- `sim/move.rs` (a), (b) and (c), with `Fault::CrashCollecting` on stream `collect-crash`
+  (§10).
+- `sim/split.rs` (iii), with `Fault::CrashSplitting` on stream `split-crash`, which first
+  moves P onto nodes 2 to 4 (§10).
+
+**Entry criteria.** Q34: `sim/membership.rs` crosses the snapshot threshold, issue #46,
+resolved in Stage A, before `sim/move.rs` is built. Stage C's exit. Question 1 approved.
+
+**Exit criteria.**
+
+- `sim/shard.rs` with splits and moves: the correct system passes every seed at every
+  tier; every key linearizable across the splits and moves it makes under faults, on
+  which SPEC's "rebalance" rests (§9); checks 1 to 4, 6 to 10 and 13 to 21, and check 22's
+  first-entry clause, hold.
+- `sim/shard.rs`'s coverage, counted per run and printed at every tier, and each asserted
+  non-zero over CI's hundred seeds and above: splits refused at proposal while a change
+  catches up; splits applied as `refused` because the configuration at or below `s` was
+  joint; learners that apply `s` and range-delete the right span; and re-adds of a
+  collected replica. A count that a hundred seeds leave at zero is a hole in the driver's
+  draw, fixed there, not a tier raised.
+- The re-add window assertion holds on every seed of `sim/shard.rs`. The first seed on
+  which a leader that re-admitted a node traces, in that term, a `RaftMatchStarted` or
+  `RaftProgressReset` for it carrying a collected incarnation is pinned, whether or not
+  the assertion fails on it (§8). A failure on the correct system is the case for which
+  D-042 names the step — a total order on incarnations or a per-follower set of retired
+  ones (DECISIONS.md:2059-2064) — not a bound to widen.
+- `sim/move.rs`: the correct system passes every seed; per seed, in (a) the frame-length
+  limit and the stayer's crash were in place, and in (c) `Fault::CrashCollecting` fired
+  (§10).
+- `sim/split.rs` (iii): on every seed the arm fired at the victim's first `WalSynced`
+  after its `RaftCommit` reaching `s`; how often the restart shows the variant's state is
+  printed (§10).
+- Measured before asserted (Q39): (a)'s hold, the move bound, and the time from a
+  `C_new`'s commit to its collection, against Q27's ten maximum election timeouts, which
+  are unmeasured and open to change.
+- The equivalence test, each fold against the variant of this stage that trips it:
+  check 7, built in Stage C, against `SplitNotAtomicWithDescriptor`; check 8's non-voter
+  clause against `SplitCreatesRightOnNonVoter`; check 13 against `JointBeforeCaughtUp`;
+  check 14 against `GcBeforeRemovalCommitted`; check 15 against `RemoveBeforeCaughtUp`;
+  check 21 against `RemovalNotDurable`; the re-add window assertion against the variant
+  question 1 approves. Check 22 runs under the test over the correct system and this
+  stage's variants; no variant of this stage trips its first-entry clause, and it is
+  asserted against `ChangeWhileFrozen` in Stage E, which builds that variant.
+
+**Commits that move pinned hashes or schedules.** Each in its own commit, with its reason
+and a re-audit: Q23's guard on accepting a change, which moves `sim/membership.rs`'s
+schedule wherever a change reaches a leader before its term's first entry has applied;
+and collection, which gives the membership scenario's removed servers a behaviour they
+lack today, since D-029's removed servers "are never told to shut down" (§11, raft 7). The
+core's `RaftMatchStarted`, `RaftLearnerRound` and `RaftChangeAccepted` moved Phase 2's
+hashes in Stage B and move none here.
+
+**Buggy variants it must catch (8).**
+
+- `PlaceholderAcknowledges` — breaks Q22's rule that a placeholder acknowledges nothing;
+  caught by commit by majority, check 3: a commit counted node 4, which traced no
+  `RaftAppend` of the entry; `sim/move.rs` (a). Its catch needs node 4's chunks dropped
+  while X's appends to node 4 are delivered, which §10's (a) asserts in a variant's run
+  only as "whether" (SHARD.md:1704-1706). *Every seed* once (a) asserts that per seed in
+  the variant's run; until it does, *rate*, with the seeds on which the shape was reached
+  printed.
+- `SplitCreatesRightOnNonVoter` — breaks §5's rule, Q23's, that only a voter of P at `s`
+  writes R and a learner range-deletes the right span; caught by check 8's non-voter
+  clause; the sharded sweep's move just after a split; *rate*. No learner replays `s`
+  before this stage's moves.
+- `SplitNotAtomicWithDescriptor` — breaks §5's single apply batch; caught at the restart
+  by check 7 and check 8, and by linearizability on the seeds where that node's P leads
+  and accepts a right-half write R also accepts (§9); `sim/split.rs` (iii) with
+  `Fault::CrashSplitting`; *rate*, since whether the second batch is durable within one
+  slice is the disk's draw.
+- `RemoveBeforeCaughtUp` — breaks §7's one change per move (D-029); caught by check 15, a
+  rule fold that sees the variant's removal-first configuration on every seed the move
+  runs, and by the hold check on the seeds where (a)'s crash leaves the range without a
+  majority; `sim/move.rs` (a); *every seed* by check 15, the hold check's catches printed.
+- `JointBeforeCaughtUp` — breaks D-029's learners-first catch-up (RAFT.md §1); caught by
+  check 13, a rule fold that sees the variant's joint entry proposed with no caught-up
+  round on every seed the move runs, and by the hold check where node 4 holds nothing when
+  the stayer crashes; `sim/move.rs` (a); *every seed* by check 13, the hold check's
+  catches printed.
+- `GcBeforeRemovalCommitted` — breaks §7's rule, D-033's, that a removed replica is
+  collected only on an applied descriptor that excludes it at a higher generation; caught
+  by check 14; `sim/move.rs` (b); *every seed*. Not by linearizability: the shape that
+  carries it to a client is issue #47 (§9).
+- `RemovalNotDurable` — breaks §7's synced deletion; caught by check 21 at the restart;
+  `sim/move.rs` (c) with `Fault::CrashCollecting`; *rate*, since what the crash keeps of
+  an unsynced write is the disk's draw (§10).
+- `MoveNeverRetried` — breaks §7 step 6's rule that a move still at the old voters after a
+  bound is traced abandoned and may be begun again; caught by the move bound (§8); the
+  sharded sweep's leader crash during a learner's catch-up; *rate*. It is placed here
+  because step 6 and that crash are built here.
+
+**Issues.** Carries #47 (Q39): `GcBeforeRemovalCommitted` carried to a client is not
+built. Carries #43, #45 and #21 unchanged.
+
+**DECISIONS.md entries.** Moves: §7's steps, the generation raised at `C_new` (Q6), the
+node records (Q8), D-029's round as built (Q28, by precedent), completion read from the
+range's leader (Q31) and the move bound as measured. Collection (Q27), with the trigger's
+time as measured. Q23's rule on accepting a change. Q26's, which states the vote argument
+for re-added replicas and records the re-add assertion, its variant (question 1) and its
+pinned seed. The two draws this plan adds to `sim/shard.rs`'s workload.
+
+### Stage E — Merge, the rebalancer, and SPEC §4's exit criteria
+
+**Questions proposed before code.**
+
+1. *Shape (e)'s wait bound.* `sim/merge.rs` (e) needs the coordinator's wait bound set
+   below a minimum election timeout (SHARD.md:1674-1676). If the node cannot set it, (e)
+   cannot be built as written, and `UnfreezeBeforeAbortCommitted`, whose approved need is
+   (d) and (e) (SHARD.md:1738), would rest on (d) alone. That is returned to the owner
+   before the merge's code, not recorded in the merge's entry after it.
+2. Check 19's variant, if Stage C's question 2 chose `UnfreezeBeforeAbortCommitted` in
+   (e): the rate at which R traces a value after the merge, measured on (e)'s seeds.
+
+**Builds.**
+
+- Merge (§6; Q24, Q25): `MergeBegin`, `Subsume`, `Merge`, `MergeAbort` and `Unfreeze`,
+  each naming the attempt by `MergeBegin`'s index `h` and re-checked at apply; the
+  coordinator's wait for every replica of R at `f`; the abort, and `Unfreeze` proposed
+  only on the abort's effect or on reading its durable record; a new leader of L that
+  resumes, and R's leader asking after a bound; range commands resent; a replica that
+  lacks R at `f` stalling, traced `RangeMergeStalled`, without refusing its node, and a
+  snapshot of L at or above `m` replacing that R (Q27); L's pre-merge snapshot not
+  streamed after the merge; the merged generation max(g_L', g_R) + 1 (Q6); R's table
+  range-deleted (Stage A) and R's quarantine not taken (Q26); and Q23's rules for a merge,
+  no `Change` from the proposal of `MergeBegin` and none for a range merging or subsumed.
+- The rebalancer (§7): on the node whose replica of range 0 leads, reading descriptors
+  when it takes over (Q29); the goal of Q30; replica sets from meta and counts from each
+  node's memory (Q31); quarantined replicas moved off first, one per range (Q33); a
+  removed node drained (Q8); ranges 0 and 1 never moved (Q9); Q42's starting policy, its
+  tie-breaks from a named rebalancer stream; at most four moves across the cluster and
+  one per range (Q30).
+- The simulator's large runs (§11, env 4, 5, 6): records without payloads or polls and a
+  raised record cap for `sim/balance.rs`, each record keeping, beside what §11's env 4
+  lists (range, kind, term, and whether an AppendEntries or a chunk resets a timer), the
+  length of the frame it came from, which env 4 does not list and Q12's byte figures need
+  (SHARD.md:1957-1965); a run-length hint that counts work; nodes added to and removed
+  from a running simulation.
+- The folds: checks 11 and 12; check 18's merge clause; check 22's clause for a merging or
+  subsumed range; the subsume bound; the balance check; the timer check's skip for a
+  stalled replica (§8).
+- `sim/merge.rs` (a) to (f) (§10); `sim/shard.rs` draws merges and a `Change` sent to a
+  range it is merging (§10); `sim/balance.rs` (§10; Q30, Q39).
+- The devlog.
+
+**Entry criterion.** Stage D's exit. Question 1 approved.
+
+**Exit criteria.**
+
+- `sim/merge.rs`: the correct system passes every seed; per seed, (a) the correct
+  coordinator refuses the first merge and completes the second; (b) traces
+  `RangeMergeAborted` and a later `RangeUnfrozen`; (c) a request naming R reached node 2
+  while its R was subsumed; (d) node 1 appended `MergeAbort` while it led L and no abort of
+  the attempt took effect before its office ended; (e) node 1 appended `MergeAbort` above
+  `m` and applied `m` as a merge, with no `RangeUnfrozen` of the attempt in the correct
+  run; (f) a new leader of L took office with L `Merging` (§10). Shape (e) is built as
+  question 1 is answered.
+- SPEC §4's first exit criterion, "Linearizability holds across split/merge/rebalance
+  under faults" (SPEC.md:307): every key linearizable on every seed of `sim/shard.rs` with
+  splits, merges and moves, of `sim/balance.rs` at its tiers, and of `sim/split.rs`,
+  `sim/merge.rs` and `sim/move.rs`; on each, every check it runs holds. `sim/shard.rs`,
+  `sim/split.rs`, `sim/merge.rs` and `sim/move.rs` run checks 1 to 4 and 6 to 22 and the
+  re-add window assertion. `sim/balance.rs` runs what Q39 lists — the balance check,
+  checks 7 to 22 and linearizability, not the timer check — and two things more:
+  - the state of checks 1 to 4 that checks 11, 13 and 18 fold — check 1's map, check 2's
+    replayed logs, check 3's configurations and check 4's applied index
+    (SHARD.md:1248-1250, 1271-1272, 1312-1313) — which is those checks' own folds, so
+    checks 1 to 4 are asserted with them. This follows from checks 11, 13 and 18 as §8
+    defines them, not a widening of Q39's list, which excludes only the timer check;
+  - the re-add window assertion, which Q26 asks on every sweep seed and Q39's list does
+    not name. `sim/balance.rs` moves replicas off and back onto nodes, and so can draw a
+    re-add; this reading of Q26 is put to the owner with the plan.
+- SPEC §4's second, a 1 000-range cluster in simulation balanced within 10 % after node add
+  and remove (SPEC.md:308): `sim/balance.rs`, a thousand ranges made by driver splits
+  (Q18) on ten nodes, an eleventh added and a non-bootstrap node removed (Q9), under
+  Phase 2's network faults with every crash restarted, passes the balance check and the
+  checks above, without the timer check (Q39), on every seed of every tier that runs it.
+  The common rule's every tier does not apply to it. Its tiers are set by its measured
+  cost within D-040's budget (Q30): it runs in CI, as D-011 requires of an exit criterion
+  (DECISIONS.md:173-174), on the seed count its cost allows there, and at the gate, the
+  premerge and the nightly on the counts its cost allows at each; the counts and the
+  measured cost per seed are recorded in the rebalancer's entry beside the premerge
+  figure. If its cost allows no seed in CI, that goes to the owner.
+- Measured before asserted (Q39): the subsume bound; the balance bound, set from the
+  worst gap measured on the correct system plus a margin (Q30); the move counts and
+  convergence that fix Q42's parameters.
+- Q12's proof at 1 000 ranges, on `sim/balance.rs`'s correct runs. Pass: in every round
+  that persists nothing, each ordered node pair carries at most one heartbeat frame and
+  one response frame per tick, as §4 derives for frames drained whole
+  (SHARD.md:482-490), counted over the rounds whose inbox drained each arriving frame
+  whole; in rounds with persists, at most that plus the frames per later flush Stage B
+  measured; and the step cost, measured again as Stage B measured it on the node as it
+  stands at this stage, below the 20 µs an idle tick at 1 000 ranges allows. Recorded
+  beside §4's computed figures: the frames and bytes per ordered node pair, from each
+  record's frame length.
+- The equivalence test, each fold against the variant of this stage that trips it:
+  check 11 against `MergeDivergentReplicas` and `MergeBeforeRightApplied`; check 12
+  against `UnfreezeBeforeAbortCommitted`; check 18's merge clause against
+  `MergeTakesLeftGeneration`; check 22, both clauses, against `ChangeWhileFrozen`; and
+  check 19 as Stage C's question 2 settles.
+- Every variant of Stages C and D still caught to its standard, and Phase 2's to Stage B's.
+- The devlog written.
+
+**Commits that move pinned hashes or schedules.** Merge, the rebalancer and the large
+runs' records run in no Phase 2 scenario and in no scenario whose seeds Stages C and D
+pinned, except `sim/shard.rs`, whose draws of merges move its schedule; that commit
+re-audits its pins. A commit that changes a path the node shares with Phase 2's scenarios
+says so and re-audits theirs.
+
+**Buggy variants it must catch (8).**
+
+- `MergeDivergentReplicas` — breaks SPEC §4's and §6's identical replica sets; caught by
+  check 11 at the first `RangeMerged` on a node that holds both; `sim/merge.rs` (a);
+  *every seed*.
+- `MergeBeforeRightApplied` — breaks §6's wait for every replica of R and each node's own
+  check; caught by check 11 (`right_applied` below `f`), and by linearizability on some
+  seed where that node's L serves without writes R committed below `f` (§9);
+  `sim/merge.rs` (b); *every seed*.
+- `MergeTakesLeftGeneration` — breaks §1's and §6's max(g_L', g_R) + 1; caught by check 18
+  at the merge's apply, check 10, and the meta convergence bound; `sim/merge.rs` (a);
+  *every seed*.
+- `ServeAfterSubsume` — breaks §6's rule that a subsumed range serves and applies nothing
+  from `f`; caught by check 9, and by linearizability on some seed where a read through R
+  returns a value L overwrote (§9); `sim/merge.rs` (c); *every seed*.
+- `UnfreezeBeforeAbortCommitted` — breaks §6's rule that `Unfreeze` is proposed only once
+  the abort has taken effect or its record has been read (Q24); caught in (d) by check
+  12's first clause, and in (e) by check 12's second clause at node 1's apply of `m`, with
+  check 10 and linearizability on the seeds where both R and the merged L then take
+  right-span writes; `sim/merge.rs` (d) and (e); *every seed*.
+- `MergeNotResumed` — breaks §6's rule that a new leader of L finding L `Merging` completes
+  or aborts; caught by the subsume bound (§8); `sim/merge.rs` (f); *every seed*.
+- `ChangeWhileFrozen` — breaks §6's and Q23's refusal of `Change` for a range merging or
+  subsumed, and before a leader's first entry of its term; caught by check 22 at the
+  acceptance; the sharded sweep's `Change` to a range it is merging; *rate*. Check 22's
+  first-entry clause exists from Stage D, but the variant's named scenario is built here.
+- `RebalancerIgnoresLeaders` — breaks SPEC §4's balance of range count and leader count;
+  caught by the balance check (§8); `sim/balance.rs`; *rate*: the scenario does not
+  assert per seed that leaders were left gathered where splits put them (Q21), so the
+  catch is asserted at the tier its measured rate supports among the tiers that run
+  `sim/balance.rs`.
+
+**Issues.** Carries #44 (Q33): the rebalancer moves quarantined replicas off before any
+other move, and a range with two quarantined replicas and no leader can neither elect nor
+be moved, which stays the issue's and which the checks about time do not ask (§8). Carries
+#45, #43 and #47 unchanged, and #21: merge batches will need to carry the session table
+when #21 lands (Q11). The phase is done by D-011's definition (DECISIONS.md:173-174) only
+once the owner tags and publishes it; the release notes of that release record 0.3.0's
+format break (Q5, condition 3).
+
+**DECISIONS.md entries.** Merge (Q24, Q25; Q27's exception for a merged L's snapshot;
+Q26's R quarantine not taken), with the subsume bound as measured and shape (e) as
+question 1 is answered. The rebalancer (Q29 to Q33, Q42 with its parameters as measured,
+Q8's drain, Q9), with `sim/balance.rs`'s tiers and cost per seed. SPEC §4's exit criteria
+as measured, with Q30's balance bound and Q12's figures at 1 000 ranges.
+
+**Every variant of §10, placed once.** The twenty-four of §10's table are placed eight in
+Stage C, eight in Stage D and eight in Stage E, each in the stage where its catching
+check and its named scenario first both exist; none is left unplaced. Outside that count,
+each proposed before the code that needs it: the engine variants Stage A adds under
+CLAUDE.md's pair rule; the re-seed shape's variant (Stage B, question 3); a variant for
+check 19, if Stage C's question 2 chooses one; and the re-add window assertion's variant
+(Stage D, question 1), which §8 leaves to that stage. The five variants §9 also asserts
+caught by linearizability are placed with their stages: `TrustStaleDescriptor` and
+`ApplyIgnoresSpan` in C, `SplitNotAtomicWithDescriptor` in D, `ServeAfterSubsume` and
+`MergeBeforeRightApplied` in E.
+
+Each stage stops for review.
+
+| Stage | Builds | Exit scenario(s) | §10 variants |
+|---|---|---|---|
+| A | RAFT.md corrected (Q1); span checkpoint and live install (Q2) first; `SimEnv`'s queue (Q16); the per-range stream method (Q13); #46; Q5's layout and format break; seek, range delete | the live install's crash test and its two-switch variant; `sim/engine.rs`; `sim/membership.rs` past the threshold; `sim/raft.rs`, `sim/quorum.rs` on the queue | 0 (one engine variant per primitive) |
+| B | §4's node in `ananke-shard` with four static ranges per node (Q14, Q40, Q41); trace and checks 1–4 keyed by range; live installs; follower compaction; Q15's refusal and re-seed | `sim/raft.rs`, `sim/membership.rs`, sharded `sim/quorum.rs`; the re-seed shape; step cost, apply lag and follower log measured | 0 (Phase 2's 16 re-asserted; re-seed variant proposed) |
+| C | descriptors, routing and `RangeMismatch` (Q10); bootstrap (Q7); root and meta (Q3, Q4); id blocks (Q17); split, placeholders, overlap rule (Q18–Q23, Q27) | `sim/shard.rs` with splits and `Fault::MetaReorder`; `sim/split.rs` (i), (ii) | 8 |
+| D | node records (Q8); moves by joint consensus (§7); collection (Q27); the change guard (Q23); re-add window (Q26) | `sim/shard.rs` with moves, joint-configuration splits and re-adds; `sim/move.rs` (a)–(c); `sim/split.rs` (iii) | 8 (re-add variant proposed) |
+| E | merge (Q24); the rebalancer (Q29–Q33, Q42); large runs (env 4–6); SPEC §4's exit criteria; devlog | `sim/merge.rs` (a)–(f); `sim/shard.rs` with merges; `sim/balance.rs` at its measured tiers | 8 |
 
 ## 13. Decisions
 
