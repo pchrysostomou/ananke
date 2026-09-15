@@ -3336,15 +3336,25 @@ impl MembershipCoverage {
                     self.step_downs_outside_new as u64,
                 ),
                 ("configuration reverts", self.config_reverts as u64),
-                // PROPOSED(D-058): an install whose snapshot's configuration is older
-                // than the receiver's, taking the receiver back to the installed prefix.
-                (
-                    "reverts to a compacted or installed prefix",
-                    self.reverts_to_a_prefix as u64,
-                ),
             ] {
                 assert!(seen > 0, "the membership runs never saw {what}: {self:?}");
             }
+        }
+        // PROPOSED(D-058): an install whose snapshot's configuration is older than the
+        // receiver's, taking the receiver back to the installed prefix. The owner's
+        // decision of 2026-09-15, recorded in D-058: asserted from the thousand-seed tier
+        // (the premerge and the nightly) and at no lower tier, and printed with the
+        // coverage at every tier. On the tree with D-056's send queue it happens on 28 of
+        // the first thousand seeds, once on each, and on one of the first hundred, seed
+        // 97. At 2.8 % a hundred seeds see none with probability 0.972^100 = 0.058 and
+        // the gate's twenty with 0.57, so the assertion there would fail a tree with
+        // nothing wrong on the draw alone; a thousand see none with 0.972^1000 = 4.6e-13.
+        if seeds >= 1000 {
+            assert!(
+                self.reverts_to_a_prefix > 0,
+                "the membership runs never saw reverts to a compacted or installed prefix: \
+                 {self:?}"
+            );
         }
     }
 }

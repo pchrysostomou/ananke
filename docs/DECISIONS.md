@@ -5096,7 +5096,9 @@ first 1 000 seeds feed no joining server a snapshot in its learner phase.
   adoptions and refusals by the reason's first clause and asserts, at every tier, that none
   is for anything but lost state.
 
-**What the extension found.** No bug in the Phase 2 code it was aimed at, and one trace
+**What the extension found.** Measured on the lane's tree, before D-056's send queue moved
+every membership schedule; the figures on the tree with the queue follow, under *On the tree
+with D-056's queue*. No bug in the Phase 2 code it was aimed at, and one trace
 inconsistency in the install path, returned to the owner unfixed:
 
 - At 20, 100 and 1 000 seeds in release the correct server passes every seed, every seed
@@ -5110,13 +5112,14 @@ inconsistency in the install path, returned to the owner unfixed:
   1 000 seeds no install kept a tail, so none wrote the key from a configuration entry in a
   tail. Every install wrote the snapshot's own configuration.
 - The core's revert floor is not reached either. No truncation in a running core restored
-  a compacted or installed prefix's configuration over 1 000 seeds, on this tree, on
+  a compacted or installed prefix's configuration over 1 000 seeds, on the lane's tree, on
   268cf58, or with the threshold alone. What the coverage's `reverts_to_a_prefix` counts, 4 at
-  100 seeds and 44 at 1 000, asserted from 100, are installs whose snapshot's configuration
+  100 seeds and 44 at 1 000 on the lane's tree, are installs whose snapshot's configuration
   is older than the receiver's in force, which take the receiver back to the installed
-  prefix. Issue #46's second item needs a follower that installs and then appends and
-  truncates a configuration entry above its prefix; this scenario does not build it, and
-  that is a question for the owner.
+  prefix; the floor itself is `truncation_reverts_to_a_prefix`, 0. Issue #46's second item
+  needs a follower that installs and then appends and truncates a configuration entry above
+  its prefix; this scenario does not build it. The owner deferred it, with the key repair's
+  tail branch above, to issue #56 (*Issue #46: met and deferred*, below).
 - The install's `RaftConfig` (node.rs, `Snap::Finish`) writes the configuration's voters
   into `new` when it is not joint, where `TraceEvent::RaftConfig` documents `new` as empty
   outside a joint configuration and the core and the restatement write it empty; the same
@@ -5134,7 +5137,7 @@ learners promoted 2 524 (2 470); elections while joint 33 (51); step-downs of a 
 reverts 69 (709). The reverts fall because installs now take conflicting configuration
 entries out of force where truncations did. On 268cf58, 717 configuration entries a server
 held in force had another term in the committed log at that index, and 709 of them left
-force by a truncation, each a revert. On this tree 780 did: 25 by a truncation, 746 by an
+force by a truncation, each a revert. On the lane's tree 780 did: 25 by a truncation, 746 by an
 install, and 9 not before the run ended. Of those 746, 44 took the receiver to an older
 configuration and count as reverts, and 702 took it to a newer one, which the counter,
 comparing indices, does not see as leaving an entry out of force. The threshold alone gives
@@ -5143,7 +5146,7 @@ comparing indices, does not see as leaving an entry out of force. The threshold 
 Timings, the two membership tests at 1 000 seeds in release, another agent's sweeps sharing
 the machine: on a563205, the commit before this review's changes, 26.0 s with the one-minute
 load at 18.4 and falling at its start, and 14.0 s at 10.1 to 11.6, against 10.4 s on 268cf58
-at 9.8 to 10.1; on this tree 26.2 s at a mean load of 84.0 over six samples, against 19.7 s on
+at 9.8 to 10.1; on the lane's tree 26.2 s at a mean load of 84.0 over six samples, against 19.7 s on
 268cf58 at 79.6 over four. The load moves these more than the change does.
 
 Every figure above has its command and output in the lane's scratchpad, `scratchpad stage-a/n/audit-d058`:
@@ -5153,6 +5156,51 @@ are the tests' coverage and timings with their load samples; `feeds-new.log` and
 (`zz_m5_new.rs`); `traces-new.log`, `traces-threshold-alone.log` and
 `traces-268cf58.log` are the reverts, truncations, installs, tails, refusals and conflicting
 configuration entries (`zz_m5_trace.rs`).
+
+**On the tree with D-056's queue.** D-056's send queue landed after the figures above and
+moved every membership schedule; no verdict moved with it. The membership tests in release
+on 4177c5b with this entry's tier change below (`RUSTFLAGS="-D warnings" ANANKE_SEEDS=<n>
+cargo test --workspace --all-features --release --test raft -- --nocapture membership
+one_majority`, `scratchpad stage-a/q/q2-membership-{20,100,1000}.log`; the same coverage at
+100 and 1 000 in the whole raft suite on 4177c5b, `q/raft-{100,1000}-4177c5b.log`): the
+correct server passes every seed at 20, 100 and 1 000, and every seed feeds a joining server
+a snapshot in its learner phase (59, 377 and 3 957 installs), with no fallback (the longest
+wait 50, 50 and 300 ms). Every install is adopted — 111, 641 and 6 377 adoptions — and no
+store is refused. No install kept a tail or carried a configuration entry in one, and no
+truncation reverted a configuration to a prefix, at any of the three
+(`installs_keeping_a_tail`, `installs_whose_tail_carries_a_configuration` and
+`truncation_reverts_to_a_prefix` all 0). `reverts_to_a_prefix` is 0, 1 and 28: once on each
+of 28 seeds of the thousand, and of the first hundred on seed 97 alone
+(`q/probe-reverts.log`, a throwaway copy of the test printing each seed's count, deleted
+and never committed). `SingleMajorityInJointConsensus` is caught on 8 of 20, 31 of 100 and
+296 of 1 000 seeds.
+
+**Issue #46: met and deferred — the owner's decision of 2026-09-15.** This part is decided;
+the scenario's extension above stays proposed. The owner accepted Q34 as "met for the
+snapshot feed and the configuration key" and had the rest filed apart, so #46 is met in
+part by Stage A and is not fully closed; SHARD.md §12's "Resolves #46" for Stage A means the
+met part below.
+
+- *Met in Stage A.* `sim/membership.rs` crosses the snapshot threshold. During 3 → 5 → 3 a
+  learner is fed by an install from a compacted leader, asserted per seed. The configuration
+  key the install's repair writes is exercised on that path, and the open after each
+  adoption checks it against the log. The correct server passes every seed, and
+  `SingleMajorityInJointConsensus` is still caught at every tier.
+- *Deferred to issue #56*, filed 2026-09-15, "Membership: the truncation revert floor and the
+  kept-tail key repair under snapshots (split from #46)". It holds the truncation revert
+  floor, a running server's configuration reverting to its snapshot's when a configuration
+  entry above the snapshot is truncated, reached on 0 of 1 000 seeds before the queue and
+  after it. It also holds the install repair's kept-tail branch, never taken. Both keep their
+  unit tests alone until #56 builds the shapes that reach them.
+- *The tier of `reverts_to_a_prefix`.* Its count above zero is asserted from the
+  thousand-seed tier, `scripts/premerge.sh` and the nightly, and at no lower tier. It stays
+  printed with the coverage at every tier. It was asserted from a hundred seeds, where the
+  lane's tree counted 4; on the tree with the queue a hundred count 1, on seed 97, and a thousand
+  see it on 28 seeds. At that rate, 2.8 %, a hundred seeds see none with probability
+  0.972^100 = 0.058 and the gate's twenty with 0.57. Below a thousand the assertion would
+  fail a tree with nothing wrong on the draw alone; a thousand see none with probability
+  0.972^1000 = 4.6 × 10^-13. The counter is installs taking a receiver back to an older
+  configuration, not the revert floor #56 holds.
 
 **Alternatives.** *The threshold alone*: 39 seeds in 1 000 without a learner-phase feed.
 *Crashing or isolating a joining server until its leader compacts past it*: a second fault
@@ -5171,7 +5219,7 @@ cite was measured at ten thousand seeds before this change; the next ten-thousan
 nightly re-measures it on the moved schedule, and those three places are marked as measured
 before D-058. `sim/move.rs` can rely on a learner fed by snapshot during a change on one group,
 not on the key repair's tail branch or the truncation revert floor, which this scenario does
-not reach. If a seed at ten thousand exhausts the wait, reaches a leader that has not
+not reach and issue #56 holds. If a seed at ten thousand exhausts the wait, reaches a leader that has not
 compacted, or refuses a store, the correct server's sweep names it.
 
 ---
