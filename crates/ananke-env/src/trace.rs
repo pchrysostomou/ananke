@@ -302,6 +302,17 @@ pub enum TraceEvent {
         /// The installed tables, each with its first and last user key.
         added: Vec<(u64, Bytes, Bytes)>,
     },
+    /// An install or a range delete was in force, its switch durable, and deleting
+    /// the tables it took out or the log segments at or below its number failed.
+    /// The install still resolves as made; what it left is removed as orphans at
+    /// the next open, or by the next flush's deletion of the log.
+    // PROPOSED(D-054): an error after the switch does not undo the install.
+    InstallCleanupFailed {
+        /// The install's sequence number.
+        seq: u64,
+        /// The error's text.
+        error: String,
+    },
     /// A compaction deleted an input table once the manifest no longer listed it.
     SstDeleted {
         /// The table's number.

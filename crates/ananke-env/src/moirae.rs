@@ -27,6 +27,7 @@
 //! | `SstWritten` / `SstDropped` / `SstDeleted` | `log` `ananke.sst.written` / `.dropped` / `.deleted` |
 //! | `CompactionWritten`                      | `log` `ananke.compaction.written`             |
 //! | `SpanInstalled`                          | `log` `ananke.engine.span-installed`          |
+//! | `InstallCleanupFailed`                   | `log` `ananke.engine.install-cleanup-failed`  |
 //! | `ManifestWritten` / `CurrentSwitched` / `ManifestFallback` | `log` `ananke.manifest.written` / `.switched` / `.fallback` |
 //! | `OpenRefused` / `EngineQuiesced`         | `log` `ananke.engine.open-refused` / `.quiesced` |
 //! | `OrphanRemoved` / `WalSegmentDeleted`    | `log` `ananke.fs.orphan-removed` / `ananke.wal.segment-deleted` |
@@ -1017,6 +1018,14 @@ fn convert(
         TraceEvent::FlusherFailed { error } => log(
             "ananke.engine.flusher-failed",
             Some(Json::obj(vec![("error", Json::str(error))])),
+        ),
+        // PROPOSED(D-054): an error after the switch does not undo the install.
+        TraceEvent::InstallCleanupFailed { seq, error } => log(
+            "ananke.engine.install-cleanup-failed",
+            Some(Json::obj(vec![
+                ("seq", int(*seq)),
+                ("error", Json::str(error)),
+            ])),
         ),
         TraceEvent::MemtableFlushed { memtable, up_to } => log(
             "ananke.memtable.flushed",

@@ -1583,6 +1583,27 @@ impl<E: Environment> Engine<E> {
     /// switch is made, and one at or above the install's number reads the span as it
     /// was until the switch and as installed after it: the install replaces the
     /// span's history, it does not add to it (D-054).
+    ///
+    /// # Errors
+    ///
+    /// The returned future resolves with the refusal ([`InstallRefused`]) or with an
+    /// I/O error, and what an error leaves depends on when it came:
+    ///
+    /// - Before the install's manifest is written (flushing, reading the tables,
+    ///   writing the rewrites and the installed tables): the engine is as it was,
+    ///   and the tables written so far are orphans the next open removes.
+    /// - Writing the install's manifest or switching `CURRENT` to it: whether
+    ///   `CURRENT` names it is not known, and a manifest file may hold the next
+    ///   number. The engine quiesces (D-044, traced as `EngineQuiesced`), so no
+    ///   flush or compaction tries to write a manifest under that number, and the
+    ///   next open finds the span as it was or as installed.
+    /// - After the switch: the install is in force and resolves `Ok`. An error
+    ///   deleting the tables it took out or the log segments at or below its number
+    ///   is traced as `InstallCleanupFailed`; the tables left are orphans the next
+    ///   open removes, and the segments go with the next flush's.
+    ///
+    /// If the install's task ends without an outcome, panicking or dropped with its
+    /// runtime, the future resolves with an error saying so.
     // PROPOSED(D-054): the live install of a span, in one manifest switch.
     pub fn install_span(&self, range: Range<Bytes>, source: SpanSource<E>) -> SpanInstall {
         self.begin_install(range, source, false)
@@ -1636,32 +1657,25 @@ impl<E: Environment> Engine<E> {
             // was marked: the split is made here instead.
             self.shared.split_at_install(seq);
         }
-        let hold = InstallHold {
-            shared: self.shared.clone(),
-            seq,
+        let slot: Arc<Mutex<InstallSlot>> = Arc::default();
+        let task = InstallTask {
+            hold: Some(InstallHold {
+                shared: self.shared.clone(),
+                seq,
+            }),
+            slot: slot.clone(),
         };
         let shared = self.shared.clone();
         // PROPOSED(D-054): the install runs in a task of its own, so a caller that
         // drops its future or leaves it unpolled cannot stop it half-way, with a
         // manifest written under the next number and never switched to.
-        let slot: Arc<Mutex<InstallSlot>> = Arc::default();
-        let done = slot.clone();
         self.shared.env.spawn("span-install", async move {
             let result = async {
                 marker.await?;
                 shared.install_span(seq, range, source, delete).await
             }
             .await;
-            // The flusher may go on before the caller learns the outcome.
-            drop(hold);
-            let waker = {
-                let mut done = lock(&done);
-                done.result = Some(result);
-                done.waker.take()
-            };
-            if let Some(waker) = waker {
-                waker.wake();
-            }
+            task.finish(result);
         });
         SpanInstall {
             seq: Some(seq),
@@ -2129,15 +2143,36 @@ impl<E: Environment> Shared<E> {
                 next.flushed_seq = next.flushed_seq.max(seq);
             }
             self.env.trace(event(next.number));
-            self.write_manifest(&next).await?;
+            if let Err(error) = self.write_manifest(&next).await {
+                // PROPOSED(D-054): whether CURRENT names the install's manifest is
+                // not known, and its file may hold the next number: a flush or a
+                // compaction writing under it would fail for good, or write over
+                // the install. The engine does no more work, and the next open
+                // finds the span as it was or as installed.
+                self.quiesce("an install's manifest or its switch failed");
+                return Err(error);
+            }
             let mut put_in = rewritten;
             put_in.extend(added);
             self.install(next, &removed, put_in);
         }
         let manifest = lock(&self.tables).manifest.number;
-        self.delete_tables(&removed).await?;
-        if !skip_memtables {
-            self.wal.delete_segments_through(seq).await?;
+        // PROPOSED(D-054): the switch is durable, so the install is in force and
+        // resolves as made whatever the deletions do; what they leave is removed as
+        // orphans at the next open, or by the next flush's deletion of the log.
+        let cleanup = async {
+            self.delete_tables(&removed).await?;
+            if !skip_memtables {
+                self.wal.delete_segments_through(seq).await?;
+            }
+            Ok::<(), io::Error>(())
+        }
+        .await;
+        if let Err(error) = cleanup {
+            self.env.trace(TraceEvent::InstallCleanupFailed {
+                seq,
+                error: error.to_string(),
+            });
         }
         Ok(InstallInfo {
             seq,
@@ -2229,8 +2264,10 @@ impl<E: Environment> std::fmt::Debug for SpanSource<E> {
 }
 
 /// An install on its way: numbered at once, and resolving once the switch that
-/// makes it the state is durable, or with the refusal. The install runs in a task
-/// of the engine's own; dropping this, or never polling it, leaves it to finish.
+/// makes it the state is durable, or with the refusal or the error. The install
+/// runs in a task of the engine's own; dropping this, or never polling it, leaves it
+/// to finish, and a task that ends without an outcome resolves this with an error
+/// rather than leaving it pending.
 // PROPOSED(D-054): the live install of a span, in one manifest switch.
 pub struct SpanInstall {
     seq: Option<Seq>,
@@ -2249,7 +2286,54 @@ enum InstallState {
 #[derive(Default)]
 struct InstallSlot {
     result: Option<io::Result<InstallInfo>>,
+    /// Set with the outcome, and never unset: taken, it is not given again.
+    done: bool,
     waker: Option<Waker>,
+}
+
+/// What an install's task owns for as long as it runs: the hold on the flusher and
+/// its caller's outcome. However the task ends — its work done, or the task
+/// panicking, aborted or dropped with its runtime — the hold is let go first, and
+/// then the caller gets an outcome and is woken, an error if the work left none.
+// PROPOSED(D-054): the caller always learns how the install ended.
+struct InstallTask<E: Environment> {
+    hold: Option<InstallHold<E>>,
+    slot: Arc<Mutex<InstallSlot>>,
+}
+
+impl<E: Environment> InstallTask<E> {
+    /// Lets the flusher go, then leaves `result` for the caller.
+    fn finish(mut self, result: io::Result<InstallInfo>) {
+        drop(self.hold.take());
+        self.resolve(|| result);
+    }
+
+    /// Leaves an outcome for the caller and wakes it, unless one was left already.
+    fn resolve(&self, result: impl FnOnce() -> io::Result<InstallInfo>) {
+        let waker = {
+            let mut slot = lock(&self.slot);
+            if slot.done {
+                return;
+            }
+            slot.done = true;
+            slot.result = Some(result());
+            slot.waker.take()
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+}
+
+impl<E: Environment> Drop for InstallTask<E> {
+    fn drop(&mut self) {
+        drop(self.hold.take());
+        self.resolve(|| {
+            Err(io::Error::other(
+                "the install's task ended without an outcome",
+            ))
+        });
+    }
 }
 
 impl SpanInstall {
@@ -2280,6 +2364,7 @@ impl Future for SpanInstall {
                 let mut slot = lock(slot);
                 match slot.result.take() {
                     Some(result) => Poll::Ready(result),
+                    None if slot.done => Poll::Ready(Err(gone())),
                     None => {
                         slot.waker = Some(cx.waker().clone());
                         Poll::Pending

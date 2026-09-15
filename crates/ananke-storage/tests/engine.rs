@@ -1636,3 +1636,295 @@ fn an_install_from_a_store_further_along_carries_the_install_s_number() {
         });
     }
 }
+
+/// An install and a range delete whose futures are dropped the moment they are
+/// numbered still run to their switches, in the task the engine spawned for each
+/// (D-054): the install is in force, a later install is not refused as in
+/// progress, and a later write is flushed as usual, with the flusher never failing.
+// PROPOSED(D-054): the install runs in a task of its own.
+#[test]
+fn a_dropped_install_or_range_delete_still_runs_to_its_switch() {
+    use ananke_storage::SpanSource;
+    let mut sim = Sim::new(SimConfig::new(47));
+    let node = sim.add_node();
+    let (install_seq, delete_seq) = on_node_for(&mut sim, node, Duration::from_millis(50), |env| {
+        Box::pin(async move {
+            let (db, _) = Engine::open(env.clone(), config(400)).await.unwrap();
+            fill(&db, 0..90, 20).await;
+            env.clock().sleep(Duration::from_millis(1)).await;
+            db.checkpoint_span(b"k005"..b"k012", Path::new("/stage/one"))
+                .await
+                .unwrap();
+            fill(&db, 90..150, 20).await;
+            env.clock().sleep(Duration::from_millis(1)).await;
+            let source = db.open_span_source(Path::new("/stage/one")).await.unwrap();
+            let install = db.install_span(b("k005")..b("k012"), source);
+            let install_seq = install.seq().expect("numbered");
+            drop(install);
+            env.clock().sleep(Duration::from_millis(5)).await;
+            for k in 0..20u32 {
+                let want = if (5..12).contains(&k) {
+                    expected(k, 90, 20)
+                } else {
+                    expected(k, 150, 20)
+                };
+                assert_eq!(
+                    db.get(format!("k{k:03}").as_bytes()).await.unwrap(),
+                    want,
+                    "k{k:03} after the dropped install"
+                );
+            }
+            let installed: Vec<(u64, u64)> = db.levels()[0]
+                .iter()
+                .filter(|t| t.first_key >= b("k005") && t.last_key < b("k012"))
+                .map(|t| (t.first_seq, t.max_seq))
+                .collect();
+            assert!(
+                !installed.is_empty() && installed.iter().all(|&s| s == (install_seq, install_seq)),
+                "the installed tables are in service at the install's number: {installed:?}"
+            );
+
+            let removal = db.delete_range(b("k013")..b("k016"));
+            let delete_seq = removal
+                .seq()
+                .expect("not refused as in progress: the dropped install finished");
+            drop(removal);
+            env.clock().sleep(Duration::from_millis(5)).await;
+            for k in 13..16 {
+                assert_eq!(db.get(format!("k{k:03}").as_bytes()).await.unwrap(), None);
+            }
+            // A third, awaited, is not refused either.
+            db.install_span(b("k017")..b("k018"), SpanSource::empty())
+                .await
+                .unwrap();
+
+            // A later write, and enough after it to fill the memtable: flushed.
+            let later = db.put(b("k007"), b("after")).await.unwrap();
+            for i in 0..20 {
+                db.put(Bytes::from(format!("z{i:02}")), Bytes::from(vec![b'x'; 40]))
+                    .await
+                    .unwrap();
+            }
+            env.clock().sleep(Duration::from_millis(5)).await;
+            assert!(
+                db.manifest().flushed_seq >= later,
+                "the write after the installs was flushed: {} < {later}",
+                db.manifest().flushed_seq
+            );
+            assert_eq!(db.get(b"k007").await.unwrap(), Some(b("after")));
+            (install_seq, delete_seq)
+        })
+    });
+    let trace = sim.trace();
+    let installed: Vec<u64> = trace
+        .iter()
+        .filter_map(|r| match r.event {
+            TraceEvent::SpanInstalled { seq, .. } => Some(seq),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        installed.contains(&install_seq) && installed.contains(&delete_seq),
+        "{installed:?}"
+    );
+    assert!(
+        !trace
+            .iter()
+            .any(|r| matches!(r.event, TraceEvent::FlusherFailed { .. })),
+        "the flusher never failed"
+    );
+}
+
+/// An install whose switch of `CURRENT` fails after its manifest is written leaves
+/// a manifest file under the next number and does not know whether `CURRENT` names
+/// it (D-054). The engine quiesces, traced, so no flush writes under that number;
+/// writes are still taken, and nothing fails later.
+// PROPOSED(D-054): an error writing or switching to the install's manifest
+// quiesces the engine.
+#[test]
+fn an_install_whose_switch_fails_quiesces_the_engine() {
+    use ananke_storage::{InstallRefused, SpanSource};
+    let mut sim = Sim::new(SimConfig::new(53));
+    let node = sim.add_node();
+    on_node_for(&mut sim, node, Duration::from_millis(50), |env| {
+        Box::pin(async move {
+            let (db, _) = Engine::open(env.clone(), config(400)).await.unwrap();
+            fill(&db, 0..90, 20).await;
+            env.clock().sleep(Duration::from_millis(1)).await;
+            // An install first, so every memtable is flushed and the next install
+            // writes no manifest before its own.
+            db.install_span(b("k000")..b("k001"), SpanSource::empty())
+                .await
+                .unwrap();
+            let before = db.manifest().number;
+            // CURRENT.tmp as a directory: the switch's open of it fails.
+            env.fs()
+                .create_dir_all(Path::new("/db/CURRENT.tmp"))
+                .await
+                .unwrap();
+            let failed = db.delete_range(b("k005")..b("k009")).await;
+            assert!(failed.is_err(), "{failed:?}");
+            assert!(db.quiesced(), "the engine quiesced");
+            assert_eq!(db.manifest().number, before, "nothing switched in memory");
+            let manifests: Vec<u64> = env
+                .fs()
+                .read_dir(Path::new("/db"))
+                .await
+                .unwrap()
+                .iter()
+                .filter_map(|n| ananke_storage::manifest::manifest_of(n))
+                .collect();
+            assert!(
+                manifests.contains(&(before + 1)),
+                "the install's manifest file holds the next number: {manifests:?}"
+            );
+            // Writes are taken; no flush runs, so none collides with that file.
+            let later = db.put(b("k007"), b("after")).await.unwrap();
+            for i in 0..20 {
+                db.put(Bytes::from(format!("z{i:02}")), Bytes::from(vec![b'x'; 40]))
+                    .await
+                    .unwrap();
+            }
+            env.clock().sleep(Duration::from_millis(5)).await;
+            assert!(db.manifest().flushed_seq < later);
+            assert_eq!(db.get(b"k007").await.unwrap(), Some(b("after")));
+            let refusal = db
+                .delete_range(b("k010")..b("k011"))
+                .await
+                .err()
+                .and_then(|e| InstallRefused::from_io(&e));
+            assert_eq!(refusal, Some(InstallRefused::Quiesced));
+        })
+    });
+    let trace = sim.trace();
+    assert!(trace.iter().any(|r| matches!(
+        r.event,
+        TraceEvent::EngineQuiesced { reason, .. } if reason.contains("install")
+    )));
+    assert!(
+        !trace
+            .iter()
+            .any(|r| matches!(r.event, TraceEvent::FlusherFailed { .. }))
+    );
+}
+
+/// An install whose deletion of the tables it took out fails after its switch is
+/// in force, and resolves as made (D-054): the error is traced, the span reads as
+/// installed, and a reopen removes the leftovers and reads the same.
+// PROPOSED(D-054): an error after the switch does not undo the install.
+#[test]
+fn an_install_whose_cleanup_fails_after_the_switch_resolves_as_made() {
+    let mut sim = Sim::new(SimConfig::new(59));
+    let node = sim.add_node();
+    let want = on_node_for(&mut sim, node, Duration::from_millis(50), |env| {
+        Box::pin(async move {
+            let (db, _) = Engine::open(env.clone(), config(400)).await.unwrap();
+            // A table holding only keys of the span, then the rest.
+            for k in 5..9 {
+                db.put(
+                    Bytes::from(format!("k{k:03}")),
+                    Bytes::from(vec![b'v'; 100]),
+                )
+                .await
+                .unwrap();
+            }
+            fill(&db, 0..90, 20).await;
+            env.clock().sleep(Duration::from_millis(1)).await;
+            let inside = db.levels()[0]
+                .iter()
+                .find(|t| t.first_key >= b("k005") && t.last_key < b("k009"))
+                .map(|t| t.number)
+                .expect("a table holds only the span's keys");
+            // Gone before the install deletes it: its deletion fails.
+            env.fs()
+                .remove_file(&ananke_storage::manifest::sst_path(
+                    Path::new("/db"),
+                    inside,
+                ))
+                .await
+                .unwrap();
+            let done = db.delete_range(b("k005")..b("k009")).await.unwrap();
+            assert!(done.removed >= 1);
+            assert!(
+                db.levels().iter().flatten().all(|t| t.number != inside),
+                "the table is out of service"
+            );
+            let mut want = Vec::new();
+            for k in 0..20u32 {
+                let expect = if (5..9).contains(&k) {
+                    None
+                } else {
+                    expected(k, 90, 20)
+                };
+                assert_eq!(
+                    db.get(format!("k{k:03}").as_bytes()).await.unwrap(),
+                    expect,
+                    "k{k:03}"
+                );
+                want.push(expect);
+            }
+            want
+        })
+    });
+    assert!(
+        sim.trace()
+            .iter()
+            .any(|r| matches!(&r.event, TraceEvent::InstallCleanupFailed { .. }))
+    );
+    let reopened = on_node(&mut sim, node, |env| {
+        Box::pin(async move {
+            let (db, _) = Engine::open(env, config(400)).await.unwrap();
+            let mut got = Vec::new();
+            for k in 0..20 {
+                got.push(db.get(format!("k{k:03}").as_bytes()).await.unwrap());
+            }
+            got
+        })
+    });
+    assert_eq!(reopened, want);
+}
+
+/// An install whose task is dropped before it has an outcome, here with its node at
+/// a crash, resolves its caller's future with an error instead of leaving it
+/// pending for good (D-054).
+// PROPOSED(D-054): the caller always learns how the install ended.
+#[test]
+fn an_install_whose_task_ends_without_an_outcome_resolves_with_an_error() {
+    use ananke_storage::SpanInstall;
+    use std::task::{Context, Poll, Waker};
+    // Every file operation takes a tenth of a millisecond, so the install is still
+    // at work when the node crashes.
+    let mut sim_config = SimConfig::new(61);
+    sim_config.fs.latency_min = Duration::from_micros(100);
+    sim_config.fs.latency_max = Duration::from_micros(100);
+    let mut sim = Sim::new(sim_config);
+    let node = sim.add_node();
+    let stash: Arc<Mutex<Option<SpanInstall>>> = Arc::default();
+    let out = stash.clone();
+    let env = sim.env(node);
+    env.clone().spawn("test", async move {
+        let (db, _) = Engine::open(env.clone(), config(400)).await.unwrap();
+        fill(&db, 0..40, 20).await;
+        *out.lock().unwrap() = Some(db.delete_range(b("k005")..b("k009")));
+        env.clock().sleep(Duration::from_secs(60)).await;
+        drop(db);
+    });
+    while stash.lock().unwrap().is_none() {
+        sim.run_for(Duration::from_micros(10));
+    }
+    let mut install = stash.lock().unwrap().take().expect("numbered");
+    assert!(install.seq().is_some());
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(
+        std::pin::Pin::new(&mut install).poll(&mut cx).is_pending(),
+        "the install had not finished when its node crashed"
+    );
+    sim.crash(node);
+    match std::pin::Pin::new(&mut install).poll(&mut cx) {
+        Poll::Ready(Err(error)) => assert!(
+            error.to_string().contains("ended without an outcome"),
+            "{error}"
+        ),
+        other => panic!("the install resolved {other:?}"),
+    }
+}

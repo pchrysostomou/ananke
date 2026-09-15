@@ -4228,7 +4228,34 @@ task leaves. A caller that drops the future, or never polls it, cannot stop the 
 between writing its manifest and switching to it, which would leave a manifest file
 under the next number that the next flush's `create_new` then fails on for good, and
 cannot hold the flusher back by not polling. The task lets the flusher go before it
-tells the caller.
+tells the caller. What the task owns — the hold on the flusher and the caller's
+outcome — is one value whose drop lets the flusher go and then, if the work left no
+outcome, leaves the error *the install's task ended without an outcome* and wakes the
+caller: a task that panics, is aborted, or is dropped with its runtime or its node no
+longer leaves `SpanInstall` pending for good, which on the real runtime it did
+(`an_install_whose_task_ends_without_an_outcome_resolves_with_an_error` crashes the
+node under an install and polls its future after). A future polled again after it
+resolved says so rather than waiting.
+
+*When an install fails.* What an error leaves depends on when it comes. Before the
+install's manifest is written — flushing the memtables below it, reading the tables,
+writing the rewrites and the installed tables — the engine is as it was, and the tables
+written so far are orphans the next open removes. Writing that manifest, or switching
+`CURRENT` to it, is different: the manifest's file may already hold the next number,
+which the next flush's `create_new` would then fail on for good, and `CURRENT` may name
+it, though the engine's memory still lists the manifest before. The engine quiesces
+(D-044), traced as `EngineQuiesced` with the reason *an install's manifest or its switch
+failed*: no flush, compaction or log deletion follows, writes are still taken into the
+log, and the next open finds the span as it was or as installed, with the log replaying
+over it (`an_install_whose_switch_fails_quiesces_the_engine`). Once the switch has
+returned the install is in force, and it resolves `Ok` whatever follows: an error
+deleting the tables it took out or the log segments at or below its number is traced as
+`InstallCleanupFailed`, the tables left are orphans the next open removes, and the
+segments go with the next flush's deletion
+(`an_install_whose_cleanup_fails_after_the_switch_resolves_as_made`). A future dropped
+at once leaves the install to its switch, and the next install is not refused
+(`a_dropped_install_or_range_delete_still_runs_to_its_switch`). The simulator's
+filesystem returns no error the engine did not cause, so none of this moves a trace.
 
 *Applies in order.* The split of the memtables at `S` rests on D-021's rule that
 writes apply in sequence order: every record below `S` applied before `S`, and `S`'s
@@ -4482,7 +4509,9 @@ the one caller that installs or deletes a range (Q14), serialises them, so it ne
 meets `InProgress`; any other caller retries after the install in progress resolves.
 D-055 puts the install, the span checkpoint, the range delete and the seek on the engine
 sweep's default schedule. `TraceEvent::SpanInstalled` is new, with the moirae line
-`ananke.engine.span-installed`. The engine sweep's default schedule runs no install, span
+`ananke.engine.span-installed`, and so is `TraceEvent::InstallCleanupFailed`, with
+`ananke.engine.install-cleanup-failed`. An install that fails writing or switching to its
+manifest leaves the engine quiesced until it is reopened. The engine sweep's default schedule runs no install, span
 checkpoint or variant of this entry, so its seeds' schedules and its three variants'
 rates are unchanged by this entry (below); the change to level 0's read order and the
 flusher's check move no schedule of a run with no install, and no pinned trace hash
