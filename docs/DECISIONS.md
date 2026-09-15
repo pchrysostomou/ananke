@@ -5224,4 +5224,190 @@ compacted, or refuses a store, the correct server's sweep names it.
 
 ---
 
-_Next entry: D-059. Add one before implementing anything not covered above._
+## D-061 — A catch or a coverage state seen on under 5 % of seeds is asserted from the thousand-seed tier
+
+**Context.** A sweep's "caught on some seed" and a coverage counter's "seen above zero" are
+draws. The seeds are fixed, so an assertion that a thin rate happens to meet on the gate's
+twenty passes every gate until a change redraws the schedules, and then fails a tree with
+nothing wrong. D-041 and D-044 gave such catches the hundred-seed tier. In its answers of
+2026-09-15 the owner moved `RefusalNotDurable`'s catch, 1.32 % at the nightlies, to the
+thousand-seed tier (D-056) and `reverts_to_a_prefix`, 2.8 %, likewise (D-058), and made it a
+rule, in answer 1: "Add a general rule to CLAUDE.md: a variant caught on under 5% of seeds
+asserts its catch at the premerge tier, never at the gate tier — the assertion belongs where
+the statistics support it. Audit the other variants against that rule and move any that are
+similarly fragile." The tiers are D-040's: 20 seeds at the gate, 100 in CI, 1 000 under
+`scripts/premerge.sh`, 10 000 in the nightly.
+
+**Decision — the owner's of 2026-09-15.** The rule is in CLAUDE.md's working agreements
+beside the pair rule and the pinned-seed rule, read as the owner applied it to
+`RefusalNotDurable`:
+
+- A variant caught on under 5 % of seeds asserts its catch when `seeds() >= 1000`, the
+  premerge and the nightly, and never at the gate's 20 or CI's 100.
+- Its firing, the fault injected or the shape it aims at reached, is still asserted at every
+  tier where that is itself well above 5 %, and the catch rate is printed at every tier.
+- The rate is over the seeds the assertion actually sees. A variant that `high_rate_share`
+  runs on a share of the tier, 20, 20, 100 and 1 000 seeds, is counted over that share. The
+  incremental checker compares `min(seeds, 100)`. A counter of events counts the seeds that
+  saw one, not the events.
+- A coverage counter asserted above zero, a state the correct server's sweep must reach, is
+  the same draw as a catch; it is what the owner moved in `reverts_to_a_prefix`. This entry
+  applies the 5 % rule to every such counter as the owner's "move any that are similarly
+  fragile".
+- A rate at or above 5 % stays at its tier.
+
+Out of the rule's scope: assertions made of every seed ("on every seed", "caught on every
+seed", a count equal to zero), pinned seeds, which CLAUDE.md's pinned-seed rule governs, and
+the fixed seed sets inside crate tests. Those sets run the same seeds at every tier, so they
+have no tier to move to; they are listed at the end with their figures.
+
+**How it was measured.** On 2ec4bf7, the tree with D-056's send queue, which moved every
+raft schedule, so no older rate is this tree's. Probe copies of the sweeps' test files
+printed each seed's coverage: `sim/tests/zz_audit_{wal,engine,raft,echo}.rs`, each the
+committed file plus `eprintln!` lines, deleted from the tree and never committed. They ran
+in release at `ANANKE_SEEDS=1000`, and the engine's deep-levels test at
+`ANANKE_DEEP_SEEDS=1000`, the nightly's count. The crate tests with fixed seed sets ran
+in debug with a count printed and were restored with `git checkout`. Everything is in
+`scratchpad stage-a/q/audit`:
+
+- `measure-1000.sh` runs the probes; their output is in `m1000-zz_audit_{wal,engine,raft}.log`,
+  `m1000-zz_audit_echo.log`, `m1000-echo-sweep.log` and `deep1000-zz_audit_engine.log`.
+- `parse_probe.py` gives the per-seed counts, in `m1000-{wal,engine,raft}-perseed.txt`.
+- `crate-fixed-loops.log` holds the fixed seed sets, and `probes/` the probe files.
+
+The ten-thousand-seed figures come from the last two green nightlies. Run 34908018220 ran
+on 0557590 and run 34948461479 on 94c6a54 (`nightly-<run>.clean.log`). They print the same
+figures, except that 94c6a54 predates D-050's term-raise schedule. Both trees predate
+D-056's queue, Stage A's lanes S and N (no install, range delete or seek in the engine
+sweep) and D-058, so they are other schedules. Where the nightly prints events rather than
+seeds, the seeds that saw one are at most that many, given as "≤". P(none) = (1 − p)^n,
+where p is the rate at 1 000 and n is the number of seeds the assertion sees at the lowest
+tier it is asserted at; "~0" is below 10^-12.
+
+**The audit.** Seeds seen are given at the gate, CI, the premerge and the nightly. Tiers are
+"every" (from the gate's twenty), "≥ 100", "≥ 1 000" and "≥ 10 000". Line numbers are on the
+commit that lands this entry.
+
+| Assertion | Where | Seeds seen | At 1 000, 2ec4bf7 | At 10 000, nightlies | Tier before → after | P(none) at its tier |
+| --- | --- | --- | --- | --- | --- | --- |
+| Echo: pongs received, both journals | sim/tests/echo.rs:97 | 20 / 100 / 1 000 / 10 000 | 1 000 (100 %) | not printed | every → every | ~0 |
+| Echo `NoSyncDir`, every fault seen: bit rot, corrupt records, torn writes, lost directory entries, a vanished journal | echo.rs:190 | 20 / 100 / 1 000 / 10 000 | 670, 329, 452, 876, 433 | 6 827, 3 350, 4 593, 8 622, 4 323 | every → every | 3.4 × 10^-4 (corrupt records) |
+| Echo correct journal, disk faults seen: bit rot, corrupt records, torn writes, torn files at replay | echo.rs:172 | 20 / 100 / 1 000 / 10 000 | 670, 409, 452, 452 | 6 827, 4 289, 4 593, 4 593 | every → every | 2.7 × 10^-5 |
+| WAL variants caught: `NoSyncDir`, `NoChecksum`, `AckBeforeSync` | wal.rs:67 (72, 77, 82) | 20 / 100 / 1 000 / 10 000 | 909, 964, 1 000 | 9 150, 9 744, 10 000 | every → every | ~0 |
+| WAL coverage: torn writes, lost fsyncs, bit rot, stops at a torn record, stops at a bad checksum, discarded segments, the lost-fsync excuse, the bit-rot excuse | wal.rs:144 | 20 / 100 / 1 000 / 10 000 | 1 000, 1 000, 1 000, 977, 999, 1 000, 994, 994 | 9 999, 10 000, 10 000 seeds; the rest thousands of epochs | every → every | ~0 |
+| WAL: a gap | wal.rs:152 | 20 / 100 / 1 000 / 10 000 | 51 (5.1 %) | 615 epochs, ≤ 6.2 % | ≥ 100 → ≥ 100 | 0.0053 |
+| **WAL: the betrayed-cut excuse** | wal.rs:165 | 20 / 100 / 1 000 / 10 000 | 34 (3.4 %) | 401 epochs, ≤ 4.0 % | **every → ≥ 1 000** | 0.50 at 20 → 9.5 × 10^-16 |
+| Engine Phase 1 variants caught: `NoWalBeforeMemtable`, `ReleaseBeforeManifest`, `DeleteBeforeManifest` | engine.rs:553 (558, 563, 568) | 20 / 100 / 1 000 / 10 000 | 985, 602, 647 | 9 825, 6 482, 5 893 | every → every | 9.9 × 10^-9 |
+| Engine `InstallInTwoSwitches` caught | engine.rs:296 | 20 / 100 / 1 000 / 10 000 | 559 | not on those trees | every → every | 7.7 × 10^-8 |
+| Engine `RangeDeleteSkipsMemtables` caught, on the share | engine.rs:359 | 20 / 20 / 100 / 1 000 | 89 of 100 | not on those trees | every → every | 6.7 × 10^-20 |
+| Engine `SeekCountsTombstones` caught, on the share | engine.rs:422 | 20 / 20 / 100 / 1 000 | 98 of 100 | not on those trees | every → every | ~0 |
+| Engine `InstallKeepsSourceNumbers` caught by the oracle, on the share | engine.rs:489 | 20 / 20 / 100 / 1 000 | 98 of 100 | not on those trees | every → every | ~0 |
+| Engine `SpanCheckpointUnsynced` caught, on the share | engine.rs:530 | 20 / 20 / 100 / 1 000 | 81 of 100 | not on those trees | every → every | 3.8 × 10^-15 |
+| Engine coverage, 29 counters: live reads, scans, rotations, flushes, crashes mid-flush, recoveries that replayed, excused losses, lost fsyncs, bit rot, torn writes, tables written, segments deleted, orphans removed, tables dropped, manifest fallbacks, missing log heads, batches, unsynced writes, checkpoints opened after a crash, compactions, compactions below level 0, inputs deleted, writes dropped, tombstones dropped, installs, range deletes, span checkpoints, seeks, recovery seeks | engine.rs:774 | 20 / 100 / 1 000 / 10 000 | 1 000, 1 000, 990, 983, 965, 970, 964, 1 000, 988, 997, 988, 983, 956, 831, 818, 704, 999, 1 000, 819, 976, 973, 981, 976, 976, 977, 961, 993, 1 000, 971 | the first 24 above zero (lost fsyncs 9 998, bit rot 9 906, torn writes 9 972 seeds); the last five not on those trees | every → every | 2.7 × 10^-11 (missing log heads) |
+| Engine: a crash inside a compaction | engine.rs:780 | 20 / 100 / 1 000 / 10 000 | 742 | 6 202 events | ≥ 100 → ≥ 100 | ~0 |
+| Engine: a store refused for a fault | engine.rs:784 | 20 / 100 / 1 000 / 10 000 | 162 (16.2 %) | 1 146 (11.5 %) | ≥ 100 → ≥ 100 | 2.1 × 10^-8 |
+| Live install: span checkpoints verified, live reads over an install | engine.rs:232, 233 | 20 / 100 / 1 000 / 10 000 | 977, 998 | not on those trees | every → every | ~0 |
+| Live install's windows: aimed, between replacement and switch, after the switch, keys written after | engine.rs:256–265 (from 230) | 20 / 100 / 1 000 / 10 000 | 1 000, 490, 411, 990 | not on those trees | every → every | 2.5 × 10^-5 |
+| Range delete's windows, the same four | engine.rs:256–265 (from 330) | 20 / 100 / 1 000 / 10 000 | 1 000, 497, 377, 984 | not on those trees | every → every | 7.8 × 10^-5 |
+| Seek: a seek stopped at its limit, a recovery walked | engine.rs:394, 395 | 20 / 100 / 1 000 / 10 000 | 999, 972 | not on those trees | every → every | ~0 |
+| Deep levels: a round from level 2 or deeper, level 3 reached | engine.rs:177, 181 | 0 / 0 / 0 / 1 000 deep seeds | 965, 965 of 1 000 deep seeds | 10 132 rounds, deepest 3 | nightly only → nightly only | ~0 |
+| Raft variants caught: `SendBeforePersist`, `ApplyBeforeCommit`, `CountOlderTermForCommit`, `TruncateOnEveryAppend`, `ResetTimerOnAnyRpc`, `SnapshotWithoutCurrentLast` | raft.rs:1736 (1926–1957) | 20 / 100 / 1 000 / 10 000 | 1 000, 882, 454, 1 000, 336, 336 | 10 000, 8 902, 4 415, 9 995, 3 465, 3 302 | every → every | 2.8 × 10^-4 |
+| `NoPreVote` caught by the pre-vote check | raft.rs:1918 | 20 / 100 / 1 000 / 10 000 | 1 000 | 9 999 | every → every | ~0 |
+| D-050's term-raise shape reached | raft.rs:1471 | 20 / 100 / 1 000 / 10 000 | 298 | 2 893 (0557590 only) | every → every | 8.4 × 10^-4 |
+| `NoPreVote` caught on the term-raise schedule | raft.rs:1637 | 20 / 100 / 1 000 / 10 000 | 1 000 | 10 000 (0557590 only) | every → every | ~0 |
+| `AdoptionAsBuilt`'s firing: the storm drawn, adoptions under it | raft.rs:2004, 2008 | 20 / 100 / 1 000 / 10 000 | 260, 1 000 | 2 529 seeds; 84 582 adoptions | every → every | 2.4 × 10^-3 |
+| `AdoptionAsBuilt` caught | raft.rs:2013 | 20 / 100 / 1 000 / 10 000 | 77 (7.7 %) | 646 (6.46 %) | ≥ 100 → ≥ 100 | 3.3 × 10^-4 |
+| `RefusalNotDurable`'s firing: a crash on a refused server | raft.rs:2050 | 20 / 100 / 1 000 / 10 000 | 347 | 3 318 | every → every | 2.0 × 10^-4 |
+| `RefusalNotDurable` caught | raft.rs:2074 | 20 / 100 / 1 000 / 10 000 | 16 (1.6 %) | 133 (1.33 %) | ≥ 100 → ≥ 1 000, by the owner (D-056) | 9.9 × 10^-8 |
+| `IgnoreIncarnation`: a refused follower re-seeded and applying | raft.rs:2358 | 20 / 100 / 1 000 / 10 000 | 659 | 6 353 | ≥ 100 → ≥ 100 | ~0 |
+| `SharedSnapshotDir`'s firing: a re-take at an index already taken | raft.rs:2460 | 20 / 100 / 1 000 / 10 000 | 525 | 5 292 | every → every | 3.4 × 10^-7 |
+| `SharedSnapshotDir`'s aimed arm reached its stream | raft.rs:2464 | 20 / 100 / 1 000 / 10 000 | 143 (14.3 %) | 1 472 (14.7 %) | every → every; for the owner, below | **0.046** |
+| `SharedSnapshotDir` caught by the liveness check | raft.rs:2469 | 20 / 100 / 1 000 / 10 000 | 2 (0.2 %) | 4 (0.04 %) | ≥ 10 000 → ≥ 10 000 | 2.0 × 10^-9; 0.018 at the nightlies' rate, below |
+| Lease: drift beyond the bound, the guard revoked | raft.rs:2602, 2603 | 20 / 100 / 1 000 / 10 000 | 503, 503 | 5 023, 5 023 | every → every | 8.5 × 10^-7 |
+| **`LeaseTrustsTheClock` caught (a stale read)** | raft.rs:2615 | 20 / 100 / 1 000 / 10 000 | 41 (4.1 %) | 472 (4.72 %) | **every → ≥ 1 000** | 0.43 at 20 → 6.6 × 10^-19 |
+| Raft coverage, 33 counters: partitions, one-way blocks, crashes, leader crashes, stale-sender faults, figure-8 drivers, burst puts, drift beyond the bound, lease reads, read-index reads, lease revocations, check-quorum step-downs, duplicates, injected drops, elections, a term above one, truncations, snapshots taken, compactions, crash-mid-install faults, crash-mid-adoption faults, re-take-under-a-stream faults, commits, applies, bit rot, puts, gets, deletes, compare-and-sets, completed, abandoned, redirected, uniformly scheduled seeds | raft.rs:3000 | 20 / 100 / 1 000 / 10 000 | 1 000, 432, 1 000, 425, 431, 727, 727, 503, 584, 1 000, 992, 1 000, 1 000, 1 000, 1 000, 1 000, 1 000, 1 000, 1 000, 517, 260, 246, 1 000, 1 000, 999, 1 000 (×7), 500 | all above zero (drift 5 023, a term above one 10 000, uniform 5 000 seeds) | every → every | 3.5 × 10^-3 (re-take faults); uniform scheduling is half the seeds by `Policy::for_seed`, seed 0 among them, not a draw |
+| Raft coverage from 100: refusals, torn writes, snapshots installed, streams resumed, re-seeded servers, re-seeds completed, adoptions, progress resets | raft.rs:3006–3040 | 20 / 100 / 1 000 / 10 000 | 853, 495, 1 000, 1 000, 852, 832, 1 000, 844 | all above zero (re-seeds completed on 8 163 seeds) | ≥ 100 → ≥ 100 | ~0 |
+| `SingleMajorityInJointConsensus` caught | raft.rs:3122 | 20 / 100 / 1 000 / 10 000 | 296 | 2 720 | every → every | 8.9 × 10^-4 |
+| Membership coverage, 9: grows, shrinks, joint and new configurations, learners promoted, partitions, completed, uniform seeds, compactions | raft.rs:3329 | 20 / 100 / 1 000 / 10 000 | 1 000 each; uniform 500 | all above zero where printed (before D-058) | every → every | ~0; uniform not a draw |
+| Membership: an install adopted | raft.rs:3337 | 20 / 100 / 1 000 / 10 000 | 1 000 | not printed before D-058 | every → every | ~0 |
+| Membership from 100: step-downs outside `C_new`, configuration reverts | raft.rs:3354 | 20 / 100 / 1 000 / 10 000 | 390, 56 (5.6 %) | 4 253 and 7 025 events, before D-058 | ≥ 100 → ≥ 100 | 0.0031 (reverts) |
+| **Membership: an election while joint** | raft.rs:3367 | 20 / 100 / 1 000 / 10 000 | 31 (3.1 %) | 463 events, ≤ 4.6 %, before D-058 | **≥ 100 → ≥ 1 000** | 0.043 at 100 → 2.1 × 10^-14 |
+| Membership: `reverts_to_a_prefix` | raft.rs:3382 | 20 / 100 / 1 000 / 10 000 | 28 (2.8 %) | D-058's counter, not on those trees | ≥ 100 → ≥ 1 000, by the owner (D-058) | 4.6 × 10^-13 |
+| Incremental checker: a compared seed in violation | raft.rs:3471 | 20 / 100 / 100 / 100 | 61 of 100 | 59 of 100 | every → every | 6.6 × 10^-9 |
+| Quorum, `RefusedCountsForQuorum` blocked: a chunk lost to the limit | raft.rs:3585 | 20 / 100 / 1 000 / 10 000 | 1 000 | 300 304 events | every → every | ~0 |
+| Quorum on the sweep's disk: the install silence deposes `RefusedCountsForQuorum` | raft.rs:3679 | 20 / 100 / 1 000 / 10 000 | 844 | 8 311 | ≥ 100 → ≥ 100 | ~0 |
+
+These are not draws, and are left as they are:
+
+- `IgnoreIncarnation` tracing no progress reset (raft.rs:2352) and the correct log losing no
+  directory entry (wal.rs:173) are assertions of zero on every seed.
+- `RefusedCountsForQuorum` and `RefusedNeverCounts` caught on every seed are assertions of
+  every seed.
+
+The fixed seed sets in crate tests run the same seeds at every tier, measured on this tree:
+
+| Assertion | Where | Seeds | Measured | P(none) over its seeds |
+| --- | --- | --- | --- | --- |
+| A write torn at a crash; more than three durable lengths | crates/ananke-env/src/sim/tests.rs:856, 857 | 64 | torn on 28; 13 lengths | 1.0 × 10^-16 |
+| More than one interleaving | tests.rs:191 | 20 | 11 distinct | not a rate |
+| A rename lost and a rename kept | tests.rs:1639 | 64 | lost on 32, kept on 32 | 1.1 × 10^-19 |
+| An unsynced create vanished | tests.rs:1675 | 32 | 12 | 2.9 × 10^-7 |
+| Two records under one sync | crates/ananke-storage/tests/wal.rs:184 | 20 | 15 | 9.1 × 10^-13 |
+| At least 20 of 40 stores came back as a state | crates/ananke-raft/tests/store.rs:242 | 40 | 31 | 3.4 × 10^-5 of under 20 |
+| A crash inside the adoption before the switch; one after it | crates/ananke-raft/tests/snapshot.rs:947, 951 | 24 | 10 before; 14 after | 2.4 × 10^-6; 7.5 × 10^-10 |
+
+**What moved.** The owner's rule moves three assertions to `seeds() >= 1000`. Each is printed
+at every tier as before and commented with its rate, its tier and this entry.
+
+- *`LeaseTrustsTheClock`'s catch* moves from every tier (sim/tests/raft.rs). Its firing, drift
+  beyond the bound and the guard's revoke, each on half the seeds, stays asserted at every
+  tier. RAFT.md §5 now names the tier.
+- *The WAL's betrayed-cut excuse* moves from every tier (sim/tests/wal.rs).
+- *The membership scenario's election while joint* moves from the hundred-seed tier
+  (sim/tests/raft.rs).
+
+`RefusalNotDurable`'s catch and `reverts_to_a_prefix` were moved by the owner in D-056 and
+D-058. Every other assertion is at or above 5 % and stays where it is. Two of them are near
+the line. A gap in the WAL is on 5.1 % of the thousand; the membership scenario's
+configuration reverts are on 5.6 %. At a thousand seeds either could be a little below 5 %,
+since a thousand seeds only estimate the rate. The rule as written leaves both at the
+hundred-seed tier, where a hundred see none with probability 0.005 and 0.003. Were a later
+measurement to put either under 5 %, the rule moves it.
+
+**For the owner — not decided.** The rule as written does not move these; they are the
+owner's to decide.
+
+- *`SharedSnapshotDir`'s aimed arm reaching its stream* (sim/tests/raft.rs:2464). It
+  reaches its stream on 14.3 % of the thousand (14.7 % at the nightlies), above 5 %. It is
+  asserted at every tier, and the gate's twenty see none with probability 0.857^20 = 0.046,
+  above one in a hundred. It is a firing assertion: the shape the arm exists to build. The
+  arm rides one seed in four (`RETAKE_STREAM_IN`, D-043), and the other firing assertion
+  beside it, the re-take at an index already taken, is on 52.5 %. The conservative options
+  are to leave it, or to assert it from the hundred-seed tier, where a hundred see none
+  with probability 2 × 10^-7.
+- *`SharedSnapshotDir`'s liveness catch at the nightly's ten thousand*
+  (sim/tests/raft.rs:2469). It is under 5 % and already above the thousand-seed tier, so the
+  rule leaves it. On this tree it is on 2 of the thousand, 0.2 %, where ten thousand see none
+  with probability 2 × 10^-9. At the nightlies' rate before the queue, 4 of 10 000, ten
+  thousand see none with probability 0.9996^10000 = 0.018. The next nightly on the tree with
+  the queue measures which rate holds.
+
+**Alternatives.** *D-044's shape, a thin catch asserted from the hundred-seed tier*: at 3 %
+a hundred seeds see none about one time in twenty, and the owner moved both measured cases
+off it. *A tier chosen by P(none) at the tier instead of by rate*: it would also move the aimed
+arm's assertion above, but the owner's rule is by rate, and a rate is what every sweep
+prints. *More seeds at the gate*: the gate's twenty keep it under a few minutes, which is
+its purpose.
+
+**Consequences.** The gate and CI no longer assert the three moved states. The premerge
+and the nightly assert them, and every tier prints them, so a sweep that stops reaching one
+is seen in the rates before it is asserted. No schedule and no pinned hash moves: the
+changes are the tier of three assertions and their comments. Rates are functions of the whole
+schedule, so a later change that moves the schedules can carry a rate across 5 % either way;
+the rates printed at the premerge and the nightly are where that shows. SHARD.md §12's Stage B
+plan (docs/SHARD.md:2344) still says `LeaseTrustsTheClock`'s stale read is caught at every
+tier, as the approved plan's text; this entry supersedes it for that assertion.
+
+---
+
+_Next entry: D-062. Add one before implementing anything not covered above._

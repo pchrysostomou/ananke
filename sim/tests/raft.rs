@@ -2531,7 +2531,10 @@ fn retook_at_one_index(report: &raft::Report) -> bool {
 /// follower's trust or the checker reports the stale read and the run fails. The
 /// correct server passes every seed (above); here each exceeded seed is run with
 /// the guard and without it, and the report says how many revoked, how many read
-/// stale without the guard, and how many did neither.
+/// stale without the guard, and how many did neither. The fault's firing, a seed
+/// whose drift exceeds the bound and a guard that revokes, is asserted at every
+/// tier; the guardless server's stale read, `LeaseTrustsTheClock`'s catch, from the
+/// thousand-seed tier (D-061).
 #[test]
 fn a_leader_that_trusts_the_clock_is_caught_and_the_guard_revokes() {
     /// What one seed contributes: the guardless server runs only where the drift
@@ -2598,7 +2601,19 @@ fn a_leader_that_trusts_the_clock_is_caught_and_the_guard_revokes() {
     );
     assert!(exceeded > 0, "no seed exceeded the drift bound");
     assert!(revoked > 0, "the guard never revoked");
-    assert!(stale > 0, "LeaseTrustsTheClock was never caught");
+    // D-061, the owner's rule of 2026-09-15: a variant caught on under 5 % of seeds
+    // asserts its catch from the thousand-seed tier (the premerge and the nightly), its
+    // firing at every tier above, and its rate printed at every tier. The stale read is
+    // caught on 41 of the first thousand seeds on the tree with D-056's send queue,
+    // 4.1 %, and was on 472 of the ten thousand of the nightlies before it, 4.72 %; the
+    // drift exceeds the bound on half the seeds and the guard revokes on every one of
+    // them. At 4.1 % the gate's twenty catch none with probability 0.959^20 = 0.43 and a
+    // hundred with 0.959^100 = 0.015, so the assertion there would fail a tree with
+    // nothing wrong the day a change redraws the schedules; a thousand catch none with
+    // probability 0.959^1000 = 6.6e-19.
+    if seeds() >= 1000 {
+        assert!(stale > 0, "LeaseTrustsTheClock was never caught");
+    }
 }
 
 /// What the correct server's sweep saw.
@@ -3330,7 +3345,6 @@ impl MembershipCoverage {
         // change: twenty seeds cannot promise them; a hundred can.
         if seeds >= 100 {
             for (what, seen) in [
-                ("elections while joint", self.elections_while_joint as u64),
                 (
                     "step-downs of a leader outside C_new",
                     self.step_downs_outside_new as u64,
@@ -3339,6 +3353,21 @@ impl MembershipCoverage {
             ] {
                 assert!(seen > 0, "the membership runs never saw {what}: {self:?}");
             }
+        }
+        // An election while joint needs the partition to cut a leader off inside the
+        // joint phase itself. D-061, the owner's rule of 2026-09-15: a state reached on
+        // under 5 % of seeds is asserted from the thousand-seed tier (the premerge and
+        // the nightly) and printed with the coverage at every tier. On the tree with
+        // D-056's send queue it is on 31 of the first thousand seeds, 3.1 % (34
+        // elections; 463 at the nightlies' ten thousand before the queue and D-058, so at
+        // most 4.6 % of their seeds). At 3.1 % a hundred seeds see none with probability
+        // 0.969^100 = 0.043 and the gate's twenty with 0.53; a thousand with
+        // 0.969^1000 = 2.1e-14.
+        if seeds >= 1000 {
+            assert!(
+                self.elections_while_joint > 0,
+                "the membership runs never saw elections while joint: {self:?}"
+            );
         }
         // PROPOSED(D-058): an install whose snapshot's configuration is older than the
         // receiver's, taking the receiver back to the installed prefix. The owner's

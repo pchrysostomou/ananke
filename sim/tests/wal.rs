@@ -140,15 +140,32 @@ impl Coverage {
             ("discarded segments", self.discarded),
             ("the lost-fsync excuse", self.excused_lost_fsync),
             ("the bit-rot excuse", self.excused_bit_rot),
-            ("the betrayed-cut excuse", self.excused_betrayed_cut),
         ] {
             assert!(seen > 0, "the sweep never saw {what}: {self:?}");
         }
         // A gap needs a lost sync on a segment's last group and then a crash that
         // drops that write whole rather than tearing it: one to two epochs in a
-        // hundred. Twenty seeds cannot promise one; a hundred can.
+        // hundred. Twenty seeds cannot promise one; a hundred can. It is on 51 of the
+        // first thousand seeds, 5.1 %, so D-061 leaves it at the hundred-seed tier,
+        // where a hundred see none with probability 0.949^100 = 0.005.
         if self.seeds >= 100 {
             assert!(self.stops_gap > 0, "the sweep never saw a gap: {self:?}");
+        }
+        // The betrayed-cut excuse needs a recovery that cut a segment, a lost sync of
+        // that cut, and the next recovery stopping exactly there: on 34 of the first
+        // thousand seeds, 3.4 % (36 epochs; 401 epochs at the nightly's ten thousand,
+        // so at most 4.0 % of its seeds). D-061, the owner's rule of 2026-09-15: a state
+        // reached on under 5 % of seeds is asserted from the thousand-seed tier, the
+        // premerge and the nightly, and printed with the coverage at every tier. At
+        // 3.4 % the gate's twenty see none with probability 0.966^20 = 0.50 and a
+        // hundred with 0.966^100 = 0.031, so the assertion there would fail a log with
+        // nothing wrong the day a change redraws the schedules; a thousand see none
+        // with probability 0.966^1000 = 9.5e-16.
+        if self.seeds >= 1000 {
+            assert!(
+                self.excused_betrayed_cut > 0,
+                "the sweep never saw the betrayed-cut excuse: {self:?}"
+            );
         }
         // A correctly synced log never has a directory operation pending at a crash,
         // and so never loses a segment.

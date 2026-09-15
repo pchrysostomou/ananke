@@ -662,9 +662,12 @@ D-056), not asserted over a sweep tier (D-045). The correct variant must pass ev
 other variant must be caught by the named check on some seeds, at every tier unless its
 window is thinner than the gate's twenty seeds show: `AdoptionAsBuilt` asserts its catch
 from the hundred-seed tier (D-041), `RefusalNotDurable` from the thousand-seed tier, with
-its first catch there, seed 119, pinned at every tier (D-044, D-056), and
-`SharedSnapshotDir` asserts its liveness catch only at the nightly's ten thousand
-(D-043, D-047); each of their tests asserts at every tier that its fault fired.
+its first catch there, seed 119, pinned at every tier (D-044, D-056),
+`LeaseTrustsTheClock` from the thousand-seed tier, its stale read being caught on about
+4 % of seeds (D-061), and `SharedSnapshotDir` asserts its liveness catch only at the
+nightly's ten thousand (D-043, D-047); each of their tests asserts at every tier that
+its fault fired. A variant caught on under 5 % of seeds asserts its catch from the
+thousand-seed tier and never below it (CLAUDE.md, D-061).
 `RefusedCountsForQuorum` and `RefusedNeverCounts` are caught by the directed re-seed
 scenario, `sim/quorum.rs`, which builds their situation on every seed and is asserted to
 catch each on every seed at every tier; the random sweep reaches it too rarely to
