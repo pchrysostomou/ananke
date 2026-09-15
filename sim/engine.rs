@@ -880,6 +880,11 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
     let mut base = 0;
     let mut epoch_start = 0;
     let mut previous_manifest: Option<(u64, u64)> = None;
+    // PROPOSED(D-054): tables the open dropped because the engine had deleted them
+    // after a manifest a fallback then abandoned, with the fallback's excuse and the
+    // manifest that was in force: the next open under the same manifest drops them
+    // again, with no fallback of its own to explain it.
+    let mut carried_drops: (u64, BTreeMap<u64, Excuse>) = (0, BTreeMap::new());
     let mut refused = None;
     let (mut checkpoints_verified, mut checkpoints_damaged) = (0u64, 0u64);
     let mut install_outcomes = InstallOutcomes::default();
@@ -1048,6 +1053,11 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
         // since CURRENT named a switch still in flight; only one that went older
         // lost what was flushed since.
         let mut fallback_why: Option<Excuse> = None;
+        // PROPOSED(D-054): the manifests a fallback abandoned, numbered above the one
+        // it used and at or below the last one switched to, in the lineage the trace
+        // mirrors; only what their tables held, and the log they let go, can the
+        // fallback have lost.
+        let mut abandoned: Vec<u64> = Vec::new();
         if let Some(named) = recovery.fallback_from {
             let from = synced
                 .switched
@@ -1133,8 +1143,26 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
                     recovery.manifest
                 ));
             }
-            fallback_why = named_why.or(Some(Excuse::LostFsync));
+            // PROPOSED(D-054): a fallback excuses only a loss it caused, from a fault
+            // it is explained by: one that used the last manifest switched to lost
+            // nothing, and one that no fault explains is the violation above.
+            if recovery.manifest < from
+                && let Some(why) = named_why
+            {
+                fallback_why = Some(why);
+                abandoned = mirror
+                    .manifests
+                    .range(recovery.manifest + 1..=from)
+                    .map(|(&n, _)| n)
+                    .collect();
+            }
         }
+        let abandoned_tables: BTreeSet<u64> = abandoned
+            .iter()
+            .filter_map(|n| mirror.manifests.get(n))
+            .flatten()
+            .copied()
+            .collect();
         // A dropped table: its sync was lost or bit rot hit it; or it is missing
         // because the engine deleted it once no manifest in force listed it, as a
         // compaction's input or as an orphan, and a fallback, this epoch's or an
@@ -1149,13 +1177,27 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
             } else if rotted(&all, &path) {
                 Some(Excuse::BitRot)
             } else if deleted {
-                Some(fallback_why.unwrap_or(Excuse::LostFsync))
+                // PROPOSED(D-054): a table the manifest in force lists and the engine
+                // deleted is gone for a fallback's fault, this open's, or an earlier
+                // open's under the same manifest; never on its own, since a correct
+                // engine deletes a table only once a switch stops listing it.
+                fallback_why.or_else(|| {
+                    (carried_drops.0 == recovery.manifest)
+                        .then(|| carried_drops.1.get(&meta.number).copied())
+                        .flatten()
+                })
             } else {
                 None
             };
             match why {
                 Some(why) => {
                     table_why.insert(meta.number, why);
+                }
+                None if verdict.is_ok() && deleted => {
+                    verdict = Err(format!(
+                        "table {} at level {} covering {}..={}, which manifest {} lists, was deleted before its manifest was in force, and no fallback explains it",
+                        meta.number, meta.level, meta.first_seq, meta.max_seq, recovery.manifest
+                    ));
                 }
                 None if verdict.is_ok() => {
                     let reason = records
@@ -1197,9 +1239,9 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
         // Past the manifest's flushed point, a fallback left tables behind whose
         // records are owed by nothing but explained by it: the log's head among them.
         let owed_through = if fallback_why.is_some() {
-            mirror
-                .tables
-                .values()
+            abandoned_tables
+                .iter()
+                .filter_map(|t| mirror.tables.get(t))
                 .filter_map(|t| t.writes.iter().map(|(_, s)| *s).max())
                 .max()
                 .unwrap_or(0)
@@ -1221,7 +1263,7 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
                 }
                 if seq > recovery.flushed_seq {
                     // Owed by nothing but a fallback that left the table behind.
-                    if mirror.tables.keys().any(|t| held_by(t, &key, seq))
+                    if abandoned_tables.iter().any(|t| held_by(t, &key, seq))
                         && let Some(why) = fallback_why
                     {
                         record_why = record_why.or(Some(why));
@@ -1237,7 +1279,7 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
                 {
                     Some(why)
                 } else if fallback_why.is_some()
-                    && mirror.tables.keys().any(|t| held_by(t, &key, seq))
+                    && abandoned_tables.iter().any(|t| held_by(t, &key, seq))
                 {
                     fallback_why
                 } else if previously_lost_writes.contains(&(key.clone(), seq)) {
@@ -1269,13 +1311,12 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
         // go. Past the manifest in force, up to the furthest any manifest covered,
         // the fallback that explains its neighbours explains it.
         if let Some(why) = fallback_why {
-            let covered = all_synced
-                .manifest_flushed
-                .values()
+            let covered = abandoned
+                .iter()
+                .filter_map(|n| all_synced.manifest_flushed.get(n))
                 .copied()
                 .max()
                 .unwrap_or(0)
-                .max(owed_through)
                 .min(ops_now.len() as u64);
             for seq in (recovery.flushed_seq + 1)..=covered {
                 if writes_of(seq).is_empty() {
@@ -1490,6 +1531,21 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
             checkpoints_verified += 1;
         }
         previous_manifest = Some((recovery.manifest, recovery.flushed_seq));
+        // PROPOSED(D-054): the drops a fallback explained, for the next open under
+        // the same manifest.
+        let deleted_drops: BTreeMap<u64, Excuse> = recovery
+            .dropped
+            .iter()
+            .filter(|m| mirror.deleted.contains(&m.number))
+            .filter_map(|m| table_why.get(&m.number).map(|why| (m.number, *why)))
+            .collect();
+        carried_drops = if carried_drops.0 == recovery.manifest {
+            let mut kept = carried_drops.1;
+            kept.extend(deleted_drops);
+            (recovery.manifest, kept)
+        } else {
+            (recovery.manifest, deleted_drops)
+        };
         base = end;
         {
             let mut m = lock(&model);

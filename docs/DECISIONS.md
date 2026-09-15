@@ -4273,24 +4273,59 @@ which `FsyncLost` already says. At the first twenty seeds `SpanCheckpointUnsynce
 caught on 1, because its tables' writes were torn more often than lost whole, and every
 torn one was skipped; with a torn write alone no longer an excuse it is caught on 19 of 20.
 
+*What review found in the oracle.* Independent review of 9eb28e4 found two excuses in the
+engine sweep's oracle, both older than this entry, that could have hidden a broken
+install, and both are tightened. **The fallback excuse was unbounded.** Any recovery that
+fell back set the fallback's excuse, including one that used the last manifest switched
+to, which loses nothing, and the excuse then covered every missing write that any table
+ever held and every log record past the manifest in force. Now a fallback excuses a loss
+only when it went older than the last manifest switched to and a fault explains why the
+manifest `CURRENT` named could not be used; and only a write that a table listed by a
+manifest it abandoned held — numbered above the one it used and at or below the last
+switch, in the lineage the trace mirrors — or a table dropped for a fault holds, and only
+the records holding no write up to the furthest those abandoned manifests covered.
+**A table deleted by the engine was excused with no fault.** A table the manifest in force
+listed and the open found missing was excused whenever the engine had deleted it after
+some manifest was written, fallback or not; the simulator never loses a directory sync, and
+a correct engine deletes a table only after the switch that stops listing it. Now such a
+table is excused only by this open's explained fallback, or by the earlier open's under the
+same manifest in force, which dropped it for that fallback and whose manifest nothing has
+replaced since; otherwise the check reports *table N, which manifest M lists, was deleted
+before its manifest was in force*. The mutation the old excuse hid, a compaction that
+writes its manifest, deletes its inputs and only then switches `CURRENT`, was run once
+against both oracles: the old one caught it on 0 of 20 and 0 of 100 seeds, the tightened
+one on 6 of 20 and 30 of 100, the first at seed 1: *table 37 at level 2 covering 373..=444,
+which manifest 40 lists, was deleted before its manifest was in force*. **No correct-engine
+seed turned red under the tightened oracle**: every correct test of the engine binary
+passes at 20, 100 and 1000 seeds, and so does the Phase 1 schedule alone
+(`Schedule::phase_1()`) at 1000.
+
 *Measured.* In release on the eight-core laptop, beside another lane's builds and
 sweeps (load averages from 4 to over 100 during the runs), `cargo test -p ananke-sim
 --release --test engine` with `ANANKE_SEEDS` at each tier:
 
 | tier | correct engine | installs asked / resolved | crashes aimed | after a crash: in force (resolved / not) | not in force (unresolved / resolved, a fault) | span keys written after an install, checked | `InstallInTwoSwitches` | `SpanCheckpointUnsynced` |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| 20 | every seed | 251 / 160 | 149 | 135 / 17 | 73 / 21 | 2 804 | 7 of 20 | 19 of 20 |
-| 100 | every seed | 1 241 / 801 | 732 | 696 / 43 | 387 / 80 | 12 926 | 31 of 100 | 95 of 100 |
-| 1000 | every seed | 12 623 / 8 277 | 7 341 | 7 190 / 416 | 3 860 / 820 | 143 868 | 384 of 1000 | 940 of 1000 |
+| 20 | every seed | 251 / 160 | 149 | 135 / 17 | 73 / 21 | 2 804 | 7 of 20, 12 once tightened | 19 of 20 |
+| 100 | every seed | 1 241 / 801 | 732 | 696 / 43 | 387 / 80 | 12 926 | 31 of 100, 55 once tightened | 95 of 100 |
+| 1000 | every seed | 12 623 / 8 277 | 7 341 | 7 190 / 416 | 3 860 / 820 | 143 868 | 384 of 1000, 565 once tightened | 940 of 1000 |
 
 At a thousand seeds 203 995 live reads of an installed key that a later write had
 overwritten agreed with the model, and 9 231 checkpoints, of spans and of the whole
-store, opened fresh after a crash and matched it. `InstallInTwoSwitches` is caught only
-where a crash lands between its two switches and no fault sends recovery to another
-manifest: at the first twenty seeds fifteen crashes landed there, and eight of them left
-nothing the oracle could hold against it: two spans with no table to take out, one
-`CURRENT` rename that survived the crash before its sync, and five fallbacks after a lost
-sync of `CURRENT` or a manifest, which excuse what the tables they passed over held. The engine sweep's own tests, on the default
+store, opened fresh after a crash and matched it. Before the oracle was tightened,
+`InstallInTwoSwitches` was caught only where a crash landed between its two switches and no
+fallback followed, and the account first written here — that eight of fifteen such
+crashes at twenty seeds left nothing to hold against it, five of them fallbacks — rested on
+the unbounded excuse, which forgave any loss behind any fallback. Tightened, it is caught on
+12 of the first twenty seeds. Eight catches are a crash between the two switches. Four are
+a fallback that lands on the removal's manifest itself, which no correct install writes: at
+seeds 3, 8 and 9 recovery fell back from the manifest that adds the tables to the one
+before it, and at seed 19 from two manifests past it. Four crashes in the window, on three
+seeds, go uncaught, for reasons the correct install shares: an install with nothing to take
+out and nothing to add (seed 15); a rename of the second switch that survived the crash
+without its directory sync, so the install came back whole (seed 15); a lost sync of
+`CURRENT` whose fallback used the second switch's manifest, whole (seed 12); and a fallback
+that went older than both switches, which is the span as it was (seed 13). The engine sweep's own tests, on the default
 schedule, which runs none of this entry, are unchanged at every tier: the correct engine
 passes every seed with the same coverage, and `NoWalBeforeMemtable`,
 `ReleaseBeforeManifest` and `DeleteBeforeManifest` are caught on 19, 13 and 10 of 20, 98,
@@ -4430,6 +4465,11 @@ The sweep's own tests on the default schedule, before this part of the entry (26
 | 20 | every seed, before and after | 19 → 20 | 13 → 12 | 10 → 11 |
 | 100 | every seed, before and after | 98 → 97 | 64 → 62 | 55 → 62 |
 | 1000 | every seed, before and after | 984 → 981 | 627 → 623 | 570 → 630 |
+
+With the oracle tightened as D-054 records, on the same schedules, the three are caught on
+20, 13 and 11 of 20, 97, 66 and 62 of 100, and 981, 645 and 632 of 1000: the tightening
+can only add catches, and it added them to `ReleaseBeforeManifest` (623 → 645) and
+`DeleteBeforeManifest` (630 → 632), whose losses a fallback had been forgiving.
 
 Every seed's schedule moved, since a new task draws from the node's stream and every
 install and delete writes, flushes and switches, so which seeds catch a variant changed
