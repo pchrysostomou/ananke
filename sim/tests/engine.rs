@@ -196,51 +196,75 @@ fn the_correct_engine_passes_every_seed_with_deep_levels() {
 // PROPOSED(D-054): the live install's crash test.
 #[test]
 fn the_live_install_crash_test_passes_every_seed() {
-    let totals = Mutex::new((engine::InstallOutcomes::default(), 0u64, 0u64, 0u64, 0u64));
+    let totals = Mutex::new((
+        engine::InstallOutcomes::default(),
+        0u64,
+        0u64,
+        0u64,
+        0u64,
+        0u64,
+    ));
     let verdicts = sweep(seeds(), |seed| {
         let report = engine::run_with(seed, engine::Schedule::install(), Variant::Correct);
         {
             let mut t = totals.lock().unwrap();
-            let o = report.install_outcomes;
-            t.0.aimed += o.aimed;
-            t.0.kept += o.kept;
-            t.0.crashed_after_switch += o.crashed_after_switch;
-            t.0.crashed_before_switch += o.crashed_before_switch;
-            t.0.lost_to_a_fault += o.lost_to_a_fault;
-            t.0.keys_written_after += o.keys_written_after;
+            add_outcomes(&mut t.0, report.install_outcomes);
             t.1 += report.installs_started;
             t.2 += report.installs_completed;
             t.3 += report.reads_over_installs;
-            t.4 += report.checkpoints_verified;
+            t.4 += report.span_checkpoints_verified;
+            t.5 += report.reads_unjudged_for_installs;
         }
         report.check().map_err(|violation| {
             write_trace(&format!("engine-install-{seed}"), &report.jsonl);
             format!("seed {seed}: {violation}")
         })
     });
-    let (outcomes, started, completed, reads_over, verified) = totals.into_inner().unwrap();
+    let (outcomes, started, completed, reads_over, verified, unjudged) =
+        totals.into_inner().unwrap();
     eprintln!(
-        "live install, Correct: {started} installs asked for, {completed} resolved, {reads_over} live reads over an install, {verified} checkpoints verified; after the crashes: {outcomes:?}"
+        "live install, Correct: {started} installs asked for, {completed} resolved, {reads_over} live reads over an install, {verified} span checkpoints verified, {unjudged} reads left unjudged while an install ran; after the crashes: {outcomes:?}"
     );
     if let Err(violation) = verdict(&verdicts) {
         panic!("{violation}");
     }
-    assert!(outcomes.aimed > 0, "no crash was aimed at an install");
-    assert!(
-        outcomes.crashed_before_switch > 0,
-        "no crash landed before an install's switch: {outcomes:?}"
-    );
-    assert!(
-        outcomes.crashed_after_switch + outcomes.kept > 0,
-        "no install was in force after a crash: {outcomes:?}"
-    );
-    assert!(
-        outcomes.keys_written_after > 0,
-        "no key written after an install was checked after a crash: {outcomes:?}"
-    );
+    assert_install_windows(&outcomes, "an install");
+    assert!(verified > 0, "no span checkpoint was opened after a crash");
     assert!(
         reads_over > 0,
         "no live read of a key written after an install: {outcomes:?}"
+    );
+}
+
+/// Adds one run's install outcomes to a sweep's.
+fn add_outcomes(total: &mut engine::InstallOutcomes, o: engine::InstallOutcomes) {
+    total.aimed += o.aimed;
+    total.kept += o.kept;
+    total.crashed_after_switch += o.crashed_after_switch;
+    total.crashed_before_record_durable += o.crashed_before_record_durable;
+    total.crashed_between_replacement_and_switch += o.crashed_between_replacement_and_switch;
+    total.crashed_otherwise_before_switch += o.crashed_otherwise_before_switch;
+    total.lost_to_a_fault += o.lost_to_a_fault;
+    total.keys_written_after += o.keys_written_after;
+}
+
+/// The windows an install's crash test must have crashed in (D-054): aimed at all,
+/// between its replacement and its switch, which is the one-switch rule's window,
+/// after the switch before the install resolved, and with writes over it checked.
+// PROPOSED(D-054): the live install's crash test.
+fn assert_install_windows(outcomes: &engine::InstallOutcomes, what: &str) {
+    assert!(outcomes.aimed > 0, "no crash was aimed at {what}");
+    assert!(
+        outcomes.crashed_between_replacement_and_switch > 0,
+        "no crash landed between {what}'s replacement and its switch: {outcomes:?}"
+    );
+    assert!(
+        outcomes.crashed_after_switch > 0,
+        "no crash landed after {what}'s switch before it resolved: {outcomes:?}"
+    );
+    assert!(
+        outcomes.keys_written_after > 0,
+        "no key written after {what} was checked after a crash: {outcomes:?}"
     );
 }
 
@@ -281,46 +305,29 @@ fn an_install_in_two_switches_is_caught() {
 // PROPOSED(D-055): the range delete's crash test.
 #[test]
 fn the_range_delete_crash_test_passes_every_seed() {
-    let totals = Mutex::new((engine::InstallOutcomes::default(), 0u64, 0u64));
+    let totals = Mutex::new((engine::InstallOutcomes::default(), 0u64, 0u64, 0u64));
     let verdicts = sweep(seeds(), |seed| {
         let report = engine::run_with(seed, engine::Schedule::range_delete(), Variant::Correct);
         {
             let mut t = totals.lock().unwrap();
-            let o = report.install_outcomes;
-            t.0.aimed += o.aimed;
-            t.0.kept += o.kept;
-            t.0.crashed_after_switch += o.crashed_after_switch;
-            t.0.crashed_before_switch += o.crashed_before_switch;
-            t.0.lost_to_a_fault += o.lost_to_a_fault;
-            t.0.keys_written_after += o.keys_written_after;
+            add_outcomes(&mut t.0, report.install_outcomes);
             t.1 += report.deletes_started;
             t.2 += report.installs_completed;
+            t.3 += report.reads_unjudged_for_installs;
         }
         report.check().map_err(|violation| {
             write_trace(&format!("engine-range-delete-{seed}"), &report.jsonl);
             format!("seed {seed}: {violation}")
         })
     });
-    let (outcomes, started, completed) = totals.into_inner().unwrap();
+    let (outcomes, started, completed, unjudged) = totals.into_inner().unwrap();
     eprintln!(
-        "range delete, Correct: {started} deletes asked for, {completed} resolved; after the crashes: {outcomes:?}"
+        "range delete, Correct: {started} deletes asked for, {completed} resolved, {unjudged} reads left unjudged while a delete ran; after the crashes: {outcomes:?}"
     );
     if let Err(violation) = verdict(&verdicts) {
         panic!("{violation}");
     }
-    assert!(outcomes.aimed > 0, "no crash was aimed at a delete");
-    assert!(
-        outcomes.crashed_before_switch > 0,
-        "no crash landed before a delete's switch: {outcomes:?}"
-    );
-    assert!(
-        outcomes.crashed_after_switch + outcomes.kept > 0,
-        "no delete was in force after a crash: {outcomes:?}"
-    );
-    assert!(
-        outcomes.keys_written_after > 0,
-        "no key written after a delete was checked after a crash: {outcomes:?}"
-    );
+    assert_install_windows(&outcomes, "a delete");
 }
 
 /// The range delete's known-buggy engine beside it (D-055): a delete that takes the
@@ -413,6 +420,50 @@ fn a_seek_that_counts_tombstones_is_caught() {
         caught.first().map_or("", String::as_str)
     );
     assert!(!caught.is_empty(), "SeekCountsTombstones was never caught");
+}
+
+/// The install that keeps its source's sequence numbers beside the same crash test
+/// (D-054): half the installs take their source from a store further along than
+/// the live engine, so a kept number hides the writes that follow the install, and
+/// the oracle checks that every installed table the manifest in force lists carries
+/// the install's own number. Caught on some seed at every tier, and the rate is
+/// printed.
+///
+/// A kept number can also equal the number of a later local write of the same key,
+/// and two writes under one internal key stop the variant's next compaction at the
+/// table writer's order assertion: the engine itself refuses the state the bug
+/// made. Such a seed counts as caught, and the test prints how many there were.
+// PROPOSED(D-054): the installed sequence numbers are the install's.
+#[test]
+fn an_install_that_keeps_its_sources_numbers_is_caught() {
+    let outcomes: Vec<Option<(String, bool)>> = sweep(seeds(), |seed| {
+        std::panic::catch_unwind(|| {
+            engine::run_with(
+                seed,
+                engine::Schedule::install(),
+                Variant::InstallKeepsSourceNumbers,
+            )
+            .check()
+            .err()
+            .map(|violation| (violation, false))
+        })
+        .unwrap_or_else(|_| Some((format!("seed {seed}: the engine panicked"), true)))
+    });
+    let caught: Vec<&(String, bool)> = outcomes.iter().flatten().collect();
+    let panicked = caught.iter().filter(|(_, p)| *p).count();
+    eprintln!(
+        "InstallKeepsSourceNumbers: caught on {} of {} seeds, {panicked} of them by the engine's own assertion, first: {}",
+        caught.len(),
+        seeds(),
+        caught
+            .iter()
+            .find(|(_, p)| !*p)
+            .map_or("", |(v, _)| v.as_str())
+    );
+    assert!(
+        !caught.is_empty(),
+        "InstallKeepsSourceNumbers was never caught"
+    );
 }
 
 /// The span checkpoint's known-buggy engine beside the same crash test (D-054): a

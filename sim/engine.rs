@@ -32,9 +32,10 @@ use std::time::Duration;
 
 use ananke_env::moirae::{Export, bytes_decoder};
 use ananke_env::sim::{Sim, SimConfig, SimEnv, TraceRecord};
-use ananke_env::{Clock, Environment, NodeId, Rng, TraceEvent};
+use ananke_env::{Clock, Environment, File, FileSystem, NodeId, OpenOptions, Rng, TraceEvent};
 use ananke_storage::engine;
 use ananke_storage::manifest;
+use ananke_storage::sst::SstWriter;
 use ananke_storage::{Engine, EngineConfig, EngineRecovery, Value, WriteBatch, wal};
 use bytes::Bytes;
 
@@ -226,6 +227,8 @@ pub struct Checkpoint {
     pub version: u64,
     /// The model's state at that version when it was taken.
     pub expected: BTreeMap<Bytes, Value>,
+    /// Whether it is a checkpoint of a span (D-054) rather than of the whole store.
+    pub span: bool,
 }
 
 /// An install the run asked for (D-054): the span, the state of the span it
@@ -310,6 +313,9 @@ pub struct Model {
     pub seeks_limited: u64,
     /// Bounded seeks that walked a recovered engine.
     pub recovery_seeks: u64,
+    /// Live reads, scans and seeks left unjudged, in whole or in part, because an
+    /// install or a range delete of their span was in progress (D-054).
+    pub reads_unjudged_for_installs: u64,
 }
 
 impl Model {
@@ -406,6 +412,8 @@ pub struct InstallMirror {
     /// The writes of the span below `seq` that the tables it took out held: gone
     /// once its manifest is in force.
     pub dropped: BTreeSet<(Bytes, u64)>,
+    /// The installed tables, by number.
+    pub added: Vec<u64>,
     /// The start of the node it was written in.
     start_of_node: u64,
 }
@@ -597,6 +605,7 @@ impl Mirror {
             start: start.clone(),
             end: end.clone(),
             dropped,
+            added: added.iter().map(|(number, _, _)| *number).collect(),
             start_of_node: self.starts,
         });
     }
@@ -752,8 +761,16 @@ pub struct InstallOutcomes {
     /// it: the crash came after the switch.
     pub crashed_after_switch: u64,
     /// Installs that had not resolved when the node crashed and were not in force
-    /// after it: the span came back as it was.
-    pub crashed_before_switch: u64,
+    /// after it, crashed before a sync of the install's own record returned.
+    pub crashed_before_record_durable: u64,
+    /// Of those not in force, crashed after the install's replacement was written
+    /// and traced and before `CURRENT` was switched to its manifest: the window the
+    /// one switch closes.
+    pub crashed_between_replacement_and_switch: u64,
+    /// Of those not in force, every other crash before the switch: flushing the
+    /// memtables below the install or writing its tables, or after a switch a
+    /// fallback then abandoned.
+    pub crashed_otherwise_before_switch: u64,
     /// Installs that had resolved and were not in force after the crash: a fault
     /// sent recovery back to an older manifest.
     pub lost_to_a_fault: u64,
@@ -783,8 +800,13 @@ pub struct Report {
     pub unsynced: u64,
     /// Checkpoints taken.
     pub checkpoints_taken: u64,
-    /// Checkpoints opened fresh and checked after a crash.
+    /// Whole-store checkpoints opened fresh and checked after a crash.
     pub checkpoints_verified: u64,
+    /// Checkpoints of a span opened fresh and checked after a crash (D-054).
+    pub span_checkpoints_verified: u64,
+    /// Live reads of a key, and scans or seeks over a span, left unjudged because
+    /// an install or a range delete of the span was in progress (D-054).
+    pub reads_unjudged_for_installs: u64,
     /// Checkpoints a fault touched, not checked.
     pub checkpoints_damaged: u64,
     /// Installs asked for (D-054).
@@ -887,6 +909,7 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
     let mut carried_drops: (u64, BTreeMap<u64, Excuse>) = (0, BTreeMap::new());
     let mut refused = None;
     let (mut checkpoints_verified, mut checkpoints_damaged) = (0u64, 0u64);
+    let mut span_checkpoints_verified = 0u64;
     let mut install_outcomes = InstallOutcomes::default();
     for crash in 0..=schedule.crashes {
         let before_open = sim.trace().len();
@@ -1342,6 +1365,21 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
         // besides is the model's to judge, key by key, below.
         for (&seq, install) in &installs_now {
             let resolved = install.applied;
+            // PROPOSED(D-054): every installed table the manifest in force lists
+            // carries the install's own number and no other, which is what reads
+            // a later write over it; the mirror stamps the number, so only the
+            // manifest's record of the table can show it.
+            if let Some(mirrored) = in_force.get(&seq)
+                && verdict.is_ok()
+                && let Some(meta) = recovery.tables.iter().find(|m| {
+                    mirrored.added.contains(&m.number) && (m.first_seq != seq || m.max_seq != seq)
+                })
+            {
+                verdict = Err(format!(
+                    "the install at record {seq} is in force (manifest {}) but its table {} carries records {}..={}, not the install's number",
+                    recovery.manifest, meta.number, meta.first_seq, meta.max_seq
+                ));
+            }
             if in_force.contains_key(&seq) {
                 let stale = in_service.iter().find_map(|t| {
                     mirror.tables.get(t).and_then(|table| {
@@ -1393,7 +1431,30 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
                     if resolved {
                         install_outcomes.lost_to_a_fault += 1;
                     } else {
-                        install_outcomes.crashed_before_switch += 1;
+                        // PROPOSED(D-054): where in the install the crash came.
+                        let durable = synced
+                            .wal
+                            .iter()
+                            .any(|&(_, first, up_to, _)| first <= seq && seq <= up_to);
+                        let written = events.iter().position(
+                            |e| matches!(e, TraceEvent::SpanInstalled { seq: s, .. } if *s == seq),
+                        );
+                        let switched = written.is_some_and(|at| {
+                            let manifest = match events[at] {
+                                TraceEvent::SpanInstalled { manifest, .. } => *manifest,
+                                _ => 0,
+                            };
+                            events[at..].iter().any(|e| {
+                                matches!(e, TraceEvent::CurrentSwitched { manifest: m } if *m == manifest)
+                            })
+                        });
+                        if !durable {
+                            install_outcomes.crashed_before_record_durable += 1;
+                        } else if written.is_some() && !switched {
+                            install_outcomes.crashed_between_replacement_and_switch += 1;
+                        } else {
+                            install_outcomes.crashed_otherwise_before_switch += 1;
+                        }
                     }
                 }
             }
@@ -1528,7 +1589,11 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
             {
                 epoch.verdict = Err(violation);
             }
-            checkpoints_verified += 1;
+            if checkpoint.span {
+                span_checkpoints_verified += 1;
+            } else {
+                checkpoints_verified += 1;
+            }
         }
         previous_manifest = Some((recovery.manifest, recovery.flushed_seq));
         // PROPOSED(D-054): the drops a fallback explained, for the next open under
@@ -1627,6 +1692,7 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
             m.reads_over_installs,
         )
     };
+    let reads_unjudged_for_installs = lock(&model).reads_unjudged_for_installs;
     let (deletes_started, seeks, recovery_seeks) = {
         let m = lock(&model);
         (
@@ -1646,6 +1712,8 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
         unsynced,
         checkpoints_taken,
         checkpoints_verified,
+        span_checkpoints_verified,
+        reads_unjudged_for_installs,
         checkpoints_damaged,
         installs_started,
         installs_completed,
@@ -1927,6 +1995,147 @@ fn check_checkpoint(
         .expect("the check completed")
 }
 
+/// Installs the span checkpoint in `dir` over `k{lo}..k{hi}` of `db`, recording it
+/// in the model as it is asked for and as it resolves. False when it could not be
+/// made, with the violation recorded.
+// PROPOSED(D-054): the live install's crash test.
+async fn install_from(
+    db: &Db,
+    model: &SharedModel,
+    dir: &Path,
+    lo: u64,
+    hi: u64,
+    entries: BTreeMap<Bytes, Bytes>,
+) -> bool {
+    let source = match db.open_span_source(dir).await {
+        Ok(source) => source,
+        Err(error) => {
+            lock(model).read_violations.push(format!(
+                "the span checkpoint in {} does not read back to install: {error}",
+                dir.display()
+            ));
+            return false;
+        }
+    };
+    let install = db.install_span(key(lo)..key(hi), source);
+    let Some(seq) = install.seq() else {
+        lock(model).read_violations.push(format!(
+            "an install of k{lo:02}..k{hi:02} was refused at once"
+        ));
+        return false;
+    };
+    begin_install(model, seq, lo, hi, entries, false);
+    if let Err(error) = install.await {
+        lock(model)
+            .read_violations
+            .push(format!("the install at record {seq} failed: {error}"));
+        return false;
+    }
+    end_install(model, seq, lo, hi);
+    true
+}
+
+/// A store further along than the live engine, written into `dir` in the engine's
+/// own formats, as a checkpoint of `k{lo}..k{hi}` from a range's leader would be:
+/// one table at level 0 holding a put of most of the span's keys, every one
+/// numbered above `live`, the newest version the live engine had applied, then its
+/// manifest and `CURRENT`, each synced in that order. The live keys it holds, or
+/// `None` if a write failed.
+///
+/// A second engine is not opened for it: on the node under test its log, table and
+/// manifest events would reach the trace the oracle reads by segment, table and
+/// manifest number, with nothing to say they were another directory's. The
+/// storage crate's own test installs from a second engine.
+// PROPOSED(D-054): the installed sequence numbers are the install's.
+async fn store_further_along(
+    env: &SimEnv,
+    schedule: &Schedule,
+    live: u64,
+    lo: u64,
+    hi: u64,
+    dir: &Path,
+    model: &SharedModel,
+) -> Option<BTreeMap<Bytes, Bytes>> {
+    let fs = env.fs();
+    fs.create_dir_all(dir).await.ok()?;
+    let first = live + 1 + env.rng().below(256);
+    let mut seq = first;
+    let mut entries = BTreeMap::new();
+    let mut writer = SstWriter::new();
+    for i in lo..hi {
+        if env.rng().below(4) == 0 {
+            continue;
+        }
+        let len = usize::try_from(env.rng().below(schedule.value_max + 1)).expect("fits");
+        let mut bytes = vec![0u8; len];
+        env.rng().fill_bytes(&mut bytes);
+        let value = Bytes::from(bytes);
+        writer.add(&key(i), seq, &Value::Live(value.clone()));
+        entries.insert(key(i), value);
+        seq += 1;
+    }
+    let mut ssts = Vec::new();
+    if let (Some((first_key, last_key)), Some((first_seq, max_seq))) =
+        (writer.key_range(), writer.seq_range())
+    {
+        let count = writer.entries();
+        let bytes = writer.finish();
+        let len = bytes.len() as u64;
+        write_synced(fs, &manifest::sst_path(dir, 1), bytes).await?;
+        ssts.push(manifest::SstMeta {
+            number: 1,
+            level: 0,
+            first_seq,
+            max_seq,
+            entries: count,
+            bytes: len,
+            first_key,
+            last_key,
+        });
+    }
+    let version = seq - 1;
+    let store = manifest::Manifest {
+        number: 1,
+        next_sst: 2,
+        flushed_seq: version,
+        ssts,
+    };
+    write_synced(fs, &manifest::manifest_path(dir, 1), store.encode()).await?;
+    write_synced(
+        fs,
+        &manifest::current_tmp_path(dir),
+        manifest::encode_current(1),
+    )
+    .await?;
+    fs.rename(
+        &manifest::current_tmp_path(dir),
+        &manifest::current_path(dir),
+    )
+    .await
+    .ok()?;
+    fs.sync_dir(dir).await.ok()?;
+    lock(model).checkpoints.push(Checkpoint {
+        dir: dir.to_path_buf(),
+        version,
+        expected: entries
+            .iter()
+            .map(|(k, v)| (k.clone(), Value::Live(v.clone())))
+            .collect(),
+        span: true,
+    });
+    Some(entries)
+}
+
+/// Writes `bytes` as a new file at `path` and syncs it.
+async fn write_synced(fs: &<SimEnv as Environment>::Fs, path: &Path, bytes: Bytes) -> Option<()> {
+    let file = fs
+        .open(path, OpenOptions::new().write(true).create_new(true))
+        .await
+        .ok()?;
+    file.write_at(0, bytes).await.ok()?;
+    file.sync().await.ok()
+}
+
 /// Records an install or a range delete of `k{lo}..k{hi}` numbered `seq` as it is
 /// asked for: its record, which holds no write, what it installs, and its keys in
 /// flight until it resolves.
@@ -2097,6 +2306,7 @@ fn spawn_clients(sim: &Sim, node: NodeId, db: Db, schedule: &Schedule, model: &S
                     dir,
                     version: info.version,
                     expected,
+                    span: false,
                 });
             }
         });
@@ -2108,6 +2318,7 @@ fn spawn_clients(sim: &Sim, node: NodeId, db: Db, schedule: &Schedule, model: &S
     // PROPOSED(D-055): the same task deletes spans, when the schedule asks for it.
     if schedule.installs || schedule.range_deletes {
         let (installs, range_deletes) = (schedule.installs, schedule.range_deletes);
+        let schedule = *schedule;
         let (env, db, model) = (sim.env(node), db.clone(), model.clone());
         env.clone().spawn("installer", async move {
             loop {
@@ -2145,6 +2356,24 @@ fn spawn_clients(sim: &Sim, node: NodeId, db: Db, schedule: &Schedule, model: &S
                     m.span_checkpoints - 1
                 };
                 let dir = PathBuf::from(format!("/stage/{n:04}"));
+                // PROPOSED(D-054): one source in two is a store further along than
+                // the live engine, as a range's snapshot from a leader is: its
+                // numbers are above every number the live engine had given, so an
+                // install that kept them would hide the writes that follow it.
+                if env.rng().below(2) == 0 {
+                    let live = db.snapshot().version();
+                    let Some(entries) =
+                        store_further_along(&env, &schedule, live, lo, hi, &dir, &model).await
+                    else {
+                        return;
+                    };
+                    let gap = 500 + env.rng().below(3000);
+                    env.clock().sleep(Duration::from_micros(gap)).await;
+                    if !install_from(&db, &model, &dir, lo, hi, entries).await {
+                        return;
+                    }
+                    continue;
+                }
                 let Ok(info) = db.checkpoint_span(&start[..]..&end[..], &dir).await else {
                     return;
                 };
@@ -2160,6 +2389,7 @@ fn spawn_clients(sim: &Sim, node: NodeId, db: Db, schedule: &Schedule, model: &S
                         dir: dir.clone(),
                         version: info.version,
                         expected: expected.clone(),
+                        span: true,
                     });
                     expected
                         .into_iter()
@@ -2168,31 +2398,9 @@ fn spawn_clients(sim: &Sim, node: NodeId, db: Db, schedule: &Schedule, model: &S
                 };
                 let gap = 500 + env.rng().below(3000);
                 env.clock().sleep(Duration::from_micros(gap)).await;
-                let source = match db.open_span_source(&dir).await {
-                    Ok(source) => source,
-                    Err(error) => {
-                        lock(&model).read_violations.push(format!(
-                            "the span checkpoint in {} does not read back to install: {error}",
-                            dir.display()
-                        ));
-                        return;
-                    }
-                };
-                let install = db.install_span(start.clone()..end.clone(), source);
-                let Some(seq) = install.seq() else {
-                    lock(&model).read_violations.push(format!(
-                        "an install of k{lo:02}..k{hi:02} was refused at once"
-                    ));
-                    return;
-                };
-                begin_install(&model, seq, lo, hi, entries, false);
-                if let Err(error) = install.await {
-                    lock(&model)
-                        .read_violations
-                        .push(format!("the install at record {seq} failed: {error}"));
+                if !install_from(&db, &model, &dir, lo, hi, entries).await {
                     return;
                 }
-                end_install(&model, seq, lo, hi);
             }
         });
     }
@@ -2253,6 +2461,7 @@ fn spawn_clients(sim: &Sim, node: NodeId, db: Db, schedule: &Schedule, model: &S
                     {
                         let mut m = lock(&model);
                         m.reads += 1;
+                        m.reads_unjudged_for_installs += u64::from(span_touched);
                         if let Some(limit) = limit {
                             m.seeks += 1;
                             m.seeks_limited += u64::from(got.len() == limit);
@@ -2278,8 +2487,13 @@ fn spawn_clients(sim: &Sim, node: NodeId, db: Db, schedule: &Schedule, model: &S
                 }
                 let key = key(env.rng().below(KEYS));
                 let expected = {
-                    let m = lock(&model);
+                    let mut m = lock(&model);
                     if m.in_flight.get(&key).is_some_and(|&n| n > 0) {
+                        let installing = m
+                            .installing
+                            .as_ref()
+                            .is_some_and(|(start, end)| *start <= key && key < *end);
+                        m.reads_unjudged_for_installs += u64::from(installing);
                         None
                     } else {
                         Some(m.committed.get(&key).cloned().and_then(|(_, v)| v.live()))

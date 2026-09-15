@@ -4249,12 +4249,25 @@ manifest (the rewrites in, the tables taken out out) and puts the installed tabl
 a second; a crash between the two leaves the span as neither what it was nor what was
 installed. `Variant::SpanCheckpointUnsynced` writes a span checkpoint's tables without
 syncing them before the manifest and `CURRENT` that name them.
+`Variant::InstallKeepsSourceNumbers` writes each installed key at the number its source
+gave it rather than at `S`: a source from a store further along than the live engine
+carries numbers above every later local write, and hides them.
 
-*The crash test.* `sim/engine.rs`'s scenario with `Schedule::install()`: the default
+*The crash test.* `sim/engine.rs`'s scenario with `Schedule::install()`: the Phase 1
 workload, three writers over all 48 keys and two readers, plus a task that every one to
-five milliseconds checkpoints a random span of one to twelve keys into a directory of its
-own, waits half a millisecond to three and a half more while the writers write over it,
-and installs the checkpoint over the span, rolling the span back. Every crash is aimed at
+five milliseconds takes a source for a random span of one to twelve keys into a directory
+of its own, waits half a millisecond to three and a half more while the writers write over
+it, and installs the source over the span. One source in two is a checkpoint of the span,
+which rolls the span back. The other is a store further along than the live engine, as a
+range's snapshot from a leader is: written in the engine's own table, manifest and
+`CURRENT` formats and synced in a checkpoint's order, holding most of the span's keys with
+new values, every one numbered above the newest version the live engine had applied. It is
+not written by a second engine on the node: that engine's log, table and manifest events
+would reach the trace the oracle reads by segment, table and manifest number with nothing
+to say they were another directory's, and the first attempt did exactly that, failing the
+correct engine on nearly every seed; the storage crate's own test,
+`an_install_from_a_store_further_along_carries_the_install_s_number`, installs from a
+second engine. Every crash is aimed at
 an install, from the harness's own stream: on half the epochs at a time drawn uniformly
 from the twelve milliseconds after the next install is asked for, and on the other half
 from the three after its replacement is traced, just before its switch. The disk faults
@@ -4292,6 +4305,28 @@ which `FsyncLost` already says. At the first twenty seeds `SpanCheckpointUnsynce
 caught on 1, because its tables' writes were torn more often than lost whole, and every
 torn one was skipped; with a torn write alone no longer an excuse it is caught on 19 of 20.
 
+*What review found in the installed numbers.* The mirror stamps installed writes at the
+number the trace records, and every source was then a checkpoint of the same engine below
+it, so an install that kept its source's numbers passed everything: nothing read a number
+the source gave. Now each recovery asserts that every installed table the manifest in force
+lists carries the install's own number and no other, from the recovered manifest's record
+of the table (`first_seq` and `max_seq` both `S`), which is what the engine wrote and not
+what the trace says; half the sources are the store further along above; and
+`InstallKeepsSourceNumbers` is its known-buggy engine. The storage test installs from a
+second engine that has taken more records than the live one, and shows the correct engine's
+installed tables at the install's number with a later local write read over them, while the
+variant keeps the donor's number and returns the installed value over the later write.
+
+*What review found in the coverage.* Whole-store checkpoints verified after a crash are
+now counted apart from span checkpoints, and the default sweep asserts some of the former;
+reads, scans and seeks left unjudged, in whole or in part, because an install of their span
+was in progress are counted; and the crashes before an install's switch are split three
+ways: before a sync of the install's own record returned, between the replacement's
+`SpanInstalled` and the switch to its manifest, which is the window the one switch closes,
+and the rest (flushing the memtables below the install, writing its tables, or a switch a
+fallback then abandoned). The live install's and the range delete's tests assert crashes
+between the replacement and the switch, and after the switch before the install resolved.
+
 *What review found in the oracle.* Independent review of 9eb28e4 found two excuses in the
 engine sweep's oracle, both older than this entry, that could have hidden a broken
 install, and both are tightened. **The fallback excuse was unbounded.** Any recovery that
@@ -4319,7 +4354,31 @@ seed turned red under the tightened oracle**: every correct test of the engine b
 passes at 20, 100 and 1000 seeds, and so does the Phase 1 schedule alone
 (`Schedule::phase_1()`) at 1000.
 
-*Measured.* In release on the eight-core laptop, beside another lane's builds and
+*Measured after review.* On the tree of the review's fixes to D-054 — the tightened
+oracle, the install's own task, the store further along and the observed numbers — in
+release on the eight-core laptop beside another lane's premerge (load averages 25 to
+58), `cargo test -p ananke-sim --release --test engine` with `ANANKE_SEEDS` at each tier.
+The correct engine passes every seed of the live install's test, the range delete's
+(D-055) and the default sweep at every tier: **no correct-engine seed is red under the
+tightened oracle.** The live install's crash test:
+
+| tier | installs asked / resolved | crashes aimed | in force after a crash (resolved / not) | not in force: before the record was durable / between replacement and switch / otherwise / resolved, a fault | span keys written after an install, checked | live reads over an install | span checkpoints verified | reads left unjudged |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 20 | 274 / 178 | 153 | 157 / 16 | 1 / 19 / 59 / 18 | 2 985 | 3 874 | 120 | 2 734 |
+| 100 | 1 344 / 912 | 733 | 797 / 56 | 2 / 61 / 306 / 90 | 15 614 | 19 024 | 583 | 13 667 |
+| 1000 | 13 460 / 9 138 | 7 320 | 7 990 / 490 | 22 / 651 / 3 087 / 902 | 163 647 | 197 835 | 5 827 | 142 416 |
+
+Its variants, on the same schedule: `InstallInTwoSwitches` caught on 13 of 20, 54 of 100
+and 559 of 1000; `InstallKeepsSourceNumbers` on 20 of 20, 98 of 100 and 975 of 1000, the first
+at seed 0: *the install at record 125 is in force (manifest 11) but its table 15 carries
+records 174..=179, not the install's number*. At one seed of the thousand a kept number equalled a later
+local write's under the same key and the variant's own compaction stopped at the table
+writer's order assertion, which the test counts as caught and prints.
+`SpanCheckpointUnsynced` is caught on 17 of 20, 81 of 100 and 816 of 1000, down from 19,
+95 and 940: half the sources are now the store further along, which the harness writes and
+syncs itself, so only the other half are the engine's span checkpoints that can show it.
+
+*Measured before review.* In release on the eight-core laptop, beside another lane's builds and
 sweeps (load averages from 4 to over 100 during the runs), `cargo test -p ananke-sim
 --release --test engine` with `ANANKE_SEEDS` at each tier:
 

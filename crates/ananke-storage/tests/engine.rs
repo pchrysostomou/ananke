@@ -1539,3 +1539,100 @@ fn a_range_delete_takes_a_span_out_in_one_switch() {
         .count();
     assert!(switches_after_delete >= 1);
 }
+
+/// A source from a store further along than the live engine, as a range's snapshot
+/// from a leader is (D-054): its writes are numbered above every number the live
+/// engine has given. Installed, every table the install adds carries the install's
+/// own number and no other, and a local write after the install reads over the
+/// installed value. The engine that keeps the source's numbers
+/// (`Variant::InstallKeepsSourceNumbers`) hides that later write behind the
+/// installed one, which is the mechanism its crash test catches.
+// PROPOSED(D-054): the installed sequence numbers are the install's.
+#[test]
+fn an_install_from_a_store_further_along_carries_the_install_s_number() {
+    for variant in [Variant::Correct, Variant::InstallKeepsSourceNumbers] {
+        let mut sim = Sim::new(SimConfig::new(43));
+        let node = sim.add_node();
+        on_node(&mut sim, node, move |env| {
+            Box::pin(async move {
+                let mut live_config = config(400);
+                live_config.dir = "/live".into();
+                live_config.variant = variant;
+                let (live, _) = Engine::open(env.clone(), live_config).await.unwrap();
+                fill(&live, 0..40, 20).await;
+                let mut donor_config = config(400);
+                donor_config.dir = "/donor".into();
+                let (donor, _) = Engine::open(env.clone(), donor_config).await.unwrap();
+                for _ in 0..300 {
+                    drop(donor.write(ananke_storage::WriteBatch::new(), false));
+                }
+                let mut batch = ananke_storage::WriteBatch::new();
+                for k in 5..9 {
+                    batch.put(
+                        Bytes::from(format!("k{k:03}")),
+                        Bytes::from(format!("donor-{k}")),
+                    );
+                }
+                let donor_seq = donor.write(batch, true).await.unwrap();
+                assert!(donor_seq > 300);
+                donor
+                    .checkpoint_span(b"k005"..b"k009", Path::new("/stage/donor"))
+                    .await
+                    .unwrap();
+                let source = live
+                    .open_span_source(Path::new("/stage/donor"))
+                    .await
+                    .unwrap();
+                let done = live
+                    .install_span(b("k005")..b("k009"), source)
+                    .await
+                    .unwrap();
+                assert!(done.seq < donor_seq, "the live engine is behind the donor");
+                let installed: Vec<(u64, u64)> = live.levels()[0]
+                    .iter()
+                    .filter(|t| t.first_key >= b("k005") && t.last_key < b("k009"))
+                    .map(|t| (t.first_seq, t.max_seq))
+                    .collect();
+                assert_eq!(installed.len(), done.added, "{installed:?}");
+                // A local write to the span, flushed into a table of its own, and
+                // then the live engine taken past the donor's numbers.
+                let local = live.put(b("k006"), b("local")).await.unwrap();
+                assert!(local > done.seq && local < donor_seq);
+                for i in 0..20 {
+                    live.put(Bytes::from(format!("z{i:02}")), Bytes::from(vec![b'x'; 40]))
+                        .await
+                        .unwrap();
+                }
+                env.clock().sleep(Duration::from_millis(1)).await;
+                for _ in 0..donor_seq {
+                    drop(live.write(ananke_storage::WriteBatch::new(), false));
+                }
+                live.put(b("zz"), b("past")).await.unwrap();
+                assert!(live.snapshot().version() > donor_seq);
+                let read = live.get(b"k006").await.unwrap();
+                if variant == Variant::Correct {
+                    assert!(
+                        installed.iter().all(|&s| s == (done.seq, done.seq)),
+                        "every installed table carries the install's number {}: {installed:?}",
+                        done.seq
+                    );
+                    assert_eq!(
+                        read,
+                        Some(b("local")),
+                        "the local write reads over the install"
+                    );
+                } else {
+                    assert!(
+                        installed.iter().all(|&s| s == (donor_seq, donor_seq)),
+                        "the variant keeps the donor's number {donor_seq}: {installed:?}"
+                    );
+                    assert_eq!(
+                        read,
+                        Some(b("donor-6")),
+                        "the variant hides the later local write behind the installed value"
+                    );
+                }
+            })
+        });
+    }
+}

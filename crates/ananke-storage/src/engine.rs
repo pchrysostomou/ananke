@@ -56,8 +56,10 @@
 //! manifest switch and puts the installed tables in with another; and
 //! [`Variant::SpanCheckpointUnsynced`], whose checkpoint of a span does not sync its
 //! tables; [`Variant::SeekCountsTombstones`], whose bounded seek counts deleted keys
-//! against its limit; and [`Variant::RangeDeleteSkipsMemtables`], whose range delete
-//! leaves the span's writes in the memtables.
+//! against its limit; [`Variant::RangeDeleteSkipsMemtables`], whose range delete
+//! leaves the span's writes in the memtables; and
+//! [`Variant::InstallKeepsSourceNumbers`], whose install keeps the source's sequence
+//! numbers.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
@@ -124,6 +126,12 @@ pub enum Variant {
     /// flush, and come back from the log after a crash.
     // PROPOSED(D-055): the range delete, an install of nothing.
     RangeDeleteSkipsMemtables,
+    /// An install writes each installed key at the sequence number the source
+    /// gave it rather than at the install's own. A source from a store that has
+    /// taken more records than the live engine carries numbers above every later
+    /// local write, and hides them.
+    // PROPOSED(D-054): the installed sequence numbers are the install's.
+    InstallKeepsSourceNumbers,
 }
 
 /// How to open an [`Engine`].
@@ -2035,7 +2043,7 @@ impl<E: Environment> Shared<E> {
         let mut last_user: Option<Bytes> = None;
         let mut keys = 0;
         while let Some((key, value)) = merge.next().await? {
-            let (user, _) = ikey::decode(&key)?;
+            let (user, source_seq) = ikey::decode(&key)?;
             if last_user.as_ref() == Some(&user) {
                 continue;
             }
@@ -2056,7 +2064,12 @@ impl<E: Environment> Shared<E> {
                 let full = std::mem::take(&mut writer);
                 added.push(self.write_output(full, 0).await?);
             }
-            writer.add(&user, seq, &value);
+            if self.config.variant == Variant::InstallKeepsSourceNumbers {
+                // The bug: the installed write keeps the number its source gave it.
+                writer.add(&user, source_seq, &value);
+            } else {
+                writer.add(&user, seq, &value);
+            }
             keys += 1;
         }
         if writer.entries() > 0 {
