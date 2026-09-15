@@ -1016,6 +1016,87 @@ fn every_env_handle_shares_the_node_stream() {
     );
 }
 
+/// Q13's stream per node and range (D-057): `n{id}/r{range}/protocol`, derived from
+/// the seed and the name as every stream is (D-017). The same seed, node and range give
+/// the same draws; another range, another node or another seed gives other draws; and
+/// the draws are the ones moirae's derivation gives for that name, so the name is the
+/// stream's identity and not an accident of the order streams were made in.
+// PROPOSED(D-057): a named stream per node and range through the environment.
+#[test]
+fn a_range_stream_is_derived_from_the_seed_and_its_name() {
+    let draws = |seed: u64, node: usize, range: u64| {
+        let mut sim = Sim::new(SimConfig::new(seed));
+        let nodes = [sim.add_node(), sim.add_node()];
+        let rng = sim.env(nodes[node]).range_rng(range);
+        [rng.next_u64(), rng.next_u64(), rng.next_u64()]
+    };
+    assert_eq!(draws(7, 0, 3), draws(7, 0, 3));
+    assert_ne!(draws(7, 0, 3), draws(7, 0, 4));
+    assert_ne!(draws(7, 0, 3), draws(7, 1, 3));
+    assert_ne!(draws(7, 0, 3), draws(8, 0, 3));
+    for (node, range, name) in [
+        (0, 3, "n1/r3/protocol"),
+        (1, 0, "n2/r0/protocol"),
+        (1, u64::MAX, "n2/r18446744073709551615/protocol"),
+    ] {
+        let mut named = moirae_sched::stream(7, name);
+        assert_eq!(
+            draws(7, node, range),
+            [named.next_u64(), named.next_u64(), named.next_u64()],
+            "{name}"
+        );
+    }
+}
+
+/// Taking a range's stream and drawing from it perturbs no other stream (D-017,
+/// D-057): the node's protocol and scheduling streams, another node's protocol stream
+/// and another range's stream draw exactly what they draw when no such stream is
+/// taken, however the takes and draws interleave with theirs.
+// PROPOSED(D-057): a named stream per node and range through the environment.
+#[test]
+fn taking_a_range_stream_perturbs_no_other_stream() {
+    let run = |take: bool| {
+        let mut sim = Sim::new(SimConfig::new(11));
+        let (a, b) = (sim.add_node(), sim.add_node());
+        let (env_a, env_b) = (sim.env(a), sim.env(b));
+        let other = env_a.range_rng(2);
+        let mut seen = Vec::new();
+        for round in 0..4 {
+            if take {
+                let rng = env_a.range_rng(9);
+                for _ in 0..=round {
+                    rng.next_u64();
+                }
+                env_b.range_rng(9).next_u64();
+                env_a.range_rng(100 + round).next_u64();
+            }
+            seen.push(env_a.rng().next_u64());
+            seen.push(env_a.sched_rng().next_u64());
+            seen.push(env_b.rng().next_u64());
+            seen.push(other.next_u64());
+        }
+        seen
+    };
+    assert_eq!(run(false), run(true));
+}
+
+/// A node's stream for a range is one stream however it is reached: every handle to
+/// the node, and every call, continues the same sequence, as `rng` does (D-017).
+// PROPOSED(D-057): a named stream per node and range through the environment.
+#[test]
+fn every_env_handle_continues_a_nodes_range_stream() {
+    let mut sim = Sim::new(SimConfig::new(5));
+    let n = sim.add_node();
+    let first = sim.env(n).range_rng(4).next_u64();
+    let second = sim.env(n).clone().range_rng(4).next_u64();
+    let third = sim.env(n).range_rng(4).next_u64();
+    let mut named = moirae_sched::stream(5, "n1/r4/protocol");
+    assert_eq!(
+        [first, second, third],
+        [named.next_u64(), named.next_u64(), named.next_u64()]
+    );
+}
+
 #[test]
 fn fault_draws_do_not_move_when_the_policy_changes() {
     // D-017: the same seed under both policies produces the same drops and delays.

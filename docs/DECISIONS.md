@@ -4133,4 +4133,59 @@ gains a pointer. No code, trace hash or seed schedule moves.
 
 ---
 
-_Next entry: D-054. Add one before implementing anything not covered above._
+## PROPOSED D-057 — A named stream per node and range: `Environment::range_rng`
+
+**Context.** SHARD.md's Q13, approved: a named stream per node and range,
+`n{id}/r{range}/protocol`, through a new `Environment` method, derived from the seed in
+`SimEnv` and drawn from OS entropy in `RealEnv`, decided before the stage that first pins
+Phase 3 seeds. Protocol code reaches randomness only through `Environment::rng` and
+`sched_rng` (crates/ananke-env/src/env.rs), and a core's generator is seeded from the
+node's protocol stream at its incarnation's start, so with many groups on a node a split
+would move every later range's election timeouts, against D-017's purpose (SHARD.md §11,
+env 2). Q13 settles the name and the two sources. It does not settle the method's shape —
+a range id or any label — whether a call starts the stream over or continues it, or how
+the simulator keeps it. Those are proposed here.
+
+**Decision.** Every site is marked `PROPOSED(D-057)`.
+
+- `Environment::range_rng(&self, range: u64) -> Self::Rng`: this node's stream for
+  `range`. It takes the range's id rather than a label, so the one name Q13 decided is
+  the only name it can make: a label would let a caller ask for `protocol` or `sched`
+  and be handed a second generator starting where the node's own stream starts, drawing
+  the same numbers.
+- `SimEnv` derives it with `moirae_sched::stream(seed, "n{id}/r{range}/protocol")` the
+  first time the node is asked for that range and keeps it in the node's entry beside
+  `n{id}/protocol` and `n{id}/sched`. Every later call and every handle to the node
+  continues the same stream, as `rng` does, and it lives as long as the simulation, as
+  the node's other streams do, so a restarted core does not draw its last incarnation's
+  numbers again. Making it draws from no other stream.
+- `RealEnv` returns `RealRng`, OS entropy, as for every other stream.
+- Nothing calls it yet. Stage B seeds each core from it, in a commit of its own that
+  moves every election timeout (SHARD.md §12, Stage B). No trace, hash or schedule moves
+  here.
+
+The simulator's tests hold it: the same seed, node and range give the same draws, and
+another range, node or seed other draws, which are moirae's derivation for the name;
+taking range streams and drawing from them, interleaved, leaves the node's protocol and
+scheduling streams, another node's and another range's exactly as they draw without; and
+every handle continues one stream (crates/ananke-env/src/sim/tests.rs). Under `RealEnv`
+two draws differ (crates/ananke-env/tests/real_env.rs).
+
+**Alternatives.** *A label* (`stream(&self, label)`): general enough for the rebalancer's
+named stream Q42 mentions, but able to alias the node's own streams; a second kind of named
+stream can have its own method when something needs it. *A fresh stream per call*, starting
+the sequence over: two handles would draw the same numbers, and a range's core restarted at
+a new incarnation would draw its last incarnation's election timeouts again, where the node's
+protocol stream continues across incarnations today. *Seeding a range's stream from the
+node's protocol stream*: Q13's reason against it, a split moving every later range's draws.
+*Returning a reference, as `rng` does*: the simulator keeps the streams under its lock and
+cannot lend one out; a `SimRng` clone shares the stream and `RealRng` is a unit, so an owned
+handle costs nothing.
+
+**Consequences.** Both environments in the workspace implement one more method. Stage B's
+switch of each core's seed to its range's stream is the change that moves schedules, and
+this entry is what it switches to.
+
+---
+
+_Next entry: D-058. Add one before implementing anything not covered above._
