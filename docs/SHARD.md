@@ -7,8 +7,7 @@ lands, numbered from the footer's next free entry then; no entry is written by t
 approval itself. §12's stages were approved by the owner on 2026-09-15 as drafted, with
 two additions: a green ten-thousand-seed nightly on a stage's branch before the stage is
 tagged, and Stage A's decision and test on a v0.3.0 store. The choices listed at the end
-of §13, under "Added in writing the approvals up", await the owner's answers, and Stage A
-starts once they are answered._
+of §13 were answered by the owner on 2026-09-15 and are recorded there._
 
 **A stated assumption.** Phase 3 has no transactions: Percolator is Phase 4 (D-006, SPEC
 §5). Every "atomic" below is one engine `WriteBatch` on one node (D-024), written by the
@@ -658,8 +657,10 @@ its node's block holds an id. The block size and the refill threshold are tunabl
   abandons the rest of every block the node held.
 
 An id taken and never used — by a split that fails, a block a node stopped using, a
-second grant, or a block abandoned at a restart — is a gap and harmless (Q17). The three
-rules are this document's: Q17's answer states the guarantee, not how it is kept. Check
+second grant, or a block abandoned at a restart — is a gap and harmless (Q17). Range ids
+are therefore unique, but neither dense nor ordered by creation, and nothing may build on
+either (§13, decided after the approvals). The three rules were this document's and are
+now decided: Q17's answer states the guarantee, not how it is kept. Check
 18 of §8 folds the guarantee, and §10's `IdBlockResumed` breaks the second rule. What a
 split does on a node whose block has run out while range 0 was unavailable is not
 settled by Q17's answer, and the stage that builds the lease states it.
@@ -1996,8 +1997,7 @@ and its Phase 2 variants, and never names a descriptor or a span.
 ## 12. Stages
 
 _Approved by the owner on 2026-09-15 as drafted, with two additions: the ten-thousand-seed
-nightly in every stage's exit, and Stage A's v0.3.0-store decision and test. Stage A
-starts once the choices at the end of §13 are answered._
+nightly in every stage's exit, and Stage A's v0.3.0-store decision and test._
 
 This section replaces §12's earlier order of work. It is proposed, not approved: SHARD.md's
 decisions in §13 are approved, these stages are not, and no implementation code lands
@@ -2306,6 +2306,11 @@ Q13's method under the cores' seeds; and questions 1 to 3 approved.
     to the owner before Stage C begins.
   - The frames per peer in a round with persists, which §4 leaves to this stage
     (SHARD.md:490-492).
+  - The replay burst after a slow persist: the ticks a core replays once its persist
+    resolves (Q41; §4's missed ticks, every one stepped), times the cores held, times a
+    step's cost, against the 10 ms tick at 1 000 ranges. If the burst breaks the tick
+    budget, that is a scheduling decision for the owner with its own DECISIONS.md entry,
+    not a change to how ticks are counted.
   - The inbox's drops under its byte bound, printed by each scenario's coverage.
   - The inbox's admission cost: a test fills the inbox to lengths from one to its bound
     in powers of two and counts the entries one admission examines; the count does not
@@ -2543,7 +2548,10 @@ commit, where a Phase 2 scenario runs under ranges 0, 1 and 2 and their initial 
   pre-vote; caught by check 20; `sim/split.rs` (ii); *every seed*.
 - `IdBlockResumed` — breaks §5's rule that a node adopts only a block granted to its
   current run (Q17); caught by check 18's range-id clause; the sharded sweep's crash and
-  restart of a node that took an id, then a split led from it; *rate*.
+  restart of a node that took an id, then a split led from it; *rate*. Its "wrong if" is a
+  check: the test fails, naming the variant and saying the sharded sweep does not reach
+  it, at any tier that runs it on which the variant is caught on no seed; the stage then
+  adds a directed shape, and does not ship the variant uncaught.
 - `MetaOverwritesByArrival` — breaks §1's maximum by generation; caught by check 16 and
   the meta convergence bound; `Fault::MetaReorder`; *rate*.
 
@@ -2712,7 +2720,8 @@ built. Carries #43, #45 and #21 unchanged.
 **DECISIONS.md entries.** Moves: §7's steps, the generation raised at `C_new` (Q6), the
 node records (Q8), D-029's round as built (Q28, by precedent), completion read from the
 range's leader (Q31) and the move bound as measured. Collection (Q27), with the trigger's
-time as measured. Q23's rule on accepting a change. Q26's, which states the vote argument
+time as measured, and the note that the trigger asks the leader meta names, which
+coincides in practice with "its range's leader". Q23's rule on accepting a change. Q26's, which states the vote argument
 for re-added replicas and records the re-add assertion, its variant (question 1) and its
 pinned seed. The two draws this plan adds to `sim/shard.rs`'s workload.
 
@@ -2769,8 +2778,11 @@ pinned seed. The two draws this plan adds to `sim/shard.rs`'s workload.
   while its R was subsumed; (d) node 1 appended `MergeAbort` while it led L and no abort of
   the attempt took effect before its office ended; (e) node 1 appended `MergeAbort` above
   `m` and applied `m` as a merge, with no `RangeUnfrozen` of the attempt in the correct
-  run; (f) a new leader of L took office with L `Merging` (§10). Shape (e) is built as
-  question 1 is answered.
+  run; (f) a new leader of L took office with L `Merging` and no entry of the attempt
+  after `MergeBegin` in L's log (§10). Shape (e) is built as question 1 is answered.
+- Shape (f)'s timing, measured, not argued: the per-seed assertion above holds on every
+  seed of every tier that runs `sim/merge.rs`. If it does not, shape (d) is reworked to
+  catch `MergeNotResumed` and (f) is dropped, with the reason in the merge's entry.
 - SPEC §4's first exit criterion, "Linearizability holds across split/merge/rebalance
   under faults" (SPEC.md:307): every key linearizable on every seed of `sim/shard.rs` with
   splits, merges and moves, of `sim/balance.rs` at its tiers, and of `sim/split.rs`,
@@ -3126,8 +3138,10 @@ collects itself only on a descriptor at a higher generation that excludes its no
 install overlapping an initialised replica is refused with a new `Overlaps` answer; the
 leader streams again after a minimum election timeout, from a fresh take only if its
 checkpoint predates the range's last split or merge; a snapshot of a merged L at or above
-`m` replaces the R it merged. Trigger as drafted (the replica asks its range's leader
-after silence, ten maximum election timeouts, unmeasured, open to change). Reason: D-029
+`m` replaces the R it merged. Trigger: after ten maximum election timeouts with no
+message from a leader of its range, the replica asks the leader meta names for the range
+(unmeasured, open to change); "its range's leader" and "the leader meta names" coincide in
+practice, since a replica silent that long finds its range's leader only through meta. Reason: D-029
 leaves removed servers "never told to shut down" (DECISIONS.md:1157-1159), a replica
 emptied before its removal commits could vote twice (§7), and without the overlap rule a
 lagging replica of P writes right-half keys over the newer state R's snapshot put there
@@ -3244,38 +3258,43 @@ from a named rebalancer stream (D-017). Reason: SPEC names what is balanced, ran
 and leader count (SPEC.md:301-302), and not how, and the greedy pairing is one policy
 among several whose move counts and convergence times nobody has measured (§7).
 
-### Added in writing the approvals up, not yet approved
+### Decided after the approvals (2026-09-15)
 
-Bringing the body into line with §13's answers took choices the answers do not make.
-They are written into the body so the design is complete, and each is open until the
-owner approves it, with the stage plan or on its own. None is silently decided.
+Bringing the body into line with §13's answers took six choices the answers did not
+make. The owner answered them on 2026-09-15; each is decided as follows, and the body
+states it.
 
-- **Q17's lease rules (§5).** A node's block is granted by an apply in range 0 that records
-  the block and the node's run nonce in the node's lease record; a node adopts only a
-  block granted to its current run, so a restart never resumes a partly used block; and
-  `RangeIdsLeased` traces each grant. The approval states the guarantee ("never reused",
-  leased blocks, range 0 gating only the refill); these rules are one way to keep it.
-  Still unsettled: what a split does when its node's block is exhausted and range 0
-  cannot refill it — waits, or is refused and retried.
-- **`IdBlockResumed` (§10).** A variant breaking the rule that a node adopts only a block
-  granted to its current run, caught by a clause of check 18. With it, §10 lists 24
-  range-layer variants.
-- **Q26's assertion and its events (§8).** The re-add window is stated as an unnumbered
-  named assertion over a new core event, `RaftMatchStarted`, and an `incarnation` field on
-  `RangeRemoved`; a replica's incarnation is drawn at its creation from the node's
-  generator. The approval requires a named assertion; its events and the incarnation's
-  source are this document's.
-- **Q10's pairing field (§9, §11).** The history pairs a resend with its original through
-  an `invoked` field on `ClientSend`.
-- **`sim/merge.rs` shapes (§10).** Shape (d) turned out not to catch `MergeNotResumed`, so
-  a sixth shape (f) was added and the scenario runs on four nodes. Shape (e) catches
-  `UnfreezeBeforeAbortCommitted` only if the coordinator's wait bound can be set below one
-  minimum election timeout; if the node's stage cannot set it that low, the variant is
-  caught by (d) alone. The timing of shapes (d) to (f) is argued from the protocol, not
-  measured.
-- **Missed ticks (§4).** A core held on its own persist (Q41) steps every tick it missed
-  once the persist resolves, in the order they fell due, none collapsed, as today's loop
-  does. The alternative, collapsing missed ticks into one, is open.
-- **Q27's trigger wording.** §13 quotes the approval ("its range's leader"); the body keeps
-  the proposal's "the leader meta names", since the approval said "trigger as drafted".
-  The two differ when meta lags; which one is meant is open.
+- **Q17's lease rules (§5), approved as written.** A block is granted by one apply in
+  range 0 that advances the counter past it and records the block and the node's run
+  nonce in the node's lease record; a node adopts only a block granted to its current
+  run; its position in a block is kept in memory only, so a restart abandons the rest and
+  leaves a harmless gap. Durability per id would buy density nothing needs. **Range ids
+  are unique, but neither dense nor ordered by creation, and no consumer may build on
+  either.** Still unsettled, and Stage C's question 1: what a split does when its node's
+  block is exhausted and range 0 cannot refill it.
+- **`IdBlockResumed` (§10), approved, with its "wrong if" as a check.** Its test fails,
+  naming the variant and saying that the sharded sweep does not reach it, if the variant
+  is caught on no seed at a tier that runs it; the fix is then a directed shape, never a
+  silent pass. No variant ships uncaught (as D-042 put it for Phase 2's variants, "a
+  variant the sweep does not catch is a hole in the sweep to be named, not a test to be
+  skipped", DECISIONS.md:2030-2032).
+- **Q26's and Q10's trace additions (§8, §9, §11), approved.** `RaftMatchStarted`,
+  `incarnation` on `RangeRemoved` and `invoked` on `ClientSend` are recorded by the
+  system that decides them, so the checker does not reconstruct them: D-047's lesson.
+  A replica's incarnation is drawn at its creation from the node's generator.
+- **`sim/merge.rs` shape (f) and four nodes (§10), approved on a measured condition.** The
+  timing argument is measured, not argued: Stage E's exit shows shape (f) producing a new
+  leader of L that takes office with L `Merging` and no entry of the attempt after
+  `MergeBegin`, on every seed at its tier. If it does not, shape (d) is reworked to catch
+  `MergeNotResumed` instead, and (f) is dropped. Shape (e)'s wait bound stays Stage E's
+  question 1.
+- **Missed ticks (§4), approved as built.** A core held on its own persist steps every
+  tick it missed once the persist resolves, in order, none collapsed. Collapsing ticks
+  would change the protocol's timing to save cost. Stage B measures the replay burst; if
+  it breaks the tick budget at 1 000 ranges, that is a scheduling decision then, with its
+  own DECISIONS.md entry.
+- **Q27's trigger: the leader meta names.** A removed replica that has heard from no leader
+  of its range for ten maximum election timeouts asks the leader meta names for the range.
+  "Its range's leader", the approval's wording, and "the leader meta names" coincide in
+  practice: a replica silent that long can find its range's leader only through meta. The
+  implementing entry (Stage D) says so.
