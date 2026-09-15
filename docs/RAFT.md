@@ -657,11 +657,12 @@ carries a set of them, `Variants`, whose empty set is the correct server; a set 
 off exactly its members' fixes and no others, so two bugs run in one server with no
 third behaviour between them (D-045). The pair `{IgnoreIncarnation, SharedSnapshotDir}`
 runs that way, as the negative control for a wedge that would need both bugs, and is
-pinned on seed 680, the one seed of the first thousand it is caught on, rather than
-asserted over a sweep tier (D-045). The correct variant must pass every seed. Each
+pinned on seed 132, the first of two of the first thousand it is caught on (680 before
+D-056), not asserted over a sweep tier (D-045). The correct variant must pass every seed. Each
 other variant must be caught by the named check on some seeds, at every tier unless its
-window is thinner than the gate's twenty seeds show: `AdoptionAsBuilt` and
-`RefusalNotDurable` assert their catch from the hundred-seed tier (D-041, D-044), and
+window is thinner than the gate's twenty seeds show: `AdoptionAsBuilt` asserts its catch
+from the hundred-seed tier (D-041), `RefusalNotDurable` from the thousand-seed tier, with
+its first catch there, seed 119, pinned at every tier (D-044, D-056), and
 `SharedSnapshotDir` asserts its liveness catch only at the nightly's ten thousand
 (D-043, D-047); each of their tests asserts at every tier that its fault fired.
 `RefusedCountsForQuorum` and `RefusedNeverCounts` are caught by the directed re-seed

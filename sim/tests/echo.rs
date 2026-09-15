@@ -25,7 +25,7 @@ use moirae_trace::trace_hash;
 /// protocol, the export or the scheduling policy changes on purpose: update it in the
 /// same commit and say why, and update the copy of the trace committed in the moirae
 /// repo as the studio's `echo-42.jsonl` fixture, whose test pins the same rule and value.
-const GOLDEN: &str = "19f19201df99a799";
+const GOLDEN: &str = "fcbe82ee7a0ba672";
 
 /// Two runs with the same seed produce byte-identical traces.
 #[test]

@@ -4803,6 +4803,168 @@ moved a seed's schedule; the sweep's did.
 
 ---
 
+## PROPOSED D-056 — `SimEnv`'s send queue: bounded, drop-oldest, per sending socket and destination, drained at a modelled link rate
+
+**Context.** D-015 gives every destination of a socket a bounded queue whose overflow
+drops the oldest frame with a `MessageDropped` event. `RealEnv` has it: one queue of
+`SEND_QUEUE_LEN`, 1 024 frames, per destination, popped by a task that writes one frame
+at a time over the destination's TCP connection (crates/ananke-env/src/real/net.rs). The
+simulator had none: `send` drew a delay and delivered into the destination socket's
+unbounded inbox, so no sweep ever saw a queue-full drop. SHARD.md §11 (env 3) and the
+owner's answer to Q16 settle that `SimEnv` gains the queue as a simulator model, per
+(sending socket, destination), drop-oldest, traced with `DropReason::QueueFull`, its
+capacity a `SimConfig` setting defaulting to 1 024, filled against a modelled per-link
+drain rate, landed before batching puts many ranges on one socket, and moving every
+pinned hash once in one commit with every pinned seed re-audited. They do not settle
+what the drain rate models, its default, where the queue sits among the fault model's
+draws, or what becomes of a closed socket's queue. Those are proposed here.
+
+**Decision.** Every site is marked `PROPOSED(D-056)`.
+
+- *Where the queue sits.* A frame that survives the send's checks — a partitioned or
+  length-limited link, then the injected drop — joins its sending socket's queue to its
+  destination. Its delay, and a duplicate's, are drawn at the send from the `net`
+  stream in the order they always were, so no fault draw moves (D-017). Partitions and
+  frame-length limits are still checked again at delivery, and an unbound destination is
+  still `Unreachable` there.
+- *What drains it.* The queue writes one frame at a time, oldest first, at
+  `NetFaults::link_bytes_per_sec`: a frame starts when it is sent or when the frame ahead
+  of it is written, whichever is later, and takes its length over the rate, rounded up
+  to the nanosecond. Its delivery, and its duplicate's, is its drawn delay after its last
+  byte is written. So a frame sent behind others waits for them, as a frame waits in
+  `RealEnv`'s queue while the connection writes the ones before it, and the queue fills
+  when one socket sends one destination faster than the link drains, which is `RealEnv`'s
+  reason and no invented count.
+- *The bound.* The frame being written is not counted, as `RealEnv`'s task pops the
+  frame it writes; the rest wait. When `NetFaults::send_queue_len` frames wait, a send
+  first drops the oldest waiting frame: its deliveries (a duplicate's with it) are
+  cancelled, `MessageDropped { reason: QueueFull }` is traced on the sender's node under
+  the dropped frame's id, after the new frame's `MessageSent`, as `RealEnv` emits them, and
+  the frames behind it move up.
+- *The settings.* `send_queue_len` defaults to `real::SEND_QUEUE_LEN`, one constant for
+  both environments, and must be at least 1; `link_bytes_per_sec` defaults to
+  125 000 000, a gigabit (`sim::GIGABIT_BYTES_PER_SEC`), and must be positive. Both are in
+  the moirae header's `config`, which no pinned hash covers.
+- *A closed socket.* A socket dropped, or unbound by its node's crash, forgets its
+  queues; frames already in them keep the deliveries they were given, as a frame in
+  flight always has.
+
+The model is held by the simulator's own tests: a frame waits only for the frames ahead
+of it on its own socket's link, a drained queue holds nothing back, and a full queue
+drops its oldest waiting frame, never the one being written nor the newest, cancels a
+duplicate with it and moves the survivors up (crates/ananke-env/src/sim/tests.rs).
+
+**What moved.** Every frame now arrives its write time later — 16 ns for two bytes and
+800 ns for a hundred at a gigabit — from the first frame of every run, so every trace and
+every schedule after a run's first delivery moved. The echo scenario's pinned body hash
+moves from `19f19201df99a799` to `fcbe82ee7a0ba672` (sim/tests/echo.rs); the moirae
+repository's copy of `echo-42.jsonl`, the studio's fixture pinned to the same value, needs
+the same update there. Every pinned seed of sim/tests/raft.rs was re-audited on the moved
+schedules, each asserting its mechanism or, with the reason, its absence:
+
+- Seeds 164, 385 and 7381 still do not reach their situations, now with no timer gap on
+  the AppendEntries-only replay (164), none on the replay without D-039's arm (385), and
+  every install above its server's floor (7381); seed 6325 still crashes inside no
+  adoption window, under the correct server or as built.
+- Seed 5909 reaches D-042's refusal, reset and re-seed on server 1 instead of server 3.
+  Under `IgnoreIncarnation` alone the stale progress for server 3 is still reached; the
+  harmless re-take under a live stream under `SharedSnapshotDir` and the pair is gone, since
+  no index is taken twice, and under the pair no refused follower is left stale; each is
+  asserted, the absences with their reasons.
+- The pair `{IgnoreIncarnation, SharedSnapshotDir}` no longer wedges seed 680. As SHARD.md
+  §12 asks, the first thousand seeds were searched again: the pair is caught on 2 of 1000,
+  seeds 132 and 848, both by the liveness check, on both of which `SharedSnapshotDir` alone
+  is caught with the same message and `IgnoreIncarnation` alone passes, and no seed catches
+  the pair without a single. Seed 132, the first, is pinned as D-045 pinned 680, with the
+  wedge's mechanism asserted on it (re-takes into the leader's own directory under live
+  streams, the duplicate-file loop, both followers uncounted); seed 848's wedge has no
+  duplicate-file loop. Seed 680's test now asserts what the seed does instead: the pair,
+  each half alone and the correct server pass it; the stream half re-takes under a live
+  stream and still commits; `IgnoreIncarnation` alone leaves server 1's progress stale with
+  server 2 countable. RAFT.md §5 names seed 132.
+- Seed 687 comes nearer its situation. As built, server 1 is refused for lost state and
+  restarted four times before an install replaces its store, the first half of the
+  premerge's failure; the second is absent, since the refused engine flushes nothing before
+  the crash and every later open is refused for the log's missing head, and that is asserted.
+  Under the correct server the refused engine's quiesce is reached and asserted: engine
+  quiesced, store refused, and no flush, manifest, `CURRENT` switch, segment deletion or
+  restart on the node until the re-seed is adopted.
+- The nightly's seeds 1885 and 2023, its eleven variant catches of the same gap, and the
+  28 catches the nightlies removed no longer reach a term change straddling an isolation's
+  start, and each asserts that absence and that the named isolation is either gone from its
+  server or, on six seeds, still there with the server keeping its term. D-047's straddle is
+  now pinned on seed 4 of the directed term-raise schedule, which reaches it seven times, and
+  D-050's shape, which seed 4 no longer reaches, on seed 1 of that schedule, the lowest that
+  does.
+
+**Measured.** On the tree with the queue, in release: the correct server passes every
+seed of `sim/raft.rs`, `sim/membership.rs` and `sim/quorum.rs` at 20, 100 and 1000, and
+the raft sweep's coverage prints `queue_drops: 0` over the correct server's thousand seeds.
+Rates at 1000 against the same tree without the queue (268cf58): `ApplyBeforeCommit` 882
+(891), `CountOlderTermForCommit` 454 (463), `ResetTimerOnAnyRpc` 336 (352),
+`SnapshotWithoutCurrentLast` 336 (340), `AdoptionAsBuilt` 77 (57), `RefusalNotDurable` 16
+(14), `SharedSnapshotDir` 2 (1), `SingleMajorityInJointConsensus` 288 (275),
+`IgnoreIncarnation` 0 (0), and `SendBeforePersist`, `TruncateOnEveryAppend`, `NoPreVote`,
+`RefusedCountsForQuorum` and `RefusedNeverCounts` on every seed as before; the lease trial
+revoked on all 503 seeds beyond the drift bound and caught 41 stale reads. With D-058's
+membership scenario under it, the correct server passes that scenario on every seed at 20,
+100 and 1000 with a joining server fed a snapshot on every one (83, 479 and 4 755 installs),
+and `SingleMajorityInJointConsensus` is caught on 8 of 20, 31 of 100 and 296 of 1000.
+
+**The tier of `RefusalNotDurable`'s catch: the owner's decision of 2026-09-15.** This part
+is decided; the queue model above stays proposed. `RefusalNotDurable`'s test asserted its
+catch from the hundred-seed tier (D-044). On the tree with the queue its rate is 16 of 1000
+against 14 before, but none of the 16 is below seed 100 (the first is 119, where it was 80),
+so the test failed at CI's hundred seeds, and the change was held off the lane's branch for
+the owner. The owner decided:
+
+- the catch is asserted from the thousand-seed tier — `scripts/premerge.sh` and the nightly
+  — and at no lower tier;
+- the fault's firing, a crash landing on a server sitting refused, stays asserted at every
+  tier, and the catch rate is printed at every tier;
+- seed 119, the first of the thousand's catches, is pinned in its own test beside the sweep,
+  `seed_119_pins_the_refusal_that_is_not_durable_which_a_hundred_seeds_can_miss`, asserting
+  its mechanism at every tier. As built, server 3 is refused for lost state (tables 29 and
+  31 dropped at its open), crashed while refused, its refused engine flushes over the loss
+  (a manifest without either table, log segments deleted), and its next open recovers clean
+  with an applied index of 330 before an install, which state machine safety reports;
+  decision time does not move the verdict. Under the correct server the schedule leaves the
+  variant's at server 3's first refusal, which the durable mark's write and sync trace 4.9 ms
+  later; the fault's three later rounds still crash server 3 inside a flush, but no open
+  drops a table, so there is no refusal for lost state and no crash on a refused server,
+  asserted with that reason, and the run passes. The correct server's quiesce and durable
+  refusal stay pinned on seed 687.
+
+The reason is binomial. At the nightly's rate, 132 of 10 000 (1.32 %, D-047,
+DECISIONS.md:3141, measured before this entry), a hundred seeds catch none with probability
+0.9868^100 = 0.26, about one run in four, and the gate's twenty with probability 0.77; at
+this tree's 16 of 1000 a hundred still miss with probability 0.20. A thousand miss with
+probability 0.9868^1000 = 1.7 × 10^-6. Below a thousand seeds the assertion fails a tree with
+nothing wrong on the draw alone; at a thousand the statistics support it. This supersedes D-044's
+hundred-seed tier for this test alone; D-044's fix, its fault and its firing at every tier
+stand.
+
+**Alternatives.** *No write time*, a queue that only counts frames sent at one instant:
+nothing drains it, so it could never fill against a rate, and its drops would be an
+invented count. *A byte bound*: `RealEnv`'s is in frames. *One rate per node, shared by its
+connections*: `RealEnv` writes each destination over its own connection, and D-015's bound
+is per destination. *A down or partitioned destination as a link that does not drain*:
+`RealEnv`'s frames to a peer that is down wait through the connection's backoff and are
+written, stale, when it returns, and a partitioned connection stalls; modelling that would
+replace `Partitioned` and `Unreachable` drops with frames delivered late, a change to Phase
+2's network fault model beyond Q16, not taken and recorded here as the divergence it is.
+*Losing a closed socket's queued frames*, as `RealEnv` does with the socket's tasks: it
+would change what a crash does to frames already sent, which the fault model has always
+delivered. *A faster default*: ten gigabits would queue less; a gigabit, the slowest common
+server link, is the conservative choice.
+
+**Consequences.** No Phase 2 scenario sends one destination fast enough to fill a queue,
+so queue-full drops wait for Stage B's batch frames, where many ranges share a socket. Any
+future change to a frame's length moves every schedule, as any change to a record's size
+always did (CLAUDE.md).
+
+---
+
 ## PROPOSED D-057 — A named stream per node and range: `Environment::range_rng`
 
 **Context.** SHARD.md's Q13, approved: a named stream per node and range,

@@ -216,6 +216,8 @@ fn abort_drops_a_task_without_a_completion_event() {
     );
 }
 
+/// A message arrives its drawn delay after its last byte is written: two bytes at the
+/// default gigabit take 16 nanoseconds (D-056).
 #[test]
 fn messages_are_delivered_after_the_configured_delay() {
     let mut config = SimConfig::new(5);
@@ -243,7 +245,7 @@ fn messages_are_delivered_after_the_configured_delay() {
         vec![(
             addr(1),
             Bytes::from_static(b"hi"),
-            Instant::from_nanos(5_000_000)
+            Instant::from_nanos(5_000_016)
         )]
     );
     let ev = events(&sim);
@@ -258,6 +260,137 @@ fn messages_are_delivered_after_the_configured_delay() {
     });
     let sent = sent.expect("a MessageSent for the ping");
     assert!(ev.iter().any(|e| matches!(e, TraceEvent::MessageDelivered { id, from, to, len: 2, .. } if *id == sent && *from == addr(1) && *to == addr(2))));
+}
+
+/// A link that writes 1 000 bytes a second, a one-millisecond delay, duplication at
+/// `p_duplicate`, and a receiver on port 2 that logs each message's first byte, its
+/// sender's port and when it arrived.
+// PROPOSED(D-056): SimEnv's bounded, drop-oldest queue per (sending socket,
+// destination), drained at a modelled per-link rate.
+fn slow_link(seed: u64, queue: usize, p_duplicate: f64) -> (Sim, NodeId, Log<(u8, u16, Instant)>) {
+    let mut config = SimConfig::new(seed);
+    config.net.delay_min = ms(1);
+    config.net.delay_max = ms(1);
+    config.net.p_duplicate = p_duplicate;
+    config.net.link_bytes_per_sec = 1_000;
+    config.net.send_queue_len = queue;
+    let mut sim = Sim::new(config);
+    let (a, b) = (sim.add_node(), sim.add_node());
+    let got: Log<(u8, u16, Instant)> = log();
+    let g = got.clone();
+    let env_b = sim.env(b);
+    env_b.clone().spawn("receiver", async move {
+        let sock = env_b.net().bind(addr(2)).await.unwrap();
+        loop {
+            let (from, msg) = sock.recv().await.unwrap();
+            g.lock()
+                .unwrap()
+                .push((msg[0], from.port(), env_b.clock().now()));
+        }
+    });
+    (sim, a, got)
+}
+
+/// From `node` on port `port`, one 100-byte frame to port 2 per tag of each burst,
+/// tags `first..end`, the bursts `gap` apart, each burst's frames sent at one instant;
+/// the socket, and so its queue, stays bound.
+fn bursts(sim: &Sim, node: NodeId, port: u16, gap: Duration, bursts: &[(u8, u8)]) {
+    let env = sim.env(node);
+    let bursts = bursts.to_vec();
+    env.clone().spawn("bursts", async move {
+        let sock = env.net().bind(addr(port)).await.unwrap();
+        for (first, end) in bursts {
+            for tag in first..end {
+                sock.send(addr(2), Bytes::from(vec![tag; 100]))
+                    .await
+                    .unwrap();
+            }
+            env.clock().sleep(gap).await;
+        }
+        env.clock().sleep(ms(10_000)).await;
+    });
+}
+
+fn at_ms(millis: u64) -> Instant {
+    Instant::from_nanos(millis * 1_000_000)
+}
+
+/// The received log, in arrival order with ties by tag.
+fn arrivals(got: &Log<(u8, u16, Instant)>) -> Vec<(u8, u16, Instant)> {
+    let mut got = got.lock().unwrap().clone();
+    got.sort_by_key(|&(tag, _, at)| (at, tag));
+    got
+}
+
+/// D-015's queue in the simulator (D-056): a sending socket writes one frame at a time
+/// to a destination at the link's rate, so a frame sent behind others waits for them,
+/// and its delay starts when its own last byte is written. The queue belongs to the
+/// socket and the destination: another socket of the same node is not held behind
+/// it. And a queue that has drained holds nothing back: a frame sent after it is
+/// written from the instant it is sent.
+#[test]
+fn a_frame_waits_only_for_the_frames_ahead_of_it_on_its_sockets_link() {
+    let (mut sim, a, got) = slow_link(21, 1024, 0.0);
+    bursts(&sim, a, 1, ms(500), &[(0, 3), (9, 10)]);
+    bursts(&sim, a, 3, ms(500), &[(7, 8)]);
+    sim.run_until(Instant::from_nanos(2_000_000_000));
+    assert_eq!(
+        arrivals(&got),
+        vec![
+            (0, 1, at_ms(101)),
+            (7, 3, at_ms(101)),
+            (1, 1, at_ms(201)),
+            (2, 1, at_ms(301)),
+            (9, 1, at_ms(601)),
+        ]
+    );
+    assert!(!events(&sim).iter().any(|e| matches!(
+        e,
+        TraceEvent::MessageDropped {
+            reason: DropReason::QueueFull,
+            ..
+        }
+    )));
+}
+
+/// The bound (D-015, D-056): with two frames allowed to wait behind the one being
+/// written, each frame sent into a full queue drops the oldest waiting frame, traced
+/// `MessageDropped` with `QueueFull` on the sender's node under the dropped frame's
+/// id, and the frames behind it move up, so the survivors leave as a queue that never
+/// held the dropped ones would send them. The frame being written is never dropped,
+/// nor the newest: a queue that dropped the newest frame instead would deliver tags 1
+/// and 2 here, and one that counted the frame being written against the bound would
+/// drop tag 4 as well. A duplicate of a dropped frame is cancelled with it.
+#[test]
+fn a_full_queue_drops_its_oldest_waiting_frame_and_the_frames_behind_it_move_up() {
+    for (p_duplicate, copies) in [(0.0, 1), (1.0, 2)] {
+        let (mut sim, a, got) = slow_link(22, 2, p_duplicate);
+        bursts(&sim, a, 1, ms(500), &[(0, 6)]);
+        sim.run_until(Instant::from_nanos(1_000_000_000));
+        let expected: Vec<(u8, u16, Instant)> = [(0, at_ms(101)), (4, at_ms(201)), (5, at_ms(301))]
+            .into_iter()
+            .flat_map(|(tag, when)| std::iter::repeat_n((tag, 1, when), copies))
+            .collect();
+        assert_eq!(arrivals(&got), expected, "p_duplicate {p_duplicate}");
+        let dropped: Vec<(MessageId, Option<NodeId>)> = sim
+            .trace()
+            .iter()
+            .filter_map(|r| match r.event {
+                TraceEvent::MessageDropped {
+                    id,
+                    from,
+                    to,
+                    reason: DropReason::QueueFull,
+                } if from == addr(1) && to == addr(2) => Some((id, r.node)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            dropped,
+            [1, 2, 3].map(|id| (MessageId::new(id), Some(a))),
+            "p_duplicate {p_duplicate}"
+        );
+    }
 }
 
 fn ping_and_count(config: SimConfig, setup: impl FnOnce(&mut Sim, NodeId, NodeId)) -> (Sim, usize) {

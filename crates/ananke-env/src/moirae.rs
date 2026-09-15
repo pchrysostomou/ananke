@@ -210,6 +210,15 @@ fn header(run: &RunHeader) -> Header {
         ("pDropPpm", ppm(c.net.p_drop)),
         ("delayMinNs", ns(c.net.delay_min)),
         ("delayMaxNs", ns(c.net.delay_max)),
+        // PROPOSED(D-056): the send queue's bound and its link's drain rate.
+        (
+            "sendQueueLen",
+            Json::Int(i64::try_from(c.net.send_queue_len).unwrap_or(i64::MAX)),
+        ),
+        (
+            "linkBytesPerSec",
+            Json::Int(i64::try_from(c.net.link_bytes_per_sec).unwrap_or(i64::MAX)),
+        ),
         ("pDurablePpm", ppm(c.fs.p_durable)),
         ("maxSkewNs", ns(c.clock.max_skew)),
         ("maxDriftPpm", Json::Int(i64::from(c.clock.max_drift_ppm))),
