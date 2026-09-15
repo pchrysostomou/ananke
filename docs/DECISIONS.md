@@ -4049,4 +4049,88 @@ that a change could take out. In the engine binary, which is not the raft binary
 
 ---
 
-_Next entry: D-053. Add one before implementing anything not covered above._
+## D-053 — RAFT.md says what the code has
+
+**Context.** Checking RAFT.md against the tree while writing SHARD.md found places where
+it describes what the code lacks (SHARD.md:23-34). The owner's answer to SHARD.md's Q1,
+approved on 2026-09-15, is that the first commit of Phase 3 corrects them, and the answer
+to Q35 is that Phase 3 has no scan. RAFT.md is the approved design, not an entry, so its
+text is corrected where it is wrong and this entry records each correction: what RAFT.md
+said, what the code does, and why the text now follows the code. None of the code
+changes. Q1 names the scan, the two variants, the frame's field order and `src/read.rs`;
+three more statements in or beside those passages, as plainly false, were found while
+correcting them and are corrected with them: the frame's fields and payload, the
+studio's name for an AppendEntries, and where a follower's entries are read from.
+
+*§4, the scan.* RAFT.md's history had a fifth operation, `Scan(range) → Vec<(k, v)>`,
+and its checker a scan check: a scan consistent iff some time in its window agrees with
+every key's chosen linearization. Neither exists and neither ever did. `ClientOp` is
+`Put`, `Get`, `Delete` and `Cas` (crates/ananke-env/src/trace.rs:752-779), and
+`sim/lin.rs` searches each key's operations on its own and returns each key's timeline,
+which only its own tests read (sim/lin.rs:207-236). A scan over many keys waits for SPEC
+§6's distributed scans, in Phase 5 (SPEC.md:351-352), since with ranges a scan across
+them has no linearizable form without transactions (Q35).
+
+*§3, the frame.* RAFT.md gave `kind: u8 | term: u64 | from: u64 | fields`. The codec
+writes and reads the kind, then the sender, then the term
+(crates/ananke-raft/src/message.rs:4, 383-385, 492-494), the order D-025 recorded when
+it landed. The same sentence called the fields length-prefixed and gave entries as
+`count | (term, index, payload_len, payload)*`. A fixed-width field is written bare, and
+of the variable-length fields a file name and a chunk's data each follow a `u32` length;
+entries follow a `u32` count, and a payload is a tag followed by a length and the bytes
+for a command, the member lists for a configuration and nothing for a no-op
+(message.rs:284-354, 442-478). And the studio's decoder names an AppendEntries
+`raft.append-entries`, not `raft.append` (message.rs:222-236, 669-673).
+
+*§3, the crate.* RAFT.md listed `src/read.rs`, "read-index and lease reads". There is no
+such file. The read-index round, the lease and the drift guard are the core's
+(`Raft::on_read`, `Guard`, in core.rs), and the node serves the reads the core makes
+ready (node.rs). The listing's `core.rs` line now says so.
+
+*§3, the log read back.* RAFT.md said that reading entries back for a follower behind
+the leader is a `scan` over the log's index range. The core holds the log in memory and
+builds each AppendEntries from it (D-025); the store scans the log table when it opens,
+to hand the log back to the core (crates/ananke-raft/src/store.rs:681-697).
+
+*§5, the variants.* RAFT.md's table had eighteen rows; `Variant::BUGS` has sixteen arms
+(crates/ananke-raft/src/core.rs:159-176). The two rows beyond them, `VoteBeforePersist`
+and `ApplyNotAtomicWithIndex`, name variants that never existed in the code: the history
+holds either name only in documents. What the code has for their rules:
+
+- *The vote durable before it is answered.* `SendBeforePersist` covers it. The server
+  enforces the order, not the core: under that variant every `Send` of a step leaves
+  before the step's `Persist` (crates/ananke-raft/src/node.rs:2090-2097), and a granted
+  vote is a step whose `Persist` carries the vote and whose `Send` is the answer
+  (core.rs:1277-1301, 2355-2380). Its row said "the same discipline for `AppendEntries`",
+  naming the vote row above it, so it now states the discipline itself.
+- *The applied index in the batch of its entry's writes.* No known-buggy variant.
+  The rule's crash test, `an_entrys_writes_and_the_applied_index_are_durable_together`
+  (crates/ananke-raft/tests/store.rs:116-245), runs the correct store over forty seeds
+  with lost syncs and bit rot and asserts the engine's state is the model's at the
+  recovered applied index, exactly once per entry.
+
+**Decision.** RAFT.md is corrected at each of these places, and each corrected passage
+cites this entry: §3's crate listing, its log paragraph and its frame; §4's history,
+partitioning and what is asserted, with a pointer to SPEC §6; §5's table, which drops the
+two rows and restates `SendBeforePersist`'s rule, and a paragraph before it that says the
+table is `Variant::BUGS` and where the two rules without a variant of their own stand.
+
+**Alternatives.** Building what RAFT.md described instead: a scan is against Q35, and the
+two variants are code the phase did not plan, a widening of scope; a known-buggy variant
+beside the atomic apply's crash test is an issue to file, not part of this correction.
+Superseding the passages with forward pointers and leaving the text: RAFT.md is not an
+accepted entry, Q1 asks for the text corrected, and a reader of RAFT.md would still meet a
+checker and two variants the code does not have. Keeping `VoteBeforePersist`'s row with a
+pointer to `SendBeforePersist`: a row for a variant that does not exist invites a test that
+cannot be written.
+
+**Consequences.** Corrections move RAFT.md's lines from §3 on. SHARD.md's citations of
+RAFT.md by line were re-checked in the same commit and point at the passages they quote.
+Ten of them were already off before it, and are corrected with the rest: those at
+SHARD.md:581, 774, 1066 and 1926 into §3, and at SHARD.md:1565, 1569, 1577 (two), 1579
+and 1580 into §5. No entry of DECISIONS.md cites RAFT.md by line, so no accepted entry
+gains a pointer. No code, trace hash or seed schedule moves.
+
+---
+
+_Next entry: D-054. Add one before implementing anything not covered above._

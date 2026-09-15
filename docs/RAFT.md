@@ -428,15 +428,14 @@ crates/ananke-raft/
                     { Command(Bytes), Config(Configuration), Noop }, Configuration
                     { voters: old and, when joint, new; learners }
   src/message.rs    Message and its codec
-  src/core.rs       the pure state machine of the protocol; Variant and the set
-                    Variants (§5)
+  src/core.rs       the pure state machine of the protocol, the read-index and lease
+                    rules included (§1, D-053); Variant and the set Variants (§5)
   src/store.rs      persistent state in the engine
   src/invariants.rs the checks of §2 as folds over trace events, one incremental
                     Checker
   src/node.rs       the tasks that run one server
   src/apply.rs      the state machine adapter: commands to engine batches
   src/snapshot.rs   checkpoints as snapshots, chunked both ways
-  src/read.rs       read-index and lease reads
   tests/            the paper's scenarios against the core: Figure 8, moirae's ten
                     rules, the D1 replay, a joint change with a leader outside C_new
 sim/raft.rs         the crash-and-partition sweep: the five checks, the workload
@@ -470,8 +469,9 @@ term or vote changed with them, `hard`; the batch's future resolving is the pers
 core waits for before sending. The hard state and the applied index are separate keys
 because separate tasks write them, the `raft` task and the `apply` task, and neither
 waits for the other. Truncation is deletes of the conflicting indices in the
-same batch as the entries that replace them. Reading entries back for a follower behind
-the leader is a `scan` over the index range, which is what the engine's scan exists for.
+same batch as the entries that replace them. The core holds the log in memory and feeds
+a follower behind it from there; the store reads the log back, a `scan` over the index
+range, only when it opens (D-053).
 Applying entry `i` is one `WriteBatch` with the command's writes under the user's
 tenant and the applied index in `applied`: the two are durable together, so a crash
 between them cannot exist, and an entry is applied exactly once whatever the crash
@@ -538,12 +538,16 @@ that history, since the state it lost may have included a vote.
 responses a follower's store answers for, `AppendEntriesResponse` and
 `InstallSnapshotResponse`, also carry the responder's store incarnation, stamped by the
 server on the way out like the clock (§1, D-042). The wire form is one frame:
-`kind: u8 | term: u64 | from: u64 | fields`, fields length-prefixed, entries as
-`count | (term, index, payload_len, payload)*`, everything little-endian like the
-engine's records, under `MAX_FRAME_LEN`. A `decode` that fails is a dropped message, not
-a panic. The moirae bridge takes a `Decoder`, and `ananke-raft` provides one that turns a
-frame into `{"type": "raft.append", "term": …, "from": …, "prevIndex": …, "entries":
-n}` and its kin, so the studio labels lanes by message kind and filters by term and
+`kind: u8 | from: u64 | term: u64 | fields` (D-053). A fixed-width field is written
+bare, and a variable-length one, a file name or a chunk's data, after its `u32` length;
+entries are `count: u32 | (term: u64 | index: u64 | payload)*`, a payload a `u8` tag
+followed, for a command, by `len: u32 | bytes` and, for a configuration, by the voters,
+a `u8` flag with the new voters when joint, and the learners, each list `count: u32 |
+ids`. Everything is little-endian like the engine's records, under `MAX_FRAME_LEN`. A
+`decode` that fails is a dropped message, not a panic. The moirae bridge takes a
+`Decoder`, and `ananke-raft` provides one, `message::studio`, that turns a frame into
+`{"type": "raft.append-entries", "from": …, "term": …, "prevIndex": …, "entries": n}`
+and its kin (D-053), so the studio labels lanes by message kind and filters by term and
 index, which is issue #3's field set.
 
 **The node's tasks.** One server is four tasks under `Environment::spawn`, and this is
@@ -612,8 +616,8 @@ Horn and Kroening's memoisation, which is what porcupine does.
 
 **History.** Each client operation is `(client, invoke_t, return_t, Op, Result)`; a
 pending operation has no return and may be linearized or discarded. Operations are
-`Put(k, v)`, `Get(k) → Option<v>`, `Delete(k)`, `Cas(k, expect, v) → bool` and
-`Scan(range) → Vec<(k, v)>`; `Cas` exists so that a double apply or a lost write is
+`Put(k, v)`, `Get(k) → Option<v>`, `Delete(k)` and `Cas(k, expect, v) → bool`, each on
+one key; there is no scan (D-053). `Cas` exists so that a double apply or a lost write is
 visible as a wrong boolean, not only as a stale value later. The trace closes most
 pending operations: `RaftProposed` says which entry a request became, and an
 abandoned operation whose entry applied took effect then, so it returns at the apply,
@@ -625,15 +629,13 @@ search, so closing them is what keeps the search small. The search has a budget 
 states per key; exhausting it is reported apart from a violation, and the correct
 server must never reach it.
 
-**Partitioning.** Single-key operations partition by key, since the KV model is a
-product of independent registers: a history is linearizable iff each key's
-sub-history is. Each partition is checked on its own, so the search is small even
-over long runs. Scans are multi-key reads and cannot be partitioned; they are checked
-after the per-key searches: a scan is consistent iff there is a time `t` within its
-invocation window at which, for every key in its range, the value it returned is the
-value the key's chosen linearization holds at `t`. Each per-key search records the
-linearization it found as a timeline of (time, value), so the scan check is a walk over
-timelines, and a scan with no such `t` is a violation named with the key that was off.
+**Partitioning.** Every operation is on one key, and the KV model is a product of
+independent registers, so the history partitions by key: a history is linearizable iff
+each key's sub-history is. Each partition is checked on its own, so the search is small
+even over long runs, and each per-key search returns the linearization it found as a
+timeline of (time, value). There is no scan and no scan check: scans are multi-key
+reads, and the distributed scans that read across ranges are SPEC §6's, in Phase 5
+(D-053).
 
 **Search.** For one partition, sort operations by invocation time; state is (the set
 of linearized operations as a bitmask, the register's value); depth-first search
@@ -643,10 +645,10 @@ model is a register with the four single-key operations. Pending operations may 
 skipped at the end. A violation reports the shortest prefix that cannot be linearized
 and the operations in it, which the studio shows as the clients' lanes.
 
-**What is asserted.** Every partition linearizable and every scan consistent, for the
-correct variant on every seed; `Variant::ApplyBeforeCommit` and
-`Variant::LeaseTrustsTheClock` are the ones this check must catch, since the four log
-invariants may hold while a stale read is served.
+**What is asserted.** Every partition linearizable, for the correct variant on every
+seed (D-053); `Variant::ApplyBeforeCommit` and `Variant::LeaseTrustsTheClock` are the
+ones this check must catch, since the four log invariants may hold while a stale read
+is served.
 
 ## 5. Buggy variants shipped from day one
 
@@ -671,18 +673,24 @@ a hundred seeds, that the sweep reached the state its wedge is built on (D-042).
 test prints its catch rate. A variant the sweep does not catch is a hole in the sweep,
 not a variant to delete.
 
+The table's sixteen rows are `Variant::BUGS` (D-053). Two rules have no variant of their
+own. The term and the vote durable before a vote is answered is `SendBeforePersist`'s
+rule, since that variant sends every message of a step, a vote's answer included, before
+the step's persist. The applied index written in the batch of its entry's writes (§3) has
+no known-buggy variant: its crash test,
+`an_entrys_writes_and_the_applied_index_are_durable_together` in
+`crates/ananke-raft/tests/store.rs`, runs the correct store alone.
+
 | Variant | The rule it breaks | What catches it | Needs |
 |---|---|---|---|
 | `NoPreVote` | thesis §9.6: a rejoining node's election disrupts the leader | pre-vote's property at every heal: the isolated server's term is what it was when the isolation began | partitions |
-| `VoteBeforePersist` | Figure 2: persist term and vote before responding | election safety: a crash between the vote and its persist lets the node vote twice in one term | crashes during elections |
-| `SendBeforePersist` | the same discipline for `AppendEntries`: append the entry, then respond | commit by majority: an entry a leader committed was not durable on a majority when it did, since `RaftAppend` is traced after the persist; with a crash between the send and the persist, leader completeness | nothing beyond the discipline; crashes between polls for the consequence |
+| `SendBeforePersist` | Figure 2, thesis §3.8: the term, the vote and the log durable before any message that depends on them; the variant sends a step's messages, a vote's answer and an append's acknowledgement alike, before the step's persist (D-053) | commit by majority: an entry a leader committed was not durable on a majority when it did, since `RaftAppend` is traced after the persist; with a crash between the send and the persist, leader completeness | nothing beyond the discipline; crashes between polls for the consequence |
 | `ApplyBeforeCommit` | Figure 2: apply only up to the commit index | state machine safety: an index applied under two terms on two servers after a truncation; linearizability: a write acknowledged and lost | the leader isolated with a client |
 | `CountOlderTermForCommit` | §5.4.2, Figure 8 | commit by current term: a leader's commit landed on an older term's entry; leader completeness on the seeds where that entry is then overwritten | a follower behind by more than a batch when a leader takes over, so the older entries and the leader's own arrive in separate messages: the sweep runs small batches |
 | `TruncateOnEveryAppend` | moirae rule 3 | committed entries stay: a server truncated at or below its own commit index | duplication and reordering (issue #1) |
 | `IndexFirstElectionRestriction` | §5.4.1: compare last terms first | leader completeness | crashes and partitions |
 | `ResetTimerOnAnyRpc` | moirae rule 5 | timers fire: a follower that heard from no leader of its term and granted no vote for two maximum election timeouts, scaled by its clock's rate, did not campaign | a follower cut off from receiving that pre-votes into the majority every timeout, each request declined, while the leader is down: the stale-sender schedule. Under check quorum a deposed leader's heartbeats stop within a timeout, so this is the stale sender that lasts |
 | `LeaseTrustsTheClock` | §1 above: no drift guard | invariant 6, lease safety under drift: the checker reports a stale lease read with no revoke before it | the lease trial: leadership transferred to the server with the slowest clock, its lease formed, then cut off with a reading client while the fast followers elect and write; and a slow clock severe enough that its lease outlives their timers |
-| `ApplyNotAtomicWithIndex` | §3: the applied index written in a separate batch | state machine safety per node: an entry applied twice after a crash; and `Cas` in the linearizability check | crashes during apply |
 | `SnapshotWithoutCurrentLast` | §1: the staged `CURRENT` written last, after the repair (D-038); the variant writes the streamed `CURRENT` the moment it arrives | state machine safety after a crash mid-install: the restart adopts a store carrying the leader's own tenant 0, which restates a *taken* snapshot and an applied index its restated log cannot account for, a state that never existed | crashes during install: on half the seeds `Fault::CrashInstalling` isolates a follower until it falls behind the threshold and crashes it two to twenty milliseconds after the stream's final chunk is delivered (D-030) |
 | `SingleMajorityInJointConsensus` | thesis §4.3: commit needs both majorities | election safety or leader completeness during 3 → 5 → 3 under partition | the membership scenario |
 | `AdoptionAsBuilt` | §1: the adoption copies and switches before it deletes, a damaged staging `CURRENT` is refused, and a marked store never opens fresh (D-041); the variant removes the old store first, sweeps a damaged staging `CURRENT` as debris, and neither checks nor writes the marker | committed entries stay: a voter restarts on a fresh store and restates a truncation from index 1 below its commit index | the adoption crash storm, `Fault::CrashAdopting`, on one seed in four: the install crash's setup, then sixteen to thirty-two crashes, each the moment the adoption's first change to the store directory is durable, each a roll of the disk's rot on the staging `CURRENT` (D-041) |
