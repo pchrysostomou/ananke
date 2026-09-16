@@ -5590,6 +5590,34 @@ bytes as other versions.
   sweep calls, and `ananke-env` is untouched; the engine, WAL and echo sweeps print the same
   rates at a thousand seeds as `2ec4bf7` did for D-061's table (below).
 
+**The cost in time.** SHARD.md §12's shared rules (docs/SHARD.md:2041-2045) ask each stage
+to record its measured premerge beside the last one measured and to size its new scenarios'
+seed shares to stay near D-040's quarter of an hour. `scripts/premerge.sh` at a thousand
+seeds, on the tree the review's commits leave, measured as D-052 and D-055 measured it —
+a warm release build first, the one-minute load sampled every 15 s across the run:
+**593.87 s** real (9 min 53.9 s), 68 min 5.0 s user and 2 min 39.1 s sys, at a **mean
+one-minute load of 20.87** over 46 samples (10.12 to 49.75; another lane built on the
+machine through part of it), against D-055's **540.37 s** at a mean load of 17.64 on
+3787528 and D-052's 374.64 s on 1ef6d7e. Per binary: `sim/tests/raft.rs` **347.76 s**
+(306.86 s at D-055), `sim/tests/engine.rs` **232.34 s** (213.06 s), the WAL binary 8.48 s,
+`sim/tests/echo_cluster.rs` 2.43 s, everything else under 1.2 s each, and ananke-raft's
+four test binaries 0.36 s together, since their seed sets are fixed (D-061). So the
+layout, the record and D-056's queue together cost about a tenth of the tier's wall time,
+almost all of it in the raft binary, which is where they change every store write:
+**the tier is still inside D-040's quarter of an hour, and no seed share needs resizing.**
+The whole suite at a hundred seeds in release takes 86.4 s.
+A premerge attempted earlier on the same code, while two lanes were building and the load
+reached 89, timed the engine binary alone at 535.69 s and never finished; read as a
+budget it said the tier had blown the quarter of an hour by three quarters, and it had
+not — the same binary on the same sweep takes 232.34 s on a moderately loaded machine.
+A premerge time means nothing without the load beside it, which is why D-052's protocol
+records one. The same caution applies to the two figures above: this run's mean load is
+about a fifth higher than D-055's, so part of the 10 % is the machine and not the tree,
+and neither number is precise enough to re-scale D-055's nightly projection from. Taken at
+face value the engine binary's 232.34 s would move that projection from about 2 h 45 min
+to about 2 h 51 min against the job's 300-minute timeout — the same picture, and the same
+answer: **issue #57**, which the owner asked for on 2026-09-15.
+
 **The re-audit of every pinned seed.** CLAUDE.md:58-67: a commit that moves a schedule
 re-audits every pinned seed it moves, and a pin asserts its mechanism or the absence of its
 situation with the reason, never a bare green. Every pinned test of `sim/tests/raft.rs` was
