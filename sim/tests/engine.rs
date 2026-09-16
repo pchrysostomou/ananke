@@ -152,9 +152,11 @@ fn seed_44_never_opens_empty_in_either_mode() {
 ///
 /// The mechanism, not the green (CLAUDE.md): the seed must still reach a cut to
 /// nothing whose sync the disk lied about, the fix must still be seen to supersede a
-/// resurrected segment, and the reader that trusts the earlier segment must still fail
-/// this seed with the violation it was pinned for. The day the schedule moves away
-/// from the shape, the first two assertions say so and the pin is upgraded.
+/// resurrected segment — *that* one, by its numbers, segment 15 restarting the
+/// numbering at 165 where the reading had reached 173 and dropping segment 14's seven
+/// stale copies — and the reader that trusts the earlier segment must still fail this
+/// seed with the violation it was pinned for. The day the schedule moves away from the
+/// shape, the first assertions say so and the pin is upgraded.
 // PROPOSED(D-062): the WAL's supersede rule.
 #[test]
 fn seed_3123_which_the_nightly_found_supersedes_a_resurrected_segment() {
@@ -176,6 +178,29 @@ fn seed_3123_which_the_nightly_found_supersedes_a_resurrected_segment() {
     assert!(
         superseded > 0,
         "the seed no longer meets the resurrected segment the fix supersedes"
+    );
+    // Which supersede, and not merely that one fired: D-062's own numbers. Segment 15,
+    // the live one, restarts the numbering at 165 where the reading had reached 173,
+    // dropping the seven copies read from the resurrected segment 14. A schedule that
+    // shifted the seed onto some other resurrection would satisfy the count above and
+    // pass; it fails here instead, and says what it found.
+    let superseded_events: Vec<(u64, u64, u64, u64)> = report
+        .records
+        .iter()
+        .filter_map(|r| match r.event {
+            TraceEvent::WalSuperseded {
+                segment,
+                expected,
+                found,
+                dropped,
+            } => Some((segment, expected, found, dropped)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        superseded_events,
+        [(15, 173, 165, 7)],
+        "not the supersede D-062 describes, as (segment, expected, found, dropped)"
     );
     // The pair on the seed itself: today's reader, kept as a variant, still returns
     // the stale copies and still fails the seed the way the nightly did.

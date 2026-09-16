@@ -646,3 +646,75 @@ fn a_betrayed_cut_to_a_shorter_length_is_superseded_below_the_expected_head_too(
         }
     }
 }
+
+/// D-062's narrowing, and the guard that carries it: the rule fires only at a
+/// segment's **first** record. What warrants superseding is the order in which
+/// segments are created — a file whose first record is behind the reading was written
+/// after every file read before it, so its copies of those numbers are the later
+/// writing's. Inside a segment there is no such warrant. The bytes after a backwards
+/// jump mid-file belong to no writing the reader can name: the tail of an earlier,
+/// longer writing that the re-issued records did not cover, a stray write, a
+/// corruption the checksums happened not to catch. The reader cannot tell, so it
+/// stops at the jump and keeps every record it has read.
+///
+/// Segment 1 holds the live 100..=112 and then, at a non-zero offset, a tail numbered
+/// from 109 again. Recovery returns the thirteen live records whole and stops at the
+/// jump, cutting the stale tail away. Superseding there instead would drop the live
+/// 109..=112 and hand back the stale copies in their place — which is why the guard
+/// is not decoration: delete `at == 0` from `parse_segment` and this test fails, while
+/// the other ten in this file and the pinned seed 3123 all still pass.
+///
+/// Both readers behave alike here, which is the point: this shape is outside what
+/// D-062 changed, and the pair's difference is at a segment's first record only.
+// PROPOSED(D-062): the WAL's supersede rule.
+#[test]
+fn a_backwards_jump_inside_a_segment_is_still_a_stop_and_keeps_the_live_records() {
+    for variant in [Variant::Correct, Variant::TrustsAStaleSegment] {
+        let mut sim = Sim::new(SimConfig::new(10));
+        let node = sim.add_node();
+        let env = sim.env(node);
+        let live = tagged(100, 13, "live");
+        // The jump is at the first byte after the live records, never at zero.
+        let at = live.len() as u64;
+        assert!(at > 0);
+        env.clone().spawn("setup", async move {
+            let mut one = live;
+            one.extend_from_slice(&tagged(109, 4, "stale"));
+            write_segment(&env, 1, one).await;
+        });
+        sim.run_for(Duration::from_millis(1));
+        let (recovery, names) = recover_at(&mut sim, node, variant, 100);
+        assert_eq!(recovery.first_seq, 100);
+        assert_eq!(
+            tags(&recovery),
+            (100..=112)
+                .map(|s| format!("live-{s}"))
+                .collect::<Vec<String>>(),
+            "the live records are kept whole and no stale copy is returned"
+        );
+        assert_eq!(
+            recovery.stop,
+            Some(WalStop {
+                segment: 1,
+                offset: at,
+                reason: WalStopReason::Gap {
+                    expected: 113,
+                    found: 109
+                }
+            }),
+            "a backwards jump that is not a segment's first record is still a gap"
+        );
+        assert_eq!((recovery.discarded, recovery.next_seq), (0, 113));
+        assert!(
+            supersedes(&sim).is_empty(),
+            "nothing is superseded away from a segment's first record"
+        );
+        // The stale tail was cut off and the live records left on disk.
+        assert_eq!(
+            sim.durable_contents(node, &segment_path(Path::new(DIR), 1))
+                .map(|b| b.len()),
+            Some(usize::try_from(at).unwrap())
+        );
+        assert_eq!(names, ["000001.wal", "000002.wal"]);
+    }
+}

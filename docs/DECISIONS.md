@@ -5879,6 +5879,9 @@ than the numbers.
 | WAL coverage: torn writes, lost fsyncs, bit rot, stops at a torn record, stops at a bad checksum, discarded segments, the lost-fsync excuse, the bit-rot excuse | wal.rs:144 | 20 / 100 / 1 000 / 10 000 | 1 000, 1 000, 1 000, 977, 999, 1 000, 994, 994 | 9 999, 10 000, 10 000 seeds; the rest thousands of epochs | every → every | ~0 |
 | WAL: a gap | wal.rs:152 | 20 / 100 / 1 000 / 10 000 | 51 (5.1 %) | 615 epochs, ≤ 6.2 % | ≥ 100 → ≥ 100 | 0.0053 |
 | **WAL: the betrayed-cut excuse** | wal.rs:165 | 20 / 100 / 1 000 / 10 000 | 34 (3.4 %) | 401 epochs, ≤ 4.0 % | **every → ≥ 1 000** | 0.50 at 20 → 9.5 × 10^-16 |
+| **WAL: a betrayed cut — a cut of recovery's own whose sync the disk lied about** (D-062) | wal.rs:193 | 20 / 100 / 1 000 / 10 000 | **765 (76.5 %)**, on the D-062 tree, not 2ec4bf7 | not on those trees: the counter is D-062's | **new → every** | 2.6 × 10^-13 (0.235²⁰) |
+| **WAL: a betrayed cut to nothing**, which resurrects a whole segment (D-062) | wal.rs:208 | 20 / 100 / 1 000 / 10 000 | **60 (6.0 %)**, on the D-062 tree | not on those trees: the counter is D-062's | **new → ≥ 100** | 0.0021 at 100 (0.94¹⁰⁰); 0.29 at 20, where the twenty in fact see none |
+| **WAL: a supersede, the rule itself firing** (D-062) | printed with the coverage, wal.rs:46 | 20 / 100 / 1 000 / 10 000 | **0 of 1 000**, on the D-062 tree | not on those trees: the counter is D-062's | **new → asserted nowhere; printed at every tier** | not asserted. At the engine seek sweep's measured 1 in 10 000 a thousand seeds see none with probability 0.90, so no tier can carry it; seed 3123's pin carries it instead |
 | Engine Phase 1 variants caught: `NoWalBeforeMemtable`, `ReleaseBeforeManifest`, `DeleteBeforeManifest` | engine.rs:553 (558, 563, 568) | 20 / 100 / 1 000 / 10 000 | 985, 602, 647 | 9 825, 6 482, 5 893 | every → every | 9.9 × 10^-9 |
 | Engine `InstallInTwoSwitches` caught | engine.rs:296 | 20 / 100 / 1 000 / 10 000 | 559 | not on those trees | every → every | 7.7 × 10^-8 |
 | Engine `RangeDeleteSkipsMemtables` caught, on the share | engine.rs:359 | 20 / 20 / 100 / 1 000 | 89 of 100 | not on those trees | every → every | 6.7 × 10^-20 |
@@ -5919,6 +5922,20 @@ than the numbers.
 | Incremental checker: a compared seed in violation | raft.rs:3471 | 20 / 100 / 100 / 100 | 61 of 100 | 59 of 100 | every → every | 6.6 × 10^-9 |
 | Quorum, `RefusedCountsForQuorum` blocked: a chunk lost to the limit | raft.rs:3585 | 20 / 100 / 1 000 / 10 000 | 1 000 | 300 304 events | every → every | ~0 |
 | Quorum on the sweep's disk: the install silence deposes `RefusedCountsForQuorum` | raft.rs:3679 | 20 / 100 / 1 000 / 10 000 | 844 | 8 311 | ≥ 100 → ≥ 100 | ~0 |
+
+**The three WAL rows marked D-062** were added by the commit that closed that entry's
+gaps, so the register holds every assertion the supersede rule brought with it rather
+than leaving their rates in D-062's prose alone. Their line numbers are on that commit
+and their figures are that tree's, re-measured for this table rather than copied over:
+one run of `ANANKE_SEEDS=1000 cargo test -p ananke-sim --test wal --release` gives
+`betrayed_cuts 765, betrayed_cuts_to_nothing 60, superseded 0`, the same three figures
+D-062 records, in a `Coverage` whose every pre-existing counter is also unchanged
+(`epochs 8000, records 2059643, stops_torn 2880, stops_bad_checksum 4074, stops_gap 54,
+discarded 6838, excused_lost_fsync 3782, excused_bit_rot 3192, excused_betrayed_cut 36`).
+The two tiers below were measured too, since the second row's tier turns on them: at a
+hundred seeds 79 and 4, at the gate's twenty 14 and **0**. So the gate would be asserting
+a betrayed cut to nothing on a counter that is in fact zero there — the assertion is
+guarded at `seeds() >= 100`, which is the rule doing its work rather than a precaution.
 
 **Re-measured on the tree with the key layout and the store's format record (D-060).**
 The layout moved every raft, membership and re-seed schedule, so every rate in the table
@@ -6141,12 +6158,18 @@ the numbers. The honest pairing is therefore in three parts.
   165..=177, head 172), and the shape a cut to a *shorter* length leaves, a stale tail
   behind live records in the same segment with the tables further behind than the stale
   numbers. The correct log returns the live records with no stop; the variant returns the
-  stale ones, stops, and cuts the live segment away.
+  stale ones, stops, and cuts the live segment away. A third state beside them pins the
+  rule's *narrowing* rather than its catch: a backwards jump at a non-zero offset inside a
+  segment, where both readers stop and keep the live records whole. Without it the
+  `at == 0` guard was a claim no test held — deleting the guard broke nothing in the suite,
+  at any tier.
 - *The seed.* 3123 is pinned in `sim/tests/engine.rs` with its mechanism: under the fix
   the run still reaches a cut to nothing whose sync the disk lied about and is still seen
-  to supersede a resurrected segment, and the variant still fails that seed with the
-  violation it was pinned for. The situation survived the fix, so the pin asserts it
-  rather than its absence.
+  to supersede a resurrected segment — *that* one, by its numbers,
+  `WalSuperseded { segment: 15, expected: 173, found: 165, dropped: 7 }`, so that a
+  schedule which moved the seed onto some other resurrection fails the pin instead of
+  passing it — and the variant still fails that seed with the violation it was pinned for.
+  The situation survived the fix, so the pin asserts it rather than its absence.
 - *The shape, in the sweep.* `sim/tests/wal.rs` counts the precondition. Measured over
   the first thousand seeds of the WAL sweep on this tree: a cut of recovery's own made on
   a sync the disk lied about on **765 of 1000, 76.5 %**, asserted at every tier (the
@@ -6211,7 +6234,45 @@ invisible in the studio; and `Wal::open`'s `firsts` map records a segment's firs
 as the running total rather than the segment's own, an over-estimate that survives a
 supersede in the same direction, so `delete_segments_through` only ever deletes later
 than necessary. `Schedule::wal_variant` is new in `sim/engine.rs` so the pin can run seed
-3123 beside the variant; it is `Correct` everywhere else.
+3123 beside the variant; it is `Correct` everywhere else. The three counters this entry
+adds to the WAL sweep have rows in D-061's register, with their rates, tiers and
+probabilities, so the register stays the one place every such assertion is listed.
+
+**Issues filed out of this entry**, all of them notes rather than code, so the fix does
+not widen past its one branch:
+
+- **#61** — the correct engine fails seed **30490** on the seek schedule: `record 1 is gone
+  although the log stopped at nothing near it` (records 1..=0, tables through 0). It is a
+  second, pre-existing defect and not this one, and that was measured rather than argued:
+  it reproduces identically on 09bed88 and on the tree with this fix, with no supersede
+  firing on that seed, so the branch above never runs and the code path is byte-identical
+  on both. It is outside the nightly's band (about 1 seed in 30 000 of the seek schedule)
+  and its trace points at the manifest and `CURRENT` fallback, not the WAL reader. The
+  exit criterion is therefore met for the nightly's ten thousand and not for the whole
+  model, which the owner should hear before signing "passes every seed".
+- **#62** — the residual shape named above: a resurrected segment whose numbers *abut* the
+  live ones instead of overlapping them, which no reader-side rule can see. The limit of
+  this fix; closing it wants a per-segment generation stamp, an on-disk format change with
+  its own entry and a format version beside D-060's.
+- **#63** — the two observability gaps: the crash model traces nothing when it drops a
+  pending `PendingOp::Truncate`, so the very fault that builds this shape is invisible in
+  the studio, and `Wal::open`'s `firsts` map records a running total rather than each
+  segment's own first record.
+
+**For the owner — not decided here.** `Variant::TrustsAStaleSegment` is the first WAL
+variant that **no sweep catches at any tier**. It is caught deterministically, at every
+tier, by the two hand-built on-disk states above, and by the pinned seed 3123, which runs
+the variant through the engine sweep's own scenario and asserts the violation the nightly
+reported. What it has not got, and cannot get, is the shape every other variant has — seen
+to fail on some seed of a sweep: the measured catch rate is 1 seed in the seek schedule's
+ten thousand and 0 of the WAL sweep's first thousand, so even the nightly would catch it
+only sometimes, and D-061's rule puts an assertion at the tier its rate supports, which
+here is no tier at all. CLAUDE.md's pair rule asks that a known-buggy variant be kept
+beside the correct code and *seen to fail*. Whether the deterministic states and the pin
+satisfy that rule as written, or whether a variant this thin should be paired some other
+way — a sweep arm that builds the shape deliberately, as `RETAKE_STREAM_IN` does for
+D-043, which is a good deal more than a one-branch fix — is the owner's to settle. This
+entry records the substitution and what it measured; it does not decide it.
 
 ---
 
