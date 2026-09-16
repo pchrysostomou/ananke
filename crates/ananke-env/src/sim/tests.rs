@@ -311,8 +311,49 @@ fn bursts(sim: &Sim, node: NodeId, port: u16, gap: Duration, bursts: &[(u8, u8)]
     });
 }
 
+/// A receiver on `port` of `node` that logs each message's first byte, its sender's
+/// port and when it arrived into `got`, as [`slow_link`]'s does.
+// PROPOSED(D-056): SimEnv's bounded, drop-oldest queue per (sending socket,
+// destination), drained at a modelled per-link rate.
+fn receiver(sim: &Sim, node: NodeId, port: u16, got: &Log<(u8, u16, Instant)>) {
+    let env = sim.env(node);
+    let g = got.clone();
+    env.clone().spawn("receiver", async move {
+        let sock = env.net().bind(addr(port)).await.unwrap();
+        loop {
+            let (from, msg) = sock.recv().await.unwrap();
+            g.lock()
+                .unwrap()
+                .push((msg[0], from.port(), env.clock().now()));
+        }
+    });
+}
+
+/// From `node` on port `port`, one `len`-byte frame per `(destination port, tag)` of
+/// `frames`, all sent at one instant; the socket, and so its queues, stay bound.
+// PROPOSED(D-056): SimEnv's bounded, drop-oldest queue per (sending socket,
+// destination), drained at a modelled per-link rate.
+fn send_frames(sim: &Sim, node: NodeId, port: u16, len: usize, frames: &[(u16, u8)]) {
+    let env = sim.env(node);
+    let frames = frames.to_vec();
+    env.clone().spawn("frames", async move {
+        let sock = env.net().bind(addr(port)).await.unwrap();
+        for (to, tag) in frames {
+            sock.send(addr(to), Bytes::from(vec![tag; len]))
+                .await
+                .unwrap();
+        }
+        env.clock().sleep(ms(10_000)).await;
+    });
+}
+
 fn at_ms(millis: u64) -> Instant {
     Instant::from_nanos(millis * 1_000_000)
+}
+
+/// `at_ms(millis)` plus `nanos`.
+fn at_ms_ns(millis: u64, nanos: u64) -> Instant {
+    Instant::from_nanos(millis * 1_000_000 + nanos)
 }
 
 /// The received log, in arrival order with ties by tag.
@@ -320,6 +361,36 @@ fn arrivals(got: &Log<(u8, u16, Instant)>) -> Vec<(u8, u16, Instant)> {
     let mut got = got.lock().unwrap().clone();
     got.sort_by_key(|&(tag, _, at)| (at, tag));
     got
+}
+
+/// Every id a `QueueFull` drop was traced for, in trace order.
+// PROPOSED(D-056): SimEnv's bounded, drop-oldest queue per (sending socket,
+// destination), drained at a modelled per-link rate.
+fn queue_full_drops(sim: &Sim) -> Vec<MessageId> {
+    events(sim)
+        .iter()
+        .filter_map(|e| match e {
+            TraceEvent::MessageDropped {
+                id,
+                reason: DropReason::QueueFull,
+                ..
+            } => Some(*id),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Every id the trace delivered, in trace order.
+// PROPOSED(D-056): SimEnv's bounded, drop-oldest queue per (sending socket,
+// destination), drained at a modelled per-link rate.
+fn delivered(sim: &Sim) -> Vec<MessageId> {
+    events(sim)
+        .iter()
+        .filter_map(|e| match e {
+            TraceEvent::MessageDelivered { id, .. } => Some(*id),
+            _ => None,
+        })
+        .collect()
 }
 
 /// D-015's queue in the simulator (D-056): a sending socket writes one frame at a time
@@ -361,6 +432,12 @@ fn a_frame_waits_only_for_the_frames_ahead_of_it_on_its_sockets_link() {
 /// nor the newest: a queue that dropped the newest frame instead would deliver tags 1
 /// and 2 here, and one that counted the frame being written against the bound would
 /// drop tag 4 as well. A duplicate of a dropped frame is cancelled with it.
+///
+/// The drop's place in the trace is the clause's too, and is asserted as the ordered
+/// `(kind, id)` sequence: each `QueueFull` record sits *after* the `MessageSent` of the
+/// frame whose admission displaced it, as `RealEnv` emits them (D-056). Tracing it
+/// before that send pairs the drop with the previous send instead, and no verdict,
+/// arrival or filtered list of dropped ids would say so.
 #[test]
 fn a_full_queue_drops_its_oldest_waiting_frame_and_the_frames_behind_it_move_up() {
     for (p_duplicate, copies) in [(0.0, 1), (1.0, 2)] {
@@ -390,7 +467,181 @@ fn a_full_queue_drops_its_oldest_waiting_frame_and_the_frames_behind_it_move_up(
             [1, 2, 3].map(|id| (MessageId::new(id), Some(a))),
             "p_duplicate {p_duplicate}"
         );
+        let order: Vec<(&str, u64)> = sim
+            .trace()
+            .iter()
+            .filter_map(|r| match r.event {
+                TraceEvent::MessageSent { id, from, to, .. }
+                    if from == addr(1) && to == addr(2) =>
+                {
+                    Some(("sent", id.get()))
+                }
+                TraceEvent::MessageDropped {
+                    id,
+                    from,
+                    to,
+                    reason: DropReason::QueueFull,
+                } if from == addr(1) && to == addr(2) => Some(("dropped", id.get())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                ("sent", 0),
+                ("sent", 1),
+                ("sent", 2),
+                ("sent", 3),
+                ("dropped", 1),
+                ("sent", 4),
+                ("dropped", 2),
+                ("sent", 5),
+                ("dropped", 3),
+            ],
+            "p_duplicate {p_duplicate}"
+        );
     }
+}
+
+/// The bound counts the frames a queue still holds, not the frames it has ever held
+/// (D-056): a frame whose last byte is written has left the queue, so a burst sent
+/// after the link has drained finds an empty queue and drops nothing. A queue that
+/// kept its written frames would count the first burst against the second's bound,
+/// evict frames it had already delivered — tracing `QueueFull` for ids the trace also
+/// delivers — and drop a frame of the new burst instead: tag 3 would be lost and tags
+/// 4 and 5 would arrive 200 ms early. Nothing else in the tree reaches the drop path
+/// through the default bound, so this is where the eviction is held.
+// PROPOSED(D-056): SimEnv's bounded, drop-oldest queue per (sending socket,
+// destination), drained at a modelled per-link rate.
+#[test]
+fn a_written_frame_leaves_the_queue_so_the_bound_counts_what_is_outstanding() {
+    let (mut sim, a, got) = slow_link(28, 2, 0.0);
+    bursts(&sim, a, 1, ms(500), &[(0, 3), (3, 6)]);
+    sim.run_until(Instant::from_nanos(2_000_000_000));
+    assert_eq!(
+        arrivals(&got),
+        vec![
+            (0, 1, at_ms(101)),
+            (1, 1, at_ms(201)),
+            (2, 1, at_ms(301)),
+            (3, 1, at_ms(601)),
+            (4, 1, at_ms(701)),
+            (5, 1, at_ms(801)),
+        ]
+    );
+    assert!(
+        queue_full_drops(&sim).is_empty(),
+        "a queue the link drained between the bursts dropped a frame"
+    );
+    let delivered = delivered(&sim);
+    assert!(
+        !queue_full_drops(&sim)
+            .iter()
+            .any(|id| delivered.contains(id)),
+        "a frame was dropped for a full queue and delivered too"
+    );
+}
+
+/// The eviction's boundary (D-056): a frame whose last byte is written *at this
+/// instant* has left the queue and holds no slot against the bound, so a frame sent
+/// at exactly that instant is admitted behind an empty queue. Testing `written < now`
+/// instead would keep it, and with one slot the frame behind would be dropped: tag 1
+/// would be lost and tag 2 would arrive at 201 ms. A discrete-event simulator makes
+/// exact-instant coincidences common — 13 % of the raft sweep's sends on seed 42 share
+/// an instant with the previous send on their link — so the boundary is asserted.
+// PROPOSED(D-056): SimEnv's bounded, drop-oldest queue per (sending socket,
+// destination), drained at a modelled per-link rate.
+#[test]
+fn a_frame_written_at_this_instant_has_already_left_the_queue() {
+    let (mut sim, a, got) = slow_link(29, 1, 0.0);
+    bursts(&sim, a, 1, ms(100), &[(0, 1), (1, 3)]);
+    sim.run_until(Instant::from_nanos(1_000_000_000));
+    assert_eq!(
+        arrivals(&got),
+        vec![(0, 1, at_ms(101)), (1, 1, at_ms(201)), (2, 1, at_ms(301)),]
+    );
+    assert!(
+        queue_full_drops(&sim).is_empty(),
+        "the frame written at the instant of the next send held a slot against the bound"
+    );
+}
+
+/// The queue belongs to a (sending socket, destination) pair, not to the socket
+/// (D-056): a burst to one destination does not hold back a frame to another. One
+/// socket sends three 100-byte frames to port 2 and one to port 4 at one instant; a
+/// queue shared by the socket's destinations would write the fourth behind the three
+/// and deliver it at 401 ms instead of 101 ms. Only eight pinned raft seeds notice that
+/// today, and they notice it as a moved schedule — a failure whose documented answer is
+/// to re-audit and re-pin — so the model's own rule is asserted here.
+// PROPOSED(D-056): SimEnv's bounded, drop-oldest queue per (sending socket,
+// destination), drained at a modelled per-link rate.
+#[test]
+fn a_frame_waits_only_behind_the_frames_to_its_own_destination() {
+    let mut config = SimConfig::new(23);
+    config.net.delay_min = ms(1);
+    config.net.delay_max = ms(1);
+    config.net.link_bytes_per_sec = 1_000;
+    let mut sim = Sim::new(config);
+    let (a, b, c) = (sim.add_node(), sim.add_node(), sim.add_node());
+    let got: Log<(u8, u16, Instant)> = log();
+    receiver(&sim, b, 2, &got);
+    receiver(&sim, c, 4, &got);
+    send_frames(&sim, a, 1, 100, &[(2, 0), (2, 1), (2, 2), (4, 3)]);
+    sim.run_until(Instant::from_nanos(1_000_000_000));
+    assert_eq!(
+        arrivals(&got),
+        vec![
+            (0, 1, at_ms(101)),
+            (3, 1, at_ms(101)),
+            (1, 1, at_ms(201)),
+            (2, 1, at_ms(301)),
+        ]
+    );
+}
+
+/// Every byte takes time (D-056): a write time is rounded *up* to the nanosecond, so a
+/// frame the link would write in less than a nanosecond still takes one and still holds
+/// the queue. Rounding down would cost nothing on the two rates the suite configures —
+/// a gigabit and `slow_link`'s thousand bytes a second both divide exactly, so no seed
+/// at any tier could see it — and would silently undo the whole model on any link
+/// faster than a byte a nanosecond: every frame written at the instant it is sent, the
+/// queue drained on every admit, and the bound unreachable. Here six one-byte frames go
+/// into a queue of two: three are dropped, and under a write time of zero all six would
+/// arrive together at 1 ms.
+// PROPOSED(D-056): SimEnv's bounded, drop-oldest queue per (sending socket,
+// destination), drained at a modelled per-link rate.
+#[test]
+fn a_frame_takes_time_on_a_link_faster_than_a_byte_a_nanosecond() {
+    let mut config = SimConfig::new(24);
+    config.net.delay_min = ms(1);
+    config.net.delay_max = ms(1);
+    config.net.link_bytes_per_sec = 2_000_000_000;
+    config.net.send_queue_len = 2;
+    let mut sim = Sim::new(config);
+    let (a, b) = (sim.add_node(), sim.add_node());
+    let got: Log<(u8, u16, Instant)> = log();
+    receiver(&sim, b, 2, &got);
+    send_frames(
+        &sim,
+        a,
+        1,
+        1,
+        &[(2, 0), (2, 1), (2, 2), (2, 3), (2, 4), (2, 5)],
+    );
+    sim.run_until(Instant::from_nanos(1_000_000_000));
+    assert_eq!(
+        arrivals(&got),
+        vec![
+            (0, 1, at_ms_ns(1, 1)),
+            (4, 1, at_ms_ns(1, 2)),
+            (5, 1, at_ms_ns(1, 3)),
+        ]
+    );
+    assert_eq!(
+        queue_full_drops(&sim),
+        [1, 2, 3].map(MessageId::new),
+        "a link faster than a byte a nanosecond stopped filling its queue"
+    );
 }
 
 fn ping_and_count(config: SimConfig, setup: impl FnOnce(&mut Sim, NodeId, NodeId)) -> (Sim, usize) {

@@ -2819,10 +2819,13 @@ struct Coverage {
     refusals: usize,
     duplicates: usize,
     drops: usize,
-    // PROPOSED(D-056): frames a sending socket's full queue dropped, printed and not
-    // asserted: a queue of 1 024 fills only when one socket sends one destination
-    // faster than a gigabit drains it, which no Phase 2 scenario does (0 over the
-    // correct server's first 1 000 seeds).
+    // PROPOSED(D-056): frames a sending socket's full queue dropped. A queue of 1 024
+    // fills only when one socket sends one destination faster than a gigabit drains it,
+    // which no Phase 2 scenario does, so this is 0 and `assert_complete` asserts the
+    // absence with that reason (D-056; CLAUDE.md's rule for a state a scenario does not
+    // reach). It was printed and not asserted until the mutation pass: a send queue
+    // whose bound counted frames *ever sent* rather than outstanding ones turned it
+    // into 3 691 drops at twenty seeds and 42 393 at a hundred with every tier green.
     queue_drops: usize,
     leaders: usize,
     terms_above_one: u64,
@@ -3239,6 +3242,21 @@ impl Coverage {
         assert!(
             self.completed > 100 * self.seeds,
             "too few operations to mean much: {self:?}"
+        );
+        // PROPOSED(D-056): the send queue's drop is a state this scenario does not
+        // reach, asserted as an absence with its reason rather than left printed. The
+        // default queue holds 1 024 frames and drains at a gigabit, so a drop needs
+        // 1 025 frames outstanding to one destination — about 1 025 frames inside the
+        // 8 µs a kilobyte frame takes to write — which the raft workload cannot
+        // produce: 0 at 20, 100 and 1 000 seeds here and in D-056's own measurement.
+        // The deepest same-instant burst on one link measured on seed 42 is 348 frames,
+        // so the margin is a factor of three, not a large one; when Stage B's batch
+        // frames put many ranges on one socket this is the assertion that will say so,
+        // and it becomes a bound rather than a zero.
+        assert_eq!(
+            self.queue_drops, 0,
+            "a sending socket's queue filled and dropped a frame, which no Phase 2 \
+             scenario reaches: {self:?}"
         );
     }
 }

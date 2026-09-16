@@ -4942,6 +4942,85 @@ the lane's tip without the queue, 9432fed: its correct server passes every seed 
 `SingleMajorityInJointConsensus` is caught on 8 of 20, 31 of 100 and 296 of 1000 (6, 35 and
 301 without the queue).
 
+**What the mutation pass found, and what now holds it.** Twenty mutations of
+`crates/ananke-env/src/sim/net.rs`, each reproduced independently, over the tree at
+09bed88. Ten were caught — the drop-newest policy, the off-by-one on the bound, the
+silent drop, the wrong `DropReason`, the delay started at the enqueue rather than the
+write, the rate charged per message, the two frames written at one instant, the LIFO
+re-timing, the rate ignored entirely, and losing a closed socket's queued frames, which
+is caught by ten unit tests and fifteen raft tests and un-catches three negative
+controls. Five survived every tier, and four of the five are now held by directed tests
+in `crates/ananke-env/src/sim/tests.rs`, each of which the mutation makes fail; none
+touches a scenario, so no schedule and no pinned hash moves.
+
+- *The eviction loop deleted*, so the bound counts frames **ever sent** rather than
+  frames outstanding. The single most consequential survivor: the whole workspace stayed
+  green at twenty seeds and the raft binary 42/42 at a hundred (1 007 s), while the
+  correct server's `queue_drops` went from 0 to **3 691** at twenty seeds and **42 393**
+  at a hundred, and the trace carried `MessageDropped { QueueFull }` for ids it had
+  already delivered. The counter was printed and not asserted. Held two ways now:
+  `a_written_frame_leaves_the_queue_so_the_bound_counts_what_is_outstanding` (two bursts
+  500 ms apart on a queue of two: with the eviction gone the second burst's first frame
+  is lost and the two behind it arrive 200 ms early, and the same drops are traced for
+  delivered ids), and `queue_drops` asserted 0 in the correct server's coverage —
+  measured 0 at 20, 100 and 1 000 seeds on this tree as on the trees above, and
+  structurally out of reach, since a drop needs 1 025 frames outstanding to one
+  destination inside the 8 µs a kilobyte frame takes to write at a gigabit.
+- *The eviction's boundary*, `written <= now` weakened to `written < now`: a frame whose
+  last byte is written at exactly this instant keeps its slot against the bound. Survived
+  the workspace at twenty seeds and the raft binary at a hundred. Held by
+  `a_frame_written_at_this_instant_has_already_left_the_queue`. Exact-instant
+  coincidences are common here: replaying the seed-42 trace the suite writes, **1 717 of
+  13 106 sends (13 %)** land at the same instant as the previous send on the same link.
+- *`write_time` rounding down* instead of up, against this entry's "rounded up to the
+  nanosecond, so that every byte takes time". It survives at **every** tier by
+  arithmetic, not by sampling: the tree configures exactly two rates, the 125 000 000
+  default and `slow_link`'s 1 000, and `div_ceil` never rounds at either, so the mutant is
+  bit-identical on every seed in debug and release. It is not cosmetic — at 2 000 000 000
+  B/s a one-byte frame's write time becomes 0 ns, every frame is written at the instant
+  it is sent, the eviction clears the queue on every admit and the bound can never be
+  reached. Held by `a_frame_takes_time_on_a_link_faster_than_a_byte_a_nanosecond`.
+- *The `QueueFull` drop traced before the `MessageSent` that caused it*, against the
+  clause above ("after the new frame's `MessageSent`, as `RealEnv` emits them"), built
+  minimally so every other trace record keeps its place. Survived every tier: the same
+  frame is dropped at the same instant for the same reason, and the existing test compared
+  only the filtered list of dropped ids. Held now by the ordered `(kind, id)` sequence
+  asserted inside `a_full_queue_drops_its_oldest_waiting_frame_and_the_frames_behind_it_move_up`.
+- *`forget_queues` made a no-op*, so a closed socket keeps its queues. **An equivalent
+  mutant, not a test gap**, and provably so: `next_socket` is written at two lines and
+  only ever incremented, so a socket id is never reused; `Fabric::queues` is read at
+  exactly two sites and never iterated, so no ordering can leak; and the moirae export
+  does not mention it. A queue left under a dead id is unreachable for the life of the
+  run. It is recorded here as a note rather than closed by a test that would assert the
+  size of a private map; it stops being equivalent the day an address is rebound by a
+  restarting node, which is when a stale queue would start to bite.
+- *Dropping `.max(enqueued)` from the re-timing loop* is equivalent too, and dead
+  defensive code: after the eviction every frame left has `written > now`, and every
+  frame's `enqueued` is the `now` of its own monotone admit.
+
+One more finding is about where the model is held rather than whether it is. *One queue
+per socket, shared by all its destinations* — the natural "one queue per connection" slip
+— was caught only by **eight pinned-seed tests**, at twenty seeds and at a hundred alike,
+whose failures read "re-audit the pin". Those are change detectors: an intended change to
+the model fails them the same way, and the documented answer is to re-audit and re-pin,
+so the realistic failure mode was to re-pin eight seeds and ship a queue bounded per
+socket with a green gate and a green CI. No property, sweep, coverage assertion or golden
+hash noticed, membership and quorum included. The rule is now asserted as a rule, by
+`a_frame_waits_only_behind_the_frames_to_its_own_destination`: three 100-byte frames to one
+destination and one to another from a single socket, the fourth arriving at 101 ms rather
+than the 401 ms a shared queue gives it.
+
+The margin is also smaller than *Consequences* below suggests. On seed 42 the deepest
+same-instant burst on one link is **348 frames** (then 267, 175, 157, 143, 127, 81, 64)
+against the 1 024 bound — a factor of three, not a large one, and with one socket per raft
+node those bursts are exactly one (socket, destination) queue. Worth remembering when
+Stage B's batch frames put many ranges on one socket.
+
+Not mutated by anyone, and still without tests: `MAX_FRAME_LEN`'s guard, the moirae
+header's `sendQueueLen`/`linkBytesPerSec` export, `NetFaults`' validation bounds
+(`send_queue_len` at least 1, `link_bytes_per_sec` positive — no `should_panic` anywhere),
+and `RealEnv`'s own queue.
+
 **The tier of `RefusalNotDurable`'s catch: the owner's decision of 2026-09-15.** This part
 is decided; the queue model above stays proposed. `RefusalNotDurable`'s test asserted its
 catch from the hundred-seed tier (D-044). On the tree with the queue its rate is 16 of 1000
