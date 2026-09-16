@@ -279,9 +279,9 @@ fn seed_6325_which_the_nightly_found_stays_green() {
 /// `CURRENT` names and that cannot be read, its progress reset by the leader at
 /// 9.798229515 s and re-seeded at 10.218206571 s. (With D-056's queue alone it was
 /// server 1, refused at 7.025 s; before the queue, server 3 at 18.696 s.) It does not
-/// reach the wedge's shape: no re-take lands under a live stream and scrambles it —
-/// the run takes no snapshot at all — and no follower goes uncounted after the last
-/// heal.
+/// reach the wedge's shape: the run takes 37 snapshots and no two at one index, so no
+/// re-take lands under a live stream to scramble it, and no follower goes uncounted
+/// after the last heal.
 #[test]
 fn seed_5909_which_the_nightly_found_stays_green() {
     let report = raft::run(5909, Variant::Correct);
@@ -310,8 +310,9 @@ fn seed_5909_which_the_nightly_found_stays_green() {
 /// again (see seed 164's pin): D-042's half is reached under `IgnoreIncarnation` alone
 /// and under the pair, on different servers, always harmlessly, and the stream half is
 /// reached under neither. The test asserts each half where it is reached and, with the
-/// reason, absent where not. No run of the seed takes a snapshot at all, so no re-take
-/// can lie under a stream on any of them:
+/// reason, absent where not. No run of the seed takes one index twice — the runs take
+/// 32, 33, 18 and 37 snapshots, each at a new index — so no re-take can lie under a
+/// stream on any of them:
 ///
 /// - under `IgnoreIncarnation` the leader's progress for server 3 goes stale — leader 1
 ///   of term 9 had 229 acknowledged, server 3 is refused at 9.793751132 s for an
@@ -344,13 +345,13 @@ fn seed_5909_passes_under_both_bugs_together_which_is_the_finding() {
         );
         assert_no_stream_wedge(&report);
         let takes = report.snapshot_takes();
-        let retaken = takes.iter().enumerate().any(|(n, take)| {
-            takes[..n]
-                .iter()
-                .any(|t| t.server == take.server && t.index == take.index)
-        });
         assert!(
-            !retaken && report.retakes_under_streams().is_empty(),
+            !takes.is_empty(),
+            "seed 5909 under {variants:?} takes no snapshot at all: the claim below is \
+             vacuous, so re-audit the pin and `snapshot_takes`"
+        );
+        assert!(
+            !took_an_index_twice(&takes) && report.retakes_under_streams().is_empty(),
             "seed 5909 under {variants:?} takes an index twice again, so a re-take may lie \
              under a stream: re-audit the pin"
         );
@@ -385,9 +386,24 @@ fn seed_5909_passes_under_both_bugs_together_which_is_the_finding() {
     }
 }
 
+/// Whether some server took a snapshot at an index it had already taken: the
+/// re-take D-043's variant rewrites one directory for, read from the takes the
+/// fold paired rather than from the raw records (`retook_at_one_index` below
+/// reads those, and the two agree).
+fn took_an_index_twice(takes: &[raft::SnapshotTake]) -> bool {
+    takes.iter().enumerate().any(|(n, take)| {
+        takes[..n]
+            .iter()
+            .any(|earlier| earlier.server == take.server && earlier.index == take.index)
+    })
+}
+
 /// The shape of seed 5909's wedge, asserted absent: no re-take lands under a live
 /// stream that the follower then never installs, and the leader in force at the
-/// last heal has at most one follower it could never count after it.
+/// last heal has at most one follower it could never count after it. Since
+/// D-060's re-audit of `snapshot_takes` this is asserting something on every
+/// seed: on the thousand, `SharedSnapshotDir` re-takes under a live stream on 180
+/// and never installs after on 135 of them, against the correct server's 0.
 fn assert_no_stream_wedge(report: &raft::Report) {
     let seed = report.seed;
     let variants = report.variants;
@@ -425,9 +441,16 @@ fn assert_no_stream_wedge(report: &raft::Report) {
 /// undisturbed — a re-take at an index already taken on 525 of the thousand, and the
 /// aimed arm reaching its stream on 153.
 ///
-/// Why this seed reaches nothing: **no run of it takes a snapshot at all**, so no index
-/// can be taken twice and no re-take can land under a live stream — the stream half's
-/// whole mechanism is out of reach — and under the pair and under `SharedSnapshotDir`
+/// Why this seed reaches nothing: **no run of it takes any index twice**, so no
+/// re-take can land under a live stream and the stream half's whole mechanism is out of
+/// reach. It is not that nothing is taken — the pair and `SharedSnapshotDir` take 31
+/// snapshots each and the correct server 37 — but that each take's applied index is a
+/// new one, so the variant's one-directory-per-index rewrite never lands on a
+/// directory a stream is reading. (The pin said "takes no snapshot at all" until the
+/// re-audit of `snapshot_takes` below: the fold it asked paired a take's record with a
+/// checkpoint written at the same instant, and D-060 put an awaited write between the
+/// two, so it answered empty everywhere. The assertion is now on the reason that is
+/// true, and asserts it is not vacuous.) Under the pair and under `SharedSnapshotDir`
 /// alone no store is refused either, so `IgnoreIncarnation` has nothing to ignore and
 /// the pair's trace is record for record the stream half's. The test asserts all three.
 /// Under `IgnoreIncarnation` alone and under the correct server the seed does refuse
@@ -455,12 +478,21 @@ fn seed_132_which_pinned_the_combined_variant_before_the_layout_reaches_no_wedge
              variant should be pinned here once more",
             report.variants
         );
-        // The reason the stream half is out of reach: nothing is taken, so nothing can
-        // be re-taken under a stream.
+        // The reason the stream half is out of reach: every take is at an index the
+        // server had not taken before, so nothing can be re-taken under a stream.
+        // Asserted with its own non-vacuity, since a fold that found no take at all
+        // would pass it silently (D-060's re-audit).
+        let takes = report.snapshot_takes();
         assert!(
-            report.snapshot_takes().is_empty(),
-            "seed 132 under {:?} takes a snapshot again, so a re-take under a live stream is \
-             reachable here: re-audit the pin",
+            !takes.is_empty(),
+            "seed 132 under {:?} takes no snapshot at all, so the reason this pin gives — that \
+             no index is taken twice — says nothing: re-audit the pin and `snapshot_takes`",
+            report.variants
+        );
+        assert!(
+            !took_an_index_twice(&takes),
+            "seed 132 under {:?} takes an index twice again, so a re-take under a live stream \
+             is reachable here: re-audit the pin",
             report.variants
         );
         assert_no_stream_wedge(report);
@@ -494,12 +526,27 @@ fn seed_132_which_pinned_the_combined_variant_before_the_layout_reaches_no_wedge
 /// and no run leaves both followers uncounted after the last heal, which the test
 /// asserts, so the day the seed wedges again it says so.
 ///
-/// The stream half is out of reach here, for a reason the test asserts rather than
-/// assumes: **no run of this seed takes a snapshot at all**, so no index can be taken
-/// twice and no re-take can land under a live stream. `SharedSnapshotDir` alone
-/// therefore behaves as the correct server does on the only refusal the seed has:
-/// server 3, refused at 17.852606007 s for lost state (table 11 dropped), has the
-/// leader's progress for it reset at 17.857397623 s and is re-seeded at 18.117876106 s.
+/// The stream half's *shape* is reached here, and the test asserts it rather than
+/// assumes its absence. Under `SharedSnapshotDir` and under the pair the seed takes 73
+/// snapshots into 36 directories: 37 of them are at an index that server had already
+/// taken — the variant's one directory per index, rewritten in place — and 7 of those
+/// land under a live stream of that index to a follower, the first at 9.105796790 s
+/// into `/raft/snap-152` under the stream to server 2 opened at 9.100938503 s. Every
+/// one of the 7 is a stream the follower still installs afterwards, so none is the
+/// wedge, which needs the stream never to complete. That is what
+/// `assert_no_stream_wedge` asserts, and on this seed it is asserting something rather
+/// than nothing. Under `IgnoreIncarnation` alone and under the correct server no index
+/// is taken twice at all (37 and 42 takes, each into its own version directory), so
+/// `SharedSnapshotDir` alone otherwise behaves as the correct server does on the only
+/// refusal the seed has: server 3, refused at 17.852606007 s for lost state (table 11
+/// dropped), has the leader's progress for it reset at 17.857397623 s and is re-seeded
+/// at 18.117876106 s.
+///
+/// (The pin said "no run of this seed takes a snapshot at all" until D-060's re-audit
+/// of `snapshot_takes`: the fold paired a take's record with a checkpoint written at
+/// the same recorded instant, and D-060's checkpoint format record put an awaited write
+/// between the two, so the fold answered empty on every seed and the assertion could
+/// not fail. The mechanism was there all along.)
 ///
 /// D-042's half is reached under the pair, and only there. Its leader, carrying
 /// `IgnoreIncarnation`, does not reset: leader 2 of term 10 had 370 acknowledged when
@@ -525,13 +572,36 @@ fn seed_680_which_pinned_the_combined_variant_before_d056_no_longer_wedges() {
             "seed 680 under {variants:?} is caught again: re-audit the pin, and whether it \
              should pin the combined variant once more"
         );
-        // The reason the stream half is out of reach on this seed: nothing is ever
-        // taken, so nothing can be re-taken under a stream.
+        // What the stream half reaches on this seed, asserted per variant: the
+        // re-take at an index already taken and the streams it lands under, where
+        // the variant is carried, and neither where it is not.
+        let takes = report.snapshot_takes();
         assert!(
-            report.snapshot_takes().is_empty(),
-            "seed 680 under {variants:?} takes a snapshot again, so a re-take under a live \
-             stream is reachable here: re-audit the pin"
+            !takes.is_empty(),
+            "seed 680 under {variants:?} takes no snapshot at all: every claim below is \
+             vacuous, so re-audit the pin and `snapshot_takes`"
         );
+        let under = report.retakes_under_streams();
+        if variants.contains(Variant::SharedSnapshotDir) {
+            assert!(
+                took_an_index_twice(&takes) && !under.is_empty(),
+                "seed 680 under {variants:?} no longer re-takes at an index already taken \
+                 ({takes:?}) under a live stream ({under:?}): the shape this pin asserts the \
+                 harmlessness of is gone, so re-audit the pin"
+            );
+            assert!(
+                under.iter().all(|retake| retake.installed_after),
+                "seed 680 under {variants:?} re-takes under a stream the follower never \
+                 installs after: that is D-043's wedge, so pin it"
+            );
+        } else {
+            assert!(
+                !took_an_index_twice(&takes) && under.is_empty(),
+                "seed 680 under {variants:?} takes an index twice ({takes:?}) or re-takes \
+                 under a stream ({under:?}) without the variant that shares one directory \
+                 per index: re-audit the pin"
+            );
+        }
         let uncounted = report.uncounted_after_heal();
         if variants == Variants::of(&[Variant::IgnoreIncarnation, Variant::SharedSnapshotDir]) {
             // D-042's half under the pair: stale progress for the one refused
@@ -551,6 +621,22 @@ fn seed_680_which_pinned_the_combined_variant_before_d056_no_longer_wedges() {
             );
         }
         if variants.contains(Variant::IgnoreIncarnation) {
+            // The absence means nothing unless server 3 is refused at all, and
+            // `refusal_reset_reseed` answers `None` to both: under the pair server 3
+            // is refused once at 17.852606007 s and under `IgnoreIncarnation` alone
+            // twenty times from 12.162591955 s, for a staging `CURRENT` that cannot
+            // be read.
+            let refused: Vec<&TraceEvent> = report
+                .records
+                .iter()
+                .map(|record| &record.event)
+                .filter(|event| matches!(event, TraceEvent::RaftRefused { server: 3, .. }))
+                .collect();
+            assert!(
+                !refused.is_empty(),
+                "seed 680 under {variants:?} no longer refuses server 3 at all, so the absence \
+                 below says nothing about the leader's progress: re-audit the pin"
+            );
             assert!(
                 report.refusal_reset_reseed(3).is_none(),
                 "seed 680 under {variants:?}: the leader as built forgot a refused follower's \
@@ -2036,14 +2122,18 @@ fn a_server_whose_refusal_is_not_durable_is_caught() {
     // D-056, the owner's decision of 2026-09-15: the catch is asserted from the
     // thousand-seed tier (the premerge and the nightly), the fault's firing at every
     // tier above, and the rate printed at every tier. On the tree with the send
-    // queue, which moved every schedule, the catch is 16 of the first thousand seeds,
-    // none of them below seed 100 (the first is 119). At the nightly's rate, 1.32 %,
-    // a hundred seeds catch none about one time in four (0.9868^100 = 0.26) and the
-    // gate's twenty three times in four, so the assertion there would fail a tree
-    // with nothing wrong on the draw alone; a thousand miss about once in six hundred
-    // thousand (0.9868^1000 = 1.7e-6). Seed 119, the first catch of the thousand, is
-    // pinned with its mechanism at every tier:
-    // `seed_119_pins_the_refusal_that_is_not_durable_which_a_hundred_seeds_can_miss`.
+    // queue alone the catch was 16 of the first thousand seeds, none of them below seed
+    // 100 (the first at 119). On this tree, with the key layout and the store's format
+    // record (D-059, D-060) having moved every raft schedule again, it is 9 of the
+    // first thousand, 0.9 %, the fault firing on 340 of them and the first catch at
+    // seed 158. At 0.9 % a hundred seeds catch none about two times in five
+    // (0.991^100 = 0.40) and the gate's twenty five times in six, so the assertion
+    // there would fail a tree with nothing wrong on the draw alone; a thousand miss
+    // about once in eight thousand (0.991^1000 = 1.2e-4). Seed 158, the first catch of
+    // the thousand, is pinned with its mechanism at every tier:
+    // `seed_158_pins_the_refusal_that_is_not_durable_which_a_hundred_seeds_can_miss`.
+    // Seed 119, which the owner named on 2026-09-15 and which the layout took the
+    // situation off, is kept beside it as an asserted absence.
     if seeds() >= 1000 {
         assert!(!caught.is_empty(), "RefusalNotDurable was never caught");
     }
@@ -2422,8 +2512,10 @@ fn a_leader_that_ignores_incarnations_never_forgets() {
 /// release seeds, 2 of 1000 on the tree with D-056's send queue — seeds 132 and 848,
 /// by the liveness check (seed 680 alone before it) — and neither catch is this arm's:
 /// neither seed draws it, and their re-takes are the server's own
-/// (`seed_132_pins_the_combined_variant_and_the_stream_half_alone_catches_it_too`).
-/// The arm reached a live stream on 143 of 1000 seeds (152 before D-056) and caught
+/// (`seed_132_which_pinned_the_combined_variant_before_the_layout_reaches_no_wedge`).
+/// On the tree with the key layout (D-060) the variant is caught on **0 of the first
+/// thousand**, which is D-061's open question for the owner; the arm reaches a live
+/// stream on **153 of 1000** (143 before the layout, 152 before D-056) and catches
 /// none of them.
 ///
 /// Why the arm reaches the shape without catching it is worth writing down,
@@ -2441,14 +2533,24 @@ fn a_leader_that_ignores_incarnations_never_forgets() {
 /// where the record already points *and* a `retake` having cleared the
 /// checkpoint, a coincidence inside the snapshot task's own failure paths that
 /// the arm can make likely but cannot force. The re-take at an index already
-/// taken happens often on its own — 46 of 100 seeds, 525 of 1000 — and is
-/// harmless every time, because no stream had that directory open.
+/// taken happens often on its own — 46 of 100 seeds, 525 of 1000 — and lands under a
+/// live stream of that index on 180 of the thousand, on 135 of which the follower
+/// never installs at that index afterwards: D-043's scrambled stream, the wedge's
+/// stream half, built and stalling nothing because the leader still has a countable
+/// follower. (Until D-060's re-audit of `snapshot_takes` this read "harmless every
+/// time, because no stream had that directory open". The fold it read that from was
+/// answering empty on every seed. What is true is that the stream half fires often and
+/// wedges nothing, which the test below now asserts; the correct server is at 0 of the
+/// thousand for the same measure, which is the pair.)
 ///
-/// So the test asserts what is true: that the fault fired, on both counts — a
-/// take at an index already taken, into the directory a stream may be reading,
-/// and the aimed arm's own stream under a leader that cannot commit — and that
-/// the catch holds at the tier that ever produced it, the nightly's ten
-/// thousand, where a rate of about one in a thousand gives some ten catches.
+/// So the test asserts what is true: that the fault fired, on all three counts — a
+/// take at an index already taken, into the directory a stream may be reading; that
+/// re-take landing under a live stream the follower never installs at afterwards,
+/// which is the wedge's stream half itself, from the hundred-seed tier where its
+/// 13.5 % rate carries an assertion; and the aimed arm's own stream under a leader
+/// that cannot commit — and that the catch holds at the tier that ever produced it,
+/// the nightly's ten thousand, where the 4 liveness catches of 10 000 that the
+/// assertion counts are missed about one run in fifty.
 /// Asserting it at the pre-merge tier on one observation would make that tier
 /// flaky; the rates are printed at every tier so the day the rate is worth an
 /// assertion is visible. The pair rule holds because the correct server passes
@@ -2467,17 +2569,40 @@ fn a_leader_that_ignores_incarnations_never_forgets() {
 #[test]
 fn a_leader_that_shares_one_snapshot_directory_and_streams_one_follower_at_a_time_is_caught() {
     let moved = Mutex::new(MovedSeeds::default());
-    let outcomes: Vec<(Option<String>, bool, usize)> = sweep(seeds(), |seed| {
+    let outcomes: Vec<(Option<String>, bool, usize, bool, usize)> = sweep(seeds(), |seed| {
         let report = raft::run(seed, Variant::SharedSnapshotDir);
+        let scrambled: Vec<_> = report
+            .retakes_under_streams()
+            .into_iter()
+            .filter(|retake| !retake.installed_after)
+            .collect();
+        // D-043's own symptom under a scrambled stream: the follower answering
+        // `More` for a file it has already been sent, over and over.
+        let looped = scrambled
+            .iter()
+            .map(|retake| {
+                report.duplicate_chunk_loop(retake.leader, retake.follower, retake.retook)
+            })
+            .sum();
         (
             checked(&report, &moved),
             retook_at_one_index(&report),
             report.aimed_streams,
+            !scrambled.is_empty(),
+            looped,
         )
     });
-    let caught: Vec<&String> = outcomes.iter().filter_map(|(v, _, _)| v.as_ref()).collect();
-    let fired = outcomes.iter().filter(|(_, fired, _)| *fired).count();
-    let aimed = outcomes.iter().filter(|(_, _, aimed)| *aimed > 0).count();
+    let caught: Vec<&String> = outcomes
+        .iter()
+        .filter_map(|(v, _, _, _, _)| v.as_ref())
+        .collect();
+    let fired = outcomes.iter().filter(|(_, fired, _, _, _)| *fired).count();
+    let aimed = outcomes
+        .iter()
+        .filter(|(_, _, aimed, _, _)| *aimed > 0)
+        .count();
+    let scrambled = outcomes.iter().filter(|(_, _, _, s, _)| *s).count();
+    let looped: usize = outcomes.iter().map(|(_, _, _, _, l)| l).sum();
     let liveness = caught.iter().filter(|v| v.contains(": liveness: ")).count();
     // D-047: the catches by check, the name a violation starts with.
     let mut by_check: BTreeMap<&str, usize> = BTreeMap::new();
@@ -2489,7 +2614,7 @@ fn a_leader_that_shares_one_snapshot_directory_and_streams_one_follower_at_a_tim
         *by_check.entry(check).or_default() += 1;
     }
     eprintln!(
-        "SharedSnapshotDir: caught on {} of {} seeds, {liveness} by the liveness check, by check {by_check:?}, re-took at an index already taken on {fired} seeds, the aimed re-take arm reached its stream on {aimed} seeds, first: {}",
+        "SharedSnapshotDir: caught on {} of {} seeds, {liveness} by the liveness check, by check {by_check:?}, re-took at an index already taken on {fired} seeds, scrambled a live stream the follower never installed after on {scrambled} seeds ({looped} duplicate-chunk loops after those), the aimed re-take arm reached its stream on {aimed} seeds, first: {}",
         caught.len(),
         seeds(),
         caught.first().map_or("", |v| v.as_str())
@@ -2503,6 +2628,20 @@ fn a_leader_that_shares_one_snapshot_directory_and_streams_one_follower_at_a_tim
         aimed > 0,
         "the aimed re-take arm never reached a stream: the shape it exists to build was never built"
     );
+    // The wedge's stream half itself: a re-take into the directory a live stream
+    // has open, which that follower then never installs at. On the thousand it is
+    // 135 seeds (13.5 %) against the correct server's 0, so the hundred-seed tier
+    // carries it and the gate's twenty do not (the owner's rule of 2026-09-15,
+    // D-061). Until D-060 this was asserted nowhere, and the fold that reads it
+    // was answering empty on every seed.
+    if seeds() >= 100 {
+        assert!(
+            scrambled > 0,
+            "SharedSnapshotDir never re-took into a directory a live stream had open and left \
+             unfinished: the wedge's stream half was not built on any of the {} seeds",
+            seeds()
+        );
+    }
     if seeds() >= 10_000 {
         assert!(
             liveness > 0,
@@ -2642,13 +2781,15 @@ fn a_leader_that_trusts_the_clock_is_caught_and_the_guard_revokes() {
     // D-061, the owner's rule of 2026-09-15: a variant caught on under 5 % of seeds
     // asserts its catch from the thousand-seed tier (the premerge and the nightly), its
     // firing at every tier above, and its rate printed at every tier. The stale read is
-    // caught on 41 of the first thousand seeds on the tree with D-056's send queue,
-    // 4.1 %, and was on 472 of the ten thousand of the nightlies before it, 4.72 %; the
-    // drift exceeds the bound on half the seeds and the guard revokes on every one of
-    // them. At 4.1 % the gate's twenty catch none with probability 0.959^20 = 0.43 and a
-    // hundred with 0.959^100 = 0.015, so the assertion there would fail a tree with
-    // nothing wrong the day a change redraws the schedules; a thousand catch none with
-    // probability 0.959^1000 = 6.6e-19.
+    // caught on 37 of the first thousand seeds on this tree, 3.7 % (41, 4.1 %, on the
+    // tree with D-056's send queue alone, before the key layout redrew them), and was on
+    // 472 of the ten thousand of the nightlies before the queue, 4.72 %; the drift
+    // exceeds the bound on 503 of the thousand seeds and the guard revokes on every one
+    // of them. The rate that carries the assertion is over the tier's seeds, as every
+    // row of D-061's table is: at 3.7 % the gate's twenty catch none with probability
+    // 0.963^20 = 0.47 and a hundred with 0.963^100 = 0.023, so the assertion there would
+    // fail a tree with nothing wrong the day a change redraws the schedules; a thousand
+    // catch none with probability 0.963^1000 = 8e-17.
     if seeds() >= 1000 {
         assert!(stale > 0, "LeaseTrustsTheClock was never caught");
     }
@@ -2686,6 +2827,12 @@ struct Coverage {
     applies: usize,
     inbox_drops: usize,
     snapshots_taken: usize,
+    /// Takes the fold paired with their own checkpoints
+    /// ([`raft::Report::snapshot_takes`]), against `snapshots_taken`, which
+    /// counts the raw records. The two are here together because the fold went
+    /// silently empty once before, at D-060, and every assertion built on it
+    /// passed while it did.
+    takes_paired: usize,
     snapshots_installed: usize,
     snapshot_resumes: usize,
     snapshot_versions_deleted: usize,
@@ -2908,6 +3055,7 @@ impl Coverage {
         self.inbox_drops += report.count(|e| matches!(e, TraceEvent::RaftInboxDropped { .. }));
         self.snapshots_taken +=
             report.count(|e| matches!(e, TraceEvent::RaftSnapshot { taken: true, .. }));
+        self.takes_paired += report.snapshot_takes().len();
         self.snapshots_installed +=
             report.count(|e| matches!(e, TraceEvent::RaftSnapshot { taken: false, .. }));
         self.snapshot_resumes +=
@@ -3013,6 +3161,10 @@ impl Coverage {
             ("seeds with a term above one", self.terms_above_one),
             ("log truncations", self.truncations as u64),
             ("snapshots taken", self.snapshots_taken as u64),
+            (
+                "takes paired with their checkpoints",
+                self.takes_paired as u64,
+            ),
             ("log compactions", self.compactions as u64),
             ("crash-mid-install faults", self.install_crash_faults as u64),
             (
@@ -3395,12 +3547,13 @@ impl MembershipCoverage {
         // An election while joint needs the partition to cut a leader off inside the
         // joint phase itself. D-061, the owner's rule of 2026-09-15: a state reached on
         // under 5 % of seeds is asserted from the thousand-seed tier (the premerge and
-        // the nightly) and printed with the coverage at every tier. On the tree with
-        // D-056's send queue it is on 31 of the first thousand seeds, 3.1 % (34
-        // elections; 463 at the nightlies' ten thousand before the queue and D-058, so at
-        // most 4.6 % of their seeds). At 3.1 % a hundred seeds see none with probability
-        // 0.969^100 = 0.043 and the gate's twenty with 0.53; a thousand with
-        // 0.969^1000 = 2.1e-14.
+        // the nightly) and printed with the coverage at every tier. On this tree it is
+        // on 34 of the first thousand seeds, 3.4 % (34 elections, one
+        // per seed; 31 seeds and the same 34 elections on the tree with D-056's send
+        // queue alone, and 463 elections at the nightlies' ten thousand before the queue
+        // and D-058, so at most 4.6 % of their seeds). At 3.4 % a hundred seeds see none
+        // with probability 0.966^100 = 0.031 and the gate's twenty with 0.50; a thousand
+        // with 0.966^1000 = 9.5e-16.
         if seeds >= 1000 {
             assert!(
                 self.elections_while_joint > 0,
@@ -3411,11 +3564,13 @@ impl MembershipCoverage {
         // receiver's, taking the receiver back to the installed prefix. The owner's
         // decision of 2026-09-15, recorded in D-058: asserted from the thousand-seed tier
         // (the premerge and the nightly) and at no lower tier, and printed with the
-        // coverage at every tier. On the tree with D-056's send queue it happens on 28 of
-        // the first thousand seeds, once on each, and on one of the first hundred, seed
-        // 97. At 2.8 % a hundred seeds see none with probability 0.972^100 = 0.058 and
-        // the gate's twenty with 0.57, so the assertion there would fail a tree with
-        // nothing wrong on the draw alone; a thousand see none with 0.972^1000 = 4.6e-13.
+        // coverage at every tier. On this tree it happens on 25 of the first thousand
+        // seeds, once on each, and on 3 of the first hundred — seeds 40, 94 and 95 (on
+        // the tree with D-056's send queue alone it was 28 of the thousand and one of
+        // the hundred, seed 97). At 2.5 % a hundred seeds see none with probability
+        // 0.975^100 = 0.080 and the gate's twenty with 0.60, so the assertion there
+        // would fail a tree with nothing wrong on the draw alone; a thousand see none
+        // with 0.975^1000 = 1.3e-11.
         if seeds >= 1000 {
             assert!(
                 self.reverts_to_a_prefix > 0,

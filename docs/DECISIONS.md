@@ -3030,11 +3030,11 @@ signature change of public functions for records no check reads by time.
 | Seed 7381's predicates | `floor_lowering_installs`, `recoveries_under_a_lost_floor` | record order | the floor fold reads no time; the time reported is the record's |
 | Seed 6325's adoption windows | `adoption_windows` | durability | a crash inside the disk work between an install being durable and its adoption being durable |
 | Seed 687's restarts | `restarts_after_lost_state_refusal` | record order | a restart after the refusal as recorded |
-| Snapshot takes | `snapshot_takes` | durability | pairs a take's record with the checkpoint written at the same recorded instant |
+| Snapshot takes | `snapshot_takes` | durability | pairs a take's record with the last checkpoint written on its node and not yet claimed; a crash or a `RaftTruncate` discards an unclaimed one. It asked for the two records to carry the *same* instant until D-060 put an awaited write between them, after which it paired nothing on any seed |
 | Re-takes under streams | `retakes_under_streams` | durability, record order | a take as recorded against chunks sent and openings as recorded, the order the audit measured in |
 | Uncounted followers, the duplicate-chunk loop | `uncounted_after_heal`, `duplicate_chunk_loop` | one time | sends and deliveries |
 | Stale progress; refusal, reset, re-seed | `stale_progress`, `refusal_reset_reseed` | record order, durability | a refusal as recorded against the messages after it; the reset answers a rejection the refused server sends only after its refusal is recorded |
-| The pin helpers | `assert_stream_wedge`, `crashes_while_refused`, `retook_at_one_index`, `reseed_completed`, `Coverage` in `sim/tests/raft.rs` | durability, record order | what the audit measured, as recorded |
+| The pin helpers | `assert_no_stream_wedge`, `took_an_index_twice`, `crashes_while_refused`, `retook_at_one_index`, `reseed_completed`, `Coverage` in `sim/tests/raft.rs` | durability, record order | what the audit measured, as recorded (`assert_stream_wedge` was replaced by `assert_no_stream_wedge` when the wedge stopped being reachable on a pinned seed) |
 
 The fault drivers — `leader_now`, `install_landing`, `install_completed`,
 `stream_opened`, `refreshed_refused`, `flush_in_flight`, `adoption_change` — read

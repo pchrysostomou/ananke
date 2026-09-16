@@ -2496,9 +2496,24 @@ impl Report {
             .collect()
     }
 
-    /// Every snapshot a server took: a checkpoint written on its node and, at the
-    /// same instant, its `RaftSnapshot` with `taken` set. A restart's restatement
-    /// of the record's snapshot writes no checkpoint and is not a take.
+    /// Every snapshot a server took: its `RaftSnapshot` with `taken` set, paired
+    /// with the checkpoint its own take wrote on its node — the last
+    /// `CheckpointWritten` of that node still unclaimed. A checkpoint is discarded
+    /// unclaimed by its node's crash and by a `RaftTruncate` on its server, so a
+    /// restart's or an install's restatement of the record's snapshot, which
+    /// writes no checkpoint and follows its truncation (`retook_at_one_index`
+    /// reads the same marker), can never claim the checkpoint of a take that did
+    /// not finish. Such a restatement is not a take.
+    ///
+    /// The pairing does **not** require the two records to carry the same instant.
+    /// It did until D-060, whose checkpoint format record
+    /// (`format::write_checkpoint_record` in `snapshot::take_numbered`) put an
+    /// awaited write between the engine's checkpoint and the `RaftSnapshot` traced
+    /// once the take returns: the take's two records now sit two to six
+    /// milliseconds apart, and the instant-equal pairing found nothing on any
+    /// seed. The fold's time assumption is durability, not one instant — a
+    /// checkpoint is claimed by the next take of its own node, and a crash or a
+    /// truncation between the two discards it (D-047's table).
     #[must_use]
     pub fn snapshot_takes(&self) -> Vec<SnapshotTake> {
         let mut written: BTreeMap<u64, (Instant, PathBuf)> = BTreeMap::new();
@@ -2510,15 +2525,16 @@ impl Report {
                         written.insert(u64::from(node.get()), (record.at, dir.clone()));
                     }
                 }
+                TraceEvent::RaftTruncate { server, .. } => {
+                    written.remove(server);
+                }
                 TraceEvent::RaftSnapshot {
                     server,
                     last_index,
                     taken: true,
                     ..
                 } => {
-                    if let Some((at, dir)) = written.remove(server)
-                        && at == record.at
-                    {
+                    if let Some((at, dir)) = written.remove(server) {
                         takes.push(SnapshotTake {
                             server: *server,
                             index: *last_index,
