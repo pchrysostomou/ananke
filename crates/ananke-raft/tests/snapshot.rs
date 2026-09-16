@@ -556,7 +556,7 @@ async fn record_fresh_format(env: &SimEnv, dir: &str) {
 }
 
 /// Builds a leader-like store at `/leader` with five applied puts and a
-/// configuration entry at index 6, past the checkpoint, whose `0 / 2 / config`
+/// configuration entry at index 6, past the checkpoint, whose `<prefix> / 2 / config`
 /// key rides in the checkpoint the way a real leader's does (D-029) — so an
 /// install that failed to rewrite the key would open a store whose key names an
 /// entry its log does not hold, and be refused. Takes a checkpoint at index 5
@@ -753,7 +753,7 @@ fn an_install_carries_the_receivers_identity_and_is_adopted_at_open() {
             assert!(record.dir.is_empty(), "an installed snapshot has no dir");
             assert!(recovered.quarantined, "the quarantine survives the switch");
             // The open above is itself the config-key check (RAFT.md §3, D-029):
-            // the leader's checkpoint carried a `0 / 2 / config` naming its
+            // the leader's checkpoint carried a `<prefix> / 2 / config` naming its
             // entry 6, which this store's log does not hold — had the repair not
             // rewritten the key consistent with the snapshot's configuration,
             // the open would have refused the store as out of step.
@@ -883,7 +883,12 @@ async fn open_follower(env: &SimEnv) -> Result<(bool, Term, Option<ServerId>), S
 #[test]
 fn a_crash_inside_the_adoption_leaves_a_store_and_the_next_start_adopts() {
     let mut outcomes = BTreeSet::new();
-    for seed in 0..24u64 {
+    // How many seeds landed in each window, printed so D-061's table of fixed seed
+    // sets can be checked at any tier rather than re-measured with a probe.
+    let mut counts: std::collections::BTreeMap<(bool, bool), usize> =
+        std::collections::BTreeMap::new();
+    let seeds = 24u64;
+    for seed in 0..seeds {
         let mut sim = Sim::new({
             let mut c = SimConfig::new(300 + seed);
             c.fs.latency_min = Duration::from_micros(100);
@@ -950,6 +955,7 @@ fn a_crash_inside_the_adoption_leaves_a_store_and_the_next_start_adopts() {
             )
             .is_some();
         outcomes.insert((named == 1, staging_current));
+        *counts.entry((named == 1, staging_current)).or_default() += 1;
         // The next start: the receiver's identity, adopted now or already.
         let (adopted, term, vote) = on_node(&mut sim, node, |env| {
             Box::pin(async move { open_follower(&env).await })
@@ -987,6 +993,10 @@ fn a_crash_inside_the_adoption_leaves_a_store_and_the_next_start_adopts() {
     assert!(
         outcomes.contains(&(false, true)) || outcomes.contains(&(false, false)),
         "no crash after the switch: {outcomes:?}"
+    );
+    println!(
+        "the adoption's crash windows over {seeds} seeds, (the old CURRENT still named, the \
+         staging still there): {counts:?}"
     );
 }
 

@@ -247,8 +247,9 @@ fn the_v0_3_0_store_fixture_holds_0_3_0_state_under_0_3_0_keys() {
                 Some(Bytes::from_static(b"3"))
             );
             // Every key is 0.3.0's: a tenant, a table and a name, sixteen bytes at
-            // least, in tenant 0 or tenant 1. No key is the format version D-059
-            // proposes, the eight bytes of tenant 0 alone.
+            // least, in tenant 0 or tenant 1. And no key of eight bytes, where
+            // D-059's first draft (9e90eed) put the format version before D-060
+            // made it a file of its own: the version is in no key at all.
             assert!(
                 every
                     .iter()
@@ -277,7 +278,9 @@ fn server_engine_config() -> EngineConfig {
     config
 }
 
-/// Every file under [`DIR`] on `env`'s disk with its bytes, by path, in name order.
+/// Every entry under [`DIR`] on `env`'s disk, by path, in name order: a file
+/// with its bytes, and a directory as its path with a trailing `/`, so a tree
+/// this says is unchanged is unchanged in its directories too.
 async fn read_tree(env: &SimEnv) -> Vec<(String, Bytes)> {
     let fs = env.fs();
     let mut files = Vec::new();
@@ -299,7 +302,10 @@ async fn read_tree(env: &SimEnv) -> Vec<(String, Bytes)> {
                         file.read_at(0, size).await.unwrap(),
                     ));
                 }
-                Err(_) => dirs.push(path),
+                Err(_) => {
+                    files.push((format!("{}/", path.display()), Bytes::new()));
+                    dirs.push(path);
+                }
             }
         }
     }
@@ -355,7 +361,10 @@ fn the_v0_3_0_tags_store_is_refused_before_anything_writes() {
             (refused.to_string(), before.len())
         })
     });
-    assert_eq!(words.1, 15, "the fixture's fifteen files");
+    assert_eq!(
+        words.1, 16,
+        "the fixture's fifteen files and its snap-4-1 directory"
+    );
     assert_names_both_formats(&words.0);
     println!("the v0.3.0 store's refusal: {}", words.0);
     // And on the durable disk: the same names and the same bytes, with no
@@ -376,11 +385,7 @@ fn the_v0_3_0_tags_store_is_refused_before_anything_writes() {
             "{name} changed"
         );
     }
-    assert_eq!(
-        names.len(),
-        10,
-        "ten files and the snapshot directory: {names:?}"
-    );
+    assert_eq!(names.len(), 10, "ten files: {names:?}");
     assert!(
         !names
             .iter()

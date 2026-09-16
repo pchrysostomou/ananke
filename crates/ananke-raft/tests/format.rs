@@ -23,6 +23,7 @@ use ananke_raft::core::{Persist, Variant, Variants};
 use ananke_raft::format::{
     COPY_LEN, Decoded, FORMAT_FILE, FORMAT_TMP, FormatRefused, Found, RECORD_LEN, STORE_FORMAT,
     Subject, UNRECORDED_FORMAT, Verdict, check_format, decode_record, encode_record, format_path,
+    record_format,
 };
 use ananke_raft::node::{SINGLE_GROUP, Start, StartOrder, start_store};
 use ananke_raft::snapshot::{
@@ -81,7 +82,11 @@ fn on_node<T: Send + 'static>(
     out.lock().unwrap().take().expect("the task finished")
 }
 
-/// Every file under `dir` on `env`'s disk with its bytes, by path, in name order.
+/// Every entry under `dir` on `env`'s disk, by path, in name order: a file with
+/// its bytes, and a directory as its path with a trailing `/` and no bytes.
+/// Directories are in the picture because a tree this says is unchanged must be
+/// unchanged in its directories too — a staging created and left behind is a
+/// change to the store.
 async fn read_tree(env: &SimEnv, dir: &str) -> Vec<(String, Bytes)> {
     let fs = env.fs();
     let mut files = Vec::new();
@@ -103,7 +108,10 @@ async fn read_tree(env: &SimEnv, dir: &str) -> Vec<(String, Bytes)> {
                         file.read_at(0, size).await.unwrap(),
                     ));
                 }
-                Err(_) => dirs.push(path),
+                Err(_) => {
+                    files.push((format!("{}/", path.display()), Bytes::new()));
+                    dirs.push(path);
+                }
             }
         }
     }
@@ -181,15 +189,18 @@ async fn build_store(env: &SimEnv, dir: &str) -> Arc<RaftStore<SimEnv>> {
 
 /// The start the server runs, for a test that wants its verdict.
 async fn start(env: &SimEnv, dir: &str, order: StartOrder) -> Start<SimEnv> {
-    start_store(
-        env,
-        1,
-        &engine_config(dir),
-        Variants::correct(),
-        &prefix(),
-        order,
-    )
-    .await
+    start_with(env, dir, Variants::correct(), order).await
+}
+
+/// The same, for a test that drives a known-buggy variant's own start rather
+/// than a known-buggy order.
+async fn start_with(
+    env: &SimEnv,
+    dir: &str,
+    variants: Variants,
+    order: StartOrder,
+) -> Start<SimEnv> {
+    start_store(env, 1, &engine_config(dir), variants, &prefix(), order).await
 }
 
 /// What a start came to, as a word and a message: the shapes these tests count.
@@ -549,12 +560,19 @@ fn a_directory_without_a_record_is_refused_or_fresh_by_what_it_holds() {
             }
 
             // Unrecorded: any one name of the store family, with no record.
+            // Every arm of `is_store_family`, so dropping one — which would
+            // read an operator's only copy of a 0.3.0 store as a foreign
+            // directory and tell them to point the store somewhere empty — is
+            // caught here.
             for (dir, name, is_dir) in [
                 ("/a", STORE_MARKER, false),
                 ("/b", "CURRENT.tmp", false),
                 ("/c", "MANIFEST-000001", false),
                 ("/d", "install", true),
                 ("/e", "snap-3-1", true),
+                ("/h", "CURRENT", false),
+                ("/i", "000002.sst", false),
+                ("/j", "000001.wal", false),
             ] {
                 fs.create_dir_all(Path::new(dir)).await.unwrap();
                 if is_dir {
@@ -593,8 +611,15 @@ struct Outcomes {
     fresh: usize,
     /// The next start opened the store the first one had written.
     with_state: usize,
-    /// The next start refused it as lost state.
-    lost: usize,
+    /// The next start refused it as lost state the engine's own rule accounts
+    /// for: a crash between the engine's first manifest and its `CURRENT`
+    /// (D-024), which costs a re-seed and is unchanged by the record.
+    lost_engine: usize,
+    /// The next start refused it as lost state the *record* caused: the record
+    /// there and unreadable beside a store (`Damage::FormatUnreadable`). This is
+    /// the re-seed the record's own cost would be, counted apart from the
+    /// engine's so D-060 can quote it rather than assert a sum (D-060).
+    lost_format: usize,
     /// The next start refused it for its format: a store this build wrote that
     /// it will not read.
     format: Vec<(u64, String)>,
@@ -693,22 +718,32 @@ fn crash_in_first_start(
         _ => 3,
     };
     outcomes.windows[window] += 1;
+    // A refusal carries which damage refused it, so the record's own re-seeds
+    // are counted apart from the engine's (D-060).
     let started = on_node(&mut sim, node, |env| {
         Box::pin(async move {
             match start(&env, DIR, StartOrder::Correct).await {
                 Start::Opened { .. } => Ok(()),
-                Start::Refused(error) => Err((true, error.to_string())),
-                Start::Failed(error) => {
-                    Err((FormatRefused::from_io(&error).is_none(), error.to_string()))
-                }
+                Start::Refused(error) => Err((
+                    true,
+                    LostState::from_io(&error).and_then(|lost| lost.damaged)
+                        == Some(Damage::FormatUnreadable),
+                    error.to_string(),
+                )),
+                Start::Failed(error) => Err((
+                    FormatRefused::from_io(&error).is_none(),
+                    false,
+                    error.to_string(),
+                )),
             }
         })
     });
     match started {
         Ok(()) if window >= 3 => outcomes.with_state += 1,
         Ok(()) => outcomes.fresh += 1,
-        Err((true, _)) => outcomes.lost += 1,
-        Err((false, message)) => outcomes.format.push((seed, message)),
+        Err((true, true, _)) => outcomes.lost_format += 1,
+        Err((true, false, _)) => outcomes.lost_engine += 1,
+        Err((false, _, message)) => outcomes.format.push((seed, message)),
     }
 }
 
@@ -723,9 +758,19 @@ fn crash_in_first_start(
 /// the engine's open and the store's first batch: the same crashes leave a store
 /// with engine files and no record, which the next correct start refuses as
 /// 0.3.0's, and the invariant is broken at the crash itself.
+///
+/// Why 200 seeds and not 40. The crash instants are a stratified sweep of the
+/// start's whole span (`crash_at`), so how many land in a window is that
+/// window's share of the span. W1 is the width of one rename — the temporary
+/// name durable and the record not yet — and at 40 seeds it held exactly one
+/// seed on both disks, one instant from empty: any later change that rescales
+/// `first_start_span` (an operation added to or taken out of the start, which is
+/// what D-060 did) could empty it and fail this test on a tree with nothing
+/// wrong. At 200 the same window holds several. The figures are printed at every
+/// tier and listed in D-061's table of fixed seed sets.
 #[test]
 fn a_crash_in_a_fresh_stores_first_open_never_leaves_it_refused_for_its_format() {
-    let seeds = 40;
+    let seeds = 200;
     let span = first_start_span();
     println!("a fresh store's whole first start takes {span:?}");
     for p_durable in [1.0, 0.7] {
@@ -763,10 +808,16 @@ fn a_crash_in_a_fresh_stores_first_open_never_leaves_it_refused_for_its_format()
             // The lost-state outcomes at a durable disk are the engine's own
             // rule, unchanged by this commit: a crash between the engine's first
             // manifest and its CURRENT leaves a directory the engine refuses
-            // (D-024), which is a re-seed, never a format refusal.
-            assert!(
-                correct.lost + correct.fresh + correct.with_state == seeds as usize,
-                "{correct:?}"
+            // (D-024), which is a re-seed, never a format refusal. The record
+            // adds none of its own on a disk that keeps its syncs, which is what
+            // this asserts — the sum of the three was a tautology, since every
+            // seed lands in exactly one bucket and `format` is asserted empty
+            // above (D-060).
+            assert_eq!(
+                correct.lost_format, 0,
+                "a crash in a fresh store's first start left its record unreadable beside a \
+                 store on a disk that loses no sync, so the record cost a re-seed the engine's \
+                 own rule does not account for: {correct:?}"
             );
         }
     }
@@ -799,6 +850,41 @@ fn a_crash_in_a_fresh_stores_first_open_never_leaves_it_refused_for_its_format()
     );
 }
 
+/// The record's rename is durable before anything else of the store is written.
+///
+/// The crash sweep above cannot see this. The simulated disk keeps a prefix of a
+/// directory's pending operations at a crash, and the record's create and rename
+/// are the first two of that directory's, so invariant I1 follows from the order
+/// alone and holds with `record_format`'s directory sync removed. On a disk that
+/// reorders, it does not: the rename could be the operation that is lost, the
+/// engine's files could be the ones that survive, and the next start would refuse
+/// this build's own store as 0.3.0's with no re-seed path (D-059). The durable
+/// namespace is the oracle for that sync, and this is the test that reads it.
+// PROPOSED(D-060)
+#[test]
+fn a_fresh_stores_record_is_made_durable_before_anything_else_is_written() {
+    let mut sim = Sim::new(SimConfig::new(11));
+    let node = sim.add_node();
+    on_node(&mut sim, node, |env| {
+        Box::pin(async move {
+            let fresh = match check_format(&env, Path::new(DIR)).await.unwrap() {
+                Verdict::Fresh(fresh) => fresh,
+                other => panic!("a fresh directory, not {other:?}"),
+            };
+            record_format(&env, fresh).await.unwrap();
+        })
+    });
+    let durable: Vec<String> = sim
+        .durable_names(node, Path::new(DIR))
+        .iter()
+        .map(|name| name.display().to_string())
+        .collect();
+    assert!(
+        durable.iter().any(|name| name == FORMAT_FILE),
+        "the record's rename was never made durable: {durable:?}"
+    );
+}
+
 // --- E11: the heal ---
 
 /// A record with one damaged copy is healed at the next start, in place and with
@@ -810,7 +896,11 @@ fn a_crash_in_a_fresh_stores_first_open_never_leaves_it_refused_for_its_format()
 /// The pair is `HealByRename`: the same crashes, with the heal done by writing a
 /// temporary file and renaming it over the record, do leave the record
 /// unreadable — the renamed inode is made durable with its content lost — and
-/// the store that follows is refused as lost.
+/// the store that follows is refused as lost. That the pair is caught at all is
+/// what is asserted; its rate is printed beside it and not asserted, because a
+/// fixed seed set runs the same seeds at every tier and so has no tier to move
+/// an assertion to (D-061). The set is 160 seeds rather than 40 so the catch has
+/// margin against the next tree that redraws these schedules.
 #[test]
 fn a_record_with_one_bad_copy_is_healed_in_place_and_a_crash_never_loses_the_other_copy() {
     // (a) Every single flip: the start opens and the record comes back whole.
@@ -834,13 +924,29 @@ fn a_record_with_one_bad_copy_is_healed_in_place_and_a_crash_never_loses_the_oth
                     "bit {bit}: the heal did not make the record whole"
                 );
             }
+            // And a record longer than the encoding — bytes appended past the
+            // two copies, the length `Verdict::Recorded` carries — is cut back
+            // to the encoding by the heal, so a record can never grow without
+            // bound over repeated heals.
+            let mut long = whole.to_vec();
+            long[COPY_LEN + 3] ^= 0x10;
+            long.extend_from_slice(b"appended past the second copy");
+            put_record(&env, DIR, Bytes::from(long)).await;
+            let started = start(&env, DIR, StartOrder::Correct).await;
+            let (word, message) = outcome(&started);
+            assert_eq!(word, "opened", "{message}");
+            assert_eq!(
+                get_record(&env, DIR).await.as_deref(),
+                Some(&whole[..]),
+                "the heal left the record longer than the encoding"
+            );
         })
     });
 
     // (b) Crashes across the heal, on a disk that loses syncs: once spread over
     // the whole start, so they land on both sides of the heal, and once in the
     // heal's own window, where the pair's rename can lose the surviving copy.
-    let seeds = 40;
+    let seeds = 160;
     for targeted in [false, true] {
         for order in [StartOrder::Correct, StartOrder::HealByRename] {
             let (healed, half, unreadable) = heal_under_crash(order, targeted, seeds);
@@ -874,12 +980,17 @@ fn a_record_with_one_bad_copy_is_healed_in_place_and_a_crash_never_loses_the_oth
                 (_, true) => {
                     // The pair: the renamed inode is made durable with its
                     // content still owed, and the copy that was valid goes with
-                    // it. The rate is printed and asserted where the statistics
-                    // support it (the owner's rule of 2026-09-15).
+                    // it. What is asserted is that it was caught; the rate is
+                    // printed above. A floor on the rate of a fixed seed set
+                    // would fail on a tree with nothing wrong the next time
+                    // these schedules are redrawn, and the owner's rule of
+                    // 2026-09-15 moves an assertion to the tier its rate
+                    // supports, which a fixed set has not got (D-061).
                     assert!(
-                        unreadable.len() * 20 >= seeds as usize,
-                        "the heal by rename was caught on {} of {seeds} seeds, under 5%",
-                        unreadable.len()
+                        !unreadable.is_empty(),
+                        "the heal by rename never lost the surviving copy over {seeds} seeds: \
+                         the pair's catch is gone, so the in-place heal above is asserted \
+                         against nothing"
                     );
                 }
             }
@@ -1421,6 +1532,15 @@ fn a_checkpoint_carries_its_record_and_a_stream_of_another_format_is_refused_unr
                     .unwrap(),
                 "a checkpoint whose record cannot be read is incomplete"
             );
+            // And the third clause: a readable record naming another version is
+            // not this build's checkpoint either, so it is never streamed.
+            put_record(&env, dir.to_str().unwrap(), encode_record(STORE_FORMAT + 1)).await;
+            assert!(
+                !ananke_raft::snapshot::checkpoint_complete(&env, &dir)
+                    .await
+                    .unwrap(),
+                "a checkpoint recording another format is complete"
+            );
             put_record(&env, dir.to_str().unwrap(), saved).await;
 
             // The sender streams the record first and the manifest last.
@@ -1593,12 +1713,34 @@ fn a_checkpoint_carries_its_record_and_a_stream_of_another_format_is_refused_unr
 
             // A staging that records another format, adopted: refused, with the
             // store's tree unchanged — and the pair, the adoption with no staged
-            // check, which adopts it.
-            for (order, refuses) in [
-                (StartOrder::Correct, true),
-                (StartOrder::StagedFormatUnchecked, false),
+            // check, which adopts it. The third case is `AdoptionAsBuilt`, whose
+            // own adoption reads the staged record too: the format rule is not
+            // what that variant models, and nothing but this drives that read.
+            //
+            // The store's own record is left with one copy damaged in every
+            // case, so the start has a heal to do. The heal runs *after* the
+            // adoption (node.rs), so a refused staging leaves the record half
+            // damaged, exactly as it was found — the owner's answer of
+            // 2026-09-15, that a store refused for a format is written to
+            // nowhere. The order of those two steps is asserted here and
+            // nowhere else: swap them and the refusal below heals the record
+            // first, `after` differs from `before`, and this fails.
+            for (case, variants, order, refuses) in [
+                ("correct", Variants::correct(), StartOrder::Correct, true),
+                (
+                    "unchecked",
+                    Variants::correct(),
+                    StartOrder::StagedFormatUnchecked,
+                    false,
+                ),
+                (
+                    "as-built",
+                    Variants::from(Variant::AdoptionAsBuilt),
+                    StartOrder::Correct,
+                    true,
+                ),
             ] {
-                let follower = format!("/adopt-{}", u8::from(refuses));
+                let follower = format!("/adopt-{case}");
                 let store = build_store(&env, &follower).await;
                 drop(store);
                 let mut assembler = Assembler::new(
@@ -1628,19 +1770,48 @@ fn a_checkpoint_carries_its_record_and_a_stream_of_another_format_is_refused_unr
                     encode_record(STORE_FORMAT + 1),
                 )
                 .await;
+                // And the store's own record has one damaged copy, so the start
+                // has a heal to do after the adoption.
+                let mut rotted = encode_record(STORE_FORMAT).to_vec();
+                rotted[COPY_LEN + 3] ^= 0x10;
+                put_record(&env, &follower, Bytes::from(rotted)).await;
+                assert!(
+                    matches!(
+                        decode_record(&get_record(&env, &follower).await.unwrap()),
+                        Decoded::Valid {
+                            version: STORE_FORMAT,
+                            whole: false
+                        }
+                    ),
+                    "{case}: the store's record is not half damaged before the start"
+                );
                 let before = read_tree(&env, &follower).await;
-                let started = start(&env, &follower, order).await;
+                let started = start_with(&env, &follower, variants, order).await;
                 let (word, message) = outcome(&started);
                 let after = read_tree(&env, &follower).await;
                 if refuses {
-                    assert_eq!(word, "failed", "{message}");
-                    assert!(message.contains("staged install"), "{message}");
-                    assert_eq!(after, before, "the refused staging changed the store");
+                    assert_eq!(word, "failed", "{case}: {message}");
+                    assert!(message.contains("staged install"), "{case}: {message}");
+                    assert_eq!(
+                        after, before,
+                        "{case}: the refused staging changed the store"
+                    );
+                    assert!(
+                        matches!(
+                            decode_record(&get_record(&env, &follower).await.unwrap()),
+                            Decoded::Valid {
+                                version: STORE_FORMAT,
+                                whole: false
+                            }
+                        ),
+                        "{case}: the store's record was healed before the staging was refused, \
+                         so a store refused for a format was written to"
+                    );
                 } else {
-                    assert_eq!(word, "opened", "{message}");
+                    assert_eq!(word, "opened", "{case}: {message}");
                     assert_ne!(
                         after, before,
-                        "the adoption without its staged check was not caught"
+                        "{case}: the adoption without its staged check was not caught"
                     );
                 }
             }

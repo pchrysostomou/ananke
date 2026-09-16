@@ -598,7 +598,7 @@ async fn adopt_staged_as_built<E: Environment>(
 }
 
 /// Takes a snapshot at `index`, whose entry has `term`: the identity is recorded
-/// under `0 / 3 / snapshot` in the live store first, synced, and then the
+/// under `<prefix> / 3 / snapshot` in the live store first, synced, and then the
 /// checkpoint is written to `dir`, so the checkpoint's copy of the record precedes
 /// the checkpoint's `CURRENT` (RAFT.md §1, D-024). The caller must be the `apply`
 /// task with no apply in flight, so `index` is exactly what the checkpoint
@@ -1223,7 +1223,7 @@ impl<E: Environment> Assembler<E> {
             self.prefix.snapshot_key(),
             Value::Live(store::encode_snapshot_record(&record)),
         );
-        // The receiver's `0 / 2 / config` key (RAFT.md §3, D-029): the streamed
+        // The receiver's `<prefix> / 2 / config` key (RAFT.md §3, D-029): the streamed
         // checkpoint carries the leader's, which may name a configuration entry
         // the kept tail does not hold, and the open refuses a key out of step
         // with the log. Rewritten like the rest of tenant 0: the tail's latest

@@ -27,12 +27,19 @@
 //!
 //! # Why two copies and a checksum
 //!
-//! The simulated disk rots at most one bit per block per crash (SPEC §1.3), and
-//! the record is one block. A single flip in a copy fails its CRC, so a flip can
-//! never read as another version; the other copy still names it, so one crash's
-//! rot never costs a healthy voter its store (D-035). Reaching "unreadable" takes
-//! two rots, one in each copy, across two crashes with no completed start between
-//! them to heal the first.
+//! The simulated disk rots at most one bit per block per crash — the
+//! simulator's own fault model, `ananke-env/src/sim/fs.rs:361-381`, which draws
+//! `p_bitrot` independently per block and flips one bit of it; SPEC §1.3 asks
+//! only that checksums catch bit rot and states no such bound — and the record
+//! is one block. A single flip in a copy fails its CRC, so a flip can never read
+//! as another version; the other copy still names it, so one crash's rot never
+//! costs a healthy voter its store (D-035). Reaching "unreadable" takes two
+//! rots, one in each copy, with no start whose heal *became durable* between
+//! them: a start that runs to completion heals the first, but on a disk that
+//! loses syncs the heal's own sync can be lost and the record stays half
+//! damaged, which
+//! `a_record_with_one_bad_copy_is_healed_in_place_and_a_crash_never_loses_the_other_copy`
+//! measures (D-060).
 //!
 //! # Permanence
 //!
@@ -321,6 +328,13 @@ fn refused_version(decoded: Decoded) -> Option<u64> {
     }
 }
 
+/// How many of a foreign directory's names the refusal spells out. The message
+/// is read by an operator and copied into a trace record, and the directory it
+/// describes is one this build knows nothing about, so its length is bounded
+/// here rather than by what is in the directory.
+// PROPOSED(D-060)
+const FOREIGN_NAMES_SHOWN: usize = 8;
+
 impl std::fmt::Display for FormatRefused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let what = match self.subject {
@@ -330,6 +344,16 @@ impl std::fmt::Display for FormatRefused {
         let dir = self.dir.display();
         let expected = self.expected;
         match &self.found {
+            // A staging carries no version of its own to attribute: this build's
+            // stream writes the record first, so a staging without one is not
+            // 0.3.0's install but an install of unknown provenance (D-060).
+            Found::Unrecorded if self.subject == Subject::StagedInstall => write!(
+                f,
+                "{what} {dir} holds an install's files and no {FORMAT_FILE} record, which this \
+                 build's own stream writes before any table: it names no format version, so it \
+                 is refused unread rather than adopted as format {expected}; remove {dir} and \
+                 let the leader stream the install again"
+            ),
             Found::Unrecorded => write!(
                 f,
                 "{what} {dir} holds a Raft store's files and no {FORMAT_FILE} record: it is in \
@@ -347,12 +371,24 @@ impl std::fmt::Display for FormatRefused {
                 "{what} {dir} records Raft store format {version}; this build reads format \
                  {expected} only and refuses the store rather than read or migrate it"
             ),
+            // The names are the operator's evidence, so some are named; the list
+            // is capped because it is an operator's line and a trace record, and
+            // a directory can hold any number of entries (D-060).
             Found::Foreign(names) => write!(
                 f,
-                "the directory {dir} holds {} and neither a Raft store's files nor a \
+                "the directory {dir} holds {}{} and neither a Raft store's files nor a \
                  {FORMAT_FILE} record: refused rather than started as a new format {expected} \
                  store; point the store at an empty directory",
-                names.join(", ")
+                names
+                    .iter()
+                    .take(FOREIGN_NAMES_SHOWN)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                match names.len().saturating_sub(FOREIGN_NAMES_SHOWN) {
+                    0 => String::new(),
+                    rest => format!(" and {rest} more"),
+                }
             ),
         }
     }

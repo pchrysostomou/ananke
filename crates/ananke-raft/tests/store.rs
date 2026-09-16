@@ -290,13 +290,21 @@ fn an_entrys_writes_and_the_applied_index_are_durable_together() {
             "seed {seed}: at most the apply in flight can be durable beyond what was acknowledged"
         );
     }
+    // Printed so D-061's table of fixed seed sets can be checked at any tier rather
+    // than re-measured with a probe: the margin over the floor is what that row is
+    // for.
+    println!(
+        "an entry's writes and the applied index: {verified} of 40 seeds came back as a \
+         state, {} refused",
+        refused.len()
+    );
     assert!(
         verified >= 20,
         "only {verified} of 40 seeds came back as a state; refused: {refused:?}"
     );
 }
 
-/// The `0 / 2 / config` key (RAFT.md §3): a persist that carries the
+/// The `<prefix> / 2 / config` key (RAFT.md §3): a persist that carries the
 /// configuration in force writes it in the same synced batch, the next open
 /// reads it back consistent with the log, and a store whose key disagrees with
 /// its log — something else wrote it — is refused.

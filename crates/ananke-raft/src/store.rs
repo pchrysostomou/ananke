@@ -650,7 +650,7 @@ async fn write_marker<E: Environment>(
     fs.sync_dir(engine_dir).await
 }
 
-/// The last snapshot, as `0 / 3 / snapshot` records it (RAFT.md §3): written into
+/// The last snapshot, as `<prefix> / 3 / snapshot` records it (RAFT.md §3): written into
 /// the live store before its checkpoint is taken, so the checkpoint carries its own
 /// identity before its `CURRENT`; written by an install's repair with the identity
 /// of the snapshot installed.
@@ -1284,6 +1284,28 @@ mod tests {
             // A log key is read back, and nothing else is read as one.
             for index in [0, 1, 1 << 63, u64::MAX] {
                 assert_eq!(prefix.log_index(&prefix.log_key(index)), Some(index));
+            }
+            // And the log sorts by index. `log_index` round-trips a
+            // little-endian index just as well, so only this says which way
+            // round the bytes go — and `RaftStore::open_dir` reads the log by
+            // scanning the purpose's span in the engine's key order and refuses
+            // a log whose indices are not consecutive. With the bytes the other
+            // way round, key 256 sorts before key 1, so the first store to hold
+            // more than 255 entries above its snapshot would be refused as lost
+            // state at every restart and re-seeded.
+            for (lower, higher) in [
+                (0u64, 1u64),
+                (127, 128),
+                (255, 256),
+                (256, 257),
+                (65_535, 65_536),
+                (1 << 32, (1 << 32) + 1),
+                (u64::MAX - 1, u64::MAX),
+            ] {
+                assert!(
+                    prefix.log_key(lower)[..] < prefix.log_key(higher)[..],
+                    "the log key of {lower} does not sort before the log key of {higher}"
+                );
             }
             assert_eq!(prefix.log_index(&prefix.hard_key()), None);
             assert_eq!(prefix.log_index(&prefix.key(PURPOSE_LOG, b"xy")), None);

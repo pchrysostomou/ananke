@@ -510,7 +510,7 @@ pub struct Persist {
     /// Entries written.
     pub append: Vec<Entry>,
     /// The configuration in force after the step, when the step changed it: the
-    /// latest configuration entry's index and content, kept under the `0 / 2 /
+    /// latest configuration entry's index and content, kept under the `<prefix> / 2 /
     /// config` key in the same synced batch (RAFT.md §3); index 0 and the initial
     /// configuration after a truncation removed every configuration entry.
     pub config: Option<(Index, Configuration)>,
