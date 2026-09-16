@@ -9,11 +9,14 @@
 //! bounded seek's (D-055) beside the delete that forgets the memtables and the seek
 //! that counts tombstones. The default schedule runs all four primitives.
 
+use std::path::Path;
 use std::sync::Mutex;
 
 use ananke_env::TraceEvent;
 use ananke_sim::engine::{self, Variant};
+use ananke_sim::wal::syncs;
 use ananke_sim::{seeds, sweep, verdict, write_trace};
+use ananke_storage::wal;
 
 /// Two runs with the same seed produce byte-identical traces.
 #[test]
@@ -131,6 +134,65 @@ fn seed_44_never_opens_empty_in_either_mode() {
     assert!(
         refusing.epochs.len() < allowed.epochs.len(),
         "refusing ends the run earlier"
+    );
+}
+
+/// The nightly's ten-thousand-seed run of the seek sweep failed here (GitHub run
+/// 35080746132, PR #60, HEAD 09bed88): the *correct* engine returned record 166
+/// changed at epoch 3. A recovery two epochs earlier had cut segment 14 to nothing;
+/// the disk lied about the sync of that cut (`FsyncLost`, legal under SPEC §1.3) and
+/// the crash after it dropped the still-pending truncation, so segment 14 came back
+/// whole — in front of the live segment 15 and holding numbers the log had since
+/// re-issued, because a number is a position and not an identity. Recovery took the
+/// resurrected copies for current, read segment 15's first record 165 as an ordinary
+/// backwards gap and stopped there, destroying thirteen acknowledged and honestly
+/// synced records and replaying a stale one above `flushed_seq`. A segment whose first
+/// record is numbered behind the reading now supersedes what was read, because
+/// segments are created in increasing number order (D-062).
+///
+/// The mechanism, not the green (CLAUDE.md): the seed must still reach a cut to
+/// nothing whose sync the disk lied about, the fix must still be seen to supersede a
+/// resurrected segment, and the reader that trusts the earlier segment must still fail
+/// this seed with the violation it was pinned for. The day the schedule moves away
+/// from the shape, the first two assertions say so and the pin is upgraded.
+// PROPOSED(D-062): the WAL's supersede rule.
+#[test]
+fn seed_3123_which_the_nightly_found_supersedes_a_resurrected_segment() {
+    let schedule = engine::Schedule::seek();
+    let report = engine::run_with(3123, schedule, Variant::Correct);
+    report.check().unwrap();
+    let events: Vec<&TraceEvent> = report.records.iter().map(|r| &r.event).collect();
+    let betrayed: Vec<(u64, u64)> = syncs(&events, Path::new(engine::DIR))
+        .cuts
+        .iter()
+        .filter(|&&(_, _, lost)| lost)
+        .map(|&(segment, len, _)| (segment, len))
+        .collect();
+    assert!(
+        betrayed.iter().any(|&(_, len)| len == 0),
+        "the seed no longer cuts a segment to nothing on a sync the disk lied about: {betrayed:?}"
+    );
+    let superseded = report.count(|e| matches!(e, TraceEvent::WalSuperseded { .. }));
+    assert!(
+        superseded > 0,
+        "the seed no longer meets the resurrected segment the fix supersedes"
+    );
+    // The pair on the seed itself: today's reader, kept as a variant, still returns
+    // the stale copies and still fails the seed the way the nightly did.
+    let caught = engine::run_with(
+        3123,
+        engine::Schedule {
+            wal_variant: wal::Variant::TrustsAStaleSegment,
+            ..schedule
+        },
+        Variant::Correct,
+    );
+    let violation = caught
+        .check()
+        .expect_err("the reader that trusts a stale segment is caught at seed 3123");
+    assert!(
+        violation.contains("record 166 came back changed"),
+        "caught, but not with the violation the seed was pinned for: {violation}"
     );
 }
 

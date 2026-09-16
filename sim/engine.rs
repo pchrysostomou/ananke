@@ -102,6 +102,12 @@ pub struct Schedule {
     /// seeks of a few keys at a time (D-055).
     // PROPOSED(D-055): the bounded seek's crash test.
     pub seeks: bool,
+    /// Which log the engine runs. [`wal::Variant::Correct`] everywhere but the pin
+    /// that runs seed 3123 beside the reader that trusts a stale segment (D-062):
+    /// the variant changes recovery's decision, never a draw or a byte written, so
+    /// it moves no schedule up to the recovery it changes.
+    // PROPOSED(D-062): the WAL's supersede rule.
+    pub wal_variant: wal::Variant,
 }
 
 impl Default for Schedule {
@@ -130,6 +136,8 @@ impl Default for Schedule {
             installs: true,
             range_deletes: true,
             seeks: true,
+            // PROPOSED(D-062): the WAL's supersede rule.
+            wal_variant: wal::Variant::Correct,
         }
     }
 }
@@ -1759,7 +1767,8 @@ fn open(
         memtable_bytes: schedule.memtable_bytes,
         segment_bytes: schedule.segment_bytes,
         variant,
-        wal_variant: wal::Variant::Correct,
+        // PROPOSED(D-062): the WAL's supersede rule.
+        wal_variant: schedule.wal_variant,
         // A missing head is judged by the oracle, so the run goes on past it.
         refuse_log_damage: false,
         allow_head_gap: true,

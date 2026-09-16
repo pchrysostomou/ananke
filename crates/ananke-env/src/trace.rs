@@ -196,6 +196,23 @@ pub enum TraceEvent {
         /// The length it was cut to.
         len: u64,
     },
+    /// Recovery met a segment whose first record is numbered *behind* the reading so
+    /// far. Segments are created in increasing number order, so this segment was
+    /// written after every one read before it and its copies of those numbers are the
+    /// live ones: the earlier copies are dropped and the numbering resumes here
+    /// (D-062). What produces the shape is a previous recovery's cut whose sync the
+    /// disk lied about, bringing a discarded segment back whole.
+    // PROPOSED(D-062): the WAL's supersede rule.
+    WalSuperseded {
+        /// The segment whose first record superseded the reading.
+        segment: u64,
+        /// The number the reading had reached: what the next record would have been.
+        expected: u64,
+        /// The number this segment's first record carries.
+        found: u64,
+        /// Records already read that this segment supersedes, now dropped.
+        dropped: u64,
+    },
     /// The log's first record was numbered past the head its caller expected: the
     /// records between are gone with their segments. Replaying past the gap would
     /// give a state that never existed (D-022), so the open was refused, or the whole

@@ -165,10 +165,15 @@ workload (Raft log + MVCC versions) is write-heavy.
   header CRC covers `len` and `seq`, the record CRC covers those and the payload, and
   `seq` numbers records from 1 (D-018, D-019, D-027).
 - Group commit: batch writers waiting on the same fsync.
-- Recovery reads until the first CRC failure, torn record or gap in the numbering
-  (which is how a missing segment shows); everything after is discarded (the stopping
-  segment is cut to its last good record, later segments removed). Segment numbers
-  are never reused, so they may have holes; the records' numbering must not.
+- Recovery reads until the first CRC failure, torn record or gap *forward* in the
+  numbering (which is how a missing segment shows); everything after is discarded (the
+  stopping segment is cut to its last good record, later segments removed). Segment
+  numbers are never reused, so they may have holes; the records' numbering must not.
+- A segment whose *first* record is numbered **behind** the reading is not a stop.
+  Segments are created in increasing number order, so that segment is the later
+  writing and its records supersede the copies already read: what produces the shape
+  is a previous recovery's cut whose sync the disk lied about, which brings a
+  discarded segment back under numbers the log has since re-issued (D-062).
 
 ### 2.3 Memtable
 

@@ -443,6 +443,14 @@ after a flush, the first surviving record will not be number 1; the manifest mus
 then carry the first sequence number recovery should expect (BACKLOG). Found in the
 sweep's first run, which is the point of the sweep.
 
+**Corrected by PROPOSED D-062.** The rule above is written without direction: any record
+that does not continue the numbering stops recovery, "treated like any other stop". The
+nightly's ten thousand found at seed 3123 that a record numbered *behind* the reading,
+at a segment's first byte, is not a hole at all — it is the live segment arriving after
+a segment a betrayed cut resurrected, and stopping there destroys acknowledged records
+and replays stale ones. D-062 makes a backwards jump at a segment's first record a
+supersede; a forward jump is still a stop.
+
 ---
 
 ## D-020 — Memtable and engine: a sequence-guarded skiplist, a flush sink that stands in for SSTables, and what the sweep may not excuse
@@ -631,6 +639,12 @@ by number, could not tell them apart; segment numbers are now monotone, and with
 in the numbering allowed the "missing segment" stop is gone, since a segment lost with
 records in it shows as a gap at the next segment's first record and the numbering of
 the records is the check that matters.
+
+**Extended by PROPOSED D-062.** "A jump in the numbering that lands at or below the head
+… is not a stop" gains its backward twin. A jump *backwards* at a segment's first record
+is not a stop either, and needs no head to justify it: the order segments are created in
+is what proves the earlier copies stale. Monotone segment numbers, decided here so the
+oracle could tell two files apart, are what make that argument available to the reader.
 
 ---
 
@@ -6046,4 +6060,159 @@ tier, as the approved plan's text; this entry supersedes it for that assertion.
 
 ---
 
-_Next entry: D-062. Add one before implementing anything not covered above._
+## PROPOSED D-062 — A segment whose first record is behind the reading supersedes what was read
+
+**Context.** The nightly's ten thousand seeds failed on the **correct** engine (GitHub
+run 35080746132, `phase-3-stage-a` at 09bed88, PR #60), at the seek schedule's seed
+3123: `epoch 3: record 166 came back changed: 44 bytes recovered, 29 appended`, the WAL
+checker's Property A. Everything else in the binary passed; the premerge's thousand and
+the gate's twenty are green on the same tree, so the seed is beyond the thousand. It is
+not a checker artefact and not a variant's catch: on the correct engine a legal disk
+fault made recovery return superseded records under live numbers, throw away thirteen
+acknowledged records whose syncs the simulator had honoured, and replay a stale record
+into the memtable above `flushed_seq` — the one thing D-018 says is never excusable.
+
+The defect is shipped Phase 1 code, not Stage A's: `parse_segment`'s numbering rule
+(D-019), reached through `Wal::open`'s mid-log cut (D-018). A recovery that stops
+mid-log discards the tail by cutting the stopping segment and syncing it, and then
+trusts that cut. When the disk lies about that fsync (`FsyncLost`, legal under SPEC
+§1.3) and the next crash drops the still-pending truncation, the segment comes back
+whole, holding records under numbers the log has since re-issued — `next_seq` reuses
+discarded numbers on purpose, because a number is a position and not an identity
+(D-018). At the next open the reader meets that resurrected segment *before* the live
+one and, with the stop rule as D-019 wrote it, has nothing to tell them apart.
+
+At seed 3123 segment 14 had been cut to nothing and came back with 166..=172. Its first
+record satisfied `seq > expected && seq <= expected_head` (166 ≤ 172), D-022's forward
+skip, so the thirteen records already read from segment 13 were dropped and the whole
+numbering re-based onto the stale segment. The live segment 15, whose first record 165
+is *behind* the reading, was then an ordinary `Gap { expected: 173, found: 165 }` — a
+stop. Recovery kept seven stale records, cut the live segment to nothing, removed the
+one after it, destroyed the acknowledged 165..=177 and replayed the stale 172 above
+`flushed_seq` 171. The simulator did only what a real filesystem does with an
+`ftruncate` whose journal transaction has not committed, and the checker is right to
+fail: nothing here is excusable. The comment at the cut already named this failure ("a
+cut whose sync the disk lied about brings the old records back at the next crash …
+numbered as if they were current", found at seed 191) and forbade it — but only in the
+head-gap branch, which discards by removal for exactly this reason.
+
+What the reader was missing is the *direction* of the jump. Segments are created in
+increasing number order, and D-022 made segment numbers monotone so that a number names
+one file for the life of the log. So a later segment whose first record repeats a number
+an earlier segment supplied **proves the earlier segment stale**. `parse_segment`
+treated forward and backward jumps identically.
+
+**Decision.** A record numbered *behind* the reading, at a segment's **first** byte, is
+not a stop: it supersedes. The copies already read that are numbered at or above it are
+dropped, the numbering resumes at it, and reading goes on into that segment. The drop is
+safe because the records discarded are exactly the ones this segment re-supplies, and
+anything below them is below the first number read, which is at or below
+`expected_head`, so the caller holds it in the tables. A backwards jump anywhere else in
+a segment is corruption and still stops: a betrayed cut leaves a prefix and brings back
+a tail contiguous with it, never a jump in mid-file. D-022's forward skip keeps its head
+guard; the backward rule needs none, because the order of creation and not the head is
+what settles it — which is why it repairs the shape where the tables are further behind
+than the resurrected numbers, and a head-guarded rule would not.
+
+The supersede emits `WalSuperseded { segment, expected, found, dropped }`, bridged as
+`ananke.wal.superseded`, so the sweep and the pin can see the mechanism rather than
+infer it (CLAUDE.md: if it can't be seen in the studio it didn't happen).
+
+This corrects D-019, whose stop rule is written without direction and decides this case
+the wrong way, extends D-022's "a jump that lands at or below the head is not a stop"
+with its backward twin, and amends SPEC.md §2.2's stop bullet. Both entries carry a note
+saying so. The oracle is unchanged: `Excuse::BetrayedCut` matches only a stop exactly
+where a lost-sync cut had been, so it never excused this, which is correct — nothing
+here should be excused.
+
+**The pair, and where each half is asserted.** No existing variant covers the rule;
+`Variant::TrustsAStaleSegment` is today's reader kept beside the fix — on a backwards
+jump it keeps the earlier prefix and stops. **It cannot be paired at the sweep tier, and
+that was measured, not assumed:** run over the seek sweep's whole nightly band, seeds
+0..10000, the variant is caught on **1 seed — 3123, with the nightly's own message** —
+a catch rate of 0.01 %, three orders below D-061's five per cent. The shape needs a
+betrayed cut *and* a crash that drops the truncation *and* a later segment that re-issues
+the numbers. The honest pairing is therefore in three parts.
+
+- *The catch, deterministic.* Two hand-built on-disk states in
+  `crates/ananke-storage/tests/wal.rs` run the correct log and the variant side by side
+  at every tier: the nightly's own shape, a segment cut to nothing that came back whole
+  in front of the live one (13/14/15 holding 152..=164, the stale 166..=172 and the live
+  165..=177, head 172), and the shape a cut to a *shorter* length leaves, a stale tail
+  behind live records in the same segment with the tables further behind than the stale
+  numbers. The correct log returns the live records with no stop; the variant returns the
+  stale ones, stops, and cuts the live segment away.
+- *The seed.* 3123 is pinned in `sim/tests/engine.rs` with its mechanism: under the fix
+  the run still reaches a cut to nothing whose sync the disk lied about and is still seen
+  to supersede a resurrected segment, and the variant still fails that seed with the
+  violation it was pinned for. The situation survived the fix, so the pin asserts it
+  rather than its absence.
+- *The shape, in the sweep.* `sim/tests/wal.rs` counts the precondition. Measured over
+  the first thousand seeds of the WAL sweep on this tree: a cut of recovery's own made on
+  a sync the disk lied about on **765 of 1000, 76.5 %**, asserted at every tier (the
+  gate's twenty see none with probability 0.235²⁰ = 3 × 10⁻¹³); such a cut *to nothing*,
+  which resurrects a whole segment, on **60 of 1000, 6.0 %**, which by D-061 stays at the
+  hundred-seed tier (a hundred see none with probability 0.94¹⁰⁰ = 0.002, the gate's
+  twenty with 0.29). The rule *firing* is rarer than either and is asserted nowhere: 0 of
+  those thousand superseded. Every tier prints all three.
+
+**Rates measured on this tree.** WAL sweep, `ANANKE_SEEDS=1000`: betrayed cuts 765,
+betrayed cuts to nothing 60, supersedes 0. Engine seek schedule, the nightly's whole band
+**0..10000 run locally with the fix: 0 failures**, betrayed cuts 4393 (43.9 %), betrayed
+cuts to nothing 337 (3.4 %), and the supersede fired on **exactly one seed of the ten
+thousand — 3123**; the band 3000..3400 gives 180, 12 and the same single supersede. The
+same band under `TrustsAStaleSegment` gives the identical 4393 and 337 and the one
+failure, which is what "the variant changes only that seed" means in numbers. The
+precondition rate is schedule-independent within noise (the investigation measured 441
+and 30 per thousand under both `seek` and `phase_1`), and the rule's own rate, 1 in
+10 000 here and one in the first five thousand on the unmodified model, is why a
+thousand-seed premerge misses the failure about 85 % of the time and why no tier can
+assert the rule firing.
+
+**Nothing moved.** No pinned trace hash and no seed's schedule moves. The change alters
+recovery's decision only on a run that meets a backwards jump at a segment's first
+record: no RNG draw, no byte written to disk, no record framing, no new fault arm. The
+proof is the counter: on a seed where no supersede fires, no new code runs, so the trace
+is byte-identical to the tree before the fix. The WAL sweep's whole `Coverage` at a
+thousand seeds is unchanged (`stops_torn 2880, stops_bad_checksum 4074, stops_gap 54,
+discarded 6838, excused_lost_fsync 3782, excused_bit_rot 3192, excused_betrayed_cut 36`)
+with 0 supersedes, and the three WAL variants' catch rates with it; the engine's seek
+schedule supersedes on 1 of its first ten thousand seeds, so 9 999 of them are unmoved,
+and the one that moves is 3123, which is the seed being fixed. No other pinned seed's
+schedule moves and no pinned trace hash moves, so nothing else is owed a re-audit.
+
+**Alternatives.** *Make a cut to nothing a removal instead, as the head-gap branch does*:
+prophylactic, not a repair — it cannot help a log that already holds a resurrected
+segment, does nothing for a cut to a non-zero offset, and it breaks the pinned test
+`recovery_stops_at_a_gap_in_the_numbering`, which pins today's cut-to-nothing behaviour.
+*The same rebase guarded by `expected_head`, as the forward skip is*: repairs the
+nightly's shape but not the one where the tables are further behind than the resurrected
+numbers, which is the commoner of the two on disk. *A generation stamp per segment*: the
+only thing that closes the residual shape below, and the only thing that would let the
+reader answer "which writing is this" without inference; it costs a format change and is
+BACKLOG. *Numbering records by identity rather than position, so a discarded number is
+never re-issued*: it removes the conflict at its root, and with it D-018's "position, not
+identity" and every oracle that reads a segment's sync history by number.
+
+**Consequences.** One branch in the reader, and the reader is where it belongs: the
+writer and the disk are behaving correctly and a real filesystem may drop a
+not-yet-committed `ftruncate` exactly this way. The log now ships five variants where
+D-018 said four, and the fifth is the first that the crash sweep does **not** catch; the
+sweep asserts the shape it needs instead, and `tests/wal.rs` catches the variant itself.
+There is a residual shape no reader-side rule can see: a stale tail whose numbers *abut*
+the live segment's first number instead of overlapping it, where nothing in the numbering
+conflicts. It is harmless to engine state by construction — the fresh segment can only be
+numbered above the stale tail when `expected_head` was already above it, so those records
+were flushed, and replay skips everything at or below `flushed_seq` — but it is the limit
+of this fix and is an issue, not code. Two observability gaps the investigation tripped
+over are also issues, not code: the simulated filesystem emits no trace event when a
+crash drops a pending `PendingOp::Truncate`, so the very fault that makes this shape is
+invisible in the studio; and `Wal::open`'s `firsts` map records a segment's first number
+as the running total rather than the segment's own, an over-estimate that survives a
+supersede in the same direction, so `delete_segments_through` only ever deletes later
+than necessary. `Schedule::wal_variant` is new in `sim/engine.rs` so the pin can run seed
+3123 beside the variant; it is `Correct` everywhere else.
+
+---
+
+_Next entry: D-063. Add one before implementing anything not covered above._

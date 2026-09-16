@@ -20,6 +20,7 @@
 //! | `DirectoryEntryLost`                     | `log` `ananke.fs.dir-entry-lost`              |
 //! | `WalSegmentOpened` / `WalSynced`         | `log` `ananke.wal.segment-opened` / `.synced` |
 //! | `WalTruncated` / `WalRecovered`          | `log` `ananke.wal.truncated` / `.recovered`   |
+//! | `WalSuperseded`                          | `log` `ananke.wal.superseded`                 |
 //! | `HeadGap`                                | `log` `ananke.wal.head-gap`                   |
 //! | `MemtableRotated` / `MemtableFlushed`    | `log` `ananke.memtable.rotated` / `.flushed`  |
 //! | `FlusherFailed`                          | `log` `ananke.engine.flusher-failed`          |
@@ -450,6 +451,20 @@ fn convert(
             Some(Json::obj(vec![
                 ("segment", int(*segment)),
                 ("len", int(*len)),
+            ])),
+        ),
+        TraceEvent::WalSuperseded {
+            segment,
+            expected,
+            found,
+            dropped,
+        } => log(
+            "ananke.wal.superseded",
+            Some(Json::obj(vec![
+                ("segment", int(*segment)),
+                ("expected", int(*expected)),
+                ("found", int(*found)),
+                ("dropped", int(*dropped)),
             ])),
         ),
         TraceEvent::HeadGap {
