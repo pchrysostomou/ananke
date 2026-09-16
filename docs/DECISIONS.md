@@ -6591,8 +6591,10 @@ against server 3's 313.983572 ms bound (drift 273 952 ppm), over by 8.378288 ms,
 **297.706633 ms of the measured stretch is a window in which the server had no timer to
 fire**. The flag fell at the first record past the bound, 19.994418991 s — 8 ms before
 the restatement — and `sim/tests/raft.rs` panicked in the nightly's words. Ten of the
-leader's frames were aimed at the server inside that stretch and the partition at
-19.729 s dropped every one at the send, so nothing reset the check's clock by accident.
+leader's frames were aimed at the server inside that stretch — nine `AppendEntries` and
+one `InstallSnapshot`, all from server 1 — and the partition at 19.729 s dropped every
+one of them at the send as `Partitioned`, along with one client frame; nothing at all was
+delivered to server 3 in the window, so nothing reset the check's clock by accident.
 
 **Decision.** For the timer check, a completed install takes the server **out of the
 replay's running set** until its restatement puts it back — the same treatment a crash
@@ -6631,15 +6633,19 @@ rule 5), the variant this rule is written for. The narrowing takes nothing from 
 measured by running both replays over every seed of a band and diffing the gaps they find,
 violation text for violation text:
 
-| Band | `ResetTimerOnAnyRpc` | Gaps this entry adds | Gaps it removes |
+| Band, on the committed tree | Caught | Gaps this entry adds | Gaps it removes |
 | --- | --- | --- | --- |
-| seeds 0..1000 | caught on **344** (34.4 %), **330** of them by the timer check | **0** | **0** |
-| seeds 0..500 (the root-cause reading) | 172 caught on both trees, 163 by the timer check, the same seeds with the same text | 0 | 0 |
+| `ResetTimerOnAnyRpc`, seeds 0..1000 | **344** (34.4 %), **330** of them by the timer check | **0** | **0** |
+| `SnapshotWithoutCurrentLast`, seeds 0..1000 | 356 (35.6 %), 0 by the timer check | 0 | 0 |
+| `AdoptionAsBuilt`, seeds 0..1000 | 57 (5.7 %), 0 by the timer check | 0 | 0 |
+| the correct server, seeds 2000..3000 | 0 failures; 1 adoption-rescued gap, seed 2605 | 0 | **1** — the nightly's |
+| the correct server, seeds 5000..9000 | 0 failures; no adoption-rescued gap | 0 | 0 |
 
-`AdoptionAsBuilt` (16 of 300) and `SnapshotWithoutCurrentLast` (106 of 300) are identical
-on both trees too. At 34.4 % the catch is far above D-061's 5 % line, so nothing moves
-tier; and the pin below asserts the catch on one named seed, which is deterministic and
-runs at every tier.
+So over the 6 000 correct-server seeds and the 3 000 variant seeds run here, the arm's
+whole effect is the removal of one gap: seed 2605's. Nothing else it touches, in either
+direction, on any seed. At 34.4 % the pair's catch is far above D-061's 5 % line, so
+nothing moves tier; and the pin below asserts the catch on one named seed, which is
+deterministic and runs at every tier.
 
 **The pinned seed.** `seed_2605_which_the_nightly_found_is_an_adoption_window_and_still_
 catches_the_variant` asserts the mechanism both ways, not green (CLAUDE.md):
@@ -6659,15 +6665,15 @@ completed install is a status record so D-051's reasoning can name it; the sweep
 scenario, the faults and the protocol are untouched. **No schedule moves and no pinned
 trace hash moves**: seed 2605's run is byte-identical instant for instant before and after,
 `same_seed_gives_byte_identical_trace`, `the_seed_42_trace_is_written_for_the_studio` and
-the membership scenario's hash test pass, all thirteen pinned seeds pass, and
-`ResetTimerOnAnyRpc`, `AdoptionAsBuilt` and `SnapshotWithoutCurrentLast` catch the same
-seeds line for line. So nothing is owed a re-audit. Decision time's removal on the raft
+the membership scenario's hash test pass, every pinned-seed test in `sim/tests` passes —
+the nineteen `seed_*` tests, this entry's included — and `ResetTimerOnAnyRpc`,
+`AdoptionAsBuilt` and `SnapshotWithoutCurrentLast` catch the same seeds line for line. So nothing is owed a re-audit. Decision time's removal on the raft
 sweep is also unchanged — `ANANKE_SEEDS=2606` prints "removed 1 catches and added 0 /
 removed: seed 2313", the nightly's own — so D-051 still resolves it.
 
-**Measured on this tree.** The correct server over seeds **0..5000** with this fix: **0
-failures**, and exactly **one** seed with an adoption-rescued gap, 2605 — the same count
-the nightly's ten thousand give, one. Over 0..3000 there are 22 669 completed installs
+**Measured on this tree.** The correct server over seeds **0..5000** and again over
+**5000..9000** with this fix: **0 failures**, and in all nine thousand exactly **one** seed
+with an adoption-rescued gap, 2605 — the same count the nightly's ten thousand give, one. Over 0..3000 there are 22 669 completed installs
 whose restatement arrived while the check held the server up; twelve adoptions run longer
 than their server's entire timer bound (seed 79 server 3 at 1.1712 ×, then 2472, 1802,
 2515, 893, 771, 893, 159, 1546, 1681, 2515, 618) and each passes today **only** because

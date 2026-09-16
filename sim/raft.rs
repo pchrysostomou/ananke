@@ -2202,8 +2202,10 @@ impl Report {
     /// restated at 20.002065925 s, 322.362 ms after that contact and 8.378 ms past
     /// its 313.983572 ms bound, with the flag falling at the first record past the
     /// bound, 19.994418991 s. Ten of the leader's frames were aimed at the server
-    /// inside that stretch and the partition at 19.729 s dropped every one of them
-    /// at the send.
+    /// inside that stretch — nine `AppendEntries` and one `InstallSnapshot`, all
+    /// from server 1 — and the partition at 19.729 s dropped every one of them at
+    /// the send as `Partitioned`, with one client frame beside them; nothing was
+    /// delivered to server 3 in the window at all.
     // PROPOSED(D-063): a server adopting a completed install has no election timer.
     #[must_use]
     pub fn timer_gaps_rescued_by_adoption(&self) -> Vec<TimerGap> {

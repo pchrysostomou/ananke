@@ -155,10 +155,12 @@ fn seed_385_which_a_local_ten_thousand_seed_run_found_stays_green() {
 /// the server running throughout, so at 19.994418991 s — the first record past the
 /// bound, 8.4 ms before the restatement — it flagged 314.715 ms against server 3's
 /// 313.983572 ms bound and the nightly panicked in the words this test pins. Ten of
-/// the leader's frames were aimed at the server inside that stretch and the
-/// partition at 19.729 s dropped every one of them at the send, so nothing reset
-/// the check's clock by accident, which is what rescues the twelve other adoptions
-/// of 0..3000 that run longer than their server's whole bound.
+/// the leader's frames were aimed at the server inside that stretch — nine
+/// `AppendEntries` and one `InstallSnapshot`, all from server 1 — and the partition
+/// at 19.729 s dropped every one of them at the send as `Partitioned`, so nothing
+/// was delivered to server 3 in the window and nothing reset the check's clock by
+/// accident, which is what rescues the twelve other adoptions of 0..3000 that run
+/// longer than their server's whole bound.
 ///
 /// The fix is PROPOSED D-063, in the check alone: a completed install takes the
 /// server out of the replay's running set until its restatement puts it back, the
