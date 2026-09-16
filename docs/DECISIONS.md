@@ -6659,6 +6659,52 @@ there by the timer check, with two gaps, neither holding a completed install, an
 replays find the same two. The day the first assertion fails the seed's schedule has moved
 off the window and the pin is re-audited, not deleted.
 
+**What fences the arm, beyond the seed** (issue #65's first two items). A pin is one
+schedule, and a schedule holds only what it happens to contain: two mutations of this arm
+leave seed 2605's pin green, the whole raft binary green at a hundred seeds and all three
+catch rates unchanged — the arm could be widened to something plainly wrong, or replaced
+by the alternative this entry rejects, and no sweep would say so. Both are now held by
+checker-level tests over trace records written by hand (`sim/raft.rs`, `mod tests`), the
+shape the membership fold's unit tests use, which need no seed and move no schedule. The
+report they are built on has three servers whose clocks run true, so each bound is 400 ms.
+
+- **`a_snapshot_a_server_took_itself_leaves_its_election_timer_running`** — the extent. A
+  server up at 0 ms, silence after it, one `RaftSnapshot { taken: true }` at 200 ms and no
+  restatement: the gap at 450 ms is still reported, with `adoptions: 0`, because a snapshot
+  a server takes of its own accord retires no incarnation — it is the live core's own work
+  — and leaves its election timer counting. The same trace with the take replaced by a
+  completed install, and that install's restatement at 500 ms, is excused: `timer_gaps`
+  under `ALL` is empty while `timer_gaps_rescued_by_adoption` is exactly that stretch with
+  `adoptions: 1`, the mechanism both ways as the pin is. And 450 ms of silence *after* the
+  restatement is a gap again, since the restatement, so the exemption is seen to close
+  where it opens rather than leaving the server blind for good.
+- **`a_coreless_window_longer_than_the_bound_is_removed_not_measured_from_the_completion`**
+  — the alternative. The honest case is one where the coreless window *alone* outlasts the
+  bound, which a reset at the completion would still measure and this entry's removal does
+  not: the install completes at 100 ms, the restatement lands at 700 ms, and a record sits
+  inside the window at 650 ms. The test asserts that the window outlasts the bound by
+  itself, so the distinction is the assertion and not an accident of the numbers; that
+  `timer_gaps(ALL)` is empty, a server with no incarnation not being measured against a
+  timer that does not exist; and that the check as it stood on 1a1cad2
+  (`WITHOUT_ADOPTION`) flags the stretch.
+
+**What the mutations showed.** Each was applied in a throwaway copy outside the worktree
+and run against `ananke-sim`'s whole test set in release at the gate's twenty seeds, with
+`--no-fail-fast` so every target reports:
+
+| mutation | the test that fails, and its words |
+| --- | --- |
+| `taken: false` dropped from the arm's pattern, so every `RaftSnapshot` excuses (issue #65's own mutation) | `a_snapshot_a_server_took_itself_…`: "a snapshot the server took is not a completed install and excuses nothing", `left: []`, `right: [TimerGap { server: 1, since: Instant(0ns), at: Instant(450ms), record: 2, installs: 0, restatements: 0, adoptions: 0 }]` |
+| the arm's body `clocks.reset(*server, at)` in place of `up.remove`: the clock reset at the completion, this entry's rejected alternative | `a_coreless_window_…`: "a server with no incarnation is not measured: `[TimerGap { server: 1, since: Instant(100ms), at: Instant(650ms), record: 2, … }]`" |
+
+In each run everything else is green — the other eighteen lib tests, the run's *other* new
+test among them, and every sweep binary: echo 5, engine 18, parallel 1, raft 43 (seed
+2605's own pin included, which is the hole), wal 6. So each mutation fails exactly one
+test and it is the one written for it, where before this commit each failed none. The first two items of issue #65 are closed by this; its third — the
+check being more forgiving than the server on install chunks, D-030's arm excusing a gap
+the real follower does have — is pre-existing, is untouched here, and stays open there. It
+is also the second issue note below.
+
 **Nothing moved.** The change is confined to `Report` — the replay, its arms, `TimerGap`,
 `TimerResets` and one predicate — and to `Report::timer_removal`, which learns that a
 completed install is a status record so D-051's reasoning can name it; the sweep, the

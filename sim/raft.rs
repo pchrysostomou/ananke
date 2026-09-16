@@ -5097,6 +5097,185 @@ mod tests {
         assert_eq!(alone.isolation_keeps_the_term_by_cause(), Ok(()));
     }
 
+    /// A `RaftSnapshot` on `server` at `at`: an install it completed, which ends the
+    /// incarnation, or a snapshot it took of its own accord, which ends nothing.
+    // PROPOSED(D-063): a server adopting a completed install has no election timer.
+    fn snapshot(at: Instant, server: u64, taken: bool) -> TraceRecord {
+        record(
+            at,
+            at,
+            Some(server),
+            TraceEvent::RaftSnapshot {
+                server,
+                last_index: 374,
+                last_term: 1,
+                taken,
+            },
+        )
+    }
+
+    /// The records a restatement traces at one instant, in `start_store`'s stable
+    /// order (D-029): the store's snapshot re-traced, the recovery — which is what
+    /// tells that re-trace from an install's completion — and the `RaftTerm` the new
+    /// incarnation resumes in, whose first tick arms its election timer.
+    // PROPOSED(D-063): a server adopting a completed install has no election timer.
+    fn restatement(at: Instant, server: u64) -> Vec<TraceRecord> {
+        vec![
+            snapshot(at, server, false),
+            record(
+                at,
+                at,
+                Some(server),
+                TraceEvent::RaftRecovered {
+                    server,
+                    term: 1,
+                    applied: 374,
+                    last_index: 374,
+                    incarnation: 1,
+                },
+            ),
+            record(at, at, Some(server), term(server, 1, "follower", None)),
+        ]
+    }
+
+    /// Nothing happening at `at`: a record for the replay to read the bound at, as a
+    /// run's own trace always has one.
+    // PROPOSED(D-063): a server adopting a completed install has no election timer.
+    fn silence(at: Instant) -> TraceRecord {
+        record(at, at, None, TraceEvent::TimeAdvanced { to: at })
+    }
+
+    /// What the exemption covers, in both directions — issue #65's first hole, which
+    /// no seed holds. The arm is written for a *completed install*, which ends the
+    /// incarnation (`Next::Reinstall`, `crates/ananke-raft/src/node.rs`) and leaves
+    /// the server with no core and no election timer until its restatement. A
+    /// snapshot a server takes of its own accord ends nothing: its core is still
+    /// there and still counting, so a stretch holding one is still a gap. Widening
+    /// the arm to fire on every `RaftSnapshot` leaves seed 2605's pin green, the raft
+    /// binary green at a hundred seeds and all three catch rates unchanged; it fails
+    /// on this test's first case.
+    // PROPOSED(D-063): a server adopting a completed install has no election timer.
+    #[test]
+    fn a_snapshot_a_server_took_itself_leaves_its_election_timer_running() {
+        // Server 1 starts at 0 ms and hears from no one after it. At 200 ms it takes
+        // a snapshot of its own accord; nothing restates it, because nothing ended.
+        let took = report(
+            vec![
+                record(ms(0), ms(0), Some(1), term(1, 1, "follower", None)),
+                snapshot(ms(200), 1, true),
+                silence(ms(450)),
+            ],
+            Vec::new(),
+        );
+        assert_eq!(
+            took.timer_gaps(TimerResets::ALL),
+            vec![TimerGap {
+                server: 1,
+                since: ms(0),
+                at: ms(450),
+                record: 2,
+                installs: 0,
+                restatements: 0,
+                adoptions: 0,
+            }],
+            "a snapshot the server took is not a completed install and excuses nothing",
+        );
+        assert_eq!(
+            took.timers_fire(),
+            Err(took.timer_gaps(TimerResets::ALL)[0].violation())
+        );
+
+        // The same silence with the take replaced by an install the server
+        // completed, and the restatement that ends the adoption: excused, and the
+        // check as it stood on 1a1cad2 reports it — the mechanism both ways.
+        let mut records = vec![
+            record(ms(0), ms(0), Some(1), term(1, 1, "follower", None)),
+            snapshot(ms(200), 1, false),
+            silence(ms(450)),
+        ];
+        records.extend(restatement(ms(500), 1));
+        let completed = report(records.clone(), Vec::new());
+        let gaps = completed.timer_gaps(TimerResets::ALL);
+        assert!(
+            gaps.is_empty(),
+            "the adoption is not measured against the bound: {gaps:?}",
+        );
+        assert_eq!(
+            completed.timer_gaps_rescued_by_adoption(),
+            vec![TimerGap {
+                server: 1,
+                since: ms(0),
+                at: ms(450),
+                record: 2,
+                installs: 0,
+                restatements: 0,
+                adoptions: 1,
+            }],
+        );
+
+        // And the exemption ends at the restatement, which re-admits the server with
+        // a fresh clock: the next stretch past the bound is a gap since 500 ms.
+        records.push(silence(ms(950)));
+        assert_eq!(
+            report(records, Vec::new()).timer_gaps(TimerResets::ALL),
+            vec![TimerGap {
+                server: 1,
+                since: ms(500),
+                at: ms(950),
+                record: 6,
+                installs: 0,
+                restatements: 0,
+                adoptions: 0,
+            }],
+            "a restated server is running again and measured again",
+        );
+    }
+
+    /// Why a completed install takes the server out of the replay's running set
+    /// rather than resetting its clock — the alternative this entry rejects, which
+    /// seed 2605's pin does not tell apart (issue #65's second hole). The honest
+    /// case is one where the coreless window *alone* outlasts the bound: the install
+    /// completes at 100 ms and the restatement lands at 700 ms, 600 ms against a
+    /// 400 ms bound, so a clock reset at the completion would still flag the window
+    /// at 650 ms — measuring a server that has no incarnation to campaign with
+    /// against a timer that does not exist. Removal reports nothing, and the
+    /// restatement's `RaftTerm` starts the next incarnation's count at 700 ms.
+    // PROPOSED(D-063): a server adopting a completed install has no election timer.
+    #[test]
+    fn a_coreless_window_longer_than_the_bound_is_removed_not_measured_from_the_completion() {
+        let mut records = vec![
+            record(ms(0), ms(0), Some(1), term(1, 1, "follower", None)),
+            snapshot(ms(100), 1, false),
+            silence(ms(650)),
+        ];
+        records.extend(restatement(ms(700), 1));
+        records.push(silence(ms(1000)));
+        let report = report(records, Vec::new());
+        assert!(
+            ms(700).duration_since(ms(100)) > report.timer_bound(1),
+            "the window from the completion to the restatement outlasts the bound by \
+             itself, so a reset at the completion measures past it",
+        );
+        let gaps = report.timer_gaps(TimerResets::ALL);
+        assert!(
+            gaps.is_empty(),
+            "a server with no incarnation is not measured: {gaps:?}",
+        );
+        assert_eq!(
+            report.timer_gaps_rescued_by_adoption(),
+            vec![TimerGap {
+                server: 1,
+                since: ms(0),
+                at: ms(650),
+                record: 2,
+                installs: 0,
+                restatements: 0,
+                adoptions: 1,
+            }],
+            "the check as it stood on 1a1cad2 flags the window",
+        );
+    }
+
     /// A change decided at the very instant an isolation began and traced after it is
     /// before the window by decision time and inside it by durability time, so it is
     /// a straddle: the boundaries the two readings draw (D-051).
