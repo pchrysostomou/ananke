@@ -4772,7 +4772,9 @@ seeds on the same laptop the same day, so it now costs 2.94 times as much.
 *The nightly.* On 1ef6d7e (run 34901799989) the engine binary took 1 346.89 s at ten
 thousand seeds and the whole `cargo test` step 2 h 1 min 15 s, against the job's
 300-minute timeout. Scaled by the same ratio, the engine binary would take about 3 958 s,
-some 44 minutes more, and the step about 2 h 45 min, a little over half the timeout. The
+some 44 minutes more, and the step about 2 h 45 min, a little over half the timeout
+(**issue #57**, filed on the owner's instruction of 2026-09-15: shard the ten thousand
+across parallel jobs, or split the job per sweep, before it starts timing out). The
 scaling overstates the deep-levels test, which runs a thousand deep seeds at every nightly,
 took 11.38 s of them on this laptop, and whose rounds rose by a seventh (above), not by the
 sweep's ratio; it leaves out what the other Stage A lanes add.
@@ -4804,6 +4806,10 @@ moved a seed's schedule; the sweep's did.
 ---
 
 ## PROPOSED D-056 — `SimEnv`'s send queue: bounded, drop-oldest, per sending socket and destination, drained at a modelled link rate
+
+*Decided in part: the tier of `RefusalNotDurable`'s catch and the pinning of its first
+seed are the owner's answer 1 of 2026-09-15 and are decided. The queue model itself is
+proposed.*
 
 **Context.** D-015 gives every destination of a socket a bounded queue whose overflow
 drops the oldest frame with a `MessageDropped` event. `RealEnv` has it: one queue of
@@ -4957,7 +4963,11 @@ this tree's 16 of 1000 a hundred still miss with probability 0.20. A thousand mi
 probability 0.9868^1000 = 1.7 × 10^-6. Below a thousand seeds the assertion fails a tree with
 nothing wrong on the draw alone; at a thousand the statistics support it. This supersedes D-044's
 hundred-seed tier for this test alone; D-044's fix, its fault and its firing at every tier
-stand.
+stand. It supersedes SHARD.md §12's Stage B plan for the same assertion
+(docs/SHARD.md:2348, "`AdoptionAsBuilt` and `RefusalNotDurable`: … the catch from the
+hundred-seed tier"), as the approved plan's text; `AdoptionAsBuilt` stays where the plan
+puts it. SHARD.md's list does not mention the two membership counters D-058 and D-061
+move, `reverts_to_a_prefix` and the election while joint; those entries are the record.
 
 **Alternatives.** *No write time*, a queue that only counts frames sent at one instant:
 nothing drains it, so it could never fill against a rate, and its drops would be an
@@ -5052,6 +5062,10 @@ this entry is what it switches to.
 ---
 
 ## PROPOSED D-058 — The membership scenario past the snapshot threshold
+
+*Decided in part: which part of issue #46 is met and the tier of `reverts_to_a_prefix`
+are the owner's answers 3 and 4 of 2026-09-15 and are decided. The scenario's shape is
+proposed.*
 
 **Context.** Issue #46 and SHARD.md's Q34, approved: extend `sim/membership.rs` past the
 snapshot threshold before `sim/move.rs`, so that during 3 → 5 → 3 a learner or joining
@@ -5202,10 +5216,11 @@ met part below.
   thousand-seed tier, `scripts/premerge.sh` and the nightly, and at no lower tier. It stays
   printed with the coverage at every tier. It was asserted from a hundred seeds, where the
   lane's tree counted 4; on the tree with the queue a hundred count 1, on seed 97, and a thousand
-  see it on 28 seeds. At that rate, 2.8 %, a hundred seeds see none with probability
-  0.972^100 = 0.058 and the gate's twenty with 0.57. Below a thousand the assertion would
-  fail a tree with nothing wrong on the draw alone; a thousand see none with probability
-  0.972^1000 = 4.6 × 10^-13. The counter is installs taking a receiver back to an older
+  see it on 28 seeds. On the tree with the key layout (D-060) a thousand see it on 25 and a
+  hundred on 3, seeds 40, 94 and 95. At that rate, 2.5 %, a hundred seeds see none with
+  probability 0.975^100 = 0.080 and the gate's twenty with 0.60. Below a thousand the
+  assertion would fail a tree with nothing wrong on the draw alone; a thousand see none
+  with probability 0.975^1000 = 1.3 × 10^-11. The counter is installs taking a receiver back to an older
   configuration, not the revert floor #56 holds.
 
 **Alternatives.** *The threshold alone*: 39 seeds in 1 000 without a learner-phase feed.
@@ -5394,7 +5409,9 @@ The simulated disk sets further limits:
 
 Any engine key can be lost with a dropped table or a damaged log. Under
 `RefusalNotDurable` a dropped table can even be laundered into a store with no damage
-(D-044, seed 687; seed 119's pin). So a version kept only in the engine cannot tell
+(D-044, seed 687; seed 158's pin, which asserts the laundered store's restatement as
+built — seed 119's pin asserts the absence of any refusal on its run). So a version kept
+only in the engine cannot tell
 "format 2 that lost its version" from "format 1 that lost state".
 
 **Decision.** Every code site carries `// PROPOSED(D-060)`, and the refusal's sites carry
@@ -5543,8 +5560,13 @@ bytes as other versions.
   `two_group_prefixes_share_one_engine_and_nothing_else`,
   `a_log_key_of_another_length_under_the_log_purpose_refuses_the_open`,
   `user_keys_are_tenant_2_and_tenant_1_stays_empty`.
-- A catch rate below 5% of a test's seeds asserts at the premerge tier (the owner's rule
-  of 2026-09-15); the heal's pair is asserted at 5% of its 40 seeds and measured at 7.5%.
+- The heal's pair is asserted *caught*, over 160 seeds, and its rate is printed beside it
+  and not asserted. The owner's rule of 2026-09-15 moves a thin catch to the tier whose
+  seeds support it, and a fixed seed set inside a crate test has no tier to move to: it
+  runs the same seeds at every one (D-061's carve-out). A floor on the rate of such a set
+  fails a tree with nothing wrong the next time the schedules are redrawn, which is what
+  this entry did to every one of them. Measured: 7 of 160 unreadable under the pair,
+  against the in-place heal's 0 of 320. The set is listed in D-061's table.
 
 **What moved.**
 - **Why.** The record's operations and inodes, the stream's extra file and eight more bytes
@@ -5555,8 +5577,12 @@ bytes as other versions.
   S and N, D-056's queue, D-058 and D-061), and on the tree of this commit: the raft
   scenario's seed-42 trace hashes `64fc3b553a9e80c2` before and `ab289ace35a8415f` after,
   the membership scenario's `bac1e6936795e5c0` and `9c88d575d39acd76`, and the re-seed
-  scenario's `84d6b14ed6d684ab`/`eedef54307ed8c23` and `0d9167f75474e730`/`d8d63ed0109360ec` (the trace
-  body as `moirae_trace::trace_hash` takes it; `scratchpad stage-a/l/reaudit/hashes-*.log`).
+  scenario's `84d6b14ed6d684ab`/`eedef54307ed8c23` and `0d9167f75474e730`/`d8d63ed0109360ec` (the whole trace as
+  written, header included, as `moirae_trace::trace_hash` takes it; `scratchpad
+  stage-a/l/reaudit/hashes-*.log`). Both columns are measured the same way on the two
+  trees, so the comparison holds; unlike echo's golden, which `sim/tests/echo.rs` takes
+  over the trace *without* its header, these values move with the crate version in the
+  header and are not goldens.
   On the lane's own base, 903f37c, before the queue, the raft hash was `810bcc9bb59159e2`.
 - **Not moved,** measured on the same two trees: `sim/engine.rs` seed 42, `sim/wal.rs` seed
   42 and echo's golden, `fcbe82ee7a0ba672`, which `sim/tests/echo.rs` asserts and which is
@@ -5576,9 +5602,9 @@ run, its trace read, and its assertions and its prose rewritten to what the seed
 | 7381 | the two floor rules agree; one refusal, server 2's at 12.575 s | the same; one refusal, server 1's at 6.396598792 s for lost state (table 1), and `floor_lowering_installs` empty, which is the agreement itself |
 | 6325 (correct and as built) | no crash inside an adoption window; 8 and 9 windows | the same absence; 6 and 6 windows, and the schedule's first crash now lands 691 ms *before* server 1's next adoption under the correct server and 712 ms before it as built |
 | 5909, correct | D-042's refusal, reset and re-seed on server 1 | **the mechanism, on server 3**: refused at 9.793751132 s, progress reset at 9.798229515 s, re-seeded at 10.218206571 s |
-| 5909, the pair and each half | stale progress under `IgnoreIncarnation` alone; none under the pair | **the mechanism on each**: server 3 stale under `IgnoreIncarnation` (leader 1 of term 9, 229 matched, 105 probes, 106 rejections), server 1 stale under the pair with server 1 alone uncounted after the heal, nothing stale under `SharedSnapshotDir`; no run takes a snapshot, so the stream half is out of reach on all three |
-| 132 | the pair's liveness catch, with the wedge's mechanism | **the absence, with the reason**: the pair, both halves and the correct server all pass; no run takes a snapshot and the pair's two runs are refusal-free, so the pair's trace is the stream half's record for record. The search over seeds 0..1000 found the pair caught on **0 of 1000** and each half on 0 |
-| 680 | the pair passes; `IgnoreIncarnation` alone leaves server 1 stale | the pair now leaves server 3 stale and only it uncounted after the heal; `SharedSnapshotDir` alone and the correct server refuse server 3 at 17.852606007 s and 12.162591955 s, reset and re-seed it; no run takes a snapshot |
+| 5909, the pair and each half | stale progress under `IgnoreIncarnation` alone; none under the pair | **the mechanism on each**: server 3 stale under `IgnoreIncarnation` (leader 1 of term 9, 229 matched, 105 probes, 106 rejections), server 1 stale under the pair with server 1 alone uncounted after the heal, nothing stale under `SharedSnapshotDir`; no run takes one index twice (32, 33, 18 and 37 takes), so the stream half is out of reach on all three |
+| 132 | the pair's liveness catch, with the wedge's mechanism | **the absence, with the reason**: the pair, both halves and the correct server all pass; no run takes one index twice (31, 31, 15 and 24 takes) and the pair's two runs are refusal-free, so the pair's trace is the stream half's record for record. The search over seeds 0..1000 found the pair caught on **0 of 1000** and each half on 0 |
+| 680 | the pair passes; `IgnoreIncarnation` alone leaves server 1 stale | the pair now leaves server 3 stale and only it uncounted after the heal; `SharedSnapshotDir` alone and the correct server refuse server 3 at 17.852606007 s and 12.162591955 s, reset and re-seed it; and under the pair and the stream half alone the seed **does** reach the stream half's shape — 73 takes, 37 at an index already taken, 7 of those under a live stream, every one of them a stream the follower still installs at afterwards, which the pin asserts |
 | 687 | as built, the first half; under the correct server, the quiesce | as built, the first half again (table 44 dropped, refused at 18.109367393 s, two crashes on the refused server, two restarts, nothing laundered); under the correct server **the absence with its reason** — no table dropped, no engine quiesced, no lost-state refusal, its two refusals being damage found before the engine could lose anything |
 | **158 (new)** | — | **the pin `RefusalNotDurable` needed**: the first of the thousand's 9 catches, with the laundered store's restatement as built (table 87, manifest 15 without it, segments deleted, a clean open at applied 423) *and* D-044's own mechanism under the correct server on the same seed (table 94, the engine quiesced at 21.378303251 s, the refusal traced at 21.382950125 s, three crashes on the refused server each refused again on the durable mark, nothing flushed until the install at 22.202624757 s) |
 | 119 | `RefusalNotDurable`'s catch | **the absence with its reason**: no store is refused at all on the run, so the variant has nothing to change and its trace is the correct server's record for record |
@@ -5595,7 +5621,19 @@ beside it; `seed_132_pins_the_combined_variant_…` becomes
 `seed_132_which_pinned_the_combined_variant_before_the_layout_reaches_no_wedge`; and seeds
 1 and 4 of the term-raise schedule exchange their test names with their shapes.
 `assert_stream_wedge`, the helper that read the wedge off seed 132's trace, is removed with
-the wedge: no seed of the first thousand reaches it on this tree.
+the wedge: no seed of the first thousand is *caught* on this tree.
+
+*Corrected after this entry landed.* The rows above for seeds 5909, 132 and 680 read "no
+run takes a snapshot" from `Report::snapshot_takes`, which pairs a take's record with the
+checkpoint its take wrote. This entry's own checkpoint format record put an awaited write
+between those two records, and the fold asked them to carry the same instant, so it
+answered empty on every seed of every variant and the three pins asserted nothing. The
+fold pairs by node and claim now, the rows say what the seeds do, and the wedge's stream
+half turns out to be built often: under `SharedSnapshotDir` a re-take lands under a live
+stream on 180 of the first thousand seeds and the follower never installs at that index
+afterwards on 135 of them, against the correct server's 0 of a thousand. None of them
+stalls a commit, so none is caught; the sweep asserts the shape from the hundred-seed
+tier.
 
 **Alternatives.**
 - *The version as the engine key `0`, read after the engine's open and after lost state*
@@ -5653,11 +5691,19 @@ the wedge: no seed of the first thousand reaches it on this tree.
   in the tree, so this entry is the record until one does.
 - A crash in a fresh store's first start can leave it refused as lost exactly where it
   could before — the engine's own rule for a manifest without a `CURRENT` (D-024) — and
-  never refused for its format.
+  never refused for its format. The record's *own* cost in re-seeds is counted apart from
+  the engine's and is **0 of 200 seeds** on a disk that keeps its syncs; at `p_durable`
+  0.7, which no Raft scenario models, it is 7 of 200.
 - Under a lost fsync, which the Raft scenarios do not model, a new node's record may be
   torn beside its first engine files. It then re-seeds.
 - A directory holding foreign entries (`lost+found`, `.DS_Store`) is refused. Operators
-  point the store at an empty directory.
+  point the store at an empty directory. The refusal names at most eight of them.
+- A healthy format-2 store whose `RAFT-FORMAT` file is *removed* — not damaged, removed —
+  is refused as 0.3.0's and the server stops for good, where a store whose record is
+  damaged beside it is lost state and re-seeds. Nothing in this build removes it (the
+  sweeps enter only `snap-*`, `is_store_file` excludes it, the as-built copy loop skips it)
+  and a synced directory entry is never lost in the simulator, so it is an operator's
+  action or a real filesystem's loss. Question 1 below is where that asymmetry is put.
 - Clusters on different formats cannot stream snapshots to each other. The next format bump
   needs a rolling-upgrade decision.
 - Stage B's per-range stream must carry and check a record (the permanence rule).
@@ -5670,8 +5716,12 @@ the wedge: no seed of the first thousand reaches it on this tree.
 - A variant pair not swept today, `{SharedSnapshotDir, SnapshotWithoutCurrentLast}`, could
   stage a `CURRENT` from a stream whose listing lacked the record. The adoption would then
   stop the server rather than adopt.
-- SHARD.md's citations of store.rs and apply.rs describe the tree before this commit. The
-  approved plan is not edited.
+- SHARD.md's citations of store.rs and apply.rs describe the tree before this commit, and
+  so do its sixteen citations of RAFT.md lines 450 and above
+  (`grep -nE "RAFT\.md:(4[5-9][0-9]|[5-9][0-9][0-9])" docs/SHARD.md`): item 1's correction
+  and this commit inserted at RAFT.md +455, +466, +541, +702 and +708 and took the file
+  from 721 lines to 770, so those citations land a few lines off or on other prose. The
+  approved plan is not edited; the integrator or the owner refreshes them.
 - Issue notes, not code:
   - the store directory's entry is never fsynced in its parent;
   - `valid_name` accepts `RAFT-*` chunk names;
@@ -5679,7 +5729,12 @@ the wedge: no seed of the first thousand reaches it on this tree.
     `std::fs::metadata` and `std::fs::set_permissions` are banned outside `ananke-env`
     (clippy.toml, `scripts/check-direct-io.sh`); it checks every name, size and byte.
 
-**Questions for the owner.** Each is resolved above the conservative way. None blocks.
+**Questions for the owner.** Each of questions 1 to 5 is resolved above the conservative
+way and none of them blocks. Question 6 is different: it is the escalation SHARD.md
+§12's own rule (docs/SHARD.md:2356-2364) makes when a schedule move leaves a pair with no
+catch, so what is conservative about it — leaving the pair asserted-absent on seed 132 —
+is stated inside the question rather than settled above it, and whether it blocks Stage A's
+exit is the owner's call, not this entry's.
 1. **An unreadable record beside a store.** "Refuse newer" and "nothing written to a
    refused store" cannot be checked when the record no longer says its version. D-044 and
    the requirement that a format-2 store whose version record is lost still re-seeds call
@@ -5697,6 +5752,13 @@ the wedge: no seed of the first thousand reaches it on this tree.
    every variant, `AdoptionAsBuilt` and `RefusalNotDurable` included. Confirm.
 5. The record's write, heal and rewrite are untraced, like the marker's. A
    `RaftFormatRecorded` event would add an ananke-env variant and a moirae line. Add one?
+6. **The pair `{IgnoreIncarnation, SharedSnapshotDir}` has no catch on this tree.** The
+   search SHARD.md:2356-2364 asks for at a schedule move found the pair caught on 0 of the
+   first thousand seeds and each half on 0, so seed 132 asserts an absence and no seed
+   pins the pair's catch. The plan says that goes to the owner, and this is it. The stream
+   half's *shape* is reached often (135 of a thousand, above) and the sweep now asserts it;
+   what is missing is a catch. Leave it asserted-absent, search the nightly's ten thousand,
+   or aim an arm at the wedge as `RefusedCountsForQuorum` has a directed scenario?
 
 ---
 
@@ -5762,7 +5824,9 @@ tier it is asserted at; "~0" is below 10^-12.
 
 **The audit.** Seeds seen are given at the gate, CI, the premerge and the nightly. Tiers are
 "every" (from the gate's twenty), "≥ 100", "≥ 1 000" and "≥ 10 000". Line numbers are on the
-commit that lands this entry.
+commit that lands this entry, 8717a71; a3beb04 moved `sim/tests/raft.rs` and ananke-raft's
+test binaries, and the review commits after it moved them again, so read the names rather
+than the numbers.
 
 | Assertion | Where | Seeds seen | At 1 000, 2ec4bf7 | At 10 000, nightlies | Tier before → after | P(none) at its tier |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -5798,6 +5862,7 @@ commit that lands this entry.
 | `IgnoreIncarnation`: a refused follower re-seeded and applying | raft.rs:2358 | 20 / 100 / 1 000 / 10 000 | 659 | 6 353 | ≥ 100 → ≥ 100 | ~0 |
 | `SharedSnapshotDir`'s firing: a re-take at an index already taken | raft.rs:2460 | 20 / 100 / 1 000 / 10 000 | 525 | 5 292 | every → every | 3.4 × 10^-7 |
 | `SharedSnapshotDir`'s aimed arm reached its stream | raft.rs:2464 | 20 / 100 / 1 000 / 10 000 | 143 (14.3 %) | 1 472 (14.7 %) | every → every; for the owner, below | **0.046** |
+| **`SharedSnapshotDir`'s stream half: a re-take under a live stream the follower never installs at afterwards** (added after this entry, by D-060's re-audit of `snapshot_takes`; `a_leader_that_shares_one_snapshot_directory_…`) | the same sweep | 20 / 100 / 1 000 / 10 000 | not measured: the fold was vacuous until the re-audit. On this tree **135 (13.5 %)**, and 10 of the first hundred, against the correct server's 0 of 1 000 | not measured on those trees | **new → ≥ 100** | 5.0 × 10^-7 at 100; 0.055 at 20, which is why the gate's twenty do not carry it |
 | `SharedSnapshotDir` caught by the liveness check | raft.rs:2469 | 20 / 100 / 1 000 / 10 000 | 2 (0.2 %) | 4 (0.04 %) | ≥ 10 000 → ≥ 10 000 | 2.0 × 10^-9; 0.018 at the nightlies' rate, below |
 | Lease: drift beyond the bound, the guard revoked | raft.rs:2602, 2603 | 20 / 100 / 1 000 / 10 000 | 503, 503 | 5 023, 5 023 | every → every | 8.5 × 10^-7 |
 | **`LeaseTrustsTheClock` caught (a stale read)** | raft.rs:2615 | 20 / 100 / 1 000 / 10 000 | 41 (4.1 %) | 472 (4.72 %) | **every → ≥ 1 000** | 0.43 at 20 → 6.6 × 10^-19 |
@@ -5835,21 +5900,31 @@ stands.** What changed:
 - `RefusalNotDurable`: caught on **9 of 1 000 (0.9 %)**, against 16, firing on 340 seeds
   (347). Already at the thousand-seed tier by the owner's decision (D-056); the first catch
   moves from seed 119 to **seed 158**, which the pin follows.
-- `LeaseTrustsTheClock`: **37 stale reads of the 503 seeds beyond the drift bound (3.7 %)**,
-  against 41 (4.1 %). Already moved to the thousand-seed tier by this entry; the firing,
-  503 and 503, is unchanged.
+- `LeaseTrustsTheClock`: **37 stale reads on the thousand seeds (3.7 %)**, against 41
+  (4.1 %). Already moved to the thousand-seed tier by this entry; the firing is unchanged —
+  the drift exceeds the bound on 503 seeds and the guard revokes on all 503. The rate is
+  over the tier's seeds, as every row of the table is; 37 of the 503 exceeded seeds would
+  be 7.4 %, and is not the number the rule reads.
 - `SharedSnapshotDir`: **caught on 0 of 1 000**, against 2. Its catch is asserted only at
   the nightly's ten thousand, so nothing fails; its firing is unchanged — a re-take at an
   index already taken on 525 seeds — and the aimed arm reaches its stream on **153 (15.3 %)**
-  against 143. This sharpens the second open question below: on this tree the liveness
-  catch's rate is at most 0.1 %, and the next nightly is what measures it.
+  against 143. A third firing measure was added after this entry, once `snapshot_takes` was
+  repaired: the re-take landing under a live stream the follower never installs at
+  afterwards, D-043's scrambled stream, on **135 of 1 000 (13.5 %)** and 10 of the first
+  hundred against the correct server's 0, asserted from the hundred-seed tier. This
+  sharpens the second open question below: on this tree the liveness catch's rate is at
+  most 0.1 %, and the next nightly is what measures it.
 - `SingleMajorityInJointConsensus` 236 (296); D-050's term-raise shape reached on 276 (298);
   the incremental checker 59 of 100 (61); `IgnoreIncarnation`'s state, a refused follower
   re-seeded and applying, on 626 (659); the quorum scenario's silent step-downs on the
   sweep's disk 886 (844).
-- Membership: `elections_while_joint` 34 events (34), `reverts_to_a_prefix` 25 (28),
-  `config_reverts` 62 (56), `step_downs_outside_new` 372 (390), installs adopted 7 468, and
-  a joining server fed a snapshot on every one of the thousand seeds.
+- Membership, in the unit the 5 % rule reads, which is seeds: `elections_while_joint` on
+  **34 seeds, 3.4 %** (31 seeds, 3.1 %, and the same 34 events), `reverts_to_a_prefix` on
+  **25** (28), `config_reverts` on **58 seeds, 5.8 %** (56, 5.6 %) over 62 events (57),
+  `step_downs_outside_new` on 372 (390); installs adopted 7 468, and a joining server fed a
+  snapshot on every one of the thousand seeds. `config_reverts` is the row nearest the
+  line and stays above it, where a hundred seeds see none with probability
+  0.942^100 = 0.0025.
 - The raft coverage counters asserted from a hundred seeds are all far above their line:
   refusals 3 444, torn writes 680, snapshots installed 19 496, streams resumed 68 261,
   re-seeded servers 4 070, re-seeds completed 803, adoptions 9 049, progress resets 2 350.
@@ -5861,7 +5936,15 @@ These are not draws, and are left as they are:
 - `RefusedCountsForQuorum` and `RefusedNeverCounts` caught on every seed are assertions of
   every seed.
 
-The fixed seed sets in crate tests run the same seeds at every tier, measured on this tree:
+The fixed seed sets in crate tests run the same seeds at every tier. The two ananke-raft
+rows were the pre-layout tree's when this entry landed and are re-measured here, on the
+tree with the key layout; the store's row is the thinnest margin in the table, three seeds
+above its floor, and the three `tests/format.rs` rows were added by the review that
+re-measured them. The five ananke-raft figures are printed by their own tests at every
+tier (`store.rs:296`, `snapshot.rs:997`, `format.rs:787`, `:836` and `:953`), so a redraw
+that moves one is visible in any test run; the five older rows keep their counts inside
+assertion messages, which print only on failure, and their figures are the ones measured
+here:
 
 | Assertion | Where | Seeds | Measured | P(none) over its seeds |
 | --- | --- | --- | --- | --- |
@@ -5870,8 +5953,11 @@ The fixed seed sets in crate tests run the same seeds at every tier, measured on
 | A rename lost and a rename kept | tests.rs:1639 | 64 | lost on 32, kept on 32 | 1.1 × 10^-19 |
 | An unsynced create vanished | tests.rs:1675 | 32 | 12 | 2.9 × 10^-7 |
 | Two records under one sync | crates/ananke-storage/tests/wal.rs:184 | 20 | 15 | 9.1 × 10^-13 |
-| At least 20 of 40 stores came back as a state | crates/ananke-raft/tests/store.rs:242 | 40 | 31 | 3.4 × 10^-5 of under 20 |
-| A crash inside the adoption before the switch; one after it | crates/ananke-raft/tests/snapshot.rs:947, 951 | 24 | 10 before; 14 after | 2.4 × 10^-6; 7.5 × 10^-10 |
+| At least 20 of 40 stores came back as a state | `an_entrys_writes_and_the_applied_index_are_durable_together`, crates/ananke-raft/tests/store.rs | 40 | **23** (31 before the key layout) | **0.13** of under 20 |
+| A crash inside the adoption before the switch; one after it | `a_crash_inside_the_adoption_leaves_a_store_and_the_next_start_adopts`, crates/ananke-raft/tests/snapshot.rs | 24 | **13 before; 11 after** (10 and 14 before the layout) | 7.4 × 10^-9; 4.1 × 10^-7 |
+| Every crash window of a fresh store's first start, W0 to W3 | `a_crash_in_a_fresh_stores_first_open_never_leaves_it_refused_for_its_format`, crates/ananke-raft/tests/format.rs | 200 | 29, **10**, 47, 114 at `p_durable` 1.0; 31, 9, 49, 111 at 0.7 | 3.5 × 10^-5 of an empty W1 |
+| The record written after the first batch is caught | the same test | 200 | 89 | ~0 |
+| The heal by rename loses the surviving copy (the targeted arm asserts it) | `a_record_with_one_bad_copy_is_healed_in_place_and_a_crash_never_loses_the_other_copy`, crates/ananke-raft/tests/format.rs | 160 | 7 targeted, 7 spread; the in-place heal 0 of 320 | 7.8 × 10^-4 |
 
 **What moved.** The owner's rule moves three assertions to `seeds() >= 1000`. Each is printed
 at every tier as before and commented with its rate, its tier and this entry.
@@ -5894,8 +5980,10 @@ measurement to put either under 5 %, the rule moves it.
 **For the owner — not decided.** The rule as written does not move these; they are the
 owner's to decide.
 
-- *`SharedSnapshotDir`'s aimed arm reaching its stream* (sim/tests/raft.rs:2464). It
-  reaches its stream on 14.3 % of the thousand (14.7 % at the nightlies), above 5 %. It is
+- *`SharedSnapshotDir`'s aimed arm reaching its stream*
+  (`a_leader_that_shares_one_snapshot_directory_…` in sim/tests/raft.rs). It reaches its
+  stream on **15.3 %** of the thousand on this tree (14.3 % when this entry landed, 14.7 %
+  at the nightlies), above 5 %. It is
   asserted at every tier, and the gate's twenty see none with probability 0.857^20 = 0.046,
   above one in a hundred. It is a firing assertion: the shape the arm exists to build. The
   arm rides one seed in four (`RETAKE_STREAM_IN`, D-043), and the other firing assertion
@@ -5903,11 +5991,14 @@ owner's to decide.
   are to leave it, or to assert it from the hundred-seed tier, where a hundred see none
   with probability 2 × 10^-7.
 - *`SharedSnapshotDir`'s liveness catch at the nightly's ten thousand*
-  (sim/tests/raft.rs:2469). It is under 5 % and already above the thousand-seed tier, so the
-  rule leaves it. On this tree it is on 2 of the thousand, 0.2 %, where ten thousand see none
-  with probability 2 × 10^-9. At the nightlies' rate before the queue, 4 of 10 000, ten
-  thousand see none with probability 0.9996^10000 = 0.018. The next nightly on the tree with
-  the queue measures which rate holds.
+  (the same test). It is under 5 % and already above the thousand-seed tier, so the rule
+  leaves it. On the tree with the queue it was on 2 of the thousand, 0.2 %; **on the tree
+  with the key layout it is on 0 of the thousand**, so its rate here is at most 0.1 % and
+  ten thousand seeds see none with probability at least 0.37. At the nightlies' measured
+  rate, 4 of 10 000, ten thousand see none with probability 0.9996^10000 = 0.018. The next
+  nightly is what measures it. D-060's question 6 puts the harder half to the owner: the
+  pair and each half are caught on 0 of the first thousand, so no seed pins the catch and
+  seed 132 asserts its absence, which SHARD.md:2362-2363 routes to the owner.
 
 **Alternatives.** *D-044's shape, a thin catch asserted from the hundred-seed tier*: at 3 %
 a hundred seeds see none about one time in twenty, and the owner moved both measured cases

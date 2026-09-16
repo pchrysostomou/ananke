@@ -301,9 +301,13 @@ fn seed_5909_which_the_nightly_found_stays_green() {
 /// The Context's premise was that the nightly's wedge needed both bugs, a stale
 /// `matched` (D-042) beside a never-completing stream (D-043). Measured on the
 /// nightly's trace it did not: the wedge was D-043's alone, as the test above
-/// says, and seed 132 below agrees, where `SharedSnapshotDir` alone fails exactly
-/// as the pair does. The variant set still makes the pair a run the sweep can ask
-/// about, and this seed is asked.
+/// says. (The sentence here used to add "and seed 132 below agrees, where
+/// `SharedSnapshotDir` alone fails exactly as the pair does". That was true of
+/// the tree with D-056's send queue, where both were caught on seed 132; on this
+/// tree neither is caught on it, which is what seed 132's own pin says, so the
+/// clause is dropped rather than left contradicting the pin it cites.) The
+/// variant set still makes the pair a run the sweep can ask about, and this seed
+/// is asked.
 ///
 /// No run of the seed has two uncounted followers. Re-audited on the tree with the key
 /// layout and the store's format record (D-059, D-060), which moved every raft schedule
