@@ -4793,6 +4793,70 @@ scaling overstates the deep-levels test, which runs a thousand deep seeds at eve
 took 11.38 s of them on this laptop, and whose rounds rose by a seventh (above), not by the
 sweep's ratio; it leaves out what the other Stage A lanes add.
 
+**What the mutation pass found, and what now holds it.** Nine mutations of the engine
+oracle, the two new primitives' variant gates and the pinned-seed machinery
+(`sim/engine.rs`, `crates/ananke-storage/src/engine.rs`, `sim/tests/raft.rs`), each
+reproduced independently on the tree at 09bed88. The primitives' gates held: taking the
+seek's tombstone count out of its variant gate and taking the range delete's memtable
+skip out of its own are each caught three ways, by a storage unit test and by two or three
+sim tests at twenty seeds, seed 42's pinned trace among them. So did D-060's re-audited
+`snapshot_takes` fold — pairing takes by instant again is caught four ways at twenty seeds,
+including the sweep's `takes_paired` assertion — and a from/to confusion in
+`uncounted_after_heal`, which two pins' positive halves catch. Four survived.
+
+- *The installed-table number check made unreachable* (`sim/engine.rs`): Q2's criterion,
+  that an install's tables carry the install's own number, stops being checked as such.
+  The variant is still caught, so the test's non-emptiness assertion passes — but on
+  **92 of the thousand-seed tier's hundred-seed share instead of 98**, and seed 0's first
+  catch degrades from *"its table 15 carries records 174..=179, not the install's number"*
+  to a bare *"key k21 holds None but the model has Some(…)"*. The margin and the reason
+  were both unasserted. Held now: `an_install_that_keeps_its_sources_numbers_is_caught`
+  asserts that some catch is the check's own, by its words. It reads runs the sweep
+  already makes and moves nothing; it does pin a message, which a schedule move must
+  re-audit with the rest.
+- *The bounded fallback excuse made unbounded* (`sim/engine.rs`): an abandoned manifest
+  excuses every install record past the manifest in force rather than only what it
+  covered. Survived at 20, 100 and 1 000 seeds. It is equivalent with respect to every
+  verdict and coverage field the suite computes, but **not** with respect to the `excused`
+  map — the loose rule exceeds the bound on 465 of 1 074 fallbacks over the engine binary
+  at a hundred seeds (53 of the 109 on the install schedule alone) — and the excess is
+  simply never consulted, because `check_epoch` tests `present(seq)` before it consults
+  `excused` and the only other consumer keys on a seq that is absent by definition. So the
+  bound is real code doing nothing today. A note, not a test: what would close it is a
+  known-buggy `Variant` deleting an install's log segments before the manifest switch, run
+  as a negative control, which is a new variant rather than an assertion and is left as an
+  issue.
+- *The deleted-table clause reverted to the pre-review rule* (`sim/engine.rs`): **an
+  equivalent mutant on every executed schedule.** Over 100 seeds and all seventeen tests,
+  2 187 dropped-table judgements (1 458 unreadable, 558 corrupt, 171 missing) and
+  `mirror.deleted` — which is not empty, holding up to 176 numbers — contained the number
+  in none of them, because `DeleteBeforeManifest` deletes before that set is filled, so its
+  deletions arrive as plain `missing` and the generic arm catches them.
+  `DeleteBeforeManifest` is caught on 647 of 1 000 seeds with the clause and without it,
+  identically. The rate the review recorded for that fix is carried by its other half, the
+  narrowed `sst_betrayed` set; this half is a dead clause. Recorded as what it is: only
+  making the state reachable — a table deleted early whose file also took bit rot earlier —
+  closes it, and finding that shape needs a search, not an assertion.
+- *A pinned seed's absence assertion made vacuous* (`sim/tests/raft.rs`): narrowing seed
+  132's refusal matcher to a server number that cannot exist — ids run from 1 — leaves
+  `assert!(refusals.is_empty())` unable to fail, and the whole workspace stayed green with
+  that slip and its twin on seed 119 applied together. The matcher really was vacuous: on
+  a report carrying six refusals it matched none. Held now by D-060's own rule applied
+  once more — the matcher is one shared `refusals` helper, and seed 132 asserts it finds
+  refusals under `IgnoreIncarnation` and under the correct server (6 and 2 on this tree,
+  server 2's log stopping at a bad checksum) before it asserts none under the pair and the
+  stream half. The same fix does **not** transfer to seed 119, which refuses nothing under
+  `Correct`, `RefusalNotDurable`, `IgnoreIncarnation` or `SharedSnapshotDir`: there is no
+  report in that test whose refusals can be non-empty, so no companion is possible there.
+  What stands in its place is the shared matcher — a matcher narrowed until it finds
+  nothing fails on seed 132 before it can make seed 119's absence vacuous — and seed 119's
+  test says so.
+
+D-056's drop-newest policy was mutated here as well and confirms the same reading from the
+other side: the raft sweep never fills a send queue, so flipping the policy leaves 42/42
+raft tests green at 20 and at 100 seeds and moves no pinned trace, and only the env unit
+test catches it. That gap, and the one that matters more beside it, are closed in D-056.
+
 **Alternatives.** Range tombstones, as RocksDB's `DeleteRange`: no forced flush and no
 rewrite, but a new kind of write that the memtable, the table format (a version bump), the
 merge, every read, compaction and its truncation at table boundaries, and the oracle would
@@ -5137,6 +5201,36 @@ derivation fails it); and every handle continues one stream
 (crates/ananke-env/src/sim/tests.rs). Under `RealEnv`
 two draws differ (crates/ananke-env/tests/real_env.rs).
 
+**What the mutation pass found.** Seven mutations of the derivation and its cache
+(`crates/ananke-env/src/sim/state.rs`), each reproduced independently. Six were caught,
+and the striking thing is by how little: the range dropped from the name and the node
+dropped from the name are each caught by two tests; seeding the range's stream from the
+node's own protocol stream by all three; a fresh `RandomState` salt per call by all
+three; but **one process-wide `OnceLock<RandomState>` salt** — stable inside a run and
+different across runs, the insidious form — is caught by the moirae-name assertion alone
+(`assert_eq!(draws, moirae_sched::stream(7, "n1/r3/protocol"))`), since every same-seed
+and cross-seed equality in that test still holds; a cache keyed by node rather than by
+(node, range) only by `taking_a_range_stream_perturbs_no_other_stream`, because the other
+test builds a fresh `Sim` per call and so never puts two ranges on one node; and no
+caching at all only by `every_env_handle_continues_a_nodes_range_stream`. Three of the six
+have exactly one detector each, which is what to know before any of them is changed.
+
+The seventh, turning `panic!("unknown node")` into a silent fallthrough that hands out an
+unregistered, restarting stream, survived — and is **an unreachable guard, not a test
+gap**. `Sim::env` already panics `unknown node {node}` before it hands out a `SimEnv`;
+that line is the only `SimEnv` construction in the workspace, its `node` field is private
+and never reassigned, and `nodes` is never removed from, reset or reassigned anywhere in
+the crate. So `Shared::range_stream` can only be called with a node `Sim::env` has already
+validated, and the `unwrap_or_else(|| panic!(…))` is a redundant second guard on a
+crate-internal path. Reaching it at all needs a test that calls
+`sim.shared.lock().range_stream(…)` directly, which would assert something nothing can
+trip; it is recorded here as the note it is, and no test was added.
+
+Both findings turn on the last bullet above: **nothing calls `range_rng` yet**, so no
+seed tier, sweep or scenario can catch any mutation of it, in this stage or the nightly.
+The four unit tests named below are its only guard, and stay its only guard until Stage B
+seeds each core from it.
+
 **Alternatives.** *A label* (`stream(&self, label)`): general enough for the rebalancer's
 named stream Q42 mentions, but able to alias the node's own streams; a second kind of named
 stream can have its own method when something needs it. *A fresh stream per call*, starting
@@ -5315,6 +5409,96 @@ met part below.
   assertion would fail a tree with nothing wrong on the draw alone; a thousand see none
   with probability 0.975^1000 = 1.3 × 10^-11. The counter is installs taking a receiver back to an older
   configuration, not the revert floor #56 holds.
+
+**What the mutation pass found, and what now holds it.** Twelve mutations of
+`sim/membership.rs`, its two assertions in `sim/tests/raft.rs` and the install repair they
+lean on, each reproduced independently on the tree at 09bed88. The scenario's mechanisms
+held: dropping the variant's joint-majority guard is caught at twenty seeds by the correct
+server's own sweep, making the variant never fire is caught at twenty by the negative
+control, and turning `await_compacted_leader` into a single look with no wait is caught at
+twenty on seed 4 — deterministically, since `sweep` runs seeds 0..count and seed 4 is
+inside every tier, though the margin is thin: at a hundred seeds only 3 miss without the
+wait. What did not hold is the fold the assertions read and the clause beside it.
+
+- *The learner phase dropped from the fold*, so an install by a server already a voter of
+  the joint configuration counts as a learner-phase feed. Survived at 20 and 100 seeds and
+  the whole workspace with it; `snapshot_fed_joiners` went **80 → 93** at twenty seeds and
+  **523 → 584** at a hundred, and nothing failed.
+- *Every server counted as a joiner*, servers 1 to 3 included, where only servers above
+  `INITIAL_VOTERS` can join. Survived the same way: **80 → 92** and **523 → 581**, so
+  twelve of the ninety-two counted feeds at the gate's tier are installs by original
+  voters — an ordinary follower catching up behind a compacted leader, which the
+  pre-D-058 scenario already produced.
+
+Both are invisible for one reason: every reader of `snapshot_fed_joiners` asks only
+whether the list is empty (the sweep's per-seed check and the coverage's
+`seeds_with_a_snapshot_fed_joiner`), and both readers are monotone in the fold, so *any*
+widening of either bound passes at every tier. The predicate's two bounds — who, and when
+— were each unguarded. Now: the fold is `snapshot_fed_joiners_of(records, grow)`, a
+function of a trace and the grow's window with its own unit test over records written by
+hand, which asserts both bounds at once (an install before the grow, one by an original
+voter inside the window, one by a joiner in its learner phase, one by the same joiner
+after the joint configuration admits it, a take rather than a feed, a restatement, and one
+after the driver stopped: only the two learner-phase feeds are returned); and the correct
+server's sweep now fails any seed where a counted server is not one of the joiners. Both
+read records a run already produced, so no schedule and no pinned hash moves.
+
+- *The refusal clause's negation flipped*, so a store refused for anything **other** than
+  lost state passes the run silently. Survived the workspace at twenty seeds and the
+  membership tests at 20 and 100. The clause has never discriminated on any tier: the
+  coverage's `refusals` is empty at 20, 100 and 1 000 seeds on the tree of this commit
+  too, and the coverage's companion assertion (every refusal clause starts with
+  `LOST_STATE`) quantifies over that empty map. It is now given a case that reaches it —
+  a unit test on `Report::check` over seed 0's own passing run with one `RaftRefused`
+  record appended, asserted to pass for a lost-state reason and to fail, with the words,
+  for a configuration key out of step with the log. **It remains a guard no run of this
+  scenario has ever tripped**, and that is the honest statement of it: the unit test makes
+  the clause discriminate, the scenario still does not reach the state, and only the shapes
+  issue #56 holds would change that.
+- *Both snapshot-fed-joiner assertions deleted*, and the same with the compacted-leader
+  wait broken as well: both survived, the whole workspace green. Nothing else in the
+  workspace — not the invariants, not commit majority, not linearizability, not the
+  liveness or availability bounds, not the coverage's other counters — notices that no
+  joining server was ever fed a snapshot. **The extension's value rests on those two
+  lines.** A deleted assertion can only be caught by a test of the test, and the shape
+  that would pin it — a scenario knob asking for the grow of the leader in force instead
+  of a compacted one, asserted to produce a seed with no learner-phase feed — is left as an
+  issue rather than taken here: wired through `Schedule::draw` it would move every
+  membership schedule on every seed and every pinned hash with them.
+
+Two corrections to what this entry records, both from the same pass.
+
+- *The membership scenario adds no discriminating power over the install repair's
+  configuration key.* Making the repair a no-op, so the leader's un-rewritten key rides
+  into the installed store, leaves all three membership tests green at twenty seeds with
+  `refusals: {}`, while the coverage moves (joint configurations 216 → 211, new
+  configurations 459 → 465, learners promoted 50 → 48, reverts 3 → 2, elections while
+  joint 1 → 0, feeds 80 → 82), so servers really did come up differently. It is caught by
+  `ananke-raft`'s own `tests/snapshot.rs` alone. The "Met in Stage A" bullet above is right
+  that the key is written on that path and checked at each adoption's open; it should not
+  be read as saying the scenario would notice a wrong key.
+- *The install repair's kept-tail branch has no unit test anywhere in the workspace.* The
+  deferral bullet above says of the truncation revert floor and the kept-tail key repair
+  that "Both keep their unit tests alone until #56 builds the shapes that reach them".
+  That is true of the revert floor and **not** of the kept-tail branch: every `Repair`
+  built in `crates/ananke-raft/tests/{snapshot,format}.rs` passes `tail: Vec::new()` except
+  one, which passes two plain command entries, so the fold over `repair.tail` returns
+  `None` on every test in the workspace and removing its non-trivial branch outright
+  changes nothing — the whole `ananke-raft` suite and the membership tests stay green. The
+  branch is production-reachable: the live install builds its tail from the receiver's own
+  log above the snapshot's last index, and those entries can be `Payload::Config`. Its
+  failure mode is now measured rather than predicted — with the branch removed, a store
+  whose kept tail carries a configuration entry above the snapshot is **refused at open**,
+  "the configuration key is out of step with the log", and the server drops into re-seed.
+  The test that would close it is one near-copy of
+  `an_install_carries_the_receivers_identity_and_is_adopted_at_open` with a `Payload::Config`
+  in the tail; it needs no seeds and moves nothing. It belongs to issue #56, which should
+  carry this correction: the branch is untested, not merely unreached.
+
+The coverage at 1 000 seeds on the tree of this commit, for the record: 4 855 learner-phase
+feeds on 1 000 seeds with every seed showing one, 7 468 adoptions, `refusals: {}`,
+`reverts_to_a_prefix` 25, and `truncation_reverts_to_a_prefix`, `installs_keeping_a_tail`
+and `installs_whose_tail_carries_a_configuration` all 0.
 
 **Alternatives.** *The threshold alone*: 39 seeds in 1 000 without a learner-phase feed.
 *Crashing or isolating a joining server until its leader compacts past it*: a second fault

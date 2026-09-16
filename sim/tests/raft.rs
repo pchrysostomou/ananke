@@ -402,6 +402,20 @@ fn took_an_index_twice(takes: &[raft::SnapshotTake]) -> bool {
     })
 }
 
+/// Every store refusal a run traced. The pins that assert an *absence* of refusals
+/// share this matcher, so that a slip narrowing it — a `server: 0` in the pattern, say,
+/// where server ids run from 1 — cannot make one pin's absence assertion vacuous
+/// without failing the non-vacuity assertion the other makes on the same matcher
+/// (seed 132 below, where `IgnoreIncarnation` and the correct server do refuse).
+fn refusals(report: &raft::Report) -> Vec<&TraceEvent> {
+    report
+        .records
+        .iter()
+        .map(|r| &r.event)
+        .filter(|e| matches!(e, TraceEvent::RaftRefused { .. }))
+        .collect()
+}
+
 /// The shape of seed 5909's wedge, asserted absent: no re-take lands under a live
 /// stream that the follower then never installs, and the leader in force at the
 /// last heal has at most one follower it could never count after it. Since
@@ -502,18 +516,27 @@ fn seed_132_which_pinned_the_combined_variant_before_the_layout_reaches_no_wedge
         assert_no_stream_wedge(report);
     }
     // And the reason the pair adds nothing: with no refusal there is no incarnation to
-    // ignore, so the pair is the stream half, record for record.
+    // ignore, so the pair is the stream half, record for record. Asserted with its own
+    // non-vacuity, as the take assertion above is: under `IgnoreIncarnation` alone and
+    // under the correct server this seed *does* refuse — server 2's log stops at a bad
+    // checksum at 8.880623616 s on both — so the same matcher is shown to find
+    // refusals here before it is asked to find none there. Without that companion a
+    // matcher narrowed to a server id that cannot exist would pass this pin silently,
+    // and pass seed 119's twin with it.
     for report in [&paired, &stream] {
-        let refusals: Vec<&TraceEvent> = report
-            .records
-            .iter()
-            .map(|r| &r.event)
-            .filter(|e| matches!(e, TraceEvent::RaftRefused { .. }))
-            .collect();
+        let refusals = refusals(report);
         assert!(
             refusals.is_empty(),
             "seed 132 under {:?} refuses a store again ({refusals:?}): IgnoreIncarnation now has \
              something to ignore here; re-audit the pin",
+            report.variants
+        );
+    }
+    for report in [&incarnation, &correct] {
+        assert!(
+            !refusals(report).is_empty(),
+            "seed 132 under {:?} refuses no store any more, so the absence asserted above says \
+             nothing: re-audit the pin and the refusal matcher",
             report.variants
         );
     }
@@ -2383,6 +2406,16 @@ fn seed_158_pins_the_refusal_that_is_not_durable_which_a_hundred_seeds_can_miss(
 /// record. The test asserts that absence with its reason, so the day the seed refuses a
 /// store again it says so and the pin can be made to assert what each server does with
 /// it; the mechanism itself is pinned on seed 158 above.
+///
+/// This pin has no companion showing its matcher can find a refusal, and cannot have
+/// one: seed 119 refuses nothing under `Correct`, `RefusalNotDurable`,
+/// `IgnoreIncarnation` or `SharedSnapshotDir`, so there is no report here whose
+/// refusals are non-empty, and D-060's rule — every absence assertion in a pin gets a
+/// companion that shows the vector can be non-empty — cannot be applied on this seed.
+/// What stands in for it is the matcher itself: [`refusals`] is shared with seed 132's
+/// pin, where `IgnoreIncarnation` and the correct server do refuse and the companion is
+/// asserted, so a matcher narrowed until it finds nothing fails there before it can
+/// make this absence vacuous.
 #[test]
 fn seed_119_which_pinned_the_refusal_that_is_not_durable_before_the_layout_refuses_nothing() {
     let built = raft::run(119, Variant::RefusalNotDurable);
@@ -2398,12 +2431,7 @@ fn seed_119_which_pinned_the_refusal_that_is_not_durable_before_the_layout_refus
         "seed 119 under the correct server no longer passes: re-audit the pin"
     );
     for report in [&built, &correct] {
-        let refusals: Vec<&TraceEvent> = report
-            .records
-            .iter()
-            .map(|r| &r.event)
-            .filter(|e| matches!(e, TraceEvent::RaftRefused { .. }))
-            .collect();
+        let refusals = refusals(report);
         assert!(
             refusals.is_empty(),
             "seed 119 under {:?} refuses a store again ({refusals:?}): the variant now has \
@@ -3279,8 +3307,10 @@ fn the_membership_scenario_has_byte_identical_traces_for_one_seed() {
 /// The positive control: the correct server passes 3 → 5 → 3 under partition on
 /// every seed, and the runs reached the states that matter. On every seed a server
 /// joining the configuration is fed a snapshot while it is a learner (issue #46), which
-/// the sweep asserts seed by seed; a store refused for anything but lost state fails
-/// the run's own check.
+/// the sweep asserts seed by seed, and every server it counts is one of the joiners;
+/// a store refused for anything but lost state fails the run's own check. The fold's
+/// other bound, the learner phase itself, is held by `membership`'s own unit test,
+/// where a window can be written by hand.
 #[test]
 fn the_correct_server_passes_the_membership_scenario_on_every_seed() {
     let coverage = Mutex::new(MembershipCoverage::default());
@@ -3291,13 +3321,32 @@ fn the_correct_server_passes_the_membership_scenario_on_every_seed() {
             .check()
             // PROPOSED(D-058): a joining server fed by snapshot, on every seed.
             .and_then(|()| {
-                if report.snapshot_fed_joiners().is_empty() {
-                    Err(format!(
+                let fed = report.snapshot_fed_joiners();
+                if fed.is_empty() {
+                    return Err(format!(
                         "seed {seed}: no server joining the configuration installed a snapshot \
                          in its learner phase"
-                    ))
-                } else {
+                    ));
+                }
+                // And every server counted is a *joining* one. Servers 1 to 3 are the
+                // initial voters and join nothing, so an install of theirs — an
+                // ordinary follower catching up behind a compacted leader, which this
+                // scenario produced before D-058 — is not what issue #46 asks for. The
+                // emptiness check above cannot see the difference, and a fold that
+                // counted every server passed every tier.
+                let voters: Vec<_> = fed
+                    .iter()
+                    .copied()
+                    .filter(|&(server, _, _)| server <= membership::INITIAL_VOTERS)
+                    .collect();
+                if voters.is_empty() {
                     Ok(())
+                } else {
+                    Err(format!(
+                        "seed {seed}: {voters:?} are counted as snapshot-fed joiners, but \
+                         servers 1 to {} are the initial voters and join nothing",
+                        membership::INITIAL_VOTERS
+                    ))
                 }
             })
             .inspect_err(|_| write_trace(&format!("membership-{seed}"), &report.jsonl()))

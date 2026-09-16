@@ -522,6 +522,14 @@ fn a_seek_that_counts_tombstones_is_caught() {
 /// made. Such a seed counts as caught, apart from the oracle's catches, and only a
 /// panic with that assertion's message does: any other panic fails the test. The
 /// oracle's own catches are asserted non-empty.
+///
+/// And at least one of them is the installed-table number check itself, not merely some
+/// key reading wrong. Q2's criterion is that the installed numbers are above the live
+/// engine's, and the check that states it is the only thing that says so: with it taken
+/// out the variant is still caught on 92 of the thousand-seed tier's hundred-seed share
+/// against 98, by the state check noticing a key read wrong, and non-emptiness cannot
+/// tell the two apart. Asserting a catch by the check's own words keeps the criterion
+/// the thing that catches this variant.
 // PROPOSED(D-054): the installed sequence numbers are the install's.
 #[test]
 fn an_install_that_keeps_its_sources_numbers_is_caught() {
@@ -576,6 +584,15 @@ fn an_install_that_keeps_its_sources_numbers_is_caught() {
     assert!(
         !oracle.is_empty(),
         "the oracle never caught InstallKeepsSourceNumbers"
+    );
+    // PROPOSED(D-054): the installed sequence numbers are the install's — the check
+    // itself, not a key that happens to read wrong once the numbers are kept.
+    assert!(
+        oracle
+            .iter()
+            .any(|violation| violation.contains("not the install's number")),
+        "no seed was caught by the installed tables' own numbers; every catch is a state \
+         mismatch, so Q2's criterion is not what caught the variant: {oracle:?}"
     );
 }
 

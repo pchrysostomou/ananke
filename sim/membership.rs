@@ -358,45 +358,15 @@ impl Report {
     /// by a voter of the joint or new configuration, in the transfer's wait, the shrink or
     /// the settle, are not counted; nor is an install's restatement at the adoption that
     /// follows it, which is the same snapshot.
+    ///
+    /// Both bounds stated above — *which* servers may be counted and *when* — are held
+    /// by the unit tests of `snapshot_fed_joiners_of`, the fold this delegates to, since
+    /// every reader of this list only asks whether it is empty and so cannot see either
+    /// bound widen.
     // PROPOSED(D-058): the membership scenario past the snapshot threshold.
     #[must_use]
     pub fn snapshot_fed_joiners(&self) -> Vec<(u64, Instant, u64)> {
-        let Some((from, grow_end)) = self.grow else {
-            return Vec::new();
-        };
-        let learner_until = |joiner: u64| {
-            self.records
-                .iter()
-                .find_map(|r| match &r.event {
-                    TraceEvent::RaftConfig {
-                        joint: true, new, ..
-                    } if r.at >= from && new.contains(&joiner) => Some(r.at),
-                    _ => None,
-                })
-                .unwrap_or(grow_end)
-        };
-        let until: Vec<(u64, Instant)> = (INITIAL_VOTERS + 1..=SERVERS)
-            .map(|joiner| (joiner, learner_until(joiner)))
-            .collect();
-        let mut joiners: Vec<(u64, Instant, u64)> = Vec::new();
-        for record in &self.records {
-            if let TraceEvent::RaftSnapshot {
-                server,
-                last_index,
-                taken: false,
-                ..
-            } = record.event
-                && until
-                    .iter()
-                    .any(|&(joiner, end)| joiner == server && record.at >= from && record.at < end)
-                && !joiners
-                    .iter()
-                    .any(|&(s, _, index)| s == server && index == last_index)
-            {
-                joiners.push((server, record.at, last_index));
-            }
-        }
-        joiners
+        snapshot_fed_joiners_of(&self.records, self.grow)
     }
 
     /// How long after the last heal the first client write completed, if one did.
@@ -513,6 +483,60 @@ impl Report {
         }
         Ok(())
     }
+}
+
+/// [`Report::snapshot_fed_joiners`] over a trace's records and the window the grow was
+/// driven in, so the predicate can be asked of records built by hand: every snapshot a
+/// server *joining* the configuration — one above [`INITIAL_VOTERS`], never an original
+/// voter — installed *in its learner phase*, which runs from `from` until the first
+/// joint configuration naming that server in `new` takes effect on any server, or, when
+/// none ever does, until `grow_end`.
+///
+/// The sweep and the coverage read the list only for emptiness, so neither bound can be
+/// seen to widen there; the mutation pass showed both widening unnoticed at every tier
+/// (the count 80 → 93 with the learner phase dropped, 80 → 92 with the initial voters
+/// counted as joiners). The tests below hold them.
+// PROPOSED(D-058): the membership scenario past the snapshot threshold.
+fn snapshot_fed_joiners_of(
+    records: &[TraceRecord],
+    grow: Option<(Instant, Instant)>,
+) -> Vec<(u64, Instant, u64)> {
+    let Some((from, grow_end)) = grow else {
+        return Vec::new();
+    };
+    let learner_until = |joiner: u64| {
+        records
+            .iter()
+            .find_map(|r| match &r.event {
+                TraceEvent::RaftConfig {
+                    joint: true, new, ..
+                } if r.at >= from && new.contains(&joiner) => Some(r.at),
+                _ => None,
+            })
+            .unwrap_or(grow_end)
+    };
+    let until: Vec<(u64, Instant)> = (INITIAL_VOTERS + 1..=SERVERS)
+        .map(|joiner| (joiner, learner_until(joiner)))
+        .collect();
+    let mut joiners: Vec<(u64, Instant, u64)> = Vec::new();
+    for record in records {
+        if let TraceEvent::RaftSnapshot {
+            server,
+            last_index,
+            taken: false,
+            ..
+        } = record.event
+            && until
+                .iter()
+                .any(|&(joiner, end)| joiner == server && record.at >= from && record.at < end)
+            && !joiners
+                .iter()
+                .any(|&(s, _, index)| s == server && index == last_index)
+        {
+            joiners.push((server, record.at, last_index));
+        }
+    }
+    joiners
 }
 
 /// What the sliced advance watches for, as the sweep's does.
@@ -895,5 +919,157 @@ pub fn run_with(seed: u64, schedule: Schedule, variants: impl Into<Variants>) ->
         stopped: driver.watch.stopped,
         history,
         clients: clients_total,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The fold and the check that hold what the scenario claims, on records written
+    //! by hand and on one seed's own run. The sweep and the coverage read
+    //! [`Report::snapshot_fed_joiners`] only for emptiness and have never seen a
+    //! refusal at any tier, so neither the fold's bounds nor the refusal clause is
+    //! held by a sweep; both are held here.
+
+    use ananke_raft::core::Variant;
+
+    use super::*;
+
+    fn at(millis: u64) -> Instant {
+        Instant::from_nanos(millis * 1_000_000)
+    }
+
+    fn record(millis: u64, event: TraceEvent) -> TraceRecord {
+        TraceRecord {
+            at: at(millis),
+            decided: at(millis),
+            node: None,
+            event,
+        }
+    }
+
+    /// An install of `last_index` by `server`, as a joining server's feed traces.
+    fn installed(millis: u64, server: u64, last_index: u64) -> TraceRecord {
+        record(
+            millis,
+            TraceEvent::RaftSnapshot {
+                server,
+                last_index,
+                last_term: 1,
+                taken: false,
+            },
+        )
+    }
+
+    /// The joint configuration that admits `joiner`, which ends its learner phase.
+    fn joint_admitting(millis: u64, joiner: u64) -> TraceRecord {
+        record(
+            millis,
+            TraceEvent::RaftConfig {
+                server: 1,
+                index: 10,
+                old: (1..=INITIAL_VOTERS).collect(),
+                new: (1..=INITIAL_VOTERS).chain([joiner]).collect(),
+                joint: true,
+                learners: Vec::new(),
+            },
+        )
+    }
+
+    /// Issue #46 asks for a *learner* fed by a snapshot during the change, and both
+    /// bounds of that are the fold's alone: the window (until the joint configuration
+    /// naming the joiner takes effect) and the set (a server above `INITIAL_VOTERS`,
+    /// never one of the original voters catching up behind a compacted leader). The
+    /// mutation pass widened each in turn — the counted feeds went 80 → 93 over the
+    /// gate's twenty seeds with the window dropped and 80 → 92 with the set widened —
+    /// and every tier stayed green, because the sweep and the coverage ask only whether
+    /// the list is empty. Here a trace holds one install of each kind.
+    // PROPOSED(D-058): the membership scenario past the snapshot threshold.
+    #[test]
+    fn only_a_joiners_install_in_its_learner_phase_is_counted() {
+        let grow = Some((at(100), at(900)));
+        let records = vec![
+            // Before the grow was asked for: not a feed of the change.
+            installed(50, 4, 1),
+            // An original voter catching up behind a compacted leader, inside the
+            // window: never a joiner, whatever else it is.
+            installed(200, 2, 2),
+            // The joiner's own feed, in its learner phase: the one #46 asks for.
+            installed(300, 4, 3),
+            // The joiner is admitted to the configuration; its learner phase ends.
+            joint_admitting(400, 4),
+            // A voter of the joint configuration installing after that: not a
+            // learner-phase feed.
+            installed(500, 4, 4),
+            // Another server's feed, whose own phase has not ended, is counted.
+            installed(600, 5, 5),
+            // A take is not a feed.
+            record(
+                650,
+                TraceEvent::RaftSnapshot {
+                    server: 5,
+                    last_index: 6,
+                    last_term: 1,
+                    taken: true,
+                },
+            ),
+            // The same install restated at the adoption that follows it.
+            installed(700, 5, 5),
+            // After the driver stopped driving the grow.
+            installed(950, 5, 7),
+        ];
+        assert_eq!(
+            snapshot_fed_joiners_of(&records, grow),
+            vec![(4, at(300), 3), (5, at(600), 5)]
+        );
+        assert!(
+            snapshot_fed_joiners_of(&records, None).is_empty(),
+            "a run whose grow was never asked for feeds no joiner"
+        );
+    }
+
+    /// A store refused for anything but lost state fails the run (D-058): no crash is
+    /// scheduled in this scenario, so such a refusal is an install's adoption gone
+    /// wrong — a configuration key its repair wrote out of step with the log — and must
+    /// not pass as a re-seed. No run has ever produced one (the coverage's `refusals` is
+    /// empty at 20, 100 and 1 000 seeds), so the clause discriminates nowhere in the
+    /// sweep: flipping its negation left every tier green. It is given a case here, on a
+    /// seed's own passing run with one refusal record appended, both ways round.
+    // PROPOSED(D-058): the membership scenario past the snapshot threshold.
+    #[test]
+    fn a_refusal_that_is_not_for_lost_state_fails_the_run() {
+        let mut report = run(0, Variant::Correct);
+        assert_eq!(
+            report.check().err(),
+            None,
+            "seed 0 under the correct server passes as it runs"
+        );
+        let ran = report.records.clone();
+        let end = ran.last().expect("a trace").at;
+        let mut refused = |reason: &str| {
+            report.records.clone_from(&ran);
+            report.records.push(TraceRecord {
+                at: end,
+                decided: end,
+                node: None,
+                event: TraceEvent::RaftRefused {
+                    server: 2,
+                    reason: reason.to_owned(),
+                },
+            });
+            report.check().err()
+        };
+        assert_eq!(
+            refused(&format!("{LOST_STATE}: tables 29 and 31")),
+            None,
+            "a refusal for state lost below the store is a re-seed, not a failure"
+        );
+        assert_eq!(
+            refused("the configuration key is out of step with the log"),
+            Some(
+                "seed 0: server 2 refused its store: the configuration key is out of step with \
+                 the log"
+                    .to_owned()
+            ),
+        );
     }
 }
