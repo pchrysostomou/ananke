@@ -4,8 +4,11 @@
 //! [`core::Raft`] is Figure 2 of the paper with pre-vote, batching and pipelining,
 //! stepped by [`core::Input`]s and producing [`core::Output`]s in an order the server
 //! must keep: a persist before the messages that depend on it. [`store::RaftStore`]
-//! keeps the hard state and the log under a reserved tenant of the engine and applies
-//! an entry's writes with the applied index in one batch. [`message`] is the wire
+//! keeps the hard state and the log under a reserved tenant of the engine, in one key
+//! interval per Raft group, and applies an entry's writes with the applied index in
+//! one batch; [`mod@format`] is the store's on-disk format, recorded in a file beside the
+//! store and read before anything writes, so a store in another format is refused
+//! rather than misread (D-059). [`message`] is the wire
 //! form and the studio's view of it, and [`client`] the requests and responses that
 //! share the servers' socket. [`invariants`] are the four log properties of Figure 3
 //! and three folds of the rules behind them, over trace events. [`node`] runs a core
@@ -21,6 +24,7 @@
 pub mod apply;
 pub mod client;
 pub mod core;
+pub mod format;
 pub mod invariants;
 pub mod message;
 pub mod node;

@@ -4881,7 +4881,9 @@ schedules, each asserting its mechanism or, with the reason, its absence:
   duplicate-file loop. Seed 680's test now asserts what the seed does instead: the pair,
   each half alone and the correct server pass it; the stream half re-takes under a live
   stream and still commits; `IgnoreIncarnation` alone leaves server 1's progress stale with
-  server 2 countable. RAFT.md §5 names seed 132.
+  server 2 countable. RAFT.md §5 names seed 132. *(Superseded by D-060: the key layout moved
+  every raft schedule again, and on that tree the pair is caught on 0 of 1000 and each half
+  on 0. Seed 132's test now asserts that absence, and RAFT.md §5 says so.)*
 - Seed 687 comes nearer its situation. As built, server 1 is refused for lost state and
   restarted four times before an install replaces its store, the first half of the
   premerge's failure; the second is absent, since the refused engine flushes nothing before
@@ -4942,7 +4944,11 @@ the owner. The owner decided:
   later; the fault's three later rounds still crash server 3 inside a flush, but no open
   drops a table, so there is no refusal for lost state and no crash on a refused server,
   asserted with that reason, and the run passes. The correct server's quiesce and durable
-  refusal stay pinned on seed 687.
+  refusal stay pinned on seed 687. *(Superseded by D-060: the key layout moved every raft
+  schedule again, the catch is 9 of 1000 with its first at seed 158, and seed 158's pin
+  carries both halves — the laundered store as built and the quiesce with the durable
+  refusal under the correct server. Seed 119's test asserts what it does instead, and seed
+  687's the half it still reaches.)*
 
 The reason is binomial. At the nightly's rate, 132 of 10 000 (1.32 %, D-047,
 DECISIONS.md:3141, measured before this entry), a hundred seeds catch none with probability
@@ -5226,71 +5232,80 @@ compacted, or refuses a store, the correct server's sweep names it.
 
 ## D-059 — A store in 0.3.0's format is refused at open, never migrated and never read
 
-**Context.** SHARD.md's Q5, approved as load-bearing: the key layout of Stage A's item 6
-breaks 0.3.0's on-disk format on three conditions, the second that a store in the old
-format is refused at open with an error naming both format versions, never misread
-(SHARD.md:71-76). The owner's addition of 2026-09-15 to Stage A's entry criteria asks,
-before the layout's code, for the decision on what becomes of a v0.3.0 store, and with it
-the test that holds it: a store written by the v0.3.0 tag's own code, kept as a fixture
-rather than made by the new code, opened by the new code and refused with that error, no
-key of it read as the new layout's (SHARD.md:2115-2122); the same test passes on the tree
-after item 6 (SHARD.md:2144-2146). Nothing records which format a store is in today. The
-engine's versions, 2 in the manifest and 2 in a table's footer, are unchanged since 0.3.0,
-and the store's `RAFT-STORE` marker carries none (SHARD.md §11, storage 1). Under the new
-layout 0.3.0's keys lie where the new code looks for nothing, so a 0.3.0 store the new code
-did not refuse would open as an empty one, as seed 6325's voter once came back blank
-(D-041).
+**Context.** SHARD.md's Q5, approved as load-bearing, lets the key layout of Stage A's
+item 6 break 0.3.0's on-disk format on three conditions:
+1. the on-disk format version is bumped;
+2. a store in the old format is refused at open with an error naming both format
+   versions, never misread;
+3. the break is recorded in the implementing entry and in the release notes
+   (SHARD.md:71-76).
+
+The owner's addition of 2026-09-15 to Stage A's entry criteria asks for two things
+before the layout's code (SHARD.md:2115-2122):
+- the decision on what becomes of a v0.3.0 store;
+- the test that holds it: a store written by the v0.3.0 tag's own code, kept as a
+  fixture rather than made by the new code, opened by the new code and refused with
+  that error, with no key of it read as the new layout's.
+
+The same test must pass on the tree after item 6 (SHARD.md:2144-2146).
+
+Nothing records which format a store is in:
+- the engine's versions (2 in the manifest, 2 in a table's footer) are unchanged since
+  0.3.0;
+- the store's `RAFT-STORE` marker carries none (SHARD.md §11, storage 1).
+
+Under the new layout 0.3.0's keys lie where the new code looks for nothing. A 0.3.0
+store the new code did not refuse would open as an empty one, the way seed 6325's voter
+once came back blank (D-041).
 
 **Decision.** The owner's, given in the brief of Stage A's lane L: a store in 0.3.0's
 format is refused at open with a clear error naming its format version and the one the
 code expects. It is never migrated, and never read under the new layout.
 
-- *The versions.* 0.3.0's store, which records no version, is Raft store format 1, the
-  layout RAFT.md §3 gave at the tag. Format 2 is the one the refusing build writes and the
-  only one it opens, and the format item 6's layout will be.
-- *The refusal.* `RaftStore::open`, after the engine's recovery is checked for lost state
-  and before it reads any other key, refuses a store in any format but 2, with an
-  `InvalidData` error of its own type whose words name format 1, format 2 and 0.3.0. A
-  store that records a newer version is refused too, naming both: a build cannot read a
-  format it predates, and reading one would be the misreading Q5 forbids.
-- *Not a loss, and not replaced.* The store is whole in its own format, so the refusal is
-  not D-022's refusal of lost state. A server that finds one traces `RaftServerFailed` with
-  the refusal's words and returns it: it writes no lost mark (D-044) and does not wait in
-  re-seed mode, where a leader's snapshot would take the store's place. The store is left
-  as it was found, and what becomes of it is its operator's decision.
+- *The versions.*
+  - 0.3.0's store, which records no version, is Raft store format 1: the layout RAFT.md
+    §3 gave at the tag.
+  - Format 2 is the layout of item 6 and the only format this build writes or opens.
+- *Newer versions too.* A store that records a version newer than the build's is
+  refused the same way, naming both. A build cannot read a format it predates, and
+  reading one would be the misreading Q5 forbids. (The owner, 2026-09-15.)
+- *Not a loss, and not replaced.*
+  - The store is whole in its own format, so the refusal is not D-022's refusal of lost
+    state.
+  - A server that finds one traces `RaftServerFailed` with the refusal's words and
+    returns it.
+  - It writes no lost mark (D-044) and does not wait in re-seed mode, where a leader's
+    snapshot would take the store's place.
+  - What becomes of the store is its operator's decision.
+- *Read before anything writes.* The format is read before anything writes to the store
+  directory, so a refused store is left byte for byte as it was found: no new log
+  segment, no marker, no lost mark, no adoption. (The owner, 2026-09-15.)
+- *The format before lost state.* The format is checked before any check for lost state:
+  the engine's recovery, the marker, the lost mark and a staged install. A 0.3.0 store
+  that has also lost state is refused for its format and never re-seeded into its own
+  directory. (The owner, 2026-09-15.)
 
-The two things the refusal needs and SHARD.md does not settle are proposed here, and their
-code will carry `PROPOSED(D-059)`:
+Where the version lives, how a fresh store is told from an unrecorded one, and the order
+of the start are the mechanism, recorded in D-060, PROPOSED. Code sites of this decision
+carry `// D-059`.
 
-- *Where the version lives.* Under the eight-byte key `0`, tenant 0's bytes and nothing
-  after them, as a little-endian `u64` like every other value of the store. Every key of the
-  Raft state and of the user's data starts with a tenant and a table, sixteen bytes; the
-  eight-byte key is a proper prefix of every key of tenant 0 and so falls inside no table's
-  key range, today's `0 / <table>` or item 6's `0 / <range>`. It is where both layouts look,
-  which is what lets a build see a store's format without reading any other key of it as
-  its own. An engine checkpoint copies it, so an installed snapshot carries its leader's
-  version. D-060, the layout, records it as part of the layout it versions.
-- *A fresh store or an unrecorded one.* A store without the key is fresh only when the
-  engine's recovery found no table and replayed no log record: it holds nothing that could
-  be misread, and the open writes the version. Any other store without the key is format 1
-  and refused. The version is written in the same synced batch as the fresh store's first
-  incarnation (D-042), the first write any store takes, so a crash leaves an engine that
-  holds neither or a store that holds both, never a store with keys and no version. The
-  test is the engine's own counts, which belong to no layout, rather than the absence of a
-  key of 0.3.0's.
+**The fixture.** `crates/ananke-raft/tests/fixtures/v0.3.0-store/store`: fifteen files
+and 5 162 bytes, written by the v0.3.0 tag's code (0d30df5) and by nothing else.
 
-**The fixture.** `crates/ananke-raft/tests/fixtures/v0.3.0-store/store`: fifteen files,
-5 162 bytes, written by the v0.3.0 tag's code (0d30df5) and by nothing else. A program,
-`generate.rs` beside it, does what a server does, in its order: the engine opened as
-`node.rs` opens it, with a 512-byte memtable and 4 KiB log segments so the state is partly
-in tables and partly only in the log; the store opened, writing incarnation 1; the store
-marker; a persist of term 2 and a vote for server 1 with a configuration entry at index 1
-and six commands at 2 to 7; applies of 1 to 4; a snapshot taken at index 4 into
-`/raft/snap-4-1`; the log compacted to it; the apply of 5; and a persist of term 3, a vote for
-server 2 and an eighth entry. It writes under the simulator, which makes the bytes the same
-on every run and the path the snapshot record carries `/raft` rather than a directory of
-the machine that ran it, and copies the files out through `RealEnv`. It was run in the tag's
-own tree, with the tag's `Cargo.lock` and toolchain, from this repository's root:
+A program, `generate.rs` beside it, does what a server does, in its order:
+1. opens the engine as `node.rs` opens it, with a 512-byte memtable and 4 KiB log
+   segments so the state is partly in tables and partly only in the log;
+2. opens the store, writing incarnation 1, and writes the store marker;
+3. persists term 2 and a vote for server 1, with a configuration entry at index 1 and
+   six commands at 2 to 7;
+4. applies 1 to 4, and takes a snapshot at index 4 into `/raft/snap-4-1`;
+5. compacts the log to it, and applies 5;
+6. persists term 3, a vote for server 2 and an eighth entry.
+
+It writes under the simulator, which makes the bytes the same on every run and makes the
+snapshot record's path `/raft` rather than a directory of the machine that ran it. It
+copies the files out through `RealEnv`. It was run in the tag's own tree, with the tag's
+`Cargo.lock` and toolchain, from this repository's root:
 
 ```
 git worktree add --detach <scratch>/v030 v0.3.0
@@ -5303,84 +5318,385 @@ cp -R <scratch>/fixture crates/ananke-raft/tests/fixtures/v0.3.0-store/store
 git worktree remove --force <scratch>/v030
 ```
 
-No tracked file of the tag's tree was changed; `--force` removes the untracked example.
-Four runs, the last of the program as committed, were identical under `diff -r`. The
-README beside the store lists what it holds under 0.3.0's keys and every file's size and
-SHA-256, and `crates/ananke-raft/tests/v030_store.rs` holds the fixture to it at the
-engine, under 0.3.0's keys spelled out byte by byte rather than through the build's
-helpers, whose layout item 6 changes: an engine whose recovery lost nothing, three tables
-and a log, the hard state, the applied index, the incarnation, the configuration key, the
-snapshot record, entries 5 to 8, the user's `a`, ten keys in all, every one sixteen bytes
-or longer, and no format version.
+- No tracked file of the tag's tree was changed; `--force` removes the untracked example.
+- Four runs, the last of the program as committed, were identical under `diff -r`.
+- The README beside the store lists what it holds under 0.3.0's keys, with every file's
+  size and SHA-256.
+- `crates/ananke-raft/tests/v030_store.rs` holds the fixture to that README at the
+  engine, under 0.3.0's keys spelled out byte by byte rather than through the build's
+  helpers:
+  - an engine whose recovery lost nothing, three tables and a log;
+  - the hard state, the applied index, the incarnation, the configuration key and the
+    snapshot record;
+  - entries 5 to 8 and the user's `a`: ten keys in all.
 
-**The test of the refusal, and why it is not in this entry's commit.** The test that holds
-the decision opens the fixture through `RaftStore::open` and asserts the refusal with both
-formats named, not as lost state; that the open wrote nothing, since the engine's sequence
-number does not move, and left every key and every file as it was; that a server started
-on it traces one `RaftServerFailed` naming both formats and no `RaftRefused`, `RaftAdopted`
-or `RaftRecovered`, and leaves every file of the fixture byte for byte as it was, beside the
-empty log segment every engine open starts; that a store the build writes records format 2
-and opens again, a store recording format 1 or 3 is refused naming both, and a store with
-keys and no version is refused as format 1; and that a crash anywhere in a fresh store's
-first open never leaves it refused for its format, beside the known-buggy order, the
-version in a second batch after the incarnation, which the same crashes catch.
+**The test.** It landed with the layout, in D-060's commit, after `SimEnv`'s queue, as
+the owner ordered on 2026-09-15. `crates/ananke-raft/tests/v030_store.rs` asserts that:
+- the fixture is refused naming format 1, format 2 and 0.3.0, and not as lost state;
+- nothing on its disk changes, with no file added — not even the empty log segment every
+  engine open adds, since the engine never opens;
+- a server started on it traces one `RaftServerFailed` naming both formats, and no
+  `RaftRefused`, `RaftAdopted`, `RaftRecovered` or engine record;
+- the fixture with a lost mark, a rotted table, a rotted log record, a completed staged
+  install, or nothing but its marker is refused for its format all the same, beside the
+  start that checked lost state first, which the same five shapes catch on 5 of 5;
+- it is refused on a real filesystem with every name, every size and every byte
+  unchanged, and a directory that is not there is fresh and stays missing.
 
-It cannot land on the tree of this entry, the lane's part 1, without moving every Raft
-scenario's schedule. The store this tree writes is byte for byte the store 0.3.0 writes,
-since neither the store nor the engine changed after the tag, so the only way to refuse the
-fixture and still open this tree's stores is for every fresh store to write something new;
-and the check reads a key before anything else. The simulated disk draws on both: a file's
-size enters the crash model's torn-write and bit-rot draws, and every read and write draws
-its latency from the disk's stream. Measured on the change, with the test and the check as
-described: every one of the forty-four pinned `raft::run`s of `sim/tests/raft.rs` has a
-different sequence of Raft, client, crash and partition records, and so does seed 4 of the
-term-raise schedule. At the gate's 20 seeds the correct server's sweeps, the membership and
-quorum scenarios and every variant's sweep pass, and nine pinned tests fail: seeds 7381 and
-6325 now meet the floor lowering and the crash inside an adoption they asserted absent;
-seeds 1885 and 2023, and seed 4 of the term-raise schedule, no longer straddle an
-isolation; the removed catches' test fails at its first seed, 1885, and the eleven variant
-catches' test fails; 5909 under `IgnoreIncarnation` no longer leaves the leader's progress
-for the refused server stale; and 680's pair no longer reproduces. Landing it needs the
-re-audit of every pinned seed, the work `SimEnv`'s queue commit (SHARD.md §12, Stage A item
-3), held to follow this tree, has done on this tree's schedules and would have to do again
-on the change's. The order is returned to the integrator.
+The test's names and D-060's tests of the mechanism are listed in D-060.
 
 **Alternatives.**
-
 - *Migrating 0.3.0's store to the new layout*: the owner's decision rules it out; 0.x has
   no users (Q5).
 - *Treating the refusal as lost state*: the server would mark the store lost and re-seed,
-  so the next leader's snapshot would replace a whole store its operator has not decided
-  about.
-- *The version in the `RAFT-STORE` marker*, checked before the engine opens: no table's
-  size would change. But the marker is the server's, written after the store's first open:
-  a 0.3.0 store opened through `RaftStore` alone, as a user of the published crate would,
-  has none, and a 0.3.0 server that crashed between its store's first write and its marker
-  left a store with keys and no marker; either would open under the new layout as an empty
-  store. The marker's own rule, that anything but a whole store's line reads as lost
-  (D-044), would also have to change, and its content's length still enters the crash
-  model's draws.
-- *`0 / 0 / format`, beside the hard state*: under item 6's layout the key would lie inside
-  range 0's table.
-- *A fresh store as one without an incarnation key*: it decides by a key of 0.3.0's
-  layout, which a later layout moves; the engine's counts belong to no layout.
-- *The version in a batch of its own after the first open's*: a crash between the two
-  leaves a store that lost nothing refused as format 1.
+  so a leader's snapshot would replace a whole store its operator has not decided about.
 - *Refusing only a missing or older version*: a newer one would be read by a build that
   cannot know its layout.
 
 **Consequences.**
-
-- The engine's open runs before the check, as it runs before every store open: its
-  recovery, unchanged since 0.3.0, starts a new empty log segment and changes no key and
-  no other file. Nothing of the Raft store writes before the refusal.
-- A 0.3.0 store that its own marker already says lost state, or whose engine recovery lost
-  writes, is refused for that before its format is read, and re-seeds as D-044 has it: a
-  re-seed replaces the store with a leader's snapshot and reads no key of it.
-- Until item 6 lands, format 2's layout is 0.3.0's. Stores written between the check and
-  the layout exist only in tests and simulations, and no build between them is released.
-- The format break is recorded for the release notes with the layout, D-060 (Q5,
+- Stores written by 0.3.0 are refused by the release that ships item 6 and must be
+  discarded or rebuilt. The break is recorded for the release notes in D-060 (Q5,
   condition 3).
+- The first draft of this entry (9e90eed) proposed a mechanism: the version as an engine
+  key, read after the engine's open and after lost state. It contradicted the last two
+  bullets above, and is superseded by D-060, where it is kept as a rejected alternative
+  and as the known-buggy start order `LostStateBeforeFormat`.
+
+---
+
+## PROPOSED D-060 — The key layout of Q5, and the store's format record read before anything writes
+
+**Context.** Stage A's item 6 (SHARD.md §12) has three parts:
+- the Raft store parameterised by a key prefix (Q40);
+- one group's Raft state under `0 / <range: u64 BE> / <purpose> / name`, with tenant 1
+  the system tenant and user data moved from tenant 1 to tenant 2 (Q5, SHARD.md §1);
+- the on-disk format version bumped and recorded where a store's open can read it, with
+  a store in 0.3.0's format refused (D-059).
+
+The owner's answers of 2026-09-15 add three constraints, recorded as decided in D-059:
+- newer formats are refused too;
+- the version is read before anything writes;
+- the format is checked before lost state.
+
+Before this commit a server's start wrote before it could read a version stored anywhere
+in the engine (node.rs:385-513 at 9e90eed):
+- the adoption can sweep, copy over or mark a store (snapshot.rs:318-449);
+- `Engine::open` creates the directory, sweeps orphans and always starts a new log
+  segment (engine.rs:898, 1023-1029; wal.rs:600-614);
+- every open error becomes a lost mark and a re-seed (node.rs:461-485).
+
+The simulated disk sets further limits:
+- it rots one bit per block at every crash (sim/fs.rs:361-381; `p_bitrot` 0.02 in the
+  raft and membership scenarios);
+- a crash keeps a prefix of each directory's unsynced entry operations, but never loses a
+  synced entry (sim/fs.rs:276-289, 611-634);
+- a lost fsync leaves pending writes to a later crash (sim/fs.rs:317-330).
+
+Any engine key can be lost with a dropped table or a damaged log. Under
+`RefusalNotDurable` a dropped table can even be laundered into a store with no damage
+(D-044, seed 687; seed 119's pin). So a version kept only in the engine cannot tell
+"format 2 that lost its version" from "format 1 that lost state".
+
+**Decision.** Every code site carries `// PROPOSED(D-060)`, and the refusal's sites carry
+`// D-059`.
+
+*The record.*
+- **What it is.** A file `RAFT-FORMAT` in the store directory, beside `RAFT-STORE`
+  (`crates/ananke-raft/src/format.rs`). Two copies of `b"ananke raft store format\n" |
+  version: u64 LE | crc32c: u32 LE`, 37 bytes each, at offsets 0 and 37, 74 bytes in one
+  block. The bytes are pinned in `tests/format.rs`.
+- **How it decodes.**
+  - A copy is valid when its magic and CRC match.
+  - Valid copies that agree give the version.
+  - Valid copies that disagree are refused, naming the version that is not 2.
+  - No valid copy means unreadable.
+  - One flip can never read as another version (the CRC). One crash's rot can never make
+    the record unreadable (two copies in one block).
+- **Permanence.**
+  - Every later format keeps the name, the magic, the copy's shape and offsets, and the
+    rule that checkpoints and staged installs carry a record. Only the version changes.
+  - No build rewrites a record in place with another version.
+  - So a record that does not decode can only be damage, and a valid copy naming another
+    version is always a refusal.
+
+*The gate, read before anything writes.* `format::check_format(env, dir)` opens the record
+and, only when it is absent or unreadable, lists the directory. It writes nothing, creates
+nothing and traces nothing; three filesystem operations at a healthy start.
+- A record naming 2 is *recorded*. The record is *whole* when both copies are valid and the
+  length is 74.
+- A record naming another version is refused (`FormatRefused { found: Recorded(v) }`),
+  with the words "newer than format 2" or "this build reads format 2 only".
+- No record, and nothing else in the directory but `RAFT-FORMAT.tmp` (or no directory at
+  all), is *fresh*.
+- No record beside any of `CURRENT`, `CURRENT.tmp`, `MANIFEST-*`, `*.sst`, `*.wal`,
+  `RAFT-STORE`, `install` or `snap-*` is refused as format 1, 0.3.0's (`Unrecorded`).
+- No record beside only other names is refused as `Foreign`, naming them. It is not
+  started fresh, and not called format 1.
+- An unreadable record with nothing else is *fresh*.
+- An unreadable record beside anything else is *damaged*: lost state, never a format.
+
+*The writes.*
+- **A fresh directory's first write is its record**: tmp, sync, rename, directory sync,
+  before the engine or anything else creates an entry there. So every durable directory
+  holding any other entry holds the record, at every crash point (invariant I1).
+- **A record with one bad copy is healed at the start** by rewriting the whole record in
+  place with byte-identical content, then a sync.
+  - A torn prefix of identical bytes cannot damage the valid copy, and a lost sync leaves
+    the old bytes. So a heal never makes a readable record unreadable.
+  - A rename-based heal can, under a lost fsync, and does.
+- **An unreadable record is rewritten** (tmp and rename) only by the adoption, right after
+  its `CURRENT` switch and before the marker.
+- **Every checkpoint carries its own record**, written after `Engine::checkpoint`.
+  - A checkpoint is complete only when its `CURRENT` parses and its record reads 2.
+  - The sender streams the record first.
+  - `Assembler::verify` reads the staged record before any table and refuses a stream in
+    another format or with none.
+  - Both adoptions read the staged record before their first write: another version or
+    none is refused (`Subject::StagedInstall`); an unreadable one is staging damage
+    (`Damage::StagingFormatUnreadable`), refused and never swept (D-041).
+- The engine never reads, lists as its own or removes the record; nor do the adoption's
+  removals, the version sweep or the assembler's. The as-built adoption's copy loop skips
+  it.
+
+*The start* (`node::start_store`, shared by `run` and the tests), in this order:
+1. the gate: a refusal or a read error stops the server with nothing written;
+2. a fresh directory's record;
+3. the adoption, with its staged check (a format refusal stops the server; staging damage
+   is lost state);
+4. the heal;
+5. a damaged record not replaced by an adoption is lost state (`Damage::FormatUnreadable`);
+6. the marker (D-041, D-044);
+7. `Engine::open`, then `RaftStore::open`.
+
+`RaftStore::open` requires a `FormatChecked` token, which only the gate, the record's
+write and the start construct. The token carries its directory, compared with a new
+`Engine::dir()`, the engine's only change. `RaftStore::open_dir` runs the gate for callers
+outside the server.
+
+The gate now runs before the marker read. D-044's sentence that `refuse_lost_store` reads
+the marker before `CURRENT` still holds, since the gate reads neither. If D-044 is read as
+"the marker is read first at every start", this entry supersedes exactly that reading and
+nothing else.
+
+*The layout.*
+- **Keys.** A group's Raft state is `0 / <group: u64 BE> / <purpose: u64 BE> / name`
+  (`store::KeyPrefix::group`), with RAFT.md §3's table ids as purposes:
+  - 0: `hard`, `applied`, `reseeded`, `incarnation`;
+  - 1: the log, keys of 32 bytes;
+  - 2: `config`;
+  - 3: `snapshot`.
+- **Today's group** is **group 2** (`node::SINGLE_GROUP`), SHARD.md §2's range 2, which
+  holds what today's group replicates.
+- **Tenants.** User data is tenant 2 (`apply::USER_TENANT`). Tenant 1 is the system tenant
+  (`apply::SYSTEM_TENANT`), which nothing in Stage A writes. A range may span tenants.
+- **The version** is a file, inside no range's table, span checkpoint or range delete.
+- **Room for #21 and the descriptor.** Purposes 4 and up are unassigned. #21's session
+  table (Q11) and Stage C's descriptor each add keys under a new purpose or name and move
+  none. The unit test asserts purpose 4's span holds no key of this build's.
+- **No aliasing.** No key format 2 writes is a key 0.3.0 wrote. Format 2's tenant-0 keys
+  are 28 bytes or more; 0.3.0's are 20 to 24 bytes, or 27 bytes with an 11-byte name, and
+  no format-2 name is 3 bytes long. The gate, not the group id, keeps 0.3.0's keys unread;
+  this is the defence in depth, enumerated in a unit test.
+
+**The pairs.** The known-buggy orders are `StartOrder` values in node.rs, `#[doc(hidden)]`
+and not `core::Variant`s, since no sweep reaches them:
+
+| Order | What it does | Caught by, measured |
+|---|---|---|
+| `LostStateBeforeFormat` | D-059's first draft and the held check patch's order | the fixture's five lost-state shapes: 5 of 5 |
+| `FormatAfterFirstBatch` | the record written after the engine's open and the first batch | the first start's crash sweep: 16 of 40 seeds refused for the format, and I1 broken on the same 16 |
+| `HealByRename` | the heal by tmp and rename | the heal's crash test at `p_durable` 0.7: 3 of 40 seeds left the record unreadable, against 0 of 80 for the correct heal |
+| `UnreadableIsUnrecorded` | an unreadable record read as none | the damaged record's re-seed: the start stops the server instead |
+| `StagedFormatUnchecked` | the adoption without its staged check | a staged install recording format 3: adopted, and the store's tree changes |
+
+The codec's pair is a decoder without the checksum, which reads flips of the version's
+bytes as other versions.
+
+**Tests.**
+- **`crates/ananke-raft/tests/v030_store.rs`** (D-059's):
+  - `the_v0_3_0_store_fixture_holds_0_3_0_state_under_0_3_0_keys`
+  - `the_v0_3_0_tags_store_is_refused_before_anything_writes`
+  - `a_server_on_the_v0_3_0_store_stops_and_changes_no_byte`
+  - `a_v0_3_0_store_that_lost_state_is_refused_for_its_format_never_reseeded`
+  - `a_v0_3_0_store_on_a_real_filesystem_is_refused_and_left_untouched`
+- **`crates/ananke-raft/tests/format.rs`:**
+  - `the_format_record_survives_one_flip_and_never_reads_as_another_version`: 592 flips,
+    87 616 flip pairs across the copies, every truncation, and the conflicting record
+  - `a_store_this_build_writes_records_format_2_and_opens_again`
+  - `a_store_recording_format_1_or_3_is_refused_naming_both_and_left_untouched`
+  - `a_directory_without_a_record_is_refused_or_fresh_by_what_it_holds`
+  - `a_crash_in_a_fresh_stores_first_open_never_leaves_it_refused_for_its_format`
+  - `a_record_with_one_bad_copy_is_healed_in_place_and_a_crash_never_loses_the_other_copy`
+  - `an_unreadable_record_beside_a_store_is_lost_state_and_the_adoption_rewrites_it`
+  - `the_format_record_survives_the_engine_the_adoptions_and_the_sweeps`
+  - `a_checkpoint_carries_its_record_and_a_stream_of_another_format_is_refused_unread`
+- **`crates/ananke-raft/tests/node.rs`:**
+  `a_server_whose_store_lost_state_asks_to_be_reseeded_and_grants_nothing`, extended: the
+  record is `Recorded { whole: true }` before the start and its bytes are unchanged
+  through the refusal, with no `RaftServerFailed`; and
+  `a_store_whose_log_record_rotted_reseeds_and_keeps_its_record`.
+- **Unit tests in `store.rs`:**
+  `every_raft_key_lies_under_its_group_prefix_and_purpose`,
+  `no_format_2_key_has_a_0_3_0_shape`,
+  `user_keys_are_tenant_2_and_tenant_1_is_the_system_tenant`,
+  `the_single_group_prefix_is_0_2`; and in `tests/store.rs`
+  `two_group_prefixes_share_one_engine_and_nothing_else`,
+  `a_log_key_of_another_length_under_the_log_purpose_refuses_the_open`,
+  `user_keys_are_tenant_2_and_tenant_1_stays_empty`.
+- A catch rate below 5% of a test's seeds asserts at the premerge tier (the owner's rule
+  of 2026-09-15); the heal's pair is asserted at 5% of its 40 seeds and measured at 7.5%.
+
+**What moved.**
+- **Why.** The record's operations and inodes, the stream's extra file and eight more bytes
+  on every Raft key move the simulated disk's latency, torn-write and bit-rot draws.
+- **Moved:** every schedule of `sim/raft.rs`, `sim/membership.rs` and `sim/quorum.rs`, and
+  with them every pinned seed of `sim/tests/raft.rs` and the seeded tests of ananke-raft's
+  test binaries. Measured on the branch's base for this commit, `8717a71` (Stage A's lanes
+  S and N, D-056's queue, D-058 and D-061), and on the tree of this commit: the raft
+  scenario's seed-42 trace hashes `64fc3b553a9e80c2` before and `ab289ace35a8415f` after,
+  the membership scenario's `bac1e6936795e5c0` and `9c88d575d39acd76`, and the re-seed
+  scenario's `84d6b14ed6d684ab`/`eedef54307ed8c23` and `0d9167f75474e730`/`d8d63ed0109360ec` (the trace
+  body as `moirae_trace::trace_hash` takes it; `scratchpad stage-a/l/reaudit/hashes-*.log`).
+  On the lane's own base, 903f37c, before the queue, the raft hash was `810bcc9bb59159e2`.
+- **Not moved,** measured on the same two trees: `sim/engine.rs` seed 42, `sim/wal.rs` seed
+  42 and echo's golden, `fcbe82ee7a0ba672`, which `sim/tests/echo.rs` asserts and which is
+  green. The engine gains one accessor, `Engine::dir()`, which does no I/O and which no
+  sweep calls, and `ananke-env` is untouched; the engine, WAL and echo sweeps print the same
+  rates at a thousand seeds as `2ec4bf7` did for D-061's table (below).
+
+**The re-audit of every pinned seed.** CLAUDE.md:58-67: a commit that moves a schedule
+re-audits every pinned seed it moves, and a pin asserts its mechanism or the absence of its
+situation with the reason, never a bare green. Every pinned test of `sim/tests/raft.rs` was
+run, its trace read, and its assertions and its prose rewritten to what the seed now does.
+
+| Pinned seed | What it did before | What it does now, asserted |
+| --- | --- | --- |
+| 164 | no snapshot-fed timer gap, over three refusals | the same absence; the replay finds no gap at all, over four refusals (server 2's for lost state at 6.405597155 s and server 3's three from 8.66689086 s) |
+| 385 | no gap for a restatement to rescue, over five refusals | the same absence, and the run now holds **no refusal at all**, over seven crashes and six isolations |
+| 7381 | the two floor rules agree; one refusal, server 2's at 12.575 s | the same; one refusal, server 1's at 6.396598792 s for lost state (table 1), and `floor_lowering_installs` empty, which is the agreement itself |
+| 6325 (correct and as built) | no crash inside an adoption window; 8 and 9 windows | the same absence; 6 and 6 windows, and the schedule's first crash now lands 691 ms *before* server 1's next adoption under the correct server and 712 ms before it as built |
+| 5909, correct | D-042's refusal, reset and re-seed on server 1 | **the mechanism, on server 3**: refused at 9.793751132 s, progress reset at 9.798229515 s, re-seeded at 10.218206571 s |
+| 5909, the pair and each half | stale progress under `IgnoreIncarnation` alone; none under the pair | **the mechanism on each**: server 3 stale under `IgnoreIncarnation` (leader 1 of term 9, 229 matched, 105 probes, 106 rejections), server 1 stale under the pair with server 1 alone uncounted after the heal, nothing stale under `SharedSnapshotDir`; no run takes a snapshot, so the stream half is out of reach on all three |
+| 132 | the pair's liveness catch, with the wedge's mechanism | **the absence, with the reason**: the pair, both halves and the correct server all pass; no run takes a snapshot and the pair's two runs are refusal-free, so the pair's trace is the stream half's record for record. The search over seeds 0..1000 found the pair caught on **0 of 1000** and each half on 0 |
+| 680 | the pair passes; `IgnoreIncarnation` alone leaves server 1 stale | the pair now leaves server 3 stale and only it uncounted after the heal; `SharedSnapshotDir` alone and the correct server refuse server 3 at 17.852606007 s and 12.162591955 s, reset and re-seed it; no run takes a snapshot |
+| 687 | as built, the first half; under the correct server, the quiesce | as built, the first half again (table 44 dropped, refused at 18.109367393 s, two crashes on the refused server, two restarts, nothing laundered); under the correct server **the absence with its reason** — no table dropped, no engine quiesced, no lost-state refusal, its two refusals being damage found before the engine could lose anything |
+| **158 (new)** | — | **the pin `RefusalNotDurable` needed**: the first of the thousand's 9 catches, with the laundered store's restatement as built (table 87, manifest 15 without it, segments deleted, a clean open at applied 423) *and* D-044's own mechanism under the correct server on the same seed (table 94, the engine quiesced at 21.378303251 s, the refusal traced at 21.382950125 s, three crashes on the refused server each refused again on the durable mark, nothing flushed until the install at 22.202624757 s) |
+| 119 | `RefusalNotDurable`'s catch | **the absence with its reason**: no store is refused at all on the run, so the variant has nothing to change and its trace is the correct server's record for record |
+| 1885, 2023 | no term change straddles an isolation's start | the same absence, re-measured: on 1885 server 1 is not isolated at 15.203 s and holds term 9 across that stretch; on 2023 it is cut off from 19.37 s, not 19.22 s, and keeps term 13 through the window |
+| the nightly's eleven variant catches | no straddle; no uncounted step-down on any | no straddle, and the two seeds whose named isolation still comes are the same (5203, 6691); seed 1252 now steps a leader down leaving a follower uncounted, which the test asserts by seed rather than forbidding outright |
+| the 28 removed catches | no catch to remove; six kept their isolation; seed 6717 the one catch | no catch to remove; **five** keep their isolation (5203, 6691, 5051, 5879, 2578); seed 5153's own gap is gone and the five the replay finds there are on a run the timer bound is not asked of (§2's carve-out, D-035); **seed 2305** under `SnapshotWithoutCurrentLast` is now caught by state machine safety over its own bug, asserted |
+| term-raise seed 1 | D-050's shape, one change received before its isolation | **D-047's straddle**: four rises decided before their isolations and traced inside them, the first server 2's from term 1 at 1.21785 s |
+| term-raise seed 4 | D-047's straddle, seven rises | **D-050's shape again**, which it held before D-056: server 3's change from term 4 to 5, received 7.362 µs before the isolation at 2.85382 s and stepped 12.88 µs into it |
+
+Two pins changed their names with what they assert:
+`seed_119_…_which_a_hundred_seeds_can_miss` becomes `seed_158_…`, with
+`seed_119_which_pinned_the_refusal_that_is_not_durable_before_the_layout_refuses_nothing`
+beside it; `seed_132_pins_the_combined_variant_…` becomes
+`seed_132_which_pinned_the_combined_variant_before_the_layout_reaches_no_wedge`; and seeds
+1 and 4 of the term-raise schedule exchange their test names with their shapes.
+`assert_stream_wedge`, the helper that read the wedge off seed 132's trace, is removed with
+the wedge: no seed of the first thousand reaches it on this tree.
+
+**Alternatives.**
+- *The version as the engine key `0`, read after the engine's open and after lost state*
+  (D-059's first draft, 9e90eed, and its held patch).
+  - It writes a new segment into a refused store.
+  - It re-seeds a 0.3.0 store that lost state.
+  - Measured on that change alone: every pinned raft run moved and nine pinned tests failed
+    at the gate.
+  - It is the pair `LostStateBeforeFormat`.
+- *The engine key read by a new read-only recovery* (`Engine::inspect`).
+  - It is a second recovery that must agree with the first forever, and it reads every
+    table twice per start.
+  - A loss that takes the key makes format 2 and format 1 the same bytes, so a damaged
+    0.3.0 store without a surviving 0.3.0 key would re-seed.
+  - 0.3.0 directories holding only a marker or an empty engine open fresh.
+  - One dropped table defeats "refuse newer".
+- *The engine key beside the file, checked in `RaftStore::open` after lost state.* Under
+  `RefusalNotDurable` the flusher launders a dropped table holding the key into a store with
+  no damage, and the key rule then refuses a format-2 store as format 1. Checking a staged
+  key would add table reads to both adoptions and change D-041's classification of a rotted
+  staged table.
+- *A manifest field*: the engine names no layout; a rotted `CURRENT` hides it; it moves the
+  engine sweep.
+- *The version in `RAFT-STORE`*: written after the first open, rewritten in place at every
+  refusal, and 0.3.0 wrote markers.
+- *One copy, plain text, or no CRC*: a flip reads 2 as 3, or one rot re-seeds and
+  quarantines a voter for good (D-035).
+- *Two copies without a heal*: one rot from a re-seed for life.
+- *The heal by tmp and rename*: it can lose the surviving copy under a lost fsync.
+- *An unreadable record alone counted as lost state*: a lost fsync on a new node's first
+  write would re-seed a node holding nothing.
+- *A fresh directory as one holding no store-family name*: a store started in a directory
+  holding things nobody identified.
+- *The record streamed last*: under `SnapshotWithoutCurrentLast` a staged `CURRENT` could
+  precede it, changing that variant's catch.
+- *A missing staged record as staging damage*: a re-seed would discard, unread, an install
+  of unknown format. It is unreachable for this build's stagings, and stopping writes
+  nothing.
+- *The adoption rewriting a damaged record before its copies*: it would label the old
+  store, of unknown format, as format 2.
+- *An unreadable record refused before the adoption*: the re-seeded install would never be
+  adopted.
+- *No proof token*: any other caller of `RaftStore::open` could read an ungated store's
+  keys.
+- *Group 0 for today's group*: range 0 is §2's root; kept as question 3.
+- *The prefix in `NodeConfig`*: churns every configuration for a constant Stage B
+  replaces.
+- *A trace event for the record's writes*: question 5.
+- *Migration*: ruled out (D-059).
+
+**Consequences.**
+- *The format break, for the release notes of the release that ships this* (Q5, condition
+  3): stores written by ananke-raft 0.3.0 are refused at open, naming format 1 and format
+  2, and must be discarded or rebuilt; there is no migration. No release-notes file exists
+  in the tree, so this entry is the record until one does.
+- A crash in a fresh store's first start can leave it refused as lost exactly where it
+  could before — the engine's own rule for a manifest without a `CURRENT` (D-024) — and
+  never refused for its format.
+- Under a lost fsync, which the Raft scenarios do not model, a new node's record may be
+  torn beside its first engine files. It then re-seeds.
+- A directory holding foreign entries (`lost+found`, `.DS_Store`) is refused. Operators
+  point the store at an empty directory.
+- Clusters on different formats cannot stream snapshots to each other. The next format bump
+  needs a rolling-upgrade decision.
+- Stage B's per-range stream must carry and check a record (the permanence rule).
+- Stage C's descriptor must either bump the format or refuse a range table without a
+  descriptor, since a format-2 store's group 2 would otherwise look like a range 2 replica
+  missing only its descriptor.
+- Every start reads the record: three filesystem operations when it is whole.
+- node.rs's comment that the as-built adoption's disk sees exactly the nightly's operations
+  is amended. The gate runs under every variant.
+- A variant pair not swept today, `{SharedSnapshotDir, SnapshotWithoutCurrentLast}`, could
+  stage a `CURRENT` from a stream whose listing lacked the record. The adoption would then
+  stop the server rather than adopt.
+- SHARD.md's citations of store.rs and apply.rs describe the tree before this commit. The
+  approved plan is not edited.
+- Issue notes, not code:
+  - the store directory's entry is never fsynced in its parent;
+  - `valid_name` accepts `RAFT-*` chunk names;
+  - the RealEnv test cannot check modification times or a read-only directory, since
+    `std::fs::metadata` and `std::fs::set_permissions` are banned outside `ananke-env`
+    (clippy.toml, `scripts/check-direct-io.sh`); it checks every name, size and byte.
+
+**Questions for the owner.** Each is resolved above the conservative way. None blocks.
+1. **An unreadable record beside a store.** "Refuse newer" and "nothing written to a
+   refused store" cannot be checked when the record no longer says its version. D-044 and
+   the requirement that a format-2 store whose version record is lost still re-seeds call
+   for lost state instead.
+   - Taken: lost state, a lost mark and a re-seed. It needs two independent rots.
+   - The cost: a newer-format store in that state, after a downgrade, is replaced rather
+     than refused.
+   - Does "nothing is written to a refused store" cover this store, or only a store
+     refused for its format?
+2. A directory with entries but no store file and no record is refused as `Foreign` rather
+   than started fresh. Confirm.
+3. Today's group is group 2 (§2's range 2) rather than group 0. Confirm, with the Stage C
+   consequence above.
+4. The gate, the staged check, the record's writes and the stream's order apply under
+   every variant, `AdoptionAsBuilt` and `RefusalNotDurable` included. Confirm.
+5. The record's write, heal and rewrite are untraced, like the marker's. A
+   `RaftFormatRecorded` event would add an ananke-env variant and a moirae line. Add one?
 
 ---
 
@@ -5496,6 +5812,47 @@ commit that lands this entry.
 | Incremental checker: a compared seed in violation | raft.rs:3471 | 20 / 100 / 100 / 100 | 61 of 100 | 59 of 100 | every → every | 6.6 × 10^-9 |
 | Quorum, `RefusedCountsForQuorum` blocked: a chunk lost to the limit | raft.rs:3585 | 20 / 100 / 1 000 / 10 000 | 1 000 | 300 304 events | every → every | ~0 |
 | Quorum on the sweep's disk: the install silence deposes `RefusedCountsForQuorum` | raft.rs:3679 | 20 / 100 / 1 000 / 10 000 | 844 | 8 311 | ≥ 100 → ≥ 100 | ~0 |
+
+**Re-measured on the tree with the key layout and the store's format record (D-060).**
+The layout moved every raft, membership and re-seed schedule, so every rate in the table
+above that comes from those three scenarios is a fresh draw; the whole table was
+re-measured at `ANANKE_SEEDS=1000` in release on the commit that lands D-060
+(`scratchpad stage-a/l/reaudit/raft-1000-merged.log` and `ewe-1000-merged.log`).
+**No assertion crossed the 5 % line, so the rule moves nothing and every tier above
+stands.** What changed:
+
+- The engine, WAL and echo rows are unchanged, figure for figure: those scenarios do not
+  touch `ananke-raft`, `ananke-storage` gains only a no-I/O accessor, and their seed-42
+  traces are byte-identical on both trees.
+- Raft variants at every tier: `ApplyBeforeCommit` 890 (882), `CountOlderTermForCommit`
+  451 (454), `ResetTimerOnAnyRpc` 344 (336), `SnapshotWithoutCurrentLast` 356 (336);
+  `SendBeforePersist`, `TruncateOnEveryAppend` and `NoPreVote` on every seed as before.
+- `AdoptionAsBuilt`: caught on **57 of 1 000 (5.7 %)**, against 77 (7.7 %), with its storm
+  drawn on the same 260 seeds and 8 707 adoptions under it. It is the nearest thing to the
+  line and stays at the hundred-seed tier, where a hundred seeds see none with probability
+  0.943^100 = 2.7 × 10^-3. At the nightlies' 6.46 % a thousand seeds catch 64.6 on average
+  with a standard deviation of 7.8, so 57 is one below the mean.
+- `RefusalNotDurable`: caught on **9 of 1 000 (0.9 %)**, against 16, firing on 340 seeds
+  (347). Already at the thousand-seed tier by the owner's decision (D-056); the first catch
+  moves from seed 119 to **seed 158**, which the pin follows.
+- `LeaseTrustsTheClock`: **37 stale reads of the 503 seeds beyond the drift bound (3.7 %)**,
+  against 41 (4.1 %). Already moved to the thousand-seed tier by this entry; the firing,
+  503 and 503, is unchanged.
+- `SharedSnapshotDir`: **caught on 0 of 1 000**, against 2. Its catch is asserted only at
+  the nightly's ten thousand, so nothing fails; its firing is unchanged — a re-take at an
+  index already taken on 525 seeds — and the aimed arm reaches its stream on **153 (15.3 %)**
+  against 143. This sharpens the second open question below: on this tree the liveness
+  catch's rate is at most 0.1 %, and the next nightly is what measures it.
+- `SingleMajorityInJointConsensus` 236 (296); D-050's term-raise shape reached on 276 (298);
+  the incremental checker 59 of 100 (61); `IgnoreIncarnation`'s state, a refused follower
+  re-seeded and applying, on 626 (659); the quorum scenario's silent step-downs on the
+  sweep's disk 886 (844).
+- Membership: `elections_while_joint` 34 events (34), `reverts_to_a_prefix` 25 (28),
+  `config_reverts` 62 (56), `step_downs_outside_new` 372 (390), installs adopted 7 468, and
+  a joining server fed a snapshot on every one of the thousand seeds.
+- The raft coverage counters asserted from a hundred seeds are all far above their line:
+  refusals 3 444, torn writes 680, snapshots installed 19 496, streams resumed 68 261,
+  re-seeded servers 4 070, re-seeds completed 803, adoptions 9 049, progress resets 2 350.
 
 These are not draws, and are left as they are:
 

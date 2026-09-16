@@ -1689,6 +1689,17 @@ impl<E: Environment> Engine<E> {
         lock(&self.shared.tables).manifest.clone()
     }
 
+    /// The directory this engine runs in: its configuration's, unchanged since
+    /// the open, and no I/O to read. A caller that checked something about the
+    /// directory before the open — ananke-raft's Raft store format, read before
+    /// anything writes — compares it with this, so a check of one directory can
+    /// never stand for another's.
+    // PROPOSED(D-060): the store's format record, read before anything writes.
+    #[must_use]
+    pub fn dir(&self) -> &Path {
+        &self.shared.config.dir
+    }
+
     /// The log's segments on disk, oldest first.
     #[must_use]
     pub fn wal_segments(&self) -> Vec<u64> {

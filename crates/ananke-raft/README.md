@@ -2,7 +2,8 @@
 
 Raft for [ananke](https://github.com/pchrysostomou/ananke), in three parts: a pure
 protocol core stepped by inputs and producing ordered outputs, with no I/O in it; the
-persistent state under a reserved tenant of the ananke storage engine, where an entry's
+persistent state under a reserved tenant of the ananke storage engine, one key interval
+per Raft group and its on-disk format recorded beside it, where an entry's
 writes and the applied index land in one batch; and the server that runs a core under
 the ananke `Environment`, so that the code that runs on real sockets and disks is the
 code the simulator partitions, delays, duplicates and crashes.

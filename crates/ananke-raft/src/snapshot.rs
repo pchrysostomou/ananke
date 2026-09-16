@@ -2,9 +2,12 @@
 //!
 //! A snapshot is an [`Engine::checkpoint`](ananke_storage::Engine::checkpoint) of
 //! the state machine's store at an applied index, with its identity, the index,
-//! term and configuration, written into the live store's `0 / 3 / snapshot` key
-//! *before* the checkpoint is taken, so the checkpoint's copy carries it before the
-//! checkpoint's own `CURRENT` (D-024). [`take`] is that sequence; the `apply` task
+//! term and configuration, written into the live store's `<prefix> / 3 / snapshot`
+//! key *before* the checkpoint is taken, so the checkpoint's copy carries it before
+//! the checkpoint's own `CURRENT` (D-024). The checkpoint's own format record
+//! follows its `CURRENT`, and a checkpoint is complete only with both, so no
+//! stream carries a store whose version nothing says (PROPOSED D-060). [`take`]
+//! is that sequence; the `apply` task
 //! runs it between applies, so the recorded index is exactly the index the
 //! checkpoint captures — the apply task is the only writer of user state and it is
 //! busy checkpointing (D-036).
@@ -17,7 +20,10 @@
 //! offset of the last file rather than from zero (RAFT.md §1). [`Assembler`] is the
 //! receiver's: chunks land in the staging directory, a well-known path under the
 //! server's data directory, and the streamed `CURRENT` is held aside in memory so
-//! the staging directory is never a complete store while the stream runs.
+//! the staging directory is never a complete store while the stream runs. The
+//! format record is streamed first and checked before any table is opened, so a
+//! leader in another format is refused unread and a staged install always carries
+//! its version before its `CURRENT` (D-059, PROPOSED D-060).
 //!
 //! Installing is [`Assembler::finish`]: the staged tables verified with the
 //! engine's own checks, then one repair table and a new manifest written with the
@@ -82,8 +88,9 @@ use ananke_storage::{Value, ikey};
 use bytes::{Bytes, BytesMut};
 
 use crate::core::{Variant, Variants};
+use crate::format;
 use crate::message::{Message, SnapshotStatus};
-use crate::store::{self, Damage, LostState, RaftStore, SnapshotRecord};
+use crate::store::{self, Damage, KeyPrefix, LostState, RaftStore, SnapshotRecord};
 use crate::types::{Configuration, Entry, Index, Payload, ServerId, Term};
 
 /// The staging directory, a well-known path under the server's data directory
@@ -125,19 +132,25 @@ pub fn parse_version(name: &str) -> Option<(Index, u64)> {
 }
 
 /// Whether the checkpoint in `dir` is complete: its `CURRENT` is there and
-/// parses. The engine writes a checkpoint's `CURRENT` last and synced (D-024),
-/// and the record names the directory before the checkpoint is written (D-036),
-/// so the record may name a take still in flight, or one a crash cut short; a
-/// stream must open neither.
+/// parses, and its own format record reads as this build's. The engine writes a
+/// checkpoint's `CURRENT` last and synced (D-024), the take writes the record
+/// after that (PROPOSED D-060), and the snapshot record names the directory
+/// before the checkpoint is written (D-036), so the record may name a take still
+/// in flight, or one a crash cut short; a stream must open neither, and must
+/// never stream a checkpoint without its version.
 ///
 /// # Errors
 ///
 /// The filesystem's, other than a missing file.
 pub async fn checkpoint_complete<E: Environment>(env: &E, dir: &Path) -> io::Result<bool> {
-    Ok(match read_whole(env, &manifest::current_path(dir)).await? {
+    let switched = match read_whole(env, &manifest::current_path(dir)).await? {
         Some(bytes) => manifest::parse_current(&bytes).is_some(),
         None => false,
-    })
+    };
+    // PROPOSED(D-060): every checkpoint carries its own RAFT-FORMAT record, and
+    // a checkpoint without one is incomplete: it costs a retake, never a stream
+    // of an unversioned store.
+    Ok(switched && format::records_this_format(env, dir).await?)
 }
 
 /// The newest complete version of the checkpoint at `index` under `engine_dir`,
@@ -320,8 +333,39 @@ pub async fn adopt_staged_under<E: Environment>(
     engine_dir: &Path,
     variants: impl Into<Variants>,
 ) -> io::Result<bool> {
-    if variants.into().contains(Variant::AdoptionAsBuilt) {
-        return adopt_staged_as_built(env, engine_dir).await;
+    // D-059: the format is read before anything writes, and an adoption writes.
+    // A fresh directory cannot hold a staged install, so there is nothing to
+    // adopt; a record that cannot be read is lost state, which the caller
+    // decides about, and the adoption of the re-seed that follows rewrites it.
+    let rewrite = match format::check_format(env, engine_dir).await? {
+        format::Verdict::Fresh(_) => return Ok(false),
+        format::Verdict::Recorded { .. } => false,
+        format::Verdict::Damaged => true,
+    };
+    adopt_checked(env, engine_dir, variants.into(), rewrite, true).await
+}
+
+/// [`adopt_staged_under`] with the gate already run: `rewrite` says the store's
+/// format record could not be read and is to be rewritten once the installed
+/// store is in force, and `check_staged` whether the staged install's own record
+/// is checked before the first write — off only for the known-buggy start orders
+/// a directed test runs beside the correct one (`node::StartOrder`).
+///
+/// # Errors
+///
+/// As [`adopt_staged`], plus `InvalidData` carrying a
+/// [`FormatRefused`](crate::format::FormatRefused) for a staged install in
+/// another format, which is refused with nothing of the store touched.
+// PROPOSED(D-060)
+pub(crate) async fn adopt_checked<E: Environment>(
+    env: &E,
+    engine_dir: &Path,
+    variants: Variants,
+    rewrite: bool,
+    check_staged: bool,
+) -> io::Result<bool> {
+    if variants.contains(Variant::AdoptionAsBuilt) {
+        return adopt_staged_as_built(env, engine_dir, rewrite, check_staged).await;
     }
     let fs = env.fs();
     let staging = staging_dir(engine_dir);
@@ -354,6 +398,13 @@ pub async fn adopt_staged_under<E: Environment>(
         {
             return Err(LostState::from_damage(Damage::StagingTableMissing(meta.number)).into_io());
         }
+    }
+    // D-059: the staged install's own format, read before the first write of
+    // this adoption. A stream of another format is refused with nothing of the
+    // store touched; one whose record cannot be read is staging damage, refused
+    // and never swept (D-041).
+    if check_staged {
+        format::check_staged_record(env, &staging).await?;
     }
     // The old store's files, listed before anything is copied, and the numbers
     // the copies go under: every staged table one past the highest table on
@@ -417,6 +468,15 @@ pub async fn adopt_staged_under<E: Environment>(
     )
     .await?;
     fs.sync_dir(engine_dir).await?;
+    // PROPOSED(D-060): the store in this directory is the installed one now, so
+    // a format record that could not be read is rewritten for it — after the
+    // switch, never before, since before it the record would label the old
+    // store, whose format could not be read, as this build's. The staging
+    // CURRENT is removed last, so a crash anywhere here re-runs the adoption and
+    // the rewrite with it.
+    if rewrite {
+        format::rewrite_format(env, engine_dir).await?;
+    }
     // D-044: the store in this directory is the installed one now, so
     // the marker is written fresh and whatever the marker said about the store
     // before it — that it lost state — goes with that store. Straight after the
@@ -458,7 +518,12 @@ pub async fn adopt_staged_under<E: Environment>(
 /// directory was a store — is a fresh one (the nightly's seed 6325).
 // D-041: the crash-safe adoption and the store identity marker.
 // D-045: a variant is a set.
-async fn adopt_staged_as_built<E: Environment>(env: &E, engine_dir: &Path) -> io::Result<bool> {
+async fn adopt_staged_as_built<E: Environment>(
+    env: &E,
+    engine_dir: &Path,
+    rewrite: bool,
+    check_staged: bool,
+) -> io::Result<bool> {
     let fs = env.fs();
     let staging = staging_dir(engine_dir);
     let Ok(names) = fs.read_dir(&staging).await else {
@@ -476,6 +541,12 @@ async fn adopt_staged_as_built<E: Environment>(env: &E, engine_dir: &Path) -> io
             return Ok(false);
         }
     };
+    // D-059: the staged install's own format, read before the first write of
+    // this adoption, under this variant as under the correct server: the format
+    // rule is not what the variant models.
+    if check_staged {
+        format::check_staged_record(env, &staging).await?;
+    }
     // The staged store is complete: it wins. The old store's CURRENT goes first,
     // so a half-adopted old store can never open; the staged CURRENT goes last,
     // so a crash anywhere before it re-runs this adoption on the same bytes.
@@ -491,7 +562,13 @@ async fn adopt_staged_as_built<E: Environment>(env: &E, engine_dir: &Path) -> io
     fs.sync_dir(engine_dir).await?;
     for name in &names {
         let Some(text) = name.to_str() else { continue };
-        if text == "CURRENT" || text == "CURRENT.tmp" {
+        // PROPOSED(D-060): the staged copy of the format record is not copied
+        // over the store's own, which says what the store in this directory is.
+        if text == "CURRENT"
+            || text == "CURRENT.tmp"
+            || text == format::FORMAT_FILE
+            || text == format::FORMAT_TMP
+        {
             continue;
         }
         let Some(bytes) = read_whole(env, &staging.join(name)).await? else {
@@ -502,6 +579,11 @@ async fn adopt_staged_as_built<E: Environment>(env: &E, engine_dir: &Path) -> io
     fs.sync_dir(engine_dir).await?;
     write_file(env, &manifest::current_path(engine_dir), &current, true).await?;
     fs.sync_dir(engine_dir).await?;
+    // PROPOSED(D-060): as in the correct adoption, a record that could not be
+    // read is rewritten for the store that is in force now.
+    if rewrite {
+        format::rewrite_format(env, engine_dir).await?;
+    }
     // The point of no return: without its CURRENT the staging directory never
     // wins again, so the adopted store's own writes are safe from a replay.
     fs.remove_file(&manifest::current_path(&staging)).await?;
@@ -604,6 +686,11 @@ async fn take_numbered<E: Environment>(
         })
         .await?;
     store.engine().checkpoint(dir).await?;
+    // PROPOSED(D-060): the checkpoint's own format record, after the engine's
+    // checkpoint, which requires an empty directory. A crash between the two
+    // leaves a checkpoint `checkpoint_complete` calls incomplete: a retake, never
+    // a stream of a store with no version.
+    format::write_checkpoint_record(env, dir).await?;
     Ok(())
 }
 
@@ -646,8 +733,22 @@ impl Sender {
         term: Term,
     ) -> io::Result<Self> {
         let fs = env.fs();
+        let mut listing = fs.read_dir(dir).await?;
+        // PROPOSED(D-060): the record is streamed first, so the receiver writes
+        // and syncs it before any staged table exists — and, under
+        // `SnapshotWithoutCurrentLast`, before the staged `CURRENT` the variant
+        // writes on arrival, which would otherwise reach the adoption as an
+        // install with no version. A stable reorder: the final chunk is still
+        // the manifest, as it was.
+        if let Some(at) = listing
+            .iter()
+            .position(|n| n.to_str() == Some(format::FORMAT_FILE))
+        {
+            let record = listing.remove(at);
+            listing.insert(0, record);
+        }
         let mut files = Vec::new();
-        for name in fs.read_dir(dir).await? {
+        for name in listing {
             let file = fs
                 .open(&dir.join(&name), OpenOptions::new().read(true))
                 .await?;
@@ -860,17 +961,29 @@ pub struct Assembler<E: Environment> {
     env: E,
     staging: PathBuf,
     variants: Variants,
+    /// The group whose Raft state the repair writes: the receiver's own prefix,
+    /// not the stream's, which carries the leader's keys under the same one.
+    // PROPOSED(D-060): the store parameterised by a key prefix (Q40).
+    prefix: KeyPrefix,
     stream: Option<Stream>,
 }
 
 impl<E: Environment> Assembler<E> {
-    /// An assembler staging under `engine_dir` (see [`staging_dir`]).
+    /// An assembler staging under `engine_dir` (see [`staging_dir`]), for the
+    /// group `prefix` names.
     // D-045: a variant is a set.
-    pub fn new(env: E, engine_dir: &Path, variants: impl Into<Variants>) -> Self {
+    // PROPOSED(D-060): the store parameterised by a key prefix (Q40).
+    pub fn new(
+        env: E,
+        engine_dir: &Path,
+        variants: impl Into<Variants>,
+        prefix: KeyPrefix,
+    ) -> Self {
         Self {
             env,
             staging: staging_dir(engine_dir),
             variants: variants.into(),
+            prefix,
             stream: None,
         }
     }
@@ -997,6 +1110,10 @@ impl<E: Environment> Assembler<E> {
     /// every table it lists opens and passes the engine's checks, and the staged
     /// snapshot record matches the stream's identity (RAFT.md §1).
     async fn verify(&self) -> io::Result<Staged> {
+        // D-059: the stream's own format, before the manifest and before any
+        // table is opened: a checkpoint of another format, or one carrying no
+        // record at all, is refused unread and none of its keys is looked at.
+        format::check_staged_record(&self.env, &self.staging).await?;
         let stream = self.stream.as_ref().expect("a stream");
         let number =
             manifest::parse_current(&stream.current_file).ok_or_else(|| bad("streamed CURRENT"))?;
@@ -1016,7 +1133,7 @@ impl<E: Environment> Assembler<E> {
                 .await?;
             let reader = SstReader::open(file).await?;
             reader.verify().await?;
-            if let Some((seq, value)) = reader.get(&store::snapshot_key(), u64::MAX).await?
+            if let Some((seq, value)) = reader.get(&self.prefix.snapshot_key(), u64::MAX).await?
                 && best.as_ref().is_none_or(|(s, _)| seq > *s)
             {
                 best = Some((seq, value));
@@ -1056,8 +1173,8 @@ impl<E: Environment> Assembler<E> {
         let seq = staged.manifest.flushed_seq + 1;
         // Every log key the staged tables hold: the leader's log, to be replaced
         // by the kept tail.
-        let start = store::key(store::RAFT_TENANT, store::LOG_TABLE, &[]);
-        let end = store::key(store::RAFT_TENANT, store::LOG_TABLE + 1, &[]);
+        let log_span = self.prefix.purpose_span(store::PURPOSE_LOG);
+        let (start, end) = (log_span.start, log_span.end);
         let mut held: BTreeSet<Index> = BTreeSet::new();
         for meta in &staged.manifest.ssts {
             let file = fs
@@ -1074,10 +1191,8 @@ impl<E: Environment> Assembler<E> {
                 if user[..] >= end[..] {
                     break;
                 }
-                if user.len() == 24 {
-                    held.insert(Index::from_be_bytes(
-                        user[16..24].try_into().expect("eight bytes"),
-                    ));
+                if let Some(index) = self.prefix.log_index(&user) {
+                    held.insert(index);
                 }
             }
         }
@@ -1097,15 +1212,15 @@ impl<E: Environment> Assembler<E> {
         };
         let mut writes: BTreeMap<Bytes, Value> = BTreeMap::new();
         writes.insert(
-            store::hard_key(),
+            self.prefix.hard_key(),
             Value::Live(store::encode_hard(repair.term, repair.vote)),
         );
         writes.insert(
-            store::applied_key(),
+            self.prefix.applied_key(),
             Value::Live(store::encode_applied(staged.last_index)),
         );
         writes.insert(
-            store::snapshot_key(),
+            self.prefix.snapshot_key(),
             Value::Live(store::encode_snapshot_record(&record)),
         );
         // The receiver's `0 / 2 / config` key (RAFT.md §3, D-029): the streamed
@@ -1123,7 +1238,7 @@ impl<E: Environment> Assembler<E> {
             })
             .unwrap_or_else(|| (staged.last_index, staged.config.clone()));
         writes.insert(
-            store::config_key(),
+            self.prefix.config_key(),
             Value::Live(store::encode_config(config_index, &config)),
         );
         // The quarantine key is always written explicitly: set when this store's
@@ -1132,28 +1247,28 @@ impl<E: Environment> Assembler<E> {
         // must not quarantine the receiver. (D-035).
         if repair.quarantined {
             writes.insert(
-                store::quarantine_key(),
+                self.prefix.quarantine_key(),
                 Value::Live(Bytes::from_static(&[1])),
             );
         } else {
-            writes.insert(store::quarantine_key(), Value::Tombstone);
+            writes.insert(self.prefix.quarantine_key(), Value::Tombstone);
         }
         // The incarnation key, for the same reason: the streamed checkpoint
         // carries the leader's number, and the receiver's own must win.
         // D-042: store incarnations.
         writes.insert(
-            store::incarnation_key(),
+            self.prefix.incarnation_key(),
             Value::Live(store::encode_incarnation(repair.incarnation)),
         );
         for entry in &repair.tail {
             writes.insert(
-                store::log_key(entry.index),
+                self.prefix.log_key(entry.index),
                 Value::Live(store::encode_entry(entry)),
             );
         }
         for index in &held {
             writes
-                .entry(store::log_key(*index))
+                .entry(self.prefix.log_key(*index))
                 .or_insert(Value::Tombstone);
         }
         let mut writer = SstWriter::new();

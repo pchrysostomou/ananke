@@ -28,6 +28,7 @@ dependencies = [
  "ananke-storage",
  "bytes",
  "moirae-trace",
+ "tempfile",
 ]
 
 [[package]]
