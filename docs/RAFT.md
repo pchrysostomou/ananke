@@ -382,7 +382,12 @@ scaled by its own clock's rate, without a reset, has started an election (moirae
 5, D-028). A reset is the delivery of an AppendEntries or an `InstallSnapshot` chunk of
 the server's term or later, whoever sends it (D-030); a vote it granted; a campaign;
 its start; its step-down as leader; and the restatement of an install on a server that
-never went down, whose new incarnation draws a fresh timer (D-039). One check is
+never went down, whose new incarnation draws a fresh timer (D-039). *Running* means
+holding a live incarnation: one ends at a shutdown, a crash, or a **completed install**,
+which retires the incarnation and leaves the server adopting the staged store with no
+core and no election timer until its restatement starts the next one, so the bound is
+not asked of it across that window any more than it is of a crashed server before its
+restart (PROPOSED D-063, which supersedes D-039's arm in the check). One check is
 pre-vote's own property (thesis §9.6): a server the schedule isolated has, at the heal,
 the term it had when the isolation began; an isolation in which the server was refused,
 re-seeded or completed an install is skipped, since the install restates the term the
@@ -752,10 +757,13 @@ no known-buggy variant: its crash test,
 The checks about time in §2 are bounds, not properties: a client write within ten
 maximum election timeouts of the last heal, and an election within two of a server's
 last reset, chosen so that the correct variant never trips them over ten thousand
-seeds. When ten thousand seeds tripped the timer bound on the correct server, what was
-wrong was the check's model of the protocol, not the bound, and widening the bound
-would have dulled its catch of `ResetTimerOnAnyRpc` (D-030, D-039). At ten thousand
-seeds the correct server passes both (nightly runs 34731272921 and 34749071877, D-047).
+seeds. Each of the three times ten thousand seeds tripped the timer bound on the correct
+server, what was wrong was the check's model of the protocol, not the bound, and widening
+the bound would have dulled its catch of `ResetTimerOnAnyRpc` (seeds 164 and 385, D-030
+and D-039; seed 2605 of nightly run 35111624618, the adoption window, PROPOSED D-063).
+At ten thousand seeds the correct server passes both (nightly runs 34731272921 and
+34749071877, D-047; and run 35111624618 tripped the timer bound alone, on the one seed
+D-063 closes).
 
 ## 6. Order of work, if approved
 

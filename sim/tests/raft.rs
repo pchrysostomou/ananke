@@ -140,6 +140,102 @@ fn seed_385_which_a_local_ten_thousand_seed_run_found_stays_green() {
     );
 }
 
+/// Seed 2605, the ten-thousand-seed nightly's (GitHub run 35111624618,
+/// `phase-3-stage-a` at 1a1cad2, PR #60): the window in which a server adopts a
+/// completed install, which it spends with no core and no election timer, and
+/// which the check was charging to the leader's last contact before it.
+///
+/// Server 3 heard the leader's last AppendEntries at 19.679704065 s. Its install of
+/// snapshot 374 completed 24.655 ms later — decided at 19.704359292 s, durable at
+/// 19.763649610 s — and that completion retired its incarnation (D-030: "the
+/// completed install retires the incarnation and the next open adopts the staged
+/// store"). The adoption that followed took 297.707 ms: `RaftAdopted` at
+/// 19.880743071 s, the store's format record, the engine, the WAL. Only the
+/// restatement at 20.002065925 s armed the next core's first tick. The check had
+/// the server running throughout, so at 19.994418991 s — the first record past the
+/// bound, 8.4 ms before the restatement — it flagged 314.715 ms against server 3's
+/// 313.983572 ms bound and the nightly panicked in the words this test pins. Ten of
+/// the leader's frames were aimed at the server inside that stretch and the
+/// partition at 19.729 s dropped every one of them at the send, so nothing reset
+/// the check's clock by accident, which is what rescues the twelve other adoptions
+/// of 0..3000 that run longer than their server's whole bound.
+///
+/// The fix is PROPOSED D-063, in the check alone: a completed install takes the
+/// server out of the replay's running set until its restatement puts it back, the
+/// same treatment a crash gets. So the pin is the mechanism both ways — the seed
+/// still reaches the window, and the check is green on it:
+/// [`raft::Report::timer_gaps_rescued_by_adoption`] is the replay with every arm
+/// but D-063's, which is the check as it stood on 1a1cad2, and on this seed it is
+/// the nightly's one gap, word for word, with the one completed install in it.
+/// The day that gap is gone the seed's schedule has moved off the window and the
+/// pin must be re-audited, not deleted.
+///
+/// And the pair, on this seed's own schedule (CLAUDE.md: a known-buggy variant
+/// beside the correct code): `ResetTimerOnAnyRpc`, the variant the timer rule is
+/// written for (RAFT.md §5, moirae rule 5), is still caught here by the same check
+/// — two gaps, neither of them holding a completed install, so the narrowing takes
+/// nothing from the catch: the replay with D-063's arm and the replay without it
+/// find the same two, and the first is what `check` reports.
+#[test]
+// PROPOSED(D-063): a server adopting a completed install has no election timer.
+fn seed_2605_which_the_nightly_found_is_an_adoption_window_and_still_catches_the_variant() {
+    /// The words the nightly panicked in, at `sim/tests/raft.rs:1801`.
+    const NIGHTLY: &str = "timers: server 3 heard from no leader of its term and granted no vote \
+                           since Instant(19.679704065s) and had not campaigned by \
+                           Instant(19.994418991s)";
+
+    let report = raft::run(2605, Variant::Correct);
+    report.check().unwrap();
+    let gaps = report.timer_gaps_rescued_by_adoption();
+    assert_eq!(
+        gaps.len(),
+        1,
+        "seed 2605 no longer reaches the nightly's adoption window, or reaches more than \
+         one: {gaps:?}; re-audit the pin against the run"
+    );
+    assert_eq!(
+        gaps[0].violation(),
+        NIGHTLY,
+        "seed 2605's adoption window has moved off the stretch the nightly failed on"
+    );
+    assert_eq!(
+        (gaps[0].server, gaps[0].adoptions),
+        (3, 1),
+        "seed 2605's window is no longer server 3's one completed install: {:?}",
+        gaps[0]
+    );
+    assert_eq!(
+        report.timer_gaps(TimerResets::WITHOUT_ADOPTION),
+        gaps,
+        "the check as it stood on 1a1cad2 flags more than the adoption window on seed 2605, \
+         so D-063's arm is doing more here than exempting the adoption"
+    );
+
+    // The pair: the same seed, the bug the rule was written for.
+    let buggy = raft::run(2605, Variant::ResetTimerOnAnyRpc);
+    let gaps = buggy.timer_gaps(TimerResets::ALL);
+    assert_eq!(
+        buggy.check(),
+        Err(format!("seed 2605: {}", gaps[0].violation())),
+        "ResetTimerOnAnyRpc is no longer caught by the timer check on seed 2605"
+    );
+    assert_eq!(
+        gaps.len(),
+        2,
+        "seed 2605 no longer catches ResetTimerOnAnyRpc twice over: {gaps:?}"
+    );
+    assert!(
+        gaps.iter().all(|gap| gap.adoptions == 0),
+        "a catch of ResetTimerOnAnyRpc on seed 2605 now rests on a stretch holding a completed \
+         install, which D-063 exempts: {gaps:?}"
+    );
+    assert_eq!(
+        buggy.timer_gaps(TimerResets::WITHOUT_ADOPTION),
+        gaps,
+        "D-063's arm moved what the timer check finds under ResetTimerOnAnyRpc on seed 2605"
+    );
+}
+
 /// The ten-thousand-seed nightly's seed 7381, on ea6fe7d: server 2 held snapshots
 /// through index 128 when it was crashed at 6.304 s, leading term 7, by a Figure 8
 /// driver. Its restart was refused at 6.641 s, `MANIFEST-000005` unreadable, and

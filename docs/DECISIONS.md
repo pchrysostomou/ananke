@@ -6539,4 +6539,171 @@ entry records the substitution and what it measured; it does not decide it.
 
 ---
 
-_Next entry: D-063. Add one before implementing anything not covered above._
+## PROPOSED D-063 — A server adopting a completed install is not running, and the timer check stops measuring it
+
+**Context.** The nightly's ten thousand seeds failed on the **correct** server (GitHub
+run 35111624618, `phase-3-stage-a` at 1a1cad2, PR #60), at the raft sweep's seed 2605:
+
+```
+seed 2605: timers: server 3 heard from no leader of its term and granted no vote
+since Instant(19.679704065s) and had not campaigned by Instant(19.994418991s)
+```
+
+Everything else in that run passed — the whole engine binary, so D-062's fix holds at the
+tier that found it; the membership and quorum scenarios; every variant's sweep; the
+incremental checker and every pinned seed — and `41 passed; 1 failed` in 7 483 s. The
+gate's twenty, CI's hundred and the premerge's thousand are green on the same tree, so
+the seed is beyond the thousand. Decision time (D-047) removed one catch in that run
+(seed 2313) and added none.
+
+**The defect is in the check, not in shipped code and not in Stage A's own new code.**
+Nothing in `crates/` is wrong and nothing in `crates/` changes. The rule at
+`sim/raft.rs` was already wrong on 903f37c, before D-056's send queue and D-060's key
+layout, and it is wrong in the released v0.3.0, whose harness has the identical
+`up`/`RaftRecovered`/`NodeCrashed` structure. What the stage moved is the margin, not the
+rule: measured over seeds 0..3000 on each tree, the longest *silent* adoption window —
+one with no leader frame delivered inside it — runs 0.81 of its server's whole timer
+bound on 903f37c and on main (14c3e17) and 1.03 on 1a1cad2, and the window's own length
+goes from p50 162.9 ms to 171.4 ms, min 94.7 to 104.6, max 348.8 to 353.1. That +8.5 ms
+at the median is the `RAFT-FORMAT` record's filesystem operations (D-059, D-060),
+corroborating the layout's own measurement at 3 000 seeds instead of 200.
+
+**What the server does.** A completed install **ends the incarnation**.
+`install_decision` stops racing the tick and awaits only `inbox.pop()`
+(`crates/ananke-raft/src/node.rs`), returns `Next::Reinstall`, the outer loop takes it and
+re-runs `start_store` — D-059/D-060's format read, D-041's `adopt_checked`, the marker,
+the engine, the store — **with no core and no election timer**. The next timeout is drawn
+in `Raft::restore_compacted` and armed by the loop's first tick, immediately after the
+restatement, exactly as `start_store`'s own comment says: "nothing awaits between these
+records and the loop arming its first tick, which is where the new core's election timer
+really starts counting." The `Next::Reinstall` the re-seed path returns (D-035) is the
+same thing.
+
+**What the check did.** The replay's only notion of "has a running incarnation" is `up`,
+which a server entered at its `RaftTerm` and left only at `NodeCrashed`. D-039's arm
+resets the clock **at** the restatement, which closes the far end of the window; the near
+end — the whole adoption — was still charged to the last contact before the completion.
+On seed 2605: server 3 heard the leader's last AppendEntries at 19.679704065 s; its
+install of snapshot 374 completed 24.655 ms later, decided at 19.704359292 s and durable
+at 19.763649610 s; the adoption ran `RaftAdopted` at 19.880743071 s and the WAL recovered
+at 19.957360426 s; the restatement landed at 20.002065925 s. That is 322.361860 ms
+against server 3's 313.983572 ms bound (drift 273 952 ppm), over by 8.378288 ms, and
+**297.706633 ms of the measured stretch is a window in which the server had no timer to
+fire**. The flag fell at the first record past the bound, 19.994418991 s — 8 ms before
+the restatement — and `sim/tests/raft.rs` panicked in the nightly's words. Ten of the
+leader's frames were aimed at the server inside that stretch and the partition at
+19.729 s dropped every one at the send, so nothing reset the check's clock by accident.
+
+**Decision.** For the timer check, a completed install takes the server **out of the
+replay's running set** until its restatement puts it back — the same treatment a crash
+gets, for the same reason: between the completion and the restatement there is no
+incarnation to campaign. The site is `TraceEvent::RaftSnapshot { taken: false }` on a
+server the replay holds up, excluding the restatement's own re-trace of the store's
+snapshot, which is told apart by the `RaftRecovered` that follows it at the same instant
+in `start_store`'s stable order (D-029). The server's `RaftTerm` at the end of the
+restatement re-admits it and resets the clock, as every start does. The protocol is
+unchanged, `TIMER_TIMEOUTS` is unchanged, the bound is unchanged, and no trace changes.
+
+This **supersedes D-039's arm** under `TimerResets::ALL`: every restatement on a server
+that never went down follows a completed install, so the server is no longer in `up` when
+that arm is reached and the arm is now unreachable in the check. It stays in the code,
+with `TimerResets::WITHOUT_RESTATEMENT`, because seed 385's pin *is* that replay — the
+check as it stood on f54b468 — and D-039's account of seed 385 stands: an install that
+takes 225 ms and a fresh timer after it is exactly this window, seen from the other end.
+
+**Alternatives.** *Widening the bound, or `TIMER_TIMEOUTS` from two to three*: forbidden
+by D-030, D-039 and RAFT.md §5 — "what was wrong was the check's model of the protocol,
+not the bound" — and it dulls the catch of `ResetTimerOnAnyRpc`. Tightening it instead is
+the measurement that shows this is a model error rather than a margin: with a check-only
+`ANANKE_BOUND_SCALE` knob on `timer_bound`, 1a1cad2 at **0.85 × bound** fails on **two**
+seeds of 0..3000 — 2605 and 500, both the same shape, a silent adoption window — and the
+tree with this fix fails on **none**. *Resetting the clock at the install's completion
+instead of exempting the window*: measured, not argued, and not enough. Of 11 421 uniform
+completions in 0..3000, four already run longer than their server's entire bound between
+the completion and the restatement, and 169 of them (1.48 %) are silent; and the two are
+not independent, because `Fault::CrashAdopting` — one seed in four (D-041) — isolates a
+follower and then crashes it mid-adoption, which is how 2605 was built. *Making the
+server inherit the old timer's elapsed count*: D-039 rejected it and this entry does not
+reopen it; it is a change to the protocol's timing, not to the check.
+
+**The pair.** The existing one covers it: **`ResetTimerOnAnyRpc`** (RAFT.md §5, moirae
+rule 5), the variant this rule is written for. The narrowing takes nothing from its catch,
+measured by running both replays over every seed of a band and diffing the gaps they find,
+violation text for violation text:
+
+| Band | `ResetTimerOnAnyRpc` | Gaps this entry adds | Gaps it removes |
+| --- | --- | --- | --- |
+| seeds 0..1000 | caught on **344** (34.4 %), **330** of them by the timer check | **0** | **0** |
+| seeds 0..500 (the root-cause reading) | 172 caught on both trees, 163 by the timer check, the same seeds with the same text | 0 | 0 |
+
+`AdoptionAsBuilt` (16 of 300) and `SnapshotWithoutCurrentLast` (106 of 300) are identical
+on both trees too. At 34.4 % the catch is far above D-061's 5 % line, so nothing moves
+tier; and the pin below asserts the catch on one named seed, which is deterministic and
+runs at every tier.
+
+**The pinned seed.** `seed_2605_which_the_nightly_found_is_an_adoption_window_and_still_
+catches_the_variant` asserts the mechanism both ways, not green (CLAUDE.md):
+`Report::timer_gaps_rescued_by_adoption` is the replay with every arm but this one —
+`TimerResets::WITHOUT_ADOPTION`, the check exactly as it stood on 1a1cad2 — and on seed
+2605 it is the nightly's one gap, its violation word for word, on server 3, with the one
+completed install in it, while `check()` is green. It also asserts that that replay finds
+nothing else on the seed, so the arm is seen to be exempting the adoption and not more.
+And the pair runs on the same seed's own schedule: `ResetTimerOnAnyRpc` is still caught
+there by the timer check, with two gaps, neither holding a completed install, and the two
+replays find the same two. The day the first assertion fails the seed's schedule has moved
+off the window and the pin is re-audited, not deleted.
+
+**Nothing moved.** The change is confined to `Report` — the replay, its arms, `TimerGap`,
+`TimerResets` and one predicate — and to `Report::timer_removal`, which learns that a
+completed install is a status record so D-051's reasoning can name it; the sweep, the
+scenario, the faults and the protocol are untouched. **No schedule moves and no pinned
+trace hash moves**: seed 2605's run is byte-identical instant for instant before and after,
+`same_seed_gives_byte_identical_trace`, `the_seed_42_trace_is_written_for_the_studio` and
+the membership scenario's hash test pass, all thirteen pinned seeds pass, and
+`ResetTimerOnAnyRpc`, `AdoptionAsBuilt` and `SnapshotWithoutCurrentLast` catch the same
+seeds line for line. So nothing is owed a re-audit. Decision time's removal on the raft
+sweep is also unchanged — `ANANKE_SEEDS=2606` prints "removed 1 catches and added 0 /
+removed: seed 2313", the nightly's own — so D-051 still resolves it.
+
+**Measured on this tree.** The correct server over seeds **0..5000** with this fix: **0
+failures**, and exactly **one** seed with an adoption-rescued gap, 2605 — the same count
+the nightly's ten thousand give, one. Over 0..3000 there are 22 669 completed installs
+whose restatement arrived while the check held the server up; twelve adoptions run longer
+than their server's entire timer bound (seed 79 server 3 at 1.1712 ×, then 2472, 1802,
+2515, 893, 771, 893, 159, 1546, 1681, 2515, 618) and each passes today **only** because
+eight to seventeen leader frames were delivered into the socket of a coreless server, the
+last of them 1.0 to 43.2 ms before the restatement. That accident is what this entry
+removes as a load-bearing mechanism. The completion-to-restatement window itself, over
+0..3000: min 104.603 ms, p50 171.396, p99 256.661, max 353.091.
+
+**Consequences.** `up` now means exactly "the server has a live incarnation": one ends at
+a shutdown, a crash, or a completed install, and begins at a `RaftTerm`. The check is
+still a function of the trace alone. **Nothing now bounds the adoption itself**, which is
+the cost: D-039's stated sensitivity — "an install that takes longer than the bound with
+no completion in the window would still trip the check … the sweep should see an install
+that slow" — is no longer carried by the timer rule, and belongs in a separate bound on
+completion → restatement. Today such a bound would have to sit above 353.091 ms (seed 79,
+server 3, 1.1712 × that server's bound) to pass, so it is a measurement and an entry of
+its own, not a line added here. It is the first of the notes below, not code.
+
+**Issue notes for the owner**, named here rather than written as code, so the fix stays one
+arm; none is filed on GitHub by this commit, which pushes nothing:
+
+- **The adoption has no bound of its own.** The instrument D-039's sensitivity wants, and
+  also the only honest way to *pair* this exemption: a "never restates after an install"
+  variant would be invisible to the timer rule exactly as a server that never restarts is,
+  so the pair for a bound is the bound, not a variant. It needs its own entry and its own
+  measurement of where the bound sits.
+- **The check is more forgiving than the server on install chunks.** The replay's comment
+  says an install keeps "its incarnation's timer … fresh", but the core pushes
+  `Message::InstallSnapshot` to the snapshot task and `continue`s without stepping it, so a
+  chunk does **not** reset the real follower's `election_elapsed`. D-030's arm therefore
+  excuses a gap the real follower does have. Pre-existing, forgiving, and it dulls
+  `ResetTimerOnAnyRpc` slightly.
+- **The adoption's own cost**: ~297.7 ms on seed 2605, about 29.5 ms per staged file, of
+  which D-060's format record is ~8.5 ms at the median. An engine-cost question, which
+  moves this threshold without touching correctness.
+
+---
+
+_Next entry: D-064. Add one before implementing anything not covered above._

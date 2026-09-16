@@ -1511,6 +1511,23 @@ impl Report {
         (election_max() * TIMER_TIMEOUTS).div_f64(rate)
     }
 
+    /// Whether the `RaftSnapshot` at `index` is the restatement's re-trace of the
+    /// store's snapshot rather than an install's completion: a start traces the
+    /// snapshot, the configuration and its `RaftRecovered` at one instant
+    /// (`crates/ananke-raft/src/node.rs`), where the completion is traced by the
+    /// snapshot task with no restatement behind it.
+    // PROPOSED(D-063): a server adopting a completed install has no election timer.
+    fn restates(records: &[TraceRecord], index: usize, server: u64) -> bool {
+        let at = records[index].at;
+        records[index..]
+            .iter()
+            .take_while(|r| r.at == at)
+            .any(|r| match &r.event {
+                TraceEvent::RaftRecovered { server: s, .. } => *s == server,
+                _ => false,
+            })
+    }
+
     /// The timer check's replay, with the reset arms `resets` names switched on,
     /// handing `gap` every stretch in which a running follower went past its bound:
     /// once per stretch, at the first record past the bound, in record order. The
@@ -1609,11 +1626,47 @@ impl Report {
                 // alone mid-install, it campaigned a hundred milliseconds after the
                 // switch and twenty-five past the bound
                 // (`Report::timer_gaps_rescued_by_restatement`).
+                //
+                // PROPOSED(D-063) supersedes this arm under [`TimerResets::ALL`]:
+                // every restatement on a server that never went down follows a
+                // completed install, and D-063's arm below takes the server out of
+                // `up` there, so `up.contains` is false here and the `RaftTerm` the
+                // restatement ends with is what resets the clock. The arm and
+                // [`TimerResets::WITHOUT_RESTATEMENT`] stay because seed 385's pin
+                // is that replay, which is the check as it stood on f54b468.
                 TraceEvent::RaftRecovered { server, .. } if up.contains(server) => {
                     if resets.restatement {
                         clocks.reset(*server, at);
                     } else {
                         *clocks.restatements.entry(*server).or_default() += 1;
+                    }
+                }
+                // PROPOSED(D-063): a completed install ends the incarnation
+                // (`Next::Reinstall`, `crates/ananke-raft/src/node.rs`): the server
+                // adopts the staged store, opens the engine on it and restates,
+                // and only the restatement arms the next core's election timer. It
+                // is no more running in between than a crashed server is between
+                // its crash and its restart, and the replay treats it the same
+                // way: out of `up` at the completion, back in at the restatement's
+                // `RaftTerm`, which resets the clock as every start does. Seed
+                // 2605, the nightly's (run 35111624618): server 3 finished
+                // installing snapshot 374 at 19.704 s, 24.7 ms after the leader's
+                // last AppendEntries, and the adoption — RaftAdopted at 19.881 s,
+                // the WAL recovered at 19.957 s — restated at 20.002 s, 322.4 ms
+                // after that contact and 8.4 ms past its 313.98 ms bound
+                // (`Report::timer_gaps_rescued_by_adoption`). The restatement's own
+                // re-trace of the snapshot is not a completion: a `RaftRecovered`
+                // for the server follows it at the same instant.
+                TraceEvent::RaftSnapshot {
+                    server,
+                    taken: false,
+                    ..
+                } if up.contains(server) && !Self::restates(&self.records, index, *server) => {
+                    if resets.adoption {
+                        up.remove(server);
+                        leaders.remove(server);
+                    } else {
+                        *clocks.adoptions.entry(*server).or_default() += 1;
                     }
                 }
                 TraceEvent::RaftTerm {
@@ -1677,6 +1730,7 @@ impl Report {
                         record: index,
                         installs: clocks.installs.get(server).copied().unwrap_or(0),
                         restatements: clocks.restatements.get(server).copied().unwrap_or(0),
+                        adoptions: clocks.adoptions.get(server).copied().unwrap_or(0),
                     };
                     if gap(found).is_break() {
                         return probed;
@@ -1752,6 +1806,12 @@ pub struct TimerResets {
     /// An install's restatement, `RaftRecovered` on a server that never went down
     /// (D-039, for seed 385).
     pub restatement: bool,
+    /// A completed install takes the server out of the replay's running set until
+    /// its restatement puts it back: the incarnation ended at the completion and
+    /// the next one starts at the restatement, so there is no election timer in
+    /// between (PROPOSED D-063, for seed 2605).
+    // PROPOSED(D-063): a server adopting a completed install has no election timer.
+    pub adoption: bool,
 }
 
 impl TimerResets {
@@ -1759,17 +1819,29 @@ impl TimerResets {
     pub const ALL: Self = Self {
         install_snapshot: true,
         restatement: true,
+        adoption: true,
     };
     /// Neither arm: the check as it stood on 1373601, which read only
     /// AppendEntries as a leader's contact.
     pub const APPEND_ENTRIES_ONLY: Self = Self {
         install_snapshot: false,
         restatement: false,
+        adoption: false,
     };
     /// Every arm but D-039's: the check as it stood on f54b468.
     pub const WITHOUT_RESTATEMENT: Self = Self {
         install_snapshot: true,
         restatement: false,
+        adoption: false,
+    };
+    /// Every arm but D-063's: the check as it stood on 1a1cad2, which read the
+    /// install's restatement as the leader's contact but measured the adoption
+    /// before it against the bound.
+    // PROPOSED(D-063): a server adopting a completed install has no election timer.
+    pub const WITHOUT_ADOPTION: Self = Self {
+        install_snapshot: true,
+        restatement: true,
+        adoption: false,
     };
 }
 
@@ -1793,6 +1865,10 @@ pub struct TimerGap {
     /// Install restatements on it, while it was up, in `(since, at]` that did not
     /// reset its clock: zero when that arm is on.
     pub restatements: usize,
+    /// Installs it completed, while it was up, in `(since, at]` that did not take
+    /// it out of the replay's running set: zero when that arm is on.
+    // PROPOSED(D-063): a server adopting a completed install has no election timer.
+    pub adoptions: usize,
 }
 
 impl TimerGap {
@@ -1817,6 +1893,8 @@ struct TimerClocks {
     last_reset_record: BTreeMap<u64, usize>,
     installs: BTreeMap<u64, usize>,
     restatements: BTreeMap<u64, usize>,
+    // PROPOSED(D-063): a server adopting a completed install has no election timer.
+    adoptions: BTreeMap<u64, usize>,
     /// The index of the record being replayed.
     replaying: usize,
 }
@@ -1827,6 +1905,7 @@ impl TimerClocks {
         self.last_reset_record.insert(server, self.replaying);
         self.installs.remove(&server);
         self.restatements.remove(&server);
+        self.adoptions.remove(&server);
     }
 }
 
@@ -2005,6 +2084,19 @@ impl Report {
                     | TraceEvent::RaftLeader { server: s, .. }
                     | TraceEvent::RaftReseeded { server: s } => *s == server,
                     TraceEvent::NodeCrashed { node } => u64::from(node.get()) == server,
+                    // PROPOSED(D-063): a completed install takes the server out of
+                    // the replay's running set until its restatement, so it says
+                    // its status the way a crash does — and, being traced once the
+                    // staged store is durable and decided when the stream was
+                    // staged, it is exactly the kind of record whose two times
+                    // place it differently against a flag record. The
+                    // restatement's own re-trace of the snapshot changes no status
+                    // and is not one of these.
+                    TraceEvent::RaftSnapshot {
+                        server: s,
+                        taken: false,
+                        ..
+                    } => *s == server && !Self::restates(&self.records, index, *s),
                     _ => false,
                 };
                 status && (index < flag) != before_by_decision(index, r)
@@ -2094,6 +2186,30 @@ impl Report {
         self.timer_gaps(TimerResets::WITHOUT_RESTATEMENT)
             .into_iter()
             .filter(|gap| gap.restatements > 0)
+            .collect()
+    }
+
+    /// Seed 2605's situation: a follower past its timer bound over a stretch it
+    /// spent adopting a completed install — the gaps of the replay with every arm
+    /// but D-063's that hold at least one install this server completed while it
+    /// was up. When [`Report::check`] passes, every gap of that replay is one of
+    /// these, since a stretch with no completed install in it is flagged by the
+    /// check itself. On the trace seed 2605 failed with (the nightly's run
+    /// 35111624618, HEAD 1a1cad2) this is one gap: server 3 from 19.679704065 s,
+    /// the leader's last AppendEntries; the install of snapshot 374 completed
+    /// 24.655 ms later, at 19.704359292 s; and the adoption it started —
+    /// `RaftAdopted` at 19.880743071 s, the WAL recovered at 19.957360426 s —
+    /// restated at 20.002065925 s, 322.362 ms after that contact and 8.378 ms past
+    /// its 313.983572 ms bound, with the flag falling at the first record past the
+    /// bound, 19.994418991 s. Ten of the leader's frames were aimed at the server
+    /// inside that stretch and the partition at 19.729 s dropped every one of them
+    /// at the send.
+    // PROPOSED(D-063): a server adopting a completed install has no election timer.
+    #[must_use]
+    pub fn timer_gaps_rescued_by_adoption(&self) -> Vec<TimerGap> {
+        self.timer_gaps(TimerResets::WITHOUT_ADOPTION)
+            .into_iter()
+            .filter(|gap| gap.adoptions > 0)
             .collect()
     }
 
