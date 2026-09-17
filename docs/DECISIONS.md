@@ -6728,6 +6728,22 @@ last of them 1.0 to 43.2 ms before the restatement. That accident is what this e
 removes as a load-bearing mechanism. The completion-to-restatement window itself, over
 0..3000: min 104.603 ms, p50 171.396, p99 256.661, max 353.091.
 
+**The stage's premerge, on the stage's tip.** §12 asks every stage to record the premerge it
+measured beside the last one measured, and the last one in this document is D-060's, on
+`ae54a20`, six commits back. On the tip, `46e95c0`, `scripts/premerge.sh` at a thousand
+seeds is **green in 822.64 s** (13 min 42.6 s), 319 tests passed and none failed, at a mean
+one-minute load of **60.94** over 87 samples (43.90 to 82.90) — `sim/tests/raft.rs`
+535.89 s, `sim/tests/engine.rs` 245.96 s, `sim/tests/wal.rs` 23.26 s, everything else under
+three seconds together. Beside it: D-060's **593.87 s at load 20.87** (`ae54a20`), D-055's
+**540.37 s at load 17.64** (`3787528`) and D-052's **374.64 s** (`1ef6d7e`). The comparison
+is confounded by load in the direction that flatters nothing — this run carried three times
+D-060's — so the honest reading is that the quarter of an hour D-040 set still holds with
+77 s to spare on a machine three times busier, not that the stage cost 229 s. One part is
+attributable: the WAL binary tripled, 8.48 s to 23.26 s, which is D-062's two hand-built
+recoveries and its wider bands. The earlier figure of 1 473 s reported for this fix's tree
+was taken while another lane was building and sampled no load; it is withdrawn in favour of
+this one, measured under D-052's protocol on an otherwise idle machine.
+
 **Consequences.** `up` now means exactly "the server has a live incarnation": one ends at
 a shutdown, a crash, or a completed install, and begins at a `RaftTerm`. The check is
 still a function of the trace alone. **Nothing now bounds the adoption itself**, which is
