@@ -386,7 +386,7 @@ groups (Q2, Q14):
   core. A round is a tick's steps, or the messages drained since the last round. The
   task keeps the order RAFT.md §3 and D-026 fix for a step's outputs — the `raft` task
   "executes every output in order, awaiting each `Persist` before the `Send`s that
-  follow it" and traces a step's events once they are durable (RAFT.md:558-560;
+  follow it" and traces a step's events once they are durable (RAFT.md:562-564;
   DECISIONS.md:831-834) — per core, and needs no superseding entry (Q41). In each round
   it:
   - flushes, before the round's sync, every send RAFT.md §3 already lets leave early:
@@ -577,7 +577,7 @@ persisted nothing keeps heartbeating.
   abandons the stream in progress (snapshot.rs:92-94, 859-915), so they restart each
   other until §11's raft item 14 keys staging by range.
 - Quarantine. Each of those 300 replicas is then on a re-seeded store and never votes
-  again (D-035; RAFT.md:523-528). Once two nodes have each lost a table, the ranges with
+  again (D-035; RAFT.md:530-533). Once two nodes have each lost a table, the ranges with
   replicas on both, 8 of every 120 placements of three replicas on ten nodes, about 67,
   have one replica that can vote: each can keep a leader it has and cannot elect one, and
   those whose leader was on either refused node have none. The rebalancer moves
@@ -772,7 +772,7 @@ designated snapshot-fed or whose `next` is at or below the compacted prefix
 behind its match and quiet for two minimum election timeouts (core.rs:1446-1455;
 RAFT.md:250-257). A silent placeholder of a range whose last index is at most 4096 is
 never fed, and any other waits at least two minimum election timeouts. A placeholder
-therefore answers every AppendEntries as a refused server does (RAFT.md:501-511): a
+therefore answers every AppendEntries as a refused server does (RAFT.md:507-511): a
 rejection with a hint of 1, an echo of zero and store incarnation 0. The hint moves the
 leader's `next` for it to 1, which feeds it the snapshot once the log is compacted and
 otherwise draws the previous-index-0 rejection that designates it (D-037). Its answers
@@ -1064,7 +1064,7 @@ where a single failure stops it; that is §10's `RemoveBeforeCaughtUp`. The step
    is proof `C_new` committed. Until then its state stays: a truncation that reverts
    `C_new` restores its right to campaign (D-033; RAFT.md:163-168). A replica emptied
    early is a placeholder on its node, which a leader of X re-seeds (§5); the install
-   carries the stream's term and no vote (RAFT.md:518-519), so the replica could grant a
+   carries the stream's term and no vote (RAFT.md:525-526), so the replica could grant a
    second vote in a term it had voted in. After ten maximum election timeouts with no
    message from a leader of X, `s`'s replica asks the leader meta names for X for X's
    descriptor, and collects itself on such proof; CockroachDB's replica GC consults a
@@ -1563,11 +1563,11 @@ DECISIONS.md:2700-2705); Phase 2 variants re-asserted on the new node keep their
 system must pass every seed. Each variant must be caught by the named check on some
 seeds. None of the rates below is measured, so no tier is claimed yet: a variant whose
 situation a directed scenario builds on every seed is asserted caught on every seed at
-every tier, as `sim/quorum.rs`'s are (D-049; RAFT.md:657-660), and each such scenario
+every tier, as `sim/quorum.rs`'s are (D-049; RAFT.md:667-670), and each such scenario
 asserts per seed that it built the situation; a variant a sweep arm reaches, or a
 directed shape reaches only on some seeds, is asserted at the tier its measured rate
 supports, and the arm's firing is asserted at every tier (D-041, D-043, D-044;
-RAFT.md:651-656).
+RAFT.md:662-666).
 
 Every Phase 2 variant is re-asserted on the node of §4, with its per-core persist order
 and batched frames (Q41), to the standard its Phase 2 test asserts and no stronger, at
@@ -1575,10 +1575,10 @@ the tier each uses today (Q39), on the same arm or directed scenario run with se
 ranges per node: the sweep variants on the
 raft sweep's arms; `RefusedCountsForQuorum` and `RefusedNeverCounts` on a sharded
 `sim/quorum.rs`, since the random sweep reaches their situation once in a thousand seeds
-(RAFT.md:657-660); `SharedSnapshotDir` at the nightly tier only (RAFT.md:655-656);
+(RAFT.md:667-670); `SharedSnapshotDir` at the nightly tier only (RAFT.md:665-666);
 `IgnoreIncarnation` as an injection-and-reach assertion, since it is caught on 0 of
-10 000 seeds (RAFT.md:681); and the pair `{IgnoreIncarnation, SharedSnapshotDir}` on its
-pinned seed (RAFT.md:648-651). `SendBeforePersist` against the round of §4 matters
+10 000 seeds (RAFT.md:697); and the pair `{IgnoreIncarnation, SharedSnapshotDir}` on its
+pinned seed (RAFT.md:658-661). `SendBeforePersist` against the round of §4 matters
 most: a send that follows a core's persist leaves when that persist resolves, and the
 variant sends it first (Q41). A variant the sweep does not catch is a hole in the sweep,
 not a variant to delete.
@@ -1924,7 +1924,7 @@ and its Phase 2 variants, and never names a descriptor or a span.
     new in both; item 5 is the server's side only.
 17. *Replicas that answer as refused without being refused.* §5's placeholder and §6's
     stalled replica answer AppendEntries with a rejection hinting index 1, an echo of
-    zero and incarnation 0 (RAFT.md:501-511), grant nothing and take a snapshot; today
+    zero and incarnation 0 (RAFT.md:507-511), grant nothing and take a snapshot; today
     only a server in re-seed mode does, and it holds no store. The merge's entries
     carry their attempt (§6), and a `MergeAbort` that takes effect writes an abort record
     under L's keys.
@@ -2359,7 +2359,7 @@ Phase 2 tests assert and no stronger, at the tier each uses today (Q39; §10):
 - `RefusedCountsForQuorum` and `RefusedNeverCounts` on a sharded `sim/quorum.rs`, caught
   on every seed at every tier (sim/tests/raft.rs:2814-2861; D-049).
 - The pair `{IgnoreIncarnation, SharedSnapshotDir}`, pinned on seed 680, the one seed of
-  the first thousand it was caught on (RAFT.md:656-659; sim/tests/raft.rs:405; D-045).
+  the first thousand it was caught on (RAFT.md:658-661; sim/tests/raft.rs:405; D-045).
   Stage A's queue and this stage's node and seed switch each move its schedule, so it is
   not asserted on seed 680 as it stands: it is re-audited under CLAUDE.md:58-67 at each
   move. Seed 680's test asserts the wedge where the moved schedule still reaches it, or,
@@ -2375,24 +2375,24 @@ Question 2 names, for each Phase 2 variant on the install path, the node code pa
 breaks. The plan proposes:
 
 - `SnapshotWithoutCurrentLast` breaks "the staged `CURRENT` written last, after the
-  repair" (RAFT.md:686). On the node the commit point of an install is the live install's
+  repair" (RAFT.md:694). On the node the commit point of an install is the live install's
   manifest switch, and the rule becomes that the switch is made only with the range's
   repair (RAFT.md:225-233) durable or carried in it; the variant makes the switch as the
   stream's last chunk arrives. Its catch and need stay Phase 2's: state machine safety
   after `Fault::CrashInstalling` crashes the follower mid-install.
-- `AdoptionAsBuilt` breaks three rules (RAFT.md:688). The first, copy and switch before
+- `AdoptionAsBuilt` breaks three rules (RAFT.md:696). The first, copy and switch before
   delete, becomes the live install's single switch, which the variant breaks by removing
   the span's keys in a switch of their own before adding the tables. The third, a marked
   store never opens fresh, becomes Q15's refused directory, which stays marked lost; the
   variant neither checks nor writes the mark. The second, a damaged staging `CURRENT`
   refused, has no path on a node that adopts no staged store at its start, and neither
   has its need, `Fault::CrashAdopting`, which crashes "the moment the adoption's first
-  change to the store directory is durable" (RAFT.md:688). §10 requires every Phase 2
+  change to the store directory is durable" (RAFT.md:696). §10 requires every Phase 2
   variant to be re-asserted, so before the node's code the stage returns `AdoptionAsBuilt`
   to the owner with this proposal: re-asserted on the two rules that remain, under a crash
   arm aimed at the live install's switch and at the refused directory's open, at its
   Phase 2 tier; or §10 amended for it.
-- `RefusalNotDurable` breaks the refusal marked before anything else (RAFT.md:691). On
+- `RefusalNotDurable` breaks the refusal marked before anything else (RAFT.md:699). On
   the node it is the whole node's mark in the refused directory (Q15), which the variant
   keeps in the process alone; `Fault::CrashRefused` crashes the node as it crashes a
   server today.
@@ -3242,7 +3242,7 @@ further until then; snapshot chunks stay unbatched on the snapshot task's socket
 keeps RAFT.md §3's and D-026's per-core order with no superseding entry. Reason: the
 proposal's merged persist would have held every send of a round, those of cores that
 persisted nothing included, behind every group's persist, putting one sync's latency on
-every co-hosted range's heartbeats and superseding RAFT.md §3's order (RAFT.md:558-560;
+every co-hosted range's heartbeats and superseding RAFT.md §3's order (RAFT.md:562-564;
 DECISIONS.md:831-834); chunks batched with heartbeats would lose small messages with
 large ones under a frame-length limit (§4, §10). Keeping that order covers every output
 that follows a core's `Persist`, not only its sends: its `Apply`, `ReadReady` and

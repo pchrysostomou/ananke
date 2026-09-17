@@ -19,11 +19,13 @@ use ananke_raft::apply::{Command, apply_command, user_key};
 use ananke_raft::core::{
     Input, Output, Persist, Raft, RaftConfig, Role, SnapshotAction, Variant, Variants,
 };
+use ananke_raft::format::{FORMAT_FILE, Verdict, check_format, record_format};
 use ananke_raft::message::Message;
+use ananke_raft::node::{SINGLE_GROUP, Start, StartOrder, start_store};
 use ananke_raft::snapshot::{Assembler, Feed, Repair, Sender, adopt_staged, staging_dir, take};
 use ananke_raft::store::{
-    Damage, LostState, RaftStore, STORE_MARKER, mark_store, mark_store_lost, marker_path,
-    refuse_lost_store,
+    Damage, KeyPrefix, LostState, PURPOSE_CONFIG, RaftStore, STORE_MARKER, mark_store,
+    mark_store_lost, marker_path, refuse_lost_store,
 };
 use ananke_raft::types::{Configuration, Entry, Index, Payload, ServerId, Term};
 use ananke_storage::manifest;
@@ -533,17 +535,36 @@ fn engine_config(dir: &str) -> EngineConfig {
     config
 }
 
+/// Today's one group, whose Raft state a store keeps (PROPOSED D-060).
+fn prefix() -> KeyPrefix {
+    KeyPrefix::group(SINGLE_GROUP)
+}
+
+/// Records `dir`'s format as a fresh directory's first start does, for a test
+/// that stages an install into a directory before any store of it exists: the
+/// server records the format before anything else of the directory is written
+/// (PROPOSED D-060), and the adoption of a directory with no record would
+/// otherwise be refused as 0.3.0's.
+async fn record_fresh_format(env: &SimEnv, dir: &str) {
+    match check_format(env, Path::new(dir)).await.unwrap() {
+        Verdict::Fresh(fresh) => {
+            record_format(env, fresh).await.unwrap();
+        }
+        Verdict::Recorded { .. } => {}
+        Verdict::Damaged => panic!("the record cannot be read"),
+    }
+}
+
 /// Builds a leader-like store at `/leader` with five applied puts and a
-/// configuration entry at index 6, past the checkpoint, whose `0 / 2 / config`
+/// configuration entry at index 6, past the checkpoint, whose `<prefix> / 2 / config`
 /// key rides in the checkpoint the way a real leader's does (D-029) — so an
 /// install that failed to rewrite the key would open a store whose key names an
 /// entry its log does not hold, and be refused. Takes a checkpoint at index 5
 /// and returns the checkpoint directory.
 async fn build_leader(env: &SimEnv) -> (Arc<RaftStore<SimEnv>>, PathBuf) {
-    let (engine, recovery) = Engine::open(env.clone(), engine_config("/leader"))
+    let (store, _) = RaftStore::open_dir(env.clone(), engine_config("/leader"), prefix())
         .await
         .unwrap();
-    let (store, _) = RaftStore::open(Arc::new(engine), &recovery).await.unwrap();
     let store = Arc::new(store);
     let mut entries = Vec::new();
     for index in 1..=5u64 {
@@ -669,18 +690,29 @@ fn an_install_carries_the_receivers_identity_and_is_adopted_at_open() {
     on_node(&mut sim, node, |env| {
         Box::pin(async move {
             let (_leader, dir) = build_leader(&env).await;
+            // The follower's directory as its first start leaves it: its format
+            // recorded, before anything else of it (PROPOSED D-060).
+            record_fresh_format(&env, "/follower").await;
             // First stream: assembled and verified, but the server "crashes"
             // before the repair — nothing to adopt, the debris is swept.
-            let mut assembler =
-                Assembler::new(env.clone(), Path::new("/follower"), Variant::Correct);
+            let mut assembler = Assembler::new(
+                env.clone(),
+                Path::new("/follower"),
+                Variant::Correct,
+                prefix(),
+            );
             let _staged = stream(&env, &dir, &mut assembler).await;
             assert!(
                 !adopt_staged(&env, Path::new("/follower")).await.unwrap(),
                 "an unrepaired staging directory must not win"
             );
             // Second stream: repaired with the receiver's identity, CURRENT last.
-            let mut assembler =
-                Assembler::new(env.clone(), Path::new("/follower"), Variant::Correct);
+            let mut assembler = Assembler::new(
+                env.clone(),
+                Path::new("/follower"),
+                Variant::Correct,
+                prefix(),
+            );
             let staged = stream(&env, &dir, &mut assembler).await;
             let repair = Repair {
                 term: 7,
@@ -695,11 +727,11 @@ fn an_install_carries_the_receivers_identity_and_is_adopted_at_open() {
             assert!(!adopt_staged(&env, Path::new("/follower")).await.unwrap());
             // The adopted store: the leader's data at the snapshot, under the
             // receiver's own hard state, applied index, record and quarantine.
-            let (engine, recovery) = Engine::open(env.clone(), engine_config("/follower"))
-                .await
-                .unwrap();
-            let engine = Arc::new(engine);
-            let (store, recovered) = RaftStore::open(engine.clone(), &recovery).await.unwrap();
+            let (store, recovered) =
+                RaftStore::open_dir(env.clone(), engine_config("/follower"), prefix())
+                    .await
+                    .unwrap();
+            let engine = store.engine().clone();
             assert_eq!(store.term(), 7);
             assert_eq!(store.vote(), Some(ServerId(3)));
             assert_eq!(
@@ -721,13 +753,13 @@ fn an_install_carries_the_receivers_identity_and_is_adopted_at_open() {
             assert!(record.dir.is_empty(), "an installed snapshot has no dir");
             assert!(recovered.quarantined, "the quarantine survives the switch");
             // The open above is itself the config-key check (RAFT.md §3, D-029):
-            // the leader's checkpoint carried a `0 / 2 / config` naming its
+            // the leader's checkpoint carried a `<prefix> / 2 / config` naming its
             // entry 6, which this store's log does not hold — had the repair not
             // rewritten the key consistent with the snapshot's configuration,
             // the open would have refused the store as out of step.
             assert!(
                 engine
-                    .get(&ananke_raft::store::key(0, 2, b"config"))
+                    .get(&prefix().key(PURPOSE_CONFIG, b"config"))
                     .await
                     .unwrap()
                     .is_some(),
@@ -761,10 +793,12 @@ fn the_variant_that_writes_current_early_adopts_the_leaders_state_on_a_crash() {
     on_node(&mut sim, node, |env| {
         Box::pin(async move {
             let (_leader, dir) = build_leader(&env).await;
+            record_fresh_format(&env, "/follower").await;
             let mut assembler = Assembler::new(
                 env.clone(),
                 Path::new("/follower"),
                 Variant::SnapshotWithoutCurrentLast,
+                prefix(),
             );
             let _staged = stream(&env, &dir, &mut assembler).await;
             // The server crashes here: the repair never runs. The staging
@@ -773,10 +807,10 @@ fn the_variant_that_writes_current_early_adopts_the_leaders_state_on_a_crash() {
                 adopt_staged(&env, Path::new("/follower")).await.unwrap(),
                 "the variant's CURRENT made an unrepaired install win"
             );
-            let (engine, recovery) = Engine::open(env.clone(), engine_config("/follower"))
-                .await
-                .unwrap();
-            let (store, recovered) = RaftStore::open(Arc::new(engine), &recovery).await.unwrap();
+            let (store, recovered) =
+                RaftStore::open_dir(env.clone(), engine_config("/follower"), prefix())
+                    .await
+                    .unwrap();
             // The leader's identity, not this server's: the state that never
             // existed here.
             assert_eq!(store.term(), 4, "the leader's term");
@@ -792,10 +826,9 @@ fn the_variant_that_writes_current_early_adopts_the_leaders_state_on_a_crash() {
 /// for server 2, three entries of term 1 with two applied — marked as a store,
 /// so an adoption's effect on both is visible.
 async fn build_follower(env: &SimEnv) {
-    let (engine, recovery) = Engine::open(env.clone(), engine_config("/follower"))
+    let (store, _) = RaftStore::open_dir(env.clone(), engine_config("/follower"), prefix())
         .await
         .unwrap();
-    let (store, _) = RaftStore::open(Arc::new(engine), &recovery).await.unwrap();
     store
         .persist(&Persist {
             term: 3,
@@ -823,19 +856,19 @@ async fn build_follower(env: &SimEnv) {
 /// marker check, then the engine — and returns whether a store was adopted with
 /// the store's term and vote, or the refusal's reason.
 async fn open_follower(env: &SimEnv) -> Result<(bool, Term, Option<ServerId>), String> {
-    let adopted = adopt_staged(env, Path::new("/follower"))
-        .await
-        .map_err(|e| e.to_string())?;
-    refuse_lost_store(env, Path::new("/follower"))
-        .await
-        .map_err(|e| e.to_string())?;
-    let (engine, recovery) = Engine::open(env.clone(), engine_config("/follower"))
-        .await
-        .map_err(|e| e.to_string())?;
-    let (store, _) = RaftStore::open(Arc::new(engine), &recovery)
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok((adopted, store.term(), store.vote()))
+    match start_store(
+        env,
+        1,
+        &engine_config("/follower"),
+        Variants::correct(),
+        &prefix(),
+        StartOrder::Correct,
+    )
+    .await
+    {
+        Start::Opened { store, adopted, .. } => Ok((adopted, store.term(), store.vote())),
+        Start::Refused(error) | Start::Failed(error) => Err(error.to_string()),
+    }
 }
 
 /// The crash-safe adoption (D-041): a completed install at `/follower`
@@ -850,7 +883,12 @@ async fn open_follower(env: &SimEnv) -> Result<(bool, Term, Option<ServerId>), S
 #[test]
 fn a_crash_inside_the_adoption_leaves_a_store_and_the_next_start_adopts() {
     let mut outcomes = BTreeSet::new();
-    for seed in 0..24u64 {
+    // How many seeds landed in each window, printed so D-061's table of fixed seed
+    // sets can be checked at any tier rather than re-measured with a probe.
+    let mut counts: std::collections::BTreeMap<(bool, bool), usize> =
+        std::collections::BTreeMap::new();
+    let seeds = 24u64;
+    for seed in 0..seeds {
         let mut sim = Sim::new({
             let mut c = SimConfig::new(300 + seed);
             c.fs.latency_min = Duration::from_micros(100);
@@ -862,8 +900,12 @@ fn a_crash_inside_the_adoption_leaves_a_store_and_the_next_start_adopts() {
             Box::pin(async move {
                 let (_leader, dir) = build_leader(&env).await;
                 build_follower(&env).await;
-                let mut assembler =
-                    Assembler::new(env.clone(), Path::new("/follower"), Variant::Correct);
+                let mut assembler = Assembler::new(
+                    env.clone(),
+                    Path::new("/follower"),
+                    Variant::Correct,
+                    prefix(),
+                );
                 let staged = stream(&env, &dir, &mut assembler).await;
                 let repair = Repair {
                     term: 7,
@@ -913,6 +955,7 @@ fn a_crash_inside_the_adoption_leaves_a_store_and_the_next_start_adopts() {
             )
             .is_some();
         outcomes.insert((named == 1, staging_current));
+        *counts.entry((named == 1, staging_current)).or_default() += 1;
         // The next start: the receiver's identity, adopted now or already.
         let (adopted, term, vote) = on_node(&mut sim, node, |env| {
             Box::pin(async move { open_follower(&env).await })
@@ -951,6 +994,10 @@ fn a_crash_inside_the_adoption_leaves_a_store_and_the_next_start_adopts() {
         outcomes.contains(&(false, true)) || outcomes.contains(&(false, false)),
         "no crash after the switch: {outcomes:?}"
     );
+    println!(
+        "the adoption's crash windows over {seeds} seeds, (the old CURRENT still named, the \
+         staging still there): {counts:?}"
+    );
 }
 
 /// A staging directory whose `CURRENT` exists but does not parse is damage, not
@@ -966,8 +1013,12 @@ fn a_damaged_staging_current_is_refused_and_not_swept() {
         Box::pin(async move {
             let (_leader, dir) = build_leader(&env).await;
             build_follower(&env).await;
-            let mut assembler =
-                Assembler::new(env.clone(), Path::new("/follower"), Variant::Correct);
+            let mut assembler = Assembler::new(
+                env.clone(),
+                Path::new("/follower"),
+                Variant::Correct,
+                prefix(),
+            );
             let staged = stream(&env, &dir, &mut assembler).await;
             let repair = Repair {
                 term: 7,
@@ -1006,10 +1057,9 @@ fn a_damaged_staging_current_is_refused_and_not_swept() {
                 "nothing was swept"
             );
             // The old store is whole: it opens with its own identity.
-            let (engine, recovery) = Engine::open(env.clone(), engine_config("/follower"))
+            let (store, _) = RaftStore::open_dir(env.clone(), engine_config("/follower"), prefix())
                 .await
                 .unwrap();
-            let (store, _) = RaftStore::open(Arc::new(engine), &recovery).await.unwrap();
             assert_eq!((store.term(), store.vote()), (3, Some(ServerId(2))));
             drop(store);
             // A CURRENT that parses but names a manifest that is not there: the
@@ -1072,8 +1122,12 @@ fn an_abandoned_staging_keeps_its_current_so_no_start_opens_the_old_store() {
         Box::pin(async move {
             let (_leader, dir) = build_leader(&env).await;
             build_follower(&env).await;
-            let mut assembler =
-                Assembler::new(env.clone(), Path::new("/follower"), Variant::Correct);
+            let mut assembler = Assembler::new(
+                env.clone(),
+                Path::new("/follower"),
+                Variant::Correct,
+                prefix(),
+            );
             let staged = stream(&env, &dir, &mut assembler).await;
             let repair = Repair {
                 term: 7,
@@ -1152,10 +1206,9 @@ fn a_marked_directory_without_a_valid_current_is_a_lost_store_never_a_fresh_one(
             let dir = Path::new("/fresh");
             // Fresh: no marker, so the check passes and the engine opens fresh.
             refuse_lost_store(&env, dir).await.unwrap();
-            let (engine, recovery) = Engine::open(env.clone(), engine_config("/fresh"))
+            let (store, _) = RaftStore::open_dir(env.clone(), engine_config("/fresh"), prefix())
                 .await
                 .unwrap();
-            let (store, _) = RaftStore::open(Arc::new(engine), &recovery).await.unwrap();
             assert_eq!((store.term(), store.applied()), (0, 0));
             assert!(
                 !fs.read_dir(dir)
@@ -1180,8 +1233,11 @@ fn a_marked_directory_without_a_valid_current_is_a_lost_store_never_a_fresh_one(
             // The directory loses everything but the marker: the engine's own
             // rule would open it fresh, since no manifest or table remains
             // (D-024); the marker says it was a store.
+            // The record stays with the marker: what is left is a directory of
+            // this build's format that lost its store, not a directory of
+            // another format (PROPOSED D-060).
             for name in fs.read_dir(dir).await.unwrap() {
-                if name.to_str() != Some(STORE_MARKER) {
+                if name.to_str() != Some(STORE_MARKER) && name.to_str() != Some(FORMAT_FILE) {
                     fs.remove_file(&dir.join(name)).await.unwrap();
                 }
             }
@@ -1232,8 +1288,13 @@ fn an_identity_change_restarts_the_staging() {
     on_node(&mut sim, node, |env| {
         Box::pin(async move {
             let (_leader, dir) = build_leader(&env).await;
-            let mut assembler =
-                Assembler::new(env.clone(), Path::new("/follower"), Variant::Correct);
+            record_fresh_format(&env, "/follower").await;
+            let mut assembler = Assembler::new(
+                env.clone(),
+                Path::new("/follower"),
+                Variant::Correct,
+                prefix(),
+            );
             let sender = Sender::open(&env, &dir, ServerId(2), 5, 1, 4)
                 .await
                 .unwrap();
@@ -1431,8 +1492,12 @@ fn a_stream_survives_a_newer_take_and_the_shared_directory_does_not() {
             let mut sender = Sender::open(&env, &pinned, ServerId(2), 5, 1, 4)
                 .await
                 .unwrap();
-            let mut assembler =
-                Assembler::new(env.clone(), Path::new("/follower"), Variant::Correct);
+            let mut assembler = Assembler::new(
+                env.clone(),
+                Path::new("/follower"),
+                Variant::Correct,
+                prefix(),
+            );
             // The stream is under way when two newer takes land: a fresh version
             // at the same index, then one at the next index, once it applies.
             let first = sender.chunk(&env, 64).await.unwrap();
@@ -1474,8 +1539,12 @@ fn a_stream_survives_a_newer_take_and_the_shared_directory_does_not() {
             let mut sender = Sender::open(&env, &shared, ServerId(3), 5, 1, 4)
                 .await
                 .unwrap();
-            let mut assembler =
-                Assembler::new(env.clone(), Path::new("/follower"), Variant::Correct);
+            let mut assembler = Assembler::new(
+                env.clone(),
+                Path::new("/follower"),
+                Variant::Correct,
+                prefix(),
+            );
             let first = sender.chunk(&env, 64).await.unwrap();
             let Message::InstallSnapshot {
                 file,
@@ -1549,10 +1618,10 @@ fn the_sweep_deletes_only_unpinned_versions() {
                     .unwrap()
                     .is_empty()
             );
-            let (engine, recovery) = Engine::open(env.clone(), engine_config("/leader"))
-                .await
-                .unwrap();
-            let (reopened, _) = RaftStore::open(Arc::new(engine), &recovery).await.unwrap();
+            let (reopened, _) =
+                RaftStore::open_dir(env.clone(), engine_config("/leader"), prefix())
+                    .await
+                    .unwrap();
             assert_eq!(reopened.applied(), 5);
         })
     });
@@ -1740,14 +1809,9 @@ fn a_refusal_is_recorded_in_the_store_and_refuses_every_later_open() {
             }
             // Nothing else refuses it: the store on disk is whole, CURRENT and
             // all, and the engine alone would open it and let the server vote.
-            let (engine, recovery) = Engine::open(env.clone(), engine_config("/follower"))
+            let (store, _) = RaftStore::open_dir(env.clone(), engine_config("/follower"), prefix())
                 .await
                 .unwrap();
-            assert!(
-                !recovery.lost_writes(),
-                "the store on disk is self-consistent"
-            );
-            let (store, _) = RaftStore::open(Arc::new(engine), &recovery).await.unwrap();
             assert_eq!((store.term(), store.vote()), (3, Some(ServerId(2))));
             // And the server's own open path refuses all the same.
             let refused = open_follower(&env)
@@ -1781,8 +1845,12 @@ fn an_install_clears_the_lost_mark() {
                 .await
                 .expect_err("the marked store is refused");
             // The leader's stream, completed: the next open adopts it.
-            let mut assembler =
-                Assembler::new(env.clone(), Path::new("/follower"), Variant::Correct);
+            let mut assembler = Assembler::new(
+                env.clone(),
+                Path::new("/follower"),
+                Variant::Correct,
+                prefix(),
+            );
             let staged = stream(&env, &dir, &mut assembler).await;
             let repair = Repair {
                 term: 7,

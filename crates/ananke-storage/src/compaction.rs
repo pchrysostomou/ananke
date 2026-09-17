@@ -156,7 +156,7 @@ impl<E: Environment> Shared<E> {
     }
 
     /// Writes `writer` as the next table at `level`, synced.
-    async fn write_output(
+    pub(crate) async fn write_output(
         &self,
         writer: SstWriter,
         level: u8,
@@ -295,7 +295,7 @@ impl<E: Environment> Shared<E> {
     }
 
     /// Deletes tables no manifest names any more and syncs the directory.
-    async fn delete_tables(&self, numbers: &[u64]) -> io::Result<()> {
+    pub(crate) async fn delete_tables(&self, numbers: &[u64]) -> io::Result<()> {
         let fs = self.env.fs();
         for &number in numbers {
             fs.remove_file(&sst_path(&self.config.dir, number)).await?;

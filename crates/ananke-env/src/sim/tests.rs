@@ -216,6 +216,8 @@ fn abort_drops_a_task_without_a_completion_event() {
     );
 }
 
+/// A message arrives its drawn delay after its last byte is written: two bytes at the
+/// default gigabit take 16 nanoseconds (D-056).
 #[test]
 fn messages_are_delivered_after_the_configured_delay() {
     let mut config = SimConfig::new(5);
@@ -243,7 +245,7 @@ fn messages_are_delivered_after_the_configured_delay() {
         vec![(
             addr(1),
             Bytes::from_static(b"hi"),
-            Instant::from_nanos(5_000_000)
+            Instant::from_nanos(5_000_016)
         )]
     );
     let ev = events(&sim);
@@ -258,6 +260,388 @@ fn messages_are_delivered_after_the_configured_delay() {
     });
     let sent = sent.expect("a MessageSent for the ping");
     assert!(ev.iter().any(|e| matches!(e, TraceEvent::MessageDelivered { id, from, to, len: 2, .. } if *id == sent && *from == addr(1) && *to == addr(2))));
+}
+
+/// A link that writes 1 000 bytes a second, a one-millisecond delay, duplication at
+/// `p_duplicate`, and a receiver on port 2 that logs each message's first byte, its
+/// sender's port and when it arrived.
+// PROPOSED(D-056): SimEnv's bounded, drop-oldest queue per (sending socket,
+// destination), drained at a modelled per-link rate.
+fn slow_link(seed: u64, queue: usize, p_duplicate: f64) -> (Sim, NodeId, Log<(u8, u16, Instant)>) {
+    let mut config = SimConfig::new(seed);
+    config.net.delay_min = ms(1);
+    config.net.delay_max = ms(1);
+    config.net.p_duplicate = p_duplicate;
+    config.net.link_bytes_per_sec = 1_000;
+    config.net.send_queue_len = queue;
+    let mut sim = Sim::new(config);
+    let (a, b) = (sim.add_node(), sim.add_node());
+    let got: Log<(u8, u16, Instant)> = log();
+    let g = got.clone();
+    let env_b = sim.env(b);
+    env_b.clone().spawn("receiver", async move {
+        let sock = env_b.net().bind(addr(2)).await.unwrap();
+        loop {
+            let (from, msg) = sock.recv().await.unwrap();
+            g.lock()
+                .unwrap()
+                .push((msg[0], from.port(), env_b.clock().now()));
+        }
+    });
+    (sim, a, got)
+}
+
+/// From `node` on port `port`, one 100-byte frame to port 2 per tag of each burst,
+/// tags `first..end`, the bursts `gap` apart, each burst's frames sent at one instant;
+/// the socket, and so its queue, stays bound.
+fn bursts(sim: &Sim, node: NodeId, port: u16, gap: Duration, bursts: &[(u8, u8)]) {
+    let env = sim.env(node);
+    let bursts = bursts.to_vec();
+    env.clone().spawn("bursts", async move {
+        let sock = env.net().bind(addr(port)).await.unwrap();
+        for (first, end) in bursts {
+            for tag in first..end {
+                sock.send(addr(2), Bytes::from(vec![tag; 100]))
+                    .await
+                    .unwrap();
+            }
+            env.clock().sleep(gap).await;
+        }
+        env.clock().sleep(ms(10_000)).await;
+    });
+}
+
+/// A receiver on `port` of `node` that logs each message's first byte, its sender's
+/// port and when it arrived into `got`, as [`slow_link`]'s does.
+// PROPOSED(D-056): SimEnv's bounded, drop-oldest queue per (sending socket,
+// destination), drained at a modelled per-link rate.
+fn receiver(sim: &Sim, node: NodeId, port: u16, got: &Log<(u8, u16, Instant)>) {
+    let env = sim.env(node);
+    let g = got.clone();
+    env.clone().spawn("receiver", async move {
+        let sock = env.net().bind(addr(port)).await.unwrap();
+        loop {
+            let (from, msg) = sock.recv().await.unwrap();
+            g.lock()
+                .unwrap()
+                .push((msg[0], from.port(), env.clock().now()));
+        }
+    });
+}
+
+/// From `node` on port `port`, one `len`-byte frame per `(destination port, tag)` of
+/// `frames`, all sent at one instant; the socket, and so its queues, stay bound.
+// PROPOSED(D-056): SimEnv's bounded, drop-oldest queue per (sending socket,
+// destination), drained at a modelled per-link rate.
+fn send_frames(sim: &Sim, node: NodeId, port: u16, len: usize, frames: &[(u16, u8)]) {
+    let env = sim.env(node);
+    let frames = frames.to_vec();
+    env.clone().spawn("frames", async move {
+        let sock = env.net().bind(addr(port)).await.unwrap();
+        for (to, tag) in frames {
+            sock.send(addr(to), Bytes::from(vec![tag; len]))
+                .await
+                .unwrap();
+        }
+        env.clock().sleep(ms(10_000)).await;
+    });
+}
+
+fn at_ms(millis: u64) -> Instant {
+    Instant::from_nanos(millis * 1_000_000)
+}
+
+/// `at_ms(millis)` plus `nanos`.
+fn at_ms_ns(millis: u64, nanos: u64) -> Instant {
+    Instant::from_nanos(millis * 1_000_000 + nanos)
+}
+
+/// The received log, in arrival order with ties by tag.
+fn arrivals(got: &Log<(u8, u16, Instant)>) -> Vec<(u8, u16, Instant)> {
+    let mut got = got.lock().unwrap().clone();
+    got.sort_by_key(|&(tag, _, at)| (at, tag));
+    got
+}
+
+/// Every id a `QueueFull` drop was traced for, in trace order.
+// PROPOSED(D-056): SimEnv's bounded, drop-oldest queue per (sending socket,
+// destination), drained at a modelled per-link rate.
+fn queue_full_drops(sim: &Sim) -> Vec<MessageId> {
+    events(sim)
+        .iter()
+        .filter_map(|e| match e {
+            TraceEvent::MessageDropped {
+                id,
+                reason: DropReason::QueueFull,
+                ..
+            } => Some(*id),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Every id the trace delivered, in trace order.
+// PROPOSED(D-056): SimEnv's bounded, drop-oldest queue per (sending socket,
+// destination), drained at a modelled per-link rate.
+fn delivered(sim: &Sim) -> Vec<MessageId> {
+    events(sim)
+        .iter()
+        .filter_map(|e| match e {
+            TraceEvent::MessageDelivered { id, .. } => Some(*id),
+            _ => None,
+        })
+        .collect()
+}
+
+/// D-015's queue in the simulator (D-056): a sending socket writes one frame at a time
+/// to a destination at the link's rate, so a frame sent behind others waits for them,
+/// and its delay starts when its own last byte is written. The queue belongs to the
+/// socket and the destination: another socket of the same node is not held behind
+/// it. And a queue that has drained holds nothing back: a frame sent after it is
+/// written from the instant it is sent.
+#[test]
+fn a_frame_waits_only_for_the_frames_ahead_of_it_on_its_sockets_link() {
+    let (mut sim, a, got) = slow_link(21, 1024, 0.0);
+    bursts(&sim, a, 1, ms(500), &[(0, 3), (9, 10)]);
+    bursts(&sim, a, 3, ms(500), &[(7, 8)]);
+    sim.run_until(Instant::from_nanos(2_000_000_000));
+    assert_eq!(
+        arrivals(&got),
+        vec![
+            (0, 1, at_ms(101)),
+            (7, 3, at_ms(101)),
+            (1, 1, at_ms(201)),
+            (2, 1, at_ms(301)),
+            (9, 1, at_ms(601)),
+        ]
+    );
+    assert!(!events(&sim).iter().any(|e| matches!(
+        e,
+        TraceEvent::MessageDropped {
+            reason: DropReason::QueueFull,
+            ..
+        }
+    )));
+}
+
+/// The bound (D-015, D-056): with two frames allowed to wait behind the one being
+/// written, each frame sent into a full queue drops the oldest waiting frame, traced
+/// `MessageDropped` with `QueueFull` on the sender's node under the dropped frame's
+/// id, and the frames behind it move up, so the survivors leave as a queue that never
+/// held the dropped ones would send them. The frame being written is never dropped,
+/// nor the newest: a queue that dropped the newest frame instead would deliver tags 1
+/// and 2 here, and one that counted the frame being written against the bound would
+/// drop tag 4 as well. A duplicate of a dropped frame is cancelled with it.
+///
+/// The drop's place in the trace is the clause's too, and is asserted as the ordered
+/// `(kind, id)` sequence: each `QueueFull` record sits *after* the `MessageSent` of the
+/// frame whose admission displaced it, as `RealEnv` emits them (D-056). Tracing it
+/// before that send pairs the drop with the previous send instead, and no verdict,
+/// arrival or filtered list of dropped ids would say so.
+#[test]
+fn a_full_queue_drops_its_oldest_waiting_frame_and_the_frames_behind_it_move_up() {
+    for (p_duplicate, copies) in [(0.0, 1), (1.0, 2)] {
+        let (mut sim, a, got) = slow_link(22, 2, p_duplicate);
+        bursts(&sim, a, 1, ms(500), &[(0, 6)]);
+        sim.run_until(Instant::from_nanos(1_000_000_000));
+        let expected: Vec<(u8, u16, Instant)> = [(0, at_ms(101)), (4, at_ms(201)), (5, at_ms(301))]
+            .into_iter()
+            .flat_map(|(tag, when)| std::iter::repeat_n((tag, 1, when), copies))
+            .collect();
+        assert_eq!(arrivals(&got), expected, "p_duplicate {p_duplicate}");
+        let dropped: Vec<(MessageId, Option<NodeId>)> = sim
+            .trace()
+            .iter()
+            .filter_map(|r| match r.event {
+                TraceEvent::MessageDropped {
+                    id,
+                    from,
+                    to,
+                    reason: DropReason::QueueFull,
+                } if from == addr(1) && to == addr(2) => Some((id, r.node)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            dropped,
+            [1, 2, 3].map(|id| (MessageId::new(id), Some(a))),
+            "p_duplicate {p_duplicate}"
+        );
+        let order: Vec<(&str, u64)> = sim
+            .trace()
+            .iter()
+            .filter_map(|r| match r.event {
+                TraceEvent::MessageSent { id, from, to, .. }
+                    if from == addr(1) && to == addr(2) =>
+                {
+                    Some(("sent", id.get()))
+                }
+                TraceEvent::MessageDropped {
+                    id,
+                    from,
+                    to,
+                    reason: DropReason::QueueFull,
+                } if from == addr(1) && to == addr(2) => Some(("dropped", id.get())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                ("sent", 0),
+                ("sent", 1),
+                ("sent", 2),
+                ("sent", 3),
+                ("dropped", 1),
+                ("sent", 4),
+                ("dropped", 2),
+                ("sent", 5),
+                ("dropped", 3),
+            ],
+            "p_duplicate {p_duplicate}"
+        );
+    }
+}
+
+/// The bound counts the frames a queue still holds, not the frames it has ever held
+/// (D-056): a frame whose last byte is written has left the queue, so a burst sent
+/// after the link has drained finds an empty queue and drops nothing. A queue that
+/// kept its written frames would count the first burst against the second's bound,
+/// evict frames it had already delivered — tracing `QueueFull` for ids the trace also
+/// delivers — and drop a frame of the new burst instead: tag 3 would be lost and tags
+/// 4 and 5 would arrive 200 ms early. Nothing else in the tree reaches the drop path
+/// through the default bound, so this is where the eviction is held.
+// PROPOSED(D-056): SimEnv's bounded, drop-oldest queue per (sending socket,
+// destination), drained at a modelled per-link rate.
+#[test]
+fn a_written_frame_leaves_the_queue_so_the_bound_counts_what_is_outstanding() {
+    let (mut sim, a, got) = slow_link(28, 2, 0.0);
+    bursts(&sim, a, 1, ms(500), &[(0, 3), (3, 6)]);
+    sim.run_until(Instant::from_nanos(2_000_000_000));
+    assert_eq!(
+        arrivals(&got),
+        vec![
+            (0, 1, at_ms(101)),
+            (1, 1, at_ms(201)),
+            (2, 1, at_ms(301)),
+            (3, 1, at_ms(601)),
+            (4, 1, at_ms(701)),
+            (5, 1, at_ms(801)),
+        ]
+    );
+    assert!(
+        queue_full_drops(&sim).is_empty(),
+        "a queue the link drained between the bursts dropped a frame"
+    );
+    let delivered = delivered(&sim);
+    assert!(
+        !queue_full_drops(&sim)
+            .iter()
+            .any(|id| delivered.contains(id)),
+        "a frame was dropped for a full queue and delivered too"
+    );
+}
+
+/// The eviction's boundary (D-056): a frame whose last byte is written *at this
+/// instant* has left the queue and holds no slot against the bound, so a frame sent
+/// at exactly that instant is admitted behind an empty queue. Testing `written < now`
+/// instead would keep it, and with one slot the frame behind would be dropped: tag 1
+/// would be lost and tag 2 would arrive at 201 ms. A discrete-event simulator makes
+/// exact-instant coincidences common — 13 % of the raft sweep's sends on seed 42 share
+/// an instant with the previous send on their link — so the boundary is asserted.
+// PROPOSED(D-056): SimEnv's bounded, drop-oldest queue per (sending socket,
+// destination), drained at a modelled per-link rate.
+#[test]
+fn a_frame_written_at_this_instant_has_already_left_the_queue() {
+    let (mut sim, a, got) = slow_link(29, 1, 0.0);
+    bursts(&sim, a, 1, ms(100), &[(0, 1), (1, 3)]);
+    sim.run_until(Instant::from_nanos(1_000_000_000));
+    assert_eq!(
+        arrivals(&got),
+        vec![(0, 1, at_ms(101)), (1, 1, at_ms(201)), (2, 1, at_ms(301)),]
+    );
+    assert!(
+        queue_full_drops(&sim).is_empty(),
+        "the frame written at the instant of the next send held a slot against the bound"
+    );
+}
+
+/// The queue belongs to a (sending socket, destination) pair, not to the socket
+/// (D-056): a burst to one destination does not hold back a frame to another. One
+/// socket sends three 100-byte frames to port 2 and one to port 4 at one instant; a
+/// queue shared by the socket's destinations would write the fourth behind the three
+/// and deliver it at 401 ms instead of 101 ms. Only eight pinned raft seeds notice that
+/// today, and they notice it as a moved schedule — a failure whose documented answer is
+/// to re-audit and re-pin — so the model's own rule is asserted here.
+// PROPOSED(D-056): SimEnv's bounded, drop-oldest queue per (sending socket,
+// destination), drained at a modelled per-link rate.
+#[test]
+fn a_frame_waits_only_behind_the_frames_to_its_own_destination() {
+    let mut config = SimConfig::new(23);
+    config.net.delay_min = ms(1);
+    config.net.delay_max = ms(1);
+    config.net.link_bytes_per_sec = 1_000;
+    let mut sim = Sim::new(config);
+    let (a, b, c) = (sim.add_node(), sim.add_node(), sim.add_node());
+    let got: Log<(u8, u16, Instant)> = log();
+    receiver(&sim, b, 2, &got);
+    receiver(&sim, c, 4, &got);
+    send_frames(&sim, a, 1, 100, &[(2, 0), (2, 1), (2, 2), (4, 3)]);
+    sim.run_until(Instant::from_nanos(1_000_000_000));
+    assert_eq!(
+        arrivals(&got),
+        vec![
+            (0, 1, at_ms(101)),
+            (3, 1, at_ms(101)),
+            (1, 1, at_ms(201)),
+            (2, 1, at_ms(301)),
+        ]
+    );
+}
+
+/// Every byte takes time (D-056): a write time is rounded *up* to the nanosecond, so a
+/// frame the link would write in less than a nanosecond still takes one and still holds
+/// the queue. Rounding down would cost nothing on the two rates the suite configures —
+/// a gigabit and `slow_link`'s thousand bytes a second both divide exactly, so no seed
+/// at any tier could see it — and would silently undo the whole model on any link
+/// faster than a byte a nanosecond: every frame written at the instant it is sent, the
+/// queue drained on every admit, and the bound unreachable. Here six one-byte frames go
+/// into a queue of two: three are dropped, and under a write time of zero all six would
+/// arrive together at 1 ms.
+// PROPOSED(D-056): SimEnv's bounded, drop-oldest queue per (sending socket,
+// destination), drained at a modelled per-link rate.
+#[test]
+fn a_frame_takes_time_on_a_link_faster_than_a_byte_a_nanosecond() {
+    let mut config = SimConfig::new(24);
+    config.net.delay_min = ms(1);
+    config.net.delay_max = ms(1);
+    config.net.link_bytes_per_sec = 2_000_000_000;
+    config.net.send_queue_len = 2;
+    let mut sim = Sim::new(config);
+    let (a, b) = (sim.add_node(), sim.add_node());
+    let got: Log<(u8, u16, Instant)> = log();
+    receiver(&sim, b, 2, &got);
+    send_frames(
+        &sim,
+        a,
+        1,
+        1,
+        &[(2, 0), (2, 1), (2, 2), (2, 3), (2, 4), (2, 5)],
+    );
+    sim.run_until(Instant::from_nanos(1_000_000_000));
+    assert_eq!(
+        arrivals(&got),
+        vec![
+            (0, 1, at_ms_ns(1, 1)),
+            (4, 1, at_ms_ns(1, 2)),
+            (5, 1, at_ms_ns(1, 3)),
+        ]
+    );
+    assert_eq!(
+        queue_full_drops(&sim),
+        [1, 2, 3].map(MessageId::new),
+        "a link faster than a byte a nanosecond stopped filling its queue"
+    );
 }
 
 fn ping_and_count(config: SimConfig, setup: impl FnOnce(&mut Sim, NodeId, NodeId)) -> (Sim, usize) {
@@ -1013,6 +1397,155 @@ fn every_env_handle_shares_the_node_stream() {
         (env.rng().next_u64(), env.rng().next_u64()),
         (first, second),
         "two handles continue one stream"
+    );
+}
+
+/// Q13's stream per node and range (D-057): `n{id}/r{range}/protocol`, derived from
+/// the seed and the name as every stream is (D-017). The same seed, node and range give
+/// the same draws; another range, another node or another seed gives other draws; and
+/// the draws are the ones moirae's derivation gives for that name, so the name is the
+/// stream's identity and not an accident of the order streams were made in.
+// PROPOSED(D-057): a named stream per node and range through the environment.
+#[test]
+fn a_range_stream_is_derived_from_the_seed_and_its_name() {
+    let draws = |seed: u64, node: usize, range: u64| {
+        let mut sim = Sim::new(SimConfig::new(seed));
+        let nodes = [sim.add_node(), sim.add_node()];
+        let rng = sim.env(nodes[node]).range_rng(range);
+        [rng.next_u64(), rng.next_u64(), rng.next_u64()]
+    };
+    assert_eq!(draws(7, 0, 3), draws(7, 0, 3));
+    assert_ne!(draws(7, 0, 3), draws(7, 0, 4));
+    assert_ne!(draws(7, 0, 3), draws(7, 1, 3));
+    assert_ne!(draws(7, 0, 3), draws(8, 0, 3));
+    for (node, range, name) in [
+        (0, 3, "n1/r3/protocol"),
+        (1, 0, "n2/r0/protocol"),
+        (1, u64::MAX, "n2/r18446744073709551615/protocol"),
+    ] {
+        let mut named = moirae_sched::stream(7, name);
+        assert_eq!(
+            draws(7, node, range),
+            [named.next_u64(), named.next_u64(), named.next_u64()],
+            "{name}"
+        );
+    }
+}
+
+/// Taking a range's stream and drawing from it perturbs no other stream (D-017,
+/// D-057), node-wide or run-wide. The node's protocol and scheduling streams, another
+/// node's, and another range's draw exactly what they draw when no such stream is
+/// taken, however the takes and draws interleave with theirs; a node added after the
+/// takes draws the same clock skew and drift from the run's `clock` stream; and a
+/// scenario with drops, duplicates and random delays, whose task takes and draws range
+/// streams in one run and not the other, records the same trace, so the `net` and
+/// `sched` streams and the scheduler's choices did not move either.
+// PROPOSED(D-057): a named stream per node and range through the environment.
+#[test]
+fn taking_a_range_stream_perturbs_no_other_stream() {
+    let run = |take: bool| {
+        let mut config = SimConfig::new(11);
+        config.clock.max_skew = ms(50);
+        config.clock.max_drift_ppm = 500;
+        let mut sim = Sim::new(config);
+        let (a, b) = (sim.add_node(), sim.add_node());
+        let (env_a, env_b) = (sim.env(a), sim.env(b));
+        let other = env_a.range_rng(2);
+        let mut seen = Vec::new();
+        for round in 0..4 {
+            if take {
+                let rng = env_a.range_rng(9);
+                for _ in 0..=round {
+                    rng.next_u64();
+                }
+                env_b.range_rng(9).next_u64();
+                env_a.range_rng(100 + round).next_u64();
+            }
+            seen.push(env_a.rng().next_u64());
+            seen.push(env_a.sched_rng().next_u64());
+            seen.push(env_b.rng().next_u64());
+            seen.push(env_b.sched_rng().next_u64());
+            seen.push(other.next_u64());
+        }
+        let c = sim.add_node();
+        let clock = {
+            let st = sim.shared.lock();
+            let node = &st.nodes[&c];
+            (node.skew_nanos, node.drift_ppm)
+        };
+        (seen, clock)
+    };
+    let (quiet, taken) = (run(false), run(true));
+    assert_ne!(quiet.1, (0, 0), "the clock faults drew nothing to compare");
+    assert_eq!(quiet, taken);
+
+    let trace = |take: bool| {
+        let mut config = SimConfig::new(12);
+        config.net.p_drop = 0.3;
+        config.net.p_duplicate = 0.2;
+        config.net.delay_min = ms(0);
+        config.net.delay_max = ms(10);
+        let mut sim = Sim::new(config);
+        let (a, b) = (sim.add_node(), sim.add_node());
+        let env_b = sim.env(b);
+        env_b.clone().spawn("receiver", async move {
+            let sock = env_b.net().bind(addr(2)).await.unwrap();
+            loop {
+                let (from, msg) = sock.recv().await.unwrap();
+                sock.send(from, msg).await.unwrap();
+            }
+        });
+        let env_a = sim.env(a);
+        env_a.clone().spawn("sender", async move {
+            let sock = env_a.net().bind(addr(1)).await.unwrap();
+            for n in 0..30u32 {
+                sock.send(addr(2), Bytes::copy_from_slice(&n.to_be_bytes()))
+                    .await
+                    .unwrap();
+                env_a.clock().sleep(ms(1)).await;
+            }
+        });
+        let env_r = sim.env(a);
+        env_r.clone().spawn("ranges", async move {
+            for range in 0..10 {
+                if take {
+                    env_r.range_rng(range).next_u64();
+                    env_r.range_rng(7).next_u64();
+                }
+                env_r.clock().sleep(ms(2)).await;
+            }
+        });
+        sim.run_until(Instant::from_nanos(200_000_000));
+        sim.trace()
+    };
+    let (quiet, taken) = (trace(false), trace(true));
+    assert!(
+        quiet.iter().any(|r| matches!(
+            r.event,
+            TraceEvent::MessageDropped {
+                reason: DropReason::Injected,
+                ..
+            }
+        )),
+        "the scenario dropped nothing, so the net stream was not exercised"
+    );
+    assert_eq!(quiet, taken);
+}
+
+/// A node's stream for a range is one stream however it is reached: every handle to
+/// the node, and every call, continues the same sequence, as `rng` does (D-017).
+// PROPOSED(D-057): a named stream per node and range through the environment.
+#[test]
+fn every_env_handle_continues_a_nodes_range_stream() {
+    let mut sim = Sim::new(SimConfig::new(5));
+    let n = sim.add_node();
+    let first = sim.env(n).range_rng(4).next_u64();
+    let second = sim.env(n).clone().range_rng(4).next_u64();
+    let third = sim.env(n).range_rng(4).next_u64();
+    let mut named = moirae_sched::stream(5, "n1/r4/protocol");
+    assert_eq!(
+        [first, second, third],
+        [named.next_u64(), named.next_u64(), named.next_u64()]
     );
 }
 

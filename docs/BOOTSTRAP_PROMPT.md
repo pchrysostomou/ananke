@@ -247,8 +247,43 @@ _Update this section at the end of every session._
   D-047's straddle reads `decided <= from < at`; the directed term-raise sweeps go
   through `checked`; D-050's rule is restated for candidacies stepped from a
   PreVoteResponse or TimeoutNow; D-052's figures compare equal loads.
-- Next concrete task: Phase 3 (SPEC §4), multi-raft sharding, starting with its design
-  proposal. Issue #37: a refused server's silence while it verifies, repairs and
+- Phase 3 design and Stage A (2026-09-15/16), branch `phase-3-stage-a` off `main` at
+  1570206 with `main` merged back in at a250b42, not merged, every commit gated, the
+  owner's review pending at Stage A's exit criteria. The design, SHARD.md, is approved
+  (PR #48) with the stage plan of §12 and the answers of §13; PR #50 added every stage's
+  green ten-thousand-seed nightly to its exit and Stage A's v0.3.0-store decision, and
+  PR #51 the owner's answers to the six post-approval choices. Stage A's seven items:
+  D-053, RAFT.md corrected where it described what the code lacks (Q1); D-054, the
+  install of a span into a live engine with its crash test, which is Q2's criterion and
+  is met in the simulator; D-055, the seek, the range delete and the span checkpoint,
+  with the engine sweep over all four primitives; D-056, `SimEnv`'s bounded drop-oldest
+  queue per (socket, destination), which moved every pinned hash and schedule and whose
+  re-audit re-pinned the `{IgnoreIncarnation, SharedSnapshotDir}` pair from seed 680 on
+  seed 132 (Q16); D-057, `Environment::range_rng`, a named stream per node and range,
+  called by nothing until Stage B (Q13); D-058, `sim/membership.rs` past the snapshot
+  threshold, which meets issue #46 for the snapshot feed and the configuration key and
+  defers the truncation revert floor and the kept-tail repair to issue #56 (Q34);
+  D-059, the owner's decision that a store in 0.3.0's format is refused at open, with
+  the v0.3.0 tag's own store as a checked-in fixture; and D-060, the key layout of Q5 —
+  a group's Raft state under `0 / <group: u64 BE> / <purpose> / name`, user data in
+  tenant 2, the store parameterised by that prefix (Q40), and the format version in a
+  `RAFT-FORMAT` record read before anything writes, the format checked before lost
+  state, older and newer versions refused naming both. D-061 is the owner's rule of
+  2026-09-15: a variant caught on under 5 % of seeds asserts its catch at the
+  thousand-seed tier, never at the gate's twenty (CLAUDE.md), with the audit of every
+  such assertion; it moved the lease's stale read, the WAL's betrayed cut, the
+  membership scenario's election while joint, `RefusalNotDurable` (D-056) and
+  `reverts_to_a_prefix` (D-058). The layout commit moved every Raft schedule and every
+  pinned trace hash, and re-audited every pinned seed in one commit;
+  `RefusalNotDurable`'s catch moved from seed 119, which now refuses nothing, to seed
+  158. `scripts/premerge.sh` at a thousand seeds: 593.87 s at mean load 20.87, against
+  D-055's 540.37 s and D-052's 374.64 s. Issues filed: #55, #56, #57 (the nightly's
+  300-minute budget). A six-lens adversarial review with an independent skeptic per
+  lens, including mutation testing of the new `ananke-raft` code, ran before the exit;
+  its findings are fixed in 3927b56, 5698992, 5bd3574 and ae54a20.
+- Next concrete task: Phase 3 Stage B (SHARD.md §12), the node: many groups on one
+  socket, one ticker and one engine — after the owner's review of Stage A at its exit
+  criteria. Issue #37: a refused server's silence while it verifies, repairs and
   adopts its re-seed deposes the leader when the third server is away.
   Open follow-ups: issue #32 (the pre-vote check: a message delivered before an
   isolation but stepped inside it) and issue #33
@@ -267,7 +302,8 @@ _Update this section at the end of every session._
   often at one instant (`PollBudgetExceeded`, then a panic naming the task). The echo
   protocol keeps a checksummed journal (`ananke_server::echo::Journal`) that syncs
   every few records and rotates without `sync_dir`, and `sim/echo.rs` checks what the
-  restarted node found against the trace. Pinned trace body hash: `19f19201df99a799`.
+  restarted node found against the trace. Pinned trace body hash: `fcbe82ee7a0ba672`
+  (`19f19201df99a799` until D-056's send queue moved every schedule).
 - Phase 0 record: `Environment` with `Clock`, `FileSystem`, `Network`, `Rng`; `RealEnv`
   on tokio; `sim::Sim` / `SimEnv` with the §1.3 torn-write and lost-fsync model and the
   §1.4 drop / delay / partition model; D-013 to D-017; the moirae bridge through

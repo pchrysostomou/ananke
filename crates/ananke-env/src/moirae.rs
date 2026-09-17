@@ -20,12 +20,15 @@
 //! | `DirectoryEntryLost`                     | `log` `ananke.fs.dir-entry-lost`              |
 //! | `WalSegmentOpened` / `WalSynced`         | `log` `ananke.wal.segment-opened` / `.synced` |
 //! | `WalTruncated` / `WalRecovered`          | `log` `ananke.wal.truncated` / `.recovered`   |
+//! | `WalSuperseded`                          | `log` `ananke.wal.superseded`                 |
 //! | `HeadGap`                                | `log` `ananke.wal.head-gap`                   |
 //! | `MemtableRotated` / `MemtableFlushed`    | `log` `ananke.memtable.rotated` / `.flushed`  |
 //! | `FlusherFailed`                          | `log` `ananke.engine.flusher-failed`          |
 //! | `CheckpointWritten`                      | `log` `ananke.engine.checkpoint-written`      |
 //! | `SstWritten` / `SstDropped` / `SstDeleted` | `log` `ananke.sst.written` / `.dropped` / `.deleted` |
 //! | `CompactionWritten`                      | `log` `ananke.compaction.written`             |
+//! | `SpanInstalled`                          | `log` `ananke.engine.span-installed`          |
+//! | `InstallCleanupFailed`                   | `log` `ananke.engine.install-cleanup-failed`  |
 //! | `ManifestWritten` / `CurrentSwitched` / `ManifestFallback` | `log` `ananke.manifest.written` / `.switched` / `.fallback` |
 //! | `OpenRefused` / `EngineQuiesced`         | `log` `ananke.engine.open-refused` / `.quiesced` |
 //! | `OrphanRemoved` / `WalSegmentDeleted`    | `log` `ananke.fs.orphan-removed` / `ananke.wal.segment-deleted` |
@@ -208,6 +211,15 @@ fn header(run: &RunHeader) -> Header {
         ("pDropPpm", ppm(c.net.p_drop)),
         ("delayMinNs", ns(c.net.delay_min)),
         ("delayMaxNs", ns(c.net.delay_max)),
+        // PROPOSED(D-056): the send queue's bound and its link's drain rate.
+        (
+            "sendQueueLen",
+            Json::Int(i64::try_from(c.net.send_queue_len).unwrap_or(i64::MAX)),
+        ),
+        (
+            "linkBytesPerSec",
+            Json::Int(i64::try_from(c.net.link_bytes_per_sec).unwrap_or(i64::MAX)),
+        ),
         ("pDurablePpm", ppm(c.fs.p_durable)),
         ("maxSkewNs", ns(c.clock.max_skew)),
         ("maxDriftPpm", Json::Int(i64::from(c.clock.max_drift_ppm))),
@@ -441,6 +453,20 @@ fn convert(
                 ("len", int(*len)),
             ])),
         ),
+        TraceEvent::WalSuperseded {
+            segment,
+            expected,
+            found,
+            dropped,
+        } => log(
+            "ananke.wal.superseded",
+            Some(Json::obj(vec![
+                ("segment", int(*segment)),
+                ("expected", int(*expected)),
+                ("found", int(*found)),
+                ("dropped", int(*dropped)),
+            ])),
+        ),
         TraceEvent::HeadGap {
             expected,
             found,
@@ -575,6 +601,59 @@ fn convert(
                 ("snapshot", int(*snapshot)),
                 ("droppedVersions", int(*dropped_versions)),
                 ("droppedTombstones", int(*dropped_tombstones)),
+            ])),
+        ),
+        // PROPOSED(D-054): the live install of a span, in one manifest switch.
+        TraceEvent::SpanInstalled {
+            manifest,
+            start,
+            end,
+            seq,
+            removed,
+            rewritten,
+            added,
+        } => log(
+            "ananke.engine.span-installed",
+            Some(Json::obj(vec![
+                ("manifest", int(*manifest)),
+                ("start", Json::str(&hex(start))),
+                ("end", Json::str(&hex(end))),
+                ("seq", int(*seq)),
+                (
+                    "removed",
+                    Json::Array(removed.iter().map(|&t| int(t)).collect()),
+                ),
+                (
+                    "rewritten",
+                    Json::Array(
+                        rewritten
+                            .iter()
+                            .map(|(from, to, first, last)| {
+                                Json::obj(vec![
+                                    ("from", int(*from)),
+                                    ("to", int(*to)),
+                                    ("firstKey", Json::str(&hex(first))),
+                                    ("lastKey", Json::str(&hex(last))),
+                                ])
+                            })
+                            .collect(),
+                    ),
+                ),
+                (
+                    "added",
+                    Json::Array(
+                        added
+                            .iter()
+                            .map(|(number, first, last)| {
+                                Json::obj(vec![
+                                    ("number", int(*number)),
+                                    ("firstKey", Json::str(&hex(first))),
+                                    ("lastKey", Json::str(&hex(last))),
+                                ])
+                            })
+                            .collect(),
+                    ),
+                ),
             ])),
         ),
         TraceEvent::SstDeleted { number } => log(
@@ -963,6 +1042,14 @@ fn convert(
         TraceEvent::FlusherFailed { error } => log(
             "ananke.engine.flusher-failed",
             Some(Json::obj(vec![("error", Json::str(error))])),
+        ),
+        // PROPOSED(D-054): an error after the switch does not undo the install.
+        TraceEvent::InstallCleanupFailed { seq, error } => log(
+            "ananke.engine.install-cleanup-failed",
+            Some(Json::obj(vec![
+                ("seq", int(*seq)),
+                ("error", Json::str(error)),
+            ])),
         ),
         TraceEvent::MemtableFlushed { memtable, up_to } => log(
             "ananke.memtable.flushed",

@@ -3,8 +3,9 @@
 //! Every stream is derived from the seed by name through [`moirae_sched::stream`]:
 //! `sched` belongs to the scheduling policy, `net` to drops and delays, `fs` to lost
 //! fsyncs and torn writes, `clock` to skew and drift, and each node has `n{id}/protocol`
-//! for what the protocol asks and `n{id}/sched` for what the executor asks inside its
-//! tasks. Nothing on one stream can perturb another.
+//! for what the protocol asks, `n{id}/sched` for what the executor asks inside its
+//! tasks, and `n{id}/r{range}/protocol` for each range it is asked for (PROPOSED D-057).
+//! Nothing on one stream can perturb another.
 
 use std::fmt;
 use std::sync::{Arc, Mutex, PoisonError};

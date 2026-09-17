@@ -443,6 +443,14 @@ after a flush, the first surviving record will not be number 1; the manifest mus
 then carry the first sequence number recovery should expect (BACKLOG). Found in the
 sweep's first run, which is the point of the sweep.
 
+**Corrected by PROPOSED D-062.** The rule above is written without direction: any record
+that does not continue the numbering stops recovery, "treated like any other stop". The
+nightly's ten thousand found at seed 3123 that a record numbered *behind* the reading,
+at a segment's first byte, is not a hole at all — it is the live segment arriving after
+a segment a betrayed cut resurrected, and stopping there destroys acknowledged records
+and replays stale ones. D-062 makes a backwards jump at a segment's first record a
+supersede; a forward jump is still a stop.
+
 ---
 
 ## D-020 — Memtable and engine: a sequence-guarded skiplist, a flush sink that stands in for SSTables, and what the sweep may not excuse
@@ -525,6 +533,13 @@ until then the order rule is smaller and does not change the memtable's shape.
 **Consequences.** One more lock per write and a map that is empty between groups.
 Found by the nightly on its first run, at seed 420: twenty seeds at the gate and a
 hundred in CI had not reached the interleaving, which is what ten thousand are for.
+
+**Completed by PROPOSED D-054.** The rule above assumes every write numbered below an
+acknowledged one is already in the map. On a runtime with more than one thread it was
+not: the log numbered a record before the engine put it in the map, and applying popped
+and applied under different locks. D-054's *Applies in order* names both windows; a
+record is now numbered and put in the map under the map's lock, and applies are
+serialised.
 
 ---
 
@@ -624,6 +639,12 @@ by number, could not tell them apart; segment numbers are now monotone, and with
 in the numbering allowed the "missing segment" stop is gone, since a segment lost with
 records in it shows as a gap at the next segment's first record and the numbering of
 the records is the check that matters.
+
+**Extended by PROPOSED D-062.** "A jump in the numbering that lands at or below the head
+… is not a stop" gains its backward twin. A jump *backwards* at a segment's first record
+is not a stop either, and needs no head to justify it: the order segments are created in
+is what proves the earlier copies stale. Monotone segment numbers, decided here so the
+oracle could tell two files apart, are what make that argument available to the reader.
 
 ---
 
@@ -3023,11 +3044,11 @@ signature change of public functions for records no check reads by time.
 | Seed 7381's predicates | `floor_lowering_installs`, `recoveries_under_a_lost_floor` | record order | the floor fold reads no time; the time reported is the record's |
 | Seed 6325's adoption windows | `adoption_windows` | durability | a crash inside the disk work between an install being durable and its adoption being durable |
 | Seed 687's restarts | `restarts_after_lost_state_refusal` | record order | a restart after the refusal as recorded |
-| Snapshot takes | `snapshot_takes` | durability | pairs a take's record with the checkpoint written at the same recorded instant |
+| Snapshot takes | `snapshot_takes` | durability | pairs a take's record with the last checkpoint written on its node and not yet claimed; a crash or a `RaftTruncate` discards an unclaimed one. It asked for the two records to carry the *same* instant until D-060 put an awaited write between them, after which it paired nothing on any seed |
 | Re-takes under streams | `retakes_under_streams` | durability, record order | a take as recorded against chunks sent and openings as recorded, the order the audit measured in |
 | Uncounted followers, the duplicate-chunk loop | `uncounted_after_heal`, `duplicate_chunk_loop` | one time | sends and deliveries |
 | Stale progress; refusal, reset, re-seed | `stale_progress`, `refusal_reset_reseed` | record order, durability | a refusal as recorded against the messages after it; the reset answers a rejection the refused server sends only after its refusal is recorded |
-| The pin helpers | `assert_stream_wedge`, `crashes_while_refused`, `retook_at_one_index`, `reseed_completed`, `Coverage` in `sim/tests/raft.rs` | durability, record order | what the audit measured, as recorded |
+| The pin helpers | `assert_no_stream_wedge`, `took_an_index_twice`, `crashes_while_refused`, `retook_at_one_index`, `reseed_completed`, `Coverage` in `sim/tests/raft.rs` | durability, record order | what the audit measured, as recorded (`assert_stream_wedge` was replaced by `assert_no_stream_wedge` when the wedge stopped being reachable on a pinned seed) |
 
 The fault drivers — `leader_now`, `install_landing`, `install_completed`,
 `stream_opened`, `refreshed_refused`, `flush_in_flight`, `adoption_change` — read
@@ -4049,4 +4070,2921 @@ that a change could take out. In the engine binary, which is not the raft binary
 
 ---
 
-_Next entry: D-053. Add one before implementing anything not covered above._
+## D-053 — RAFT.md says what the code has
+
+**Context.** Checking RAFT.md against the tree while writing SHARD.md found places where
+it describes what the code lacks (SHARD.md:23-34). The owner's answer to SHARD.md's Q1,
+approved on 2026-09-15, is that the first commit of Phase 3 corrects them, and the answer
+to Q35 is that Phase 3 has no scan. RAFT.md is the approved design, not an entry, so its
+text is corrected where it is wrong and this entry records each correction: what RAFT.md
+said, what the code does, and why the text now follows the code. None of the code
+changes. Q1 names the scan, the two variants, the frame's field order and `src/read.rs`;
+three more statements in or beside those passages, as plainly false, were found while
+correcting them and are corrected with them: the frame's fields and payload, the
+studio's name for an AppendEntries, and where a follower's entries are read from.
+
+*§4, the scan.* RAFT.md's history had a fifth operation, `Scan(range) → Vec<(k, v)>`,
+and its checker a scan check: a scan consistent iff some time in its window agrees with
+every key's chosen linearization. Neither exists and neither ever did. `ClientOp` is
+`Put`, `Get`, `Delete` and `Cas` (crates/ananke-env/src/trace.rs:752-779), and
+`sim/lin.rs` searches each key's operations on its own and returns each key's timeline,
+which only its own tests read (sim/lin.rs:207-236). A scan over many keys waits for SPEC
+§6's distributed scans, in Phase 5 (SPEC.md:351-352), since with ranges a scan across
+them has no linearizable form without transactions (Q35).
+
+*§3, the frame.* RAFT.md gave `kind: u8 | term: u64 | from: u64 | fields`. The codec
+writes and reads the kind, then the sender, then the term
+(crates/ananke-raft/src/message.rs:4, 383-385, 492-494), the order D-025 recorded when
+it landed. The same sentence called the fields length-prefixed and gave entries as
+`count | (term, index, payload_len, payload)*`. A fixed-width field is written bare, and
+of the variable-length fields a file name and a chunk's data each follow a `u32` length;
+entries follow a `u32` count, and a payload is a tag followed by a length and the bytes
+for a command, the member lists for a configuration and nothing for a no-op
+(message.rs:284-354, 442-478). And the studio's decoder names an AppendEntries
+`raft.append-entries`, not `raft.append` (message.rs:222-236, 669-673).
+
+*§3, the crate.* RAFT.md listed `src/read.rs`, "read-index and lease reads". There is no
+such file. The read-index round, the lease and the drift guard are the core's
+(`Raft::on_read`, `Guard`, in core.rs), and the node serves the reads the core makes
+ready (node.rs). The listing's `core.rs` line now says so.
+
+*§3, the log read back.* RAFT.md said that reading entries back for a follower behind
+the leader is a `scan` over the log's index range. The core holds the log in memory and
+builds each AppendEntries from it (D-025); the store scans the log table when it opens,
+to hand the log back to the core (crates/ananke-raft/src/store.rs:681-697).
+
+*§5, the variants.* RAFT.md's table had eighteen rows; `Variant::BUGS` has sixteen arms
+(crates/ananke-raft/src/core.rs:159-176). The two rows beyond them, `VoteBeforePersist`
+and `ApplyNotAtomicWithIndex`, name variants that never existed in the code: the history
+holds either name only in documents. What the code has for their rules:
+
+- *The vote durable before it is answered.* `SendBeforePersist` covers it. The server
+  enforces the order, not the core: under that variant every `Send` of a step leaves
+  before the step's `Persist` (crates/ananke-raft/src/node.rs:2090-2097), and a granted
+  vote is a step whose `Persist` carries the vote and whose `Send` is the answer
+  (core.rs:1277-1301, 2355-2380). Its row said "the same discipline for `AppendEntries`",
+  naming the vote row above it, so it now states the discipline itself.
+- *The applied index in the batch of its entry's writes.* No known-buggy variant.
+  The rule's crash test, `an_entrys_writes_and_the_applied_index_are_durable_together`
+  (crates/ananke-raft/tests/store.rs:116-245), runs the correct store over forty seeds
+  with lost syncs and bit rot and asserts the engine's state is the model's at the
+  recovered applied index, exactly once per entry.
+
+**Decision.** RAFT.md is corrected at each of these places, and each corrected passage
+cites this entry: §3's crate listing, its log paragraph and its frame; §4's history,
+partitioning and what is asserted, with a pointer to SPEC §6; §5's table, which drops the
+two rows and restates `SendBeforePersist`'s rule, and a paragraph before it that says the
+table is `Variant::BUGS` and where the two rules without a variant of their own stand.
+
+**Alternatives.** Building what RAFT.md described instead: a scan is against Q35, and the
+two variants are code the phase did not plan, a widening of scope; a known-buggy variant
+beside the atomic apply's crash test is an issue to file, not part of this correction.
+Superseding the passages with forward pointers and leaving the text: RAFT.md is not an
+accepted entry, Q1 asks for the text corrected, and a reader of RAFT.md would still meet a
+checker and two variants the code does not have. Keeping `VoteBeforePersist`'s row with a
+pointer to `SendBeforePersist`: a row for a variant that does not exist invites a test that
+cannot be written.
+
+**Consequences.** Corrections move RAFT.md's lines from §3 on. SHARD.md's citations of
+RAFT.md by line were re-checked in the same commit and point at the passages they quote.
+Ten of them were already off before it, and are corrected with the rest: those at
+SHARD.md:581, 774, 1066 and 1926 into §3, and at SHARD.md:1565, 1569, 1577 (two), 1579
+and 1580 into §5. No entry of DECISIONS.md cites RAFT.md by line, so no accepted entry
+gains a pointer. No code, trace hash or seed schedule moves.
+
+---
+
+## PROPOSED D-054 — The live install of a span: one manifest switch, numbered above the engine, from a checkpoint of the span
+
+**Context.** Q2, approved by the owner on 2026-09-15, puts every range of a node in one
+engine, and makes its entry criterion a crash test: a span's keys removed and its tables
+added in one manifest switch, the installed sequence numbers above the live engine's,
+green before any split code (SHARD.md §11 storage 5, §12 Stage A item 2 and its exit).
+Two things were missing. The only install replaced a whole store directory at the
+server's next start (crates/ananke-raft/src/snapshot.rs:305), and putting tables into a
+running engine was crate-private and knew nothing of a span (`manifest_edit`, `install`,
+engine.rs). And the only checkpoint copied the whole store (D-024), so there was nothing
+of one span to install from (storage 4). What Q2 settles, the one switch and the numbers
+above the engine's, and what the stage asks of the test, the span as it was or as
+installed, every other key unchanged, a later write read over the install, and the
+two-switch variant caught by the same test, are the owner's. How the engine keeps them
+is not settled anywhere, and is proposed here: where the number comes from, what becomes
+of the memtables and the log below it, what becomes of a table that holds keys on both
+sides of the span's edge, the order level 0 is read in, what a snapshot sees, how many
+installs run at once, and the test's shape and oracle. D-054 takes the checkpoint of a
+span, since the crash test installs from one; D-055 does not need it. Every site is
+marked `PROPOSED(D-054)`.
+
+**Decision.** *The checkpoint of a span.* `Engine::checkpoint_span(range, dir)` writes,
+under the turnstile as `checkpoint` does, the newest write at or below the newest version
+applied of every key in `[start, end)` that is present, each at its own sequence number,
+into tables at level 0 sealed near `sst_bytes` in key order, then `MANIFEST-000001`
+listing them with `flushed_seq` the version, then `CURRENT`, each synced in that order. A
+deleted key leaves nothing: the checkpoint is the span's state, not its history. A crash
+leaves a whole checkpoint or one without `CURRENT`, which nothing opens.
+
+*The source.* `Engine::open_span_source(dir)` reads `CURRENT`, the manifest it names and
+every table that lists, each opened and verified whole, and writes nothing; anything
+missing or damaged refuses it (`InstallRefused::SourceDamaged`). Any whole store whose
+keys lie inside the span is a source, a checkpoint of the span among them.
+
+*The number.* `Engine::install_span(range, source)` appends, as it is called, one log
+record of its own that holds no write (an empty batch, synced), and every installed write
+carries that record's number `S`. `SpanInstall::seq` reports it before anything is
+written, as `Write::seq` does. `S` is above every write the engine has taken, and every
+write taken after the call is above `S`: a later write to the span is newer than every
+installed one, which is what reads it over the install.
+
+*The memtables and the log below it.* The engine marks the install in progress. As `S`
+is applied the active memtable, if it holds anything, is rotated, so every memtable holds
+writes from one side of `S` only; while the install is in progress the flusher leaves
+alone every memtable whose writes are all above `S`. The install waits for its record to
+be durable, takes the turnstile and flushes every memtable holding a write at or below
+`S` itself; a memtable the flusher was handed before is no longer the queue's head when
+the flusher gets in, and it moves on. Then every write at or below `S` is in a table, and
+the manifest that makes the install the state says so: its `flushed_seq` is at least `S`,
+and recovery never replays a write of the span older than the install.
+
+*The span's writes out.* Every table in service that holds a write of the span below `S`
+is taken out: whole when every key it holds lies in the span and every write is below
+`S`, and otherwise written again at its own level, under a new number, without those
+writes, keeping every other write at its own sequence number.
+
+*The installed tables.* The source's newest write of each key, if it is live, is written
+at `S` into tables at level 0 sealed near `sst_bytes`. A key outside the span refuses the
+install (`OutsideSpan`): from the source's manifest before anything is numbered, and key
+by key as the tables are written, where the tables already written are orphans the next
+open removes.
+
+*One switch.* The next manifest lists the tables in service less those taken out, with
+the rewrites and the installed tables, and `flushed_seq` at least `S`.
+`TraceEvent::SpanInstalled` records the manifest's number, the span, `S`, the tables taken
+out, each rewrite with its original, and the installed tables with their key ranges,
+before the manifest is written, as `CompactionWritten` is (D-023); then the manifest is
+written, synced and switched to, the result put in service, and only then are the tables
+taken out deleted and the log segments at or below `S`. A crash before the switch leaves
+the old manifest, the old span and the new files as orphans; after it, the installed span.
+
+*Level 0 is read newest sequence number first.* A lookup took level 0 newest file number
+first. A rewritten level-0 table keeps its writes' numbers under a new, higher file
+number, so a key outside the span whose older write it holds would be read before a newer
+write in a table flushed after the original but numbered below the rewrite. Level 0 is now
+ordered by the highest sequence number a table holds, then its number. For flushed tables
+the two orders are one, since their sequence ranges are disjoint and numbered in order, so
+nothing an engine did before an install reads differently.
+`a_rewritten_level_0_table_does_not_hide_a_newer_write` (tests/engine.rs) builds the case
+and reads the old value under the old order.
+
+*The install's own task.* The work after the install is numbered, from waiting for its
+record to deleting what it took out, runs in a task the engine spawns through
+`Environment::spawn` (`span-install`), and `SpanInstall` only waits for the outcome the
+task leaves. A caller that drops the future, or never polls it, cannot stop the install
+between writing its manifest and switching to it, which would leave a manifest file
+under the next number that the next flush's `create_new` then fails on for good, and
+cannot hold the flusher back by not polling. The task lets the flusher go before it
+tells the caller. What the task owns — the hold on the flusher and the caller's
+outcome — is one value whose drop lets the flusher go and then, if the work left no
+outcome, leaves the error *the install's task ended without an outcome* and wakes the
+caller: a task that panics, is aborted, or is dropped with its runtime or its node no
+longer leaves `SpanInstall` pending for good, which on the real runtime it did
+(`an_install_whose_task_ends_without_an_outcome_resolves_with_an_error` crashes the
+node under an install and polls its future after). A future polled again after it
+resolved says so rather than waiting.
+
+*When an install fails.* What an error leaves depends on when it comes. Before the
+install's manifest is written — flushing the memtables below it, reading the tables,
+writing the rewrites and the installed tables — the engine is as it was, and the tables
+written so far are orphans the next open removes. Writing that manifest, or switching
+`CURRENT` to it, is different: the manifest's file may already hold the next number,
+which the next flush's `create_new` would then fail on for good, and `CURRENT` may name
+it, though the engine's memory still lists the manifest before. The engine quiesces
+(D-044), traced as `EngineQuiesced` with the reason *an install's manifest or its switch
+failed*: no flush, compaction or log deletion follows, writes are still taken into the
+log, and the next open finds the span as it was or as installed, with the log replaying
+over it (`an_install_whose_switch_fails_quiesces_the_engine`). Once the switch has
+returned the install is in force, and it resolves `Ok` whatever follows: an error
+deleting the tables it took out or the log segments at or below its number is traced as
+`InstallCleanupFailed`, the tables left are orphans the next open removes, and the
+segments go with the next flush's deletion
+(`an_install_whose_cleanup_fails_after_the_switch_resolves_as_made`). A future dropped
+at once leaves the install to its switch, and the next install is not refused
+(`a_dropped_install_or_range_delete_still_runs_to_its_switch`). The simulator's
+filesystem returns no error the engine did not cause, so none of this moves a trace.
+
+*Applies in order.* The split of the memtables at `S` rests on D-021's rule that
+writes apply in sequence order: every record below `S` applied before `S`, and `S`'s
+rotation before any record above it. On a runtime with more than one thread that rule
+had two windows, and the simulator, which polls one task at a time with no await inside
+a write or an apply, reaches neither.
+
+The first: `apply_through` popped a record under the pending lock and applied it after
+letting the lock go, so two callers could apply out of order. Applies are now
+serialised by a lock of their own (`apply_order`), held from the first pop to the last
+apply.
+
+The second, found by the second review: `Engine::write` had the log number a record
+(`append_with`, under the log's state lock, which also wakes the log's writer) and put
+it in `pending` afterwards, under the pending lock. Between the two, the writer could
+sync `S - 1` and `S` together and a caller of `S` apply through it: `S - 1` was not yet
+in the map, so `S` was applied and the memtable split at it, and `S - 1` landed in the
+memtable past the split. The install's switch then set `flushed_seq` at or above `S`
+and deleted the log segments through `S`, so a crash lost `S - 1`, which had been
+acknowledged, and reads before the crash saw the span's replacement mixed with it.
+The same window let a flush's rotation fall between `S` and `S - 1`, D-021's own case.
+Now the record is numbered and put in `pending` under one lock: `write` takes the
+pending lock, has the log number the record, and inserts it before letting go. The
+lock order is `pending`, then the log's state, which `begin_install` already follows
+(the install lock, then a write), and the log's writer never takes `pending`. Whoever
+pops `S` from the map therefore finds every record below it either there or already
+popped, and the popping is serialised. Neither change moves anything a simulated run
+does, and no trace changes.
+
+Neither window is covered by a test that forces it. The first is closed by a lock held
+across the pop and the apply, and the second by a lock held across the numbering and
+the insertion: in each case the interleaving a test would force is one the code no
+longer has a point to stop at, and without a hook inside `write` or `apply_through`,
+which the engine does not carry for tests, a test on the real runtime would be a timing
+race that passes on the broken code as readily as on the fixed one.
+
+*One at a time, and refusals.* A second install while one is in progress is refused
+(`InProgress`), as are a span with no key (`EmptySpan`), a source with a key outside the
+span (`OutsideSpan`) and a quiesced engine (`Quiesced`, D-044). A refusal before the
+number is taken writes nothing; one after it leaves the install's record, which holds no
+write. An install of an empty source takes the span's keys out and puts nothing in.
+
+*What a snapshot sees.* The install replaces the span's history, it does not add to it: a
+snapshot older than `S` reads the span as empty once the switch is made, and one at or
+above `S` reads the span as it was until the switch and as installed after it. A scan
+that began before the switch reads the tables it began with to the end.
+
+*The variants.* `Variant::InstallInTwoSwitches` takes the span's writes out with one
+manifest (the rewrites in, the tables taken out out) and puts the installed tables in with
+a second; a crash between the two leaves the span as neither what it was nor what was
+installed. `Variant::SpanCheckpointUnsynced` writes a span checkpoint's tables without
+syncing them before the manifest and `CURRENT` that name them.
+`Variant::InstallKeepsSourceNumbers` writes each installed key at the number its source
+gave it rather than at `S`: a source from a store further along than the live engine
+carries numbers above every later local write, and hides them.
+
+*The crash test.* `sim/engine.rs`'s scenario with `Schedule::install()`: the Phase 1
+workload, three writers over all 48 keys and two readers, plus a task that every one to
+five milliseconds takes a source for a random span of one to twelve keys into a directory
+of its own, waits half a millisecond to three and a half more while the writers write over
+it, and installs the source over the span. One source in two is a checkpoint of the span,
+which rolls the span back. The other is a store further along than the live engine, as a
+range's snapshot from a leader is: written in the engine's own table, manifest and
+`CURRENT` formats and synced in a checkpoint's order, holding most of the span's keys with
+new values, every one numbered above the newest version the live engine had applied. It is
+not written by a second engine on the node: that engine's log, table and manifest events
+would reach the trace the oracle reads by segment, table and manifest number with nothing
+to say they were another directory's, and the first attempt did exactly that, failing the
+correct engine on nearly every seed; the storage crate's own test,
+`an_install_from_a_store_further_along_carries_the_install_s_number`, installs from a
+second engine. Every crash is aimed at
+an install, from the harness's own stream: on half the epochs at a time drawn uniformly
+from the twelve milliseconds after the next install is asked for, and on the other half
+from the three after its replacement is traced, just before its switch. The disk faults
+are the engine sweep's: lost syncs at one in five, bit rot, torn writes, lost directory
+entries and latency. The oracle is the engine sweep's (D-022, D-023, D-024) extended by
+the trace's account of each install. The mirror takes `SpanInstalled` as it takes a
+compaction: the rewrites hold their originals' writes less the span's below `S`, the
+installed tables hold the source's live keys at `S` split by their key ranges, and the
+span's writes below `S` in the tables taken out are dropped. An install is in force when
+the manifest in force is in the lineage of the one it named, which the mirror prunes on a
+fallback as it prunes compactions, and it belongs to the start of the node it was written
+in, so a later start's manifest under the same number is not its manifest. In force, its
+writes are its keys at `S`, owed like any flushed write and present only in a table,
+never by a replay, since its record holds none, and the span's writes it dropped are
+excused as a compaction's are; not in force, it holds no write. On top of every property
+the sweep had, each recovery asserts Q2's criterion directly: with an install in force no
+table in service and no replayed record holds a write of its span below `S`, and without
+it no table in service holds a write it installed. The model folds an install in force
+as the span replaced whole at `S`, so the state check reads every key of it, the later
+writes over it included, and the checkpoint of every span is opened fresh after the
+crash that follows it. During the run a live read of a span's keys and the span's part of
+a scan are not judged while its install is in progress, and once it resolves the model
+takes the install as made.
+
+**What the sweep found.** One thing, in the oracle. At seed 9 of the first twenty the
+correct engine was reported for record 527, gone with a missing log head after a
+fallback: the record was an install's that had not been in force, which holds no write,
+so no table a fallback left behind held it, the way every write of its neighbours was
+held and excused. A record holding no write now takes the excuse its neighbours take:
+past the manifest in force, up to the furthest any manifest covered, the fallback that
+explains them explains it. And one thing the span checkpoint's variant showed: the
+checkpoint check skipped any checkpoint a torn write touched, and a correct checkpoint
+syncs every file before it completes, so a crash tears one only if its sync was lost,
+which `FsyncLost` already says. At the first twenty seeds `SpanCheckpointUnsynced` was
+caught on 1, because its tables' writes were torn more often than lost whole, and every
+torn one was skipped; with a torn write alone no longer an excuse it is caught on 19 of 20.
+
+*What review found in the installed numbers.* The mirror stamps installed writes at the
+number the trace records, and every source was then a checkpoint of the same engine below
+it, so an install that kept its source's numbers passed everything: nothing read a number
+the source gave. Now each recovery asserts that every installed table the manifest in force
+lists carries the install's own number and no other, from the recovered manifest's record
+of the table (`first_seq` and `max_seq` both `S`), which is what the engine wrote and not
+what the trace says; half the sources are the store further along above; and
+`InstallKeepsSourceNumbers` is its known-buggy engine. The storage test installs from a
+second engine that has taken more records than the live one, and shows the correct engine's
+installed tables at the install's number with a later local write read over them, while the
+variant keeps the donor's number and returns the installed value over the later write.
+
+*What review found in the coverage.* Whole-store checkpoints verified after a crash are
+now counted apart from span checkpoints, and the default sweep asserts some of the former;
+reads, scans and seeks left unjudged, in whole or in part, because an install of their span
+was in progress are counted; and the crashes before an install's switch are split three
+ways: before a sync of the install's own record returned, between the replacement's
+`SpanInstalled` and the switch to its manifest, which is the window the one switch closes,
+and the rest (flushing the memtables below the install, writing its tables, or a switch a
+fallback then abandoned). The live install's and the range delete's tests assert crashes
+between the replacement and the switch, and after the switch before the install resolved.
+
+*What review found in the oracle.* Independent review of 9eb28e4 found two excuses in the
+engine sweep's oracle, both older than this entry, that could have hidden a broken
+install, and both are tightened. **The fallback excuse was unbounded.** Any recovery that
+fell back set the fallback's excuse, including one that used the last manifest switched
+to, which loses nothing, and the excuse then covered every missing write that any table
+ever held and every log record past the manifest in force. Now a fallback excuses a loss
+only when it went older than the last manifest switched to and a fault explains why the
+manifest `CURRENT` named could not be used; and only a write that a table listed by a
+manifest it abandoned held — numbered above the one it used and at or below the last
+switch, in the lineage the trace mirrors — or a table dropped for a fault holds, and only
+the records holding no write up to the furthest those abandoned manifests covered.
+**A table deleted by the engine was excused with no fault.** A table the manifest in force
+listed and the open found missing was excused whenever the engine had deleted it after
+some manifest was written, fallback or not; the simulator never loses a directory sync, and
+a correct engine deletes a table only after the switch that stops listing it. Now such a
+table is excused only by this open's explained fallback, or by the earlier open's under the
+same manifest in force, which dropped it for that fallback and whose manifest nothing has
+replaced since (clauses the second review showed could never fire, and which are gone;
+below); otherwise the check reports *table N, which manifest M lists, was deleted before
+its manifest was in force*. The mutation the old excuse hid, a compaction that
+writes its manifest, deletes its inputs and only then switches `CURRENT`, was run once
+against both oracles: the old one caught it on 0 of 20 and 0 of 100 seeds, the tightened
+one on 6 of 20 and 30 of 100, the first at seed 1: *table 37 at level 2 covering 373..=444,
+which manifest 40 lists, was deleted before its manifest was in force*. **No correct-engine
+seed turned red under the tightened oracle**: every correct test of the engine binary
+passes at 20, 100 and 1000 seeds, and so does the Phase 1 schedule alone
+(`Schedule::phase_1()`) at 1000.
+
+*What the second review found in the oracle.* Two more gaps in the dropped-table
+check, and two clauses of the first tightening that could never fire.
+- **A fault on a table's contents excused its deletion.** The check asked whether any
+  sync of the table's file had been lost, or bit rot had hit it, anywhere in the trace,
+  before it asked whether the engine had deleted it. A table the engine deleted and the
+  open found *missing* was excused so, though a lost sync or bit rot explains a table
+  *unreadable* or *corrupt*, not a file whose deletion the trace shows and whose
+  directory entry a sync made durable. Now the reason is the one this open gave in
+  `SstDropped`, and a table dropped as missing that the engine deleted is judged as
+  deleted, whatever faults its contents met.
+- **A reused number carried its first life's deletion.** A fallback can hand out a
+  table number again, and the mirror's set of deleted tables was by number across the
+  whole trace, so a second table under a number could be taken for the first's
+  deletion. A table written again now leaves that set, and its first life's finished
+  compaction inputs, as the log's betrayed-sync set already did.
+- **The fallback and carry-over clauses could not fire.** The first review excused a
+  deleted table by this open's explained fallback, or by an earlier open's under the
+  same manifest. But an open that falls back never reports a dropped table: it uses only
+  a manifest whose every table is there (D-022), which the pin on seed 44 asserts. So
+  the fallback clause never met a dropped table, and the carry-over only ever carried
+  what the fallback clause gave it. Both are deleted, and so is the carried state.
+
+No correct-engine seed turned red: every correct test of the engine binary passes at
+20, 100 and 1000 seeds with every coverage and outcome field unchanged. The only rates
+that moved are `DeleteBeforeManifest`'s, whose deletions a contents fault had forgiven:
+12 of 20, 67 of 100 and 647 of 1000, from 11, 66 and 645. The mutations were run against
+the oracle before the second review's tightening and after it, each as the correct
+engine's checks over a scratch copy of the tree:
+
+| mutation | schedule | 20 | 100 | 1000 |
+| --- | --- | --- | --- | --- |
+| a compaction writes its manifest, deletes its inputs, then switches | default | 7 → 7 | 29 → 30 | 258 → 280 |
+| an install writes its manifest, deletes the tables it took out, then switches | `install()` | 8 → 10 | 34 → 40 | 405 → 442 |
+
+The first catch of each is the deleted-table check: at seed 1, *table 11 at level 0
+covering 83..=107, which manifest 11 lists, was deleted before its manifest was in
+force*, and at seed 2, *table 68 at level 2 covering 728..=841, which manifest 65 lists,
+was deleted before its manifest was in force*. The compaction mutation's rates differ
+from the first review's (6 of 20, 30 of 100) because every schedule has moved since.
+
+*Measured after review.* On the tree of the review's fixes to D-054 — the tightened
+oracle, the install's own task, the store further along and the observed numbers — in
+release on the eight-core laptop beside another lane's premerge (load averages 25 to
+58), `cargo test -p ananke-sim --release --test engine` with `ANANKE_SEEDS` at each tier.
+The correct engine passes every seed of the live install's test, the range delete's
+(D-055) and the default sweep at every tier: **no correct-engine seed is red under the
+tightened oracle.** The live install's crash test:
+
+| tier | installs asked / resolved | crashes aimed | in force after a crash (resolved / not) | not in force: before the record was durable / between replacement and switch / otherwise / resolved, a fault | span keys written after an install, checked | live reads over an install | span checkpoints verified | reads left unjudged |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 20 | 274 / 178 | 153 | 157 / 16 | 1 / 19 / 59 / 18 | 2 985 | 3 874 | 120 | 2 734 |
+| 100 | 1 344 / 912 | 733 | 797 / 56 | 2 / 61 / 306 / 90 | 15 614 | 19 024 | 583 | 13 667 |
+| 1000 | 13 460 / 9 138 | 7 320 | 7 990 / 490 | 22 / 651 / 3 087 / 902 | 163 647 | 197 835 | 5 827 | 142 416 |
+
+Its variants, on the same schedule: `InstallInTwoSwitches` caught on 13 of 20, 54 of 100
+and 559 of 1000; `InstallKeepsSourceNumbers` on 20 of 20, 98 of 100 and 975 of 1000, the first
+at seed 0: *the install at record 125 is in force (manifest 11) but its table 15 carries
+records 174..=179, not the install's number*. At one seed of the thousand a kept number equalled a later
+local write's under the same key and the variant's own compaction stopped at the table
+writer's order assertion, which the test counts as caught and prints. Since the second
+review that count is kept apart from the oracle's, only a panic whose message is that
+assertion's counts, any other panic fails the test, and the oracle's own catches are what
+the test asserts: 20 of 20, 98 of 100 and 974 of 1000 by the oracle, and at a thousand
+one more by the assertion.
+`SpanCheckpointUnsynced` is caught on 17 of 20, 81 of 100 and 816 of 1000, down from 19,
+95 and 940: half the sources are now the store further along, which the harness writes and
+syncs itself, so only the other half are the engine's span checkpoints that can show it.
+
+*Measured before review.* In release on the eight-core laptop, beside another lane's builds and
+sweeps (load averages from 4 to over 100 during the runs), `cargo test -p ananke-sim
+--release --test engine` with `ANANKE_SEEDS` at each tier:
+
+| tier | correct engine | installs asked / resolved | crashes aimed | after a crash: in force (resolved / not) | not in force (unresolved / resolved, a fault) | span keys written after an install, checked | `InstallInTwoSwitches` | `SpanCheckpointUnsynced` |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 20 | every seed | 251 / 160 | 149 | 135 / 17 | 73 / 21 | 2 804 | 7 of 20, 12 once tightened | 19 of 20 |
+| 100 | every seed | 1 241 / 801 | 732 | 696 / 43 | 387 / 80 | 12 926 | 31 of 100, 55 once tightened | 95 of 100 |
+| 1000 | every seed | 12 623 / 8 277 | 7 341 | 7 190 / 416 | 3 860 / 820 | 143 868 | 384 of 1000, 565 once tightened | 940 of 1000 |
+
+At a thousand seeds 203 995 live reads of an installed key that a later write had
+overwritten agreed with the model, and 9 231 checkpoints, of spans and of the whole
+store, opened fresh after a crash and matched it. Before the oracle was tightened,
+`InstallInTwoSwitches` was caught only where a crash landed between its two switches and no
+fallback followed, and the account first written here — that eight of fifteen such
+crashes at twenty seeds left nothing to hold against it, five of them fallbacks — rested on
+the unbounded excuse, which forgave any loss behind any fallback. Tightened, it is caught on
+12 of the first twenty seeds. Eight catches are a crash between the two switches. Four are
+a fallback that lands on the removal's manifest itself, which no correct install writes: at
+seeds 3, 8 and 9 recovery fell back from the manifest that adds the tables to the one
+before it, and at seed 19 from two manifests past it. Four crashes in the window, on three
+seeds, go uncaught, for reasons the correct install shares: an install with nothing to take
+out and nothing to add (seed 15); a rename of the second switch that survived the crash
+without its directory sync, so the install came back whole (seed 15); a lost sync of
+`CURRENT` whose fallback used the second switch's manifest, whole (seed 12); and a fallback
+that went older than both switches, which is the span as it was (seed 13). The engine sweep's own tests, on the default
+schedule, which runs none of this entry, are unchanged at every tier: the correct engine
+passes every seed with the same coverage, and `NoWalBeforeMemtable`,
+`ReleaseBeforeManifest` and `DeleteBeforeManifest` are caught on 19, 13 and 10 of 20, 98,
+64 and 55 of 100, and 984, 627 and 570 of 1000, before this entry and after it.
+
+**Alternatives.** A number per installed table carried in the manifest, as RocksDB's
+ingested files carry a global sequence number: no rewrite of the source, but a manifest
+format change and a read path that consults it; revisit when a range's snapshot is large
+enough for the copy to cost. Range tombstones in the memtables and tables instead of the
+flush and the rewrite: no forced flush, but a tombstone kind that every read, merge,
+compaction and the oracle must learn, which is the range delete's question (D-055).
+Numbering the install at its switch, with no record of its own: the number would not be
+known before the install is durable, and a number no record carries is a gap the log's
+numbering refuses (D-019). Installed tables at the bottom level: a rewritten table there
+keeps a key range that can straddle the span, and a level's tables must not overlap.
+Keeping level 0 in file-number order and compacting level 0 away before an install: a
+compaction under every install, and more writing than the rewrite. Waiting for the
+flusher to flush the memtables at or below `S` instead of flushing them under the
+turnstile: a waker the flusher would have to answer, and the same flushes. Concurrent
+installs: two pending numbers would let a memtable between them reach a table before the
+older install switches, below its installed tables in level 0; Q14's one apply task per
+node serialises installs anyway. Keeping the span's old versions for older snapshots:
+range tombstones again; the node's apply task holds no snapshot across an install of the
+span it replaces. Filtering the source to the span instead of refusing: it would drop
+keys a caller meant to install without a word. Installing a whole checkpoint and taking
+the span from it: the leader would stream a whole store for one range.
+
+**Consequences.** An install forces a flush of the memtables at or below its number,
+before its own switch; rewrites every table that straddles the span's edges; and copies
+the source into the engine, since the simulator's filesystem has no links (D-024). The
+flusher waits behind an install in progress, so memtables pile up for its length. The
+install holds the turnstile from its flush of the memtables at or below its number to
+its deletion of the tables it took out, so no flush, compaction or checkpoint of any
+span runs on the engine meanwhile: with one engine per node (Q2), an install of one
+range stalls every range's flushes and compactions for its length, as a checkpoint
+already does (SHARD.md §11, storage 6). A refused install can still take a sequence
+number. A snapshot is not stable across an install of the span it reads, so **Stage B
+holds no snapshot across an install of the span it reads**: the node's one apply task
+(Q14) takes no snapshot of a range it is installing, and a read served at one version
+(SHARD.md §11, raft 15) is not served from a range while its install runs. An install
+refused as `InProgress` changes nothing and may be asked for again; the engine does not
+queue it. Installs and range deletes (D-055) share the rule, and Stage B's apply task,
+the one caller that installs or deletes a range (Q14), serialises them, so it never
+meets `InProgress`; any other caller retries after the install in progress resolves.
+D-055 puts the install, the span checkpoint, the range delete and the seek on the engine
+sweep's default schedule. `TraceEvent::SpanInstalled` is new, with the moirae line
+`ananke.engine.span-installed`, and so is `TraceEvent::InstallCleanupFailed`, with
+`ananke.engine.install-cleanup-failed`. An install that fails writing or switching to its
+manifest leaves the engine quiesced until it is reopened. The engine sweep's default schedule runs no install, span
+checkpoint or variant of this entry, so its seeds' schedules and its three variants'
+rates are unchanged by this entry (below); the change to level 0's read order and the
+flusher's check move no schedule of a run with no install, and no pinned trace hash
+moves. The checkpoint check's torn-write exclusion is narrowed for every checkpoint, the
+whole-store checkpoints of D-024 included, which the correct engine passes at every tier
+below.
+
+---
+
+## PROPOSED D-055 — The bounded seek, the range delete as an install of nothing, and the engine sweep with all four primitives
+
+**Context.** Stage A's item 7 (SHARD.md §12) asks for the engine's other primitives, each
+with its own crash test and its own engine variant caught on some seed at every tier: a
+bounded, ordered seek (§11, storage 2), a range delete (storage 3), and the checkpoint of a
+span if the live install did not build it, which it did (D-054). And it asks for
+`sim/engine.rs`'s workload extended with all four, the correct engine passing every seed,
+and `NoWalBeforeMemtable`, `ReleaseBeforeManifest` and `DeleteBeforeManifest` still
+caught. `scan` returned every key of a span, with no limit and no "first key at or after
+`k`" (engine.rs, `scan`); a meta lookup, the first record whose end key is above `k`
+(§1), and a split key chosen from a range's keys (Q18) need one. Deleting a merged range's
+Raft state, a collected replica's span or the right span on a node outside the right
+half's configuration (§5) was one tombstone per key in a `WriteBatch`, each kept until it
+reaches the bottom level or no older write lies below it (compaction.rs). SHARD.md does
+not settle the primitives' shapes, so each is proposed, one commit each, and this entry
+grows with them. Every site is marked `PROPOSED(D-055)`.
+
+**Decision.** *The seek.* `Engine::seek(range, limit, snapshot)` returns the first
+`limit` present keys at or after `range.start` and below `range.end` as of the snapshot,
+in key order, with their values: the one merge `scan` walks, stopped once `limit` keys
+are found. A deleted key is passed over and does not count, so a seek returns fewer than
+`limit` keys only when the range holds no more. The first key at or after `k` is
+`seek(k..end, 1)`, and a range is paged by seeking again from just past the last key
+returned. It walks forward only: nothing SHARD.md asks for walks backward, and a reverse
+seek needs a backward merge over memtables and blocks, which is an issue to file rather
+than code for this stage. `Variant::SeekCountsTombstones` counts a deleted key against
+the limit.
+
+*The seek's crash test.* `Schedule::seek()`: the engine sweep's workload with half the
+readers' scans made bounded seeks of one to six keys at a snapshot, each of which must be
+the first keys the model holds in the range at that version, and every recovery walked
+by seeks of three keys at a time, each from just past the last key the one before
+returned, which must be the model's state, beside the reads and the scan the state check
+made already. A seek whose first keys touch the span of an install in progress is not
+judged, since which keys fill its limit depends on the span (D-054).
+
+*The range delete.* `Engine::delete_range(range)` is an install of nothing over the span
+(D-054): numbered by a record of its own above every write taken, the memtables split
+there and flushed up to it, the tables holding the span's older writes taken out or
+written again without them, and one manifest switch that makes it the state, with no
+tombstone written. It shares the install's one-at-a-time rule, its refusals and what a
+snapshot sees; a write to the span after the call is newer than the delete and survives
+it. It is traced as the install it is, `SpanInstalled` with no table added.
+`Variant::RangeDeleteSkipsMemtables` takes the span's writes out of the tables but flushes
+no memtable first and leaves the manifest's `flushed_seq` where it was, so the span's
+writes still in a memtable stay readable, reach a table at the next flush, and come back
+from the log after a crash.
+
+*The range delete's crash test.* `Schedule::range_delete()`: the engine sweep's workload
+with D-054's installing task deleting a random span of one to twelve keys every one to
+five milliseconds, and every crash aimed at a delete as D-054 aims at an install. The
+oracle is the install's with nothing installed: a delete in force leaves no table in
+service and no replayed record holding a write of its span below it, a delete not in
+force holds nothing, and the state check reads the span empty but for the writes after
+the delete.
+
+*The sweep.* The default schedule of `sim/engine.rs` now runs all four primitives beside
+the Phase 1 workload: the installing task installs a checkpoint of a span two times in
+three and deletes a span the third, and the readers seek and every recovery is walked by
+seeks. Its crashes are not aimed; `Schedule::install()` and `Schedule::range_delete()` aim
+them. `Schedule::phase_1()` runs none of it and is the schedule every seed ran before this
+part of the entry, and each primitive's own schedule is `phase_1()` with that primitive.
+The two seeds the sweep pins keep the Phase 1 schedule, on which each was found: seed 420
+and seed 44 in both its modes. Re-audited: each run's moirae trace hashes the same on
+268cf58, the tree before D-054, on 7e3d25d, D-054's commit, and with `Schedule::phase_1()`
+on the tree committed as 9eb28e4, this part's commit (`a858ef4b153bf4c6`,
+`dabd6adfaee000f5` and, refusing fallbacks, `977a703fb51c96e8`), so neither schedule moved
+and seed 44's assertions of its fallbacks still bite on the run they were written for.
+
+*Re-audited after both reviews.* Four of the review fixes' commit messages say no pinned
+trace hash moves: 86d9cc2, 447a9e9, 01ef12c and 3787528. None had a run behind it when
+it was written; each claim was reasoned from what the commit changed. The harness was run
+afterwards, over an archive of each commit, and on every commit since the one before them:
+9eb28e4, 86d9cc2, 447a9e9, 01ef12c, 3787528, a759732, d672fec and 44db7c6, the last with
+code. On all eight, seeds 420 and 44 in both modes hash `a858ef4b153bf4c6`,
+`dabd6adfaee000f5` and `977a703fb51c96e8`, and the raft, membership and quorum scenarios'
+seed 42 hash `5a858d67288924ec`, `34f120f8565660e1` and `ea7f7371d5c8cda4`, as on 268cf58
+and 9eb28e4 before. So the four claims hold, now with a run behind them. The same run
+hashes the default schedule's seed 42 as a control, since that run installs and deletes
+spans in each tree's own engine and must move when the engine's schedule does:
+`9aaa19e003755c18` on 9eb28e4 and 86d9cc2, `1906280227f47acc` on 447a9e9, whose spawned
+task draws from the stream, and `1c3d09e48dbca635` on 01ef12c, whose store further along
+draws and writes. It stays `1c3d09e48dbca635` on 3787528, a759732, d672fec and 44db7c6,
+whose messages say they move no schedule or no trace: the claims of a759732 and d672fec
+were likewise reasoned, not run, when written, and on this seed the run agrees.
+
+*Measured*, in release beside another lane's builds (load averages 10 to 47),
+`cargo test -p ananke-sim --release --test engine` at each tier: the correct engine
+passes every seed of `Schedule::seek()`, with 3 836 live seeks at twenty seeds, 2 589 of
+them stopping at their limit, and 1 643 seeks walking recovered engines; at a hundred,
+19 492, 13 261 and 8 199; at a thousand, 196 904, 132 680 and 80 402.
+`SeekCountsTombstones` is caught on 20 of 20, 98 of 100 and 972 of 1000, the first at
+seed 0: *seek of 1 of k15..k30 at version 17 saw 0 keys but the model has 1*.
+
+The correct engine passes every seed of `Schedule::range_delete()`: at twenty seeds 387
+deletes were asked for and 289 resolved, 150 crashes were aimed at one, and after them 267
+deletes that had resolved and 16 that had not were in force, 79 that had not were not, and
+13 that had resolved were lost to a fault's fallback, with 5 906 keys written after a delete
+in force checked over it; at a hundred, 1 903 and 1 448 deletes, 711 crashes aimed, 1 276
+and 44 in force, 397 and 118 not, and 24 248 keys; at a thousand, 19 767 and 15 058
+deletes, 7 363 crashes aimed, 13 189 and 456 in force, 4 148 and 1 419 not, and 255 522
+keys. `RangeDeleteSkipsMemtables` is caught on 17 of 20, 92 of 100 and 947 of 1000, the
+first at seed 0 by a live scan that saw a deleted key: *scan of k16..k42 at version 21 saw
+4 keys but the model has 3*.
+
+The sweep's own tests on the default schedule, before this part of the entry (268cf58 and
+7e3d25d, identical) and after it, at each tier:
+
+| tier | correct engine | `NoWalBeforeMemtable` | `ReleaseBeforeManifest` | `DeleteBeforeManifest` |
+| --- | --- | --- | --- | --- |
+| 20 | every seed, before and after | 19 → 20 | 13 → 12 | 10 → 11 |
+| 100 | every seed, before and after | 98 → 97 | 64 → 62 | 55 → 62 |
+| 1000 | every seed, before and after | 984 → 981 | 627 → 623 | 570 → 630 |
+
+With the oracle tightened as D-054 records, on the same schedules, the three are caught on
+20, 13 and 11 of 20, 97, 66 and 62 of 100, and 981, 645 and 632 of 1000: the tightening
+can only add catches, and it added them to `ReleaseBeforeManifest` (623 → 645) and
+`DeleteBeforeManifest` (630 → 632), whose losses a fallback had been forgiving.
+
+Every seed's schedule moved, since a new task draws from the node's stream and every
+install and delete writes, flushes and switches, so which seeds catch a variant changed
+and each rate is the one measured on the new schedules, not the old ones shifted. The
+correct engine's coverage at a thousand seeds says what moved. Tables written rose from
+45 781 to 64 898 and compactions from 13 375 to 14 678, since installs and deletes add
+level-0 tables and rewrites and each forces a flush; crashes landing inside a compaction
+nearly doubled, from 595 to 1 166, and `DeleteBeforeManifest`, which is caught only by a
+crash between a compaction's deletion of its inputs and its manifest, rose from 570 to
+630. Flushes rose from 31 040 to 32 297 and crashes with a memtable mid-flush from 4 369 to
+6 061, but `ReleaseBeforeManifest` did not follow, 627 to 623: its catch needs a crash
+after its early release and before the manifest, with the released segments' records
+owed and no fault explaining their loss, and the four seeds' difference was not traced
+further. `NoWalBeforeMemtable`
+is caught whenever a crash follows a write acknowledged without a sync, on nearly every
+seed on either schedule, 984 and 981. Scans fell from 395 698 to 197 937 because half of
+them are now seeks (199 599), and 4 481 checkpoints opened fresh after a crash where 2 657
+did, the span checkpoints among them; beside those, 4 806 installs, 4 098 range deletes,
+7 817 span checkpoints and 76 453 seeks walking recovered engines, every seed passing.
+
+*After review.* Independent review of 9eb28e4 changed what these numbers stand on, and
+they are measured again on the tree of its fixes (D-054 records the oracle's two tightened
+excuses, the install's own task, the store further along and the observed numbers). The
+correct engine passes every seed of the range delete's test, the seek's and the default
+sweep at 20, 100 and 1000. The range delete's crash test, with the crashes before a
+delete's switch split as D-054 splits an install's:
+
+| tier | deletes asked / resolved | crashes aimed | in force after a crash (resolved / not) | not in force: before the record was durable / between replacement and switch / otherwise / resolved, a fault | span keys written after a delete, checked | reads left unjudged |
+| --- | --- | --- | --- | --- | --- | --- |
+| 20 | 388 / 285 | 150 | 264 / 14 | 2 / 13 / 71 / 16 | 5 444 | 4 018 |
+| 100 | 1 997 / 1 507 | 748 | 1 342 / 46 | 11 / 68 / 357 / 137 | 25 890 | 20 047 |
+| 1000 | 19 950 / 15 205 | 7 414 | 13 334 / 456 | 154 / 659 / 3 374 / 1 497 | 259 253 | 202 429 |
+
+`RangeDeleteSkipsMemtables` is caught on 15 of 20, 89 of 100 and 933 of 1000, the first now
+at seed 0 by the direct check of Q2's criterion: *the install at record 22 is in force
+(manifest 11) but table 8 still holds the write of k40 at record 11: a mixture*. The seek's
+test runs no install, so its schedule did not move: its numbers above stand, and
+`SeekCountsTombstones` is still caught on 20 of 20, 98 of 100 and 972 of 1000.
+
+The default sweep's three Phase 1 variants on the moved schedules (the install's task and
+the store further along both draw and write): `NoWalBeforeMemtable`,
+`ReleaseBeforeManifest` and `DeleteBeforeManifest` are caught on 20, 10 and 11 of 20, 99,
+51 and 66 of 100, and 985, 602 and 645 of 1000; the second review's tightening of the
+oracle (D-054) moves `DeleteBeforeManifest` to 12, 67 and 647 and nothing else.
+`ReleaseBeforeManifest` fell, from 645 on the same oracle a schedule earlier to 602,
+though crashes with a memtable mid-flush did not (6 061 then, 6 109 now, at a thousand
+seeds). Its catch needs a crash between its early
+release and its manifest with the released segments' records still owed and no fault
+explaining their loss, and every schedule move reshuffles which seeds meet all three; the
+difference was not traced seed by seed, and it stays caught on some seed at every tier.
+Coverage at a thousand seeds: 66 992 tables written, 14 815 compactions, 1 327 crashes
+inside a compaction, 1 858 whole-store checkpoints opened fresh after a crash, 8 130 span
+checkpoints taken, 5 806 installs, 3 998 range deletes, 196 205 seeks and 75 602 seeks
+walking recovered engines.
+
+*Deep levels.* `Schedule::deep()` is the default schedule with small level limits, so it
+moved with the default. At a thousand deep seeds, as the nightly runs them, every seed
+passes, and compaction wrote from level 2 or deeper in 10 132 rounds on 268cf58, in 11 599
+on 9eb28e4's schedules and in 11 609 on the tree committed as 3787528, reaching level 3
+each time. Its reach
+did not drop, so `deep()` stays on the default schedule rather than on `phase_1()`.
+
+*What review found in the cost.* Review found the engine binary's cost grown several
+times over by this entry and D-054, much of it variants caught on nearly every seed and
+swept over every seed. The four caught on four seeds in five or more,
+`SpanCheckpointUnsynced`, `SeekCountsTombstones`, `RangeDeleteSkipsMemtables` and
+`InstallKeepsSourceNumbers`, now run a share of the tier's seeds,
+`max(seeds / 10, min(seeds, 20))`: twenty at the gate, twenty in CI, a hundred at the
+premerge and a thousand at the nightly. Each still asserts a catch at every tier. A share
+is the tier's first seeds, so its rates are the ones measured above at that many seeds: at
+twenty 17, 20, 15 and 20; at a hundred 81, 98, 89 and 98 (the premerge below printed the
+same); at a thousand 816, 972, 933 and 975. `SpanCheckpointUnsynced` is the lowest, about
+four in five since half the sources became the store further along, and at a share of
+twenty it still expects sixteen. `InstallInTwoSwitches`, caught on about one seed in two,
+and the three Phase 1 variants, whose tests D-052 measured, run every seed as before.
+
+`scripts/premerge.sh` at a thousand seeds on the tree committed as 3787528, measured as
+D-052 measured it (a
+warm build first, no other lane building at its start or its end, the one-minute load
+sampled every 15 s): **540.37 s** real at a mean load of 17.64, 3 914.07 s user, the raft
+binary, which this entry does not touch, 306.86 s and the engine binary 213.06 s, against
+**374.64 s** at 13.90 on 1ef6d7e: 44% more wall time, most of it the engine binary. The
+engine binary on 268cf58, whose engine sweep is 1ef6d7e's, took 72.51 s at a thousand
+seeds on the same laptop the same day, so it now costs 2.94 times as much.
+
+*The nightly.* On 1ef6d7e (run 34901799989) the engine binary took 1 346.89 s at ten
+thousand seeds and the whole `cargo test` step 2 h 1 min 15 s, against the job's
+300-minute timeout. Scaled by the same ratio, the engine binary would take about 3 958 s,
+some 44 minutes more, and the step about 2 h 45 min, a little over half the timeout
+(**issue #57**, filed on the owner's instruction of 2026-09-15: shard the ten thousand
+across parallel jobs, or split the job per sweep, before it starts timing out). The
+scaling overstates the deep-levels test, which runs a thousand deep seeds at every nightly,
+took 11.38 s of them on this laptop, and whose rounds rose by a seventh (above), not by the
+sweep's ratio; it leaves out what the other Stage A lanes add.
+
+**What the mutation pass found, and what now holds it.** Nine mutations of the engine
+oracle, the two new primitives' variant gates and the pinned-seed machinery
+(`sim/engine.rs`, `crates/ananke-storage/src/engine.rs`, `sim/tests/raft.rs`), each
+reproduced independently on the tree at 09bed88. The primitives' gates held: taking the
+seek's tombstone count out of its variant gate and taking the range delete's memtable
+skip out of its own are each caught three ways, by a storage unit test and by two or three
+sim tests at twenty seeds, seed 42's pinned trace among them. So did D-060's re-audited
+`snapshot_takes` fold — pairing takes by instant again is caught four ways at twenty seeds,
+including the sweep's `takes_paired` assertion — and a from/to confusion in
+`uncounted_after_heal`, which two pins' positive halves catch. Four survived.
+
+- *The installed-table number check made unreachable* (`sim/engine.rs`): Q2's criterion,
+  that an install's tables carry the install's own number, stops being checked as such.
+  The variant is still caught, so the test's non-emptiness assertion passes — but on
+  **92 of the thousand-seed tier's hundred-seed share instead of 98**, and seed 0's first
+  catch degrades from *"its table 15 carries records 174..=179, not the install's number"*
+  to a bare *"key k21 holds None but the model has Some(…)"*. The margin and the reason
+  were both unasserted. Held now: `an_install_that_keeps_its_sources_numbers_is_caught`
+  asserts that some catch is the check's own, by its words. It reads runs the sweep
+  already makes and moves nothing; it does pin a message, which a schedule move must
+  re-audit with the rest.
+- *The bounded fallback excuse made unbounded* (`sim/engine.rs`): an abandoned manifest
+  excuses every install record past the manifest in force rather than only what it
+  covered. Survived at 20, 100 and 1 000 seeds. It is equivalent with respect to every
+  verdict and coverage field the suite computes, but **not** with respect to the `excused`
+  map — the loose rule exceeds the bound on 465 of 1 074 fallbacks over the engine binary
+  at a hundred seeds (53 of the 109 on the install schedule alone) — and the excess is
+  simply never consulted, because `check_epoch` tests `present(seq)` before it consults
+  `excused` and the only other consumer keys on a seq that is absent by definition. So the
+  bound is real code doing nothing today. A note, not a test: what would close it is a
+  known-buggy `Variant` deleting an install's log segments before the manifest switch, run
+  as a negative control, which is a new variant rather than an assertion and is left as an
+  issue.
+- *The deleted-table clause reverted to the pre-review rule* (`sim/engine.rs`): **an
+  equivalent mutant on every executed schedule.** Over 100 seeds and all seventeen tests,
+  2 187 dropped-table judgements (1 458 unreadable, 558 corrupt, 171 missing) and
+  `mirror.deleted` — which is not empty, holding up to 176 numbers — contained the number
+  in none of them, because `DeleteBeforeManifest` deletes before that set is filled, so its
+  deletions arrive as plain `missing` and the generic arm catches them.
+  `DeleteBeforeManifest` is caught on 647 of 1 000 seeds with the clause and without it,
+  identically. The rate the review recorded for that fix is carried by its other half, the
+  narrowed `sst_betrayed` set; this half is a dead clause. Recorded as what it is: only
+  making the state reachable — a table deleted early whose file also took bit rot earlier —
+  closes it, and finding that shape needs a search, not an assertion.
+- *A pinned seed's absence assertion made vacuous* (`sim/tests/raft.rs`): narrowing seed
+  132's refusal matcher to a server number that cannot exist — ids run from 1 — leaves
+  `assert!(refusals.is_empty())` unable to fail, and the whole workspace stayed green with
+  that slip and its twin on seed 119 applied together. The matcher really was vacuous: on
+  a report carrying six refusals it matched none. Held now by D-060's own rule applied
+  once more — the matcher is one shared `refusals` helper, and seed 132 asserts it finds
+  refusals under `IgnoreIncarnation` and under the correct server (6 and 2 on this tree,
+  server 2's log stopping at a bad checksum) before it asserts none under the pair and the
+  stream half. The same fix does **not** transfer to seed 119, which refuses nothing under
+  `Correct`, `RefusalNotDurable`, `IgnoreIncarnation` or `SharedSnapshotDir`: there is no
+  report in that test whose refusals can be non-empty, so no companion is possible there.
+  What stands in its place is the shared matcher — a matcher narrowed until it finds
+  nothing fails on seed 132 before it can make seed 119's absence vacuous — and seed 119's
+  test says so.
+
+D-056's drop-newest policy was mutated here as well and confirms the same reading from the
+other side: the raft sweep never fills a send queue, so flipping the policy leaves 42/42
+raft tests green at 20 and at 100 seeds and moves no pinned trace, and only the env unit
+test catches it. That gap, and the one that matters more beside it, are closed in D-056.
+
+**Alternatives.** Range tombstones, as RocksDB's `DeleteRange`: no forced flush and no
+rewrite, but a new kind of write that the memtable, the table format (a version bump), the
+merge, every read, compaction and its truncation at table boundaries, and the oracle would
+all have to learn, when the deletes Phase 3 names are rare and whole-range. A batch of one
+tombstone per key, as today: a collected replica's span leaves a tombstone per key until
+compaction carries it to the bottom, and every scan of the span walks them. A seek that
+counts deleted keys toward its limit: a meta lookup of one record could come back empty
+with records past a deleted one, which is the variant. A limit on entries read rather
+than keys returned: a caller could not tell a short range from a range of tombstones. A
+reverse seek now: no consumer in Phase 3.
+
+**Consequences.** The engine sweep's default schedule moved for every seed, and its
+three Phase 1 variants' rates with it (above); no pinned trace hash moved, and seeds 420
+and 44 keep the schedule they were found on. The gate's engine tests take longer. `scan`
+stays as it was; a seek costs what the part of a scan it walks
+costs, and no more than `limit` live keys past the deleted ones it passes over. A range
+delete costs what an install costs: a flush of the memtables at or below it and a rewrite
+of every table straddling the span's edges, all under the turnstile, so no flush,
+compaction or checkpoint runs on the engine meanwhile, and it shares the install's
+`InProgress` rule: Stage B's one apply task serialises installs and range deletes, and any
+other caller retries (D-054). A snapshot is not stable across a range delete of the span it
+reads either, and Stage B holds none across one (D-054). Neither primitive's own commit
+moved a seed's schedule; the sweep's did.
+
+---
+
+## PROPOSED D-056 — `SimEnv`'s send queue: bounded, drop-oldest, per sending socket and destination, drained at a modelled link rate
+
+*Decided in part: the tier of `RefusalNotDurable`'s catch and the pinning of its first
+seed are the owner's answer 1 of 2026-09-15 and are decided. The queue model itself is
+proposed.*
+
+**Context.** D-015 gives every destination of a socket a bounded queue whose overflow
+drops the oldest frame with a `MessageDropped` event. `RealEnv` has it: one queue of
+`SEND_QUEUE_LEN`, 1 024 frames, per destination, popped by a task that writes one frame
+at a time over the destination's TCP connection (crates/ananke-env/src/real/net.rs). The
+simulator had none: `send` drew a delay and delivered into the destination socket's
+unbounded inbox, so no sweep ever saw a queue-full drop. SHARD.md §11 (env 3) and the
+owner's answer to Q16 settle that `SimEnv` gains the queue as a simulator model, per
+(sending socket, destination), drop-oldest, traced with `DropReason::QueueFull`, its
+capacity a `SimConfig` setting defaulting to 1 024, filled against a modelled per-link
+drain rate, landed before batching puts many ranges on one socket, and moving every
+pinned hash once in one commit with every pinned seed re-audited. They do not settle
+what the drain rate models, its default, where the queue sits among the fault model's
+draws, or what becomes of a closed socket's queue. Those are proposed here.
+
+**Decision.** Every site is marked `PROPOSED(D-056)`.
+
+- *Where the queue sits.* A frame that survives the send's checks — a partitioned or
+  length-limited link, then the injected drop — joins its sending socket's queue to its
+  destination. Its delay, and a duplicate's, are drawn at the send from the `net`
+  stream in the order they always were, so no fault draw moves (D-017). Partitions and
+  frame-length limits are still checked again at delivery, and an unbound destination is
+  still `Unreachable` there.
+- *What drains it.* The queue writes one frame at a time, oldest first, at
+  `NetFaults::link_bytes_per_sec`: a frame starts when it is sent or when the frame ahead
+  of it is written, whichever is later, and takes its length over the rate, rounded up
+  to the nanosecond. Its delivery, and its duplicate's, is its drawn delay after its last
+  byte is written. So a frame sent behind others waits for them, as a frame waits in
+  `RealEnv`'s queue while the connection writes the ones before it, and the queue fills
+  when one socket sends one destination faster than the link drains, which is `RealEnv`'s
+  reason and no invented count.
+- *The bound.* The frame being written is not counted, as `RealEnv`'s task pops the
+  frame it writes; the rest wait. When `NetFaults::send_queue_len` frames wait, a send
+  first drops the oldest waiting frame: its deliveries (a duplicate's with it) are
+  cancelled, `MessageDropped { reason: QueueFull }` is traced on the sender's node under
+  the dropped frame's id, after the new frame's `MessageSent`, as `RealEnv` emits them, and
+  the frames behind it move up.
+- *The settings.* `send_queue_len` defaults to `real::SEND_QUEUE_LEN`, one constant for
+  both environments, and must be at least 1; `link_bytes_per_sec` defaults to
+  125 000 000, a gigabit (`sim::GIGABIT_BYTES_PER_SEC`), and must be positive. Both are in
+  the moirae header's `config`, which no pinned hash covers.
+- *A closed socket.* A socket dropped, or unbound by its node's crash, forgets its
+  queues; frames already in them keep the deliveries they were given, as a frame in
+  flight always has.
+
+The model is held by the simulator's own tests: a frame waits only for the frames ahead
+of it on its own socket's link, a drained queue holds nothing back, and a full queue
+drops its oldest waiting frame, never the one being written nor the newest, cancels a
+duplicate with it and moves the survivors up (crates/ananke-env/src/sim/tests.rs).
+
+**What moved.** Every frame now arrives its write time later — 16 ns for two bytes and
+800 ns for a hundred at a gigabit — from the first frame of every run, so every trace and
+every schedule after a run's first delivery moved. The echo scenario's pinned body hash
+moves from `19f19201df99a799` to `fcbe82ee7a0ba672` (sim/tests/echo.rs); the moirae
+repository's copy of `echo-42.jsonl`, the studio's fixture pinned to the same value, needs
+the same update there. Every pinned seed of sim/tests/raft.rs was re-audited on the moved
+schedules, each asserting its mechanism or, with the reason, its absence:
+
+- Seeds 164, 385 and 7381 still do not reach their situations, now with no timer gap on
+  the AppendEntries-only replay (164), none on the replay without D-039's arm (385), and
+  every install above its server's floor (7381); seed 6325 still crashes inside no
+  adoption window, under the correct server or as built.
+- Seed 5909 reaches D-042's refusal, reset and re-seed on server 1 instead of server 3.
+  Under `IgnoreIncarnation` alone the stale progress for server 3 is still reached; the
+  harmless re-take under a live stream under `SharedSnapshotDir` and the pair is gone, since
+  no index is taken twice, and under the pair no refused follower is left stale; each is
+  asserted, the absences with their reasons.
+- The pair `{IgnoreIncarnation, SharedSnapshotDir}` no longer wedges seed 680. As SHARD.md
+  §12 asks, the first thousand seeds were searched again: the pair is caught on 2 of 1000,
+  seeds 132 and 848, both by the liveness check, on both of which `SharedSnapshotDir` alone
+  is caught with the same message and `IgnoreIncarnation` alone passes, and no seed catches
+  the pair without a single. Seed 132, the first, is pinned as D-045 pinned 680, with the
+  wedge's mechanism asserted on it (re-takes into the leader's own directory under live
+  streams, the duplicate-file loop, both followers uncounted); seed 848's wedge has no
+  duplicate-file loop. Seed 680's test now asserts what the seed does instead: the pair,
+  each half alone and the correct server pass it; the stream half re-takes under a live
+  stream and still commits; `IgnoreIncarnation` alone leaves server 1's progress stale with
+  server 2 countable. RAFT.md §5 names seed 132. *(Superseded by D-060: the key layout moved
+  every raft schedule again, and on that tree the pair is caught on 0 of 1000 and each half
+  on 0. Seed 132's test now asserts that absence, and RAFT.md §5 says so.)*
+- Seed 687 comes nearer its situation. As built, server 1 is refused for lost state and
+  restarted four times before an install replaces its store, the first half of the
+  premerge's failure; the second is absent, since the refused engine flushes nothing before
+  the crash and every later open is refused for the log's missing head, and that is asserted.
+  Under the correct server the refused engine's quiesce is reached and asserted: engine
+  quiesced, store refused, and no flush, manifest, `CURRENT` switch, segment deletion or
+  restart on the node until the re-seed is adopted.
+- The nightly's seeds 1885 and 2023, its eleven variant catches of the same gap, and the
+  28 catches the nightlies removed no longer reach a term change straddling an isolation's
+  start, and each asserts that absence and that the named isolation is either gone from its
+  server or, on six seeds, still there with the server keeping its term. D-047's straddle is
+  now pinned on seed 4 of the directed term-raise schedule, which reaches it seven times, and
+  D-050's shape, which seed 4 no longer reaches, on seed 1 of that schedule, the lowest that
+  does.
+
+**Measured.** On the tree with the queue, in release: the correct server passes every
+seed of `sim/raft.rs`, `sim/membership.rs` and `sim/quorum.rs` at 20, 100 and 1000, and
+the raft sweep's coverage prints `queue_drops: 0` over the correct server's thousand seeds.
+The raft sweep's rates at 1000 seeds are compared with 268cf58, the lane's base before
+D-057 and D-058, which change neither the raft scenario nor its server:
+`ApplyBeforeCommit` 882 (891), `CountOlderTermForCommit` 454 (463), `ResetTimerOnAnyRpc`
+336 (352), `SnapshotWithoutCurrentLast` 336 (340), `AdoptionAsBuilt` 77 (57),
+`RefusalNotDurable` 16 (14), `SharedSnapshotDir` 2 (1), `IgnoreIncarnation` 0 (0), and
+`SendBeforePersist`, `TruncateOnEveryAppend`, `NoPreVote`, `RefusedCountsForQuorum` and
+`RefusedNeverCounts` on every seed as before; the lease trial revoked on all 503 seeds
+beyond the drift bound and caught 41 stale reads (49). Every change is the moved schedule's
+draw and within the binomial spread of the rate the nightly measured. `AdoptionAsBuilt`'s
+storm is drawn on the same 260 seeds on both trees, and at its ten-thousand-seed rate, 646 of
+10 000 (6.46 %, D-047, DECISIONS.md:3144), a thousand seeds catch 64.6 on average with a
+standard deviation of 7.8: 57 is one below the mean and 77 1.6 above. The lease trials'
+rate, 472 stale reads in 5 023 exceeded seeds at ten thousand (9.4 %), gives 47.3 of 503 with
+a deviation of 6.5: 49 and 41 are each within one. The membership scenario is compared with
+the lane's tip without the queue, 9432fed: its correct server passes every seed at 20, 100 and
+1000 with a joining server fed a snapshot in its learner phase on every one (59, 377 and
+3 957 installs; 63, 388 and 4 056 without the queue), no refusal and no fallback, and
+`SingleMajorityInJointConsensus` is caught on 8 of 20, 31 of 100 and 296 of 1000 (6, 35 and
+301 without the queue).
+
+**What the mutation pass found, and what now holds it.** Twenty mutations of
+`crates/ananke-env/src/sim/net.rs`, each reproduced independently, over the tree at
+09bed88. Ten were caught — the drop-newest policy, the off-by-one on the bound, the
+silent drop, the wrong `DropReason`, the delay started at the enqueue rather than the
+write, the rate charged per message, the two frames written at one instant, the LIFO
+re-timing, the rate ignored entirely, and losing a closed socket's queued frames, which
+is caught by ten unit tests and fifteen raft tests and un-catches three negative
+controls. Five survived every tier, and four of the five are now held by directed tests
+in `crates/ananke-env/src/sim/tests.rs`, each of which the mutation makes fail; none
+touches a scenario, so no schedule and no pinned hash moves.
+
+- *The eviction loop deleted*, so the bound counts frames **ever sent** rather than
+  frames outstanding. The single most consequential survivor: the whole workspace stayed
+  green at twenty seeds and the raft binary 42/42 at a hundred (1 007 s), while the
+  correct server's `queue_drops` went from 0 to **3 691** at twenty seeds and **42 393**
+  at a hundred, and the trace carried `MessageDropped { QueueFull }` for ids it had
+  already delivered. The counter was printed and not asserted. Held two ways now:
+  `a_written_frame_leaves_the_queue_so_the_bound_counts_what_is_outstanding` (two bursts
+  500 ms apart on a queue of two: with the eviction gone the second burst's first frame
+  is lost and the two behind it arrive 200 ms early, and the same drops are traced for
+  delivered ids), and `queue_drops` asserted 0 in the correct server's coverage —
+  measured 0 at 20, 100 and 1 000 seeds on this tree as on the trees above, and
+  structurally out of reach, since a drop needs 1 025 frames outstanding to one
+  destination inside the 8 µs a kilobyte frame takes to write at a gigabit.
+- *The eviction's boundary*, `written <= now` weakened to `written < now`: a frame whose
+  last byte is written at exactly this instant keeps its slot against the bound. Survived
+  the workspace at twenty seeds and the raft binary at a hundred. Held by
+  `a_frame_written_at_this_instant_has_already_left_the_queue`. Exact-instant
+  coincidences are common here: replaying the seed-42 trace the suite writes, **1 717 of
+  13 106 sends (13 %)** land at the same instant as the previous send on the same link.
+- *`write_time` rounding down* instead of up, against this entry's "rounded up to the
+  nanosecond, so that every byte takes time". It survives at **every** tier by
+  arithmetic, not by sampling: the tree configures exactly two rates, the 125 000 000
+  default and `slow_link`'s 1 000, and `div_ceil` never rounds at either, so the mutant is
+  bit-identical on every seed in debug and release. It is not cosmetic — at 2 000 000 000
+  B/s a one-byte frame's write time becomes 0 ns, every frame is written at the instant
+  it is sent, the eviction clears the queue on every admit and the bound can never be
+  reached. Held by `a_frame_takes_time_on_a_link_faster_than_a_byte_a_nanosecond`.
+- *The `QueueFull` drop traced before the `MessageSent` that caused it*, against the
+  clause above ("after the new frame's `MessageSent`, as `RealEnv` emits them"), built
+  minimally so every other trace record keeps its place. Survived every tier: the same
+  frame is dropped at the same instant for the same reason, and the existing test compared
+  only the filtered list of dropped ids. Held now by the ordered `(kind, id)` sequence
+  asserted inside `a_full_queue_drops_its_oldest_waiting_frame_and_the_frames_behind_it_move_up`.
+- *`forget_queues` made a no-op*, so a closed socket keeps its queues. **An equivalent
+  mutant, not a test gap**, and provably so: `next_socket` is written at two lines and
+  only ever incremented, so a socket id is never reused; `Fabric::queues` is read at
+  exactly two sites and never iterated, so no ordering can leak; and the moirae export
+  does not mention it. A queue left under a dead id is unreachable for the life of the
+  run. It is recorded here as a note rather than closed by a test that would assert the
+  size of a private map; it stops being equivalent the day an address is rebound by a
+  restarting node, which is when a stale queue would start to bite.
+- *Dropping `.max(enqueued)` from the re-timing loop* is equivalent too, and dead
+  defensive code: after the eviction every frame left has `written > now`, and every
+  frame's `enqueued` is the `now` of its own monotone admit.
+
+One more finding is about where the model is held rather than whether it is. *One queue
+per socket, shared by all its destinations* — the natural "one queue per connection" slip
+— was caught only by **eight pinned-seed tests**, at twenty seeds and at a hundred alike,
+whose failures read "re-audit the pin". Those are change detectors: an intended change to
+the model fails them the same way, and the documented answer is to re-audit and re-pin,
+so the realistic failure mode was to re-pin eight seeds and ship a queue bounded per
+socket with a green gate and a green CI. No property, sweep, coverage assertion or golden
+hash noticed, membership and quorum included. The rule is now asserted as a rule, by
+`a_frame_waits_only_behind_the_frames_to_its_own_destination`: three 100-byte frames to one
+destination and one to another from a single socket, the fourth arriving at 101 ms rather
+than the 401 ms a shared queue gives it.
+
+The margin is also smaller than *Consequences* below suggests. On seed 42 the deepest
+same-instant burst on one link is **348 frames** (then 267, 175, 157, 143, 127, 81, 64)
+against the 1 024 bound — a factor of three, not a large one, and with one socket per raft
+node those bursts are exactly one (socket, destination) queue. Worth remembering when
+Stage B's batch frames put many ranges on one socket.
+
+Not mutated by anyone, and still without tests: `MAX_FRAME_LEN`'s guard, the moirae
+header's `sendQueueLen`/`linkBytesPerSec` export, `NetFaults`' validation bounds
+(`send_queue_len` at least 1, `link_bytes_per_sec` positive — no `should_panic` anywhere),
+and `RealEnv`'s own queue.
+
+**The tier of `RefusalNotDurable`'s catch: the owner's decision of 2026-09-15.** This part
+is decided; the queue model above stays proposed. `RefusalNotDurable`'s test asserted its
+catch from the hundred-seed tier (D-044). On the tree with the queue its rate is 16 of 1000
+against 14 before, but none of the 16 is below seed 100 (the first is 119, where it was 80),
+so the test failed at CI's hundred seeds, and the change was held off the lane's branch for
+the owner. The owner decided:
+
+- the catch is asserted from the thousand-seed tier — `scripts/premerge.sh` and the nightly
+  — and at no lower tier;
+- the fault's firing, a crash landing on a server sitting refused, stays asserted at every
+  tier, and the catch rate is printed at every tier;
+- seed 119, the first of the thousand's catches, is pinned in its own test beside the sweep,
+  `seed_119_pins_the_refusal_that_is_not_durable_which_a_hundred_seeds_can_miss`, asserting
+  its mechanism at every tier. As built, server 3 is refused for lost state (tables 29 and
+  31 dropped at its open), crashed while refused, its refused engine flushes over the loss
+  (a manifest without either table, log segments deleted), and its next open recovers clean
+  with an applied index of 330 before an install, which state machine safety reports;
+  decision time does not move the verdict. Under the correct server the schedule leaves the
+  variant's at server 3's first refusal, which the durable mark's write and sync trace 4.9 ms
+  later; the fault's three later rounds still crash server 3 inside a flush, but no open
+  drops a table, so there is no refusal for lost state and no crash on a refused server,
+  asserted with that reason, and the run passes. The correct server's quiesce and durable
+  refusal stay pinned on seed 687. *(Superseded by D-060: the key layout moved every raft
+  schedule again, the catch is 9 of 1000 with its first at seed 158, and seed 158's pin
+  carries both halves — the laundered store as built and the quiesce with the durable
+  refusal under the correct server. Seed 119's test asserts what it does instead, and seed
+  687's the half it still reaches.)*
+
+The reason is binomial. At the nightly's rate, 132 of 10 000 (1.32 %, D-047,
+DECISIONS.md:3141, measured before this entry), a hundred seeds catch none with probability
+0.9868^100 = 0.26, about one run in four, and the gate's twenty with probability 0.77; at
+this tree's 16 of 1000 a hundred still miss with probability 0.20. A thousand miss with
+probability 0.9868^1000 = 1.7 × 10^-6. Below a thousand seeds the assertion fails a tree with
+nothing wrong on the draw alone; at a thousand the statistics support it. This supersedes D-044's
+hundred-seed tier for this test alone; D-044's fix, its fault and its firing at every tier
+stand. It supersedes SHARD.md §12's Stage B plan for the same assertion
+(docs/SHARD.md:2348, "`AdoptionAsBuilt` and `RefusalNotDurable`: … the catch from the
+hundred-seed tier"), as the approved plan's text; `AdoptionAsBuilt` stays where the plan
+puts it. SHARD.md's list does not mention the two membership counters D-058 and D-061
+move, `reverts_to_a_prefix` and the election while joint; those entries are the record.
+
+**Alternatives.** *No write time*, a queue that only counts frames sent at one instant:
+nothing drains it, so it could never fill against a rate, and its drops would be an
+invented count. *A byte bound*: `RealEnv`'s is in frames. *One rate per node, shared by its
+connections*: `RealEnv` writes each destination over its own connection, and D-015's bound
+is per destination. *A down or partitioned destination as a link that does not drain*:
+`RealEnv`'s frames to a peer that is down wait through the connection's backoff and are
+written, stale, when it returns, and a partitioned connection stalls; modelling that would
+replace `Partitioned` and `Unreachable` drops with frames delivered late, a change to Phase
+2's network fault model beyond Q16, not taken and recorded here as the divergence it is.
+*Losing a closed socket's queued frames*, as `RealEnv` does with the socket's tasks: it
+would change what a crash does to frames already sent, which the fault model has always
+delivered. *A faster default*: ten gigabits would queue less; a gigabit, the slowest common
+server link, is the conservative choice.
+
+*Where the model still differs from `RealEnv`, not changed here.* `RealEnv`'s task pops a
+frame as soon as its connection's write returns, and a write returns once the bytes are in
+the kernel's send buffer, not on the wire; the simulator has no such buffer and drains only
+at the link's rate, so a burst to one destination fills its queue sooner than `RealEnv`'s,
+and the simulator drops earlier — the conservative direction, since a drop is what the
+protocol must survive. Two omissions point the other way, and are smaller wherever a backlog
+outgrows the send buffer: the simulator does not count `RealEnv`'s 12-byte frame header, a
+4-byte length and an 8-byte message id, over a fifth of a 53-byte heartbeat (SHARD.md §4's 61 less the range id), nor
+the hello frame at each connection's start; and it has no connect or reconnect delay, during
+which `RealEnv`'s queue does not drain at all. So the claim is that the simulator's queue
+drops no later than `RealEnv`'s for a sustained backlog, not for every burst.
+
+**Consequences.** No Phase 2 scenario sends one destination fast enough to fill a queue,
+so queue-full drops wait for Stage B's batch frames, where many ranges share a socket. Any
+future change to a frame's length moves every schedule, as any change to a record's size
+always did (CLAUDE.md).
+
+---
+
+## PROPOSED D-057 — A named stream per node and range: `Environment::range_rng`
+
+**Context.** SHARD.md's Q13, approved: a named stream per node and range,
+`n{id}/r{range}/protocol`, through a new `Environment` method, derived from the seed in
+`SimEnv` and drawn from OS entropy in `RealEnv`, decided before the stage that first pins
+Phase 3 seeds. Protocol code reaches randomness only through `Environment::rng` and
+`sched_rng` (crates/ananke-env/src/env.rs), and a core's generator is seeded from the
+node's protocol stream at its incarnation's start, so with many groups on a node a split
+would move every later range's election timeouts, against D-017's purpose (SHARD.md §11,
+env 2). Q13 settles the name and the two sources. It does not settle the method's shape —
+a range id or any label — whether a call starts the stream over or continues it, or how
+the simulator keeps it. Those are proposed here.
+
+**Decision.** Every site is marked `PROPOSED(D-057)`.
+
+- `Environment::range_rng(&self, range: u64) -> Self::Rng`: this node's stream for
+  `range`. It takes the range's id rather than a label, so the one name Q13 decided is
+  the only name it can make: a label would let a caller ask for `protocol` or `sched`
+  and be handed a second generator starting where the node's own stream starts, drawing
+  the same numbers.
+- `SimEnv` derives it with `moirae_sched::stream(seed, "n{id}/r{range}/protocol")` the
+  first time the node is asked for that range and keeps it in the node's entry beside
+  `n{id}/protocol` and `n{id}/sched`. Every later call and every handle to the node
+  continues the same stream, as `rng` does, and it lives as long as the simulation, as
+  the node's other streams do, so a restarted core does not draw its last incarnation's
+  numbers again. Making it draws from no other stream.
+- `RealEnv` returns `RealRng`, OS entropy, as for every other stream.
+- Nothing calls it yet. Stage B seeds each core from it, in a commit of its own that
+  moves every election timeout (SHARD.md §12, Stage B). No trace, hash or schedule moves
+  here.
+
+The simulator's tests hold it: the same seed, node and range give the same draws, and
+another range, node or seed other draws, which are moirae's derivation for the name;
+taking range streams and drawing from them, interleaved, leaves the node's protocol and
+scheduling streams, another node's and another range's exactly as they draw without, a
+node added after the takes draws the same clock skew and drift, and a scenario with
+drops, duplicates and random delays whose task takes range streams in one run only
+records the same trace (a draw from the `clock` or the `net` stream added to the
+derivation fails it); and every handle continues one stream
+(crates/ananke-env/src/sim/tests.rs). Under `RealEnv`
+two draws differ (crates/ananke-env/tests/real_env.rs).
+
+**What the mutation pass found.** Seven mutations of the derivation and its cache
+(`crates/ananke-env/src/sim/state.rs`), each reproduced independently. Six were caught,
+and the striking thing is by how little: the range dropped from the name and the node
+dropped from the name are each caught by two tests; seeding the range's stream from the
+node's own protocol stream by all three; a fresh `RandomState` salt per call by all
+three; but **one process-wide `OnceLock<RandomState>` salt** — stable inside a run and
+different across runs, the insidious form — is caught by the moirae-name assertion alone
+(`assert_eq!(draws, moirae_sched::stream(7, "n1/r3/protocol"))`), since every same-seed
+and cross-seed equality in that test still holds; a cache keyed by node rather than by
+(node, range) only by `taking_a_range_stream_perturbs_no_other_stream`, because the other
+test builds a fresh `Sim` per call and so never puts two ranges on one node; and no
+caching at all only by `every_env_handle_continues_a_nodes_range_stream`. Three of the six
+have exactly one detector each, which is what to know before any of them is changed.
+
+The seventh, turning `panic!("unknown node")` into a silent fallthrough that hands out an
+unregistered, restarting stream, survived — and is **an unreachable guard, not a test
+gap**. `Sim::env` already panics `unknown node {node}` before it hands out a `SimEnv`;
+that line is the only `SimEnv` construction in the workspace, its `node` field is private
+and never reassigned, and `nodes` is never removed from, reset or reassigned anywhere in
+the crate. So `Shared::range_stream` can only be called with a node `Sim::env` has already
+validated, and the `unwrap_or_else(|| panic!(…))` is a redundant second guard on a
+crate-internal path. Reaching it at all needs a test that calls
+`sim.shared.lock().range_stream(…)` directly, which would assert something nothing can
+trip; it is recorded here as the note it is, and no test was added.
+
+Both findings turn on the last bullet above: **nothing calls `range_rng` yet**, so no
+seed tier, sweep or scenario can catch any mutation of it, in this stage or the nightly.
+The four unit tests named below are its only guard, and stay its only guard until Stage B
+seeds each core from it.
+
+**Alternatives.** *A label* (`stream(&self, label)`): general enough for the rebalancer's
+named stream Q42 mentions, but able to alias the node's own streams; a second kind of named
+stream can have its own method when something needs it. *A fresh stream per call*, starting
+the sequence over: two handles would draw the same numbers, and a range's core restarted at
+a new incarnation would draw its last incarnation's election timeouts again, where the node's
+protocol stream continues across incarnations today. *Seeding a range's stream from the
+node's protocol stream*: Q13's reason against it, a split moving every later range's draws.
+*Returning a reference, as `rng` does*: the simulator keeps the streams under its lock and
+cannot lend one out; a `SimRng` clone shares the stream and `RealRng` is a unit, so an owned
+handle costs nothing.
+
+**Consequences.** Both environments in the workspace implement one more method. Stage B's
+switch of each core's seed to its range's stream is the change that moves schedules, and
+this entry is what it switches to.
+
+---
+
+## PROPOSED D-058 — The membership scenario past the snapshot threshold
+
+*Decided in part: which part of issue #46 is met and the tier of `reverts_to_a_prefix`
+are the owner's answers 3 and 4 of 2026-09-15 and are decided. The scenario's shape is
+proposed.*
+
+**Context.** Issue #46 and SHARD.md's Q34, approved: extend `sim/membership.rs` past the
+snapshot threshold before `sim/move.rs`, so that during 3 → 5 → 3 a learner or joining
+voter is fed by a snapshot, asserted per seed; the correct server passes every seed and
+`SingleMajorityInJointConsensus` is still caught on some seed at every tier. The scenario
+ran `RaftConfig`'s default threshold of 4 096 entries and never crossed it
+(OVERNIGHT.md:188-191), so the two pieces of Phase 2 code the issue names, the
+configuration key an install's repair writes and the floor a truncated configuration
+entry reverts to (D-029, D-030), had only unit tests. Q34 settles that the scenario is
+extended. It does not settle how a snapshot feed is made certain on every seed, and a
+lower threshold alone does not make it: only a leader compacts (D-030), a leader elected
+from followers holds a whole log, and such a leader catches an empty learner up with
+entries from index 1. With the threshold lowered and the grow asked as before, 39 of the
+first 1 000 seeds feed no joining server a snapshot in its learner phase.
+
+**Decision.** Every site is marked `PROPOSED(D-058)`.
+
+- The membership servers run the raft sweep's `snapshot_threshold` of 12 and
+  `snapshot_chunk` of 4 096, so leaders take checkpoints and compact routinely.
+- The operator asks for the grow only of a leader that has compacted since it took
+  office — its `RaftCompacted` after its `RaftLeader` in the trace — waiting for one in
+  slices for at most two seconds, and asks that leader alone: a request that finds it no
+  longer leading ends there rather than following the hint, and the driver's next attempt
+  waits for a compacted leader again. A learner's catch-up starts only when a leader
+  accepts the request, and is the leader's alone (D-032), so the first leader to catch
+  servers 4 and 5 up has a compacted prefix, and their first rejection, asking from index
+  1, lands below it: they are fed a snapshot. When no compacted leader appears within the
+  budget the request goes to the leader in force, so a seed without a snapshot feed is
+  reported rather than hidden; `Report::compaction_fallbacks` counts those requests and
+  `Report::compaction_waited` the time waited. The shrink is asked as before.
+- `Schedule::total`, the run-length hint's estimate (D-016), does not count the wait. It is
+  at most 300 ms of a run over the first 1 000 seeds (a mean of 3.85 ms, no fallback),
+  where counting its budget, eight seconds over four attempts, would have lowered PCT's
+  change-point rate on every run for time no run spends.
+- `Report::snapshot_fed_joiners` is every snapshot a joining server installed in its
+  learner phase: from the operator's first request for the grow (`Report::grow`) until the
+  first joint configuration naming that server in `new` takes effect on any server, or,
+  when none does, until the driver stops driving the grow. Installs after that — by a voter
+  of the joint or new configuration, in the transfer's wait, the shrink or the settle — are
+  not counted, nor an install's restatement at its adoption. The correct server's sweep
+  fails any seed with none and its coverage asserts one on every seed; the variant's sweep
+  prints how many of its runs had one; the coverage prints the seeds with a fallback.
+- The run's check fails on any `RaftRefused` whose reason does not start with
+  `LOST_STATE`. No crash is scheduled here, so a refusal can only come from an install's
+  adoption, and a configuration key its repair wrote out of step with the log refuses the
+  store at the open (store.rs) and puts the server in re-seed mode, which traces no
+  failure and whose re-seed install would otherwise count as a feed. The coverage counts
+  adoptions and refusals by the reason's first clause and asserts, at every tier, that none
+  is for anything but lost state.
+
+**What the extension found.** Measured on the lane's tree, before D-056's send queue moved
+every membership schedule; the figures on the tree with the queue follow, under *On the tree
+with D-056's queue*. No bug in the Phase 2 code it was aimed at, and one trace
+inconsistency in the install path, returned to the owner unfixed:
+
+- At 20, 100 and 1 000 seeds in release the correct server passes every seed, every seed
+  feeds a joining server a snapshot in its learner phase (63, 388 and 4 056 installs), and
+  no operator request fell back (the longest wait 300 ms). Every install is adopted — 109,
+  651 and 6 557 adoptions — and the open after each checks the configuration key its repair
+  wrote against the log; no store is refused and no server fails.
+- The key repair's non-trivial branch is not reached. An install keeps a tail of the
+  receiver's log only when the receiver holds the snapshot's last index with its term, and
+  a server is fed a snapshot here because its log ends below the leader's prefix: over
+  1 000 seeds no install kept a tail, so none wrote the key from a configuration entry in a
+  tail. Every install wrote the snapshot's own configuration.
+- The core's revert floor is not reached either. No truncation in a running core restored
+  a compacted or installed prefix's configuration over 1 000 seeds, on the lane's tree, on
+  268cf58, or with the threshold alone. What the coverage's `reverts_to_a_prefix` counts, 4 at
+  100 seeds and 44 at 1 000 on the lane's tree, are installs whose snapshot's configuration
+  is older than the receiver's in force, which take the receiver back to the installed
+  prefix; the floor itself is `truncation_reverts_to_a_prefix`, 0. Issue #46's second item
+  needs a follower that installs and then appends and truncates a configuration entry above
+  its prefix; this scenario does not build it. The owner deferred it, with the key repair's
+  tail branch above, to issue #56 (*Issue #46: met and deferred*, below).
+- The install's `RaftConfig` (node.rs, `Snap::Finish`) writes the configuration's voters
+  into `new` when it is not joint, where `TraceEvent::RaftConfig` documents `new` as empty
+  outside a joint configuration and the core and the restatement write it empty; the same
+  configuration is traced two ways within one install. The checks read `new` only when
+  `joint` is set, so no verdict depends on it; the studio shows it. Not fixed here.
+- `SingleMajorityInJointConsensus` is caught on 6 of 20, 35 of 100 and 301 of 1 000 seeds
+  (275 of 1 000 on 268cf58).
+
+The coverage at 1 000 seeds against 268cf58: grows and shrinks completed on every seed both
+times; joint configurations taken 10 729 (10 663); new configurations taken 22 861 (9 760),
+since each install traces its snapshot's configuration and its adoption re-states it;
+learners promoted 2 524 (2 470); elections while joint 33 (51); step-downs of a leader outside
+`C_new` 412 (435); completed operations 348 849 (287 719); worst completion gap 352.96 ms
+(382.24 ms); slowest first write after the last heal 471.89 ms (450.07 ms); configuration
+reverts 69 (709). The reverts fall because installs now take conflicting configuration
+entries out of force where truncations did. On 268cf58, 717 configuration entries a server
+held in force had another term in the committed log at that index, and 709 of them left
+force by a truncation, each a revert. On the lane's tree 780 did: 25 by a truncation, 746 by an
+install, and 9 not before the run ended. Of those 746, 44 took the receiver to an older
+configuration and count as reverts, and 702 took it to a newer one, which the counter,
+comparing indices, does not see as leaving an entry out of force. The threshold alone gives
+79 reverts (29 truncations, 50 installs).
+
+Timings, the two membership tests at 1 000 seeds in release, another agent's sweeps sharing
+the machine: on a563205, the commit before this review's changes, 26.0 s with the one-minute
+load at 18.4 and falling at its start, and 14.0 s at 10.1 to 11.6, against 10.4 s on 268cf58
+at 9.8 to 10.1; on the lane's tree 26.2 s at a mean load of 84.0 over six samples, against 19.7 s on
+268cf58 at 79.6 over four. The load moves these more than the change does.
+
+Every figure above has its command and output in the lane's scratchpad, `scratchpad stage-a/n/audit-d058`:
+`run-audit.sh` runs them all; `membership-{20,100,1000}.log` and `membership-1000-268cf58.log`
+are the tests' coverage and timings with their load samples; `feeds-new.log` and
+`feeds-threshold-alone.log` are the learner-phase feeds, fallbacks and waits
+(`zz_m5_new.rs`); `traces-new.log`, `traces-threshold-alone.log` and
+`traces-268cf58.log` are the reverts, truncations, installs, tails, refusals and conflicting
+configuration entries (`zz_m5_trace.rs`).
+
+**On the tree with D-056's queue.** D-056's send queue landed after the figures above and
+moved every membership schedule; no verdict moved with it. The membership tests in release
+on 4177c5b with this entry's tier change below (`RUSTFLAGS="-D warnings" ANANKE_SEEDS=<n>
+cargo test --workspace --all-features --release --test raft -- --nocapture membership
+one_majority`, `scratchpad stage-a/q/q2-membership-{20,100,1000}.log`; the same coverage at
+100 and 1 000 in the whole raft suite on 4177c5b, `q/raft-{100,1000}-4177c5b.log`): the
+correct server passes every seed at 20, 100 and 1 000, and every seed feeds a joining server
+a snapshot in its learner phase (59, 377 and 3 957 installs), with no fallback (the longest
+wait 50, 50 and 300 ms). Every install is adopted — 111, 641 and 6 377 adoptions — and no
+store is refused. No install kept a tail or carried a configuration entry in one, and no
+truncation reverted a configuration to a prefix, at any of the three
+(`installs_keeping_a_tail`, `installs_whose_tail_carries_a_configuration` and
+`truncation_reverts_to_a_prefix` all 0). `reverts_to_a_prefix` is 0, 1 and 28: once on each
+of 28 seeds of the thousand, and of the first hundred on seed 97 alone
+(`q/probe-reverts.log`, a throwaway copy of the test printing each seed's count, deleted
+and never committed). `SingleMajorityInJointConsensus` is caught on 8 of 20, 31 of 100 and
+296 of 1 000 seeds.
+
+**Issue #46: met and deferred — the owner's decision of 2026-09-15.** This part is decided;
+the scenario's extension above stays proposed. The owner accepted Q34 as "met for the
+snapshot feed and the configuration key" and had the rest filed apart, so #46 is met in
+part by Stage A and is not fully closed; SHARD.md §12's "Resolves #46" for Stage A means the
+met part below.
+
+- *Met in Stage A.* `sim/membership.rs` crosses the snapshot threshold. During 3 → 5 → 3 a
+  learner is fed by an install from a compacted leader, asserted per seed. The configuration
+  key the install's repair writes is exercised on that path, and the open after each
+  adoption checks it against the log. The correct server passes every seed, and
+  `SingleMajorityInJointConsensus` is still caught at every tier.
+- *Deferred to issue #56*, filed 2026-09-15, "Membership: the truncation revert floor and the
+  kept-tail key repair under snapshots (split from #46)". It holds the truncation revert
+  floor, a running server's configuration reverting to its snapshot's when a configuration
+  entry above the snapshot is truncated, reached on 0 of 1 000 seeds before the queue and
+  after it. It also holds the install repair's kept-tail branch, never taken. Both keep their
+  unit tests alone until #56 builds the shapes that reach them.
+- *The tier of `reverts_to_a_prefix`.* Its count above zero is asserted from the
+  thousand-seed tier, `scripts/premerge.sh` and the nightly, and at no lower tier. It stays
+  printed with the coverage at every tier. It was asserted from a hundred seeds, where the
+  lane's tree counted 4; on the tree with the queue a hundred count 1, on seed 97, and a thousand
+  see it on 28 seeds. On the tree with the key layout (D-060) a thousand see it on 25 and a
+  hundred on 3, seeds 40, 94 and 95. At that rate, 2.5 %, a hundred seeds see none with
+  probability 0.975^100 = 0.080 and the gate's twenty with 0.60. Below a thousand the
+  assertion would fail a tree with nothing wrong on the draw alone; a thousand see none
+  with probability 0.975^1000 = 1.3 × 10^-11. The counter is installs taking a receiver back to an older
+  configuration, not the revert floor #56 holds.
+
+**What the mutation pass found, and what now holds it.** Twelve mutations of
+`sim/membership.rs`, its two assertions in `sim/tests/raft.rs` and the install repair they
+lean on, each reproduced independently on the tree at 09bed88. The scenario's mechanisms
+held: dropping the variant's joint-majority guard is caught at twenty seeds by the correct
+server's own sweep, making the variant never fire is caught at twenty by the negative
+control, and turning `await_compacted_leader` into a single look with no wait is caught at
+twenty on seed 4 — deterministically, since `sweep` runs seeds 0..count and seed 4 is
+inside every tier, though the margin is thin: at a hundred seeds only 3 miss without the
+wait. What did not hold is the fold the assertions read and the clause beside it.
+
+- *The learner phase dropped from the fold*, so an install by a server already a voter of
+  the joint configuration counts as a learner-phase feed. Survived at 20 and 100 seeds and
+  the whole workspace with it; `snapshot_fed_joiners` went **80 → 93** at twenty seeds and
+  **523 → 584** at a hundred, and nothing failed.
+- *Every server counted as a joiner*, servers 1 to 3 included, where only servers above
+  `INITIAL_VOTERS` can join. Survived the same way: **80 → 92** and **523 → 581**, so
+  twelve of the ninety-two counted feeds at the gate's tier are installs by original
+  voters — an ordinary follower catching up behind a compacted leader, which the
+  pre-D-058 scenario already produced.
+
+Both are invisible for one reason: every reader of `snapshot_fed_joiners` asks only
+whether the list is empty (the sweep's per-seed check and the coverage's
+`seeds_with_a_snapshot_fed_joiner`), and both readers are monotone in the fold, so *any*
+widening of either bound passes at every tier. The predicate's two bounds — who, and when
+— were each unguarded. Now: the fold is `snapshot_fed_joiners_of(records, grow)`, a
+function of a trace and the grow's window with its own unit test over records written by
+hand, which asserts both bounds at once (an install before the grow, one by an original
+voter inside the window, one by a joiner in its learner phase, one by the same joiner
+after the joint configuration admits it, a take rather than a feed, a restatement, and one
+after the driver stopped: only the two learner-phase feeds are returned); and the correct
+server's sweep now fails any seed where a counted server is not one of the joiners. Both
+read records a run already produced, so no schedule and no pinned hash moves.
+
+- *The refusal clause's negation flipped*, so a store refused for anything **other** than
+  lost state passes the run silently. Survived the workspace at twenty seeds and the
+  membership tests at 20 and 100. The clause has never discriminated on any tier: the
+  coverage's `refusals` is empty at 20, 100 and 1 000 seeds on the tree of this commit
+  too, and the coverage's companion assertion (every refusal clause starts with
+  `LOST_STATE`) quantifies over that empty map. It is now given a case that reaches it —
+  a unit test on `Report::check` over seed 0's own passing run with one `RaftRefused`
+  record appended, asserted to pass for a lost-state reason and to fail, with the words,
+  for a configuration key out of step with the log. **It remains a guard no run of this
+  scenario has ever tripped**, and that is the honest statement of it: the unit test makes
+  the clause discriminate, the scenario still does not reach the state, and only the shapes
+  issue #56 holds would change that.
+- *Both snapshot-fed-joiner assertions deleted*, and the same with the compacted-leader
+  wait broken as well: both survived, the whole workspace green. Nothing else in the
+  workspace — not the invariants, not commit majority, not linearizability, not the
+  liveness or availability bounds, not the coverage's other counters — notices that no
+  joining server was ever fed a snapshot. **The extension's value rests on those two
+  lines.** A deleted assertion can only be caught by a test of the test, and the shape
+  that would pin it — a scenario knob asking for the grow of the leader in force instead
+  of a compacted one, asserted to produce a seed with no learner-phase feed — is left as an
+  issue rather than taken here: wired through `Schedule::draw` it would move every
+  membership schedule on every seed and every pinned hash with them.
+
+Two corrections to what this entry records, both from the same pass.
+
+- *The membership scenario adds no discriminating power over the install repair's
+  configuration key.* Making the repair a no-op, so the leader's un-rewritten key rides
+  into the installed store, leaves all three membership tests green at twenty seeds with
+  `refusals: {}`, while the coverage moves (joint configurations 216 → 211, new
+  configurations 459 → 465, learners promoted 50 → 48, reverts 3 → 2, elections while
+  joint 1 → 0, feeds 80 → 82), so servers really did come up differently. It is caught by
+  `ananke-raft`'s own `tests/snapshot.rs` alone. The "Met in Stage A" bullet above is right
+  that the key is written on that path and checked at each adoption's open; it should not
+  be read as saying the scenario would notice a wrong key.
+- *The install repair's kept-tail branch has no unit test anywhere in the workspace.* The
+  deferral bullet above says of the truncation revert floor and the kept-tail key repair
+  that "Both keep their unit tests alone until #56 builds the shapes that reach them".
+  That is true of the revert floor and **not** of the kept-tail branch: every `Repair`
+  built in `crates/ananke-raft/tests/{snapshot,format}.rs` passes `tail: Vec::new()` except
+  one, which passes two plain command entries, so the fold over `repair.tail` returns
+  `None` on every test in the workspace and removing its non-trivial branch outright
+  changes nothing — the whole `ananke-raft` suite and the membership tests stay green. The
+  branch is production-reachable: the live install builds its tail from the receiver's own
+  log above the snapshot's last index, and those entries can be `Payload::Config`. Its
+  failure mode is now measured rather than predicted — with the branch removed, a store
+  whose kept tail carries a configuration entry above the snapshot is **refused at open**,
+  "the configuration key is out of step with the log", and the server drops into re-seed.
+  The test that would close it is one near-copy of
+  `an_install_carries_the_receivers_identity_and_is_adopted_at_open` with a `Payload::Config`
+  in the tail; it needs no seeds and moves nothing. It belongs to issue #56, which should
+  carry this correction: the branch is untested, not merely unreached.
+
+The coverage at 1 000 seeds on the tree of this commit, for the record: 4 855 learner-phase
+feeds on 1 000 seeds with every seed showing one, 7 468 adoptions, `refusals: {}`,
+`reverts_to_a_prefix` 25, and `truncation_reverts_to_a_prefix`, `installs_keeping_a_tail`
+and `installs_whose_tail_carries_a_configuration` all 0.
+
+**Alternatives.** *The threshold alone*: 39 seeds in 1 000 without a learner-phase feed.
+*Crashing or isolating a joining server until its leader compacts past it*: a second fault
+in a scenario about membership under partition, and D-037's designation would feed it
+only after two quiet election timeouts. *Asserting the feed only on seeds that reach it*: the
+issue asks it of every seed, as §10's *every seed* standard does of a directed shape.
+*Counting any install by a joining server during 3 → 5 → 3*: it counts voters fed after the
+change, which the exit criterion does not ask for. *Directing the shrink too*: no server
+joins in the shrink.
+
+**Consequences.** The scenario's schedule moved: a lower threshold changes every
+membership run from its first checkpoint on, and the run-length hint no longer counts a
+wait. Its pinned assertions are the sweep's and the variant's, both re-run above. The worst
+completion gap of 549.359683 ms that SPEC §3, RAFT.md §1 and the scenario's module comment
+cite was measured at ten thousand seeds before this change; the next ten-thousand-seed
+nightly re-measures it on the moved schedule, and those three places are marked as measured
+before D-058. `sim/move.rs` can rely on a learner fed by snapshot during a change on one group,
+not on the key repair's tail branch or the truncation revert floor, which this scenario does
+not reach and issue #56 holds. If a seed at ten thousand exhausts the wait, reaches a leader that has not
+compacted, or refuses a store, the correct server's sweep names it.
+
+**At ten thousand, on the stage's two green nightlies.** Runs 35161762372 (605e62e) and
+35172923002 (the tip, 27f6c97) print this scenario's whole `MembershipCoverage`, identical
+in both, and the correct server passes every one of the ten thousand seeds: no seed
+exhausts the wait, none refuses a store (`refusals: {}`), and a joining server is fed a
+snapshot on all 10 000. Four things this entry left open are in that line.
+
+- **The truncation revert floor is reached.** `truncation_reverts_to_a_prefix: 3` over the
+  ten thousand — the floor deferred to issue #56 as one the scenario does not reach, in
+  fact reached, on at most 3 seeds, 0.03 %. **It is a printed counter, asserted nowhere,
+  and too thin for any tier D-061 allows:** at 0.03 % a thousand seeds see none with
+  probability 0.9997^1000 = **0.74**, a hundred with 0.97 and the gate's twenty with 0.994,
+  and even the nightly's own ten thousand see none about one run in twenty
+  (0.9997^10000 = 0.050). Three seeds in ten thousand say the shape exists on this
+  schedule; they are not a rate an assertion can stand on, at the nightly tier or any
+  other. What it changes is the deferral's wording — the floor is reached rarely rather
+  than unreachable — and issue #56 should carry that. Whether the shapes #56 holds are
+  still wanted, and whether these seeds are worth finding and pinning, is the owner's.
+- **The kept-tail branch is still not reached.** `installs_keeping_a_tail: 0` and
+  `installs_whose_tail_carries_a_configuration: 0` over the same ten thousand, so the
+  correction above stands at the highest tier there is: the branch is untested rather than
+  merely unreached, and no seed of ten thousand builds a kept tail to test it with.
+- **`reverts_to_a_prefix`**: 264 over the ten thousand, at most 2.64 % of seeds, beside the
+  2.8 % and 2.5 % measured at a thousand. It sits where the owner put it, the thousand-seed
+  tier, where a thousand seeds see none with probability 0.9736^1000 = 2.4 × 10^-12.
+- **The worst completion gap, re-measured on the moved schedule.** This entry says the
+  549.359683 ms that SPEC §3, RAFT.md §1 and the scenario's module comment cite was measured
+  at ten thousand seeds before this change, and that the next ten-thousand-seed nightly
+  re-measures it. It has: **`worst_completion_gap: 555.458839ms`**, with
+  `slowest_write_after_heal: 633.927431ms`, against the 2 s bound SPEC §3 states. The moved
+  schedule's worst gap is 6.1 ms worse than the pre-D-058 figure and still under a third of
+  the bound. Those three places are not edited here — this commit touches DECISIONS.md
+  alone — and they are marked as measured before D-058; the figure to carry into them is
+  this one.
+
+---
+
+## D-059 — A store in 0.3.0's format is refused at open, never migrated and never read
+
+**Context.** SHARD.md's Q5, approved as load-bearing, lets the key layout of Stage A's
+item 6 break 0.3.0's on-disk format on three conditions:
+1. the on-disk format version is bumped;
+2. a store in the old format is refused at open with an error naming both format
+   versions, never misread;
+3. the break is recorded in the implementing entry and in the release notes
+   (SHARD.md:71-76).
+
+The owner's addition of 2026-09-15 to Stage A's entry criteria asks for two things
+before the layout's code (SHARD.md:2115-2122):
+- the decision on what becomes of a v0.3.0 store;
+- the test that holds it: a store written by the v0.3.0 tag's own code, kept as a
+  fixture rather than made by the new code, opened by the new code and refused with
+  that error, with no key of it read as the new layout's.
+
+The same test must pass on the tree after item 6 (SHARD.md:2144-2146).
+
+Nothing records which format a store is in:
+- the engine's versions (2 in the manifest, 2 in a table's footer) are unchanged since
+  0.3.0;
+- the store's `RAFT-STORE` marker carries none (SHARD.md §11, storage 1).
+
+Under the new layout 0.3.0's keys lie where the new code looks for nothing. A 0.3.0
+store the new code did not refuse would open as an empty one, the way seed 6325's voter
+once came back blank (D-041).
+
+**Decision.** The owner's, given in the brief of Stage A's lane L: a store in 0.3.0's
+format is refused at open with a clear error naming its format version and the one the
+code expects. It is never migrated, and never read under the new layout.
+
+- *The versions.*
+  - 0.3.0's store, which records no version, is Raft store format 1: the layout RAFT.md
+    §3 gave at the tag.
+  - Format 2 is the layout of item 6 and the only format this build writes or opens.
+- *Newer versions too.* A store that records a version newer than the build's is
+  refused the same way, naming both. A build cannot read a format it predates, and
+  reading one would be the misreading Q5 forbids. (The owner, 2026-09-15.)
+- *Not a loss, and not replaced.*
+  - The store is whole in its own format, so the refusal is not D-022's refusal of lost
+    state.
+  - A server that finds one traces `RaftServerFailed` with the refusal's words and
+    returns it.
+  - It writes no lost mark (D-044) and does not wait in re-seed mode, where a leader's
+    snapshot would take the store's place.
+  - What becomes of the store is its operator's decision.
+- *Read before anything writes.* The format is read before anything writes to the store
+  directory, so a refused store is left byte for byte as it was found: no new log
+  segment, no marker, no lost mark, no adoption. (The owner, 2026-09-15.)
+- *The format before lost state.* The format is checked before any check for lost state:
+  the engine's recovery, the marker, the lost mark and a staged install. A 0.3.0 store
+  that has also lost state is refused for its format and never re-seeded into its own
+  directory. (The owner, 2026-09-15.)
+
+Where the version lives, how a fresh store is told from an unrecorded one, and the order
+of the start are the mechanism, recorded in D-060, PROPOSED. Code sites of this decision
+carry `// D-059`.
+
+**The fixture.** `crates/ananke-raft/tests/fixtures/v0.3.0-store/store`: fifteen files
+and 5 162 bytes, written by the v0.3.0 tag's code (0d30df5) and by nothing else.
+
+A program, `generate.rs` beside it, does what a server does, in its order:
+1. opens the engine as `node.rs` opens it, with a 512-byte memtable and 4 KiB log
+   segments so the state is partly in tables and partly only in the log;
+2. opens the store, writing incarnation 1, and writes the store marker;
+3. persists term 2 and a vote for server 1, with a configuration entry at index 1 and
+   six commands at 2 to 7;
+4. applies 1 to 4, and takes a snapshot at index 4 into `/raft/snap-4-1`;
+5. compacts the log to it, and applies 5;
+6. persists term 3, a vote for server 2 and an eighth entry.
+
+It writes under the simulator, which makes the bytes the same on every run and makes the
+snapshot record's path `/raft` rather than a directory of the machine that ran it. It
+copies the files out through `RealEnv`. It was run in the tag's own tree, with the tag's
+`Cargo.lock` and toolchain, from this repository's root:
+
+```
+git worktree add --detach <scratch>/v030 v0.3.0
+mkdir -p <scratch>/v030/crates/ananke-raft/examples
+cp crates/ananke-raft/tests/fixtures/v0.3.0-store/generate.rs \
+   <scratch>/v030/crates/ananke-raft/examples/v030_store_fixture.rs
+(cd <scratch>/v030 && CARGO_TARGET_DIR=<scratch>/target-v030 \
+   cargo run -p ananke-raft --example v030_store_fixture -- <scratch>/fixture)
+cp -R <scratch>/fixture crates/ananke-raft/tests/fixtures/v0.3.0-store/store
+git worktree remove --force <scratch>/v030
+```
+
+- No tracked file of the tag's tree was changed; `--force` removes the untracked example.
+- Four runs, the last of the program as committed, were identical under `diff -r`.
+- The README beside the store lists what it holds under 0.3.0's keys, with every file's
+  size and SHA-256.
+- `crates/ananke-raft/tests/v030_store.rs` holds the fixture to that README at the
+  engine, under 0.3.0's keys spelled out byte by byte rather than through the build's
+  helpers:
+  - an engine whose recovery lost nothing, three tables and a log;
+  - the hard state, the applied index, the incarnation, the configuration key and the
+    snapshot record;
+  - entries 5 to 8 and the user's `a`: ten keys in all.
+
+**The test.** It landed with the layout, in D-060's commit, after `SimEnv`'s queue, as
+the owner ordered on 2026-09-15. `crates/ananke-raft/tests/v030_store.rs` asserts that:
+- the fixture is refused naming format 1, format 2 and 0.3.0, and not as lost state;
+- nothing on its disk changes, with no file added — not even the empty log segment every
+  engine open adds, since the engine never opens;
+- a server started on it traces one `RaftServerFailed` naming both formats, and no
+  `RaftRefused`, `RaftAdopted`, `RaftRecovered` or engine record;
+- the fixture with a lost mark, a rotted table, a rotted log record, a completed staged
+  install, or nothing but its marker is refused for its format all the same, beside the
+  start that checked lost state first, which the same five shapes catch on 5 of 5;
+- it is refused on a real filesystem with every name, every size and every byte
+  unchanged, and a directory that is not there is fresh and stays missing.
+
+The test's names and D-060's tests of the mechanism are listed in D-060.
+
+**Alternatives.**
+- *Migrating 0.3.0's store to the new layout*: the owner's decision rules it out; 0.x has
+  no users (Q5).
+- *Treating the refusal as lost state*: the server would mark the store lost and re-seed,
+  so a leader's snapshot would replace a whole store its operator has not decided about.
+- *Refusing only a missing or older version*: a newer one would be read by a build that
+  cannot know its layout.
+
+**Consequences.**
+- Stores written by 0.3.0 are refused by the release that ships item 6 and must be
+  discarded or rebuilt. The break is recorded for the release notes in D-060 (Q5,
+  condition 3).
+- The first draft of this entry (9e90eed) proposed a mechanism: the version as an engine
+  key, read after the engine's open and after lost state. It contradicted the last two
+  bullets above, and is superseded by D-060, where it is kept as a rejected alternative
+  and as the known-buggy start order `LostStateBeforeFormat`.
+
+---
+
+## PROPOSED D-060 — The key layout of Q5, and the store's format record read before anything writes
+
+**Context.** Stage A's item 6 (SHARD.md §12) has three parts:
+- the Raft store parameterised by a key prefix (Q40);
+- one group's Raft state under `0 / <range: u64 BE> / <purpose> / name`, with tenant 1
+  the system tenant and user data moved from tenant 1 to tenant 2 (Q5, SHARD.md §1);
+- the on-disk format version bumped and recorded where a store's open can read it, with
+  a store in 0.3.0's format refused (D-059).
+
+The owner's answers of 2026-09-15 add three constraints, recorded as decided in D-059:
+- newer formats are refused too;
+- the version is read before anything writes;
+- the format is checked before lost state.
+
+Before this commit a server's start wrote before it could read a version stored anywhere
+in the engine (node.rs:385-513 at 9e90eed):
+- the adoption can sweep, copy over or mark a store (snapshot.rs:318-449);
+- `Engine::open` creates the directory, sweeps orphans and always starts a new log
+  segment (engine.rs:898, 1023-1029; wal.rs:600-614);
+- every open error becomes a lost mark and a re-seed (node.rs:461-485).
+
+The simulated disk sets further limits:
+- it rots one bit per block at every crash (sim/fs.rs:361-381; `p_bitrot` 0.02 in the
+  raft and membership scenarios);
+- a crash keeps a prefix of each directory's unsynced entry operations, but never loses a
+  synced entry (sim/fs.rs:276-289, 611-634);
+- a lost fsync leaves pending writes to a later crash (sim/fs.rs:317-330).
+
+Any engine key can be lost with a dropped table or a damaged log. Under
+`RefusalNotDurable` a dropped table can even be laundered into a store with no damage
+(D-044, seed 687; seed 158's pin, which asserts the laundered store's restatement as
+built — seed 119's pin asserts the absence of any refusal on its run). So a version kept
+only in the engine cannot tell
+"format 2 that lost its version" from "format 1 that lost state".
+
+**Decision.** Every code site carries `// PROPOSED(D-060)`, and the refusal's sites carry
+`// D-059`.
+
+*The record.*
+- **What it is.** A file `RAFT-FORMAT` in the store directory, beside `RAFT-STORE`
+  (`crates/ananke-raft/src/format.rs`). Two copies of `b"ananke raft store format\n" |
+  version: u64 LE | crc32c: u32 LE`, 37 bytes each, at offsets 0 and 37, 74 bytes in one
+  block. The bytes are pinned in `tests/format.rs`.
+- **How it decodes.**
+  - A copy is valid when its magic and CRC match.
+  - Valid copies that agree give the version.
+  - Valid copies that disagree are refused, naming the version that is not 2.
+  - No valid copy means unreadable.
+  - One flip can never read as another version (the CRC). One crash's rot can never make
+    the record unreadable (two copies in one block).
+- **Permanence.**
+  - Every later format keeps the name, the magic, the copy's shape and offsets, and the
+    rule that checkpoints and staged installs carry a record. Only the version changes.
+  - No build rewrites a record in place with another version.
+  - So a record that does not decode can only be damage, and a valid copy naming another
+    version is always a refusal.
+
+*The gate, read before anything writes.* `format::check_format(env, dir)` opens the record
+and, only when it is absent or unreadable, lists the directory. It writes nothing, creates
+nothing and traces nothing; three filesystem operations at a healthy start.
+- A record naming 2 is *recorded*. The record is *whole* when both copies are valid and the
+  length is 74.
+- A record naming another version is refused (`FormatRefused { found: Recorded(v) }`),
+  with the words "newer than format 2" or "this build reads format 2 only".
+- No record, and nothing else in the directory but `RAFT-FORMAT.tmp` (or no directory at
+  all), is *fresh*.
+- No record beside any of `CURRENT`, `CURRENT.tmp`, `MANIFEST-*`, `*.sst`, `*.wal`,
+  `RAFT-STORE`, `install` or `snap-*` is refused as format 1, 0.3.0's (`Unrecorded`).
+- No record beside only other names is refused as `Foreign`, naming them. It is not
+  started fresh, and not called format 1.
+- An unreadable record with nothing else is *fresh*.
+- An unreadable record beside anything else is *damaged*: lost state, never a format.
+
+*The writes.*
+- **A fresh directory's first write is its record**: tmp, sync, rename, directory sync,
+  before the engine or anything else creates an entry there. So every durable directory
+  holding any other entry holds the record, at every crash point (invariant I1).
+- **A record with one bad copy is healed at the start** by rewriting the whole record in
+  place with byte-identical content, then a sync.
+  - A torn prefix of identical bytes cannot damage the valid copy, and a lost sync leaves
+    the old bytes. So a heal never makes a readable record unreadable.
+  - A rename-based heal can, under a lost fsync, and does.
+- **An unreadable record is rewritten** (tmp and rename) only by the adoption, right after
+  its `CURRENT` switch and before the marker.
+- **Every checkpoint carries its own record**, written after `Engine::checkpoint`.
+  - A checkpoint is complete only when its `CURRENT` parses and its record reads 2.
+  - The sender streams the record first.
+  - `Assembler::verify` reads the staged record before any table and refuses a stream in
+    another format or with none.
+  - Both adoptions read the staged record before their first write: another version or
+    none is refused (`Subject::StagedInstall`); an unreadable one is staging damage
+    (`Damage::StagingFormatUnreadable`), refused and never swept (D-041).
+- The engine never reads, lists as its own or removes the record; nor do the adoption's
+  removals, the version sweep or the assembler's. The as-built adoption's copy loop skips
+  it.
+
+*The start* (`node::start_store`, shared by `run` and the tests), in this order:
+1. the gate: a refusal or a read error stops the server with nothing written;
+2. a fresh directory's record;
+3. the adoption, with its staged check (a format refusal stops the server; staging damage
+   is lost state);
+4. the heal;
+5. a damaged record not replaced by an adoption is lost state (`Damage::FormatUnreadable`);
+6. the marker (D-041, D-044);
+7. `Engine::open`, then `RaftStore::open`.
+
+`RaftStore::open` requires a `FormatChecked` token, which only the gate, the record's
+write and the start construct. The token carries its directory, compared with a new
+`Engine::dir()`, the engine's only change. `RaftStore::open_dir` runs the gate for callers
+outside the server.
+
+The gate now runs before the marker read. D-044's sentence that `refuse_lost_store` reads
+the marker before `CURRENT` still holds, since the gate reads neither. If D-044 is read as
+"the marker is read first at every start", this entry supersedes exactly that reading and
+nothing else.
+
+*The layout.*
+- **Keys.** A group's Raft state is `0 / <group: u64 BE> / <purpose: u64 BE> / name`
+  (`store::KeyPrefix::group`), with RAFT.md §3's table ids as purposes:
+  - 0: `hard`, `applied`, `reseeded`, `incarnation`;
+  - 1: the log, keys of 32 bytes;
+  - 2: `config`;
+  - 3: `snapshot`.
+- **Today's group** is **group 2** (`node::SINGLE_GROUP`), SHARD.md §2's range 2, which
+  holds what today's group replicates.
+- **Tenants.** User data is tenant 2 (`apply::USER_TENANT`). Tenant 1 is the system tenant
+  (`apply::SYSTEM_TENANT`), which nothing in Stage A writes. A range may span tenants.
+- **The version** is a file, inside no range's table, span checkpoint or range delete.
+- **Room for #21 and the descriptor.** Purposes 4 and up are unassigned. #21's session
+  table (Q11) and Stage C's descriptor each add keys under a new purpose or name and move
+  none. The unit test asserts purpose 4's span holds no key of this build's.
+- **No aliasing.** No key format 2 writes is a key 0.3.0 wrote. Format 2's tenant-0 keys
+  are 28 bytes or more; 0.3.0's are 20 to 24 bytes, or 27 bytes with an 11-byte name, and
+  no format-2 name is 3 bytes long. The gate, not the group id, keeps 0.3.0's keys unread;
+  this is the defence in depth, enumerated in a unit test.
+
+**The pairs.** The known-buggy orders are `StartOrder` values in node.rs, `#[doc(hidden)]`
+and not `core::Variant`s, since no sweep reaches them:
+
+| Order | What it does | Caught by, measured |
+|---|---|---|
+| `LostStateBeforeFormat` | D-059's first draft and the held check patch's order | the fixture's five lost-state shapes: 5 of 5 |
+| `FormatAfterFirstBatch` | the record written after the engine's open and the first batch | the first start's crash sweep: 16 of 40 seeds refused for the format, and I1 broken on the same 16 |
+| `HealByRename` | the heal by tmp and rename | the heal's crash test at `p_durable` 0.7: 3 of 40 seeds left the record unreadable, against 0 of 80 for the correct heal |
+| `UnreadableIsUnrecorded` | an unreadable record read as none | the damaged record's re-seed: the start stops the server instead |
+| `StagedFormatUnchecked` | the adoption without its staged check | a staged install recording format 3: adopted, and the store's tree changes |
+
+The codec's pair is a decoder without the checksum, which reads flips of the version's
+bytes as other versions.
+
+**Tests.**
+- **`crates/ananke-raft/tests/v030_store.rs`** (D-059's):
+  - `the_v0_3_0_store_fixture_holds_0_3_0_state_under_0_3_0_keys`
+  - `the_v0_3_0_tags_store_is_refused_before_anything_writes`
+  - `a_server_on_the_v0_3_0_store_stops_and_changes_no_byte`
+  - `a_v0_3_0_store_that_lost_state_is_refused_for_its_format_never_reseeded`
+  - `a_v0_3_0_store_on_a_real_filesystem_is_refused_and_left_untouched`
+- **`crates/ananke-raft/tests/format.rs`:**
+  - `the_format_record_survives_one_flip_and_never_reads_as_another_version`: 592 flips,
+    87 616 flip pairs across the copies, every truncation, and the conflicting record
+  - `a_store_this_build_writes_records_format_2_and_opens_again`
+  - `a_store_recording_format_1_or_3_is_refused_naming_both_and_left_untouched`
+  - `a_directory_without_a_record_is_refused_or_fresh_by_what_it_holds`
+  - `a_crash_in_a_fresh_stores_first_open_never_leaves_it_refused_for_its_format`
+  - `a_record_with_one_bad_copy_is_healed_in_place_and_a_crash_never_loses_the_other_copy`
+  - `an_unreadable_record_beside_a_store_is_lost_state_and_the_adoption_rewrites_it`
+  - `the_format_record_survives_the_engine_the_adoptions_and_the_sweeps`
+  - `a_checkpoint_carries_its_record_and_a_stream_of_another_format_is_refused_unread`
+- **`crates/ananke-raft/tests/node.rs`:**
+  `a_server_whose_store_lost_state_asks_to_be_reseeded_and_grants_nothing`, extended: the
+  record is `Recorded { whole: true }` before the start and its bytes are unchanged
+  through the refusal, with no `RaftServerFailed`; and
+  `a_store_whose_log_record_rotted_reseeds_and_keeps_its_record`.
+- **Unit tests in `store.rs`:**
+  `every_raft_key_lies_under_its_group_prefix_and_purpose`,
+  `no_format_2_key_has_a_0_3_0_shape`,
+  `user_keys_are_tenant_2_and_tenant_1_is_the_system_tenant`,
+  `the_single_group_prefix_is_0_2`; and in `tests/store.rs`
+  `two_group_prefixes_share_one_engine_and_nothing_else`,
+  `a_log_key_of_another_length_under_the_log_purpose_refuses_the_open`,
+  `user_keys_are_tenant_2_and_tenant_1_stays_empty`.
+- The heal's pair is asserted *caught*, over 160 seeds, and its rate is printed beside it
+  and not asserted. The owner's rule of 2026-09-15 moves a thin catch to the tier whose
+  seeds support it, and a fixed seed set inside a crate test has no tier to move to: it
+  runs the same seeds at every one (D-061's carve-out). A floor on the rate of such a set
+  fails a tree with nothing wrong the next time the schedules are redrawn, which is what
+  this entry did to every one of them. Measured: 7 of 160 unreadable under the pair,
+  against the in-place heal's 0 of 320. The set is listed in D-061's table.
+
+**What moved.**
+- **Why.** The record's operations and inodes, the stream's extra file and eight more bytes
+  on every Raft key move the simulated disk's latency, torn-write and bit-rot draws.
+- **Moved:** every schedule of `sim/raft.rs`, `sim/membership.rs` and `sim/quorum.rs`, and
+  with them every pinned seed of `sim/tests/raft.rs` and the seeded tests of ananke-raft's
+  test binaries. Measured on the branch's base for this commit, `8717a71` (Stage A's lanes
+  S and N, D-056's queue, D-058 and D-061), and on the tree of this commit: the raft
+  scenario's seed-42 trace hashes `64fc3b553a9e80c2` before and `ab289ace35a8415f` after,
+  the membership scenario's `bac1e6936795e5c0` and `9c88d575d39acd76`, and the re-seed
+  scenario's `84d6b14ed6d684ab`/`eedef54307ed8c23` and `0d9167f75474e730`/`d8d63ed0109360ec` (the whole trace as
+  written, header included, as `moirae_trace::trace_hash` takes it; `scratchpad
+  stage-a/l/reaudit/hashes-*.log`). Both columns are measured the same way on the two
+  trees, so the comparison holds; unlike echo's golden, which `sim/tests/echo.rs` takes
+  over the trace *without* its header, these values move with the crate version in the
+  header and are not goldens.
+  On the lane's own base, 903f37c, before the queue, the raft hash was `810bcc9bb59159e2`.
+- **Not moved,** measured on the same two trees: `sim/engine.rs` seed 42, `sim/wal.rs` seed
+  42 and echo's golden, `fcbe82ee7a0ba672`, which `sim/tests/echo.rs` asserts and which is
+  green. The engine gains one accessor, `Engine::dir()`, which does no I/O and which no
+  sweep calls, and `ananke-env` is untouched; the engine, WAL and echo sweeps print the same
+  rates at a thousand seeds as `2ec4bf7` did for D-061's table (below).
+
+**The cost in time.** SHARD.md §12's shared rules (docs/SHARD.md:2041-2045) ask each stage
+to record its measured premerge beside the last one measured and to size its new scenarios'
+seed shares to stay near D-040's quarter of an hour. `scripts/premerge.sh` at a thousand
+seeds, on the tree the review's commits leave, measured as D-052 and D-055 measured it —
+a warm release build first, the one-minute load sampled every 15 s across the run:
+**593.87 s** real (9 min 53.9 s), 68 min 5.0 s user and 2 min 39.1 s sys, at a **mean
+one-minute load of 20.87** over 46 samples (10.12 to 49.75; another lane built on the
+machine through part of it), against D-055's **540.37 s** at a mean load of 17.64 on
+3787528 and D-052's 374.64 s on 1ef6d7e. Per binary: `sim/tests/raft.rs` **347.76 s**
+(306.86 s at D-055), `sim/tests/engine.rs` **232.34 s** (213.06 s), the WAL binary 8.48 s,
+`sim/tests/echo_cluster.rs` 2.43 s, everything else under 1.2 s each, and ananke-raft's
+four test binaries 0.36 s together, since their seed sets are fixed (D-061). So the
+layout, the record and D-056's queue together cost about a tenth of the tier's wall time,
+almost all of it in the raft binary, which is where they change every store write:
+**the tier is still inside D-040's quarter of an hour, and no seed share needs resizing.**
+The whole suite at a hundred seeds in release takes 86.4 s.
+A premerge attempted earlier on the same code, while two lanes were building and the load
+reached 89, timed the engine binary alone at 535.69 s and never finished; read as a
+budget it said the tier had blown the quarter of an hour by three quarters, and it had
+not — the same binary on the same sweep takes 232.34 s on a moderately loaded machine.
+A premerge time means nothing without the load beside it, which is why D-052's protocol
+records one. The same caution applies to the two figures above: this run's mean load is
+about a fifth higher than D-055's, so part of the 10 % is the machine and not the tree,
+and neither number is precise enough to re-scale D-055's nightly projection from. Taken at
+face value the engine binary's 232.34 s would move that projection from about 2 h 45 min
+to about 2 h 51 min against the job's 300-minute timeout — the same picture, and the same
+answer: **issue #57**, which the owner asked for on 2026-09-15.
+
+**The re-audit of every pinned seed.** CLAUDE.md:58-67: a commit that moves a schedule
+re-audits every pinned seed it moves, and a pin asserts its mechanism or the absence of its
+situation with the reason, never a bare green. Every pinned test of `sim/tests/raft.rs` was
+run, its trace read, and its assertions and its prose rewritten to what the seed now does.
+
+| Pinned seed | What it did before | What it does now, asserted |
+| --- | --- | --- |
+| 164 | no snapshot-fed timer gap, over three refusals | the same absence; the replay finds no gap at all, over four refusals (server 2's for lost state at 6.405597155 s and server 3's three from 8.66689086 s) |
+| 385 | no gap for a restatement to rescue, over five refusals | the same absence, and the run now holds **no refusal at all**, over seven crashes and six isolations |
+| 7381 | the two floor rules agree; one refusal, server 2's at 12.575 s | the same; one refusal, server 1's at 6.396598792 s for lost state (table 1), and `floor_lowering_installs` empty, which is the agreement itself |
+| 6325 (correct and as built) | no crash inside an adoption window; 8 and 9 windows | the same absence; 6 and 6 windows, and the schedule's first crash now lands 691 ms *before* server 1's next adoption under the correct server and 712 ms before it as built |
+| 5909, correct | D-042's refusal, reset and re-seed on server 1 | **the mechanism, on server 3**: refused at 9.793751132 s, progress reset at 9.798229515 s, re-seeded at 10.218206571 s |
+| 5909, the pair and each half | stale progress under `IgnoreIncarnation` alone; none under the pair | **the mechanism on each**: server 3 stale under `IgnoreIncarnation` (leader 1 of term 9, 229 matched, 105 probes, 106 rejections), server 1 stale under the pair with server 1 alone uncounted after the heal, nothing stale under `SharedSnapshotDir`; no run takes one index twice (32, 33, 18 and 37 takes), so the stream half is out of reach on all three |
+| 132 | the pair's liveness catch, with the wedge's mechanism | **the absence, with the reason**: the pair, both halves and the correct server all pass; no run takes one index twice (31, 31, 15 and 24 takes) and the pair's two runs are refusal-free, so the pair's trace is the stream half's record for record. The search over seeds 0..1000 found the pair caught on **0 of 1000** and each half on 0 |
+| 680 | the pair passes; `IgnoreIncarnation` alone leaves server 1 stale | the pair now leaves server 3 stale and only it uncounted after the heal; `SharedSnapshotDir` alone and the correct server refuse server 3 at 17.852606007 s and 12.162591955 s, reset and re-seed it; and under the pair and the stream half alone the seed **does** reach the stream half's shape — 73 takes, 37 at an index already taken, 7 of those under a live stream, every one of them a stream the follower still installs at afterwards, which the pin asserts |
+| 687 | as built, the first half; under the correct server, the quiesce | as built, the first half again (table 44 dropped, refused at 18.109367393 s, two crashes on the refused server, two restarts, nothing laundered); under the correct server **the absence with its reason** — no table dropped, no engine quiesced, no lost-state refusal, its two refusals being damage found before the engine could lose anything |
+| **158 (new)** | — | **the pin `RefusalNotDurable` needed**: the first of the thousand's 9 catches, with the laundered store's restatement as built (table 87, manifest 15 without it, segments deleted, a clean open at applied 423) *and* D-044's own mechanism under the correct server on the same seed (table 94, the engine quiesced at 21.378303251 s, the refusal traced at 21.382950125 s, three crashes on the refused server each refused again on the durable mark, nothing flushed until the install at 22.202624757 s) |
+| 119 | `RefusalNotDurable`'s catch | **the absence with its reason**: no store is refused at all on the run, so the variant has nothing to change and its trace is the correct server's record for record |
+| 1885, 2023 | no term change straddles an isolation's start | the same absence, re-measured: on 1885 server 1 is not isolated at 15.203 s and holds term 9 across that stretch; on 2023 it is cut off from 19.37 s, not 19.22 s, and keeps term 13 through the window |
+| the nightly's eleven variant catches | no straddle; no uncounted step-down on any | no straddle, and the two seeds whose named isolation still comes are the same (5203, 6691); seed 1252 now steps a leader down leaving a follower uncounted, which the test asserts by seed rather than forbidding outright |
+| the 28 removed catches | no catch to remove; six kept their isolation; seed 6717 the one catch | no catch to remove; **five** keep their isolation (5203, 6691, 5051, 5879, 2578); seed 5153's own gap is gone and the five the replay finds there are on a run the timer bound is not asked of (§2's carve-out, D-035); **seed 2305** under `SnapshotWithoutCurrentLast` is now caught by state machine safety over its own bug, asserted |
+| term-raise seed 1 | D-050's shape, one change received before its isolation | **D-047's straddle**: four rises decided before their isolations and traced inside them, the first server 2's from term 1 at 1.21785 s |
+| term-raise seed 4 | D-047's straddle, seven rises | **D-050's shape again**, which it held before D-056: server 3's change from term 4 to 5, received 7.362 µs before the isolation at 2.85382 s and stepped 12.88 µs into it |
+
+Two pins changed their names with what they assert:
+`seed_119_…_which_a_hundred_seeds_can_miss` becomes `seed_158_…`, with
+`seed_119_which_pinned_the_refusal_that_is_not_durable_before_the_layout_refuses_nothing`
+beside it; `seed_132_pins_the_combined_variant_…` becomes
+`seed_132_which_pinned_the_combined_variant_before_the_layout_reaches_no_wedge`; and seeds
+1 and 4 of the term-raise schedule exchange their test names with their shapes.
+`assert_stream_wedge`, the helper that read the wedge off seed 132's trace, is removed with
+the wedge: no seed of the first thousand is *caught* on this tree.
+
+*Corrected after this entry landed.* The rows above for seeds 5909, 132 and 680 read "no
+run takes a snapshot" from `Report::snapshot_takes`, which pairs a take's record with the
+checkpoint its take wrote. This entry's own checkpoint format record put an awaited write
+between those two records, and the fold asked them to carry the same instant, so it
+answered empty on every seed of every variant and the three pins asserted nothing. The
+fold pairs by node and claim now, the rows say what the seeds do, and the wedge's stream
+half turns out to be built often: under `SharedSnapshotDir` a re-take lands under a live
+stream on 180 of the first thousand seeds and the follower never installs at that index
+afterwards on 135 of them, against the correct server's 0 of a thousand. None of them
+stalls a commit, so none is caught; the sweep asserts the shape from the hundred-seed
+tier.
+
+**Alternatives.**
+- *The version as the engine key `0`, read after the engine's open and after lost state*
+  (D-059's first draft, 9e90eed, and its held patch).
+  - It writes a new segment into a refused store.
+  - It re-seeds a 0.3.0 store that lost state.
+  - Measured on that change alone: every pinned raft run moved and nine pinned tests failed
+    at the gate.
+  - It is the pair `LostStateBeforeFormat`.
+- *The engine key read by a new read-only recovery* (`Engine::inspect`).
+  - It is a second recovery that must agree with the first forever, and it reads every
+    table twice per start.
+  - A loss that takes the key makes format 2 and format 1 the same bytes, so a damaged
+    0.3.0 store without a surviving 0.3.0 key would re-seed.
+  - 0.3.0 directories holding only a marker or an empty engine open fresh.
+  - One dropped table defeats "refuse newer".
+- *The engine key beside the file, checked in `RaftStore::open` after lost state.* Under
+  `RefusalNotDurable` the flusher launders a dropped table holding the key into a store with
+  no damage, and the key rule then refuses a format-2 store as format 1. Checking a staged
+  key would add table reads to both adoptions and change D-041's classification of a rotted
+  staged table.
+- *A manifest field*: the engine names no layout; a rotted `CURRENT` hides it; it moves the
+  engine sweep.
+- *The version in `RAFT-STORE`*: written after the first open, rewritten in place at every
+  refusal, and 0.3.0 wrote markers.
+- *One copy, plain text, or no CRC*: a flip reads 2 as 3, or one rot re-seeds and
+  quarantines a voter for good (D-035).
+- *Two copies without a heal*: one rot from a re-seed for life.
+- *The heal by tmp and rename*: it can lose the surviving copy under a lost fsync.
+- *An unreadable record alone counted as lost state*: a lost fsync on a new node's first
+  write would re-seed a node holding nothing.
+- *A fresh directory as one holding no store-family name*: a store started in a directory
+  holding things nobody identified.
+- *The record streamed last*: under `SnapshotWithoutCurrentLast` a staged `CURRENT` could
+  precede it, changing that variant's catch.
+- *A missing staged record as staging damage*: a re-seed would discard, unread, an install
+  of unknown format. It is unreachable for this build's stagings, and stopping writes
+  nothing.
+- *The adoption rewriting a damaged record before its copies*: it would label the old
+  store, of unknown format, as format 2.
+- *An unreadable record refused before the adoption*: the re-seeded install would never be
+  adopted.
+- *No proof token*: any other caller of `RaftStore::open` could read an ungated store's
+  keys.
+- *Group 0 for today's group*: range 0 is §2's root; kept as question 3.
+- *The prefix in `NodeConfig`*: churns every configuration for a constant Stage B
+  replaces.
+- *A trace event for the record's writes*: question 5.
+- *Migration*: ruled out (D-059).
+
+**Consequences.**
+- *The format break, for the release notes of the release that ships this* (Q5, condition
+  3): stores written by ananke-raft 0.3.0 are refused at open, naming format 1 and format
+  2, and must be discarded or rebuilt; there is no migration. No release-notes file exists
+  in the tree, so this entry is the record until one does.
+- A crash in a fresh store's first start can leave it refused as lost exactly where it
+  could before — the engine's own rule for a manifest without a `CURRENT` (D-024) — and
+  never refused for its format. The record's *own* cost in re-seeds is counted apart from
+  the engine's and is **0 of 200 seeds** on a disk that keeps its syncs; at `p_durable`
+  0.7, which no Raft scenario models, it is 7 of 200.
+- Under a lost fsync, which the Raft scenarios do not model, a new node's record may be
+  torn beside its first engine files. It then re-seeds.
+- A directory holding foreign entries (`lost+found`, `.DS_Store`) is refused. Operators
+  point the store at an empty directory. The refusal names at most eight of them.
+- A healthy format-2 store whose `RAFT-FORMAT` file is *removed* — not damaged, removed —
+  is refused as 0.3.0's and the server stops for good, where a store whose record is
+  damaged beside it is lost state and re-seeds. Nothing in this build removes it (the
+  sweeps enter only `snap-*`, `is_store_file` excludes it, the as-built copy loop skips it)
+  and a synced directory entry is never lost in the simulator, so it is an operator's
+  action or a real filesystem's loss. Question 1 below is where that asymmetry is put.
+- Clusters on different formats cannot stream snapshots to each other. The next format bump
+  needs a rolling-upgrade decision.
+- Stage B's per-range stream must carry and check a record (the permanence rule).
+- Stage C's descriptor must either bump the format or refuse a range table without a
+  descriptor, since a format-2 store's group 2 would otherwise look like a range 2 replica
+  missing only its descriptor.
+- Every start reads the record: three filesystem operations when it is whole.
+- node.rs's comment that the as-built adoption's disk sees exactly the nightly's operations
+  is amended. The gate runs under every variant.
+- A variant pair not swept today, `{SharedSnapshotDir, SnapshotWithoutCurrentLast}`, could
+  stage a `CURRENT` from a stream whose listing lacked the record. The adoption would then
+  stop the server rather than adopt.
+- SHARD.md's citations of store.rs and apply.rs describe the tree before this commit, and
+  so do its sixteen citations of RAFT.md lines 450 and above
+  (`grep -nE "RAFT\.md:(4[5-9][0-9]|[5-9][0-9][0-9])" docs/SHARD.md`): item 1's correction
+  and this commit inserted at RAFT.md +455, +466, +541, +702 and +708 and took the file
+  from 721 lines to 770, so those citations land a few lines off or on other prose. The
+  approved plan is not edited; the integrator or the owner refreshes them.
+- Issue notes, not code:
+  - the store directory's entry is never fsynced in its parent;
+  - `valid_name` accepts `RAFT-*` chunk names;
+  - the RealEnv test cannot check modification times or a read-only directory, since
+    `std::fs::metadata` and `std::fs::set_permissions` are banned outside `ananke-env`
+    (clippy.toml, `scripts/check-direct-io.sh`); it checks every name, size and byte.
+
+**Questions for the owner.** Each of questions 1 to 5 is resolved above the conservative
+way and none of them blocks. Question 6 is different: it is the escalation SHARD.md
+§12's own rule (docs/SHARD.md:2356-2364) makes when a schedule move leaves a pair with no
+catch, so what is conservative about it — leaving the pair asserted-absent on seed 132 —
+is stated inside the question rather than settled above it, and whether it blocks Stage A's
+exit is the owner's call, not this entry's.
+1. **An unreadable record beside a store.** "Refuse newer" and "nothing written to a
+   refused store" cannot be checked when the record no longer says its version. D-044 and
+   the requirement that a format-2 store whose version record is lost still re-seeds call
+   for lost state instead.
+   - Taken: lost state, a lost mark and a re-seed. It needs two independent rots.
+   - The cost: a newer-format store in that state, after a downgrade, is replaced rather
+     than refused.
+   - Does "nothing is written to a refused store" cover this store, or only a store
+     refused for its format?
+2. A directory with entries but no store file and no record is refused as `Foreign` rather
+   than started fresh. Confirm.
+3. Today's group is group 2 (§2's range 2) rather than group 0. Confirm, with the Stage C
+   consequence above.
+4. The gate, the staged check, the record's writes and the stream's order apply under
+   every variant, `AdoptionAsBuilt` and `RefusalNotDurable` included. Confirm.
+5. The record's write, heal and rewrite are untraced, like the marker's. A
+   `RaftFormatRecorded` event would add an ananke-env variant and a moirae line. Add one?
+6. **The pair `{IgnoreIncarnation, SharedSnapshotDir}` has no catch on this tree.** The
+   search SHARD.md:2356-2364 asks for at a schedule move found the pair caught on 0 of the
+   first thousand seeds and each half on 0, so seed 132 asserts an absence and no seed
+   pins the pair's catch. The plan says that goes to the owner, and this is it. The stream
+   half's *shape* is reached often (135 of a thousand, above) and the sweep now asserts it;
+   what is missing is a catch. Leave it asserted-absent, search the nightly's ten thousand,
+   or aim an arm at the wedge as `RefusedCountsForQuorum` has a directed scenario?
+   **What the stage's green nightlies add to the question** (runs 35161762372 and
+   35172923002, the same figures in both): at ten thousand seeds **each half is caught**,
+   where at a thousand both were 0. `IgnoreIncarnation` is caught on **1 of 10 000**, seed
+   5220, by linearizability — "caught on 1 of 10000 seeds, 0 progress resets, a refused
+   follower re-seeded and applying again on 6283 seeds" — and `SharedSnapshotDir` on **5 of
+   10 000**, first seed 3300, 3 by linearizability and 2 by the liveness check. So of the
+   three options above, "search the nightly's ten thousand" is the one with evidence behind
+   it: the band where each half catches at all is the band a pair search would have to run
+   in, and the thousand-seed search that found nothing was looking below it. That is not an
+   answer — the pair itself is run at no tier, so nothing here says the pair catches
+   anywhere in the ten thousand, and at 1 in 10 000 and 5 in 10 000 a pair search could as
+   easily come back empty and cost a nightly to learn it. The question stays the owner's.
+
+---
+
+## D-061 — A catch or a coverage state seen on under 5 % of seeds is asserted from the thousand-seed tier
+
+**Context.** A sweep's "caught on some seed" and a coverage counter's "seen above zero" are
+draws. The seeds are fixed, so an assertion that a thin rate happens to meet on the gate's
+twenty passes every gate until a change redraws the schedules, and then fails a tree with
+nothing wrong. D-041 and D-044 gave such catches the hundred-seed tier. In its answers of
+2026-09-15 the owner moved `RefusalNotDurable`'s catch, 1.32 % at the nightlies, to the
+thousand-seed tier (D-056) and `reverts_to_a_prefix`, 2.8 %, likewise (D-058), and made it a
+rule, in answer 1: "Add a general rule to CLAUDE.md: a variant caught on under 5% of seeds
+asserts its catch at the premerge tier, never at the gate tier — the assertion belongs where
+the statistics support it. Audit the other variants against that rule and move any that are
+similarly fragile." The tiers are D-040's: 20 seeds at the gate, 100 in CI, 1 000 under
+`scripts/premerge.sh`, 10 000 in the nightly.
+
+**Decision — the owner's of 2026-09-15.** The rule is in CLAUDE.md's working agreements
+beside the pair rule and the pinned-seed rule, read as the owner applied it to
+`RefusalNotDurable`:
+
+- A variant caught on under 5 % of seeds asserts its catch when `seeds() >= 1000`, the
+  premerge and the nightly, and never at the gate's 20 or CI's 100.
+- Its firing, the fault injected or the shape it aims at reached, is still asserted at every
+  tier where that is itself well above 5 %, and the catch rate is printed at every tier.
+- The rate is over the seeds the assertion actually sees. A variant that `high_rate_share`
+  runs on a share of the tier, 20, 20, 100 and 1 000 seeds, is counted over that share. The
+  incremental checker compares `min(seeds, 100)`. A counter of events counts the seeds that
+  saw one, not the events.
+- A coverage counter asserted above zero, a state the correct server's sweep must reach, is
+  the same draw as a catch; it is what the owner moved in `reverts_to_a_prefix`. This entry
+  applies the 5 % rule to every such counter as the owner's "move any that are similarly
+  fragile".
+- A rate at or above 5 % stays at its tier.
+
+Out of the rule's scope: assertions made of every seed ("on every seed", "caught on every
+seed", a count equal to zero), pinned seeds, which CLAUDE.md's pinned-seed rule governs, and
+the fixed seed sets inside crate tests. Those sets run the same seeds at every tier, so they
+have no tier to move to; they are listed at the end with their figures.
+
+**How it was measured.** On 2ec4bf7, the tree with D-056's send queue, which moved every
+raft schedule, so no older rate is this tree's. Probe copies of the sweeps' test files
+printed each seed's coverage: `sim/tests/zz_audit_{wal,engine,raft,echo}.rs`, each the
+committed file plus `eprintln!` lines, deleted from the tree and never committed. They ran
+in release at `ANANKE_SEEDS=1000`, and the engine's deep-levels test at
+`ANANKE_DEEP_SEEDS=1000`, the nightly's count. The crate tests with fixed seed sets ran
+in debug with a count printed and were restored with `git checkout`. Everything is in
+`scratchpad stage-a/q/audit`:
+
+- `measure-1000.sh` runs the probes; their output is in `m1000-zz_audit_{wal,engine,raft}.log`,
+  `m1000-zz_audit_echo.log`, `m1000-echo-sweep.log` and `deep1000-zz_audit_engine.log`.
+- `parse_probe.py` gives the per-seed counts, in `m1000-{wal,engine,raft}-perseed.txt`.
+- `crate-fixed-loops.log` holds the fixed seed sets, and `probes/` the probe files.
+
+The ten-thousand-seed figures come from the last two green nightlies. Run 34908018220 ran
+on 0557590 and run 34948461479 on 94c6a54 (`nightly-<run>.clean.log`). They print the same
+figures, except that 94c6a54 predates D-050's term-raise schedule. Both trees predate
+D-056's queue, Stage A's lanes S and N (no install, range delete or seek in the engine
+sweep) and D-058, so they are other schedules. Where the nightly prints events rather than
+seeds, the seeds that saw one are at most that many, given as "≤". P(none) = (1 − p)^n,
+where p is the rate at 1 000 and n is the number of seeds the assertion sees at the lowest
+tier it is asserted at; "~0" is below 10^-12.
+
+**The audit.** Seeds seen are given at the gate, CI, the premerge and the nightly. Tiers are
+"every" (from the gate's twenty), "≥ 100", "≥ 1 000" and "≥ 10 000". Line numbers are on the
+commit that lands this entry, 8717a71; a3beb04 moved `sim/tests/raft.rs` and ananke-raft's
+test binaries, and the review commits after it moved them again, so read the names rather
+than the numbers.
+
+| Assertion | Where | Seeds seen | At 1 000, 2ec4bf7 | At 10 000, the older nightlies | At 10 000, run 35172923002 (27f6c97) | Tier before → after | P(none) at its tier |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Echo: pongs received, both journals | sim/tests/echo.rs:97 | 20 / 100 / 1 000 / 10 000 | 1 000 (100 %) | not printed | not printed | every → every | ~0 |
+| Echo `NoSyncDir`, every fault seen: bit rot, corrupt records, torn writes, lost directory entries, a vanished journal | echo.rs:190 | 20 / 100 / 1 000 / 10 000 | 670, 329, 452, 876, 433 | 6 827, 3 350, 4 593, 8 622, 4 323 | 6 827, 3 350, 4 593, 8 622, 4 323 — the same five | every → every | 3.4 × 10^-4 (corrupt records) |
+| Echo correct journal, disk faults seen: bit rot, corrupt records, torn writes, torn files at replay | echo.rs:172 | 20 / 100 / 1 000 / 10 000 | 670, 409, 452, 452 | 6 827, 4 289, 4 593, 4 593 | 6 827, 4 289, 4 593, 4 593 — the same four | every → every | 2.7 × 10^-5 |
+| WAL variants caught: `NoSyncDir`, `NoChecksum`, `AckBeforeSync` | wal.rs:67 (72, 77, 82) | 20 / 100 / 1 000 / 10 000 | 909, 964, 1 000 | 9 150, 9 744, 10 000 | 9 150, 9 744, 10 000 — the same three | every → every | ~0 |
+| WAL coverage: torn writes, lost fsyncs, bit rot, stops at a torn record, stops at a bad checksum, discarded segments, the lost-fsync excuse, the bit-rot excuse | wal.rs:144 | 20 / 100 / 1 000 / 10 000 | 1 000, 1 000, 1 000, 977, 999, 1 000, 994, 994 | 9 999, 10 000, 10 000 seeds; the rest thousands of epochs | 9 999, 10 000, 10 000 seeds; 29 026, 40 607, 68 533, 37 804, 32 074 over 80 000 epochs | every → every | ~0 |
+| WAL: a gap | wal.rs:152 | 20 / 100 / 1 000 / 10 000 | 51 (5.1 %) | 615 epochs, ≤ 6.2 % | 615 epochs, ≤ 6.2 % | ≥ 100 → ≥ 100 | 0.0053 |
+| **WAL: the betrayed-cut excuse** | wal.rs:165 | 20 / 100 / 1 000 / 10 000 | 34 (3.4 %) | 401 epochs, ≤ 4.0 % | 401 epochs, ≤ 4.0 % | **every → ≥ 1 000** | 0.50 at 20 → 9.5 × 10^-16 |
+| **WAL: a betrayed cut — a cut of recovery's own whose sync the disk lied about** (D-062) | wal.rs:193 | 20 / 100 / 1 000 / 10 000 | **765 (76.5 %)**, on the D-062 tree, not 2ec4bf7 | not on those trees: the counter is D-062's | **7 806 epochs, ≤ 78 %** | **new → every** | 2.6 × 10^-13 (0.235²⁰) |
+| **WAL: a betrayed cut to nothing**, which resurrects a whole segment (D-062) | wal.rs:208 | 20 / 100 / 1 000 / 10 000 | **60 (6.0 %)**, on the D-062 tree | not on those trees: the counter is D-062's | **579 epochs, ≤ 5.8 %** | **new → ≥ 100** | 0.0021 at 100 (0.94¹⁰⁰); 0.29 at 20, where the twenty in fact see none |
+| **WAL: a supersede, the rule itself firing** (D-062) | printed with the coverage, wal.rs:46 | 20 / 100 / 1 000 / 10 000 | **0 of 1 000**, on the D-062 tree | not on those trees: the counter is D-062's | **0 of the sweep's 10 000 seeds (80 000 epochs)** | **new → asserted nowhere; printed at every tier** | not asserted. At the engine seek sweep's measured 1 in 10 000 a thousand seeds see none with probability 0.90, so no tier can carry it; seed 3123's pin carries it instead |
+| Engine Phase 1 variants caught: `NoWalBeforeMemtable`, `ReleaseBeforeManifest`, `DeleteBeforeManifest` | engine.rs:553 (558, 563, 568) | 20 / 100 / 1 000 / 10 000 | 985, 602, 647 | 9 825, 6 482, 5 893 | 9 823, 6 254, 6 473 | every → every | 9.9 × 10^-9 |
+| Engine `InstallInTwoSwitches` caught | engine.rs:296 | 20 / 100 / 1 000 / 10 000 | 559 | not on those trees | 5 457 | every → every | 7.7 × 10^-8 |
+| Engine `RangeDeleteSkipsMemtables` caught, on the share | engine.rs:359 | 20 / 20 / 100 / 1 000 | 89 of 100 | not on those trees | 933 of its 1 000 | every → every | 6.7 × 10^-20 |
+| Engine `SeekCountsTombstones` caught, on the share | engine.rs:422 | 20 / 20 / 100 / 1 000 | 98 of 100 | not on those trees | 972 of its 1 000 | every → every | ~0 |
+| Engine `InstallKeepsSourceNumbers` caught by the oracle, on the share | engine.rs:489 | 20 / 20 / 100 / 1 000 | 98 of 100 | not on those trees | 974 of its 1 000, and 1 by the writer's order assertion | every → every | ~0 |
+| Engine `SpanCheckpointUnsynced` caught, on the share | engine.rs:530 | 20 / 20 / 100 / 1 000 | 81 of 100 | not on those trees | 816 of its 1 000 | every → every | 3.8 × 10^-15 |
+| Engine coverage, 29 counters: live reads, scans, rotations, flushes, crashes mid-flush, recoveries that replayed, excused losses, lost fsyncs, bit rot, torn writes, tables written, segments deleted, orphans removed, tables dropped, manifest fallbacks, missing log heads, batches, unsynced writes, checkpoints opened after a crash, compactions, compactions below level 0, inputs deleted, writes dropped, tombstones dropped, installs, range deletes, span checkpoints, seeks, recovery seeks | engine.rs:774 | 20 / 100 / 1 000 / 10 000 | 1 000, 1 000, 990, 983, 965, 970, 964, 1 000, 988, 997, 988, 983, 956, 831, 818, 704, 999, 1 000, 819, 976, 973, 981, 976, 976, 977, 961, 993, 1 000, 971 | the first 24 above zero (lost fsyncs 9 998, bit rot 9 906, torn writes 9 972 seeds); the last five not on those trees | all 29 above zero: lost fsyncs 9 999, bit rot 9 920, torn writes 9 976 seeds; missing log heads 11 973; the last five now printed — installs 58 901, range deletes 40 672, span checkpoints 82 264, seeks 1 999 417, recovery seeks 758 002 | every → every | 2.7 × 10^-11 (missing log heads) |
+| Engine: a crash inside a compaction | engine.rs:780 | 20 / 100 / 1 000 / 10 000 | 742 | 6 202 events | 13 504 events | ≥ 100 → ≥ 100 | ~0 |
+| Engine: a store refused for a fault | engine.rs:784 | 20 / 100 / 1 000 / 10 000 | 162 (16.2 %) | 1 146 (11.5 %) | 1 668 events, ≤ 16.7 % | ≥ 100 → ≥ 100 | 2.1 × 10^-8 |
+| Live install: span checkpoints verified, live reads over an install | engine.rs:232, 233 | 20 / 100 / 1 000 / 10 000 | 977, 998 | not on those trees | 59 164 and 2 020 152 events | every → every | ~0 |
+| Live install's windows: aimed, between replacement and switch, after the switch, keys written after | engine.rs:256–265 (from 230) | 20 / 100 / 1 000 / 10 000 | 1 000, 490, 411, 990 | not on those trees | 73 255, 6 403, 4 758, 1 649 955 events | every → every | 2.5 × 10^-5 |
+| Range delete's windows, the same four | engine.rs:256–265 (from 330) | 20 / 100 / 1 000 / 10 000 | 1 000, 497, 377, 984 | not on those trees | 73 899, 6 187, 4 569, 2 606 393 events | every → every | 7.8 × 10^-5 |
+| Seek: a seek stopped at its limit, a recovery walked | engine.rs:394, 395 | 20 / 100 / 1 000 / 10 000 | 999, 972 | not on those trees | 1 355 458 and 807 889 of 2 017 057 live seeks | every → every | ~0 |
+| Deep levels: a round from level 2 or deeper, level 3 reached | engine.rs:177, 181 | 0 / 0 / 0 / 1 000 deep seeds | 965, 965 of 1 000 deep seeds | 10 132 rounds, deepest 3 | 11 609 rounds, deepest 3 | nightly only → nightly only | ~0 |
+| Raft variants caught: `SendBeforePersist`, `ApplyBeforeCommit`, `CountOlderTermForCommit`, `TruncateOnEveryAppend`, `ResetTimerOnAnyRpc`, `SnapshotWithoutCurrentLast` | raft.rs:1736 (1926–1957) | 20 / 100 / 1 000 / 10 000 | 1 000, 882, 454, 1 000, 336, 336 | 10 000, 8 902, 4 415, 9 995, 3 465, 3 302 | 10 000, 8 843, 4 359, 9 996, 3 548, 3 371 | every → every | 2.8 × 10^-4 |
+| `NoPreVote` caught by the pre-vote check | raft.rs:1918 | 20 / 100 / 1 000 / 10 000 | 1 000 | 9 999 | 9 998 | every → every | ~0 |
+| D-050's term-raise shape reached | raft.rs:1471 | 20 / 100 / 1 000 / 10 000 | 298 | 2 893 (0557590 only) | 2 833 | every → every | 8.4 × 10^-4 |
+| `NoPreVote` caught on the term-raise schedule | raft.rs:1637 | 20 / 100 / 1 000 / 10 000 | 1 000 | 10 000 (0557590 only) | 10 000 | every → every | ~0 |
+| `AdoptionAsBuilt`'s firing: the storm drawn, adoptions under it | raft.rs:2004, 2008 | 20 / 100 / 1 000 / 10 000 | 260, 1 000 | 2 529 seeds; 84 582 adoptions | 2 529 seeds; 87 456 adoptions | every → every | 2.4 × 10^-3 |
+| `AdoptionAsBuilt` caught | raft.rs:2013 | 20 / 100 / 1 000 / 10 000 | 77 (7.7 %) | 646 (6.46 %) | 637 (6.37 %) | ≥ 100 → ≥ 100 | 3.3 × 10^-4 |
+| `RefusalNotDurable`'s firing: a crash on a refused server | raft.rs:2050 | 20 / 100 / 1 000 / 10 000 | 347 | 3 318 | 3 371 | every → every | 2.0 × 10^-4 |
+| `RefusalNotDurable` caught | raft.rs:2074 | 20 / 100 / 1 000 / 10 000 | 16 (1.6 %) | 133 (1.33 %) | 129 (1.29 %) | ≥ 100 → ≥ 1 000, by the owner (D-056) | 9.9 × 10^-8 |
+| `IgnoreIncarnation`: a refused follower re-seeded and applying | raft.rs:2358 | 20 / 100 / 1 000 / 10 000 | 659 | 6 353 | 6 283 | ≥ 100 → ≥ 100 | ~0 |
+| `SharedSnapshotDir`'s firing: a re-take at an index already taken | raft.rs:2460 | 20 / 100 / 1 000 / 10 000 | 525 | 5 292 | 5 265 | every → every | 3.4 × 10^-7 |
+| `SharedSnapshotDir`'s aimed arm reached its stream | raft.rs:2464 | 20 / 100 / 1 000 / 10 000 | 143 (14.3 %) | 1 472 (14.7 %) | 1 477 (14.77 %) | every → every; for the owner, below | **0.046** |
+| **`SharedSnapshotDir`'s stream half: a re-take under a live stream the follower never installs at afterwards** (added after this entry, by D-060's re-audit of `snapshot_takes`; `a_leader_that_shares_one_snapshot_directory_…`) | the same sweep | 20 / 100 / 1 000 / 10 000 | not measured: the fold was vacuous until the re-audit. On this tree **135 (13.5 %)**, and 10 of the first hundred, against the correct server's 0 of 1 000 | not measured on those trees | **1 308 (13.08 %)**, with 5 948 duplicate-chunk loops after them | **new → ≥ 100** | 5.0 × 10^-7 at 100; 0.055 at 20, which is why the gate's twenty do not carry it |
+| `SharedSnapshotDir` caught by the liveness check | raft.rs:2469 | 20 / 100 / 1 000 / 10 000 | 2 (0.2 %) | 4 (0.04 %) | **2 (0.02 %)**; 5 caught in all, by check {linearizability 3, liveness 2} | ≥ 10 000 → ≥ 10 000 | 2.0 × 10^-9; 0.018 at the nightlies' rate, below |
+| Lease: drift beyond the bound, the guard revoked | raft.rs:2602, 2603 | 20 / 100 / 1 000 / 10 000 | 503, 503 | 5 023, 5 023 | 5 023, 5 023 | every → every | 8.5 × 10^-7 |
+| **`LeaseTrustsTheClock` caught (a stale read)** | raft.rs:2615 | 20 / 100 / 1 000 / 10 000 | 41 (4.1 %) | 472 (4.72 %) | 450 (4.50 %) | **every → ≥ 1 000** | 0.43 at 20 → 6.6 × 10^-19 |
+| Raft coverage, 33 counters: partitions, one-way blocks, crashes, leader crashes, stale-sender faults, figure-8 drivers, burst puts, drift beyond the bound, lease reads, read-index reads, lease revocations, check-quorum step-downs, duplicates, injected drops, elections, a term above one, truncations, snapshots taken, compactions, crash-mid-install faults, crash-mid-adoption faults, re-take-under-a-stream faults, commits, applies, bit rot, puts, gets, deletes, compare-and-sets, completed, abandoned, redirected, uniformly scheduled seeds | raft.rs:3000 | 20 / 100 / 1 000 / 10 000 | 1 000, 432, 1 000, 425, 431, 727, 727, 503, 584, 1 000, 992, 1 000, 1 000, 1 000, 1 000, 1 000, 1 000, 1 000, 1 000, 517, 260, 246, 1 000, 1 000, 999, 1 000 (×7), 500 | all above zero (drift 5 023, a term above one 10 000, uniform 5 000 seeds) | all above zero (drift 5 023, a term above one 10 000, uniform 5 000 seeds; the three fault counters nearest the line: crash-mid-install 5 038, crash-mid-adoption 2 529, re-take-under-a-stream 2 500) | every → every | 3.5 × 10^-3 (re-take faults); uniform scheduling is half the seeds by `Policy::for_seed`, seed 0 among them, not a draw |
+| Raft coverage from 100: refusals, torn writes, snapshots installed, streams resumed, re-seeded servers, re-seeds completed, adoptions, progress resets | raft.rs:3006–3040 | 20 / 100 / 1 000 / 10 000 | 853, 495, 1 000, 1 000, 852, 832, 1 000, 844 | all above zero (re-seeds completed on 8 163 seeds) | all above zero: 32 494, 7 092, 192 919, 672 557, 40 313, 8 007, 89 498, 22 671 | ≥ 100 → ≥ 100 | ~0 |
+| `SingleMajorityInJointConsensus` caught | raft.rs:3122 | 20 / 100 / 1 000 / 10 000 | 296 | 2 720 | 2 386 | every → every | 8.9 × 10^-4 |
+| Membership coverage, 9: grows, shrinks, joint and new configurations, learners promoted, partitions, completed, uniform seeds, compactions | raft.rs:3329 | 20 / 100 / 1 000 / 10 000 | 1 000 each; uniform 500 | all above zero where printed (before D-058) | all above zero: grows and shrinks 10 000 each, joint 105 524, new 245 527, learners promoted 23 976, partitions 20 000, completed 3 658 749, compactions 153 406; uniform 5 000 seeds | every → every | ~0; uniform not a draw |
+| Membership: an install adopted | raft.rs:3337 | 20 / 100 / 1 000 / 10 000 | 1 000 | not printed before D-058 | 74 102 adoptions, and a snapshot-fed joiner on all 10 000 seeds | every → every | ~0 |
+| Membership from 100: step-downs outside `C_new`, configuration reverts | raft.rs:3354 | 20 / 100 / 1 000 / 10 000 | 390, 56 (5.6 %) | 4 253 and 7 025 events, before D-058 | 3 870 and 569 events | ≥ 100 → ≥ 100 | 0.0031 (reverts) |
+| **Membership: an election while joint** | raft.rs:3367 | 20 / 100 / 1 000 / 10 000 | 31 (3.1 %) | 463 events, ≤ 4.6 %, before D-058 | 365 events, ≤ 3.65 % | **≥ 100 → ≥ 1 000** | 0.043 at 100 → 2.1 × 10^-14 |
+| Membership: `reverts_to_a_prefix` | raft.rs:3382 | 20 / 100 / 1 000 / 10 000 | 28 (2.8 %) | D-058's counter, not on those trees | **264 events, ≤ 2.64 %** | ≥ 100 → ≥ 1 000, by the owner (D-058) | 4.6 × 10^-13 |
+| Incremental checker: a compared seed in violation | raft.rs:3471 | 20 / 100 / 100 / 100 | 61 of 100 | 59 of 100 | 59 of 100 | every → every | 6.6 × 10^-9 |
+| Quorum, `RefusedCountsForQuorum` blocked: a chunk lost to the limit | raft.rs:3585 | 20 / 100 / 1 000 / 10 000 | 1 000 | 300 304 events | 294 589 events | every → every | ~0 |
+| Quorum on the sweep's disk: the install silence deposes `RefusedCountsForQuorum` | raft.rs:3679 | 20 / 100 / 1 000 / 10 000 | 844 | 8 311 | 9 058 failed, 9 002 of them by a step-down with nothing uncounted | ≥ 100 → ≥ 100 | ~0 |
+
+**The ten-thousand-seed column, re-measured on this stage's own nightly.** The column
+"At 10 000, run 35172923002 (27f6c97)" is this stage's own evidence: the green
+ten-thousand-seed nightly on the branch tip, whose log is
+`scratchpad stage-a/nightly4-green.log`. Every figure in it is read off that log, and a
+row whose counter the log does not print says so rather than carrying a number over. The
+column beside it, "At 10 000, the older nightlies", is runs 34908018220 (0557590) and
+34948461479 (94c6a54) as before, and **both of those trees predate this stage** — its
+lanes S and N, D-056's queue, D-058 and D-060 — so their raft, membership, re-seed and
+engine figures are other schedules, and the two columns are not a before-and-after of one
+tree. The unit is the log's: where a counter counts events the cell says so and gives the
+seed rate as "≤", since the seeds that saw one are at most that many, and the WAL sweep's
+counters run over 80 000 epochs on its 10 000 seeds.
+
+**No rate in the new column crosses the 5 % line**, in either direction, so the rule moves
+nothing here and every tier above stands. The rows near the line are the ones that were
+near it before: `AdoptionAsBuilt` at 6.37 % (646 → 637), where a hundred seeds see none
+with probability 0.9363^100 = 1.4 × 10^-3; the membership scenario's configuration reverts
+at ≤ 5.69 %, where a hundred see none with 0.0029; a gap in the WAL at ≤ 6.15 %, 0.0018;
+and D-062's betrayed cut to nothing at ≤ 5.79 %, 0.0026. The last three are event counts,
+so the seed rate behind each could be a little under 5 % — the nightly does not settle
+that, and the thousand-seed measurements above, which the rule reads, are 5.6 %, 5.1 % and
+6.0 %. The two that moved furthest are both already at the thousand-seed tier:
+`LeaseTrustsTheClock`'s stale read at 4.50 % (472 → 450) and the betrayed-cut excuse at
+≤ 4.01 %. `SharedSnapshotDir`'s liveness catch, the thinnest row in the table, is at the
+foot of the "For the owner" section below with what this nightly measured of it.
+
+**The stage's nightly record.** SHARD.md §12 asks that before a stage is tagged the
+nightly at ten thousand seeds run on the stage's branch and be green — every sweep and
+directed scenario the stage runs, the correct system on every seed, every variant to its
+standard (docs/SHARD.md:2030-2037, the owner's addition of 2026-09-15). Four ran on
+`phase-3-stage-a` (PR #60):
+
+| Run | Tree | Started → ended, UTC | Wall | Outcome |
+| --- | --- | --- | --- | --- |
+| 34908018220 / 34948461479 | 0557590, 94c6a54 | before the stage | — | the older nightlies the column above names; not this branch |
+| 35080746132 | 09bed88 | 2026-09-16 09:40 → 11:05 | 1 h 24 m 55 s | **red** — the correct engine, seek schedule, seed 3123 (D-062) |
+| 35111624618 | 1a1cad2 | 2026-09-16 14:53 → 18:25 | 3 h 32 m 02 s | **red** — the correct server, raft sweep, seed 2605 (D-063) |
+| 35161762372 | 605e62e | 2026-09-16 23:19 → 2026-09-17 02:02 | 2 h 43 m 42 s | **green** |
+| 35172923002 | 27f6c97, the tip | 2026-09-17 02:03 → 05:41 | 3 h 37 m 35 s | **green** |
+
+The two red runs' downloaded logs hold only the `cargo test` step, so their wall is that
+step's; the two green ones are the whole job, whose step is within twelve seconds of it.
+The two green runs are the evidence for §12's bullet, and they agree with each other
+figure for figure: every rate, every coverage counter and every first-catch seed in the
+new column is identical in `nightly3-green.log` and `nightly4-green.log`. The only
+differences between the two logs' summaries are the wall times, the order the parallel
+binaries finished in, the last digits of two floats in `ReseedEpisodes`, and
+`ananke-sim`'s lib tests at 17 against 19 — the two checker-level tests over hand-written
+records that 46e95c0 added between the two trees (D-063), which need no seed and move no
+schedule. That is what a stage whose last commits move no schedule should look like.
+
+**The tip's run covers the tip, and this commit is docs-only on top of it.** Run
+35172923002 ran on 27f6c97, the tree this entry is being written on. The commit that
+lands these paragraphs touches docs/DECISIONS.md and nothing else — no crate, no sweep,
+no test, no script, nothing the nightly exercises — so the green run is evidence for the
+tree the commit makes as much as for the tree it ran on, and `scripts/gate.sh` is green
+on that tree, as CLAUDE.md asks of every commit. It is worth saying plainly because the
+opposite is the usual case: a nightly is evidence for the tree it ran on, and a commit
+that changed a line of the model would need its own.
+
+**Issue #57, in live figures.** D-055 projected the nightly's `cargo test` step at about
+2 h 45 min against the job's 300-minute timeout and D-060's re-measurement moved that to
+about 2 h 51 min. What the four runs took: the red run that got furthest, 35111624618,
+**212 minutes**, and the two green ones **164** and **218 minutes**, the tip's run at 73 %
+of the timeout. The two green runs did the same work — raft 5 834.48 s against 7 509.64 s,
+engine 3 746.41 s against 5 228.23 s, wal 154.11 s against 204.16 s, a third more wall for
+figures identical seed for seed — so that spread is the runner, not the tree. A 54-minute
+swing between two runs of the same work is the sharpest thing the issue has: the headroom
+left is a draw, not a margin.
+
+**The three WAL rows marked D-062** were added by the commit that closed that entry's
+gaps, so the register holds every assertion the supersede rule brought with it rather
+than leaving their rates in D-062's prose alone. Their line numbers are on that commit
+and their figures are that tree's, re-measured for this table rather than copied over:
+one run of `ANANKE_SEEDS=1000 cargo test -p ananke-sim --test wal --release` gives
+`betrayed_cuts 765, betrayed_cuts_to_nothing 60, superseded 0`, the same three figures
+D-062 records, in a `Coverage` whose every pre-existing counter is also unchanged
+(`epochs 8000, records 2059643, stops_torn 2880, stops_bad_checksum 4074, stops_gap 54,
+discarded 6838, excused_lost_fsync 3782, excused_bit_rot 3192, excused_betrayed_cut 36`).
+The two tiers below were measured too, since the second row's tier turns on them: at a
+hundred seeds 79 and 4, at the gate's twenty 14 and **0**. So the gate would be asserting
+a betrayed cut to nothing on a counter that is in fact zero there — the assertion is
+guarded at `seeds() >= 100`, which is the rule doing its work rather than a precaution.
+
+**Re-measured on the tree with the key layout and the store's format record (D-060).**
+The layout moved every raft, membership and re-seed schedule, so every rate in the table
+above that comes from those three scenarios is a fresh draw; the whole table was
+re-measured at `ANANKE_SEEDS=1000` in release on the commit that lands D-060
+(`scratchpad stage-a/l/reaudit/raft-1000-merged.log` and `ewe-1000-merged.log`).
+**No assertion crossed the 5 % line, so the rule moves nothing and every tier above
+stands.** What changed:
+
+- The engine, WAL and echo rows are unchanged, figure for figure: those scenarios do not
+  touch `ananke-raft`, `ananke-storage` gains only a no-I/O accessor, and their seed-42
+  traces are byte-identical on both trees.
+- Raft variants at every tier: `ApplyBeforeCommit` 890 (882), `CountOlderTermForCommit`
+  451 (454), `ResetTimerOnAnyRpc` 344 (336), `SnapshotWithoutCurrentLast` 356 (336);
+  `SendBeforePersist`, `TruncateOnEveryAppend` and `NoPreVote` on every seed as before.
+- `AdoptionAsBuilt`: caught on **57 of 1 000 (5.7 %)**, against 77 (7.7 %), with its storm
+  drawn on the same 260 seeds and 8 707 adoptions under it. It is the nearest thing to the
+  line and stays at the hundred-seed tier, where a hundred seeds see none with probability
+  0.943^100 = 2.7 × 10^-3. At the nightlies' 6.46 % a thousand seeds catch 64.6 on average
+  with a standard deviation of 7.8, so 57 is one below the mean.
+- `RefusalNotDurable`: caught on **9 of 1 000 (0.9 %)**, against 16, firing on 340 seeds
+  (347). Already at the thousand-seed tier by the owner's decision (D-056); the first catch
+  moves from seed 119 to **seed 158**, which the pin follows.
+- `LeaseTrustsTheClock`: **37 stale reads on the thousand seeds (3.7 %)**, against 41
+  (4.1 %). Already moved to the thousand-seed tier by this entry; the firing is unchanged —
+  the drift exceeds the bound on 503 seeds and the guard revokes on all 503. The rate is
+  over the tier's seeds, as every row of the table is; 37 of the 503 exceeded seeds would
+  be 7.4 %, and is not the number the rule reads.
+- `SharedSnapshotDir`: **caught on 0 of 1 000**, against 2. Its catch is asserted only at
+  the nightly's ten thousand, so nothing fails; its firing is unchanged — a re-take at an
+  index already taken on 525 seeds — and the aimed arm reaches its stream on **153 (15.3 %)**
+  against 143. A third firing measure was added after this entry, once `snapshot_takes` was
+  repaired: the re-take landing under a live stream the follower never installs at
+  afterwards, D-043's scrambled stream, on **135 of 1 000 (13.5 %)** and 10 of the first
+  hundred against the correct server's 0, asserted from the hundred-seed tier. This
+  sharpens the second open question below: on this tree the liveness catch's rate is at
+  most 0.1 %, and the next nightly is what measures it.
+- `SingleMajorityInJointConsensus` 236 (296); D-050's term-raise shape reached on 276 (298);
+  the incremental checker 59 of 100 (61); `IgnoreIncarnation`'s state, a refused follower
+  re-seeded and applying, on 626 (659); the quorum scenario's silent step-downs on the
+  sweep's disk 886 (844).
+- Membership, in the unit the 5 % rule reads, which is seeds: `elections_while_joint` on
+  **34 seeds, 3.4 %** (31 seeds, 3.1 %, and the same 34 events), `reverts_to_a_prefix` on
+  **25** (28), `config_reverts` on **58 seeds, 5.8 %** (56, 5.6 %) over 62 events (57),
+  `step_downs_outside_new` on 372 (390); installs adopted 7 468, and a joining server fed a
+  snapshot on every one of the thousand seeds. `config_reverts` is the row nearest the
+  line and stays above it, where a hundred seeds see none with probability
+  0.942^100 = 0.0025.
+- The raft coverage counters asserted from a hundred seeds are all far above their line:
+  refusals 3 444, torn writes 680, snapshots installed 19 496, streams resumed 68 261,
+  re-seeded servers 4 070, re-seeds completed 803, adoptions 9 049, progress resets 2 350.
+
+These are not draws, and are left as they are:
+
+- `IgnoreIncarnation` tracing no progress reset (raft.rs:2352) and the correct log losing no
+  directory entry (wal.rs:173) are assertions of zero on every seed.
+- `RefusedCountsForQuorum` and `RefusedNeverCounts` caught on every seed are assertions of
+  every seed.
+
+The fixed seed sets in crate tests run the same seeds at every tier. The two ananke-raft
+rows were the pre-layout tree's when this entry landed and are re-measured here, on the
+tree with the key layout; the store's row is the thinnest margin in the table, three seeds
+above its floor, and the three `tests/format.rs` rows were added by the review that
+re-measured them. The five ananke-raft figures are printed by their own tests at every
+tier (`store.rs:296`, `snapshot.rs:997`, `format.rs:787`, `:836` and `:953`), so a redraw
+that moves one is visible in any test run; the five older rows keep their counts inside
+assertion messages, which print only on failure, and their figures are the ones measured
+here:
+
+| Assertion | Where | Seeds | Measured | P(none) over its seeds |
+| --- | --- | --- | --- | --- |
+| A write torn at a crash; more than three durable lengths | crates/ananke-env/src/sim/tests.rs:856, 857 | 64 | torn on 28; 13 lengths | 1.0 × 10^-16 |
+| More than one interleaving | tests.rs:191 | 20 | 11 distinct | not a rate |
+| A rename lost and a rename kept | tests.rs:1639 | 64 | lost on 32, kept on 32 | 1.1 × 10^-19 |
+| An unsynced create vanished | tests.rs:1675 | 32 | 12 | 2.9 × 10^-7 |
+| Two records under one sync | crates/ananke-storage/tests/wal.rs:184 | 20 | 15 | 9.1 × 10^-13 |
+| At least 20 of 40 stores came back as a state | `an_entrys_writes_and_the_applied_index_are_durable_together`, crates/ananke-raft/tests/store.rs | 40 | **23** (31 before the key layout) | **0.13** of under 20 |
+| A crash inside the adoption before the switch; one after it | `a_crash_inside_the_adoption_leaves_a_store_and_the_next_start_adopts`, crates/ananke-raft/tests/snapshot.rs | 24 | **13 before; 11 after** (10 and 14 before the layout) | 7.4 × 10^-9; 4.1 × 10^-7 |
+| Every crash window of a fresh store's first start, W0 to W3 | `a_crash_in_a_fresh_stores_first_open_never_leaves_it_refused_for_its_format`, crates/ananke-raft/tests/format.rs | 200 | 29, **10**, 47, 114 at `p_durable` 1.0; 31, 9, 49, 111 at 0.7 | 3.5 × 10^-5 of an empty W1 |
+| The record written after the first batch is caught | the same test | 200 | 89 | ~0 |
+| The heal by rename loses the surviving copy (the targeted arm asserts it) | `a_record_with_one_bad_copy_is_healed_in_place_and_a_crash_never_loses_the_other_copy`, crates/ananke-raft/tests/format.rs | 160 | 7 targeted, 7 spread; the in-place heal 0 of 320 | 7.8 × 10^-4 |
+
+**What moved.** The owner's rule moves three assertions to `seeds() >= 1000`. Each is printed
+at every tier as before and commented with its rate, its tier and this entry.
+
+- *`LeaseTrustsTheClock`'s catch* moves from every tier (sim/tests/raft.rs). Its firing, drift
+  beyond the bound and the guard's revoke, each on half the seeds, stays asserted at every
+  tier. RAFT.md §5 now names the tier.
+- *The WAL's betrayed-cut excuse* moves from every tier (sim/tests/wal.rs).
+- *The membership scenario's election while joint* moves from the hundred-seed tier
+  (sim/tests/raft.rs).
+
+`RefusalNotDurable`'s catch and `reverts_to_a_prefix` were moved by the owner in D-056 and
+D-058. Every other assertion is at or above 5 % and stays where it is. Two of them are near
+the line. A gap in the WAL is on 5.1 % of the thousand; the membership scenario's
+configuration reverts are on 5.6 %. At a thousand seeds either could be a little below 5 %,
+since a thousand seeds only estimate the rate. The rule as written leaves both at the
+hundred-seed tier, where a hundred see none with probability 0.005 and 0.003. Were a later
+measurement to put either under 5 %, the rule moves it.
+
+**For the owner — not decided.** The rule as written does not move these; they are the
+owner's to decide.
+
+- *`SharedSnapshotDir`'s aimed arm reaching its stream*
+  (`a_leader_that_shares_one_snapshot_directory_…` in sim/tests/raft.rs). It reaches its
+  stream on **15.3 %** of the thousand on this tree (14.3 % when this entry landed, 14.7 %
+  at the nightlies), above 5 %. It is
+  asserted at every tier, and the gate's twenty see none with probability 0.857^20 = 0.046,
+  above one in a hundred. It is a firing assertion: the shape the arm exists to build. The
+  arm rides one seed in four (`RETAKE_STREAM_IN`, D-043), and the other firing assertion
+  beside it, the re-take at an index already taken, is on 52.5 %. The conservative options
+  are to leave it, or to assert it from the hundred-seed tier, where a hundred see none
+  with probability 2 × 10^-7.
+  **Measured on this stage's own nightly**, run 35172923002 on the tip: the arm reaches its
+  stream on **1 477 of 10 000, 14.77 %**, beside 5 265 re-takes at an index already taken
+  and 1 308 seeds of the stream half. So the number the question turns on has not moved —
+  14.3 % and 15.3 % at a thousand on two trees, 14.7 % at the older nightlies and now
+  14.77 % at this stage's own, four measurements on three trees — and at
+  14.77 % the gate's twenty see none with probability 0.8523^20 = 0.041, still above one in
+  a hundred. The measurement is recorded; the choice between leaving it and moving it to
+  the hundred-seed tier is the owner's and is not made here.
+- *`SharedSnapshotDir`'s liveness catch at the nightly's ten thousand*
+  (the same test). It is under 5 % and already above the thousand-seed tier, so the rule
+  leaves it. On the tree with the queue it was on 2 of the thousand, 0.2 %; **on the tree
+  with the key layout it is on 0 of the thousand**, so its rate here is at most 0.1 % and
+  ten thousand seeds see none with probability at least 0.37. At the nightlies' measured
+  rate, 4 of 10 000, ten thousand see none with probability 0.9996^10000 = 0.018. The next
+  nightly is what measures it. D-060's question 6 puts the harder half to the owner: the
+  pair and each half are caught on 0 of the first thousand, so no seed pins the catch and
+  seed 132 asserts its absence, which SHARD.md:2362-2363 routes to the owner.
+  **The next nightly has now run, and this is what it measured.** Run 35172923002 on the
+  tip, and run 35161762372 before it, print the same line:
+
+  ```
+  SharedSnapshotDir: caught on 5 of 10000 seeds, 2 by the liveness check, by check
+  {"linearizability": 3, "liveness": 2}, re-took at an index already taken on 5265 seeds,
+  scrambled a live stream the follower never installed after on 1308 seeds (5948
+  duplicate-chunk loops after those), the aimed re-take arm reached its stream on 1477
+  seeds, first: seed 3300: liveness: no client write completed after the last heal at
+  Instant(13.289s)
+  ```
+
+  So the catch is on **5 of 10 000, 0.05 %**, of which **2 are the liveness check's,
+  0.02 %** — half what the older nightlies measured (4) and not the 0 the thousand-seed
+  tree suggested. The assertion is the liveness half alone, at the ten-thousand-seed tier,
+  and at 0.02 % ten thousand seeds see none with probability 0.9998^10000 = **0.135**: about
+  one nightly in seven would fail this tree with nothing wrong in it. Read against the whole
+  catch, 5 of 10 000, ten thousand see none with 0.0067. Both figures are measurements, not
+  a decision: whether an assertion that misses one run in seven belongs at the nightly tier
+  at all, or belongs beside the liveness check as a whole-catch assertion, or nowhere, stays
+  the owner's to answer.
+
+**Alternatives.** *D-044's shape, a thin catch asserted from the hundred-seed tier*: at 3 %
+a hundred seeds see none about one time in twenty, and the owner moved both measured cases
+off it. *A tier chosen by P(none) at the tier instead of by rate*: it would also move the aimed
+arm's assertion above, but the owner's rule is by rate, and a rate is what every sweep
+prints. *More seeds at the gate*: the gate's twenty keep it under a few minutes, which is
+its purpose.
+
+**Consequences.** The gate and CI no longer assert the three moved states. The premerge
+and the nightly assert them, and every tier prints them, so a sweep that stops reaching one
+is seen in the rates before it is asserted. No schedule and no pinned hash moves: the
+changes are the tier of three assertions and their comments. Rates are functions of the whole
+schedule, so a later change that moves the schedules can carry a rate across 5 % either way;
+the rates printed at the premerge and the nightly are where that shows. SHARD.md §12's Stage B
+plan (docs/SHARD.md:2344) still says `LeaseTrustsTheClock`'s stale read is caught at every
+tier, as the approved plan's text; this entry supersedes it for that assertion.
+
+---
+
+## PROPOSED D-062 — A segment whose first record is behind the reading supersedes what was read
+
+**Context.** The nightly's ten thousand seeds failed on the **correct** engine (GitHub
+run 35080746132, `phase-3-stage-a` at 09bed88, PR #60), at the seek schedule's seed
+3123: `epoch 3: record 166 came back changed: 44 bytes recovered, 29 appended`, the WAL
+checker's Property A. Everything else in the binary passed; the premerge's thousand and
+the gate's twenty are green on the same tree, so the seed is beyond the thousand. It is
+not a checker artefact and not a variant's catch: on the correct engine a legal disk
+fault made recovery return superseded records under live numbers, throw away thirteen
+acknowledged records whose syncs the simulator had honoured, and replay a stale record
+into the memtable above `flushed_seq` — the one thing D-018 says is never excusable.
+
+The defect is shipped Phase 1 code, not Stage A's: `parse_segment`'s numbering rule
+(D-019), reached through `Wal::open`'s mid-log cut (D-018). A recovery that stops
+mid-log discards the tail by cutting the stopping segment and syncing it, and then
+trusts that cut. When the disk lies about that fsync (`FsyncLost`, legal under SPEC
+§1.3) and the next crash drops the still-pending truncation, the segment comes back
+whole, holding records under numbers the log has since re-issued — `next_seq` reuses
+discarded numbers on purpose, because a number is a position and not an identity
+(D-018). At the next open the reader meets that resurrected segment *before* the live
+one and, with the stop rule as D-019 wrote it, has nothing to tell them apart.
+
+At seed 3123 segment 14 had been cut to nothing and came back with 166..=172. Its first
+record satisfied `seq > expected && seq <= expected_head` (166 ≤ 172), D-022's forward
+skip, so the thirteen records already read from segment 13 were dropped and the whole
+numbering re-based onto the stale segment. The live segment 15, whose first record 165
+is *behind* the reading, was then an ordinary `Gap { expected: 173, found: 165 }` — a
+stop. Recovery kept seven stale records, cut the live segment to nothing, removed the
+one after it, destroyed the acknowledged 165..=177 and replayed the stale 172 above
+`flushed_seq` 171. The simulator did only what a real filesystem does with an
+`ftruncate` whose journal transaction has not committed, and the checker is right to
+fail: nothing here is excusable. The comment at the cut already named this failure ("a
+cut whose sync the disk lied about brings the old records back at the next crash …
+numbered as if they were current", found at seed 191) and forbade it — but only in the
+head-gap branch, which discards by removal for exactly this reason.
+
+What the reader was missing is the *direction* of the jump. Segments are created in
+increasing number order, and D-022 made segment numbers monotone so that a number names
+one file for the life of the log. So a later segment whose first record repeats a number
+an earlier segment supplied **proves the earlier segment stale**. `parse_segment`
+treated forward and backward jumps identically.
+
+**Decision.** A record numbered *behind* the reading, at a segment's **first** byte, is
+not a stop: it supersedes. The copies already read that are numbered at or above it are
+dropped, the numbering resumes at it, and reading goes on into that segment. The drop is
+safe because the records discarded are exactly the ones this segment re-supplies, and
+anything below them is below the first number read, which is at or below
+`expected_head`, so the caller holds it in the tables. A backwards jump anywhere else in
+a segment is corruption and still stops: a betrayed cut leaves a prefix and brings back
+a tail contiguous with it, never a jump in mid-file. D-022's forward skip keeps its head
+guard; the backward rule needs none, because the order of creation and not the head is
+what settles it — which is why it repairs the shape where the tables are further behind
+than the resurrected numbers, and a head-guarded rule would not.
+
+The supersede emits `WalSuperseded { segment, expected, found, dropped }`, bridged as
+`ananke.wal.superseded`, so the sweep and the pin can see the mechanism rather than
+infer it (CLAUDE.md: if it can't be seen in the studio it didn't happen).
+
+This corrects D-019, whose stop rule is written without direction and decides this case
+the wrong way, extends D-022's "a jump that lands at or below the head is not a stop"
+with its backward twin, and amends SPEC.md §2.2's stop bullet. Both entries carry a note
+saying so. The oracle is unchanged: `Excuse::BetrayedCut` matches only a stop exactly
+where a lost-sync cut had been, so it never excused this, which is correct — nothing
+here should be excused.
+
+**The pair, and where each half is asserted.** No existing variant covers the rule;
+`Variant::TrustsAStaleSegment` is today's reader kept beside the fix — on a backwards
+jump it keeps the earlier prefix and stops. **It cannot be paired at the sweep tier, and
+that was measured, not assumed:** run over the seek sweep's whole nightly band, seeds
+0..10000, the variant is caught on **1 seed — 3123, with the nightly's own message** —
+a catch rate of 0.01 %, three orders below D-061's five per cent. The shape needs a
+betrayed cut *and* a crash that drops the truncation *and* a later segment that re-issues
+the numbers. The honest pairing is therefore in three parts.
+
+- *The catch, deterministic.* Two hand-built on-disk states in
+  `crates/ananke-storage/tests/wal.rs` run the correct log and the variant side by side
+  at every tier: the nightly's own shape, a segment cut to nothing that came back whole
+  in front of the live one (13/14/15 holding 152..=164, the stale 166..=172 and the live
+  165..=177, head 172), and the shape a cut to a *shorter* length leaves, a stale tail
+  behind live records in the same segment with the tables further behind than the stale
+  numbers. The correct log returns the live records with no stop; the variant returns the
+  stale ones, stops, and cuts the live segment away. A third state beside them pins the
+  rule's *narrowing* rather than its catch: a backwards jump at a non-zero offset inside a
+  segment, where both readers stop and keep the live records whole. Without it the
+  `at == 0` guard was a claim no test held — deleting the guard broke nothing in the suite,
+  at any tier.
+- *The seed.* 3123 is pinned in `sim/tests/engine.rs` with its mechanism: under the fix
+  the run still reaches a cut to nothing whose sync the disk lied about and is still seen
+  to supersede a resurrected segment — *that* one, by its numbers,
+  `WalSuperseded { segment: 15, expected: 173, found: 165, dropped: 7 }`, so that a
+  schedule which moved the seed onto some other resurrection fails the pin instead of
+  passing it — and the variant still fails that seed with the violation it was pinned for.
+  The situation survived the fix, so the pin asserts it rather than its absence.
+- *The shape, in the sweep.* `sim/tests/wal.rs` counts the precondition. Measured over
+  the first thousand seeds of the WAL sweep on this tree: a cut of recovery's own made on
+  a sync the disk lied about on **765 of 1000, 76.5 %**, asserted at every tier (the
+  gate's twenty see none with probability 0.235²⁰ = 3 × 10⁻¹³); such a cut *to nothing*,
+  which resurrects a whole segment, on **60 of 1000, 6.0 %**, which by D-061 stays at the
+  hundred-seed tier (a hundred see none with probability 0.94¹⁰⁰ = 0.002, the gate's
+  twenty with 0.29). The rule *firing* is rarer than either and is asserted nowhere: 0 of
+  those thousand superseded. Every tier prints all three.
+
+**Rates measured on this tree.** WAL sweep, `ANANKE_SEEDS=1000`: betrayed cuts 765,
+betrayed cuts to nothing 60, supersedes 0. Engine seek schedule, the nightly's whole band
+**0..10000 run locally with the fix: 0 failures**, betrayed cuts 4393 (43.9 %), betrayed
+cuts to nothing 337 (3.4 %), and the supersede fired on **exactly one seed of the ten
+thousand — 3123**; the band 3000..3400 gives 180, 12 and the same single supersede. The
+same band under `TrustsAStaleSegment` gives the identical 4393 and 337 and the one
+failure, which is what "the variant changes only that seed" means in numbers. The
+precondition rate is schedule-independent within noise (the investigation measured 441
+and 30 per thousand under both `seek` and `phase_1`), and the rule's own rate, 1 in
+10 000 here and one in the first five thousand on the unmodified model, is why a
+thousand-seed premerge misses the failure about 85 % of the time and why no tier can
+assert the rule firing.
+
+**Nothing moved.** No pinned trace hash and no seed's schedule moves. The change alters
+recovery's decision only on a run that meets a backwards jump at a segment's first
+record: no RNG draw, no byte written to disk, no record framing, no new fault arm. The
+proof is the counter: on a seed where no supersede fires, no new code runs, so the trace
+is byte-identical to the tree before the fix. The WAL sweep's whole `Coverage` at a
+thousand seeds is unchanged (`stops_torn 2880, stops_bad_checksum 4074, stops_gap 54,
+discarded 6838, excused_lost_fsync 3782, excused_bit_rot 3192, excused_betrayed_cut 36`)
+with 0 supersedes, and the three WAL variants' catch rates with it; the engine's seek
+schedule supersedes on 1 of its first ten thousand seeds, so 9 999 of them are unmoved,
+and the one that moves is 3123, which is the seed being fixed. No other pinned seed's
+schedule moves and no pinned trace hash moves, so nothing else is owed a re-audit.
+
+**Alternatives.** *Make a cut to nothing a removal instead, as the head-gap branch does*:
+prophylactic, not a repair — it cannot help a log that already holds a resurrected
+segment, does nothing for a cut to a non-zero offset, and it breaks the pinned test
+`recovery_stops_at_a_gap_in_the_numbering`, which pins today's cut-to-nothing behaviour.
+*The same rebase guarded by `expected_head`, as the forward skip is*: repairs the
+nightly's shape but not the one where the tables are further behind than the resurrected
+numbers, which is the commoner of the two on disk. *A generation stamp per segment*: the
+only thing that closes the residual shape below, and the only thing that would let the
+reader answer "which writing is this" without inference; it costs a format change and is
+BACKLOG. *Numbering records by identity rather than position, so a discarded number is
+never re-issued*: it removes the conflict at its root, and with it D-018's "position, not
+identity" and every oracle that reads a segment's sync history by number.
+
+**Consequences.** One branch in the reader, and the reader is where it belongs: the
+writer and the disk are behaving correctly and a real filesystem may drop a
+not-yet-committed `ftruncate` exactly this way. The log now ships five variants where
+D-018 said four, and the fifth is the first that the crash sweep does **not** catch; the
+sweep asserts the shape it needs instead, and `tests/wal.rs` catches the variant itself.
+There is a residual shape no reader-side rule can see: a stale tail whose numbers *abut*
+the live segment's first number instead of overlapping it, where nothing in the numbering
+conflicts. It is harmless to engine state by construction — the fresh segment can only be
+numbered above the stale tail when `expected_head` was already above it, so those records
+were flushed, and replay skips everything at or below `flushed_seq` — but it is the limit
+of this fix and is an issue, not code. Two observability gaps the investigation tripped
+over are also issues, not code: the simulated filesystem emits no trace event when a
+crash drops a pending `PendingOp::Truncate`, so the very fault that makes this shape is
+invisible in the studio; and `Wal::open`'s `firsts` map records a segment's first number
+as the running total rather than the segment's own, an over-estimate that survives a
+supersede in the same direction, so `delete_segments_through` only ever deletes later
+than necessary. `Schedule::wal_variant` is new in `sim/engine.rs` so the pin can run seed
+3123 beside the variant; it is `Correct` everywhere else. The three counters this entry
+adds to the WAL sweep have rows in D-061's register, with their rates, tiers and
+probabilities, so the register stays the one place every such assertion is listed.
+
+**Issues filed out of this entry**, all of them notes rather than code, so the fix does
+not widen past its one branch:
+
+- **#61** — the correct engine fails seed **30490** on the seek schedule: `record 1 is gone
+  although the log stopped at nothing near it` (records 1..=0, tables through 0). It is a
+  second, pre-existing defect and not this one, and that was measured rather than argued:
+  it reproduces identically on 09bed88 and on the tree with this fix, with no supersede
+  firing on that seed, so the branch above never runs and the code path is byte-identical
+  on both. It is outside the nightly's band (about 1 seed in 30 000 of the seek schedule)
+  and its trace points at the manifest and `CURRENT` fallback, not the WAL reader. The
+  exit criterion is therefore met for the nightly's ten thousand and not for the whole
+  model, which the owner should hear before signing "passes every seed".
+- **#62** — the residual shape named above: a resurrected segment whose numbers *abut* the
+  live ones instead of overlapping them, which no reader-side rule can see. The limit of
+  this fix; closing it wants a per-segment generation stamp, an on-disk format change with
+  its own entry and a format version beside D-060's.
+- **#63** — the two observability gaps: the crash model traces nothing when it drops a
+  pending `PendingOp::Truncate`, so the very fault that builds this shape is invisible in
+  the studio, and `Wal::open`'s `firsts` map records a running total rather than each
+  segment's own first record.
+
+**At ten thousand, on the stage's two green nightlies.** The tier that found this defect
+has since run twice on this branch with the fix in: run 35161762372 on 605e62e and run
+35172923002 on the tip, 27f6c97. In both, `the_seek_crash_test_passes_every_seed` passes
+over the nightly's ten thousand and **the whole engine binary is green, 18 passed and 0
+failed** (5 228.23 s on the tip, 3 746.41 s on the run before it), with
+`seed_3123_which_the_nightly_found_supersedes_a_resurrected_segment` among the tests that
+pass — so the seed this entry was written for is asserted to still reach a betrayed cut and
+still supersede its resurrected segment, by its numbers, rather than merely to come back
+green. Seed 30490, issue #61's, is outside the nightly's band as this entry says, and
+neither run reaches it.
+
+The WAL sweep's own `superseded` counter is **0 at ten thousand seeds** in both runs:
+`Coverage { seeds: 10000, epochs: 80000, …, excused_betrayed_cut: 401, betrayed_cuts: 7806,
+betrayed_cuts_to_nothing: 579, superseded: 0 }`. That is this entry's "rarer than either and
+asserted nowhere", measured a tier higher than it could be measured when the entry was
+written: the two preconditions are reached — 7 806 and 579 over 80 000 epochs, at most 78 %
+and 5.8 % of the ten thousand seeds, the first far above the 5 % line its tier reads and the
+second just above it, as the 6.0 % at a thousand was — and the rule still fires on none of
+the WAL sweep's ten thousand. Its rows in D-061's register carry the same three figures.
+
+**This sharpens the question below; it does not answer it.** `TrustsAStaleSegment` is caught
+by no sweep at any tier, and the nightly is the highest tier there is: at ten thousand the
+WAL sweep does not fire the rule once, so a sweep-tier pairing cannot be reached by running
+more seeds of that sweep. The only place the rule is seen to fire in a green nightly is seed
+3123's pin, on the engine's seek schedule — a fixed seed, not a draw. So one option the
+owner might have weighed, wait for a larger tier to catch it, is closed by measurement
+rather than by argument; what remains is what this entry already puts to the owner, the
+deterministic states and the pin as they stand, or an arm that builds the shape deliberately.
+
+**For the owner — not decided here.** `Variant::TrustsAStaleSegment` is the first WAL
+variant that **no sweep catches at any tier**. It is caught deterministically, at every
+tier, by the two hand-built on-disk states above, and by the pinned seed 3123, which runs
+the variant through the engine sweep's own scenario and asserts the violation the nightly
+reported. What it has not got, and cannot get, is the shape every other variant has — seen
+to fail on some seed of a sweep: the measured catch rate is 1 seed in the seek schedule's
+ten thousand and 0 of the WAL sweep's first thousand, so even the nightly would catch it
+only sometimes, and D-061's rule puts an assertion at the tier its rate supports, which
+here is no tier at all. CLAUDE.md's pair rule asks that a known-buggy variant be kept
+beside the correct code and *seen to fail*. Whether the deterministic states and the pin
+satisfy that rule as written, or whether a variant this thin should be paired some other
+way — a sweep arm that builds the shape deliberately, as `RETAKE_STREAM_IN` does for
+D-043, which is a good deal more than a one-branch fix — is the owner's to settle. This
+entry records the substitution and what it measured; it does not decide it.
+
+---
+
+## PROPOSED D-063 — A server adopting a completed install is not running, and the timer check stops measuring it
+
+**Context.** The nightly's ten thousand seeds failed on the **correct** server (GitHub
+run 35111624618, `phase-3-stage-a` at 1a1cad2, PR #60), at the raft sweep's seed 2605:
+
+```
+seed 2605: timers: server 3 heard from no leader of its term and granted no vote
+since Instant(19.679704065s) and had not campaigned by Instant(19.994418991s)
+```
+
+Everything else in that run passed — the whole engine binary, so D-062's fix holds at the
+tier that found it; the membership and quorum scenarios; every variant's sweep; the
+incremental checker and every pinned seed — and `41 passed; 1 failed` in 7 483 s. The
+gate's twenty, CI's hundred and the premerge's thousand are green on the same tree, so
+the seed is beyond the thousand. Decision time (D-047) removed one catch in that run
+(seed 2313) and added none.
+
+**The defect is in the check, not in shipped code and not in Stage A's own new code.**
+Nothing in `crates/` is wrong and nothing in `crates/` changes. The rule at
+`sim/raft.rs` was already wrong on 903f37c, before D-056's send queue and D-060's key
+layout, and it is wrong in the released v0.3.0, whose harness has the identical
+`up`/`RaftRecovered`/`NodeCrashed` structure. What the stage moved is the margin, not the
+rule: measured over seeds 0..3000 on each tree, the longest *silent* adoption window —
+one with no leader frame delivered inside it — runs 0.81 of its server's whole timer
+bound on 903f37c and on main (14c3e17) and 1.03 on 1a1cad2, and the window's own length
+goes from p50 162.9 ms to 171.4 ms, min 94.7 to 104.6, max 348.8 to 353.1. That +8.5 ms
+at the median is the `RAFT-FORMAT` record's filesystem operations (D-059, D-060),
+corroborating the layout's own measurement at 3 000 seeds instead of 200.
+
+**What the server does.** A completed install **ends the incarnation**.
+`install_decision` stops racing the tick and awaits only `inbox.pop()`
+(`crates/ananke-raft/src/node.rs`), returns `Next::Reinstall`, the outer loop takes it and
+re-runs `start_store` — D-059/D-060's format read, D-041's `adopt_checked`, the marker,
+the engine, the store — **with no core and no election timer**. The next timeout is drawn
+in `Raft::restore_compacted` and armed by the loop's first tick, immediately after the
+restatement, exactly as `start_store`'s own comment says: "nothing awaits between these
+records and the loop arming its first tick, which is where the new core's election timer
+really starts counting." The `Next::Reinstall` the re-seed path returns (D-035) is the
+same thing.
+
+**What the check did.** The replay's only notion of "has a running incarnation" is `up`,
+which a server entered at its `RaftTerm` and left only at `NodeCrashed`. D-039's arm
+resets the clock **at** the restatement, which closes the far end of the window; the near
+end — the whole adoption — was still charged to the last contact before the completion.
+On seed 2605: server 3 heard the leader's last AppendEntries at 19.679704065 s; its
+install of snapshot 374 completed 24.655 ms later, decided at 19.704359292 s and durable
+at 19.763649610 s; the adoption ran `RaftAdopted` at 19.880743071 s and the WAL recovered
+at 19.957360426 s; the restatement landed at 20.002065925 s. That is 322.361860 ms
+against server 3's 313.983572 ms bound (drift 273 952 ppm), over by 8.378288 ms, and
+**297.706633 ms of the measured stretch is a window in which the server had no timer to
+fire**. The flag fell at the first record past the bound, 19.994418991 s — 8 ms before
+the restatement — and `sim/tests/raft.rs` panicked in the nightly's words. Ten of the
+leader's frames were aimed at the server inside that stretch — nine `AppendEntries` and
+one `InstallSnapshot`, all from server 1 — and the partition at 19.729 s dropped every
+one of them at the send as `Partitioned`, along with one client frame; nothing at all was
+delivered to server 3 in the window, so nothing reset the check's clock by accident.
+
+**Decision.** For the timer check, a completed install takes the server **out of the
+replay's running set** until its restatement puts it back — the same treatment a crash
+gets, for the same reason: between the completion and the restatement there is no
+incarnation to campaign. The site is `TraceEvent::RaftSnapshot { taken: false }` on a
+server the replay holds up, excluding the restatement's own re-trace of the store's
+snapshot, which is told apart by the `RaftRecovered` that follows it at the same instant
+in `start_store`'s stable order (D-029). The server's `RaftTerm` at the end of the
+restatement re-admits it and resets the clock, as every start does. The protocol is
+unchanged, `TIMER_TIMEOUTS` is unchanged, the bound is unchanged, and no trace changes.
+
+This **supersedes D-039's arm** under `TimerResets::ALL`: every restatement on a server
+that never went down follows a completed install, so the server is no longer in `up` when
+that arm is reached and the arm is now unreachable in the check. It stays in the code,
+with `TimerResets::WITHOUT_RESTATEMENT`, because seed 385's pin *is* that replay — the
+check as it stood on f54b468 — and D-039's account of seed 385 stands: an install that
+takes 225 ms and a fresh timer after it is exactly this window, seen from the other end.
+
+**Alternatives.** *Widening the bound, or `TIMER_TIMEOUTS` from two to three*: forbidden
+by D-030, D-039 and RAFT.md §5 — "what was wrong was the check's model of the protocol,
+not the bound" — and it dulls the catch of `ResetTimerOnAnyRpc`. Tightening it instead is
+the measurement that shows this is a model error rather than a margin: with a check-only
+`ANANKE_BOUND_SCALE` knob on `timer_bound`, 1a1cad2 at **0.85 × bound** fails on **two**
+seeds of 0..3000 — 2605 and 500, both the same shape, a silent adoption window — and the
+tree with this fix fails on **none**. *Resetting the clock at the install's completion
+instead of exempting the window*: measured, not argued, and not enough. Of 11 421 uniform
+completions in 0..3000, four already run longer than their server's entire bound between
+the completion and the restatement, and 169 of them (1.48 %) are silent; and the two are
+not independent, because `Fault::CrashAdopting` — one seed in four (D-041) — isolates a
+follower and then crashes it mid-adoption, which is how 2605 was built. *Making the
+server inherit the old timer's elapsed count*: D-039 rejected it and this entry does not
+reopen it; it is a change to the protocol's timing, not to the check.
+
+**The pair.** The existing one covers it: **`ResetTimerOnAnyRpc`** (RAFT.md §5, moirae
+rule 5), the variant this rule is written for. The narrowing takes nothing from its catch,
+measured by running both replays over every seed of a band and diffing the gaps they find,
+violation text for violation text:
+
+| Band, on the committed tree | Caught | Gaps this entry adds | Gaps it removes |
+| --- | --- | --- | --- |
+| `ResetTimerOnAnyRpc`, seeds 0..1000 | **344** (34.4 %), **330** of them by the timer check | **0** | **0** |
+| `SnapshotWithoutCurrentLast`, seeds 0..1000 | 356 (35.6 %), 0 by the timer check | 0 | 0 |
+| `AdoptionAsBuilt`, seeds 0..1000 | 57 (5.7 %), 0 by the timer check | 0 | 0 |
+| the correct server, seeds 2000..3000 | 0 failures; 1 adoption-rescued gap, seed 2605 | 0 | **1** — the nightly's |
+| the correct server, seeds 5000..9000 | 0 failures; no adoption-rescued gap | 0 | 0 |
+
+So over the 6 000 correct-server seeds and the 3 000 variant seeds run here, the arm's
+whole effect is the removal of one gap: seed 2605's. Nothing else it touches, in either
+direction, on any seed. At 34.4 % the pair's catch is far above D-061's 5 % line, so
+nothing moves tier; and the pin below asserts the catch on one named seed, which is
+deterministic and runs at every tier.
+
+**The pinned seed.** `seed_2605_which_the_nightly_found_is_an_adoption_window_and_still_
+catches_the_variant` asserts the mechanism both ways, not green (CLAUDE.md):
+`Report::timer_gaps_rescued_by_adoption` is the replay with every arm but this one —
+`TimerResets::WITHOUT_ADOPTION`, the check exactly as it stood on 1a1cad2 — and on seed
+2605 it is the nightly's one gap, its violation word for word, on server 3, with the one
+completed install in it, while `check()` is green. It also asserts that that replay finds
+nothing else on the seed, so the arm is seen to be exempting the adoption and not more.
+And the pair runs on the same seed's own schedule: `ResetTimerOnAnyRpc` is still caught
+there by the timer check, with two gaps, neither holding a completed install, and the two
+replays find the same two. The day the first assertion fails the seed's schedule has moved
+off the window and the pin is re-audited, not deleted.
+
+**What fences the arm, beyond the seed** (issue #65's first two items). A pin is one
+schedule, and a schedule holds only what it happens to contain: two mutations of this arm
+leave seed 2605's pin green, the whole raft binary green at a hundred seeds and all three
+catch rates unchanged — the arm could be widened to something plainly wrong, or replaced
+by the alternative this entry rejects, and no sweep would say so. Both are now held by
+checker-level tests over trace records written by hand (`sim/raft.rs`, `mod tests`), the
+shape the membership fold's unit tests use, which need no seed and move no schedule. The
+report they are built on has three servers whose clocks run true, so each bound is 400 ms.
+
+- **`a_snapshot_a_server_took_itself_leaves_its_election_timer_running`** — the extent. A
+  server up at 0 ms, silence after it, one `RaftSnapshot { taken: true }` at 200 ms and no
+  restatement: the gap at 450 ms is still reported, with `adoptions: 0`, because a snapshot
+  a server takes of its own accord retires no incarnation — it is the live core's own work
+  — and leaves its election timer counting. The same trace with the take replaced by a
+  completed install, and that install's restatement at 500 ms, is excused: `timer_gaps`
+  under `ALL` is empty while `timer_gaps_rescued_by_adoption` is exactly that stretch with
+  `adoptions: 1`, the mechanism both ways as the pin is. And 450 ms of silence *after* the
+  restatement is a gap again, since the restatement, so the exemption is seen to close
+  where it opens rather than leaving the server blind for good.
+- **`a_coreless_window_longer_than_the_bound_is_removed_not_measured_from_the_completion`**
+  — the alternative. The honest case is one where the coreless window *alone* outlasts the
+  bound, which a reset at the completion would still measure and this entry's removal does
+  not: the install completes at 100 ms, the restatement lands at 700 ms, and a record sits
+  inside the window at 650 ms. The test asserts that the window outlasts the bound by
+  itself, so the distinction is the assertion and not an accident of the numbers; that
+  `timer_gaps(ALL)` is empty, a server with no incarnation not being measured against a
+  timer that does not exist; and that the check as it stood on 1a1cad2
+  (`WITHOUT_ADOPTION`) flags the stretch.
+
+**What the mutations showed.** Each was applied in a throwaway copy outside the worktree
+and run against `ananke-sim`'s whole test set in release at the gate's twenty seeds, with
+`--no-fail-fast` so every target reports:
+
+| mutation | the test that fails, and its words |
+| --- | --- |
+| `taken: false` dropped from the arm's pattern, so every `RaftSnapshot` excuses (issue #65's own mutation) | `a_snapshot_a_server_took_itself_…`: "a snapshot the server took is not a completed install and excuses nothing", `left: []`, `right: [TimerGap { server: 1, since: Instant(0ns), at: Instant(450ms), record: 2, installs: 0, restatements: 0, adoptions: 0 }]` |
+| the arm's body `clocks.reset(*server, at)` in place of `up.remove`: the clock reset at the completion, this entry's rejected alternative | `a_coreless_window_…`: "a server with no incarnation is not measured: `[TimerGap { server: 1, since: Instant(100ms), at: Instant(650ms), record: 2, … }]`" |
+
+In each run everything else is green — the other eighteen lib tests, the run's *other* new
+test among them, and every sweep binary: echo 5, engine 18, parallel 1, raft 43 (seed
+2605's own pin included, which is the hole), wal 6. So each mutation fails exactly one
+test and it is the one written for it, where before this commit each failed none. The first two items of issue #65 are closed by this; its third — the
+check being more forgiving than the server on install chunks, D-030's arm excusing a gap
+the real follower does have — is pre-existing, is untouched here, and stays open there. It
+is also the second issue note below.
+
+**Nothing moved.** The change is confined to `Report` — the replay, its arms, `TimerGap`,
+`TimerResets` and one predicate — and to `Report::timer_removal`, which learns that a
+completed install is a status record so D-051's reasoning can name it; the sweep, the
+scenario, the faults and the protocol are untouched. **No schedule moves and no pinned
+trace hash moves**: seed 2605's run is byte-identical instant for instant before and after,
+`same_seed_gives_byte_identical_trace`, `the_seed_42_trace_is_written_for_the_studio` and
+the membership scenario's hash test pass, every pinned-seed test in `sim/tests` passes —
+the nineteen `seed_*` tests, this entry's included — and `ResetTimerOnAnyRpc`,
+`AdoptionAsBuilt` and `SnapshotWithoutCurrentLast` catch the same seeds line for line. So nothing is owed a re-audit. Decision time's removal on the raft
+sweep is also unchanged — `ANANKE_SEEDS=2606` prints "removed 1 catches and added 0 /
+removed: seed 2313", the nightly's own — so D-051 still resolves it.
+
+**Measured on this tree.** The correct server over seeds **0..5000** and again over
+**5000..9000** with this fix: **0 failures**, and in all nine thousand exactly **one** seed
+with an adoption-rescued gap, 2605 — the same count the nightly's ten thousand give, one. Over 0..3000 there are 22 669 completed installs
+whose restatement arrived while the check held the server up; twelve adoptions run longer
+than their server's entire timer bound (seed 79 server 3 at 1.1712 ×, then 2472, 1802,
+2515, 893, 771, 893, 159, 1546, 1681, 2515, 618) and each passes today **only** because
+eight to seventeen leader frames were delivered into the socket of a coreless server, the
+last of them 1.0 to 43.2 ms before the restatement. That accident is what this entry
+removes as a load-bearing mechanism. The completion-to-restatement window itself, over
+0..3000: min 104.603 ms, p50 171.396, p99 256.661, max 353.091.
+
+**The stage's premerge, on the stage's tip.** §12 asks every stage to record the premerge it
+measured beside the last one measured, and the last one in this document is D-060's, on
+`ae54a20`, six commits back. On the tip, `46e95c0`, `scripts/premerge.sh` at a thousand
+seeds is **green in 822.64 s** (13 min 42.6 s), 319 tests passed and none failed, at a mean
+one-minute load of **60.94** over 87 samples (43.90 to 82.90) — `sim/tests/raft.rs`
+535.89 s, `sim/tests/engine.rs` 245.96 s, `sim/tests/wal.rs` 23.26 s, everything else under
+three seconds together. Beside it: D-060's **593.87 s at load 20.87** (`ae54a20`), D-055's
+**540.37 s at load 17.64** (`3787528`) and D-052's **374.64 s** (`1ef6d7e`). The comparison
+is confounded by load in the direction that flatters nothing — this run carried three times
+D-060's — so the honest reading is that the quarter of an hour D-040 set still holds with
+77 s to spare on a machine three times busier, not that the stage cost 229 s. One part is
+attributable: the WAL binary tripled, 8.48 s to 23.26 s, which is D-062's two hand-built
+recoveries and its wider bands. The earlier figure of 1 473 s reported for this fix's tree
+was taken while another lane was building and sampled no load; it is withdrawn in favour of
+this one, measured under D-052's protocol on an otherwise idle machine.
+
+**At ten thousand, on the stage's two green nightlies.** The tier that found seed 2605 has
+since run twice on this branch with this arm in: run 35161762372 on 605e62e and run
+35172923002 on the tip, 27f6c97. In both **the raft binary is green, 43 passed and 0
+failed** (7 509.64 s on the tip, 5 834.48 s on the run before it) — the whole sweep, the
+membership and quorum scenarios, the incremental checker and every pinned seed, this
+entry's
+`seed_2605_which_the_nightly_found_is_an_adoption_window_and_still_catches_the_variant`
+among them. The seed the nightly failed on now passes at the tier that found it, with its
+mechanism asserted both ways rather than green, and the correct server passes every one of
+the ten thousand.
+
+The adoption figures the two runs print, identical in both:
+
+- `AdoptionAsBuilt`: **caught on 637 of 10 000**, its storm drawn on **2 529 seeds with
+  87 456 adoptions under it**, first seed 1; decision time (D-047) removed 3 catches and
+  added none. The pair this entry leans on, `ResetTimerOnAnyRpc`, is **caught on 3 548 of
+  10 000, 35.48 %**, far above D-061's line, as the 34.4 % measured at a thousand said it
+  would be; decision time removed 10 of its catches and added none.
+- The raft sweep's coverage on the correct server: **89 498 adoptions**, 2 529
+  crash-mid-adoption faults and 5 038 crash-mid-install faults, 192 919 snapshots
+  installed, 40 313 re-seeded servers, 8 007 re-seeds completed.
+- D-049's re-seed episodes: 13 326 episodes, 12 956 completed, 12 259 answered from the
+  store, and the adoption's own length in election-timeout windows, **median 1.559 and
+  longest 48.551**, beside the stream's median 2.753 and longest 56.224. Those are re-seed
+  episodes' adoptions (D-035's path), not the completed-install window this entry measures;
+  they are the nearest thing the nightly prints to it.
+- The membership scenario: **74 102 adoptions** over its own ten thousand, with a
+  snapshot-fed joiner on every seed.
+
+**What a green nightly cannot show, and does not.** It prints no count of
+adoption-rescued gaps, so "in all nine thousand exactly one seed with an adoption-rescued
+gap, 2605 — the same count the nightly's ten thousand give" above rests on run
+35111624618's single failure and on the local runs recorded there, not on a counter in a
+green run: a green run is silent about the gaps this arm removed, by construction. Nor does
+it print the completion-to-restatement window, so that window's figures above (min
+104.603 ms, p50 171.396, p99 256.661, max 353.091 over 0..3000) stay local measurements.
+The instrument that would put either in a nightly is the first issue note below, which is
+not code this entry writes.
+
+**Consequences.** `up` now means exactly "the server has a live incarnation": one ends at
+a shutdown, a crash, or a completed install, and begins at a `RaftTerm`. The check is
+still a function of the trace alone. **Nothing now bounds the adoption itself**, which is
+the cost: D-039's stated sensitivity — "an install that takes longer than the bound with
+no completion in the window would still trip the check … the sweep should see an install
+that slow" — is no longer carried by the timer rule, and belongs in a separate bound on
+completion → restatement. Today such a bound would have to sit above 353.091 ms (seed 79,
+server 3, 1.1712 × that server's bound) to pass, so it is a measurement and an entry of
+its own, not a line added here. It is the first of the notes below, not code.
+
+**Issue notes for the owner**, named here rather than written as code, so the fix stays one
+arm; none is filed on GitHub by this commit, which pushes nothing:
+
+- **The adoption has no bound of its own.** The instrument D-039's sensitivity wants, and
+  also the only honest way to *pair* this exemption: a "never restates after an install"
+  variant would be invisible to the timer rule exactly as a server that never restarts is,
+  so the pair for a bound is the bound, not a variant. It needs its own entry and its own
+  measurement of where the bound sits.
+- **The check is more forgiving than the server on install chunks.** The replay's comment
+  says an install keeps "its incarnation's timer … fresh", but the core pushes
+  `Message::InstallSnapshot` to the snapshot task and `continue`s without stepping it, so a
+  chunk does **not** reset the real follower's `election_elapsed`. D-030's arm therefore
+  excuses a gap the real follower does have. Pre-existing, forgiving, and it dulls
+  `ResetTimerOnAnyRpc` slightly.
+- **The adoption's own cost**: ~297.7 ms on seed 2605, about 29.5 ms per staged file, of
+  which D-060's format record is ~8.5 ms at the median. An engine-cost question, which
+  moves this threshold without touching correctness.
+
+---
+
+_Next entry: D-064. Add one before implementing anything not covered above._

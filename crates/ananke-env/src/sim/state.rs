@@ -58,6 +58,10 @@ pub(super) struct Node {
     pub(super) protocol: SimRng,
     /// The node's scheduling stream, `n{id}/sched`; what `race` draws from (D-017).
     pub(super) sched: SimRng,
+    /// The node's streams per range, `n{id}/r{range}/protocol`, each made the first
+    /// time it is asked for and shared from then on (Q13).
+    // PROPOSED(D-057): a named stream per node and range through the environment.
+    pub(super) ranges: BTreeMap<u64, SimRng>,
 }
 
 pub(super) struct Task {
@@ -169,6 +173,23 @@ impl State {
             self.config.seed,
             &format!("n{}/{label}", node.get()),
         ))
+    }
+
+    /// `node`'s stream for `range`, `n{id}/r{range}/protocol`: made from the seed and
+    /// the name the first time it is asked for, which draws from no other stream, and
+    /// the same shared stream every time after (Q13, D-017).
+    // PROPOSED(D-057): a named stream per node and range through the environment.
+    pub(super) fn range_stream(&mut self, node: NodeId, range: u64) -> SimRng {
+        if let Some(rng) = self.nodes.get(&node).and_then(|n| n.ranges.get(&range)) {
+            return rng.clone();
+        }
+        let rng = self.node_stream(node, &format!("r{range}/protocol"));
+        self.nodes
+            .get_mut(&node)
+            .unwrap_or_else(|| panic!("unknown node {node}"))
+            .ranges
+            .insert(range, rng.clone());
+        rng
     }
 
     // --- node clocks -----------------------------------------------------------------

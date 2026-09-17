@@ -17,5 +17,9 @@ ananke-storage = { path = "../ananke-storage", version = "0.3" }
 bytes.workspace = true
 moirae-trace.workspace = true
 
+[dev-dependencies]
+# The fixture of D-059 is copied onto a real disk for the RealEnv test.
+tempfile.workspace = true
+
 [lints]
 workspace = true

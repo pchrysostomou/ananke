@@ -113,6 +113,11 @@ impl Environment for RealEnv {
         &self.inner.rng
     }
 
+    // PROPOSED(D-057): OS entropy, like every other stream under `RealEnv`.
+    fn range_rng(&self, _range: u64) -> RealRng {
+        RealRng
+    }
+
     fn spawn<F: Future<Output = ()> + Send + 'static>(
         &self,
         name: &'static str,

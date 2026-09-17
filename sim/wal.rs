@@ -165,6 +165,23 @@ impl Report {
     pub fn has(&self, f: impl Fn(&TraceEvent) -> bool) -> bool {
         self.records.iter().any(|r| f(&r.event))
     }
+
+    /// Recovery's cuts whose sync the disk lied about, as `(segment, len)`. A cut
+    /// that does not hold brings the records it discarded back at the next crash,
+    /// under numbers the log has since re-issued: that is the shape the supersede
+    /// rule exists for (D-062), and the sweep asserts it is reached even though the
+    /// rule itself fires on far too few seeds to assert at any tier.
+    // PROPOSED(D-062): the WAL's supersede rule.
+    #[must_use]
+    pub fn betrayed_cuts(&self) -> Vec<(u64, u64)> {
+        let events: Vec<&TraceEvent> = self.records.iter().map(|r| &r.event).collect();
+        syncs(&events, Path::new(DIR))
+            .cuts
+            .iter()
+            .filter(|&&(_, _, lost)| lost)
+            .map(|&(segment, len, _)| (segment, len))
+            .collect()
+    }
 }
 
 /// The simulator configuration: every §1.3 fault on.

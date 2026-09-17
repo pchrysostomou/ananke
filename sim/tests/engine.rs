@@ -3,13 +3,20 @@
 //! mid-flush and mid-compaction; the engine that acknowledges before the log is
 //! caught, and so are the one that releases a memtable and its log segments before
 //! the manifest names its table and the one whose compaction deletes its inputs
-//! before the manifest stops naming them.
+//! before the manifest stops naming them. The live install's crash test (Q2, D-054)
+//! runs the same scenario with installs, beside the install that switches twice and
+//! the span checkpoint that does not sync its tables; the range delete's and the
+//! bounded seek's (D-055) beside the delete that forgets the memtables and the seek
+//! that counts tombstones. The default schedule runs all four primitives.
 
+use std::path::Path;
 use std::sync::Mutex;
 
 use ananke_env::TraceEvent;
 use ananke_sim::engine::{self, Variant};
+use ananke_sim::wal::syncs;
 use ananke_sim::{seeds, sweep, verdict, write_trace};
+use ananke_storage::wal;
 
 /// Two runs with the same seed produce byte-identical traces.
 #[test]
@@ -53,9 +60,16 @@ fn the_correct_engine_passes_every_seed() {
 /// their callers newer-first, the memtable rotated in between, and the older write
 /// landed in the newer memtable and shadowed the newer one. Writes now apply in
 /// sequence order (D-021); this seed stays in the gate so they keep doing so.
+///
+/// It runs the Phase 1 workload it was found in: the default schedule runs Stage A's
+/// primitives beside it since D-055, which moves every seed's schedule, and this pin
+/// is on the schedule it was found on, which that commit left as it was.
+// PROPOSED(D-055): the pins keep the schedule they were found on.
 #[test]
 fn seed_420_which_the_first_nightly_found_stays_green() {
-    engine::run(420, Variant::Correct).check().unwrap();
+    engine::run_with(420, engine::Schedule::phase_1(), Variant::Correct)
+        .check()
+        .unwrap();
 }
 
 /// The first 3000-seed sweep with compaction found this: CURRENT and the two newest
@@ -72,10 +86,12 @@ fn seed_420_which_the_first_nightly_found_stays_green() {
 #[test]
 fn seed_44_never_opens_empty_in_either_mode() {
     // The schedule the sweep ran with when it found the seed: level 1 eight times
-    // larger than the gate's.
+    // larger than the gate's, and the Phase 1 workload, without the primitives the
+    // default schedule runs since D-055.
+    // PROPOSED(D-055): the pins keep the schedule they were found on.
     let schedule = engine::Schedule {
         level_base_bytes: 8192,
-        ..engine::Schedule::default()
+        ..engine::Schedule::phase_1()
     };
     let allowed = engine::run_with(44, schedule, Variant::Correct);
     allowed.check().unwrap();
@@ -118,6 +134,90 @@ fn seed_44_never_opens_empty_in_either_mode() {
     assert!(
         refusing.epochs.len() < allowed.epochs.len(),
         "refusing ends the run earlier"
+    );
+}
+
+/// The nightly's ten-thousand-seed run of the seek sweep failed here (GitHub run
+/// 35080746132, PR #60, HEAD 09bed88): the *correct* engine returned record 166
+/// changed at epoch 3. A recovery two epochs earlier had cut segment 14 to nothing;
+/// the disk lied about the sync of that cut (`FsyncLost`, legal under SPEC §1.3) and
+/// the crash after it dropped the still-pending truncation, so segment 14 came back
+/// whole — in front of the live segment 15 and holding numbers the log had since
+/// re-issued, because a number is a position and not an identity. Recovery took the
+/// resurrected copies for current, read segment 15's first record 165 as an ordinary
+/// backwards gap and stopped there, destroying thirteen acknowledged and honestly
+/// synced records and replaying a stale one above `flushed_seq`. A segment whose first
+/// record is numbered behind the reading now supersedes what was read, because
+/// segments are created in increasing number order (D-062).
+///
+/// The mechanism, not the green (CLAUDE.md): the seed must still reach a cut to
+/// nothing whose sync the disk lied about, the fix must still be seen to supersede a
+/// resurrected segment — *that* one, by its numbers, segment 15 restarting the
+/// numbering at 165 where the reading had reached 173 and dropping segment 14's seven
+/// stale copies — and the reader that trusts the earlier segment must still fail this
+/// seed with the violation it was pinned for. The day the schedule moves away from the
+/// shape, the first assertions say so and the pin is upgraded.
+// PROPOSED(D-062): the WAL's supersede rule.
+#[test]
+fn seed_3123_which_the_nightly_found_supersedes_a_resurrected_segment() {
+    let schedule = engine::Schedule::seek();
+    let report = engine::run_with(3123, schedule, Variant::Correct);
+    report.check().unwrap();
+    let events: Vec<&TraceEvent> = report.records.iter().map(|r| &r.event).collect();
+    let betrayed: Vec<(u64, u64)> = syncs(&events, Path::new(engine::DIR))
+        .cuts
+        .iter()
+        .filter(|&&(_, _, lost)| lost)
+        .map(|&(segment, len, _)| (segment, len))
+        .collect();
+    assert!(
+        betrayed.iter().any(|&(_, len)| len == 0),
+        "the seed no longer cuts a segment to nothing on a sync the disk lied about: {betrayed:?}"
+    );
+    let superseded = report.count(|e| matches!(e, TraceEvent::WalSuperseded { .. }));
+    assert!(
+        superseded > 0,
+        "the seed no longer meets the resurrected segment the fix supersedes"
+    );
+    // Which supersede, and not merely that one fired: D-062's own numbers. Segment 15,
+    // the live one, restarts the numbering at 165 where the reading had reached 173,
+    // dropping the seven copies read from the resurrected segment 14. A schedule that
+    // shifted the seed onto some other resurrection would satisfy the count above and
+    // pass; it fails here instead, and says what it found.
+    let superseded_events: Vec<(u64, u64, u64, u64)> = report
+        .records
+        .iter()
+        .filter_map(|r| match r.event {
+            TraceEvent::WalSuperseded {
+                segment,
+                expected,
+                found,
+                dropped,
+            } => Some((segment, expected, found, dropped)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        superseded_events,
+        [(15, 173, 165, 7)],
+        "not the supersede D-062 describes, as (segment, expected, found, dropped)"
+    );
+    // The pair on the seed itself: today's reader, kept as a variant, still returns
+    // the stale copies and still fails the seed the way the nightly did.
+    let caught = engine::run_with(
+        3123,
+        engine::Schedule {
+            wal_variant: wal::Variant::TrustsAStaleSegment,
+            ..schedule
+        },
+        Variant::Correct,
+    );
+    let violation = caught
+        .check()
+        .expect_err("the reader that trusts a stale segment is caught at seed 3123");
+    assert!(
+        violation.contains("record 166 came back changed"),
+        "caught, but not with the violation the seed was pinned for: {violation}"
     );
 }
 
@@ -168,6 +268,372 @@ fn the_correct_engine_passes_every_seed_with_deep_levels() {
     assert!(
         deepest >= 3,
         "compaction never reached level 3: deepest {deepest}"
+    );
+}
+
+/// Q2's criterion, the stage's gate (SHARD.md §11 storage 5, §12 Stage A; D-054):
+/// the live install's crash test. A task checkpoints random spans and installs each
+/// over its span a little later while the writers write every key, and every crash
+/// is aimed at an install, anywhere from the moment it is asked for to past its end,
+/// under the full disk fault model. After each crash the span comes back as it was
+/// or as installed, never a mixture; every key outside it as it was, bar what a
+/// fault explains; and every write to the span after the install is read over the
+/// installed version. The correct engine passes every seed, and the sweep is seen
+/// to crash before an install's switch, after it, and after writes over it.
+// PROPOSED(D-054): the live install's crash test.
+#[test]
+fn the_live_install_crash_test_passes_every_seed() {
+    let totals = Mutex::new((
+        engine::InstallOutcomes::default(),
+        0u64,
+        0u64,
+        0u64,
+        0u64,
+        0u64,
+    ));
+    let verdicts = sweep(seeds(), |seed| {
+        let report = engine::run_with(seed, engine::Schedule::install(), Variant::Correct);
+        {
+            let mut t = totals.lock().unwrap();
+            add_outcomes(&mut t.0, report.install_outcomes);
+            t.1 += report.installs_started;
+            t.2 += report.installs_completed;
+            t.3 += report.reads_over_installs;
+            t.4 += report.span_checkpoints_verified;
+            t.5 += report.reads_unjudged_for_installs;
+        }
+        report.check().map_err(|violation| {
+            write_trace(&format!("engine-install-{seed}"), &report.jsonl);
+            format!("seed {seed}: {violation}")
+        })
+    });
+    let (outcomes, started, completed, reads_over, verified, unjudged) =
+        totals.into_inner().unwrap();
+    eprintln!(
+        "live install, Correct: {started} installs asked for, {completed} resolved, {reads_over} live reads over an install, {verified} span checkpoints verified, {unjudged} reads left unjudged while an install ran; after the crashes: {outcomes:?}"
+    );
+    if let Err(violation) = verdict(&verdicts) {
+        panic!("{violation}");
+    }
+    assert_install_windows(&outcomes, "an install");
+    assert!(verified > 0, "no span checkpoint was opened after a crash");
+    assert!(
+        reads_over > 0,
+        "no live read of a key written after an install: {outcomes:?}"
+    );
+}
+
+/// Adds one run's install outcomes to a sweep's.
+fn add_outcomes(total: &mut engine::InstallOutcomes, o: engine::InstallOutcomes) {
+    total.aimed += o.aimed;
+    total.kept += o.kept;
+    total.crashed_after_switch += o.crashed_after_switch;
+    total.crashed_before_record_durable += o.crashed_before_record_durable;
+    total.crashed_between_replacement_and_switch += o.crashed_between_replacement_and_switch;
+    total.crashed_otherwise_before_switch += o.crashed_otherwise_before_switch;
+    total.lost_to_a_fault += o.lost_to_a_fault;
+    total.keys_written_after += o.keys_written_after;
+}
+
+/// The windows an install's crash test must have crashed in (D-054): aimed at all,
+/// between its replacement and its switch, which is the one-switch rule's window,
+/// after the switch before the install resolved, and with writes over it checked.
+// PROPOSED(D-054): the live install's crash test.
+fn assert_install_windows(outcomes: &engine::InstallOutcomes, what: &str) {
+    assert!(outcomes.aimed > 0, "no crash was aimed at {what}");
+    assert!(
+        outcomes.crashed_between_replacement_and_switch > 0,
+        "no crash landed between {what}'s replacement and its switch: {outcomes:?}"
+    );
+    assert!(
+        outcomes.crashed_after_switch > 0,
+        "no crash landed after {what}'s switch before it resolved: {outcomes:?}"
+    );
+    assert!(
+        outcomes.keys_written_after > 0,
+        "no key written after {what} was checked after a crash: {outcomes:?}"
+    );
+}
+
+/// The install's known-buggy engine beside it (CLAUDE.md's pair rule; D-054): the
+/// install that takes the span's keys out with one manifest switch and puts the
+/// installed tables in with a second is caught by the same crash test, on some seed
+/// at every tier, and the rate is printed.
+// PROPOSED(D-054): the live install's crash test.
+#[test]
+fn an_install_in_two_switches_is_caught() {
+    let caught: Vec<String> = sweep(seeds(), |seed| {
+        engine::run_with(
+            seed,
+            engine::Schedule::install(),
+            Variant::InstallInTwoSwitches,
+        )
+        .check()
+        .err()
+    })
+    .into_iter()
+    .flatten()
+    .collect();
+    eprintln!(
+        "InstallInTwoSwitches: caught on {} of {} seeds, first: {}",
+        caught.len(),
+        seeds(),
+        caught.first().map_or("", String::as_str)
+    );
+    assert!(!caught.is_empty(), "InstallInTwoSwitches was never caught");
+}
+
+/// The range delete's crash test (D-055): a task deletes a random span now and then
+/// while the writers write every key, and every crash is aimed at a delete, under
+/// the full disk fault model. After each crash the span comes back as it was or
+/// empty, never a mixture, with every other key as the oracle says and every write
+/// after the delete read over it. The correct engine passes every seed, and the
+/// sweep is seen to crash before a delete's switch and after it.
+// PROPOSED(D-055): the range delete's crash test.
+#[test]
+fn the_range_delete_crash_test_passes_every_seed() {
+    let totals = Mutex::new((engine::InstallOutcomes::default(), 0u64, 0u64, 0u64));
+    let verdicts = sweep(seeds(), |seed| {
+        let report = engine::run_with(seed, engine::Schedule::range_delete(), Variant::Correct);
+        {
+            let mut t = totals.lock().unwrap();
+            add_outcomes(&mut t.0, report.install_outcomes);
+            t.1 += report.deletes_started;
+            t.2 += report.installs_completed;
+            t.3 += report.reads_unjudged_for_installs;
+        }
+        report.check().map_err(|violation| {
+            write_trace(&format!("engine-range-delete-{seed}"), &report.jsonl);
+            format!("seed {seed}: {violation}")
+        })
+    });
+    let (outcomes, started, completed, unjudged) = totals.into_inner().unwrap();
+    eprintln!(
+        "range delete, Correct: {started} deletes asked for, {completed} resolved, {unjudged} reads left unjudged while a delete ran; after the crashes: {outcomes:?}"
+    );
+    if let Err(violation) = verdict(&verdicts) {
+        panic!("{violation}");
+    }
+    assert_install_windows(&outcomes, "a delete");
+}
+
+/// The range delete's known-buggy engine beside it (D-055): a delete that takes the
+/// span's writes out of the tables but leaves the memtables unflushed and the
+/// manifest's `flushed_seq` where it was, so the span's writes in a memtable stay
+/// readable and come back, is caught by the same crash test on some seed at every
+/// tier, and the rate is printed.
+// PROPOSED(D-055): the range delete's crash test.
+#[test]
+fn a_range_delete_that_skips_the_memtables_is_caught() {
+    let caught: Vec<String> = sweep(high_rate_share(), |seed| {
+        engine::run_with(
+            seed,
+            engine::Schedule::range_delete(),
+            Variant::RangeDeleteSkipsMemtables,
+        )
+        .check()
+        .err()
+    })
+    .into_iter()
+    .flatten()
+    .collect();
+    eprintln!(
+        "RangeDeleteSkipsMemtables: caught on {} of {} seeds, first: {}",
+        caught.len(),
+        high_rate_share(),
+        caught.first().map_or("", String::as_str)
+    );
+    assert!(
+        !caught.is_empty(),
+        "RangeDeleteSkipsMemtables was never caught"
+    );
+}
+
+/// The bounded seek's crash test (D-055): half the readers' scans are seeks of one
+/// to six keys at a snapshot, which must be the first keys the model holds in the
+/// range, and every recovery is walked by seeks of three keys at a time, which must
+/// be the model's state. The correct engine passes every seed, and the sweep is seen
+/// to make seeks that stop at their limit and walks after a crash.
+// PROPOSED(D-055): the bounded seek's crash test.
+#[test]
+fn the_seek_crash_test_passes_every_seed() {
+    let totals = Mutex::new((0u64, 0u64, 0u64));
+    let verdicts = sweep(seeds(), |seed| {
+        let report = engine::run_with(seed, engine::Schedule::seek(), Variant::Correct);
+        {
+            let mut t = totals.lock().unwrap();
+            t.0 += report.seeks.0;
+            t.1 += report.seeks.1;
+            t.2 += report.recovery_seeks;
+        }
+        report.check().map_err(|violation| {
+            write_trace(&format!("engine-seek-{seed}"), &report.jsonl);
+            format!("seed {seed}: {violation}")
+        })
+    });
+    let (seeks, limited, walks) = totals.into_inner().unwrap();
+    eprintln!(
+        "seek, Correct: {seeks} live seeks, {limited} of them stopped at their limit, {walks} seeks walking a recovered engine"
+    );
+    if let Err(violation) = verdict(&verdicts) {
+        panic!("{violation}");
+    }
+    assert!(limited > 0, "no seek stopped at its limit");
+    assert!(walks > 0, "no recovered engine was walked by seeks");
+}
+
+/// The bounded seek's known-buggy engine beside it (D-055): a seek that counts a
+/// deleted key against its limit returns fewer keys than the range holds, and is
+/// caught by the same crash test on some seed at every tier.
+// PROPOSED(D-055): the bounded seek's crash test.
+#[test]
+fn a_seek_that_counts_tombstones_is_caught() {
+    let caught: Vec<String> = sweep(high_rate_share(), |seed| {
+        engine::run_with(
+            seed,
+            engine::Schedule::seek(),
+            Variant::SeekCountsTombstones,
+        )
+        .check()
+        .err()
+    })
+    .into_iter()
+    .flatten()
+    .collect();
+    eprintln!(
+        "SeekCountsTombstones: caught on {} of {} seeds, first: {}",
+        caught.len(),
+        high_rate_share(),
+        caught.first().map_or("", String::as_str)
+    );
+    assert!(!caught.is_empty(), "SeekCountsTombstones was never caught");
+}
+
+/// The install that keeps its source's sequence numbers beside the same crash test
+/// (D-054): half the installs take their source from a store further along than
+/// the live engine, so a kept number hides the writes that follow the install, and
+/// the oracle checks that every installed table the manifest in force lists carries
+/// the install's own number. Caught on some seed at every tier, and the rate is
+/// printed.
+///
+/// A kept number can also equal the number of a later local write of the same key,
+/// and two writes under one internal key stop the variant's next compaction at the
+/// table writer's order assertion: the engine itself refuses the state the bug
+/// made. Such a seed counts as caught, apart from the oracle's catches, and only a
+/// panic with that assertion's message does: any other panic fails the test. The
+/// oracle's own catches are asserted non-empty.
+///
+/// And at least one of them is the installed-table number check itself, not merely some
+/// key reading wrong. Q2's criterion is that the installed numbers are above the live
+/// engine's, and the check that states it is the only thing that says so: with it taken
+/// out the variant is still caught on 92 of the thousand-seed tier's hundred-seed share
+/// against 98, by the state check noticing a key read wrong, and non-emptiness cannot
+/// tell the two apart. Asserting a catch by the check's own words keeps the criterion
+/// the thing that catches this variant.
+// PROPOSED(D-054): the installed sequence numbers are the install's.
+#[test]
+fn an_install_that_keeps_its_sources_numbers_is_caught() {
+    /// The table writer's assertion a kept number trips (`SstWriter::add`).
+    const ORDER: &str = "SSTable writes must be added in internal-key order";
+    enum Catch {
+        Oracle(String),
+        Order,
+    }
+    let outcomes: Vec<Option<Catch>> = sweep(high_rate_share(), |seed| {
+        let run = std::panic::catch_unwind(|| {
+            engine::run_with(
+                seed,
+                engine::Schedule::install(),
+                Variant::InstallKeepsSourceNumbers,
+            )
+            .check()
+            .err()
+        });
+        match run {
+            Ok(violation) => violation.map(Catch::Oracle),
+            Err(payload) => {
+                let message = payload
+                    .downcast_ref::<&str>()
+                    .copied()
+                    .or_else(|| payload.downcast_ref::<String>().map(String::as_str));
+                if message == Some(ORDER) {
+                    Some(Catch::Order)
+                } else {
+                    std::panic::resume_unwind(payload)
+                }
+            }
+        }
+    });
+    let oracle: Vec<&str> = outcomes
+        .iter()
+        .filter_map(|o| match o {
+            Some(Catch::Oracle(v)) => Some(v.as_str()),
+            _ => None,
+        })
+        .collect();
+    let order = outcomes
+        .iter()
+        .filter(|o| matches!(o, Some(Catch::Order)))
+        .count();
+    eprintln!(
+        "InstallKeepsSourceNumbers: caught on {} of {} seeds by the oracle and {order} by the table writer's order assertion, first: {}",
+        oracle.len(),
+        high_rate_share(),
+        oracle.first().copied().unwrap_or("")
+    );
+    assert!(
+        !oracle.is_empty(),
+        "the oracle never caught InstallKeepsSourceNumbers"
+    );
+    // PROPOSED(D-054): the installed sequence numbers are the install's — the check
+    // itself, not a key that happens to read wrong once the numbers are kept.
+    assert!(
+        oracle
+            .iter()
+            .any(|violation| violation.contains("not the install's number")),
+        "no seed was caught by the installed tables' own numbers; every catch is a state \
+         mismatch, so Q2's criterion is not what caught the variant: {oracle:?}"
+    );
+}
+
+/// The seeds a variant caught on at least four seeds in five runs: a tenth of the
+/// tier, and never fewer than twenty or the tier itself. At those rates a share of
+/// twenty still expects sixteen catches or more, and a premerge share of a hundred
+/// eighty or more, while the engine binary's cost stays near what the sweep's other
+/// tests make it.
+// PROPOSED(D-055): the high-rate variants run a share of the seeds.
+fn high_rate_share() -> u64 {
+    (seeds() / 10).max(seeds().min(20))
+}
+
+/// The span checkpoint's known-buggy engine beside the same crash test (D-054): a
+/// checkpoint of a span whose tables are not synced before the manifest and
+/// `CURRENT` that name them is caught when a crash leaves one of them short and
+/// the checkpoint is opened fresh after it, on some seed at every tier.
+// PROPOSED(D-054): the checkpoint of a span, which the live install installs from.
+#[test]
+fn a_span_checkpoint_without_syncs_is_caught() {
+    let caught: Vec<String> = sweep(high_rate_share(), |seed| {
+        engine::run_with(
+            seed,
+            engine::Schedule::install(),
+            Variant::SpanCheckpointUnsynced,
+        )
+        .check()
+        .err()
+    })
+    .into_iter()
+    .flatten()
+    .collect();
+    eprintln!(
+        "SpanCheckpointUnsynced: caught on {} of {} seeds, first: {}",
+        caught.len(),
+        high_rate_share(),
+        caught.first().map_or("", String::as_str)
+    );
+    assert!(
+        !caught.is_empty(),
+        "SpanCheckpointUnsynced was never caught"
     );
 }
 
@@ -240,6 +706,11 @@ struct Coverage {
     versions_dropped: u64,
     tombstones_dropped: u64,
     crashes_mid_compaction: u32,
+    installs: u64,
+    range_deletes: u64,
+    span_checkpoints: u64,
+    seeks: u64,
+    recovery_seeks: u64,
 }
 
 impl Coverage {
@@ -331,6 +802,11 @@ impl Coverage {
             .iter()
             .filter(|e| e.recovery.wal.head_gap.is_some())
             .count() as u32;
+        self.installs += report.installs_started - report.deletes_started;
+        self.range_deletes += report.deletes_started;
+        self.span_checkpoints += report.span_checkpoints;
+        self.seeks += report.seeks.0;
+        self.recovery_seeks += report.recovery_seeks;
     }
 
     fn assert_complete(&self) {
@@ -382,6 +858,21 @@ impl Coverage {
             (
                 "tombstones dropped by compaction",
                 u32::try_from(self.tombstones_dropped).unwrap_or(u32::MAX),
+            ),
+            // PROPOSED(D-055): the sweep runs all four primitives.
+            ("installs", u32::try_from(self.installs).unwrap_or(u32::MAX)),
+            (
+                "range deletes",
+                u32::try_from(self.range_deletes).unwrap_or(u32::MAX),
+            ),
+            (
+                "span checkpoints",
+                u32::try_from(self.span_checkpoints).unwrap_or(u32::MAX),
+            ),
+            ("seeks", u32::try_from(self.seeks).unwrap_or(u32::MAX)),
+            (
+                "seeks walking a recovered engine",
+                u32::try_from(self.recovery_seeks).unwrap_or(u32::MAX),
             ),
         ] {
             assert!(seen > 0, "the sweep never saw {what}: {self:?}");

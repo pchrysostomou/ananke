@@ -165,10 +165,15 @@ workload (Raft log + MVCC versions) is write-heavy.
   header CRC covers `len` and `seq`, the record CRC covers those and the payload, and
   `seq` numbers records from 1 (D-018, D-019, D-027).
 - Group commit: batch writers waiting on the same fsync.
-- Recovery reads until the first CRC failure, torn record or gap in the numbering
-  (which is how a missing segment shows); everything after is discarded (the stopping
-  segment is cut to its last good record, later segments removed). Segment numbers
-  are never reused, so they may have holes; the records' numbering must not.
+- Recovery reads until the first CRC failure, torn record or gap *forward* in the
+  numbering (which is how a missing segment shows); everything after is discarded (the
+  stopping segment is cut to its last good record, later segments removed). Segment
+  numbers are never reused, so they may have holes; the records' numbering must not.
+- A segment whose *first* record is numbered **behind** the reading is not a stop.
+  Segments are created in increasing number order, so that segment is the later
+  writing and its records supersede the copies already read: what produces the shape
+  is a previous recovery's cut whose sync the disk lied about, which brings a
+  discarded segment back under numbers the log has since re-issued (D-062).
 
 ### 2.3 Memtable
 
@@ -261,11 +266,11 @@ RAFT.md holds the invariants we check under simulation:
   operations, with the time inside the partition windows taken out, is longer than ten
   maximum election timeouts, 2 s at the scenario's 200 ms maximum
   (`AVAILABILITY_TIMEOUTS`, `availability_bound()`). Both are liveness, asserted on every
-  uniformly scheduled seed (D-016). The worst gap measured is 549.359683 ms over the
-  5 000 uniformly scheduled seeds of 10 000, printed as `worst_completion_gap` by nightly
-  runs 34749071877 on `9b5995d` and 34769934684 on `dc603ea`, each of which completed
-  the change both ways on all 10 000 seeds: under three maximum election timeouts, and
-  over one.
+  uniformly scheduled seed (D-016). Measured before D-058 moved the schedule, the worst
+  gap is 549.359683 ms over the 5 000 uniformly scheduled seeds of 10 000, printed as
+  `worst_completion_gap` by nightly runs 34749071877 on `9b5995d` and 34769934684 on
+  `dc603ea`, each of which completed the change both ways on all 10 000 seeds: under
+  three maximum election timeouts, and over one.
 
   This criterion first asked for no availability loss beyond one election timeout. That
   was an aim, not a bound the scenario can assert. Under its drops, duplicates, delays,

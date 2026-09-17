@@ -196,6 +196,23 @@ pub enum TraceEvent {
         /// The length it was cut to.
         len: u64,
     },
+    /// Recovery met a segment whose first record is numbered *behind* the reading so
+    /// far. Segments are created in increasing number order, so this segment was
+    /// written after every one read before it and its copies of those numbers are the
+    /// live ones: the earlier copies are dropped and the numbering resumes here
+    /// (D-062). What produces the shape is a previous recovery's cut whose sync the
+    /// disk lied about, bringing a discarded segment back whole.
+    // PROPOSED(D-062): the WAL's supersede rule.
+    WalSuperseded {
+        /// The segment whose first record superseded the reading.
+        segment: u64,
+        /// The number the reading had reached: what the next record would have been.
+        expected: u64,
+        /// The number this segment's first record carries.
+        found: u64,
+        /// Records already read that this segment supersedes, now dropped.
+        dropped: u64,
+    },
     /// The log's first record was numbered past the head its caller expected: the
     /// records between are gone with their segments. Replaying past the gap would
     /// give a state that never existed (D-022), so the open was refused, or the whole
@@ -277,6 +294,41 @@ pub enum TraceEvent {
         dropped_versions: u64,
         /// Tombstones dropped because no older write of the key lay below.
         dropped_tombstones: u64,
+    },
+    /// A span's replacement is written and synced: the tables that held the span's
+    /// writes below `seq` taken out, those that also held keys outside it rewritten
+    /// without them, and the installed tables written, every write in them at
+    /// `seq`. The manifest that makes all of it the state in one switch is written
+    /// next. Recorded before that manifest is written, like `CompactionWritten`.
+    // PROPOSED(D-054): the live install of a span, in one manifest switch.
+    SpanInstalled {
+        /// The manifest that lists the result.
+        manifest: u64,
+        /// The span's first key.
+        start: Bytes,
+        /// The key past its last.
+        end: Bytes,
+        /// The sequence number every installed write carries: the install's own log
+        /// record, above every write the engine had taken when it was asked.
+        seq: u64,
+        /// Every table taken out of service, the rewritten ones' originals included.
+        removed: Vec<u64>,
+        /// Each rewritten table: its original, its replacement, and the
+        /// replacement's first and last user key.
+        rewritten: Vec<(u64, u64, Bytes, Bytes)>,
+        /// The installed tables, each with its first and last user key.
+        added: Vec<(u64, Bytes, Bytes)>,
+    },
+    /// An install or a range delete was in force, its switch durable, and deleting
+    /// the tables it took out or the log segments at or below its number failed.
+    /// The install still resolves as made; what it left is removed as orphans at
+    /// the next open, or by the next flush's deletion of the log.
+    // PROPOSED(D-054): an error after the switch does not undo the install.
+    InstallCleanupFailed {
+        /// The install's sequence number.
+        seq: u64,
+        /// The error's text.
+        error: String,
     },
     /// A compaction deleted an input table once the manifest no longer listed it.
     SstDeleted {

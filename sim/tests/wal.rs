@@ -101,6 +101,18 @@ struct Coverage {
     excused_lost_fsync: u32,
     excused_bit_rot: u32,
     excused_betrayed_cut: u32,
+    /// Seeds where a cut of recovery's own was made on a sync the disk lied about:
+    /// the cut may not hold, so the records it discarded can come back at the next
+    /// crash under numbers the log has since re-issued (D-062).
+    // PROPOSED(D-062): the WAL's supersede rule.
+    betrayed_cuts: u32,
+    /// Of those, seeds where such a cut was to nothing, which brings a whole segment
+    /// back in front of the live one — the nightly's seed 3123.
+    // PROPOSED(D-062): the WAL's supersede rule.
+    betrayed_cuts_to_nothing: u32,
+    /// Seeds where recovery met a resurrected segment and superseded it.
+    // PROPOSED(D-062): the WAL's supersede rule.
+    superseded: u32,
 }
 
 impl Coverage {
@@ -113,6 +125,11 @@ impl Coverage {
         self.bit_rot += u32::from(report.has(|e| matches!(e, TraceEvent::BlockRotted { .. })));
         self.lost_entries +=
             u32::from(report.has(|e| matches!(e, TraceEvent::DirectoryEntryLost { .. })));
+        // PROPOSED(D-062): the WAL's supersede rule.
+        let betrayed = report.betrayed_cuts();
+        self.betrayed_cuts += u32::from(!betrayed.is_empty());
+        self.betrayed_cuts_to_nothing += u32::from(betrayed.iter().any(|&(_, len)| len == 0));
+        self.superseded += u32::from(report.has(|e| matches!(e, TraceEvent::WalSuperseded { .. })));
         for epoch in &report.epochs {
             match epoch.recovery.stop.map(|s| s.reason) {
                 Some(WalStopReason::TornRecord) => self.stops_torn += 1,
@@ -140,15 +157,58 @@ impl Coverage {
             ("discarded segments", self.discarded),
             ("the lost-fsync excuse", self.excused_lost_fsync),
             ("the bit-rot excuse", self.excused_bit_rot),
-            ("the betrayed-cut excuse", self.excused_betrayed_cut),
         ] {
             assert!(seen > 0, "the sweep never saw {what}: {self:?}");
         }
         // A gap needs a lost sync on a segment's last group and then a crash that
         // drops that write whole rather than tearing it: one to two epochs in a
-        // hundred. Twenty seeds cannot promise one; a hundred can.
+        // hundred. Twenty seeds cannot promise one; a hundred can. It is on 51 of the
+        // first thousand seeds, 5.1 %, so D-061 leaves it at the hundred-seed tier,
+        // where a hundred see none with probability 0.949^100 = 0.005.
         if self.seeds >= 100 {
             assert!(self.stops_gap > 0, "the sweep never saw a gap: {self:?}");
+        }
+        // The betrayed-cut excuse needs a recovery that cut a segment, a lost sync of
+        // that cut, and the next recovery stopping exactly there: on 34 of the first
+        // thousand seeds, 3.4 % (36 epochs; 401 epochs at the nightly's ten thousand,
+        // so at most 4.0 % of its seeds). D-061, the owner's rule of 2026-09-15: a state
+        // reached on under 5 % of seeds is asserted from the thousand-seed tier, the
+        // premerge and the nightly, and printed with the coverage at every tier. At
+        // 3.4 % the gate's twenty see none with probability 0.966^20 = 0.50 and a
+        // hundred with 0.966^100 = 0.031, so the assertion there would fail a log with
+        // nothing wrong the day a change redraws the schedules; a thousand see none
+        // with probability 0.966^1000 = 9.5e-16.
+        if self.seeds >= 1000 {
+            assert!(
+                self.excused_betrayed_cut > 0,
+                "the sweep never saw the betrayed-cut excuse: {self:?}"
+            );
+        }
+        // The shape the supersede rule exists for (D-062): a cut of recovery's own
+        // made on a sync the disk lied about. The cut may not hold, and when it does
+        // not the discarded records come back under numbers the log has re-issued.
+        // On 765 of the first thousand seeds, 76.5 %, so it is asserted at every
+        // tier, where the gate's twenty see none with probability 0.235^20 = 3e-13.
+        // PROPOSED(D-062): the WAL's supersede rule.
+        assert!(
+            self.betrayed_cuts > 0,
+            "the sweep never saw a cut whose sync the disk lied about: {self:?}"
+        );
+        // The worse half of that shape: the betrayed cut was to nothing, so a whole
+        // segment comes back in front of the live one, which is what the nightly met
+        // at seed 3123. On 60 of the first thousand, 6.0 %, so by D-061 it stays at
+        // the hundred-seed tier, where a hundred see none with probability
+        // 0.94^100 = 0.002 and the gate's twenty with 0.29 — far too often to assert
+        // there. The rule firing is rarer still and is not asserted anywhere: no
+        // seed of the first thousand superseded here, and the engine's seek sweep
+        // superseded on 1 of its first ten thousand. Seed 3123 pins it instead
+        // (sim/tests/engine.rs), and `superseded` above prints it at every tier.
+        // PROPOSED(D-062): the WAL's supersede rule.
+        if self.seeds >= 100 {
+            assert!(
+                self.betrayed_cuts_to_nothing > 0,
+                "the sweep never saw a betrayed cut to nothing: {self:?}"
+            );
         }
         // A correctly synced log never has a directory operation pending at a crash,
         // and so never loses a segment.

@@ -13,17 +13,35 @@
 //!
 //! Keys follow SPEC §2.6's shape, tenant and table as big-endian `u64`s in front of
 //! the user key, so the Raft state sorts apart from everything else and a scan over
-//! one table is a scan over one key range.
+//! one range of one purpose is a scan over one key range. A store is opened for one
+//! Raft *group*, under the [`KeyPrefix`] `0 / <group: u64 BE>`; every key of the
+//! group is `prefix / <purpose: u64 BE> / name`, so a group's whole Raft state is
+//! one key interval, and several groups share one engine without sharing a key
+//! (PROPOSED D-060, Q5 and Q40). Today's one group is
+//! [`node::SINGLE_GROUP`](crate::node::SINGLE_GROUP).
 //!
 //! | Key | Value |
 //! |---|---|
-//! | `0 / 0 / hard` | `term: u64 \| vote: u64 (u64::MAX for none)` |
-//! | `0 / 0 / applied` | `applied: u64` |
-//! | `0 / 0 / reseeded` | present on a store a re-seed rebuilt (RAFT.md §3) |
-//! | `0 / 0 / incarnation` | `incarnation: u64`: 1 for a store started fresh, a fresh value on every store a re-seed rebuilt |
-//! | `0 / 1 / <index: u64 BE>` | `term: u64 \| payload` |
-//! | `0 / 2 / config` | `index: u64 \| configuration` |
-//! | `0 / 3 / snapshot` | the last snapshot's index, term, configuration, checkpoint directory |
+//! | `0 / g / 0 / hard` | `term: u64 \| vote: u64 (u64::MAX for none)` |
+//! | `0 / g / 0 / applied` | `applied: u64` |
+//! | `0 / g / 0 / reseeded` | present on a store a re-seed rebuilt (RAFT.md §3) |
+//! | `0 / g / 0 / incarnation` | `incarnation: u64`: 1 for a store started fresh, a fresh value on every store a re-seed rebuilt |
+//! | `0 / g / 1 / <index: u64 BE>` | `term: u64 \| payload` |
+//! | `0 / g / 2 / config` | `index: u64 \| configuration` |
+//! | `0 / g / 3 / snapshot` | the last snapshot's index, term, configuration, checkpoint directory |
+//!
+//! Purposes 4 and up are unassigned, so a later session table (#21, Q11) or a
+//! range descriptor takes one inside the group's interval and moves no key
+//! (PROPOSED D-060). User data is tenant 2 ([`crate::apply::USER_TENANT`]);
+//! tenant 1 is the system tenant, which nothing in Stage A writes.
+//!
+//! Which layout a directory holds is recorded in a file beside the store marker,
+//! [`crate::format::FORMAT_FILE`], read before anything
+//! writes: a store of ananke-raft 0.3.0's format, which records none, is refused
+//! at open rather than read under this layout, and so is one recording any other
+//! version (D-059). [`RaftStore::open`] takes the proof of that check,
+//! [`FormatChecked`], so no caller can read a key of
+//! a directory the gate has not seen; [`RaftStore::open_dir`] runs the gate itself.
 //!
 //! The `config` key carries the latest configuration entry's index and content
 //! (RAFT.md §3), written in the same synced batch as the append or truncation
@@ -54,25 +72,37 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use ananke_env::{Environment, File, FileSystem, OpenOptions, WalStop, WalStopReason};
 use ananke_storage::manifest;
-use ananke_storage::{Engine, EngineRecovery, WriteBatch};
+use ananke_storage::{Engine, EngineConfig, EngineRecovery, WriteBatch};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 use crate::core::Persist;
+use crate::format::{self, FormatChecked};
 use crate::message::{get_payload, put_payload};
 use crate::types::{Configuration, Entry, Index, Payload, ServerId, Term};
 
 /// The tenant the protocol's state lives under.
 pub const RAFT_TENANT: u64 = 0;
-const META_TABLE: u64 = 0;
-pub(crate) const LOG_TABLE: u64 = 1;
-const CONFIG_TABLE: u64 = 2;
-/// The table the snapshot record lives under (RAFT.md §3): written into the live
+/// The purpose the hard state, the applied index, the quarantine flag and the
+/// incarnation live under, inside a group's prefix: RAFT.md §3's table 0.
+// PROPOSED(D-060): RAFT.md §3's table ids, as purposes under a group's prefix.
+pub const PURPOSE_META: u64 = 0;
+/// The purpose the log lives under: one key per index, `prefix / 1 / <index: u64 BE>`.
+// PROPOSED(D-060)
+pub const PURPOSE_LOG: u64 = 1;
+/// The purpose the configuration key lives under (RAFT.md §3): the latest
+/// configuration entry's index and content, written in the same synced batch as
+/// the append or truncation that changed which entry that is, and rewritten by an
+/// install's repair so a compacted store still knows its configuration.
+// PROPOSED(D-060)
+pub const PURPOSE_CONFIG: u64 = 2;
+/// The purpose the snapshot record lives under (RAFT.md §3): written into the live
 /// store before a checkpoint is taken, so the checkpoint's copy carries the
 /// snapshot's own identity, before the checkpoint's `CURRENT` (D-024).
-const SNAP_TABLE: u64 = 3;
+// PROPOSED(D-060)
+pub const PURPOSE_SNAPSHOT: u64 = 3;
 const NO_VOTE: u64 = u64::MAX;
 
-/// A key under `tenant` and `table`.
+/// A key under `tenant` and `table`, SPEC §2.6's encoding.
 #[must_use]
 pub fn key(tenant: u64, table: u64, user: &[u8]) -> Bytes {
     let mut out = BytesMut::with_capacity(16 + user.len());
@@ -82,48 +112,121 @@ pub fn key(tenant: u64, table: u64, user: &[u8]) -> Bytes {
     out.freeze()
 }
 
-pub(crate) fn hard_key() -> Bytes {
-    key(RAFT_TENANT, META_TABLE, b"hard")
-}
+/// The key prefix one Raft group's state lives under: `0 / <group: u64 BE>`,
+/// sixteen bytes. Every key of the group is `prefix / <purpose: u64 BE> / name`,
+/// so the group's whole Raft state is one key interval and a store is
+/// parameterised by the prefix rather than by a fixed pair of tables (Q40).
+/// `ananke-raft` names a group, never a range or a span: which range a group
+/// replicates is the layer above's (SHARD.md §2).
+// PROPOSED(D-060): the store parameterised by a key prefix (Q40).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct KeyPrefix(Bytes);
 
-pub(crate) fn applied_key() -> Bytes {
-    key(RAFT_TENANT, META_TABLE, b"applied")
-}
+impl KeyPrefix {
+    /// The prefix of `group`'s Raft state.
+    #[must_use]
+    pub fn group(group: u64) -> Self {
+        Self(key(RAFT_TENANT, group, &[]))
+    }
 
-pub(crate) fn log_key(index: Index) -> Bytes {
-    key(RAFT_TENANT, LOG_TABLE, &index.to_be_bytes())
-}
+    /// The prefix's bytes: `0 / <group: u64 BE>`.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
 
-/// The `0 / 2 / config` key (RAFT.md §3): the latest configuration entry's index
-/// and content, written in the same synced batch as the append or truncation that
-/// changed which entry that is, and rewritten by an install's repair so a
-/// compacted store still knows its configuration.
-pub(crate) fn config_key() -> Bytes {
-    key(RAFT_TENANT, CONFIG_TABLE, b"config")
-}
+    /// The group's whole interval, `[0 / g, 0 / (g + 1))`; for the last group,
+    /// everything above it in tenant 0.
+    #[must_use]
+    pub fn span(&self) -> std::ops::Range<Bytes> {
+        let group = u64::from_be_bytes(self.0[8..16].try_into().expect("eight bytes"));
+        let end = match group.checked_add(1) {
+            Some(next) => key(RAFT_TENANT, next, &[]),
+            None => Bytes::copy_from_slice(&(RAFT_TENANT + 1).to_be_bytes()),
+        };
+        self.0.clone()..end
+    }
 
-/// The `0 / 3 / snapshot` key (RAFT.md §3).
-pub(crate) fn snapshot_key() -> Bytes {
-    key(RAFT_TENANT, SNAP_TABLE, b"snapshot")
-}
+    /// One purpose's interval inside the group's, `[prefix / p, prefix / (p + 1))`.
+    #[must_use]
+    pub fn purpose_span(&self, purpose: u64) -> std::ops::Range<Bytes> {
+        let start = self.key(purpose, &[]);
+        let end = match purpose.checked_add(1) {
+            Some(next) => self.key(next, &[]),
+            None => self.span().end,
+        };
+        start..end
+    }
 
-/// The re-seed quarantine flag: present on a store rebuilt from a snapshot after a
-/// refusal (RAFT.md §3), durable so a later clean restart keeps the suppression.
-// D-035: re-seeded servers are quarantined from voting for good.
-pub(crate) fn quarantine_key() -> Bytes {
-    key(RAFT_TENANT, META_TABLE, b"reseeded")
-}
+    /// The key `prefix / <purpose: u64 BE> / name`.
+    #[must_use]
+    pub fn key(&self, purpose: u64, name: &[u8]) -> Bytes {
+        let mut out = BytesMut::with_capacity(self.0.len() + 8 + name.len());
+        out.put_slice(&self.0);
+        out.put_u64(purpose);
+        out.put_slice(name);
+        out.freeze()
+    }
 
-/// The store's incarnation number (RAFT.md §3): written as 1 at a fresh store's
-/// first open, and by an install's repair — carried forward on an install into a
-/// live store, drawn afresh for a re-seed, whose predecessor's value is lost with
-/// the rest of the refused store. Followers answer with it so a leader can tell a
-/// rebuilt store, whose log may have lost acknowledged entries, from the one it
-/// recorded a match index for.
-// D-042: store incarnations, so a leader forgets what a re-seeded
-// follower forgot.
-pub(crate) fn incarnation_key() -> Bytes {
-    key(RAFT_TENANT, META_TABLE, b"incarnation")
+    pub(crate) fn hard_key(&self) -> Bytes {
+        self.key(PURPOSE_META, b"hard")
+    }
+
+    pub(crate) fn applied_key(&self) -> Bytes {
+        self.key(PURPOSE_META, b"applied")
+    }
+
+    /// The log key of `index`: the prefix, the log purpose and the index as a
+    /// big-endian `u64`, so the log sorts by index.
+    pub(crate) fn log_key(&self, index: Index) -> Bytes {
+        self.key(PURPOSE_LOG, &index.to_be_bytes())
+    }
+
+    /// The index a log key names: exactly the prefix, the log purpose and eight
+    /// bytes, or `None` for anything else.
+    pub(crate) fn log_index(&self, key: &[u8]) -> Option<Index> {
+        let at = self.0.len();
+        if key.len() != at + 16 || key[..at] != self.0[..] {
+            return None;
+        }
+        if u64::from_be_bytes(key[at..at + 8].try_into().ok()?) != PURPOSE_LOG {
+            return None;
+        }
+        Some(Index::from_be_bytes(key[at + 8..].try_into().ok()?))
+    }
+
+    /// The `prefix / 2 / config` key (RAFT.md §3): the latest configuration
+    /// entry's index and content, written in the same synced batch as the append
+    /// or truncation that changed which entry that is, and rewritten by an
+    /// install's repair so a compacted store still knows its configuration.
+    pub(crate) fn config_key(&self) -> Bytes {
+        self.key(PURPOSE_CONFIG, b"config")
+    }
+
+    /// The `prefix / 3 / snapshot` key (RAFT.md §3).
+    pub(crate) fn snapshot_key(&self) -> Bytes {
+        self.key(PURPOSE_SNAPSHOT, b"snapshot")
+    }
+
+    /// The re-seed quarantine flag: present on a store rebuilt from a snapshot
+    /// after a refusal (RAFT.md §3), durable so a later clean restart keeps the
+    /// suppression.
+    // D-035: re-seeded servers are quarantined from voting for good.
+    pub(crate) fn quarantine_key(&self) -> Bytes {
+        self.key(PURPOSE_META, b"reseeded")
+    }
+
+    /// The store's incarnation number (RAFT.md §3): written as 1 at a fresh
+    /// store's first open, and by an install's repair — carried forward on an
+    /// install into a live store, drawn afresh for a re-seed, whose predecessor's
+    /// value is lost with the rest of the refused store. Followers answer with it
+    /// so a leader can tell a rebuilt store, whose log may have lost acknowledged
+    /// entries, from the one it recorded a match index for.
+    // D-042: store incarnations, so a leader forgets what a re-seeded
+    // follower forgot.
+    pub(crate) fn incarnation_key(&self) -> Bytes {
+        self.key(PURPOSE_META, b"incarnation")
+    }
 }
 
 /// The incarnation of a store started fresh.
@@ -192,6 +295,17 @@ pub enum Damage {
     /// it traced anything, and only an install replaces it.
     // D-044: a durable refusal, and a refused engine that does no work.
     MarkedLost,
+    /// Neither copy of the store's format record can be read, beside a store:
+    /// damage, never another format, since this build writes only its own and
+    /// the record's encoding is permanent (PROPOSED D-060). The adoption of the
+    /// re-seed that follows rewrites it.
+    // PROPOSED(D-060)
+    FormatUnreadable,
+    /// Neither copy of a staged install's format record can be read: staging
+    /// damage, refused and never swept, like a staged `CURRENT` that does not
+    /// parse (D-041).
+    // PROPOSED(D-060)
+    StagingFormatUnreadable,
 }
 
 impl std::fmt::Display for Damage {
@@ -222,6 +336,16 @@ impl std::fmt::Display for Damage {
                 "the directory carries the {STORE_MARKER} marker and a CURRENT that cannot be read"
             ),
             Damage::MarkedLost => write!(f, "the {STORE_MARKER} marker says this store lost state"),
+            Damage::FormatUnreadable => write!(
+                f,
+                "the {} record beside the store cannot be read",
+                crate::format::FORMAT_FILE
+            ),
+            Damage::StagingFormatUnreadable => write!(
+                f,
+                "the staging directory's {} record cannot be read",
+                crate::format::FORMAT_FILE
+            ),
         }
     }
 }
@@ -526,7 +650,7 @@ async fn write_marker<E: Environment>(
     fs.sync_dir(engine_dir).await
 }
 
-/// The last snapshot, as `0 / 3 / snapshot` records it (RAFT.md §3): written into
+/// The last snapshot, as `<prefix> / 3 / snapshot` records it (RAFT.md §3): written into
 /// the live store before its checkpoint is taken, so the checkpoint carries its own
 /// identity before its `CURRENT`; written by an install's repair with the identity
 /// of the snapshot installed.
@@ -615,6 +739,9 @@ pub(crate) fn decode_snapshot_record(mut bytes: Bytes) -> io::Result<SnapshotRec
 /// persists and the task that applies; see the module documentation.
 pub struct RaftStore<E: Environment> {
     engine: Arc<Engine<E>>,
+    /// The group's key prefix: every key this store reads or writes is under it.
+    // PROPOSED(D-060): the store parameterised by a key prefix (Q40).
+    prefix: KeyPrefix,
     /// The hard state on disk, written by [`persist`](Self::persist) only.
     term: AtomicU64,
     vote: AtomicU64,
@@ -630,62 +757,79 @@ pub struct RaftStore<E: Environment> {
 }
 
 impl<E: Environment> RaftStore<E> {
-    /// Loads the state the engine holds: the hard state, the applied index, the
-    /// snapshot record and the log's tail past it, in index order. `recovery` is
-    /// what the engine's open reported. Log keys the snapshot covers are deleted
-    /// here: a crash between a snapshot's record and its compaction leaves them,
-    /// and this cleanup is idempotent.
+    /// Loads the state the engine holds under `prefix`: the hard state, the
+    /// applied index, the snapshot record and the log's tail past it, in index
+    /// order. `recovery` is what the engine's open reported, and `checked` the
+    /// proof that the directory's on-disk format is this build's (D-059): it
+    /// carries the directory it was taken for, so no key of an ungated store can
+    /// be read here. Log keys the snapshot covers are deleted here: a crash
+    /// between a snapshot's record and its compaction leaves them, and this
+    /// cleanup is idempotent.
     ///
     /// # Errors
     ///
-    /// `InvalidData` carrying a [`LostState`] when the recovery lost writes in the
-    /// middle of the state; the engine's; or `InvalidData` for a value that is not
-    /// what was written.
+    /// `InvalidInput` when `checked` names another directory; `InvalidData`
+    /// carrying a [`LostState`] when the recovery lost writes in the middle of
+    /// the state; the engine's; or `InvalidData` for a value that is not what was
+    /// written.
     pub async fn open(
         engine: Arc<Engine<E>>,
         recovery: &EngineRecovery,
+        prefix: KeyPrefix,
+        checked: FormatChecked,
     ) -> io::Result<(Self, Recovered)> {
+        // PROPOSED(D-060): the token binds its directory, so the format that was
+        // read is this engine's and not another store's.
+        if checked.dir() != engine.dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the store's format was checked for another directory",
+            ));
+        }
         if let Some(lost) = LostState::of(recovery) {
             return Err(io::Error::new(io::ErrorKind::InvalidData, lost));
         }
-        let (term, vote) = match engine.get(&hard_key()).await? {
+        let (term, vote) = match engine.get(&prefix.hard_key()).await? {
             None => (0, None),
             Some(bytes) => decode_hard(bytes)?,
         };
-        let applied = match engine.get(&applied_key()).await? {
+        let applied = match engine.get(&prefix.applied_key()).await? {
             None => 0,
             Some(bytes) => decode_applied(bytes)?,
         };
-        let stored_config = match engine.get(&config_key()).await? {
+        let stored_config = match engine.get(&prefix.config_key()).await? {
             None => None,
             Some(bytes) => Some(decode_config(bytes)?),
         };
-        let record = match engine.get(&snapshot_key()).await? {
+        let record = match engine.get(&prefix.snapshot_key()).await? {
             None => None,
             Some(bytes) => Some(decode_snapshot_record(bytes)?),
         };
-        let quarantined = engine.get(&quarantine_key()).await?.is_some();
+        let quarantined = engine.get(&prefix.quarantine_key()).await?.is_some();
         // The incarnation number: a fresh store starts at the first and writes
         // it here, synced, so every store carries the key explicitly; an
         // installed store carries the one its repair wrote.
         // D-042: store incarnations.
-        let incarnation = match engine.get(&incarnation_key()).await? {
+        let incarnation = match engine.get(&prefix.incarnation_key()).await? {
             Some(bytes) => decode_incarnation(bytes)?,
             None => {
                 let mut first = WriteBatch::new();
-                first.put(incarnation_key(), encode_incarnation(FIRST_INCARNATION));
+                first.put(
+                    prefix.incarnation_key(),
+                    encode_incarnation(FIRST_INCARNATION),
+                );
                 engine.write(first, true).await?;
                 FIRST_INCARNATION
             }
         };
         let snap_index = record.as_ref().map_or(0, |r| r.last_index);
         let snapshot = engine.snapshot();
-        let start = key(RAFT_TENANT, LOG_TABLE, &[]);
-        let end = key(RAFT_TENANT, LOG_TABLE + 1, &[]);
+        let log_span = prefix.purpose_span(PURPOSE_LOG);
+        let (start, end) = (log_span.start, log_span.end);
         let mut log = Vec::new();
         let mut stale = WriteBatch::new();
         for (k, value) in engine.scan(&start[..]..&end[..], &snapshot).await? {
-            let index = u64::from_be_bytes(k[16..24].try_into().map_err(|_| bad("log key"))?);
+            let index = prefix.log_index(&k).ok_or_else(|| bad("log key"))?;
             if index <= snap_index {
                 stale.delete(Bytes::copy_from_slice(&k));
                 continue;
@@ -725,6 +869,7 @@ impl<E: Environment> RaftStore<E> {
         Ok((
             Self {
                 engine,
+                prefix,
                 term: AtomicU64::new(term),
                 vote: AtomicU64::new(vote.map_or(NO_VOTE, |v| v.0)),
                 first_index: AtomicU64::new(snap_index + 1),
@@ -738,6 +883,64 @@ impl<E: Environment> RaftStore<E> {
                 quarantined,
             },
         ))
+    }
+
+    /// Checks the directory's format, records it if the directory is fresh, heals
+    /// a record with one damaged copy, and then opens the engine and the store on
+    /// it: what a crate user outside the server does instead of assembling the
+    /// start by hand. It neither adopts a staged install nor reads the store
+    /// marker, which [`open`](Self::open) never did either; the server's own
+    /// start, [`node::start_store`](crate::node::start_store), does all of it in
+    /// order.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidData` carrying a [`FormatRefused`](crate::format::FormatRefused)
+    /// for a directory in another format, which is not a loss and leaves the
+    /// directory untouched (D-059); `InvalidData` carrying a [`LostState`] when
+    /// the record cannot be read beside a store, or when the recovery lost
+    /// writes; otherwise the engine's or the filesystem's.
+    // PROPOSED(D-060)
+    pub async fn open_dir(
+        env: E,
+        config: EngineConfig,
+        prefix: KeyPrefix,
+    ) -> io::Result<(Self, Recovered)> {
+        let dir = config.dir.clone();
+        let checked = match format::check_format(&env, &dir).await? {
+            format::Verdict::Fresh(fresh) => format::record_format(&env, fresh).await?,
+            format::Verdict::Recorded {
+                checked,
+                whole,
+                len,
+            } => {
+                if !whole {
+                    format::heal_format(&env, &checked, len).await?;
+                }
+                checked
+            }
+            // D-044: a record that cannot be read beside a store is lost state.
+            format::Verdict::Damaged => {
+                return Err(LostState::from_damage(Damage::FormatUnreadable).into_io());
+            }
+        };
+        let (engine, recovery) = Engine::open(env, config).await?;
+        let engine = Arc::new(engine);
+        match Self::open(engine.clone(), &recovery, prefix, checked).await {
+            Ok(opened) => Ok(opened),
+            Err(error) => {
+                // D-044: the engine that recovered a hole does no more work.
+                engine.quiesce();
+                Err(error)
+            }
+        }
+    }
+
+    /// The group's key prefix: what every key of this store is under.
+    // PROPOSED(D-060): the store parameterised by a key prefix (Q40).
+    #[must_use]
+    pub fn prefix(&self) -> &KeyPrefix {
+        &self.prefix
     }
 
     /// The current term on disk.
@@ -791,7 +994,7 @@ impl<E: Environment> RaftStore<E> {
     /// The engine's.
     pub async fn record_snapshot(&self, record: &SnapshotRecord) -> io::Result<()> {
         let mut batch = WriteBatch::new();
-        batch.put(snapshot_key(), encode_snapshot_record(record));
+        batch.put(self.prefix.snapshot_key(), encode_snapshot_record(record));
         self.engine.write(batch, true).await?;
         Ok(())
     }
@@ -802,7 +1005,7 @@ impl<E: Environment> RaftStore<E> {
     ///
     /// The engine's, or `InvalidData` for a value that is not a record.
     pub async fn snapshot_record(&self) -> io::Result<Option<SnapshotRecord>> {
-        match self.engine.get(&snapshot_key()).await? {
+        match self.engine.get(&self.prefix.snapshot_key()).await? {
             None => Ok(None),
             Some(bytes) => Ok(Some(decode_snapshot_record(bytes)?)),
         }
@@ -830,7 +1033,7 @@ impl<E: Environment> RaftStore<E> {
             let mut out = BytesMut::with_capacity(16);
             out.put_u64_le(persist.term);
             out.put_u64_le(vote);
-            batch.put(hard_key(), out.freeze());
+            batch.put(self.prefix.hard_key(), out.freeze());
         }
         let mut first_index = self.first_index();
         let mut last_index = self.last_index();
@@ -838,23 +1041,23 @@ impl<E: Environment> RaftStore<E> {
             // The log compacted to a snapshot: the engine's compaction reclaims
             // the space in its own time (RAFT.md §3).
             for index in first_index..=to.min(last_index) {
-                batch.delete(log_key(index));
+                batch.delete(self.prefix.log_key(index));
             }
             first_index = first_index.max(to + 1);
             last_index = last_index.max(to);
         }
         if let Some(from) = persist.truncate_from {
             for index in from..=last_index {
-                batch.delete(log_key(index));
+                batch.delete(self.prefix.log_key(index));
             }
             last_index = from.saturating_sub(1).min(last_index);
         }
         for entry in &persist.append {
-            batch.put(log_key(entry.index), encode_entry(entry));
+            batch.put(self.prefix.log_key(entry.index), encode_entry(entry));
             last_index = last_index.max(entry.index);
         }
         if let Some((index, config)) = &persist.config {
-            batch.put(config_key(), encode_config(*index, config));
+            batch.put(self.prefix.config_key(), encode_config(*index, config));
         }
         if batch.is_empty() {
             return Ok(());
@@ -885,7 +1088,7 @@ impl<E: Environment> RaftStore<E> {
         }
         let mut out = BytesMut::with_capacity(8);
         out.put_u64_le(index);
-        writes.put(applied_key(), out.freeze());
+        writes.put(self.prefix.applied_key(), out.freeze());
         self.engine.write(writes, true).await?;
         self.applied.store(index, Ordering::Release);
         Ok(())
@@ -980,4 +1183,231 @@ fn decode_entry(index: Index, mut bytes: Bytes) -> io::Result<Entry> {
         index,
         payload,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::apply::{SYSTEM_TENANT, USER_TENANT, user_key};
+    use crate::node::SINGLE_GROUP;
+
+    /// The groups the layout is checked over: the first few and the last, so a
+    /// prefix's arithmetic is held at both ends.
+    const GROUPS: [u64; 5] = [0, 1, 2, 3, u64::MAX];
+
+    /// Every key a group's store writes, for the checks below.
+    fn keys(prefix: &KeyPrefix) -> Vec<(&'static str, Bytes)> {
+        let mut keys = vec![
+            ("hard", prefix.hard_key()),
+            ("applied", prefix.applied_key()),
+            ("reseeded", prefix.quarantine_key()),
+            ("incarnation", prefix.incarnation_key()),
+            ("config", prefix.config_key()),
+            ("snapshot", prefix.snapshot_key()),
+        ];
+        for index in [0, 1, 1 << 63, u64::MAX] {
+            keys.push(("log", prefix.log_key(index)));
+        }
+        keys
+    }
+
+    /// The purpose a key names: bytes 16 to 24, after the prefix.
+    fn purpose_of(prefix: &KeyPrefix, key: &[u8]) -> u64 {
+        u64::from_be_bytes(
+            key[prefix.as_bytes().len()..][..8]
+                .try_into()
+                .expect("eight"),
+        )
+    }
+
+    /// Every key of a group lies under its prefix, inside its purpose's span and
+    /// inside the group's, and inside no other group's and no other purpose's
+    /// (PROPOSED D-060). Purpose 4 is empty: the room #21's session table and a
+    /// range descriptor take (Q11).
+    #[test]
+    fn every_raft_key_lies_under_its_group_prefix_and_purpose() {
+        for group in GROUPS {
+            let prefix = KeyPrefix::group(group);
+            assert_eq!(prefix.as_bytes().len(), 16);
+            assert_eq!(&prefix.as_bytes()[..8], &RAFT_TENANT.to_be_bytes());
+            assert_eq!(&prefix.as_bytes()[8..], &group.to_be_bytes());
+            let span = prefix.span();
+            for (what, key) in keys(&prefix) {
+                assert!(
+                    key.starts_with(prefix.as_bytes()),
+                    "group {group}'s {what} key is not under its prefix"
+                );
+                assert!(
+                    key[..] >= span.start[..] && key[..] < span.end[..],
+                    "group {group}'s {what} key is outside its span"
+                );
+                let purpose = purpose_of(&prefix, &key);
+                let own = prefix.purpose_span(purpose);
+                assert!(key[..] >= own.start[..] && key[..] < own.end[..]);
+                for other in [
+                    PURPOSE_META,
+                    PURPOSE_LOG,
+                    PURPOSE_CONFIG,
+                    PURPOSE_SNAPSHOT,
+                    4,
+                ] {
+                    if other == purpose {
+                        continue;
+                    }
+                    let span = prefix.purpose_span(other);
+                    assert!(
+                        key[..] < span.start[..] || key[..] >= span.end[..],
+                        "group {group}'s {what} key is in purpose {other}'s span"
+                    );
+                }
+                // And in no other group's span.
+                for elsewhere in GROUPS.iter().filter(|g| **g != group) {
+                    let span = KeyPrefix::group(*elsewhere).span();
+                    assert!(
+                        key[..] < span.start[..] || key[..] >= span.end[..],
+                        "group {group}'s {what} key is in group {elsewhere}'s span"
+                    );
+                }
+            }
+            // The purposes are disjoint and in order, and purpose 4 is free.
+            let spans: Vec<_> = (0..5).map(|p| prefix.purpose_span(p)).collect();
+            for pair in spans.windows(2) {
+                assert!(pair[0].end[..] <= pair[1].start[..], "the purposes overlap");
+            }
+            let free = prefix.purpose_span(4);
+            assert!(
+                keys(&prefix)
+                    .iter()
+                    .all(|(_, key)| key[..] < free.start[..] || key[..] >= free.end[..]),
+                "purpose 4 is not free for #21's session table"
+            );
+            // A log key is read back, and nothing else is read as one.
+            for index in [0, 1, 1 << 63, u64::MAX] {
+                assert_eq!(prefix.log_index(&prefix.log_key(index)), Some(index));
+            }
+            // And the log sorts by index. `log_index` round-trips a
+            // little-endian index just as well, so only this says which way
+            // round the bytes go — and `RaftStore::open_dir` reads the log by
+            // scanning the purpose's span in the engine's key order and refuses
+            // a log whose indices are not consecutive. With the bytes the other
+            // way round, key 256 sorts before key 1, so the first store to hold
+            // more than 255 entries above its snapshot would be refused as lost
+            // state at every restart and re-seeded.
+            for (lower, higher) in [
+                (0u64, 1u64),
+                (127, 128),
+                (255, 256),
+                (256, 257),
+                (65_535, 65_536),
+                (1 << 32, (1 << 32) + 1),
+                (u64::MAX - 1, u64::MAX),
+            ] {
+                assert!(
+                    prefix.log_key(lower)[..] < prefix.log_key(higher)[..],
+                    "the log key of {lower} does not sort before the log key of {higher}"
+                );
+            }
+            assert_eq!(prefix.log_index(&prefix.hard_key()), None);
+            assert_eq!(prefix.log_index(&prefix.key(PURPOSE_LOG, b"xy")), None);
+            assert_eq!(prefix.log_index(&prefix.key(PURPOSE_LOG, &[0; 9])), None);
+            assert_eq!(prefix.log_index(&prefix.snapshot_key()), None);
+            assert_eq!(
+                KeyPrefix::group(group ^ 1).log_index(&prefix.log_key(7)),
+                None,
+                "a log key of another group"
+            );
+        }
+    }
+
+    /// No key this build writes is a key ananke-raft 0.3.0 wrote: the defence in
+    /// depth behind the gate (PROPOSED D-060, D.3). 0.3.0's tenant-0 keys are 20
+    /// to 24 bytes, or 27 for `incarnation`; format 2's are 28 at the shortest,
+    /// and no name of three bytes exists to make one 27.
+    #[test]
+    fn no_format_2_key_has_a_0_3_0_shape() {
+        /// A key as 0.3.0 wrote it, spelled out rather than built by this build.
+        fn v030_key(tenant: u64, table: u64, name: &[u8]) -> Vec<u8> {
+            let mut out = tenant.to_be_bytes().to_vec();
+            out.extend_from_slice(&table.to_be_bytes());
+            out.extend_from_slice(name);
+            out
+        }
+        let mut theirs: Vec<Vec<u8>> = vec![
+            v030_key(0, 0, b"hard"),
+            v030_key(0, 0, b"applied"),
+            v030_key(0, 0, b"reseeded"),
+            v030_key(0, 0, b"incarnation"),
+            v030_key(0, 2, b"config"),
+            v030_key(0, 3, b"snapshot"),
+        ];
+        for index in [0u64, 1, 1 << 63, u64::MAX] {
+            theirs.push(v030_key(0, 1, &index.to_be_bytes()));
+            // 0.3.0's user keys, tenant 1.
+            theirs.push(v030_key(1, 0, format!("k{index}").as_bytes()));
+        }
+        assert!(
+            theirs
+                .iter()
+                .filter(|key| key[..8] == [0; 8])
+                .all(|key| key.len() <= 27),
+            "0.3.0's tenant-0 keys are 27 bytes at most"
+        );
+        for group in GROUPS {
+            let prefix = KeyPrefix::group(group);
+            for (what, key) in keys(&prefix) {
+                assert!(
+                    key.len() >= 28,
+                    "a format 2 {what} key of {} bytes",
+                    key.len()
+                );
+                assert!(
+                    !theirs.iter().any(|old| old[..] == key[..]),
+                    "a format 2 {what} key is a key 0.3.0 wrote"
+                );
+            }
+        }
+        for name in [b"k".as_slice(), b"a", b"kkk"] {
+            let key = user_key(name);
+            assert!(
+                !theirs.iter().any(|old| old[..] == key[..]),
+                "a user key is a key 0.3.0 wrote"
+            );
+            assert_eq!(&key[..8], &USER_TENANT.to_be_bytes());
+        }
+    }
+
+    /// The tenants of SHARD.md §1: the protocol's is 0, the system tenant is 1
+    /// and nothing here writes it, and the user's data is tenant 2 (PROPOSED
+    /// D-060).
+    #[test]
+    fn user_keys_are_tenant_2_and_tenant_1_is_the_system_tenant() {
+        assert_eq!((RAFT_TENANT, SYSTEM_TENANT, USER_TENANT), (0, 1, 2));
+        assert_eq!(&user_key(b"k")[..8], &2u64.to_be_bytes());
+        assert_eq!(&user_key(b"k")[8..16], &0u64.to_be_bytes());
+        assert_eq!(&user_key(b"k")[16..], b"k");
+        for group in GROUPS {
+            let prefix = KeyPrefix::group(group);
+            for (what, key) in keys(&prefix) {
+                assert_ne!(
+                    &key[..8],
+                    &SYSTEM_TENANT.to_be_bytes(),
+                    "a {what} key under the system tenant"
+                );
+            }
+        }
+    }
+
+    /// Today's group is group 2, SHARD.md §2's range 2 (PROPOSED D-060, Q3).
+    #[test]
+    fn the_single_group_prefix_is_0_2() {
+        assert_eq!(SINGLE_GROUP, 2);
+        let mut expected = [0u8; 16];
+        expected[15] = 2;
+        assert_eq!(KeyPrefix::group(SINGLE_GROUP).as_bytes(), expected);
+        assert_eq!(
+            KeyPrefix::group(SINGLE_GROUP).hard_key().len(),
+            28,
+            "the shortest key of format 2"
+        );
+    }
 }

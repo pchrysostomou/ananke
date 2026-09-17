@@ -70,7 +70,7 @@ pub enum Variant {
     /// The server installing a snapshot writes the staging directory's `CURRENT`
     /// before the rest of the staged store is durable (RAFT.md §1, D-024): a crash
     /// mid-install then comes back on a store that opens but was never repaired,
-    /// the leader's tenant 0 in place of the receiver's, and state machine safety
+    /// the leader's Raft state in place of the receiver's, and state machine safety
     /// catches the state that never existed after the restart. The install order is
     /// the server's business (`snapshot.rs`); the core ignores this variant.
     SnapshotWithoutCurrentLast,
@@ -510,7 +510,7 @@ pub struct Persist {
     /// Entries written.
     pub append: Vec<Entry>,
     /// The configuration in force after the step, when the step changed it: the
-    /// latest configuration entry's index and content, kept under the `0 / 2 /
+    /// latest configuration entry's index and content, kept under the `<prefix> / 2 /
     /// config` key in the same synced batch (RAFT.md §3); index 0 and the initial
     /// configuration after a truncation removed every configuration entry.
     pub config: Option<(Index, Configuration)>,
@@ -1664,7 +1664,7 @@ impl Raft {
 
     /// Puts a configuration in force and traces it, so the trace always shows
     /// every server's configuration in force; the step's persist carries it to the
-    /// `0 / 2 / config` key in the same batch.
+    /// `<prefix> / 2 / config` key in the same batch.
     fn adopt(&mut self, index: Index, config: Configuration) {
         self.trace(TraceEvent::RaftConfig {
             server: self.id.0,

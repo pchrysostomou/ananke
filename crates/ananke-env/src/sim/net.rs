@@ -5,6 +5,13 @@
 //! configured range. Different delays reorder messages. Partitions are checked again at
 //! delivery, so a message in flight when a partition starts is lost; so are frame-length
 //! limits, the path-MTU black hole a scenario can put on one direction of a link (D-049).
+//!
+//! Every frame that survives the send's checks joins its sending socket's queue to its
+//! destination, as `RealEnv`'s does (D-015): one frame at a time is written, at the
+//! link's drain rate, and the rest wait behind it. A frame's delay starts once its last
+//! byte is written. When as many frames wait as the queue holds, the oldest waiting
+//! frame is dropped, `MessageDropped` with [`DropReason::QueueFull`], and the frames
+//! behind it move up (PROPOSED D-056).
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
@@ -13,9 +20,11 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
+use std::time::Duration;
 
 use bytes::Bytes;
 
+use super::NetFaults;
 use super::state::{Shared, State};
 use crate::{DropReason, Instant, MAX_FRAME_LEN, MessageId, Network, NodeId, Socket, TraceEvent};
 
@@ -36,11 +45,51 @@ pub(super) struct Delivery {
     dup: bool,
 }
 
+/// One frame in a sending socket's queue to one destination: the one being written,
+/// or one waiting behind it.
+// PROPOSED(D-056): SimEnv's bounded, drop-oldest queue per (sending socket,
+// destination), drained at a modelled per-link rate.
+struct Queued {
+    id: MessageId,
+    len: usize,
+    /// When `send` accepted it.
+    enqueued: Instant,
+    /// When its last byte is written: its delays start here.
+    written: Instant,
+    /// Each delivery the frame makes, the original and a duplicate if one was drawn:
+    /// the delay drawn at the send and the delivery's tie-breaker, which together with
+    /// `written` are its key in [`Fabric::deliveries`].
+    deliveries: Vec<(Duration, u64)>,
+}
+
+/// A sending socket's queue to one destination, oldest first. Every frame in it has
+/// its last byte written after now: the first is being written and the rest wait
+/// (D-015).
+// PROPOSED(D-056): SimEnv's bounded, drop-oldest queue per (sending socket,
+// destination), drained at a modelled per-link rate.
+#[derive(Default)]
+struct SendQueue {
+    frames: VecDeque<Queued>,
+}
+
+/// How long writing `len` bytes takes at `bytes_per_sec`, rounded up to the
+/// nanosecond, so that every byte takes time.
+// PROPOSED(D-056): SimEnv's bounded, drop-oldest queue per (sending socket,
+// destination), drained at a modelled per-link rate.
+fn write_time(len: usize, bytes_per_sec: u64) -> Duration {
+    let nanos = (len as u128 * 1_000_000_000).div_ceil(u128::from(bytes_per_sec));
+    Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX))
+}
+
 /// Every socket, every message in flight, and every blocked link.
 #[derive(Default)]
 pub(super) struct Fabric {
     sockets: BTreeMap<SocketAddr, SocketState>,
     deliveries: BTreeMap<(Instant, u64), Delivery>,
+    /// Each sending socket's queue to each destination it has sent to, by socket id.
+    // PROPOSED(D-056): SimEnv's bounded, drop-oldest queue per (sending socket,
+    // destination), drained at a modelled per-link rate.
+    queues: BTreeMap<(u64, SocketAddr), SendQueue>,
     blocked: BTreeSet<(NodeId, NodeId)>,
     /// The symmetric partition in force, if any, as recorded in the trace.
     pub(super) active_partition: Option<Vec<Vec<NodeId>>>,
@@ -91,7 +140,101 @@ impl Fabric {
     }
 
     pub(super) fn remove_node_sockets(&mut self, node: NodeId) {
+        let gone: BTreeSet<u64> = self
+            .sockets
+            .values()
+            .filter(|socket| socket.node == node)
+            .map(|socket| socket.id)
+            .collect();
         self.sockets.retain(|_, socket| socket.node != node);
+        self.forget_queues(&gone);
+    }
+
+    /// Forgets the queues of sockets that are gone. Their frames already in the
+    /// queue keep the deliveries they were given, as a frame in flight always has;
+    /// no send can add to a queue whose socket is gone, so nothing is dropped from it.
+    // PROPOSED(D-056): SimEnv's bounded, drop-oldest queue per (sending socket,
+    // destination), drained at a modelled per-link rate.
+    fn forget_queues(&mut self, sockets: &BTreeSet<u64>) {
+        if !sockets.is_empty() {
+            self.queues
+                .retain(|(socket, _), _| !sockets.contains(socket));
+        }
+    }
+
+    /// Admits frame `id` of `len` bytes to `socket`'s queue to `to` at `now`. Frames
+    /// already written leave the queue first; then, if as many frames as `net`'s
+    /// [`send_queue_len`](NetFaults::send_queue_len) wait behind the one being written,
+    /// the oldest waiting one is dropped, its deliveries cancelled and the frames behind
+    /// it moved up. Returns the id of the frame dropped to make room, if one was.
+    // PROPOSED(D-056): SimEnv's bounded, drop-oldest queue per (sending socket,
+    // destination), drained at a modelled per-link rate.
+    fn admit(
+        &mut self,
+        socket: u64,
+        to: SocketAddr,
+        (id, len): (MessageId, usize),
+        now: Instant,
+        net: &NetFaults,
+    ) -> Option<MessageId> {
+        let (capacity, bytes_per_sec) = (net.send_queue_len, net.link_bytes_per_sec);
+        let Self {
+            queues, deliveries, ..
+        } = self;
+        let queue = queues.entry((socket, to)).or_default();
+        while queue.frames.front().is_some_and(|f| f.written <= now) {
+            queue.frames.pop_front();
+        }
+        // Every frame left is unwritten, so the first is being written (it started
+        // no later than now) and the rest wait.
+        let mut dropped = None;
+        if queue.frames.len().saturating_sub(1) >= capacity {
+            let oldest = queue.frames.remove(1).expect("a waiting frame");
+            for (delay, seq) in &oldest.deliveries {
+                deliveries.remove(&(oldest.written + *delay, *seq));
+            }
+            dropped = Some(oldest.id);
+            for i in 1..queue.frames.len() {
+                let ahead = queue.frames[i - 1].written;
+                let frame = &mut queue.frames[i];
+                let written = frame.enqueued.max(ahead) + write_time(frame.len, bytes_per_sec);
+                if written != frame.written {
+                    for (delay, seq) in &frame.deliveries {
+                        if let Some(delivery) = deliveries.remove(&(frame.written + *delay, *seq)) {
+                            deliveries.insert((written + *delay, *seq), delivery);
+                        }
+                    }
+                    frame.written = written;
+                }
+            }
+        }
+        let start = queue
+            .frames
+            .back()
+            .map_or(now, |last| last.written.max(now));
+        queue.frames.push_back(Queued {
+            id,
+            len,
+            enqueued: now,
+            written: start + write_time(len, bytes_per_sec),
+            deliveries: Vec::new(),
+        });
+        dropped
+    }
+
+    /// Records a delivery of the newest frame in `socket`'s queue to `to`.
+    // PROPOSED(D-056): SimEnv's bounded, drop-oldest queue per (sending socket,
+    // destination), drained at a modelled per-link rate.
+    fn schedule(&mut self, socket: u64, delay: Duration, seq: u64, delivery: Delivery) {
+        let to = delivery.to;
+        let frame = self
+            .queues
+            .get_mut(&(socket, to))
+            .and_then(|queue| queue.frames.back_mut())
+            .expect("the frame was just admitted");
+        frame.deliveries.push((delay, seq));
+        self.deliveries
+            .insert((frame.written + delay, seq), delivery);
     }
 }
 
@@ -135,6 +278,7 @@ impl State {
     fn net_send(
         &mut self,
         node: NodeId,
+        socket: u64,
         from: SocketAddr,
         to: SocketAddr,
         msg: Bytes,
@@ -192,10 +336,28 @@ impl State {
         }
         let (min, max) = (self.config.net.delay_min, self.config.net.delay_max);
         let delay = super::rng::duration_between(&mut self.net_stream, min, max);
-        let at = self.now + delay;
+        // PROPOSED(D-056): the frame joins its socket's queue to `to`; the draws above
+        // and below are the ones a send made before the queue, in the same order.
+        let now = self.now;
+        let dropped = self
+            .fabric
+            .admit(socket, to, (id, msg.len()), now, &self.config.net);
+        if let Some(oldest) = dropped {
+            self.record(
+                Some(node),
+                TraceEvent::MessageDropped {
+                    id: oldest,
+                    from,
+                    to,
+                    reason: DropReason::QueueFull,
+                },
+            );
+        }
         let seq = self.next_seq();
-        self.fabric.deliveries.insert(
-            (at, seq),
+        self.fabric.schedule(
+            socket,
+            delay,
+            seq,
             Delivery {
                 id,
                 from,
@@ -211,10 +373,11 @@ impl State {
         let p_duplicate = self.config.net.p_duplicate;
         if p_duplicate > 0.0 && self.net_stream.chance(p_duplicate) {
             let delay = super::rng::duration_between(&mut self.net_stream, min, max);
-            let at = self.now + delay;
             let seq = self.next_seq();
-            self.fabric.deliveries.insert(
-                (at, seq),
+            self.fabric.schedule(
+                socket,
+                delay,
+                seq,
                 Delivery {
                     id,
                     from,
@@ -346,6 +509,7 @@ impl Drop for SimSocket {
             .is_some_and(|s| s.id == self.id)
         {
             st.fabric.sockets.remove(&self.addr);
+            st.fabric.forget_queues(&BTreeSet::from([self.id]));
         }
     }
 }
@@ -356,7 +520,11 @@ impl Socket for SimSocket {
     }
 
     fn send(&self, to: SocketAddr, msg: Bytes) -> impl Future<Output = io::Result<()>> + Send {
-        std::future::ready(self.shared.lock().net_send(self.node, self.addr, to, msg))
+        std::future::ready(
+            self.shared
+                .lock()
+                .net_send(self.node, self.id, self.addr, to, msg),
+        )
     }
 
     fn recv(&self) -> impl Future<Output = io::Result<(SocketAddr, Bytes)>> + Send {

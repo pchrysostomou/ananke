@@ -65,6 +65,20 @@ Deferred ideas are GitHub issues labelled by phase; [docs/BACKLOG.md](docs/BACKL
   `check().unwrap()` on a pinned seed proves only that the seed is green. A seed's
   schedule moves whenever a fault arm is added, a record changes size or a draw
   changes, so a pin that asserts only green silently stops meaning anything.
+- **An assertion belongs where the statistics support it.** A variant caught on under
+  5% of seeds asserts its catch at the premerge tier, `seeds() >= 1000` (the premerge
+  and the nightly), never at the gate's twenty or CI's hundred. At 3%, twenty seeds
+  catch nothing more than half the time and a hundred about one time in twenty, so an
+  assertion there fails a tree with nothing wrong the day a change redraws the
+  schedules; a thousand miss about once in 10^13. What every tier still asserts is the
+  fault's firing, the fault injected or the shape it aims at reached, wherever that is
+  itself well above 5%, so a sweep that passes is known to have injected it; and every
+  tier prints the catch rate. A coverage counter asserted above zero, a state the
+  correct server's sweep must reach, is the same draw and follows the same rule. The
+  rate is over the seeds the assertion actually sees: a variant run on a share of the
+  tier (`high_rate_share` in `sim/tests/engine.rs`) over that share, and a counter of
+  events over the seeds that saw one, not the events. The owner's rule and the audit
+  of every such assertion are D-061.
 - **Every published crate carries copies of `LICENSE-MIT` and `LICENSE-APACHE`** in
   its own directory (copies, not symlinks) so `cargo package` bundles them.
 - **Prefer boring, well-documented Rust.** This is a project meant to be read.

@@ -25,7 +25,10 @@
 //! segment's number is never reused), unless
 //! the record it would stop at is numbered below [`WalConfig::expected_head`], which
 //! the caller holds elsewhere: then the rest of that segment is skipped and reading
-//! goes on with the next. Everything after a stop is
+//! goes on with the next. A gap *backwards* at a segment's first record is not a stop
+//! either: segments are created in increasing number order, so that segment is the
+//! later one and its copies of those numbers supersede the ones already read, which a
+//! betrayed cut had brought back (D-062). Everything after a stop is
 //! discarded, as the SPEC says: the stopping segment is cut to its last good record,
 //! later segments are removed, and a fresh segment is started, numbered past every
 //! segment the directory held so that a segment number is never reused. A first
@@ -33,9 +36,12 @@
 //! under [`HeadGapPolicy::Discard`] the whole log is discarded, since replaying past
 //! the gap would produce a state that never existed (D-022).
 //!
-//! The [`Variant`] enum carries the correct log and three with known bugs. The crash
-//! sweep in `sim/wal.rs` must pass the first and catch each of the others; that pair is
-//! what shows the fault model works (CLAUDE.md). Production uses the default,
+//! The [`Variant`] enum carries the correct log and four with known bugs. The crash
+//! sweep in `sim/wal.rs` must pass the first and catch the next three; that pair is
+//! what shows the fault model works (CLAUDE.md). The fourth,
+//! [`Variant::TrustsAStaleSegment`], is reached on far too few seeds to assert at any
+//! tier (D-061), so it is caught instead by hand-built segments in `tests/wal.rs`, and
+//! the sweep asserts the shape it needs is reached. Production uses the default,
 //! [`Variant::Correct`].
 
 use std::collections::{BTreeMap, VecDeque};
@@ -85,6 +91,18 @@ pub enum Variant {
         /// How long acknowledged records may sit unsynced.
         interval: Duration,
     },
+    /// Recovery treats a segment whose first record is numbered behind the reading as
+    /// an ordinary gap and stops there, keeping the earlier copies of those numbers
+    /// (D-062). Those copies are stale by construction — a segment is created after
+    /// every segment before it — so the bug returns records a previous recovery had
+    /// discarded, under numbers the log has since re-issued, and throws away the live
+    /// ones behind them. The shape needs a cut whose sync the disk lied about and a
+    /// crash that drops the truncation: the engine's seek sweep reaches it on 1 of its
+    /// first ten thousand seeds, far below the rate an assertion can live at (D-061),
+    /// so this variant is caught deterministically by the hand-built segments in
+    /// `tests/wal.rs` rather than by the sweep.
+    // PROPOSED(D-062): the WAL's supersede rule.
+    TrustsAStaleSegment,
 }
 
 /// What to do when the log's head is missing: its first record is numbered past
@@ -275,17 +293,31 @@ pub struct Recovery {
     pub next_seq: Seq,
 }
 
+/// What a segment's first record superseded (D-062): the number the reading had
+/// reached, the number this segment restarts it at, and how many records already read
+/// were dropped as superseded copies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Superseded {
+    expected: Seq,
+    found: Seq,
+    dropped: u64,
+}
+
 /// Parses one segment's bytes, expecting the records to continue the numbering from
 /// `first_seq + records.len()`; the log's first record sets `first_seq`. A jump
 /// forward that lands at or below `expected_head` skips only records held elsewhere,
 /// so the records before it are dropped and the numbering restarts there rather than
-/// stopping. `verify` false is the [`Variant::NoChecksum`] bug.
+/// stopping. A jump *backwards* at a segment's first record supersedes instead, and
+/// returns what it dropped; `supersede` false is the [`Variant::TrustsAStaleSegment`]
+/// bug. `verify` false is the [`Variant::NoChecksum`] bug.
 fn parse_segment(
     bytes: &[u8],
     verify: bool,
+    supersede: bool,
     expected_head: Seq,
     first_seq: &mut Option<Seq>,
     records: &mut Vec<Bytes>,
+    superseded: &mut Option<Superseded>,
 ) -> Result<(), (u64, WalStopReason)> {
     let mut offset = 0usize;
     while offset < bytes.len() {
@@ -326,6 +358,30 @@ fn parse_segment(
                     // Everything skipped is below the head the caller holds elsewhere.
                     records.clear();
                     *first_seq = Some(seq);
+                } else if seq < expected && at == 0 && supersede {
+                    // PROPOSED(D-062): the WAL's supersede rule.
+                    // A number this segment repeats supersedes the copy already read
+                    // (D-062). Segments are created in increasing number order, so a
+                    // segment whose *first* record is behind the reading was written
+                    // after every segment read before it, which proves those are the
+                    // stale copies: a segment a previous recovery cut, whose cut's
+                    // sync the disk lied about, comes back whole with its old records
+                    // in front of the live ones. The records dropped are exactly the
+                    // ones numbered at or above `seq`, which this segment re-supplies;
+                    // anything below `seq` is below `first`, which is at or below
+                    // `expected_head`, so the caller holds it elsewhere.
+                    let keep = usize::try_from(seq.saturating_sub(first))
+                        .unwrap_or(usize::MAX)
+                        .min(records.len());
+                    *superseded = Some(Superseded {
+                        expected,
+                        found: seq,
+                        dropped: (records.len() - keep) as u64,
+                    });
+                    records.truncate(keep);
+                    if seq < first {
+                        *first_seq = Some(seq);
+                    }
                 } else if seq != expected {
                     return Err((
                         at,
@@ -431,6 +487,7 @@ impl<E: Environment> Wal<E> {
         segments.sort_unstable();
 
         let verify = config.variant != Variant::NoChecksum;
+        let supersede = config.variant != Variant::TrustsAStaleSegment;
         let mut records = Vec::new();
         let mut first_seq = None;
         let mut firsts: BTreeMap<u64, Seq> = BTreeMap::new();
@@ -459,13 +516,27 @@ impl<E: Environment> Wal<E> {
                 .await?;
             let before = records.len() as u64;
             let unread = first_seq.is_none();
+            let mut superseded = None;
             let parsed = parse_segment(
                 &bytes,
                 verify,
+                supersede,
                 config.expected_head,
                 &mut first_seq,
                 &mut records,
+                &mut superseded,
             );
+            // A segment created after the ones read before it, holding their numbers
+            // again: what a betrayed cut leaves behind, and what the reader must not
+            // take for current (D-062).
+            if let Some(s) = superseded {
+                env.trace(TraceEvent::WalSuperseded {
+                    segment,
+                    expected: s.expected,
+                    found: s.found,
+                    dropped: s.dropped,
+                });
+            }
             // The segment's first number: its first record's, or the next number if
             // it is empty; unknown until the log's first record is seen.
             if let Some(first) = first_seq {
@@ -559,7 +630,10 @@ impl<E: Environment> Wal<E> {
         // every segment by removal, never by a cut to nothing: a cut whose sync the
         // disk lied about brings the old records back at the next crash, in front of
         // the new ones and numbered as if they were current (the sweep found this at
-        // seed 191), whereas a removal is durable once the directory is synced.
+        // seed 191), whereas a removal is durable once the directory is synced. Every
+        // other cut is still made by cutting, and a betrayed one of those is what the
+        // supersede rule above exists for: a later segment repeating a number proves
+        // the earlier copy stale (D-062, the nightly's seed 3123).
         let mut discarded = 0;
         if let Some(stop) = stop {
             if head_gap.is_some() {

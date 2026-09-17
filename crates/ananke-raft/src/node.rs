@@ -1,13 +1,18 @@
 //! One server under the [`Environment`] (RAFT.md §3): the tasks that run a core.
 //!
 //! [`run`] binds the socket, spawns the `net` task, and then runs the server as a
-//! sequence of *incarnations*, one per store the server runs on: at each start a
-//! completed install at the staging path is adopted ([`crate::snapshot::adopt_staged`]),
-//! the engine and store open, and the `raft` loop runs with the `apply` and
-//! `snapshot` tasks beside it until the server stops or an installed snapshot
-//! switches its store, which starts the next incarnation on the adopted state. The
-//! socket and the inbox live across incarnations, so messages arriving during a
-//! switch are queued, not lost.
+//! sequence of *incarnations*, one per store the server runs on: at each start
+//! [`start_store`] reads the store directory's format before anything writes
+//! (D-059), records it if the directory is fresh, adopts a completed install at the
+//! staging path ([`crate::snapshot::adopt_staged`]), heals a record with one damaged
+//! copy, reads the store marker and then opens the engine and the store; the `raft`
+//! loop runs with the `apply` and `snapshot` tasks beside it until the server stops
+//! or an installed snapshot switches its store, which starts the next incarnation on
+//! the adopted state. The socket and the inbox live across incarnations, so messages
+//! arriving during a switch are queued, not lost. A store in another Raft store
+//! format is refused with nothing written to it: the server traces
+//! [`TraceEvent::RaftServerFailed`] and stops, since that store lost nothing and is
+//! not this server's to replace (D-059).
 //!
 //! - `raft` owns the core and the timer: one loop over a race of the inbox and the
 //!   tick, stepping the core once per event and executing every output in order,
@@ -108,12 +113,13 @@ use ananke_storage::{Engine, EngineConfig};
 use crate::apply::{Command, Outcome, apply_command, user_key};
 use crate::client::{self, Reply, Request, Response};
 use crate::core::{Input, Output, Raft, RaftConfig, SnapshotAction, Variant, Variants};
+use crate::format::{self, FormatChecked, FormatRefused};
 use crate::message::{Frame, Message, SnapshotStatus};
 use crate::queue::Queue;
 use crate::snapshot::{self, Assembler, Feed, Repair, Sender, Staged};
 use crate::store::{
-    FIRST_INCARNATION, LostState, RaftStore, Recovered, mark_store, mark_store_lost,
-    refuse_lost_store,
+    Damage, FIRST_INCARNATION, KeyPrefix, LostState, RaftStore, Recovered, mark_store,
+    mark_store_lost, refuse_lost_store,
 };
 use crate::types::{Configuration, Entry, Index, Payload, ServerId, Term};
 
@@ -303,6 +309,335 @@ enum Next {
     Reinstall,
 }
 
+/// The group today's one-group server keeps its Raft state under: SHARD.md §2's
+/// range 2, the rest of the keyspace, which is what this one group replicates
+/// (ranges 0 and 1 are the root and meta ranges of the system tenant). Stage B
+/// gives a server a group per range and this constant goes.
+// PROPOSED(D-060): today's group is group 2.
+pub const SINGLE_GROUP: u64 = 2;
+
+/// How a start ended (see [`start_store`]).
+#[doc(hidden)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the opened store is the point of the opened arm, and a start is made once"
+)]
+pub enum Start<E: Environment> {
+    /// The store opened; `adopted` says whether an install was adopted first.
+    Opened {
+        /// The store.
+        store: RaftStore<E>,
+        /// What it found beside the store itself.
+        recovered: Recovered,
+        /// Whether a completed install was adopted first.
+        adopted: bool,
+    },
+    /// Lost state or damage (D-022, D-041, D-044): the caller marks the loss and
+    /// re-seeds.
+    Refused(io::Error),
+    /// A format refusal (D-059) or an I/O error that is not a refusal: nothing
+    /// was written after the failure, and the caller traces `RaftServerFailed`
+    /// and stops.
+    Failed(io::Error),
+}
+
+/// The order a start runs its checks in: the correct one, or a known-buggy one a
+/// directed test must catch beside it (CLAUDE.md's pair rule). Not a
+/// [`Variant`]: no sweep reaches an old-format store or runs a start in another
+/// order, so §10's sweep standards do not apply to these.
+// PROPOSED(D-060)
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum StartOrder {
+    /// The server's own order: the format, a fresh directory's record, the
+    /// adoption, the heal, a damaged record, the marker, the engine, the store.
+    #[default]
+    Correct,
+    /// The version read after the engine's open and after lost state, as D-059's
+    /// first draft proposed: a 0.3.0 store that also lost state is marked lost
+    /// and re-seeded into its own directory, and the engine writes a log segment
+    /// into a store this build will not read.
+    LostStateBeforeFormat,
+    /// A fresh directory's record written after the engine's open and the
+    /// store's first batch: a crash between them leaves a store this build wrote
+    /// and refuses as 0.3.0's.
+    FormatAfterFirstBatch,
+    /// A record with one bad copy healed by tmp and rename instead of in place:
+    /// under a lost fsync the renamed inode's content can be torn, which loses
+    /// the copy that was still valid.
+    HealByRename,
+    /// An unreadable record beside a store read as no record at all: a store
+    /// whose record rotted twice stops the server instead of re-seeding.
+    UnreadableIsUnrecorded,
+    /// The adoption without its staged-record check: an install of another
+    /// format is adopted over the store.
+    StagedFormatUnchecked,
+}
+
+/// The server's start, in the order of D-059 and PROPOSED D-060: the format
+/// first, read before anything writes; a fresh directory's record; the adoption
+/// of a completed install, with the staged install's own format checked before
+/// its first write; the heal of a record with one damaged copy; a record that
+/// cannot be read, which is lost state; the store marker; and then the engine
+/// and the store. Every step before the record's write only reads, and every
+/// refusal before the engine's open writes nothing at all.
+///
+/// The `raft` tests and the server share this, so a test drives the order the
+/// server runs; `order` is the pair rule's known-buggy alternative, which no
+/// sweep runs.
+// D-059: the format is read before anything writes, and before lost state.
+// PROPOSED(D-060): the start's order.
+#[doc(hidden)]
+pub async fn start_store<E: Environment>(
+    env: &E,
+    server: u64,
+    engine: &EngineConfig,
+    variants: Variants,
+    prefix: &KeyPrefix,
+    order: StartOrder,
+) -> Start<E> {
+    if order == StartOrder::LostStateBeforeFormat {
+        return start_lost_state_first(env, server, engine, variants, prefix).await;
+    }
+    let dir = engine.dir.clone();
+    // 1. The format (D-059). A refusal or a read error stops the server with
+    //    nothing written: a store in another format lost nothing and is not this
+    //    server's to replace.
+    let verdict = match format::check_format(env, &dir).await {
+        Ok(verdict) => verdict,
+        Err(error) if FormatRefused::from_io(&error).is_some() => return Start::Failed(error),
+        Err(error) => {
+            return Start::Failed(io::Error::new(
+                error.kind(),
+                format!("reading the store's format: {error}"),
+            ));
+        }
+    };
+    // 2. A fresh directory's first write is its record, before the engine or
+    //    anything else creates an entry there (PROPOSED D-060).
+    let mut damaged = false;
+    let mut heal = None;
+    let mut late = None;
+    let checked = match verdict {
+        format::Verdict::Fresh(fresh) => {
+            if order == StartOrder::FormatAfterFirstBatch {
+                late = Some(fresh);
+                FormatChecked::new(&dir)
+            } else {
+                match format::record_format(env, fresh).await {
+                    Ok(checked) => checked,
+                    Err(error) => {
+                        return Start::Failed(io::Error::new(
+                            error.kind(),
+                            format!("recording the store's format: {error}"),
+                        ));
+                    }
+                }
+            }
+        }
+        format::Verdict::Recorded {
+            checked,
+            whole,
+            len,
+        } => {
+            if !whole {
+                heal = Some(len);
+            }
+            checked
+        }
+        format::Verdict::Damaged => {
+            if order == StartOrder::UnreadableIsUnrecorded {
+                return Start::Failed(
+                    FormatRefused {
+                        dir: dir.clone(),
+                        subject: format::Subject::Store,
+                        found: format::Found::Unrecorded,
+                        expected: format::STORE_FORMAT,
+                    }
+                    .into_io(),
+                );
+            }
+            damaged = true;
+            FormatChecked::new(&dir)
+        }
+    };
+    // 3. The adoption (D-041), with the staged install's own format read before
+    //    its first write, and the store's record rewritten after the switch when
+    //    it was the damaged part.
+    let adopted = match snapshot::adopt_checked(
+        env,
+        &dir,
+        variants,
+        damaged,
+        order != StartOrder::StagedFormatUnchecked,
+    )
+    .await
+    {
+        Ok(adopted) => adopted,
+        Err(error) if LostState::from_io(&error).is_some() => return Start::Refused(error),
+        Err(error) if FormatRefused::from_io(&error).is_some() => return Start::Failed(error),
+        Err(error) => {
+            return Start::Failed(io::Error::new(
+                error.kind(),
+                format!("adopting an installed snapshot: {error}"),
+            ));
+        }
+    };
+    if adopted {
+        // D-047, an open point: the adoption decides to adopt inside
+        // `adopt_checked`, once it has read the staged CURRENT and manifest, and
+        // does the copies in the same call, so no stamp taken out here could be
+        // that decision's; it is traced as decided when it is recorded, which no
+        // earlier time is provably.
+        env.trace(TraceEvent::RaftAdopted { server });
+    }
+    // The adoption rewrote a record that could not be read, so the directory's
+    // format is this build's again.
+    let damaged = damaged && !adopted;
+    // 4. The heal of a record with one damaged copy, after the adoption, so a
+    //    staged install refused for its format stops the server with nothing of
+    //    the store written.
+    if let Some(len) = heal {
+        let healed = if order == StartOrder::HealByRename {
+            format::rewrite_format(env, &dir).await.map(|_| ())
+        } else {
+            format::heal_format(env, &checked, len).await
+        };
+        if let Err(error) = healed {
+            return Start::Failed(io::Error::new(
+                error.kind(),
+                format!("healing the store's format record: {error}"),
+            ));
+        }
+    }
+    // 5. A record that cannot be read beside a store is lost state (D-044),
+    //    after the adoption: refusing before it would never adopt the install
+    //    the re-seed this refusal asks for stages, and the server would loop.
+    if damaged {
+        return Start::Refused(LostState::from_damage(Damage::FormatUnreadable).into_io());
+    }
+    // 6. The marker (D-041, D-044).
+    if !variants.contains(Variant::AdoptionAsBuilt)
+        && let Err(error) = refuse_lost_store(env, &dir).await
+    {
+        return Start::Refused(error);
+    }
+    // 7. The engine, then the store.
+    open_engine_and_store(env, engine, variants, prefix, checked, adopted, late).await
+}
+
+/// Steps 7 and 8 of [`start_store`]: the engine, the store, and — for the
+/// known-buggy order that records a fresh directory's format last — the record.
+async fn open_engine_and_store<E: Environment>(
+    env: &E,
+    engine: &EngineConfig,
+    variants: Variants,
+    prefix: &KeyPrefix,
+    checked: FormatChecked,
+    adopted: bool,
+    late: Option<format::FreshDir>,
+) -> Start<E> {
+    let (opened, recovery) = match Engine::open(env.clone(), engine.clone()).await {
+        Ok(opened) => opened,
+        Err(error) => return Start::Refused(error),
+    };
+    let opened = Arc::new(opened);
+    let (store, recovered) =
+        match RaftStore::open(opened.clone(), &recovery, prefix.clone(), checked).await {
+            Ok(opened) => opened,
+            Err(error) => {
+                // D-044: the engine that recovered the hole does no more work. It
+                // started quiesced when the recovery itself reported the loss; this
+                // is the refusal the store alone can see.
+                if !variants.contains(Variant::RefusalNotDurable) {
+                    opened.quiesce();
+                }
+                return Start::Refused(error);
+            }
+        };
+    if let Some(fresh) = late
+        && let Err(error) = format::record_format(env, fresh).await
+    {
+        return Start::Failed(io::Error::new(
+            error.kind(),
+            format!("recording the store's format: {error}"),
+        ));
+    }
+    Start::Opened {
+        store,
+        recovered,
+        adopted,
+    }
+}
+
+/// The known-buggy order D-059's first draft proposed and the check patch built:
+/// the adoption with no gate and no staged check, the marker, the engine and the
+/// recovery's loss, and only then the format. A 0.3.0 store that also lost state
+/// is marked lost and re-seeded into its own directory, and the engine's open
+/// has already written a log segment into it.
+// PROPOSED(D-060): the pair for the start's order.
+async fn start_lost_state_first<E: Environment>(
+    env: &E,
+    server: u64,
+    engine: &EngineConfig,
+    variants: Variants,
+    prefix: &KeyPrefix,
+) -> Start<E> {
+    let dir = engine.dir.clone();
+    let adopted = match snapshot::adopt_checked(env, &dir, variants, false, false).await {
+        Ok(adopted) => adopted,
+        Err(error) if LostState::from_io(&error).is_some() => return Start::Refused(error),
+        Err(error) => {
+            return Start::Failed(io::Error::new(
+                error.kind(),
+                format!("adopting an installed snapshot: {error}"),
+            ));
+        }
+    };
+    if adopted {
+        env.trace(TraceEvent::RaftAdopted { server });
+    }
+    if !variants.contains(Variant::AdoptionAsBuilt)
+        && let Err(error) = refuse_lost_store(env, &dir).await
+    {
+        return Start::Refused(error);
+    }
+    let started = open_engine_and_store(
+        env,
+        engine,
+        variants,
+        prefix,
+        FormatChecked::new(&dir),
+        adopted,
+        None,
+    )
+    .await;
+    let Start::Opened {
+        store,
+        recovered,
+        adopted,
+    } = started
+    else {
+        return started;
+    };
+    match format::check_format(env, &dir).await {
+        Ok(format::Verdict::Fresh(fresh)) => match format::record_format(env, fresh).await {
+            Ok(_) => {}
+            Err(error) => return Start::Failed(error),
+        },
+        Ok(format::Verdict::Recorded { .. }) => {}
+        Ok(format::Verdict::Damaged) => {
+            return Start::Refused(LostState::from_damage(Damage::FormatUnreadable).into_io());
+        }
+        Err(error) => return Start::Failed(error),
+    }
+    Start::Opened {
+        store,
+        recovered,
+        adopted,
+    }
+}
+
 /// Runs one server until its store fails or its socket closes. Spawn it with
 /// `Environment::spawn`; spawn it again after a crash to restart the server on what
 /// its disk kept.
@@ -311,7 +646,8 @@ enum Next {
 ///
 /// The bind, or an I/O error while running; each is traced before it is returned.
 /// A store refused for lost state is no longer an error: the server runs in
-/// re-seed mode until a leader's snapshot rebuilds it (RAFT.md §3).
+/// re-seed mode until a leader's snapshot rebuilds it (RAFT.md §3). A store in
+/// another on-disk format is an error, and nothing was written to it (D-059).
 pub async fn run<E: Environment>(env: E, config: NodeConfig) -> io::Result<()> {
     let NodeConfig {
         id,
@@ -325,7 +661,10 @@ pub async fn run<E: Environment>(env: E, config: NodeConfig) -> io::Result<()> {
     let server = id.0;
     // D-041: the as-built adoption is the server before the store
     // marker existed: it neither checks nor writes one, lost mark included, so
-    // its disk sees exactly the operations the nightly's did.
+    // its disk sees the operations the nightly's did but for the store's own —
+    // PROPOSED(D-060): the format record is read at every start and written by
+    // every fresh one, under this variant as under the correct server, since the
+    // format rule is not what the variant models.
     let as_built = raft.variants.contains(Variant::AdoptionAsBuilt);
     // D-044: a refusal is recorded in the store directory before
     // anything else and quiesces the engine that recovered the hole. The
@@ -382,92 +721,40 @@ pub async fn run<E: Environment>(env: E, config: NodeConfig) -> io::Result<()> {
         }
     });
 
+    // PROPOSED(D-060): today's one group, whose Raft state is one key interval
+    // under `0 / <group>`; Stage B gives a server a group per range.
+    let prefix = KeyPrefix::group(SINGLE_GROUP);
     loop {
-        // D-041: a staging directory whose CURRENT exists but cannot
-        // be read is a damaged install, refused like a store whose recovery lost
-        // state and never swept; the server waits in re-seed mode for a leader's
-        // stream, which replaces the staging directory.
-        let adopted = match snapshot::adopt_staged_under(&env, &engine.dir, raft.variants).await {
-            Ok(adopted) => adopted,
-            Err(error) if LostState::from_io(&error).is_some() => {
-                // D-047: refused when the adoption returned the damage,
-                // before the mark's write and sync.
-                let refused = env.decision();
-                // D-044: the loss is recorded in the store directory
-                // before anything else, so the store this server was running on
-                // — which the damaged install superseded and which a sweep of
-                // the staging would otherwise let it fall back to — is refused
-                // at every open until an install replaces it.
-                record_loss(&env, server, durable_refusal, &engine.dir, &error).await?;
-                env.trace_decided(
-                    refused,
-                    TraceEvent::RaftRefused {
-                        server,
-                        reason: error.to_string(),
-                    },
-                );
-                match reseed(&env, id, &sock, &addrs, &raft, &engine.dir, &inbox).await {
-                    Next::Closed => return Ok(()),
-                    Next::Reinstall => continue,
-                }
-            }
-            Err(error) => {
+        // The start, in the order of D-059 and PROPOSED D-060: the format read
+        // before anything writes, the adoption (D-041), the marker (D-044), the
+        // engine and the store.
+        let started = start_store(
+            &env,
+            server,
+            &engine,
+            raft.variants,
+            &prefix,
+            StartOrder::Correct,
+        )
+        .await;
+        let (store, recovered) = match started {
+            // D-059: a store in another format lost nothing and is not this
+            // server's to replace: no lost mark, no re-seed, nothing written.
+            Start::Failed(error) => {
                 env.trace(TraceEvent::RaftServerFailed {
                     server,
-                    reason: format!("adopting an installed snapshot: {error}"),
+                    reason: error.to_string(),
                 });
                 return Err(error);
             }
-        };
-        if adopted {
-            // D-047, an open point: the adoption decides to adopt inside
-            // `adopt_staged_under`, once it has read the staged CURRENT and
-            // manifest, and does the copies in the same call, so no stamp taken
-            // out here could be that decision's; it is traced as decided when it
-            // is recorded, which no earlier time is provably.
-            env.trace(TraceEvent::RaftAdopted { server });
-        }
-        // D-041: a directory that carries the store marker but no valid
-        // CURRENT is a lost store, never a fresh one; the engine alone would open
-        // it fresh once nothing else remains (D-024). D-044: a marker
-        // that says the store lost state refuses every open on its own.
-        let marked = if as_built {
-            Ok(())
-        } else {
-            refuse_lost_store(&env, &engine.dir).await
-        };
-        let opened = match marked {
-            Ok(()) => match Engine::open(env.clone(), engine.clone()).await {
-                Ok((opened, recovery)) => {
-                    let opened = Arc::new(opened);
-                    match RaftStore::open(opened.clone(), &recovery).await {
-                        Ok(store) => Ok(store),
-                        Err(error) => {
-                            // D-044: the engine that recovered the
-                            // hole does no more work. It started quiesced when
-                            // the recovery itself reported the loss; this is
-                            // the refusal the store alone can see.
-                            if quiesce_refused {
-                                opened.quiesce();
-                            }
-                            Err(error)
-                        }
-                    }
-                }
-                Err(error) => Err(error),
-            },
-            Err(error) => Err(error),
-        };
-        let (store, recovered) = match opened {
-            Ok(opened) => opened,
-            Err(error) => {
-                // D-047: refused when the open returned the loss, before
-                // the mark's write and sync.
+            Start::Refused(error) => {
+                // D-047: refused when the start returned the loss, before the
+                // mark's write and sync.
                 let refused = env.decision();
-                // D-044: before the trace, before the re-seed, before
-                // anything that can be interrupted: the store directory itself
-                // records that this store lost state, so a restart cannot find
-                // it whole again.
+                // D-044: before the trace, before the re-seed, before anything
+                // that can be interrupted: the store directory itself records
+                // that this store lost state, so a restart cannot find it whole
+                // again.
                 record_loss(&env, server, durable_refusal, &engine.dir, &error).await?;
                 env.trace_decided(
                     refused,
@@ -478,11 +765,25 @@ pub async fn run<E: Environment>(env: E, config: NodeConfig) -> io::Result<()> {
                 );
                 // Re-seed mode (RAFT.md §3): the store is gone; wait for a
                 // leader's snapshot to rebuild it, taking part in nothing else.
-                match reseed(&env, id, &sock, &addrs, &raft, &engine.dir, &inbox).await {
+                match reseed(
+                    &env,
+                    id,
+                    &sock,
+                    &addrs,
+                    &raft,
+                    &engine.dir,
+                    &inbox,
+                    prefix.clone(),
+                )
+                .await
+                {
                     Next::Closed => return Ok(()),
                     Next::Reinstall => continue,
                 }
             }
+            Start::Opened {
+                store, recovered, ..
+            } => (store, recovered),
         };
         // D-041: the marker, written once the directory has opened as a
         // store — a fresh directory at its first open — and kept for good.
@@ -504,6 +805,7 @@ pub async fn run<E: Environment>(env: E, config: NodeConfig) -> io::Result<()> {
             &inbox,
             Arc::new(store),
             recovered,
+            prefix.clone(),
         )
         .await?;
         match next {
@@ -559,6 +861,7 @@ async fn incarnation<E: Environment>(
     inbox: &Queue<Event>,
     store: Arc<RaftStore<E>>,
     recovered: Recovered,
+    prefix: KeyPrefix,
 ) -> io::Result<Next> {
     let server = id.0;
     let tick = Duration::from_nanos(raft.tick_nanos);
@@ -627,6 +930,7 @@ async fn incarnation<E: Environment>(
             inbox.clone(),
             snaps.clone(),
             stream_acks.clone(),
+            prefix,
         ),
     );
 
@@ -1423,11 +1727,12 @@ async fn snapshot_task<E: Environment>(
     inbox: Queue<Event>,
     snaps: Queue<Snap>,
     stream_acks: StreamAcks,
+    prefix: KeyPrefix,
 ) {
     let server = id.0;
     let chunk_timeout = Duration::from_nanos(config.tick_nanos * config.election_ticks.0 / 2);
     let shared = config.variants.contains(Variant::SharedSnapshotDir);
-    let mut assembler = Assembler::new(env.clone(), &engine_dir, config.variants);
+    let mut assembler = Assembler::new(env.clone(), &engine_dir, config.variants, prefix);
     let mut staged: Option<Staged> = None;
     let streamer = Streamer {
         env: env.clone(),
@@ -1823,6 +2128,7 @@ async fn send_chunk<E: Environment>(
 /// quarantine flag (D-035) and a fresh store incarnation
 /// (D-042), and the caller adopts it. Its answers carry incarnation 0
 /// until then: a refused server has no store.
+#[expect(clippy::too_many_arguments, reason = "re-seed mode names its world")]
 async fn reseed<E: Environment>(
     env: &E,
     id: ServerId,
@@ -1831,8 +2137,9 @@ async fn reseed<E: Environment>(
     raft: &RaftConfig,
     engine_dir: &Path,
     inbox: &Queue<Event>,
+    prefix: KeyPrefix,
 ) -> Next {
-    let mut assembler = Assembler::new(env.clone(), engine_dir, raft.variants);
+    let mut assembler = Assembler::new(env.clone(), engine_dir, raft.variants, prefix);
     loop {
         let Some(event) = inbox.pop().await else {
             return Next::Closed;

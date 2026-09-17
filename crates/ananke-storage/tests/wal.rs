@@ -14,11 +14,17 @@ use bytes::Bytes;
 const DIR: &str = "/wal";
 
 fn config(variant: Variant) -> WalConfig {
+    config_at(variant, 1)
+}
+
+/// The log as `variant` would open it with the caller's tables holding everything
+/// below `expected_head`.
+fn config_at(variant: Variant, expected_head: u64) -> WalConfig {
     WalConfig {
         dir: DIR.into(),
         segment_bytes: 256,
         variant,
-        expected_head: 1,
+        expected_head,
         refuse_damage: false,
         head_gap: HeadGapPolicy::Discard,
     }
@@ -189,11 +195,23 @@ fn concurrent_appenders_share_syncs() {
 /// Recovers with `variant` after the segments were written by hand; the log is
 /// dropped at once so the directory shows recovery's cleanup.
 fn recover(sim: &mut Sim, node: ananke_env::NodeId, variant: Variant) -> (Recovery, Vec<String>) {
+    recover_at(sim, node, variant, 1)
+}
+
+/// As [`recover`], with the caller's tables holding everything below `expected_head`.
+fn recover_at(
+    sim: &mut Sim,
+    node: ananke_env::NodeId,
+    variant: Variant,
+    expected_head: u64,
+) -> (Recovery, Vec<String>) {
     let env = sim.env(node);
     let result: Out<(Recovery, Vec<String>)> = out();
     let r = result.clone();
     env.clone().spawn("recover", async move {
-        let (wal, recovery) = Wal::open(env.clone(), config(variant)).await.unwrap();
+        let (wal, recovery) = Wal::open(env.clone(), config_at(variant, expected_head))
+            .await
+            .unwrap();
         drop(wal);
         let names = env.fs().read_dir(Path::new(DIR)).await.unwrap();
         let names = names.iter().map(|n| n.display().to_string()).collect();
@@ -441,4 +459,262 @@ fn recovery_stops_at_a_gap_in_the_numbering() {
     assert_eq!((recovery.discarded, recovery.next_seq), (0, 3));
     // Segment 2 was cut to nothing and reopened fresh as the next segment.
     assert_eq!(names, ["000001.wal", "000002.wal", "000003.wal"]);
+}
+
+/// Records numbered from `first`, each payload tagged with which writing it came
+/// from, so a stale copy of a number can be told from the live one.
+fn tagged(first: u64, count: u64, tag: &str) -> Vec<u8> {
+    let mut buf = Vec::new();
+    for i in 0..count {
+        encode_record(
+            &mut buf,
+            first + i,
+            format!("{tag}-{}", first + i).as_bytes(),
+        );
+    }
+    buf
+}
+
+/// The tag each recovered record carries.
+fn tags(recovery: &Recovery) -> Vec<String> {
+    recovery
+        .records
+        .iter()
+        .map(|b| String::from_utf8_lossy(b).into_owned())
+        .collect()
+}
+
+/// The supersedes in the trace: `(segment, expected, found, dropped)`.
+fn supersedes(sim: &Sim) -> Vec<(u64, u64, u64, u64)> {
+    sim.trace()
+        .iter()
+        .filter_map(|r| match r.event {
+            TraceEvent::WalSuperseded {
+                segment,
+                expected,
+                found,
+                dropped,
+            } => Some((segment, expected, found, dropped)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// D-062, the state the nightly found at seed 3123, built by hand. A previous
+/// recovery cut segment 14 to nothing; the disk lied about the sync of that cut and
+/// the crash after it dropped the truncation, so segment 14 came back whole, holding
+/// 166..=172 under numbers the log had re-issued to the live segment 15. The tables
+/// hold through 171, so the engine opens the log expecting its head at 172.
+///
+/// Segment 15's first record, 165, is *behind* the reading: segments are created in
+/// increasing order, so segment 15 is the later writing and its numbers supersede
+/// segment 14's copies. The correct log drops the stale seven and returns the live
+/// thirteen; the variant that trusts the earlier segment takes the stale copies for
+/// current, stops, and destroys the thirteen acknowledged records behind them —
+/// which is the violation the nightly reported ("record 166 came back changed").
+// PROPOSED(D-062): the WAL's supersede rule.
+#[test]
+fn a_segment_a_betrayed_cut_brought_back_whole_is_superseded_by_the_live_one() {
+    for variant in [Variant::Correct, Variant::TrustsAStaleSegment] {
+        let mut sim = Sim::new(SimConfig::new(8));
+        let node = sim.add_node();
+        let env = sim.env(node);
+        env.clone().spawn("setup", async move {
+            write_segment(&env, 13, tagged(152, 13, "old")).await;
+            write_segment(&env, 14, tagged(166, 7, "stale")).await;
+            write_segment(&env, 15, tagged(165, 13, "live")).await;
+        });
+        sim.run_for(Duration::from_millis(1));
+        let (recovery, names) = recover_at(&mut sim, node, variant, 172);
+        match variant {
+            Variant::Correct => {
+                assert_eq!(recovery.first_seq, 165);
+                assert_eq!(
+                    tags(&recovery),
+                    (165..=177)
+                        .map(|s| format!("live-{s}"))
+                        .collect::<Vec<String>>(),
+                    "every record comes from the live segment"
+                );
+                assert_eq!((recovery.stop, recovery.next_seq), (None, 178));
+                assert_eq!(
+                    supersedes(&sim),
+                    [(15, 173, 165, 7)],
+                    "segment 15 superseded segment 14's seven stale records"
+                );
+                // Nothing was cut: with no stop, the stale segment stays on disk and
+                // is superseded again at the next open until a flush deletes it.
+                assert_eq!(
+                    names,
+                    ["000013.wal", "000014.wal", "000015.wal", "000016.wal"]
+                );
+            }
+            _ => {
+                // The bug: the resurrected segment is taken for current.
+                assert_eq!(recovery.first_seq, 166);
+                assert_eq!(
+                    tags(&recovery),
+                    (166..=172)
+                        .map(|s| format!("stale-{s}"))
+                        .collect::<Vec<String>>(),
+                    "the stale copies came back as current"
+                );
+                assert_eq!(
+                    recovery.stop,
+                    Some(WalStop {
+                        segment: 15,
+                        offset: 0,
+                        reason: WalStopReason::Gap {
+                            expected: 173,
+                            found: 165
+                        }
+                    }),
+                    "the live segment reads as an ordinary gap and stops recovery"
+                );
+                assert_eq!(recovery.next_seq, 173);
+                assert!(supersedes(&sim).is_empty());
+                // The live segment was cut to nothing: thirteen acknowledged records
+                // gone, and the stale 172 above the tables' 171 to be replayed.
+                assert_eq!(
+                    sim.durable_contents(node, &segment_path(Path::new(DIR), 15))
+                        .map(|b| b.len()),
+                    Some(0)
+                );
+            }
+        }
+    }
+}
+
+/// D-062's other shape: the betrayed cut was to a shorter length, not to nothing, so
+/// the stale records come back *behind* live ones in the same segment and contiguous
+/// with them — segment 1 holds the live 100..=110 and the stale 111..=120 a cut had
+/// removed, and segment 2 holds the live 111..=118 written after that cut. Nothing in
+/// segment 1 is ill-formed, so only segment 2's backwards first record can tell the
+/// two writings apart. The tables here hold only through 99, so the head guard the
+/// forward jump uses cannot help: it is the direction of the jump that decides.
+// PROPOSED(D-062): the WAL's supersede rule.
+#[test]
+fn a_betrayed_cut_to_a_shorter_length_is_superseded_below_the_expected_head_too() {
+    for variant in [Variant::Correct, Variant::TrustsAStaleSegment] {
+        let mut sim = Sim::new(SimConfig::new(9));
+        let node = sim.add_node();
+        let env = sim.env(node);
+        env.clone().spawn("setup", async move {
+            let mut one = tagged(100, 11, "live");
+            one.extend_from_slice(&tagged(111, 10, "stale"));
+            write_segment(&env, 1, one).await;
+            write_segment(&env, 2, tagged(111, 8, "live")).await;
+        });
+        sim.run_for(Duration::from_millis(1));
+        let (recovery, _names) = recover_at(&mut sim, node, variant, 100);
+        assert_eq!(recovery.first_seq, 100);
+        match variant {
+            Variant::Correct => {
+                assert_eq!(
+                    tags(&recovery),
+                    (100..=118)
+                        .map(|s| format!("live-{s}"))
+                        .collect::<Vec<String>>(),
+                    "the stale tail is dropped and the live records are whole"
+                );
+                assert_eq!((recovery.stop, recovery.next_seq), (None, 119));
+                assert_eq!(supersedes(&sim), [(2, 121, 111, 10)]);
+            }
+            _ => {
+                // The bug: ten stale records returned as current and the live
+                // 111..=118 cut away behind them.
+                assert_eq!(
+                    tags(&recovery)[11..],
+                    (111..=120)
+                        .map(|s| format!("stale-{s}"))
+                        .collect::<Vec<String>>()
+                );
+                assert_eq!(
+                    recovery.stop,
+                    Some(WalStop {
+                        segment: 2,
+                        offset: 0,
+                        reason: WalStopReason::Gap {
+                            expected: 121,
+                            found: 111
+                        }
+                    })
+                );
+                assert_eq!(recovery.next_seq, 121);
+                assert!(supersedes(&sim).is_empty());
+            }
+        }
+    }
+}
+
+/// D-062's narrowing, and the guard that carries it: the rule fires only at a
+/// segment's **first** record. What warrants superseding is the order in which
+/// segments are created — a file whose first record is behind the reading was written
+/// after every file read before it, so its copies of those numbers are the later
+/// writing's. Inside a segment there is no such warrant. The bytes after a backwards
+/// jump mid-file belong to no writing the reader can name: the tail of an earlier,
+/// longer writing that the re-issued records did not cover, a stray write, a
+/// corruption the checksums happened not to catch. The reader cannot tell, so it
+/// stops at the jump and keeps every record it has read.
+///
+/// Segment 1 holds the live 100..=112 and then, at a non-zero offset, a tail numbered
+/// from 109 again. Recovery returns the thirteen live records whole and stops at the
+/// jump, cutting the stale tail away. Superseding there instead would drop the live
+/// 109..=112 and hand back the stale copies in their place — which is why the guard
+/// is not decoration: delete `at == 0` from `parse_segment` and this test fails, while
+/// the other ten in this file and the pinned seed 3123 all still pass.
+///
+/// Both readers behave alike here, which is the point: this shape is outside what
+/// D-062 changed, and the pair's difference is at a segment's first record only.
+// PROPOSED(D-062): the WAL's supersede rule.
+#[test]
+fn a_backwards_jump_inside_a_segment_is_still_a_stop_and_keeps_the_live_records() {
+    for variant in [Variant::Correct, Variant::TrustsAStaleSegment] {
+        let mut sim = Sim::new(SimConfig::new(10));
+        let node = sim.add_node();
+        let env = sim.env(node);
+        let live = tagged(100, 13, "live");
+        // The jump is at the first byte after the live records, never at zero.
+        let at = live.len() as u64;
+        assert!(at > 0);
+        env.clone().spawn("setup", async move {
+            let mut one = live;
+            one.extend_from_slice(&tagged(109, 4, "stale"));
+            write_segment(&env, 1, one).await;
+        });
+        sim.run_for(Duration::from_millis(1));
+        let (recovery, names) = recover_at(&mut sim, node, variant, 100);
+        assert_eq!(recovery.first_seq, 100);
+        assert_eq!(
+            tags(&recovery),
+            (100..=112)
+                .map(|s| format!("live-{s}"))
+                .collect::<Vec<String>>(),
+            "the live records are kept whole and no stale copy is returned"
+        );
+        assert_eq!(
+            recovery.stop,
+            Some(WalStop {
+                segment: 1,
+                offset: at,
+                reason: WalStopReason::Gap {
+                    expected: 113,
+                    found: 109
+                }
+            }),
+            "a backwards jump that is not a segment's first record is still a gap"
+        );
+        assert_eq!((recovery.discarded, recovery.next_seq), (0, 113));
+        assert!(
+            supersedes(&sim).is_empty(),
+            "nothing is superseded away from a segment's first record"
+        );
+        // The stale tail was cut off and the live records left on disk.
+        assert_eq!(
+            sim.durable_contents(node, &segment_path(Path::new(DIR), 1))
+                .map(|b| b.len()),
+            Some(usize::try_from(at).unwrap())
+        );
+        assert_eq!(names, ["000001.wal", "000002.wal"]);
+    }
 }

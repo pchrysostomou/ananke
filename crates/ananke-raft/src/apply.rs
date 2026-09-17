@@ -20,8 +20,17 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use crate::store::{RaftStore, key};
 use crate::types::Index;
 
-/// The tenant user data lives under.
-pub const USER_TENANT: u64 = 1;
+/// The tenant user data lives under (SHARD.md §1): tenant 0 is the protocol's
+/// own, tenant 1 the system tenant, and the user's data starts at tenant 2.
+// PROPOSED(D-060): user data moves from tenant 1 to tenant 2.
+pub const USER_TENANT: u64 = 2;
+
+/// The system tenant (SHARD.md §1): the catalogue and the tables the database
+/// keeps about itself. Nothing in Stage A writes a key under it; it is named
+/// here so that nothing else takes it.
+// PROPOSED(D-060): tenant 1 is the system tenant.
+pub const SYSTEM_TENANT: u64 = 1;
+
 const USER_TABLE: u64 = 0;
 
 /// A key of the user's key-value store, as the engine sees it.

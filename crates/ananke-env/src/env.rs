@@ -33,6 +33,15 @@ pub trait Environment: Clone + Send + Sync + 'static {
     /// order from. Kept apart from [`rng`](Self::rng) so an executor change never moves a
     /// protocol-visible draw. Under `RealEnv` both are OS entropy.
     fn sched_rng(&self) -> &Self::Rng;
+    /// This node's stream for range `range`, `n{id}/r{range}/protocol` (Q13, D-017):
+    /// what a range's protocol state is seeded from, so that one range's draws never
+    /// move another's. The same range gives the same stream on every call and to every
+    /// handle to the node, continuing where the last draw left it, as
+    /// [`rng`](Self::rng) does; taking it or drawing from it moves no draw of any other
+    /// stream. Under the simulator it is derived from the seed and the name; under
+    /// `RealEnv` it is OS entropy.
+    // PROPOSED(D-057): a named stream per node and range through the environment.
+    fn range_rng(&self, range: u64) -> Self::Rng;
     /// Runs `f` as a task named `name`.
     ///
     /// The name appears in traces and need not be unique. Dropping the returned handle

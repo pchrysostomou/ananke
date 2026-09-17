@@ -1223,3 +1223,708 @@ fn an_engine_whose_recovery_lost_writes_starts_quiesced_and_launders_nothing() {
         "the store as built opens clean, the loss laundered away"
     );
 }
+
+/// The live install (D-054, SHARD.md §11 storage 5): a checkpoint of a span holds
+/// the newest live write of each of its keys at its version and nothing outside
+/// it; installed over the span while the engine runs, it replaces the span's keys
+/// and leaves every other key as it was, with one manifest switch, and a write to
+/// the span after the install is read over it. A reopen sees the same.
+// PROPOSED(D-054): the live install of a span, in one manifest switch.
+#[test]
+fn a_span_checkpoint_installs_over_its_span_in_one_switch() {
+    let mut sim = Sim::new(SimConfig::new(23));
+    let node = sim.add_node();
+    let expected = on_node(&mut sim, node, |env| {
+        Box::pin(async move {
+            let mut c = config(400);
+            c.background_compaction = true;
+            let (db, _) = Engine::open(env.clone(), c).await.unwrap();
+            fill(&db, 0..90, 20).await;
+            env.clock().sleep(Duration::from_millis(1)).await;
+            let span = b("k005")..b("k012");
+            let info = db
+                .checkpoint_span(&span.start[..]..&span.end[..], Path::new("/stage/one"))
+                .await
+                .unwrap();
+            assert_eq!(info.version, 90);
+            // What the span held at the checkpoint, and the state after writes
+            // that follow it.
+            let at_checkpoint: Vec<Option<Bytes>> = (0..20).map(|k| expected(k, 90, 20)).collect();
+            fill(&db, 90..150, 20).await;
+            env.clock().sleep(Duration::from_millis(1)).await;
+            let source = db.open_span_source(Path::new("/stage/one")).await.unwrap();
+            let live_in_span = (5..12).filter(|&k| at_checkpoint[k].is_some()).count();
+            let (first, last) = source.key_range().expect("the span held keys");
+            assert!(
+                first >= span.start && last < span.end,
+                "{first:?}..{last:?}"
+            );
+            let install = db.install_span(span.clone(), source);
+            assert_eq!(install.seq(), Some(151), "numbered above every write taken");
+            let done = install.await.unwrap();
+            assert_eq!(done.seq, 151);
+            assert_eq!(done.keys, live_in_span as u64);
+            let mut want: Vec<Option<Bytes>> = (0..20).map(|k| expected(k, 150, 20)).collect();
+            want[5..12].clone_from_slice(&at_checkpoint[5..12]);
+            for (k, w) in want.iter().enumerate() {
+                assert_eq!(
+                    db.get(format!("k{k:03}").as_bytes()).await.unwrap(),
+                    *w,
+                    "k{k:03} after the install"
+                );
+            }
+            // A write to the span after the install is read over it.
+            let seq = db.put(b("k007"), b("after")).await.unwrap();
+            assert!(seq > done.seq);
+            want[7] = Some(b("after"));
+            assert_eq!(db.get(b"k007").await.unwrap(), Some(b("after")));
+            want
+        })
+    });
+    let trace = sim.trace();
+    let installed = trace
+        .iter()
+        .position(|r| matches!(r.event, TraceEvent::SpanInstalled { .. }))
+        .expect("the install is traced");
+    let manifest = match &trace[installed].event {
+        TraceEvent::SpanInstalled { manifest, seq, .. } => {
+            assert_eq!(*seq, 151);
+            *manifest
+        }
+        _ => unreachable!(),
+    };
+    // One switch after the replacement is written, and it is to the manifest the
+    // install named.
+    let switches: Vec<u64> = trace[installed..]
+        .iter()
+        .take_while(|r| {
+            !matches!(
+                r.event,
+                TraceEvent::WalSegmentOpened { .. } | TraceEvent::MemtableRotated { .. }
+            )
+        })
+        .filter_map(|r| match r.event {
+            TraceEvent::CurrentSwitched { manifest } => Some(manifest),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(switches.first(), Some(&manifest), "{switches:?}");
+    let reopened = on_node(&mut sim, node, |env| {
+        Box::pin(async move {
+            let (db, _) = Engine::open(env, config(400)).await.unwrap();
+            let mut got = Vec::new();
+            for k in 0..20 {
+                got.push(db.get(format!("k{k:03}").as_bytes()).await.unwrap());
+            }
+            got
+        })
+    });
+    assert_eq!(reopened, expected, "a reopen sees the install");
+}
+
+/// A table an install writes again without the span's keys gets a new, higher
+/// file number while keeping its writes' sequence numbers. Level 0 is read newest
+/// sequence number first, so an older write of a key outside the span, in the
+/// rewritten table, never hides a newer one in a table flushed after it but
+/// numbered below the rewrite (D-054). Read newest file number first, `j` would
+/// come back as its old value.
+// PROPOSED(D-054): level 0 is read newest sequence number first.
+#[test]
+fn a_rewritten_level_0_table_does_not_hide_a_newer_write() {
+    let mut sim = Sim::new(SimConfig::new(29));
+    let node = sim.add_node();
+    on_node(&mut sim, node, |env| {
+        Box::pin(async move {
+            let (db, _) = Engine::open(env.clone(), config(100)).await.unwrap();
+            let pad = |s: &str| Bytes::from(format!("{s:<40}"));
+            // Table one: j and k. Table two, flushed after it: a newer j.
+            db.put(b("j"), pad("old")).await.unwrap();
+            db.put(b("k"), pad("k")).await.unwrap();
+            env.clock().sleep(Duration::from_millis(1)).await;
+            db.put(b("j"), pad("new")).await.unwrap();
+            db.put(b("x"), pad("x")).await.unwrap();
+            env.clock().sleep(Duration::from_millis(1)).await;
+            assert_eq!(db.levels()[0].len(), 2, "{:?}", db.levels());
+            // Take k out: table one is written again, holding only the old j.
+            let done = db
+                .install_span(b("k")..b("l"), ananke_storage::SpanSource::empty())
+                .await
+                .unwrap();
+            assert_eq!((done.removed, done.rewritten, done.added), (1, 1, 0));
+            let level_0 = db.levels()[0].clone();
+            assert_eq!(level_0.len(), 2);
+            assert!(
+                level_0[1].max_seq < level_0[0].max_seq,
+                "the rewrite is numbered after the newer table: {level_0:?}"
+            );
+            assert_eq!(db.get(b"k").await.unwrap(), None);
+            assert_eq!(db.get(b"j").await.unwrap(), Some(pad("new")));
+        })
+    });
+}
+
+/// An install is refused, and the store left as it was, for a span with no key,
+/// a source holding a key outside the span, a source that is not a whole store,
+/// and while another install has not switched (D-054).
+// PROPOSED(D-054): the live install of a span, in one manifest switch.
+#[test]
+fn an_install_is_refused_when_it_cannot_be_made() {
+    use ananke_storage::{InstallRefused, SpanSource};
+    let mut sim = Sim::new(SimConfig::new(31));
+    let node = sim.add_node();
+    on_node(&mut sim, node, |env| {
+        Box::pin(async move {
+            let (db, _) = Engine::open(env.clone(), config(400)).await.unwrap();
+            fill(&db, 0..40, 20).await;
+            let refusal = |e: std::io::Error| InstallRefused::from_io(&e);
+            let empty = db.install_span(b("k")..b("k"), SpanSource::empty());
+            assert_eq!(empty.seq(), None);
+            assert_eq!(
+                empty.await.err().and_then(refusal),
+                Some(InstallRefused::EmptySpan)
+            );
+            db.checkpoint_span(b"k000"..b"k010", Path::new("/stage/wide"))
+                .await
+                .unwrap();
+            let source = db.open_span_source(Path::new("/stage/wide")).await.unwrap();
+            let outside = db.install_span(b("k002")..b("k005"), source);
+            assert_eq!(outside.seq(), None);
+            assert!(matches!(
+                outside.await.err().and_then(refusal),
+                Some(InstallRefused::OutsideSpan { .. })
+            ));
+            let missing = db.open_span_source(Path::new("/stage/none")).await;
+            assert!(matches!(
+                missing.err().and_then(refusal),
+                Some(InstallRefused::SourceDamaged(_))
+            ));
+            let first = db.install_span(b("k000")..b("k001"), SpanSource::empty());
+            assert!(first.seq().is_some());
+            let second = db.install_span(b("k002")..b("k003"), SpanSource::empty());
+            assert_eq!(second.seq(), None);
+            assert_eq!(
+                second.await.err().and_then(refusal),
+                Some(InstallRefused::InProgress)
+            );
+            first.await.unwrap();
+            assert_eq!(db.get(b"k000").await.unwrap(), None);
+            assert_eq!(db.get(b"k002").await.unwrap(), expected(2, 40, 20));
+            db.quiesce();
+            let quiesced = db.install_span(b("k002")..b("k003"), SpanSource::empty());
+            assert_eq!(
+                quiesced.await.err().and_then(refusal),
+                Some(InstallRefused::Quiesced)
+            );
+        })
+    });
+}
+
+/// The bounded, ordered seek (D-055, SHARD.md §11 storage 2): the first `limit`
+/// present keys at or after a start and below an end, at a snapshot, in key order.
+/// A deleted key is passed over and does not count; a write after the snapshot is
+/// not seen; a limit of one is the first key at or after the start.
+// PROPOSED(D-055): the bounded, ordered seek.
+#[test]
+fn a_bounded_seek_returns_the_first_live_keys_from_its_start() {
+    let mut sim = Sim::new(SimConfig::new(37));
+    let node = sim.add_node();
+    on_node(&mut sim, node, |env| {
+        Box::pin(async move {
+            let (db, _) = Engine::open(env.clone(), config(400)).await.unwrap();
+            fill(&db, 0..120, 20).await;
+            // Some keys deleted outright, in the memtable over older tables.
+            for k in [4, 5, 6, 9] {
+                db.delete(Bytes::from(format!("k{k:03}"))).await.unwrap();
+            }
+            env.clock().sleep(Duration::from_millis(1)).await;
+            let snapshot = db.snapshot();
+            let live = |from: u32| -> Vec<Bytes> {
+                (from..20)
+                    .filter(|k| ![4, 5, 6, 9].contains(k) && expected(*k, 120, 20).is_some())
+                    .map(|k| Bytes::from(format!("k{k:03}")))
+                    .collect()
+            };
+            let got = db
+                .seek(b"k003"..b"k020", 3, &snapshot)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|(k, _)| k)
+                .collect::<Vec<_>>();
+            assert_eq!(got, live(3).into_iter().take(3).collect::<Vec<_>>());
+            assert!(!got.contains(&b("k004")), "a deleted key does not count");
+            let first = db.seek(b"k0045"..b"k020", 1, &snapshot).await.unwrap();
+            assert_eq!(
+                first.first().map(|(k, _)| k.clone()),
+                live(5).first().cloned()
+            );
+            assert!(
+                db.seek(b"k000"..b"k020", 0, &snapshot)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            // Past the range's end nothing, and a write after the snapshot unseen.
+            db.put(b("k0035"), b("later")).await.unwrap();
+            let bounded = db.seek(b"k003"..b"k004", 5, &snapshot).await.unwrap();
+            assert!(bounded.iter().all(|(k, _)| k == "k003"), "{bounded:?}");
+            let fresh = db.snapshot();
+            let seen = db.seek(b"k0031"..b"k020", 1, &fresh).await.unwrap();
+            assert_eq!(seen.first().map(|(k, _)| k.clone()), Some(b("k0035")));
+        })
+    });
+}
+
+/// The range delete (D-055, SHARD.md §11 storage 3): an install of nothing over the
+/// span, so its keys go with one manifest switch and no tombstone is written, every
+/// key outside it stays, a write to the span after the delete survives it, and a
+/// reopen sees the same.
+// PROPOSED(D-055): the range delete, an install of nothing.
+#[test]
+fn a_range_delete_takes_a_span_out_in_one_switch() {
+    let mut sim = Sim::new(SimConfig::new(41));
+    let node = sim.add_node();
+    let want = on_node(&mut sim, node, |env| {
+        Box::pin(async move {
+            let (db, _) = Engine::open(env.clone(), config(400)).await.unwrap();
+            fill(&db, 0..150, 20).await;
+            env.clock().sleep(Duration::from_millis(1)).await;
+            let entries_before: u64 = db.levels().iter().flatten().map(|t| t.entries).sum();
+            let removal = db.delete_range(b("k005")..b("k015"));
+            let seq = removal.seq().expect("numbered");
+            let done = removal.await.unwrap();
+            assert_eq!((done.seq, done.added, done.keys), (seq, 0, 0));
+            let entries_after: u64 = db.levels().iter().flatten().map(|t| t.entries).sum();
+            assert!(
+                entries_after < entries_before,
+                "the span's writes left the tables and nothing took their place: {entries_before} then {entries_after}"
+            );
+            db.put(b("k007"), b("after")).await.unwrap();
+            let mut want = Vec::new();
+            for k in 0..20u32 {
+                let got = db.get(format!("k{k:03}").as_bytes()).await.unwrap();
+                let expect = if (5..15).contains(&k) {
+                    (k == 7).then(|| b("after"))
+                } else {
+                    expected(k, 150, 20)
+                };
+                assert_eq!(got, expect, "k{k:03}");
+                want.push(expect);
+            }
+            want
+        })
+    });
+    let reopened = on_node(&mut sim, node, |env| {
+        Box::pin(async move {
+            let (db, _) = Engine::open(env, config(400)).await.unwrap();
+            let mut got = Vec::new();
+            for k in 0..20 {
+                got.push(db.get(format!("k{k:03}").as_bytes()).await.unwrap());
+            }
+            got
+        })
+    });
+    assert_eq!(reopened, want);
+    let switches_after_delete = sim
+        .trace()
+        .iter()
+        .skip_while(|r| !matches!(r.event, TraceEvent::SpanInstalled { .. }))
+        .take_while(|r| {
+            !matches!(
+                r.event,
+                TraceEvent::MemtableRotated { .. } | TraceEvent::NodeCrashed { .. }
+            )
+        })
+        .filter(|r| matches!(r.event, TraceEvent::CurrentSwitched { .. }))
+        .count();
+    assert!(switches_after_delete >= 1);
+}
+
+/// A source from a store further along than the live engine, as a range's snapshot
+/// from a leader is (D-054): its writes are numbered above every number the live
+/// engine has given. Installed, every table the install adds carries the install's
+/// own number and no other, and a local write after the install reads over the
+/// installed value. The engine that keeps the source's numbers
+/// (`Variant::InstallKeepsSourceNumbers`) hides that later write behind the
+/// installed one, which is the mechanism its crash test catches.
+// PROPOSED(D-054): the installed sequence numbers are the install's.
+#[test]
+fn an_install_from_a_store_further_along_carries_the_install_s_number() {
+    for variant in [Variant::Correct, Variant::InstallKeepsSourceNumbers] {
+        let mut sim = Sim::new(SimConfig::new(43));
+        let node = sim.add_node();
+        on_node(&mut sim, node, move |env| {
+            Box::pin(async move {
+                let mut live_config = config(400);
+                live_config.dir = "/live".into();
+                live_config.variant = variant;
+                let (live, _) = Engine::open(env.clone(), live_config).await.unwrap();
+                fill(&live, 0..40, 20).await;
+                let mut donor_config = config(400);
+                donor_config.dir = "/donor".into();
+                let (donor, _) = Engine::open(env.clone(), donor_config).await.unwrap();
+                for _ in 0..300 {
+                    drop(donor.write(ananke_storage::WriteBatch::new(), false));
+                }
+                let mut batch = ananke_storage::WriteBatch::new();
+                for k in 5..9 {
+                    batch.put(
+                        Bytes::from(format!("k{k:03}")),
+                        Bytes::from(format!("donor-{k}")),
+                    );
+                }
+                let donor_seq = donor.write(batch, true).await.unwrap();
+                assert!(donor_seq > 300);
+                donor
+                    .checkpoint_span(b"k005"..b"k009", Path::new("/stage/donor"))
+                    .await
+                    .unwrap();
+                let source = live
+                    .open_span_source(Path::new("/stage/donor"))
+                    .await
+                    .unwrap();
+                let done = live
+                    .install_span(b("k005")..b("k009"), source)
+                    .await
+                    .unwrap();
+                assert!(done.seq < donor_seq, "the live engine is behind the donor");
+                let installed: Vec<(u64, u64)> = live.levels()[0]
+                    .iter()
+                    .filter(|t| t.first_key >= b("k005") && t.last_key < b("k009"))
+                    .map(|t| (t.first_seq, t.max_seq))
+                    .collect();
+                assert_eq!(installed.len(), done.added, "{installed:?}");
+                // A local write to the span, flushed into a table of its own, and
+                // then the live engine taken past the donor's numbers.
+                let local = live.put(b("k006"), b("local")).await.unwrap();
+                assert!(local > done.seq && local < donor_seq);
+                for i in 0..20 {
+                    live.put(Bytes::from(format!("z{i:02}")), Bytes::from(vec![b'x'; 40]))
+                        .await
+                        .unwrap();
+                }
+                env.clock().sleep(Duration::from_millis(1)).await;
+                for _ in 0..donor_seq {
+                    drop(live.write(ananke_storage::WriteBatch::new(), false));
+                }
+                live.put(b("zz"), b("past")).await.unwrap();
+                assert!(live.snapshot().version() > donor_seq);
+                let read = live.get(b"k006").await.unwrap();
+                if variant == Variant::Correct {
+                    assert!(
+                        installed.iter().all(|&s| s == (done.seq, done.seq)),
+                        "every installed table carries the install's number {}: {installed:?}",
+                        done.seq
+                    );
+                    assert_eq!(
+                        read,
+                        Some(b("local")),
+                        "the local write reads over the install"
+                    );
+                } else {
+                    assert!(
+                        installed.iter().all(|&s| s == (donor_seq, donor_seq)),
+                        "the variant keeps the donor's number {donor_seq}: {installed:?}"
+                    );
+                    assert_eq!(
+                        read,
+                        Some(b("donor-6")),
+                        "the variant hides the later local write behind the installed value"
+                    );
+                }
+            })
+        });
+    }
+}
+
+/// An install and a range delete whose futures are dropped the moment they are
+/// numbered still run to their switches, in the task the engine spawned for each
+/// (D-054): the install is in force, a later install is not refused as in
+/// progress, and a later write is flushed as usual, with the flusher never failing.
+// PROPOSED(D-054): the install runs in a task of its own.
+#[test]
+fn a_dropped_install_or_range_delete_still_runs_to_its_switch() {
+    use ananke_storage::SpanSource;
+    let mut sim = Sim::new(SimConfig::new(47));
+    let node = sim.add_node();
+    let (install_seq, delete_seq) = on_node_for(&mut sim, node, Duration::from_millis(50), |env| {
+        Box::pin(async move {
+            let (db, _) = Engine::open(env.clone(), config(400)).await.unwrap();
+            fill(&db, 0..90, 20).await;
+            env.clock().sleep(Duration::from_millis(1)).await;
+            db.checkpoint_span(b"k005"..b"k012", Path::new("/stage/one"))
+                .await
+                .unwrap();
+            fill(&db, 90..150, 20).await;
+            env.clock().sleep(Duration::from_millis(1)).await;
+            let source = db.open_span_source(Path::new("/stage/one")).await.unwrap();
+            let install = db.install_span(b("k005")..b("k012"), source);
+            let install_seq = install.seq().expect("numbered");
+            drop(install);
+            env.clock().sleep(Duration::from_millis(5)).await;
+            for k in 0..20u32 {
+                let want = if (5..12).contains(&k) {
+                    expected(k, 90, 20)
+                } else {
+                    expected(k, 150, 20)
+                };
+                assert_eq!(
+                    db.get(format!("k{k:03}").as_bytes()).await.unwrap(),
+                    want,
+                    "k{k:03} after the dropped install"
+                );
+            }
+            let installed: Vec<(u64, u64)> = db.levels()[0]
+                .iter()
+                .filter(|t| t.first_key >= b("k005") && t.last_key < b("k012"))
+                .map(|t| (t.first_seq, t.max_seq))
+                .collect();
+            assert!(
+                !installed.is_empty() && installed.iter().all(|&s| s == (install_seq, install_seq)),
+                "the installed tables are in service at the install's number: {installed:?}"
+            );
+
+            let removal = db.delete_range(b("k013")..b("k016"));
+            let delete_seq = removal
+                .seq()
+                .expect("not refused as in progress: the dropped install finished");
+            drop(removal);
+            env.clock().sleep(Duration::from_millis(5)).await;
+            for k in 13..16 {
+                assert_eq!(db.get(format!("k{k:03}").as_bytes()).await.unwrap(), None);
+            }
+            // A third, awaited, is not refused either.
+            db.install_span(b("k017")..b("k018"), SpanSource::empty())
+                .await
+                .unwrap();
+
+            // A later write, and enough after it to fill the memtable: flushed.
+            let later = db.put(b("k007"), b("after")).await.unwrap();
+            for i in 0..20 {
+                db.put(Bytes::from(format!("z{i:02}")), Bytes::from(vec![b'x'; 40]))
+                    .await
+                    .unwrap();
+            }
+            env.clock().sleep(Duration::from_millis(5)).await;
+            assert!(
+                db.manifest().flushed_seq >= later,
+                "the write after the installs was flushed: {} < {later}",
+                db.manifest().flushed_seq
+            );
+            assert_eq!(db.get(b"k007").await.unwrap(), Some(b("after")));
+            (install_seq, delete_seq)
+        })
+    });
+    let trace = sim.trace();
+    let installed: Vec<u64> = trace
+        .iter()
+        .filter_map(|r| match r.event {
+            TraceEvent::SpanInstalled { seq, .. } => Some(seq),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        installed.contains(&install_seq) && installed.contains(&delete_seq),
+        "{installed:?}"
+    );
+    assert!(
+        !trace
+            .iter()
+            .any(|r| matches!(r.event, TraceEvent::FlusherFailed { .. })),
+        "the flusher never failed"
+    );
+}
+
+/// An install whose switch of `CURRENT` fails after its manifest is written leaves
+/// a manifest file under the next number and does not know whether `CURRENT` names
+/// it (D-054). The engine quiesces, traced, so no flush writes under that number;
+/// writes are still taken, and nothing fails later.
+// PROPOSED(D-054): an error writing or switching to the install's manifest
+// quiesces the engine.
+#[test]
+fn an_install_whose_switch_fails_quiesces_the_engine() {
+    use ananke_storage::{InstallRefused, SpanSource};
+    let mut sim = Sim::new(SimConfig::new(53));
+    let node = sim.add_node();
+    on_node_for(&mut sim, node, Duration::from_millis(50), |env| {
+        Box::pin(async move {
+            let (db, _) = Engine::open(env.clone(), config(400)).await.unwrap();
+            fill(&db, 0..90, 20).await;
+            env.clock().sleep(Duration::from_millis(1)).await;
+            // An install first, so every memtable is flushed and the next install
+            // writes no manifest before its own.
+            db.install_span(b("k000")..b("k001"), SpanSource::empty())
+                .await
+                .unwrap();
+            let before = db.manifest().number;
+            // CURRENT.tmp as a directory: the switch's open of it fails.
+            env.fs()
+                .create_dir_all(Path::new("/db/CURRENT.tmp"))
+                .await
+                .unwrap();
+            let failed = db.delete_range(b("k005")..b("k009")).await;
+            assert!(failed.is_err(), "{failed:?}");
+            assert!(db.quiesced(), "the engine quiesced");
+            assert_eq!(db.manifest().number, before, "nothing switched in memory");
+            let manifests: Vec<u64> = env
+                .fs()
+                .read_dir(Path::new("/db"))
+                .await
+                .unwrap()
+                .iter()
+                .filter_map(|n| ananke_storage::manifest::manifest_of(n))
+                .collect();
+            assert!(
+                manifests.contains(&(before + 1)),
+                "the install's manifest file holds the next number: {manifests:?}"
+            );
+            // Writes are taken; no flush runs, so none collides with that file.
+            let later = db.put(b("k007"), b("after")).await.unwrap();
+            for i in 0..20 {
+                db.put(Bytes::from(format!("z{i:02}")), Bytes::from(vec![b'x'; 40]))
+                    .await
+                    .unwrap();
+            }
+            env.clock().sleep(Duration::from_millis(5)).await;
+            assert!(db.manifest().flushed_seq < later);
+            assert_eq!(db.get(b"k007").await.unwrap(), Some(b("after")));
+            let refusal = db
+                .delete_range(b("k010")..b("k011"))
+                .await
+                .err()
+                .and_then(|e| InstallRefused::from_io(&e));
+            assert_eq!(refusal, Some(InstallRefused::Quiesced));
+        })
+    });
+    let trace = sim.trace();
+    assert!(trace.iter().any(|r| matches!(
+        r.event,
+        TraceEvent::EngineQuiesced { reason, .. } if reason.contains("install")
+    )));
+    assert!(
+        !trace
+            .iter()
+            .any(|r| matches!(r.event, TraceEvent::FlusherFailed { .. }))
+    );
+}
+
+/// An install whose deletion of the tables it took out fails after its switch is
+/// in force, and resolves as made (D-054): the error is traced, the span reads as
+/// installed, and a reopen removes the leftovers and reads the same.
+// PROPOSED(D-054): an error after the switch does not undo the install.
+#[test]
+fn an_install_whose_cleanup_fails_after_the_switch_resolves_as_made() {
+    let mut sim = Sim::new(SimConfig::new(59));
+    let node = sim.add_node();
+    let want = on_node_for(&mut sim, node, Duration::from_millis(50), |env| {
+        Box::pin(async move {
+            let (db, _) = Engine::open(env.clone(), config(400)).await.unwrap();
+            // A table holding only keys of the span, then the rest.
+            for k in 5..9 {
+                db.put(
+                    Bytes::from(format!("k{k:03}")),
+                    Bytes::from(vec![b'v'; 100]),
+                )
+                .await
+                .unwrap();
+            }
+            fill(&db, 0..90, 20).await;
+            env.clock().sleep(Duration::from_millis(1)).await;
+            let inside = db.levels()[0]
+                .iter()
+                .find(|t| t.first_key >= b("k005") && t.last_key < b("k009"))
+                .map(|t| t.number)
+                .expect("a table holds only the span's keys");
+            // Gone before the install deletes it: its deletion fails.
+            env.fs()
+                .remove_file(&ananke_storage::manifest::sst_path(
+                    Path::new("/db"),
+                    inside,
+                ))
+                .await
+                .unwrap();
+            let done = db.delete_range(b("k005")..b("k009")).await.unwrap();
+            assert!(done.removed >= 1);
+            assert!(
+                db.levels().iter().flatten().all(|t| t.number != inside),
+                "the table is out of service"
+            );
+            let mut want = Vec::new();
+            for k in 0..20u32 {
+                let expect = if (5..9).contains(&k) {
+                    None
+                } else {
+                    expected(k, 90, 20)
+                };
+                assert_eq!(
+                    db.get(format!("k{k:03}").as_bytes()).await.unwrap(),
+                    expect,
+                    "k{k:03}"
+                );
+                want.push(expect);
+            }
+            want
+        })
+    });
+    assert!(
+        sim.trace()
+            .iter()
+            .any(|r| matches!(&r.event, TraceEvent::InstallCleanupFailed { .. }))
+    );
+    let reopened = on_node(&mut sim, node, |env| {
+        Box::pin(async move {
+            let (db, _) = Engine::open(env, config(400)).await.unwrap();
+            let mut got = Vec::new();
+            for k in 0..20 {
+                got.push(db.get(format!("k{k:03}").as_bytes()).await.unwrap());
+            }
+            got
+        })
+    });
+    assert_eq!(reopened, want);
+}
+
+/// An install whose task is dropped before it has an outcome, here with its node at
+/// a crash, resolves its caller's future with an error instead of leaving it
+/// pending for good (D-054).
+// PROPOSED(D-054): the caller always learns how the install ended.
+#[test]
+fn an_install_whose_task_ends_without_an_outcome_resolves_with_an_error() {
+    use ananke_storage::SpanInstall;
+    use std::task::{Context, Poll, Waker};
+    // Every file operation takes a tenth of a millisecond, so the install is still
+    // at work when the node crashes.
+    let mut sim_config = SimConfig::new(61);
+    sim_config.fs.latency_min = Duration::from_micros(100);
+    sim_config.fs.latency_max = Duration::from_micros(100);
+    let mut sim = Sim::new(sim_config);
+    let node = sim.add_node();
+    let stash: Arc<Mutex<Option<SpanInstall>>> = Arc::default();
+    let out = stash.clone();
+    let env = sim.env(node);
+    env.clone().spawn("test", async move {
+        let (db, _) = Engine::open(env.clone(), config(400)).await.unwrap();
+        fill(&db, 0..40, 20).await;
+        *out.lock().unwrap() = Some(db.delete_range(b("k005")..b("k009")));
+        env.clock().sleep(Duration::from_secs(60)).await;
+        drop(db);
+    });
+    while stash.lock().unwrap().is_none() {
+        sim.run_for(Duration::from_micros(10));
+    }
+    let mut install = stash.lock().unwrap().take().expect("numbered");
+    assert!(install.seq().is_some());
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(
+        std::pin::Pin::new(&mut install).poll(&mut cx).is_pending(),
+        "the install had not finished when its node crashed"
+    );
+    sim.crash(node);
+    match std::pin::Pin::new(&mut install).poll(&mut cx) {
+        Poll::Ready(Err(error)) => assert!(
+            error.to_string().contains("ended without an outcome"),
+            "{error}"
+        ),
+        other => panic!("the install resolved {other:?}"),
+    }
+}

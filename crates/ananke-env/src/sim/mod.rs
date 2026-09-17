@@ -27,6 +27,7 @@ mod state;
 #[cfg(test)]
 mod tests;
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::future::Future;
 use std::sync::Arc;
@@ -53,9 +54,32 @@ pub struct NetFaults {
     pub p_duplicate: f64,
     /// Shortest delivery delay.
     pub delay_min: Duration,
-    /// Longest delivery delay. Messages with different delays reorder.
+    /// Longest delivery delay. Messages with different delays reorder. A frame's
+    /// delay starts once its sending socket has written its last byte (below).
     pub delay_max: Duration,
+    /// How many frames may wait behind the one a sending socket is writing to a
+    /// destination before the oldest waiting frame is dropped, traced
+    /// `MessageDropped` with [`DropReason::QueueFull`](crate::DropReason::QueueFull):
+    /// the bounded, drop-oldest queue per destination of D-015. `RealEnv`'s
+    /// [`SEND_QUEUE_LEN`](crate::real::SEND_QUEUE_LEN), 1 024, by default. At least 1.
+    // PROPOSED(D-056): SimEnv's bounded, drop-oldest queue per (sending socket,
+    // destination), drained at a modelled per-link rate.
+    pub send_queue_len: usize,
+    /// How fast a sending socket writes its queue to one destination, in bytes per
+    /// second: a frame of `n` bytes takes `n` over this, rounded up to the nanosecond,
+    /// once the frames ahead of it are written. The queue fills when frames are sent
+    /// to one destination faster than this drains them, which is how `RealEnv`'s
+    /// fills. A gigabit link, 125 000 000, by default. Positive.
+    // PROPOSED(D-056): SimEnv's bounded, drop-oldest queue per (sending socket,
+    // destination), drained at a modelled per-link rate.
+    pub link_bytes_per_sec: u64,
 }
+
+/// A gigabit link's rate in bytes per second, [`NetFaults::link_bytes_per_sec`]'s
+/// default.
+// PROPOSED(D-056): SimEnv's bounded, drop-oldest queue per (sending socket,
+// destination), drained at a modelled per-link rate.
+pub const GIGABIT_BYTES_PER_SEC: u64 = 125_000_000;
 
 impl Default for NetFaults {
     fn default() -> Self {
@@ -64,6 +88,8 @@ impl Default for NetFaults {
             p_duplicate: 0.0,
             delay_min: Duration::from_millis(1),
             delay_max: Duration::from_millis(1),
+            send_queue_len: crate::real::SEND_QUEUE_LEN,
+            link_bytes_per_sec: GIGABIT_BYTES_PER_SEC,
         }
     }
 }
@@ -235,7 +261,8 @@ impl Sim {
     /// # Panics
     ///
     /// If `config` is inconsistent: a delay range with `min > max`, a probability
-    /// outside `0..=1`, or a drift of a million ppm or more.
+    /// outside `0..=1`, an empty send queue or a link that drains nothing, or a drift
+    /// of a million ppm or more.
     #[must_use]
     pub fn new(config: SimConfig) -> Self {
         assert!(
@@ -245,6 +272,14 @@ impl Sim {
         assert!(
             (0.0..=1.0).contains(&config.net.p_drop),
             "p_drop must be within 0..=1"
+        );
+        assert!(
+            config.net.send_queue_len > 0,
+            "send_queue_len must be at least 1"
+        );
+        assert!(
+            config.net.link_bytes_per_sec > 0,
+            "link_bytes_per_sec must be positive"
         );
         assert!(
             (0.0..=1.0).contains(&config.fs.p_durable),
@@ -310,6 +345,7 @@ impl Sim {
                 drift_ppm,
                 protocol,
                 sched,
+                ranges: BTreeMap::new(),
             },
         );
         st.fs.entry(id).or_insert_with(fs::NodeFs::new);
@@ -756,6 +792,11 @@ impl Environment for SimEnv {
 
     fn sched_rng(&self) -> &SimRng {
         &self.sched_rng
+    }
+
+    // PROPOSED(D-057): a named stream per node and range through the environment.
+    fn range_rng(&self, range: u64) -> SimRng {
+        self.shared.lock().range_stream(self.node, range)
     }
 
     fn spawn<F: Future<Output = ()> + Send + 'static>(

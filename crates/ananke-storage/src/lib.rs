@@ -25,8 +25,8 @@ pub mod wal;
 
 pub use compaction::Compaction;
 pub use engine::{
-    CheckpointInfo, Engine, EngineConfig, EngineRecovery, OpenRefused, Rejected, Snapshot, Write,
-    WriteBatch,
+    CheckpointInfo, Engine, EngineConfig, EngineRecovery, InstallInfo, InstallRefused, OpenRefused,
+    Rejected, Snapshot, SpanInstall, SpanSource, Write, WriteBatch,
 };
 pub use memtable::{Memtable, Value};
 pub use wal::{

@@ -169,13 +169,13 @@ reverts the entry excluding it restores its right to campaign. The exit criterio
 3 → 5 → 3 under partition (SPEC §3), is a scenario in `sim/membership.rs` with a leader
 on the minority side during the change: the change completes both ways, and no gap
 between completed client operations, partition windows taken out, is longer than ten
-maximum election timeouts (D-029). The worst gap at ten thousand seeds is 549.359683 ms.
+maximum election timeouts (D-029). The worst gap at 10 000 seeds was 549.359683 ms before D-058.
 
 **Snapshots (thesis §5, SPEC §3).** A snapshot is an `Engine::checkpoint` of the state
 machine's store at an applied index, with the index, term and configuration at that
 point written into the store's reserved tenant before the checkpoint's `CURRENT`. A
 take is a job on the `apply` task's own queue (D-036): between two applies that task
-writes the record under `0 / 3 / snapshot` with its own applied index and the term of
+writes the record under `<prefix> / 3 / snapshot` with its own applied index and the term of
 the entry it last applied, synced, and then checkpoints, so no apply lands between the
 record and the copy and the record is exact by construction; applies wait behind the
 take. Every take goes to a directory of its own, `snap-<index>-<take>`, numbered by a
@@ -225,7 +225,7 @@ holds everything the snapshot carries, or hands the receiver's identity to the
 `snapshot` task, which writes it into the staged store as one repair table and a
 successor manifest: the receiver's term and vote, the applied index at the snapshot,
 the snapshot record, the log tail it keeps — kept only when its entry at the snapshot's
-last index carries the snapshot's last term — the `0 / 2 / config` key consistent with
+last index carries the snapshot's last term — the `<prefix> / 2 / config` key consistent with
 that tail, the quarantine flag, set on a re-seeded history and tombstoned otherwise,
 the store incarnation, and tombstones for the leader's log keys the tail does not
 replace (D-030, D-035, D-038, D-042). Only when the repair is durable is the staged
@@ -382,7 +382,12 @@ scaled by its own clock's rate, without a reset, has started an election (moirae
 5, D-028). A reset is the delivery of an AppendEntries or an `InstallSnapshot` chunk of
 the server's term or later, whoever sends it (D-030); a vote it granted; a campaign;
 its start; its step-down as leader; and the restatement of an install on a server that
-never went down, whose new incarnation draws a fresh timer (D-039). One check is
+never went down, whose new incarnation draws a fresh timer (D-039). *Running* means
+holding a live incarnation: one ends at a shutdown, a crash, or a **completed install**,
+which retires the incarnation and leaves the server adopting the staged store with no
+core and no election timer until its restatement starts the next one, so the bound is
+not asked of it across that window any more than it is of a crashed server before its
+restart (PROPOSED D-063, which supersedes D-039's arm in the check). One check is
 pre-vote's own property (thesis §9.6): a server the schedule isolated has, at the heal,
 the term it had when the isolation began; an isolation in which the server was refused,
 re-seeded or completed an install is skipped, since the install restates the term the
@@ -428,15 +433,14 @@ crates/ananke-raft/
                     { Command(Bytes), Config(Configuration), Noop }, Configuration
                     { voters: old and, when joint, new; learners }
   src/message.rs    Message and its codec
-  src/core.rs       the pure state machine of the protocol; Variant and the set
-                    Variants (§5)
+  src/core.rs       the pure state machine of the protocol, the read-index and lease
+                    rules included (§1, D-053); Variant and the set Variants (§5)
   src/store.rs      persistent state in the engine
   src/invariants.rs the checks of §2 as folds over trace events, one incremental
                     Checker
   src/node.rs       the tasks that run one server
   src/apply.rs      the state machine adapter: commands to engine batches
   src/snapshot.rs   checkpoints as snapshots, chunked both ways
-  src/read.rs       read-index and lease reads
   tests/            the paper's scenarios against the core: Figure 8, moirae's ten
                     rules, the D1 replay, a joint change with a leader outside C_new
 sim/raft.rs         the crash-and-partition sweep: the five checks, the workload
@@ -453,25 +457,62 @@ Figure 2 lives and where the paper's scenarios are unit tests without a simulato
 is generic over nothing: the node task does the I/O.
 
 **The log in the engine.** SPEC §3 puts the Raft log in the storage engine under a
-reserved tenant, tenant 0 in the §2.6 key encoding, table ids by purpose:
+reserved tenant, tenant 0 in the §2.6 key encoding. A store is opened for one Raft
+*group*, under the key prefix `0 / <group: u64 BE>`; every key of the group is
+`prefix / <purpose: u64 BE> / name`, with SHARD.md §13's Q5 purposes in the place
+RAFT.md's table ids had, so a group's whole Raft state is one key interval and
+several groups share one engine without sharing a key. Today's one group is group
+2, SHARD.md §2's range 2 (`node::SINGLE_GROUP`); Stage B gives a server a group per
+range. The layout, the group and the format record below are D-060, PROPOSED, which
+this section describes and which the entry decides (Stage A item 6, Q5 and Q40).
 
 | Key | Value |
 |---|---|
-| `0 / 0 / hard` | current term, vote |
-| `0 / 0 / applied` | the applied index |
-| `0 / 0 / reseeded` | present on a store whose history a re-seed rebuilt, carried by every later install on it: the quarantine (§3, D-035) |
-| `0 / 0 / incarnation` | the store incarnation (§1, D-042) |
-| `0 / 1 / <index: u64 BE>` | the entry: term, payload |
-| `0 / 2 / config` | the latest configuration entry's index and content |
-| `0 / 3 / snapshot` | last snapshot's index, term and configuration, whether it was taken here, the store's take counter (D-043), and its checkpoint directory |
+| `0 / g / 0 / hard` | current term, vote |
+| `0 / g / 0 / applied` | the applied index |
+| `0 / g / 0 / reseeded` | present on a store whose history a re-seed rebuilt, carried by every later install on it: the quarantine (§3, D-035) |
+| `0 / g / 0 / incarnation` | the store incarnation (§1, D-042) |
+| `0 / g / 1 / <index: u64 BE>` | the entry: term, payload |
+| `0 / g / 2 / config` | the latest configuration entry's index and content |
+| `0 / g / 3 / snapshot` | last snapshot's index, term and configuration, whether it was taken here, the store's take counter (D-043), and its checkpoint directory |
+
+Purposes 4 and up are unassigned: #21's session table (Q11) and a range descriptor
+each take one inside the group's interval and move no key. User data is tenant 2
+(`apply::USER_TENANT`, SHARD.md §1) and tenant 1 is the system tenant, which nothing
+in Stage A writes; a range may span tenants.
+
+**The format record.** Nothing in the engine says which layout a store directory
+holds, so the store records it in a file of its own, `RAFT-FORMAT`, beside the store
+marker: two checksummed copies of the format version in one block, 37 bytes each at
+offsets 0 and 37. Format 1 is ananke-raft 0.3.0's, which records none; format 2 is
+the layout above, the only one this build reads or writes. The name, the magic, the
+copy's shape and offsets are permanent, so any build can read any build's version.
+
+The record is read before anything writes: a directory holding a store's files and
+no record is ananke-raft 0.3.0's and is refused unread, with nothing written to it
+— no log segment, no marker, no lost mark — and so is one recording any other
+version, older or newer, naming both (D-059). A directory holding nothing but a
+record that cannot be read, or nothing at all, is fresh, and its record is its first
+write, before the engine creates an entry there; a record with one damaged copy is
+healed in place at the start; a record that cannot be read at all beside a store is
+lost state, refused and re-seeded like any other loss, and the adoption that
+follows rewrites it. A directory holding entries that are neither is refused as
+foreign rather than started as a new store.
+
+Every checkpoint carries its own record, written after `Engine::checkpoint`, and a
+checkpoint without one is incomplete; the stream sends it first, the assembler reads
+it before it opens a staged table, and both adoptions read the staged record before
+their first write, so a snapshot of another format is never staged and never
+adopted.
 
 Appending entries is a `WriteBatch` with `sync: true` of the entries and, when the
 term or vote changed with them, `hard`; the batch's future resolving is the persist the
 core waits for before sending. The hard state and the applied index are separate keys
 because separate tasks write them, the `raft` task and the `apply` task, and neither
 waits for the other. Truncation is deletes of the conflicting indices in the
-same batch as the entries that replace them. Reading entries back for a follower behind
-the leader is a `scan` over the index range, which is what the engine's scan exists for.
+same batch as the entries that replace them. The core holds the log in memory and feeds
+a follower behind it from there; the store reads the log back, a `scan` over the index
+range, only when it opens (D-053).
 Applying entry `i` is one `WriteBatch` with the command's writes under the user's
 tenant and the applied index in `applied`: the two are durable together, so a crash
 between them cannot exist, and an entry is applied exactly once whatever the crash
@@ -501,6 +542,13 @@ an adoption writes it whole again (§1, D-044). A refused engine does no more wo
 whose recovery lost writes never starts its flusher, and one the store refused is
 quiesced, so no flush, manifest switch or deleted log segment can make the lost store
 look whole to the next start (D-044).
+
+The start runs its checks in this order (D-059, D-060): the format record, read
+before anything writes; a fresh directory's record; the adoption, with the staged
+install's own format checked before its first write; the heal of a record with one
+damaged copy; a record that cannot be read, which is lost state; the store marker;
+and then the engine and the store. A format refusal stops the server, traced as
+`RaftServerFailed`: the store lost nothing and is not this server's to replace.
 
 Raft's safety argument assumes persistent state is persistent, so a server that lost
 it neither votes nor serves until a snapshot rebuilds it. A refused server traces
@@ -538,12 +586,16 @@ that history, since the state it lost may have included a vote.
 responses a follower's store answers for, `AppendEntriesResponse` and
 `InstallSnapshotResponse`, also carry the responder's store incarnation, stamped by the
 server on the way out like the clock (§1, D-042). The wire form is one frame:
-`kind: u8 | term: u64 | from: u64 | fields`, fields length-prefixed, entries as
-`count | (term, index, payload_len, payload)*`, everything little-endian like the
-engine's records, under `MAX_FRAME_LEN`. A `decode` that fails is a dropped message, not
-a panic. The moirae bridge takes a `Decoder`, and `ananke-raft` provides one that turns a
-frame into `{"type": "raft.append", "term": …, "from": …, "prevIndex": …, "entries":
-n}` and its kin, so the studio labels lanes by message kind and filters by term and
+`kind: u8 | from: u64 | term: u64 | fields` (D-053). A fixed-width field is written
+bare, and a variable-length one, a file name or a chunk's data, after its `u32` length;
+entries are `count: u32 | (term: u64 | index: u64 | payload)*`, a payload a `u8` tag
+followed, for a command, by `len: u32 | bytes` and, for a configuration, by the voters,
+a `u8` flag with the new voters when joint, and the learners, each list `count: u32 |
+ids`. Everything is little-endian like the engine's records, under `MAX_FRAME_LEN`. A
+`decode` that fails is a dropped message, not a panic. The moirae bridge takes a
+`Decoder`, and `ananke-raft` provides one, `message::studio`, that turns a frame into
+`{"type": "raft.append-entries", "from": …, "term": …, "prevIndex": …, "entries": n}`
+and its kin (D-053), so the studio labels lanes by message kind and filters by term and
 index, which is issue #3's field set.
 
 **The node's tasks.** One server is four tasks under `Environment::spawn`, and this is
@@ -612,8 +664,8 @@ Horn and Kroening's memoisation, which is what porcupine does.
 
 **History.** Each client operation is `(client, invoke_t, return_t, Op, Result)`; a
 pending operation has no return and may be linearized or discarded. Operations are
-`Put(k, v)`, `Get(k) → Option<v>`, `Delete(k)`, `Cas(k, expect, v) → bool` and
-`Scan(range) → Vec<(k, v)>`; `Cas` exists so that a double apply or a lost write is
+`Put(k, v)`, `Get(k) → Option<v>`, `Delete(k)` and `Cas(k, expect, v) → bool`, each on
+one key; there is no scan (D-053). `Cas` exists so that a double apply or a lost write is
 visible as a wrong boolean, not only as a stale value later. The trace closes most
 pending operations: `RaftProposed` says which entry a request became, and an
 abandoned operation whose entry applied took effect then, so it returns at the apply,
@@ -625,15 +677,13 @@ search, so closing them is what keeps the search small. The search has a budget 
 states per key; exhausting it is reported apart from a violation, and the correct
 server must never reach it.
 
-**Partitioning.** Single-key operations partition by key, since the KV model is a
-product of independent registers: a history is linearizable iff each key's
-sub-history is. Each partition is checked on its own, so the search is small even
-over long runs. Scans are multi-key reads and cannot be partitioned; they are checked
-after the per-key searches: a scan is consistent iff there is a time `t` within its
-invocation window at which, for every key in its range, the value it returned is the
-value the key's chosen linearization holds at `t`. Each per-key search records the
-linearization it found as a timeline of (time, value), so the scan check is a walk over
-timelines, and a scan with no such `t` is a violation named with the key that was off.
+**Partitioning.** Every operation is on one key, and the KV model is a product of
+independent registers, so the history partitions by key: a history is linearizable iff
+each key's sub-history is. Each partition is checked on its own, so the search is small
+even over long runs, and each per-key search returns the linearization it found as a
+timeline of (time, value). There is no scan and no scan check: scans are multi-key
+reads, and the distributed scans that read across ranges are SPEC §6's, in Phase 5
+(D-053).
 
 **Search.** For one partition, sort operations by invocation time; state is (the set
 of linearized operations as a bitmask, the register's value); depth-first search
@@ -643,10 +693,10 @@ model is a register with the four single-key operations. Pending operations may 
 skipped at the end. A violation reports the shortest prefix that cannot be linearized
 and the operations in it, which the studio shows as the clients' lanes.
 
-**What is asserted.** Every partition linearizable and every scan consistent, for the
-correct variant on every seed; `Variant::ApplyBeforeCommit` and
-`Variant::LeaseTrustsTheClock` are the ones this check must catch, since the four log
-invariants may hold while a stale read is served.
+**What is asserted.** Every partition linearizable, for the correct variant on every
+seed (D-053); `Variant::ApplyBeforeCommit` and `Variant::LeaseTrustsTheClock` are the
+ones this check must catch, since the four log invariants may hold while a stale read
+is served.
 
 ## 5. Buggy variants shipped from day one
 
@@ -654,14 +704,20 @@ Each is a `Variant` on `ananke-raft` and breaks one rule with a reference. A ser
 carries a set of them, `Variants`, whose empty set is the correct server; a set turns
 off exactly its members' fixes and no others, so two bugs run in one server with no
 third behaviour between them (D-045). The pair `{IgnoreIncarnation, SharedSnapshotDir}`
-runs that way, as the negative control for a wedge that would need both bugs, and is
-pinned on seed 680, the one seed of the first thousand it is caught on, rather than
-asserted over a sweep tier (D-045). The correct variant must pass every seed. Each
+runs that way, as the negative control for a wedge that would need both bugs, and is not
+asserted over a sweep tier (D-045). On the tree with the key layout (D-060) no seed of
+the first thousand catches it, or either half of it, so no seed pins its catch; seed 132,
+which pinned it on the tree before, now asserts that absence with its reason (680 held it
+before D-056). The correct variant must pass every seed. Each
 other variant must be caught by the named check on some seeds, at every tier unless its
-window is thinner than the gate's twenty seeds show: `AdoptionAsBuilt` and
-`RefusalNotDurable` assert their catch from the hundred-seed tier (D-041, D-044), and
-`SharedSnapshotDir` asserts its liveness catch only at the nightly's ten thousand
-(D-043, D-047); each of their tests asserts at every tier that its fault fired.
+window is thinner than the gate's twenty seeds show: `AdoptionAsBuilt` asserts its catch
+from the hundred-seed tier (D-041), `RefusalNotDurable` from the thousand-seed tier, with
+its first catch there, seed 158, pinned at every tier (D-044, D-056, D-060),
+`LeaseTrustsTheClock` from the thousand-seed tier, its stale read being caught on about
+4 % of seeds (D-061), and `SharedSnapshotDir` asserts its liveness catch only at the
+nightly's ten thousand (D-043, D-047); each of their tests asserts at every tier that
+its fault fired. A variant caught on under 5 % of seeds asserts its catch from the
+thousand-seed tier and never below it (CLAUDE.md, D-061).
 `RefusedCountsForQuorum` and `RefusedNeverCounts` are caught by the directed re-seed
 scenario, `sim/quorum.rs`, which builds their situation on every seed and is asserted to
 catch each on every seed at every tier; the random sweep reaches it too rarely to
@@ -671,23 +727,29 @@ a hundred seeds, that the sweep reached the state its wedge is built on (D-042).
 test prints its catch rate. A variant the sweep does not catch is a hole in the sweep,
 not a variant to delete.
 
+The table's sixteen rows are `Variant::BUGS` (D-053). Two rules have no variant of their
+own. The term and the vote durable before a vote is answered is `SendBeforePersist`'s
+rule, since that variant sends every message of a step, a vote's answer included, before
+the step's persist. The applied index written in the batch of its entry's writes (§3) has
+no known-buggy variant: its crash test,
+`an_entrys_writes_and_the_applied_index_are_durable_together` in
+`crates/ananke-raft/tests/store.rs`, runs the correct store alone.
+
 | Variant | The rule it breaks | What catches it | Needs |
 |---|---|---|---|
 | `NoPreVote` | thesis §9.6: a rejoining node's election disrupts the leader | pre-vote's property at every heal: the isolated server's term is what it was when the isolation began | partitions |
-| `VoteBeforePersist` | Figure 2: persist term and vote before responding | election safety: a crash between the vote and its persist lets the node vote twice in one term | crashes during elections |
-| `SendBeforePersist` | the same discipline for `AppendEntries`: append the entry, then respond | commit by majority: an entry a leader committed was not durable on a majority when it did, since `RaftAppend` is traced after the persist; with a crash between the send and the persist, leader completeness | nothing beyond the discipline; crashes between polls for the consequence |
+| `SendBeforePersist` | Figure 2, thesis §3.8: the term, the vote and the log durable before any message that depends on them; the variant sends a step's messages, a vote's answer and an append's acknowledgement alike, before the step's persist (D-053) | commit by majority: an entry a leader committed was not durable on a majority when it did, since `RaftAppend` is traced after the persist; with a crash between the send and the persist, leader completeness | nothing beyond the discipline; crashes between polls for the consequence |
 | `ApplyBeforeCommit` | Figure 2: apply only up to the commit index | state machine safety: an index applied under two terms on two servers after a truncation; linearizability: a write acknowledged and lost | the leader isolated with a client |
 | `CountOlderTermForCommit` | §5.4.2, Figure 8 | commit by current term: a leader's commit landed on an older term's entry; leader completeness on the seeds where that entry is then overwritten | a follower behind by more than a batch when a leader takes over, so the older entries and the leader's own arrive in separate messages: the sweep runs small batches |
 | `TruncateOnEveryAppend` | moirae rule 3 | committed entries stay: a server truncated at or below its own commit index | duplication and reordering (issue #1) |
 | `IndexFirstElectionRestriction` | §5.4.1: compare last terms first | leader completeness | crashes and partitions |
 | `ResetTimerOnAnyRpc` | moirae rule 5 | timers fire: a follower that heard from no leader of its term and granted no vote for two maximum election timeouts, scaled by its clock's rate, did not campaign | a follower cut off from receiving that pre-votes into the majority every timeout, each request declined, while the leader is down: the stale-sender schedule. Under check quorum a deposed leader's heartbeats stop within a timeout, so this is the stale sender that lasts |
 | `LeaseTrustsTheClock` | §1 above: no drift guard | invariant 6, lease safety under drift: the checker reports a stale lease read with no revoke before it | the lease trial: leadership transferred to the server with the slowest clock, its lease formed, then cut off with a reading client while the fast followers elect and write; and a slow clock severe enough that its lease outlives their timers |
-| `ApplyNotAtomicWithIndex` | §3: the applied index written in a separate batch | state machine safety per node: an entry applied twice after a crash; and `Cas` in the linearizability check | crashes during apply |
-| `SnapshotWithoutCurrentLast` | §1: the staged `CURRENT` written last, after the repair (D-038); the variant writes the streamed `CURRENT` the moment it arrives | state machine safety after a crash mid-install: the restart adopts a store carrying the leader's own tenant 0, which restates a *taken* snapshot and an applied index its restated log cannot account for, a state that never existed | crashes during install: on half the seeds `Fault::CrashInstalling` isolates a follower until it falls behind the threshold and crashes it two to twenty milliseconds after the stream's final chunk is delivered (D-030) |
+| `SnapshotWithoutCurrentLast` | §1: the staged `CURRENT` written last, after the repair (D-038); the variant writes the streamed `CURRENT` the moment it arrives, after the `RAFT-FORMAT` record the stream sends first (D-060) | state machine safety after a crash mid-install: the restart adopts a store carrying the leader's own tenant 0, which restates a *taken* snapshot and an applied index its restated log cannot account for, a state that never existed | crashes during install: on half the seeds `Fault::CrashInstalling` isolates a follower until it falls behind the threshold and crashes it two to twenty milliseconds after the stream's final chunk is delivered (D-030) |
 | `SingleMajorityInJointConsensus` | thesis §4.3: commit needs both majorities | election safety or leader completeness during 3 → 5 → 3 under partition | the membership scenario |
 | `AdoptionAsBuilt` | §1: the adoption copies and switches before it deletes, a damaged staging `CURRENT` is refused, and a marked store never opens fresh (D-041); the variant removes the old store first, sweeps a damaged staging `CURRENT` as debris, and neither checks nor writes the marker | committed entries stay: a voter restarts on a fresh store and restates a truncation from index 1 below its commit index | the adoption crash storm, `Fault::CrashAdopting`, on one seed in four: the install crash's setup, then sixteen to thirty-two crashes, each the moment the adoption's first change to the store directory is durable, each a roll of the disk's rot on the staging `CURRENT` (D-041) |
 | `IgnoreIncarnation` | §1: a leader forgets a follower's progress when its store incarnation changes (D-042); the variant records the incarnation and never resets | the liveness check, were the wedge to stall a commit where the bound is asked (the configuration under Needs is not): a re-seeded follower below the match its leader recorded is never counted again while that leader leads. Caught on 4 of 10 000 seeds before D-047 (nightly run 34711427220) and on 0 of 10 000 after it (runs 34731272921 and 34749071877); D-047 moved no schedule, so the drop is itself evidence that the four were timing artefacts of the pre-vote check, as D-047 measured each directly | a follower refused and re-seeded below the match its leader recorded, while the third server is unavailable; after the last heal a server is unavailable only by refusal, and a refused server beside a re-seeded one is where §2 does not ask the liveness bound (D-035) |
-| `SharedSnapshotDir` | §1: every take its own version, a stream pinned to one, and a stream to every designated follower at once (D-043); the variant rewrites one directory per index under whatever stream reads it and streams to one follower at a time | the liveness check: a take lands on the directory a live stream reads, that stream never completes, and a second designated follower waits behind it with no entries, so neither follower counts and nothing commits. Only the liveness check's catches count: a linearizability search that exhausts its budget proves nothing (D-047) | a take at an index a live stream is reading, which no fault forces; `Fault::RetakeUnderStream`, on one seed in four, builds the shape around it: a designated follower's stream running while the leader's other follower is cut off |
+| `SharedSnapshotDir` | §1: every take its own version, a stream pinned to one, and a stream to every designated follower at once (D-043); the variant rewrites one directory per index under whatever stream reads it and streams to one follower at a time | the liveness check: a take lands on the directory a live stream reads, that stream never completes, and a second designated follower waits behind it with no entries, so neither follower counts and nothing commits. Only the liveness check's catches count: a linearizability search that exhausts its budget proves nothing (D-047). The *shape* short of the stall — a re-take into a directory a live stream has open, at an index the follower never installs at afterwards — is reached on 13.5 % of a thousand seeds against the correct server's 0, and is asserted from the hundred-seed tier (D-060) | a take at an index a live stream is reading, which no fault forces; `Fault::RetakeUnderStream`, on one seed in four, builds the shape around it: a designated follower's stream running while the leader's other follower is cut off |
 | `RefusalNotDurable` | §3: a refusal is marked in the store directory before anything else, and a refused engine does no work (D-044); the variant keeps the refusal in the process alone and its engine flushing | state machine safety: a server restarts on a store its refused engine flushed into self-consistency, a `RaftRecovered` after a `RaftRefused` with no install between, whose applied index its log does not hold | `Fault::CrashRefused`, on every seed: three to five rounds, each crashing the victim inside a memtable flush it has begun or, when it already sits refused, sixty to a hundred and sixty milliseconds into the round, and restarting it (D-044) |
 | `RefusedCountsForQuorum` | §1: a refused follower's rejection counts for check quorum only in a window in which the leader's re-seed stream to it had a chunk acknowledged (D-049); the variant counts it whatever the stream does, the leader as built | the re-seed scenario's blocked half: with the leader's other follower cut off and the stream to the refused one lost to a path-MTU black hole, the leader keeps its office through the whole hold where the correct leader steps down within two windows and three ticks | a follower refused and being re-seeded while the leader's other follower is away, which `sim/quorum.rs` builds on every seed: the refusal made by the store's lost mark at a restart, the other follower cut off the moment the leader opens the stream |
 | `RefusedNeverCounts` | the same rule from the other side: nothing from a refused follower counts, the alternative D-049 rejected | the re-seed scenario's open half: the leader steps down mid-re-seed and, the re-seeded server never voting (D-035) and the other follower away, commits nothing after the install, where the correct leader keeps its office and commits | the same, with the stream open, on a disk that takes no time, since on the sweep's the refused server's silence while it repairs and adopts deposes the leader under any counting |
@@ -695,10 +757,13 @@ not a variant to delete.
 The checks about time in §2 are bounds, not properties: a client write within ten
 maximum election timeouts of the last heal, and an election within two of a server's
 last reset, chosen so that the correct variant never trips them over ten thousand
-seeds. When ten thousand seeds tripped the timer bound on the correct server, what was
-wrong was the check's model of the protocol, not the bound, and widening the bound
-would have dulled its catch of `ResetTimerOnAnyRpc` (D-030, D-039). At ten thousand
-seeds the correct server passes both (nightly runs 34731272921 and 34749071877, D-047).
+seeds. Each of the three times ten thousand seeds tripped the timer bound on the correct
+server, what was wrong was the check's model of the protocol, not the bound, and widening
+the bound would have dulled its catch of `ResetTimerOnAnyRpc` (seeds 164 and 385, D-030
+and D-039; seed 2605 of nightly run 35111624618, the adoption window, PROPOSED D-063).
+At ten thousand seeds the correct server passes both (nightly runs 34731272921 and
+34749071877, D-047; and run 35111624618 tripped the timer bound alone, on the one seed
+D-063 closes).
 
 ## 6. Order of work, if approved
 
