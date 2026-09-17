@@ -5520,6 +5520,40 @@ not on the key repair's tail branch or the truncation revert floor, which this s
 not reach and issue #56 holds. If a seed at ten thousand exhausts the wait, reaches a leader that has not
 compacted, or refuses a store, the correct server's sweep names it.
 
+**At ten thousand, on the stage's two green nightlies.** Runs 35161762372 (605e62e) and
+35172923002 (the tip, 27f6c97) print this scenario's whole `MembershipCoverage`, identical
+in both, and the correct server passes every one of the ten thousand seeds: no seed
+exhausts the wait, none refuses a store (`refusals: {}`), and a joining server is fed a
+snapshot on all 10 000. Four things this entry left open are in that line.
+
+- **The truncation revert floor is reached.** `truncation_reverts_to_a_prefix: 3` over the
+  ten thousand — the floor deferred to issue #56 as one the scenario does not reach, in
+  fact reached, on at most 3 seeds, 0.03 %. **It is a printed counter, asserted nowhere,
+  and too thin for any tier D-061 allows:** at 0.03 % a thousand seeds see none with
+  probability 0.9997^1000 = **0.74**, a hundred with 0.97 and the gate's twenty with 0.994,
+  and even the nightly's own ten thousand see none about one run in twenty
+  (0.9997^10000 = 0.050). Three seeds in ten thousand say the shape exists on this
+  schedule; they are not a rate an assertion can stand on, at the nightly tier or any
+  other. What it changes is the deferral's wording — the floor is reached rarely rather
+  than unreachable — and issue #56 should carry that. Whether the shapes #56 holds are
+  still wanted, and whether these seeds are worth finding and pinning, is the owner's.
+- **The kept-tail branch is still not reached.** `installs_keeping_a_tail: 0` and
+  `installs_whose_tail_carries_a_configuration: 0` over the same ten thousand, so the
+  correction above stands at the highest tier there is: the branch is untested rather than
+  merely unreached, and no seed of ten thousand builds a kept tail to test it with.
+- **`reverts_to_a_prefix`**: 264 over the ten thousand, at most 2.64 % of seeds, beside the
+  2.8 % and 2.5 % measured at a thousand. It sits where the owner put it, the thousand-seed
+  tier, where a thousand seeds see none with probability 0.9736^1000 = 2.4 × 10^-12.
+- **The worst completion gap, re-measured on the moved schedule.** This entry says the
+  549.359683 ms that SPEC §3, RAFT.md §1 and the scenario's module comment cite was measured
+  at ten thousand seeds before this change, and that the next ten-thousand-seed nightly
+  re-measures it. It has: **`worst_completion_gap: 555.458839ms`**, with
+  `slowest_write_after_heal: 633.927431ms`, against the 2 s bound SPEC §3 states. The moved
+  schedule's worst gap is 6.1 ms worse than the pre-D-058 figure and still under a third of
+  the bound. Those three places are not edited here — this commit touches DECISIONS.md
+  alone — and they are marked as measured before D-058; the figure to carry into them is
+  this one.
+
 ---
 
 ## D-059 — A store in 0.3.0's format is refused at open, never migrated and never read
@@ -6064,6 +6098,18 @@ exit is the owner's call, not this entry's.
    half's *shape* is reached often (135 of a thousand, above) and the sweep now asserts it;
    what is missing is a catch. Leave it asserted-absent, search the nightly's ten thousand,
    or aim an arm at the wedge as `RefusedCountsForQuorum` has a directed scenario?
+   **What the stage's green nightlies add to the question** (runs 35161762372 and
+   35172923002, the same figures in both): at ten thousand seeds **each half is caught**,
+   where at a thousand both were 0. `IgnoreIncarnation` is caught on **1 of 10 000**, seed
+   5220, by linearizability — "caught on 1 of 10000 seeds, 0 progress resets, a refused
+   follower re-seeded and applying again on 6283 seeds" — and `SharedSnapshotDir` on **5 of
+   10 000**, first seed 3300, 3 by linearizability and 2 by the liveness check. So of the
+   three options above, "search the nightly's ten thousand" is the one with evidence behind
+   it: the band where each half catches at all is the band a pair search would have to run
+   in, and the thousand-seed search that found nothing was looking below it. That is not an
+   answer — the pair itself is run at no tier, so nothing here says the pair catches
+   anywhere in the ten thousand, and at 1 in 10 000 and 5 in 10 000 a pair search could as
+   easily come back empty and cost a nightly to learn it. The question stays the owner's.
 
 ---
 
@@ -6133,58 +6179,128 @@ commit that lands this entry, 8717a71; a3beb04 moved `sim/tests/raft.rs` and ana
 test binaries, and the review commits after it moved them again, so read the names rather
 than the numbers.
 
-| Assertion | Where | Seeds seen | At 1 000, 2ec4bf7 | At 10 000, nightlies | Tier before → after | P(none) at its tier |
-| --- | --- | --- | --- | --- | --- | --- |
-| Echo: pongs received, both journals | sim/tests/echo.rs:97 | 20 / 100 / 1 000 / 10 000 | 1 000 (100 %) | not printed | every → every | ~0 |
-| Echo `NoSyncDir`, every fault seen: bit rot, corrupt records, torn writes, lost directory entries, a vanished journal | echo.rs:190 | 20 / 100 / 1 000 / 10 000 | 670, 329, 452, 876, 433 | 6 827, 3 350, 4 593, 8 622, 4 323 | every → every | 3.4 × 10^-4 (corrupt records) |
-| Echo correct journal, disk faults seen: bit rot, corrupt records, torn writes, torn files at replay | echo.rs:172 | 20 / 100 / 1 000 / 10 000 | 670, 409, 452, 452 | 6 827, 4 289, 4 593, 4 593 | every → every | 2.7 × 10^-5 |
-| WAL variants caught: `NoSyncDir`, `NoChecksum`, `AckBeforeSync` | wal.rs:67 (72, 77, 82) | 20 / 100 / 1 000 / 10 000 | 909, 964, 1 000 | 9 150, 9 744, 10 000 | every → every | ~0 |
-| WAL coverage: torn writes, lost fsyncs, bit rot, stops at a torn record, stops at a bad checksum, discarded segments, the lost-fsync excuse, the bit-rot excuse | wal.rs:144 | 20 / 100 / 1 000 / 10 000 | 1 000, 1 000, 1 000, 977, 999, 1 000, 994, 994 | 9 999, 10 000, 10 000 seeds; the rest thousands of epochs | every → every | ~0 |
-| WAL: a gap | wal.rs:152 | 20 / 100 / 1 000 / 10 000 | 51 (5.1 %) | 615 epochs, ≤ 6.2 % | ≥ 100 → ≥ 100 | 0.0053 |
-| **WAL: the betrayed-cut excuse** | wal.rs:165 | 20 / 100 / 1 000 / 10 000 | 34 (3.4 %) | 401 epochs, ≤ 4.0 % | **every → ≥ 1 000** | 0.50 at 20 → 9.5 × 10^-16 |
-| **WAL: a betrayed cut — a cut of recovery's own whose sync the disk lied about** (D-062) | wal.rs:193 | 20 / 100 / 1 000 / 10 000 | **765 (76.5 %)**, on the D-062 tree, not 2ec4bf7 | not on those trees: the counter is D-062's | **new → every** | 2.6 × 10^-13 (0.235²⁰) |
-| **WAL: a betrayed cut to nothing**, which resurrects a whole segment (D-062) | wal.rs:208 | 20 / 100 / 1 000 / 10 000 | **60 (6.0 %)**, on the D-062 tree | not on those trees: the counter is D-062's | **new → ≥ 100** | 0.0021 at 100 (0.94¹⁰⁰); 0.29 at 20, where the twenty in fact see none |
-| **WAL: a supersede, the rule itself firing** (D-062) | printed with the coverage, wal.rs:46 | 20 / 100 / 1 000 / 10 000 | **0 of 1 000**, on the D-062 tree | not on those trees: the counter is D-062's | **new → asserted nowhere; printed at every tier** | not asserted. At the engine seek sweep's measured 1 in 10 000 a thousand seeds see none with probability 0.90, so no tier can carry it; seed 3123's pin carries it instead |
-| Engine Phase 1 variants caught: `NoWalBeforeMemtable`, `ReleaseBeforeManifest`, `DeleteBeforeManifest` | engine.rs:553 (558, 563, 568) | 20 / 100 / 1 000 / 10 000 | 985, 602, 647 | 9 825, 6 482, 5 893 | every → every | 9.9 × 10^-9 |
-| Engine `InstallInTwoSwitches` caught | engine.rs:296 | 20 / 100 / 1 000 / 10 000 | 559 | not on those trees | every → every | 7.7 × 10^-8 |
-| Engine `RangeDeleteSkipsMemtables` caught, on the share | engine.rs:359 | 20 / 20 / 100 / 1 000 | 89 of 100 | not on those trees | every → every | 6.7 × 10^-20 |
-| Engine `SeekCountsTombstones` caught, on the share | engine.rs:422 | 20 / 20 / 100 / 1 000 | 98 of 100 | not on those trees | every → every | ~0 |
-| Engine `InstallKeepsSourceNumbers` caught by the oracle, on the share | engine.rs:489 | 20 / 20 / 100 / 1 000 | 98 of 100 | not on those trees | every → every | ~0 |
-| Engine `SpanCheckpointUnsynced` caught, on the share | engine.rs:530 | 20 / 20 / 100 / 1 000 | 81 of 100 | not on those trees | every → every | 3.8 × 10^-15 |
-| Engine coverage, 29 counters: live reads, scans, rotations, flushes, crashes mid-flush, recoveries that replayed, excused losses, lost fsyncs, bit rot, torn writes, tables written, segments deleted, orphans removed, tables dropped, manifest fallbacks, missing log heads, batches, unsynced writes, checkpoints opened after a crash, compactions, compactions below level 0, inputs deleted, writes dropped, tombstones dropped, installs, range deletes, span checkpoints, seeks, recovery seeks | engine.rs:774 | 20 / 100 / 1 000 / 10 000 | 1 000, 1 000, 990, 983, 965, 970, 964, 1 000, 988, 997, 988, 983, 956, 831, 818, 704, 999, 1 000, 819, 976, 973, 981, 976, 976, 977, 961, 993, 1 000, 971 | the first 24 above zero (lost fsyncs 9 998, bit rot 9 906, torn writes 9 972 seeds); the last five not on those trees | every → every | 2.7 × 10^-11 (missing log heads) |
-| Engine: a crash inside a compaction | engine.rs:780 | 20 / 100 / 1 000 / 10 000 | 742 | 6 202 events | ≥ 100 → ≥ 100 | ~0 |
-| Engine: a store refused for a fault | engine.rs:784 | 20 / 100 / 1 000 / 10 000 | 162 (16.2 %) | 1 146 (11.5 %) | ≥ 100 → ≥ 100 | 2.1 × 10^-8 |
-| Live install: span checkpoints verified, live reads over an install | engine.rs:232, 233 | 20 / 100 / 1 000 / 10 000 | 977, 998 | not on those trees | every → every | ~0 |
-| Live install's windows: aimed, between replacement and switch, after the switch, keys written after | engine.rs:256–265 (from 230) | 20 / 100 / 1 000 / 10 000 | 1 000, 490, 411, 990 | not on those trees | every → every | 2.5 × 10^-5 |
-| Range delete's windows, the same four | engine.rs:256–265 (from 330) | 20 / 100 / 1 000 / 10 000 | 1 000, 497, 377, 984 | not on those trees | every → every | 7.8 × 10^-5 |
-| Seek: a seek stopped at its limit, a recovery walked | engine.rs:394, 395 | 20 / 100 / 1 000 / 10 000 | 999, 972 | not on those trees | every → every | ~0 |
-| Deep levels: a round from level 2 or deeper, level 3 reached | engine.rs:177, 181 | 0 / 0 / 0 / 1 000 deep seeds | 965, 965 of 1 000 deep seeds | 10 132 rounds, deepest 3 | nightly only → nightly only | ~0 |
-| Raft variants caught: `SendBeforePersist`, `ApplyBeforeCommit`, `CountOlderTermForCommit`, `TruncateOnEveryAppend`, `ResetTimerOnAnyRpc`, `SnapshotWithoutCurrentLast` | raft.rs:1736 (1926–1957) | 20 / 100 / 1 000 / 10 000 | 1 000, 882, 454, 1 000, 336, 336 | 10 000, 8 902, 4 415, 9 995, 3 465, 3 302 | every → every | 2.8 × 10^-4 |
-| `NoPreVote` caught by the pre-vote check | raft.rs:1918 | 20 / 100 / 1 000 / 10 000 | 1 000 | 9 999 | every → every | ~0 |
-| D-050's term-raise shape reached | raft.rs:1471 | 20 / 100 / 1 000 / 10 000 | 298 | 2 893 (0557590 only) | every → every | 8.4 × 10^-4 |
-| `NoPreVote` caught on the term-raise schedule | raft.rs:1637 | 20 / 100 / 1 000 / 10 000 | 1 000 | 10 000 (0557590 only) | every → every | ~0 |
-| `AdoptionAsBuilt`'s firing: the storm drawn, adoptions under it | raft.rs:2004, 2008 | 20 / 100 / 1 000 / 10 000 | 260, 1 000 | 2 529 seeds; 84 582 adoptions | every → every | 2.4 × 10^-3 |
-| `AdoptionAsBuilt` caught | raft.rs:2013 | 20 / 100 / 1 000 / 10 000 | 77 (7.7 %) | 646 (6.46 %) | ≥ 100 → ≥ 100 | 3.3 × 10^-4 |
-| `RefusalNotDurable`'s firing: a crash on a refused server | raft.rs:2050 | 20 / 100 / 1 000 / 10 000 | 347 | 3 318 | every → every | 2.0 × 10^-4 |
-| `RefusalNotDurable` caught | raft.rs:2074 | 20 / 100 / 1 000 / 10 000 | 16 (1.6 %) | 133 (1.33 %) | ≥ 100 → ≥ 1 000, by the owner (D-056) | 9.9 × 10^-8 |
-| `IgnoreIncarnation`: a refused follower re-seeded and applying | raft.rs:2358 | 20 / 100 / 1 000 / 10 000 | 659 | 6 353 | ≥ 100 → ≥ 100 | ~0 |
-| `SharedSnapshotDir`'s firing: a re-take at an index already taken | raft.rs:2460 | 20 / 100 / 1 000 / 10 000 | 525 | 5 292 | every → every | 3.4 × 10^-7 |
-| `SharedSnapshotDir`'s aimed arm reached its stream | raft.rs:2464 | 20 / 100 / 1 000 / 10 000 | 143 (14.3 %) | 1 472 (14.7 %) | every → every; for the owner, below | **0.046** |
-| **`SharedSnapshotDir`'s stream half: a re-take under a live stream the follower never installs at afterwards** (added after this entry, by D-060's re-audit of `snapshot_takes`; `a_leader_that_shares_one_snapshot_directory_…`) | the same sweep | 20 / 100 / 1 000 / 10 000 | not measured: the fold was vacuous until the re-audit. On this tree **135 (13.5 %)**, and 10 of the first hundred, against the correct server's 0 of 1 000 | not measured on those trees | **new → ≥ 100** | 5.0 × 10^-7 at 100; 0.055 at 20, which is why the gate's twenty do not carry it |
-| `SharedSnapshotDir` caught by the liveness check | raft.rs:2469 | 20 / 100 / 1 000 / 10 000 | 2 (0.2 %) | 4 (0.04 %) | ≥ 10 000 → ≥ 10 000 | 2.0 × 10^-9; 0.018 at the nightlies' rate, below |
-| Lease: drift beyond the bound, the guard revoked | raft.rs:2602, 2603 | 20 / 100 / 1 000 / 10 000 | 503, 503 | 5 023, 5 023 | every → every | 8.5 × 10^-7 |
-| **`LeaseTrustsTheClock` caught (a stale read)** | raft.rs:2615 | 20 / 100 / 1 000 / 10 000 | 41 (4.1 %) | 472 (4.72 %) | **every → ≥ 1 000** | 0.43 at 20 → 6.6 × 10^-19 |
-| Raft coverage, 33 counters: partitions, one-way blocks, crashes, leader crashes, stale-sender faults, figure-8 drivers, burst puts, drift beyond the bound, lease reads, read-index reads, lease revocations, check-quorum step-downs, duplicates, injected drops, elections, a term above one, truncations, snapshots taken, compactions, crash-mid-install faults, crash-mid-adoption faults, re-take-under-a-stream faults, commits, applies, bit rot, puts, gets, deletes, compare-and-sets, completed, abandoned, redirected, uniformly scheduled seeds | raft.rs:3000 | 20 / 100 / 1 000 / 10 000 | 1 000, 432, 1 000, 425, 431, 727, 727, 503, 584, 1 000, 992, 1 000, 1 000, 1 000, 1 000, 1 000, 1 000, 1 000, 1 000, 517, 260, 246, 1 000, 1 000, 999, 1 000 (×7), 500 | all above zero (drift 5 023, a term above one 10 000, uniform 5 000 seeds) | every → every | 3.5 × 10^-3 (re-take faults); uniform scheduling is half the seeds by `Policy::for_seed`, seed 0 among them, not a draw |
-| Raft coverage from 100: refusals, torn writes, snapshots installed, streams resumed, re-seeded servers, re-seeds completed, adoptions, progress resets | raft.rs:3006–3040 | 20 / 100 / 1 000 / 10 000 | 853, 495, 1 000, 1 000, 852, 832, 1 000, 844 | all above zero (re-seeds completed on 8 163 seeds) | ≥ 100 → ≥ 100 | ~0 |
-| `SingleMajorityInJointConsensus` caught | raft.rs:3122 | 20 / 100 / 1 000 / 10 000 | 296 | 2 720 | every → every | 8.9 × 10^-4 |
-| Membership coverage, 9: grows, shrinks, joint and new configurations, learners promoted, partitions, completed, uniform seeds, compactions | raft.rs:3329 | 20 / 100 / 1 000 / 10 000 | 1 000 each; uniform 500 | all above zero where printed (before D-058) | every → every | ~0; uniform not a draw |
-| Membership: an install adopted | raft.rs:3337 | 20 / 100 / 1 000 / 10 000 | 1 000 | not printed before D-058 | every → every | ~0 |
-| Membership from 100: step-downs outside `C_new`, configuration reverts | raft.rs:3354 | 20 / 100 / 1 000 / 10 000 | 390, 56 (5.6 %) | 4 253 and 7 025 events, before D-058 | ≥ 100 → ≥ 100 | 0.0031 (reverts) |
-| **Membership: an election while joint** | raft.rs:3367 | 20 / 100 / 1 000 / 10 000 | 31 (3.1 %) | 463 events, ≤ 4.6 %, before D-058 | **≥ 100 → ≥ 1 000** | 0.043 at 100 → 2.1 × 10^-14 |
-| Membership: `reverts_to_a_prefix` | raft.rs:3382 | 20 / 100 / 1 000 / 10 000 | 28 (2.8 %) | D-058's counter, not on those trees | ≥ 100 → ≥ 1 000, by the owner (D-058) | 4.6 × 10^-13 |
-| Incremental checker: a compared seed in violation | raft.rs:3471 | 20 / 100 / 100 / 100 | 61 of 100 | 59 of 100 | every → every | 6.6 × 10^-9 |
-| Quorum, `RefusedCountsForQuorum` blocked: a chunk lost to the limit | raft.rs:3585 | 20 / 100 / 1 000 / 10 000 | 1 000 | 300 304 events | every → every | ~0 |
-| Quorum on the sweep's disk: the install silence deposes `RefusedCountsForQuorum` | raft.rs:3679 | 20 / 100 / 1 000 / 10 000 | 844 | 8 311 | ≥ 100 → ≥ 100 | ~0 |
+| Assertion | Where | Seeds seen | At 1 000, 2ec4bf7 | At 10 000, the older nightlies | At 10 000, run 35172923002 (27f6c97) | Tier before → after | P(none) at its tier |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Echo: pongs received, both journals | sim/tests/echo.rs:97 | 20 / 100 / 1 000 / 10 000 | 1 000 (100 %) | not printed | not printed | every → every | ~0 |
+| Echo `NoSyncDir`, every fault seen: bit rot, corrupt records, torn writes, lost directory entries, a vanished journal | echo.rs:190 | 20 / 100 / 1 000 / 10 000 | 670, 329, 452, 876, 433 | 6 827, 3 350, 4 593, 8 622, 4 323 | 6 827, 3 350, 4 593, 8 622, 4 323 — the same five | every → every | 3.4 × 10^-4 (corrupt records) |
+| Echo correct journal, disk faults seen: bit rot, corrupt records, torn writes, torn files at replay | echo.rs:172 | 20 / 100 / 1 000 / 10 000 | 670, 409, 452, 452 | 6 827, 4 289, 4 593, 4 593 | 6 827, 4 289, 4 593, 4 593 — the same four | every → every | 2.7 × 10^-5 |
+| WAL variants caught: `NoSyncDir`, `NoChecksum`, `AckBeforeSync` | wal.rs:67 (72, 77, 82) | 20 / 100 / 1 000 / 10 000 | 909, 964, 1 000 | 9 150, 9 744, 10 000 | 9 150, 9 744, 10 000 — the same three | every → every | ~0 |
+| WAL coverage: torn writes, lost fsyncs, bit rot, stops at a torn record, stops at a bad checksum, discarded segments, the lost-fsync excuse, the bit-rot excuse | wal.rs:144 | 20 / 100 / 1 000 / 10 000 | 1 000, 1 000, 1 000, 977, 999, 1 000, 994, 994 | 9 999, 10 000, 10 000 seeds; the rest thousands of epochs | 9 999, 10 000, 10 000 seeds; 29 026, 40 607, 68 533, 37 804, 32 074 over 80 000 epochs | every → every | ~0 |
+| WAL: a gap | wal.rs:152 | 20 / 100 / 1 000 / 10 000 | 51 (5.1 %) | 615 epochs, ≤ 6.2 % | 615 epochs, ≤ 6.2 % | ≥ 100 → ≥ 100 | 0.0053 |
+| **WAL: the betrayed-cut excuse** | wal.rs:165 | 20 / 100 / 1 000 / 10 000 | 34 (3.4 %) | 401 epochs, ≤ 4.0 % | 401 epochs, ≤ 4.0 % | **every → ≥ 1 000** | 0.50 at 20 → 9.5 × 10^-16 |
+| **WAL: a betrayed cut — a cut of recovery's own whose sync the disk lied about** (D-062) | wal.rs:193 | 20 / 100 / 1 000 / 10 000 | **765 (76.5 %)**, on the D-062 tree, not 2ec4bf7 | not on those trees: the counter is D-062's | **7 806 epochs, ≤ 78 %** | **new → every** | 2.6 × 10^-13 (0.235²⁰) |
+| **WAL: a betrayed cut to nothing**, which resurrects a whole segment (D-062) | wal.rs:208 | 20 / 100 / 1 000 / 10 000 | **60 (6.0 %)**, on the D-062 tree | not on those trees: the counter is D-062's | **579 epochs, ≤ 5.8 %** | **new → ≥ 100** | 0.0021 at 100 (0.94¹⁰⁰); 0.29 at 20, where the twenty in fact see none |
+| **WAL: a supersede, the rule itself firing** (D-062) | printed with the coverage, wal.rs:46 | 20 / 100 / 1 000 / 10 000 | **0 of 1 000**, on the D-062 tree | not on those trees: the counter is D-062's | **0 of the sweep's 10 000 seeds (80 000 epochs)** | **new → asserted nowhere; printed at every tier** | not asserted. At the engine seek sweep's measured 1 in 10 000 a thousand seeds see none with probability 0.90, so no tier can carry it; seed 3123's pin carries it instead |
+| Engine Phase 1 variants caught: `NoWalBeforeMemtable`, `ReleaseBeforeManifest`, `DeleteBeforeManifest` | engine.rs:553 (558, 563, 568) | 20 / 100 / 1 000 / 10 000 | 985, 602, 647 | 9 825, 6 482, 5 893 | 9 823, 6 254, 6 473 | every → every | 9.9 × 10^-9 |
+| Engine `InstallInTwoSwitches` caught | engine.rs:296 | 20 / 100 / 1 000 / 10 000 | 559 | not on those trees | 5 457 | every → every | 7.7 × 10^-8 |
+| Engine `RangeDeleteSkipsMemtables` caught, on the share | engine.rs:359 | 20 / 20 / 100 / 1 000 | 89 of 100 | not on those trees | 933 of its 1 000 | every → every | 6.7 × 10^-20 |
+| Engine `SeekCountsTombstones` caught, on the share | engine.rs:422 | 20 / 20 / 100 / 1 000 | 98 of 100 | not on those trees | 972 of its 1 000 | every → every | ~0 |
+| Engine `InstallKeepsSourceNumbers` caught by the oracle, on the share | engine.rs:489 | 20 / 20 / 100 / 1 000 | 98 of 100 | not on those trees | 974 of its 1 000, and 1 by the writer's order assertion | every → every | ~0 |
+| Engine `SpanCheckpointUnsynced` caught, on the share | engine.rs:530 | 20 / 20 / 100 / 1 000 | 81 of 100 | not on those trees | 816 of its 1 000 | every → every | 3.8 × 10^-15 |
+| Engine coverage, 29 counters: live reads, scans, rotations, flushes, crashes mid-flush, recoveries that replayed, excused losses, lost fsyncs, bit rot, torn writes, tables written, segments deleted, orphans removed, tables dropped, manifest fallbacks, missing log heads, batches, unsynced writes, checkpoints opened after a crash, compactions, compactions below level 0, inputs deleted, writes dropped, tombstones dropped, installs, range deletes, span checkpoints, seeks, recovery seeks | engine.rs:774 | 20 / 100 / 1 000 / 10 000 | 1 000, 1 000, 990, 983, 965, 970, 964, 1 000, 988, 997, 988, 983, 956, 831, 818, 704, 999, 1 000, 819, 976, 973, 981, 976, 976, 977, 961, 993, 1 000, 971 | the first 24 above zero (lost fsyncs 9 998, bit rot 9 906, torn writes 9 972 seeds); the last five not on those trees | all 29 above zero: lost fsyncs 9 999, bit rot 9 920, torn writes 9 976 seeds; missing log heads 11 973; the last five now printed — installs 58 901, range deletes 40 672, span checkpoints 82 264, seeks 1 999 417, recovery seeks 758 002 | every → every | 2.7 × 10^-11 (missing log heads) |
+| Engine: a crash inside a compaction | engine.rs:780 | 20 / 100 / 1 000 / 10 000 | 742 | 6 202 events | 13 504 events | ≥ 100 → ≥ 100 | ~0 |
+| Engine: a store refused for a fault | engine.rs:784 | 20 / 100 / 1 000 / 10 000 | 162 (16.2 %) | 1 146 (11.5 %) | 1 668 events, ≤ 16.7 % | ≥ 100 → ≥ 100 | 2.1 × 10^-8 |
+| Live install: span checkpoints verified, live reads over an install | engine.rs:232, 233 | 20 / 100 / 1 000 / 10 000 | 977, 998 | not on those trees | 59 164 and 2 020 152 events | every → every | ~0 |
+| Live install's windows: aimed, between replacement and switch, after the switch, keys written after | engine.rs:256–265 (from 230) | 20 / 100 / 1 000 / 10 000 | 1 000, 490, 411, 990 | not on those trees | 73 255, 6 403, 4 758, 1 649 955 events | every → every | 2.5 × 10^-5 |
+| Range delete's windows, the same four | engine.rs:256–265 (from 330) | 20 / 100 / 1 000 / 10 000 | 1 000, 497, 377, 984 | not on those trees | 73 899, 6 187, 4 569, 2 606 393 events | every → every | 7.8 × 10^-5 |
+| Seek: a seek stopped at its limit, a recovery walked | engine.rs:394, 395 | 20 / 100 / 1 000 / 10 000 | 999, 972 | not on those trees | 1 355 458 and 807 889 of 2 017 057 live seeks | every → every | ~0 |
+| Deep levels: a round from level 2 or deeper, level 3 reached | engine.rs:177, 181 | 0 / 0 / 0 / 1 000 deep seeds | 965, 965 of 1 000 deep seeds | 10 132 rounds, deepest 3 | 11 609 rounds, deepest 3 | nightly only → nightly only | ~0 |
+| Raft variants caught: `SendBeforePersist`, `ApplyBeforeCommit`, `CountOlderTermForCommit`, `TruncateOnEveryAppend`, `ResetTimerOnAnyRpc`, `SnapshotWithoutCurrentLast` | raft.rs:1736 (1926–1957) | 20 / 100 / 1 000 / 10 000 | 1 000, 882, 454, 1 000, 336, 336 | 10 000, 8 902, 4 415, 9 995, 3 465, 3 302 | 10 000, 8 843, 4 359, 9 996, 3 548, 3 371 | every → every | 2.8 × 10^-4 |
+| `NoPreVote` caught by the pre-vote check | raft.rs:1918 | 20 / 100 / 1 000 / 10 000 | 1 000 | 9 999 | 9 998 | every → every | ~0 |
+| D-050's term-raise shape reached | raft.rs:1471 | 20 / 100 / 1 000 / 10 000 | 298 | 2 893 (0557590 only) | 2 833 | every → every | 8.4 × 10^-4 |
+| `NoPreVote` caught on the term-raise schedule | raft.rs:1637 | 20 / 100 / 1 000 / 10 000 | 1 000 | 10 000 (0557590 only) | 10 000 | every → every | ~0 |
+| `AdoptionAsBuilt`'s firing: the storm drawn, adoptions under it | raft.rs:2004, 2008 | 20 / 100 / 1 000 / 10 000 | 260, 1 000 | 2 529 seeds; 84 582 adoptions | 2 529 seeds; 87 456 adoptions | every → every | 2.4 × 10^-3 |
+| `AdoptionAsBuilt` caught | raft.rs:2013 | 20 / 100 / 1 000 / 10 000 | 77 (7.7 %) | 646 (6.46 %) | 637 (6.37 %) | ≥ 100 → ≥ 100 | 3.3 × 10^-4 |
+| `RefusalNotDurable`'s firing: a crash on a refused server | raft.rs:2050 | 20 / 100 / 1 000 / 10 000 | 347 | 3 318 | 3 371 | every → every | 2.0 × 10^-4 |
+| `RefusalNotDurable` caught | raft.rs:2074 | 20 / 100 / 1 000 / 10 000 | 16 (1.6 %) | 133 (1.33 %) | 129 (1.29 %) | ≥ 100 → ≥ 1 000, by the owner (D-056) | 9.9 × 10^-8 |
+| `IgnoreIncarnation`: a refused follower re-seeded and applying | raft.rs:2358 | 20 / 100 / 1 000 / 10 000 | 659 | 6 353 | 6 283 | ≥ 100 → ≥ 100 | ~0 |
+| `SharedSnapshotDir`'s firing: a re-take at an index already taken | raft.rs:2460 | 20 / 100 / 1 000 / 10 000 | 525 | 5 292 | 5 265 | every → every | 3.4 × 10^-7 |
+| `SharedSnapshotDir`'s aimed arm reached its stream | raft.rs:2464 | 20 / 100 / 1 000 / 10 000 | 143 (14.3 %) | 1 472 (14.7 %) | 1 477 (14.77 %) | every → every; for the owner, below | **0.046** |
+| **`SharedSnapshotDir`'s stream half: a re-take under a live stream the follower never installs at afterwards** (added after this entry, by D-060's re-audit of `snapshot_takes`; `a_leader_that_shares_one_snapshot_directory_…`) | the same sweep | 20 / 100 / 1 000 / 10 000 | not measured: the fold was vacuous until the re-audit. On this tree **135 (13.5 %)**, and 10 of the first hundred, against the correct server's 0 of 1 000 | not measured on those trees | **1 308 (13.08 %)**, with 5 948 duplicate-chunk loops after them | **new → ≥ 100** | 5.0 × 10^-7 at 100; 0.055 at 20, which is why the gate's twenty do not carry it |
+| `SharedSnapshotDir` caught by the liveness check | raft.rs:2469 | 20 / 100 / 1 000 / 10 000 | 2 (0.2 %) | 4 (0.04 %) | **2 (0.02 %)**; 5 caught in all, by check {linearizability 3, liveness 2} | ≥ 10 000 → ≥ 10 000 | 2.0 × 10^-9; 0.018 at the nightlies' rate, below |
+| Lease: drift beyond the bound, the guard revoked | raft.rs:2602, 2603 | 20 / 100 / 1 000 / 10 000 | 503, 503 | 5 023, 5 023 | 5 023, 5 023 | every → every | 8.5 × 10^-7 |
+| **`LeaseTrustsTheClock` caught (a stale read)** | raft.rs:2615 | 20 / 100 / 1 000 / 10 000 | 41 (4.1 %) | 472 (4.72 %) | 450 (4.50 %) | **every → ≥ 1 000** | 0.43 at 20 → 6.6 × 10^-19 |
+| Raft coverage, 33 counters: partitions, one-way blocks, crashes, leader crashes, stale-sender faults, figure-8 drivers, burst puts, drift beyond the bound, lease reads, read-index reads, lease revocations, check-quorum step-downs, duplicates, injected drops, elections, a term above one, truncations, snapshots taken, compactions, crash-mid-install faults, crash-mid-adoption faults, re-take-under-a-stream faults, commits, applies, bit rot, puts, gets, deletes, compare-and-sets, completed, abandoned, redirected, uniformly scheduled seeds | raft.rs:3000 | 20 / 100 / 1 000 / 10 000 | 1 000, 432, 1 000, 425, 431, 727, 727, 503, 584, 1 000, 992, 1 000, 1 000, 1 000, 1 000, 1 000, 1 000, 1 000, 1 000, 517, 260, 246, 1 000, 1 000, 999, 1 000 (×7), 500 | all above zero (drift 5 023, a term above one 10 000, uniform 5 000 seeds) | all above zero (drift 5 023, a term above one 10 000, uniform 5 000 seeds; the three fault counters nearest the line: crash-mid-install 5 038, crash-mid-adoption 2 529, re-take-under-a-stream 2 500) | every → every | 3.5 × 10^-3 (re-take faults); uniform scheduling is half the seeds by `Policy::for_seed`, seed 0 among them, not a draw |
+| Raft coverage from 100: refusals, torn writes, snapshots installed, streams resumed, re-seeded servers, re-seeds completed, adoptions, progress resets | raft.rs:3006–3040 | 20 / 100 / 1 000 / 10 000 | 853, 495, 1 000, 1 000, 852, 832, 1 000, 844 | all above zero (re-seeds completed on 8 163 seeds) | all above zero: 32 494, 7 092, 192 919, 672 557, 40 313, 8 007, 89 498, 22 671 | ≥ 100 → ≥ 100 | ~0 |
+| `SingleMajorityInJointConsensus` caught | raft.rs:3122 | 20 / 100 / 1 000 / 10 000 | 296 | 2 720 | 2 386 | every → every | 8.9 × 10^-4 |
+| Membership coverage, 9: grows, shrinks, joint and new configurations, learners promoted, partitions, completed, uniform seeds, compactions | raft.rs:3329 | 20 / 100 / 1 000 / 10 000 | 1 000 each; uniform 500 | all above zero where printed (before D-058) | all above zero: grows and shrinks 10 000 each, joint 105 524, new 245 527, learners promoted 23 976, partitions 20 000, completed 3 658 749, compactions 153 406; uniform 5 000 seeds | every → every | ~0; uniform not a draw |
+| Membership: an install adopted | raft.rs:3337 | 20 / 100 / 1 000 / 10 000 | 1 000 | not printed before D-058 | 74 102 adoptions, and a snapshot-fed joiner on all 10 000 seeds | every → every | ~0 |
+| Membership from 100: step-downs outside `C_new`, configuration reverts | raft.rs:3354 | 20 / 100 / 1 000 / 10 000 | 390, 56 (5.6 %) | 4 253 and 7 025 events, before D-058 | 3 870 and 569 events | ≥ 100 → ≥ 100 | 0.0031 (reverts) |
+| **Membership: an election while joint** | raft.rs:3367 | 20 / 100 / 1 000 / 10 000 | 31 (3.1 %) | 463 events, ≤ 4.6 %, before D-058 | 365 events, ≤ 3.65 % | **≥ 100 → ≥ 1 000** | 0.043 at 100 → 2.1 × 10^-14 |
+| Membership: `reverts_to_a_prefix` | raft.rs:3382 | 20 / 100 / 1 000 / 10 000 | 28 (2.8 %) | D-058's counter, not on those trees | **264 events, ≤ 2.64 %** | ≥ 100 → ≥ 1 000, by the owner (D-058) | 4.6 × 10^-13 |
+| Incremental checker: a compared seed in violation | raft.rs:3471 | 20 / 100 / 100 / 100 | 61 of 100 | 59 of 100 | 59 of 100 | every → every | 6.6 × 10^-9 |
+| Quorum, `RefusedCountsForQuorum` blocked: a chunk lost to the limit | raft.rs:3585 | 20 / 100 / 1 000 / 10 000 | 1 000 | 300 304 events | 294 589 events | every → every | ~0 |
+| Quorum on the sweep's disk: the install silence deposes `RefusedCountsForQuorum` | raft.rs:3679 | 20 / 100 / 1 000 / 10 000 | 844 | 8 311 | 9 058 failed, 9 002 of them by a step-down with nothing uncounted | ≥ 100 → ≥ 100 | ~0 |
+
+**The ten-thousand-seed column, re-measured on this stage's own nightly.** The column
+"At 10 000, run 35172923002 (27f6c97)" is this stage's own evidence: the green
+ten-thousand-seed nightly on the branch tip, whose log is
+`scratchpad stage-a/nightly4-green.log`. Every figure in it is read off that log, and a
+row whose counter the log does not print says so rather than carrying a number over. The
+column beside it, "At 10 000, the older nightlies", is runs 34908018220 (0557590) and
+34948461479 (94c6a54) as before, and **both of those trees predate this stage** — its
+lanes S and N, D-056's queue, D-058 and D-060 — so their raft, membership, re-seed and
+engine figures are other schedules, and the two columns are not a before-and-after of one
+tree. The unit is the log's: where a counter counts events the cell says so and gives the
+seed rate as "≤", since the seeds that saw one are at most that many, and the WAL sweep's
+counters run over 80 000 epochs on its 10 000 seeds.
+
+**No rate in the new column crosses the 5 % line**, in either direction, so the rule moves
+nothing here and every tier above stands. The rows near the line are the ones that were
+near it before: `AdoptionAsBuilt` at 6.37 % (646 → 637), where a hundred seeds see none
+with probability 0.9363^100 = 1.4 × 10^-3; the membership scenario's configuration reverts
+at ≤ 5.69 %, where a hundred see none with 0.0029; a gap in the WAL at ≤ 6.15 %, 0.0018;
+and D-062's betrayed cut to nothing at ≤ 5.79 %, 0.0026. The last three are event counts,
+so the seed rate behind each could be a little under 5 % — the nightly does not settle
+that, and the thousand-seed measurements above, which the rule reads, are 5.6 %, 5.1 % and
+6.0 %. The two that moved furthest are both already at the thousand-seed tier:
+`LeaseTrustsTheClock`'s stale read at 4.50 % (472 → 450) and the betrayed-cut excuse at
+≤ 4.01 %. `SharedSnapshotDir`'s liveness catch, the thinnest row in the table, is at the
+foot of the "For the owner" section below with what this nightly measured of it.
+
+**The stage's nightly record.** SHARD.md §12 asks that before a stage is tagged the
+nightly at ten thousand seeds run on the stage's branch and be green — every sweep and
+directed scenario the stage runs, the correct system on every seed, every variant to its
+standard (docs/SHARD.md:2030-2037, the owner's addition of 2026-09-15). Four ran on
+`phase-3-stage-a` (PR #60):
+
+| Run | Tree | Started → ended, UTC | Wall | Outcome |
+| --- | --- | --- | --- | --- |
+| 34908018220 / 34948461479 | 0557590, 94c6a54 | before the stage | — | the older nightlies the column above names; not this branch |
+| 35080746132 | 09bed88 | 2026-09-16 09:40 → 11:05 | 1 h 24 m 55 s | **red** — the correct engine, seek schedule, seed 3123 (D-062) |
+| 35111624618 | 1a1cad2 | 2026-09-16 14:53 → 18:25 | 3 h 32 m 02 s | **red** — the correct server, raft sweep, seed 2605 (D-063) |
+| 35161762372 | 605e62e | 2026-09-16 23:19 → 2026-09-17 02:02 | 2 h 43 m 42 s | **green** |
+| 35172923002 | 27f6c97, the tip | 2026-09-17 02:03 → 05:41 | 3 h 37 m 35 s | **green** |
+
+The two red runs' downloaded logs hold only the `cargo test` step, so their wall is that
+step's; the two green ones are the whole job, whose step is within twelve seconds of it.
+The two green runs are the evidence for §12's bullet, and they agree with each other
+figure for figure: every rate, every coverage counter and every first-catch seed in the
+new column is identical in `nightly3-green.log` and `nightly4-green.log`. The only
+differences between the two logs' summaries are the wall times, the order the parallel
+binaries finished in, the last digits of two floats in `ReseedEpisodes`, and
+`ananke-sim`'s lib tests at 17 against 19 — the two checker-level tests over hand-written
+records that 46e95c0 added between the two trees (D-063), which need no seed and move no
+schedule. That is what a stage whose last commits move no schedule should look like.
+
+**The tip's run covers the tip, and this commit is docs-only on top of it.** Run
+35172923002 ran on 27f6c97, the tree this entry is being written on. The commit that
+lands these paragraphs touches docs/DECISIONS.md and nothing else — no crate, no sweep,
+no test, no script, nothing the nightly exercises — so the green run is evidence for the
+tree the commit makes as much as for the tree it ran on, and `scripts/gate.sh` is green
+on that tree, as CLAUDE.md asks of every commit. It is worth saying plainly because the
+opposite is the usual case: a nightly is evidence for the tree it ran on, and a commit
+that changed a line of the model would need its own.
+
+**Issue #57, in live figures.** D-055 projected the nightly's `cargo test` step at about
+2 h 45 min against the job's 300-minute timeout and D-060's re-measurement moved that to
+about 2 h 51 min. What the four runs took: the red run that got furthest, 35111624618,
+**212 minutes**, and the two green ones **164** and **218 minutes**, the tip's run at 73 %
+of the timeout. The two green runs did the same work — raft 5 834.48 s against 7 509.64 s,
+engine 3 746.41 s against 5 228.23 s, wal 154.11 s against 204.16 s, a third more wall for
+figures identical seed for seed — so that spread is the runner, not the tree. A 54-minute
+swing between two runs of the same work is the sharpest thing the issue has: the headroom
+left is a draw, not a margin.
 
 **The three WAL rows marked D-062** were added by the commit that closed that entry's
 gaps, so the register holds every assertion the supersede rule brought with it rather
@@ -6312,6 +6428,14 @@ owner's to decide.
   beside it, the re-take at an index already taken, is on 52.5 %. The conservative options
   are to leave it, or to assert it from the hundred-seed tier, where a hundred see none
   with probability 2 × 10^-7.
+  **Measured on this stage's own nightly**, run 35172923002 on the tip: the arm reaches its
+  stream on **1 477 of 10 000, 14.77 %**, beside 5 265 re-takes at an index already taken
+  and 1 308 seeds of the stream half. So the number the question turns on has not moved —
+  14.3 % and 15.3 % at a thousand on two trees, 14.7 % at the older nightlies and now
+  14.77 % at this stage's own, four measurements on three trees — and at
+  14.77 % the gate's twenty see none with probability 0.8523^20 = 0.041, still above one in
+  a hundred. The measurement is recorded; the choice between leaving it and moving it to
+  the hundred-seed tier is the owner's and is not made here.
 - *`SharedSnapshotDir`'s liveness catch at the nightly's ten thousand*
   (the same test). It is under 5 % and already above the thousand-seed tier, so the rule
   leaves it. On the tree with the queue it was on 2 of the thousand, 0.2 %; **on the tree
@@ -6321,6 +6445,27 @@ owner's to decide.
   nightly is what measures it. D-060's question 6 puts the harder half to the owner: the
   pair and each half are caught on 0 of the first thousand, so no seed pins the catch and
   seed 132 asserts its absence, which SHARD.md:2362-2363 routes to the owner.
+  **The next nightly has now run, and this is what it measured.** Run 35172923002 on the
+  tip, and run 35161762372 before it, print the same line:
+
+  ```
+  SharedSnapshotDir: caught on 5 of 10000 seeds, 2 by the liveness check, by check
+  {"linearizability": 3, "liveness": 2}, re-took at an index already taken on 5265 seeds,
+  scrambled a live stream the follower never installed after on 1308 seeds (5948
+  duplicate-chunk loops after those), the aimed re-take arm reached its stream on 1477
+  seeds, first: seed 3300: liveness: no client write completed after the last heal at
+  Instant(13.289s)
+  ```
+
+  So the catch is on **5 of 10 000, 0.05 %**, of which **2 are the liveness check's,
+  0.02 %** — half what the older nightlies measured (4) and not the 0 the thousand-seed
+  tree suggested. The assertion is the liveness half alone, at the ten-thousand-seed tier,
+  and at 0.02 % ten thousand seeds see none with probability 0.9998^10000 = **0.135**: about
+  one nightly in seven would fail this tree with nothing wrong in it. Read against the whole
+  catch, 5 of 10 000, ten thousand see none with 0.0067. Both figures are measurements, not
+  a decision: whether an assertion that misses one run in seven belongs at the nightly tier
+  at all, or belongs beside the liveness check as a whole-catch assertion, or nowhere, stays
+  the owner's to answer.
 
 **Alternatives.** *D-044's shape, a thin catch asserted from the hundred-seed tier*: at 3 %
 a hundred seeds see none about one time in twenty, and the owner moved both measured cases
@@ -6521,6 +6666,35 @@ not widen past its one branch:
   pending `PendingOp::Truncate`, so the very fault that builds this shape is invisible in
   the studio, and `Wal::open`'s `firsts` map records a running total rather than each
   segment's own first record.
+
+**At ten thousand, on the stage's two green nightlies.** The tier that found this defect
+has since run twice on this branch with the fix in: run 35161762372 on 605e62e and run
+35172923002 on the tip, 27f6c97. In both, `the_seek_crash_test_passes_every_seed` passes
+over the nightly's ten thousand and **the whole engine binary is green, 18 passed and 0
+failed** (5 228.23 s on the tip, 3 746.41 s on the run before it), with
+`seed_3123_which_the_nightly_found_supersedes_a_resurrected_segment` among the tests that
+pass — so the seed this entry was written for is asserted to still reach a betrayed cut and
+still supersede its resurrected segment, by its numbers, rather than merely to come back
+green. Seed 30490, issue #61's, is outside the nightly's band as this entry says, and
+neither run reaches it.
+
+The WAL sweep's own `superseded` counter is **0 at ten thousand seeds** in both runs:
+`Coverage { seeds: 10000, epochs: 80000, …, excused_betrayed_cut: 401, betrayed_cuts: 7806,
+betrayed_cuts_to_nothing: 579, superseded: 0 }`. That is this entry's "rarer than either and
+asserted nowhere", measured a tier higher than it could be measured when the entry was
+written: the two preconditions are reached — 7 806 and 579 over 80 000 epochs, at most 78 %
+and 5.8 % of the ten thousand seeds, the first far above the 5 % line its tier reads and the
+second just above it, as the 6.0 % at a thousand was — and the rule still fires on none of
+the WAL sweep's ten thousand. Its rows in D-061's register carry the same three figures.
+
+**This sharpens the question below; it does not answer it.** `TrustsAStaleSegment` is caught
+by no sweep at any tier, and the nightly is the highest tier there is: at ten thousand the
+WAL sweep does not fire the rule once, so a sweep-tier pairing cannot be reached by running
+more seeds of that sweep. The only place the rule is seen to fire in a green nightly is seed
+3123's pin, on the engine's seek schedule — a fixed seed, not a draw. So one option the
+owner might have weighed, wait for a larger tier to catch it, is closed by measurement
+rather than by argument; what remains is what this entry already puts to the owner, the
+deterministic states and the pin as they stand, or an arm that builds the shape deliberately.
 
 **For the owner — not decided here.** `Variant::TrustsAStaleSegment` is the first WAL
 variant that **no sweep catches at any tier**. It is caught deterministically, at every
@@ -6743,6 +6917,45 @@ attributable: the WAL binary tripled, 8.48 s to 23.26 s, which is D-062's two ha
 recoveries and its wider bands. The earlier figure of 1 473 s reported for this fix's tree
 was taken while another lane was building and sampled no load; it is withdrawn in favour of
 this one, measured under D-052's protocol on an otherwise idle machine.
+
+**At ten thousand, on the stage's two green nightlies.** The tier that found seed 2605 has
+since run twice on this branch with this arm in: run 35161762372 on 605e62e and run
+35172923002 on the tip, 27f6c97. In both **the raft binary is green, 43 passed and 0
+failed** (7 509.64 s on the tip, 5 834.48 s on the run before it) — the whole sweep, the
+membership and quorum scenarios, the incremental checker and every pinned seed, this
+entry's
+`seed_2605_which_the_nightly_found_is_an_adoption_window_and_still_catches_the_variant`
+among them. The seed the nightly failed on now passes at the tier that found it, with its
+mechanism asserted both ways rather than green, and the correct server passes every one of
+the ten thousand.
+
+The adoption figures the two runs print, identical in both:
+
+- `AdoptionAsBuilt`: **caught on 637 of 10 000**, its storm drawn on **2 529 seeds with
+  87 456 adoptions under it**, first seed 1; decision time (D-047) removed 3 catches and
+  added none. The pair this entry leans on, `ResetTimerOnAnyRpc`, is **caught on 3 548 of
+  10 000, 35.48 %**, far above D-061's line, as the 34.4 % measured at a thousand said it
+  would be; decision time removed 10 of its catches and added none.
+- The raft sweep's coverage on the correct server: **89 498 adoptions**, 2 529
+  crash-mid-adoption faults and 5 038 crash-mid-install faults, 192 919 snapshots
+  installed, 40 313 re-seeded servers, 8 007 re-seeds completed.
+- D-049's re-seed episodes: 13 326 episodes, 12 956 completed, 12 259 answered from the
+  store, and the adoption's own length in election-timeout windows, **median 1.559 and
+  longest 48.551**, beside the stream's median 2.753 and longest 56.224. Those are re-seed
+  episodes' adoptions (D-035's path), not the completed-install window this entry measures;
+  they are the nearest thing the nightly prints to it.
+- The membership scenario: **74 102 adoptions** over its own ten thousand, with a
+  snapshot-fed joiner on every seed.
+
+**What a green nightly cannot show, and does not.** It prints no count of
+adoption-rescued gaps, so "in all nine thousand exactly one seed with an adoption-rescued
+gap, 2605 — the same count the nightly's ten thousand give" above rests on run
+35111624618's single failure and on the local runs recorded there, not on a counter in a
+green run: a green run is silent about the gaps this arm removed, by construction. Nor does
+it print the completion-to-restatement window, so that window's figures above (min
+104.603 ms, p50 171.396, p99 256.661, max 353.091 over 0..3000) stay local measurements.
+The instrument that would put either in a nightly is the first issue note below, which is
+not code this entry writes.
 
 **Consequences.** `up` now means exactly "the server has a live incarnation": one ends at
 a shutdown, a crash, or a completed install, and begins at a `RaftTerm`. The check is
