@@ -4578,6 +4578,14 @@ moves. The checkpoint check's torn-write exclusion is narrowed for every checkpo
 whole-store checkpoints of D-024 included, which the correct engine passes at every tier
 below.
 
+**Extended by D-068.** The checkpoint and the install above take one span. D-068 extends
+both to a set of spans, sorted and disjoint, because a range lives in two (D-066): the
+checkpoint copies every span at one version, and the install takes every span out and puts
+the source in with the one switch described here, carrying the receiver's repair in it as a
+table of its own at the record after the install's. `checkpoint_span` and `install_span`
+are its one-span forms and behave as above. The crash test above now installs over two or
+three spans with a repair, and the figures measured since are D-068's.
+
 ---
 
 ## PROPOSED D-055 — The bounded seek, the range delete as an install of nothing, and the engine sweep with all four primitives
@@ -4880,6 +4888,11 @@ compaction or checkpoint runs on the engine meanwhile, and it shares the install
 other caller retries (D-054). A snapshot is not stable across a range delete of the span it
 reads either, and Stage B holds none across one (D-054). Neither primitive's own commit
 moved a seed's schedule; the sweep's did.
+
+**Extended by D-068.** The range delete above takes one span. `Engine::delete_ranges` is the
+install of nothing over a set of spans, in one switch (D-068), and `delete_range` is its
+one-span form, unchanged. The range delete's crash test and the default schedule now delete
+two or three spans at once, and the rates measured since are D-068's.
 
 ---
 
@@ -7440,4 +7453,527 @@ the scenario cannot catch proves nothing about the correct node beside it.
 
 ---
 
-_Next entry: D-068. Add one before implementing anything not covered above._
+## PROPOSED D-068 — The span primitives over a set of spans: one version, one switch, the repair a table in it
+
+**Context.** D-066 decided option (a). A range lives in two key intervals, its Raft state
+under `0 / <range>` and its user keys in tenant 2, and each of Stage A's primitives took one:
+`checkpoint_span`, `install_span` and `delete_range` (engine.rs; D-054, D-055). The owner
+asked for them extended to a set of disjoint intervals, in a PR of its own before any node
+code, with the generalised crash test and its variants. What the extension must guarantee is
+settled there:
+- the checkpoint copies every interval at one version;
+- the install removes every interval's keys, adds the source's tables, and carries the
+  receiver's repair in the same manifest switch, numbered above the live engine as D-054
+  numbers it. The repair is the whole of today's: term and vote, applied index, snapshot
+  record, kept log tail, configuration key, quarantine flag, incarnation, and tombstones
+  (D-066);
+- the range delete is the install of nothing over the set, in one switch (D-055);
+- a crash leaves every interval as it was, or every interval installed with its repair,
+  never a mixture across intervals or between the tables and the repair.
+
+The owner's brief for this PR adds that the repair is a table of its own, numbered above the
+source's. It left open the API's shape, how the repair is numbered, the refusals, and the
+variants' shapes. Each is proposed here, taking the most conservative option where there was
+a choice. "Span" below means one interval, as D-054 uses the word. Every site is marked
+`PROPOSED(D-068)`.
+
+**Decision.**
+
+*The shape.* Each primitive gains a form over a set, and the one-span form becomes a thin
+wrapper over it, so every existing caller is unchanged: twenty-one call sites in the storage
+crate's tests, and none outside the tests and the sweep, whose three now call the set forms.
+- `Engine::checkpoint_spans(&[Range<&[u8]>], dir)`; `checkpoint_span(range, dir)` is it over
+  one span.
+- `Engine::install_spans(Vec<Range<Bytes>>, SpanSource, WriteBatch)`, the batch being the
+  repair; `install_span(range, source)` is it over one span with an empty repair.
+- `Engine::delete_ranges(Vec<Range<Bytes>>)`; `delete_range(range)` is it over one span.
+- `SpanInstall::repair_seq()` and `InstallInfo::repair_seq` report the repair's number.
+
+The wrappers were chosen over one-element sets at every call site because a one-span install
+with no repair is exactly D-054's, byte for byte in what it writes and traces, and the diff
+then shows that no caller's meaning moved. The node will call the set forms.
+
+*A set is sorted and disjoint.* Each span must end at or before the next begins; adjacent
+spans are allowed. An install or a delete is refused with `EmptySpan` when the set is empty or
+any span in it holds no key, and with the new `SpansOverlap { end, start }` when one span ends
+past the next one's start, which covers spans out of order too. A checkpoint drops spans that
+hold no key, as a single empty span always copied nothing, and refuses the rest with the same
+`SpansOverlap` when they are out of order or overlap, before anything is written. Unrefused,
+spans out of order would feed the table writer keys out of order, which it asserts against.
+
+*One version.* `checkpoint_spans` reads the newest version applied once, under the turnstile,
+before the first span's copy. Each span then walks a merge of the memtables and tables in
+service and keeps the newest write at or below that version. The turnstile holds off every
+flush, compaction and install, so every write at or below the version stays where the walks
+find it, and writes applied during the copy are above it. Tables are sealed near `sst_bytes`
+in key order across the spans, so one table can hold keys of two. `CheckpointInfo::version`
+and the manifest's `flushed_seq` are that one version.
+
+*The repair's number.* A repair that is not empty takes the log record after the install's:
+`S` for the install and `R = S + 1` for the repair, both holding no write. They are appended
+under one hold of the pending lock, so no other write is numbered between them (D-021's
+lock, which D-054 made the numbering's). The install's task waits for both to be durable.
+Every installed write carries `S` and every repair write `R`, so a repair write of a key is
+read over the source's write of it, and every write taken after the call is above both. An
+empty repair takes no number and writes no table, so a single-span install without one is
+D-054's.
+- Why not `S` for both, the source's writes of the repair's keys dropped: that is one fewer
+  record, but the repair would then be spliced into the installed tables rather than being a
+  table of its own. Without the splice, two writes under one internal key would stop the
+  table writer, as `InstallKeepsSourceNumbers` once did (D-054).
+- Why under one lock: were another write `W` numbered between `S` and `R`, the switch's
+  `flushed_seq` of at least `R` would claim `W` was in a table while it sat in a memtable
+  the flusher held back. The log segments through `R` would then be deleted and `W` lost at
+  the next crash, acknowledged.
+- *Argued, not tested*, as D-054 says of its own two windows. In the simulator no await sits
+  between the two numbers and no other task runs there, so no test can put a write between
+  them; on the real runtime a test would be a timing race that passes on broken code as
+  readily as on this. So `begin_install` checks, right after the numbering and before the
+  install is marked in progress, that `R` is exactly `S + 1`, and otherwise refuses the
+  install with the new `RepairNotNext { seq, repair_seq }`. A change that let a write in
+  between would then refuse every install carrying a repair on the real runtime, loudly,
+  rather than switch to a manifest that loses `W`. What the review's mutation of it showed is
+  under *The review*, below.
+
+*The repair is a table in the switch.* The repair's last write per key is written at `R`
+into one level-0 table, deletes kept as tombstones since a delete must hide the source's
+write of its key. The install's own manifest lists that table beside the rewrites and the
+installed tables; its `flushed_seq` is at least `R`, and once it is switched to, the log
+segments through `R` are deleted. A crash before the switch leaves the spans as they were and
+the repair's table an orphan the next open removes; after it, every span is installed and the
+repair is there. The repair is one table whatever its size. The kept log tail can make it
+large, and sealing it near `sst_bytes` is left until a measured repair needs it.
+
+*Taking the spans out.* A table in service that meets any span is taken out whole only when
+one span holds both its first and its last key and every write it holds is below `S`: then
+every key it holds lies in that span. A table whose two ends lie in two spans can hold keys
+between them, so it is walked and written again without the spans' writes below `S`, as a
+table straddling one span's edge already was.
+
+*The refusals.* In the order they are checked, before anything is numbered:
+1. `EmptySpan`.
+2. `SpansOverlap`.
+3. `Quiesced`.
+4. `OutsideSpan` for a source table with its first or last key outside every span; the
+   refusal still carries the source's smallest and largest key, as D-054's does.
+5. The new `RepairOutsideSpan { key }` for a repair write outside every span. The install
+   removes and replaces the spans' keys alone, so such a write would be one the log never
+   numbered, over a key the install was not asked to touch.
+6. `InProgress`.
+
+Right after the numbering, `RepairNotNext` when the repair's number is not the install's plus
+one, which the one hold of the lock rules out (above). The install is not yet marked in
+progress, and both records hold no write. Later, a source key between two spans, inside a
+table whose ends lie in both, refuses the install as `OutsideSpan` key by key, as D-054's
+second check does. The tables written so far are then orphans, and the two records hold no
+write.
+
+*What a snapshot sees.* As D-054, over every span. On a runtime with more than one thread a
+snapshot can be taken with its version at `S`, between the applies of `S` and `R`. Once the
+switch is made, such a snapshot reads the installed spans without the repair. Stage B holds
+no snapshot across an install of the range it reads (D-054), so the node never meets it. In
+the simulator the two records are synced in one group and no task runs between their applies.
+
+*The trace.* `TraceEvent::SpanInstalled` carries `spans`, the sorted list, in place of
+`start` and `end`. It also carries `repair`: the repair's number, its table's number and its
+first and last key, or nothing. The moirae line `ananke.engine.span-installed` carries them as
+`spans` (objects of `start` and `end`) and `repair` (an object, or null). No other event
+changed, and no scenario other than the engine's emits this one.
+
+*The variants.* Each differs from the correct engine only in the property it breaks, and each
+is caught by its primitive's crash test, the live install's (below).
+- `Variant::InstallSwitchPerSpan` installs the spans one at a time, in order. Each is the
+  install of that span alone at `S`, with the source's keys and the repair's writes in it at
+  their numbers, taken out and put in against the tables the previous span's switch left,
+  and traced and switched before the next span is begun. A crash between two switches leaves
+  the earlier spans installed and the later as they were.
+- `Variant::RepairAfterSwitch` makes the install's switch without the repair's table and
+  lists that table with a second switch after it. A crash between the two leaves the
+  installed tables without their repair. The brief described the repair as written "in a
+  batch after" the switch; the variant writes it with a switch of its own, not through the
+  log. A log record written after the switch would take a number that neither the caller nor
+  the sweep's model was told of when the install was asked for, one past whatever the writers
+  had taken meanwhile. The model numbers every record as it is appended, so every write after
+  it would be off by one. The sweep would then catch the variant on every install by the
+  miscount, before any crash, which says nothing about the window. As a second switch, every
+  number is where the correct engine puts it, and the only difference is the window.
+- `Variant::RepairBeforeSwitch`, added by the review (below), is that pair the other way
+  round: a switch of its own lists the repair's table first, and the install's switch takes
+  the spans' keys out and puts the installed tables in after it. A crash between the two
+  leaves the repair without its tables: the receiver's writes over the spans as they were.
+  The replacement is traced once the repair's manifest is written and before `CURRENT` names
+  it, and names the install's own manifest, the next one; the turnstile holds every other
+  manifest off until then. Traced before the repair's manifest is written, it would name a
+  manifest above one written after it, which the sweep's mirror takes for a lineage a
+  fallback abandoned.
+- `Variant::CheckpointVersionPerSpan` reads the version again before each span's copy and
+  names the last. A write applied between two spans' copies is then in the later span's copy
+  and not in the earlier's.
+
+*The crash test.* `sim/engine.rs`'s installer task now draws two spans, or three one time in
+three, and every install and range delete covers them all. The key space is cut into as many
+equal slices, with a span of one to eight keys in each. Half the sources are
+`checkpoint_spans` over the set, and half a store further along holding most of the spans'
+keys, as before. Every install carries a repair of one to four writes to keys of the spans,
+one in three a delete. This applies to `Schedule::install()`, `Schedule::range_delete()` and
+the default schedule, whose installer is the same task; `phase_1()` and `seek()` run none of
+it. The model folds the repair at `R` over the installed spans when the install is made. The
+mirror gives the repair's table its writes at `R`, and compaction's rule reads a repair's
+deletes from the repair rather than from the model's ops, where `R` holds none. On top of
+every check the oracle had, each recovery now judges, per install:
+- *The spans agree*, two ways. By the trace: a span is in force when a replacement in force
+  switched it, and one in force beside one not is a mixture. By what the tables in service
+  and the log's replay hold: a write the install put in one span at `S` beside a write older
+  than the install in another is a mixture too. A repair write at `R` does not count as
+  installed there, so a repair without its tables is named by the repair's own check below,
+  not as a mixture (the review, below). The second does not rest on how many replacements
+  the engine traced.
+- *The repair is present exactly when the installed tables are.* With the install in force,
+  every repair write must be in a table in service or lost to what a fault or a compaction
+  explains. Without it, no table in service may hold one.
+- *The repair's table carries `R`* and no other number, from the recovered manifest's record
+  of it, beside D-054's check that the installed tables carry `S`.
+
+These are judged before the per-write account, so a mixture is named as one. What the oracle
+checked before stays: keys outside every span as they were, bar what a fault explains; a
+write after the install read over the installed version; the installed numbers above the
+live engine's. The crash windows the live install's and the range delete's tests assert stay
+as they were. Three counters are added and asserted above zero:
+- installs over several spans judged after a crash, counted when two of the spans or more held
+  a write to judge by, the source's at `S` or one older than the install;
+- installs in force after a crash whose repair was found;
+- installs left out by a crash between their replacement and their switch, the window in which
+  a repair could stand without its tables, whose repair was found absent.
+
+Each test now prints, beside every window's count of events, the number of seeds that saw one,
+which is what D-061's rule reads.
+
+**Measured before the assertions were written.** In release on the eight-core laptop,
+`ANANKE_SEEDS` at each tier, the engine binary run whole. Every
+correct test of the binary passes every seed at 20, 100 and 1 000. The four variants on the
+live install's schedule, `RepairBeforeSwitch` the review's, each rate over the seeds its test
+sees. All four run on the high-rate share, so the gate and CI see twenty seeds of each, the
+premerge a hundred and the nightly a thousand; the columns are the variant on 20, 100 and
+1 000 seeds. P(none) is D-061's, (1 − p)^20 with p the thousand's rate, since the gate's share
+is twenty:
+
+| Variant | Seeds it runs | 20 | 100 | 1 000 | Caught by its own check | Tier asserted | P(none) at the gate |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `InstallSwitchPerSpan` | the share: 20, 20, 100, 1 000 | 18 | 90 | 922 | every catch, the spans' agreement | every | ~0 |
+| `RepairAfterSwitch` | the share | 16 | 61 | 616 | every catch, the repair's check | every | 4.9 × 10^-9 |
+| `RepairBeforeSwitch` | the share | 14 | 52 | 529 | every catch, the repair's check | every | 2.9 × 10^-7 |
+| `CheckpointVersionPerSpan` | the share | 9 | 47 | 468 | 4, 25 and 324, the span checkpoint's check | every | 3.3 × 10^-6; 4.0 × 10^-4 by its check |
+
+Every rate is well above 5 %, so each catch, and each catch by the variant's own check, is
+asserted from the gate's twenty (D-061, and its rule for new variants). All four run on
+`high_rate_share()`: `InstallSwitchPerSpan`, caught on more than four seeds in five, by D-055's
+rule for its high-rate variants; the other three, below four in five, by a choice this entry
+puts to the owner (*For the owner*, below). Each test asserts that some catch is its variant's
+own check, by its words, so the property is what catches it and not merely a key that reads
+wrong afterwards:
+- `InstallSwitchPerSpan`'s first catch, at seed 0: *the install at record 114 over k13..k20,
+  k43..k46 is in force for k13..k20 and not for k43..k46 (manifest 12): a mixture across its
+  spans*.
+- `RepairAfterSwitch`'s, at seed 1: *the install at record 204 is in force (manifest 17) but
+  its repair's write of k26 at record 205 is in no table in service and no fault explains it:
+  the installed tables without their repair*.
+- `RepairBeforeSwitch`'s, at seed 1: *the install at record 204 is not in force (manifest 17)
+  but a table in service holds its repair's write of k26 at record 205: a repair without its
+  tables*.
+- `CheckpointVersionPerSpan`'s, at seed 2: *checkpoint /stage/0001 at version 260: key k02
+  holds Some(…) but the model has None*. Its other catches are installs from such a
+  checkpoint, whose installed values no one version held. Of the first hundred seeds' 47,
+  8 are an installed write the model expects and no table holds, and 14 are a key or a scan
+  read wrong, live or after the crash; a probe printed them and was deleted.
+
+`InstallSwitchPerSpan` traces a replacement per span, so the agreement by the trace could be
+thought to rest on the variant saying what it did. It does not: a probe copy of the tree with
+that half of the check taken out still caught the variant on 89 of the first hundred seeds,
+76 of them by the agreement by what the tables hold. The first such catch, at seed 0: *left
+k13..k20 as installed (its write of k13 at record 114) and k43..k46 as it was (the write of
+k43 at record 79)*. The probe was deleted and never committed. Run again once the review had
+stopped the agreement by the tables counting a repair write as installed, in a throwaway copy,
+the same probe still catches 89 of the hundred, 70 of them by the tables. In the other six the
+only write that read as installed was a repair's at `R`, which is now the repair's check's to
+judge.
+
+The correct engine's crash windows, each as events and, in brackets, the seeds that saw one
+(the rate D-061's rule reads):
+
+| Test | Tier | Aimed | Between replacement and switch | After the switch | Keys written after | Several spans judged | Repair found | Repair found absent |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| live install | 20 | 141 (20) | 15 (11) | 16 (10) | 4 736 (20) | 123 (20) | 154 (20) | 15 (11) |
+| live install | 100 | 724 (100) | 59 (47) | 55 (41) | 24 379 (100) | 639 (100) | 796 (100) | 59 (47) |
+| live install | 1 000 | 7 177 (1 000) | 604 (459) | 477 (392) | 229 108 (984) | 6 202 (983) | 7 806 (984) | 604 (459) |
+| range delete | 20 | 151 (20) | 12 (9) | 12 (10) | 7 839 (20) | 71 (19) | — | — |
+| range delete | 100 | 706 (100) | 55 (44) | 38 (33) | 36 643 (96) | 337 (91) | — | — |
+| range delete | 1 000 | 7 425 (1 000) | 621 (468) | 487 (396) | 388 264 (983) | 3 599 (965) | — | — |
+
+"Several spans judged" and "Repair found absent" are counted as the review made them count
+(*The review*, below). As first built they counted every install over several spans judged,
+245 (20), 1 275 (100) and 12 697 (985), and every install left out by a crash, 91 (19),
+479 (98) and 4 891 (970); and every delete judged, 378 (20), 1 825 (96) and 19 280 (984).
+Every window the two tests assert is seen on a third of the seeds or more at every tier. The
+thinnest is the range delete's crash after its switch, on 10 of 20, 33 of 100 and 396 of
+1 000 seeds. So each assertion, the three new ones included, is made from the gate's twenty.
+
+**What moved, and the re-audit.** Measured on the branch's base, 4690d00, and on this tree,
+the same way: `moirae_trace::trace_hash` of each run's moirae trace as written, header
+included, from a probe test file in `sim/tests` that was deleted and never committed.
+Echo's golden is the trace without its header, as `sim/tests/echo.rs` takes it.
+
+| Run | Base 4690d00 | This tree | |
+| --- | --- | --- | --- |
+| engine, default schedule, seed 42 | `7112afc050205615` | `edb96df998f44632` | moved |
+| engine, `install()`, seed 42 | `e26fae961366b062` | `bef5286e53f6eef8` | moved |
+| engine, `range_delete()`, seed 42 | `338df31d8136bf5e` | `aa28d75149ab3206` | moved |
+| engine, `seek()`, seed 42 | `15d9190a66b34ec4` | `15d9190a66b34ec4` | not moved |
+| engine, `phase_1()`, seed 420 (pinned) | `62953c18b447290a` | `62953c18b447290a` | not moved |
+| engine, seed 44's schedule, fallback allowed (pinned) | `dd5cb91cd46d6cc1` | `dd5cb91cd46d6cc1` | not moved |
+| engine, seed 44's schedule, fallback refused (pinned) | `e47f2a5d152d8a7c` | `e47f2a5d152d8a7c` | not moved |
+| engine, `seek()`, seed 3123 (pinned, D-062) | `8436a85fea896e33` | `8436a85fea896e33` | not moved |
+| engine, `seek()`, seed 3123, `TrustsAStaleSegment` | `19c196ed7efc928f` | `19c196ed7efc928f` | not moved |
+| WAL, seed 42 | `4cd95dedc1202acc` | `4cd95dedc1202acc` | not moved |
+| echo's golden, seed 42 | `fcbe82ee7a0ba672` | `fcbe82ee7a0ba672` | not moved |
+| raft, seed 42 | `ab289ace35a8415f` | `ab289ace35a8415f` | not moved |
+| membership, seed 42 | `9c88d575d39acd76` | `9c88d575d39acd76` | not moved |
+| quorum, seed 42, stream blocked / open | `0d9167f75474e730` / `d8d63ed0109360ec` | the same | not moved |
+
+What moved is exactly what runs the installer task: the default, install and range-delete
+schedules of `sim/engine.rs`. Their spans, repairs and extra log record move every draw
+after the first install. The raft, membership and quorum sweeps call none of these
+primitives, and their seed-42 hashes are the ones D-060 recorded. `ananke-env`'s change is
+confined to the `SpanInstalled` event and its export, which only the engine emits.
+
+The re-audit, seed by seed (CLAUDE.md's pinned-seed rule):
+- *Seed 420* runs `phase_1()`, which runs no install. Its trace hashes as on the base, so its
+  schedule did not move, and its pin is as D-055 left it.
+- *Seed 44*, in both its modes, runs `phase_1()` with a larger level 1. Both traces hash as
+  on the base; its assertions of every fallback's manifest and of the refusal still bite on
+  the run they were written for.
+- *Seed 3123* runs `seek()`, which runs no install. Its trace and its `TrustsAStaleSegment`
+  run hash as on the base, so D-062's supersede `(15, 173, 165, 7)` and the violation *record
+  166 came back changed* are asserted on the same run as before.
+- *Seed 42 of the default schedule* is the studio trace, not a pin for a mechanism; its test
+  asserted only green. Its schedule moved. It now also asserts that the trace shows an
+  install over two spans or more, carrying a repair, switched to the manifest it names, so
+  the day the schedule stops reaching one the test says so. The hashes of seed 42 in
+  `sim/tests/parallel.rs` compare a run with itself, and hold.
+- No test pins a seed of the install or range-delete schedules, so nothing else moved.
+
+The engine sweep's other rates, before this entry (the base) and after, at 20, 100 and 1 000:
+
+| Test | Base | This tree |
+| --- | --- | --- |
+| `NoWalBeforeMemtable`, default schedule | 20, 99, 985 | 20, 98, 977 |
+| `ReleaseBeforeManifest`, default | 10, 51, 602 | 8, 58, 599 |
+| `DeleteBeforeManifest`, default | 12, 67, 647 | 11, 59, 655 |
+| `InstallInTwoSwitches`, install | 13, 54, 559 | 13, 58, 580 |
+| `InstallKeepsSourceNumbers`, install, on the share | 20 of 20, 98 of 100 | 20 of 20, 98 of 100 |
+| `SpanCheckpointUnsynced`, install, on the share | 17 of 20, 81 of 100 | 15 of 20, 77 of 100 |
+| `RangeDeleteSkipsMemtables`, range delete, on the share | 15 of 20, 89 of 100 | 20 of 20, 95 of 100 |
+| `SeekCountsTombstones`, seek, on the share | 20 of 20, 98 of 100 | the same: its schedule did not move |
+
+Every one stays well above 5 % and keeps its tier. One note for the owner:
+`SpanCheckpointUnsynced` is now caught on 77 of the premerge's hundred-seed share. D-055 put
+it on the share as a variant caught on four seeds in five or more, and it is now just below
+that. Its assertion is unaffected, since a share of twenty sees none with probability
+1.7 × 10^-13. Whether it should go back to every seed is the owner's call, and nothing here
+changes it. The seek schedule's live seeks, 196 904 at a thousand seeds, are the base's to
+the seek. Coverage of the default schedule at a thousand seeds: 70 728 tables written
+against 66 992, 14 939 compactions against 14 815, 1 455 crashes inside a compaction against
+1 327, 5 553 installs and 3 876 range deletes against 5 806 and 3 998, and 7 978 span
+checkpoints against 8 130. The installs are fewer and larger: two or three spans of one to
+eight keys, against one span of one to twelve.
+
+**PROPOSED, for the owner: three of the variants on every seed, or on the high-rate share.**
+3e66e86 moved `RepairAfterSwitch` and `CheckpointVersionPerSpan` onto `high_rate_share()`, and
+the review built `RepairBeforeSwitch` there beside them. That step was not this entry's to take.
+D-055 put on the share only the variants caught on four seeds in five or more, and none of the
+three reaches that: 616, 529 and 468 of 1 000. D-061 sets the tier an assertion is made at, not
+which variants run a share. 9478da3 had left the step to the owner; 3e66e86 took it as though
+D-061 settled it. It is set out here as a choice. The code stays as built, on the share, until
+the owner chooses.
+
+Either way each catch, and each catch by the variant's own check, is asserted from the gate's
+twenty, since every rate is far above D-061's 5 %, and the gate runs twenty seeds of each under
+both. What differs is how many seeds CI, the premerge and the nightly give these three tests,
+and what the premerge costs. SHARD.md §12 asks a stage to size its new tests' seed shares so the
+premerge stays near the quarter of an hour D-040 set.
+
+- *Every seed*, as D-055's rule reads. CI sees 100 seeds of each, the premerge 1 000 and the
+  nightly 10 000. The premerge exceeds the quarter of an hour: with `RepairAfterSwitch` and
+  `CheckpointVersionPerSpan` on every seed, the engine binary alone weighed 2 747 CPU seconds
+  at a thousand seeds, against the base's 1 574 (f2c6581 and 4690d00, 9478da3). On every seed
+  `RepairBeforeSwitch` weighs about 370 CPU seconds more at a thousand, against 37 on its share
+  (weighed alone on this tree, idle).
+- *The share, as built.* Twenty seeds at the gate and in CI, a hundred at the premerge, a
+  thousand at the nightly. The engine binary's tests weighed 1 824 CPU seconds at a thousand
+  seeds on 3e66e86, idle, and the premerge ran in 622 s there and in 613 s on the review's
+  tree, ea44e38 (below). The cost is coverage.
+  CI's hundred now runs the same twenty seeds as the gate for these three tests, so CI adds
+  nothing to them that the gate did not see, and the premerge sees a hundred seeds of each
+  rather than a thousand. The thinnest check is the checkpoint's own: its catches at CI fall
+  from 25 to 4, and at the premerge from 324 to 25. `RepairAfterSwitch`'s fall from 61 to 16 at
+  CI and from 616 to 61 at the premerge; `RepairBeforeSwitch`'s from 52 to 14, and from 529 to
+  52.
+
+At the gate, under either option, P(none) is by D-061's method, (1 − p)^20 with p the
+thousand-seed rate: 4.9 × 10^-9 for `RepairAfterSwitch`, 2.9 × 10^-7 for `RepairBeforeSwitch`,
+and for `CheckpointVersionPerSpan`'s own check (1 − 0.324)^20 ≈ 4.0 × 10^-4 (3.97 × 10^-4). The
+gate's own 4 of 20 gives a more pessimistic reading, 0.8^20 ≈ 1.2 × 10^-2. A schedule move that
+takes that check to none at the gate is a move of the kind D-061 describes, measured and moved
+by its rule, never loosened in place.
+
+`InstallSwitchPerSpan`, at 922 of 1 000, is on the share by D-055's own rule and is not part of
+the choice.
+
+**The premerge, on an otherwise idle machine.** Measured on the tree with the share, after a
+warm release build, with the one-minute load sampled every ten seconds: `scripts/premerge.sh`
+green at a thousand seeds in **622 s**, at a mean one-minute load of **11.72** over 62 samples.
+Beside it: D-060's 593.87 s at load 20.87 (`ae54a20`) and D-063's 822.64 s at load 60.94
+(`46e95c0`). The engine binary's tests, each run alone at a thousand seeds on the same tree and
+machine, now total **1 824 CPU seconds** against the base's 1 574, the added 250 being the
+heavier install and range-delete schedules, with two or three spans and a repair each time,
+and the three new tests at 35 to 40 CPU seconds each on their share. The review's
+`RepairBeforeSwitch` adds 37 more on its share.
+
+On the review's tree, ea44e38, measured the same way, started once the one-minute load was
+below 2.5: `scripts/premerge.sh` green at a thousand seeds in **613.38 s**, 327 tests passed
+and none failed, at a mean one-minute load of **28.49** over 62 samples (2.42 to 68.87).
+Nothing else ran on the machine, so that load is the premerge's own. Per binary: raft
+343.93 s, engine 246.94 s, WAL 9.01 s, every other under two and a half seconds.
+
+An earlier figure, 2 122.50 s at a mean load of 58.40, was taken on f2c6581, before the share
+change, while the machine carried its own background work: the raft binary, which runs no code
+this change touches, took 2.1 times its usual time in it. It is withdrawn in favour of the two
+measurements above, which D-052's protocol asks for.
+
+**The nightly's shards.** The four new tests are rows of `scripts/nightly-shards.txt` (D-064),
+each weighed alone in release at `ANANKE_SEEDS=1000` and `ANANKE_DEEP_SEEDS=100` on the idle
+machine, on the tree with the share, and placed in the lightest shard:
+
+| Test | Seeds at a thousand | CPU s | Shard |
+| --- | --- | --- | --- |
+| `an_install_whose_repair_follows_its_switch_is_caught` | 100, its share | 39.8 | 3 |
+| `an_install_that_switches_one_span_at_a_time_is_caught` | 100, its share | 38.6 | 4 |
+| `a_checkpoint_that_copies_each_span_at_its_own_version_is_caught` | 100, its share | 34.6 | 2 |
+| `an_install_whose_repair_precedes_its_switch_is_caught` (the review's) | 100, its share | 36.8 | 1 |
+
+The last is the mean of two runs, 38.0 and 35.5, on the review's tree; shard 1 and shard 6 were
+the lightest, level at 1 241.7, and it went to the first. The shards now weigh 1 241.7 to
+1 281.3 CPU seconds, within 3 % of one another. The older rows keep D-064's weights, though
+this change makes the install and range-delete crash tests heavier (their idle weights on this
+tree, 346.8 and 223.7 CPU seconds, are measured in a different condition from D-064's and are
+not mixed into the table). The next nightly measures what that
+adds; if a shard passes an hour, D-064's procedure re-balances the table in a change of its own.
+
+**The review.** One adversarial review of this PR found no engine bug. It found gaps in the
+PR's own tests and record, each fixed in the PR:
+
+- *The repair's check was shadowed.* The agreement by what the tables hold counted a repair
+  write at `R` as installed. A span holding only a repair write, beside a span holding its own
+  old writes, then read as "left … as installed", and the agreement named the catch first. So
+  the check that names a repair without its tables caught almost nothing, and the review's
+  mutation O3, which makes that check accept one, passed every test at 20 and 100 seeds. The
+  agreement now counts only the source's writes at `S`. The pair rule for that direction had
+  no variant; it has `RepairBeforeSwitch` now, measured at 20, 100 and 1 000 seeds before its
+  assertion was written, every catch by the repair's check in its words (the tables above).
+- *Nothing else moved with the fix.* Every other install-schedule variant ran on the same
+  thousand seeds before and after it, and every seed's verdict, down to the words of its
+  violation, is the same. On 20, 100 and 1 000 seeds of each: `InstallInTwoSwitches`, every
+  seed, 13, 58 and 580; on the share, `SpanCheckpointUnsynced` 15, 77 and 812,
+  `InstallKeepsSourceNumbers` 20, 98 and 967 (2 of them by the table writer's order
+  assertion), `InstallSwitchPerSpan` 18, 90 and 922, `RepairAfterSwitch` 16, 61 and 616, and
+  `CheckpointVersionPerSpan` 9, 47 and 468. `InstallSwitchPerSpan`'s test asks for a catch
+  named "a mixture across its spans". Every one of its catches is still the agreement by the
+  trace, which the fix does not touch, and the agreement by the tables alone still finds 70 of
+  the hundred's 89 (above).
+- *Two counters asserted above zero were close to vacuous.* "Several spans judged" counted
+  every install over several spans after a crash, though the agreement by the tables has
+  nothing to judge where fewer than two spans hold a write. "Repair found absent" counted
+  every install a crash left out, wherever the crash fell, though only a crash between the
+  replacement and the switch can leave the repair's table written and not yet listed. The
+  first now counts an install only when two spans or more held a write, installed or older;
+  the second only such a crash. Measured before their assertions were kept: installs judged
+  on 20 of 20, 100 of 100 and 983 of 1 000 seeds, deletes judged on 19 of 20, 91 of 100 and
+  965 of 1 000, repairs found absent on 11 of 20, 47 of 100 and 459 of 1 000. Every rate is
+  far above 5 %, so each stays asserted from the gate's twenty; the thinnest, the repair found
+  absent, at P(none) = 0.541^20 ≈ 4.6 × 10^-6.
+- *The repair's number was argued, not tested.* It still is, and now says so, with a check
+  that refuses the install if the argument ever fails (*The repair's number*, above).
+- *The repair's boundary and adjacent spans had no directed test.* The refusal test now puts a
+  repair write exactly at each span's end, which is outside it, and expects
+  `RepairOutsideSpan` naming that key. A new crate test installs over two adjacent spans with a
+  repair that deletes the first span's first key, puts at the shared boundary and at each
+  span's last key, and puts then deletes one key. Every key and a scan are read right after
+  the install, after a compaction takes the repair's table into level 1, and after a reopen.
+- *The record contradicted itself after 3e66e86.* Two variants were said to run every seed, the
+  binary to cost three quarters more CPU, the checkpoint check's P(none) was not by D-061's
+  method, and the share was presented as decided. Each is corrected above.
+
+The review's mutations, re-run in a throwaway copy of the fixed tree with its own target
+directory, the storage crate's tests in debug and the engine binary in release:
+- O3, the repair's check accepting a repair without its tables:
+  `an_install_whose_repair_precedes_its_switch_is_caught` fails at 20 and at 100 seeds. The
+  variant is still caught on 8 of 20 by a key read wrong, and on none by the repair's check.
+- E10, a repair write at a span's end accepted: `an_install_of_several_spans_is_refused_when_it_cannot_be_made`
+  fails, the install with a write at the end numbered rather than refused.
+- E11, adjacent spans refused: `an_install_of_two_adjacent_spans_reads_right_at_their_boundary`
+  fails, its checkpoint of the two refused as `SpansOverlap { end: k008, start: k008 }`.
+- E8, the two numbers taken under two holds of the lock: every test passes, as it must, since
+  nothing runs between the holds in the simulator. With a write let in between them, as
+  another thread could, the crate's installs with a repair are refused as
+  `RepairNotNext { seq: 151, repair_seq: 153 }`, and two crate tests fail on it. The sweep
+  fails too, but on its model's own count, since it never asked for the write let in.
+
+No trace hash moved. The fixes change what the oracle checks, add a refusal the simulator never
+reaches, and add a variant that runs only in its own test. Each run in *What moved* above
+hashes, on the fixed tree, to exactly its "This tree" column, by a probe built on 3e66e86 and on
+the fixed tree, deleted and never committed.
+
+**Alternatives.**
+- *Option (b) of D-066, two single-span steps bracketed by a durable marker.* The owner
+  decided against it (D-066).
+- *One number for the source and the repair, the source's writes of the repair's keys
+  dropped as the installed tables are written.* One fewer log record, but the repair would
+  no longer be a table of its own, as the brief asks. It would also be spliced into the
+  source's tables, so neither the trace nor the oracle could tell a repair write from an
+  installed one.
+- *The repair through the log, as a batch after the switch.* That is the crash window
+  `RepairAfterSwitch` models: installed tables without their repair.
+- *The repair as the install's own log record, holding its writes.* A crash before the
+  switch would replay the repair over the spans as they were: a repair without its tables,
+  the window `RepairBeforeSwitch` models.
+- *One-element sets at every call site, with no wrappers.* The same behaviour, with a larger
+  diff that shows no caller's meaning moving.
+- *Refusing an empty span in a checkpoint too.* An empty span has always given an empty
+  checkpoint, and dropping it keeps that. An install refuses one, as it always has.
+- *Sealing the repair near `sst_bytes`.* Several tables would be needed only when a kept log
+  tail is large. The trace would then carry a list, and the oracle would judge every table in
+  it; that is left until a measured repair needs it.
+
+**Consequences.**
+- Every one-span caller is unchanged, and a one-span install without a repair writes and
+  traces what it did before, bar the event's `spans` field in place of `start` and `end`.
+- An install with a repair takes two log records, so a caller counting records sees one more.
+  The repair's table is one more level-0 table per install, which compaction folds in like
+  any other.
+- The node (Stage B's next PR) calls `checkpoint_spans` for a range's take and
+  `install_spans` for its install, over the range's two spans, with the repair D-066 lists.
+- The engine sweep's default, install and range-delete schedules moved for every seed. The
+  studio trace of seed 42 moved with them and now asserts the shape it shows. No pinned seed
+  moved.
+- The engine binary costs about a sixth more CPU at a thousand seeds with the variants on the
+  share, 1 824 CPU seconds against the base's 1 574 (+16 %), measured on 3e66e86, and about
+  half as much again at the gate's twenty, 64.07 s against 40.96 s in debug (+56 %), where
+  the share is every seed. Most of the first is the heavier install and range-delete
+  schedules. The review's `RepairBeforeSwitch` adds 37 CPU seconds at a thousand on its
+  share, and at the gate's twenty in debug 45 CPU seconds, 8.6 s run alone. Under the owner's
+  other option, every seed, the binary weighed 2 747 CPU seconds at a thousand with
+  `RepairAfterSwitch` and `CheckpointVersionPerSpan` there, and `RepairBeforeSwitch` would add
+  about 370 more (above).
+
+---
+
+_Next entry: D-069. Add one before implementing anything not covered above._

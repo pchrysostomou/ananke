@@ -604,20 +604,33 @@ fn convert(
             ])),
         ),
         // PROPOSED(D-054): the live install of a span, in one manifest switch.
+        // PROPOSED(D-068): several spans and the receiver's repair, in that one switch.
         TraceEvent::SpanInstalled {
             manifest,
-            start,
-            end,
+            spans,
             seq,
             removed,
             rewritten,
             added,
+            repair,
         } => log(
             "ananke.engine.span-installed",
             Some(Json::obj(vec![
                 ("manifest", int(*manifest)),
-                ("start", Json::str(&hex(start))),
-                ("end", Json::str(&hex(end))),
+                (
+                    "spans",
+                    Json::Array(
+                        spans
+                            .iter()
+                            .map(|(start, end)| {
+                                Json::obj(vec![
+                                    ("start", Json::str(&hex(start))),
+                                    ("end", Json::str(&hex(end))),
+                                ])
+                            })
+                            .collect(),
+                    ),
+                ),
                 ("seq", int(*seq)),
                 (
                     "removed",
@@ -653,6 +666,19 @@ fn convert(
                             })
                             .collect(),
                     ),
+                ),
+                (
+                    "repair",
+                    repair
+                        .as_ref()
+                        .map_or(Json::Null, |(seq, number, first, last)| {
+                            Json::obj(vec![
+                                ("seq", int(*seq)),
+                                ("number", int(*number)),
+                                ("firstKey", Json::str(&hex(first))),
+                                ("lastKey", Json::str(&hex(last))),
+                            ])
+                        }),
                 ),
             ])),
         ),

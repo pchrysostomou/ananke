@@ -6,10 +6,14 @@
 # scripts/check-nightly-shards.sh, part of the gate, fails when a test here does not exist, is
 # listed twice, or when a test of these binaries is in no shard: a new sweep names its shard here
 # in the commit that adds it.
+# Rows added since fc75f68 are weighed the same way on the tree that adds them and placed
+# longest-first into the lightest shard; the rows before them keep fc75f68's weights. D-068's
+# four were weighed on its tree, on an idle machine, on their high-rate share.
 #
 # shard	binary	cpu_s	test
-# shard 1: 1241.6 cpu s
+# shard 1: 1278.5 cpu s
 1	engine	625.1	an_install_in_two_switches_is_caught
+1	engine	36.8	an_install_whose_repair_precedes_its_switch_is_caught
 1	engine	0.6	seed_44_never_opens_empty_in_either_mode
 1	engine	0.4	same_seed_gives_byte_identical_trace
 1	engine	0.3	seed_420_which_the_first_nightly_found_stays_green
@@ -22,16 +26,18 @@
 1	raft	0.2	seed_5909_which_the_nightly_found_stays_green
 1	raft	0.2	seed_164_which_a_local_ten_thousand_seed_run_found_stays_green
 1	wal	29.3	a_log_that_skips_the_checksum_is_caught
-# shard 2: 1241.6 cpu s
+# shard 2: 1276.2 cpu s
 2	echo	0.2	different_seeds_give_different_traces
+2	engine	34.6	a_checkpoint_that_copies_each_span_at_its_own_version_is_caught
 2	engine	581.7	the_live_install_crash_test_passes_every_seed
 2	engine	211.2	a_compaction_that_deletes_its_inputs_before_the_manifest_is_caught
 2	engine	16.6	the_correct_engine_passes_every_seed_with_deep_levels
 2	raft	276.0	a_leader_that_shares_one_snapshot_directory_and_streams_one_follower_at_a_time_is_caught
 2	raft	151.5	a_leader_that_counts_nothing_from_a_refused_follower_is_caught
 2	raft	4.4	a_server_that_sends_before_it_persists_is_caught
-# shard 3: 1241.6 cpu s
+# shard 3: 1281.3 cpu s
 3	echo	0.2	trace_hash_matches_the_pinned_golden
+3	engine	39.8	an_install_whose_repair_follows_its_switch_is_caught
 3	engine	417.5	the_range_delete_crash_test_passes_every_seed
 3	engine	235.9	the_seek_crash_test_passes_every_seed
 3	engine	58.7	an_install_that_keeps_its_sources_numbers_is_caught
@@ -47,9 +53,10 @@
 3	raft	0.2	seed_385_which_a_local_ten_thousand_seed_run_found_stays_green
 3	raft	0.2	the_membership_scenario_has_byte_identical_traces_for_one_seed
 3	wal	21.2	a_log_that_acknowledges_before_syncing_is_caught
-# shard 4: 1241.7 cpu s
+# shard 4: 1280.2 cpu s
 4	echo	0.1	same_seed_gives_byte_identical_trace
 4	engine	210.8	the_correct_engine_passes_every_seed
+4	engine	38.6	an_install_that_switches_one_span_at_a_time_is_caught
 4	parallel	6.4	a_seed_inside_the_driver_gives_the_sequential_trace
 4	raft	355.6	a_leader_that_trusts_the_clock_is_caught_and_the_guard_revokes
 4	raft	282.6	a_server_without_pre_vote_is_caught_on_the_term_raise_schedule

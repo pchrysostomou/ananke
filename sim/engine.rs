@@ -24,6 +24,12 @@
 //! seeking and every recovery walked by seeks (D-055). The default schedule runs all
 //! four primitives beside the Phase 1 workload; [`Schedule::phase_1`] runs none, as
 //! the sweep did before them.
+//!
+//! Every install and range delete covers two or three disjoint spans at once, as a
+//! range's Raft state and its user keys will be, and every install carries a repair,
+//! a batch of the receiver's own writes over the spans (D-066, D-068). Each recovery
+//! must then find every span as it was or every span as installed, the spans agreeing
+//! with each other, and the repair present exactly when the installed tables are.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -240,29 +246,65 @@ pub struct Checkpoint {
     pub span: bool,
 }
 
-/// An install the run asked for (D-054): the span, the state of the span it
-/// installs, and whether it is taken to be the state.
+/// An install the run asked for (D-054): the spans, the state of the spans it
+/// installs, the repair it carries, and whether it is taken to be the state.
 // PROPOSED(D-054): the live install's crash test.
+// PROPOSED(D-068): several spans and a repair.
 #[derive(Clone, Debug)]
 pub struct InstallRecord {
-    /// The span's first key.
-    pub start: Bytes,
-    /// The key past its last.
-    pub end: Bytes,
-    /// The live keys the installed source holds, with their values: the span's
+    /// The spans, sorted and disjoint: each one's first key and the key past its
+    /// last.
+    pub spans: Vec<(Bytes, Bytes)>,
+    /// The live keys the installed source holds, with their values: the spans'
     /// state at the checkpoint the install was taken from.
     pub entries: BTreeMap<Bytes, Bytes>,
+    /// The repair's record, the one after the install's, which holds no write;
+    /// `None` for a range delete, which carries none.
+    pub repair_seq: Option<u64>,
+    /// The repair's writes, the last per key: what the receiver writes over the
+    /// installed spans in the install's own switch.
+    pub repair: BTreeMap<Bytes, Value>,
     /// Whether the fold takes the install as made: during the run once it resolved,
     /// and after a recovery when the manifest in force is in its lineage.
     pub applied: bool,
 }
 
 impl InstallRecord {
-    /// Whether `key` is in the span.
+    /// Whether `key` is in one of the spans.
     #[must_use]
     pub fn covers(&self, key: &[u8]) -> bool {
-        self.start[..] <= *key && *key < self.end[..]
+        self.span_of(key).is_some()
     }
+
+    /// Which span holds `key`, if one does.
+    #[must_use]
+    pub fn span_of(&self, key: &[u8]) -> Option<usize> {
+        self.spans
+            .iter()
+            .position(|(start, end)| start[..] <= *key && *key < end[..])
+    }
+
+    /// The spans as `k00..k04, k30..k33`, for a message.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        describe_spans(&self.spans)
+    }
+}
+
+/// Spans as `k00..k04, k30..k33`, for a message.
+#[must_use]
+pub fn describe_spans(spans: &[(Bytes, Bytes)]) -> String {
+    spans
+        .iter()
+        .map(|(start, end)| {
+            format!(
+                "{}..{}",
+                String::from_utf8_lossy(start),
+                String::from_utf8_lossy(end)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// What the writers know, on top of the log model: the ops in log order, which keys
@@ -301,9 +343,12 @@ pub struct Model {
     /// Installs by the sequence number of their log record, which holds no write
     /// (D-054).
     pub installs: BTreeMap<u64, InstallRecord>,
-    /// The span of the install asked for and not yet resolved: reads of its keys
-    /// are not judged meanwhile.
-    pub installing: Option<(Bytes, Bytes)>,
+    /// Installs by the sequence number of their repair's log record, which holds
+    /// no write either (D-068).
+    pub repairs: BTreeMap<u64, u64>,
+    /// The spans of the install asked for and not yet resolved: reads of their
+    /// keys are not judged meanwhile.
+    pub installing: Option<Vec<(Bytes, Bytes)>>,
     /// Installs asked for over the run.
     pub installs_started: u64,
     /// Installs that resolved over the run.
@@ -341,6 +386,21 @@ impl Model {
                 for (key, value) in &install.entries {
                     if !self.lost_writes.contains(&(key.clone(), seq)) {
                         state.insert(key.clone(), Value::Live(value.clone()));
+                    }
+                }
+                continue;
+            }
+            // PROPOSED(D-068): and its repair is written over the installed spans, at
+            // the record after the install's, when the install is made.
+            if let Some(install) = self
+                .repairs
+                .get(&seq)
+                .and_then(|s| self.installs.get(s))
+                .filter(|i| i.applied)
+            {
+                for (key, value) in &install.repair {
+                    if !self.lost_writes.contains(&(key.clone(), seq)) {
+                        state.insert(key.clone(), value.clone());
                     }
                 }
                 continue;
@@ -414,15 +474,17 @@ pub struct InstallMirror {
     pub manifest: u64,
     /// Its sequence number.
     pub seq: u64,
-    /// The span's first key.
-    pub start: Bytes,
-    /// The key past its last.
-    pub end: Bytes,
-    /// The writes of the span below `seq` that the tables it took out held: gone
+    /// The spans, each one's first key and the key past its last.
+    // PROPOSED(D-068): several spans in one switch.
+    pub spans: Vec<(Bytes, Bytes)>,
+    /// The writes of the spans below `seq` that the tables it took out held: gone
     /// once its manifest is in force.
     pub dropped: BTreeSet<(Bytes, u64)>,
     /// The installed tables, by number.
     pub added: Vec<u64>,
+    /// The repair's number and its table's, if the install carried a repair.
+    // PROPOSED(D-068): the repair, a table of its own in the install's switch.
+    pub repair: Option<(u64, u64)>,
     /// The start of the node it was written in.
     start_of_node: u64,
 }
@@ -436,6 +498,17 @@ impl Mirror {
         installs: &BTreeMap<u64, InstallRecord>,
     ) -> Self {
         let mut mirror = Self::default();
+        // PROPOSED(D-068): a repair's writes, by (key, the repair's number): its
+        // record holds none, so the model's ops cannot say which is a delete.
+        let repairs: BTreeMap<(Bytes, u64), bool> = installs
+            .values()
+            .filter_map(|i| i.repair_seq.map(|r| (i, r)))
+            .flat_map(|(i, r)| {
+                i.repair
+                    .iter()
+                    .map(move |(key, value)| ((key.clone(), r), *value == Value::Tombstone))
+            })
+            .collect();
         for event in events {
             match event {
                 TraceEvent::NodeRestarted { .. } => {
@@ -520,17 +593,26 @@ impl Mirror {
                     outputs,
                     snapshot,
                     ..
-                } => mirror.compaction(ops, *level, *manifest, inputs, outputs, *snapshot),
+                } => {
+                    mirror.compaction(ops, &repairs, *level, *manifest, inputs, outputs, *snapshot)
+                }
                 TraceEvent::SpanInstalled {
                     manifest,
-                    start,
-                    end,
+                    spans,
                     seq,
                     removed,
                     rewritten,
                     added,
+                    repair,
                 } => mirror.install(
-                    installs, *manifest, start, end, *seq, removed, rewritten, added,
+                    installs,
+                    *manifest,
+                    spans,
+                    *seq,
+                    removed,
+                    rewritten,
+                    added,
+                    repair.as_ref(),
                 ),
                 TraceEvent::SstDeleted { number } => {
                     if mirror.finished_inputs.contains(number) {
@@ -549,23 +631,24 @@ impl Mirror {
     }
 
     /// An install's replacement: the rewritten tables hold their originals' writes
-    /// less the span's below the install, the installed tables hold the source's
+    /// less the spans' below the install, the installed tables hold the source's
     /// live keys at the install's number, split by the key ranges the trace gives,
-    /// and every write of the span below it that a table taken out held is dropped.
+    /// the repair's table holds the repair's writes at its own number, and every
+    /// write of the spans below the install that a table taken out held is dropped.
     // PROPOSED(D-054): the live install's crash test.
     #[allow(clippy::too_many_arguments)]
     fn install(
         &mut self,
         installs: &BTreeMap<u64, InstallRecord>,
         manifest: u64,
-        start: &Bytes,
-        end: &Bytes,
+        spans: &[(Bytes, Bytes)],
         seq: u64,
         removed: &[u64],
         rewritten: &[(u64, u64, Bytes, Bytes)],
         added: &[(u64, Bytes, Bytes)],
+        repair: Option<&(u64, u64, Bytes, Bytes)>,
     ) {
-        let in_span = |key: &Bytes| start <= key && key < end;
+        let in_span = |key: &Bytes| spans.iter().any(|(start, end)| start <= key && key < end);
         let dropped: BTreeSet<(Bytes, u64)> = removed
             .iter()
             .filter_map(|t| self.tables.get(t))
@@ -614,22 +697,46 @@ impl Mirror {
                 },
             );
         }
+        // PROPOSED(D-068): the repair's table, at the repair's own number.
+        if let Some((repair_seq, number, first, last)) = repair {
+            let writes = installs
+                .get(&seq)
+                .map(|i| {
+                    i.repair
+                        .keys()
+                        .filter(|key| first <= *key && *key <= last)
+                        .map(|key| (key.clone(), *repair_seq))
+                        .collect()
+                })
+                .unwrap_or_default();
+            self.tables.insert(
+                *number,
+                TableMirror {
+                    level: 0,
+                    first_key: first.clone(),
+                    last_key: last.clone(),
+                    writes,
+                },
+            );
+        }
         self.pending_inputs.insert(manifest, removed.to_vec());
         self.installs.push(InstallMirror {
             manifest,
             seq,
-            start: start.clone(),
-            end: end.clone(),
+            spans: spans.to_vec(),
             dropped,
             added: added.iter().map(|(number, _, _)| *number).collect(),
+            repair: repair.map(|(repair_seq, number, _, _)| (*repair_seq, *number)),
             start_of_node: self.starts,
         });
     }
 
     /// Merges the inputs by the engine's rules and fills in the outputs.
+    #[allow(clippy::too_many_arguments)]
     fn compaction(
         &mut self,
         ops: &[Record],
+        repairs: &BTreeMap<(Bytes, u64), bool>,
         level: u8,
         manifest: u64,
         inputs: &[u64],
@@ -670,11 +777,17 @@ impl Mirror {
                 if *seq as usize > ops.len() {
                     continue;
                 }
-                let tombstone = ops[*seq as usize - 1]
-                    .iter()
-                    .rev()
-                    .find(|(k, _)| k == key)
-                    .is_some_and(|(_, v)| *v == Value::Tombstone);
+                // PROPOSED(D-068): a repair's delete is in no record of the model's.
+                let tombstone = repairs
+                    .get(&(key.clone(), *seq))
+                    .copied()
+                    .unwrap_or_else(|| {
+                        ops[*seq as usize - 1]
+                            .iter()
+                            .rev()
+                            .find(|(k, _)| k == key)
+                            .is_some_and(|(_, v)| *v == Value::Tombstone)
+                    });
                 by_key
                     .entry(key.clone())
                     .or_default()
@@ -793,6 +906,34 @@ pub struct InstallOutcomes {
     /// Keys of a span an install in force covered, written again after the install
     /// and present after the crash, which the state check read over the install.
     pub keys_written_after: u64,
+    /// Installs over two spans or more judged after the crash that followed them,
+    /// every span found as installed or every span as it was, counted when two of
+    /// the spans or more held a write to judge by, the source's at the install's
+    /// number or one older than it.
+    // PROPOSED(D-068): the spans agree with each other.
+    pub spans_judged: u64,
+    /// Installs in force after the crash that followed them whose repair's every
+    /// write was found, or lost to what a fault explains.
+    // PROPOSED(D-068): the repair is present exactly when the installed tables are.
+    pub repairs_present: u64,
+    /// Installs not in force after the crash that followed them whose repair no
+    /// table in service held, counted when the crash came between the install's
+    /// replacement, the repair's table among it, and its switch: the window in
+    /// which a repair could be in service without its tables.
+    pub repairs_absent: u64,
+}
+
+/// Where in an install that had not resolved the crash came, as the trace shows it.
+// PROPOSED(D-054): the live install's crash test.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CrashPoint {
+    /// Before a sync of the install's own record returned.
+    BeforeRecordDurable,
+    /// After its replacement was written and traced, and before `CURRENT` was
+    /// switched to the manifest the replacement names.
+    BetweenReplacementAndSwitch,
+    /// Anywhere else before the switch, or after a switch a fallback abandoned.
+    Otherwise,
 }
 
 /// What one run produced.
@@ -1021,12 +1162,18 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
         // number, held by the tables it added; and the span's writes below it that
         // the tables it took out held are gone, as a compaction's dropped writes are.
         // An install not in force holds no write: its log record holds none.
-        let in_force: BTreeMap<u64, &InstallMirror> = mirror
+        // PROPOSED(D-068): an engine that switches an install in parts traces a
+        // replacement per part, each over the spans it switched: the install is in
+        // force when any part is, and the spans' agreement below says whether every
+        // part is.
+        let mut in_force: BTreeMap<u64, Vec<&InstallMirror>> = BTreeMap::new();
+        for part in mirror
             .installs
             .iter()
             .filter(|i| i.manifest <= recovery.manifest)
-            .map(|i| (i.seq, i))
-            .collect();
+        {
+            in_force.entry(part.seq).or_default().push(part);
+        }
         // A write is present if a table in service holds it or the log replayed its
         // record; a record is present if any of its writes is. An install's writes
         // are never replayed: its record holds none.
@@ -1038,10 +1185,17 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
                     .is_some_and(|t| t.writes.contains(&(key.clone(), seq)))
             })
         };
+        // PROPOSED(D-068): the repairs by their own records' numbers, which hold no
+        // write: a repair's writes are in its table or nowhere.
+        let repair_of: BTreeMap<u64, u64> = installs_now
+            .iter()
+            .filter_map(|(&seq, install)| install.repair_seq.map(|r| (r, seq)))
+            .collect();
         let present_write = |key: &Bytes, seq: u64| {
             (!recovery.wal.records.is_empty()
                 && replayed.contains(&seq)
-                && !installs_now.contains_key(&seq))
+                && !installs_now.contains_key(&seq)
+                && !repair_of.contains_key(&seq))
                 || held_in_service(key, seq)
         };
         let writes_of = |seq: u64| -> Vec<Bytes> {
@@ -1050,6 +1204,15 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
                     install.entries.keys().cloned().collect()
                 } else {
                     Vec::new()
+                };
+            }
+            // PROPOSED(D-068): a repair's writes are the install's when it is in force.
+            if let Some(install_seq) = repair_of.get(&seq) {
+                return match installs_now.get(install_seq) {
+                    Some(install) if in_force.contains_key(install_seq) => {
+                        install.repair.keys().cloned().collect()
+                    }
+                    _ => Vec::new(),
                 };
             }
             ops_now
@@ -1068,7 +1231,12 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
             .iter()
             .filter(|(manifest, _)| *manifest <= recovery.manifest)
             .flat_map(|(_, dropped)| dropped.iter().cloned())
-            .chain(in_force.values().flat_map(|i| i.dropped.iter().cloned()))
+            .chain(
+                in_force
+                    .values()
+                    .flatten()
+                    .flat_map(|i| i.dropped.iter().cloned()),
+            )
             .collect();
         let mut verdict = Ok(());
         let synced = syncs(&events, dir);
@@ -1282,6 +1450,208 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
                 .get(t)
                 .is_some_and(|t| t.writes.contains(&(key.clone(), seq)))
         };
+        // Why a write at or below the manifest's flushed point is not there, if
+        // anything explains it: dropped by a compaction in the manifest's lineage,
+        // in a dropped table, in a table a fallback left behind, or lost before and
+        // not brought back.
+        let why_missing = |key: &Bytes, seq: u64| -> Option<Excuse> {
+            if compacted_writes.contains(&(key.clone(), seq)) {
+                Some(Excuse::Compacted)
+            } else if let Some(why) = table_why
+                .iter()
+                .find(|(t, _)| held_by(t, key, seq))
+                .map(|(_, why)| *why)
+            {
+                Some(why)
+            } else if fallback_why.is_some()
+                && abandoned_tables.iter().any(|t| held_by(t, key, seq))
+            {
+                fallback_why
+            } else if previously_lost_writes.contains(&(key.clone(), seq)) {
+                Some(Excuse::LostFsync)
+            } else {
+                None
+            }
+        };
+        // PROPOSED(D-054): where in an install the crash came, from the trace:
+        // before a sync of its own record returned; after its replacement was
+        // written and traced and before `CURRENT` was switched to the manifest
+        // the replacement names; or anywhere else.
+        let crash_point = |seq: u64| -> CrashPoint {
+            let durable = synced
+                .wal
+                .iter()
+                .any(|&(_, first, up_to, _)| first <= seq && seq <= up_to);
+            let written = events
+                .iter()
+                .position(|e| matches!(e, TraceEvent::SpanInstalled { seq: s, .. } if *s == seq));
+            let switched = written.is_some_and(|at| {
+                let manifest = match events[at] {
+                    TraceEvent::SpanInstalled { manifest, .. } => *manifest,
+                    _ => 0,
+                };
+                events[at..].iter().any(
+                    |e| matches!(e, TraceEvent::CurrentSwitched { manifest: m } if *m == manifest),
+                )
+            });
+            if !durable {
+                CrashPoint::BeforeRecordDurable
+            } else if written.is_some() && !switched {
+                CrashPoint::BetweenReplacementAndSwitch
+            } else {
+                CrashPoint::Otherwise
+            }
+        };
+        // PROPOSED(D-068): the spans of an install agree with each other, and its
+        // repair is there exactly when its installed tables are. Judged from what
+        // the tables in service and the log's replay hold, before the per-write
+        // account below, so a mixture is named as one.
+        for (&seq, install) in &installs_now {
+            let span_holds = |i: usize, key: &Bytes| install.span_of(key) == Some(i);
+            // What of span `i` is as installed: a write the source put there at the
+            // install's number. A repair write at its own number is not counted:
+            // the repair is judged on its own below, so a repair in service
+            // without its tables is named as that, not as a mixture.
+            let installed_in = |i: usize| -> Option<(Bytes, u64)> {
+                in_service.iter().find_map(|t| {
+                    mirror.tables.get(t).and_then(|table| {
+                        table
+                            .writes
+                            .iter()
+                            .find(|(key, s)| span_holds(i, key) && *s == seq)
+                            .cloned()
+                    })
+                })
+            };
+            // What of span `i` is as it was: a write older than the install, in a
+            // table in service or replayed by the log.
+            let old_in = |i: usize| -> Option<(Bytes, u64)> {
+                let held = in_service.iter().find_map(|t| {
+                    mirror.tables.get(t).and_then(|table| {
+                        table
+                            .writes
+                            .iter()
+                            .find(|(key, s)| span_holds(i, key) && *s < seq)
+                            .cloned()
+                    })
+                });
+                held.or_else(|| {
+                    if recovery.wal.records.is_empty() {
+                        return None;
+                    }
+                    replayed.clone().filter(|&s| s < seq).find_map(|s| {
+                        writes_of(s)
+                            .into_iter()
+                            .find(|key| span_holds(i, key))
+                            .map(|key| (key, s))
+                    })
+                })
+            };
+            if install.spans.len() > 1 {
+                // By the trace: a span is in force when a replacement in force
+                // switched it. The correct engine switches every span in one.
+                let switched: Vec<bool> = install
+                    .spans
+                    .iter()
+                    .map(|span| {
+                        in_force
+                            .get(&seq)
+                            .is_some_and(|parts| parts.iter().any(|p| p.spans.contains(span)))
+                    })
+                    .collect();
+                if verdict.is_ok()
+                    && let (Some(a), Some(b)) = (
+                        switched.iter().position(|&s| s),
+                        switched.iter().position(|&s| !s),
+                    )
+                {
+                    let span = |i: usize| describe_spans(&install.spans[i..=i]);
+                    verdict = Err(format!(
+                        "the install at record {seq} over {} is in force for {} and not for {} (manifest {}): a mixture across its spans",
+                        install.describe(),
+                        span(a),
+                        span(b),
+                        recovery.manifest
+                    ));
+                }
+                // By what the tables and the log hold: a write the install put in
+                // one span, and a write older than it in another.
+                let installed =
+                    (0..install.spans.len()).find_map(|i| installed_in(i).map(|w| (i, w)));
+                let old = installed.as_ref().and_then(|(a, _)| {
+                    (0..install.spans.len())
+                        .filter(|i| i != a)
+                        .find_map(|i| old_in(i).map(|w| (i, w)))
+                });
+                if verdict.is_ok()
+                    && let (Some((a, (new_key, new_seq))), Some((b, (old_key, old_seq)))) =
+                        (installed, old)
+                {
+                    let span = |i: usize| describe_spans(&install.spans[i..=i]);
+                    verdict = Err(format!(
+                        "the install at record {seq} over {} left {} as installed (its write of {} at record {new_seq}) and {} as it was (the write of {} at record {old_seq}), manifest {}: a mixture across its spans",
+                        install.describe(),
+                        span(a),
+                        String::from_utf8_lossy(&new_key),
+                        span(b),
+                        String::from_utf8_lossy(&old_key),
+                        recovery.manifest
+                    ));
+                }
+                // Counted only when two spans or more held something to judge,
+                // as installed or as they were: an install whose writes lie in one
+                // of its spans, or in none, gives the agreement nothing to compare.
+                let judged = (0..install.spans.len())
+                    .filter(|&i| installed_in(i).is_some() || old_in(i).is_some())
+                    .count();
+                if seq > base as u64 && judged >= 2 {
+                    install_outcomes.spans_judged += 1;
+                }
+            }
+            let Some(repair_seq) = install.repair_seq.filter(|_| !install.repair.is_empty()) else {
+                continue;
+            };
+            if in_force.contains_key(&seq) {
+                let missing = install.repair.keys().find(|key| {
+                    !present_write(key, repair_seq) && why_missing(key, repair_seq).is_none()
+                });
+                if verdict.is_ok()
+                    && let Some(key) = missing
+                {
+                    verdict = Err(format!(
+                        "the install at record {seq} is in force (manifest {}) but its repair's write of {} at record {repair_seq} is in no table in service and no fault explains it: the installed tables without their repair",
+                        recovery.manifest,
+                        String::from_utf8_lossy(key)
+                    ));
+                }
+                if seq > base as u64 {
+                    install_outcomes.repairs_present += 1;
+                }
+            } else {
+                let held = install
+                    .repair
+                    .keys()
+                    .find(|key| held_in_service(key, repair_seq));
+                if verdict.is_ok()
+                    && let Some(key) = held
+                {
+                    verdict = Err(format!(
+                        "the install at record {seq} is not in force (manifest {}) but a table in service holds its repair's write of {} at record {repair_seq}: a repair without its tables",
+                        recovery.manifest,
+                        String::from_utf8_lossy(key)
+                    ));
+                }
+                // Counted only where a repair without its tables could be seen:
+                // a crash after the replacement, the repair's table among it, was
+                // written and traced, and before `CURRENT` was switched to it.
+                if seq > base as u64
+                    && !install.applied
+                    && crash_point(seq) == CrashPoint::BetweenReplacementAndSwitch
+                {
+                    install_outcomes.repairs_absent += 1;
+                }
+            }
+        }
         for seq in 1..=owed_through {
             let mut record_why: Option<Excuse> = None;
             for key in writes_of(seq) {
@@ -1297,23 +1667,7 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
                     }
                     continue;
                 }
-                let why = if compacted_writes.contains(&(key.clone(), seq)) {
-                    Some(Excuse::Compacted)
-                } else if let Some(why) = table_why
-                    .iter()
-                    .find(|(t, _)| held_by(t, &key, seq))
-                    .map(|(_, why)| *why)
-                {
-                    Some(why)
-                } else if fallback_why.is_some()
-                    && abandoned_tables.iter().any(|t| held_by(t, &key, seq))
-                {
-                    fallback_why
-                } else if previously_lost_writes.contains(&(key.clone(), seq)) {
-                    Some(Excuse::LostFsync)
-                } else {
-                    None
-                };
+                let why = why_missing(&key, seq);
                 match why {
                     Some(why) => record_why = record_why.or(Some(why)),
                     None if verdict.is_ok() => {
@@ -1373,14 +1727,38 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
             // carries the install's own number and no other, which is what reads
             // a later write over it; the mirror stamps the number, so only the
             // manifest's record of the table can show it.
-            if let Some(mirrored) = in_force.get(&seq)
-                && verdict.is_ok()
+            let parts: &[&InstallMirror] = in_force.get(&seq).map_or(&[], Vec::as_slice);
+            if verdict.is_ok()
                 && let Some(meta) = recovery.tables.iter().find(|m| {
-                    mirrored.added.contains(&m.number) && (m.first_seq != seq || m.max_seq != seq)
+                    parts.iter().any(|p| p.added.contains(&m.number))
+                        && (m.first_seq != seq || m.max_seq != seq)
                 })
             {
                 verdict = Err(format!(
                     "the install at record {seq} is in force (manifest {}) but its table {} carries records {}..={}, not the install's number",
+                    recovery.manifest, meta.number, meta.first_seq, meta.max_seq
+                ));
+            }
+            // PROPOSED(D-068): and the repair's table carries the repair's own
+            // number, the record after the install's, and no other.
+            if verdict.is_ok()
+                && let Some((repair_seq, meta)) =
+                    parts
+                        .iter()
+                        .filter_map(|p| p.repair)
+                        .find_map(|(repair_seq, table)| {
+                            recovery
+                                .tables
+                                .iter()
+                                .find(|m| {
+                                    m.number == table
+                                        && (m.first_seq != repair_seq || m.max_seq != repair_seq)
+                                })
+                                .map(|meta| (repair_seq, meta))
+                        })
+            {
+                verdict = Err(format!(
+                    "the install at record {seq} is in force (manifest {}) but its repair's table {} carries records {}..={}, not the repair's number {repair_seq}",
                     recovery.manifest, meta.number, meta.first_seq, meta.max_seq
                 ));
             }
@@ -1435,29 +1813,16 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
                     if resolved {
                         install_outcomes.lost_to_a_fault += 1;
                     } else {
-                        // PROPOSED(D-054): where in the install the crash came.
-                        let durable = synced
-                            .wal
-                            .iter()
-                            .any(|&(_, first, up_to, _)| first <= seq && seq <= up_to);
-                        let written = events.iter().position(
-                            |e| matches!(e, TraceEvent::SpanInstalled { seq: s, .. } if *s == seq),
-                        );
-                        let switched = written.is_some_and(|at| {
-                            let manifest = match events[at] {
-                                TraceEvent::SpanInstalled { manifest, .. } => *manifest,
-                                _ => 0,
-                            };
-                            events[at..].iter().any(|e| {
-                                matches!(e, TraceEvent::CurrentSwitched { manifest: m } if *m == manifest)
-                            })
-                        });
-                        if !durable {
-                            install_outcomes.crashed_before_record_durable += 1;
-                        } else if written.is_some() && !switched {
-                            install_outcomes.crashed_between_replacement_and_switch += 1;
-                        } else {
-                            install_outcomes.crashed_otherwise_before_switch += 1;
+                        match crash_point(seq) {
+                            CrashPoint::BeforeRecordDurable => {
+                                install_outcomes.crashed_before_record_durable += 1;
+                            }
+                            CrashPoint::BetweenReplacementAndSwitch => {
+                                install_outcomes.crashed_between_replacement_and_switch += 1;
+                            }
+                            CrashPoint::Otherwise => {
+                                install_outcomes.crashed_otherwise_before_switch += 1;
+                            }
                         }
                     }
                 }
@@ -1609,6 +1974,15 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
             m.log.acked.iter_mut().for_each(|a| *a = true);
             m.ops.truncate(base);
             m.installs.retain(|&seq, _| seq <= base as u64);
+            // PROPOSED(D-068): a repair whose record the log lost goes with it: its
+            // install was never in force, and the number is given again.
+            m.repairs.retain(|&repair_seq, _| repair_seq <= base as u64);
+            for install in m.installs.values_mut() {
+                if install.repair_seq.is_some_and(|r| r > base as u64) {
+                    install.repair_seq = None;
+                    install.repair.clear();
+                }
+            }
             m.installing = None;
             m.in_flight.clear();
             m.committed = m
@@ -1985,17 +2359,86 @@ fn check_checkpoint(
         .expect("the check completed")
 }
 
-/// Installs the span checkpoint in `dir` over `k{lo}..k{hi}` of `db`, recording it
+/// Spans of the key space by key number, each `(lo, hi)` the span `k{lo}..k{hi}`,
+/// sorted and disjoint.
+// PROPOSED(D-068): an install covers several spans.
+type KeySpans = Vec<(u64, u64)>;
+
+/// The spans as keys.
+fn span_keys(spans: &[(u64, u64)]) -> Vec<(Bytes, Bytes)> {
+    spans.iter().map(|&(lo, hi)| (key(lo), key(hi))).collect()
+}
+
+/// The spans as the engine takes them.
+fn span_ranges(spans: &[(u64, u64)]) -> Vec<std::ops::Range<Bytes>> {
+    spans.iter().map(|&(lo, hi)| key(lo)..key(hi)).collect()
+}
+
+/// Every key number the spans hold, in order.
+fn span_members(spans: &[(u64, u64)]) -> impl Iterator<Item = u64> + '_ {
+    spans.iter().flat_map(|&(lo, hi)| lo..hi)
+}
+
+/// Two spans, or three one time in three, sorted and disjoint, as a range's Raft
+/// state and its user keys lie apart (D-066): the key space cut into as many equal
+/// slices, and in each a span of one to eight keys.
+// PROPOSED(D-068): every install and delete covers two spans or more.
+fn draw_spans(env: &SimEnv) -> KeySpans {
+    let count = 2 + u64::from(env.rng().below(3) == 0);
+    let slice = KEYS / count;
+    (0..count)
+        .map(|j| {
+            let base = j * slice;
+            let lo = base + env.rng().below(slice);
+            let hi = (lo + 1 + env.rng().below(8)).min(base + slice);
+            (lo, hi)
+        })
+        .collect()
+}
+
+/// A repair of one to four writes to keys of the spans, one in three a delete: the
+/// receiver's own writes, carried in the install's switch (D-066). The batch, and
+/// its last write per key.
+// PROPOSED(D-068): every install carries a repair.
+fn draw_repair(
+    env: &SimEnv,
+    spans: &[(u64, u64)],
+    value_max: u64,
+) -> (WriteBatch, BTreeMap<Bytes, Value>) {
+    let members: Vec<u64> = span_members(spans).collect();
+    let mut batch = WriteBatch::new();
+    let mut last = BTreeMap::new();
+    for _ in 0..1 + env.rng().below(4) {
+        let index = usize::try_from(env.rng().below(members.len() as u64)).expect("fits");
+        let k = key(members[index]);
+        let value = if env.rng().below(3) == 0 {
+            batch.delete(k.clone());
+            Value::Tombstone
+        } else {
+            let len = usize::try_from(env.rng().below(value_max + 1)).expect("fits");
+            let mut bytes = vec![0u8; len];
+            env.rng().fill_bytes(&mut bytes);
+            let bytes = Bytes::from(bytes);
+            batch.put(k.clone(), bytes.clone());
+            Value::Live(bytes)
+        };
+        last.insert(k, value);
+    }
+    (batch, last)
+}
+
+/// Installs the checkpoint in `dir` over `spans` of `db` with `repair`, recording it
 /// in the model as it is asked for and as it resolves. False when it could not be
 /// made, with the violation recorded.
 // PROPOSED(D-054): the live install's crash test.
+// PROPOSED(D-068): over several spans, with a repair.
 async fn install_from(
     db: &Db,
     model: &SharedModel,
     dir: &Path,
-    lo: u64,
-    hi: u64,
+    spans: &[(u64, u64)],
     entries: BTreeMap<Bytes, Bytes>,
+    repair: (WriteBatch, BTreeMap<Bytes, Value>),
 ) -> bool {
     let source = match db.open_span_source(dir).await {
         Ok(source) => source,
@@ -2007,30 +2450,40 @@ async fn install_from(
             return false;
         }
     };
-    let install = db.install_span(key(lo)..key(hi), source);
+    let (batch, repair) = repair;
+    let install = db.install_spans(span_ranges(spans), source, batch);
     let Some(seq) = install.seq() else {
         lock(model).read_violations.push(format!(
-            "an install of k{lo:02}..k{hi:02} was refused at once"
+            "an install of {} was refused at once",
+            describe_spans(&span_keys(spans))
         ));
         return false;
     };
-    begin_install(model, seq, lo, hi, entries, false);
+    begin_install(
+        model,
+        seq,
+        install.repair_seq(),
+        spans,
+        entries,
+        repair,
+        false,
+    );
     if let Err(error) = install.await {
         lock(model)
             .read_violations
             .push(format!("the install at record {seq} failed: {error}"));
         return false;
     }
-    end_install(model, seq, lo, hi);
+    end_install(model, seq, spans);
     true
 }
 
 /// A store further along than the live engine, written into `dir` in the engine's
-/// own formats, as a checkpoint of `k{lo}..k{hi}` from a range's leader would be:
-/// one table at level 0 holding a put of most of the span's keys, every one
-/// numbered above `live`, the newest version the live engine had applied, then its
-/// manifest and `CURRENT`, each synced in that order. The live keys it holds, or
-/// `None` if a write failed.
+/// own formats, as a checkpoint of `spans` from a range's leader would be: one table
+/// at level 0 holding a put of most of the spans' keys, every one numbered above
+/// `live`, the newest version the live engine had applied, then its manifest and
+/// `CURRENT`, each synced in that order. The live keys it holds, or `None` if a
+/// write failed.
 ///
 /// A second engine is not opened for it: on the node under test its log, table and
 /// manifest events would reach the trace the oracle reads by segment, table and
@@ -2041,8 +2494,7 @@ async fn store_further_along(
     env: &SimEnv,
     schedule: &Schedule,
     live: u64,
-    lo: u64,
-    hi: u64,
+    spans: &[(u64, u64)],
     dir: &Path,
     model: &SharedModel,
 ) -> Option<BTreeMap<Bytes, Bytes>> {
@@ -2052,7 +2504,7 @@ async fn store_further_along(
     let mut seq = first;
     let mut entries = BTreeMap::new();
     let mut writer = SstWriter::new();
-    for i in lo..hi {
+    for i in span_members(spans) {
         if env.rng().below(4) == 0 {
             continue;
         }
@@ -2126,61 +2578,77 @@ async fn write_synced(fs: &<SimEnv as Environment>::Fs, path: &Path, bytes: Byte
     file.sync().await.ok()
 }
 
-/// Records an install or a range delete of `k{lo}..k{hi}` numbered `seq` as it is
-/// asked for: its record, which holds no write, what it installs, and its keys in
-/// flight until it resolves.
+/// Records an install or a range delete of `spans` numbered `seq` as it is asked
+/// for: its record, which holds no write, its repair's record after it, which holds
+/// none either, what it installs and the repair it carries, and its keys in flight
+/// until it resolves.
 // PROPOSED(D-054): the live install's crash test.
+// PROPOSED(D-068): over several spans, with a repair.
 fn begin_install(
     model: &SharedModel,
     seq: u64,
-    lo: u64,
-    hi: u64,
+    repair_seq: Option<u64>,
+    spans: &[(u64, u64)],
     entries: BTreeMap<Bytes, Bytes>,
+    repair: BTreeMap<Bytes, Value>,
     delete: bool,
 ) {
     let mut m = lock(model);
-    m.log.appended.push(engine::encode_batch(&[]));
-    m.log.acked.push(false);
-    m.log.sync_requested.push(true);
-    m.ops.push(Vec::new());
-    assert_eq!(
-        m.ops.len() as u64,
-        seq,
-        "the model and the log number the install alike"
-    );
+    for number in std::iter::once(seq).chain(repair_seq) {
+        m.log.appended.push(engine::encode_batch(&[]));
+        m.log.acked.push(false);
+        m.log.sync_requested.push(true);
+        m.ops.push(Vec::new());
+        assert_eq!(
+            m.ops.len() as u64,
+            number,
+            "the model and the log number the install and its repair alike"
+        );
+    }
+    if let Some(repair_seq) = repair_seq {
+        m.repairs.insert(repair_seq, seq);
+    }
     m.installs.insert(
         seq,
         InstallRecord {
-            start: key(lo),
-            end: key(hi),
+            spans: span_keys(spans),
             entries,
+            repair_seq,
+            repair,
             applied: false,
         },
     );
-    m.installing = Some((key(lo), key(hi)));
+    m.installing = Some(span_keys(spans));
     m.installs_started += 1;
     m.deletes_started += u64::from(delete);
-    for i in lo..hi {
+    for i in span_members(spans) {
         *m.in_flight.entry(key(i)).or_default() += 1;
     }
 }
 
-/// Records that the install numbered `seq` resolved: acknowledged, made, and its
-/// keys newer than every write numbered below it.
+/// Records that the install numbered `seq` resolved: acknowledged, made, its keys
+/// newer than every write numbered below it, and its repair's writes newer still.
 // PROPOSED(D-054): the live install's crash test.
-fn end_install(model: &SharedModel, seq: u64, lo: u64, hi: u64) {
+// PROPOSED(D-068): over several spans, with a repair.
+fn end_install(model: &SharedModel, seq: u64, spans: &[(u64, u64)]) {
     let mut m = lock(model);
-    if let Some(acked) = m.log.acked.get_mut(seq as usize - 1) {
-        *acked = true;
+    let (entries, repair_seq, repair) =
+        m.installs
+            .get_mut(&seq)
+            .map_or_else(Default::default, |install| {
+                install.applied = true;
+                (
+                    install.entries.clone(),
+                    install.repair_seq,
+                    install.repair.clone(),
+                )
+            });
+    for number in std::iter::once(seq).chain(repair_seq) {
+        if let Some(acked) = m.log.acked.get_mut(number as usize - 1) {
+            *acked = true;
+        }
     }
-    let entries = m
-        .installs
-        .get_mut(&seq)
-        .map_or_else(BTreeMap::new, |install| {
-            install.applied = true;
-            install.entries.clone()
-        });
-    for i in lo..hi {
+    for i in span_members(spans) {
         let k = key(i);
         if let Some(n) = m.in_flight.get_mut(&k) {
             *n -= 1;
@@ -2191,6 +2659,14 @@ fn end_install(model: &SharedModel, seq: u64, lo: u64, hi: u64) {
                 .get(&k)
                 .map_or(Value::Tombstone, |v| Value::Live(v.clone()));
             m.committed.insert(k, (seq, value));
+        }
+    }
+    if let Some(repair_seq) = repair_seq {
+        for (k, value) in repair {
+            let newer = m.committed.get(&k).is_none_or(|(s, _)| *s < repair_seq);
+            if newer {
+                m.committed.insert(k, (repair_seq, value));
+            }
         }
     }
     m.installing = None;
@@ -2306,6 +2782,8 @@ fn spawn_clients(sim: &Sim, node: NodeId, db: Db, schedule: &Schedule, model: &S
     // every key: the install rolls the span back to the checkpoint, and every write
     // after the install's number is newer than it.
     // PROPOSED(D-055): the same task deletes spans, when the schedule asks for it.
+    // PROPOSED(D-068): each install and delete covers two or three spans at once,
+    // and each install carries a repair.
     if schedule.installs || schedule.range_deletes {
         let (installs, range_deletes) = (schedule.installs, schedule.range_deletes);
         let schedule = *schedule;
@@ -2314,30 +2792,38 @@ fn spawn_clients(sim: &Sim, node: NodeId, db: Db, schedule: &Schedule, model: &S
             loop {
                 let gap = 1000 + env.rng().below(4000);
                 env.clock().sleep(Duration::from_micros(gap)).await;
-                let lo = env.rng().below(KEYS);
-                let hi = (lo + 1 + env.rng().below(12)).min(KEYS);
-                let (start, end) = (key(lo), key(hi));
+                let spans = draw_spans(&env);
+                let keys = span_keys(&spans);
                 let delete = match (installs, range_deletes) {
                     (true, true) => env.rng().below(3) == 0,
                     (false, true) => true,
                     _ => false,
                 };
                 if delete {
-                    let removal = db.delete_range(start.clone()..end.clone());
+                    let removal = db.delete_ranges(span_ranges(&spans));
                     let Some(seq) = removal.seq() else {
                         lock(&model).read_violations.push(format!(
-                            "a range delete of k{lo:02}..k{hi:02} was refused at once"
+                            "a range delete of {} was refused at once",
+                            describe_spans(&keys)
                         ));
                         return;
                     };
-                    begin_install(&model, seq, lo, hi, BTreeMap::new(), true);
+                    begin_install(
+                        &model,
+                        seq,
+                        None,
+                        &spans,
+                        BTreeMap::new(),
+                        BTreeMap::new(),
+                        true,
+                    );
                     if let Err(error) = removal.await {
                         lock(&model)
                             .read_violations
                             .push(format!("the range delete at record {seq} failed: {error}"));
                         return;
                     }
-                    end_install(&model, seq, lo, hi);
+                    end_install(&model, seq, &spans);
                     continue;
                 }
                 let n = {
@@ -2353,27 +2839,35 @@ fn spawn_clients(sim: &Sim, node: NodeId, db: Db, schedule: &Schedule, model: &S
                 if env.rng().below(2) == 0 {
                     let live = db.snapshot().version();
                     let Some(entries) =
-                        store_further_along(&env, &schedule, live, lo, hi, &dir, &model).await
+                        store_further_along(&env, &schedule, live, &spans, &dir, &model).await
                     else {
                         return;
                     };
                     let gap = 500 + env.rng().below(3000);
                     env.clock().sleep(Duration::from_micros(gap)).await;
-                    if !install_from(&db, &model, &dir, lo, hi, entries).await {
+                    let repair = draw_repair(&env, &spans, schedule.value_max);
+                    if !install_from(&db, &model, &dir, &spans, entries, repair).await {
                         return;
                     }
                     continue;
                 }
-                let Ok(info) = db.checkpoint_span(&start[..]..&end[..], &dir).await else {
+                // PROPOSED(D-068): every span of the install checkpointed at one
+                // version.
+                let ranges: Vec<std::ops::Range<&[u8]>> = keys
+                    .iter()
+                    .map(|(start, end)| &start[..]..&end[..])
+                    .collect();
+                let Ok(info) = db.checkpoint_spans(&ranges, &dir).await else {
                     return;
                 };
+                let in_spans = |k: &Bytes| keys.iter().any(|(start, end)| start <= k && k < end);
                 let entries: BTreeMap<Bytes, Bytes> = {
                     let mut m = lock(&model);
                     let version = usize::try_from(info.version).expect("fits");
                     let expected: BTreeMap<Bytes, Value> = m
                         .state_after(version.min(m.ops.len()))
                         .into_iter()
-                        .filter(|(k, _)| start <= *k && *k < end)
+                        .filter(|(k, _)| in_spans(k))
                         .collect();
                     m.checkpoints.push(Checkpoint {
                         dir: dir.clone(),
@@ -2388,7 +2882,8 @@ fn spawn_clients(sim: &Sim, node: NodeId, db: Db, schedule: &Schedule, model: &S
                 };
                 let gap = 500 + env.rng().below(3000);
                 env.clock().sleep(Duration::from_micros(gap)).await;
-                if !install_from(&db, &model, &dir, lo, hi, entries).await {
+                let repair = draw_repair(&env, &spans, schedule.value_max);
+                if !install_from(&db, &model, &dir, &spans, entries, repair).await {
                     return;
                 }
             }
@@ -2419,9 +2914,9 @@ fn spawn_clients(sim: &Sim, node: NodeId, db: Db, schedule: &Schedule, model: &S
                     // resolves.
                     let installing = lock(&model).installing.clone();
                     let judged = |k: &Bytes| {
-                        installing
-                            .as_ref()
-                            .is_none_or(|(start, end)| !(start <= k && k < end))
+                        installing.as_ref().is_none_or(|spans| {
+                            !spans.iter().any(|(start, end)| start <= k && k < end)
+                        })
                     };
                     let mut want: Vec<(Bytes, Bytes)> = {
                         let m = lock(&model);
@@ -2479,10 +2974,9 @@ fn spawn_clients(sim: &Sim, node: NodeId, db: Db, schedule: &Schedule, model: &S
                 let expected = {
                     let mut m = lock(&model);
                     if m.in_flight.get(&key).is_some_and(|&n| n > 0) {
-                        let installing = m
-                            .installing
-                            .as_ref()
-                            .is_some_and(|(start, end)| *start <= key && key < *end);
+                        let installing = m.installing.as_ref().is_some_and(|spans| {
+                            spans.iter().any(|(start, end)| *start <= key && key < *end)
+                        });
                         m.reads_unjudged_for_installs += u64::from(installing);
                         None
                     } else {
