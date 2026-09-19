@@ -7138,6 +7138,298 @@ excluding ananke-sim's integration targets from `rest` by target would not.
   own.
 - Issue #57 is closed by this entry.
 
+## PROPOSED D-065 — A follower compacts its log to its own applied index, and takes a checkpoint only when one is asked for
+
+**Context.** Stage B's first question before code (SHARD.md:2189-2193; §11, raft 13,
+SHARD.md:1897-1901). Only a leader compacts: the take is asked from the leader's tick once its
+log is `snapshot_threshold` entries past its last take (core.rs:1427-1441; 4 096 by default,
+core.rs:381, and 12 in the sweeps, sim/raft.rs:3650), and `maybe_compact` returns at once on any
+other role (core.rs:1834-1837). A follower's log shrinks only by truncation or when an install
+replaces its store (SHARD.md:333-340). On a node most replicas are followers, so their
+in-memory logs grow without bound while their ranges take writes. SHARD.md leaves open whether
+a follower compacts "to its own applied checkpoint, or to one its leader names", and the answer
+changes RAFT.md's rule that a leader compacts (RAFT.md:249).
+
+**Three options, on the facts as they stand.**
+
+- *A. Its own applied checkpoint.* Every replica takes a checkpoint when its log passes the
+  threshold, and a follower compacts to its take at once. The Raft paper's rule: each server
+  snapshots independently, covering only committed entries (Ongaro and Ousterhout, 2014, §7).
+- *B. An index its leader names.* The leader sends each follower an index it has matched and
+  applied; the follower drops its prefix to it. Needs a field on the wire.
+- *C. Its own applied index, with a checkpoint taken only when one is asked for.* A follower
+  whose log passes the threshold writes a snapshot record at its applied index and drops the
+  prefix, with no checkpoint. It takes one only when it must stream a snapshot, as a leader
+  already does when the record it holds has no complete checkpoint under it.
+
+**Proposed: C.** It needs no new state and no new message:
+
+- a snapshot record with no local checkpoint under it already exists, after an install and
+  after a crash between D-036's record and its checkpoint (DECISIONS.md:1594-1597);
+- a leader already asks for a take when it finds no complete version to stream
+  (node.rs:2064-2071, "the record is an install's. Ask for a take"), and split-born ranges
+  depend on that path (SHARD.md §11, raft 6);
+- a follower's compaction is a record and a deletion of log keys at or below it, which
+  `RaftStore::open` already performs (store.rs:825-836).
+
+The record is written in the apply task at the applied index, as D-036 writes a take's, so its
+last term and configuration are exact. The compaction keeps D-029's revert floor, the
+configuration in force at the new prefix's end. A follower's applied index never passes its
+commit index on the correct system, so nothing uncommitted is dropped. The leader keeps its
+rules unchanged: its threshold take, its two-election-timeout hold-off, and D-037's condition
+for compacting.
+
+**Why not A.** A's cost is paid in the steady state, on every replica. On a node the factor
+is the replicas it hosts over the replicas it leads, not three: with four ranges on three
+nodes, a node that leads none goes from no takes to four per threshold. In the sweeps, where
+the threshold is 12, every replica would take every twelve entries. A take holds the node's
+turnstile, so no flush or compaction runs, and it holds every range's applies (D-036;
+SHARD.md §11, storage 6). Stage B measures how long one take holds them, which cannot see how
+often takes come. A follower's take would also stall the no-op of a range the node has just
+started leading, which is what the leader's hold-off exists to avoid (core.rs:1427-1432). C
+pays for a take only when a snapshot is actually streamed, which is when A's take would have
+been read.
+
+**Why not B.** The wire field buys nothing C lacks. A follower's own applied index is already
+a safe compaction point, and a follower needs no leader's word for it.
+
+**What C costs.** A follower that becomes leader must take on demand before it can feed a
+follower behind its prefix. That take happens at a moment of change rather than in the steady
+state; the path is the one a leader uses today after an install.
+
+**Measured before asserted.** Stage B's exit asserts the largest in-memory log of any follower
+replica, under `sim/raft.rs`'s client writes on the correct system, below a bound set from that
+measurement and stated as a multiple of `snapshot_threshold` (Q39). Stage B also measures, for
+whichever option is chosen, the share of time a node's apply task is held by takes, with and
+without follower compaction, and takes it to the owner if it exceeds a heartbeat interval's
+share.
+
+**Re-measured in the commit that builds it.**
+- Under `ApplyBeforeCommit` a follower's applied index passes its commit index
+  (node.rs:2418-2429), so compacting to it drops uncommitted entries. The core then counts a
+  request below the prefix as matched (core.rs:2423-2448), and the variant's catch may move.
+- `TruncateOnEveryAppend` never truncates below the prefix (core.rs:1693), so its window
+  shrinks on followers.
+- D-029's revert floor, reached on 3 of 10 000 seeds today and deferred to issue #56, becomes
+  a routine path on every follower.
+
+**Departures from the stage plan, for the owner.**
+- The plan has the entry supersede RAFT.md:249 with a forward pointer, as D-048 did
+  (SHARD.md:2192-2193). This entry defers the pointer to the commit that builds follower
+  compaction, since RAFT.md says what the code does (D-053).
+- The plan builds follower compaction inside the node (SHARD.md:2233-2234), not in a commit of
+  its own. Under the owner's rule of one change per PR, it is proposed here as its own PR,
+  after the node, with its own re-audit.
+
+**For the owner.** Choose C, as proposed, or A or B.
+
+## PROPOSED D-066 — Every install on the node is a live install; a range lives in two key intervals, which Stage A's primitives do not reach in one step
+
+**Context.** Stage B's second question before code (SHARD.md:2194-2198). Today an install stages
+a whole store, retires the server's run-loop incarnation, and is adopted at the next start
+before the engine opens (RAFT.md:225-247; D-041). On a node with one engine, ending the run
+loop and reopening the engine "would restart every range on it" (SHARD.md:1799). Stage A built
+the live install of a span, with its crash test (PROPOSED D-054; Q2). The question asks:
+- which installs go through the live install;
+- whether the staged whole-store adoption survives on the node;
+- what `RaftAdopted` then records (§8 keeps it per node, SHARD.md:1131-1136);
+- which node code path each install-path Phase 2 variant breaks.
+
+The stage plan proposes answers in its builds (SHARD.md:2236-2242) and its variant mapping
+(SHARD.md:2374-2400).
+
+**A range lives in two key intervals, and Stage A's primitives take one.** A range's Raft state
+is the interval `0 / <range>` (store.rs:115) and its user keys lie in tenant 2 (store.rs:35;
+apply.rs:26). SHARD.md already says a range's snapshot "needs the span's user keys and that
+range's Raft keys at one version" (SHARD.md:1790-1791).
+- `checkpoint_span` takes one interval (engine.rs:1404).
+- `install_span` takes one interval and refuses any source key outside it (engine.rs:1608,
+  1639-1643; D-054's `OutsideSpan`).
+
+So neither a range's take nor its install can be done in one step with what Stage A built, and
+the repair cannot be carried in the switch that installs the user keys. It is a question for
+the owner before the node's code:
+
+- *(a) Extend the primitives to a set of disjoint intervals.* `checkpoint_span` over several
+  intervals at one version; `install_span` removing several intervals' keys and adding their
+  tables, and the receiver's repair writes, in one manifest switch. D-054's crash test is
+  generalised to two intervals, with a variant that switches them one at a time. This lands
+  as its own PR before the node. The switch stays the one commit point, and a crash leaves
+  the range as it was or as installed with its repair, never a mixture.
+- *(b) Two single-interval steps bracketed by a durable marker.* The marker "installing at
+  index I" is written synced into the range's Raft state first. Then the user span is
+  installed, then the Raft state and repair, then the marker is cleared. A restart that finds
+  the marker treats the range's user span as untrusted and asks for the snapshot again.
+  Either order without the marker is unsafe: new Raft state over old user keys misstates what
+  is applied, and old Raft state over new user keys replays applied commands onto them.
+
+**Proposed: (a)**, as the one with a single commit point, the shape Stage A's crash test
+already holds.
+
+**Proposed, whichever of (a) and (b) is chosen:**
+
+- *Every install on the node is a live install.* This covers a follower behind its leader's
+  compacted prefix, and each range of Q15's re-seed into the fresh engine. The whole-store
+  staged install adopted at the next start is not kept for a replica's install, and nothing
+  on the node reopens the engine to install a range.
+- *The range is held from its repair's capture to the switch.* Today `install_decision`
+  closes the apply queue and drops every other event before capturing term, vote and tail
+  (node.rs:1283-1286). On the node, the range's core must take no input and no tick from the
+  capture to the switch. Otherwise a vote or append persisted in between would be erased by
+  the install, which removes every write of the span below its number (D-054), or would
+  survive above it and diverge from the core. After the switch the range's core restarts from
+  the installed store and traces its restatement.
+- *The repair is the whole of today's.* It carries the receiver's term and vote, applied
+  index, snapshot record, kept log tail, configuration key, quarantine flag and incarnation,
+  and tombstones for the leader's log keys the tail does not replace (RAFT.md:225-233; D-030,
+  D-035, D-038, D-042).
+- *The shared apply task's hold during an install is measured* beside a take's (Stage B's
+  measurements), since the install quiesces applies for its flush and switch.
+- *`RaftAdopted` records only a node taking a fresh directory as its store after a whole-node
+  refusal (Q15).* It is traced when the fresh engine is opened and before any range installs
+  into it, and never for a replica's install. Its readers are re-keyed in the node's commit,
+  each named:
+  - the coverage assertions that every install is adopted (sim/tests/raft.rs:3354-3359,
+    3694-3696) count `RangeCreated { cause: snapshot }` and installs per replica instead;
+  - `adoption_windows` and `restarts_after_lost_state_refusal` (sim/raft.rs:2513, 2559) move
+    to the fresh-directory switch;
+  - D-063's timer exemption, which takes a server out of the replay's running set at a
+    completed install (sim/raft.rs:1665), does not apply to a live install, which ends no
+    incarnation. It is re-keyed to the range's hold above, the one stretch in which a
+    replica's core has no timer to fire.
+- *At start a node opens the newest directory not marked lost.* A refused directory is marked
+  lost before the fresh one is created. A crash between the two leaves the node to create the
+  fresh one at its restart, and never to reopen the refused one.
+
+**The install-path variants, each on the node path it breaks.**
+
+- `SnapshotWithoutCurrentLast` makes the switch before the repair is carried or made durable.
+  State machine safety after `Fault::CrashInstalling` catches it, as today; its catch depends
+  on the answer to (a) or (b).
+- `RefusalNotDurable` keeps the whole node's refusal in the process alone, and lets the
+  refused engine flush (RAFT.md:753). Its catch lives in the window before the fresh directory
+  exists: a crash there, under the variant, restarts the node on the refused directory,
+  unmarked, which the start's rule then opens. `Fault::CrashRefused` is aimed at that window.
+- `IgnoreIncarnation` and `SharedSnapshotDir` break the stream's and the leader's progress
+  rules, which the node keeps per range, with the path unchanged.
+- `RefusedCountsForQuorum` and `RefusedNeverCounts` (D-049) read the progress of a refused
+  follower's re-seed stream. With whole-node refusal, four streams head for one node under
+  Q14's receive cap. If `sim/quorum.rs` sets that cap below its ranges, a range whose stream
+  waits shows no progress, and its correct leader steps down where RAFT.md:754-755 expects it to
+  keep office. The quorum scenario's cap is set at or above its ranges, or D-049's rule counts
+  a queued stream as progress. That is the owner's choice when the node is built, noted here.
+- `AdoptionAsBuilt` loses one of its three rules on the node and needs the owner's choice,
+  below.
+
+**`AdoptionAsBuilt` — for the owner.** It breaks three rules today (RAFT.md:750; D-041).
+1. *Copy and switch before delete.* On the node this is the live install's single switch. The
+   variant breaks it by removing the span's keys in a switch of their own before adding the
+   tables, which is Stage A's engine variant `InstallInTwoSwitches` (D-054) reached through the
+   node.
+2. *A damaged staging `CURRENT` refused.* This moves into the engine: `open_span_source`
+   refuses a damaged source (`SourceDamaged`, D-054). `Fault::CrashAdopting` has no path on
+   the node.
+3. *A marked store never opens fresh.* This becomes the start's rule above; the variant
+   neither checks nor writes the mark.
+
+§10 requires every Phase 2 variant re-asserted, so the owner chooses:
+- *re-assert it on rules 1 and 3*, under crash arms aimed at the live install's switch and at
+  the window before the fresh directory exists, at its Phase 2 tier; or
+- *amend §10*, letting `InstallInTwoSwitches` and the engine's `SourceDamaged` carry rules 1
+  and 2, and re-asserting only rule 3 on the node.
+
+The plan recommends the first, as the stricter.
+
+**Dependencies.** This entry builds on D-054 and D-055, which are still PROPOSED
+(DECISIONS.md:4157, 4583). Approving it presumes approving their primitives, and under (a)
+extending them.
+
+**For the owner.**
+- Choose (a) or (b) for the range's two intervals.
+- Approve the points above.
+- Choose for `AdoptionAsBuilt`.
+- Note the quorum scenario's cap.
+
+**Alternatives.**
+- *Keep the staged whole-store install for the re-seed.* A re-seed replaces every range, so a
+  node could stage them all and adopt once. But the fresh directory's ranges arrive one stream
+  at a time under a receive cap (Q15; Stage B's shape caps two of four), and waiting for all
+  of them keeps every range down until the slowest stream ends.
+- *Give the fresh-directory switch an event of its own and retire `RaftAdopted` on the node.*
+  Clearer for new readers, but §8 keeps `RaftAdopted` per node, and the readers are re-keyed
+  either way.
+
+**Consequences.** `snapshot.rs`'s staged adoption stays in `ananke-raft` for the single-group
+server until nothing uses it; the node does not call it.
+
+## PROPOSED D-067 — The re-seed shape's variant: `ReseedMarkNotSynced`, the replica's refused mark written unsynced
+
+**Context.** Stage B's third question before code (SHARD.md:2199-2202). Q15 refuses a whole node
+whose shared engine lost state. The node re-seeds into a fresh engine in a new directory, and
+writes a durable per-replica refused mark into it before that replica serves
+(SHARD.md:1818-1824). The mark is D-041's rule, applied per replica: a replica whose state was
+lost never opens fresh. The reason is D-035's: opening fresh, with no term and no vote, would
+let it vote in a term it may already have voted in before the loss. Once its re-seed completes,
+the quarantine flag carried in the repair keeps the rebuilt replica from voting (D-035). §10
+names no variant for this path, and CLAUDE.md's pair rule asks for a known-buggy one beside the
+directed re-seed shape Stage B adds (SHARD.md:2253-2262).
+
+**Proposed.** `ReseedMarkNotSynced` writes each replica's refused mark in a batch that is not
+synced. Otherwise it behaves as the correct node: it traces the mark as the correct node does,
+and answers as the correct node would once the mark is written.
+
+*The crash must come before anything else syncs the new engine's log.* An unsynced write becomes
+durable at the next sync from any writer on the same log (D-024; the simulated disk syncs a
+whole file, fs.rs:317-330). In the re-seed shape several things sync:
+- installs write synced records (engine.rs:1650);
+- re-seeded ranges persist;
+- `RaftStore::open` writes a synced incarnation (store.rs:813-823).
+
+So the `reseed-crash` arm crashes the node on the mark's own trace event, before any later sync
+of the new engine's log. This is the precondition `RemovalNotDurable`'s shape states
+(SHARD.md:1709-1716). The shape asserts per seed, as coverage, that the mark was still unsynced
+at the crash; otherwise the catch rate would say nothing about the variant.
+
+*What catches it.*
+- The shape's trace-order check (c) cannot (SHARD.md:2280-2291), since the variant traces what
+  the correct node traces.
+- What a crash keeps of an unsynced write is the disk's draw, so on some seeds the mark is gone
+  at the restart. The replica then has no state and no mark, so `RaftStore::open` opens it
+  fresh: term 0, no vote, a new incarnation (store.rs:792-823). It is later fed a snapshot as
+  an ordinary lagging follower, its quarantine tombstoned by the repair (RAFT.md:229), and it
+  votes from then on.
+- Check (d) catches it: the replica whose mark was written must be restarted refused and
+  re-seeded. For (d) to read that, the restart must trace it per replica. §8 keeps
+  `RaftRefused` per node, so `RaftRecovered`, per replica (§8), gains the replica's state at
+  its restatement: refused, quarantined, or neither.
+- A second check catches the loss whenever it happens, not only when a vote follows: every
+  replica of a node refused whole restates as refused or quarantined, never neither, until the
+  node is re-seeded. Election safety fails only when the unprotected replica actually grants a
+  vote in a term it voted in before the loss, which is rare. The check is the one that matters.
+
+*Its standard is rate*, as §10 sets for `RemovalNotDurable` (SHARD.md:1748). The arm's firing,
+and the mark still unsynced at the crash, are asserted on every seed at every tier. The catch
+is asserted from the thousand-seed tier if its measured rate is under 5 % (D-061). D-061 gives
+no tier for a new variant at or above 5 %, so this entry proposes, for new variants: the lowest
+tier at which the chance of catching nothing is under 1 %, with that chance printed.
+
+*Where it lives.* In the range layer's variant set in `ananke-shard` (SHARD.md:1557-1561),
+outside §10's count of range-layer variants, as the plan says.
+
+**For the owner.**
+- Approve `ReseedMarkNotSynced`, the crash on the mark's own event, `RaftRecovered`'s
+  per-replica state, and the two checks.
+- Approve the tier rule for a new variant caught on 5 % or more.
+- Or name another variant for Q15's path.
+
+**Alternatives.**
+- *A variant that writes no mark at all.* Caught on every seed by (c) and (d), so it tests the
+  checks more than the crash. It cannot tell a durable mark from a written one, which is the
+  property the path depends on.
+- *A variant that writes the mark after the replica's first answer.* Caught by (c) on every
+  seed, since the order is in the trace. It pairs the ordering rule, not durability, and the
+  shape asserts the order anyway.
+
 ---
 
-_Next entry: D-065. Add one before implementing anything not covered above._
+_Next entry: D-068. Add one before implementing anything not covered above._
