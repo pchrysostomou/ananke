@@ -5,7 +5,8 @@
 # not have; when a row appears twice; when a test of sim/tests/*.rs is in no row; and when
 # a name in the table also names a test outside the table, which the `rest` job's
 # `--skip`, matching by name alone, would then skip. It lists tests from the binaries the
-# gate's `cargo test` has just built, so it builds nothing new.
+# gate's `cargo test` has just built, so it builds nothing new; if listing fails, it prints
+# cargo's own errors rather than failing silently.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 table=scripts/nightly-shards.txt
@@ -30,8 +31,9 @@ fi
 : > "$work/exists"
 for file in sim/tests/*.rs; do
     binary=$(basename "$file" .rs)
-    cargo test -q -p ananke-sim --all-features --test "$binary" -- --list 2>/dev/null |
-        sed -n 's/: test$//p' | awk -v binary="$binary" '{ print binary "\t" $0 }' >> "$work/exists"
+    cargo test -q -p ananke-sim --all-features --test "$binary" -- --list 2> "$work/err" |
+        sed -n 's/: test$//p' | awk -v binary="$binary" '{ print binary "\t" $0 }' >> "$work/exists" ||
+        { echo "check-nightly-shards: could not list the tests of sim/tests/$binary.rs:" >&2; cat "$work/err" >&2; exit 1; }
 done
 sort -o "$work/exists" "$work/exists"
 comm -23 "$work/table" "$work/exists" > "$work/stale"
@@ -47,8 +49,9 @@ if [ -s "$work/missing" ]; then
     fail=1
 fi
 
-cargo test -q --workspace --all-features --all-targets -- --list 2>/dev/null |
-    sed -n 's/: test$//p' | sort > "$work/everywhere"
+cargo test -q --workspace --all-features --all-targets -- --list 2> "$work/err" |
+    sed -n 's/: test$//p' | sort > "$work/everywhere" ||
+    { echo "check-nightly-shards: could not list the workspace's tests:" >&2; cat "$work/err" >&2; exit 1; }
 cut -f2 "$work/table" | sort > "$work/names"
 comm -12 <(sort -u "$work/names") <(sort -u "$work/everywhere") |
     while IFS= read -r name; do

@@ -112,8 +112,9 @@ git log --format='%an %cn' main..HEAD | sort -u   # before any push: one line, p
 
 The gate runs, in order: `cargo fmt --all -- --check`, `cargo clippy --workspace
 --all-targets --all-features -- -D warnings`, `scripts/check-direct-io.sh`, `cargo doc
---workspace --no-deps` with warnings as errors, `cargo test --workspace --all-targets`
-and the doctests. The sweeps' four tiers (D-040): 20 seeds at the gate, 100 in CI,
+--workspace --no-deps` with warnings as errors, `cargo test --workspace --all-targets`,
+`scripts/check-nightly-shards.sh` and the doctests. A new sweep in `sim/tests` names its
+nightly shard in `scripts/nightly-shards.txt` in the commit that adds it (D-064). The sweeps' four tiers (D-040): 20 seeds at the gate, 100 in CI,
 1000 under `scripts/premerge.sh` on the machine in front of you, 10 000 in the
 nightly workflow on GitHub — the only place ten thousand run. Every sweep runs its
 seeds in parallel through `ananke_sim::sweep` (`sim/parallel.rs`, the one file

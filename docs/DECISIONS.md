@@ -7000,8 +7000,8 @@ jobs, or split per sweep, whichever the measurement supports.
 
 **Measured.** Every test of ananke-sim's integration binaries (`sim/tests/*.rs`) run alone, in
 release, at `ANANKE_SEEDS=1000` and `ANANKE_DEEP_SEEDS=100` (the nightly's one to ten), on
-fc75f68, on an eight-core Apple machine with nothing else running, its CPU time taken as user
-plus system from `/usr/bin/time -p`. Seventy-three tests, **7 450 CPU seconds** in all: the
+fc75f68, on an Apple M2 with nothing else running — four performance and four efficiency
+cores — its CPU time taken as user plus system from `/usr/bin/time -p`. Seventy-three tests, **7 450 CPU seconds** in all: the
 engine binary 2 985, the raft binary 4 330, the WAL binary 122, echo 7, the determinism test 6.
 The five heaviest: `an_install_in_two_switches_is_caught` 625 (8.4 % of the whole),
 `the_live_install_crash_test_passes_every_seed` 582, `the_range_delete_crash_test_passes_every_seed`
@@ -7010,14 +7010,17 @@ under three seconds together at any tier.
 
 A sweep's cost is its CPU: every sweep runs its seeds on rayon's global pool, one pool per
 process (`sim/parallel.rs`), so a test binary's wall time is its tests' CPU over the cores it
-has, and a job on a runner of its own has cores of its own.
+has, and a job on a runner of its own has cores of its own. The unit is this machine's CPU
+second, not a runner's: a test that keeps few cores busy spends a larger share of its time on
+the M2's slower efficiency cores than one that fills all eight, so the weights rank the tests
+and balance the shards roughly, not exactly, on a runner.
 
 **Decision.**
 
 - *Split per sweep, not per seed.* Each test runs whole in exactly one job, over all its seeds.
-  Longest-first into the lightest shard puts the seventy-three tests into six shards of 1 241.6
-  to 1 242.0 CPU seconds each at a thousand seeds: no test is large enough to unbalance them,
-  the heaviest being 8.4 % of the whole and half of one shard.
+  Longest-first into the lightest shard puts the seventy-three tests into six shards of equal
+  weight at a thousand seeds: no test is large enough to unbalance them, the heaviest being
+  8.4 % of the whole and half of one shard.
 - *Six shards and the rest.* `scripts/nightly-shards.txt` names each test's shard and records
   the weight it was placed by. `scripts/nightly.sh <1-6>` runs a shard, binary by binary, with
   `--exact` filters; `scripts/nightly.sh rest` runs every other test of the workspace, with
@@ -7062,8 +7065,53 @@ each planted in the table or the tree and then removed: a test in no shard, a ro
 renamed test's stale row, a shard outside one to six, a row of three fields, and a test in
 another crate named as a sweep is (`crates/ananke-env/tests/`, which `rest` would have skipped).
 
-**Measured on the branch.** *Filled in from the first sharded run on this branch before the
-change is asked to merge: each shard's wall time and the heaviest test in it.*
+**Measured on the branch.** Run 35411994368 on ecc30ef, the first sharded nightly: green, the
+seven jobs passing **319 tests** between them and failing none, the single job's count. The
+whole run took **39 minutes**, against 161 to 218 for the single job. Each shard's
+`scripts/nightly.sh` step, which on this first run includes a cold release build, since the
+cache's new key had nothing to restore:
+
+| Shard | Its heaviest test | Minutes |
+|---|---|---|
+| 1 | `an_install_in_two_switches_is_caught` | 26.6 |
+| 2 | `the_live_install_crash_test_passes_every_seed` | 36.9 |
+| 3 | `the_range_delete_crash_test_passes_every_seed` | 32.4 |
+| 4 | the lease trial | 36.1 |
+| 5 | the term-raise schedule's excuse | 39.0 |
+| 6 | `the_correct_server_passes_every_seed` | 37.5 |
+| rest | — | 1.6 |
+
+The prediction of 27 to 36 minutes a shard held, give or take the cold build. The shards are
+not equal on a runner, as the unit above warns: the one heaviest in engine sweeps ran shortest
+and the raft-heavy ones longest, so the raft sweeps cost a runner relatively more than they
+cost the M2. The heaviest shard is 12 % above the mean. Shard 6's slow-tailed test did not
+make it the longest: its tail is shorter than its shard's CPU on four cores. The deep-levels
+sweep printed the figure Stage A's nightly printed, 11 609 rounds from level 2 or deeper, so
+`ANANKE_DEEP_SEEDS` still reaches it.
+
+**Review.** One adversarial review of ecc30ef found no blocker and eight minor points. Six are
+fixed in the commit after it:
+
+- a failing test no longer stops its job, so a night's log holds every sweep's verdict and
+  rate — a shard runs every binary and fails at the end, and `rest` runs with
+  `--no-fail-fast`;
+- each shard checks, before running a binary, that the binary has every test its rows name,
+  since a filter that matches nothing passes: a row pointing at the wrong binary would
+  otherwise run its test nowhere on a green night, the check in the gate being no help to a
+  nightly dispatched on a branch whose CI never ran;
+- the check prints cargo's errors when it cannot list a binary's tests, instead of failing
+  silently;
+- a job that reaches its limit uploads its traces, since a timed-out job is cancelled, not
+  failed;
+- this entry states the measuring machine's cores and drops a balance figure more precise
+  than its unit;
+- CLAUDE.md and CONTRIBUTING.md name the check and the table.
+
+The other two are hardening against changes not yet made, recorded as an issue rather than
+built here: the check finds sweeps only in top-level `sim/tests/*.rs` files, so a test target
+in a subdirectory or declared in `Cargo.toml` would pass it unweighed into `rest`; and
+excluding tests from `rest` by name reserves the table's names across the workspace, where
+excluding ananke-sim's integration targets from `rest` by target would not.
 
 **Alternatives.**
 

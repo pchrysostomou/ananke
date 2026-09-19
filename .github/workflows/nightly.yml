@@ -32,8 +32,8 @@ jobs:
   sweep:
     name: 10 000 seeds (${{ matrix.shard }})
     runs-on: ubuntu-latest
-    # A shard is sized to finish in well under an hour (D-064); the limit is there so a
-    # hung run fails the night instead of holding a runner for five hours.
+    # A shard's tests took 27 to 39 minutes on the first sharded run (D-064); the limit is
+    # there so a hung run fails the night instead of holding a runner for five hours.
     timeout-minutes: 150
     strategy:
       # A failing shard does not cancel the others: the night's result is every
@@ -52,7 +52,8 @@ jobs:
           save-if: ${{ matrix.shard == 'rest' }}
       - run: scripts/nightly.sh ${{ matrix.shard }}
       - name: Upload the traces of failing seeds
-        if: failure()
+        # A job that reaches its limit is cancelled, not failed; its traces still upload.
+        if: failure() || cancelled()
         uses: actions/upload-artifact@v4
         with:
           name: failing-traces-${{ matrix.shard }}
