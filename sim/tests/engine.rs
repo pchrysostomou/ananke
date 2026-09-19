@@ -729,13 +729,14 @@ fn an_install_that_switches_one_span_at_a_time_is_caught() {
 
 /// An install that puts its repair in with a switch after its own leaves the
 /// installed tables without the receiver's own writes when a crash falls between
-/// the two, and the crash test says so (D-068). Caught on some seed at every tier,
-/// and by the repair's own check. Measured before this was written: 16 of 20, 61 of
-/// 100 and 616 of 1000, every catch the repair's check.
+/// the two, and the crash test says so (D-068). Caught on some seed of the high-rate
+/// share at every tier, and by the repair's own check. Measured before this was
+/// written: 16 of 20, 61 of 100 and 616 of 1000, every catch the repair's check, so a
+/// share of twenty catches none with probability about 0.38^20, 5e-9.
 // PROPOSED(D-068): the repair is carried in the install's own switch.
 #[test]
 fn an_install_whose_repair_follows_its_switch_is_caught() {
-    let caught = caught_on_the_install_schedule(Variant::RepairAfterSwitch, seeds());
+    let caught = caught_on_the_install_schedule(Variant::RepairAfterSwitch, high_rate_share());
     let repair = caught_by(
         Variant::RepairAfterSwitch,
         &caught,
@@ -753,13 +754,16 @@ fn an_install_whose_repair_follows_its_switch_is_caught() {
 /// reaches it holds a write applied between two spans' copies in one and not the
 /// other. The checkpoint, opened fresh after the next crash, disagrees with the
 /// model at the version it names, and an install from it installs what no version
-/// held (D-068). Caught on some seed at every tier, and by the checkpoint's own
-/// check. Measured before this was written: 9 of 20, 47 of 100 and 468 of 1000, the
-/// checkpoint's check 4, 25 and 324 of them.
+/// held (D-068). Caught on some seed of the high-rate share at every tier, and by the
+/// checkpoint's own check. Measured before this was written: 9 of 20, 47 of 100 and
+/// 468 of 1000, the checkpoint's check 4, 25 and 324 of them, so a share of twenty
+/// sees no catch by that check with probability about 0.68^20 to 0.8^20, 5e-4 to 1e-2
+/// on the measured rates, the larger at the gate's own 4 of 20.
 // PROPOSED(D-068): the checkpoint of several spans, at one version.
 #[test]
 fn a_checkpoint_that_copies_each_span_at_its_own_version_is_caught() {
-    let caught = caught_on_the_install_schedule(Variant::CheckpointVersionPerSpan, seeds());
+    let caught =
+        caught_on_the_install_schedule(Variant::CheckpointVersionPerSpan, high_rate_share());
     let checkpoint = caught_by(
         Variant::CheckpointVersionPerSpan,
         &caught,
@@ -780,8 +784,13 @@ fn a_checkpoint_that_copies_each_span_at_its_own_version_is_caught() {
 /// tier, and never fewer than twenty or the tier itself. At those rates a share of
 /// twenty still expects sixteen catches or more, and a premerge share of a hundred
 /// eighty or more, while the engine binary's cost stays near what the sweep's other
-/// tests make it.
+/// tests make it. D-068 runs two of its variants on the share too, below four in five
+/// but far above D-061's 5 %: `RepairAfterSwitch` and `CheckpointVersionPerSpan`, whose
+/// catch by their own checks a share of twenty misses with probability at most about
+/// one in a hundred on their measured rates, so that the premerge stays near the
+/// quarter of an hour D-040 set.
 // PROPOSED(D-055): the high-rate variants run a share of the seeds.
+// PROPOSED(D-068): and two of D-068's, for the premerge's time.
 fn high_rate_share() -> u64 {
     (seeds() / 10).max(seeds().min(20))
 }

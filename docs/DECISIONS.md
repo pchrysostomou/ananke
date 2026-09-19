@@ -7741,61 +7741,55 @@ against 66 992, 14 939 compactions against 14 815, 1 455 crashes inside a compac
 checkpoints against 8 130. The installs are fewer and larger: two or three spans of one to
 eight keys, against one span of one to twelve.
 
-**The nightly's shards.** The three new tests are rows of `scripts/nightly-shards.txt`
-(D-064), each weighed alone in release at `ANANKE_SEEDS=1000` and `ANANKE_DEEP_SEEDS=100` on
-this laptop, and placed longest-first into the lightest shard. The machine's own background
-work had the load averages at 56 over one minute and 70 over five when they finished, so the
-weights may be somewhat high.
+**Two of the variants run on the high-rate share.** SHARD.md §12 asks a stage to size its new
+tests' seed shares so the premerge stays near the quarter of an hour D-040 set. Run on every
+seed, the two new every-seed variants took the premerge past it: the engine binary alone went
+from 1 574 CPU seconds on the base, 4690d00, to 2 747. `RepairAfterSwitch` and
+`CheckpointVersionPerSpan` therefore run on `high_rate_share()` — twenty seeds at the gate and
+in CI, a hundred at the premerge, a thousand at the nightly — as D-055's review put the
+variants caught on four seeds in five. Neither reaches four in five, but both are far above
+D-061's 5 %, which is the rule that sets a tier:
+
+- `RepairAfterSwitch` is caught on 16 of 20, 61 of 100 and 616 of 1 000, every catch its own
+  check's. A share of twenty misses it with probability about 0.38^20, 5 × 10^-9.
+- `CheckpointVersionPerSpan` is caught by its own check on 4 of 20, 25 of 100 and 324 of 1 000.
+  A share of twenty misses that check with probability between about 0.68^20 and 0.8^20,
+  5 × 10^-4 to 1 × 10^-2 on those rates. The test asserts the check's catch at every tier, so
+  its margin at the gate is the thinnest of the three; a schedule move that takes it to none
+  is a move of the kind D-061 describes, measured and moved by its rule, never loosened in
+  place.
+
+`InstallSwitchPerSpan`, at 922 of 1 000, was on the share from the start.
+
+**The premerge, on an otherwise idle machine.** Measured on the tree with the share, after a
+warm release build, with the one-minute load sampled every ten seconds: `scripts/premerge.sh`
+green at a thousand seeds in **622 s**, at a mean one-minute load of **11.72** over 62 samples.
+Beside it: D-060's 593.87 s at load 20.87 (`ae54a20`) and D-063's 822.64 s at load 60.94
+(`46e95c0`). The engine binary's tests, each run alone at a thousand seeds on the same tree and
+machine, now total **1 824 CPU seconds** against the base's 1 574, the added 250 being the
+heavier install and range-delete schedules, with two or three spans and a repair each time,
+and the three new tests at 35 to 40 CPU seconds each on their share.
+
+An earlier figure, 2 122.50 s at a mean load of 58.40, was taken on f2c6581, before the share
+change, while the machine carried its own background work: the raft binary, which runs no code
+this change touches, took 2.1 times its usual time in it. It is withdrawn in favour of the two
+measurements above, which D-052's protocol asks for.
+
+**The nightly's shards.** The three new tests are rows of `scripts/nightly-shards.txt` (D-064),
+each weighed alone in release at `ANANKE_SEEDS=1000` and `ANANKE_DEEP_SEEDS=100` on the idle
+machine, on the tree with the share:
 
 | Test | Seeds at a thousand | CPU s | Shard |
 | --- | --- | --- | --- |
-| `an_install_whose_repair_follows_its_switch_is_caught` | 1 000 | 715.4 | 3 |
-| `a_checkpoint_that_copies_each_span_at_its_own_version_is_caught` | 1 000 | 616.7 | 2 |
-| `an_install_that_switches_one_span_at_a_time_is_caught` | 100, its share | 70.7 | 4 |
+| `an_install_whose_repair_follows_its_switch_is_caught` | 100, its share | 39.8 | 3 |
+| `an_install_that_switches_one_span_at_a_time_is_caught` | 100, its share | 38.6 | 4 |
+| `a_checkpoint_that_copies_each_span_at_its_own_version_is_caught` | 100, its share | 34.6 | 2 |
 
-Shards 3, 2 and 4 now weigh 1 957.0, 1 858.3 and 1 312.4 CPU seconds, against about 1 242
-for the other three. At the first sharded run's minutes (D-064), scaled by weight, shard 3
-would take about 51 minutes and shard 2 about 55, both under the hour at which D-064
-re-balances the table, and far under the job's 150-minute limit. The older rows keep D-064's
-weights and are not re-measured here, though this change makes the install and
-range-delete tests heavier: two or three spans with a repair each time. The next nightly
-measures what that adds, and if a shard passes an hour, D-064's procedure re-balances the
-table in a change of its own.
-
-**The premerge.** Measured on f2c6581, the commit that lands the rest of this entry.
-`scripts/premerge.sh` ran at a thousand seeds after a warm release build, with the one-minute
-load sampled every 15 s, as D-052 and D-055 measured it. It was **green in 2 122.50 s**
-(35 min 22.5 s), with 8 743.12 s user and 374.22 s sys; 325 tests passed and none failed. The
-**mean one-minute load was 58.40** over 138 samples, from 19.60 to 100.37. Per binary:
-`sim/tests/raft.rs` 1 124.40 s, `sim/tests/engine.rs` 907.29 s, `sim/tests/wal.rs` 23.66 s,
-and every other binary under five seconds. Beside it stands D-063's run on 46e95c0: 822.64 s
-at a load of 60.94, with raft 535.89 s, engine 245.96 s and WAL 23.26 s.
-
-The run is not a clean measure of this change. The raft binary runs no code this change
-touches, and its seed-42 traces hash as on the base. Yet it took 2.1 times D-063's figure at
-a similar mean load: the load reached 100 while it ran, and the machine was slower for
-reasons of its own.
-
-What the change costs was measured apart, the same day and the same way on both trees: the
-engine binary alone at a thousand seeds, in release, its tests one at a time.
-- On this tree, 404.26 s and 2 747 CPU seconds; on the base, 4690d00, 223.32 s and 1 574.
-- The gate's tier on its own, twenty seeds in debug: 64.07 s against 40.96 s.
-- The three new tests weigh 1 403 CPU seconds in the nightly's table. They were weighed at a
-  higher load (above), when a CPU second of this machine buys less, so that weight cannot be
-  subtracted from these two figures. The older tests grew too, by an amount not separated
-  here: the install and range-delete schedules' installs are heavier, and the oracle checks
-  more.
-
-The premerge therefore exceeds D-040's quarter of an hour on this machine, however its load
-is read: the engine binary's 181 s of added wall, run alone, takes D-063's 822.64 s past
-fifteen minutes.
-
-For the owner, not decided here. The two new variants that run every seed are caught on
-62 % and 47 % of seeds. Run on `high_rate_share()`, as D-055's review did for the variants
-caught on four seeds in five, each would still be caught at the premerge's hundred with
-P(none) below 10^-27, and about nine tenths of their 1 332 CPU seconds at a thousand would
-be saved. This entry does not take that, since D-055 set the share by rate and neither rate
-reaches it.
+The shards now weigh 1 241.7 to 1 281.3 CPU seconds, within 3 % of one another. The older rows
+keep D-064's weights, though this change makes the install and range-delete crash tests heavier
+(their idle weights on this tree, 346.8 and 223.7 CPU seconds, are measured in a different
+condition from D-064's and are not mixed into the table). The next nightly measures what that
+adds; if a shard passes an hour, D-064's procedure re-balances the table in a change of its own.
 
 **Alternatives.**
 - *Option (b) of D-066, two single-span steps bracketed by a durable marker.* The owner
