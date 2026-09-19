@@ -47,6 +47,13 @@
 //! install of nothing: the span's keys go with one manifest switch and leave no
 //! tombstone (D-055).
 //!
+//! Each of the three takes a set of spans as well as one (D-068), since a range lives
+//! in two: its Raft state and its user keys (D-066). [`Engine::checkpoint_spans`]
+//! copies every span at one version; [`Engine::install_spans`] takes every span's
+//! keys out, puts the source's in, and carries the receiver's own writes, the repair,
+//! as a table of its own at the number after the install's, all in the one manifest
+//! switch; and [`Engine::delete_ranges`] is the install of nothing over the set.
+//!
 //! The [`Variant`]s for the crash sweep: [`Variant::Correct`];
 //! [`Variant::NoWalBeforeMemtable`], which applies and acknowledges a write before
 //! the log has it; [`Variant::ReleaseBeforeManifest`], which releases a memtable
@@ -57,9 +64,12 @@
 //! [`Variant::SpanCheckpointUnsynced`], whose checkpoint of a span does not sync its
 //! tables; [`Variant::SeekCountsTombstones`], whose bounded seek counts deleted keys
 //! against its limit; [`Variant::RangeDeleteSkipsMemtables`], whose range delete
-//! leaves the span's writes in the memtables; and
+//! leaves the span's writes in the memtables;
 //! [`Variant::InstallKeepsSourceNumbers`], whose install keeps the source's sequence
-//! numbers.
+//! numbers; [`Variant::InstallSwitchPerSpan`], whose install of several spans
+//! switches them one at a time; [`Variant::RepairAfterSwitch`], whose install puts
+//! the repair in with a switch after its own; and [`Variant::CheckpointVersionPerSpan`],
+//! whose checkpoint of several spans copies each at its own version.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
@@ -132,6 +142,22 @@ pub enum Variant {
     /// local write, and hides them.
     // PROPOSED(D-054): the installed sequence numbers are the install's.
     InstallKeepsSourceNumbers,
+    /// An install of several spans switches them one at a time: each manifest
+    /// switch takes out and puts in what first falls in one span, the next span's
+    /// with the next switch. A crash between two leaves some spans installed and
+    /// the rest as they were: a mixture across the spans.
+    // PROPOSED(D-068): several spans in one manifest switch.
+    InstallSwitchPerSpan,
+    /// An install makes its switch without the repair, the receiver's own writes,
+    /// and puts the repair's table in with a second switch after it. A crash
+    /// between the two leaves the installed tables without their repair.
+    // PROPOSED(D-068): the repair is carried in the install's own switch.
+    RepairAfterSwitch,
+    /// A checkpoint of several spans copies each at the newest version applied
+    /// when it reaches that span, and names the last. A write applied between two
+    /// spans' copies is in the later span's copy and not in the earlier's.
+    // PROPOSED(D-068): the checkpoint of several spans, at one version.
+    CheckpointVersionPerSpan,
 }
 
 /// How to open an [`Engine`].
@@ -393,33 +419,54 @@ pub struct InstallInfo {
     /// The sequence number every installed write carries: the install's own log
     /// record.
     pub seq: Seq,
+    /// The sequence number every write of the repair carries, the record after
+    /// `seq`, which holds no write; `None` when the install carried no repair.
+    // PROPOSED(D-068): the repair, in a table of its own numbered above the source's.
+    pub repair_seq: Option<Seq>,
     /// The manifest that made the install the state.
     pub manifest: u64,
     /// Tables taken out of service, the rewritten ones' originals included.
     pub removed: usize,
     /// Of those, tables written again without the span's keys.
     pub rewritten: usize,
-    /// Installed tables.
+    /// Installed tables, the repair's not counted.
     pub added: usize,
-    /// Keys installed.
+    /// Keys installed, the repair's not counted.
     pub keys: u64,
 }
 
-/// Why [`Engine::install_span`] refused an install. Nothing in the store changed,
-/// though a refusal after the install took its number leaves its log record, which
-/// holds no write.
+/// Why [`Engine::install_span`] or [`Engine::install_spans`] refused an install.
+/// Nothing in the store changed, though a refusal after the install took its number
+/// leaves its log record, which holds no write.
 // PROPOSED(D-054): the live install of a span, in one manifest switch.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InstallRefused {
-    /// The span holds no key: its start is not below its end.
+    /// A span holds no key, its start not below its end, or no span was given.
     EmptySpan,
-    /// The source holds a key outside the span, which the install would have
+    /// The spans are not sorted and disjoint: one ends past the start of the one
+    /// after it. A checkpoint of several spans is refused for it too.
+    // PROPOSED(D-068): a set of spans is sorted and disjoint.
+    SpansOverlap {
+        /// Where the earlier span ends.
+        end: Bytes,
+        /// Where the later one starts, below `end`.
+        start: Bytes,
+    },
+    /// The source holds a key outside every span, which the install would have
     /// written over a key it was not asked to replace.
     OutsideSpan {
         /// The smallest key the source holds.
         first: Bytes,
         /// The largest.
         last: Bytes,
+    },
+    /// The repair writes a key outside every span. The install removes and
+    /// replaces the spans' keys alone, so a repair write outside them would be a
+    /// write the log never numbered, over a key the install was not asked to touch.
+    // PROPOSED(D-068): the repair lies inside the spans it is carried with.
+    RepairOutsideSpan {
+        /// The first such key in the repair.
+        key: Bytes,
     },
     /// Another install has not switched yet: one runs at a time.
     InProgress,
@@ -446,10 +493,17 @@ impl std::fmt::Display for InstallRefused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             InstallRefused::EmptySpan => write!(f, "the span holds no key"),
+            InstallRefused::SpansOverlap { end, start } => write!(
+                f,
+                "the spans are not sorted and disjoint: one ends at {end:?}, past the start of the next at {start:?}"
+            ),
             InstallRefused::OutsideSpan { first, last } => write!(
                 f,
                 "the source holds keys {first:?} to {last:?}, not all inside the span"
             ),
+            InstallRefused::RepairOutsideSpan { key } => {
+                write!(f, "the repair writes {key:?}, outside every span")
+            }
             InstallRefused::InProgress => write!(f, "another install is in progress"),
             InstallRefused::Quiesced => write!(f, "the engine is quiesced"),
             InstallRefused::SourceDamaged(what) => write!(f, "the source is damaged: {what}"),
@@ -1406,6 +1460,32 @@ impl<E: Environment> Engine<E> {
         range: Range<&[u8]>,
         dir: &Path,
     ) -> io::Result<CheckpointInfo> {
+        self.checkpoint_spans(&[range], dir).await
+    }
+
+    /// Writes the spans `spans` as of the newest write applied into `dir`, as
+    /// [`checkpoint_span`](Self::checkpoint_span) writes one: every span at the
+    /// one version read before the first is copied, so a write applied while the
+    /// copy runs is in no span's copy, and never in one span's and not another's
+    /// (D-068). The spans must be sorted and disjoint; one that holds no key copies
+    /// nothing. The tables are sealed near `sst_bytes` in key order across the
+    /// spans, so one table can hold keys of two.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidData` carrying [`InstallRefused::SpansOverlap`] when two spans that
+    /// hold keys are out of order or overlap, before anything is written;
+    /// `AlreadyExists` if `dir` is not empty; else the filesystem's.
+    // PROPOSED(D-068): the checkpoint of several spans, at one version.
+    pub async fn checkpoint_spans(
+        &self,
+        spans: &[Range<&[u8]>],
+        dir: &Path,
+    ) -> io::Result<CheckpointInfo> {
+        // A span that holds no key copies nothing, as a single one always has; the
+        // rest must be in key order, or the tables' keys would not be.
+        let spans: Vec<Range<&[u8]>> = spans.iter().filter(|s| s.start < s.end).cloned().collect();
+        check_disjoint(&spans).map_err(InstallRefused::into_io)?;
         let _turn = self.shared.turnstile.acquire().await;
         let shared = &self.shared;
         let fs = shared.env.fs();
@@ -1416,30 +1496,39 @@ impl<E: Environment> Engine<E> {
                 "the checkpoint directory is not empty",
             ));
         }
-        let version = shared.visible.load(Ordering::Acquire);
-        let mut merge = shared.merge_all();
-        merge.seek(&ikey::lower_bound(range.start)).await?;
+        // The turnstile holds every flush and compaction off, so every write at or
+        // below the version stays in the memtables and tables each span's merge
+        // walks, and the version filters out whatever is applied meanwhile.
+        let mut version = shared.visible.load(Ordering::Acquire);
         let mut listed = Vec::new();
         let mut writer = SstWriter::new();
-        let mut last_user: Option<Bytes> = None;
-        while let Some((key, value)) = merge.next().await? {
-            let (user, seq) = ikey::decode(&key)?;
-            if user[..] >= *range.end {
-                break;
+        for range in &spans {
+            if shared.config.variant == Variant::CheckpointVersionPerSpan {
+                // The bug: each span at the version applied when its copy begins.
+                version = shared.visible.load(Ordering::Acquire);
             }
-            if seq > version || last_user.as_ref() == Some(&user) {
-                continue;
+            let mut merge = shared.merge_all();
+            merge.seek(&ikey::lower_bound(range.start)).await?;
+            let mut last_user: Option<Bytes> = None;
+            while let Some((key, value)) = merge.next().await? {
+                let (user, seq) = ikey::decode(&key)?;
+                if user[..] >= *range.end {
+                    break;
+                }
+                if seq > version || last_user.as_ref() == Some(&user) {
+                    continue;
+                }
+                last_user = Some(user.clone());
+                if value == Value::Tombstone {
+                    continue;
+                }
+                if writer.entries() > 0 && writer.bytes_so_far() as u64 >= shared.config.sst_bytes {
+                    let number = listed.len() as u64 + 1;
+                    let full = std::mem::take(&mut writer);
+                    listed.push(write_level_0_table(shared, dir, number, full).await?);
+                }
+                writer.add(&user, seq, &value);
             }
-            last_user = Some(user.clone());
-            if value == Value::Tombstone {
-                continue;
-            }
-            if writer.entries() > 0 && writer.bytes_so_far() as u64 >= shared.config.sst_bytes {
-                let number = listed.len() as u64 + 1;
-                let full = std::mem::take(&mut writer);
-                listed.push(write_level_0_table(shared, dir, number, full).await?);
-            }
-            writer.add(&user, seq, &value);
         }
         if writer.entries() > 0 {
             let number = listed.len() as u64 + 1;
@@ -1606,7 +1695,44 @@ impl<E: Environment> Engine<E> {
     /// runtime, the future resolves with an error saying so.
     // PROPOSED(D-054): the live install of a span, in one manifest switch.
     pub fn install_span(&self, range: Range<Bytes>, source: SpanSource<E>) -> SpanInstall {
-        self.begin_install(range, source, false)
+        self.install_spans(vec![range], source, WriteBatch::new())
+    }
+
+    /// Installs `source` over the spans `spans` while the engine runs, and carries
+    /// `repair`, the receiver's own writes, with it: every write of a key in any
+    /// span that the engine holds is taken out, the newest live write of every key
+    /// `source` holds put in, and the repair put in over both, all in one manifest
+    /// switch (D-066, D-068). A crash at any point leaves every span as it was, or
+    /// every span installed with the repair, never a mixture across the spans or
+    /// between the installed tables and the repair.
+    ///
+    /// It is [`install_span`](Self::install_span) over a set: numbered, flushed,
+    /// rewritten and switched as that is, with the same refusals and what a
+    /// snapshot sees. The spans must be sorted and disjoint, and every key of the
+    /// source and of the repair must lie in one of them. A repair that is not
+    /// empty takes the log record after the install's own, numbered with it under
+    /// one lock so no other write falls between, and holding no write either;
+    /// [`SpanInstall::repair_seq`] reports it. Its writes, the last per key and
+    /// deletes kept, are written at that number into a table of their own, which
+    /// the install's switch lists beside the installed tables: so a repair write
+    /// is read over the source's write of the same key, and a write to a span after
+    /// the call is read over both. An empty repair takes no number and writes no
+    /// table, as `install_span` does.
+    ///
+    /// # Errors
+    ///
+    /// As [`install_span`](Self::install_span)'s, and refused
+    /// ([`InstallRefused::SpansOverlap`], [`InstallRefused::RepairOutsideSpan`])
+    /// before it is numbered when the spans are out of order or overlap, or when
+    /// the repair writes a key outside every span.
+    // PROPOSED(D-068): several spans and the receiver's repair, in one manifest switch.
+    pub fn install_spans(
+        &self,
+        spans: Vec<Range<Bytes>>,
+        source: SpanSource<E>,
+        repair: WriteBatch,
+    ) -> SpanInstall {
+        self.begin_install(spans, source, repair.ops, false)
     }
 
     /// Deletes every key in `range` with one manifest switch, and no tombstone: an
@@ -1616,41 +1742,63 @@ impl<E: Environment> Engine<E> {
     /// the span after the call is newer than the delete and survives it.
     // PROPOSED(D-055): the range delete, an install of nothing.
     pub fn delete_range(&self, range: Range<Bytes>) -> SpanInstall {
-        self.begin_install(range, SpanSource::empty(), true)
+        self.delete_ranges(vec![range])
+    }
+
+    /// Deletes every key in each of `spans` with one manifest switch, and no
+    /// tombstone: an install of nothing over the set, as
+    /// [`delete_range`](Self::delete_range) is over one span, with
+    /// [`install_spans`](Self::install_spans)'s rule for the spans (D-068).
+    // PROPOSED(D-068): the range delete over several spans, in one manifest switch.
+    pub fn delete_ranges(&self, spans: Vec<Range<Bytes>>) -> SpanInstall {
+        self.begin_install(spans, SpanSource::empty(), Vec::new(), true)
     }
 
     /// An install or a range delete, numbered now; see
-    /// [`install_span`](Self::install_span).
+    /// [`install_spans`](Self::install_spans).
     fn begin_install(
         &self,
-        range: Range<Bytes>,
+        spans: Vec<Range<Bytes>>,
         source: SpanSource<E>,
+        repair: Vec<(Bytes, Value)>,
         delete: bool,
     ) -> SpanInstall {
         let refused = |why: InstallRefused| SpanInstall {
             seq: None,
+            repair_seq: None,
             state: InstallState::Refused(Some(why.into_io())),
         };
-        if range.start >= range.end {
+        if spans.is_empty() || spans.iter().any(|s| s.start >= s.end) {
             return refused(InstallRefused::EmptySpan);
+        }
+        // PROPOSED(D-068): a set of spans is sorted and disjoint.
+        if let Err(why) = check_disjoint(&spans) {
+            return refused(why);
         }
         if self.quiesced() {
             return refused(InstallRefused::Quiesced);
         }
-        if let Some((first, last)) = source.key_range()
-            && (first < range.start || last >= range.end)
+        if source.outside(&spans)
+            && let Some((first, last)) = source.key_range()
         {
             return refused(InstallRefused::OutsideSpan { first, last });
         }
-        let (marker, seq) = {
+        // PROPOSED(D-068): the repair lies inside the spans it is carried with.
+        if let Some((key, _)) = repair.iter().find(|(key, _)| !in_spans(&spans, key)) {
+            return refused(InstallRefused::RepairOutsideSpan { key: key.clone() });
+        }
+        let (markers, seq, repair_seq) = {
             let mut install = lock(&self.shared.install);
             if install.is_some() {
                 return refused(InstallRefused::InProgress);
             }
-            let marker = self.write(WriteBatch::new(), true);
-            let seq = marker.seq();
+            // PROPOSED(D-068): the repair's number is the record after the
+            // install's, taken with it.
+            let markers = self.number_empty(if repair.is_empty() { 1 } else { 2 });
+            let seq = markers[0].seq();
+            let repair_seq = markers.get(1).map(Write::seq);
             *install = Some(seq);
-            (marker, seq)
+            (markers, seq, repair_seq)
         };
         if self.shared.config.variant == Variant::NoWalBeforeMemtable {
             // That engine applied the record as it was written, before the install
@@ -1666,21 +1814,57 @@ impl<E: Environment> Engine<E> {
             slot: slot.clone(),
         };
         let shared = self.shared.clone();
+        let plan = InstallPlan {
+            seq,
+            repair_seq,
+            spans,
+            source,
+            repair,
+            delete,
+        };
         // PROPOSED(D-054): the install runs in a task of its own, so a caller that
         // drops its future or leaves it unpolled cannot stop it half-way, with a
         // manifest written under the next number and never switched to.
         self.shared.env.spawn("span-install", async move {
             let result = async {
-                marker.await?;
-                shared.install_span(seq, range, source, delete).await
+                for marker in markers {
+                    marker.await?;
+                }
+                shared.install_span(plan).await
             }
             .await;
             task.finish(result);
         });
         SpanInstall {
             seq: Some(seq),
+            repair_seq,
             state: InstallState::Running(slot),
         }
+    }
+
+    /// `count` log records holding no write, numbered back to back and synced, and
+    /// pending under one hold of the pending lock, so no other write is numbered
+    /// between them (D-021). One is what [`write`](Self::write) makes of an empty
+    /// batch.
+    // PROPOSED(D-068): the repair's number is the record after the install's.
+    fn number_empty(&self, count: usize) -> Vec<Write<E>> {
+        if self.shared.config.variant == Variant::NoWalBeforeMemtable {
+            // That engine takes no pending lock: it applies as it writes.
+            return (0..count)
+                .map(|_| self.write(WriteBatch::new(), true))
+                .collect();
+        }
+        let mut pending = lock(&self.shared.pending);
+        (0..count)
+            .map(|_| {
+                let append = self.shared.wal.append_with(encode_batch(&[]), true);
+                pending.insert(append.seq(), Vec::new());
+                Write {
+                    shared: self.shared.clone(),
+                    append,
+                }
+            })
+            .collect()
     }
 
     /// The manifest in force.
@@ -1997,24 +2181,31 @@ impl<E: Environment> Shared<E> {
         tables.manifest = next;
     }
 
-    /// The install numbered `seq` of `source` over `range`, once its record is
-    /// durable: see [`Engine::install_span`].
+    /// The install `plan` asks for, once its records are durable: see
+    /// [`Engine::install_spans`].
     // PROPOSED(D-054): the live install of a span, in one manifest switch.
-    async fn install_span(
-        &self,
-        seq: Seq,
-        range: Range<Bytes>,
-        source: SpanSource<E>,
-        delete: bool,
-    ) -> io::Result<InstallInfo> {
+    // PROPOSED(D-068): several spans and the receiver's repair, in that one switch.
+    async fn install_span(&self, plan: InstallPlan<E>) -> io::Result<InstallInfo> {
+        let InstallPlan {
+            seq,
+            repair_seq,
+            spans,
+            source,
+            repair,
+            delete,
+        } = plan;
         let _turn = self.turnstile.acquire().await;
         if self.quiesced.load(Ordering::SeqCst) {
             return Err(InstallRefused::Quiesced.into_io());
         }
-        let (start, end) = (&range.start[..], &range.end[..]);
-        let in_span = |user: &[u8]| start <= user && user < end;
         // PROPOSED(D-055): the range delete's variant forgets the memtables.
         let skip_memtables = delete && self.config.variant == Variant::RangeDeleteSkipsMemtables;
+        // The last record the install numbered: its repair's, if it carries one.
+        // Neither holds a write, so every write at or below it is at or below
+        // `seq`, and in a table once the memtables below `seq` are flushed.
+        let top = repair_seq.unwrap_or(seq);
+        // The repair's last write per key.
+        let repair: BTreeMap<Bytes, Value> = repair.into_iter().collect();
 
         // Every memtable holding writes at or below the install, flushed: the
         // active one was rotated as the install's record was applied, and the
@@ -2028,18 +2219,192 @@ impl<E: Environment> Shared<E> {
                 _ => break,
             }
         }
+        let flushed = |manifest: &mut Manifest| {
+            if !skip_memtables {
+                manifest.flushed_seq = manifest.flushed_seq.max(top);
+            }
+        };
+        let metas = |tables: &[Table<E>]| -> Vec<SstMeta> {
+            tables.iter().map(|(m, _)| m.clone()).collect()
+        };
+        let event = |manifest: u64, part: &InstallPart<E>| TraceEvent::SpanInstalled {
+            manifest,
+            spans: part
+                .spans
+                .iter()
+                .map(|s| (s.start.clone(), s.end.clone()))
+                .collect(),
+            seq,
+            removed: part.removed.clone(),
+            rewritten: part
+                .rewritten
+                .iter()
+                .map(|(from, m, _)| (*from, m.number, m.first_key.clone(), m.last_key.clone()))
+                .collect(),
+            added: part
+                .added
+                .iter()
+                .map(|(m, _)| (m.number, m.first_key.clone(), m.last_key.clone()))
+                .collect(),
+            repair: part
+                .repair
+                .as_ref()
+                .map(|(m, _)| (top, m.number, m.first_key.clone(), m.last_key.clone())),
+        };
 
-        // The tables that hold a write of the span below the install: taken out
-        // whole when every write they hold is one, else written again at their level
-        // without those writes.
+        if self.config.variant == Variant::InstallSwitchPerSpan && spans.len() > 1 {
+            // The bug: the spans one at a time, each the install of that span alone
+            // at the install's number, with the source's keys and the repair's that
+            // lie in it, traced and switched before the next is begun. A crash
+            // between two switches leaves the earlier spans installed and the later
+            // as they were.
+            let (mut removed, mut rewrites, mut added, mut keys) = (Vec::new(), 0, 0, 0);
+            for span in &spans {
+                let part = self
+                    .install_part(
+                        std::slice::from_ref(span),
+                        true,
+                        &source,
+                        &repair,
+                        seq,
+                        repair_seq,
+                    )
+                    .await?;
+                let mut next = self.manifest_edit(&part.removed, part.put_in_metas());
+                flushed(&mut next);
+                self.env.trace(event(next.number, &part));
+                self.write_manifest(&next).await?;
+                removed.extend(part.removed.iter().copied());
+                (rewrites, added, keys) = (
+                    rewrites + part.rewritten.len(),
+                    added + part.added.len(),
+                    keys + part.keys,
+                );
+                let taken_out = part.removed.clone();
+                self.install(next, &taken_out, part.put_in());
+            }
+            return Ok(self
+                .finish_install(
+                    seq,
+                    repair_seq,
+                    top,
+                    &removed,
+                    skip_memtables,
+                    (rewrites, added, keys),
+                )
+                .await);
+        }
+
+        let part = self
+            .install_part(&spans, false, &source, &repair, seq, repair_seq)
+            .await?;
+        let removed = part.removed.clone();
+        let counts = (part.rewritten.len(), part.added.len(), part.keys);
+        match self.config.variant {
+            Variant::InstallInTwoSwitches => {
+                // The bug: the spans' keys go with one switch and the installed
+                // tables come with a second. A crash between the two leaves the
+                // spans empty.
+                let traced = event(0, &part);
+                let InstallPart {
+                    rewritten,
+                    added,
+                    repair,
+                    ..
+                } = part;
+                let rewritten: Vec<Table<E>> =
+                    rewritten.into_iter().map(|(_, m, r)| (m, r)).collect();
+                let mut first = self.manifest_edit(&removed, metas(&rewritten));
+                flushed(&mut first);
+                self.write_manifest(&first).await?;
+                self.install(first, &removed, rewritten);
+                let mut put_in = added;
+                put_in.extend(repair);
+                let mut next = self.manifest_edit(&[], metas(&put_in));
+                flushed(&mut next);
+                self.env.trace(with_manifest(traced, next.number));
+                self.write_manifest(&next).await?;
+                self.install(next, &[], put_in);
+            }
+            Variant::RepairAfterSwitch if part.repair.is_some() => {
+                // The bug: the switch puts the installed tables in without the
+                // repair, and a second switch puts the repair's table in after it.
+                // A crash between the two leaves the tables without their repair.
+                let traced = event(0, &part);
+                let InstallPart {
+                    rewritten,
+                    added,
+                    repair,
+                    ..
+                } = part;
+                let mut put_in: Vec<Table<E>> =
+                    rewritten.into_iter().map(|(_, m, r)| (m, r)).collect();
+                put_in.extend(added);
+                let mut next = self.manifest_edit(&removed, metas(&put_in));
+                flushed(&mut next);
+                self.env.trace(with_manifest(traced, next.number));
+                self.write_manifest(&next).await?;
+                self.install(next, &removed, put_in);
+                let repair: Vec<Table<E>> = repair.into_iter().collect();
+                let mut after = self.manifest_edit(&[], metas(&repair));
+                flushed(&mut after);
+                self.write_manifest(&after).await?;
+                self.install(after, &[], repair);
+            }
+            _ => {
+                // PROPOSED(D-068): the repair's table is listed by the install's
+                // own manifest, beside the installed tables, so it is in force
+                // exactly when they are.
+                let mut next = self.manifest_edit(&removed, part.put_in_metas());
+                flushed(&mut next);
+                self.env.trace(event(next.number, &part));
+                if let Err(error) = self.write_manifest(&next).await {
+                    // PROPOSED(D-054): whether CURRENT names the install's manifest is
+                    // not known, and its file may hold the next number: a flush or a
+                    // compaction writing under it would fail for good, or write over
+                    // the install. The engine does no more work, and the next open
+                    // finds the spans as they were or as installed.
+                    self.quiesce("an install's manifest or its switch failed");
+                    return Err(error);
+                }
+                self.install(next, &removed, part.put_in());
+            }
+        }
+        Ok(self
+            .finish_install(seq, repair_seq, top, &removed, skip_memtables, counts)
+            .await)
+    }
+
+    /// An install's tables over `spans`, written and synced but not yet listed:
+    /// every table in service holding a write of the spans below `seq` taken out,
+    /// whole when every write it holds is one, which one span holding both of its
+    /// ends and no write at or past `seq` says, else written again at its level
+    /// without those writes; the source's newest live write of each key of the
+    /// spans at `seq`, in level-0 tables sealed near `sst_bytes`; and the repair's
+    /// writes in the spans at `repair_seq`, in a table of their own. A key of the
+    /// source outside every one of `spans` refuses the install, and the tables
+    /// written so far are orphans the next open removes; but with `one_of_several`,
+    /// which only the variant that switches span by span sets, `spans` is one span
+    /// of the install's, and only the source's keys in it are walked.
+    // PROPOSED(D-068): several spans and the receiver's repair, in one manifest switch.
+    async fn install_part(
+        &self,
+        spans: &[Range<Bytes>],
+        one_of_several: bool,
+        source: &SpanSource<E>,
+        repair: &BTreeMap<Bytes, Value>,
+        seq: Seq,
+        repair_seq: Option<Seq>,
+    ) -> io::Result<InstallPart<E>> {
+        let in_span = |user: &[u8]| in_spans(spans, user);
         let in_service: Vec<(SstMeta, Arc<SstReader<FileOf<E>>>)> = lock(&self.tables).ssts.clone();
         let mut removed = Vec::new();
         let mut rewritten = Vec::new();
         for (meta, reader) in &in_service {
-            if meta.first_key[..] >= *end || meta.last_key[..] < *start {
+            if !overlaps_spans(spans, &meta.first_key, &meta.last_key) {
                 continue;
             }
-            if in_span(&meta.first_key) && in_span(&meta.last_key) && meta.max_seq < seq {
+            if within_one_span(spans, &meta.first_key, &meta.last_key) && meta.max_seq < seq {
                 removed.push(meta.number);
                 continue;
             }
@@ -2073,6 +2438,9 @@ impl<E: Environment> Shared<E> {
                 .map(|(_, r)| Source::Sst(r.iter()))
                 .collect(),
         );
+        if one_of_several && let [only] = spans {
+            merge.seek(&ikey::lower_bound(&only.start)).await?;
+        }
         let mut added = Vec::new();
         let mut writer = SstWriter::new();
         let mut last_user: Option<Bytes> = None;
@@ -2084,6 +2452,10 @@ impl<E: Environment> Shared<E> {
             }
             last_user = Some(user.clone());
             if !in_span(&user) {
+                if one_of_several {
+                    // Past the one span walked: the rest are other spans'.
+                    break;
+                }
                 // The manifest's key ranges said otherwise. The tables written so
                 // far are orphans, which the next open removes.
                 return Err(InstallRefused::OutsideSpan {
@@ -2111,70 +2483,51 @@ impl<E: Environment> Shared<E> {
             added.push(self.write_output(writer, 0).await?);
         }
 
-        let traced_rewrites: Vec<(u64, u64, Bytes, Bytes)> = rewritten
-            .iter()
-            .map(|(from, m, _)| (*from, m.number, m.first_key.clone(), m.last_key.clone()))
-            .collect();
-        let traced_added: Vec<(u64, Bytes, Bytes)> = added
-            .iter()
-            .map(|(m, _)| (m.number, m.first_key.clone(), m.last_key.clone()))
-            .collect();
-        let event = |manifest: u64| TraceEvent::SpanInstalled {
-            manifest,
-            start: range.start.clone(),
-            end: range.end.clone(),
-            seq,
-            removed: removed.clone(),
-            rewritten: traced_rewrites.clone(),
-            added: traced_added.clone(),
-        };
-        let (rewrites, added_count) = (rewritten.len(), added.len());
-        let rewritten_metas: Vec<SstMeta> = rewritten.iter().map(|(_, m, _)| m.clone()).collect();
-        let added_metas: Vec<SstMeta> = added.iter().map(|(m, _)| m.clone()).collect();
-        let rewritten: Vec<(SstMeta, SstReader<FileOf<E>>)> =
-            rewritten.into_iter().map(|(_, m, r)| (m, r)).collect();
-        if self.config.variant == Variant::InstallInTwoSwitches {
-            // The bug: the span's keys go with one switch and the installed tables
-            // come with a second. A crash between the two leaves the span empty.
-            let mut first = self.manifest_edit(&removed, rewritten_metas);
-            first.flushed_seq = first.flushed_seq.max(seq);
-            self.write_manifest(&first).await?;
-            self.install(first, &removed, rewritten);
-            let mut next = self.manifest_edit(&[], added_metas);
-            next.flushed_seq = next.flushed_seq.max(seq);
-            self.env.trace(event(next.number));
-            self.write_manifest(&next).await?;
-            self.install(next, &[], added);
-        } else {
-            let mut next = self.manifest_edit(
-                &removed,
-                rewritten_metas.into_iter().chain(added_metas).collect(),
-            );
-            if !skip_memtables {
-                next.flushed_seq = next.flushed_seq.max(seq);
+        // PROPOSED(D-068): the repair, the receiver's own writes, in a table of its
+        // own at the repair's number, above the installed tables' and below every
+        // later write: the last write per key, a delete kept as a tombstone, since
+        // it must hide the source's write of the key.
+        let mut repair_table = None;
+        if let Some(repair_seq) = repair_seq {
+            let mut writer = SstWriter::new();
+            for (key, value) in repair.iter().filter(|(key, _)| in_span(key)) {
+                writer.add(key, repair_seq, value);
             }
-            self.env.trace(event(next.number));
-            if let Err(error) = self.write_manifest(&next).await {
-                // PROPOSED(D-054): whether CURRENT names the install's manifest is
-                // not known, and its file may hold the next number: a flush or a
-                // compaction writing under it would fail for good, or write over
-                // the install. The engine does no more work, and the next open
-                // finds the span as it was or as installed.
-                self.quiesce("an install's manifest or its switch failed");
-                return Err(error);
+            if writer.entries() > 0 {
+                repair_table = Some(self.write_output(writer, 0).await?);
             }
-            let mut put_in = rewritten;
-            put_in.extend(added);
-            self.install(next, &removed, put_in);
         }
+        Ok(InstallPart {
+            spans: spans.to_vec(),
+            removed,
+            rewritten,
+            added,
+            repair: repair_table,
+            keys,
+        })
+    }
+
+    /// After an install's switch: the tables it took out deleted, and the log
+    /// segments at or below `top`, its last record; an error in either traced and
+    /// the install resolved as made.
+    // PROPOSED(D-054): an error after the switch does not undo the install.
+    async fn finish_install(
+        &self,
+        seq: Seq,
+        repair_seq: Option<Seq>,
+        top: Seq,
+        removed: &[u64],
+        skip_memtables: bool,
+        (rewritten, added, keys): (usize, usize, u64),
+    ) -> InstallInfo {
         let manifest = lock(&self.tables).manifest.number;
         // PROPOSED(D-054): the switch is durable, so the install is in force and
         // resolves as made whatever the deletions do; what they leave is removed as
         // orphans at the next open, or by the next flush's deletion of the log.
         let cleanup = async {
-            self.delete_tables(&removed).await?;
+            self.delete_tables(removed).await?;
             if !skip_memtables {
-                self.wal.delete_segments_through(seq).await?;
+                self.wal.delete_segments_through(top).await?;
             }
             Ok::<(), io::Error>(())
         }
@@ -2185,15 +2538,143 @@ impl<E: Environment> Shared<E> {
                 error: error.to_string(),
             });
         }
-        Ok(InstallInfo {
+        InstallInfo {
             seq,
+            repair_seq,
             manifest,
             removed: removed.len(),
-            rewritten: rewrites,
-            added: added_count,
+            rewritten,
+            added,
             keys,
-        })
+        }
     }
+}
+
+/// A table written and open, with what the manifest says of it.
+type Table<E> = (SstMeta, SstReader<FileOf<E>>);
+
+/// An install's tables, written and not yet listed: see `Shared::install_part`.
+// PROPOSED(D-068): several spans and the receiver's repair, in one manifest switch.
+struct InstallPart<E: Environment> {
+    /// The spans it covers.
+    spans: Vec<Range<Bytes>>,
+    /// Tables taken out of service, the rewritten ones' originals included.
+    removed: Vec<u64>,
+    /// Each rewrite: its original's number, and the table written in its place.
+    rewritten: Vec<(u64, SstMeta, SstReader<FileOf<E>>)>,
+    /// The installed tables.
+    added: Vec<Table<E>>,
+    /// The repair's table, when there is a repair with a write in the spans.
+    repair: Option<Table<E>>,
+    /// Keys installed.
+    keys: u64,
+}
+
+impl<E: Environment> InstallPart<E> {
+    /// What the manifest lists in place of the tables taken out: the rewrites,
+    /// the installed tables and the repair's.
+    fn put_in_metas(&self) -> Vec<SstMeta> {
+        self.rewritten
+            .iter()
+            .map(|(_, m, _)| m.clone())
+            .chain(self.added.iter().map(|(m, _)| m.clone()))
+            .chain(self.repair.iter().map(|(m, _)| m.clone()))
+            .collect()
+    }
+
+    /// The tables put in service, in the order [`put_in_metas`](Self::put_in_metas)
+    /// lists them.
+    fn put_in(self) -> Vec<Table<E>> {
+        self.rewritten
+            .into_iter()
+            .map(|(_, m, r)| (m, r))
+            .chain(self.added)
+            .chain(self.repair)
+            .collect()
+    }
+}
+
+/// `event`, a [`TraceEvent::SpanInstalled`], naming `manifest` as the one that
+/// makes it the state.
+fn with_manifest(event: TraceEvent, manifest: u64) -> TraceEvent {
+    match event {
+        TraceEvent::SpanInstalled {
+            spans,
+            seq,
+            removed,
+            rewritten,
+            added,
+            repair,
+            ..
+        } => TraceEvent::SpanInstalled {
+            manifest,
+            spans,
+            seq,
+            removed,
+            rewritten,
+            added,
+            repair,
+        },
+        other => other,
+    }
+}
+
+/// What an install is asked to do, once it is numbered: see
+/// [`Engine::install_spans`].
+// PROPOSED(D-068): several spans and the receiver's repair, in one manifest switch.
+struct InstallPlan<E: Environment> {
+    /// The install's own record: every installed write carries it.
+    seq: Seq,
+    /// The repair's record, the one after `seq`, when there is a repair.
+    repair_seq: Option<Seq>,
+    /// The spans, sorted and disjoint.
+    spans: Vec<Range<Bytes>>,
+    /// What is installed over them.
+    source: SpanSource<E>,
+    /// The receiver's own writes, in the order given.
+    repair: Vec<(Bytes, Value)>,
+    /// Whether it is a range delete.
+    delete: bool,
+}
+
+/// Whether `key` lies in one of `spans`.
+// PROPOSED(D-068): several spans in one manifest switch.
+fn in_spans(spans: &[Range<Bytes>], key: &[u8]) -> bool {
+    spans
+        .iter()
+        .any(|s| s.start[..] <= *key && *key < s.end[..])
+}
+
+/// Whether the keys from `first` to `last` meet one of `spans`.
+// PROPOSED(D-068): several spans in one manifest switch.
+fn overlaps_spans(spans: &[Range<Bytes>], first: &[u8], last: &[u8]) -> bool {
+    spans
+        .iter()
+        .any(|s| *first < s.end[..] && *last >= s.start[..])
+}
+
+/// Whether one of `spans` holds both `first` and `last`, and so every key between.
+// PROPOSED(D-068): several spans in one manifest switch.
+fn within_one_span(spans: &[Range<Bytes>], first: &[u8], last: &[u8]) -> bool {
+    spans
+        .iter()
+        .any(|s| s.start[..] <= *first && *last < s.end[..])
+}
+
+/// Refuses spans that are out of order or overlap: each must end at or before the
+/// next one starts.
+// PROPOSED(D-068): a set of spans is sorted and disjoint.
+fn check_disjoint<K: AsRef<[u8]>>(spans: &[Range<K>]) -> Result<(), InstallRefused> {
+    for pair in spans.windows(2) {
+        let (end, start) = (pair[0].end.as_ref(), pair[1].start.as_ref());
+        if end > start {
+            return Err(InstallRefused::SpansOverlap {
+                end: Bytes::copy_from_slice(end),
+                start: Bytes::copy_from_slice(start),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Writes `writer` into `dir` as table `number` at level 0, synced, for a checkpoint
@@ -2264,6 +2745,17 @@ impl<E: Environment> SpanSource<E> {
     pub fn tables(&self) -> usize {
         self.tables.len()
     }
+
+    /// Whether a table of the source holds a key outside every one of `spans`, by
+    /// the first and last key its manifest gives: either end outside them. A table
+    /// whose two ends lie in two spans can still hold a key between them, which
+    /// the install finds key by key as it writes.
+    // PROPOSED(D-068): the source lies inside the spans.
+    fn outside(&self, spans: &[Range<Bytes>]) -> bool {
+        self.tables
+            .iter()
+            .any(|(m, _)| !in_spans(spans, &m.first_key) || !in_spans(spans, &m.last_key))
+    }
 }
 
 impl<E: Environment> std::fmt::Debug for SpanSource<E> {
@@ -2282,6 +2774,7 @@ impl<E: Environment> std::fmt::Debug for SpanSource<E> {
 // PROPOSED(D-054): the live install of a span, in one manifest switch.
 pub struct SpanInstall {
     seq: Option<Seq>,
+    repair_seq: Option<Seq>,
     state: InstallState,
 }
 
@@ -2354,12 +2847,22 @@ impl SpanInstall {
     pub fn seq(&self) -> Option<Seq> {
         self.seq
     }
+
+    /// The repair's sequence number, the record after [`seq`](Self::seq), known
+    /// before anything is written; `None` when the install carries no repair or
+    /// was refused before it took a number.
+    // PROPOSED(D-068): the repair, in a table of its own numbered above the source's.
+    #[must_use]
+    pub fn repair_seq(&self) -> Option<Seq> {
+        self.repair_seq
+    }
 }
 
 impl std::fmt::Debug for SpanInstall {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SpanInstall")
             .field("seq", &self.seq)
+            .field("repair_seq", &self.repair_seq)
             .finish_non_exhaustive()
     }
 }

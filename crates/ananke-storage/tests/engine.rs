@@ -1928,3 +1928,366 @@ fn an_install_whose_task_ends_without_an_outcome_resolves_with_an_error() {
         other => panic!("the install resolved {other:?}"),
     }
 }
+
+/// The keys `k000` to `k019` as the engine reads them.
+async fn read_all(db: &Engine<SimEnv>) -> Vec<Option<Bytes>> {
+    let mut got = Vec::new();
+    for k in 0..20 {
+        got.push(db.get(format!("k{k:03}").as_bytes()).await.unwrap());
+    }
+    got
+}
+
+/// A range lives in two spans (D-066), and its install is one step over both
+/// (D-068): a checkpoint of two spans holds each at the one version it names; the
+/// install over both takes every key of each out and puts the checkpoint's in, and
+/// carries the receiver's repair — a put over an installed key, a delete of one, a
+/// put of a key the source lacks — as a table of its own at the record after the
+/// install's, all in one manifest switch. Every key outside the spans stays as it
+/// was, a write after the install is read over the repair, and a reopen sees the
+/// same.
+// PROPOSED(D-068): several spans and the receiver's repair, in one manifest switch.
+#[test]
+fn an_install_of_two_spans_carries_its_repair_in_one_switch() {
+    let mut sim = Sim::new(SimConfig::new(53));
+    let node = sim.add_node();
+    let expected_after = on_node(&mut sim, node, |env| {
+        Box::pin(async move {
+            let (db, _) = Engine::open(env.clone(), config(400)).await.unwrap();
+            fill(&db, 0..90, 20).await;
+            env.clock().sleep(Duration::from_millis(1)).await;
+            let spans = [b("k002")..b("k005"), b("k010")..b("k014")];
+            let info = db
+                .checkpoint_spans(
+                    &[
+                        &spans[0].start[..]..&spans[0].end[..],
+                        &spans[1].start[..]..&spans[1].end[..],
+                    ],
+                    Path::new("/stage/two"),
+                )
+                .await
+                .unwrap();
+            assert_eq!(info.version, 90, "both spans at the one version");
+            let at_checkpoint: Vec<Option<Bytes>> = (0..20).map(|k| expected(k, 90, 20)).collect();
+            fill(&db, 90..150, 20).await;
+            env.clock().sleep(Duration::from_millis(1)).await;
+            let source = db.open_span_source(Path::new("/stage/two")).await.unwrap();
+            let in_spans = |k: usize| (2..5).contains(&k) || (10..14).contains(&k);
+            let live_in_spans = (0..20)
+                .filter(|&k| in_spans(k) && at_checkpoint[k].is_some())
+                .count();
+            // The repair: a put over a key the source holds, a delete of another,
+            // and a put of a key it may not hold.
+            let mut repair = ananke_storage::WriteBatch::new();
+            repair.put(b("k003"), b("term"));
+            repair.delete(b("k011"));
+            repair.put(b("k013"), b("stale"));
+            repair.put(b("k013"), b("tail"));
+            let install = db.install_spans(spans.to_vec(), source, repair);
+            assert_eq!(install.seq(), Some(151), "numbered above every write taken");
+            assert_eq!(install.repair_seq(), Some(152), "the repair's is the next");
+            let done = install.await.unwrap();
+            assert_eq!((done.seq, done.repair_seq), (151, Some(152)));
+            assert_eq!(done.keys, live_in_spans as u64);
+            let mut want: Vec<Option<Bytes>> = (0..20)
+                .map(|k| {
+                    if in_spans(k as usize) {
+                        at_checkpoint[k as usize].clone()
+                    } else {
+                        expected(k, 150, 20)
+                    }
+                })
+                .collect();
+            want[3] = Some(b("term"));
+            want[11] = None;
+            want[13] = Some(b("tail"));
+            assert_eq!(read_all(&db).await, want, "after the install");
+            // The repair is a table of its own at level 0, carrying its number and
+            // no other; the installed tables carry the install's.
+            let level_0 = db.levels()[0].clone();
+            let repair_tables: Vec<_> = level_0.iter().filter(|t| t.max_seq == 152).collect();
+            assert_eq!(repair_tables.len(), 1, "{level_0:?}");
+            let table = repair_tables[0];
+            assert_eq!(
+                (
+                    table.first_seq,
+                    table.entries,
+                    &table.first_key,
+                    &table.last_key
+                ),
+                (152, 3, &b("k003"), &b("k013"))
+            );
+            assert!(
+                level_0
+                    .iter()
+                    .filter(|t| t.max_seq == 151)
+                    .all(|t| t.first_seq == 151),
+                "{level_0:?}"
+            );
+            // A write to a span after the install is read over the repair.
+            let seq = db.put(b("k011"), b("after")).await.unwrap();
+            assert!(seq > 152);
+            want[11] = Some(b("after"));
+            assert_eq!(db.get(b"k011").await.unwrap(), Some(b("after")));
+            want
+        })
+    });
+    let trace = sim.trace();
+    let installed = trace
+        .iter()
+        .position(|r| matches!(r.event, TraceEvent::SpanInstalled { .. }))
+        .expect("the install is traced");
+    let manifest = match &trace[installed].event {
+        TraceEvent::SpanInstalled {
+            manifest,
+            spans,
+            seq,
+            repair,
+            ..
+        } => {
+            assert_eq!(*seq, 151);
+            assert_eq!(spans, &vec![(b("k002"), b("k005")), (b("k010"), b("k014"))]);
+            let (repair_seq, _, first, last) = repair.as_ref().expect("the repair is traced");
+            assert_eq!((*repair_seq, first, last), (152, &b("k003"), &b("k013")));
+            *manifest
+        }
+        _ => unreachable!(),
+    };
+    // One switch after the replacement is written, to the manifest the install
+    // named, and no other before the next flush.
+    let switches: Vec<u64> = trace[installed..]
+        .iter()
+        .take_while(|r| {
+            !matches!(
+                r.event,
+                TraceEvent::WalSegmentOpened { .. } | TraceEvent::MemtableRotated { .. }
+            )
+        })
+        .filter_map(|r| match r.event {
+            TraceEvent::CurrentSwitched { manifest } => Some(manifest),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(switches, [manifest], "one switch");
+    let reopened = on_node(&mut sim, node, |env| {
+        Box::pin(async move {
+            let (db, _) = Engine::open(env, config(400)).await.unwrap();
+            read_all(&db).await
+        })
+    });
+    assert_eq!(
+        reopened, expected_after,
+        "a reopen sees the install and its repair"
+    );
+}
+
+/// An install over a set of spans is refused, and the store left as it was, when
+/// the set is empty or a span in it holds no key, when two spans overlap or are out
+/// of order, when the repair writes outside every span, and when the source holds a
+/// key outside every span: by a table's end before it is numbered, or key by key
+/// when a table's two ends lie in two spans and a key lies between. A checkpoint of
+/// spans out of order is refused too (D-068).
+// PROPOSED(D-068): the refusals of an install over several spans.
+#[test]
+fn an_install_of_several_spans_is_refused_when_it_cannot_be_made() {
+    use ananke_storage::{InstallRefused, SpanSource, WriteBatch};
+    let mut sim = Sim::new(SimConfig::new(59));
+    let node = sim.add_node();
+    on_node(&mut sim, node, |env| {
+        Box::pin(async move {
+            let (db, _) = Engine::open(env.clone(), config(400)).await.unwrap();
+            fill(&db, 0..40, 20).await;
+            let before = read_all(&db).await;
+            let refusal = |e: std::io::Error| InstallRefused::from_io(&e);
+            let refused_at_once = |install: ananke_storage::SpanInstall| {
+                assert_eq!(install.seq(), None);
+                assert_eq!(install.repair_seq(), None);
+                install
+            };
+            let none = refused_at_once(db.install_spans(
+                Vec::new(),
+                SpanSource::empty(),
+                WriteBatch::new(),
+            ));
+            assert_eq!(
+                none.await.err().and_then(refusal),
+                Some(InstallRefused::EmptySpan)
+            );
+            let hollow = refused_at_once(db.install_spans(
+                vec![b("k001")..b("k002"), b("k005")..b("k005")],
+                SpanSource::empty(),
+                WriteBatch::new(),
+            ));
+            assert_eq!(
+                hollow.await.err().and_then(refusal),
+                Some(InstallRefused::EmptySpan)
+            );
+            let overlapping =
+                refused_at_once(db.delete_ranges(vec![b("k001")..b("k006"), b("k004")..b("k008")]));
+            assert_eq!(
+                overlapping.await.err().and_then(refusal),
+                Some(InstallRefused::SpansOverlap {
+                    end: b("k006"),
+                    start: b("k004")
+                })
+            );
+            let unsorted = refused_at_once(db.install_spans(
+                vec![b("k010")..b("k012"), b("k001")..b("k003")],
+                SpanSource::empty(),
+                WriteBatch::new(),
+            ));
+            assert_eq!(
+                unsorted.await.err().and_then(refusal),
+                Some(InstallRefused::SpansOverlap {
+                    end: b("k012"),
+                    start: b("k001")
+                })
+            );
+            let mut repair = WriteBatch::new();
+            repair.put(b("k002"), b("inside"));
+            repair.delete(b("k007"));
+            let stray = refused_at_once(db.install_spans(
+                vec![b("k001")..b("k003"), b("k010")..b("k012")],
+                SpanSource::empty(),
+                repair,
+            ));
+            assert_eq!(
+                stray.await.err().and_then(refusal),
+                Some(InstallRefused::RepairOutsideSpan { key: b("k007") })
+            );
+            let checkpoint_out_of_order = db
+                .checkpoint_spans(
+                    &[b"k005"..b"k010", b"k000"..b"k003"],
+                    Path::new("/stage/bad"),
+                )
+                .await;
+            assert!(matches!(
+                checkpoint_out_of_order.err().and_then(refusal),
+                Some(InstallRefused::SpansOverlap { .. })
+            ));
+            // One table, k000 to k008 (k009's last write is a delete).
+            db.checkpoint_spans(
+                &[b"k000"..b"k003", b"k005"..b"k010"],
+                Path::new("/stage/two"),
+            )
+            .await
+            .unwrap();
+            let source = db.open_span_source(Path::new("/stage/two")).await.unwrap();
+            assert_eq!(source.tables(), 1);
+            assert_eq!(source.key_range(), Some((b("k000"), b("k008"))));
+            let past_the_end = refused_at_once(db.install_spans(
+                vec![b("k000")..b("k003"), b("k005")..b("k008")],
+                source,
+                WriteBatch::new(),
+            ));
+            assert!(matches!(
+                past_the_end.await.err().and_then(refusal),
+                Some(InstallRefused::OutsideSpan { .. })
+            ));
+            // Both ends inside, k002 between the spans: numbered, then refused as
+            // the installed tables are written.
+            let source = db.open_span_source(Path::new("/stage/two")).await.unwrap();
+            let between = db.install_spans(
+                vec![b("k000")..b("k002"), b("k005")..b("k010")],
+                source,
+                WriteBatch::new(),
+            );
+            assert!(between.seq().is_some());
+            assert_eq!(
+                between.await.err().and_then(refusal),
+                Some(InstallRefused::OutsideSpan {
+                    first: b("k002"),
+                    last: b("k002")
+                })
+            );
+            assert_eq!(
+                read_all(&db).await,
+                before,
+                "every refusal left the store as it was"
+            );
+            // And the next install is not refused as in progress.
+            db.delete_ranges(vec![b("k000")..b("k001"), b("k019")..b("k020")])
+                .await
+                .unwrap();
+            assert_eq!(db.get(b"k000").await.unwrap(), None);
+        })
+    });
+}
+
+/// The range delete over several spans (D-068): an install of nothing over the set,
+/// so every span's keys go with one manifest switch and no tombstone and no repair
+/// is written, every key outside them stays, a write to a span after the delete
+/// survives it, and a reopen sees the same.
+// PROPOSED(D-068): the range delete over several spans, in one manifest switch.
+#[test]
+fn a_range_delete_of_two_spans_takes_them_out_in_one_switch() {
+    let mut sim = Sim::new(SimConfig::new(61));
+    let node = sim.add_node();
+    let want = on_node(&mut sim, node, |env| {
+        Box::pin(async move {
+            let (db, _) = Engine::open(env.clone(), config(400)).await.unwrap();
+            fill(&db, 0..150, 20).await;
+            env.clock().sleep(Duration::from_millis(1)).await;
+            let removal = db.delete_ranges(vec![b("k002")..b("k005"), b("k010")..b("k014")]);
+            let seq = removal.seq().expect("numbered");
+            assert_eq!(removal.repair_seq(), None, "a delete carries no repair");
+            let done = removal.await.unwrap();
+            assert_eq!(
+                (done.seq, done.repair_seq, done.added, done.keys),
+                (seq, None, 0, 0)
+            );
+            db.put(b("k011"), b("after")).await.unwrap();
+            let want: Vec<Option<Bytes>> = (0..20u32)
+                .map(|k| {
+                    if (2..5).contains(&k) || (10..14).contains(&k) {
+                        (k == 11).then(|| b("after"))
+                    } else {
+                        expected(k, 150, 20)
+                    }
+                })
+                .collect();
+            assert_eq!(read_all(&db).await, want);
+            want
+        })
+    });
+    let trace = sim.trace();
+    let installed = trace
+        .iter()
+        .position(|r| matches!(r.event, TraceEvent::SpanInstalled { .. }))
+        .expect("the delete is traced");
+    let manifest = match &trace[installed].event {
+        TraceEvent::SpanInstalled {
+            manifest,
+            spans,
+            added,
+            repair,
+            ..
+        } => {
+            assert_eq!(spans.len(), 2);
+            assert!(added.is_empty() && repair.is_none());
+            *manifest
+        }
+        _ => unreachable!(),
+    };
+    let switches: Vec<u64> = trace[installed..]
+        .iter()
+        .take_while(|r| {
+            !matches!(
+                r.event,
+                TraceEvent::WalSegmentOpened { .. } | TraceEvent::MemtableRotated { .. }
+            )
+        })
+        .filter_map(|r| match r.event {
+            TraceEvent::CurrentSwitched { manifest } => Some(manifest),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(switches, [manifest], "one switch");
+    let reopened = on_node(&mut sim, node, |env| {
+        Box::pin(async move {
+            let (db, _) = Engine::open(env, config(400)).await.unwrap();
+            read_all(&db).await
+        })
+    });
+    assert_eq!(reopened, want);
+}

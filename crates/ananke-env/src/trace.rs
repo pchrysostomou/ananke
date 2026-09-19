@@ -295,19 +295,21 @@ pub enum TraceEvent {
         /// Tombstones dropped because no older write of the key lay below.
         dropped_tombstones: u64,
     },
-    /// A span's replacement is written and synced: the tables that held the span's
-    /// writes below `seq` taken out, those that also held keys outside it rewritten
-    /// without them, and the installed tables written, every write in them at
-    /// `seq`. The manifest that makes all of it the state in one switch is written
-    /// next. Recorded before that manifest is written, like `CompactionWritten`.
+    /// The replacement of a set of spans is written and synced: the tables that held
+    /// the spans' writes below `seq` taken out, those that also held keys outside
+    /// them rewritten without them, the installed tables written, every write in
+    /// them at `seq`, and the repair's table, if the install carries one, every
+    /// write in it at the repair's own number. The manifest that makes all of it the
+    /// state in one switch is written next. Recorded before that manifest is
+    /// written, like `CompactionWritten`.
     // PROPOSED(D-054): the live install of a span, in one manifest switch.
+    // PROPOSED(D-068): several spans and the receiver's repair, in that one switch.
     SpanInstalled {
         /// The manifest that lists the result.
         manifest: u64,
-        /// The span's first key.
-        start: Bytes,
-        /// The key past its last.
-        end: Bytes,
+        /// The spans, sorted and disjoint: each one's first key and the key past its
+        /// last.
+        spans: Vec<(Bytes, Bytes)>,
         /// The sequence number every installed write carries: the install's own log
         /// record, above every write the engine had taken when it was asked.
         seq: u64,
@@ -318,6 +320,10 @@ pub enum TraceEvent {
         rewritten: Vec<(u64, u64, Bytes, Bytes)>,
         /// The installed tables, each with its first and last user key.
         added: Vec<(u64, Bytes, Bytes)>,
+        /// The repair's table, if the install carries a repair: the number every
+        /// write in it carries, the record after `seq`, which holds no write; the
+        /// table's number; and its first and last user key.
+        repair: Option<(u64, u64, Bytes, Bytes)>,
     },
     /// An install or a range delete was in force, its switch durable, and deleting
     /// the tables it took out or the log segments at or below its number failed.
