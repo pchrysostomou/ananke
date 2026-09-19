@@ -7809,7 +7809,8 @@ premerge stays near the quarter of an hour D-040 set.
   (weighed alone on this tree, idle).
 - *The share, as built.* Twenty seeds at the gate and in CI, a hundred at the premerge, a
   thousand at the nightly. The engine binary's tests weighed 1 824 CPU seconds at a thousand
-  seeds on 3e66e86, idle, and the premerge ran in 622 s there (below). The cost is coverage.
+  seeds on 3e66e86, idle, and the premerge ran in 622 s there and in 613 s on the review's
+  tree, ea44e38 (below). The cost is coverage.
   CI's hundred now runs the same twenty seeds as the gate for these three tests, so CI adds
   nothing to them that the gate did not see, and the premerge sees a hundred seeds of each
   rather than a thousand. The thinnest check is the checkpoint's own: its catches at CI fall
@@ -7837,6 +7838,12 @@ heavier install and range-delete schedules, with two or three spans and a repair
 and the three new tests at 35 to 40 CPU seconds each on their share. The review's
 `RepairBeforeSwitch` adds 37 more on its share.
 
+On the review's tree, ea44e38, measured the same way, started once the one-minute load was
+below 2.5: `scripts/premerge.sh` green at a thousand seeds in **613.38 s**, 327 tests passed
+and none failed, at a mean one-minute load of **28.49** over 62 samples (2.42 to 68.87).
+Nothing else ran on the machine, so that load is the premerge's own. Per binary: raft
+343.93 s, engine 246.94 s, WAL 9.01 s, every other under two and a half seconds.
+
 An earlier figure, 2 122.50 s at a mean load of 58.40, was taken on f2c6581, before the share
 change, while the machine carried its own background work: the raft binary, which runs no code
 this change touches, took 2.1 times its usual time in it. It is withdrawn in favour of the two
@@ -7855,10 +7862,10 @@ machine, on the tree with the share, and placed in the lightest shard:
 
 The last is the mean of two runs, 38.0 and 35.5, on the review's tree; shard 1 and shard 6 were
 the lightest, level at 1 241.7, and it went to the first. The shards now weigh 1 241.7 to
-1 281.3 CPU seconds, within 3 % of one another. The older rows
-keep D-064's weights, though this change makes the install and range-delete crash tests heavier
-(their idle weights on this tree, 346.8 and 223.7 CPU seconds, are measured in a different
-condition from D-064's and are not mixed into the table). The next nightly measures what that
+1 281.3 CPU seconds, within 3 % of one another. The older rows keep D-064's weights, though
+this change makes the install and range-delete crash tests heavier (their idle weights on this
+tree, 346.8 and 223.7 CPU seconds, are measured in a different condition from D-064's and are
+not mixed into the table). The next nightly measures what that
 adds; if a shard passes an hour, D-064's procedure re-balances the table in a change of its own.
 
 **The review.** One adversarial review of this PR found no engine bug. It found gaps in the
@@ -7885,13 +7892,14 @@ PR's own tests and record, each fixed in the PR:
 - *Two counters asserted above zero were close to vacuous.* "Several spans judged" counted
   every install over several spans after a crash, though the agreement by the tables has
   nothing to judge where fewer than two spans hold a write. "Repair found absent" counted
-  every install a crash left out, mostly before its repair's table was written. The first now
-  counts an install only when two spans or more held a write, installed or older; the second
-  only a crash between the replacement and the switch. Measured before their assertions were
-  kept: installs judged on 20 of 20, 100 of 100 and 983 of 1 000 seeds, deletes judged on 19
-  of 20, 91 of 100 and 965 of 1 000, repairs found absent on 11 of 20, 47 of 100 and 459 of
-  1 000. Every rate is far above 5 %, so each stays asserted from the gate's twenty; the
-  thinnest, the repair found absent, at P(none) = 0.541^20 ≈ 4.6 × 10^-6.
+  every install a crash left out, wherever the crash fell, though only a crash between the
+  replacement and the switch can leave the repair's table written and not yet listed. The
+  first now counts an install only when two spans or more held a write, installed or older;
+  the second only such a crash. Measured before their assertions were kept: installs judged
+  on 20 of 20, 100 of 100 and 983 of 1 000 seeds, deletes judged on 19 of 20, 91 of 100 and
+  965 of 1 000, repairs found absent on 11 of 20, 47 of 100 and 459 of 1 000. Every rate is
+  far above 5 %, so each stays asserted from the gate's twenty; the thinnest, the repair found
+  absent, at P(none) = 0.541^20 ≈ 4.6 × 10^-6.
 - *The repair's number was argued, not tested.* It still is, and now says so, with a check
   that refuses the install if the argument ever fails (*The repair's number*, above).
 - *The repair's boundary and adjacent spans had no directed test.* The refusal test now puts a
