@@ -7786,14 +7786,23 @@ against 66 992, 14 939 compactions against 14 815, 1 455 crashes inside a compac
 checkpoints against 8 130. The installs are fewer and larger: two or three spans of one to
 eight keys, against one span of one to twelve.
 
-**PROPOSED, for the owner: three of the variants on every seed, or on the high-rate share.**
-3e66e86 moved `RepairAfterSwitch` and `CheckpointVersionPerSpan` onto `high_rate_share()`, and
-the review built `RepairBeforeSwitch` there beside them. That step was not this entry's to take.
-D-055 put on the share only the variants caught on four seeds in five or more, and none of the
-three reaches that: 616, 529 and 468 of 1 000. D-061 sets the tier an assertion is made at, not
-which variants run a share. 9478da3 had left the step to the owner; 3e66e86 took it as though
-D-061 settled it. It is set out here as a choice. The code stays as built, on the share, until
-the owner chooses.
+**Decided — the owner's, of 2026-09-20, on PR #70: three of the variants stay on the high-rate
+share.** 3e66e86 moved `RepairAfterSwitch` and `CheckpointVersionPerSpan` onto
+`high_rate_share()`, and the review built `RepairBeforeSwitch` there beside them. D-055 put on
+the share only the variants caught on four seeds in five or more, and none of the three reaches
+that: 616, 529 and 468 of 1 000; D-061 sets the tier an assertion is made at, not which variants
+run a share. 9478da3 left the step to the owner and 3e66e86 took it, which is recorded here as
+what happened. The owner's reason for keeping it: the premerge budget is load-bearing — the
+nightly went from 3 h 38 min to 39 minutes in the change before this one (D-064), and D-040's
+quarter of an hour is what keeps iteration cheap — and three variants measuring four catches at
+the gate instead of twenty-five is a weaker sample, not a missing assertion, since each catch is
+asserted at the tier its rate supports, which is what D-061 requires.
+
+**The condition, the owner's.** These three variants get no independent hundred-seed evidence:
+CI's hundred runs the same twenty seeds of them that the gate runs, so a green CI says of them
+exactly what the gate said, and nothing more. The premerge's hundred and the nightly's thousand
+are their only larger samples. If a later change makes the engine sweep cheaper, this is
+revisited and they go back to every seed.
 
 Either way each catch, and each catch by the variant's own check, is asserted from the gate's
 twenty, since every rate is far above D-061's 5 %, and the gate runs twenty seeds of each under
@@ -7801,13 +7810,13 @@ both. What differs is how many seeds CI, the premerge and the nightly give these
 and what the premerge costs. SHARD.md §12 asks a stage to size its new tests' seed shares so the
 premerge stays near the quarter of an hour D-040 set.
 
-- *Every seed*, as D-055's rule reads. CI sees 100 seeds of each, the premerge 1 000 and the
+- *Every seed*, as D-055's rule reads, which the owner did not take. CI sees 100 seeds of each, the premerge 1 000 and the
   nightly 10 000. The premerge exceeds the quarter of an hour: with `RepairAfterSwitch` and
   `CheckpointVersionPerSpan` on every seed, the engine binary alone weighed 2 747 CPU seconds
   at a thousand seeds, against the base's 1 574 (f2c6581 and 4690d00, 9478da3). On every seed
   `RepairBeforeSwitch` weighs about 370 CPU seconds more at a thousand, against 37 on its share
   (weighed alone on this tree, idle).
-- *The share, as built.* Twenty seeds at the gate and in CI, a hundred at the premerge, a
+- *The share, as decided.* Twenty seeds at the gate and in CI, a hundred at the premerge, a
   thousand at the nightly. The engine binary's tests weighed 1 824 CPU seconds at a thousand
   seeds on 3e66e86, idle, and the premerge ran in 622 s there and in 613 s on the review's
   tree, ea44e38 (below). The cost is coverage.
