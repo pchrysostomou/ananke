@@ -60,4 +60,6 @@ jobs:
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --all-features --all-targets
+      # The nightly's shard table names every sweep once (D-064).
+      - run: scripts/check-nightly-shards.sh
       - run: cargo test --workspace --all-features --doc

@@ -1,0 +1,89 @@
+# The nightly's shards (D-064): every test of ananke-sim's integration binaries, sim/tests/*.rs,
+# assigned to one of six shards, each a job of its own. The weight is the test's CPU seconds
+# (user + sys) at ANANKE_SEEDS=1000 and ANANKE_DEEP_SEEDS=100, run alone in release, measured on
+# fc75f68 on an 8-core Apple machine; the assignment is longest-first into the lightest shard, so
+# the shards carry equal weight. Everything outside these binaries runs in the `rest` job.
+# scripts/check-nightly-shards.sh, part of the gate, fails when a test here does not exist, is
+# listed twice, or when a test of these binaries is in no shard: a new sweep names its shard here
+# in the commit that adds it.
+#
+# shard	binary	cpu_s	test
+# shard 1: 1241.6 cpu s
+1	engine	625.1	an_install_in_two_switches_is_caught
+1	engine	0.6	seed_44_never_opens_empty_in_either_mode
+1	engine	0.4	same_seed_gives_byte_identical_trace
+1	engine	0.3	seed_420_which_the_first_nightly_found_stays_green
+1	raft	258.5	a_leader_that_ignores_incarnations_never_forgets
+1	raft	208.6	a_server_that_installs_without_current_last_is_caught
+1	raft	103.3	on_the_sweeps_disk_the_install_silence_deposes_the_leader_under_either_count
+1	raft	14.6	a_follower_that_truncates_on_every_append_is_caught
+1	raft	0.3	seed_1885_which_the_nightly_failed_on_a_trace_timestamp_no_longer_straddles_an_isolation
+1	raft	0.3	seed_6325_which_the_nightly_found_stays_green
+1	raft	0.2	seed_5909_which_the_nightly_found_stays_green
+1	raft	0.2	seed_164_which_a_local_ten_thousand_seed_run_found_stays_green
+1	wal	29.3	a_log_that_skips_the_checksum_is_caught
+# shard 2: 1241.6 cpu s
+2	echo	0.2	different_seeds_give_different_traces
+2	engine	581.7	the_live_install_crash_test_passes_every_seed
+2	engine	211.2	a_compaction_that_deletes_its_inputs_before_the_manifest_is_caught
+2	engine	16.6	the_correct_engine_passes_every_seed_with_deep_levels
+2	raft	276.0	a_leader_that_shares_one_snapshot_directory_and_streams_one_follower_at_a_time_is_caught
+2	raft	151.5	a_leader_that_counts_nothing_from_a_refused_follower_is_caught
+2	raft	4.4	a_server_that_sends_before_it_persists_is_caught
+# shard 3: 1241.6 cpu s
+3	echo	0.2	trace_hash_matches_the_pinned_golden
+3	engine	417.5	the_range_delete_crash_test_passes_every_seed
+3	engine	235.9	the_seek_crash_test_passes_every_seed
+3	engine	58.7	an_install_that_keeps_its_sources_numbers_is_caught
+3	engine	52.4	a_span_checkpoint_without_syncs_is_caught
+3	engine	0.3	seed_3123_which_the_nightly_found_supersedes_a_resurrected_segment
+3	raft	281.7	a_server_whose_refusal_is_not_durable_is_caught
+3	raft	158.5	a_leader_that_counts_a_refused_followers_rejections_whatever_its_stream_does_is_caught
+3	raft	12.8	the_incremental_checker_agrees_with_the_fold_over_the_whole_trace
+3	raft	0.7	seed_132_which_pinned_the_combined_variant_before_the_layout_reaches_no_wedge
+3	raft	0.5	the_seed_42_trace_is_written_for_the_studio
+3	raft	0.4	seed_5909_passes_under_both_bugs_together_which_is_the_finding
+3	raft	0.3	seed_687_which_the_premerge_found_stays_green
+3	raft	0.2	seed_385_which_a_local_ten_thousand_seed_run_found_stays_green
+3	raft	0.2	the_membership_scenario_has_byte_identical_traces_for_one_seed
+3	wal	21.2	a_log_that_acknowledges_before_syncing_is_caught
+# shard 4: 1241.7 cpu s
+4	echo	0.1	same_seed_gives_byte_identical_trace
+4	engine	210.8	the_correct_engine_passes_every_seed
+4	parallel	6.4	a_seed_inside_the_driver_gives_the_sequential_trace
+4	raft	355.6	a_leader_that_trusts_the_clock_is_caught_and_the_guard_revokes
+4	raft	282.6	a_server_without_pre_vote_is_caught_on_the_term_raise_schedule
+4	raft	237.7	a_server_that_resets_its_timer_on_any_message_is_caught
+4	raft	107.1	a_server_that_counts_one_majority_in_joint_consensus_is_caught
+4	raft	3.7	the_nightlys_eleven_variant_catches_of_the_trace_timestamp_gap_are_not_catches
+4	raft	0.3	seed_119_which_pinned_the_refusal_that_is_not_durable_before_the_layout_refuses_nothing
+4	raft	0.2	seed_2023_which_the_nightly_failed_on_a_trace_timestamp_no_longer_straddles_an_isolation
+4	wal	36.9	the_correct_log_passes_every_seed
+4	wal	0.2	the_seed_42_trace_is_written_for_the_studio
+# shard 5: 1242.0 cpu s
+5	echo	6.0	every_seed_satisfies_the_invariants_and_the_sweep_exercises_the_disk_faults
+5	engine	19.5	a_seek_that_counts_tombstones_is_caught
+5	raft	332.9	a_term_change_stepped_inside_an_isolation_from_a_message_received_before_it_is_excused
+5	raft	304.8	the_correct_leader_steps_down_on_a_blocked_reseed_and_commits_through_an_open_one
+5	raft	252.2	a_server_without_pre_vote_is_caught
+5	raft	187.0	a_leader_that_commits_an_older_terms_entry_by_count_is_caught
+5	raft	139.6	the_correct_server_passes_the_membership_scenario_on_every_seed
+# shard 6: 1241.7 cpu s
+6	echo	0.1	a_busy_looping_task_fails_the_scenario_instead_of_hanging
+6	engine	310.3	an_engine_that_acknowledges_before_the_log_is_caught
+6	engine	204.5	an_engine_that_releases_a_memtable_before_the_manifest_is_caught
+6	engine	39.2	a_range_delete_that_skips_the_memtables_is_caught
+6	engine	0.3	the_seed_42_trace_is_written_for_the_studio
+6	raft	311.9	the_correct_server_passes_every_seed
+6	raft	266.4	a_server_whose_adoption_is_as_built_is_caught
+6	raft	62.5	a_server_that_applies_before_commit_is_caught
+6	raft	8.7	the_nightlies_removed_catches_meet_the_sweeps_assertions
+6	raft	0.7	seed_680_which_pinned_the_combined_variant_before_d056_no_longer_wedges
+6	raft	0.7	seed_2605_which_the_nightly_found_is_an_adoption_window_and_still_catches_the_variant
+6	raft	0.6	same_seed_gives_byte_identical_trace
+6	raft	0.4	seed_1_of_the_term_raise_schedule_now_straddles_its_isolations_by_decision_time
+6	raft	0.3	seed_158_pins_the_refusal_that_is_not_durable_which_a_hundred_seeds_can_miss
+6	raft	0.2	seed_4_of_the_term_raise_schedule_steps_a_message_received_before_its_isolation
+6	raft	0.2	seed_7381_which_the_first_nightly_found_stays_green
+6	wal	34.4	a_log_that_skips_sync_dir_on_rotation_is_caught
+6	wal	0.3	same_seed_gives_byte_identical_trace

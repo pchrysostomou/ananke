@@ -6985,6 +6985,111 @@ arm; none is filed on GitHub by this commit, which pushes nothing:
   which D-060's format record is ~8.5 ms at the median. An engine-cost question, which
   moves this threshold without touching correctness.
 
+## PROPOSED D-064 — The nightly runs as seven jobs: six shards of the sweeps, balanced by measured cost, and the rest
+
+**Context.** The nightly is the only place ten thousand seeds run (D-040), and every stage of
+Phase 3 closes on a green one on its branch (SHARD.md §12, the owner's addition of
+2026-09-15). It was one job running the whole workspace's tests under a 300-minute limit. On
+Stage A's tree it took 164 and 218 minutes green (runs 35161762372 and 35172923002, the same
+tree 54 minutes apart, which is runner variance, D-061), 212 minutes to the failure of run
+35111624618, and 161 minutes on `main` after the merge (run 35323559664 on fc75f68); Phase 2's
+first nightly runs were cancelled at the limit (37e3bad, 78a3711). Stage B adds the node's
+scenarios on top. Issue #57 asked for the fix before a stage's nightly times out, and the owner
+asked for it before Stage B's first change, as its own change: shard the seeds across parallel
+jobs, or split per sweep, whichever the measurement supports.
+
+**Measured.** Every test of ananke-sim's integration binaries (`sim/tests/*.rs`) run alone, in
+release, at `ANANKE_SEEDS=1000` and `ANANKE_DEEP_SEEDS=100` (the nightly's one to ten), on
+fc75f68, on an eight-core Apple machine with nothing else running, its CPU time taken as user
+plus system from `/usr/bin/time -p`. Seventy-three tests, **7 450 CPU seconds** in all: the
+engine binary 2 985, the raft binary 4 330, the WAL binary 122, echo 7, the determinism test 6.
+The five heaviest: `an_install_in_two_switches_is_caught` 625 (8.4 % of the whole),
+`the_live_install_crash_test_passes_every_seed` 582, `the_range_delete_crash_test_passes_every_seed`
+418, the lease trial 356, the term-raise schedule's excuse 333. The other crates' tests are
+under three seconds together at any tier.
+
+A sweep's cost is its CPU: every sweep runs its seeds on rayon's global pool, one pool per
+process (`sim/parallel.rs`), so a test binary's wall time is its tests' CPU over the cores it
+has, and a job on a runner of its own has cores of its own.
+
+**Decision.**
+
+- *Split per sweep, not per seed.* Each test runs whole in exactly one job, over all its seeds.
+  Longest-first into the lightest shard puts the seventy-three tests into six shards of 1 241.6
+  to 1 242.0 CPU seconds each at a thousand seeds: no test is large enough to unbalance them,
+  the heaviest being 8.4 % of the whole and half of one shard.
+- *Six shards and the rest.* `scripts/nightly-shards.txt` names each test's shard and records
+  the weight it was placed by. `scripts/nightly.sh <1-6>` runs a shard, binary by binary, with
+  `--exact` filters; `scripts/nightly.sh rest` runs every other test of the workspace, with
+  `--skip --exact` for each name in the table, so the seven jobs together run each test once.
+  The workflow runs them as a matrix of seven jobs at once, each with the seed counts as before,
+  its own trace artifact, one shared build cache that one job saves, `fail-fast: false` so a
+  failing shard does not cancel the others, and a limit of 150 minutes per job.
+- *The table is held to the tests.* `scripts/check-nightly-shards.sh`, run by the gate and by
+  CI after the tests are built, fails when a row names a shard outside one to six, a binary
+  outside `sim/tests`, or a test that binary lacks; when a row appears twice; when a test of
+  `sim/tests/*.rs` is in no row; and when a name in the table also names a test outside it,
+  which `rest`'s `--skip` would then skip. A new sweep names its shard in the commit that adds
+  it, and a renamed one cannot leave its shard running an empty filter.
+
+**Why per sweep.** Sharding the seeds would change what every sweep's assertions mean. A
+"caught on some seed" and a coverage counter above zero are asserted over the seeds one test
+sees, at the tier its rate supports (D-061); a shard of 2 500 seeds is a different tier.
+`SharedSnapshotDir`'s liveness catch is 2 of 10 000 on Stage A's tree and asserted only at the
+nightly's count: split four ways, most shards see none, and the assertion would need a job that
+gathers every shard's verdicts and asserts over their union. Splitting per sweep keeps every
+assertion as it is and needs no such job, and the measurement shows it balances. Seed sharding
+becomes the right tool only if one sweep alone outgrows a job, which none is near.
+
+**Why six.** Scaling the old job's throughput: 74 500 CPU seconds, ten times the measurement,
+finished in 164 to 218 minutes, so a sixth of it predicts 27 to 36 minutes a shard, plus a
+cached build. That leaves room for Phase 3's later stages to triple the work before a shard
+nears two hours. The prediction is checked by the first sharded run below, and the 150-minute
+limit is set from it, not from the old job's 300.
+
+**A shard may be bounded by one test rather than by its CPU.**
+`the_correct_server_passes_every_seed` used 312 CPU seconds over 193 wall seconds on eight
+cores, less than two cores' worth: a long tail of slow seeds, which no amount of cores
+shortens. Its shard's time is the larger of its CPU over the runner's cores and that test's own
+tail; the first sharded run measures which.
+
+**Verified before the change.** The seven jobs run the workspace's tests once each: on this
+tree `scripts/nightly.sh <shard> --list` over the seven names 319 tests, and sorted with their
+repeats they are line for line the 319 that one `cargo test --workspace --all-features --release
+--all-targets -- --list` names; run at twenty seeds, the seven jobs pass 319 tests between them
+and fail none, as the single command does. The check was shown to fail on each thing it claims,
+each planted in the table or the tree and then removed: a test in no shard, a row twice, a
+renamed test's stale row, a shard outside one to six, a row of three fields, and a test in
+another crate named as a sweep is (`crates/ananke-env/tests/`, which `rest` would have skipped).
+
+**Measured on the branch.** *Filled in from the first sharded run on this branch before the
+change is asked to merge: each shard's wall time and the heaviest test in it.*
+
+**Alternatives.**
+
+- *Seed ranges per shard, with a job that gathers the verdicts.* Keeps any number of jobs
+  balanced whatever one sweep costs, but changes every tier's meaning and adds a job whose
+  failure mode is to assert over too few seeds. Not needed while every sweep fits a job.
+- *One job per test binary.* Needs no table, but the raft binary alone is 58 % of the work: its
+  job would take most of today's two hours and grow with every scenario Stage B adds to it.
+- *A larger runner.* Costs money the project does not spend, and only postpones the limit.
+- *Assigning tests by a hash of their name.* Needs no table either, but ignores cost: with
+  eight tests of 300 to 600 CPU seconds among seventy-three, a hash puts two of them in one
+  shard often enough to double its time.
+
+**Consequences.**
+
+- The nightly uses about the same runner minutes as before plus six cached builds; the
+  repository is public, so the minutes are free.
+- A failing shard names its seed in its own job's log and uploads its traces as
+  `failing-traces-<shard>`.
+- `scripts/premerge.sh` is unchanged: a thousand seeds still run as one process on the
+  machine in front of you.
+- The weights are a measurement of one tree. When a shard's time drifts above an hour, the
+  table is re-measured by the same procedure and the shards re-balanced, in a change of its
+  own.
+- Issue #57 is closed by this entry.
+
 ---
 
-_Next entry: D-064. Add one before implementing anything not covered above._
+_Next entry: D-065. Add one before implementing anything not covered above._
