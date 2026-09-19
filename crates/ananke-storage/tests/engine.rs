@@ -2081,12 +2081,119 @@ fn an_install_of_two_spans_carries_its_repair_in_one_switch() {
     );
 }
 
+/// Two adjacent spans, the first ending where the second begins, are one install
+/// (D-068), and the key at the boundary is the second's. The repair deletes the
+/// first span's first key, puts at the shared boundary and at each span's last key,
+/// and puts a key then deletes it. Every key and a scan across both spans read
+/// right after the install, after a compaction takes the repair's table and the
+/// installed ones into level 1, and after a reopen.
+// PROPOSED(D-068): a set of spans is sorted and disjoint; adjacent spans are allowed.
+#[test]
+fn an_install_of_two_adjacent_spans_reads_right_at_their_boundary() {
+    use ananke_storage::WriteBatch;
+    // Every key of k000 to k019 and a scan of them, which covers both spans and
+    // the keys on either side.
+    async fn reads(db: &Engine<SimEnv>) -> (Vec<Option<Bytes>>, Vec<(Bytes, Bytes)>) {
+        let snapshot = db.snapshot();
+        let scanned = db
+            .scan(&b"k000"[..]..&b"k020"[..], &snapshot)
+            .await
+            .unwrap();
+        (read_all(db).await, scanned)
+    }
+    let mut sim = Sim::new(SimConfig::new(67));
+    let node = sim.add_node();
+    let (want, after_install, after_compaction) = on_node(&mut sim, node, |env| {
+        Box::pin(async move {
+            let (db, _) = Engine::open(env.clone(), config(400)).await.unwrap();
+            fill(&db, 0..90, 20).await;
+            env.clock().sleep(Duration::from_millis(1)).await;
+            let spans = [b("k004")..b("k008"), b("k008")..b("k012")];
+            let info = db
+                .checkpoint_spans(
+                    &[b"k004"..b"k008", b"k008"..b"k012"],
+                    Path::new("/stage/adjacent"),
+                )
+                .await
+                .unwrap();
+            assert_eq!(info.version, 90);
+            fill(&db, 90..150, 20).await;
+            env.clock().sleep(Duration::from_millis(1)).await;
+            let source = db
+                .open_span_source(Path::new("/stage/adjacent"))
+                .await
+                .unwrap();
+            let mut repair = WriteBatch::new();
+            repair.delete(b("k004"));
+            repair.put(b("k008"), b("boundary"));
+            repair.put(b("k007"), b("first-last"));
+            repair.put(b("k011"), b("second-last"));
+            repair.put(b("k006"), b("brief"));
+            repair.delete(b("k006"));
+            let done = db
+                .install_spans(spans.to_vec(), source, repair)
+                .await
+                .unwrap();
+            assert_eq!(done.repair_seq, Some(done.seq + 1));
+            let mut want: Vec<Option<Bytes>> = (0..20)
+                .map(|k| {
+                    if (4..12).contains(&k) {
+                        expected(k, 90, 20)
+                    } else {
+                        expected(k, 150, 20)
+                    }
+                })
+                .collect();
+            want[4] = None;
+            want[6] = None;
+            want[7] = Some(b("first-last"));
+            want[8] = Some(b("boundary"));
+            want[11] = Some(b("second-last"));
+            let after_install = reads(&db).await;
+            // The repair's table goes into level 1 with the installed tables.
+            let repair_table = db.levels()[0]
+                .iter()
+                .find(|t| t.max_seq == done.seq + 1)
+                .map(|t| t.number)
+                .expect("the repair's table is at level 0");
+            let mut rounds = Vec::new();
+            while let Some(round) = db.compact_once().await.unwrap() {
+                rounds.push(round);
+            }
+            assert!(
+                rounds
+                    .iter()
+                    .any(|r| r.level == 0 && r.inputs.contains(&repair_table)),
+                "no round took the repair's table {repair_table} into level 1: {rounds:?}"
+            );
+            assert!(db.levels()[0].is_empty(), "{:?}", db.levels());
+            (want, after_install, reads(&db).await)
+        })
+    });
+    let scanned: Vec<(Bytes, Bytes)> = want
+        .iter()
+        .enumerate()
+        .filter_map(|(k, v)| v.clone().map(|v| (Bytes::from(format!("k{k:03}")), v)))
+        .collect();
+    let want = (want, scanned);
+    assert_eq!(after_install, want, "after the install");
+    assert_eq!(after_compaction, want, "after a compaction to level 1");
+    let reopened = on_node(&mut sim, node, |env| {
+        Box::pin(async move {
+            let (db, _) = Engine::open(env, config(400)).await.unwrap();
+            reads(&db).await
+        })
+    });
+    assert_eq!(reopened, want, "after a reopen");
+}
+
 /// An install over a set of spans is refused, and the store left as it was, when
 /// the set is empty or a span in it holds no key, when two spans overlap or are out
-/// of order, when the repair writes outside every span, and when the source holds a
-/// key outside every span: by a table's end before it is numbered, or key by key
-/// when a table's two ends lie in two spans and a key lies between. A checkpoint of
-/// spans out of order is refused too (D-068).
+/// of order, when the repair writes outside every span, a span's own end among the
+/// keys outside it, and when the source holds a key outside every span: by a
+/// table's end before it is numbered, or key by key when a table's two ends lie in
+/// two spans and a key lies between. A checkpoint of spans out of order is refused
+/// too (D-068).
 // PROPOSED(D-068): the refusals of an install over several spans.
 #[test]
 fn an_install_of_several_spans_is_refused_when_it_cannot_be_made() {
@@ -2155,6 +2262,26 @@ fn an_install_of_several_spans_is_refused_when_it_cannot_be_made() {
                 stray.await.err().and_then(refusal),
                 Some(InstallRefused::RepairOutsideSpan { key: b("k007") })
             );
+            // A span's end is not in it: a repair write exactly at the end of either
+            // span is outside, though every other write of the repair is at a span's
+            // first or last key.
+            for end in ["k003", "k012"] {
+                let mut repair = WriteBatch::new();
+                repair.put(b("k001"), b("first"));
+                repair.put(b("k002"), b("last"));
+                repair.put(b("k011"), b("last"));
+                repair.put(b(end), b("end"));
+                let at_the_end = refused_at_once(db.install_spans(
+                    vec![b("k001")..b("k003"), b("k010")..b("k012")],
+                    SpanSource::empty(),
+                    repair,
+                ));
+                assert_eq!(
+                    at_the_end.await.err().and_then(refusal),
+                    Some(InstallRefused::RepairOutsideSpan { key: b(end) }),
+                    "a repair write at {end}, a span's end"
+                );
+            }
             let checkpoint_out_of_order = db
                 .checkpoint_spans(
                     &[b"k005"..b"k010", b"k000"..b"k003"],

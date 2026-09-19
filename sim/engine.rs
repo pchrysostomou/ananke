@@ -907,7 +907,9 @@ pub struct InstallOutcomes {
     /// and present after the crash, which the state check read over the install.
     pub keys_written_after: u64,
     /// Installs over two spans or more judged after the crash that followed them,
-    /// every span found as installed or every span as it was.
+    /// every span found as installed or every span as it was, counted when two of
+    /// the spans or more held a write to judge by, the source's at the install's
+    /// number or one older than it.
     // PROPOSED(D-068): the spans agree with each other.
     pub spans_judged: u64,
     /// Installs in force after the crash that followed them whose repair's every
@@ -915,8 +917,23 @@ pub struct InstallOutcomes {
     // PROPOSED(D-068): the repair is present exactly when the installed tables are.
     pub repairs_present: u64,
     /// Installs not in force after the crash that followed them whose repair no
-    /// table in service held.
+    /// table in service held, counted when the crash came between the install's
+    /// replacement, the repair's table among it, and its switch: the window in
+    /// which a repair could be in service without its tables.
     pub repairs_absent: u64,
+}
+
+/// Where in an install that had not resolved the crash came, as the trace shows it.
+// PROPOSED(D-054): the live install's crash test.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CrashPoint {
+    /// Before a sync of the install's own record returned.
+    BeforeRecordDurable,
+    /// After its replacement was written and traced, and before `CURRENT` was
+    /// switched to the manifest the replacement names.
+    BetweenReplacementAndSwitch,
+    /// Anywhere else before the switch, or after a switch a fallback abandoned.
+    Otherwise,
 }
 
 /// What one run produced.
@@ -1456,23 +1473,52 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
                 None
             }
         };
+        // PROPOSED(D-054): where in an install the crash came, from the trace:
+        // before a sync of its own record returned; after its replacement was
+        // written and traced and before `CURRENT` was switched to the manifest
+        // the replacement names; or anywhere else.
+        let crash_point = |seq: u64| -> CrashPoint {
+            let durable = synced
+                .wal
+                .iter()
+                .any(|&(_, first, up_to, _)| first <= seq && seq <= up_to);
+            let written = events
+                .iter()
+                .position(|e| matches!(e, TraceEvent::SpanInstalled { seq: s, .. } if *s == seq));
+            let switched = written.is_some_and(|at| {
+                let manifest = match events[at] {
+                    TraceEvent::SpanInstalled { manifest, .. } => *manifest,
+                    _ => 0,
+                };
+                events[at..].iter().any(
+                    |e| matches!(e, TraceEvent::CurrentSwitched { manifest: m } if *m == manifest),
+                )
+            });
+            if !durable {
+                CrashPoint::BeforeRecordDurable
+            } else if written.is_some() && !switched {
+                CrashPoint::BetweenReplacementAndSwitch
+            } else {
+                CrashPoint::Otherwise
+            }
+        };
         // PROPOSED(D-068): the spans of an install agree with each other, and its
         // repair is there exactly when its installed tables are. Judged from what
         // the tables in service and the log's replay hold, before the per-write
         // account below, so a mixture is named as one.
         for (&seq, install) in &installs_now {
             let span_holds = |i: usize, key: &Bytes| install.span_of(key) == Some(i);
-            // What of span `i` is as installed: a write the install put there, the
-            // source's at its number or the repair's at its own.
+            // What of span `i` is as installed: a write the source put there at the
+            // install's number. A repair write at its own number is not counted:
+            // the repair is judged on its own below, so a repair in service
+            // without its tables is named as that, not as a mixture.
             let installed_in = |i: usize| -> Option<(Bytes, u64)> {
                 in_service.iter().find_map(|t| {
                     mirror.tables.get(t).and_then(|table| {
                         table
                             .writes
                             .iter()
-                            .find(|(key, s)| {
-                                span_holds(i, key) && (*s == seq || Some(*s) == install.repair_seq)
-                            })
+                            .find(|(key, s)| span_holds(i, key) && *s == seq)
                             .cloned()
                     })
                 })
@@ -1552,7 +1598,13 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
                         recovery.manifest
                     ));
                 }
-                if seq > base as u64 {
+                // Counted only when two spans or more held something to judge,
+                // as installed or as they were: an install whose writes lie in one
+                // of its spans, or in none, gives the agreement nothing to compare.
+                let judged = (0..install.spans.len())
+                    .filter(|&i| installed_in(i).is_some() || old_in(i).is_some())
+                    .count();
+                if seq > base as u64 && judged >= 2 {
                     install_outcomes.spans_judged += 1;
                 }
             }
@@ -1589,7 +1641,13 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
                         String::from_utf8_lossy(key)
                     ));
                 }
-                if seq > base as u64 {
+                // Counted only where a repair without its tables could be seen:
+                // a crash after the replacement, the repair's table among it, was
+                // written and traced, and before `CURRENT` was switched to it.
+                if seq > base as u64
+                    && !install.applied
+                    && crash_point(seq) == CrashPoint::BetweenReplacementAndSwitch
+                {
                     install_outcomes.repairs_absent += 1;
                 }
             }
@@ -1755,29 +1813,16 @@ pub fn run_with(seed: u64, schedule: Schedule, variant: Variant) -> Report {
                     if resolved {
                         install_outcomes.lost_to_a_fault += 1;
                     } else {
-                        // PROPOSED(D-054): where in the install the crash came.
-                        let durable = synced
-                            .wal
-                            .iter()
-                            .any(|&(_, first, up_to, _)| first <= seq && seq <= up_to);
-                        let written = events.iter().position(
-                            |e| matches!(e, TraceEvent::SpanInstalled { seq: s, .. } if *s == seq),
-                        );
-                        let switched = written.is_some_and(|at| {
-                            let manifest = match events[at] {
-                                TraceEvent::SpanInstalled { manifest, .. } => *manifest,
-                                _ => 0,
-                            };
-                            events[at..].iter().any(|e| {
-                                matches!(e, TraceEvent::CurrentSwitched { manifest: m } if *m == manifest)
-                            })
-                        });
-                        if !durable {
-                            install_outcomes.crashed_before_record_durable += 1;
-                        } else if written.is_some() && !switched {
-                            install_outcomes.crashed_between_replacement_and_switch += 1;
-                        } else {
-                            install_outcomes.crashed_otherwise_before_switch += 1;
+                        match crash_point(seq) {
+                            CrashPoint::BeforeRecordDurable => {
+                                install_outcomes.crashed_before_record_durable += 1;
+                            }
+                            CrashPoint::BetweenReplacementAndSwitch => {
+                                install_outcomes.crashed_between_replacement_and_switch += 1;
+                            }
+                            CrashPoint::Otherwise => {
+                                install_outcomes.crashed_otherwise_before_switch += 1;
+                            }
                         }
                     }
                 }

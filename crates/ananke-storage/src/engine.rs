@@ -68,8 +68,10 @@
 //! [`Variant::InstallKeepsSourceNumbers`], whose install keeps the source's sequence
 //! numbers; [`Variant::InstallSwitchPerSpan`], whose install of several spans
 //! switches them one at a time; [`Variant::RepairAfterSwitch`], whose install puts
-//! the repair in with a switch after its own; and [`Variant::CheckpointVersionPerSpan`],
-//! whose checkpoint of several spans copies each at its own version.
+//! the repair in with a switch after its own; [`Variant::RepairBeforeSwitch`], whose
+//! install puts the repair in with a switch before its own; and
+//! [`Variant::CheckpointVersionPerSpan`], whose checkpoint of several spans copies
+//! each at its own version.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
@@ -153,6 +155,12 @@ pub enum Variant {
     /// between the two leaves the installed tables without their repair.
     // PROPOSED(D-068): the repair is carried in the install's own switch.
     RepairAfterSwitch,
+    /// An install puts the repair's table in with a switch of its own before the
+    /// install's, which takes the spans' keys out and puts the installed tables in
+    /// after it. A crash between the two leaves the repair without its tables: the
+    /// receiver's writes over the spans as they were.
+    // PROPOSED(D-068): the repair is carried in the install's own switch.
+    RepairBeforeSwitch,
     /// A checkpoint of several spans copies each at the newest version applied
     /// when it reaches that span, and names the last. A write applied between two
     /// spans' copies is in the later span's copy and not in the earlier's.
@@ -437,7 +445,7 @@ pub struct InstallInfo {
 
 /// Why [`Engine::install_span`] or [`Engine::install_spans`] refused an install.
 /// Nothing in the store changed, though a refusal after the install took its number
-/// leaves its log record, which holds no write.
+/// leaves its log records, which hold no write.
 // PROPOSED(D-054): the live install of a span, in one manifest switch.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InstallRefused {
@@ -467,6 +475,19 @@ pub enum InstallRefused {
     RepairOutsideSpan {
         /// The first such key in the repair.
         key: Bytes,
+    },
+    /// The repair's record was not numbered the one after the install's: another
+    /// write took a number between them. The two are numbered under one hold of the
+    /// pending lock, so this is never seen while that holds. It is checked so that
+    /// a change breaking it refuses the install, rather than switching to a manifest
+    /// whose `flushed_seq` claims the write between them was in a table while it sat
+    /// in a memtable the flusher held back, to be lost at the next crash (D-068).
+    // PROPOSED(D-068): the repair's number is the record after the install's.
+    RepairNotNext {
+        /// The install's number.
+        seq: Seq,
+        /// The repair's, which is not `seq + 1`.
+        repair_seq: Seq,
     },
     /// Another install has not switched yet: one runs at a time.
     InProgress,
@@ -504,6 +525,10 @@ impl std::fmt::Display for InstallRefused {
             InstallRefused::RepairOutsideSpan { key } => {
                 write!(f, "the repair writes {key:?}, outside every span")
             }
+            InstallRefused::RepairNotNext { seq, repair_seq } => write!(
+                f,
+                "the repair was numbered {repair_seq}, not the record after the install's {seq}: another write was numbered between them"
+            ),
             InstallRefused::InProgress => write!(f, "another install is in progress"),
             InstallRefused::Quiesced => write!(f, "the engine is quiesced"),
             InstallRefused::SourceDamaged(what) => write!(f, "the source is damaged: {what}"),
@@ -1724,7 +1749,10 @@ impl<E: Environment> Engine<E> {
     /// As [`install_span`](Self::install_span)'s, and refused
     /// ([`InstallRefused::SpansOverlap`], [`InstallRefused::RepairOutsideSpan`])
     /// before it is numbered when the spans are out of order or overlap, or when
-    /// the repair writes a key outside every span.
+    /// the repair writes a key outside every span; and refused
+    /// ([`InstallRefused::RepairNotNext`]) once numbered if the repair's number is
+    /// not the install's plus one, which the one hold of the lock that numbers them
+    /// rules out.
     // PROPOSED(D-068): several spans and the receiver's repair, in one manifest switch.
     pub fn install_spans(
         &self,
@@ -1797,6 +1825,18 @@ impl<E: Environment> Engine<E> {
             let markers = self.number_empty(if repair.is_empty() { 1 } else { 2 });
             let seq = markers[0].seq();
             let repair_seq = markers.get(1).map(Write::seq);
+            // PROPOSED(D-068): argued from the one hold of the pending lock in
+            // `number_empty`, not tested: in the simulator nothing runs between the
+            // two numbers, so no test can put a write there. Checked, so that a
+            // change which lets one in refuses every install that carries a repair
+            // on the real runtime, loudly, rather than switching to a manifest that
+            // claims the write between is in a table. Both records hold no write,
+            // and the install is not yet marked in progress.
+            if let Some(repair_seq) = repair_seq
+                && repair_seq != seq + 1
+            {
+                return refused(InstallRefused::RepairNotNext { seq, repair_seq });
+            }
             *install = Some(seq);
             (markers, seq, repair_seq)
         };
@@ -2350,6 +2390,40 @@ impl<E: Environment> Shared<E> {
                 flushed(&mut after);
                 self.write_manifest(&after).await?;
                 self.install(after, &[], repair);
+            }
+            Variant::RepairBeforeSwitch if part.repair.is_some() => {
+                // The bug: a switch puts the repair's table in first, and the
+                // install's own switch takes the spans' keys out and puts the
+                // installed tables in after it. A crash between the two leaves the
+                // repair without its tables.
+                let traced = event(0, &part);
+                let InstallPart {
+                    rewritten,
+                    added,
+                    repair,
+                    ..
+                } = part;
+                let repair: Vec<Table<E>> = repair.into_iter().collect();
+                let mut before = self.manifest_edit(&[], metas(&repair));
+                flushed(&mut before);
+                self.write_manifest_file(&before).await?;
+                // The replacement is traced once the repair's manifest is written
+                // and before `CURRENT` names it, and names the install's own
+                // manifest, the next one: the turnstile holds every other manifest
+                // off until the install's is written. Traced before the repair's
+                // manifest is written, it would name a manifest above one written
+                // after it, which the trace's readers take for a lineage a
+                // fallback abandoned.
+                self.env.trace(with_manifest(traced, before.number + 1));
+                self.switch_to(&before).await?;
+                self.install(before, &[], repair);
+                let mut put_in: Vec<Table<E>> =
+                    rewritten.into_iter().map(|(_, m, r)| (m, r)).collect();
+                put_in.extend(added);
+                let mut next = self.manifest_edit(&removed, metas(&put_in));
+                flushed(&mut next);
+                self.write_manifest(&next).await?;
+                self.install(next, &removed, put_in);
             }
             _ => {
                 // PROPOSED(D-068): the repair's table is listed by the install's

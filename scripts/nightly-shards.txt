@@ -8,11 +8,12 @@
 # in the commit that adds it.
 # Rows added since fc75f68 are weighed the same way on the tree that adds them and placed
 # longest-first into the lightest shard; the rows before them keep fc75f68's weights. D-068's
-# three were weighed on its tree, on an idle machine, on their high-rate share.
+# four were weighed on its tree, on an idle machine, on their high-rate share.
 #
 # shard	binary	cpu_s	test
-# shard 1: 1241.7 cpu s
+# shard 1: 1278.5 cpu s
 1	engine	625.1	an_install_in_two_switches_is_caught
+1	engine	36.8	an_install_whose_repair_precedes_its_switch_is_caught
 1	engine	0.6	seed_44_never_opens_empty_in_either_mode
 1	engine	0.4	same_seed_gives_byte_identical_trace
 1	engine	0.3	seed_420_which_the_first_nightly_found_stays_green

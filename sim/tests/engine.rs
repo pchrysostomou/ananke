@@ -10,8 +10,8 @@
 //! that counts tombstones. The default schedule runs all four primitives. Every
 //! install and range delete covers two spans or three and every install carries a
 //! repair (D-068), beside the install that switches its spans one at a time, the
-//! install whose repair follows its switch, and the checkpoint that copies each span
-//! at its own version.
+//! installs whose repair follows and precedes their switch, and the checkpoint that
+//! copies each span at its own version.
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -308,8 +308,13 @@ fn the_correct_engine_passes_every_seed_with_deep_levels() {
 /// spans as it was, bar what a fault explains; and every write to a span after the
 /// install is read over the installed version. The correct engine passes every
 /// seed, and the sweep is seen to crash before an install's switch, after it, and
-/// after writes over it, to judge installs over several spans, and to find repairs
-/// both there and absent.
+/// after writes over it; to judge installs over several spans, two of them or more
+/// holding a write to judge by; and to find repairs there with their tables, and
+/// absent after a crash between the replacement and the switch, the window in
+/// which a repair could be in service without them. Both counters were measured
+/// on the tree that made them that strict: installs judged on 20 of 20, 100 of 100
+/// and 983 of 1000 seeds, repairs found absent in that window on 11 of 20, 47 of
+/// 100 and 459 of 1000, so both are asserted from the gate's twenty (D-061).
 // PROPOSED(D-054): the live install's crash test.
 // PROPOSED(D-068): over several spans, with a repair.
 #[test]
@@ -355,7 +360,7 @@ fn the_live_install_crash_test_passes_every_seed() {
     // PROPOSED(D-068): the spans' agreement and the repair, judged both ways.
     assert!(
         outcomes.spans_judged > 0,
-        "no install over several spans was judged after a crash: {outcomes:?}"
+        "no install over several spans, two of them holding a write, was judged after a crash: {outcomes:?}"
     );
     assert!(
         outcomes.repairs_present > 0,
@@ -363,7 +368,7 @@ fn the_live_install_crash_test_passes_every_seed() {
     );
     assert!(
         outcomes.repairs_absent > 0,
-        "no install left out by a crash had its repair checked absent: {outcomes:?}"
+        "no install left out by a crash between its replacement and its switch had its repair checked absent: {outcomes:?}"
     );
 }
 
@@ -485,10 +490,13 @@ fn the_range_delete_crash_test_passes_every_seed() {
         panic!("{violation}");
     }
     assert_install_windows(&outcomes, "a delete");
-    // PROPOSED(D-068): every delete covers several spans, judged as one.
+    // PROPOSED(D-068): every delete covers several spans, judged as one, and is
+    // counted when two of them or more held a write older than it: on 19 of 20, 91
+    // of 100 and 965 of 1000 seeds when this was made that strict, so from the
+    // gate's twenty (D-061).
     assert!(
         outcomes.spans_judged > 0,
-        "no delete over several spans was judged after a crash: {outcomes:?}"
+        "no delete over several spans, two of them holding a write, was judged after a crash: {outcomes:?}"
     );
 }
 
@@ -750,6 +758,31 @@ fn an_install_whose_repair_follows_its_switch_is_caught() {
     );
 }
 
+/// The other half of the repair's pair: an install that puts its repair in with a
+/// switch before its own leaves the repair without its tables, the receiver's
+/// writes over the spans as they were, when a crash falls between the two, and the
+/// crash test says so (D-068). Caught on some seed of the high-rate share at every
+/// tier, and by the repair's own check, whose words are "a repair without its
+/// tables". Measured before this was written, on the share it runs: 14 of 20, 52 of
+/// 100 and 529 of 1000, every catch that check's, so a share of twenty catches none
+/// with probability about 0.471^20, 2.9e-7.
+// PROPOSED(D-068): the repair is carried in the install's own switch.
+#[test]
+fn an_install_whose_repair_precedes_its_switch_is_caught() {
+    let caught = caught_on_the_install_schedule(Variant::RepairBeforeSwitch, high_rate_share());
+    let repair = caught_by(
+        Variant::RepairBeforeSwitch,
+        &caught,
+        "a repair without its tables",
+        "the repair's own check",
+    );
+    assert!(!caught.is_empty(), "RepairBeforeSwitch was never caught");
+    assert!(
+        !repair.is_empty(),
+        "no catch of RepairBeforeSwitch was the repair's own check: {caught:?}"
+    );
+}
+
 /// A checkpoint of several spans that copies each at the version applied when it
 /// reaches it holds a write applied between two spans' copies in one and not the
 /// other. The checkpoint, opened fresh after the next crash, disagrees with the
@@ -757,8 +790,9 @@ fn an_install_whose_repair_follows_its_switch_is_caught() {
 /// held (D-068). Caught on some seed of the high-rate share at every tier, and by the
 /// checkpoint's own check. Measured before this was written: 9 of 20, 47 of 100 and
 /// 468 of 1000, the checkpoint's check 4, 25 and 324 of them, so a share of twenty
-/// sees no catch by that check with probability about 0.68^20 to 0.8^20, 5e-4 to 1e-2
-/// on the measured rates, the larger at the gate's own 4 of 20.
+/// sees no catch by that check with probability about 0.676^20, 4.0e-4, by D-061's
+/// method on the thousand's rate; the gate's own 4 of 20, the more pessimistic
+/// reading, gives 0.8^20, 1.2e-2.
 // PROPOSED(D-068): the checkpoint of several spans, at one version.
 #[test]
 fn a_checkpoint_that_copies_each_span_at_its_own_version_is_caught() {
@@ -784,13 +818,15 @@ fn a_checkpoint_that_copies_each_span_at_its_own_version_is_caught() {
 /// tier, and never fewer than twenty or the tier itself. At those rates a share of
 /// twenty still expects sixteen catches or more, and a premerge share of a hundred
 /// eighty or more, while the engine binary's cost stays near what the sweep's other
-/// tests make it. D-068 runs two of its variants on the share too, below four in five
-/// but far above D-061's 5 %: `RepairAfterSwitch` and `CheckpointVersionPerSpan`, whose
-/// catch by their own checks a share of twenty misses with probability at most about
-/// one in a hundred on their measured rates, so that the premerge stays near the
-/// quarter of an hour D-040 set.
+/// tests make it. D-068 runs three of its variants on the share too, below four in
+/// five but far above D-061's 5 %: `RepairAfterSwitch`, `RepairBeforeSwitch` and
+/// `CheckpointVersionPerSpan`, whose catch by their own checks a share of twenty
+/// misses with probability about 4e-4 at most on their thousand-seed rates, so that
+/// the premerge stays near the quarter of an hour D-040 set. That goes past D-055's
+/// four in five, and is a choice D-068 puts to the owner, with running them on
+/// every seed beside it.
 // PROPOSED(D-055): the high-rate variants run a share of the seeds.
-// PROPOSED(D-068): and two of D-068's, for the premerge's time.
+// PROPOSED(D-068): and three of D-068's, for the premerge's time: the owner's choice.
 fn high_rate_share() -> u64 {
     (seeds() / 10).max(seeds().min(20))
 }
