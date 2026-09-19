@@ -14,5 +14,6 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 scripts/check-direct-io.sh
 cargo doc --workspace --no-deps --all-features
 cargo test --workspace --all-features --all-targets
+scripts/check-nightly-shards.sh
 cargo test --workspace --all-features --doc
 echo "gate: green"

@@ -27,10 +27,12 @@ scripts/gate.sh
 ```
 
 runs rustfmt, clippy with warnings denied, the direct-I/O check, `cargo doc` with
-warnings as errors, and every test, in that order, under `set -euo pipefail`. No commit is
-made unless it has exited 0 on the exact tree being committed, run as that one command.
-CI runs the same checks as parallel jobs on every push; a nightly job runs the
-simulation sweeps at ten thousand seeds in release.
+warnings as errors, every test, and the check that the nightly's shard table names every
+sweep once, in that order, under `set -euo pipefail`. No commit is made unless it has
+exited 0 on the exact tree being committed, run as that one command. CI runs the same
+checks as parallel jobs on every push; the nightly runs the simulation sweeps at ten
+thousand seeds in release, as seven jobs at once (D-064). A new sweep in `sim/tests` names
+its shard in `scripts/nightly-shards.txt`; `scripts/nightly.sh <shard>` runs one job here.
 
 ## Determinism first
 
