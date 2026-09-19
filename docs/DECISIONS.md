@@ -6144,6 +6144,11 @@ beside the pair rule and the pinned-seed rule, read as the owner applied it to
   applies the 5 % rule to every such counter as the owner's "move any that are similarly
   fragile".
 - A rate at or above 5 % stays at its tier.
+- *A new variant* — the owner's, of 2026-09-19, on PR #68 — asserts its catch at whatever
+  tier its measured rate supports under this rule, the rate measured before the assertion is
+  written, never after. A new variant caught on no seed at any tier needs a directed scenario
+  that builds its situation, not a lower bar: Phase 2's standing rule, as `RefusedCountsForQuorum`
+  got its directed scenario (D-049).
 
 Out of the rule's scope: assertions made of every seed ("on every seed", "caught on every
 seed", a count equal to zero), pinned seeds, which CLAUDE.md's pinned-seed rule governs, and
@@ -7138,7 +7143,7 @@ excluding ananke-sim's integration targets from `rest` by target would not.
   own.
 - Issue #57 is closed by this entry.
 
-## PROPOSED D-065 — A follower compacts its log to its own applied index, and takes a checkpoint only when one is asked for
+## D-065 — A follower compacts its log to its own applied index, and takes a checkpoint only when one is asked for
 
 **Context.** Stage B's first question before code (SHARD.md:2189-2193; §11, raft 13,
 SHARD.md:1897-1901). Only a leader compacts: the take is asked from the leader's tick once its
@@ -7162,7 +7167,8 @@ changes RAFT.md's rule that a leader compacts (RAFT.md:249).
   prefix, with no checkpoint. It takes one only when it must stream a snapshot, as a leader
   already does when the record it holds has no complete checkpoint under it.
 
-**Proposed: C.** It needs no new state and no new message:
+**Decided: C** — the owner's, of 2026-09-19, on PR #68, approved as written here. It needs no
+new state and no new message:
 
 - a snapshot record with no local checkpoint under it already exists, after an install and
   after a crash between D-036's record and its checkpoint (DECISIONS.md:1594-1597);
@@ -7213,7 +7219,8 @@ share.
 - D-029's revert floor, reached on 3 of 10 000 seeds today and deferred to issue #56, becomes
   a routine path on every follower.
 
-**Departures from the stage plan, for the owner.**
+**Departures from the stage plan, approved by the owner**, since the plan predates what Stage A
+shipped.
 - The plan has the entry supersede RAFT.md:249 with a forward pointer, as D-048 did
   (SHARD.md:2192-2193). This entry defers the pointer to the commit that builds follower
   compaction, since RAFT.md says what the code does (D-053).
@@ -7221,9 +7228,11 @@ share.
   its own. Under the owner's rule of one change per PR, it is proposed here as its own PR,
   after the node, with its own re-audit.
 
-**For the owner.** Choose C, as proposed, or A or B.
+**What the owner weighed.** The first draft of this entry proposed A. Its cost, a checkpoint
+per hosted replica, each holding every range's applies, is what the review caught and what
+decided the matter.
 
-## PROPOSED D-066 — Every install on the node is a live install; a range lives in two key intervals, which Stage A's primitives do not reach in one step
+## D-066 — Every install on the node is a live install; a range lives in two key intervals, which Stage A's primitives do not reach in one step
 
 **Context.** Stage B's second question before code (SHARD.md:2194-2198). Today an install stages
 a whole store, retires the server's run-loop incarnation, and is adopted at the next start
@@ -7263,10 +7272,14 @@ the owner before the node's code:
   Either order without the marker is unsafe: new Raft state over old user keys misstates what
   is applied, and old Raft state over new user keys replays applied commands onto them.
 
-**Proposed: (a)**, as the one with a single commit point, the shape Stage A's crash test
-already holds.
+**Decided: (a)** — the owner's, of 2026-09-19, on PR #68. The primitives are extended to
+several intervals in one switch, in a PR of their own with the generalised crash test and its
+variant, before any node code. Not (b), in the owner's words: it "puts a durable marker between
+two steps that must be one commit point, which is the same shape as the D-041 adoption bug — a
+point of no return before the new state is durable." The adoption as first built had that shape
+and paid for it (D-041).
 
-**Proposed, whichever of (a) and (b) is chosen:**
+**Decided, with (a):**
 
 - *Every install on the node is a live install.* This covers a follower behind its leader's
   compacted prefix, and each range of Q15's re-seed into the fresh engine. The whole-store
@@ -7318,10 +7331,9 @@ already holds.
   waits shows no progress, and its correct leader steps down where RAFT.md:754-755 expects it to
   keep office. The quorum scenario's cap is set at or above its ranges, or D-049's rule counts
   a queued stream as progress. That is the owner's choice when the node is built, noted here.
-- `AdoptionAsBuilt` loses one of its three rules on the node and needs the owner's choice,
-  below.
+- `AdoptionAsBuilt` loses one of its three rules on the node; the owner's choice is below.
 
-**`AdoptionAsBuilt` — for the owner.** It breaks three rules today (RAFT.md:750; D-041).
+**`AdoptionAsBuilt`.** It breaks three rules today (RAFT.md:750; D-041).
 1. *Copy and switch before delete.* On the node this is the live install's single switch. The
    variant breaks it by removing the span's keys in a switch of their own before adding the
    tables, which is Stage A's engine variant `InstallInTwoSwitches` (D-054) reached through the
@@ -7332,23 +7344,18 @@ already holds.
 3. *A marked store never opens fresh.* This becomes the start's rule above; the variant
    neither checks nor writes the mark.
 
-§10 requires every Phase 2 variant re-asserted, so the owner chooses:
-- *re-assert it on rules 1 and 3*, under crash arms aimed at the live install's switch and at
-  the window before the fresh directory exists, at its Phase 2 tier; or
-- *amend §10*, letting `InstallInTwoSwitches` and the engine's `SourceDamaged` carry rules 1
-  and 2, and re-asserting only rule 3 on the node.
-
-The plan recommends the first, as the stricter.
+§10 requires every Phase 2 variant re-asserted. *Decided* — the owner's, the stricter reading,
+as the plan recommended: `AdoptionAsBuilt` is re-asserted on rules 1 and 3, under crash arms
+aimed at the live install's switch and at the window before the fresh directory exists, at its
+Phase 2 tier. §10 is not amended.
 
 **Dependencies.** This entry builds on D-054 and D-055, which are still PROPOSED
-(DECISIONS.md:4157, 4583). Approving it presumes approving their primitives, and under (a)
-extending them.
+(DECISIONS.md:4157, 4583), and (a) extends their primitives; the multi-interval PR carries that
+extension and its own entry. The quorum scenario's receive cap is settled when the node is
+built, as noted above.
 
-**For the owner.**
-- Choose (a) or (b) for the range's two intervals.
-- Approve the points above.
-- Choose for `AdoptionAsBuilt`.
-- Note the quorum scenario's cap.
+**Merge order**, the owner's: this entry's PR, then the multi-interval primitives, then Stage
+B's node, one PR each.
 
 **Alternatives.**
 - *Keep the staged whole-store install for the re-seed.* A re-seed replaces every range, so a
@@ -7362,7 +7369,7 @@ extending them.
 **Consequences.** `snapshot.rs`'s staged adoption stays in `ananke-raft` for the single-group
 server until nothing uses it; the node does not call it.
 
-## PROPOSED D-067 — The re-seed shape's variant: `ReseedMarkNotSynced`, the replica's refused mark written unsynced
+## D-067 — The re-seed shape's variant: `ReseedMarkNotSynced`, the replica's refused mark written unsynced
 
 **Context.** Stage B's third question before code (SHARD.md:2199-2202). Q15 refuses a whole node
 whose shared engine lost state. The node re-seeds into a fresh engine in a new directory, and
@@ -7374,7 +7381,9 @@ the quarantine flag carried in the repair keeps the rebuilt replica from voting 
 names no variant for this path, and CLAUDE.md's pair rule asks for a known-buggy one beside the
 directed re-seed shape Stage B adds (SHARD.md:2253-2262).
 
-**Proposed.** `ReseedMarkNotSynced` writes each replica's refused mark in a batch that is not
+**Decided** — the owner's, of 2026-09-19, on PR #68, approved as written here, the crash before
+any other sync and the check that catches a lost mark every time included. `ReseedMarkNotSynced`
+writes each replica's refused mark in a batch that is not
 synced. Otherwise it behaves as the correct node: it traces the mark as the correct node does,
 and answers as the correct node would once the mark is written.
 
@@ -7409,18 +7418,17 @@ at the crash; otherwise the catch rate would say nothing about the variant.
 
 *Its standard is rate*, as §10 sets for `RemovalNotDurable` (SHARD.md:1748). The arm's firing,
 and the mark still unsynced at the crash, are asserted on every seed at every tier. The catch
-is asserted from the thousand-seed tier if its measured rate is under 5 % (D-061). D-061 gives
-no tier for a new variant at or above 5 %, so this entry proposes, for new variants: the lowest
-tier at which the chance of catching nothing is under 1 %, with that chance printed.
+is asserted at the tier its measured rate supports under D-061's rule, the rate measured
+before the assertion is written; the owner added that rule for new variants to D-061 rather
+than to this entry. Were it caught on no seed at any tier, it would need a directed scenario,
+not a lower bar.
 
 *Where it lives.* In the range layer's variant set in `ananke-shard` (SHARD.md:1557-1561),
 outside §10's count of range-layer variants, as the plan says.
 
-**For the owner.**
-- Approve `ReseedMarkNotSynced`, the crash on the mark's own event, `RaftRecovered`'s
-  per-replica state, and the two checks.
-- Approve the tier rule for a new variant caught on 5 % or more.
-- Or name another variant for Q15's path.
+**Why it matters.** The first draft's catch could have been near zero, since any later sync
+makes an unsynced mark durable. That is the failure the pair rule exists to prevent: a variant
+the scenario cannot catch proves nothing about the correct node beside it.
 
 **Alternatives.**
 - *A variant that writes no mark at all.* Caught on every seed by (c) and (d), so it tests the
