@@ -7744,7 +7744,8 @@ eight keys, against one span of one to twelve.
 **The nightly's shards.** The three new tests are rows of `scripts/nightly-shards.txt`
 (D-064), each weighed alone in release at `ANANKE_SEEDS=1000` and `ANANKE_DEEP_SEEDS=100` on
 this laptop, and placed longest-first into the lightest shard. The machine's own background
-work held the one-minute load at 56 to 69 while they ran, so the weights may be somewhat high.
+work had the load averages at 56 over one minute and 70 over five when they finished, so the
+weights may be somewhat high.
 
 | Test | Seeds at a thousand | CPU s | Shard |
 | --- | --- | --- | --- |
@@ -7761,7 +7762,40 @@ range-delete tests heavier: two or three spans with a repair each time. The next
 measures what that adds, and if a shard passes an hour, D-064's procedure re-balances the
 table in a change of its own.
 
-**The premerge.** Recorded by the commit after this one, once it has run on this tree.
+**The premerge.** Measured on f2c6581, the commit that lands the rest of this entry.
+`scripts/premerge.sh` ran at a thousand seeds after a warm release build, with the one-minute
+load sampled every 15 s, as D-052 and D-055 measured it. It was **green in 2 122.50 s**
+(35 min 22.5 s), with 8 743.12 s user and 374.22 s sys; 325 tests passed and none failed. The
+**mean one-minute load was 58.40** over 138 samples, from 19.60 to 100.37. Per binary:
+`sim/tests/raft.rs` 1 124.40 s, `sim/tests/engine.rs` 907.29 s, `sim/tests/wal.rs` 23.66 s,
+and every other binary under five seconds. Beside it stands D-063's run on 46e95c0: 822.64 s
+at a load of 60.94, with raft 535.89 s, engine 245.96 s and WAL 23.26 s.
+
+The run is not a clean measure of this change. The raft binary runs no code this change
+touches, and its seed-42 traces hash as on the base. Yet it took 2.1 times D-063's figure at
+a similar mean load: the load reached 100 while it ran, and the machine was slower for
+reasons of its own.
+
+What the change costs was measured apart, the same day and the same way on both trees: the
+engine binary alone at a thousand seeds, in release, its tests one at a time.
+- On this tree, 404.26 s and 2 747 CPU seconds; on the base, 4690d00, 223.32 s and 1 574.
+- The gate's tier on its own, twenty seeds in debug: 64.07 s against 40.96 s.
+- The three new tests weigh 1 403 CPU seconds in the nightly's table. They were weighed at a
+  higher load (above), when a CPU second of this machine buys less, so that weight cannot be
+  subtracted from these two figures. The older tests grew too, by an amount not separated
+  here: the install and range-delete schedules' installs are heavier, and the oracle checks
+  more.
+
+The premerge therefore exceeds D-040's quarter of an hour on this machine, however its load
+is read: the engine binary's 181 s of added wall, run alone, takes D-063's 822.64 s past
+fifteen minutes.
+
+For the owner, not decided here. The two new variants that run every seed are caught on
+62 % and 47 % of seeds. Run on `high_rate_share()`, as D-055's review did for the variants
+caught on four seeds in five, each would still be caught at the premerge's hundred with
+P(none) below 10^-27, and about nine tenths of their 1 332 CPU seconds at a thousand would
+be saved. This entry does not take that, since D-055 set the share by rate and neither rate
+reaches it.
 
 **Alternatives.**
 - *Option (b) of D-066, two single-span steps bracketed by a durable marker.* The owner
@@ -7794,8 +7828,9 @@ table in a change of its own.
 - The engine sweep's default, install and range-delete schedules moved for every seed. The
   studio trace of seed 42 moved with them and now asserts the shape it shows. No pinned seed
   moved.
-- The engine binary costs more at the premerge, most of it the two new variants that run
-  every seed; the premerge, above, measures how much.
+- The engine binary costs about three quarters more CPU at a thousand seeds, and half as much
+  again at the gate. Much of it is the two new variants that run every seed (the premerge,
+  above).
 
 ---
 
