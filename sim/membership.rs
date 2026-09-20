@@ -59,8 +59,8 @@ use moirae_sched::Policy;
 
 use crate::lin::{self, History};
 use crate::raft::{
-    CLIENTS, ClientStats, DIR, DRIFT_BOUND_PPM, LIVENESS_TIMEOUTS, SLICE, TICK, admin_addr, client,
-    election_max, leader_now, server_addr,
+    self, CLIENTS, ClientStats, DIR, DRIFT_BOUND_PPM, LIVENESS_TIMEOUTS, SLICE, TICK, admin_addr,
+    client, election_max, leader_now, server_addr,
 };
 
 /// The raft sweep's snapshot threshold, which the membership servers run too, so that
@@ -434,6 +434,16 @@ impl Report {
             _ => None,
         }) {
             return fail(format!("server {} failed: {}", failed.0, failed.1));
+        }
+        // PROPOSED(D-069): the payload of SHARD.md §8's trace, and the rule
+        // `RaftMatchStarted` states, folded here as in the raft sweep — this is the
+        // scenario that drives changes, so it is where learners and re-tracked
+        // followers raise a match.
+        if let Err(violation) = raft::payload_is_well_formed(&self.records) {
+            return fail(violation);
+        }
+        if let Err(violation) = raft::match_starts_are_first_rises(&self.records) {
+            return fail(violation);
         }
         // PROPOSED(D-058): no crash is scheduled here, so a store refused at an open is
         // an install's adoption gone wrong — a configuration key its repair wrote out
@@ -931,6 +941,7 @@ mod tests {
     //! held by a sweep; both are held here.
 
     use ananke_raft::core::Variant;
+    use ananke_raft::node::SINGLE_GROUP;
 
     use super::*;
 
@@ -953,6 +964,7 @@ mod tests {
             millis,
             TraceEvent::RaftSnapshot {
                 server,
+                range: SINGLE_GROUP,
                 last_index,
                 last_term: 1,
                 taken: false,
@@ -966,6 +978,7 @@ mod tests {
             millis,
             TraceEvent::RaftConfig {
                 server: 1,
+                range: SINGLE_GROUP,
                 index: 10,
                 old: (1..=INITIAL_VOTERS).collect(),
                 new: (1..=INITIAL_VOTERS).chain([joiner]).collect(),
@@ -1007,6 +1020,7 @@ mod tests {
                 650,
                 TraceEvent::RaftSnapshot {
                     server: 5,
+                    range: SINGLE_GROUP,
                     last_index: 6,
                     last_term: 1,
                     taken: true,

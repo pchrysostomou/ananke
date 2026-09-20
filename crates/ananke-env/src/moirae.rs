@@ -39,8 +39,25 @@
 //! | `RaftCompacted` / `RaftReseeded` / `RaftSnapshotResumed` / `RaftAdopted` | `log` `ananke.raft.compacted` / `.reseeded` / `.snapshot-resumed` / `.adopted` |
 //! | `RaftProgressReset`                      | `log` `ananke.raft.progress-reset`            |
 //! | `RaftSnapshotDeleted` / `RaftSnapshotReused` / `RaftSnapshotStreams` | `log` `ananke.raft.snapshot-deleted` / `.snapshot-reused` / `.snapshot-streams` |
+//! | `RaftMatchStarted` / `RaftLearnerRound` / `RaftChangeAccepted` | `log` `ananke.raft.match-started` / `.learner-round` / `.change-accepted` |
+//! | `RangeCreated` / `RangeDescriptor` / `RangesRestated` / `RangeReplicaCreated` | `log` `ananke.range.created` / `.descriptor` / `.restated` / `.replica-created` |
+//! | `RangeSplit` / `RangeSubsumed` / `RangeMerged`           | `log` `ananke.range.split` / `.subsumed` / `.merged` |
+//! | `RangeMergeAborted` / `RangeMergeStalled` / `RangeUnfrozen` | `log` `ananke.range.merge-aborted` / `.merge-stalled` / `.unfrozen` |
+//! | `RangeRemoved` / `RangeMismatchSent` / `RangeIdsLeased`  | `log` `ananke.range.removed` / `.mismatch-sent` / `.ids-leased` |
+//! | `MetaApplied` / `RebalanceMove`          | `log` `ananke.meta.applied` / `ananke.rebalance.move` |
+//! | `NodeAdded` / `NodeRemoved`              | `log` `ananke.node.added` / `.removed`        |
 //! | `ClientInvoke` / `ClientReturn`          | `log` `ananke.client.invoke` / `.return`      |
+//! | `ClientSend` / `ClientMismatch`          | `log` `ananke.client.send` / `.mismatch`      |
 //! | `TimeAdvanced`                           | nothing: every line carries `t`               |
+//!
+//! Every `Raft*` line about a replica carries `range` after `server`, and the three
+//! that are about a node's store — `ananke.raft.refused`, `.adopted` and `.failed` —
+//! carry none (SHARD.md §8). `ananke.raft.apply` carries `effect` and, where the
+//! entry names one, `key`; `ananke.raft.read` is written by the server that serves
+//! the read and carries `key` and `applied`, the applied index of the engine version
+//! it was served from. A span bound goes out as hex, as `ananke.engine.span-installed`
+//! writes its keys, and a key a client named as text, as `ananke.client.invoke` writes
+//! its own.
 //!
 //! `t` is global virtual time in nanoseconds and the header says `unit: "ns"`. Node ids
 //! pass through unchanged: ananke numbers nodes from 1 exactly because moirae does
@@ -282,6 +299,17 @@ fn hex(bytes: &[u8]) -> String {
 
 fn int(v: u64) -> Json {
     i64::try_from(v).map_or_else(|_| Json::Str(v.to_string()), Json::Int)
+}
+
+/// Key or value bytes as text, as the client events have always written them: a
+/// key a client named is text here, and the studio filters and groups by it.
+fn text(bytes: &[u8]) -> Json {
+    Json::str(&String::from_utf8_lossy(bytes))
+}
+
+/// A list of server or range ids.
+fn ids(list: &[u64]) -> Json {
+    Json::Array(list.iter().map(|&id| int(id)).collect())
 }
 
 fn convert(
@@ -715,12 +743,14 @@ fn convert(
         ),
         TraceEvent::RaftTerm {
             server,
+            range,
             term,
             role,
             received,
         } => {
             let mut fields = vec![
                 ("server", int(*server)),
+                ("range", int(*range)),
                 ("term", int(*term)),
                 ("role", Json::str(role)),
             ];
@@ -736,6 +766,7 @@ fn convert(
         }
         TraceEvent::RaftVote {
             server,
+            range,
             term,
             candidate,
             granted,
@@ -744,6 +775,7 @@ fn convert(
             "ananke.raft.vote",
             Some(Json::obj(vec![
                 ("server", int(*server)),
+                ("range", int(*range)),
                 ("term", int(*term)),
                 ("candidate", int(*candidate)),
                 ("granted", Json::Bool(*granted)),
@@ -752,18 +784,21 @@ fn convert(
         ),
         TraceEvent::RaftLeader {
             server,
+            range,
             term,
             last_index,
         } => log(
             "ananke.raft.leader",
             Some(Json::obj(vec![
                 ("server", int(*server)),
+                ("range", int(*range)),
                 ("term", int(*term)),
                 ("lastIndex", int(*last_index)),
             ])),
         ),
         TraceEvent::RaftAppend {
             server,
+            range,
             index,
             entry_term,
             hash,
@@ -771,67 +806,86 @@ fn convert(
             "ananke.raft.append",
             Some(Json::obj(vec![
                 ("server", int(*server)),
+                ("range", int(*range)),
                 ("index", int(*index)),
                 ("entryTerm", int(*entry_term)),
                 ("hash", int(*hash)),
             ])),
         ),
-        TraceEvent::RaftTruncate { server, from_index } => log(
+        TraceEvent::RaftTruncate {
+            server,
+            range,
+            from_index,
+        } => log(
             "ananke.raft.truncate",
             Some(Json::obj(vec![
                 ("server", int(*server)),
+                ("range", int(*range)),
                 ("fromIndex", int(*from_index)),
             ])),
         ),
         TraceEvent::RaftCommit {
             server,
+            range,
             term,
             index,
         } => log(
             "ananke.raft.commit",
             Some(Json::obj(vec![
                 ("server", int(*server)),
+                ("range", int(*range)),
                 ("term", int(*term)),
                 ("index", int(*index)),
             ])),
         ),
+        // PROPOSED(D-069): `key` and `effect` on `RaftApply`. The key is written
+        // as text, as `ananke.client.invoke`'s is, so the studio lines an
+        // operation up with its apply; `key` is absent where the entry names none.
         TraceEvent::RaftApply {
             server,
+            range,
             index,
             entry_term,
             hash,
-        } => log(
-            "ananke.raft.apply",
-            Some(Json::obj(vec![
+            key,
+            effect,
+        } => {
+            let mut fields = vec![
                 ("server", int(*server)),
+                ("range", int(*range)),
                 ("index", int(*index)),
                 ("entryTerm", int(*entry_term)),
                 ("hash", int(*hash)),
-            ])),
-        ),
+            ];
+            if let Some(key) = key {
+                fields.push(("key", text(key)));
+            }
+            fields.push(("effect", Json::str(effect.as_str())));
+            log("ananke.raft.apply", Some(Json::obj(fields)))
+        }
         TraceEvent::RaftConfig {
             server,
+            range,
             index,
             old,
             new,
             joint,
             learners,
-        } => {
-            let ids = |list: &[u64]| Json::Array(list.iter().map(|&id| int(id)).collect());
-            log(
-                "ananke.raft.config",
-                Some(Json::obj(vec![
-                    ("server", int(*server)),
-                    ("index", int(*index)),
-                    ("old", ids(old)),
-                    ("new", ids(new)),
-                    ("joint", Json::Bool(*joint)),
-                    ("learners", ids(learners)),
-                ])),
-            )
-        }
+        } => log(
+            "ananke.raft.config",
+            Some(Json::obj(vec![
+                ("server", int(*server)),
+                ("range", int(*range)),
+                ("index", int(*index)),
+                ("old", ids(old)),
+                ("new", ids(new)),
+                ("joint", Json::Bool(*joint)),
+                ("learners", ids(learners)),
+            ])),
+        ),
         TraceEvent::RaftSnapshot {
             server,
+            range,
             last_index,
             last_term,
             taken,
@@ -839,45 +893,65 @@ fn convert(
             "ananke.raft.snapshot",
             Some(Json::obj(vec![
                 ("server", int(*server)),
+                ("range", int(*range)),
                 ("lastIndex", int(*last_index)),
                 ("lastTerm", int(*last_term)),
                 ("taken", Json::Bool(*taken)),
             ])),
         ),
+        // PROPOSED(D-069): traced by the server that serves the read, with the key
+        // and the applied index of the engine version it was served from.
         TraceEvent::RaftRead {
             server,
+            range,
             index,
             lease,
+            key,
+            applied,
         } => log(
             "ananke.raft.read",
             Some(Json::obj(vec![
                 ("server", int(*server)),
+                ("range", int(*range)),
                 ("index", int(*index)),
                 ("lease", Json::Bool(*lease)),
+                ("key", text(key)),
+                ("applied", int(*applied)),
             ])),
         ),
         TraceEvent::RaftLeaseRevoked {
             server,
+            range,
             follower,
             offset_moved,
         } => log(
             "ananke.raft.lease-revoked",
             Some(Json::obj(vec![
                 ("server", int(*server)),
+                ("range", int(*range)),
                 ("follower", int(*follower)),
                 ("offsetMovedNs", int(*offset_moved)),
             ])),
         ),
-        TraceEvent::RaftTransfer { server, to } => log(
+        TraceEvent::RaftTransfer { server, range, to } => log(
             "ananke.raft.transfer",
-            Some(Json::obj(vec![("server", int(*server)), ("to", int(*to))])),
+            Some(Json::obj(vec![
+                ("server", int(*server)),
+                ("range", int(*range)),
+                ("to", int(*to)),
+            ])),
         ),
         TraceEvent::RaftQuorumLost {
             server,
+            range,
             term,
             uncounted,
         } => {
-            let mut fields = vec![("server", int(*server)), ("term", int(*term))];
+            let mut fields = vec![
+                ("server", int(*server)),
+                ("range", int(*range)),
+                ("term", int(*term)),
+            ];
             // D-049: written only when a refused follower went uncounted, so a
             // step-down the rule did not touch exports as it did before.
             if !uncounted.is_empty() {
@@ -890,6 +964,7 @@ fn convert(
         }
         TraceEvent::RaftRecovered {
             server,
+            range,
             term,
             applied,
             last_index,
@@ -898,6 +973,7 @@ fn convert(
             "ananke.raft.recovered",
             Some(Json::obj(vec![
                 ("server", int(*server)),
+                ("range", int(*range)),
                 ("term", int(*term)),
                 ("applied", int(*applied)),
                 ("lastIndex", int(*last_index)),
@@ -906,6 +982,7 @@ fn convert(
         ),
         TraceEvent::RaftProposed {
             server,
+            range,
             client,
             seq,
             index,
@@ -914,6 +991,7 @@ fn convert(
             "ananke.raft.proposed",
             Some(Json::obj(vec![
                 ("server", int(*server)),
+                ("range", int(*range)),
                 ("client", int(*client)),
                 ("seq", int(*seq)),
                 ("index", int(*index)),
@@ -934,33 +1012,52 @@ fn convert(
                 ("reason", Json::str(reason)),
             ])),
         ),
-        TraceEvent::RaftInboxDropped { server, kind } => log(
+        TraceEvent::RaftInboxDropped {
+            server,
+            range,
+            kind,
+        } => log(
             "ananke.raft.inbox-dropped",
             Some(Json::obj(vec![
                 ("server", int(*server)),
+                ("range", int(*range)),
                 ("kind", Json::str(kind)),
             ])),
         ),
-        TraceEvent::RaftCompacted { server, through } => log(
+        TraceEvent::RaftCompacted {
+            server,
+            range,
+            through,
+        } => log(
             "ananke.raft.compacted",
             Some(Json::obj(vec![
                 ("server", int(*server)),
+                ("range", int(*range)),
                 ("through", int(*through)),
             ])),
         ),
-        TraceEvent::RaftReseeded { server } => log(
+        TraceEvent::RaftReseeded { server, range } => log(
             "ananke.raft.reseeded",
-            Some(Json::obj(vec![("server", int(*server))])),
+            Some(Json::obj(vec![
+                ("server", int(*server)),
+                ("range", int(*range)),
+            ])),
         ),
         // D-041: the crash-safe adoption and the store identity marker.
         TraceEvent::RaftAdopted { server } => log(
             "ananke.raft.adopted",
             Some(Json::obj(vec![("server", int(*server))])),
         ),
-        TraceEvent::RaftSnapshotResumed { server, to, offset } => log(
+        TraceEvent::RaftSnapshotResumed {
+            server,
+            range,
+            to,
+            offset,
+        } => log(
             "ananke.raft.snapshot-resumed",
             Some(Json::obj(vec![
                 ("server", int(*server)),
+                ("range", int(*range)),
                 ("to", int(*to)),
                 ("offset", int(*offset)),
             ])),
@@ -968,12 +1065,14 @@ fn convert(
         // D-042: store incarnations.
         TraceEvent::RaftProgressReset {
             server,
+            range,
             follower,
             incarnation,
         } => log(
             "ananke.raft.progress-reset",
             Some(Json::obj(vec![
                 ("server", int(*server)),
+                ("range", int(*range)),
                 ("follower", int(*follower)),
                 ("incarnation", int(*incarnation)),
             ])),
@@ -981,42 +1080,47 @@ fn convert(
         // D-043: snapshot versions and the streams pinned to them.
         TraceEvent::RaftSnapshotDeleted {
             server,
+            range,
             last_index,
             take,
         } => log(
             "ananke.raft.snapshot-deleted",
             Some(Json::obj(vec![
                 ("server", int(*server)),
+                ("range", int(*range)),
                 ("lastIndex", int(*last_index)),
                 ("take", int(*take)),
             ])),
         ),
         TraceEvent::RaftSnapshotReused {
             server,
+            range,
             last_index,
             take,
         } => log(
             "ananke.raft.snapshot-reused",
             Some(Json::obj(vec![
                 ("server", int(*server)),
+                ("range", int(*range)),
                 ("lastIndex", int(*last_index)),
                 ("take", int(*take)),
             ])),
         ),
         TraceEvent::RaftSnapshotStreams {
             server,
+            range,
             to,
             streams,
         } => log(
             "ananke.raft.snapshot-streams",
             Some(Json::obj(vec![
                 ("server", int(*server)),
+                ("range", int(*range)),
                 ("to", int(*to)),
                 ("streams", int(*streams)),
             ])),
         ),
         TraceEvent::ClientInvoke { client, seq, op } => {
-            let text = |bytes: &[u8]| Json::str(&String::from_utf8_lossy(bytes));
             let mut fields = vec![
                 ("client", int(*client)),
                 ("seq", int(*seq)),
@@ -1038,7 +1142,6 @@ fn convert(
             seq,
             result,
         } => {
-            let text = |bytes: &[u8]| Json::str(&String::from_utf8_lossy(bytes));
             let mut fields = vec![("client", int(*client)), ("seq", int(*seq))];
             match result {
                 ClientResult::Done => fields.push(("result", Json::str("done"))),
@@ -1053,6 +1156,371 @@ fn convert(
             }
             log("ananke.client.return", Some(Json::obj(fields)))
         }
+        // PROPOSED(D-069): SHARD.md §8's new events. Three are emitted by this
+        // commit; the rest are defined and exported here and emitted by the stage
+        // that builds what each reports. Span bounds go out as hex, as
+        // `ananke.engine.span-installed`'s keys do, since a bound is not
+        // necessarily text; a key a client named goes out as text.
+        TraceEvent::RaftMatchStarted {
+            range,
+            follower,
+            incarnation,
+            matched,
+        } => log(
+            "ananke.raft.match-started",
+            Some(Json::obj(vec![
+                ("range", int(*range)),
+                ("follower", int(*follower)),
+                ("incarnation", int(*incarnation)),
+                ("matched", int(*matched)),
+            ])),
+        ),
+        TraceEvent::RaftLearnerRound {
+            range,
+            learner,
+            from_index,
+            to_index,
+            ticks,
+            caught_up,
+        } => log(
+            "ananke.raft.learner-round",
+            Some(Json::obj(vec![
+                ("range", int(*range)),
+                ("learner", int(*learner)),
+                ("fromIndex", int(*from_index)),
+                ("toIndex", int(*to_index)),
+                ("ticks", int(*ticks)),
+                ("caughtUp", Json::Bool(*caught_up)),
+            ])),
+        ),
+        TraceEvent::RaftChangeAccepted {
+            range,
+            voters,
+            applied,
+            term,
+        } => log(
+            "ananke.raft.change-accepted",
+            Some(Json::obj(vec![
+                ("range", int(*range)),
+                ("voters", ids(voters)),
+                ("applied", int(*applied)),
+                ("term", int(*term)),
+            ])),
+        ),
+        TraceEvent::RangeCreated {
+            range,
+            cause,
+            parent,
+            start,
+            end,
+            generation,
+            voters,
+            floor_index,
+            floor_term,
+            incarnation,
+        } => log(
+            "ananke.range.created",
+            Some(Json::obj(vec![
+                ("range", int(*range)),
+                ("cause", Json::str(cause.as_str())),
+                ("parent", parent.map_or(Json::Null, int)),
+                ("start", Json::str(&hex(start))),
+                ("end", Json::str(&hex(end))),
+                ("generation", int(*generation)),
+                ("voters", ids(voters)),
+                ("floorIndex", int(*floor_index)),
+                ("floorTerm", int(*floor_term)),
+                ("incarnation", int(*incarnation)),
+            ])),
+        ),
+        TraceEvent::RangeDescriptor {
+            range,
+            index,
+            applied,
+            start,
+            end,
+            generation,
+            voters,
+            state,
+        } => log(
+            "ananke.range.descriptor",
+            Some(Json::obj(vec![
+                ("range", int(*range)),
+                ("index", int(*index)),
+                ("applied", int(*applied)),
+                ("start", Json::str(&hex(start))),
+                ("end", Json::str(&hex(end))),
+                ("generation", int(*generation)),
+                ("voters", ids(voters)),
+                ("state", Json::str(state.as_str())),
+            ])),
+        ),
+        TraceEvent::RangesRestated { ranges } => log(
+            "ananke.range.restated",
+            Some(Json::obj(vec![("ranges", ids(ranges))])),
+        ),
+        TraceEvent::RangeReplicaCreated { range } => log(
+            "ananke.range.replica-created",
+            Some(Json::obj(vec![("range", int(*range))])),
+        ),
+        TraceEvent::RangeSplit {
+            range,
+            right,
+            key,
+            index,
+        } => log(
+            "ananke.range.split",
+            Some(Json::obj(vec![
+                ("range", int(*range)),
+                ("right", int(*right)),
+                ("key", Json::str(&hex(key))),
+                ("index", int(*index)),
+            ])),
+        ),
+        TraceEvent::RangeSubsumed {
+            range,
+            into,
+            begun,
+            index,
+            generation,
+            voters,
+        } => log(
+            "ananke.range.subsumed",
+            Some(Json::obj(vec![
+                ("range", int(*range)),
+                ("into", int(*into)),
+                ("begun", int(*begun)),
+                ("index", int(*index)),
+                ("generation", int(*generation)),
+                ("voters", ids(voters)),
+            ])),
+        ),
+        TraceEvent::RangeMerged {
+            range,
+            right,
+            begun,
+            index,
+            right_index,
+            right_generation,
+            right_applied,
+        } => log(
+            "ananke.range.merged",
+            Some(Json::obj(vec![
+                ("range", int(*range)),
+                ("right", int(*right)),
+                ("begun", int(*begun)),
+                ("index", int(*index)),
+                ("rightIndex", int(*right_index)),
+                ("rightGeneration", int(*right_generation)),
+                ("rightApplied", int(*right_applied)),
+            ])),
+        ),
+        TraceEvent::RangeMergeAborted {
+            range,
+            right,
+            begun,
+            index,
+        } => log(
+            "ananke.range.merge-aborted",
+            Some(Json::obj(vec![
+                ("range", int(*range)),
+                ("right", int(*right)),
+                ("begun", int(*begun)),
+                ("index", int(*index)),
+            ])),
+        ),
+        TraceEvent::RangeMergeStalled {
+            range,
+            right,
+            index,
+        } => log(
+            "ananke.range.merge-stalled",
+            Some(Json::obj(vec![
+                ("range", int(*range)),
+                ("right", int(*right)),
+                ("index", int(*index)),
+            ])),
+        ),
+        TraceEvent::RangeUnfrozen {
+            range,
+            from,
+            begun,
+            subsumed,
+            index,
+        } => log(
+            "ananke.range.unfrozen",
+            Some(Json::obj(vec![
+                ("range", int(*range)),
+                ("from", int(*from)),
+                ("begun", int(*begun)),
+                ("subsumed", int(*subsumed)),
+                ("index", int(*index)),
+            ])),
+        ),
+        TraceEvent::RangeRemoved {
+            range,
+            generation,
+            incarnation,
+            cause,
+        } => log(
+            "ananke.range.removed",
+            Some(Json::obj(vec![
+                ("range", int(*range)),
+                ("generation", int(*generation)),
+                ("incarnation", int(*incarnation)),
+                ("cause", Json::str(cause.as_str())),
+            ])),
+        ),
+        TraceEvent::RangeMismatchSent {
+            range,
+            client,
+            seq,
+            at,
+            descriptors,
+        } => log(
+            "ananke.range.mismatch-sent",
+            Some(Json::obj(vec![
+                ("range", int(*range)),
+                ("client", int(*client)),
+                ("seq", int(*seq)),
+                ("at", Json::str(at.as_str())),
+                (
+                    "descriptors",
+                    Json::Array(
+                        descriptors
+                            .iter()
+                            .map(|(range, generation)| {
+                                Json::obj(vec![
+                                    ("range", int(*range)),
+                                    ("generation", int(*generation)),
+                                ])
+                            })
+                            .collect(),
+                    ),
+                ),
+            ])),
+        ),
+        TraceEvent::MetaApplied { index, descriptors } => log(
+            "ananke.meta.applied",
+            Some(Json::obj(vec![
+                ("index", int(*index)),
+                (
+                    "descriptors",
+                    Json::Array(
+                        descriptors
+                            .iter()
+                            .map(|descriptor| {
+                                Json::obj(vec![
+                                    ("range", int(descriptor.range)),
+                                    ("start", Json::str(&hex(&descriptor.start))),
+                                    ("end", Json::str(&hex(&descriptor.end))),
+                                    ("generation", int(descriptor.generation)),
+                                    ("voters", ids(&descriptor.voters)),
+                                    (
+                                        "won",
+                                        Json::Array(
+                                            descriptor
+                                                .won
+                                                .iter()
+                                                .map(|(start, end)| {
+                                                    Json::obj(vec![
+                                                        ("start", Json::str(&hex(start))),
+                                                        ("end", Json::str(&hex(end))),
+                                                    ])
+                                                })
+                                                .collect(),
+                                        ),
+                                    ),
+                                ])
+                            })
+                            .collect(),
+                    ),
+                ),
+            ])),
+        ),
+        TraceEvent::RebalanceMove {
+            range,
+            from,
+            to,
+            phase,
+        } => log(
+            "ananke.rebalance.move",
+            Some(Json::obj(vec![
+                ("range", int(*range)),
+                ("from", int(*from)),
+                ("to", int(*to)),
+                ("phase", Json::str(phase.as_str())),
+            ])),
+        ),
+        TraceEvent::NodeAdded { node } => log(
+            "ananke.node.added",
+            Some(Json::obj(vec![("node", int(*node))])),
+        ),
+        TraceEvent::NodeRemoved { node } => log(
+            "ananke.node.removed",
+            Some(Json::obj(vec![("node", int(*node))])),
+        ),
+        TraceEvent::RangeIdsLeased {
+            node,
+            run,
+            first,
+            last,
+            index,
+        } => log(
+            "ananke.range.ids-leased",
+            Some(Json::obj(vec![
+                ("node", int(*node)),
+                ("run", int(*run)),
+                ("first", int(*first)),
+                ("last", int(*last)),
+                ("index", int(*index)),
+            ])),
+        ),
+        TraceEvent::ClientSend {
+            client,
+            seq,
+            range,
+            generation,
+            to,
+            invoked,
+        } => log(
+            "ananke.client.send",
+            Some(Json::obj(vec![
+                ("client", int(*client)),
+                ("seq", int(*seq)),
+                ("range", int(*range)),
+                ("generation", int(*generation)),
+                ("to", int(*to)),
+                ("invoked", int(*invoked)),
+            ])),
+        ),
+        TraceEvent::ClientMismatch {
+            client,
+            seq,
+            descriptors,
+        } => log(
+            "ananke.client.mismatch",
+            Some(Json::obj(vec![
+                ("client", int(*client)),
+                ("seq", int(*seq)),
+                (
+                    "descriptors",
+                    Json::Array(
+                        descriptors
+                            .iter()
+                            .map(|(range, generation, start, end)| {
+                                Json::obj(vec![
+                                    ("range", int(*range)),
+                                    ("generation", int(*generation)),
+                                    ("start", Json::str(&hex(start))),
+                                    ("end", Json::str(&hex(end))),
+                                ])
+                            })
+                            .collect(),
+                    ),
+                ),
+            ])),
+        ),
         TraceEvent::CheckpointWritten {
             dir,
             version,
@@ -1357,6 +1825,7 @@ mod tests {
             file.sync().await.unwrap();
             let event = TraceEvent::RaftTerm {
                 server: 1,
+                range: 2,
                 term: 7,
                 role: "follower",
                 received: stamp,
@@ -1413,7 +1882,7 @@ mod tests {
             stamped.to_moirae(&export).unwrap(),
             plain.to_moirae(&export).unwrap(),
         );
-        let field = "\"event\":\"ananke.raft.term\",\"data\":{\"server\":1,\"term\":7,\"role\":\"follower\",\"decidedNs\":3000000}";
+        let field = "\"event\":\"ananke.raft.term\",\"data\":{\"server\":1,\"range\":2,\"term\":7,\"role\":\"follower\",\"decidedNs\":3000000}";
         assert!(s_jsonl.contains(field), "{s_jsonl}");
         assert!(!p_jsonl.contains("decidedNs"), "{p_jsonl}");
         assert_eq!(s_jsonl.replace(",\"decidedNs\":3000000", ""), p_jsonl);
@@ -1439,7 +1908,7 @@ mod tests {
         assert_eq!(record.received(), Some(Instant::from_nanos(1_000_000)));
         assert_eq!(record.decided, Instant::from_nanos(3_000_000));
         let jsonl = early.to_moirae(&export).unwrap();
-        let field = "\"data\":{\"server\":1,\"term\":7,\"role\":\"follower\",\"receivedNs\":1000000,\"decidedNs\":3000000}";
+        let field = "\"data\":{\"server\":1,\"range\":2,\"term\":7,\"role\":\"follower\",\"receivedNs\":1000000,\"decidedNs\":3000000}";
         assert!(jsonl.contains(field), "{jsonl}");
         let plain = received_scenario(true, Some((1, false)));
         assert_eq!(term(&plain).received(), None);

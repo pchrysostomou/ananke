@@ -81,13 +81,14 @@ use std::time::Duration;
 use ananke_env::moirae::Export;
 use ananke_env::sim::{RunHeader, Sim, SimConfig, TraceRecord};
 use ananke_env::{
-    ClientOp, ClientResult, Clock, Either, Environment, Instant, Network, NodeId, Rng, Socket,
-    TraceEvent, race,
+    ApplyEffect, ClientOp, ClientResult, Clock, Either, Environment, Instant, Network, NodeId, Rng,
+    Socket, TraceEvent, race,
 };
 use ananke_raft::apply::{Command, Outcome};
 use ananke_raft::client::{Reply, Request, Response};
 use ananke_raft::core::{RaftConfig, Variants};
 use ananke_raft::message::{self, Frame, Message};
+use ananke_raft::node::SINGLE_GROUP;
 use ananke_raft::store::LOST_STATE;
 use ananke_raft::{NodeConfig, ServerId, invariants, run as run_server};
 use ananke_storage::EngineConfig;
@@ -1019,6 +1020,176 @@ impl Report {
     }
 }
 
+/// The structure of what SHARD.md §8's trace carries, over a run's records: the
+/// oracle of the payload the checks of §8 will read, which nothing in the tree read
+/// before it. Every check of §8 is keyed by range and reads `key`, `effect` and a
+/// read's `applied`; until those checks arrive a field stamped wrong is a field
+/// nothing sees, and the three mutations this fold was written against — a wrong
+/// range on one event kind, `applied` for a configuration entry, a single-key apply
+/// with its `key` dropped — passed every tier without it.
+///
+/// Three folds over the records the run already walks, each naming the record it
+/// fails on:
+///
+/// - every `Raft*` record about a replica carries [`SINGLE_GROUP`], the one range
+///   this stage runs (D-069). The three events about a node's *store* —
+///   `RaftRefused`, `RaftAdopted`, `RaftServerFailed` — carry none, which their
+///   types say, so there is nothing to fold for them;
+/// - a [`TraceEvent::RaftApply`] with [`ApplyEffect::Applied`] carries the key it
+///   executed, and one with [`ApplyEffect::None`] — a no-op, a configuration entry,
+///   a command naming no key — carries none. The other five effects belong to §3's
+///   re-check and to §5's and §6's range commands and no apply of this stage can
+///   produce one (`node.rs`), so one here is a stamp from nowhere and fails too;
+///   the stage that emits them widens this arm;
+/// - a [`TraceEvent::RaftRead`]'s `applied` is at or above its read index: the core
+///   holds a confirmed read until `applied >= index` (`core.rs`), and the value and
+///   the index come from one engine version, so a record saying otherwise says the
+///   read was served from a state older than the index it claims.
+///
+/// # Errors
+///
+/// The first record that breaks one of the three, in words naming it.
+// PROPOSED(D-069): the payload of SHARD.md §8's trace has an oracle here.
+pub fn payload_is_well_formed(records: &[TraceRecord]) -> Result<(), String> {
+    for record in records {
+        // The twenty-six `Raft*` kinds about a replica: the twenty-three D-069 gave
+        // a `range` and the three it adds carrying one. A kind a later stage adds
+        // joins this list; the moirae export's exhaustive `convert` is what says one
+        // exists.
+        let range = match &record.event {
+            TraceEvent::RaftTerm { range, .. }
+            | TraceEvent::RaftVote { range, .. }
+            | TraceEvent::RaftLeader { range, .. }
+            | TraceEvent::RaftAppend { range, .. }
+            | TraceEvent::RaftTruncate { range, .. }
+            | TraceEvent::RaftCommit { range, .. }
+            | TraceEvent::RaftApply { range, .. }
+            | TraceEvent::RaftConfig { range, .. }
+            | TraceEvent::RaftSnapshot { range, .. }
+            | TraceEvent::RaftRead { range, .. }
+            | TraceEvent::RaftLeaseRevoked { range, .. }
+            | TraceEvent::RaftTransfer { range, .. }
+            | TraceEvent::RaftQuorumLost { range, .. }
+            | TraceEvent::RaftRecovered { range, .. }
+            | TraceEvent::RaftProposed { range, .. }
+            | TraceEvent::RaftInboxDropped { range, .. }
+            | TraceEvent::RaftCompacted { range, .. }
+            | TraceEvent::RaftReseeded { range, .. }
+            | TraceEvent::RaftSnapshotResumed { range, .. }
+            | TraceEvent::RaftProgressReset { range, .. }
+            | TraceEvent::RaftSnapshotDeleted { range, .. }
+            | TraceEvent::RaftSnapshotReused { range, .. }
+            | TraceEvent::RaftSnapshotStreams { range, .. }
+            | TraceEvent::RaftMatchStarted { range, .. }
+            | TraceEvent::RaftLearnerRound { range, .. }
+            | TraceEvent::RaftChangeAccepted { range, .. } => Some(*range),
+            _ => None,
+        };
+        if let Some(range) = range
+            && range != SINGLE_GROUP
+        {
+            return Err(format!(
+                "the trace's payload: a replica's record carries range {range}, not the \
+                 {SINGLE_GROUP} this stage runs: {:?}",
+                record.event
+            ));
+        }
+        match &record.event {
+            TraceEvent::RaftApply {
+                server,
+                index,
+                key,
+                effect,
+                ..
+            } => match effect {
+                ApplyEffect::Applied if key.is_none() => {
+                    return Err(format!(
+                        "the trace's payload: server {server}'s apply of {index} is `applied` \
+                         and names no key"
+                    ));
+                }
+                ApplyEffect::None if key.is_some() => {
+                    return Err(format!(
+                        "the trace's payload: server {server}'s apply of {index} is `none` and \
+                         names the key {key:?}"
+                    ));
+                }
+                ApplyEffect::Applied | ApplyEffect::None => {}
+                other => {
+                    return Err(format!(
+                        "the trace's payload: server {server}'s apply of {index} is `{}`, which \
+                         belongs to a stage this one does not run",
+                        other.as_str()
+                    ));
+                }
+            },
+            TraceEvent::RaftRead {
+                server,
+                index,
+                applied,
+                key,
+                ..
+            } if applied < index => {
+                return Err(format!(
+                    "the trace's payload: server {server} served a read of {key:?} at index \
+                     {index} from an engine version whose applied index is {applied}"
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// A leader traces one [`TraceEvent::RaftMatchStarted`] per (leader, term,
+/// follower, incarnation): the rule the event's own definition states — the *first*
+/// rise of `matched` under the store incarnation the follower's answer carried
+/// (SHARD.md §8) — folded per run, so that a leader emitting one on every rise is
+/// seen.
+///
+/// The counters cannot see that: dropping the `match_started` clause from the
+/// core's guard raises this sweep's count from 1 840 to 63 164 at a hundred seeds,
+/// on every one of which a match start is still seen, with every seed still green.
+/// Measured on this tree, the mutation planted and this fold silenced. The leader is
+/// the record's node and its term is the latest term record of that node — the core
+/// traces one at every role it takes and the node one at every restatement — and a
+/// leader holds one term for one leadership, so a second record under one key is a
+/// second "first" rise.
+///
+/// # Errors
+///
+/// The first repeat, naming the leader, the term, the follower and the incarnation.
+// PROPOSED(D-069): `RaftMatchStarted` is the first rise, and this is what says so.
+pub fn match_starts_are_first_rises(records: &[TraceRecord]) -> Result<(), String> {
+    let mut terms: BTreeMap<u64, u64> = BTreeMap::new();
+    let mut started: BTreeSet<(u64, u64, u64, u64)> = BTreeSet::new();
+    for record in records {
+        match &record.event {
+            TraceEvent::RaftTerm { server, term, .. }
+            | TraceEvent::RaftRecovered { server, term, .. } => {
+                terms.insert(*server, *term);
+            }
+            TraceEvent::RaftMatchStarted {
+                follower,
+                incarnation,
+                matched,
+                ..
+            } => {
+                let leader = record.node.map_or(0, |node| u64::from(node.get()));
+                let term = terms.get(&leader).copied().unwrap_or_default();
+                if !started.insert((leader, term, *follower, *incarnation)) {
+                    return Err(format!(
+                        "match starts: leader {leader} of term {term} traced a second first rise \
+                         of {follower}'s match under incarnation {incarnation} (at {matched})"
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 impl Report {
     /// The events, without their times.
     #[must_use]
@@ -1064,7 +1235,7 @@ impl Report {
                 TraceEvent::RaftRecovered { server, .. } => {
                     down.remove(server);
                 }
-                TraceEvent::RaftReseeded { server } => {
+                TraceEvent::RaftReseeded { server, .. } => {
                     quarantined.insert(*server);
                 }
                 _ => {}
@@ -1112,6 +1283,14 @@ impl Report {
             _ => None,
         }) {
             return fail(format!("server {} failed: {}", failed.0, failed.1));
+        }
+        // PROPOSED(D-069): the trace SHARD.md §8 asks for has an oracle, so that a
+        // field stamped wrong fails a sweep before §8's checks are written.
+        if let Err(violation) = payload_is_well_formed(&self.records) {
+            return fail(violation);
+        }
+        if let Err(violation) = match_starts_are_first_rises(&self.records) {
+            return fail(violation);
         }
         if let Err(violation) = self.isolation_keeps_the_term() {
             return fail(violation);
@@ -1446,7 +1625,7 @@ impl Report {
                 && r.at <= until
                 && matches!(&r.event,
                     TraceEvent::RaftRefused { server: s, .. }
-                    | TraceEvent::RaftReseeded { server: s }
+                    | TraceEvent::RaftReseeded { server: s, .. }
                     | TraceEvent::RaftSnapshot { server: s, taken: false, .. }
                     if *s == server)
         })
@@ -1579,7 +1758,7 @@ impl Report {
             let at = time.of(record);
             clocks.replaying = index;
             match &record.event {
-                TraceEvent::RaftReseeded { server } => {
+                TraceEvent::RaftReseeded { server, .. } => {
                     reseeded.insert(*server);
                 }
                 TraceEvent::MessageSent { id, payload, .. } => {
@@ -2082,7 +2261,7 @@ impl Report {
                 let status = match &r.event {
                     TraceEvent::RaftTerm { server: s, .. }
                     | TraceEvent::RaftLeader { server: s, .. }
-                    | TraceEvent::RaftReseeded { server: s } => *s == server,
+                    | TraceEvent::RaftReseeded { server: s, .. } => *s == server,
                     TraceEvent::NodeCrashed { node } => u64::from(node.get()) == server,
                     // PROPOSED(D-063): a completed install takes the server out of
                     // the replay's running set until its restatement, so it says
@@ -3137,7 +3316,7 @@ impl Report {
                     follower: f,
                     ..
                 } => *server == leader && *f == follower,
-                TraceEvent::RaftReseeded { server } => *server == follower,
+                TraceEvent::RaftReseeded { server, .. } => *server == follower,
                 _ => false,
             });
             if forgotten {
@@ -3201,7 +3380,7 @@ impl Report {
         )?;
         let reseeded = at(
             reset,
-            &|e| matches!(e, TraceEvent::RaftReseeded { server } if *server == follower),
+            &|e| matches!(e, TraceEvent::RaftReseeded { server, .. } if *server == follower),
         )?;
         Some((refused, reset, reseeded))
     }
@@ -4856,6 +5035,7 @@ mod tests {
     use super::*;
     use ananke_env::Decision;
     use ananke_raft::core::Variant;
+    use ananke_raft::node::SINGLE_GROUP;
 
     fn ms(n: u64) -> Instant {
         Instant::from_nanos(n * 1_000_000)
@@ -4873,6 +5053,7 @@ mod tests {
     fn term(server: u64, term: u64, role: &'static str, received: Option<Decision>) -> TraceEvent {
         TraceEvent::RaftTerm {
             server,
+            range: SINGLE_GROUP,
             term,
             role,
             received,
@@ -4913,6 +5094,7 @@ mod tests {
     fn vote(server: u64) -> TraceEvent {
         TraceEvent::RaftVote {
             server,
+            range: SINGLE_GROUP,
             term: 1,
             candidate: 2,
             granted: true,
@@ -4979,6 +5161,7 @@ mod tests {
                     Some(2),
                     TraceEvent::RaftCommit {
                         server: 2,
+                        range: SINGLE_GROUP,
                         term: 1,
                         index: 1,
                     },
@@ -5021,6 +5204,7 @@ mod tests {
                     Some(1),
                     TraceEvent::RaftLeader {
                         server: 1,
+                        range: SINGLE_GROUP,
                         term: 1,
                         last_index: 0,
                     },
@@ -5107,6 +5291,7 @@ mod tests {
             Some(server),
             TraceEvent::RaftSnapshot {
                 server,
+                range: SINGLE_GROUP,
                 last_index: 374,
                 last_term: 1,
                 taken,
@@ -5128,6 +5313,7 @@ mod tests {
                 Some(server),
                 TraceEvent::RaftRecovered {
                     server,
+                    range: SINGLE_GROUP,
                     term: 1,
                     applied: 374,
                     last_index: 374,

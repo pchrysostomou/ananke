@@ -365,6 +365,13 @@ pub struct RaftConfig {
     /// correct one (D-045).
     // D-045: a variant is a set.
     pub variants: Variants,
+    /// The range this core replicates (SHARD.md §2, §8): what every trace event
+    /// about this replica carries. `ananke-raft` names a group, never a span; the
+    /// id is the layer above's. Today a node runs one, [`SINGLE_GROUP`].
+    ///
+    /// [`SINGLE_GROUP`]: crate::node::SINGLE_GROUP
+    // PROPOSED(D-069): `range` on every `Raft*` event about a replica.
+    pub range: u64,
 }
 
 impl Default for RaftConfig {
@@ -381,6 +388,7 @@ impl Default for RaftConfig {
             snapshot_threshold: 4096,
             snapshot_chunk: 256 * 1024,
             variants: Variants::correct(),
+            range: crate::node::SINGLE_GROUP,
         }
     }
 }
@@ -550,6 +558,11 @@ pub enum Output {
         id: u64,
         /// The read index.
         index: Index,
+        /// Whether the lease confirmed it, rather than a heartbeat round: what
+        /// the server's [`TraceEvent::RaftRead`] records.
+        // PROPOSED(D-069): `RaftRead` moved to the server, which needs to know
+        // which of the two confirmed the read.
+        lease: bool,
     },
     /// The read `id` will not be served: this server stopped leading first.
     ReadDropped {
@@ -689,6 +702,10 @@ struct Change {
 struct Learner {
     /// The tick the round under way started at.
     round_start: u64,
+    /// The learner's match index when the round under way started: the round's
+    /// `from_index` in the trace (SHARD.md §8).
+    // PROPOSED(D-069): `RaftLearnerRound`.
+    from_index: Index,
     /// The leader's last index when it started: the acknowledgement that covers it
     /// ends the round.
     target: Index,
@@ -745,6 +762,13 @@ struct Progress {
     /// acknowledged, and everything above starts over.
     // D-042: store incarnations.
     incarnation: Option<u64>,
+    /// Whether `matched` has risen since the leader recorded the incarnation in
+    /// force for this follower: cleared when the leader takes office, when the
+    /// follower is first tracked, and at every change of its incarnation, so the
+    /// next rise is the first one under that incarnation (SHARD.md §8).
+    // PROPOSED(D-069): `RaftMatchStarted`, the first rise of `matched` under an
+    // incarnation.
+    match_started: bool,
 }
 
 /// One server's protocol state.
@@ -1172,11 +1196,9 @@ impl Raft {
             lease,
         });
         if lease {
-            self.trace(TraceEvent::RaftRead {
-                server: self.id.0,
-                index,
-                lease: true,
-            });
+            // PROPOSED(D-069): the read is traced by the server that serves it,
+            // not here: the core holds neither the key nor the applied index of
+            // the engine version the value comes from (SHARD.md §8).
             self.serve_reads();
         } else {
             // The round: a heartbeat to everyone, sent after the read arrived.
@@ -1199,11 +1221,6 @@ impl Raft {
                 if self.membership.has_majority(&on) && self.commit >= self.first_of_term {
                     read.confirmed = true;
                     read.index = read.index.max(self.first_of_term);
-                    self.trace(TraceEvent::RaftRead {
-                        server: self.id.0,
-                        index: read.index,
-                        lease: false,
-                    });
                 }
             }
             if read.confirmed && self.applied >= read.index {
@@ -1217,6 +1234,7 @@ impl Raft {
             self.outputs.push(Output::ReadReady {
                 id: read.id,
                 index: read.index,
+                lease: read.lease,
             });
         }
     }
@@ -1246,6 +1264,7 @@ impl Raft {
         self.transferee = None;
         self.trace(TraceEvent::RaftTransfer {
             server: self.id.0,
+            range: self.config.range,
             to: to.0,
         });
         self.send(to, Message::TimeoutNow { term: self.term });
@@ -1331,6 +1350,7 @@ impl Raft {
         self.role = role;
         self.trace(TraceEvent::RaftTerm {
             server: self.id.0,
+            range: self.config.range,
             term: self.term,
             role: role.name(),
             // PROPOSED(D-050): a term's record carries when the message its step
@@ -1477,6 +1497,7 @@ impl Raft {
                     if !self.membership.has_majority(&heard) {
                         self.trace(TraceEvent::RaftQuorumLost {
                             server: self.id.0,
+                            range: self.config.range,
                             term: self.term,
                             uncounted,
                         });
@@ -1619,12 +1640,14 @@ impl Raft {
                         needs_snapshot: false,
                         quiet_ticks: 0,
                         incarnation: None,
+                        match_started: false,
                     },
                 )
             })
             .collect();
         self.trace(TraceEvent::RaftLeader {
             server: self.id.0,
+            range: self.config.range,
             term: self.term,
             last_index: last,
         });
@@ -1646,6 +1669,7 @@ impl Raft {
             debug_assert_eq!(entry.index, self.last_index() + 1);
             self.trace(TraceEvent::RaftAppend {
                 server: self.id.0,
+                range: self.config.range,
                 index: entry.index,
                 entry_term: entry.term,
                 hash: entry.payload.hash(),
@@ -1668,6 +1692,7 @@ impl Raft {
     fn adopt(&mut self, index: Index, config: Configuration) {
         self.trace(TraceEvent::RaftConfig {
             server: self.id.0,
+            range: self.config.range,
             index,
             old: config.voters.iter().map(|s| s.0).collect(),
             new: config
@@ -1699,6 +1724,7 @@ impl Raft {
         self.truncate_from = Some(self.truncate_from.map_or(from, |f| f.min(from)));
         self.trace(TraceEvent::RaftTruncate {
             server: self.id.0,
+            range: self.config.range,
             from_index: from,
         });
         if self.membership_index >= from {
@@ -1751,6 +1777,12 @@ impl Raft {
         };
         let changed = progress.incarnation.is_some_and(|seen| seen != incarnation);
         progress.incarnation = Some(incarnation);
+        if changed {
+            // PROPOSED(D-069): the next rise of `matched` is the first under this
+            // incarnation, whether or not the progress itself is reset — the
+            // record is what SHARD.md §8's `RaftMatchStarted` is keyed on.
+            progress.match_started = false;
+        }
         if !changed || self.config.variants.contains(Variant::IgnoreIncarnation) {
             return false;
         }
@@ -1761,10 +1793,40 @@ impl Raft {
         progress.needs_snapshot = false;
         self.trace(TraceEvent::RaftProgressReset {
             server: self.id.0,
+            range: self.config.range,
             follower: from.0,
             incarnation,
         });
         true
+    }
+
+    /// The first rise of `matched` for `from` under the store incarnation the
+    /// leader has recorded for it (SHARD.md §8): traced by the step that raised
+    /// it, as [`TraceEvent::RaftProgressReset`] is. `before` is the match index
+    /// the step started with; nothing is traced where the step did not raise it,
+    /// or where a rise under this incarnation was already traced.
+    ///
+    /// SHARD.md §8's re-add window assertion reads it: on a re-add, a success from
+    /// the collected replica stamped with its own incarnation would show here.
+    // PROPOSED(D-069): `RaftMatchStarted`, emitted from this stage; the core
+    // already does the work it reports.
+    fn note_match_started(&mut self, from: ServerId, before: Index) {
+        let range = self.config.range;
+        let Some(progress) = self.progress.get_mut(&from) else {
+            return;
+        };
+        if progress.match_started || progress.matched <= before {
+            return;
+        }
+        progress.match_started = true;
+        let incarnation = progress.incarnation.unwrap_or(0);
+        let matched = progress.matched;
+        self.trace(TraceEvent::RaftMatchStarted {
+            range,
+            follower: from.0,
+            incarnation,
+            matched,
+        });
     }
 
     /// The snapshot task streamed a snapshot to `to`, which runs on it now: its
@@ -1788,10 +1850,14 @@ impl Raft {
         // D-049: a refused follower counts for check quorum only while its re-seed
         // stream progresses.
         progress.stream_acked = true;
+        let before = progress.matched;
         progress.matched = progress.matched.max(index);
         progress.next = progress.next.max(progress.matched + 1);
         progress.probe = None;
         progress.inflight.clear();
+        // PROPOSED(D-069): an install's answer raises `matched` under the
+        // incarnation it carried, as an AppendEntries success does.
+        self.note_match_started(to, before);
         self.maybe_commit();
         self.maybe_compact();
         self.replicate(to, false);
@@ -1865,6 +1931,7 @@ impl Raft {
         self.compacted_to = Some(index);
         self.trace(TraceEvent::RaftCompacted {
             server: self.id.0,
+            range: self.config.range,
             through: index,
         });
     }
@@ -1907,6 +1974,9 @@ impl Raft {
         let mut target = voters;
         target.sort_unstable();
         target.dedup();
+        // PROPOSED(D-069): `RaftChangeAccepted`, traced below for every change
+        // this leader takes on — the cases the caller answers `Done`.
+        let accepted: Vec<u64> = target.iter().map(|server| server.0).collect();
         let same = |set: &[ServerId]| -> bool {
             let mut sorted = set.to_vec();
             sorted.sort_unstable();
@@ -1950,12 +2020,14 @@ impl Raft {
                             needs_snapshot: false,
                             quiet_ticks: 0,
                             incarnation: None,
+                            match_started: false,
                         },
                     );
                     tracked.insert(
                         learner,
                         Learner {
                             round_start: self.ticks,
+                            from_index: 0,
                             target: last,
                             caught_up: false,
                         },
@@ -1974,6 +2046,17 @@ impl Raft {
         if refused {
             self.outputs.push(Output::Rejected {
                 leader: self.leader,
+            });
+        } else {
+            // PROPOSED(D-069): a change accepted whenever the core had none in
+            // flight (D-029), which is what the server answers `Done` for. The
+            // leader is the record's node; check 22 of SHARD.md §8 folds it with
+            // the range's descriptor at `applied`.
+            self.trace(TraceEvent::RaftChangeAccepted {
+                range: self.config.range,
+                voters: accepted,
+                applied: self.applied,
+                term: self.term,
             });
         }
     }
@@ -2009,22 +2092,39 @@ impl Raft {
         let last = self.last_index();
         let ticks = self.ticks;
         let min = self.config.election_ticks.0;
+        let range = self.config.range;
         let Some(change) = &mut self.change else {
             return;
         };
+        // PROPOSED(D-069): the round's record, taken while the learner is
+        // borrowed and traced once the borrow ends.
+        let mut round = None;
         if let Some(learner) = change.learners.get_mut(&from)
             && !learner.caught_up
             && matched >= learner.target
         {
-            if ticks - learner.round_start < min {
+            let caught_up = ticks - learner.round_start < min;
+            round = Some(TraceEvent::RaftLearnerRound {
+                range,
+                learner: from.0,
+                from_index: learner.from_index,
+                to_index: learner.target,
+                ticks: ticks - learner.round_start,
+                caught_up,
+            });
+            if caught_up {
                 learner.caught_up = true;
             } else {
                 learner.round_start = ticks;
+                learner.from_index = matched;
                 learner.target = last;
             }
         }
-        if change.learners.values().all(|l| l.caught_up) {
-            let target = change.new_voters.clone();
+        let done = change.learners.values().all(|l| l.caught_up);
+        if let Some(round) = round {
+            self.trace(round);
+        }
+        if done && let Some(target) = self.change.as_ref().map(|change| change.new_voters.clone()) {
             self.append_joint(target);
         }
     }
@@ -2198,6 +2298,7 @@ impl Raft {
         {
             self.trace(TraceEvent::RaftVote {
                 server: self.id.0,
+                range: self.config.range,
                 term,
                 candidate: from.0,
                 granted: false,
@@ -2314,6 +2415,7 @@ impl Raft {
             && self.log_up_to_date(last_index, last_term);
         self.trace(TraceEvent::RaftVote {
             server: self.id.0,
+            range: self.config.range,
             term,
             candidate: from.0,
             granted,
@@ -2365,6 +2467,7 @@ impl Raft {
         }
         self.trace(TraceEvent::RaftVote {
             server: self.id.0,
+            range: self.config.range,
             term: self.term,
             candidate: from.0,
             granted,
@@ -2516,6 +2619,7 @@ impl Raft {
             self.commit = new_commit;
             self.trace(TraceEvent::RaftCommit {
                 server: self.id.0,
+                range: self.config.range,
                 term: self.term,
                 index: new_commit,
             });
@@ -2588,6 +2692,7 @@ impl Raft {
             if let Some(moved) = progress.guard.observe(&self.config, now, echo, local) {
                 self.trace(TraceEvent::RaftLeaseRevoked {
                     server: self.id.0,
+                    range: self.config.range,
                     follower: from.0,
                     offset_moved: moved,
                 });
@@ -2605,6 +2710,7 @@ impl Raft {
         };
         if success {
             // Monotone: a stale or duplicated response proposes only what was passed.
+            let before = progress.matched;
             progress.matched = progress.matched.max(match_index);
             progress.needs_snapshot = false;
             while progress
@@ -2618,6 +2724,9 @@ impl Raft {
             progress.probe = None;
             let matched = progress.matched;
             let caught_up = matched == self.last_index();
+            // PROPOSED(D-069): the first rise of `matched` under the incarnation
+            // this answer carried, recorded just above by `note_incarnation`.
+            self.note_match_started(from, before);
             self.note_learner_round(from, matched);
             self.maybe_commit();
             self.maybe_compact();
@@ -2675,6 +2784,7 @@ impl Raft {
                     self.commit = index;
                     self.trace(TraceEvent::RaftCommit {
                         server: self.id.0,
+                        range: self.config.range,
                         term: self.term,
                         index,
                     });

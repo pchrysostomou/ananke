@@ -8,7 +8,9 @@
 # in the commit that adds it.
 # Rows added since fc75f68 are weighed the same way on the tree that adds them and placed
 # longest-first into the lightest shard; the rows before them keep fc75f68's weights. D-068's
-# four were weighed on its tree, on an idle machine, on their high-rate share.
+# four were weighed on its tree, on an idle machine, on their high-rate share. D-069 renamed
+# seed 158's pin and added seed 102's, both weighed on its tree; the renamed row keeps its
+# shard and the new one went to the lightest, which was the same shard 6.
 #
 # shard	binary	cpu_s	test
 # shard 1: 1278.5 cpu s
@@ -75,7 +77,7 @@
 5	raft	252.2	a_server_without_pre_vote_is_caught
 5	raft	187.0	a_leader_that_commits_an_older_terms_entry_by_count_is_caught
 5	raft	139.6	the_correct_server_passes_the_membership_scenario_on_every_seed
-# shard 6: 1241.7 cpu s
+# shard 6: 1242.0 cpu s
 6	echo	0.1	a_busy_looping_task_fails_the_scenario_instead_of_hanging
 6	engine	310.3	an_engine_that_acknowledges_before_the_log_is_caught
 6	engine	204.5	an_engine_that_releases_a_memtable_before_the_manifest_is_caught
@@ -89,7 +91,8 @@
 6	raft	0.7	seed_2605_which_the_nightly_found_is_an_adoption_window_and_still_catches_the_variant
 6	raft	0.6	same_seed_gives_byte_identical_trace
 6	raft	0.4	seed_1_of_the_term_raise_schedule_now_straddles_its_isolations_by_decision_time
-6	raft	0.3	seed_158_pins_the_refusal_that_is_not_durable_which_a_hundred_seeds_can_miss
+6	raft	0.4	seed_158_which_pinned_the_refusal_that_is_not_durable_before_the_read_moved_loses_nothing
+6	raft	0.2	seed_102_pins_the_refusal_that_is_not_durable_which_a_hundred_seeds_can_miss
 6	raft	0.2	seed_4_of_the_term_raise_schedule_steps_a_message_received_before_its_isolation
 6	raft	0.2	seed_7381_which_the_first_nightly_found_stays_green
 6	wal	34.4	a_log_that_skips_sync_dir_on_rotation_is_caught

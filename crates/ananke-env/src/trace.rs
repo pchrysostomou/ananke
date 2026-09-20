@@ -426,6 +426,10 @@ pub enum TraceEvent {
     RaftTerm {
         /// The server.
         server: u64,
+        /// The range the replica is of (SHARD.md §8). Today a server holds one
+        /// group and every replica event carries its id.
+        // PROPOSED(D-069): `range` on every `Raft*` event about a replica.
+        range: u64,
         /// The new term.
         term: u64,
         /// The role: `follower`, `pre-candidate`, `candidate` or `leader`.
@@ -445,6 +449,10 @@ pub enum TraceEvent {
     RaftVote {
         /// The server voting.
         server: u64,
+        /// The range the replica is of (SHARD.md §8). Today a server holds one
+        /// group and every replica event carries its id.
+        // PROPOSED(D-069): `range` on every `Raft*` event about a replica.
+        range: u64,
         /// The term voted in (the prospective term, for a pre-vote).
         term: u64,
         /// The candidate.
@@ -458,6 +466,10 @@ pub enum TraceEvent {
     RaftLeader {
         /// The server.
         server: u64,
+        /// The range the replica is of (SHARD.md §8). Today a server holds one
+        /// group and every replica event carries its id.
+        // PROPOSED(D-069): `range` on every `Raft*` event about a replica.
+        range: u64,
         /// Its term.
         term: u64,
         /// Its last log index on election.
@@ -467,6 +479,10 @@ pub enum TraceEvent {
     RaftAppend {
         /// The server.
         server: u64,
+        /// The range the replica is of (SHARD.md §8). Today a server holds one
+        /// group and every replica event carries its id.
+        // PROPOSED(D-069): `range` on every `Raft*` event about a replica.
+        range: u64,
         /// The entry's index.
         index: u64,
         /// The entry's term.
@@ -478,6 +494,10 @@ pub enum TraceEvent {
     RaftTruncate {
         /// The server.
         server: u64,
+        /// The range the replica is of (SHARD.md §8). Today a server holds one
+        /// group and every replica event carries its id.
+        // PROPOSED(D-069): `range` on every `Raft*` event about a replica.
+        range: u64,
         /// The first index removed.
         from_index: u64,
     },
@@ -485,6 +505,10 @@ pub enum TraceEvent {
     RaftCommit {
         /// The server.
         server: u64,
+        /// The range the replica is of (SHARD.md §8). Today a server holds one
+        /// group and every replica event carries its id.
+        // PROPOSED(D-069): `range` on every `Raft*` event about a replica.
+        range: u64,
         /// Its term.
         term: u64,
         /// The new commit index.
@@ -494,12 +518,23 @@ pub enum TraceEvent {
     RaftApply {
         /// The server.
         server: u64,
+        /// The range the replica is of (SHARD.md §8). Today a server holds one
+        /// group and every replica event carries its id.
+        // PROPOSED(D-069): `range` on every `Raft*` event about a replica.
+        range: u64,
         /// The entry's index.
         index: u64,
         /// The entry's term.
         entry_term: u64,
         /// The hash of the entry's payload.
         hash: u64,
+        /// The key a single-key command touches (SHARD.md §8); `None` for a no-op,
+        /// a configuration entry, or a command that names no key.
+        // PROPOSED(D-069): `key` and `effect` on `RaftApply`.
+        key: Option<Bytes>,
+        /// What applying the entry did (SHARD.md §8).
+        // PROPOSED(D-069): `key` and `effect` on `RaftApply`.
+        effect: ApplyEffect,
     },
     /// A Raft configuration entry took effect on a server (RAFT.md §1): appended
     /// to its log, restored at a restart, or re-stated after a truncation
@@ -508,6 +543,10 @@ pub enum TraceEvent {
     RaftConfig {
         /// The server.
         server: u64,
+        /// The range the replica is of (SHARD.md §8). Today a server holds one
+        /// group and every replica event carries its id.
+        // PROPOSED(D-069): `range` on every `Raft*` event about a replica.
+        range: u64,
         /// The configuration entry's index; 0 for the initial configuration.
         index: u64,
         /// The voters, or the old voters while joint.
@@ -525,6 +564,10 @@ pub enum TraceEvent {
     RaftSnapshot {
         /// The server.
         server: u64,
+        /// The range the replica is of (SHARD.md §8). Today a server holds one
+        /// group and every replica event carries its id.
+        // PROPOSED(D-069): `range` on every `Raft*` event about a replica.
+        range: u64,
         /// The snapshot's last applied index.
         last_index: u64,
         /// That entry's term.
@@ -534,19 +577,41 @@ pub enum TraceEvent {
     },
     /// A Raft leader served a linearizable read (RAFT.md §1): at `index`, by its
     /// lease or after a read-index round.
+    ///
+    /// Traced by the server where the read is served, not by the core that
+    /// confirmed it (SHARD.md §8): the value and `applied` are read at one engine
+    /// version, so the record says which state the client was answered from.
+    // PROPOSED(D-069): `RaftRead` moved from the core to the server, with `key`
+    // and the applied index of the engine version it was served from.
     RaftRead {
         /// The server.
         server: u64,
+        /// The range the replica is of (SHARD.md §8). Today a server holds one
+        /// group and every replica event carries its id.
+        // PROPOSED(D-069): `range` on every `Raft*` event about a replica.
+        range: u64,
         /// The read index.
         index: u64,
         /// Whether the lease served it, rather than a heartbeat round.
         lease: bool,
+        /// The key read.
+        // PROPOSED(D-069)
+        key: Bytes,
+        /// The applied index of the engine version the value was read at: the
+        /// value and this index come from one snapshot of the engine, so a check
+        /// can place the read in the log's order.
+        // PROPOSED(D-069)
+        applied: u64,
     },
     /// A Raft leader's drift guard stopped trusting a follower's promise (RAFT.md
     /// §1): the follower's clock moved against the leader's by more than the bound.
     RaftLeaseRevoked {
         /// The leader.
         server: u64,
+        /// The range the replica is of (SHARD.md §8). Today a server holds one
+        /// group and every replica event carries its id.
+        // PROPOSED(D-069): `range` on every `Raft*` event about a replica.
+        range: u64,
         /// The follower.
         follower: u64,
         /// How far the offset moved, in nanoseconds.
@@ -556,6 +621,10 @@ pub enum TraceEvent {
     RaftTransfer {
         /// The leader.
         server: u64,
+        /// The range the replica is of (SHARD.md §8). Today a server holds one
+        /// group and every replica event carries its id.
+        // PROPOSED(D-069): `range` on every `Raft*` event about a replica.
+        range: u64,
         /// The follower asked to lead.
         to: u64,
     },
@@ -564,6 +633,10 @@ pub enum TraceEvent {
     RaftQuorumLost {
         /// The server.
         server: u64,
+        /// The range the replica is of (SHARD.md §8). Today a server holds one
+        /// group and every replica event carries its id.
+        // PROPOSED(D-069): `range` on every `Raft*` event about a replica.
+        range: u64,
         /// The term it led.
         term: u64,
         /// The followers that answered in the window only as refused servers, with
@@ -577,6 +650,10 @@ pub enum TraceEvent {
     RaftRecovered {
         /// The server.
         server: u64,
+        /// The range the replica is of (SHARD.md §8). Today a server holds one
+        /// group and every replica event carries its id.
+        // PROPOSED(D-069): `range` on every `Raft*` event about a replica.
+        range: u64,
         /// The term it resumes in.
         term: u64,
         /// The applied index on disk.
@@ -597,6 +674,10 @@ pub enum TraceEvent {
     RaftProposed {
         /// The server.
         server: u64,
+        /// The range the replica is of (SHARD.md §8). Today a server holds one
+        /// group and every replica event carries its id.
+        // PROPOSED(D-069): `range` on every `Raft*` event about a replica.
+        range: u64,
         /// The client process.
         client: u64,
         /// The operation's number within the process.
@@ -629,6 +710,10 @@ pub enum TraceEvent {
     RaftInboxDropped {
         /// The server.
         server: u64,
+        /// The range the replica is of (SHARD.md §8). Today a server holds one
+        /// group and every replica event carries its id.
+        // PROPOSED(D-069): `range` on every `Raft*` event about a replica.
+        range: u64,
         /// The kind of message dropped.
         kind: &'static str,
     },
@@ -638,6 +723,10 @@ pub enum TraceEvent {
     RaftCompacted {
         /// The server.
         server: u64,
+        /// The range the replica is of (SHARD.md §8). Today a server holds one
+        /// group and every replica event carries its id.
+        // PROPOSED(D-069): `range` on every `Raft*` event about a replica.
+        range: u64,
         /// The highest index removed: the snapshot's last index.
         through: u64,
     },
@@ -649,12 +738,20 @@ pub enum TraceEvent {
     RaftReseeded {
         /// The server.
         server: u64,
+        /// The range the replica is of (SHARD.md §8). Today a server holds one
+        /// group and every replica event carries its id.
+        // PROPOSED(D-069): `range` on every `Raft*` event about a replica.
+        range: u64,
     },
     /// A snapshot stream was resumed (RAFT.md §1): the sender re-sent from the last
     /// acknowledged offset of the last file after loss, rather than from zero.
     RaftSnapshotResumed {
         /// The sending server.
         server: u64,
+        /// The range the replica is of (SHARD.md §8). Today a server holds one
+        /// group and every replica event carries its id.
+        // PROPOSED(D-069): `range` on every `Raft*` event about a replica.
+        range: u64,
         /// The receiver.
         to: u64,
         /// The offset within the current file the stream resumed from.
@@ -680,6 +777,10 @@ pub enum TraceEvent {
     RaftProgressReset {
         /// The leader.
         server: u64,
+        /// The range the replica is of (SHARD.md §8). Today a server holds one
+        /// group and every replica event carries its id.
+        // PROPOSED(D-069): `range` on every `Raft*` event about a replica.
+        range: u64,
         /// The follower whose progress was reset.
         follower: u64,
         /// The incarnation the follower answered with.
@@ -690,6 +791,10 @@ pub enum TraceEvent {
     RaftSnapshotDeleted {
         /// The server.
         server: u64,
+        /// The range the replica is of (SHARD.md §8). Today a server holds one
+        /// group and every replica event carries its id.
+        // PROPOSED(D-069): `range` on every `Raft*` event about a replica.
+        range: u64,
         /// The version's last applied index.
         last_index: u64,
         /// The version's take number.
@@ -701,6 +806,10 @@ pub enum TraceEvent {
     RaftSnapshotReused {
         /// The server.
         server: u64,
+        /// The range the replica is of (SHARD.md §8). Today a server holds one
+        /// group and every replica event carries its id.
+        // PROPOSED(D-069): `range` on every `Raft*` event about a replica.
+        range: u64,
         /// The version's last applied index.
         last_index: u64,
         /// The version's take number.
@@ -712,10 +821,301 @@ pub enum TraceEvent {
     RaftSnapshotStreams {
         /// The leader.
         server: u64,
+        /// The range the replica is of (SHARD.md §8). Today a server holds one
+        /// group and every replica event carries its id.
+        // PROPOSED(D-069): `range` on every `Raft*` event about a replica.
+        range: u64,
         /// The follower the new stream feeds.
         to: u64,
         /// Streams in flight from this leader, the new one included.
         streams: u64,
+    },
+    /// A leader's `matched` for a follower rose for the first time under the store
+    /// incarnation the follower's answer carried: the first rise after the leader
+    /// recorded that incarnation, whether as its first record or by a change
+    /// (D-042). The re-add window assertion of SHARD.md §8 reads it, and the
+    /// leader is the record's node.
+    // PROPOSED(D-069): SHARD.md §8's event, emitted here; the core already does
+    // the work it reports.
+    RaftMatchStarted {
+        /// The range.
+        range: u64,
+        /// The follower whose match rose.
+        follower: u64,
+        /// The store incarnation the follower's answer carried.
+        incarnation: u64,
+        /// The match index the rise reached.
+        matched: u64,
+    },
+    /// A leader ended a catch-up round for a learner (SHARD.md §7, thesis §4.2.1).
+    /// The leader is the record's node.
+    // PROPOSED(D-069): SHARD.md §8's event, emitted here; the core already does
+    // the work it reports.
+    RaftLearnerRound {
+        /// The range.
+        range: u64,
+        /// The learner.
+        learner: u64,
+        /// The learner's match index when the round started.
+        from_index: u64,
+        /// The index the round ran to: the leader's last index when it started,
+        /// which the acknowledgement that ends the round covers.
+        to_index: u64,
+        /// How many of the leader's ticks the round took.
+        ticks: u64,
+        /// Whether the round ended the catch-up: it ran inside the minimum
+        /// election timeout.
+        caught_up: bool,
+    },
+    /// A leader accepted a `Change` (SHARD.md §8): it held none in flight, so the
+    /// change became this leader's. The leader is the record's node.
+    // PROPOSED(D-069): SHARD.md §8's event, emitted here; the core already does
+    // the work it reports.
+    RaftChangeAccepted {
+        /// The range.
+        range: u64,
+        /// The voters the change asks for.
+        voters: Vec<u64>,
+        /// The leader's applied index when it accepted.
+        applied: u64,
+        /// The leader's term.
+        term: u64,
+    },
+    /// A replica of a range was initialised (SHARD.md §8): at bootstrap, at a
+    /// split's apply, or at an install on a node that held no initialised replica
+    /// of the range.
+    // PROPOSED(D-069): defined and exported here; emitted by the stage that
+    // builds what it reports (SHARD.md §11, raft 12; Stages B to E).
+    RangeCreated {
+        /// The range.
+        range: u64,
+        /// Why the replica was created.
+        cause: RangeCause,
+        /// The range it was split from, for a split; `None` otherwise.
+        parent: Option<u64>,
+        /// The span's first key.
+        start: Bytes,
+        /// The key past the span's last.
+        end: Bytes,
+        /// The descriptor's generation.
+        generation: u64,
+        /// The descriptor's voters.
+        voters: Vec<u64>,
+        /// The replica's floor index: the log starts above it.
+        floor_index: u64,
+        /// That index's term.
+        floor_term: u64,
+        /// The replica's incarnation, drawn at this creation (Q26).
+        incarnation: u64,
+    },
+    /// A replica's descriptor changed at an apply, was changed by an install onto
+    /// an initialised replica, or was restated at its node's start (SHARD.md §8).
+    // PROPOSED(D-069): defined and exported here; emitted by the stage that
+    // builds what it reports.
+    RangeDescriptor {
+        /// The range.
+        range: u64,
+        /// The index the descriptor took this value at.
+        index: u64,
+        /// The replica's applied index: the snapshot's last index for an install,
+        /// the replica's own at a restatement.
+        applied: u64,
+        /// The span's first key.
+        start: Bytes,
+        /// The key past the span's last.
+        end: Bytes,
+        /// The descriptor's generation.
+        generation: u64,
+        /// The descriptor's voters.
+        voters: Vec<u64>,
+        /// The range's state.
+        state: RangeState,
+    },
+    /// A node has restated every replica it holds (SHARD.md §8): the end of its
+    /// restatement at a start.
+    // PROPOSED(D-069): defined and exported here; emitted by the stage that
+    // builds what it reports.
+    RangesRestated {
+        /// The ranges restated, sorted.
+        ranges: Vec<u64>,
+    },
+    /// A node made a placeholder for a range it does not hold (SHARD.md §5).
+    // PROPOSED(D-069): defined and exported here; emitted by the stage that
+    // builds what it reports.
+    RangeReplicaCreated {
+        /// The range the placeholder stands for.
+        range: u64,
+    },
+    /// A replica applied a split that took effect (SHARD.md §5).
+    // PROPOSED(D-069): defined and exported here; emitted by the stage that
+    // builds what it reports.
+    RangeSplit {
+        /// The range that split.
+        range: u64,
+        /// The right half's range id.
+        right: u64,
+        /// The key the split is at: the right half's first.
+        key: Bytes,
+        /// The split entry's index.
+        index: u64,
+    },
+    /// A replica of R applied a `Subsume` that took effect (SHARD.md §6).
+    // PROPOSED(D-069): defined and exported here; emitted by the stage that
+    // builds what it reports.
+    RangeSubsumed {
+        /// The range subsumed.
+        range: u64,
+        /// The range it is subsumed into.
+        into: u64,
+        /// The merge attempt's index on the left range.
+        begun: u64,
+        /// The `Subsume` entry's index.
+        index: u64,
+        /// The merge's right generation.
+        generation: u64,
+        /// The voters at the subsume.
+        voters: Vec<u64>,
+    },
+    /// A replica of L applied a `Merge` that took effect (SHARD.md §6).
+    // PROPOSED(D-069): defined and exported here; emitted by the stage that
+    // builds what it reports.
+    RangeMerged {
+        /// The left range, which grows.
+        range: u64,
+        /// The right range, which goes.
+        right: u64,
+        /// The merge attempt's index.
+        begun: u64,
+        /// The `Merge` entry's index.
+        index: u64,
+        /// The right range's `Subsume` index.
+        right_index: u64,
+        /// The right range's generation at the subsume.
+        right_generation: u64,
+        /// The right replica's applied index on this node.
+        right_applied: u64,
+    },
+    /// A replica of L applied a `MergeAbort`, or a `Merge` whose shared checks
+    /// failed, that moved L from `Merging` back to `Live` (SHARD.md §6); never for
+    /// one that applied as nothing.
+    // PROPOSED(D-069): defined and exported here; emitted by the stage that
+    // builds what it reports.
+    RangeMergeAborted {
+        /// The left range.
+        range: u64,
+        /// The right range the attempt named.
+        right: u64,
+        /// The merge attempt's index.
+        begun: u64,
+        /// The entry's index.
+        index: u64,
+    },
+    /// A replica of L stopped at `m − 1` on its own node's check (SHARD.md §6).
+    // PROPOSED(D-069): defined and exported here; emitted by the stage that
+    // builds what it reports.
+    RangeMergeStalled {
+        /// The left range.
+        range: u64,
+        /// The right range.
+        right: u64,
+        /// The index it stopped below.
+        index: u64,
+    },
+    /// A replica of R applied an `Unfreeze` that took effect (SHARD.md §6).
+    // PROPOSED(D-069): defined and exported here; emitted by the stage that
+    // builds what it reports.
+    RangeUnfrozen {
+        /// The range unfrozen.
+        range: u64,
+        /// The range whose merge froze it.
+        from: u64,
+        /// The merge attempt's index.
+        begun: u64,
+        /// The index of the `Subsume` the unfreeze ends.
+        subsumed: u64,
+        /// The `Unfreeze` entry's index.
+        index: u64,
+    },
+    /// A replica's state was deleted (SHARD.md §8).
+    // PROPOSED(D-069): defined and exported here; emitted by the stage that
+    // builds what it reports.
+    RangeRemoved {
+        /// The range.
+        range: u64,
+        /// The descriptor's generation when it went.
+        generation: u64,
+        /// The replica's incarnation (Q26).
+        incarnation: u64,
+        /// Why it went.
+        cause: RangeRemovedCause,
+    },
+    /// A server answered `RangeMismatch` (SHARD.md §3).
+    // PROPOSED(D-069): defined and exported here; emitted by the stage that
+    // builds what it reports.
+    RangeMismatchSent {
+        /// The range asked for.
+        range: u64,
+        /// The client process.
+        client: u64,
+        /// The operation's number within the process.
+        seq: u64,
+        /// Where the mismatch was seen.
+        at: MismatchAt,
+        /// The descriptors the answer carried, as (range, generation).
+        descriptors: Vec<(u64, u64)>,
+    },
+    /// A replica of the meta range applied a `MetaUpdate`, and at bootstrap for
+    /// range 1's initial record at index 0 (SHARD.md §8).
+    // PROPOSED(D-069): defined and exported here; emitted by the stage that
+    // builds what it reports.
+    MetaApplied {
+        /// The meta entry's index.
+        index: u64,
+        /// The descriptors the apply names.
+        descriptors: Vec<MetaDescriptor>,
+    },
+    /// The rebalancer began a move, saw it done, or gave it up (SHARD.md §8).
+    // PROPOSED(D-069): defined and exported here; emitted by the stage that
+    // builds what it reports.
+    RebalanceMove {
+        /// The range moved.
+        range: u64,
+        /// The node it leaves.
+        from: u64,
+        /// The node it goes to.
+        to: u64,
+        /// Which of the three this record is.
+        phase: RebalancePhase,
+    },
+    /// A replica of range 0 applied an operator's `AddNode` (SHARD.md §8).
+    // PROPOSED(D-069): defined and exported here; emitted by the stage that
+    // builds what it reports.
+    NodeAdded {
+        /// The node added.
+        node: u64,
+    },
+    /// A replica of range 0 applied an operator's `RemoveNode` (SHARD.md §8).
+    // PROPOSED(D-069): defined and exported here; emitted by the stage that
+    // builds what it reports.
+    NodeRemoved {
+        /// The node removed.
+        node: u64,
+    },
+    /// A replica of range 0 applied a refill of a node's block of range ids
+    /// (SHARD.md §5, Q17).
+    // PROPOSED(D-069): defined and exported here; emitted by the stage that
+    // builds what it reports.
+    RangeIdsLeased {
+        /// The node the block is granted to.
+        node: u64,
+        /// The nonce the refill carried.
+        run: u64,
+        /// The block's first id.
+        first: u64,
+        /// The block's last id.
+        last: u64,
+        /// The entry's index in range 0's log.
+        index: u64,
     },
     /// A client operation started (RAFT.md §2): the invocation end of one operation
     /// of the linearizability history. Its time is the record's.
@@ -738,6 +1138,35 @@ pub enum TraceEvent {
         seq: u64,
         /// The result.
         result: ClientResult,
+    },
+    /// A client sent an operation's request (SHARD.md §8).
+    // PROPOSED(D-069): defined and exported here; emitted by the stage that
+    // builds what it reports (SHARD.md §11, raft 16).
+    ClientSend {
+        /// The client process.
+        client: u64,
+        /// The number this send carries, which a resend after a definite
+        /// `RangeMismatch` raises (Q10, SHARD.md §9).
+        seq: u64,
+        /// The range it is addressed to.
+        range: u64,
+        /// The generation the client believes that range is at.
+        generation: u64,
+        /// The server it is sent to.
+        to: u64,
+        /// The `seq` of the operation's `ClientInvoke`.
+        invoked: u64,
+    },
+    /// A client received `RangeMismatch` (SHARD.md §8).
+    // PROPOSED(D-069): defined and exported here; emitted by the stage that
+    // builds what it reports.
+    ClientMismatch {
+        /// The client process.
+        client: u64,
+        /// The number of the send that was refused.
+        seq: u64,
+        /// The descriptors the answer carried, as (range, generation, start, end).
+        descriptors: Vec<(u64, u64, Bytes, Bytes)>,
     },
     /// A node's tasks were killed and the filesystem fault model applied to its disk.
     NodeCrashed {
@@ -802,6 +1231,204 @@ pub enum TraceEvent {
         /// The receiver.
         to: NodeId,
     },
+}
+
+/// What applying a Raft entry did (SHARD.md §8): the `effect` of
+/// [`TraceEvent::RaftApply`], which state machine safety folds beside the entry's
+/// term and hash, so two replicas that apply one entry differently are seen at the
+/// second.
+///
+/// Only [`Applied`](Self::Applied) and [`None`](Self::None) are reachable today: a
+/// range has no span to refuse a key against and no range commands, so the other
+/// five are defined here and emitted by the stages that build what they report —
+/// [`OutOfSpan`](Self::OutOfSpan) and [`Frozen`](Self::Frozen) with §3's
+/// re-check at apply, [`Took`](Self::Took), [`Aborted`](Self::Aborted) and
+/// [`Refused`](Self::Refused) with §5's split and §6's merge.
+// PROPOSED(D-069): `effect` on `RaftApply`, with SHARD.md §8's values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
+pub enum ApplyEffect {
+    /// A client command executed within its range's span, whatever it wrote: a
+    /// `Cas` whose compare failed writes nothing and is still `applied`.
+    Applied,
+    /// A client command refused at apply for a key outside its range's span
+    /// (SHARD.md §3).
+    OutOfSpan,
+    /// A client command refused at apply because its range is frozen
+    /// (SHARD.md §3).
+    Frozen,
+    /// A range command that took effect (SHARD.md §5, §6).
+    Took,
+    /// A `Merge` that applied as an abort (SHARD.md §6).
+    Aborted,
+    /// A range command whose re-check failed, which applied as nothing.
+    Refused,
+    /// A no-op or a configuration entry.
+    None,
+}
+
+impl ApplyEffect {
+    /// The name the moirae bridge writes, as SHARD.md §8's table spells it.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ApplyEffect::Applied => "applied",
+            ApplyEffect::OutOfSpan => "out_of_span",
+            ApplyEffect::Frozen => "frozen",
+            ApplyEffect::Took => "took",
+            ApplyEffect::Aborted => "aborted",
+            ApplyEffect::Refused => "refused",
+            ApplyEffect::None => "none",
+        }
+    }
+}
+
+/// Why a replica was created (SHARD.md §8): the `cause` of
+/// [`TraceEvent::RangeCreated`].
+// PROPOSED(D-069): defined here; emitted by the stage that builds what it reports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
+pub enum RangeCause {
+    /// The cluster's ranges as configuration fixes them at bootstrap.
+    Bootstrap,
+    /// A split's apply made the right half.
+    Split,
+    /// An install onto a node that held no initialised replica of the range.
+    Snapshot,
+}
+
+impl RangeCause {
+    /// The name the moirae bridge writes.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RangeCause::Bootstrap => "bootstrap",
+            RangeCause::Split => "split",
+            RangeCause::Snapshot => "snapshot",
+        }
+    }
+}
+
+/// Why a replica's state was deleted (SHARD.md §8): the `cause` of
+/// [`TraceEvent::RangeRemoved`].
+// PROPOSED(D-069): defined here; emitted by the stage that builds what it reports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
+pub enum RangeRemovedCause {
+    /// The range was merged into its left neighbour.
+    Merged,
+    /// The replica was collected once its removal committed (D-033).
+    Collected,
+}
+
+impl RangeRemovedCause {
+    /// The name the moirae bridge writes.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RangeRemovedCause::Merged => "merged",
+            RangeRemovedCause::Collected => "collected",
+        }
+    }
+}
+
+/// A range's state (SHARD.md §6): the `state` of
+/// [`TraceEvent::RangeDescriptor`], which moves along `Live` → `Merging` → `Live`
+/// or `Live` → `Subsumed` → `Live`.
+// PROPOSED(D-069): defined here; emitted by the stage that builds what it reports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
+pub enum RangeState {
+    /// Serving.
+    Live,
+    /// A merge of the range to its right is under way.
+    Merging,
+    /// The range is frozen into its left neighbour's merge.
+    Subsumed,
+}
+
+impl RangeState {
+    /// The name the moirae bridge writes.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RangeState::Live => "live",
+            RangeState::Merging => "merging",
+            RangeState::Subsumed => "subsumed",
+        }
+    }
+}
+
+/// Where a server saw a range mismatch (SHARD.md §3): the `at` of
+/// [`TraceEvent::RangeMismatchSent`].
+// PROPOSED(D-069): defined here; emitted by the stage that builds what it reports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
+pub enum MismatchAt {
+    /// When the request was received.
+    Receipt,
+    /// When a read was served.
+    Read,
+    /// When the entry applied.
+    Apply,
+}
+
+impl MismatchAt {
+    /// The name the moirae bridge writes.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MismatchAt::Receipt => "receipt",
+            MismatchAt::Read => "read",
+            MismatchAt::Apply => "apply",
+        }
+    }
+}
+
+/// Which of a move's three records this is (SHARD.md §8): the `phase` of
+/// [`TraceEvent::RebalanceMove`].
+// PROPOSED(D-069): defined here; emitted by the stage that builds what it reports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
+pub enum RebalancePhase {
+    /// The rebalancer began the move.
+    Began,
+    /// It saw the move done.
+    Done,
+    /// It gave the move up.
+    Abandoned,
+}
+
+impl RebalancePhase {
+    /// The name the moirae bridge writes.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RebalancePhase::Began => "began",
+            RebalancePhase::Done => "done",
+            RebalancePhase::Abandoned => "abandoned",
+        }
+    }
+}
+
+/// One descriptor a meta apply names (SHARD.md §8): a row of
+/// [`TraceEvent::MetaApplied`].
+// PROPOSED(D-069): defined here; emitted by the stage that builds what it reports.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MetaDescriptor {
+    /// The range.
+    pub range: u64,
+    /// The span's first key.
+    pub start: Bytes,
+    /// The key past the span's last.
+    pub end: Bytes,
+    /// The descriptor's generation.
+    pub generation: u64,
+    /// The descriptor's voters.
+    pub voters: Vec<u64>,
+    /// The sub-intervals this descriptor won in the apply, each a first key and
+    /// the key past its last.
+    pub won: Vec<(Bytes, Bytes)>,
 }
 
 /// A key-value operation as a client issues it (RAFT.md §4): the single-key

@@ -281,7 +281,10 @@ starts its new incarnation with a freshly drawn timeout, as a restart does (D-03
 ## 2. The five invariants and how the trace checks each
 
 Raft emits a trace event for every state transition that the invariants read. The
-events, each recorded with its node and two times (D-047):
+events, each recorded with its node and two times (D-047). Every event about a
+replica carries `range`, the group it is of, and the three about the node's store —
+`RaftRefused`, `RaftAdopted` and `RaftServerFailed` — carry none (SHARD.md §8,
+D-069); today a node runs one group, `node::SINGLE_GROUP`:
 
 | Event | When | Fields |
 |---|---|---|
@@ -291,10 +294,10 @@ events, each recorded with its node and two times (D-047):
 | `RaftAppend` | an entry is written to the log | `index`, `entry_term`, `hash` of the payload |
 | `RaftTruncate` | a conflict removes entries | `from_index` |
 | `RaftCommit` | the commit index advances | `index` |
-| `RaftApply` | an entry is applied | `index`, `entry_term`, `hash` |
+| `RaftApply` | an entry is applied | `index`, `entry_term`, `hash`, `key` where the entry names one, `effect`: `applied` for a client command executed in its range, `none` for a no-op or a configuration entry; SHARD.md §8's other five values belong to what later stages build (D-069) |
 | `RaftConfig` | a configuration entry takes effect | `index`, `old`, `new`, `joint` |
 | `RaftSnapshot` | a snapshot is taken or installed | `last_index`, `last_term`, `taken` |
-| `RaftRead` | a read is served | `index`, `lease` |
+| `RaftRead` | a read is served, traced by the server that serves it, not by the core that confirmed it (D-069) | `index`, `lease`, `key`, `applied`: the applied index of the engine version the value was read at, taken at that one version |
 | `RaftLeaseRevoked` | the guard revoked a lease | `follower`, `offset_moved` |
 | `RaftQuorumLost` | a leader stepped down for want of a majority | `term`, `uncounted`: the refused followers whose rejections went uncounted for want of re-seed progress (D-049) |
 | `RaftTransfer` | a leader sent TimeoutNow | `to` |
@@ -309,6 +312,9 @@ events, each recorded with its node and two times (D-047):
 | `RaftSnapshotStreams` | a leader opened a snapshot stream (D-043) | `to`, `streams` |
 | `RaftSnapshotReused` | a take answered with the recorded version (D-043) | `last_index`, `take` |
 | `RaftSnapshotDeleted` | a checkpoint version nothing reads was deleted (D-043) | `last_index`, `take` |
+| `RaftMatchStarted` | a leader's `matched` for a follower rose for the first time under the incarnation the follower's answer carried (D-042, D-069) | `follower`, `incarnation`, `matched` |
+| `RaftLearnerRound` | a leader ended a catch-up round for a learner (D-029, D-069) | `learner`, `from_index`, `to_index`, `ticks`, `caught_up` |
+| `RaftChangeAccepted` | a leader accepted a `Change`, holding none in flight (D-029, D-069) | `voters`, `applied`, `term` |
 | `ClientInvoke` | a client operation starts | `client`, `seq`, `op` |
 | `ClientReturn` | it returns | `client`, `seq`, `result` |
 
@@ -335,7 +341,9 @@ on every seed (D-046). The rest are in `sim/` and run at the end:
    been appended on a majority of the configuration then in force, which the
    reconstructed logs and `RaftConfig` events show.
 4. **State machine safety.** Fold `RaftApply`: a map from index to (term, hash); a
-   second value for an index is a violation. Per node, applied indices must be the
+   second value for an index is a violation. The event's `effect` joins that value
+   when the checks are keyed by range (SHARD.md §8, check 4); the fold here still
+   holds term and hash. Per node, applied indices must be the
    consecutive integers from one, so an entry applied twice or skipped shows here as
    well, which is where the applied index being written in the same batch as the
    entry's writes (§3) is proven. An apply durable at a crash but not yet traced
@@ -361,6 +369,9 @@ on every seed (D-046). The rest are in `sim/` and run at the end:
    run passes only if no lease read was served stale. The invariant is a fold over
    `RaftRead`, `RaftLeaseRevoked` and the simulator's clock configuration, and the
    checker in §4 is what decides staleness; the guard's sufficiency is never assumed.
+   The read's event is the serving server's since D-069, so what the fold sees is
+   exactly the reads a client was answered from, each with the key and the applied
+   index of the engine version it was answered at.
 
 Three more folds check the rules behind the properties directly, so a broken rule is
 seen the first time it is exercised and not only when its consequence happens to
