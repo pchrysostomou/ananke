@@ -106,7 +106,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ananke_env::{
-    Clock, Decision, Either, Environment, Instant, Network, Rng, Socket, TraceEvent, race,
+    ApplyEffect, Clock, Decision, Either, Environment, Instant, Network, Rng, Socket, TraceEvent,
+    race,
 };
 use ananke_storage::{Engine, EngineConfig};
 
@@ -947,22 +948,28 @@ async fn incarnation<E: Environment>(
     // really starts counting. The sweep's await above decides nothing they report.
     env.trace(TraceEvent::RaftTruncate {
         server,
+        range: SINGLE_GROUP,
         from_index: core.last_index() + 1,
     });
     if snap_index > 0 {
         env.trace(TraceEvent::RaftSnapshot {
             server,
+            range: SINGLE_GROUP,
             last_index: snap_index,
             last_term: snap_term,
             taken: snapshot_record.as_ref().is_some_and(|s| s.taken),
         });
     }
     if quarantined {
-        env.trace(TraceEvent::RaftReseeded { server });
+        env.trace(TraceEvent::RaftReseeded {
+            server,
+            range: SINGLE_GROUP,
+        });
     }
     for entry in core.log() {
         env.trace(TraceEvent::RaftAppend {
             server,
+            range: SINGLE_GROUP,
             index: entry.index,
             entry_term: entry.term,
             hash: entry.payload.hash(),
@@ -974,6 +981,7 @@ async fn incarnation<E: Environment>(
     let membership = core.membership();
     env.trace(TraceEvent::RaftConfig {
         server,
+        range: SINGLE_GROUP,
         index: core.membership_index(),
         old: membership.voters.iter().map(|s| s.0).collect(),
         new: membership
@@ -988,6 +996,7 @@ async fn incarnation<E: Environment>(
     // the sweep's timer check, which counts from here.
     env.trace(TraceEvent::RaftRecovered {
         server,
+        range: SINGLE_GROUP,
         term: core.term(),
         applied,
         last_index: core.last_index(),
@@ -995,6 +1004,7 @@ async fn incarnation<E: Environment>(
     });
     env.trace(TraceEvent::RaftTerm {
         server,
+        range: SINGLE_GROUP,
         term: core.term(),
         role: "follower",
         // PROPOSED(D-050): a term's record carries when the message its step
@@ -1238,6 +1248,7 @@ async fn incarnation<E: Environment>(
                         decided,
                         TraceEvent::RaftProposed {
                             server,
+                            range: SINGLE_GROUP,
                             client: request.client,
                             seq: request.seq,
                             index,
@@ -1440,6 +1451,7 @@ fn spawn_apply<E: Environment>(
                                 taken_job,
                                 TraceEvent::RaftSnapshotReused {
                                     server,
+                                    range: SINGLE_GROUP,
                                     last_index: record.last_index,
                                     take: record.take,
                                 },
@@ -1467,6 +1479,7 @@ fn spawn_apply<E: Environment>(
                                 taken_job,
                                 TraceEvent::RaftSnapshot {
                                     server,
+                                    range: SINGLE_GROUP,
                                     last_index: applied,
                                     last_term: applied_term,
                                     taken: true,
@@ -1516,13 +1529,31 @@ fn spawn_apply<E: Environment>(
                 if let Payload::Config(new_config) = &entry.payload {
                     config = new_config.clone();
                 }
+                // PROPOSED(D-069): `key` and `effect` (SHARD.md §8). A client
+                // command executed in its range is `applied` whatever it wrote —
+                // a `Cas` whose compare failed writes nothing and is still
+                // `applied` — and a no-op or a configuration entry is `none`.
+                // The other five effects of §8's table belong to a command
+                // refused at apply (§3) and to the range commands of §5 and §6,
+                // neither of which exists yet: no apply here can produce them.
+                let (key, effect) = match command.as_ref().and_then(Command::key) {
+                    Some(key) => (Some(key.clone()), ApplyEffect::Applied),
+                    // A no-op, a configuration entry, a command that names no key
+                    // — `Transfer` and `Change` are never entries — or one the
+                    // state machine could not decode, which wrote nothing and
+                    // which no client of this workspace encodes.
+                    None => (None, ApplyEffect::None),
+                };
                 env.trace_decided(
                     took,
                     TraceEvent::RaftApply {
                         server,
+                        range: SINGLE_GROUP,
                         index: entry.index,
                         entry_term: entry.term,
                         hash: entry.payload.hash(),
+                        key,
+                        effect,
                     },
                 );
                 let waiting = lock_pending(&pending).remove(&entry.index);
@@ -1647,6 +1678,7 @@ impl<E: Environment> Streamer<E> {
                 decided,
                 TraceEvent::RaftSnapshotStreams {
                     server: self.id.0,
+                    range: SINGLE_GROUP,
                     to: to.0,
                     streams: running as u64,
                 },
@@ -1702,6 +1734,7 @@ async fn sweep_versions<E: Environment>(
             // decided when it is recorded, which no earlier time is provably.
             env.trace(TraceEvent::RaftSnapshotDeleted {
                 server: id.0,
+                range: SINGLE_GROUP,
                 last_index,
                 take,
             });
@@ -1782,6 +1815,7 @@ async fn snapshot_task<E: Environment>(
                         pass,
                         TraceEvent::RaftSnapshotResumed {
                             server,
+                            range: SINGLE_GROUP,
                             to: to.0,
                             offset: out.sender.position_offset(config.snapshot_chunk),
                         },
@@ -1891,6 +1925,7 @@ async fn snapshot_task<E: Environment>(
                             installing,
                             TraceEvent::RaftSnapshot {
                                 server,
+                                range: SINGLE_GROUP,
                                 last_index: identity.0,
                                 last_term: identity.1,
                                 taken: false,
@@ -1901,6 +1936,7 @@ async fn snapshot_task<E: Environment>(
                             installing,
                             TraceEvent::RaftConfig {
                                 server,
+                                range: SINGLE_GROUP,
                                 index: identity.0,
                                 old: config.voters.iter().map(|s| s.0).collect(),
                                 new: config
@@ -1996,6 +2032,7 @@ async fn snapshot_task<E: Environment>(
                         if out.sender.on_more(&file, offset) {
                             env.trace(TraceEvent::RaftSnapshotResumed {
                                 server,
+                                range: SINGLE_GROUP,
                                 to: from.0,
                                 offset,
                             });
@@ -2222,6 +2259,7 @@ async fn reseed<E: Environment>(
                                     installing,
                                     TraceEvent::RaftSnapshot {
                                         server: id.0,
+                                        range: SINGLE_GROUP,
                                         last_index: identity.0,
                                         last_term: identity.1,
                                         taken: false,
@@ -2274,7 +2312,11 @@ fn admit<E: Environment>(
     };
     if inbox.count(is_message) >= capacity {
         let dropped = |kind: &'static str| {
-            env.trace(TraceEvent::RaftInboxDropped { server, kind });
+            env.trace(TraceEvent::RaftInboxDropped {
+                server,
+                range: SINGLE_GROUP,
+                kind,
+            });
         };
         let (from, kind) = (frame.from, frame.message.kind());
         let victim = inbox
@@ -2435,7 +2477,13 @@ impl<E: Environment> Server<E> {
                 }
                 Output::Apply { through } => self.apply_through(core, through),
                 Output::Rejected { .. } => {}
-                Output::ReadReady { id, .. } => {
+                // PROPOSED(D-069): the read is served here and traced here
+                // (SHARD.md §8). The value and the applied index come from one
+                // engine version, so the record says which state the client was
+                // answered from: a check can place the read in the log's order,
+                // and the descriptor a later stage reads at that version is the
+                // one the value was read under (§11, raft 15).
+                Output::ReadReady { id, index, lease } => {
                     let key = match self.reads.get(&id) {
                         Some((_, request)) => match request.command.key() {
                             Some(key) => key.clone(),
@@ -2443,8 +2491,9 @@ impl<E: Environment> Server<E> {
                         },
                         None => continue,
                     };
-                    let reply = match self.store.engine().get(&user_key(&key)).await {
-                        Ok(value) => Reply::Outcome(Outcome::Value(value)),
+                    let version = self.store.engine().snapshot();
+                    let value = match self.store.engine().get_at(&user_key(&key), &version).await {
+                        Ok(value) => value,
                         Err(error) => {
                             self.env.trace(TraceEvent::RaftServerFailed {
                                 server: self.id.0,
@@ -2453,7 +2502,32 @@ impl<E: Environment> Server<E> {
                             return Err(error);
                         }
                     };
-                    self.answer_read(id, reply).await;
+                    let served_at = match self.store.applied_at(&version).await {
+                        Ok(applied) => applied,
+                        Err(error) => {
+                            self.env.trace(TraceEvent::RaftServerFailed {
+                                server: self.id.0,
+                                reason: error.to_string(),
+                            });
+                            return Err(error);
+                        }
+                    };
+                    drop(version);
+                    // D-047: decided when the core confirmed the read, recorded
+                    // now, when the server answered it from that version.
+                    self.env.trace_decided(
+                        decided,
+                        TraceEvent::RaftRead {
+                            server: self.id.0,
+                            range: SINGLE_GROUP,
+                            index,
+                            lease,
+                            key,
+                            applied: served_at,
+                        },
+                    );
+                    self.answer_read(id, Reply::Outcome(Outcome::Value(value)))
+                        .await;
                 }
                 Output::ReadDropped { id } => {
                     self.answer_read(id, Reply::NotLeader { leader: None })

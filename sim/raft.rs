@@ -1064,7 +1064,7 @@ impl Report {
                 TraceEvent::RaftRecovered { server, .. } => {
                     down.remove(server);
                 }
-                TraceEvent::RaftReseeded { server } => {
+                TraceEvent::RaftReseeded { server, .. } => {
                     quarantined.insert(*server);
                 }
                 _ => {}
@@ -1446,7 +1446,7 @@ impl Report {
                 && r.at <= until
                 && matches!(&r.event,
                     TraceEvent::RaftRefused { server: s, .. }
-                    | TraceEvent::RaftReseeded { server: s }
+                    | TraceEvent::RaftReseeded { server: s, .. }
                     | TraceEvent::RaftSnapshot { server: s, taken: false, .. }
                     if *s == server)
         })
@@ -1579,7 +1579,7 @@ impl Report {
             let at = time.of(record);
             clocks.replaying = index;
             match &record.event {
-                TraceEvent::RaftReseeded { server } => {
+                TraceEvent::RaftReseeded { server, .. } => {
                     reseeded.insert(*server);
                 }
                 TraceEvent::MessageSent { id, payload, .. } => {
@@ -2082,7 +2082,7 @@ impl Report {
                 let status = match &r.event {
                     TraceEvent::RaftTerm { server: s, .. }
                     | TraceEvent::RaftLeader { server: s, .. }
-                    | TraceEvent::RaftReseeded { server: s } => *s == server,
+                    | TraceEvent::RaftReseeded { server: s, .. } => *s == server,
                     TraceEvent::NodeCrashed { node } => u64::from(node.get()) == server,
                     // PROPOSED(D-063): a completed install takes the server out of
                     // the replay's running set until its restatement, so it says
@@ -3137,7 +3137,7 @@ impl Report {
                     follower: f,
                     ..
                 } => *server == leader && *f == follower,
-                TraceEvent::RaftReseeded { server } => *server == follower,
+                TraceEvent::RaftReseeded { server, .. } => *server == follower,
                 _ => false,
             });
             if forgotten {
@@ -3201,7 +3201,7 @@ impl Report {
         )?;
         let reseeded = at(
             reset,
-            &|e| matches!(e, TraceEvent::RaftReseeded { server } if *server == follower),
+            &|e| matches!(e, TraceEvent::RaftReseeded { server, .. } if *server == follower),
         )?;
         Some((refused, reset, reseeded))
     }
@@ -4856,6 +4856,7 @@ mod tests {
     use super::*;
     use ananke_env::Decision;
     use ananke_raft::core::Variant;
+    use ananke_raft::node::SINGLE_GROUP;
 
     fn ms(n: u64) -> Instant {
         Instant::from_nanos(n * 1_000_000)
@@ -4873,6 +4874,7 @@ mod tests {
     fn term(server: u64, term: u64, role: &'static str, received: Option<Decision>) -> TraceEvent {
         TraceEvent::RaftTerm {
             server,
+            range: SINGLE_GROUP,
             term,
             role,
             received,
@@ -4913,6 +4915,7 @@ mod tests {
     fn vote(server: u64) -> TraceEvent {
         TraceEvent::RaftVote {
             server,
+            range: SINGLE_GROUP,
             term: 1,
             candidate: 2,
             granted: true,
@@ -4979,6 +4982,7 @@ mod tests {
                     Some(2),
                     TraceEvent::RaftCommit {
                         server: 2,
+                        range: SINGLE_GROUP,
                         term: 1,
                         index: 1,
                     },
@@ -5021,6 +5025,7 @@ mod tests {
                     Some(1),
                     TraceEvent::RaftLeader {
                         server: 1,
+                        range: SINGLE_GROUP,
                         term: 1,
                         last_index: 0,
                     },
@@ -5107,6 +5112,7 @@ mod tests {
             Some(server),
             TraceEvent::RaftSnapshot {
                 server,
+                range: SINGLE_GROUP,
                 last_index: 374,
                 last_term: 1,
                 taken,
@@ -5128,6 +5134,7 @@ mod tests {
                 Some(server),
                 TraceEvent::RaftRecovered {
                     server,
+                    range: SINGLE_GROUP,
                     term: 1,
                     applied: 374,
                     last_index: 374,

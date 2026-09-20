@@ -279,7 +279,8 @@ fn a_leader_compacts_only_when_every_follower_is_past_the_checkpoint() {
         o,
         Output::Trace(TraceEvent::RaftCompacted {
             server: 1,
-            through: 5
+            through: 5,
+            ..
         })
     )));
     assert_eq!(leader.snapshot(), (5, 2));

@@ -72,7 +72,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use ananke_env::{Environment, File, FileSystem, OpenOptions, WalStop, WalStopReason};
 use ananke_storage::manifest;
-use ananke_storage::{Engine, EngineConfig, EngineRecovery, WriteBatch};
+use ananke_storage::{Engine, EngineConfig, EngineRecovery, Snapshot, WriteBatch};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 use crate::core::Persist;
@@ -962,6 +962,28 @@ impl<E: Environment> RaftStore<E> {
     #[must_use]
     pub fn applied(&self) -> Index {
         self.applied.load(Ordering::Acquire)
+    }
+
+    /// The applied index as of `snapshot`: the value under the applied-index key
+    /// at that engine version, which the apply batch that wrote it wrote with the
+    /// entry's own writes. A read taken at the same snapshot is therefore the
+    /// state at exactly this index, which is what a served read records
+    /// (SHARD.md §8, §11 raft 15). Zero where nothing has applied at that version.
+    ///
+    /// # Errors
+    ///
+    /// The engine's, or `InvalidData` if the value is not eight bytes.
+    // PROPOSED(D-069): a read is served, and its applied index taken, at one
+    // engine version.
+    pub async fn applied_at(&self, snapshot: &Snapshot<E>) -> io::Result<Index> {
+        match self
+            .engine
+            .get_at(&self.prefix.applied_key(), snapshot)
+            .await?
+        {
+            None => Ok(0),
+            Some(bytes) => decode_applied(bytes),
+        }
     }
 
     /// The store's incarnation number (RAFT.md §3): what this server's

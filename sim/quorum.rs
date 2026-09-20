@@ -378,6 +378,7 @@ impl Report {
                     server,
                     term,
                     uncounted,
+                    ..
                 } if *server == leader
                     && *term == hold.term
                     && in_hold(r.decided)
@@ -385,7 +386,7 @@ impl Report {
                 {
                     hold.quorum_lost = Some((r.decided, uncounted.clone()));
                 }
-                TraceEvent::RaftReseeded { server }
+                TraceEvent::RaftReseeded { server, .. }
                     if *server == refused && in_hold(r.at) && hold.reseeded.is_none() =>
                 {
                     hold.reseeded = Some(r.at);
@@ -394,6 +395,7 @@ impl Report {
                     server,
                     term,
                     index,
+                    ..
                 } if *server == leader
                     && *term == hold.term
                     && *index > hold.commit_at_cut

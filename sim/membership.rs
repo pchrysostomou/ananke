@@ -931,6 +931,7 @@ mod tests {
     //! held by a sweep; both are held here.
 
     use ananke_raft::core::Variant;
+    use ananke_raft::node::SINGLE_GROUP;
 
     use super::*;
 
@@ -953,6 +954,7 @@ mod tests {
             millis,
             TraceEvent::RaftSnapshot {
                 server,
+                range: SINGLE_GROUP,
                 last_index,
                 last_term: 1,
                 taken: false,
@@ -966,6 +968,7 @@ mod tests {
             millis,
             TraceEvent::RaftConfig {
                 server: 1,
+                range: SINGLE_GROUP,
                 index: 10,
                 old: (1..=INITIAL_VOTERS).collect(),
                 new: (1..=INITIAL_VOTERS).chain([joiner]).collect(),
@@ -1007,6 +1010,7 @@ mod tests {
                 650,
                 TraceEvent::RaftSnapshot {
                     server: 5,
+                    range: SINGLE_GROUP,
                     last_index: 6,
                     last_term: 1,
                     taken: true,

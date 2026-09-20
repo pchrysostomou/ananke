@@ -50,6 +50,7 @@ pub use rng::Rng;
 pub use task::{TaskHandle, TaskId};
 pub use time::{Instant, WallTime, WallTimeOutOfRange};
 pub use trace::{
-    ClientOp, ClientResult, Decision, DirEntryOp, DropReason, MessageId, TraceEvent, WalStop,
-    WalStopReason,
+    ApplyEffect, ClientOp, ClientResult, Decision, DirEntryOp, DropReason, MessageId,
+    MetaDescriptor, MismatchAt, RangeCause, RangeRemovedCause, RangeState, RebalancePhase,
+    TraceEvent, WalStop, WalStopReason,
 };

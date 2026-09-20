@@ -59,13 +59,16 @@ impl Logs {
                 index,
                 entry_term,
                 hash,
+                ..
             } => {
                 self.logs
                     .entry(*server)
                     .or_default()
                     .insert(*index, (*entry_term, *hash));
             }
-            TraceEvent::RaftTruncate { server, from_index } => {
+            TraceEvent::RaftTruncate {
+                server, from_index, ..
+            } => {
                 self.logs
                     .entry(*server)
                     .or_default()
@@ -76,6 +79,7 @@ impl Logs {
                 last_index,
                 last_term,
                 taken,
+                ..
             } => {
                 // Two snapshots cover committed prefixes, so at one index their
                 // terms agree: the log-matching check at a boundary the logs no
@@ -235,9 +239,11 @@ struct Verdicts {
 /// ```
 /// use ananke_env::TraceEvent;
 /// use ananke_raft::invariants::Checker;
+/// use ananke_raft::node::SINGLE_GROUP;
 ///
 /// let leader = |server, term| TraceEvent::RaftLeader {
 ///     server,
+///     range: SINGLE_GROUP,
 ///     term,
 ///     last_index: 0,
 /// };
@@ -461,6 +467,7 @@ impl Checker {
             index,
             entry_term,
             hash,
+            ..
         } = event
         else {
             return Ok(());
@@ -507,6 +514,7 @@ impl Checker {
                 server,
                 term,
                 index,
+                ..
             } if self.is_leader.get(server) == Some(term) => {
                 if let Some(log) = self.logs.log(*server) {
                     for (i, (entry_term, hash)) in log.range(..=index) {
@@ -528,6 +536,7 @@ impl Checker {
             server,
             term,
             index,
+            ..
         } = event
         else {
             return Ok(());
@@ -559,7 +568,9 @@ impl Checker {
             TraceEvent::RaftRefused { server, .. } => {
                 self.commit.remove(server);
             }
-            TraceEvent::RaftTruncate { server, from_index } => {
+            TraceEvent::RaftTruncate {
+                server, from_index, ..
+            } => {
                 let known = self.commit.get(server).copied().unwrap_or(0);
                 if *from_index <= known {
                     return Err(format!(
@@ -575,11 +586,15 @@ impl Checker {
     /// State machine safety, one event at a time: see [`state_machine_safety`].
     fn state_machine_safety(&mut self, event: &TraceEvent) -> Result<(), String> {
         match event {
+            // PROPOSED(D-069): `range`, `key` and `effect` are on the event now;
+            // state machine safety keeps the value it folds — (term, hash) per
+            // index — until the checks are keyed by range (SHARD.md §8, check 4).
             TraceEvent::RaftApply {
                 server,
                 index,
                 entry_term,
                 hash,
+                ..
             } => self.applied.record(*server, *index, (*entry_term, *hash))?,
             TraceEvent::RaftSnapshot {
                 server,
@@ -634,6 +649,7 @@ impl Checker {
                 server,
                 term,
                 index,
+                ..
             } if self.is_leader.get(server) == Some(term) => {
                 let from = self
                     .checked

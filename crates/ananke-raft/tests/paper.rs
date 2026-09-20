@@ -10,6 +10,7 @@ use ananke_env::TraceEvent;
 use ananke_raft::core::{Input, Output, Persist, Raft, RaftConfig, Role, Variant, Variants};
 use ananke_raft::invariants;
 use ananke_raft::message::Message;
+use ananke_raft::node::SINGLE_GROUP;
 use ananke_raft::types::{Configuration, Entry, Index, Payload, ServerId, Term};
 use bytes::Bytes;
 
@@ -52,8 +53,12 @@ struct Cluster {
     now: u64,
     /// Each server's clock rate error in parts per million, for the guard tests.
     drift_ppm: BTreeMap<ServerId, i64>,
-    /// Reads the cores declared ready: (server, read id, read index).
-    reads: Vec<(ServerId, u64, Index)>,
+    /// Reads the cores declared ready: (server, read id, read index, whether the
+    /// lease confirmed it rather than a heartbeat round).
+    // PROPOSED(D-069): the core no longer traces `RaftRead` — the server that
+    // serves the read does (SHARD.md §8) — so `lease` is read from the output the
+    // core hands the server, where the trace read it before.
+    reads: Vec<(ServerId, u64, Index, bool)>,
     /// Reads the cores dropped: (server, read id).
     dropped: Vec<(ServerId, u64)>,
 }
@@ -92,6 +97,7 @@ impl Cluster {
             for entry in log {
                 events.push(TraceEvent::RaftAppend {
                     server: id.0,
+                    range: SINGLE_GROUP,
                     index: entry.index,
                     entry_term: entry.term,
                     hash: entry.payload.hash(),
@@ -148,7 +154,11 @@ impl Cluster {
                     self.inbox.push((id, *to, message));
                 }
                 Output::Trace(event) => self.events.push(event.clone()),
-                Output::ReadReady { id: read, index } => self.reads.push((id, *read, *index)),
+                Output::ReadReady {
+                    id: read,
+                    index,
+                    lease,
+                } => self.reads.push((id, *read, *index, *lease)),
                 Output::ReadDropped { id: read } => self.dropped.push((id, *read)),
                 Output::Apply { .. } | Output::Rejected { .. } | Output::Snapshot(_) => {}
             }
@@ -891,7 +901,8 @@ fn a_follower_with_a_new_incarnation_is_probed_from_its_hint() {
                 TraceEvent::RaftProgressReset {
                     server: 1,
                     follower: 2,
-                    incarnation: 7
+                    incarnation: 7,
+                    ..
                 }
             )
         });
@@ -1039,13 +1050,14 @@ fn a_read_index_read_needs_acknowledgements_sent_after_it() {
     // The fresh round's do.
     cluster.inbox = fresh;
     cluster.settle();
-    assert_eq!(cluster.reads, vec![(s(1), 7, commit)]);
-    let lease_reads = cluster
-        .events
-        .iter()
-        .filter(|e| matches!(e, TraceEvent::RaftRead { lease: true, .. }))
-        .count();
-    assert_eq!(lease_reads, 0, "served by a round, not a lease");
+    // PROPOSED(D-069): `lease` is on the output now, not on a trace event of the
+    // core's; the read's `false` is what the `RaftRead` the core used to trace
+    // carried, asserted per read rather than as a count of zero.
+    assert_eq!(
+        cluster.reads,
+        vec![(s(1), 7, commit, false)],
+        "served by a round, not a lease"
+    );
 }
 
 /// A lease read (RAFT.md §1): served at once within the promise of a majority,
@@ -1065,19 +1077,14 @@ fn a_lease_read_is_served_within_the_promise_and_not_after() {
             now: cluster.now,
         },
     );
+    // PROPOSED(D-069): `lease: true` is on the output the core hands the server,
+    // which traces it; the core traces no `RaftRead` any more (SHARD.md §8).
     assert!(
-        out.iter()
-            .any(|o| matches!(o, Output::ReadReady { id: 1, index } if *index == commit)),
+        out.iter().any(
+            |o| matches!(o, Output::ReadReady { id: 1, index, lease: true } if *index == commit)
+        ),
         "served at once by the lease: {out:?}"
     );
-    assert!(cluster.events.iter().any(|e| matches!(
-        e,
-        TraceEvent::RaftRead {
-            server: 1,
-            lease: true,
-            ..
-        }
-    )));
     // Time passes past the lease with nothing heard: the next read needs a round.
     cluster.cut = vec![(s(2), s(1)), (s(3), s(1))];
     while cluster.now < lease_end {
@@ -1465,12 +1472,14 @@ fn leadership_transfer_makes_the_target_leader_without_a_pre_vote() {
         .filter(|e| matches!(e, TraceEvent::RaftVote { pre: true, term: t, .. } if *t == term + 1))
         .count();
     assert_eq!(pre_votes, 0, "no pre-vote round for a transfer");
-    assert!(
-        cluster
-            .events
-            .iter()
-            .any(|e| matches!(e, TraceEvent::RaftTransfer { server: 1, to: 2 }))
-    );
+    assert!(cluster.events.iter().any(|e| matches!(
+        e,
+        TraceEvent::RaftTransfer {
+            server: 1,
+            to: 2,
+            ..
+        }
+    )));
     assert!(
         cluster.events.iter().any(|e| matches!(e, TraceEvent::RaftVote { server: 3, granted: true, pre: false, term: t, .. } if *t == term + 1)),
         "server 3 voted although it had heard from server 1"

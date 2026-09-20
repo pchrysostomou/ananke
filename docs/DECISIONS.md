@@ -7976,4 +7976,204 @@ the fixed tree, deleted and never committed.
 
 ---
 
-_Next entry: D-069. Add one before implementing anything not covered above._
+## PROPOSED D-069 — The trace of SHARD.md §8: a range on every replica event, `key` and `effect` on an apply, and the read traced where it is served
+
+**Context.** Stage B's second build (SHARD.md:2208-2218): "The trace of §8 (§11, env 1)".
+SHARD.md §8 is the list of the invariants of a sharded cluster and the trace events each
+check folds, and it opens by saying what today's trace lacks: "Today no event names a
+group: every `Raft*` event names a server (trace.rs:368-652), and the enum already says
+it 'grows with each phase (range id, …)'" (SHARD.md:1113-1116). Every check of §8 is
+keyed by range; none of them can be written until the events carry one. §11's env item 1
+says the same and adds that "Every pinned trace hash moves once, deliberately, with the
+reason in the commit" (SHARD.md:1933-1935).
+
+This entry is the trace alone. It changes what is recorded and what the existing checks
+read, not what the system does — with one exception, stated below, which is how a read is
+served: at one engine version rather than two reads of the latest state.
+
+**Decision.**
+
+*A range on every `Raft*` event about a replica.* Twenty-three event kinds gain a `range:
+u64` field, and so does `RaftProposed`, which §9's history closure needs. The three
+events about a node's *store* — `RaftRefused`, `RaftAdopted` and `RaftServerFailed` —
+stay per node and carry none, as §8 says (SHARD.md:1127-1129). The moirae export writes
+`range` immediately after `server`, so a studio filter carves a per-range trace
+(SPEC.md:117-124). Today a node runs one group and the id is the one D-060's key layout
+uses, `node::SINGLE_GROUP`; the core carries it in `RaftConfig::range`, whose default is
+that constant, and the node stamps it on the events it traces itself.
+
+*`key` and `effect` on `RaftApply`.* `key` is the key a single-key command touches, and
+`None` for an entry that names none. `effect` is a new enum, `ApplyEffect`, with §8's
+seven values (SHARD.md:1126). Two are reachable today and are emitted: `applied` for a
+client command executed in its range, whatever it wrote — a `Cas` whose compare failed
+writes nothing and is still `applied` — and `none` for a no-op or a configuration entry.
+The other five belong to what later stages build and are defined here, with the stage
+that emits each named in the doc comment: `out_of_span` and `frozen` with §3's re-check
+at apply, `took`, `aborted` and `refused` with §5's split and §6's merge.
+
+*`RaftRead` moved from the core to the server.* The core traced it when a read was
+confirmed (core.rs:1175, 1202), before the server held the key or had served anything;
+it is now traced by the server that serves the read (§11, raft 15; SHARD.md:1913-1918).
+It keeps `index` and `lease` and gains `key` and `applied`, the applied index of the
+engine version the value was read at. The server takes one `Engine::snapshot` and reads
+both the value, with `get_at`, and the applied index, with a new
+`RaftStore::applied_at`, at that version: the applied index is a key of the store,
+written in the same synced batch as the entry's own writes (store.rs), so a read at one
+version is the state at exactly that index. `Output::ReadReady` gains `lease`, since the
+core is where the lease is known and the server is where the record is written. The
+record's own time is when the server answered, and it carries the decision stamp of the
+step that confirmed the read (D-047).
+
+*The new event kinds of §8.* All twenty-two are added to `TraceEvent` with the fields
+§8's table lists, each with its `convert` arm in the moirae bridge and its row in the
+bridge's doc table. Three are emitted by this commit, because the core already does the
+work they report:
+
+- `RaftMatchStarted` — a leader's `matched` for a follower rose for the first time under
+  the store incarnation the follower's answer carried (§11, raft 12). `Progress` gains a
+  `match_started` flag, cleared when the leader takes office, when the follower is first
+  tracked and at every change of its recorded incarnation.
+- `RaftLearnerRound` — a leader ended a catch-up round for a learner (raft 9). `Learner`
+  gains `from_index`, the learner's match when the round began.
+- `RaftChangeAccepted` — a change accepted when the core has none in flight, as today
+  (raft 8; D-029, DECISIONS.md:1099-1104).
+
+Every other new kind is emitted by the stage that builds what it reports, and says so in
+its doc comment: the `Range*` family, `MetaApplied`, `RebalanceMove`, `NodeAdded`,
+`NodeRemoved`, `RangeIdsLeased`, `RangeMismatchSent`, `ClientSend` and `ClientMismatch`.
+Six supporting enums and one struct come with them: `ApplyEffect`, `RangeCause`,
+`RangeRemovedCause`, `RangeState`, `MismatchAt`, `RebalancePhase` and `MetaDescriptor`.
+
+**What §8 leaves open, settled here, each marked `// PROPOSED(D-069)` in the code.**
+
+1. *The new events carry no `server`.* §8's table lists none, and every record already
+   carries its node (D-047). A replica is (range, node) and `ServerId` stays the node
+   (Q26), so the node is the server. The existing `Raft*` events keep their `server`
+   field, which is redundant with the record's node and always has been; nothing is
+   removed.
+2. *`effect`'s exported names are §8's own spellings*, `out_of_span` included, although
+   the other enums the bridge writes are kebab-case (`torn-record`, `queue-full`). §8's
+   table is the specification of these values and matching it exactly is the
+   conservative reading; the check reads the Rust enum, not the string.
+3. *`RaftInboxDropped` and `RaftSnapshotStreams` gain `range`.* §8 exempts only the three
+   events about a node's store. A dropped frame is a message of some range's replica, and
+   Q10 puts an 8-byte range id on every frame; a stream is per (range, follower) from
+   Stage B (raft 14). Both are about a replica, so both carry one.
+4. *The core's range lives in `RaftConfig`.* The alternative was a constructor parameter
+   on `Raft::new`, `restore` and `restore_compacted`. The config is already per core and
+   already carries the variant set; this keeps every existing call site unchanged and
+   gives Stage B one place to set a range per core.
+5. *`RaftChangeAccepted` is traced for every change the core does not refuse*, including
+   one naming the voters already in force, which the core accepts and the server answers
+   `Done` for. "Accepted" is what the caller is told, and check 22 folds what the caller
+   was told.
+6. *`RaftMatchStarted` is also traced when an install's answer raises `matched`* — the
+   install's answer carries the follower's incarnation and is recorded by the same
+   `note_incarnation` (core.rs). §8's wording is "the first rise ... under the store
+   incarnation the follower's answer carried", and an install's completion is such an
+   answer. Including it can only make the re-add window assertion see more.
+7. *`match_started` is cleared at every change of the recorded incarnation*, whether or
+   not the progress itself is reset, so `Variant::IgnoreIncarnation` — which records and
+   never resets — still traces the first rise under each incarnation rather than one
+   for the leader's whole term.
+8. *An entry whose command the state machine cannot decode is `none` with no key.* It
+   wrote nothing, no client of this workspace encodes one, and `none` is the value that
+   claims least. `Transfer` and `Change` are never entries and fall here too.
+9. *A key a client named is exported as text* (as `ananke.client.invoke` has always
+   written its `key`, so the studio lines an operation up with its apply) *and a span
+   bound as hex* (as `ananke.engine.span-installed` writes its keys, since a bound is not
+   necessarily text).
+10. *The existing checks are untouched.* State machine safety still folds (term, hash)
+    per index; §8's check 4 adds `effect` to that value when the checks are keyed by
+    range, which is the next PR.
+
+**Alternatives.**
+
+- *Stamping the range in the environment rather than on the event.* `SimEnv::trace` knows
+  the node, not the replica; one node will run many ranges from Stage B. Rejected.
+- *Keeping `RaftRead` in the core and adding the key there.* The core holds neither the
+  key — it stays in the server's `reads` map — nor an engine version. Rejected: §8 and
+  §11 raft 15 both say the record must be the serving server's.
+- *Reading the applied index from `RaftStore::applied()`, the in-memory atomic.* It is
+  free and moves no schedule, but it is the store's newest applied index, not the one of
+  the version the value came from; a read served from an older snapshot would carry a
+  newer index and check 9 would read the wrong descriptor. Rejected. A map from engine
+  version to applied index, kept in memory, would also avoid the extra read; it is more
+  state to keep correct across a re-open for a figure the engine can be asked for, and
+  §11 raft 15 names `Engine::snapshot` and `get_at`. Rejected.
+- *Defining only the three emitted events now.* The export's `convert` is an exhaustive
+  match, so a later stage adding an event cannot compile without its export line; adding
+  them all now is what §8's "every new event kind" asks for and lets the checks of the
+  next PR be written against a type that exists.
+
+**Consequences.**
+
+- *No pinned trace hash moves.* The tree holds exactly one, echo's golden body hash in
+  `sim/tests/echo.rs`, and the echo scenario runs no Raft, so it is unchanged — the
+  moirae repository's studio fixture, which is pinned to it, does not move either. §11's
+  env item 1 anticipated that every pinned hash would move once; on this tree there is
+  none to move. The raft, membership and quorum traces all change: every `Raft*` line
+  about a replica carries `range`, `ananke.raft.apply` carries `effect` and a `key`, and
+  `ananke.raft.read` is written by the server with `key` and `applied`.
+- *Every raft, membership and quorum schedule moves on any seed that serves a read.*
+  Serving a read now takes two reads at one engine version where it took one read of the
+  latest state, and the second read can await the disk, which redraws the schedule from
+  the first served read on. This is the one behavioural change in the commit. Every
+  pinned seed in `sim/tests` is re-audited in the same commit; the table is below.
+- *The correct system passes every seed* at 20, 100 and 1 000 seeds, and every variant
+  keeps the standard and the tier it held before.
+- *`RefusalNotDurable`'s catch rate moved* from 9 of the first thousand seeds to 7,
+  0.7 %, and its first catch from seed 158 to seed 102. The assertion stays at the
+  thousand-seed tier under D-061's rule; at 0.7 % a hundred seeds miss about half the
+  time and a thousand about once in a thousand.
+- *Coverage counters are added for the three events this commit emits*, each asserted
+  above zero at every tier together with the seeds that saw one, which is the rate
+  D-061 measures over: match starts in the raft sweep, and match starts, learner rounds,
+  learner rounds that caught up and accepted changes in the membership sweep. Measured
+  at a thousand seeds in release on this tree: the raft sweep sees 18 373 match starts
+  on 1 000 of 1 000 seeds; the membership sweep sees 11 671 match starts, 5 171 learner
+  rounds of which 2 494 caught up, and 3 143 accepted changes, each on 1 000 of 1 000
+  seeds. At 100 % these are far above D-061's 5 % bar at every tier: every leader's
+  first answer from a follower raises `matched`, and the membership driver grows the
+  configuration on every seed.
+- *RAFT.md §2's event table is updated in the same commit* (D-053): the `range` rule and
+  its three exceptions, `RaftApply`'s `key` and `effect`, `RaftRead`'s move and its two
+  new fields, and the three new events.
+- *The next PR* keys checks 1 to 4 by range and adds check 4's `effect`; the checks of
+  §8 that fold the events defined here arrive with the stages that emit them.
+
+**The per-seed re-audit** (CLAUDE.md:58-67, and the owner's ask on this PR). Every pinned
+seed in `sim/tests`, with what it asserts on the moved schedule — its mechanism, or the
+situation's absence with the reason. No pin is left asserting green alone.
+
+| Pin | On this tree |
+|---|---|
+| `seed_164_…_stays_green` (raft) | Absence, unchanged. No snapshot-fed timer gap on the run; `snapshot_fed_timer_gaps` empty, and the pin fails the day it is not. |
+| `seed_385_…_stays_green` | Absence, unchanged. `timer_gaps_rescued_by_restatement` empty: the replay without D-039's arm finds no gap, so there is no stretch for a restatement to rescue. |
+| `seed_2605_…_adoption_window…` | **Was a mechanism, now an absence.** The correct run holds 14 adoption windows but the replay without D-063's arm finds no gap at all, so no window lies inside one. The search of the first thousand seeds for a home found none: 0 of 1000 reach a gap holding a completed install, so the pin stays here as an asserted absence, as D-056's did for seed 132's pair. Its pair moved too: `ResetTimerOnAnyRpc` is no longer caught here, because the run's majority is not up at the end and RAFT.md §2's carve-out withholds the timer bound; the replay still finds the variant out twice, which is asserted, as is the carve-out being the reason. The variant's catch is asserted at every tier by its own sweep. |
+| `seed_7381_…_stays_green` | Absence, unchanged. `recoveries_under_a_lost_floor` and `floor_lowering_installs` both empty. |
+| `seed_6325_…_stays_green` | Absence, unchanged, under both servers: adoption windows present (non-vacuity asserted) and no crash inside one. |
+| `seed_5909_…_stays_green` | **Mechanism, moved instants.** D-042's refusal → reset → re-seed is still on server 3, now refused at 18.200834224 s on the marker its lost-state refusal wrote, reset at 18.206060773 s, re-seeded at 18.492068093 s. No stream wedge; 29 takes, no index twice. |
+| `seed_5909_passes_under_both_bugs_together` | **Mechanism, one set changed.** Under `IgnoreIncarnation` alone server 3's progress still goes stale and now also leaves server 3 uncounted after the last heal, where it left nothing before; the stream half and the pair are unchanged ([], and [1] stale and uncounted). Each run's stale and uncounted sets are asserted exactly. |
+| `seed_132_…_reaches_no_wedge` | **Was "reaches nothing", now a mechanism and an absence.** Every one of the four runs refuses server 2 at least once, where the pair and the stream half refused nothing before, so `IgnoreIncarnation` has something to ignore: under the pair leader 3 of term 13 had 335 acknowledged, server 2 is refused at 13.750549431 s, and of 806 probes after it 778 are rejected and none accepted, leaving server 2 the one follower uncounted after the last heal — one, not the wedge's two. The stream half stays out of reach for its old reason, no index taken twice, which is asserted with its non-vacuity. The fix — refusal, reset, re-seed — is asserted where the leader keeps D-042's rule. |
+| `seed_680_…_no_longer_wedges` | Mechanism, unchanged: the stream half's shape reached (re-takes under live streams that still complete), D-042's half under the pair, one uncounted follower, and no wedge. |
+| `seed_687_…_stays_green` | **The two halves swapped.** The fix's half is here now and is asserted record by record: table 34 dropped at 19.024651157 s, the engine quiesced at 19.061652101 s, the node restarted at 19.083 s, and that open refused at 19.093731093 s on the durable mark, with the quiesced engine writing no manifest, switching no `CURRENT`, deleting no log segment and opening clean nowhere before the install adopted at 19.318300999 s. The bug's half is absent with its reason: as built no engine on the run reports lost state at all, so there is no refusal for a flush to launder and no crash lands on a refused server. |
+| `seed_1885_…_no_longer_straddles…` | Absence, unchanged: no term change straddles any isolation's start, the check by durability time flags nothing, and the isolation the nightly named does not begin. |
+| `seed_2023_…_no_longer_straddles…` | Absence, unchanged, the same three ways. |
+| `seed_1_of_the_term_raise_schedule…` | **Mechanism, count changed 4 → 5.** Every one of the run's five isolations now straddles, where four did; the first — server 2, term 1 to 2, decided 1.217846847 s at the delivery of server 1's RequestVote of term 2 and traced 2.758 ms into the window at 1.220607818 s — is unchanged instant for instant, and is what the pin names. D-050's shape is still absent here, which is asserted. |
+| `seed_4_of_the_term_raise_schedule…` | Mechanism, unchanged: exactly one change received before an isolation and stepped inside it, server 3 from term 4 to 5, receipt 2.853812638 s, isolation 2.85382 s, step 2.853832880 s. |
+| `seed_158_pins_the_refusal_that_is_not_durable…` | **Was the mechanism, now an absence, and renamed** to `seed_158_which_pinned_the_refusal_that_is_not_durable_before_the_read_moved_loses_nothing`. No open on either run drops a table, so no engine reports lost state: the variant has no refusal to launder and the correct server has nothing to quiesce. The seed still refuses stores — a log that stops at a bad checksum, an unreadable manifest, an unreadable marker — which is asserted as the companion that keeps the absence from being vacuous. |
+| `seed_102_pins_the_refusal_that_is_not_durable…` | **New**, the re-pin the search found: `RefusalNotDurable` is caught on 7 of the first thousand seeds (102, 293, 378, 465, 744, 893, 926) and seed 102 is the first. The mechanism is asserted whole — table 6 dropped at 13.556327079 s, the lost-state refusal at 13.578870962 s, the crash on the refused server and its restart, the second refusal at 13.67192931 s, the refused engine's flush and manifest 10 without table 6, `CURRENT` switched at 13.690493628 s, the orphan removal of `000006.sst`, the clean open at applied 331 with no install between, and state machine safety's report of it — with the correct server's half absent here and its reason asserted. |
+| `seed_119_…_refuses_nothing` | Absence, unchanged: neither run refuses a store, the two traces are record for record the same, and no crash lands on a refused server. |
+| `the_nightlys_eleven_variant_catches…` | Eleven (seed, variant) pins, each an absence of the straddle: unchanged, all eleven. The companion fact moved: the one run whose leader steps down leaving a follower uncounted is seed 3087's, not seed 1252's, and the pin asserts which rather than that none does. |
+| `the_nightlies_removed_catches…` | Twenty-eight (seed, variant) pins, each an absence of the catch: unchanged, all twenty-eight, and no catch is added on any. Two companion facts moved. The runs that keep the isolation their catch named are now six, seed 5918's having come back (5203, 6691, 5051, 5879, 5918, 2578). And three runs are now caught over their own variant's bug rather than passing — seed 2305 under `SnapshotWithoutCurrentLast` by state machine safety at applied 282 over index 281 (it was 288 over 279), seed 6717 under `ResetTimerOnAnyRpc` by the timer check, and seed 9557 under `AdoptionAsBuilt` by committed-entries-stay, server 2 truncating from index 1 — each asserted by its words, and `checked` asserts for each that decision time removes nothing. Seed 5153's replay by durability time finds three gaps where it found five, on a run the timer bound is still not asked of, which is asserted. |
+| `the_seed_42_trace_is_written_for_the_studio` (raft) | Not a mechanism pin: it writes `out/raft-42.jsonl` and asserts the run's shape. Green; the trace's content moved with the new fields, as the whole commit's does. |
+| `same_seed_gives_byte_identical_trace` (raft, echo, wal, engine) | Determinism pins. Green: two runs of one seed still agree byte for byte. |
+| `trace_hash_matches_the_pinned_golden` (echo) | The one pinned trace hash in the tree. **Unmoved**: echo runs no Raft. |
+| `the_membership_scenario_has_byte_identical_traces_for_one_seed` (seed 7) | Determinism pin on the membership scenario. Green. |
+| `seed_420_…`, `seed_44_…`, `seed_3123_…` (engine) | The engine scenario's three pins. Green and unmoved: the engine sweep runs no Raft, so nothing on their schedules changed. |
+| The quorum tests (`the_correct_leader_steps_down_on_a_blocked_reseed…`, `a_leader_that_counts_a_refused_followers_rejections…`, `a_leader_that_counts_nothing_from_a_refused_follower…`, `on_the_sweeps_disk_the_install_silence_deposes_the_leader…`) | Not seed pins: each asserts on *every* seed of the directed quorum scenario. Each holds its standard — the correct leader steps down naming the refused follower on every seed, and each variant is caught on every seed — on the moved schedule. |
+
+---
+
+_Next entry: D-070. Add one before implementing anything not covered above._
