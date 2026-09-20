@@ -8037,7 +8037,9 @@ none in `ananke-raft`, none in `ananke-server`, none in the raft, membership or 
 scenarios — and a server's engine is fixed for the life of its incarnation, since a
 re-seed opens a fresh one in a new directory behind a restart. Stage B's live per-range
 install (SHARD.md §11, storage 8; Q15) is what first makes the straddle possible, so
-that item carries this caveat: it must say what a read served across an install of its
+that item carries this caveat — **filed as issue #72**, which states what it must settle and
+what it measured, so it cannot be lost between two PRs as D-030's account of seed 164 once
+was: it must say what a read served across an install of its
 own range sees, and either order the two reads against the switch or read the descriptor
 the same way. The caveat is on `RaftStore::applied_at`'s own doc comment, where the next
 caller will read it. `applied_at` also answers `Ok(0)` where the key is absent at that

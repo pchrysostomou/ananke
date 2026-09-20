@@ -982,8 +982,9 @@ impl<E: Environment> RaftStore<E> {
     /// `ananke-server` or in the raft scenarios — and a server's engine is fixed for
     /// the life of its incarnation, a re-seed opening a fresh one in a new directory
     /// behind a restart. Stage B's live per-range install (SHARD.md §11, storage 8)
-    /// is what makes the straddle possible, and that item carries this caveat: it
-    /// must say what a read served across an install of its own range sees.
+    /// is what makes the straddle possible, and that item carries this caveat, filed
+    /// as issue #72: it must say what a read served across an install of its own
+    /// range sees.
     ///
     /// Zero where the key is absent at that version, which is to say where nothing
     /// had applied when it was taken. A served read cannot see it: the core holds a
