@@ -1254,9 +1254,14 @@ impl Report {
     /// (D-035), so while it counts for commits it cannot help elect, and a range
     /// whose impaired replicas reach half has no leader to wait for: a refused
     /// replica can only be re-seeded *by* a leader, so the deadlock is real and
-    /// priced into D-035, not a liveness failure. The release run's seed 60 reached
-    /// exactly that: one server quarantined by an early re-seed, a second refused by
-    /// rot, and the last pre-voting forever with nobody left to grant.
+    /// priced into D-035, not a liveness failure. Seed 8 reaches exactly that, and
+    /// is the seed of this tree that does: rot refuses server 2, a leader re-seeds
+    /// it and the quarantine sticks (D-035); rot then refuses server 1, which no
+    /// leader ever re-seeds; and server 3 is left with nobody able to grant it a
+    /// vote. Its live set is empty and nothing about time is asked of the run.
+    /// (D-030 and D-035 tell the same story of seed 60 of *their* release runs;
+    /// every schedule has been redrawn since, and seed 60 of this tree has its
+    /// range live.)
     ///
     /// A node's refusal is its whole store's, so every replica on it counts as
     /// refused (SHARD.md §8); its re-seed and its quarantine are per replica.
@@ -1619,8 +1624,15 @@ impl Report {
 
     /// Every range the trace shows a replica of on `server`, from `records`, the
     /// [`Report::pre_vote_records`]: the replicas whose terms the pre-vote property
-    /// is asked of. A `RangeCreated` names its node and no server, as every record
-    /// carries its node (SHARD.md §8).
+    /// is asked of, which are the replicas that stepped.
+    ///
+    /// A replica's term record is the only thing read. A `RangeCreated` on the node
+    /// adds nothing: a replica that ever steps traces a term record, and one that
+    /// never steps has no term to keep — while the creation's `floor_term` would be
+    /// read as the term the window began with and its absent term record as 0, so
+    /// an arm for it could only report a raise "from `floor_term` to 0" that never
+    /// happened. The creation is still read for the floor term of a replica that
+    /// *does* step ([`Report::created_term_in`]).
     // PROPOSED(D-071): pre-vote's property is per (range, server).
     fn ranges_of(records: &[&TraceRecord], server: u64) -> BTreeSet<u64> {
         records
@@ -1629,11 +1641,6 @@ impl Report {
                 TraceEvent::RaftTerm {
                     server: s, range, ..
                 } if *s == server => Some(*range),
-                TraceEvent::RangeCreated { range, .. }
-                    if record.node.map(|node| u64::from(node.get())) == Some(server) =>
-                {
-                    Some(*range)
-                }
                 _ => None,
             })
             .collect()
@@ -6133,6 +6140,54 @@ mod tests {
             Vec::new(),
         );
         assert_eq!(whole_node.ranges_with_a_majority_up(), BTreeSet::new());
+    }
+
+    /// And the carve-out is read where it is *used*, not only where it is
+    /// computed: the check about time asks it of the gap's own range. Server 1
+    /// holds two ranges; both replicas of the other range are quarantined by a
+    /// re-seed, so that range has no majority and the range beside it does. The
+    /// live range's replica then hears nothing for 500 ms, past its 400 ms bound,
+    /// and is the violation. A check that asked the cluster-wide
+    /// [`Report::majority_up`] — false here, since one range is short — would skip
+    /// every gap of the run and pass: the wedged range beside a live one of
+    /// SHARD.md §8, seen from the consuming end.
+    #[test]
+    fn a_live_ranges_gap_is_flagged_though_the_range_beside_it_has_no_majority() {
+        let quarantined = |server, range| TraceEvent::RaftReseeded { server, range };
+        let report = report(
+            vec![
+                record(
+                    ms(0),
+                    ms(0),
+                    Some(1),
+                    term_of(1, SINGLE_GROUP, 1, "follower"),
+                ),
+                record(ms(0), ms(0), Some(1), term_of(1, OTHER, 1, "follower")),
+                record(ms(1), ms(1), Some(1), quarantined(1, OTHER)),
+                record(ms(2), ms(2), Some(2), quarantined(2, OTHER)),
+                record(
+                    ms(500),
+                    ms(500),
+                    None,
+                    TraceEvent::TimeAdvanced { to: ms(500) },
+                ),
+            ],
+            Vec::new(),
+        );
+        assert_eq!(
+            report.ranges_with_a_majority_up(),
+            BTreeSet::from([SINGLE_GROUP])
+        );
+        assert!(!report.majority_up(), "the cluster-wide reading is false");
+        let gaps = report.timer_gaps(TimerResets::ALL);
+        let live_gap = gaps
+            .iter()
+            .find(|gap| gap.range == SINGLE_GROUP)
+            .expect("the live range's replica is past its bound");
+        assert_eq!(
+            report.timers_fire_by(RecordTime::Decided),
+            Err(live_gap.violation())
+        );
     }
 
     /// The write bound is asked per key (SHARD.md §8): one key's write completing

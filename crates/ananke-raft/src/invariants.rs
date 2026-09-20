@@ -332,9 +332,11 @@ impl Applied {
             return Ok(());
         };
         if (other.term, other.hash) != (entry.term, entry.hash) {
+            // The comparison is of (term, payload), so the message names both: a
+            // disagreement over the payload alone read as "term 1 ... and term 1".
             return Err(format!(
-                "state machine safety: index {index} of group {group} was applied as term {} on one server and term {} on server {server}",
-                other.term, entry.term
+                "state machine safety: index {index} of group {group} was applied as term {} payload {:#x} on one server and term {} payload {:#x} on server {server}",
+                other.term, other.hash, entry.term, entry.hash
             ));
         }
         match (other.effect, entry.effect) {

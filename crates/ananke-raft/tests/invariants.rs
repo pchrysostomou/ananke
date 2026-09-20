@@ -377,12 +377,19 @@ fn two_groups_may_apply_different_entries_at_one_index() {
     check(&[apply(1, A, 1, 1, 0xaa), apply(2, B, 1, 3, 0xbb)]).unwrap();
 }
 
-/// And within one group it is the violation it always was.
+/// And within one group it is the violation it always was. The value compared is
+/// (term, payload), so the message names both: a disagreement over the payload
+/// alone — the second pair here — read as "term 1 ... and term 1" while the
+/// message named the terms it did not differ in.
 #[test]
 fn one_group_may_not_apply_two_entries_at_one_index() {
     assert_eq!(
         check(&[apply(1, A, 1, 1, 0xaa), apply(2, A, 1, 3, 0xbb)]).unwrap_err(),
-        "state machine safety: index 1 of group 2 was applied as term 1 on one server and term 3 on server 2"
+        "state machine safety: index 1 of group 2 was applied as term 1 payload 0xaa on one server and term 3 payload 0xbb on server 2"
+    );
+    assert_eq!(
+        check(&[apply(1, A, 1, 1, 0xaa), apply(2, A, 1, 1, 0xbb)]).unwrap_err(),
+        "state machine safety: index 1 of group 2 was applied as term 1 payload 0xaa on one server and term 1 payload 0xbb on server 2"
     );
 }
 
