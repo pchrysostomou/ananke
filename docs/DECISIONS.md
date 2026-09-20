@@ -7994,7 +7994,8 @@ served: at one engine version rather than two reads of the latest state.
 **Decision.**
 
 *A range on every `Raft*` event about a replica.* Twenty-three event kinds gain a `range:
-u64` field, and so does `RaftProposed`, which §9's history closure needs. The three
+u64` field — every `Raft*` event about a replica, `RaftProposed` among them, which §9's
+history closure needs (SHARD.md:1128). The three
 events about a node's *store* — `RaftRefused`, `RaftAdopted` and `RaftServerFailed` —
 stay per node and carry none, as §8 says (SHARD.md:1127-1129). The moirae export writes
 `range` immediately after `server`, so a studio filter carves a per-range trace
@@ -8139,6 +8140,21 @@ Six supporting enums and one struct come with them: `ApplyEffect`, `RangeCause`,
 - *RAFT.md §2's event table is updated in the same commit* (D-053): the `range` rule and
   its three exceptions, `RaftApply`'s `key` and `effect`, `RaftRead`'s move and its two
   new fields, and the three new events.
+- *`scripts/premerge.sh` at a thousand seeds on the commit's own tree, a7c9f54*:
+  **1 615 s** (26 min 55 s), green, on an 8-core Apple M2, with the one-minute load
+  sampled every ten seconds over the run — 160 samples, mean 18.39, maximum 43.34 — so
+  the machine was not idle and the figure is an upper bound. Against Stage A's exit,
+  593.87 s at mean load 20.87 (D-060), and D-068's tree. The growth is the stage's
+  accumulated sweeps, not this commit alone; the rates it prints are below.
+- *Every variant's catch rate at a thousand seeds on this tree*, against the tier each
+  asserts at: `RefusalNotDurable` 7 (0.7 %, from the thousand-seed tier, D-061),
+  `LeaseTrustsTheClock`'s stale read 40 (4.0 %, same tier; it was 37), `SharedSnapshotDir`
+  1 and `IgnoreIncarnation` 0 (both asserted only at the nightly's ten thousand, as
+  before), `AdoptionAsBuilt` 62, `SingleMajorityInJointConsensus` 230,
+  `SnapshotWithoutCurrentLast` 334, `ResetTimerOnAnyRpc` 341,
+  `CountOlderTermForCommit` 449, `ApplyBeforeCommit` 882, `TruncateOnEveryAppend` 999,
+  `NoPreVote`, `SendBeforePersist`, `RefusedNeverCounts` and `RefusedCountsForQuorum`
+  1 000. No variant changed the tier it asserts at.
 - *The next PR* keys checks 1 to 4 by range and adds check 4's `effect`; the checks of
   §8 that fold the events defined here arrive with the stages that emit them.
 
