@@ -290,6 +290,9 @@ _Update this section at the end of every session._
   With one group a wrongly keyed check is invisible to every sweep, so each keyed check
   has a hand-made two-range case of its own and every wrong key was planted in a
   throwaway copy and shown to fail one: the table is in D-071.
+  `scripts/premerge.sh` at a thousand seeds: green in 713.53 s on AC power at mean load
+  29.64. The per-key write bound runs 214 ms under its 2 s on the worst key of the
+  thousand seeds, where the minimum over every write ran 886 ms under it.
 - Next concrete task: Phase 3 Stage B (SHARD.md §12), the node: many groups on one
   socket, one ticker and one engine — after the owner's review of Stage A at its exit
   criteria. Issue #37: a refused server's silence while it verifies, repairs and

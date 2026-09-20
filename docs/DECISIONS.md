@@ -8415,7 +8415,8 @@ The pairs' other halves — the one-range violations — are in the same files b
    term 5 of group 2", "server 1 applied index 1 of group 2 after 1" — and four pinned
    literals in `sim/tests/raft.rs` moved with them, on the same seeds, over the same
    mechanisms. **The pre-vote violation does not name the range**: it is asserted word for
-   word by forty-four pinned seeds, a run of this stage has one range, and the stage that
+   word by forty-four pinned assertions in `sim/tests/raft.rs`, a run of this stage has
+   one range, and the stage that
    gives a node many ranges moves every one of those pins for its own reasons (SHARD.md,
    Stage B: the node and the seed switch each move every schedule). Naming it there costs
    nothing and naming it here would rewrite forty-four assertions twice.
@@ -8454,7 +8455,15 @@ The pairs' other halves — the one-range violations — are in the same files b
    cleared a quarantine, the range read as live, and the liveness check was asked of a
    run RAFT.md §2 withholds it from. The pair of sets is the tree's own reading, now per
    replica.
-9. *The pinned-seed straddle predicates keep the per-node skip.* `Report::isolation_term_straddles`
+9. *`sim/membership.rs`'s own write bound is left alone.* §8 keys the checks about time
+   where RAFT.md §2's run and cites the raft sweep's own lines for both the majority
+   carve-out (sim/raft.rs:967-986) and the write bound (sim/raft.rs:990-998); the
+   membership scenario's liveness is D-029's availability check, its bound is asked of
+   every uniform seed with no carve-out, and keying it per key is an assertion that
+   would need its own thousand-seed measurement on a scenario this build does not
+   otherwise touch. It is keyed by the stage that runs that scenario on the node with
+   four ranges, which is Stage B's own exit criterion.
+10. *The pinned-seed straddle predicates keep the per-node skip.* `Report::isolation_term_straddles`
    and `isolation_received_straddles` describe the situation a seed was pinned for and
    read the isolated *server*'s term records; they skip an isolation in which any replica
    on the node was refused, re-seeded or finished installing (`reseeding_during_any`),
@@ -8464,16 +8473,30 @@ The pairs' other halves — the one-range violations — are in the same files b
 **Measurements.**
 
 - *The correct system, at 1 000 seeds in release on this tree*: green, every seed, with
-  the per-key write bound. The worst first completion of a write after the last heal,
-  over every key of every seed — the figure the bound is asked against, which the raft
-  sweep's coverage now prints as `slowest_write_after_heal` — is 1.114 s against the
-  bound of 2 s. It was the best of the keys before, and the same 1.114 s: no key of the
-  thousand seeds is slower than the one the old check measured. At the gate's twenty and
-  CI's hundred the sweep is green too.
+  the per-key write bound, and green at the gate's twenty and CI's hundred. **The margin
+  is worth knowing.** The raft sweep's coverage prints `slowest_write_after_heal`, and it
+  now prints the figure the bound is asked against — the worst first completion of a
+  write after the last heal over every key of every seed, where it printed the best of
+  the keys. Over the same thousand runs, which are deterministic and so are the same
+  runs either way, the best of the keys is 1.114473988 s and the worst is 1.785543304 s,
+  against the bound of ten maximum election timeouts, 2 s: the per-key check runs 214 ms
+  under it where the old one ran 886 ms under it. The bound is SHARD.md's and
+  `LIVENESS_TIMEOUTS`'s and is not moved here; what is recorded is that a change which
+  redraws the schedules has a fifth of the bound to play with on this check, not a half,
+  and that the next stage's four ranges per node will want this figure measured again.
 - *Every variant keeps its standard at its tier*, the gate's twenty and the premerge's
-  thousand: no variant's catch moved, since no schedule moved and the checks say of one
-  group exactly what they said before.
-- *The premerge* is below.
+  thousand, and every rate is the one D-069 recorded: `TruncateOnEveryAppend` 999 of
+  1 000, `LeaseTrustsTheClock`'s stale read 40 of the 503 seeds whose drift exceeds the
+  bound, with the guard revoking on every one of them. No catch moved, because no
+  schedule moved and the checks say of one group exactly what they said before.
+- *`scripts/premerge.sh` at a thousand seeds on this tree*: **green in 713.53 s** real
+  (4 879.02 s user, 196.76 s sys), on the 8-core Apple M2 **on AC power** — the machine
+  throttles on battery — with the load sampled every ten seconds through the run at mean
+  29.64, minimum 12.11 and maximum 95.08, which is the premerge's own parallelism and
+  nothing else of this session running. It is inside D-040's quarter of an hour. Against
+  the figures beside it: D-071 changes no code that runs in a simulation, so this is a
+  measurement of the machine and the tier, not of the change; the pair D-069 recorded
+  says what a change costs, and nothing here needs that number.
 
 ---
 

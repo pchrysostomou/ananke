@@ -1786,7 +1786,7 @@ impl Report {
     /// election of its own.
     ///
     /// The violation names the server, the terms and the window and not the range,
-    /// which forty-four pinned seeds assert word for word and a run of this stage
+    /// which forty-four pinned assertions take word for word and a run of this stage
     /// has one of; the stage that gives a node many ranges moves those pins and
     /// names it there (SHARD.md, Stage B, the commits that move schedules).
     // PROPOSED(D-071): pre-vote's property is per (range, server).

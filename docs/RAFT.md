@@ -409,7 +409,8 @@ a leader's commit index only ever lands on an entry of its own term; *committed
 entries stay*, no server truncates at or below its own commit index. Two checks are
 about time and run only on seeds the simulator scheduled uniformly, where no task can
 be starved (D-016), and only of a *range* whose replicas that are neither refused nor on a
-re-seeded store form a majority at the end of the run (PROPOSED D-071; SHARD.md §8): a refused replica can only be
+re-seeded store form a majority at the end of the run (PROPOSED D-071; SHARD.md
+§8): a refused replica can only be
 re-seeded by a leader and a re-seeded one never votes, so a range whose impaired
 replicas are not a minority cannot elect a leader if it loses the one it has, which is
 the availability D-035 gives up and not a liveness failure (D-030, D-035), and it is
@@ -426,7 +427,8 @@ scaled by its own node's clock rate, without a reset, has started an election (m
 range's heartbeats do not stand in for another's silence on the same node (PROPOSED
 D-071). A reset is the delivery of an AppendEntries or an `InstallSnapshot` chunk of
 that replica's term or later, whoever sends it (D-030); a vote it granted; a campaign;
-its start; its `RangeCreated`; its step-down as leader; and the restatement of an install on a server that
+its start; its `RangeCreated`; its step-down as leader; and the restatement of an
+install on a server that
 never went down, whose new incarnation draws a fresh timer (D-039). A replica's
 `RangeRemoved` ends its timer: there is no replica left to campaign. *Running* means
 holding a live incarnation: one ends at a shutdown, a crash, or a **completed install**,
@@ -442,7 +444,7 @@ isolation takes the term of its `RangeCreated` as the term the isolation began w
 since the replica did not exist at the start. An isolation in which the node was
 refused, or that replica was re-seeded or completed an install, is skipped, since the
 install restates the term the stream carried (D-030). The violation names the server,
-the terms and the window and not the range, which forty-four pinned seeds assert word
+the terms and the window and not the range, which forty-four pinned assertions take word
 for word and a run of this stage has one of; the stage that gives a node many ranges
 moves those pins and names it there.
 
@@ -728,7 +730,8 @@ leader proposed cannot have taken effect and leaves the history; one proposed an
 applied stays pending. An entry is an entry of one Raft group, so a proposal and an
 apply are matched by `(range, index, term)`: with several groups in one trace, an
 operation proposed at (5, 2) in one range must not be closed by another range's apply
-of its own (5, 2) (PROPOSED D-071; SHARD.md §9). A pending operation is a candidate at every step of the
+of its own (5, 2) (PROPOSED D-071; SHARD.md §9). A pending operation is a candidate
+at every step of the
 search, so closing them is what keeps the search small. The search has a budget of
 states per key; exhausting it is reported apart from a violation, and the correct
 server must never reach it.
@@ -737,7 +740,8 @@ server must never reach it.
 independent registers, so the history partitions by key: a history is linearizable iff
 each key's sub-history is. Which range served an operation is not part of the
 operation, so a key's register is one register whichever range served it and no
-boundary moves the partition (SHARD.md §9). Each partition is checked on its own, so the search is small
+boundary moves the partition (SHARD.md §9). Each partition is checked on its own,
+so the search is small
 even over long runs, and each per-key search returns the linearization it found as a
 timeline of (time, value). There is no scan and no scan check: scans are multi-key
 reads, and the distributed scans that read across ranges are SPEC §6's, in Phase 5
