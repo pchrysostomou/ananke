@@ -1408,12 +1408,14 @@ fn the_nightlies_removed_catches_meet_the_sweeps_assertions() {
         );
         eprintln!("seed {seed} under {variant:?}: {verdict:?}");
         if *seed == 5153 {
-            // The key layout and the format record (D-060) moved this schedule again.
-            // The nightly's own gap is gone from the replay by durability time, and what
-            // that replay finds instead is five other stretches on a run the timer bound
-            // is not asked of at all: its schedule is not uniform, or its majority is not
-            // up, so §2's carve-out (D-035) withholds the bound and neither reading makes
-            // a catch of them. That is why nothing is removed here.
+            // The key layout and the format record (D-060) moved this schedule, and the
+            // read's move to the server that serves it (D-069) moved it again: the count
+            // below was five stretches before that and is three now. The nightly's own
+            // gap is gone from the replay by durability time, and what that replay finds
+            // instead is three other stretches on a run the timer bound is not asked of
+            // at all: its schedule is not uniform, or its majority is not up, so §2's
+            // carve-out (D-035) withholds the bound and neither reading makes a catch of
+            // them. That is why nothing is removed here.
             assert!(
                 durable_gaps > 0 && !names_the_nightlys && !asked && removed.is_empty(),
                 "seed 5153 under {variant:?}: the replay by durability time finds \
@@ -2578,7 +2580,9 @@ fn seed_158_which_pinned_the_refusal_that_is_not_durable_before_the_read_moved_l
 /// refusal it has nothing to change, and its trace is the correct server's record for
 /// record. The test asserts that absence with its reason, so the day the seed refuses a
 /// store again it says so and the pin can be made to assert what each server does with
-/// it; the mechanism itself is pinned on seed 158 above.
+/// it; the mechanism itself is pinned on seed 102 above, the first of the seven seeds of
+/// the first thousand the variant is caught on since the read moved (D-069), seed 158
+/// above having become an asserted absence with it.
 ///
 /// This pin has no companion showing its matcher can find a refusal, and cannot have
 /// one: seed 119 refuses nothing under `Correct`, `RefusalNotDurable`,
@@ -2986,15 +2990,16 @@ fn a_leader_that_trusts_the_clock_is_caught_and_the_guard_revokes() {
     // D-061, the owner's rule of 2026-09-15: a variant caught on under 5 % of seeds
     // asserts its catch from the thousand-seed tier (the premerge and the nightly), its
     // firing at every tier above, and its rate printed at every tier. The stale read is
-    // caught on 37 of the first thousand seeds on this tree, 3.7 % (41, 4.1 %, on the
-    // tree with D-056's send queue alone, before the key layout redrew them), and was on
-    // 472 of the ten thousand of the nightlies before the queue, 4.72 %; the drift
-    // exceeds the bound on 503 of the thousand seeds and the guard revokes on every one
-    // of them. The rate that carries the assertion is over the tier's seeds, as every
-    // row of D-061's table is: at 3.7 % the gate's twenty catch none with probability
-    // 0.963^20 = 0.47 and a hundred with 0.963^100 = 0.023, so the assertion there would
+    // caught on 40 of the first thousand seeds on this tree, 4.0 % (37, 3.7 %, before
+    // the read moved to the server it is served on, D-069; 41, 4.1 %, on the tree with
+    // D-056's send queue alone, before the key layout redrew them), and was on 472 of
+    // the ten thousand of the nightlies before the queue, 4.72 %; the drift exceeds the
+    // bound on 503 of the thousand seeds and the guard revokes on every one of them.
+    // The rate that carries the assertion is over the tier's seeds, as every row of
+    // D-061's table is: at 4.0 % the gate's twenty catch none with probability
+    // 0.96^20 = 0.44 and a hundred with 0.96^100 = 0.017, so the assertion there would
     // fail a tree with nothing wrong the day a change redraws the schedules; a thousand
-    // catch none with probability 0.963^1000 = 8e-17.
+    // catch none with probability 0.96^1000 = 1.9e-18.
     if seeds() >= 1000 {
         assert!(stale > 0, "LeaseTrustsTheClock was never caught");
     }
@@ -3395,9 +3400,6 @@ impl Coverage {
             ),
             ("commits", self.commits as u64),
             ("applies", self.applies as u64),
-            // PROPOSED(D-069): `RaftMatchStarted`, seen on every seed of this sweep.
-            ("match starts", self.match_starts as u64),
-            ("seeds with a match start", self.seeds_with_a_match_start),
             ("bit rot", self.bit_rot as u64),
             ("puts", self.puts),
             ("gets", self.gets),
@@ -3410,6 +3412,18 @@ impl Coverage {
         ] {
             assert!(seen > 0, "the sweep never saw {what}: {self:?}");
         }
+        // PROPOSED(D-069): `RaftMatchStarted` is on every seed of this sweep, not
+        // merely somewhere in it: every leader's first answer from a follower raises
+        // `matched` under the incarnation it carried, so the count is 1 000 of 1 000
+        // seeds at the premerge and every tier below. A whole-sweep total above zero
+        // is what a wrong emission rule passes; the seeds are what a rule that stops
+        // emitting on a tier's worth of seeds fails. The rate is over the seeds the
+        // assertion sees, as D-061 measures it: 100 %.
+        assert_eq!(
+            self.seeds_with_a_match_start, self.seeds,
+            "a run of this sweep saw no leader's match rise under a follower's incarnation: \
+             {self:?}"
+        );
         // A refusal needs bit rot to land in a table or a log block still in use:
         // twenty seeds cannot promise one; a hundred can. The same goes for what
         // follows from a refusal — the re-seed — and for a resumed stream, which
@@ -3804,18 +3818,14 @@ impl MembershipCoverage {
             ("completed operations", self.completed),
             ("uniformly scheduled seeds", self.uniform_seeds),
             ("log compactions", self.compactions as u64),
-            // PROPOSED(D-069): SHARD.md §8's three events the core already does
-            // the work for. Each is on every seed of this scenario at every tier:
-            // the driver grows the configuration, so a change is accepted and a
-            // learner catches up, and every leader's first answer from a follower
-            // raises `matched` under the incarnation it carried.
-            ("match starts", self.match_starts as u64),
-            ("learner rounds", self.learner_rounds as u64),
+            // PROPOSED(D-069): a round that caught up inside the minimum election
+            // timeout is the one of the four that is not on every seed — 2 494 rounds
+            // over 1 000 seeds, against 5 171 rounds — so it is the one asserted as a
+            // whole-sweep total. The other three are asserted per seed below.
             (
                 "learner rounds that caught up",
                 self.learner_rounds_caught_up as u64,
             ),
-            ("changes accepted", self.changes_accepted as u64),
         ] {
             assert!(seen > 0, "the membership runs never saw {what}: {self:?}");
         }
@@ -3823,6 +3833,28 @@ impl MembershipCoverage {
             self.seeds_with_a_snapshot_fed_joiner, seeds,
             "a membership run fed no joining server a snapshot in its learner phase: {self:?}"
         );
+        // PROPOSED(D-069): SHARD.md §8's three events the core already does the work
+        // for, each on *every* seed of this scenario and asserted seed by seed: the
+        // driver grows the configuration on every seed, so a change is accepted and a
+        // learner is tracked and caught up, and every leader's first answer from a
+        // follower raises `matched` under the incarnation it carried. Measured at a
+        // thousand seeds in release: 1 000 of 1 000 for each. A total above zero is
+        // what an emission rule gone wrong passes — one event on one seed satisfies
+        // it — and these say the rule fires where it must. The rate is over the seeds
+        // the assertion sees, as D-061 measures it: 100 % for all three.
+        for (what, seen) in [
+            (
+                "a leader's match rise under a follower's incarnation",
+                self.seeds_with_a_match_start,
+            ),
+            (
+                "a learner's catch-up round",
+                self.seeds_with_a_learner_round,
+            ),
+            ("an accepted change", self.seeds_with_a_change_accepted),
+        ] {
+            assert_eq!(seen, seeds, "a membership run saw no {what}: {self:?}");
+        }
         // PROPOSED(D-058): every seed adopts installs, and none is refused for anything
         // but lost state, which each run's check also fails.
         assert!(self.adoptions > 0, "no install was adopted: {self:?}");
