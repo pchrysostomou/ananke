@@ -8632,6 +8632,18 @@ earlier draft of this list miscounted it as a violation.
   the figures beside it: D-071 changes no code that runs in a simulation, so this is a
   measurement of the machine and the tier, not of the change; the pair D-069 recorded
   says what a change costs, and nothing here needs that number.
+- *And again at a thousand seeds after this entry's review fixes* (fc21689 and 8ce19a3, on
+  the same 8-core Apple M2, again **on AC power**): **green in 625.01 s** real (4 465.90 s
+  user, 180.21 s sys), with the load sampled every ten seconds at mean 12.70, minimum 9.38
+  and maximum 16.16 over 63 samples — lower than the run above because that one built the
+  tree first and this one had it built. The whole suite is green in release at CI's
+  hundred too. The figure that matters is not the time: **nothing moved.** The raft
+  sweep's `slowest_write_after_heal` is 1.785543304 s to the nanosecond, the same run it
+  was above, and every variant's rate is the one recorded here and by D-069 —
+  `TruncateOnEveryAppend` 999 of 1 000, `LeaseTrustsTheClock`'s stale read 40 of the 503
+  seeds whose drift exceeds the bound with the guard revoking on all 503. A check whose
+  message changed (item 14) and a check whose arm was deleted (item 12) leave the
+  schedules exactly where they were, which is what the two runs being the same run says.
 
 ---
 

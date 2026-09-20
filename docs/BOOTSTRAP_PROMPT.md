@@ -292,7 +292,22 @@ _Update this section at the end of every session._
   throwaway copy and shown to fail one: the table is in D-071.
   `scripts/premerge.sh` at a thousand seeds: green in 713.53 s on AC power at mean load
   29.64. The per-key write bound runs 214 ms under its 2 s on the worst key of the
-  thousand seeds, where the minimum over every write ran 886 ms under it.
+  thousand seeds — a *tenth* of the bound, one of its ten election timeouts — where the
+  minimum over every write ran 886 ms under it.
+  An adversarial review re-ran the whole oracle and found one major gap and eight smaller
+  points, fixed in fc21689 and 8ce19a3. The major one: the majority carve-out's case
+  asserted the helper and not the key, so replacing both of the carve-out's *uses* with
+  the cluster-wide reading passed every tier; the new case
+  `a_live_ranges_gap_is_flagged_though_the_range_beside_it_has_no_majority` drives the
+  consuming end and is the only case that fails under that mutation. The oracle is re-run
+  whole and logged (23 rows, none green), `Report::ranges_of` loses a `RangeCreated` arm
+  that could only misfire, check 4's mismatch message names the payload beside the term,
+  and D-071 now says plainly that **nothing in the tree emits `RangeCreated` or
+  `RangeRemoved`**, that both are trusted unconditionally until §8's check 7 exists, and
+  that a refusal over-impairs by marking the node down for every range of the run — for
+  the node's PR to close. The premerge at a thousand seeds on the fixed tree: green in
+  625.01 s on AC power, with `slowest_write_after_heal` and every variant rate identical,
+  so nothing moved.
 - Next concrete task: Phase 3 Stage B (SHARD.md §12), the node: many groups on one
   socket, one ticker and one engine — after the owner's review of Stage A at its exit
   criteria. Issue #37: a refused server's silence while it verifies, repairs and
