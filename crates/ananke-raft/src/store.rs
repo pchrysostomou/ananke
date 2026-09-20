@@ -968,7 +968,30 @@ impl<E: Environment> RaftStore<E> {
     /// at that engine version, which the apply batch that wrote it wrote with the
     /// entry's own writes. A read taken at the same snapshot is therefore the
     /// state at exactly this index, which is what a served read records
-    /// (SHARD.md §8, §11 raft 15). Zero where nothing has applied at that version.
+    /// (SHARD.md §8, §11 raft 15).
+    ///
+    /// **The one version is one version while no live span install and no range
+    /// delete runs on this engine.** [`Engine::get_at`] excepts exactly those: from
+    /// an install's or a range delete's switch, a read at a version *below* the
+    /// install's number sees the span it replaced as empty rather than as it stood
+    /// (D-054, and [`Snapshot`]'s own documentation). A value and an applied index
+    /// taken at one version could then straddle a switch and be the state at no
+    /// index at all. Nothing can reach that today: `Engine::install_span`,
+    /// `install_spans`, `delete_range` and `delete_ranges` have no caller outside
+    /// ananke-storage's own tests and the engine sweep — none in this crate, in
+    /// `ananke-server` or in the raft scenarios — and a server's engine is fixed for
+    /// the life of its incarnation, a re-seed opening a fresh one in a new directory
+    /// behind a restart. Stage B's live per-range install (SHARD.md §11, storage 8)
+    /// is what makes the straddle possible, and that item carries this caveat: it
+    /// must say what a read served across an install of its own range sees.
+    ///
+    /// Zero where the key is absent at that version, which is to say where nothing
+    /// had applied when it was taken. A served read cannot see it: the core holds a
+    /// confirmed read until `applied >= index` and a read's index is at or above the
+    /// leader's first entry of its term, so at least one apply — which writes this
+    /// key in its own batch — is durable at the version the read is served from. The
+    /// raft sweeps fold that: every `RaftRead`'s `applied` is at or above its index
+    /// (`sim/raft.rs`), and a zero here would be below it.
     ///
     /// # Errors
     ///

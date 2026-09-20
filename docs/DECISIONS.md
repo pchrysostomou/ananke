@@ -7989,7 +7989,7 @@ reason in the commit" (SHARD.md:1933-1935).
 
 This entry is the trace alone. It changes what is recorded and what the existing checks
 read, not what the system does — with one exception, stated below, which is how a read is
-served: at one engine version rather than two reads of the latest state.
+served: two reads at one engine version, where it was one read of the latest state.
 
 **Decision.**
 
@@ -8024,6 +8024,28 @@ version is the state at exactly that index. `Output::ReadReady` gains `lease`, s
 core is where the lease is known and the server is where the record is written. The
 record's own time is when the server answered, and it carries the decision stamp of the
 step that confirmed the read (D-047).
+
+*The one version is one version while no live span install and no range delete runs on
+this engine.* `Engine::get_at` excepts exactly those: from an install's or a range
+delete's switch, a read at a version below the install's number sees the span it replaced
+as empty rather than as it stood (D-054, engine.rs:783-788, 1275-1281). A value and an
+applied index taken at one version could then straddle a switch and be the state at no
+index at all, which is stronger than the guarantee stated above. Nothing reaches it
+today, and the tree says so: `install_span`, `install_spans`, `delete_range` and
+`delete_ranges` have no caller outside ananke-storage's own tests and the engine sweep —
+none in `ananke-raft`, none in `ananke-server`, none in the raft, membership or quorum
+scenarios — and a server's engine is fixed for the life of its incarnation, since a
+re-seed opens a fresh one in a new directory behind a restart. Stage B's live per-range
+install (SHARD.md §11, storage 8; Q15) is what first makes the straddle possible, so
+that item carries this caveat: it must say what a read served across an install of its
+own range sees, and either order the two reads against the switch or read the descriptor
+the same way. The caveat is on `RaftStore::applied_at`'s own doc comment, where the next
+caller will read it. `applied_at` also answers `Ok(0)` where the key is absent at that
+version; a served read cannot see it, since the core holds a confirmed read until
+`applied >= index` and a read's index is at or above the leader's first entry of its
+term, so at least one apply — which writes that key in its own batch — is durable at the
+version served from. The sweeps fold it anyway: every `RaftRead`'s `applied` is at or
+above its `index`, and a zero would be below it.
 
 *The new event kinds of §8.* All twenty-two are added to `TraceEvent` with the fields
 §8's table lists, each with its `convert` arm in the moirae bridge and its row in the
@@ -8067,7 +8089,18 @@ Six supporting enums and one struct come with them: `ApplyEffect`, `RangeCause`,
 5. *`RaftChangeAccepted` is traced for every change the core does not refuse*, including
    one naming the voters already in force, which the core accepts and the server answers
    `Done` for. "Accepted" is what the caller is told, and check 22 folds what the caller
-   was told.
+   was told. Two consequences of that reading, stated so a check does not read the
+   record for more than it says. *It counts accepted requests, not changes.* A re-sent
+   `Change` naming the voters of the change already under way is not refused either —
+   it asks for what is already true (D-029, core.rs:1985-1991) — so it is accepted and
+   traced again, and one change can carry several records, each with the `applied` and
+   `term` of its own acceptance. A count of these records is a count of what the leader
+   answered `Done`, never a count of configurations. *It is traced after the entry it
+   accepts.* The record is written at the end of `on_change`, after `append_joint` has
+   appended and replicated the joint entry (core.rs:2050-2058), so the joint entry's
+   `RaftAppend` and `RaftConfig` precede the `RaftChangeAccepted` that reports accepting
+   it; a fold that expects the acceptance first would see none. The learner branch
+   traces in the same place, before any of the change's entries exist.
 6. *`RaftMatchStarted` is also traced when an install's answer raises `matched`* — the
    install's answer carries the follower's incarnation and is recorded by the same
    `note_incarnation` (core.rs). §8's wording is "the first rise ... under the store
@@ -8121,22 +8154,67 @@ Six supporting enums and one struct come with them: `ApplyEffect`, `RangeCause`,
   latest state, and the second read can await the disk, which redraws the schedule from
   the first served read on. This is the one behavioural change in the commit. Every
   pinned seed in `sim/tests` is re-audited in the same commit; the table is below.
+- *A served read pins an engine version for as long as it is being served*, which is the
+  second thing that changed beyond the trace. The `Engine::snapshot` the server takes is
+  a live snapshot in the engine's set until it is dropped, and compaction's
+  `smallest_snapshot` (compaction.rs:85) is the oldest live one: while a read is served,
+  compaction cannot drop the versions at or above it, so a round that overlaps a read
+  keeps writes it would otherwise have merged away. The window is one `get_at` and one
+  `applied_at`, either of which can await the disk, and a read that is never served
+  cannot hold one: the version is taken in the `ReadReady` arm and dropped before the
+  client is answered (node.rs). Nothing measures the retention today; it is named here
+  because a per-range read of Stage B holds a version per read in flight, where this
+  holds at most one per server.
 - *The correct system passes every seed* at 20, 100 and 1 000 seeds, and every variant
   keeps the standard and the tier it held before.
 - *`RefusalNotDurable`'s catch rate moved* from 9 of the first thousand seeds to 7,
   0.7 %, and its first catch from seed 158 to seed 102. The assertion stays at the
   thousand-seed tier under D-061's rule; at 0.7 % a hundred seeds miss about half the
   time and a thousand about once in a thousand.
-- *Coverage counters are added for the three events this commit emits*, each asserted
-  above zero at every tier together with the seeds that saw one, which is the rate
-  D-061 measures over: match starts in the raft sweep, and match starts, learner rounds,
-  learner rounds that caught up and accepted changes in the membership sweep. Measured
-  at a thousand seeds in release on this tree: the raft sweep sees 18 373 match starts
-  on 1 000 of 1 000 seeds; the membership sweep sees 11 671 match starts, 5 171 learner
-  rounds of which 2 494 caught up, and 3 143 accepted changes, each on 1 000 of 1 000
-  seeds. At 100 % these are far above D-061's 5 % bar at every tier: every leader's
-  first answer from a follower raises `matched`, and the membership driver grows the
-  configuration on every seed.
+- *Coverage counters are added for the three events this commit emits*: match starts in
+  the raft sweep, and match starts, learner rounds, learner rounds that caught up and
+  accepted changes in the membership sweep. Measured at a thousand seeds in release on
+  this tree: the raft sweep sees 18 373 match starts on 1 000 of 1 000 seeds; the
+  membership sweep sees 11 671 match starts, 5 171 learner rounds of which 2 494 caught
+  up, and 3 143 accepted changes, each on 1 000 of 1 000 seeds. Four of the five are on
+  every seed, so each is asserted *per seed* — `seeds_with_a_match_start == seeds` in
+  both sweeps, and the learner rounds and the accepted changes the same way in the
+  membership sweep — which is what D-061's rule asks of a counter at 100 %: the rate is
+  over the seeds the assertion sees, and a whole-sweep total above zero is not a rate at
+  all, since one event on one seed satisfies it however the emission rule behaves
+  elsewhere. Rounds that *caught up* are 2 494 over 5 171 rounds and are not on every
+  seed, so that one stays a total above zero. The counters as first written asserted
+  only totals, and the membership sweep's three per-seed counters were printed and never
+  asserted; both are corrected here.
+- *What the counters cannot see, and what does.* A counter says an event fired, never
+  that it fired by its rule. Emitting `RaftMatchStarted` on *every* rise of `matched`
+  rather than the first under an incarnation — deleting one clause from the core's
+  guard — raises the raft sweep's count from 1 840 to 63 164 at a hundred seeds, on
+  every one of which a match start is still seen, with every seed still green (measured
+  on this tree with the fold below silenced). So the sweeps fold the rule itself, per
+  run: at most one `RaftMatchStarted` per (leader, term, follower, incarnation), which
+  that mutation fails on the first seed. What remains unverified is the rest of the
+  rule — that an
+  event fires *where it must*, and in particular that the first rise after a re-add is
+  the one traced. Nothing in the tree reads these three records yet: §8's checks are
+  keyed by range and arrive with the stages that emit the rest of §8's events, and the
+  re-add window assertion of §8 comes with Stage D's `IncarnationFromRangeStream`
+  variant (SHARD.md:2583), the known-buggy pair that makes `RaftMatchStarted` the record
+  a check turns on. Until then these events are recorded, counted per seed and held to
+  the one-per-window rule, and nothing more is claimed for them.
+- *The payload's own structure is folded by the sweeps*, since nothing else reads it.
+  Before this, no code in the tree read `range`, `key`, `effect` or a read's `applied`:
+  a mutation stamping the wrong range on one event kind, `applied` on a configuration
+  entry, or dropping the `key` from a single-key apply passed 20 and 100 seeds green.
+  The raft and membership checks now fold three structural facts over the records they
+  already walk — every `Raft*` record about a replica carries `node::SINGLE_GROUP`; an
+  apply is `applied` with a key or `none` without one, and no other effect exists at
+  this stage; a read's `applied` is at or above its `index` — and each of the three
+  mutations above now fails, naming the record, as does a fourth stamping a single-key
+  apply `none`. They are the oracle the checks of §8 will replace. Both folds are green
+  on every seed at the gate's twenty and at CI's hundred; the thousand-seed premerge
+  below was run before them, so the next premerge is the first to run them at that
+  tier.
 - *RAFT.md §2's event table is updated in the same commit* (D-053): the `range` rule and
   its three exceptions, `RaftApply`'s `key` and `effect`, `RaftRead`'s move and its two
   new fields, and the three new events.
@@ -8150,9 +8228,18 @@ Six supporting enums and one struct come with them: `ApplyEffect`, `RangeCause`,
   | this commit, a7c9f54 | 1 476 s | 17.15 | 893.2 s | 538.2 s | 23.3 s |
   | `main`, b292034 | 1 473 s | 20.16 | 888.2 s | 541.2 s | 22.9 s |
 
-  **This change costs 5 s on the raft binary, 0.6 %**, nothing on the engine binary, which
-  came out 3 s faster, and nothing on the WAL's. The two-reads-at-one-version of `RaftRead`
-  and the fields on every replica event are inside the noise of one run.
+  The raft binary came out 5 s slower here, the engine binary 3 s faster and the WAL's
+  0.4 s slower. **What this pair supports is that the change makes no difference the
+  premerge can see, not a figure of 0.6 %.** It is one unrepeated measurement; its two
+  halves ran at different loads (mean 17.15 against 20.16, sampled every ten seconds) on
+  a machine measured between 1.7 and 2.4 times slower than it was two days earlier; and
+  the two raft binaries do not run the same work — this branch's has 44 tests to `main`'s
+  43, the new one being seed 102's pin, which is two full scenario runs of its own, so
+  part of the 5 s is a test `main` does not run. The engine binary, which this change
+  does not touch, moved 3 s the other way on the same pair, which is the size of the
+  noise. A cost for the two-reads-at-one-version of `RaftRead` and the fields on every
+  replica event would take the pair repeated, with the test sets matched; no decision
+  here needs that number.
 
   Both trees are over D-040's quarter of an hour on this machine today, and `main` is over it
   by itself: the same code that ran the premerge in 613 s two days ago (D-068, on ea44e38)
