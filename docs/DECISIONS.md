@@ -8296,6 +8296,52 @@ situation's absence with the reason. No pin is left asserting green alone.
 | `seed_420_…`, `seed_44_…`, `seed_3123_…` (engine) | The engine scenario's three pins. Green and unmoved: the engine sweep runs no Raft, so nothing on their schedules changed. |
 | The quorum tests (`the_correct_leader_steps_down_on_a_blocked_reseed…`, `a_leader_that_counts_a_refused_followers_rejections…`, `a_leader_that_counts_nothing_from_a_refused_follower…`, `on_the_sweeps_disk_the_install_silence_deposes_the_leader…`) | Not seed pins: each asserts on *every* seed of the directed quorum scenario. Each holds its standard — the correct leader steps down naming the refused follower on every seed, and each variant is caught on every seed — on the moved schedule. |
 
+## PROPOSED D-070 — The premerge says what machine it ran on
+
+**Context.** D-052 set how the premerge is measured: warm build, the one-minute load
+sampled, the figure recorded beside the last one. D-069 then measured the same tree twice
+and found the protocol was not enough. `scripts/premerge.sh` ran in **613 s** on 2026-09-19
+and in **1 473 s** on 2026-09-20 on this laptop, with no code between them that touched the
+sweeps; the raft binary went from 535.9 s (D-063) to 888.2 s for the same tests. Every
+premerge figure in this document was therefore incomparable with every other, and D-069's
+own paired run — both trees measured back to back — was the only honest way to say what a
+change cost. A figure that cannot be compared is a figure that misleads: the owner asked,
+on 2026-09-20, that a slow run explain itself in its own output rather than become a mystery
+a week later.
+
+**The cause, most likely, and the reason this is cheap to fix.** The machine was on battery
+and discharging at 29 % when the slow figures were taken; macOS throttles sustained load on
+battery, and `pmset -g therm` records no thermal warning in that state, so nothing in the
+old output said anything was different. One line of the run's own output would have said it.
+
+**Decision.** `scripts/premerge.sh` prints, before the sweeps and again after them:
+
+- the kernel, the processor and the core count, once;
+- the one, five and fifteen-minute load averages;
+- the power source — `AC Power` or `Battery Power` on macOS, the `online` flag under
+  `/sys/class/power_supply` on Linux;
+- any thermal pressure — the CPU speed limit `pmset -g therm` reports, or "no thermal
+  warning recorded"; `thermal_zone0` on Linux;
+- and its own wall time, so a run's cost and the state it ran in are in the same three lines.
+
+The state after the sweeps is printed whether they passed or failed, and a failed run says so
+with its own time: the machine's state matters most exactly when a run was slow or red, so the
+script keeps the sweeps' status and reports it after that line rather than ending at the
+failure.
+
+Whatever a machine does not report reads `unknown`, never nothing: a missing field must be
+visibly missing. The script runs on macOS and on Linux, and adds no dependency.
+
+**Consequences.**
+
+- A premerge figure quoted in an entry carries the state it was taken in, and two figures
+  are comparable only when their states are.
+- D-052's protocol stands, with this added: a figure from another day is evidence only
+  beside its machine state, and what a change costs is still the paired measurement D-069
+  used — both trees, one session, one machine.
+- The gate and the nightly are unchanged. The gate is a yes or no, and the nightly runs on
+  GitHub's runners, whose own variance issue #57 records.
+
 ---
 
-_Next entry: D-070. Add one before implementing anything not covered above._
+_Next entry: D-071. Add one before implementing anything not covered above._
