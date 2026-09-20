@@ -464,13 +464,13 @@ impl Report {
                 "setup: no leader opened a snapshot stream to the refused follower within {STREAM_WAIT:?}"
             ));
         };
-        let events: Vec<TraceEvent> = self.records.iter().map(|r| r.event.clone()).collect();
-        if let Err(violation) = invariants::all(&events) {
+        if let Err(violation) = invariants::all(crate::traced(&self.records)) {
             return fail(violation);
         }
-        if let Err(violation) =
-            invariants::commit_majority(&events, usize::try_from(SERVERS).expect("small"))
-        {
+        if let Err(violation) = invariants::commit_majority(
+            crate::traced(&self.records),
+            usize::try_from(SERVERS).expect("small"),
+        ) {
             return fail(violation);
         }
         if let Err(violation) = lin::check(&self.history) {

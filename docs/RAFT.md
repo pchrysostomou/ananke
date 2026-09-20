@@ -325,28 +325,48 @@ checker, `invariants::Checker`, that keeps every check's state across calls: the
 feeds it only the records since its last look, every ten slices of fifty milliseconds
 of virtual time, and stops the run at its first violation; and at the end of the run
 the same folds run again over the whole trace from its first record, a second opinion
-on every seed (D-046). The rest are in `sim/` and run at the end:
+on every seed (D-046). The rest are in `sim/` and run at the end.
 
-1. **Election safety.** Fold `RaftLeader` events: a map from term to the node that
-   became leader in it; a second node for a term is a violation. Cheap, exact.
-2. **Log matching.** Reconstruct each node's log from `RaftAppend`, `RaftTruncate` and
-   `RaftSnapshot` events as a map from index to (term, hash). After every event, for
-   the node it touches and every other node holding the same index with the same term,
-   every index below must agree in term and hash. Incremental: the new entry's index is
-   the only one that can newly violate it.
+Every one of checks 1 to 4 is a property of *one Raft group* and is keyed by the group
+each event names (PROPOSED D-071; SHARD.md §8): the leader of each (group, term), the
+log and floor of each (group, server), the committed set of each group, and what each
+group's index applied as. The crate names no range — a group is an opaque id,
+`node::SINGLE_GROUP` while a server runs one group — and the checker is fed each event
+with the node that traced it, since `RangeCreated` and `RangeRemoved` name their range
+and their node and no server (`invariants::Traced`).
+
+1. **Election safety.** Fold `RaftLeader` events: a map from (group, term) to the node
+   that became leader in it; a second node for one of those is a violation. Two groups
+   electing in one term are two elections. Cheap, exact.
+2. **Log matching.** Reconstruct each *replica's* log — one per (group, server) — from
+   `RaftAppend`, `RaftTruncate` and `RaftSnapshot` events as a map from index to
+   (term, hash). After every event, for the replica it touches and every other replica
+   of that group holding the same index with the same term, every index below must
+   agree in term and hash. One node's two groups hold two logs and share nothing.
+   A `RangeCreated` sets its replica's floor as an installed snapshot does, so a group
+   born above index 0 starts at that floor with no log below it (PROPOSED D-071).
+   Incremental: the new entry's index is the only one that can newly violate it.
 3. **Leader completeness.** From `RaftCommit` on a leader, the set of committed
-   (index, term, hash). At every `RaftLeader` event, the new leader's reconstructed log
-   must contain every entry committed in an earlier term. Also checked, as the property
+   (index, term, hash) *per group*. At every `RaftLeader` event, the new leader's
+   reconstructed log must contain every entry committed in an earlier term **of that
+   group**, which is the set the rescan reads. Also checked, as the property
    that makes rule 2 of moirae's list bite: an entry counted committed must have
    been appended on a majority of the configuration then in force, which the
-   reconstructed logs and `RaftConfig` events show.
-4. **State machine safety.** Fold `RaftApply`: a map from index to (term, hash); a
-   second value for an index is a violation. The event's `effect` joins that value
-   when the checks are keyed by range (SHARD.md §8, check 4); the fold here still
-   holds term and hash. Per node, applied indices must be the
-   consecutive integers from one, so an entry applied twice or skipped shows here as
+   reconstructed logs and `RaftConfig` events show. A group's first configuration —
+   the one in force on a replica that has traced no `RaftConfig` — is the voters of its
+   `RangeCreated`, and servers 1 through the cluster's count for a group whose creation
+   the trace does not hold (PROPOSED D-071).
+4. **State machine safety.** Fold `RaftApply`: a map **per group** from index to
+   (term, hash, effect); a second value for an index of a group is a violation, so two
+   replicas that apply one entry to different effects — one executing a client's
+   command, another refusing it — are seen at the second (PROPOSED D-071). Per (group,
+   server), applied indices must be the
+   consecutive integers from the floor a `RangeCreated` or an install sets, so an entry
+   applied twice or skipped shows here as
    well, which is where the applied index being written in the same batch as the
-   entry's writes (§3) is proven. An apply durable at a crash but not yet traced
+   entry's writes (§3) is proven. A `RangeRemoved` ends that (group, server)'s memory
+   the way a node's `RaftRefused` ends its store's, so a group removed from a node and
+   created there again starts clean. An apply durable at a crash but not yet traced
    shows at the restart as `RaftRecovered` carrying an applied index past the last
    traced apply; the entries between are what the server's log holds there, and
    are checked like any other. For the same reason a restarting server re-states
@@ -356,11 +376,16 @@ on every seed (D-046). The rest are in `sim/` and run at the end:
    server took moves nothing, and a refusal removes the floor, so every applied
    index a restart restates past the floor must be held by its restated log: that
    is how both a store switched to without its repair and a refusal a restart
-   forgot are seen (D-030, D-038, D-044).
+   forgot are seen (D-030, D-038, D-044). The refusal is the node's and clears every
+   group on it; the entries a recovered applied index accounts for are read from the
+   replica's log, which holds the entry and not what applying it did, so they agree
+   with any effect.
 5. **Linearizability of the KV API.** The history is the `ClientInvoke` and
    `ClientReturn` pairs with their virtual times, checked by the checker in §4. An
    operation that never returned, because its client's node crashed or the run ended,
-   is kept as pending and may take effect or not, as porcupine treats it.
+   is kept as pending and may take effect or not, as porcupine treats it. An entry is
+   an entry of one group, so the closure that ends a pending operation is keyed by
+   (range, index, term) (§4; PROPOSED D-071).
 6. **Lease safety under drift.** For every `RaftRead` with `lease` set, served while
    the simulator's clock drift between the leader and some voter exceeded the
    configured `drift_bound` over the lease period, either a `RaftLeaseRevoked` event on
@@ -371,7 +396,10 @@ on every seed (D-046). The rest are in `sim/` and run at the end:
    checker in §4 is what decides staleness; the guard's sufficiency is never assumed.
    The read's event is the serving server's since D-069, so what the fold sees is
    exactly the reads a client was answered from, each with the key and the applied
-   index of the engine version it was answered at.
+   index of the engine version it was answered at. It is per range, and carried over as
+   what it is: not a fold, but check 5 on every seed — whose closure is keyed by range —
+   and the test that runs each drift-exceeded seed with the guard and without it
+   (SHARD.md §8, check 6; PROPOSED D-071).
 
 Three more folds check the rules behind the properties directly, so a broken rule is
 seen the first time it is exercised and not only when its consequence happens to
@@ -380,29 +408,43 @@ after the persist says, on a majority when it did; *commit by current term* (§5
 a leader's commit index only ever lands on an entry of its own term; *committed
 entries stay*, no server truncates at or below its own commit index. Two checks are
 about time and run only on seeds the simulator scheduled uniformly, where no task can
-be starved (D-016), and only where the servers that are neither refused nor on a
-re-seeded store form a majority at the end of the run: a refused server can only be
-re-seeded by a leader and a re-seeded one never votes, so a cluster whose impaired
-servers are not a minority cannot elect a leader if it loses the one it has, which is
+be starved (D-016), and only of a *range* whose replicas that are neither refused nor on a
+re-seeded store form a majority at the end of the run (PROPOSED D-071; SHARD.md §8): a refused replica can only be
+re-seeded by a leader and a re-seeded one never votes, so a range whose impaired
+replicas are not a minority cannot elect a leader if it loses the one it has, which is
 the availability D-035 gives up and not a liveness failure (D-030, D-035), and it is
-also where `IgnoreIncarnation`'s wedge would stall a commit (§5, D-042). After the last
-fault heals, a client write completes within ten maximum election timeouts. And a
-running server that is not leading and not on a re-seeded store, and has gone two
+also where `IgnoreIncarnation`'s wedge would stall a commit (§5, D-042). A node's
+refusal is its whole store's, so every replica on it counts as refused. After the last
+fault heals, a client write to **every key** of such a range completes within ten
+maximum election timeouts: a single minimum over every write is passed by a wedged
+range beside a live one, so the bound is asked of each key some client wrote to after
+the heal (PROPOSED D-071). And a
+running replica that is not leading its range and not on a re-seeded store, and has gone two
 maximum election timeouts,
-scaled by its own clock's rate, without a reset, has started an election (moirae rule
-5, D-028). A reset is the delivery of an AppendEntries or an `InstallSnapshot` chunk of
-the server's term or later, whoever sends it (D-030); a vote it granted; a campaign;
-its start; its step-down as leader; and the restatement of an install on a server that
-never went down, whose new incarnation draws a fresh timer (D-039). *Running* means
+scaled by its own node's clock rate, without a reset, has started an election (moirae rule
+5, D-028). The check is per (range, server): a replica's timer is its own, so one
+range's heartbeats do not stand in for another's silence on the same node (PROPOSED
+D-071). A reset is the delivery of an AppendEntries or an `InstallSnapshot` chunk of
+that replica's term or later, whoever sends it (D-030); a vote it granted; a campaign;
+its start; its `RangeCreated`; its step-down as leader; and the restatement of an install on a server that
+never went down, whose new incarnation draws a fresh timer (D-039). A replica's
+`RangeRemoved` ends its timer: there is no replica left to campaign. *Running* means
 holding a live incarnation: one ends at a shutdown, a crash, or a **completed install**,
 which retires the incarnation and leaves the server adopting the staged store with no
 core and no election timer until its restatement starts the next one, so the bound is
 not asked of it across that window any more than it is of a crashed server before its
 restart (PROPOSED D-063, which supersedes D-039's arm in the check). One check is
-pre-vote's own property (thesis §9.6): a server the schedule isolated has, at the heal,
-the term it had when the isolation began; an isolation in which the server was refused,
-re-seeded or completed an install is skipped, since the install restates the term the
-stream carried (D-030).
+pre-vote's own property (thesis §9.6), asked of each of the isolated node's replicas
+(PROPOSED D-071): a replica on a server the schedule isolated has, at the heal,
+the term it had when the isolation began — a term is a range's, and one range's
+election says nothing of another's. A range created on the isolated node during the
+isolation takes the term of its `RangeCreated` as the term the isolation began with,
+since the replica did not exist at the start. An isolation in which the node was
+refused, or that replica was re-seeded or completed an install, is skipped, since the
+install restates the term the stream carried (D-030). The violation names the server,
+the terms and the window and not the range, which forty-four pinned seeds assert word
+for word and a run of this stage has one of; the stage that gives a node many ranges
+moves those pins and names it there.
 
 A record carries two times (D-047). A server traces a step's events once what they
 report is durable (D-026), so a record's time is its durability time; beside it the
@@ -683,14 +725,19 @@ abandoned operation whose entry applied took effect then, so it returns at the a
 at the time the apply was durable, the latest its effect can have become visible
 (D-047), with a result the client never saw and the model may give it any; one no
 leader proposed cannot have taken effect and leaves the history; one proposed and never
-applied stays pending. A pending operation is a candidate at every step of the
+applied stays pending. An entry is an entry of one Raft group, so a proposal and an
+apply are matched by `(range, index, term)`: with several groups in one trace, an
+operation proposed at (5, 2) in one range must not be closed by another range's apply
+of its own (5, 2) (PROPOSED D-071; SHARD.md §9). A pending operation is a candidate at every step of the
 search, so closing them is what keeps the search small. The search has a budget of
 states per key; exhausting it is reported apart from a violation, and the correct
 server must never reach it.
 
 **Partitioning.** Every operation is on one key, and the KV model is a product of
 independent registers, so the history partitions by key: a history is linearizable iff
-each key's sub-history is. Each partition is checked on its own, so the search is small
+each key's sub-history is. Which range served an operation is not part of the
+operation, so a key's register is one register whichever range served it and no
+boundary moves the partition (SHARD.md §9). Each partition is checked on its own, so the search is small
 even over long runs, and each per-key search returns the linearization it found as a
 timeline of (time, value). There is no scan and no scan check: scans are multi-key
 reads, and the distributed scans that read across ranges are SPEC §6's, in Phase 5

@@ -12,6 +12,14 @@
 //! proposed but never applied stays pending. A pending operation is a candidate at
 //! every step of the search, so closing them is what keeps the search small.
 //!
+//! An entry is an entry of one Raft group, so the closure is keyed by `(range,
+//! index, term)` (SHARD.md §9): a trace of several groups holds an entry (5, 2) in
+//! each of them, and an operation proposed at (5, 2) in one range must not be
+//! closed — given a return time it never had — by another range's apply of its own
+//! (5, 2). Nothing else about the search knows of ranges: the model is a product of
+//! independent registers and a key's register is one register whichever range
+//! served it, so a split, a merge or a move changes no partition (SHARD.md §9).
+//!
 //! Single-key operations partition by key, since the store is a product of
 //! independent registers, so each key is searched on its own: a state is the set of
 //! operations linearized so far and the register's value, and a state seen once is
@@ -28,6 +36,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use ananke_env::sim::TraceRecord;
 use ananke_env::{ClientOp, ClientResult, Instant, TraceEvent};
 use bytes::Bytes;
+
+/// One entry of one Raft group, as `(range, index, term)`: what a proposal names
+/// and what an apply closes (SHARD.md §9). With several groups in one trace the
+/// index and the term alone name an entry in each of them.
+// PROPOSED(D-071): the history's closure keyed by (range, index, term).
+type EntryId = (u64, u64, u64);
 
 /// One client operation of the history.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -65,8 +79,13 @@ impl History {
     pub fn from_trace(records: &[TraceRecord]) -> Self {
         let mut ops: Vec<Op> = Vec::new();
         let mut open: BTreeMap<(u64, u64), usize> = BTreeMap::new();
-        let mut proposed: BTreeMap<(u64, u64), Vec<(u64, u64)>> = BTreeMap::new();
-        let mut applied_at: BTreeMap<(u64, u64), Instant> = BTreeMap::new();
+        // The proposals and the applies are keyed by (range, index, term): an entry
+        // is an entry *of one group*, and with several groups in one trace an
+        // operation proposed at (5, 2) in one range would otherwise be closed by
+        // the first apply of (5, 2) in any range (SHARD.md §9; §11, env 9).
+        // PROPOSED(D-071): the history's closure keyed by (range, index, term).
+        let mut proposed: BTreeMap<(u64, u64), Vec<EntryId>> = BTreeMap::new();
+        let mut applied_at: BTreeMap<EntryId, Instant> = BTreeMap::new();
         for record in records {
             match &record.event {
                 TraceEvent::ClientInvoke { client, seq, op } => {
@@ -91,6 +110,7 @@ impl History {
                     }
                 }
                 TraceEvent::RaftProposed {
+                    range,
                     client,
                     seq,
                     index,
@@ -100,12 +120,17 @@ impl History {
                     proposed
                         .entry((*client, *seq))
                         .or_default()
-                        .push((*index, *term));
+                        .push((*range, *index, *term));
                 }
                 TraceEvent::RaftApply {
-                    index, entry_term, ..
+                    range,
+                    index,
+                    entry_term,
+                    ..
                 } => {
-                    applied_at.entry((*index, *entry_term)).or_insert(record.at);
+                    applied_at
+                        .entry((*range, *index, *entry_term))
+                        .or_insert(record.at);
                 }
                 _ => {}
             }
@@ -413,6 +438,7 @@ fn timeline(ops: &[&Op], order: &[usize]) -> Timeline {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ananke_env::{ApplyEffect, NodeId};
     use std::time::Duration;
 
     fn at(ms: u64) -> Instant {
@@ -552,6 +578,96 @@ mod tests {
     fn a_value_nobody_wrote_is_a_violation() {
         let h = history(vec![put(1, 0, Some(1), "a"), get(2, 2, 3, Some("z"))]);
         assert!(check(&h).is_err());
+    }
+
+    /// A trace of two ranges, with a write proposed in one of them and never
+    /// applied there, and the other range's entry at the same (index, term)
+    /// applied: the record the closure keyed by (index, term) alone would close
+    /// the write at (SHARD.md §9).
+    ///
+    /// Every event of every sweep in this tree carries one range, so the two
+    /// keyings say the same thing on every seed; this is the history that tells
+    /// them apart. `applied_in` is the range whose apply is traced.
+    fn two_range_trace(applied_in: u64) -> Vec<TraceRecord> {
+        let record = |ms, event| TraceRecord {
+            at: at(ms),
+            decided: at(ms),
+            node: Some(NodeId::new(1)),
+            event,
+        };
+        vec![
+            record(
+                0,
+                TraceEvent::ClientInvoke {
+                    client: 1,
+                    seq: 0,
+                    op: ClientOp::Put {
+                        key: b("k"),
+                        value: b("a"),
+                    },
+                },
+            ),
+            record(
+                10,
+                TraceEvent::RaftProposed {
+                    server: 1,
+                    range: 2,
+                    client: 1,
+                    seq: 0,
+                    index: 5,
+                    term: 2,
+                },
+            ),
+            record(
+                50,
+                TraceEvent::RaftApply {
+                    server: 1,
+                    range: applied_in,
+                    index: 5,
+                    entry_term: 2,
+                    hash: 0xaa,
+                    key: Some(b("k")),
+                    effect: ApplyEffect::Applied,
+                },
+            ),
+            record(
+                100,
+                TraceEvent::ClientInvoke {
+                    client: 2,
+                    seq: 0,
+                    op: ClientOp::Get { key: b("k") },
+                },
+            ),
+            record(
+                110,
+                TraceEvent::ClientReturn {
+                    client: 2,
+                    seq: 0,
+                    result: ClientResult::Value(None),
+                },
+            ),
+        ]
+    }
+
+    /// The write was proposed in range 2 and only range 3's entry at (5, 2)
+    /// applied, so the write never took effect: it stays pending, and a later read
+    /// seeing nothing is linearizable. A closure keyed by (index, term) alone would
+    /// close it at range 3's apply, force it before the read, and report a
+    /// violation of nothing.
+    #[test]
+    fn an_operations_proposal_is_closed_only_by_its_own_ranges_apply() {
+        let history = History::from_trace(&two_range_trace(3));
+        assert_eq!((history.closed_by_apply, history.pending()), (0, 1));
+        check(&history).unwrap();
+    }
+
+    /// And the apply of the range it was proposed in closes it, as ever: the write
+    /// took effect before the read, which saw nothing, and that is the violation.
+    #[test]
+    fn an_operations_proposal_is_closed_by_its_own_ranges_apply() {
+        let history = History::from_trace(&two_range_trace(2));
+        assert_eq!((history.closed_by_apply, history.pending()), (1, 0));
+        assert!(check(&history).is_err(), "{history:?}");
     }
 
     #[test]

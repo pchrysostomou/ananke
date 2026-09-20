@@ -281,6 +281,15 @@ _Update this section at the end of every session._
   300-minute budget). A six-lens adversarial review with an independent skeptic per
   lens, including mutation testing of the new `ananke-raft` code, ran before the exit;
   its findings are fixed in 3927b56, 5698992, 5bd3574 and ae54a20.
+- Phase 3 Stage B, the checks keyed by range (2026-09-20), branch
+  `phase-3-stage-b-checks` off `main` at 0d76236, one of the stage's builds and not the
+  stage: D-071 keys checks 1 to 4 by the group each event names, over a generic group
+  key in `ananke-raft`; the history's closure by `(range, index, term)`; the timer check
+  and pre-vote's property per (range, server); the checks about time per range and the
+  write bound per key. It changes no behaviour, moves no pinned hash and no schedule.
+  With one group a wrongly keyed check is invisible to every sweep, so each keyed check
+  has a hand-made two-range case of its own and every wrong key was planted in a
+  throwaway copy and shown to fail one: the table is in D-071.
 - Next concrete task: Phase 3 Stage B (SHARD.md §12), the node: many groups on one
   socket, one ticker and one engine — after the owner's review of Stage A at its exit
   criteria. Issue #37: a refused server's silence while it verifies, repairs and

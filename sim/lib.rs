@@ -14,7 +14,9 @@
 
 use std::path::Path;
 
+use ananke_env::sim::TraceRecord;
 use ananke_env::{Environment, File, FileSystem, OpenOptions, RealEnv};
+use ananke_raft::invariants::Traced;
 use bytes::Bytes;
 
 pub mod echo;
@@ -27,6 +29,19 @@ pub mod raft;
 pub mod wal;
 
 pub use parallel::{sweep, verdict};
+
+/// The records as the log invariants read them: each event with the node that
+/// traced it ([`Traced`]). Every `Raft*` event about a replica names its server,
+/// and the two range events the checks fold — `RangeCreated`, which sets a
+/// replica's floor, and `RangeRemoved`, which ends a replica's memory — name their
+/// range and are recorded with their node alone (SHARD.md §8). A scenario's node
+/// ids are its server ids.
+// PROPOSED(D-071): checks 1 to 4 keyed by group.
+pub fn traced(records: &[TraceRecord]) -> impl Iterator<Item = Traced<'_>> {
+    records
+        .iter()
+        .map(|record| Traced::new(record.node.map(|node| u64::from(node.get())), &record.event))
+}
 
 /// The default number of seeds a sweep runs.
 pub const DEFAULT_SEEDS: u64 = 20;
