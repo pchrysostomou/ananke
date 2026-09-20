@@ -2239,7 +2239,10 @@ the membership scenario's extension, with what it found (Q34).
   incarnation and reopens the engine, "which in a shared node would restart every range
   on it" (SHARD.md:1793-1795), so the whole-store staged install adopted at the next
   start (RAFT.md:225-247) is not kept for a replica's install. This is question 2's
-  proposal.
+  proposal. It carries issue #72: from the first live install on a node's engine, a read
+  served from a pinned version can straddle an install's switch on its own span, since a
+  read below the install's number sees the replaced span as empty (D-069; D-054). The item
+  says what such a read sees, and pairs it.
 - Ranges fixed at bootstrap from configuration, as §2 generalises `initial_voters`, each
   traced `RangeCreated { cause: bootstrap }`. Nothing changes a descriptor and nothing
   routes: a client takes its key's range from the scenario's fixed map.
