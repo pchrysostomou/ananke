@@ -8140,12 +8140,29 @@ Six supporting enums and one struct come with them: `ApplyEffect`, `RangeCause`,
 - *RAFT.md §2's event table is updated in the same commit* (D-053): the `range` rule and
   its three exceptions, `RaftApply`'s `key` and `effect`, `RaftRead`'s move and its two
   new fields, and the three new events.
-- *`scripts/premerge.sh` at a thousand seeds on the commit's own tree, a7c9f54*:
-  **1 615 s** (26 min 55 s), green, on an 8-core Apple M2, with the one-minute load
-  sampled every ten seconds over the run — 160 samples, mean 18.39, maximum 43.34 — so
-  the machine was not idle and the figure is an upper bound. Against Stage A's exit,
-  593.87 s at mean load 20.87 (D-060), and D-068's tree. The growth is the stage's
-  accumulated sweeps, not this commit alone; the rates it prints are below.
+- *`scripts/premerge.sh` at a thousand seeds, measured against `main` in one session*, since
+  a figure from another day says nothing on a machine whose speed drifts (D-052's protocol,
+  sharpened here). Both trees built first, then run one after the other on the same idle
+  8-core Apple M2, the one-minute load sampled every ten seconds:
+
+  | Tree | Wall | Mean load | raft | engine | WAL |
+  |---|---|---|---|---|---|
+  | this commit, a7c9f54 | 1 476 s | 17.15 | 893.2 s | 538.2 s | 23.3 s |
+  | `main`, b292034 | 1 473 s | 20.16 | 888.2 s | 541.2 s | 22.9 s |
+
+  **This change costs 5 s on the raft binary, 0.6 %**, nothing on the engine binary, which
+  came out 3 s faster, and nothing on the WAL's. The two-reads-at-one-version of `RaftRead`
+  and the fields on every replica event are inside the noise of one run.
+
+  Both trees are over D-040's quarter of an hour on this machine today, and `main` is over it
+  by itself: the same code that ran the premerge in 613 s two days ago (D-068, on ea44e38)
+  takes 1 473 s now, and D-063's 46e95c0 ran the raft binary in 535.9 s where `main` now takes
+  888.2 s. The machine is between 1.7 and 2.4 times slower than it was for those runs — no
+  thermal or power warning is recorded, and nothing else of this session was running — so the
+  premerge's budget cannot be read from figures taken on different days. What a change costs
+  is the paired measurement above; what the premerge costs in wall time is a question for the
+  machine it runs on, and the earlier figure of 1 615 s at mean load 18.39, taken on this tree
+  alone, is withdrawn in favour of the pair.
 - *Every variant's catch rate at a thousand seeds on this tree*, against the tier each
   asserts at: `RefusalNotDurable` 7 (0.7 %, from the thousand-seed tier, D-061),
   `LeaseTrustsTheClock`'s stale read 40 (4.0 %, same tier; it was 37), `SharedSnapshotDir`
