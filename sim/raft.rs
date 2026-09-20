@@ -1020,6 +1020,56 @@ impl Report {
     }
 }
 
+/// The range a record about a replica names, and `None` for a record about
+/// something else: a node's store (`RaftRefused`, `RaftAdopted`,
+/// `RaftServerFailed`), the network, a client or the simulator itself.
+///
+/// The twenty-six `Raft*` kinds about a replica: the twenty-three D-069 gave
+/// a `range` and the three it adds carrying one. A kind a later stage adds
+/// joins this list; the moirae export's exhaustive `convert` is what says one
+/// exists.
+#[must_use]
+pub fn range_of(event: &TraceEvent) -> Option<u64> {
+    match event {
+        TraceEvent::RaftTerm { range, .. }
+        | TraceEvent::RaftVote { range, .. }
+        | TraceEvent::RaftLeader { range, .. }
+        | TraceEvent::RaftAppend { range, .. }
+        | TraceEvent::RaftTruncate { range, .. }
+        | TraceEvent::RaftCommit { range, .. }
+        | TraceEvent::RaftApply { range, .. }
+        | TraceEvent::RaftConfig { range, .. }
+        | TraceEvent::RaftSnapshot { range, .. }
+        | TraceEvent::RaftRead { range, .. }
+        | TraceEvent::RaftLeaseRevoked { range, .. }
+        | TraceEvent::RaftTransfer { range, .. }
+        | TraceEvent::RaftQuorumLost { range, .. }
+        | TraceEvent::RaftRecovered { range, .. }
+        | TraceEvent::RaftProposed { range, .. }
+        | TraceEvent::RaftInboxDropped { range, .. }
+        | TraceEvent::RaftCompacted { range, .. }
+        | TraceEvent::RaftReseeded { range, .. }
+        | TraceEvent::RaftSnapshotResumed { range, .. }
+        | TraceEvent::RaftProgressReset { range, .. }
+        | TraceEvent::RaftSnapshotDeleted { range, .. }
+        | TraceEvent::RaftSnapshotReused { range, .. }
+        | TraceEvent::RaftSnapshotStreams { range, .. }
+        | TraceEvent::RaftMatchStarted { range, .. }
+        | TraceEvent::RaftLearnerRound { range, .. }
+        | TraceEvent::RaftChangeAccepted { range, .. } => Some(*range),
+        _ => None,
+    }
+}
+
+/// The range a key is served by. The scenario fixes its ranges and a client takes
+/// its key's range from that fixed map (SHARD.md, Stage B); while a node runs one
+/// group every key is in it.
+// PROPOSED(D-071): the write bound is asked per key, of a range with a majority.
+#[must_use]
+pub fn range_of_key(_key: &Bytes) -> u64 {
+    SINGLE_GROUP
+}
+
 /// The structure of what SHARD.md §8's trace carries, over a run's records: the
 /// oracle of the payload the checks of §8 will read, which nothing in the tree read
 /// before it. Every check of §8 is keyed by range and reads `key`, `effect` and a
@@ -1052,39 +1102,7 @@ impl Report {
 // PROPOSED(D-069): the payload of SHARD.md §8's trace has an oracle here.
 pub fn payload_is_well_formed(records: &[TraceRecord]) -> Result<(), String> {
     for record in records {
-        // The twenty-six `Raft*` kinds about a replica: the twenty-three D-069 gave
-        // a `range` and the three it adds carrying one. A kind a later stage adds
-        // joins this list; the moirae export's exhaustive `convert` is what says one
-        // exists.
-        let range = match &record.event {
-            TraceEvent::RaftTerm { range, .. }
-            | TraceEvent::RaftVote { range, .. }
-            | TraceEvent::RaftLeader { range, .. }
-            | TraceEvent::RaftAppend { range, .. }
-            | TraceEvent::RaftTruncate { range, .. }
-            | TraceEvent::RaftCommit { range, .. }
-            | TraceEvent::RaftApply { range, .. }
-            | TraceEvent::RaftConfig { range, .. }
-            | TraceEvent::RaftSnapshot { range, .. }
-            | TraceEvent::RaftRead { range, .. }
-            | TraceEvent::RaftLeaseRevoked { range, .. }
-            | TraceEvent::RaftTransfer { range, .. }
-            | TraceEvent::RaftQuorumLost { range, .. }
-            | TraceEvent::RaftRecovered { range, .. }
-            | TraceEvent::RaftProposed { range, .. }
-            | TraceEvent::RaftInboxDropped { range, .. }
-            | TraceEvent::RaftCompacted { range, .. }
-            | TraceEvent::RaftReseeded { range, .. }
-            | TraceEvent::RaftSnapshotResumed { range, .. }
-            | TraceEvent::RaftProgressReset { range, .. }
-            | TraceEvent::RaftSnapshotDeleted { range, .. }
-            | TraceEvent::RaftSnapshotReused { range, .. }
-            | TraceEvent::RaftSnapshotStreams { range, .. }
-            | TraceEvent::RaftMatchStarted { range, .. }
-            | TraceEvent::RaftLearnerRound { range, .. }
-            | TraceEvent::RaftChangeAccepted { range, .. } => Some(*range),
-            _ => None,
-        };
+        let range = range_of(&record.event);
         if let Some(range) = range
             && range != SINGLE_GROUP
         {
@@ -1213,48 +1231,118 @@ impl Report {
         self.policy == Policy::Uniform
     }
 
-    /// Whether a majority that can still elect a leader was running at the end:
-    /// liveness needs one. A refused server is down until a snapshot re-seeds it,
-    /// which its restatement's `RaftRecovered` says (RAFT.md §3) — but a re-seeded
-    /// server never votes again (D-035), so while it counts for commits
-    /// it cannot help elect, and a cluster whose impaired servers reach half has
-    /// no leader to wait for: a refused server can only be re-seeded *by* a
-    /// leader, so the deadlock is real and priced into D-035, not a liveness
-    /// failure. The release run's seed 60 reached exactly that: one server
-    /// quarantined by an early re-seed, a second refused by rot, and the last
-    /// pre-voting forever with nobody left to grant.
+    /// Every range the trace names a replica of.
+    // PROPOSED(D-071): the checks about time are asked per range.
     #[must_use]
-    pub fn majority_up(&self) -> bool {
-        let mut down: BTreeSet<u64> = BTreeSet::new();
-        let mut quarantined: BTreeSet<u64> = BTreeSet::new();
+    pub fn ranges(&self) -> BTreeSet<u64> {
+        self.records
+            .iter()
+            .filter_map(|record| match &record.event {
+                TraceEvent::RangeCreated { range, .. } | TraceEvent::RangeRemoved { range, .. } => {
+                    Some(*range)
+                }
+                event => range_of(event),
+            })
+            .collect()
+    }
+
+    /// The ranges whose replicas that are neither refused nor quarantined form a
+    /// majority at the end of the run: the ranges the checks about time are asked
+    /// of (SHARD.md §8), where RAFT.md §2 asked them of the cluster. A refused
+    /// replica is down until a snapshot re-seeds it, which its restatement's
+    /// `RaftRecovered` says (RAFT.md §3) — but a re-seeded server never votes again
+    /// (D-035), so while it counts for commits it cannot help elect, and a range
+    /// whose impaired replicas reach half has no leader to wait for: a refused
+    /// replica can only be re-seeded *by* a leader, so the deadlock is real and
+    /// priced into D-035, not a liveness failure. Seed 8 reaches exactly that, and
+    /// is the seed of this tree that does: rot refuses server 2, a leader re-seeds
+    /// it and the quarantine sticks (D-035); rot then refuses server 1, which no
+    /// leader ever re-seeds; and server 3 is left with nobody able to grant it a
+    /// vote. Its live set is empty and nothing about time is asked of the run.
+    /// (D-030 and D-035 tell the same story of seed 60 of *their* release runs;
+    /// every schedule has been redrawn since, and seed 60 of this tree has its
+    /// range live.)
+    ///
+    /// A node's refusal is its whole store's, so every replica on it counts as
+    /// refused (SHARD.md §8); its re-seed and its quarantine are per replica.
+    // PROPOSED(D-071): the checks about time are asked per range.
+    #[must_use]
+    pub fn ranges_with_a_majority_up(&self) -> BTreeSet<u64> {
+        let ranges = self.ranges();
+        let mut down: BTreeSet<(u64, u64)> = BTreeSet::new();
+        let mut quarantined: BTreeSet<(u64, u64)> = BTreeSet::new();
         for record in &self.records {
             match &record.event {
                 TraceEvent::RaftRefused { server, .. } => {
-                    down.insert(*server);
+                    down.extend(ranges.iter().map(|range| (*range, *server)));
                 }
-                TraceEvent::RaftRecovered { server, .. } => {
-                    down.remove(server);
+                TraceEvent::RaftRecovered { server, range, .. } => {
+                    down.remove(&(*range, *server));
                 }
-                TraceEvent::RaftReseeded { server, .. } => {
-                    quarantined.insert(*server);
+                TraceEvent::RaftReseeded { server, range } => {
+                    quarantined.insert((*range, *server));
                 }
                 _ => {}
             }
         }
-        let impaired: BTreeSet<u64> = down.union(&quarantined).copied().collect();
-        (impaired.len() as u64) * 2 < SERVERS
+        ranges
+            .into_iter()
+            .filter(|range| {
+                let impaired: BTreeSet<u64> = down
+                    .union(&quarantined)
+                    .filter(|(g, _)| g == range)
+                    .map(|&(_, server)| server)
+                    .collect();
+                (impaired.len() as u64) * 2 < SERVERS
+            })
+            .collect()
+    }
+
+    /// Whether every range of the run has a majority that can still elect a leader
+    /// ([`Report::ranges_with_a_majority_up`]): what the sweep's figures print, where
+    /// the checks about time ask it of each range on its own.
+    #[must_use]
+    pub fn majority_up(&self) -> bool {
+        self.ranges_with_a_majority_up().len() == self.ranges().len()
     }
 
     /// How long after the last heal the first client write completed, if one did.
     #[must_use]
     pub fn time_to_write_after_heal(&self) -> Option<Duration> {
-        self.history
+        self.writes_after_heal_by_key()
+            .into_values()
+            .flatten()
+            .min()
+    }
+
+    /// Per key some client wrote to after the last heal, how long after the heal
+    /// the first of those writes completed, and `None` for a key whose post-heal
+    /// writes all stayed pending. The write bound is asked of each of these
+    /// (SHARD.md §8): one minimum over every write is passed by a wedged range
+    /// beside a live one, since the live one's writes complete.
+    ///
+    /// An operation the trace closed by its entry's apply counts as completed, as
+    /// it does everywhere else the history is read: the client abandoned it, but
+    /// the entry applied (`lin.rs`). A write no leader ever proposed is not in the
+    /// history at all and is no key's evidence either way.
+    // PROPOSED(D-071): the write bound is asked per key.
+    #[must_use]
+    pub fn writes_after_heal_by_key(&self) -> BTreeMap<Bytes, Option<Duration>> {
+        let mut by_key: BTreeMap<Bytes, Option<Duration>> = BTreeMap::new();
+        for op in self
+            .history
             .ops
             .iter()
             .filter(|op| op.op.is_write() && op.call >= self.last_heal)
-            .filter_map(|op| op.ret)
-            .map(|ret| ret.duration_since(self.last_heal))
-            .min()
+        {
+            let took = op.ret.map(|ret| ret.duration_since(self.last_heal));
+            let first = by_key.entry(op.op.key().clone()).or_default();
+            *first = match (*first, took) {
+                (Some(one), Some(another)) => Some(one.min(another)),
+                (one, another) => one.or(another),
+            };
+        }
+        by_key
     }
 
     /// Every invariant the run must satisfy, or the first violation.
@@ -1268,11 +1356,12 @@ impl Report {
         if let Some(why) = &self.stopped {
             return fail(why.clone());
         }
-        let events = self.events();
-        if let Err(violation) = invariants::all(&events) {
+        if let Err(violation) = invariants::all(crate::traced(&self.records)) {
             return fail(violation);
         }
-        if let Err(violation) = invariants::commit_majority(&events, SERVERS as usize) {
+        if let Err(violation) =
+            invariants::commit_majority(crate::traced(&self.records), SERVERS as usize)
+        {
             return fail(violation);
         }
         if let Err(violation) = lin::check(&self.history) {
@@ -1295,7 +1384,9 @@ impl Report {
         if let Err(violation) = self.isolation_keeps_the_term() {
             return fail(violation);
         }
-        if self.uniform() && self.majority_up() {
+        // Both are asked only of a range whose unimpaired replicas form a majority
+        // (SHARD.md §8), which each reads for itself: with none, both pass.
+        if self.uniform() {
             if let Err(violation) = self.liveness() {
                 return fail(violation);
             }
@@ -1306,20 +1397,51 @@ impl Report {
         Ok(())
     }
 
-    /// Liveness: on a uniform run with a majority up, a client write completes
-    /// within [`LIVENESS_TIMEOUTS`] maximum election timeouts of the last heal.
+    /// Liveness: on a uniform run, a client write to *every key* of a range whose
+    /// unimpaired replicas form a majority completes within [`LIVENESS_TIMEOUTS`]
+    /// maximum election timeouts of the last heal (SHARD.md §8).
+    ///
+    /// The bound is asked of each key some client wrote to after the heal
+    /// ([`Report::writes_after_heal_by_key`]), and of no other: a key no client
+    /// wrote to in the window is no evidence of anything, and the two clients draw
+    /// their keys at random. A key whose post-heal writes all stayed pending is the
+    /// wedge this check is here to see. With no range left with a majority nothing
+    /// is asked, as nothing was when the check was the cluster's.
     fn liveness(&self) -> Result<(), String> {
+        let live = self.ranges_with_a_majority_up();
+        if live.is_empty() {
+            return Ok(());
+        }
         let bound = election_max() * LIVENESS_TIMEOUTS;
-        match self.time_to_write_after_heal() {
-            Some(took) if took <= bound => Ok(()),
-            Some(took) => Err(format!(
-                "liveness: the first client write after the last heal took {took:?}, over {bound:?}"
-            )),
-            None => Err(format!(
+        let mut asked = 0usize;
+        for (key, took) in self.writes_after_heal_by_key() {
+            if !live.contains(&range_of_key(&key)) {
+                continue;
+            }
+            asked += 1;
+            let key = String::from_utf8_lossy(&key).into_owned();
+            match took {
+                Some(took) if took <= bound => {}
+                Some(took) => {
+                    return Err(format!(
+                        "liveness: the first client write to {key} after the last heal took {took:?}, over {bound:?}"
+                    ));
+                }
+                None => {
+                    return Err(format!(
+                        "liveness: no client write to {key} completed after the last heal at {:?}",
+                        self.last_heal
+                    ));
+                }
+            }
+        }
+        if asked == 0 {
+            return Err(format!(
                 "liveness: no client write completed after the last heal at {:?}",
                 self.last_heal
-            )),
+            ));
         }
+        Ok(())
     }
 
     /// Whether reading records by decision time (D-047) moved this run's
@@ -1334,7 +1456,7 @@ impl Report {
     // D-047: every trace record carries its decision time and its durability time.
     #[must_use]
     pub fn moved_by_decision_time(&self, verdict: &Result<(), String>) -> Option<Moved> {
-        let live = self.uniform() && self.majority_up();
+        let live = self.uniform();
         let by_durability = |from_pre_vote: bool| -> Result<(), String> {
             if from_pre_vote {
                 self.isolation_keeps_the_term_by(RecordTime::Durable)?;
@@ -1463,16 +1585,65 @@ impl Report {
         from: Instant,
         until: Instant,
     ) -> Result<(), String> {
-        let verdict = Self::keeps_its_term_by(records, RecordTime::Decided, server, from, until);
+        Self::ranges_of(records, server)
+            .into_iter()
+            .try_for_each(|range| {
+                Self::replica_keeps_its_term_by_cause(records, range, server, from, until)
+            })
+    }
+
+    /// [`Report::keeps_its_term_by_cause`] on one replica of the isolated server:
+    /// the property is per (range, server) (SHARD.md §8), and the excuse is that
+    /// replica's own.
+    // PROPOSED(D-071): pre-vote's property is per (range, server).
+    fn replica_keeps_its_term_by_cause(
+        records: &[&TraceRecord],
+        range: u64,
+        server: u64,
+        from: Instant,
+        until: Instant,
+    ) -> Result<(), String> {
+        let verdict = Self::replica_keeps_its_term_by(
+            records,
+            RecordTime::Decided,
+            range,
+            server,
+            from,
+            until,
+        );
         if verdict.is_ok() {
             return verdict;
         }
-        let changes = Self::term_changes_decided_in(records, server, from, until);
+        let changes = Self::term_changes_decided_in(records, range, server, from, until);
         let caused_before = !changes.is_empty()
             && changes
                 .iter()
                 .all(|r| r.received().is_some_and(|received| received <= from));
         if caused_before { Ok(()) } else { verdict }
+    }
+
+    /// Every range the trace shows a replica of on `server`, from `records`, the
+    /// [`Report::pre_vote_records`]: the replicas whose terms the pre-vote property
+    /// is asked of, which are the replicas that stepped.
+    ///
+    /// A replica's term record is the only thing read. A `RangeCreated` on the node
+    /// adds nothing: a replica that ever steps traces a term record, and one that
+    /// never steps has no term to keep — while the creation's `floor_term` would be
+    /// read as the term the window began with and its absent term record as 0, so
+    /// an arm for it could only report a raise "from `floor_term` to 0" that never
+    /// happened. The creation is still read for the floor term of a replica that
+    /// *does* step ([`Report::created_term_in`]).
+    // PROPOSED(D-071): pre-vote's property is per (range, server).
+    fn ranges_of(records: &[&TraceRecord], server: u64) -> BTreeSet<u64> {
+        records
+            .iter()
+            .filter_map(|record| match &record.event {
+                TraceEvent::RaftTerm {
+                    server: s, range, ..
+                } if *s == server => Some(*range),
+                _ => None,
+            })
+            .collect()
     }
 
     /// `server`'s term records decided in `(from, until]` that change its term from
@@ -1487,7 +1658,11 @@ impl Report {
         from: Instant,
         until: Instant,
     ) -> Vec<&TraceRecord> {
-        Self::term_changes_decided_in(&self.pre_vote_records(), server, from, until)
+        let records = self.pre_vote_records();
+        Self::ranges_of(&records, server)
+            .into_iter()
+            .flat_map(|range| Self::term_changes_decided_in(&records, range, server, from, until))
+            .collect()
     }
 
     /// The records the pre-vote check and its predicates read, in record order:
@@ -1507,6 +1682,7 @@ impl Report {
                         | TraceEvent::RaftRefused { .. }
                         | TraceEvent::RaftReseeded { .. }
                         | TraceEvent::RaftSnapshot { taken: false, .. }
+                        | TraceEvent::RangeCreated { .. }
                 )
             })
             .collect()
@@ -1519,6 +1695,7 @@ impl Report {
     // received.
     fn term_changes_decided_in<'a>(
         records: &[&'a TraceRecord],
+        range: u64,
         server: u64,
         from: Instant,
         until: Instant,
@@ -1527,12 +1704,15 @@ impl Report {
         let mut changes = Vec::new();
         for &record in records {
             let TraceEvent::RaftTerm {
-                server: s, term, ..
+                server: s,
+                range: g,
+                term,
+                ..
             } = &record.event
             else {
                 continue;
             };
-            if *s != server {
+            if (*g, *s) != (range, server) {
                 continue;
             }
             if *term != previous && from < record.decided && record.decided <= until {
@@ -1596,13 +1776,43 @@ impl Report {
         from: Instant,
         until: Instant,
     ) -> Result<(), String> {
-        if Self::reseeding_during(records, server, from, until) {
+        Self::ranges_of(records, server)
+            .into_iter()
+            .try_for_each(|range| {
+                Self::replica_keeps_its_term_by(records, time, range, server, from, until)
+            })
+    }
+
+    /// [`Report::keeps_its_term_by`] on one replica of the isolated server: the
+    /// property is per (range, server) (SHARD.md §8), since a term is a range's and
+    /// one range's election says nothing of another's.
+    ///
+    /// A range created on the isolated node during the isolation takes the term of
+    /// its `RangeCreated` as the term the isolation began with (SHARD.md §8): the
+    /// replica did not exist at the start, and the term its creation names is no
+    /// election of its own.
+    ///
+    /// The violation names the server, the terms and the window and not the range,
+    /// which forty-four pinned assertions take word for word and a run of this stage
+    /// has one of; the stage that gives a node many ranges moves those pins and
+    /// names it there (SHARD.md, Stage B, the commits that move schedules).
+    // PROPOSED(D-071): pre-vote's property is per (range, server).
+    fn replica_keeps_its_term_by(
+        records: &[&TraceRecord],
+        time: RecordTime,
+        range: u64,
+        server: u64,
+        from: Instant,
+        until: Instant,
+    ) -> Result<(), String> {
+        if Self::reseeding_during(records, range, server, from, until) {
             return Ok(());
         }
-        let (before, after) = (
-            Self::term_by(records, server, time, from),
-            Self::term_by(records, server, time, until),
-        );
+        let before = match Self::term_by(records, range, server, time, from) {
+            0 => Self::created_term_in(records, range, server, from, until).unwrap_or(0),
+            term => term,
+        };
+        let after = Self::term_by(records, range, server, time, until);
         if after != before {
             return Err(format!(
                 "pre-vote: server {server} raised its term from {before} to {after} while isolated from {from:?} to {until:?}"
@@ -1611,10 +1821,15 @@ impl Report {
         Ok(())
     }
 
-    /// Whether `server` was refused, re-seeded or finished installing a snapshot
-    /// while isolated from `from` to `until`, by when those records were traced:
-    /// the pre-vote check's skip; from `records`, the [`Report::pre_vote_records`].
-    fn reseeding_during(
+    /// Whether *any* replica on `server` was refused, re-seeded or finished
+    /// installing a snapshot while isolated from `from` to `until`, by when those
+    /// records were traced: the skip the pinned-seed straddle predicates take,
+    /// where the pre-vote check takes it per replica
+    /// ([`Report::reseeding_during`]). It is the skip as it stood before the
+    /// property was keyed by (range, server), so a pin's predicate reads the
+    /// window it was pinned on.
+    // PROPOSED(D-071): pre-vote's property is per (range, server).
+    fn reseeding_during_any(
         records: &[&TraceRecord],
         server: u64,
         from: Instant,
@@ -1631,34 +1846,109 @@ impl Report {
         })
     }
 
+    /// The floor term of `server`'s replica of `range` where its `RangeCreated` was
+    /// traced while the server was isolated from `from` to `until`, and `None`
+    /// otherwise; from `records`, the [`Report::pre_vote_records`].
+    // PROPOSED(D-071): pre-vote's property is per (range, server).
+    fn created_term_in(
+        records: &[&TraceRecord],
+        range: u64,
+        server: u64,
+        from: Instant,
+        until: Instant,
+    ) -> Option<u64> {
+        records.iter().find_map(|record| match &record.event {
+            TraceEvent::RangeCreated {
+                range: g,
+                floor_term,
+                ..
+            } if *g == range
+                && record.node.map(|node| u64::from(node.get())) == Some(server)
+                && record.at >= from
+                && record.at <= until =>
+            {
+                Some(*floor_term)
+            }
+            _ => None,
+        })
+    }
+
+    /// Whether `server` was refused, re-seeded or finished installing a snapshot
+    /// while isolated from `from` to `until`, by when those records were traced:
+    /// the pre-vote check's skip; from `records`, the [`Report::pre_vote_records`].
+    fn reseeding_during(
+        records: &[&TraceRecord],
+        range: u64,
+        server: u64,
+        from: Instant,
+        until: Instant,
+    ) -> bool {
+        records.iter().any(|r| {
+            r.at >= from
+                && r.at <= until
+                && match &r.event {
+                    // A node's refusal is its whole store's, so it skips every
+                    // range on it; the re-seed and the install are one replica's
+                    // (SHARD.md §8).
+                    TraceEvent::RaftRefused { server: s, .. } => *s == server,
+                    TraceEvent::RaftReseeded {
+                        server: s,
+                        range: g,
+                    }
+                    | TraceEvent::RaftSnapshot {
+                        server: s,
+                        range: g,
+                        taken: false,
+                        ..
+                    } => (*g, *s) == (range, server),
+                    _ => false,
+                }
+        })
+    }
+
     /// `server`'s term at `at`: its last `RaftTerm` whose `time` is at or before
     /// `at`, 0 before any. A server's term records come from one task's steps in
     /// sequence, each decided after the one before was traced, so their decision
     /// times rise with their order just as their durability times do, and the last
     /// such record is the latest either way. From `records`, the
     /// [`Report::pre_vote_records`].
-    fn term_by(records: &[&TraceRecord], server: u64, time: RecordTime, at: Instant) -> u64 {
+    fn term_by(
+        records: &[&TraceRecord],
+        range: u64,
+        server: u64,
+        time: RecordTime,
+        at: Instant,
+    ) -> u64 {
         records
             .iter()
             .filter(|r| time.of(r) <= at)
             .filter_map(|r| match &r.event {
                 TraceEvent::RaftTerm {
-                    server: s, term, ..
-                } if *s == server => Some(*term),
+                    server: s,
+                    range: g,
+                    term,
+                    ..
+                } if (*g, *s) == (range, server) => Some(*term),
                 _ => None,
             })
             .next_back()
             .unwrap_or(0)
     }
 
-    /// Election timers fire (moirae rule 5): a running server that is not the
-    /// leader campaigns within [`TIMER_TIMEOUTS`] maximum election timeouts of the
-    /// last AppendEntries it received from a leader of its term or later, the last
-    /// vote it granted, or its start. A re-seeded server is exempt: it never
-    /// campaigns on that store, by design (RAFT.md §3, D-035). The first
-    /// gap [`Report::replay_timers`] finds under every reset arm is the violation.
+    /// Election timers fire (moirae rule 5): a running replica that is not the
+    /// leader of its range campaigns within [`TIMER_TIMEOUTS`] maximum election
+    /// timeouts of the last AppendEntries it received from a leader of that range's
+    /// term or later, the last vote it granted, its range's `RangeCreated`, or its
+    /// start. A re-seeded server is exempt: it never campaigns on that store, by
+    /// design (RAFT.md §3, D-035). The first gap [`Report::replay_timers`] finds
+    /// under every reset arm, in a range whose unimpaired replicas form a majority
+    /// (SHARD.md §8), is the violation.
     ///
-    /// Whether a server campaigned in time is about when it decided to, so the
+    /// The check is per (range, server) (SHARD.md §8): a replica's timer is its
+    /// own, reset by what reaches *it*, so one range's heartbeats must not stand in
+    /// for another's silence on the same node.
+    ///
+    /// Whether a replica campaigned in time is about when it decided to, so the
     /// replay reads every record by its decision time (D-047).
     fn timers_fire(&self) -> Result<(), String> {
         self.timers_fire_by(RecordTime::Decided)
@@ -1668,11 +1958,15 @@ impl Report {
     /// [`RecordTime::Durable`], the check as it stood before D-047.
     // D-047: every trace record carries its decision time and its durability time.
     fn timers_fire_by(&self, time: RecordTime) -> Result<(), String> {
+        let live = self.ranges_with_a_majority_up();
         let mut first = None;
         self.replay_timers(
             TimerResets::ALL,
             time,
             |gap| {
+                if !live.contains(&gap.range) {
+                    return ControlFlow::Continue(());
+                }
                 first = Some(gap);
                 ControlFlow::Break(())
             },
@@ -1691,18 +1985,23 @@ impl Report {
     }
 
     /// Whether the `RaftSnapshot` at `index` is the restatement's re-trace of the
-    /// store's snapshot rather than an install's completion: a start traces the
+    /// replica's snapshot rather than an install's completion: a start traces the
     /// snapshot, the configuration and its `RaftRecovered` at one instant
     /// (`crates/ananke-raft/src/node.rs`), where the completion is traced by the
-    /// snapshot task with no restatement behind it.
+    /// snapshot task with no restatement behind it. The restatement is that
+    /// replica's, so it is looked for on the same (range, server).
     // PROPOSED(D-063): a server adopting a completed install has no election timer.
-    fn restates(records: &[TraceRecord], index: usize, server: u64) -> bool {
+    fn restates(records: &[TraceRecord], index: usize, range: u64, server: u64) -> bool {
         let at = records[index].at;
         records[index..]
             .iter()
             .take_while(|r| r.at == at)
             .any(|r| match &r.event {
-                TraceEvent::RaftRecovered { server: s, .. } => *s == server,
+                TraceEvent::RaftRecovered {
+                    server: s,
+                    range: g,
+                    ..
+                } => (*g, *s) == (range, server),
                 _ => false,
             })
     }
@@ -1738,18 +2037,22 @@ impl Report {
         resets: TimerResets,
         time: RecordTime,
         mut gap: impl FnMut(TimerGap) -> ControlFlow<()>,
-        probe: Option<(usize, u64)>,
+        probe: Option<(usize, u64, u64)>,
     ) -> Option<TimerState> {
         // A server measures its timeout by its own clock: a slow one takes longer
-        // in global time, and the bound scales with its rate.
+        // in global time, and the bound scales with its rate. The clock is the
+        // node's, so every replica on it measures the same bound.
         let bound_for = |server: u64| self.timer_bound(server);
         let mut payloads: BTreeMap<ananke_env::MessageId, Bytes> = BTreeMap::new();
-        let mut up: BTreeSet<u64> = BTreeSet::new();
-        let mut leaders: BTreeSet<u64> = BTreeSet::new();
-        let mut reseeded: BTreeSet<u64> = BTreeSet::new();
-        let mut terms: BTreeMap<u64, u64> = BTreeMap::new();
+        // Every set below is keyed by the replica, (range, server), not the server:
+        // one node runs a group per range and each has its own election timer
+        // (SHARD.md §8).
+        let mut up: BTreeSet<(u64, u64)> = BTreeSet::new();
+        let mut leaders: BTreeSet<(u64, u64)> = BTreeSet::new();
+        let mut reseeded: BTreeSet<(u64, u64)> = BTreeSet::new();
+        let mut terms: BTreeMap<(u64, u64), u64> = BTreeMap::new();
         let mut clocks = TimerClocks::default();
-        let mut reported: BTreeMap<u64, Instant> = BTreeMap::new();
+        let mut reported: BTreeMap<(u64, u64), Instant> = BTreeMap::new();
         let mut probed = None;
         // D-047: the replay's order; stable, so ties keep record order.
         let mut order: Vec<(usize, &TraceRecord)> = self.records.iter().enumerate().collect();
@@ -1758,16 +2061,16 @@ impl Report {
             let at = time.of(record);
             clocks.replaying = index;
             match &record.event {
-                TraceEvent::RaftReseeded { server, .. } => {
-                    reseeded.insert(*server);
+                TraceEvent::RaftReseeded { server, range } => {
+                    reseeded.insert((*range, *server));
                 }
                 TraceEvent::MessageSent { id, payload, .. } => {
                     payloads.insert(*id, payload.clone());
                 }
                 TraceEvent::MessageDelivered { id, to, .. } => {
-                    // Any contact from a leader of the server's term or later resets
-                    // its election timer (moirae rule 5): an AppendEntries, whether
-                    // its consistency check passes or not, and equally an
+                    // Any contact from a leader of the replica's term or later
+                    // resets its election timer (moirae rule 5): an AppendEntries,
+                    // whether its consistency check passes or not, and equally an
                     // InstallSnapshot, which is how a leader reaches a follower whose
                     // next index has fallen below the leader's compacted prefix
                     // (RAFT.md §1). The core routes the snapshot to its own task, but
@@ -1778,29 +2081,53 @@ impl Report {
                     // chunks kept arriving from a deposed leader after it lost its
                     // quorum, with no leader in the cluster at all
                     // (`Report::snapshot_fed_timer_gaps`).
+                    //
+                    // The message resets the timer of the replica it is addressed
+                    // to: a frame carries one message of one group today, and the
+                    // batch frame of §4 tags each message it holds with its range
+                    // (SHARD.md §11, raft 1), which the decode reads there.
+                    let range = SINGLE_GROUP;
                     if let Some(server) = server_of(*to)
                         && let Some(payload) = payloads.get(id)
                         && let Ok(frame) = Frame::decode(payload.clone())
-                        && frame.message.term() >= terms.get(&server).copied().unwrap_or(0)
+                        && frame.message.term() >= terms.get(&(range, server)).copied().unwrap_or(0)
                     {
                         match frame.message {
-                            Message::AppendEntries { .. } => clocks.reset(server, at),
+                            Message::AppendEntries { .. } => clocks.reset((range, server), at),
                             Message::InstallSnapshot { .. } if resets.install_snapshot => {
-                                clocks.reset(server, at);
+                                clocks.reset((range, server), at);
                             }
                             Message::InstallSnapshot { .. } => {
-                                *clocks.installs.entry(server).or_default() += 1;
+                                *clocks.installs.entry((range, server)).or_default() += 1;
                             }
                             _ => {}
                         }
                     }
                 }
-                // D-039: a completed snapshot install re-states the server
+                // A replica's creation arms its election timer (SHARD.md §8): a
+                // group born at a split, or installed onto a node that held none,
+                // starts counting from there.
+                // PROPOSED(D-071): the timer check is per (range, server).
+                TraceEvent::RangeCreated { range, .. } => {
+                    if let Some(server) = record.node.map(|node| u64::from(node.get())) {
+                        clocks.reset((*range, server), at);
+                    }
+                }
+                // And its removal ends it: a replica whose state was deleted keeps
+                // no timer to fire (SHARD.md §8).
+                // PROPOSED(D-071): the timer check is per (range, server).
+                TraceEvent::RangeRemoved { range, .. } => {
+                    if let Some(server) = record.node.map(|node| u64::from(node.get())) {
+                        up.remove(&(*range, server));
+                        leaders.remove(&(*range, server));
+                    }
+                }
+                // D-039: a completed snapshot install re-states the replica
                 // and rebuilds its incarnation with a fresh election timer. The
-                // install was the leader's doing and the server was busy finishing
+                // install was the leader's doing and the replica was busy finishing
                 // it, so the restatement counts as the leader's contact here. A crash
                 // restart re-states the same way and is reset below when its RaftTerm
-                // re-admits it; this arm is for the server that never went down. Seed
+                // re-admits it; this arm is for the replica that never went down. Seed
                 // 385, found by a local ten-thousand-seed run on f54b468: cut off
                 // alone mid-install, it campaigned a hundred milliseconds after the
                 // switch and twenty-five past the bound
@@ -1808,16 +2135,18 @@ impl Report {
                 //
                 // PROPOSED(D-063) supersedes this arm under [`TimerResets::ALL`]:
                 // every restatement on a server that never went down follows a
-                // completed install, and D-063's arm below takes the server out of
+                // completed install, and D-063's arm below takes the replica out of
                 // `up` there, so `up.contains` is false here and the `RaftTerm` the
                 // restatement ends with is what resets the clock. The arm and
                 // [`TimerResets::WITHOUT_RESTATEMENT`] stay because seed 385's pin
                 // is that replay, which is the check as it stood on f54b468.
-                TraceEvent::RaftRecovered { server, .. } if up.contains(server) => {
+                TraceEvent::RaftRecovered { server, range, .. }
+                    if up.contains(&(*range, *server)) =>
+                {
                     if resets.restatement {
-                        clocks.reset(*server, at);
+                        clocks.reset((*range, *server), at);
                     } else {
-                        *clocks.restatements.entry(*server).or_default() += 1;
+                        *clocks.restatements.entry((*range, *server)).or_default() += 1;
                     }
                 }
                 // PROPOSED(D-063): a completed install ends the incarnation
@@ -1835,97 +2164,115 @@ impl Report {
                 // after that contact and 8.4 ms past its 313.98 ms bound
                 // (`Report::timer_gaps_rescued_by_adoption`). The restatement's own
                 // re-trace of the snapshot is not a completion: a `RaftRecovered`
-                // for the server follows it at the same instant.
+                // for the replica follows it at the same instant.
                 TraceEvent::RaftSnapshot {
                     server,
+                    range,
                     taken: false,
                     ..
-                } if up.contains(server) && !Self::restates(&self.records, index, *server) => {
+                } if up.contains(&(*range, *server))
+                    && !Self::restates(&self.records, index, *range, *server) =>
+                {
                     if resets.adoption {
-                        up.remove(server);
-                        leaders.remove(server);
+                        up.remove(&(*range, *server));
+                        leaders.remove(&(*range, *server));
                     } else {
-                        *clocks.adoptions.entry(*server).or_default() += 1;
+                        *clocks.adoptions.entry((*range, *server)).or_default() += 1;
                     }
                 }
                 TraceEvent::RaftTerm {
-                    server, term, role, ..
+                    server,
+                    range,
+                    term,
+                    role,
+                    ..
                 } => {
-                    terms.insert(*server, *term);
-                    if !up.contains(server) {
-                        up.insert(*server);
-                        clocks.reset(*server, at);
+                    terms.insert((*range, *server), *term);
+                    if !up.contains(&(*range, *server)) {
+                        up.insert((*range, *server));
+                        clocks.reset((*range, *server), at);
                     }
                     match *role {
                         "leader" => {
-                            leaders.insert(*server);
+                            leaders.insert((*range, *server));
                         }
                         "pre-candidate" | "candidate" => {
-                            leaders.remove(server);
-                            clocks.reset(*server, at);
+                            leaders.remove(&(*range, *server));
+                            clocks.reset((*range, *server), at);
                         }
                         _ => {
                             // A leader that steps down starts counting from here:
                             // its timer meant nothing while it led.
-                            if leaders.remove(server) {
-                                clocks.reset(*server, at);
+                            if leaders.remove(&(*range, *server)) {
+                                clocks.reset((*range, *server), at);
                             }
                         }
                     }
                 }
-                TraceEvent::RaftLeader { server, .. } => {
-                    leaders.insert(*server);
+                TraceEvent::RaftLeader { server, range, .. } => {
+                    leaders.insert((*range, *server));
                 }
                 TraceEvent::RaftVote {
                     server,
+                    range,
                     granted: true,
                     pre: false,
                     ..
                 } => {
-                    clocks.reset(*server, at);
+                    clocks.reset((*range, *server), at);
                 }
+                // A crash takes every replica on the node down with it.
                 TraceEvent::NodeCrashed { node } => {
                     let server = u64::from(node.get());
-                    up.remove(&server);
-                    leaders.remove(&server);
+                    up.retain(|&(_, s)| s != server);
+                    leaders.retain(|&(_, s)| s != server);
                 }
                 _ => {}
             }
             let mut flagged = BTreeSet::new();
-            for server in &up {
-                if leaders.contains(server) || reseeded.contains(server) {
+            for &(range, server) in &up {
+                if leaders.contains(&(range, server)) || reseeded.contains(&(range, server)) {
                     continue;
                 }
-                let since = clocks.last_reset.get(server).copied().unwrap_or(at);
-                if at.duration_since(since) > bound_for(*server)
-                    && reported.get(server) != Some(&since)
+                let since = clocks
+                    .last_reset
+                    .get(&(range, server))
+                    .copied()
+                    .unwrap_or(at);
+                if at.duration_since(since) > bound_for(server)
+                    && reported.get(&(range, server)) != Some(&since)
                 {
-                    reported.insert(*server, since);
-                    flagged.insert(*server);
+                    reported.insert((range, server), since);
+                    flagged.insert((range, server));
                     let found = TimerGap {
-                        server: *server,
+                        server,
+                        range,
                         since,
                         at,
                         record: index,
-                        installs: clocks.installs.get(server).copied().unwrap_or(0),
-                        restatements: clocks.restatements.get(server).copied().unwrap_or(0),
-                        adoptions: clocks.adoptions.get(server).copied().unwrap_or(0),
+                        installs: clocks.installs.get(&(range, server)).copied().unwrap_or(0),
+                        restatements: clocks
+                            .restatements
+                            .get(&(range, server))
+                            .copied()
+                            .unwrap_or(0),
+                        adoptions: clocks.adoptions.get(&(range, server)).copied().unwrap_or(0),
                     };
                     if gap(found).is_break() {
                         return probed;
                     }
                 }
             }
-            if let Some((target, server)) = probe
+            if let Some((target, range, server)) = probe
                 && target == index
             {
                 probed = Some(TimerState {
-                    up: up.contains(&server),
-                    leader: leaders.contains(&server),
-                    reseeded: reseeded.contains(&server),
-                    since: clocks.last_reset.get(&server).copied(),
-                    since_record: clocks.last_reset_record.get(&server).copied(),
-                    flagged: flagged.contains(&server),
+                    up: up.contains(&(range, server)),
+                    leader: leaders.contains(&(range, server)),
+                    reseeded: reseeded.contains(&(range, server)),
+                    since: clocks.last_reset.get(&(range, server)).copied(),
+                    since_record: clocks.last_reset_record.get(&(range, server)).copied(),
+                    flagged: flagged.contains(&(range, server)),
                 });
             }
         }
@@ -2030,6 +2377,10 @@ impl TimerResets {
 pub struct TimerGap {
     /// The server.
     pub server: u64,
+    /// The range whose replica on it went past the bound: the timer is the
+    /// replica's, not the node's (SHARD.md §8).
+    // PROPOSED(D-071): the timer check is per (range, server).
+    pub range: u64,
     /// Its clock's last reset under the replay's arms.
     pub since: Instant,
     /// The first record past its bound: where the check would have reported it.
@@ -2057,34 +2408,34 @@ impl TimerGap {
     // names.
     pub fn violation(&self) -> String {
         format!(
-            "timers: server {} heard from no leader of its term and granted no vote since {:?} and had not campaigned by {:?}",
-            self.server, self.since, self.at
+            "timers: server {}'s replica of range {} heard from no leader of its term and granted no vote since {:?} and had not campaigned by {:?}",
+            self.server, self.range, self.since, self.at
         )
     }
 }
 
-/// The per-server clocks of the timer replay, and what arrived since each reset
-/// that the replay's arms did not count as one.
+/// The per-replica clocks of the timer replay, each keyed by (range, server), and
+/// what arrived since each reset that the replay's arms did not count as one.
 #[derive(Default)]
 struct TimerClocks {
-    last_reset: BTreeMap<u64, Instant>,
+    last_reset: BTreeMap<(u64, u64), Instant>,
     /// The index in [`Report::records`] of the record behind each `last_reset`.
-    last_reset_record: BTreeMap<u64, usize>,
-    installs: BTreeMap<u64, usize>,
-    restatements: BTreeMap<u64, usize>,
+    last_reset_record: BTreeMap<(u64, u64), usize>,
+    installs: BTreeMap<(u64, u64), usize>,
+    restatements: BTreeMap<(u64, u64), usize>,
     // PROPOSED(D-063): a server adopting a completed install has no election timer.
-    adoptions: BTreeMap<u64, usize>,
+    adoptions: BTreeMap<(u64, u64), usize>,
     /// The index of the record being replayed.
     replaying: usize,
 }
 
 impl TimerClocks {
-    fn reset(&mut self, server: u64, at: Instant) {
-        self.last_reset.insert(server, at);
-        self.last_reset_record.insert(server, self.replaying);
-        self.installs.remove(&server);
-        self.restatements.remove(&server);
-        self.adoptions.remove(&server);
+    fn reset(&mut self, replica: (u64, u64), at: Instant) {
+        self.last_reset.insert(replica, at);
+        self.last_reset_record.insert(replica, self.replaying);
+        self.installs.remove(&replica);
+        self.restatements.remove(&replica);
+        self.adoptions.remove(&replica);
     }
 }
 
@@ -2219,7 +2570,7 @@ impl Report {
     // PROPOSED(D-051): a removed catch is asserted against the isolation or the flag it
     // names.
     pub fn timer_removal(&self, gap: &TimerGap) -> Result<Vec<TimerRemoval>, String> {
-        let (server, flag) = (gap.server, gap.record);
+        let (server, range, flag) = (gap.server, gap.range, gap.record);
         let x = self
             .records
             .get(flag)
@@ -2229,7 +2580,7 @@ impl Report {
                 TimerResets::ALL,
                 time,
                 |_| ControlFlow::Continue(()),
-                Some((flag, server)),
+                Some((flag, range, server)),
             )
             .ok_or_else(|| format!("the replay by {time:?} time never replayed record {flag}"))
         };
@@ -2259,9 +2610,21 @@ impl Report {
         if decided.leader || decided.reseeded || !decided.up {
             let moved = self.records.iter().enumerate().find(|&(index, r)| {
                 let status = match &r.event {
-                    TraceEvent::RaftTerm { server: s, .. }
-                    | TraceEvent::RaftLeader { server: s, .. }
-                    | TraceEvent::RaftReseeded { server: s, .. } => *s == server,
+                    TraceEvent::RaftTerm {
+                        server: s,
+                        range: g,
+                        ..
+                    }
+                    | TraceEvent::RaftLeader {
+                        server: s,
+                        range: g,
+                        ..
+                    }
+                    | TraceEvent::RaftReseeded {
+                        server: s,
+                        range: g,
+                        ..
+                    } => (*g, *s) == (range, server),
                     TraceEvent::NodeCrashed { node } => u64::from(node.get()) == server,
                     // PROPOSED(D-063): a completed install takes the server out of
                     // the replay's running set until its restatement, so it says
@@ -2273,9 +2636,12 @@ impl Report {
                     // and is not one of these.
                     TraceEvent::RaftSnapshot {
                         server: s,
+                        range: g,
                         taken: false,
                         ..
-                    } => *s == server && !Self::restates(&self.records, index, *s),
+                    } => {
+                        (*g, *s) == (range, server) && !Self::restates(&self.records, index, *g, *s)
+                    }
                     _ => false,
                 };
                 status && (index < flag) != before_by_decision(index, r)
@@ -2441,7 +2807,7 @@ impl Report {
         };
         let mut straddles = Vec::new();
         for &(server, from, until) in &self.isolations {
-            if Self::reseeding_during(&pre_vote, server, from, until) {
+            if Self::reseeding_during_any(&pre_vote, server, from, until) {
                 continue;
             }
             let mut previous = 0;
@@ -2519,7 +2885,7 @@ impl Report {
             .collect();
         let mut straddles = Vec::new();
         for &(server, from, until) in &self.isolations {
-            if Self::reseeding_during(&pre_vote, server, from, until) {
+            if Self::reseeding_during_any(&pre_vote, server, from, until) {
                 continue;
             }
             let mut previous = 0;
@@ -5018,7 +5384,7 @@ fn advance(sim: &mut Sim, duration: Duration, watch: &mut Watch) {
         if watch.slices.is_multiple_of(CHECK_EVERY) {
             let records = sim.trace_from(watch.checked);
             watch.checked += records.len();
-            watch.checker.extend(records.iter().map(|r| &r.event));
+            watch.checker.extend(crate::traced(&records));
             if let Err(violation) = watch.checker.verdict() {
                 watch.stopped = Some(format!("{violation} (at {:?})", sim.now()));
                 return;
@@ -5356,6 +5722,7 @@ mod tests {
         assert_eq!(
             took.timer_gaps(TimerResets::ALL),
             vec![TimerGap {
+                range: SINGLE_GROUP,
                 server: 1,
                 since: ms(0),
                 at: ms(450),
@@ -5389,6 +5756,7 @@ mod tests {
         assert_eq!(
             completed.timer_gaps_rescued_by_adoption(),
             vec![TimerGap {
+                range: SINGLE_GROUP,
                 server: 1,
                 since: ms(0),
                 at: ms(450),
@@ -5405,6 +5773,7 @@ mod tests {
         assert_eq!(
             report(records, Vec::new()).timer_gaps(TimerResets::ALL),
             vec![TimerGap {
+                range: SINGLE_GROUP,
                 server: 1,
                 since: ms(500),
                 at: ms(950),
@@ -5450,6 +5819,7 @@ mod tests {
         assert_eq!(
             report.timer_gaps_rescued_by_adoption(),
             vec![TimerGap {
+                range: SINGLE_GROUP,
                 server: 1,
                 since: ms(0),
                 at: ms(650),
@@ -5489,5 +5859,383 @@ mod tests {
         let straddles = report.isolation_term_straddles();
         assert_eq!(straddles.len(), 1, "{straddles:?}");
         assert_eq!((straddles[0].decided, straddles[0].at), (ms(100), ms(102)));
+    }
+
+    // --- What the range key decides in the checks of `sim/` (SHARD.md §8) ---
+    //
+    // Every event of every sweep in this tree carries one range, so a check keyed
+    // by the server alone says exactly what one keyed by (range, server) says on
+    // every seed at every tier. These are the records that tell them apart, in the
+    // shape the folds above are tested in: a trace of two ranges the keyed check
+    // reads one way and a check without the key reads another.
+
+    /// The other range a two-range case uses: the next id after the one a server
+    /// runs today.
+    const OTHER: u64 = SINGLE_GROUP + 1;
+
+    fn term_of(server: u64, range: u64, term: u64, role: &'static str) -> TraceEvent {
+        TraceEvent::RaftTerm {
+            server,
+            range,
+            term,
+            role,
+            received: None,
+        }
+    }
+
+    fn vote_in(server: u64, range: u64) -> TraceEvent {
+        TraceEvent::RaftVote {
+            server,
+            range,
+            term: 1,
+            candidate: 2,
+            granted: true,
+            pre: false,
+        }
+    }
+
+    fn range_created(range: u64, floor_term: u64) -> TraceEvent {
+        TraceEvent::RangeCreated {
+            range,
+            cause: ananke_env::RangeCause::Snapshot,
+            parent: None,
+            start: Bytes::from_static(b""),
+            end: Bytes::from_static(b"\xff"),
+            generation: 1,
+            voters: vec![1, 2, 3],
+            floor_index: 0,
+            floor_term,
+            incarnation: 2,
+        }
+    }
+
+    fn range_removed(range: u64) -> TraceEvent {
+        TraceEvent::RangeRemoved {
+            range,
+            generation: 1,
+            incarnation: 2,
+            cause: ananke_env::RangeRemovedCause::Collected,
+        }
+    }
+
+    /// Server 1 holds two ranges. It grants a vote in one of them at 300 ms, which
+    /// resets that replica's timer and no other's: at 500 ms the replica of the
+    /// other range has heard nothing for 500 ms, past its 400 ms bound, and is the
+    /// gap. A check keyed by the server alone reads the vote as the node's and sees
+    /// no gap at all — the wedged range beside the live one of SHARD.md §8.
+    #[test]
+    fn one_ranges_reset_does_not_stand_in_for_anothers_silence() {
+        let report = report(
+            vec![
+                record(
+                    ms(0),
+                    ms(0),
+                    Some(1),
+                    term_of(1, SINGLE_GROUP, 1, "follower"),
+                ),
+                record(ms(0), ms(0), Some(1), term_of(1, OTHER, 1, "follower")),
+                record(ms(300), ms(300), Some(1), vote_in(1, SINGLE_GROUP)),
+                record(
+                    ms(500),
+                    ms(500),
+                    None,
+                    TraceEvent::TimeAdvanced { to: ms(500) },
+                ),
+            ],
+            Vec::new(),
+        );
+        let gaps = report.timer_gaps(TimerResets::ALL);
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        assert_eq!((gaps[0].range, gaps[0].server), (OTHER, 1));
+        assert_eq!(
+            report.timers_fire_by(RecordTime::Decided),
+            Err(gaps[0].violation())
+        );
+    }
+
+    /// And the keying has not made every quiet range a gap: with both replicas
+    /// reset within the bound there is none.
+    #[test]
+    fn each_ranges_own_reset_keeps_its_own_timer() {
+        let report = report(
+            vec![
+                record(
+                    ms(0),
+                    ms(0),
+                    Some(1),
+                    term_of(1, SINGLE_GROUP, 1, "follower"),
+                ),
+                record(ms(0), ms(0), Some(1), term_of(1, OTHER, 1, "follower")),
+                record(ms(300), ms(300), Some(1), vote_in(1, SINGLE_GROUP)),
+                record(ms(300), ms(300), Some(1), vote_in(1, OTHER)),
+                record(
+                    ms(500),
+                    ms(500),
+                    None,
+                    TraceEvent::TimeAdvanced { to: ms(500) },
+                ),
+            ],
+            Vec::new(),
+        );
+        assert_eq!(report.timer_gaps(TimerResets::ALL), Vec::new());
+        assert_eq!(report.timers_fire_by(RecordTime::Decided), Ok(()));
+    }
+
+    /// A replica's `RangeCreated` arms its election timer, and its `RangeRemoved`
+    /// ends it (SHARD.md §8): the replica installed at 300 ms is 200 ms from its
+    /// creation at 500 ms, and the one removed at 300 ms has no timer to fire.
+    /// Without either arm both are 500 ms past a reset and flagged.
+    #[test]
+    fn a_creation_arms_a_replicas_timer_and_a_removal_ends_it() {
+        let report = report(
+            vec![
+                record(
+                    ms(0),
+                    ms(0),
+                    Some(1),
+                    term_of(1, SINGLE_GROUP, 1, "follower"),
+                ),
+                record(ms(0), ms(0), Some(1), term_of(1, OTHER, 1, "follower")),
+                record(ms(300), ms(300), Some(1), range_created(SINGLE_GROUP, 1)),
+                record(ms(300), ms(300), Some(1), range_removed(OTHER)),
+                record(
+                    ms(500),
+                    ms(500),
+                    None,
+                    TraceEvent::TimeAdvanced { to: ms(500) },
+                ),
+            ],
+            Vec::new(),
+        );
+        assert_eq!(report.timer_gaps(TimerResets::ALL), Vec::new());
+    }
+
+    /// Pre-vote's property is per (range, server) (SHARD.md §8). Server 1 leads one
+    /// range at term 5 and follows the other at term 2; inside the isolation it
+    /// steps down in the range it led, at the term it already had. No replica's
+    /// term moved. A check that reads the server's terms as one sequence sees the
+    /// last record before the window (the follower's term 2) and the last record in
+    /// it (the leader's term 5) and reports a raise that never happened.
+    #[test]
+    fn one_servers_two_ranges_keep_their_terms_apart() {
+        let report = report(
+            vec![
+                record(
+                    ms(50),
+                    ms(50),
+                    Some(1),
+                    term_of(1, SINGLE_GROUP, 5, "leader"),
+                ),
+                record(ms(80), ms(80), Some(1), term_of(1, OTHER, 2, "follower")),
+                record(
+                    ms(200),
+                    ms(200),
+                    Some(1),
+                    term_of(1, SINGLE_GROUP, 5, "follower"),
+                ),
+            ],
+            vec![(1, ms(100), ms(500))],
+        );
+        assert_eq!(
+            report.isolation_keeps_the_term_by(RecordTime::Decided),
+            Ok(())
+        );
+        assert_eq!(report.isolation_keeps_the_term_by_cause(), Ok(()));
+    }
+
+    /// And a replica that does raise its own range's term while its node is cut off
+    /// is the violation it always was.
+    #[test]
+    fn a_replica_that_raises_its_own_ranges_term_while_isolated_is_caught() {
+        let report = report(
+            vec![
+                record(
+                    ms(50),
+                    ms(50),
+                    Some(1),
+                    term_of(1, SINGLE_GROUP, 5, "leader"),
+                ),
+                record(ms(80), ms(80), Some(1), term_of(1, OTHER, 2, "follower")),
+                record(ms(200), ms(200), Some(1), term_of(1, OTHER, 3, "candidate")),
+            ],
+            vec![(1, ms(100), ms(500))],
+        );
+        assert_eq!(
+            report.isolation_keeps_the_term_by(RecordTime::Decided),
+            Err(
+                "pre-vote: server 1 raised its term from 2 to 3 while isolated from Instant(100ms) to Instant(500ms)"
+                    .to_owned()
+            )
+        );
+    }
+
+    /// A range created on the isolated node during the isolation takes the term of
+    /// its `RangeCreated` as the term the isolation began with (SHARD.md §8): the
+    /// replica did not exist at the start, and the term its creation names is no
+    /// election of its own. Without that clause its term reads as a raise from 0.
+    #[test]
+    fn a_range_created_under_an_isolation_starts_at_its_creations_term() {
+        let report = report(
+            vec![
+                record(
+                    ms(50),
+                    ms(50),
+                    Some(1),
+                    term_of(1, SINGLE_GROUP, 4, "follower"),
+                ),
+                record(ms(200), ms(200), Some(1), range_created(OTHER, 4)),
+                record(ms(210), ms(210), Some(1), term_of(1, OTHER, 4, "follower")),
+            ],
+            vec![(1, ms(100), ms(500))],
+        );
+        assert_eq!(
+            report.isolation_keeps_the_term_by(RecordTime::Decided),
+            Ok(())
+        );
+    }
+
+    /// The checks about time are asked only of a range whose unimpaired replicas
+    /// form a majority (SHARD.md §8), where RAFT.md §2 asked it of the cluster: two
+    /// of one range's three replicas quarantined by a re-seed leave that range with
+    /// no majority, and say nothing about the range beside it. A node's refusal is
+    /// its whole store's and impairs every range on it.
+    #[test]
+    fn a_majority_is_asked_of_each_range_and_a_refusal_is_the_whole_nodes() {
+        let quarantined = |server, range| TraceEvent::RaftReseeded { server, range };
+        let one_range = report(
+            vec![
+                record(
+                    ms(0),
+                    ms(0),
+                    Some(1),
+                    term_of(1, SINGLE_GROUP, 1, "follower"),
+                ),
+                record(ms(0), ms(0), Some(1), term_of(1, OTHER, 1, "follower")),
+                record(ms(1), ms(1), Some(1), quarantined(1, SINGLE_GROUP)),
+                record(ms(2), ms(2), Some(2), quarantined(2, SINGLE_GROUP)),
+            ],
+            Vec::new(),
+        );
+        assert_eq!(
+            one_range.ranges_with_a_majority_up(),
+            BTreeSet::from([OTHER]),
+            "one range short of a majority, the other not"
+        );
+        let refused = |server| TraceEvent::RaftRefused {
+            server,
+            reason: "a table the manifest names is gone".to_owned(),
+        };
+        let whole_node = report(
+            vec![
+                record(
+                    ms(0),
+                    ms(0),
+                    Some(1),
+                    term_of(1, SINGLE_GROUP, 1, "follower"),
+                ),
+                record(ms(0), ms(0), Some(1), term_of(1, OTHER, 1, "follower")),
+                record(ms(1), ms(1), Some(1), refused(1)),
+                record(ms(2), ms(2), Some(2), refused(2)),
+            ],
+            Vec::new(),
+        );
+        assert_eq!(whole_node.ranges_with_a_majority_up(), BTreeSet::new());
+    }
+
+    /// And the carve-out is read where it is *used*, not only where it is
+    /// computed: the check about time asks it of the gap's own range. Server 1
+    /// holds two ranges; both replicas of the other range are quarantined by a
+    /// re-seed, so that range has no majority and the range beside it does. The
+    /// live range's replica then hears nothing for 500 ms, past its 400 ms bound,
+    /// and is the violation. A check that asked the cluster-wide
+    /// [`Report::majority_up`] — false here, since one range is short — would skip
+    /// every gap of the run and pass: the wedged range beside a live one of
+    /// SHARD.md §8, seen from the consuming end.
+    #[test]
+    fn a_live_ranges_gap_is_flagged_though_the_range_beside_it_has_no_majority() {
+        let quarantined = |server, range| TraceEvent::RaftReseeded { server, range };
+        let report = report(
+            vec![
+                record(
+                    ms(0),
+                    ms(0),
+                    Some(1),
+                    term_of(1, SINGLE_GROUP, 1, "follower"),
+                ),
+                record(ms(0), ms(0), Some(1), term_of(1, OTHER, 1, "follower")),
+                record(ms(1), ms(1), Some(1), quarantined(1, OTHER)),
+                record(ms(2), ms(2), Some(2), quarantined(2, OTHER)),
+                record(
+                    ms(500),
+                    ms(500),
+                    None,
+                    TraceEvent::TimeAdvanced { to: ms(500) },
+                ),
+            ],
+            Vec::new(),
+        );
+        assert_eq!(
+            report.ranges_with_a_majority_up(),
+            BTreeSet::from([SINGLE_GROUP])
+        );
+        assert!(!report.majority_up(), "the cluster-wide reading is false");
+        let gaps = report.timer_gaps(TimerResets::ALL);
+        let live_gap = gaps
+            .iter()
+            .find(|gap| gap.range == SINGLE_GROUP)
+            .expect("the live range's replica is past its bound");
+        assert_eq!(
+            report.timers_fire_by(RecordTime::Decided),
+            Err(live_gap.violation())
+        );
+    }
+
+    /// The write bound is asked per key (SHARD.md §8): one key's write completing
+    /// says nothing of the key beside it, which a minimum over every write would
+    /// let stand.
+    #[test]
+    fn the_write_bound_is_asked_of_every_key_written_after_the_heal() {
+        let write = |key: &str, ret: Option<u64>| lin::Op {
+            process: 1,
+            seq: 0,
+            call: ms(1),
+            ret: ret.map(ms),
+            op: ClientOp::Put {
+                key: Bytes::from(key.to_owned()),
+                value: Bytes::from_static(b"v"),
+            },
+            result: ret.map(|_| ananke_env::ClientResult::Done),
+        };
+        let live = vec![record(
+            ms(0),
+            ms(0),
+            Some(1),
+            term_of(1, SINGLE_GROUP, 1, "follower"),
+        )];
+        let with = |ops| Report {
+            history: History {
+                ops,
+                ..History::default()
+            },
+            ..report(live.clone(), Vec::new())
+        };
+        // Both keys written and completed: the bound holds of each.
+        with(vec![write("k0", Some(100)), write("k1", Some(200))])
+            .liveness()
+            .unwrap();
+        // The second key's writes never completed: the wedge, which the minimum
+        // over every write — 99 ms here — would have passed.
+        let wedged = with(vec![write("k0", Some(100)), write("k1", None)]);
+        assert_eq!(
+            wedged.time_to_write_after_heal(),
+            Some(Duration::from_millis(100))
+        );
+        assert_eq!(
+            wedged.liveness(),
+            Err(
+                "liveness: no client write to k1 completed after the last heal at Instant(0ns)"
+                    .to_owned()
+            )
+        );
     }
 }

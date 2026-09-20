@@ -8344,4 +8344,353 @@ visibly missing. The script runs on macOS and on Linux, and adds no dependency.
 
 ---
 
-_Next entry: D-071. Add one before implementing anything not covered above._
+## PROPOSED D-071 — The checks of SHARD.md §8 keyed by range: checks 1 to 4 over a group key, the history's closure, and the bounds per replica, per range and per key
+
+**Context.** Stage B's third build (SHARD.md:2219-2225): "The checks keyed by range (§8;
+§11, raft 12): checks 1 to 4 in `ananke-raft` over a generic group key, each range's
+first configuration taken from its `RangeCreated`; check 6 per range; the history's
+closure keyed by `(range, index, term)` (§9; §11, env 9); the timer check and pre-vote's
+property per (range, server); the checks about time asked only of a range whose
+unimpaired replicas form a majority, and the write bound asked per key (§8)."
+
+§11's raft item 12 says what the tree has: `invariants::Checker` "keys every map by
+server, term or index (invariants.rs:253-282) and takes `1..=servers` as the first
+configuration (invariants.rs:289-295)". D-069 put a `range` on every replica event and
+defined `RangeCreated` and `RangeRemoved`; this entry keys the checks that read them.
+
+**It changes no behaviour.** Every line it touches is a check over a trace the code under
+test produced: no event is added or moved, no draw changes, no fault arm changes. No
+pinned trace hash moves and no schedule moves, which the determinism pins and every
+pinned seed's own assertion say on the gate.
+
+**Nothing in this tree emits `RangeCreated` or `RangeRemoved`, and the table below should
+be read with that in front of it.** The two events exist in the trace type (D-069), in
+the moirae export, in the checks here that read them, and in the hand-built unit cases of
+this PR — and nowhere else. No scenario, no node, no sweep produces one. So every clause
+of this entry that turns on them is true of the unit cases and of nothing that runs: "a
+group's first configuration is the voters of its `RangeCreated`" describes a path no seed
+takes and `Checker::initial_voters` returns `1..=servers` on every seed of every tier; no
+replica's election timer is ever armed by a creation or ended by a removal; no isolation
+ever meets a range created inside it; no floor and no applied memory is ever set or
+cleared by either event outside a test. The keys are built and proved here so that the
+stage which emits the events finds the checks already keyed — that is the whole of what
+this PR buys. What the sweeps do exercise is the other half: the `(range, server)` and
+`(group, index)` keys over the events every seed *does* trace, which with one group say
+exactly what the keys before them said, which is why the oracle below is hand-built and
+not a sweep.
+
+**Decision — each check's key as built.**
+
+| Check | Where | Key as built | The key before |
+|---|---|---|---|
+| 1, election safety | `invariants.rs` | `(group, term) → server` | `term → server` |
+| 2, log matching | `invariants.rs` | a log and a snapshot floor per `(group, server)`; a `RangeCreated` sets its replica's floor as an installed snapshot does; two snapshots are compared at an index only within one group | per `server` |
+| 3, leader completeness | `invariants.rs` | the committed set per `(group, index)`, and the rescan at every `RaftLeader` is over that group's range of it | one set, per `index` |
+| 3, commit by majority | `invariants.rs` | the configuration in force per `(group, server)`; a group's first configuration is the voters of its `RangeCreated`, and `1..=servers` only for a group whose creation the trace does not hold | per `server`, always `1..=servers` |
+| 3, commit by current term | `invariants.rs` | who leads, per `(group, server)` | per `server` |
+| 3, committed entries stay | `invariants.rs` | the commit index per `(group, server)`; a node's `RaftRefused` clears every group on it, a `RangeRemoved` that one replica | per `server` |
+| 4, state machine safety | `invariants.rs` | a map per group from index to `(term, hash, effect)`; the applied index per `(group, server)`, consecutive from the floor a `RangeCreated` or an install sets; a `RangeRemoved` ends that replica's memory as a refusal ends a store's | per `index`, and per `server` |
+| 5, linearizability | `sim/lin.rs` | the history's closure by `(range, index, term)`; the partition stays the key, which no boundary moves (§9) | `(index, term)` |
+| 6, lease safety under drift | `sim/tests/raft.rs` | nothing of its own: it is not a fold but check 5 on every seed — whose closure is now keyed — and the with-guard/without-guard test, and it is carried over as that | — |
+| the timer check | `sim/raft.rs` | every set of the replay per `(range, server)`: running, leading, re-seeded, the term, the clock and its last reset. A replica's `RangeCreated` arms its timer and its `RangeRemoved` ends it; a `NodeCrashed` takes every replica on the node down | per `server` |
+| pre-vote's property | `sim/raft.rs` | asked of each replica of the isolated node, `(range, server)` — the replicas its term records name, and only those (item 12); a range created on it during the isolation takes its `RangeCreated`'s floor term as the term the window began with | per `server` |
+| the checks about time | `sim/raft.rs` | asked of each range whose replicas that are neither refused nor quarantined form a majority, at the two places the carve-out is used and not only where it is computed (rows M1 and X3); a node's refusal impairs every range on it — every range of the whole run, in fact, which over-impairs (item 13) | per cluster |
+| the write bound | `sim/raft.rs` | per key: the first write to each key the run wrote after the heal completes within ten maximum election timeouts | one minimum over every write |
+
+**The oracle: what a wrong key would look like, and the case that catches it.** With one
+group every event of every sweep carries `SINGLE_GROUP`, so a check keyed by `(group,
+term)` and one keyed by `term` say the same thing on every seed at every tier: no sweep
+can tell them apart, and a wrongly keyed check would ship green. Each keyed check
+therefore has a hand-made two-range case of its own, in the style of the folds' existing
+unit tests — `crates/ananke-raft/tests/invariants.rs` for checks 1 to 4, `sim/lin.rs`'s
+and `sim/raft.rs`'s own test modules for the rest — and each is a pair: a two-range trace
+the keyed check accepts and a wrongly keyed one rejects, and a one-range trace that is a
+real violation and the keyed check still rejects, so that keying has not widened a check
+into a check of nothing.
+
+Then each wrong key was planted, one at a time, in a copy of this tree with a target
+directory of its own, and the tests run. **Every row fails, and every row names the case
+written for it.** A check whose wrong key nothing catches is not keyed; the first run of
+this table had two such rows, and both were the case's fault, not the check's:
+`a_created_replica_starts_at_the_floor_its_creation_names` exercised only the *applied*
+floor a creation sets and not the *log's*, and now commits index 6 of a group created at
+floor 5 through the majority check, which asks for index 1 without the floor; and
+`a_leader_of_one_group_is_not_a_leader_of_another` traced the leader's role record before
+the follower's, so the wrong key's own `remove` undid it, and the two are now in the
+order a node takes them in.
+
+The table below *is* that run and not a transcription of one. The harness is `scratchpad
+stage-b/checks-fix/mutate.py` and the run these cells are read off is `scratchpad
+stage-b/checks-fix/mutations-d071.log`, which plants all twenty-three rows in sequence
+and prints the table at the end; no row of it says "NOTHING FAILED". Three rows plant
+something that is not a key, and say so: **X3** and **T0** plant the timer check's body,
+and **4f** is check 4's mismatch message (item 14).
+
+**X3 is the row that matters most, and the first draft of this table did not have it.**
+M1 plants the wrong key inside `ranges_with_a_majority_up` and is caught — but that only
+proves the *helper*. The carve-out is **used** in two places, `Report::timers_fire_by`
+and `Report::liveness`, and replacing both of those with the cluster-wide
+`Report::majority_up`, leaving the helper perfectly correct, passed every sim unit test
+and every sweep tier as this PR first stood: with one group the two predicates coincide,
+so the wedged range beside a live one that §8 exists to prevent would have shipped green.
+`a_live_ranges_gap_is_flagged_though_the_range_beside_it_has_no_majority` drives the
+consuming end instead of the helper — one range short of a majority, the range beside it
+live and past its timer bound, and the check must report that gap — and it is the only
+case that fails under X3. The liveness half of the carve-out cannot be driven by a case
+today, and is not: `range_of_key` is the constant `SINGLE_GROUP` for every key (item 6),
+so no hand-built history can put two keys in two ranges, and that half is driven by the
+stage that gives `range_of_key` a map.
+
+| Wrong key planted | The case that fails |
+|---|---|
+| 1 election safety: the leader map keyed by the term alone | `two_groups_may_elect_different_leaders_in_one_term` |
+| 2a log matching: the logs and floors keyed by the server alone | `two_groups_on_one_server_may_differ_at_one_index`, `two_groups_snapshots_at_one_index_may_carry_different_terms` |
+| 2b log matching: two groups' snapshot floors compared at one index | `two_groups_snapshots_at_one_index_may_carry_different_terms` |
+| 2c log matching: a `RangeCreated` sets no floor | `a_created_replica_starts_at_the_floor_its_creation_names` |
+| 3a commit majority: the first configuration taken as `1..=servers` | `a_group_commits_on_a_majority_of_the_voters_it_was_created_with`, `a_group_may_not_commit_on_a_minority_of_the_voters_it_was_created_with` |
+| 3b leader completeness: the rescan over every group's committed set | `a_new_leader_of_one_group_need_not_hold_another_groups_committed_entries` |
+| 3c commit by current term: who leads kept per server | `a_leader_of_one_group_is_not_a_leader_of_another` |
+| 3d committed entries stay: the commit index kept per server | `a_commit_index_in_one_group_does_not_bind_another_groups_truncation` |
+| 4a state machine safety: the applied map keyed by the index alone | `two_groups_may_apply_different_entries_at_one_index`, `a_servers_applies_are_consecutive_within_each_group`, `one_group_may_not_apply_one_entry_to_two_effects`, `a_nodes_refusal_ends_every_groups_memory_on_it` |
+| 4b state machine safety: the applied index kept per server | `a_servers_applies_are_consecutive_within_each_group`, `a_removal_ends_one_replicas_memory_and_no_other`, `a_nodes_refusal_ends_every_groups_memory_on_it` |
+| 4c state machine safety: the effect left out of the value | `one_group_may_not_apply_one_entry_to_two_effects` |
+| 4d state machine safety: a removal read as the node's | `a_removal_ends_one_replicas_memory_and_no_other` |
+| 4e state machine safety: a removal read as every node's | `a_removal_ends_one_replicas_memory_and_no_other` |
+| 4f *not a key, the message*: check 4's mismatch names the terms alone | `one_group_may_not_apply_two_entries_at_one_index` |
+| 5 the history's closure keyed by `(index, term)` | `lin::tests::an_operations_proposal_is_closed_only_by_its_own_ranges_apply` |
+| T0 *not a key, the body*: the timer check's gap report neutered | in `raft::tests`: `a_snapshot_a_server_took_itself_leaves_its_election_timer_running`, `a_coreless_window_longer_than_the_bound_is_removed_not_measured_from_the_completion`, D-051's four `a_timer_catch_*` cases, `one_ranges_reset_does_not_stand_in_for_anothers_silence` and `a_live_ranges_gap_is_flagged_though_the_range_beside_it_has_no_majority` — eight in all |
+| T1 the timer check's clocks kept per server | `raft::tests::one_ranges_reset_does_not_stand_in_for_anothers_silence` |
+| T2 the timer check: a creation arms no timer and a removal ends none | `raft::tests::a_creation_arms_a_replicas_timer_and_a_removal_ends_it` |
+| P1 pre-vote: the isolated server's terms read as one sequence | `raft::tests::one_servers_two_ranges_keep_their_terms_apart` |
+| P2 pre-vote: a range created under the isolation starts at term 0 | `raft::tests::a_range_created_under_an_isolation_starts_at_its_creations_term` |
+| M1 the checks about time asked of the cluster in the *helper* | `raft::tests::a_majority_is_asked_of_each_range_and_a_refusal_is_the_whole_nodes`, `raft::tests::a_live_ranges_gap_is_flagged_though_the_range_beside_it_has_no_majority` |
+| X3 the checks about time asked of the cluster where the carve-out is *used* | `raft::tests::a_live_ranges_gap_is_flagged_though_the_range_beside_it_has_no_majority` |
+| W1 the write bound as one minimum over every write | `raft::tests::the_write_bound_is_asked_of_every_key_written_after_the_heal` |
+
+The pairs' other halves — the one-range violations — are in the same files beside them.
+There are **ten**:
+`one_group_may_not_elect_two_leaders_in_one_term`,
+`one_group_may_not_hold_two_payloads_at_one_index_and_term`,
+`a_new_leader_of_the_group_that_committed_an_entry_must_hold_it`,
+`a_group_may_not_commit_on_a_minority_of_the_voters_it_was_created_with`,
+`a_leader_may_not_commit_an_older_terms_entry_of_its_own_group`,
+`a_replica_may_not_truncate_below_its_own_groups_commit_index`,
+`one_group_may_not_apply_two_entries_at_one_index`,
+`a_replica_may_not_apply_one_index_twice`,
+`an_operations_proposal_is_closed_by_its_own_ranges_apply`, and
+`a_replica_that_raises_its_own_ranges_term_while_isolated_is_caught`.
+
+**The timer check is the one keyed check with no one-range violation of its own in this
+PR**, and it does not need one: its one-range half is the suite that was already there
+and that this PR did not write.
+`a_snapshot_a_server_took_itself_leaves_its_election_timer_running`,
+`a_coreless_window_longer_than_the_bound_is_removed_not_measured_from_the_completion` and
+D-051's four catch cases — the three removals
+(`a_timer_catch_removed_by_a_reset_decided_before_the_flag`,
+`a_timer_catch_removed_by_the_flag_record_decided_within_the_bound`,
+`a_timer_catch_removed_by_leadership_decided_before_the_flag`) and
+`a_timer_catch_both_readings_make_has_no_removal_reason` — all read the gap report on one
+range, and all six die when that report is neutered (mutation row T0 below), so the check
+is held to a one-range violation exactly as the other ten are.
+`each_ranges_own_reset_keeps_its_own_timer` is *not* one of them: it is the two-range
+**accept** case beside `one_ranges_reset_does_not_stand_in_for_anothers_silence`, and an
+earlier draft of this list miscounted it as a violation.
+
+**What §8 leaves open, settled here, each marked `// PROPOSED(D-071)` in the code.**
+
+1. *The checker is fed the node beside the event.* `RangeCreated` and `RangeRemoved` name
+   their range and no server — §8's table lists none, and every record carries its node
+   (D-069, item 1) — but the state they key is a *replica's*, `(range, server)`. The
+   checker's input becomes `invariants::Traced`, the event with the node that traced it;
+   a `&TraceEvent` converts into one with no node, so every existing caller compiles
+   unchanged and the two range events are skipped there, naming no replica. The sweeps
+   pass the record's node (`ananke_sim::traced`), and the scenarios' node ids are their
+   server ids. The alternative, a `server` field on the two events, would contradict §8's
+   table and D-069's first settled item.
+2. *Check 4's value is `(term, hash, effect)`, and a recovered apply has no effect.* The
+   entries a restart's recovered applied index accounts for are read from the replica's
+   log, which holds the entry and not what applying it did, so their effect is `None`; it
+   agrees with any effect and is filled in by the first apply that names one. Term and
+   hash are compared as before. The conservative reading is the one taken: an unknown
+   effect never makes a violation and never hides a disagreement between two apply
+   records.
+3. *The messages name the group.* Every violation of checks 1 to 4 names it — "both led
+   term 5 of group 2", "server 1 applied index 1 of group 2 after 1" — and four pinned
+   literals in `sim/tests/raft.rs` moved with them, on the same seeds, over the same
+   mechanisms. **The pre-vote violation does not name the range**: it is asserted word for
+   word by forty-four pinned assertions in `sim/tests/raft.rs`, a run of this stage has
+   one range, and the stage that
+   gives a node many ranges moves every one of those pins for its own reasons (SHARD.md,
+   Stage B: the node and the seed switch each move every schedule). Naming it there costs
+   nothing and naming it here would rewrite forty-four assertions twice.
+4. *§9's other two changes are not built here.* §11's env item 9 asks for three things:
+   the closure keyed by range, closing only on effect `applied`, and an operation's
+   proposals gathered across the fresh sequence numbers of its resends by `ClientSend`'s
+   `invoked`. Stage B's bullet asks for the first, and the other two have nothing to act
+   on yet: no apply of this stage can carry an effect other than `applied` or `none`,
+   which D-069's payload oracle asserts on every seed, and `ClientSend` is emitted by the
+   stage that routes a client to a range. Each belongs to the stage that can make it
+   false.
+5. *The timer check's other skips are not built here.* §8 lists four skips for the
+   *sharded* sweep: a replica that is not a voter of its configuration in force, a
+   placeholder between its `RangeReplicaCreated` and its `RangeCreated`, one stalled at a
+   merge, and one after its `RangeRemoved`. The first three read events no stage emits
+   yet and a notion of the configuration in force that the replay does not keep; the
+   fourth is built, with the creation that arms the timer, because both are this
+   stage's events and both are what make a replica's timer its own.
+6. *A delivered frame resets the timer of the group it carries.* A frame holds one
+   message of one group today, so the reset is `SINGLE_GROUP`'s; §4's batch frame tags
+   each message it holds with its range (§11, raft 1), which the decode reads there. The
+   same holds for the key's range in the write bound: the scenario's ranges are fixed and
+   a client takes its key's range from that map (Stage B), so `range_of_key` is one
+   group until the node gives it more. **It is a constant function**: it returns
+   `SINGLE_GROUP` whatever key it is handed. That is why the liveness half of the majority
+   carve-out has no case of its own in the oracle above — with every key in one range, no
+   hand-built history can put a live range and a range without a majority on two different
+   keys, so `Report::liveness`'s `live.contains(&range_of_key(&key))` cannot be told apart
+   from the cluster-wide reading by any test that can be written today. The timer half
+   *can* be told apart, and is (row X3). The stage that gives `range_of_key` a map owes
+   the liveness half its own two-range case in the same PR.
+7. *The write bound is asked of the keys the run wrote to after the heal, and of no
+   others.* A key no client wrote to in the window is no evidence either way — the two
+   clients draw their keys at random, and a key can go a whole window unwritten — and a
+   write no leader ever proposed is not in the history at all. A key whose post-heal
+   writes all stayed pending *is* the wedge the check is here to see, and is a violation.
+   With no range left with a majority the check asks nothing, as it asked nothing when it
+   was the cluster's.
+8. *The per-range majority keeps the down set and the quarantine apart.* A refusal is
+   cleared by that replica's `RaftRecovered`; a re-seed's quarantine is not cleared by
+   anything, because a re-seeded server never votes again (D-035). Folding the two into
+   one map was the first thing written here and it was wrong: on seed 8 a recovery
+   cleared a quarantine, the range read as live, and the liveness check was asked of a
+   run RAFT.md §2 withholds it from. The pair of sets is the tree's own reading, now per
+   replica. Seed 8 is also the seed this tree reaches an *empty* live set on, and the
+   helper's doc comment now says so: it told the story of seed 60 instead, carried over
+   from D-030 and D-035, which described the release runs of their own day. Every schedule
+   has been redrawn many times since and seed 60 of this tree has its range live
+   (`live = {2}`), so the anecdote no longer reproduced. On seed 8 rot refuses server 2, a
+   leader re-seeds it and the quarantine sticks, rot then refuses server 1 and no leader
+   ever re-seeds it, and server 3 is left with nobody able to grant it a vote — D-035's
+   priced-in deadlock, exactly what the two older entries described.
+9. *`sim/membership.rs`'s own write bound is left alone.* §8 keys the checks about time
+   where RAFT.md §2's run and cites the raft sweep's own lines for both the majority
+   carve-out (sim/raft.rs:967-986) and the write bound (sim/raft.rs:990-998); the
+   membership scenario's liveness is D-029's availability check, its bound is asked of
+   every uniform seed with no carve-out, and keying it per key is an assertion that
+   would need its own thousand-seed measurement on a scenario this build does not
+   otherwise touch. It is keyed by the stage that runs that scenario on the node with
+   four ranges, which is Stage B's own exit criterion.
+10. *The pinned-seed straddle predicates keep the per-node skip.* `Report::isolation_term_straddles`
+   and `isolation_received_straddles` describe the situation a seed was pinned for and
+   read the isolated *server*'s term records; they skip an isolation in which any replica
+   on the node was refused, re-seeded or finished installing (`reseeding_during_any`),
+   which is the skip as it stood. The pre-vote check itself takes it per replica. A pin
+   must read the window it was pinned on.
+11. *A `RangeCreated` and a `RangeRemoved` are believed on sight, and neither `cause` is
+   read.* Check 2 and check 4 take a creation's `floor_index` and `floor_term` as a floor
+   exactly as an install's completion sets one, and a removal ends that replica's commit
+   index and its applied memory exactly as a node's refusal ends a store's. §8 sanctions
+   both, and both are an amnesty with nothing behind them. A replica that applies 1 and 2,
+   traces `RangeCreated { floor_index: 9 }` and then applies 10 now passes where it failed
+   "state machine safety: server 1 applied index 10 of group 2 after 2"; a `RangeRemoved`
+   erases a commit index, so a later truncation below it passes too. Neither event's
+   `cause` is read, so nothing here tells a legitimate split, merge or install from a
+   bogus one: a replica that forged either event would launder its own violation past
+   checks 2, 3 and 4. §8's **check 7** — a range's replicas agree on the sequence of its
+   configurations, of which every creation and removal is a step — is what ties them down,
+   and it is not built here: there is no membership change of a range for it to read yet
+   (item 5, and the paragraph above on what emits these events, which is nothing). Until
+   check 7 exists, the checks of this entry hold only against traces whose range events
+   the code under test produced honestly. **The stage that emits these events inherits an
+   unguarded amnesty and owes check 7 in the same PR.**
+12. *Pre-vote's per-replica set is read from term records alone.* `Report::ranges_of` says
+   which replicas of the isolated node the property is asked of, and a first draft read a
+   `RangeCreated` on the node as well as a `RaftTerm`. **That arm is removed here.** It
+   could catch nothing the `RaftTerm` arm does not — a replica that ever steps traces a
+   term record, and a replica that never steps has no term to keep — and it could produce
+   a catch that is simply wrong: for a replica with a creation and no term record,
+   `term_by` reads 0 at both ends of the window while `created_term_in` makes the window's
+   opening term the creation's `floor_term`, so the check would report a raise "from
+   `floor_term` to 0" that no replica made. Deleting it leaves every sim unit test green,
+   because the case written for it
+   (`a_range_created_under_an_isolation_starts_at_its_creations_term`) also traces a
+   `RaftTerm` for the created range and `ranges_of` scans the whole trace with no window —
+   so the arm was untestable as well as useless. The creation is still read where it earns
+   its place, for the opening term of a replica that *does* step (`created_term_in`,
+   mutation row P2).
+13. *A refusal marks the node down for every range of the whole run: a known
+   over-impairment, left for the node's PR to close.* `ranges_with_a_majority_up` reads a
+   `RaftRefused` as "every range this trace ever names is down on this server", where the
+   honest reading is "every range this replica held at that moment". It over-impairs: a
+   range created after the refusal, and a range the node never held, each count a replica
+   down that was never there, so a range can read as short of a majority and be skipped by
+   the checks about time that should have been asked of it. Inert today — every trace has
+   one range and every node holds it — and silently weakening the day a node holds four.
+   It is **not** fixed here, on purpose. The honest predicate needs to know what a node
+   holds, and the only source for that in this tree is what the node happened to trace,
+   which is empty at exactly the moment it matters: `RaftRefused` is traced when the start
+   returns the loss, before the store is open and before the node has traced one record
+   about any replica (`crates/ananke-raft/src/node.rs`, `Start::Refused`). A refusal at a
+   node's first start would then impair nothing at all, its range would read as live, and
+   the checks about time would be asked of a run RAFT.md §2 withholds them from — which is
+   the failure item 8 above already cost this entry once, on seed 8. Under-impairing is
+   the dangerous direction and over-impairing the safe one, so the safe one stands until
+   there is range membership to read rather than guess: the PR that gives a node many
+   ranges emits `RangeCreated` and `RangeRemoved` for real, and with them a refusal can
+   mark down the ranges that node is known to hold at that point. **That PR closes this.**
+14. *Check 4's mismatch message names the payload as well as the term.* The value the
+   check compares at an index is `(term, payload hash)`, and the message printed only the
+   two terms, so a disagreement over the *payload* alone — two replicas applying two
+   different commands at one index of one term, which is the worst thing this check can
+   see — read "index 1 of group 2 was applied as term 1 on one server and term 1 on
+   server 1": true, and useless. It cost a reviewer of this PR three wrong diagnoses. The
+   message now names both, in check 2's own vocabulary ("with different payloads"), and
+   `one_group_may_not_apply_two_entries_at_one_index` asserts it on a term disagreement
+   and on a payload-only one (mutation row 4f). The fault is older than this PR; it is
+   fixed here because this PR keyed the line it is on.
+
+**Measurements.**
+
+- *The correct system, at 1 000 seeds in release on this tree*: green, every seed, with
+  the per-key write bound, and green at the gate's twenty and CI's hundred. **The margin
+  is worth knowing.** The raft sweep's coverage prints `slowest_write_after_heal`, and it
+  now prints the figure the bound is asked against — the worst first completion of a
+  write after the last heal over every key of every seed, where it printed the best of
+  the keys. Over the same thousand runs, which are deterministic and so are the same
+  runs either way, the best of the keys is 1.114473988 s and the worst is 1.785543304 s,
+  against the bound of ten maximum election timeouts, 2 s: the per-key check runs 214 ms
+  under it where the old one ran 886 ms under it. The bound is SHARD.md's and
+  `LIVENESS_TIMEOUTS`'s and is not moved here; what is recorded is that a change which
+  redraws the schedules has a *tenth* of the bound to play with on this check — 214 ms of
+  2 s, one of the ten election timeouts, not two — where the old one had a little under a
+  half, and that the next stage's four ranges per node will want this figure measured
+  again.
+- *Every variant keeps its standard at its tier*, the gate's twenty and the premerge's
+  thousand, and every rate is the one D-069 recorded: `TruncateOnEveryAppend` 999 of
+  1 000, `LeaseTrustsTheClock`'s stale read 40 of the 503 seeds whose drift exceeds the
+  bound, with the guard revoking on every one of them. No catch moved, because no
+  schedule moved and the checks say of one group exactly what they said before.
+- *`scripts/premerge.sh` at a thousand seeds on this tree*: **green in 713.53 s** real
+  (4 879.02 s user, 196.76 s sys), on the 8-core Apple M2 **on AC power** — the machine
+  throttles on battery — with the load sampled every ten seconds through the run at mean
+  29.64, minimum 12.11 and maximum 95.08, which is the premerge's own parallelism and
+  nothing else of this session running. It is inside D-040's quarter of an hour. Against
+  the figures beside it: D-071 changes no code that runs in a simulation, so this is a
+  measurement of the machine and the tier, not of the change; the pair D-069 recorded
+  says what a change costs, and nothing here needs that number.
+- *And again at a thousand seeds after this entry's review fixes* (fc21689 and 8ce19a3, on
+  the same 8-core Apple M2, again **on AC power**): **green in 625.01 s** real (4 465.90 s
+  user, 180.21 s sys), with the load sampled every ten seconds at mean 12.70, minimum 9.38
+  and maximum 16.16 over 63 samples — lower than the run above because that one built the
+  tree first and this one had it built. The whole suite is green in release at CI's
+  hundred too. The figure that matters is not the time: **nothing moved.** The raft
+  sweep's `slowest_write_after_heal` is 1.785543304 s to the nanosecond, the same run it
+  was above, and every variant's rate is the one recorded here and by D-069 —
+  `TruncateOnEveryAppend` 999 of 1 000, `LeaseTrustsTheClock`'s stale read 40 of the 503
+  seeds whose drift exceeds the bound with the guard revoking on all 503. A check whose
+  message changed (item 14) and a check whose arm was deleted (item 12) leave the
+  schedules exactly where they were, which is what the two runs being the same run says.
+
+---
+
+_Next entry: D-072. Add one before implementing anything not covered above._

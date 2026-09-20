@@ -8,13 +8,14 @@ use std::collections::BTreeSet;
 use std::sync::Mutex;
 use std::time::Duration;
 
+use ananke_env::sim::TraceRecord;
 use ananke_env::{ClientOp, DropReason, TraceEvent};
 use ananke_raft::core::{Variant, Variants};
 use ananke_raft::invariants::{self, Checker};
 use ananke_raft::store::{LOST_STATE, STORE_MARKER};
 use ananke_sim::raft::DRIFT_BOUND_PPM;
 use ananke_sim::raft::{self, Fault, Moved, RecordTime, TimerResets};
-use ananke_sim::{seeds, sweep, verdict, write_trace};
+use ananke_sim::{seeds, sweep, traced, verdict, write_trace};
 
 /// Two runs with the same seed produce byte-identical traces.
 #[test]
@@ -1434,19 +1435,19 @@ fn the_nightlies_removed_catches_meet_the_sweeps_assertions() {
             // adopts the store it leaves (RAFT.md §5).
             (2305, Variant::SnapshotWithoutCurrentLast) => Some(
                 "seed 2305: state machine safety: server 3 recovered an applied index of 282 \
-                 but its log does not hold index 281",
+                 in group 2 but its log does not hold index 281",
             ),
             // The timer variant's own catch, the rule it is written for.
             (6717, Variant::ResetTimerOnAnyRpc) => Some(
-                "seed 6717: timers: server 1 heard from no leader of its term and granted no \
-                 vote since Instant(1.987649864s) and had not campaigned by \
-                 Instant(2.388765868s)",
+                "seed 6717: timers: server 1's replica of range 2 heard from no leader of its \
+                 term and granted no vote since Instant(1.987649864s) and had not campaigned \
+                 by Instant(2.388765868s)",
             ),
             // The adoption as built losing the copied store, caught where D-041's own
             // pin on seed 6325 describes it: a voter restating from index 1.
             (9557, Variant::AdoptionAsBuilt) => Some(
-                "seed 9557: committed entries stay: server 2 truncated from index 1 with \
-                 commit index 249",
+                "seed 9557: committed entries stay: server 2 truncated group 2 from index 1 \
+                 with commit index 249",
             ),
             _ => None,
         };
@@ -2393,8 +2394,8 @@ fn seed_102_pins_the_refusal_that_is_not_durable_which_a_hundred_seeds_can_miss(
     let violation = verdict.err().unwrap_or_default();
     assert!(
         violation.starts_with(
-            "seed 102: state machine safety: server 1 recovered an applied index of 331 but its \
-             log does not hold index 1"
+            "seed 102: state machine safety: server 1 recovered an applied index of 331 in \
+             group 2 but its log does not hold index 1"
         ),
         "seed 102 as built is no longer caught with the laundered store's restatement: \
          {violation:?}; re-audit the pin"
@@ -3356,7 +3357,10 @@ impl Coverage {
         self.completed += report.clients.completed;
         self.abandoned += report.clients.abandoned;
         self.redirected += report.clients.redirected;
-        if let Some(took) = report.time_to_write_after_heal() {
+        // The write bound is asked of every key some client wrote to after the heal
+        // (SHARD.md §8), so the figure is the worst of those keys' first
+        // completions and not the best of them.
+        for took in report.writes_after_heal_by_key().into_values().flatten() {
             self.slowest_write_after_heal = self.slowest_write_after_heal.max(took);
         }
     }
@@ -3944,26 +3948,31 @@ const CHUNK: usize = 37;
 /// chunks against the verdict of the folds over that whole prefix from the first
 /// record — the same `Ok` or `Err` and, when `Err`, the same words. `Ok(true)` if
 /// some prefix was in violation, so the sweep can say the comparison saw one.
-fn compare(seed: u64, variant: Variant, events: &[TraceEvent]) -> Result<bool, String> {
+///
+/// Both are fed the records as the sweep feeds them, each event with the node that
+/// traced it ([`traced`]), so the comparison covers the checks as they are keyed by
+/// group — including the two range events, which name no server of their own
+/// (SHARD.md §8).
+fn compare(seed: u64, variant: Variant, records: &[TraceRecord]) -> Result<bool, String> {
     let servers = raft::SERVERS as usize;
     let mut checker = Checker::new(servers);
     let mut fed = 0;
     let mut violated = false;
     for step in 1..=PREFIXES {
-        let stop = events.len() * step / PREFIXES;
+        let stop = records.len() * step / PREFIXES;
         while fed < stop {
             let next = (fed + CHUNK).min(stop);
-            checker.extend(&events[fed..next]);
+            checker.extend(traced(&records[fed..next]));
             fed = next;
         }
         let incremental = checker.verdict();
-        let whole = invariants::all(&events[..stop])
-            .and_then(|()| invariants::commit_majority(&events[..stop], servers));
+        let whole = invariants::all(traced(&records[..stop]))
+            .and_then(|()| invariants::commit_majority(traced(&records[..stop]), servers));
         violated |= whole.is_err();
         if incremental != whole {
             return Err(format!(
                 "seed {seed}: under {variant:?}, over the first {stop} of {} records, the incremental checker said {incremental:?} and the fold over the whole prefix said {whole:?}",
-                events.len()
+                records.len()
             ));
         }
     }
@@ -3984,7 +3993,7 @@ fn the_incremental_checker_agrees_with_the_fold_over_the_whole_trace() {
     let compared = compared_seeds();
     let outcomes = sweep(compared, |seed| {
         let variant = COMPARED[seed as usize % COMPARED.len()];
-        compare(seed, variant, &raft::run(seed, variant).events())
+        compare(seed, variant, &raft::run(seed, variant).records)
     });
     let violated = outcomes.iter().filter(|o| matches!(o, Ok(true))).count();
     eprintln!(

@@ -419,11 +419,12 @@ impl Report {
         if let Some(why) = &self.stopped {
             return fail(why.clone());
         }
-        let events = self.events();
-        if let Err(violation) = invariants::all(&events) {
+        if let Err(violation) = invariants::all(crate::traced(&self.records)) {
             return fail(violation);
         }
-        if let Err(violation) = invariants::commit_majority(&events, INITIAL_VOTERS as usize) {
+        if let Err(violation) =
+            invariants::commit_majority(crate::traced(&self.records), INITIAL_VOTERS as usize)
+        {
             return fail(violation);
         }
         if let Err(violation) = lin::check(&self.history) {
@@ -667,7 +668,7 @@ impl Driver {
             if self.watch.slices.is_multiple_of(crate::raft::CHECK_EVERY) {
                 let records = self.sim.trace_from(self.watch.checked);
                 self.watch.checked += records.len();
-                self.watch.checker.extend(records.iter().map(|r| &r.event));
+                self.watch.checker.extend(crate::traced(&records));
                 if let Err(violation) = self.watch.checker.verdict() {
                     self.watch.stopped = Some(format!("{violation} (at {:?})", self.sim.now()));
                     return;
