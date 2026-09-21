@@ -9028,15 +9028,25 @@ caught by the cost measurement alone, which is why that measurement is a test an
 printed figure, and row 7 is the range/server confusion `RangeId` exists to make hard.
 
 - *`scripts/gate.sh`*: green, as it must be before each of this PR's commits.
-- *`scripts/premerge.sh` at a thousand seeds*: **not run for this entry, and still
-  owed.** The machine has been on battery for both sessions — `pmset -g batt` said "Now
-  drawing from 'Battery Power'" at 74 % when the wire was written and at 64 % when the
-  review's findings were fixed — and this laptop throttles on battery, so a figure taken
-  here would be the incomparable kind D-070 exists to stop. It is to be run on AC power
-  before the merge, with the machine state D-070's script prints quoted beside it. What
-  the tier would be asked is unchanged by this PR in any case: nothing in `sim/` changes
-  behaviour, no schedule moves, and `ananke-shard`'s own tests are 34 unit tests that run
-  in 0.26 s at any tier.
+- *`scripts/premerge.sh` at a thousand seeds*: **green in 779 s, on AC power**, the run's
+  own machine lines beside it, as D-070 asks:
+
+  ```
+  premerge: Darwin 25.6.0 arm64, Apple M2, 8 cores
+  premerge: before, load 18.72/23.69/28.80, AC Power, no thermal warning recorded
+  premerge: after, load 51.08/59.77/47.66, AC Power, no thermal warning recorded
+  premerge: green at 1000 seeds in 779 s
+  ```
+
+  It was owed for two sessions: the machine was on battery while the wire was written
+  (74 %) and while the review's findings were fixed (64 %), and this laptop throttles
+  there, so a figure taken then would have been the incomparable kind D-070 exists to
+  stop. Beside D-071's 625 s on AC at a mean load of 12.70, this run started at a
+  one-minute load of 18.72 and ended at 51.08, which is the premerge's own parallelism on
+  a machine that was already busy; what the two say together is that this PR did not move
+  the tier, which is what the figure is for here. Nothing in `sim/` changes behaviour, no
+  schedule moves, and `ananke-shard`'s own tests are 34 unit tests that run in 0.26 s at
+  any tier.
 
 ---
 
