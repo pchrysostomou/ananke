@@ -101,6 +101,22 @@ ananke/
 
 _Update this section at the end of every session._
 
+- Phase 3, Stage B in progress (2026-09-21). Merged: PR #71 the trace of §8 (D-069),
+  PR #75 the checks keyed by range (D-071), PR #76 the node's wire (D-072, crate
+  `ananke-shard`: `RangeId`, range-tagged batch frames, the per-peer outbox keyed by
+  range, the byte-bounded inbox). Branch `phase-3-stage-b-tasks`: the node's **tasks and
+  Q41's round** (PROPOSED D-073) — `ananke_shard::round`, the discipline alone, and
+  `ananke_shard::node`, one `raft` task holding every core keyed by range on one ticker
+  and one `apply` task over every range's jobs one at a time, with five node variants
+  beside the correct round (`ananke_shard::variant`). Measured: a core's idle step costs
+  **32 ns** against a pass bound of 20 µs (Apple M2, 8 cores, load 11, release, host
+  time, `cargo run --release -p ananke-shard --example step-cost`), so one `raft` task
+  holds 1 000 ranges' idle ticks in 0.2 % of a 10 ms tick; the replay burst after a slow
+  persist is under 1 % of a tick at every disk latency the tree models and first fills a
+  tick at a sync of about 10.4 s; a round with `p` persisting cores costs up to `1 + p`
+  frames per peer, which is the one figure D-073 puts to the owner. The node runs one
+  range and is in no scenario yet; the single-group server in `ananke-raft` is
+  untouched.
 - Phase: 2 CODE-COMPLETE, not tagged. Overnight (2026-09-09), branch
   `phase-2-overnight`, merged to main as PR #24: stages D and E of RAFT.md's order
   and issue #22 landed (D-029, D-030, D-031), every commit gated, the correct server

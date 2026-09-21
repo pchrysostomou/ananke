@@ -9048,6 +9048,215 @@ printed figure, and row 7 is the range/server confusion `RangeId` exists to make
   schedule moves, and `ananke-shard`'s own tests are 34 unit tests that run in 0.26 s at
   any tier.
 
+## PROPOSED D-073 — The node's tasks: one `raft` task over every core in Q41's round, and one `apply` task over every range
+
+**Context.** Stage B's third build (SHARD.md:2219-2232) is §4's node. D-072 built its
+wire. This entry is the next slice, the **tasks and the round**, and nothing else: "one
+`raft` task stepping every core on one ticker in Q41's round, every output after a
+core's `Persist` executed when that core's own persist resolves and its messages and
+ticks held until then; one `apply` task (Q14)". The snapshot task keyed by range and
+follower, bootstrap ranges and the four ranges per node in the scenarios, Q15's refusal
+and re-seed, and follower compaction are each their own PR. The single-group server in
+`ananke-raft` runs exactly as it did; nothing in `sim/` changes behaviour; the node runs
+one range, `node::SINGLE_GROUP`, until the slice that switches the sweeps to it.
+
+What the tree has. One server is one group: `incarnation` (node.rs:854-1285) owns one
+`Raft`, one ticker and one `Server::execute` (node.rs:2432-2562) that runs a step's
+outputs in order, awaiting `store.persist(..)` before everything after it. That order is
+right for one core and wrong for many: it makes every core on the node wait on every
+other core's disk. Q41 says what replaces it, and §4 sets it out in full
+(SHARD.md:384-425).
+
+**Decision.** `ananke-shard` gains three modules beside the wire.
+
+`round` is the discipline alone — no clock, no socket, no disk — so the order can be
+asserted without a simulation. `Cores` holds every range's core keyed by `RangeId` and
+hands back a `Round`: the outputs that leave **before** the round's sync (those that
+precede a core's `Persist`, and all outputs of a core that persisted nothing), and the
+persists the round submits **together**. Everything a core produced after its `Persist` —
+its sends, `Apply`, `ReadReady`, `ReadDropped`, snapshot actions and its trace events —
+is held for that core and executed when *that core's own* persist resolves, and that
+core steps no further until then. The work handed to a waiting core meanwhile is held in
+arrival order, one entry per missed tick, and replayed in that order when its persist
+resolves, every missed tick stepped and none collapsed; the replay stops at the first
+step that persists again.
+
+`node` is the two tasks. `Node::raft` is one loop over a three-way race of the inbox,
+the ticker and the outstanding persists: a round is a tick's steps, or the messages
+drained since the last round. It never waits on a persist — while a sync is outstanding
+it goes on stepping the cores that persisted nothing, so a later round's persists can be
+submitted behind it (SHARD.md:519-543). `Persists` holds the round's persists side by
+side and polls every one of them on every poll, so each is enqueued with the WAL writer
+before the task awaits anything and the writer takes them as one group (wal.rs:16-20,
+D-018). `node::apply` is one task per node taking every range's jobs one at a time, in
+the order they were queued, whatever the range: Q14's rule, and D-036's consequence that
+one range's take holds every range's applies. Sends leave through D-072's per-peer
+outbox, one frame per peer per flush.
+
+`variant` is the node's known-buggy variants. They are a set of their own, not more of
+`ananke_raft::Variant`: the core is untouched, they are not Raft bugs, and they are
+outside §10's count. The node is not under the sweeps until the slice that puts it
+there, so each is caught by a deterministic check in the crate. That is what CLAUDE.md's
+pair rule asks — the buggy variant is *seen to fail* the check the correct code passes —
+and D-061's tier rule does not apply, because it is a rule about a *sweep's* assertion
+and there is no rate to measure in a check that is a single deterministic run.
+
+`Host` and `Applier` are what the tasks need of the node's disk, socket and clients. The
+node is the schedule; the host is what it drives. Splitting them is what lets a check
+drive the round with a host that resolves persists in an order it chooses, which is the
+only way to assert Q41's rule that each core's later outputs wait on that core's own
+persist and on no other's.
+
+**What §4 leaves open, settled here, each marked `// PROPOSED(D-073)` in the code.**
+
+1. *The order several ready persists resolve in* (`node.rs`, `Persists`). §4 says each
+   core's outputs follow its own persist and says nothing about ties. A fixed order —
+   range order — would let one range's persists always be seen before another's, which
+   is exactly what the round exists to prevent. The bit comes from the environment's
+   scheduling stream, as `race` draws it, and only where there is a choice: a node with
+   one range draws nothing, so its schedule is the one-group server's and no pinned seed
+   moves.
+2. *Which round a resolution's flush belongs to* (`node.rs`, `Frames`). A round flushes
+   once before its sync and again as each of its persists resolves. The replayed work's
+   own early outputs ride the resolution's flush rather than taking one of their own:
+   both are correct, since the discipline forbids only flushing a core's later outputs
+   *early*, and one flush is the option that puts fewer frames on the wire. The
+   resolution's flush is credited to the round whose persist resolved, which is what
+   makes "frames per peer in a round" a figure with an answer.
+3. *Whether a held message keeps its charge against the node's bound*
+   (`inbox.rs`, `Inbox::hold_at`). §4 says a message for a waiting core "is still taken
+   from the inbox and held for that core, counted against the node's byte bound (Q14)",
+   and D-072's inbox releases a message's bytes when it is popped. The node tells the
+   inbox what it holds, as a whole figure rather than a delta, because the node knows
+   what it holds and a lost increment would leak the bound away. D-072's rule that
+   nothing is refused into an *empty queue* is not touched: a node whose held bytes
+   already fill the bound still admits into an empty queue, so no range stops
+   replicating for good.
+4. *Where the `net` task's receipt comes from* (`node.rs`, `received`). D-050's stamp is
+   taken by the `net` task in the one-group server and carried on the inbox entry.
+   D-072's `Received` does not carry one, so the node takes the stamp as it hands the
+   message to its core. Taking one reads the time and nothing else (D-047), so it moves
+   no schedule; the conservative reading is that it is a receipt of the wrong moment by
+   however long the message waited in the inbox, and the fix belongs on `Received`, in
+   the slice that next touches the wire.
+5. *The outbox's drops* (`node.rs`, `Node::act`). `TraceEvent` has no kind for a message
+   the outbox dropped over its per-peer bound or refused as oversized (D-072); the node
+   counts both on `Frames` and traces neither. Adding an event kind moves every pinned
+   trace hash, and nothing would emit it until the node is under the sweeps: the event
+   belongs with that slice, where it can also be seen to fire. This is the one place
+   this slice is knowingly short of "every state transition that matters emits a trace
+   event", and it is short of it in the crate's own counters, not silently.
+6. *A persist that fails*. The task fails the node — `Host::failed` and the error
+   returned — as `Server::execute` does today (node.rs:2083-2090). Not open, recorded
+   because a node holding many ranges fails all of them at once, which is Q15's
+   territory and the slice after next's.
+
+**The pair, for each variant (CLAUDE.md:52-67).** Each is built beside the correct round
+and caught by the same check that asserts the correct round's order.
+
+| variant | what it does | the check that catches it |
+|---|---|---|
+| `DeferredFlushedEarly` | a core's outputs after its `Persist` go with the round's early ones | `a_cores_later_outputs_wait_on_its_own_persist_and_on_no_others` (the response leaves before either persist resolved) and `an_apply_reaches_the_task_only_once_its_cores_persist_resolved` |
+| `StepWhilePersisting` | a waiting core is stepped anyway | `every_tick_a_core_missed_is_stepped_when_its_persist_resolves` (nothing is held, no tick is replayed) |
+| `CollapseHeldTicks` | the missed ticks become one | the same check (one tick replayed where three fell due) and `the_variant_collapses_the_missed_ticks_into_one` |
+| `PersistsOneAtATime` | each persist pays a sync of its own | `a_rounds_persists_are_submitted_together` (the second reaches the writer only after the first resolved) |
+| `HeldNotCounted` | a held message stops counting against the bound | `a_held_message_still_counts_against_the_nodes_bound` (the inbox charges nothing while the node holds a message) |
+
+**Measurements.** Machine: Darwin 25.6.0 arm64, Apple M2, 8 cores, AC Power. Other
+agents were building in parallel on it, so the load averages are recorded beside each
+figure and every one of them is an over-estimate of the cost on a quiet machine.
+
+*A core step's cost*, release, host time, outside the simulator (SHARD.md §12):
+
+```
+cargo run --release -p ananke-shard --example step-cost
+before: load 11.17/10.03/11.18, AC Power     (second run: 14.45/11.02/11.47)
+idle tick           32 ns/step   500 steps = 0.016 ms of a 10 ms tick (0.2 %)
+leader tick         75 ns/step   500 steps = 0.037 ms of a 10 ms tick (0.4 %)
+heartbeat in        39 ns/step   500 steps = 0.019 ms of a 10 ms tick (0.2 %)
+response in        114 ns/step   500 steps = 0.057 ms of a 10 ms tick (0.6 %)
+loaded             223 ns/step   500 steps = 0.112 ms of a 10 ms tick (1.1 %)
+```
+
+**The pass bound is an idle step below 20 µs**, computed from §4's constants — 500
+steps in a 10 ms tick at 1 000 ranges (SHARD.md:504, 512-517), not measured. The idle
+step is **32 ns**, 625 times under it, on a machine carrying a load average of 11 on 8
+cores; an earlier run of the same command at a load of 10 gave 28 ns. **PASS**, and
+nothing goes to the owner on this figure. One `raft` task per node holds 1 000 ranges'
+idle ticks in 0.2 % of a tick, and 10 000 ranges' in 1.6 %. The two tick shapes run on a
+core whose election timeout is set long, so that every tick measured is the tick that
+does not time out — the tick almost every one of a node's 300 replicas takes on any
+given tick of a steady cluster. Without that the follower times out after ten ticks and
+the figure becomes an election storm's, which is a different step and not one of §4's
+500.
+
+*The frames per peer in a round with persists* (SHARD.md:490-492, which leaves it to this
+stage). A round flushes once before its sync and once as each of its persists resolves,
+so a round with `p` persisting cores costs, per peer, one frame at each flush that has
+sends for it: **up to 1 + p frames per peer per round**. §4 asks how many flushes that
+is, saying it "depends on how the group commit resolves the round's persists": it is one
+per persisting core *even when one group commit resolves them all*, which
+`a_shared_sync_still_costs_one_later_flush_per_persisting_core` measures — two cores
+whose persists resolve at the same instant cost three flushes and two frames to the one
+peer, not one. An idle tick's round persists nothing and costs the one frame §4 counts
+(SHARD.md:485-492); a round in which 100 of a node's leader replicas persist costs up to
+100 frames to each peer. **This is what the slice asks the owner** — see below.
+
+*The replay burst after a slow persist* (SHARD.md §12): the ticks a core replays once
+its persist resolves, times the cores held, times a step's cost, against the 10 ms tick
+at 1 000 ranges. A core behind a sync of `s` holds one tick per 10 ms of it, every one
+stepped; a node at 1 000 ranges holds 300 replicas (SHARD.md:504). At the measured 32 ns:
+
+```
+sync      ticks replayed   burst      of a 10 ms tick
+    2 ms          0        0.000 ms     0.00 %
+   20 ms          2        0.019 ms     0.19 %
+   80 ms          8        0.077 ms     0.77 %
+  200 ms         20        0.192 ms     1.92 %
+ 1000 ms        100        0.960 ms     9.60 %
+```
+
+The burst first fills a whole tick at 1 041 ticks replayed, a sync of about **10.4 s**.
+The sweep's disk operations are 100 µs to 2 ms (sim/raft.rs:2807-2808) and the sync §4
+calls as bad as a crash is 80 ms, so the burst costs under 1 % of a tick at every
+latency the tree models, and it does not break the tick budget. Nothing goes to the
+owner on this figure either.
+
+**What it asks of the owner.** One thing, and it is the frames figure, not a bound.
+
+> A round with `p` persisting cores costs up to `1 + p` frames per peer, because §4's
+> rule is read literally: each core's later outputs are flushed *when that core's own
+> persist resolves*, one flush per resolution, even when one group commit resolved the
+> whole round at one instant. At 1 000 ranges a write burst touching 100 of a node's
+> leader replicas therefore costs up to 100 frames toward each peer in that round,
+> against the one frame an idle tick costs. Coalescing the resolutions that are ready in
+> the same poll into one flush would cut that to one frame and would still be correct —
+> every core's outputs would still follow its own persist — but it is a change to when
+> outputs leave, which is a scheduling decision and not this slice's to make. **The
+> recommendation** is to leave it as built through Stage B, which is the conservative
+> option and the one §4's words say, and to decide it before Stage C with the figure
+> measured on the sweeps' real traffic, where the node runs four ranges and the number
+> of cores that persist in one round is a measurement rather than an argument.
+
+**What moved.** Nothing. No schedule moves and no pinned seed moves: `ananke-raft`,
+`ananke-env`, `ananke-storage` and `sim/` are untouched but for RAFT.md, the new code
+runs in no scenario yet, and the one draw the node makes from the scheduling stream is
+taken only where two or more persists are outstanding, which a one-range node never has.
+`Inbox`'s arithmetic gained a `held` term that is zero everywhere the wire's own tests
+reach it, and its twelve tests are unchanged and green. So there is no re-audit to do,
+and this entry says so rather than leaving it unsaid.
+
+**What is not done, and why.** The node is not wired to a `RaftStore`, a socket or the
+scenarios: `Host` and `Applier` are the seam, and the slice that switches the sweeps to
+the node implements them over the store, the engine and the `net` task. The `snapshot`
+task, bootstrap ranges, four ranges per node, Q15's whole-node refusal and follower
+compaction are each their own PR, as the plan sets out. The measurements the node's
+entry also owes — the inbox's drops under its byte bound, the apply lag, how long one
+range's take holds the node's other ranges' applies, and the trace records per range per
+virtual second — are all measurements *under the sweep's client load*, which needs the
+node in the scenarios: they belong to the slice that puts it there, and this entry
+records the three that do not.
+
 ---
 
-_Next entry: D-073. Add one before implementing anything not covered above._
+_Next entry: D-074. Add one before implementing anything not covered above._
