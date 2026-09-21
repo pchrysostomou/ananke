@@ -15,6 +15,15 @@
 //! 4 MiB ones. This one counts the frame bytes each message occupied, which is exactly
 //! what the node took off the wire for it.
 //!
+//! The bound is what the wire spent, not what the heap holds. A decoded command is a
+//! `Bytes` slice of the frame it arrived in (`ananke_raft::message`), so one admitted
+//! message can keep its whole frame alive: a 16 MiB frame of which one 65-byte message
+//! is admitted holds 16 MiB against 65 bytes of the bound. Bounding the heap instead
+//! means copying every message out of its frame at admission, a copy per message on the
+//! receive path, and the figure to decide that on — the inbox's live bytes against its
+//! bound — is the node's stage's to measure. Today's server has the same exposure with
+//! one message to a frame; batching changes its size, not its kind.
+//!
 //! **What it drops when it is full** is not settled by §4, and this is the
 //! conservative answer, PROPOSED D-072: *the arriving message is refused and nothing
 //! already admitted is dropped.* Admission is final; the byte bound is never exceeded;
@@ -105,6 +114,8 @@ pub struct Received {
     pub message: Message,
     /// The frame bytes it occupied, tag included: what it counts for against the
     /// inbox's bound.
+    // PROPOSED(D-072): the bound is in wire bytes, not in live heap; see the module
+    // documentation.
     pub bytes: usize,
 }
 
