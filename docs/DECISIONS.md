@@ -9459,13 +9459,25 @@ that proves it:
   `node.rs`'s, and it is *not* the same shape in `take`; SHARD.md's unbounded-growth
   sentence is 339-340, not 337-338. Both corrected above.
 
-**One mutation is left untested, and is recorded as untested rather than as verified.**
-The review's M10 — `Event::Recorded` also clearing `fresh_take` — survives. The arm's
-reasoning is that no version was written, so nothing is swept and the flag is left as it
-was; whether clearing it too would change anything depends on the node loop's state, and
-reaching it needs a test over the loop, which this tree has no shape for. It is stated
-here as an untested decision. The other three survivors on this slice's code are killed
-by the tests above.
+**Two mutations are left standing, and are recorded as such rather than as verified.**
+The other three survivors on this slice's code are killed by the tests above.
+
+- The review's M10 — `Event::Recorded` also clearing `fresh_take` — survives. The arm's
+  reasoning is that no version was written, so nothing is swept and the flag is left as
+  it was; whether clearing it too would change anything depends on the node loop's
+  state, and reaching it needs a test over the loop, which this tree has no shape for.
+  It is stated here as an untested decision.
+- The review's M12 — dropping the `RaftSnapshot` arm from `compaction_stays_committed` —
+  still survives the whole raft suite (46 tests, 20 seeds), re-measured on the tree that
+  ships. It is left standing deliberately, because the mutation makes the oracle
+  *stricter*, not weaker: the arm only ever raises the floor a compaction is compared
+  against, so dropping it can produce a false failure and can hide nothing. That it
+  survives says the arm is not load-bearing on the correct system at that tier — a
+  compaction's index is always covered by a `RaftCommit` the same server traced — and
+  the arm is kept for the install case, where a prefix is committed by construction and
+  no `RaftCommit` of that server need name it. A pair for it would have to be a variant
+  that compacts past an installed prefix, which is `ApplyBeforeCommit`'s ground and
+  already covered.
 
 **RAFT.md.** Updated where it describes what changed (D-053): the paragraph after "A
 leader compacts the Raft log to its last checkpoint…" now says what a follower does,
@@ -9477,16 +9489,17 @@ row now says the event is a take, an install or a re-statement, and that a compa
 record surfaces only as the re-statement of the next open. The variants table gains
 `Variant::FollowerNeverCompacts` and its count of rows goes from sixteen to seventeen.
 
-**The premerge**, on this branch, quoting its own machine lines:
+**The premerge**, re-run on the tip that carries the review's fixes, quoting its own
+machine lines:
 `premerge: Darwin 25.6.0 arm64, Apple M2, 8 cores`;
-`premerge: before, load 20.95/28.30/31.01, AC Power, no thermal warning recorded`;
-`premerge: after, load 48.04/52.17/56.40, AC Power, no thermal warning recorded`;
-`premerge: green at 1000 seeds in 1410 s`. **On AC power** throughout, and slow for the
-reason the loads say: other slices of this stage were building and sweeping on the same
-laptop, at load averages between 20 and 135 over the run. The figure is not comparable
-with D-071's 625 s on an otherwise idle machine, and is recorded with its loads for that
-reason (D-070). Every rate quoted above is from that output or from a run made the same
-way.
+`premerge: before, load 10.06/10.07/28.14, AC Power, no thermal warning recorded`;
+`premerge: after, load 29.42/23.10/22.65, AC Power, no thermal warning recorded`;
+`premerge: green at 1000 seeds in 1279 s`. **On AC power** throughout. The first build's
+premerge was green in 1410 s at loads of 20 to 135; this one is faster because fewer of
+the stage's other slices were sweeping, not because anything here got cheaper. Neither
+figure is comparable with D-071's 625 s on an otherwise idle machine, and both are
+recorded with their loads for that reason (D-070). Every rate quoted above is from one of
+those outputs or from a run made the same way.
 
 **What is not done.**
 
