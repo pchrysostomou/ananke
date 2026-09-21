@@ -9086,9 +9086,11 @@ the ticker and the outstanding persists: a round is a tick's steps, or the messa
 drained since the last round. It never waits on a persist — while a sync is outstanding
 it goes on stepping the cores that persisted nothing, so a later round's persists can be
 submitted behind it (SHARD.md:519-543). `Persists` holds the round's persists side by
-side and polls every one of them on every poll, so each is enqueued with the WAL writer
-before the task awaits anything and the writer takes them as one group (wal.rs:16-20,
-D-018). `node::apply` is one task per node taking every range's jobs one at a time, in
+side; the round submits them all and then arms them in one synchronous pass with no
+await between, so a round's records reach the WAL writer together and are never split
+across two of its groups, and the writer syncs them once (wal.rs:16-20, D-018). A round
+submitted while an earlier sync is outstanding joins the group that sync's records did
+not take, which is §4's loaded case (SHARD.md:519-533). `node::apply` is one task per node taking every range's jobs one at a time, in
 the order they were queued, whatever the range: Q14's rule, and D-036's consequence that
 one range's take holds every range's applies. Sends leave through D-072's per-peer
 outbox, one frame per peer per flush.

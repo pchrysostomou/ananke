@@ -56,9 +56,10 @@ pub type Boxed<'h, T> = Pin<Box<dyn Future<Output = T> + Send + 'h>>;
 /// futures it hands back are held side by side while the round's persists share one
 /// group commit.
 pub trait Host {
-    /// Makes `range`'s state durable. The future does nothing until it is polled, and
-    /// the task polls every persist of a round before it awaits anything else, so the
-    /// WAL writer takes them as one group and syncs them once (wal.rs:16-20, D-018).
+    /// Makes `range`'s state durable. The future does nothing until it is polled; the
+    /// round submits all of its persists and then polls every one of them in one pass
+    /// with no await between, so the WAL writer takes the round's records as one group
+    /// and syncs them once (wal.rs:16-20, D-018).
     ///
     /// It borrows nothing of the host, because the round holds several of them side
     /// by side while it goes on stepping the cores that persisted nothing: a host
@@ -382,13 +383,15 @@ impl<E: Environment, H: Host> Node<E, H> {
                 }
                 continue;
             }
-            // Submitted together: nothing is awaited between them, so the WAL writer
-            // takes the round's records as one group and syncs them once.
+            // Submitted together, then armed in one pass with no await between them,
+            // so the WAL writer takes the round's records as one group and syncs them
+            // once — and never splits a round across two groups.
             for submission in round.persists {
                 let range = submission.range;
                 let future = self.host.persist(range, submission.persist);
                 persists.submit(range, id, future);
             }
+            persists.arm().await;
         }
         Ok(())
     }
@@ -557,11 +560,15 @@ pub async fn apply<A: Applier>(jobs: &Queue<ApplyJob>, applier: &A) {
 
 /// The persists a round submitted together, resolved as each core's own resolves.
 ///
-/// The futures are held side by side and every one of them is polled on every poll of
-/// [`next`](Persists::next), so each is enqueued with the WAL writer before the task
-/// awaits anything, and the writer takes them as one group (wal.rs:16-20, D-018).
+/// The futures are held side by side and every one of them is polled in one
+/// synchronous pass, with no await between, by [`arm`](Persists::arm) as the round
+/// submits them and by [`next`](Persists::next) on every poll. So a round's records
+/// reach the WAL writer together and are never split across two of its groups, and
+/// the writer syncs them once (wal.rs:16-20, D-018). A round submitted while an
+/// earlier sync is outstanding joins the group that sync's records did not take,
+/// which is what §4's loaded case describes (SHARD.md:519-533).
 ///
-/// Which of several ready persists is reported first is drawn from the environment's
+/// Which of several *ready* persists is reported first is drawn from the environment's
 /// scheduling stream, as [`race`] draws it: a fixed order would let one range's
 /// persists always be seen before another's, and the round's whole point is that no
 /// core waits on another's disk.
@@ -570,6 +577,8 @@ pub async fn apply<A: Applier>(jobs: &Queue<ApplyJob>, applier: &A) {
 #[derive(Default)]
 pub struct Persists {
     outstanding: Vec<Outstanding>,
+    /// Persists that resolved during a poll and have not been reported yet.
+    ready: VecDeque<Resolved>,
 }
 
 struct Outstanding {
@@ -589,8 +598,9 @@ pub struct Resolved {
 }
 
 impl Persists {
-    /// Adds a persist to the outstanding set. It is not polled here: the task polls
-    /// the whole set at once, which is what puts the round's records in one group.
+    /// Adds a persist to the outstanding set. It is not polled here: the round submits
+    /// all of its persists and then arms them in one pass, which is what puts its
+    /// records in one group.
     pub fn submit(&mut self, range: RangeId, round: u64, future: BoxedPersist) {
         self.outstanding.push(Outstanding {
             range,
@@ -599,22 +609,79 @@ impl Persists {
         });
     }
 
-    /// How many persists are outstanding.
+    /// Polls every outstanding persist once, with the task's own waker, and resolves
+    /// at once: what the round awaits after submitting, so its records are enqueued
+    /// with the WAL writer before the task awaits anything that could let the writer
+    /// close a group without them.
+    pub fn arm(&mut self) -> Arm<'_> {
+        Arm(self)
+    }
+
+    /// How many persists are outstanding, the ones that resolved and are waiting to be
+    /// reported included.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.outstanding.len()
+        self.outstanding.len() + self.ready.len()
     }
 
     /// Whether none is.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.outstanding.is_empty()
+        self.len() == 0
     }
 
     /// Resolves with the next persist to resolve; pending for ever while none is
     /// outstanding, so a task can race it against its inbox and its ticker.
     pub fn next<'a, E: Environment>(&'a mut self, env: &'a E) -> Next<'a, E> {
         Next { set: self, env }
+    }
+
+    /// Polls every outstanding persist once, in one pass with no await between, and
+    /// moves the ones that resolved to `ready`.
+    fn poll_all(&mut self, cx: &mut Context<'_>) {
+        let mut index = 0;
+        while index < self.outstanding.len() {
+            if let Poll::Ready(result) = self.outstanding[index].future.as_mut().poll(cx) {
+                let outstanding = self.outstanding.remove(index);
+                self.ready.push_back(Resolved {
+                    range: outstanding.range,
+                    round: outstanding.round,
+                    result,
+                });
+                continue;
+            }
+            index += 1;
+        }
+    }
+
+    /// One of the persists that have resolved, drawn from the scheduling stream where
+    /// there is more than one to choose from.
+    fn take_ready<E: Environment>(&mut self, env: &E) -> Option<Resolved> {
+        let len = self.ready.len();
+        if len == 0 {
+            return None;
+        }
+        // One draw only where there is a choice to make, so a node with one range
+        // draws nothing and its schedule is the one-group server's.
+        let index = if len > 1 {
+            usize::try_from(env.sched_rng().next_u64() % len as u64).unwrap_or(0)
+        } else {
+            0
+        };
+        self.ready.remove(index)
+    }
+}
+
+/// See [`Persists::arm`].
+#[must_use = "futures do nothing unless polled"]
+pub struct Arm<'a>(&'a mut Persists);
+
+impl Future for Arm<'_> {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.get_mut().0.poll_all(cx);
+        Poll::Ready(())
     }
 }
 
@@ -630,35 +697,11 @@ impl<E: Environment> Future for Next<'_, E> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        let len = this.set.outstanding.len();
-        if len == 0 {
-            return Poll::Pending;
+        this.set.poll_all(cx);
+        match this.set.take_ready(this.env) {
+            Some(resolved) => Poll::Ready(resolved),
+            None => Poll::Pending,
         }
-        // One draw only where there is a choice to make, so a node with one range
-        // draws nothing and its schedule is the one-group server's.
-        let offset = if len > 1 {
-            usize::try_from(this.env.sched_rng().next_u64() % len as u64).unwrap_or(0)
-        } else {
-            0
-        };
-        let mut ready = None;
-        for step in 0..len {
-            let index = (offset + step) % len;
-            let outstanding = &mut this.set.outstanding[index];
-            if let Poll::Ready(result) = outstanding.future.as_mut().poll(cx) {
-                ready = Some((index, result));
-                break;
-            }
-        }
-        let Some((index, result)) = ready else {
-            return Poll::Pending;
-        };
-        let outstanding = this.set.outstanding.remove(index);
-        Poll::Ready(Resolved {
-            range: outstanding.range,
-            round: outstanding.round,
-            result,
-        })
     }
 }
 
@@ -973,10 +1016,20 @@ mod tests {
             .iter()
             .position(|note| matches!(note, Note::Persisted(_)))
             .expect("a persist resolves");
+        let (first, second) = (
+            position(&correct.log, &Note::Submitted(R1)),
+            position(&correct.log, &Note::Submitted(R2)),
+        );
         assert!(
-            position(&correct.log, &Note::Submitted(R1)) < first_resolution
-                && position(&correct.log, &Note::Submitted(R2)) < first_resolution,
+            first < first_resolution && second < first_resolution,
             "the round's persists did not reach the writer as one group: {:?}",
+            correct.log
+        );
+        assert_eq!(
+            second,
+            first + 1,
+            "the round's persists reach the writer in one pass, with nothing between \
+             them that could let the writer close a group: {:?}",
             correct.log
         );
 
