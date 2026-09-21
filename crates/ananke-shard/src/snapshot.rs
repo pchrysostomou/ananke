@@ -3,7 +3,7 @@
 //! Today one server is one group, so one snapshot task holds one stream, one staging
 //! directory sits under the engine directory, a version directory is named by index
 //! and take alone, and a sweep deletes every version directory the store's single
-//! snapshot record does not name (snapshot.rs:92-94, 112-114, 193-228, 859-864;
+//! snapshot record does not name (snapshot.rs:96-101, 119-121, 193-228, 1018-1027;
 //! node.rs:1430, 1835). On a node all four are wrong at once: two ranges' takes at one
 //! index collide, one range's sweep deletes another range's checkpoints, and the
 //! re-seeds heading for one node restart each other (SHARD.md §11, raft 14).
@@ -18,9 +18,11 @@
 //!   abandons the assembly a stream is using.
 //! - **A per-node cap on what is received and assembled** (Q14). Streams over the cap
 //!   wait: a chunk for an unadmitted (range, sender) is answered with a restart and
-//!   touches nothing, and the first waiter is admitted when a slot frees. The re-seed
-//!   shape caps two of a node's four ranges on purpose, "so that re-seeds toward it
-//!   wait for one another" (SHARD.md §12).
+//!   touches nothing, and a freed slot is granted to a waiter on its next chunk — not
+//!   reserved for one, because nothing here has a clock and the waiter whose turn it
+//!   is may be a leader that has since been replaced. The re-seed shape caps two of a
+//!   node's four ranges on purpose, "so that re-seeds toward it wait for one another"
+//!   (SHARD.md §12).
 //! - **Paths keyed by range.** [`staging_name`] and [`version_name`] put the range in
 //!   the name, and [`Snapshots::sweep`] is a range's own sweep: it proposes for
 //!   deletion only version directories of the range it is sweeping.
@@ -75,7 +77,7 @@ pub fn staging_name(range: RangeId, from: ServerId) -> String {
 
 /// The name of a version directory: `snap-r<range>-<index>-<take>`.
 ///
-/// Today's is `snap-<index>-<take>` (snapshot.rs:112-114), which on a node collides
+/// Today's is `snap-<index>-<take>` (snapshot.rs:119-121), which on a node collides
 /// whenever two ranges take a checkpoint at one index — and ranges on a node apply
 /// their own streams of commands, so equal indexes are ordinary, not rare.
 #[must_use]
@@ -144,8 +146,14 @@ pub enum Route {
 pub enum Started {
     /// The stream is running, staging on the follower's side under this name.
     Streaming {
-        /// The name the follower stages under, which the sender records so a resumed
-        /// stream is recognisably the same one.
+        /// The name the follower stages under.
+        ///
+        /// The follower assembles under `staging_name(range, sender)`, and the sender
+        /// is this node: the name is built from the node's own id, never the
+        /// follower's. A leader streaming one range to three followers names one
+        /// directory, and it is the one each of the three stages under. It is derived
+        /// rather than kept per stream ([`Snapshots::staging_sent`]), so there is one
+        /// place for it to be right.
         staging: String,
     },
     /// The node is already sending as many streams as it allows. No correct node
@@ -164,17 +172,29 @@ pub enum Landing {
         staged: usize,
     },
     /// The sender started over: its identity differs from the one this assembly held,
-    /// so this assembly's staging directory starts again. No *other* assembly is
-    /// touched.
+    /// so this assembly's staging directory starts again, empty, and the sender is
+    /// asked for the stream from its first byte (RAFT.md:203-207). No *other* assembly
+    /// is touched, and the chunk that restarted the assembly is not kept — not even
+    /// when it is the stream's last, which is what [`NodeVariant::CompleteOnRestart`]
+    /// gets wrong.
+    // PROPOSED(D-075): a restarting chunk is discarded with the assembly it restarted,
+    // because nothing here carries the chunk's offset and so nothing can tell a chunk
+    // that starts the new stream from one in the middle of it (snapshot.rs:1018-1027).
     Restarted {
-        /// The staging directory, now holding this chunk alone.
+        /// The staging directory, started over and holding nothing.
         dir: PathBuf,
+        /// What the assembly has staged now: none of it. The sender's next chunk is
+        /// the new stream's first byte.
+        staged: usize,
     },
     /// The node is assembling as many streams as its cap allows and this is not one of
     /// them. Nothing was written and no other assembly was disturbed; the sender is
-    /// told to restart, and this (range, sender) takes the first free slot.
+    /// told to restart, and this (range, sender) takes a slot on the first chunk it
+    /// sends while one is free.
     Waiting {
-        /// How many are ahead of it.
+        /// How many (range, sender)s asked for a slot before this one and have not
+        /// been given one. A queue position, not a reservation: a slot is granted to a
+        /// stream that is asking for it, never held for one that may be gone.
         ahead: usize,
     },
     /// The stream's last chunk: what the node installs, and how.
@@ -220,8 +240,11 @@ pub struct Install {
 pub struct Adopted {
     /// The fresh directory, beside the refused one.
     pub dir: PathBuf,
-    /// The ranges installed into it when the event is traced: none. It is traced when
-    /// the fresh engine is opened and before any range installs into it.
+    /// The ranges that had installed into *this* directory when the event was traced,
+    /// read back from what the task counted, not a constant: none, because the event
+    /// is traced when the fresh engine is opened and before any range installs into
+    /// it. [`Snapshots::adopt_fresh`] refuses to adopt a directory that is not in that
+    /// state, which is how the figure is kept true.
     pub ranges_installed: usize,
 }
 
@@ -242,6 +265,11 @@ pub struct Streams {
     /// Assemblies abandoned for a chunk that was not theirs. Zero, on the correct
     /// node: an assembly is only ever restarted by its own sender.
     pub abandoned: usize,
+    /// Streams completed into an install, over the task's whole life. What
+    /// [`Adopted::ranges_installed`] reads is this count for one directory.
+    pub installs: usize,
+    /// Assemblies started over for a chunk of another identity of their own sender.
+    pub restarts: usize,
     /// `RaftAdopted` events. One per fresh directory, none per install.
     pub adoptions: usize,
 }
@@ -253,7 +281,7 @@ pub struct Streams {
 /// where the key already carries it, and is what [`NodeVariant::OneAssemblyPerNode`]
 /// gets wrong: today's identity is (sender, term, last index, last term), and one
 /// assembly for the whole node is abandoned whenever the sender changes
-/// (snapshot.rs:859-864).
+/// (snapshot.rs:1018-1027).
 #[derive(Clone, Debug, Default)]
 struct Assembly {
     from: Option<ServerId>,
@@ -262,10 +290,13 @@ struct Assembly {
 }
 
 /// One stream being sent to one follower of one range.
+///
+/// The name the follower stages under is not kept here: it is `staging_name(range,
+/// self.me)` for every follower of the range, so a copy per stream would be a second
+/// place for it to be wrong. [`Snapshots::staging_sent`] derives it.
 #[derive(Clone, Debug)]
 struct Sending {
     at: Identity,
-    staging: String,
 }
 
 /// The node's `snapshot` task.
@@ -276,12 +307,16 @@ struct Sending {
 /// [`finish`](Self::finish) ends an assembly and admits whoever was waiting.
 pub struct Snapshots {
     engine_dir: PathBuf,
+    me: ServerId,
     cap: usize,
     variants: NodeVariants,
     hosted: BTreeMap<RangeId, Vec<KeyRange<Bytes>>>,
     sending: BTreeMap<(RangeId, ServerId), Sending>,
     receiving: BTreeMap<(RangeId, ServerId), Assembly>,
     waiting: VecDeque<(RangeId, ServerId)>,
+    /// Ranges installed into each engine directory this task has had: what
+    /// [`Snapshots::adopt_fresh`] reads to answer whether a directory is fresh.
+    installed: BTreeMap<PathBuf, usize>,
     meters: Streams,
 }
 
@@ -291,7 +326,12 @@ pub struct Snapshots {
 const BUGGY_SEND_CAP: usize = 1;
 
 impl Snapshots {
-    /// A task staging under `engine_dir`, assembling at most `cap` streams at once.
+    /// A task on node `me`, staging under `engine_dir`, assembling at most `cap`
+    /// streams at once.
+    ///
+    /// `me` is the node's own id: the staging name a follower assembles under carries
+    /// the *sender*, so the send half can only name the directory its followers stage
+    /// under if it knows who it is.
     ///
     /// `cap` is Q14's per-node cap on streams received and assembled. Nothing in the
     /// design documents fixes a default: the re-seed shape sets it to two, below its
@@ -301,15 +341,22 @@ impl Snapshots {
     // PROPOSED(D-075): the receive cap is a node setting with no default; a scenario
     // not about the cap sets it at or above its range count.
     #[must_use]
-    pub fn new(engine_dir: impl Into<PathBuf>, cap: usize, variants: NodeVariants) -> Self {
+    pub fn new(
+        engine_dir: impl Into<PathBuf>,
+        me: ServerId,
+        cap: usize,
+        variants: NodeVariants,
+    ) -> Self {
         Self {
             engine_dir: engine_dir.into(),
+            me,
             cap,
             variants,
             hosted: BTreeMap::new(),
             sending: BTreeMap::new(),
             receiving: BTreeMap::new(),
             waiting: VecDeque::new(),
+            installed: BTreeMap::new(),
             meters: Streams::default(),
         }
     }
@@ -351,8 +398,14 @@ impl Snapshots {
     pub fn staging(&self, range: RangeId, from: ServerId) -> PathBuf {
         if self.variants.contains(NodeVariant::SharedStagingDir) {
             // The variant: today's one staging directory per engine directory
-            // (snapshot.rs:92-94). Two assemblies then write over each other's files.
+            // (snapshot.rs:96-101). Two assemblies then write over each other's files.
             return self.engine_dir.join("staging");
+        }
+        if self.variants.contains(NodeVariant::StagingByRangeAlone) {
+            // The variant: keyed by range alone, the literal reading of §11 raft 14.
+            // The two senders of one range — a leader and the stale leader it replaced
+            // — then stage into one directory, each holding an assembly of its own.
+            return self.engine_dir.join(format!("staging-{range}"));
         }
         self.engine_dir.join(staging_name(range, from))
     }
@@ -361,7 +414,7 @@ impl Snapshots {
     #[must_use]
     pub fn version(&self, range: RangeId, index: Index, take: u64) -> PathBuf {
         if self.variants.contains(NodeVariant::VersionDirWithoutRange) {
-            // The variant: today's `snap-<index>-<take>` (snapshot.rs:112-114), which
+            // The variant: today's `snap-<index>-<take>` (snapshot.rs:119-121), which
             // two ranges taking at one index share.
             return self.engine_dir.join(format!("snap-{index}-{take}"));
         }
@@ -414,23 +467,27 @@ impl Snapshots {
             // followers one at a time and the rest wait on the slowest (D-043).
             return Started::Waiting;
         }
-        let staging = staging_name(range, to);
-        self.sending.insert(
-            (range, to),
-            Sending {
-                at,
-                staging: staging.clone(),
-            },
-        );
-        Started::Streaming { staging }
+        self.sending.insert((range, to), Sending { at });
+        Started::Streaming {
+            staging: self.staging_sent(range),
+        }
+    }
+
+    /// The name a follower of `range` stages this node's stream under.
+    ///
+    /// The follower keys its staging directory by the *sender*, and the sender is this
+    /// node: `staging_name(range, self.me)`, never the follower's id. One name serves
+    /// every follower of the range, and a name built from a follower's would name a
+    /// path that exists on no node.
+    #[must_use]
+    pub fn staging_sent(&self, range: RangeId) -> String {
+        staging_name(range, self.me)
     }
 
     /// Whether a stream to this (range, follower) is running, at this identity.
     #[must_use]
     pub fn is_streaming(&self, range: RangeId, to: ServerId, at: Identity) -> bool {
-        self.sending
-            .get(&(range, to))
-            .is_some_and(|s| s.at == at && s.staging == staging_name(range, to))
+        self.sending.get(&(range, to)).is_some_and(|s| s.at == at)
     }
 
     /// Ends the stream to this (range, follower).
@@ -438,20 +495,36 @@ impl Snapshots {
         self.sending.remove(&(range, to));
     }
 
-    /// Puts one chunk on the wire: a frame of its own, on the task's own socket
-    /// handle (Q41).
+    /// Puts one chunk of a running stream on the wire: a frame of its own, on the
+    /// task's own socket handle (Q41).
     ///
     /// # Errors
     ///
     /// [`Oversized`] when the chunk does not fit a frame at all, which the outbox
     /// refuses the same way: nothing splits a message across frames.
+    ///
+    /// # Panics
+    ///
+    /// If no stream to this (range, follower) is running — a chunk framed for a
+    /// follower nothing is being streamed to is the send half's two ends having come
+    /// apart — or if the chunk carries no bytes, which is the caller's own checkpoint
+    /// file, not anything a peer sent. An empty chunk is not an oversized one, and is
+    /// not reported as one; `Builder::push` refuses it too (frame.rs:134-137).
     pub fn route(
         &mut self,
         range: RangeId,
         to: ServerId,
         chunk: &[u8],
     ) -> Result<Route, Oversized> {
-        if encoded_len(chunk.len()) > MAX_FRAME_LEN || chunk.is_empty() {
+        assert!(
+            self.sending.contains_key(&(range, to)),
+            "a chunk of {range} routed to {to}, which no stream is running to"
+        );
+        assert!(
+            !chunk.is_empty(),
+            "a chunk of {range} for {to} carries no bytes"
+        );
+        if encoded_len(chunk.len()) > MAX_FRAME_LEN {
             return Err(Oversized {
                 to,
                 range,
@@ -473,7 +546,18 @@ impl Snapshots {
 
     /// Takes one chunk off the wire for `range` from `from`.
     ///
-    /// `done` is the stream's last chunk, which asks for the install.
+    /// `done` is the stream's last chunk, which asks for the install — unless this
+    /// same chunk restarted the assembly, in which case there is nothing to install:
+    /// the directory has just been started over, and what the node has is one chunk of
+    /// a stream whose earlier bytes it never saw. That stream is restarted from its
+    /// first byte (RAFT.md:203-207) and completes on the next pass.
+    ///
+    /// # Panics
+    ///
+    /// If `range` completes a stream but was never [`host`](Self::host)ed. The install
+    /// switches exactly the range's spans, and a node that cannot say what a range
+    /// holds has lost track of it: it fails here, where it lost track, and not at the
+    /// switch with an empty span set (`EmptySpan`, D-068).
     pub fn on_chunk(
         &mut self,
         range: RangeId,
@@ -499,19 +583,43 @@ impl Snapshots {
         // check reads. On the correct node it never happens, because the key the
         // assembly is under already carries the sender.
         let abandoned = restarted && assembly.from != Some(from);
-        assembly.staged = if restarted {
-            bytes
+        // The variant: the chunk that restarts an assembly is kept and the stream
+        // completes on it, so the node installs a directory still holding the
+        // abandoned stream's files and is never told to start it over
+        // (RAFT.md:203-207).
+        let completes_a_restart =
+            restarted && done && self.variants.contains(NodeVariant::CompleteOnRestart);
+        if restarted && !completes_a_restart {
+            // The staging directory starts over and keeps nothing, this chunk
+            // included: the sender is asked for the stream from its first byte, and
+            // the assembly is as it was before any chunk landed. Keeping the chunk
+            // would need its offset, which nothing here carries.
+            *assembly = Assembly::default();
         } else {
-            assembly.staged + bytes
-        };
-        assembly.from = Some(from);
-        assembly.at = Some(at);
+            assembly.staged = if restarted {
+                bytes
+            } else {
+                assembly.staged + bytes
+            };
+            assembly.from = Some(from);
+            assembly.at = Some(at);
+        }
         let staged = assembly.staged;
         if abandoned {
             self.meters.abandoned += 1;
         }
+        if restarted {
+            self.meters.restarts += 1;
+            if !completes_a_restart {
+                return Landing::Restarted { dir, staged };
+            }
+        }
         if done {
-            let spans = self.hosted.get(&range).cloned().unwrap_or_default();
+            let spans = self.hosted.get(&range).cloned().unwrap_or_else(|| {
+                panic!("{range} completed a stream from {from} but is not hosted here")
+            });
+            self.meters.installs += 1;
+            *self.installed.entry(self.engine_dir.clone()).or_default() += 1;
             return Landing::Complete(Box::new(Install {
                 range,
                 from,
@@ -527,46 +635,70 @@ impl Snapshots {
                 adopted: self.variants.contains(NodeVariant::AdoptedOnRangeInstall),
             }));
         }
-        if restarted {
-            Landing::Restarted { dir }
-        } else {
-            Landing::Staged { dir, staged }
-        }
+        Landing::Staged { dir, staged }
     }
 
     /// Ends the assembly for this (range, sender) — its install switched, or its
-    /// stream gave up — and admits the first (range, sender) waiting for a slot.
+    /// stream gave up — and frees its slot under the receive cap.
     ///
-    /// Returns the pair admitted, if any.
+    /// Returns the (range, sender) at the head of the queue, as a hint for the node's
+    /// trace: the slot is *not* reserved for it. A waiter is admitted when its own
+    /// next chunk arrives ([`on_chunk`](Self::on_chunk)), because a reservation would
+    /// be held for a sender that may never send again — a waiter's leader can change
+    /// while it waits, and nothing here has a clock to reclaim what it left behind.
+    /// That is [`NodeVariant::SlotReservedForWaiter`].
+    // PROPOSED(D-075): a freed slot is granted to the first waiter that asks for it,
+    // not reserved for the head of the queue, so a departed sender costs nothing.
     pub fn finish(&mut self, range: RangeId, from: ServerId) -> Option<(RangeId, ServerId)> {
         let key = self.key(range, from);
         if self.receiving.remove(&key).is_none() {
             self.waiting.retain(|w| *w != key);
             return None;
         }
-        let next = self.waiting.pop_front()?;
-        self.receiving.insert(next, Assembly::default());
-        Some(next)
+        if self.variants.contains(NodeVariant::SlotReservedForWaiter) {
+            // The variant: the freed slot is reserved for the head of the queue, held
+            // by that (range, sender) until it finishes — which a sender replaced as
+            // leader never does, so the node's slots fill with reservations for
+            // senders that are gone and it re-seeds nothing more.
+            let next = self.waiting.pop_front()?;
+            self.receiving.insert(next, Assembly::default());
+            return Some(next);
+        }
+        self.waiting.front().copied()
     }
 
     /// The node taking a fresh directory as its store after a whole-node refusal: the
     /// one `RaftAdopted` on the node (D-066, Q15).
     ///
+    /// The assemblies, the waiters and the streams being sent are dropped with the
+    /// refused store: they named directories under it, and a stream that was feeding
+    /// this node starts again against the fresh one.
+    ///
     /// # Panics
     ///
-    /// If any range has already installed into the fresh directory. The event is
+    /// If a range has already installed into the directory being adopted. The event is
     /// traced when the fresh engine is opened and *before* any range installs into it,
-    /// so a later one would record a directory that is no longer fresh.
+    /// so a directory that has taken an install is not the one this event describes.
+    // PROPOSED(D-075): adopting a fresh directory drops what the refused one was
+    // assembling and sending, rather than carrying it across the switch.
     pub fn adopt_fresh(&mut self, dir: impl Into<PathBuf>) -> Adopted {
-        assert!(
-            self.receiving.is_empty(),
-            "a fresh directory is adopted before any range installs into it"
+        let dir = dir.into();
+        let ranges_installed = self.installed.get(&dir).copied().unwrap_or_default();
+        assert_eq!(
+            ranges_installed,
+            0,
+            "{} has taken {ranges_installed} install(s): a fresh directory is adopted \
+             before any range installs into it",
+            dir.display()
         );
         self.meters.adoptions += 1;
-        self.engine_dir = dir.into();
+        self.engine_dir = dir;
+        self.receiving.clear();
+        self.waiting.clear();
+        self.sending.clear();
         Adopted {
             dir: self.engine_dir.clone(),
-            ranges_installed: 0,
+            ranges_installed,
         }
     }
 
@@ -574,7 +706,7 @@ impl Snapshots {
     fn key(&self, range: RangeId, from: ServerId) -> (RangeId, ServerId) {
         if self.variants.contains(NodeVariant::OneAssemblyPerNode) {
             // The variant: one assembly for the whole node, as the one-group snapshot
-            // task holds one stream (snapshot.rs:859-864; node.rs:1430). Every range
+            // task holds one stream (snapshot.rs:1018-1027; node.rs:1430). Every range
             // and every sender share it, so each chunk abandons the last one's work.
             return (RangeId(0), ServerId(0));
         }
@@ -583,8 +715,18 @@ impl Snapshots {
 
     /// Admits a (range, sender) under the cap, or queues it. `true` when it now has an
     /// assembly.
+    ///
+    /// A free slot goes to whichever (range, sender) asks for it — a waiter's next
+    /// chunk, or an arrival's first — and the key it admits leaves the queue. Nothing
+    /// here has a clock, so asking is the only evidence a stream is still there: the
+    /// waiter at the head of the queue may be a leader that was replaced while it
+    /// waited, and a slot held for that one would never be used again. The queue keeps
+    /// the order the waiters asked in, which is what `ahead` reports and what
+    /// [`finish`](Self::finish) hints at, but it is an order among streams that are
+    /// still asking, not a reservation.
     fn admit(&mut self, key: (RangeId, ServerId)) -> bool {
         if self.receiving.len() < self.cap {
+            self.waiting.retain(|w| *w != key);
             self.receiving.insert(key, Assembly::default());
             return true;
         }
@@ -631,8 +773,12 @@ mod tests {
         last_term: 5,
     };
 
+    /// The node these checks run on: not one of the peers it streams to or from, so a
+    /// name built from the node's own id is never a follower's by accident.
+    const ME: ServerId = ServerId(9);
+
     fn task(variants: NodeVariants) -> Snapshots {
-        let mut task = Snapshots::new("/n1", 4, variants);
+        let mut task = Snapshots::new("/n1", ME, 4, variants);
         for range in [R1, R2] {
             task.host(range, spans(range));
         }
@@ -775,10 +921,26 @@ mod tests {
         receive(&mut task, R1, S1, AT);
         receive(&mut task, R2, S1, AT);
         let landing = task.on_chunk(R1, S1, LATER, 64, false);
-        let Landing::Restarted { dir } = &landing else {
+        let Landing::Restarted { dir, staged } = &landing else {
             panic!("a new identity restarts the assembly: {landing:?}");
         };
         assert_eq!(dir, &task.staging(R1, S1));
+        assert_eq!(
+            *staged, 0,
+            "the directory starts over: the restarting chunk is not kept either, \
+             because nothing here carries its offset"
+        );
+        // And the sender's next chunk is the new stream's first byte: the count the
+        // receiver acknowledges starts from this chunk, not from the old stream's.
+        let landing = task.on_chunk(R1, S1, LATER, 64, false);
+        assert_eq!(
+            landing,
+            Landing::Staged {
+                dir: task.staging(R1, S1),
+                staged: 64
+            },
+            "the new stream's bytes are its own: {landing:?}"
+        );
         // R2's assembly is untouched: its next chunk adds to what it had.
         let landing = task.on_chunk(R2, S1, AT, 8, false);
         assert!(
@@ -786,12 +948,52 @@ mod tests {
             "R2 kept its bytes: {landing:?}"
         );
         assert_eq!(task.meters().abandoned, 0);
+        assert_eq!(task.meters().restarts, 1);
+    }
+
+    #[test]
+    fn a_restarted_stream_is_never_installed() {
+        // The ordinary small range: a new leader's whole snapshot is one chunk, so the
+        // chunk that restarts the assembly is also the stream's last. The directory has
+        // just been started over and holds the abandoned stream's files until the node
+        // is told so; completing here would install one snapshot's files labelled as
+        // another's (RAFT.md:203-207).
+        let mut task = correct();
+        receive(&mut task, R1, S2, AT);
+        let landing = task.on_chunk(R1, S2, LATER, 16, true);
+        assert_eq!(
+            landing,
+            Landing::Restarted {
+                dir: task.staging(R1, S2),
+                staged: 0
+            },
+            "a restart is answered with a restart, whatever the chunk's `done` says"
+        );
+        assert_eq!(task.meters().installs, 0);
+        // The sender restarts from its first byte, and that stream completes.
+        let landing = task.on_chunk(R1, S2, LATER, 16, true);
+        let Landing::Complete(install) = landing else {
+            panic!("the restarted stream completes on its own bytes: {landing:?}");
+        };
+        assert_eq!(install.at, LATER);
+        assert_eq!(task.meters().installs, 1);
+
+        let mut buggy = buggy(NodeVariant::CompleteOnRestart);
+        receive(&mut buggy, R1, S2, AT);
+        let landing = buggy.on_chunk(R1, S2, LATER, 16, true);
+        let Landing::Complete(install) = landing else {
+            panic!("the variant is meant to install the chunk that restarted it: {landing:?}");
+        };
+        assert_eq!(
+            install.at, LATER,
+            "the variant installs {LATER}'s label over {AT}'s staged files"
+        );
     }
 
     #[test]
     fn the_receive_cap_holds_and_a_freed_slot_admits_the_first_waiter() {
         // The re-seed shape's: four ranges, two slots (SHARD.md §12).
-        let mut task = Snapshots::new("/n1", 2, NodeVariants::correct());
+        let mut task = Snapshots::new("/n1", ME, 2, NodeVariants::correct());
         for range in [RangeId(1), RangeId(2), RangeId(3), RangeId(4)] {
             task.host(range, spans(range));
         }
@@ -811,19 +1013,104 @@ mod tests {
         }
         assert_eq!(task.meters().receiving, 2);
         assert_eq!(task.meters().waiting, 2);
+        // A refused sender that asks again is one waiter, not two: the queue holds a
+        // (range, sender) once, and its place in it does not move.
+        assert_eq!(
+            task.on_chunk(RangeId(3), S1, AT, 16, false),
+            Landing::Waiting { ahead: 0 }
+        );
+        assert_eq!(task.meters().waiting, 2, "a resend queues nothing new");
         // Nothing the waiters sent disturbed the two that were admitted.
         assert!(matches!(
             task.on_chunk(RangeId(1), S1, AT, 16, false),
             Landing::Staged { staged: 32, .. }
         ));
-        // A slot frees: the first waiter takes it, in the order it asked.
+        // A slot frees. It is not reserved: the head of the queue is named as a hint,
+        // and takes the slot when its own next chunk arrives.
         assert_eq!(task.finish(RangeId(1), S1), Some((RangeId(3), S1)));
+        assert_eq!(
+            task.meters().receiving,
+            1,
+            "the freed slot is free, not reserved"
+        );
         assert!(matches!(
             task.on_chunk(RangeId(3), S1, AT, 16, false),
             Landing::Staged { .. }
         ));
+        assert_eq!(task.meters().waiting, 1);
         assert_eq!(task.finish(RangeId(2), S1), Some((RangeId(4), S1)));
+        assert!(matches!(
+            task.on_chunk(RangeId(4), S1, AT, 16, false),
+            Landing::Staged { .. }
+        ));
         assert_eq!(task.meters().waiting, 0);
+        assert_eq!(task.meters().receiving, 2);
+    }
+
+    #[test]
+    fn a_freed_slot_goes_to_a_stream_still_asking_for_it() {
+        // §12's shape again — four ranges, two slots — with the thing this task exists
+        // to survive: a leader changes while its range waits. The waiter that asked
+        // first is S1's, and S1 is gone; nothing here has a clock to notice. The slot
+        // must go to the new leader's stream that is asking for it now, or the node
+        // re-seeds nothing more (SHARD.md:571-578).
+        let mut task = Snapshots::new("/n1", ME, 2, NodeVariants::correct());
+        for range in [RangeId(1), RangeId(2), RangeId(3), RangeId(4)] {
+            task.host(range, spans(range));
+        }
+        for range in [RangeId(1), RangeId(2)] {
+            task.on_chunk(range, S1, AT, 16, false);
+        }
+        for range in [RangeId(3), RangeId(4)] {
+            task.on_chunk(range, S1, AT, 16, false);
+        }
+        assert_eq!(task.meters().waiting, 2);
+        // S1 is replaced. Its two assemblies end — the node knows those streams stopped
+        // — and its two waiters never send again.
+        task.finish(RangeId(1), S1);
+        task.finish(RangeId(2), S1);
+        assert_eq!(task.meters().receiving, 0);
+        let landing = task.on_chunk(RangeId(3), S2, AT, 16, false);
+        assert!(
+            matches!(landing, Landing::Staged { .. }),
+            "R3's new leader takes a free slot: {landing:?}"
+        );
+        let landing = task.on_chunk(RangeId(4), S2, AT, 16, false);
+        assert!(
+            matches!(landing, Landing::Staged { .. }),
+            "and R4's: {landing:?}"
+        );
+        assert_eq!(task.meters().receiving, 2);
+
+        // The variant: the freed slot is reserved for the head of the queue, which is
+        // a stream of the departed leader's. Both slots are held by senders that will
+        // never send again and the node wedges.
+        let mut buggy = Snapshots::new(
+            "/n1",
+            ME,
+            2,
+            NodeVariants::correct().with(NodeVariant::SlotReservedForWaiter),
+        );
+        for range in [RangeId(1), RangeId(2), RangeId(3), RangeId(4)] {
+            buggy.host(range, spans(range));
+        }
+        for range in [RangeId(1), RangeId(2), RangeId(3), RangeId(4)] {
+            buggy.on_chunk(range, S1, AT, 16, false);
+        }
+        buggy.finish(RangeId(1), S1);
+        buggy.finish(RangeId(2), S1);
+        assert_eq!(
+            buggy.meters().receiving,
+            2,
+            "the variant is meant to reserve the freed slots for the waiters"
+        );
+        assert!(
+            matches!(
+                buggy.on_chunk(RangeId(3), S2, AT, 16, false),
+                Landing::Waiting { .. }
+            ),
+            "the variant is meant to refuse the new leader for ever"
+        );
     }
 
     #[test]
@@ -842,6 +1129,13 @@ mod tests {
         ));
         assert_eq!(correct.meters().sending, 4);
         assert!(correct.is_streaming(R1, S3, AT));
+        // And it is only running where one is: not at another identity, not to a
+        // follower nothing was started to, and not after the stream ends.
+        assert!(!correct.is_streaming(R1, S3, LATER), "another identity");
+        assert!(!correct.is_streaming(R2, S3, AT), "no stream to R2's S3");
+        correct.sent(R1, S3);
+        assert!(!correct.is_streaming(R1, S3, AT), "the stream ended");
+        assert_eq!(correct.meters().sending, 3);
 
         let mut buggy = buggy(NodeVariant::CapStreamsSent);
         assert!(matches!(
@@ -857,24 +1151,33 @@ mod tests {
 
     #[test]
     fn a_chunk_travels_in_a_frame_of_its_own() {
-        let chunk = vec![7u8; 256 * 1024];
         let mut correct = correct();
-        let route = correct
-            .route(R1, S2, &chunk)
-            .expect("a chunk under the cap");
-        let Route::OwnFrame(frame) = route else {
-            panic!("a chunk goes in a frame of its own: {route:?}");
-        };
-        // The framing alone: the chunk's bytes are a snapshot file's, not a message
-        // the codec reads, so `slices` is the right reader here.
-        let carried = crate::frame::slices(&frame).expect("a frame");
-        assert_eq!(carried.len(), 1, "one message, which is the chunk");
-        assert_eq!(carried[0].0, R1);
-        assert_eq!(&carried[0].1[..], &chunk[..]);
-        let meters = correct.meters();
-        assert_eq!((meters.chunks, meters.frames), (1, 1));
+        correct.stream(R1, S2, AT);
+        // Three sizes, so "one frame per chunk" is read off the frames and not off a
+        // single size: a byte, a chunk of the size §4 streams in, and the largest
+        // chunk that fits a frame at all.
+        let sizes = [1, 256 * 1024, MAX_FRAME_LEN - encoded_len(0)];
+        for (n, size) in sizes.iter().enumerate() {
+            let chunk = vec![7u8; *size];
+            let route = correct
+                .route(R1, S2, &chunk)
+                .expect("a chunk that fits a frame");
+            let Route::OwnFrame(frame) = route else {
+                panic!("a chunk goes in a frame of its own: {route:?}");
+            };
+            // The framing alone: the chunk's bytes are a snapshot file's, not a message
+            // the codec reads, so `slices` is the right reader here.
+            let carried = crate::frame::slices(&frame).expect("a frame");
+            assert_eq!(carried.len(), 1, "one message, which is the chunk");
+            assert_eq!(carried[0].0, R1);
+            assert_eq!(&carried[0].1[..], &chunk[..]);
+            let meters = correct.meters();
+            assert_eq!((meters.chunks, meters.frames), (n + 1, n + 1));
+        }
 
         let mut buggy = buggy(NodeVariant::ChunksInBatchFrames);
+        buggy.stream(R1, S2, AT);
+        let chunk = vec![7u8; 256 * 1024];
         assert_eq!(
             buggy.route(R1, S2, &chunk).expect("under the cap"),
             Route::Outbox,
@@ -886,11 +1189,63 @@ mod tests {
     #[test]
     fn a_chunk_too_large_for_a_frame_is_refused_and_not_split() {
         let mut task = correct();
+        task.stream(R1, S2, AT);
         let chunk = vec![7u8; MAX_FRAME_LEN];
         let refused = task.route(R1, S2, &chunk).expect_err("over a frame");
         assert_eq!(refused.range, R1);
         assert_eq!(refused.to, S2);
+        assert_eq!(refused.len, MAX_FRAME_LEN);
         assert_eq!(task.meters().frames, 0);
+        assert_eq!(task.meters().chunks, 0, "a refused chunk is not counted");
+    }
+
+    #[test]
+    #[should_panic(expected = "carries no bytes")]
+    fn a_chunk_of_no_bytes_is_not_routed_and_is_not_an_oversized_one() {
+        // `Builder::push` refuses an empty message (frame.rs:134-137); reporting it as
+        // an oversized chunk of length 0 would name the wrong thing entirely.
+        let mut task = correct();
+        task.stream(R1, S2, AT);
+        let _ = task.route(R1, S2, &[]);
+    }
+
+    #[test]
+    #[should_panic(expected = "which no stream is running to")]
+    fn a_chunk_is_not_routed_to_a_follower_no_stream_is_running_to() {
+        // The two halves of the send path are one path: a chunk is a chunk *of* a
+        // stream, and a frame built for a follower nothing is being streamed to is the
+        // two halves having come apart.
+        let mut task = correct();
+        let _ = task.route(R1, S2, &[7u8; 64]);
+    }
+
+    #[test]
+    fn the_name_a_leader_records_is_the_name_its_followers_stage_under() {
+        // The send half records the directory the *receiver* assembles into, and the
+        // receiver keys it by the sender — this node. A leader streaming one range to
+        // three followers records one name, and each follower stages under it.
+        let mut leader = correct();
+        let mut recorded = Vec::new();
+        for to in [S1, S2, S3] {
+            let Started::Streaming { staging } = leader.stream(R1, to, AT) else {
+                panic!("no cap on sends");
+            };
+            recorded.push(staging);
+        }
+        assert_eq!(recorded, vec![staging_name(R1, ME); 3]);
+        assert_eq!(leader.staging_sent(R1), recorded[0]);
+
+        // The follower's side of the same stream: a node receiving from ME.
+        let mut follower = Snapshots::new("/n2", S2, 4, NodeVariants::correct());
+        follower.host(R1, spans(R1));
+        let Landing::Staged { dir, .. } = follower.on_chunk(R1, ME, AT, 16, false) else {
+            panic!("the chunk stages");
+        };
+        assert_eq!(
+            dir,
+            Path::new("/n2").join(&recorded[1]),
+            "the name the leader recorded is the directory the follower staged in"
+        );
     }
 
     #[test]
@@ -903,6 +1258,10 @@ mod tests {
         };
         assert_eq!(install.range, R1);
         assert_eq!(install.from, S2);
+        assert_eq!(
+            install.at, AT,
+            "the install names the snapshot that was installed"
+        );
         assert_eq!(install.source, task.staging(R1, S2));
         assert_eq!(
             install.spans,
@@ -942,11 +1301,29 @@ mod tests {
             task.finish(range, S2);
         }
         assert_eq!(task.meters().adoptions, 0);
-        // The one thing that does: the node taking a fresh directory (Q15).
+        assert_eq!(
+            task.meters().installs,
+            2,
+            "two ranges installed, not adopted"
+        );
+        // An assembly is open and a stream is being sent: both name directories under
+        // the refused store, and the adoption drops them.
+        receive(&mut task, R1, S3, AT);
+        task.stream(R2, S1, AT);
+        // The one thing that traces an adoption: the node taking a fresh directory
+        // (Q15). Nothing has installed into *that* directory, which is what the figure
+        // says and what the assertion checks.
         let adopted = task.adopt_fresh("/n1-fresh");
+        assert_eq!(adopted.dir, Path::new("/n1-fresh"));
         assert_eq!(adopted.ranges_installed, 0);
         assert_eq!(task.meters().adoptions, 1);
         assert_eq!(task.staging(R1, S2), Path::new("/n1-fresh/staging-r1-s2"));
+        let meters = task.meters();
+        assert_eq!(
+            (meters.receiving, meters.waiting, meters.sending),
+            (0, 0, 0),
+            "what the refused store was assembling and sending goes with it"
+        );
 
         let mut buggy = buggy(NodeVariant::AdoptedOnRangeInstall);
         receive(&mut buggy, R1, S2, AT);
@@ -957,6 +1334,92 @@ mod tests {
             install.adopted,
             "the variant is meant to adopt on a replica's install"
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "a fresh directory is adopted before any range installs")]
+    fn a_directory_a_range_installed_into_is_not_adopted_as_fresh() {
+        // The fresh directory's whole point is that the event describes it before any
+        // range is in it. A node that adopted a directory it had already installed
+        // into — its own refused store, under a name that collided — would trace a
+        // `RaftAdopted` for a store that is not fresh, and the figure it carries would
+        // be false.
+        let mut task = correct();
+        receive(&mut task, R1, S2, AT);
+        let Landing::Complete(_) = task.on_chunk(R1, S2, AT, 16, true) else {
+            panic!("the stream completes");
+        };
+        task.finish(R1, S2);
+        task.adopt_fresh("/n1");
+    }
+
+    #[test]
+    fn two_senders_of_one_range_assemble_into_directories_of_their_own() {
+        // The decision this slice argues at most length (D-075, proposed 1): one range,
+        // two senders — a leader and the stale leader it replaced — each hold an
+        // assembly, so the staging name carries the sender as well as the range. Keyed
+        // by range alone the two write over each other's files, which is what
+        // §11 raft 14 asks not to happen, one level down from two ranges doing it.
+        let mut correct = correct();
+        let one = receive(&mut correct, R1, S1, AT);
+        let two = receive(&mut correct, R1, S2, LATER);
+        let (Landing::Staged { dir: first, .. }, Landing::Staged { dir: second, .. }) =
+            (&one, &two)
+        else {
+            panic!("both chunks stage: {one:?}, {two:?}");
+        };
+        assert_ne!(first, second, "one directory each");
+        assert_eq!(first, &Path::new("/n1").join(staging_name(R1, S1)));
+        assert_eq!(second, &Path::new("/n1").join(staging_name(R1, S2)));
+        // And the bytes are each stream's own, not one count over both.
+        let landing = correct.on_chunk(R1, S1, AT, 8, false);
+        assert!(
+            matches!(landing, Landing::Staged { staged: 1_032, .. }),
+            "S1's stream counts its own bytes: {landing:?}"
+        );
+        assert_eq!(correct.meters().receiving, 2);
+        assert_eq!(correct.meters().abandoned, 0);
+
+        let mut buggy = buggy(NodeVariant::StagingByRangeAlone);
+        let one = receive(&mut buggy, R1, S1, AT);
+        let two = receive(&mut buggy, R1, S2, LATER);
+        let (Landing::Staged { dir: first, .. }, Landing::Staged { dir: second, .. }) =
+            (&one, &two)
+        else {
+            panic!("both chunks stage: {one:?}, {two:?}");
+        };
+        assert_eq!(
+            first, second,
+            "the variant is meant to stage both senders of a range in one directory"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "but is not hosted here")]
+    fn a_range_the_task_does_not_host_never_completes_a_stream() {
+        // A replica the rebalancer has just placed here, whose spans the task has not
+        // been told: the install would switch an empty set of spans, which
+        // `Engine::install_spans` refuses at the switch (`EmptySpan`, D-068). The node
+        // fails where it lost track of the range instead (D-075, proposed 5).
+        let mut task = correct();
+        let unhosted = RangeId(7);
+        task.on_chunk(unhosted, S2, AT, 16, true);
+    }
+
+    #[test]
+    #[should_panic(expected = "spans are not sorted and disjoint")]
+    fn overlapping_spans_are_refused_where_the_range_is_hosted() {
+        let raft = |g: u64| Bytes::copy_from_slice(&[0u64.to_be_bytes(), g.to_be_bytes()].concat());
+        let mut task = correct();
+        task.host(RangeId(7), vec![raft(0)..raft(4), raft(2)..raft(6)]);
+    }
+
+    #[test]
+    #[should_panic(expected = "has an empty span")]
+    fn an_empty_span_is_refused_where_the_range_is_hosted() {
+        let raft = |g: u64| Bytes::copy_from_slice(&[0u64.to_be_bytes(), g.to_be_bytes()].concat());
+        let mut task = correct();
+        task.host(RangeId(7), vec![raft(4)..raft(4)]);
     }
 
     #[test]
@@ -996,6 +1459,18 @@ mod tests {
             (
                 NodeVariant::AdoptedOnRangeInstall,
                 "only_a_fresh_directory_after_a_refusal_is_adopted",
+            ),
+            (
+                NodeVariant::StagingByRangeAlone,
+                "two_senders_of_one_range_assemble_into_directories_of_their_own",
+            ),
+            (
+                NodeVariant::SlotReservedForWaiter,
+                "a_freed_slot_goes_to_a_stream_still_asking_for_it",
+            ),
+            (
+                NodeVariant::CompleteOnRestart,
+                "a_restarted_stream_is_never_installed",
             ),
         ];
         for (variant, _) in caught {

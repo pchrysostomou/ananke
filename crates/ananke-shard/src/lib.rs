@@ -38,7 +38,10 @@
 //! - [`mod@snapshot`], the `snapshot` task: one task keyed by (range, follower) on the
 //!   way out and (range, sender) on the way in, its staging and version directories
 //!   and their sweep keyed by range, its chunks in frames of their own, and D-066's
-//!   live install of a range's spans with the repair carried in the switch.
+//!   live install of a range's spans with the repair carried in the switch. A stream
+//!   over the receive cap takes a slot by asking again once one is free, and a stream
+//!   that starts its assembly over is restarted from its first byte rather than
+//!   installed from a directory that has just been cleared.
 //! - [`mod@variant`], the node's known-buggy variants, each a plausible way to get
 //!   the round or the snapshot task wrong, built beside the correct code (CLAUDE.md's
 //!   pair rule).

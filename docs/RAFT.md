@@ -207,7 +207,11 @@ of them, a new leader's stream included, starts the receiver's staging over (D-0
 one-group receiver holds one stream and abandons it for a chunk of another identity; the
 node holds one assembly per (range, sender), under a per-node cap on what is assembled at
 once, so a chunk that is not an assembly's own never disturbs it and the streams over the
-cap wait rather than restarting one another (Q14; D-075, proposed). An
+cap wait rather than restarting one another. A slot the cap frees is granted to a stream
+that is asking for it, never reserved for one that asked earlier and may since have been
+replaced as leader; and a chunk that starts an assembly over is answered with that
+restart even when it is its stream's last, since the directory it would be installed from
+has just been started over (Q14; D-075, proposed). An
 acknowledgement that takes a stream past the furthest point any acknowledgement had
 taken it is that stream's progress, and the task marks the follower for the core, which
 reads the marks before each tick; a duplicate, the answer a resend gets and ground a

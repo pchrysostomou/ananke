@@ -68,16 +68,16 @@ pub enum NodeVariant {
     /// [`SnapshotAction::Take`]: ananke_raft::core::SnapshotAction::Take
     TakeToSnapshotTask,
     /// One staging directory for the whole engine directory, as the one-group
-    /// receiver has (snapshot.rs:92-94), instead of one per (range, sender): two
+    /// receiver has (snapshot.rs:96-101), instead of one per (range, sender): two
     /// assemblies then write over each other's files (SHARD.md §11, raft 14).
     SharedStagingDir,
     /// One assembly for the whole node, abandoned for a chunk of another identity, as
-    /// the one-group snapshot task's is (snapshot.rs:859-864; node.rs:1430). The
+    /// the one-group snapshot task's is (snapshot.rs:1018-1027; node.rs:1430). The
     /// re-seeds heading for one node then restart each other (SHARD.md §4, §11 raft
     /// 14).
     OneAssemblyPerNode,
     /// A version directory named by index and take alone, `snap-<index>-<take>`
-    /// (snapshot.rs:112-114): two ranges' takes at one index share a directory.
+    /// (snapshot.rs:119-121): two ranges' takes at one index share a directory.
     VersionDirWithoutRange,
     /// A sweep that deletes every unpinned version directory, whatever range it
     /// belongs to, as today's does against the store's single snapshot record
@@ -99,6 +99,23 @@ pub enum NodeVariant {
     /// records only a node taking a fresh directory after a whole-node refusal
     /// (D-066), and a reader that counts adoptions would count every install as one.
     AdoptedOnRangeInstall,
+    /// The staging directory keyed by range alone, `staging-r<range>`, which is what
+    /// §11's raft item 14 says in so many words. Two senders of one range — a leader
+    /// and the stale leader it replaced — each hold an assembly of their own, and
+    /// under this name the two assemblies write over each other's files exactly as
+    /// two ranges would (SHARD.md:1910-1911; D-075, proposed).
+    StagingByRangeAlone,
+    /// A freed receive slot reserved for the waiter at the head of the queue, instead
+    /// of granted to a waiter when its next chunk arrives. The reservation is held for
+    /// a (range, sender) that may never send again — its leader changed while it
+    /// waited, which is the case §11 raft 14 exists for — and nothing here has a clock
+    /// to reclaim it, so the node's slots fill with reservations for departed senders
+    /// and it re-seeds nothing more (SHARD.md §12; Q14).
+    SlotReservedForWaiter,
+    /// A stream completed on the very chunk that restarted it: the node is told to
+    /// install, never that the staging directory must start over, so the install takes
+    /// the abandoned stream's files for the new snapshot's (RAFT.md:203-207).
+    CompleteOnRestart,
 }
 
 impl NodeVariant {
@@ -120,13 +137,17 @@ impl NodeVariant {
         NodeVariant::ChunksInBatchFrames,
         NodeVariant::InstallWithoutRepair,
         NodeVariant::AdoptedOnRangeInstall,
+        NodeVariant::StagingByRangeAlone,
+        NodeVariant::SlotReservedForWaiter,
+        NodeVariant::CompleteOnRestart,
     ];
 
-    /// The `snapshot` task's own, in order: the eight ways to get a snapshot keyed by
-    /// range and follower wrong (SHARD.md §11, raft 14; D-066). Six of the eight are
-    /// mutations a single-range, single-follower world could not catch at all: with
-    /// one range and one stream, a shared staging directory, one assembly, a version
-    /// name without a range, a sweep across ranges and a cap of one stream sent are
+    /// The `snapshot` task's own, in order: the eleven ways to get a snapshot keyed by
+    /// range and follower wrong (SHARD.md §11, raft 14; D-066). Seven of the eleven
+    /// are mutations a single-range, single-follower world could not catch at all:
+    /// with one range and one stream, a shared staging directory, a staging directory
+    /// keyed by range alone, one assembly, a version name without a range, a sweep
+    /// across ranges, a cap of one stream sent and a slot reserved for a waiter are
     /// each indistinguishable from the correct node.
     pub const SNAPSHOT: &'static [NodeVariant] = &[
         NodeVariant::SharedStagingDir,
@@ -137,6 +158,9 @@ impl NodeVariant {
         NodeVariant::ChunksInBatchFrames,
         NodeVariant::InstallWithoutRepair,
         NodeVariant::AdoptedOnRangeInstall,
+        NodeVariant::StagingByRangeAlone,
+        NodeVariant::SlotReservedForWaiter,
+        NodeVariant::CompleteOnRestart,
     ];
 
     /// The bit this variant takes in a [`NodeVariants`].
@@ -158,6 +182,9 @@ impl NodeVariant {
             NodeVariant::ChunksInBatchFrames => 1 << 13,
             NodeVariant::InstallWithoutRepair => 1 << 14,
             NodeVariant::AdoptedOnRangeInstall => 1 << 15,
+            NodeVariant::StagingByRangeAlone => 1 << 16,
+            NodeVariant::SlotReservedForWaiter => 1 << 17,
+            NodeVariant::CompleteOnRestart => 1 << 18,
         }
     }
 
@@ -181,6 +208,9 @@ impl NodeVariant {
             NodeVariant::ChunksInBatchFrames => "ChunksInBatchFrames",
             NodeVariant::InstallWithoutRepair => "InstallWithoutRepair",
             NodeVariant::AdoptedOnRangeInstall => "AdoptedOnRangeInstall",
+            NodeVariant::StagingByRangeAlone => "StagingByRangeAlone",
+            NodeVariant::SlotReservedForWaiter => "SlotReservedForWaiter",
+            NodeVariant::CompleteOnRestart => "CompleteOnRestart",
         }
     }
 }
@@ -264,14 +294,14 @@ mod tests {
             assert_eq!(seen & variant.bit(), 0, "{variant} shares a bit");
             seen |= variant.bit();
         }
-        assert_eq!(NodeVariant::BUGS.len(), 16);
+        assert_eq!(NodeVariant::BUGS.len(), 19);
         for variant in NodeVariant::SNAPSHOT {
             assert!(
                 NodeVariant::BUGS.contains(variant),
                 "{variant} is not in BUGS"
             );
         }
-        assert_eq!(NodeVariant::SNAPSHOT.len(), 8);
+        assert_eq!(NodeVariant::SNAPSHOT.len(), 11);
     }
 
     #[test]

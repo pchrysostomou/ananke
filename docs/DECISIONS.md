@@ -9415,9 +9415,9 @@ follower, one assembly per (range, sender) under per-node receive caps, no cap o
 sent, and chunks in frames of their own on its own socket handle (Q14, Q41); staging,
 version directories and their sweep keyed by range" (SHARD.md:2224-2229; §11, raft 14).
 D-066 decided what an install on the node is. Today all of it is one group's: one staging
-directory per engine directory (snapshot.rs:92-94), a version directory named by index and
-take alone (snapshot.rs:112-114), one `Assembler` per snapshot task holding one stream and
-abandoning it for a chunk of another identity (snapshot.rs:859-864; node.rs:1430), and a
+directory per engine directory (snapshot.rs:96-101), a version directory named by index and
+take alone (snapshot.rs:119-121), one `Assembler` per snapshot task holding one stream and
+abandoning it for a chunk of another identity (snapshot.rs:1018-1027; node.rs:1430), and a
 sweep that deletes every unpinned version directory the store's single snapshot record does
 not name (snapshot.rs:193-228). On a node each of those is wrong in a way a single-range
 world cannot show: two ranges' takes at one index collide, one range's sweep deletes
@@ -9432,9 +9432,10 @@ slice that puts the node under the sweeps carries.
 - *Keyed both ways.* Sends are keyed by (range, follower) and receives by (range, sender).
   Nothing caps the sends, so a leader feeds every designated follower of a range at once
   (Q14, D-043). A per-node cap bounds the assemblies; a (range, sender) over it is answered
-  with a restart, writes nothing and disturbs no admitted assembly, and takes the first slot
-  that frees, in the order it asked. This is the re-seed shape's "wait for one another"
-  (SHARD.md:2257-2259).
+  with a restart, writes nothing and disturbs no admitted assembly, and takes a slot by
+  asking for it again once one is free. This is the re-seed shape's "wait for one another"
+  (SHARD.md:2257-2259). The send half names the directory its followers stage under from
+  the node's *own* id, because that is the sender the receiver keys the name by.
 - *Paths keyed by range.* `version_name` is `snap-r<range>-<index>-<take>` and `staging_name`
   is `staging-r<range>-s<sender>`. `Snapshots::sweep` is one range's sweep: it proposes for
   deletion only version directories of the range it is sweeping, and among those only the
@@ -9444,9 +9445,13 @@ slice that puts the node under the sweeps carries.
   is refused as the outbox refuses an oversized message, never split (Q41).
 - *Installs are D-066's.* A completed stream yields an `Install`: the range's two key
   intervals, sorted and disjoint (D-068), the staged source, the repair carried in the
-  switch, no engine reopen, and `adopted: false`. `RaftAdopted` is `Snapshots::adopt_fresh`
-  alone — a node taking a fresh directory after a whole-node refusal, traced before any
-  range installs into it.
+  switch, no engine reopen, and `adopted: false`. A range the task was never told it hosts
+  has no spans to switch and fails here rather than at the switch, and a chunk that starts
+  its assembly over never completes a stream, whatever its `done` says: the directory it
+  would install from has just been cleared. `RaftAdopted` is `Snapshots::adopt_fresh` alone
+  — a node taking a fresh directory after a whole-node refusal, traced before any range
+  installs into it, which the task asserts against the installs it counted for that
+  directory rather than asserting nothing and reporting a constant.
 
 **What the design documents left open, and the conservative choice taken.**
 
@@ -9463,10 +9468,19 @@ slice that puts the node under the sweeps carries.
    recommendation that a scenario which is not about the cap sets it at or above the node's
    range count, so no stream waits by accident. A wrong default would be invisible; a cap
    that must be named is not.
-3. *What a stream over the cap is told.* Nothing settles whether an over-cap stream is
-   refused, queued or admitted by evicting another. *Taken:* refused with a restart, nothing
-   evicted, admission FIFO when a slot frees. Eviction would make the node the thing that
-   restarts streams, which is the bug §11 names.
+3. *What a stream over the cap is told, and who gets the slot when one frees.* Nothing
+   settles whether an over-cap stream is refused, queued or admitted by evicting another.
+   *Taken:* refused with a restart, nothing evicted. Eviction would make the node the thing
+   that restarts streams, which is the bug §11 names. *Amended after the review:* the freed
+   slot is **granted to a stream that asks for it**, not reserved for the waiter at the head
+   of the queue. A reservation is held for a (range, sender) that may never send again — a
+   waiter's leader can change while it waits, which is the case this whole slice exists for
+   — and nothing here has a clock to reclaim it, so a node under §12's shape fills both its
+   slots with reservations for a departed sender and re-seeds nothing more, for ever. Strict
+   FIFO by ask-order cannot be had without a clock: the queue keeps the order the waiters
+   asked in, and reports it as `ahead`, but the order holds only among streams that are
+   still asking. A standing wedge is worse than a fair order, and `SlotReservedForWaiter`
+   keeps the reservation beside the correct code.
 4. *The one-group layout's directories.* `snap-<index>-<take>` belongs to no range.
    *Taken:* it parses as no range's, so no range's sweep proposes it for deletion. A sweep
    never deletes a directory it cannot attribute; what becomes of an engine directory that
@@ -9480,11 +9494,27 @@ slice that puts the node under the sweeps carries.
    that scenario is Q15's slice. *Recommendation:* set the cap at or above its ranges.
    D-049's rule is a variant's catch condition, and changing what counts as progress to suit
    a scenario's cap weakens the rule the variants are caught by.
+7. *What becomes of the chunk that restarts an assembly.* RAFT.md:203-207 says a change of
+   identity "starts the receiver's staging over" and that a stream told to start over is
+   "restarted from its first byte"; the one-group receiver keeps the restarting chunk only
+   when it is that stream's first (offset 0) and asks for a restart otherwise
+   (snapshot.rs:1018-1027). Nothing here carries a chunk's offset, so the node cannot tell
+   the two apart. *Taken:* a restarting chunk is discarded with the assembly it restarted,
+   the directory starts over empty, and the sender is asked for the stream from its first
+   byte — including when that chunk says it is its stream's last, which is the ordinary
+   case for a range small enough to fit one chunk. The alternative, completing on it, would
+   install one snapshot's staged files under another's label; that is
+   `CompleteOnRestart`. The cost is one round trip per restart, and it terminates: the
+   resent stream is at the assembly's own identity and completes.
+8. *What an adoption does with what the refused store was carrying.* Q15's slice owns the
+   refusal; nothing settles whether the task's assemblies, waiters and sends survive it.
+   *Taken:* they do not. Every one of them names a directory under the store the node just
+   refused, so `adopt_fresh` drops them and the streams come again against the fresh one.
 
-**The pair (CLAUDE.md:52-67), and the mutation standard.** Eight variants, each built beside
-the correct code and each failing a check here. Six of the eight are mutations that a
-single-range, single-follower world could not catch at all — with one range and one stream
-they are indistinguishable from the correct node:
+**The pair (CLAUDE.md:52-67), and the mutation standard.** Eleven variants, each built
+beside the correct code and each failing a check here. Seven of the eleven are mutations
+that a single-range, single-follower world could not catch at all — with one range and one
+stream they are indistinguishable from the correct node:
 
 | Variant | The mutation | The check that fails under it |
 | --- | --- | --- |
@@ -9496,10 +9526,43 @@ they are indistinguishable from the correct node:
 | `ChunksInBatchFrames` | chunks through the per-peer outbox | `a_chunk_travels_in_a_frame_of_its_own` |
 | `InstallWithoutRepair` | the switch made without the range's repair (D-066) | `an_install_is_a_live_install_of_the_ranges_spans_with_its_repair` |
 | `AdoptedOnRangeInstall` | `RaftAdopted` traced for a replica's install | `only_a_fresh_directory_after_a_refusal_is_adopted` |
+| `StagingByRangeAlone` | the staging directory keyed by range and not also by sender | `two_senders_of_one_range_assemble_into_directories_of_their_own` |
+| `SlotReservedForWaiter` | a freed slot reserved for the waiter at the head of the queue | `a_freed_slot_goes_to_a_stream_still_asking_for_it` |
+| `CompleteOnRestart` | a stream completed on the very chunk that restarted it | `a_restarted_stream_is_never_installed` |
 
-The first six need more than one range or more than one follower to be wrong about: that is
-the mutation standard applied to this slice. `ChunksInBatchFrames` and `InstallWithoutRepair`
-are wrong with one range too, and are here because Q41 and D-066 name them.
+Seven need more than one range, more than one sender or more than one follower to be wrong
+about, and that is the mutation standard applied to this slice: `SharedStagingDir`,
+`StagingByRangeAlone`, `OneAssemblyPerNode`, `VersionDirWithoutRange`, `SweepAcrossRanges`,
+`CapStreamsSent` and `SlotReservedForWaiter` — the last needs three keys and a cap below
+them, which is §12's shape exactly, and the first two are the same mistake one level apart.
+The other four — `ChunksInBatchFrames`, `InstallWithoutRepair`, `AdoptedOnRangeInstall` and
+`CompleteOnRestart` — are wrong with one range and one follower too, and are here because
+Q41, D-066 and RAFT.md:203-207 name them. (This entry first claimed "six of the eight" and
+then contradicted itself in the next sentence; the count above is against the standard, not
+against the table's row order, and it is the corrected one.)
+
+**What the adversarial review changed.** The review ran three probes against the *correct*
+node and found two safety defects and one that turned an ordinary case into a permanent
+refusal. Each fix below is the smallest one that makes the code do what this entry already
+claimed, and each is proved by the mutation that undoes it being caught. The mutations were
+run one at a time against the fixed tree, reverted between runs.
+
+| Finding | The fix | The mutation that proves it |
+| --- | --- | --- |
+| A chunk that restarted an assembly *and* said it was its stream's last was installed: `Install` pointed at a directory holding two streams' files, labelled as one | the restart wins; the stream is restarted from its first byte and completes on the next pass (open choice 7 above) | completing on a restart → `a_restarted_stream_is_never_installed` fails; kept as `CompleteOnRestart` |
+| `finish` reserved the freed slot for the head of the queue, so a waiter whose leader had changed held a slot for ever and the node wedged under §12's own shape | the slot is freed, not reserved, and granted to whichever stream asks (open choice 3, amended) | reserving on `finish` → `a_freed_slot_goes_to_a_stream_still_asking_for_it` and the cap check fail; kept as `SlotReservedForWaiter` |
+| A range the task was never told it hosts completed with `spans: []`, which `Engine::install_spans` refuses at every switch (`EmptySpan`, D-068) — a permanent refusal for a newly placed replica | `on_chunk` panics where the range is unknown, as `host` does | `unwrap_or_default()` → `a_range_the_task_does_not_host_never_completes_a_stream` fails |
+| The send half recorded the staging name of the *follower*, a path that exists on no node, and `is_streaming` compared it with itself | `Snapshots::new` takes the node's own id and the name is built from it; the tautology is gone | naming it by the follower → `the_name_a_leader_records_is_the_name_its_followers_stage_under` fails |
+| `adopt_fresh` asserted "no assembly is open" while its doc said "no range has installed", and `ranges_installed` was the literal `0` | installs are counted per engine directory; the assertion and the figure both read that count, and the adoption drops what the refused store was carrying (open choice 8) | dropping the assertion → `a_directory_a_range_installed_into_is_not_adopted_as_fresh` fails |
+| The slice's most-argued decision — staging keyed by (range, sender) — had no variant, and was held up only by a path literal in a check about adoption | `StagingByRangeAlone`, and a check about two senders of one range | keying by range alone → `two_senders_of_one_range_assemble_into_directories_of_their_own` fails |
+| `host`'s span assertions (open choice 5) had no check at all | two `#[should_panic]` checks | dropping either assertion → the matching check fails |
+| `sent`, `is_streaming`'s `false`, `Install.at`, the waiting queue's duplicate guard, the bytes an assembly holds after a restart, and `route`'s guards were all unasserted; an empty chunk was reported as `Oversized { len: 0 }`, which is not what it is | each is asserted now; an empty chunk and a chunk for a follower no stream is running to are panics, since both are the node's own bug and not a peer's message | each mutation is caught: see the list above |
+
+Two of the review's points are recorded rather than changed. Its count of the variants that
+need more than one range is corrected in the paragraph above. Its observation that two of
+the four measurements were constants rather than observations is why the Measurements table
+now says which is which, and the frames figure is now read at three chunk sizes instead of
+one.
 
 **Tiers and rates (D-061).** Nothing here is asserted at a tier, because nothing here is a
 sweep: each check is deterministic and fails under its variant on every run. D-061 asks a
@@ -9511,12 +9574,14 @@ none was widened or lowered.
 'Battery Power'"), with other Stage B slices building in parallel — load averages 19.00 18.68
 30.98 at the time of the run. Counts, not times, so they are the same on any machine:
 
-| What | Figure | Where |
-| --- | --- | --- |
-| frames a chunk travels in | 1 per chunk, at any chunk size under the frame cap | `a_chunk_travels_in_a_frame_of_its_own` (`meters().chunks == meters().frames == 1`) |
-| assemblies abandoned for a chunk that is not their own | 0 on the correct node, over four interleaved (range, sender) streams | `a_chunk_of_another_stream_never_abandons_an_assembly` |
-| assemblies open under a cap of two with four ranges arriving | 2, with 2 waiting, and each freed slot taking the first waiter | `the_receive_cap_holds_and_a_freed_slot_admits_the_first_waiter` |
-| `RaftAdopted` events per replica install | 0; one per fresh directory | `only_a_fresh_directory_after_a_refusal_is_adopted` |
+| What | Figure | Observation or constant | Where |
+| --- | --- | --- | --- |
+| frames a chunk travels in | 1 per chunk, at each of three chunk sizes — one byte, §4's 256 KiB, and the largest chunk that fits a frame | the *decode* is an observation: the frame is read back and asserted to carry one message, that range's tag and the chunk's bytes, at each size. The counter pair `chunks == frames` is arithmetic on one path | `a_chunk_travels_in_a_frame_of_its_own` |
+| assemblies abandoned for a chunk that is not their own | 0 on the correct node, over four interleaved (range, sender) streams | a **constant**: with the key carrying the sender, the abandon path is unreachable by construction. The figure cannot distinguish a correct-side mutation, and is here as the variant's contrast, not as a count | `a_chunk_of_another_stream_never_abandons_an_assembly` |
+| assemblies open under a cap of two with four ranges arriving | 2 open, 2 waiting; a freed slot stays free until a waiter asks, and a resend queues nothing new | observation | `the_receive_cap_holds_and_a_freed_slot_admits_the_first_waiter` |
+| slots recovered when the waiters' leader is replaced | 2 of 2 — both freed slots go to the new leader's streams | observation, and the figure the review's wedge turned into a check | `a_freed_slot_goes_to_a_stream_still_asking_for_it` |
+| `RaftAdopted` events per replica install | 0; one per fresh directory, and `ranges_installed` is read from the installs counted for that directory | observation | `only_a_fresh_directory_after_a_refusal_is_adopted` |
+| streams installed from a directory that had just been started over | 0 | observation | `a_restarted_stream_is_never_installed` |
 
 Stage B's timed measurements — the step cost, the frames per peer in a round, the replay
 burst, the inbox's drops, the apply lag, the take's hold — belong to the tasks slice and the
@@ -9539,8 +9604,10 @@ beside D-068's 613 s and D-072's 779 s on the same machine. It is a green, not a
 
 **What moved.** Nothing outside `crates/ananke-shard` and the two documents. `sim/` does not
 depend on `ananke-shard`, so no schedule moves, no pinned trace hash moves and no pinned seed
-is re-audited: `crates/ananke-shard/src/variant.rs` gained eight variants at bits 8 to 15,
-which no existing code reads, and every other file of the crate is unchanged. The one-group
+is re-audited: `crates/ananke-shard/src/variant.rs` gained eleven variants at bits 8 to 18,
+which no existing code reads, and the crate's other files are unchanged but for `lib.rs`'s
+description of this module. `Snapshots::new` takes the node's own `ServerId`, which only
+this module's own checks call. The one-group
 server's `snapshot.rs` is untouched and keeps working exactly as RAFT.md §1 says; RAFT.md
 gains the node's naming, the node's assembly rule and the node's snapshot task beside it
 (D-053).
