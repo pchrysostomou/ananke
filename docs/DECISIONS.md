@@ -9522,6 +9522,21 @@ Stage B's timed measurements — the step cost, the frames per peer in a round, 
 burst, the inbox's drops, the apply lag, the take's hold — belong to the tasks slice and the
 slice that runs the sweeps; this slice adds none and relies on none.
 
+**The premerge.** `ANANKE_SEEDS=1000 scripts/premerge.sh` on the commit this entry lands
+with, in the words the script printed (D-070):
+
+```
+premerge: Darwin 25.6.0 arm64, Apple M2, 8 cores
+premerge: before, load 26.10/61.10/56.18, AC Power, no thermal warning recorded
+premerge: after, load 154.70/140.32/112.73, AC Power, no thermal warning recorded
+premerge: green at 1000 seeds in 1308 s
+```
+
+On AC throughout and with no thermal warning, but the load lines are the figure's context
+and not decoration: six other Stage B slices were building and running their own sweeps on
+this laptop for the whole run, and a load average of 140 on eight cores is why 1 308 s sits
+beside D-068's 613 s and D-072's 779 s on the same machine. It is a green, not a timing.
+
 **What moved.** Nothing outside `crates/ananke-shard` and the two documents. `sim/` does not
 depend on `ananke-shard`, so no schedule moves, no pinned trace hash moves and no pinned seed
 is re-audited: `crates/ananke-shard/src/variant.rs` gained eight variants at bits 8 to 15,
