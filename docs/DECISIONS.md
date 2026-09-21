@@ -8691,7 +8691,7 @@ earlier draft of this list miscounted it as a violation.
   message changed (item 14) and a check whose arm was deleted (item 12) leave the
   schedules exactly where they were, which is what the two runs being the same run says.
 
-## PROPOSED D-072 — The node's wire: a frame of range-tagged messages, a per-peer outbox cut under `MAX_FRAME_LEN`, and an inbox bounded in bytes that refuses the arrival
+## PROPOSED D-072 — The node's wire: a frame of range-tagged messages, a per-peer outbox keyed by range and bounded in bytes, and an inbox bounded in bytes that makes room for the messages carrying data
 
 **Context.** Stage B's third build (SHARD.md:2219-2232) is §4's node. This entry is its
 first slice, the wire, and nothing else: "one socket; frames tagged with an 8-byte range
@@ -8705,11 +8705,15 @@ did.
 
 What the tree has. A frame is one message, `kind | from | term | fields`
 (message.rs:1-8), and nothing on the wire names a group (SHARD.md:317-321). The inbox is
-bounded by message count, 128 in the sweep, drops the oldest heartbeat of any sender
-first, admits an AppendEntries carrying entries *over* the bound, and scans the queue on
-every arrival — `count` a linear filter and `remove_first` a linear search, called up to
-twice — so a tick costs arrivals × capacity (SHARD.md:567-576; §11, raft item 11). And
-`ananke-shard` did not exist. Q40 divides the crates; §11's raft items 1, 2 and 11 are
+bounded by message count, 128 in the sweep, and drops the oldest heartbeat of any sender
+first, then the oldest message of the arriving one's kind and sender — and **never** an
+AppendEntries with entries or an InstallSnapshot chunk, which it admits over the bound
+deliberately (node.rs:22-26, 2333-2337). That clause is not a defect: it is the guarantee
+that a range's replication cannot be stopped by a flood of cheap messages, and what a
+byte bound has to keep by some other means. What is a defect is the scan: `count` is a
+linear filter and `remove_first` a linear search, called up to twice, so a tick costs
+arrivals × capacity (SHARD.md:567-576; §11, raft item 11). And `ananke-shard` did not
+exist. Q40 divides the crates; §11's raft items 1, 2 and 11 are
 what this slice of them needs.
 
 **Decision.**
@@ -8719,8 +8723,12 @@ with its own `README.md` and copies of both licences, crate and module documenta
 `-D warnings` clean under `cargo clippy --all-targets --all-features`, and clippy.toml's
 bans in force — `scripts/check-direct-io.sh` needed no change, since it scans `crates`
 and `sim` whole. It depends on `ananke-env`, for `MAX_FRAME_LEN`, and on `ananke-raft`,
-for the codec and the types; **`ananke-raft` does not depend on it** and still names no
-range, descriptor or span (Q40). Four modules: `range`, the id; `frame`, the batch frame
+for the codec and the types; **`ananke-raft` does not depend on it** and still carries
+**no range descriptor and no span**, which is what Q40 asks. It does name a range where
+the trace needs one — `RaftConfig::range`, and `range` on every `Raft*` event (D-069) —
+and that is a `u64` label on a group, not knowledge of what keys a range holds; where a
+range's bounds, its splits and its placement live is this crate's side of the line. Four
+modules: `range`, the id; `frame`, the batch frame
 with its builder, its decoder and the studio's view of one; `outbox`; `inbox`. Nothing
 here spawns anything or touches a clock, a disk or a socket: it is the wire's shape and
 two queues, and the tasks that will drive them are the next PR's.
@@ -8747,13 +8755,40 @@ at 10 000 ranges, is 17.3 kB where it says 16.4 kB — both four orders under
 `MAX_FRAME_LEN`, so the extra 4 bytes change nothing §4 concludes. At 1 000 ranges, the
 count Phase 3 builds for, an idle pair's frame is 22 messages, 1.7 kB.
 
-*The cut.* A flush is at most one frame per peer, built in peer order, cut under the cap.
-A message that does not fit the frame being cut is left at the head of its peer's queue
-and starts the *next flush's* frame — this is §4's "one frame per peer per flush" read
-literally, so that a flush's work and its bytes are both bounded, and since Q41's round
-flushes at least once a round a backlog drains at the round's rate. Since a message that
-could not fit an empty frame is refused at the push, every flush of a non-empty queue
-takes at least one message from it and a queue always drains.
+*The cut, over a queue per (peer, range).* A flush is at most one frame per peer, built
+in peer order, cut under the cap — §4's "one frame per peer per flush" read literally, so
+that a flush's work and its bytes are both bounded, and since Q41's round flushes at
+least once a round a backlog drains at the round's rate.
+
+**The queue is keyed by (peer, range), not by peer, and the frame is cut round-robin over
+the peer's ranges.** One queue a peer puts every range behind whichever range spoke
+first: eight in-flight AppendEntries for one range hold every other range's heartbeat to
+that peer behind them, up to eight flushes, which at Q41's 10 ms tick is 80 ms against a
+minimum election timeout of 100 ms (core.rs:373-377) — one slow range starting elections
+in the other 299 a node leads. Measured on this outbox: with a 24 kB frame cap, eight
+4 KiB entry-carriers for one range against 299 ranges with one heartbeat each, **every
+one of the 299 heartbeats leaves in the first frame** and the backlogged range leads that
+frame too. Order within a range is the order it was queued in, which is all Raft asks of
+it; order between ranges is the round-robin's, which is what stops one range spending
+another's frame. A range whose next message does not fit the frame being cut is passed
+over and leads the next flush's frame, so no range is passed over twice running. Since a
+message that could not fit an empty frame is refused at the push, every flush of a
+non-empty queue takes at least one message and a queue always drains.
+
+*The outbox is bounded, per peer, in bytes.* The queue in front of the socket is bounded
+— 1 024 frames a destination, oldest dropped, traced as `MessageDropped` (net.rs:9-11) —
+and an unbounded queue in front of a bounded one bounds nothing: a peer that is not
+draining grows the outbox without limit and the socket's bound is never reached. Measured
+on the outbox as it was: 100 000 pushes with no flush, nothing refused and nothing
+dropped. So each peer's queue holds at most `2 * MAX_FRAME_LEN` of frame bytes — the
+frame a flush is about to cut and one behind it — and a push over that drops the *oldest*
+message queued for that peer, whatever range it is about, handing it back so the caller
+traces it exactly as the socket's own drop is traced. A message is never dropped for one
+of another peer. Measured: 100 000 pushes into a 64 kB test bound, 98 992 dropped and
+65 520 bytes queued, the bound never passed and every dropped message handed back. The
+figure 2 × 16 MiB is a bound and not a tuning — at §4's largest idle frame, 17.3 kB, it
+is about 1 900 rounds of headroom, and what a node's queues actually reach is the node's
+stage's to measure, with the drops now traceable.
 
 *A message larger than a frame is refused at the push*, with the peer, the range and its
 length, and nothing is queued. It is not truncated; it is not split across frames, since
@@ -8767,38 +8802,72 @@ snapshot task's own socket handle (Q41) — so the 16 MiB cap is spent on entrie
 nothing else.
 
 *The inbox.* One per node, bounded in bytes, and a message's cost is **the frame bytes it
-occupied**, its 12-byte tag included: what the node took off the wire for it. Admission
-is one comparison against a kept size — no index, no scan, no entry of the queue examined
-— and it is per message, not per frame: a frame is admitted as far as it fits, in order,
-and the messages after that are refused. Nothing is torn by a refusal, since the framing
-decides where a message ends before any of this.
+occupied** — its 12-byte tag, its own length, and for the first message of a frame that
+frame's 5-byte header, so a frame's bytes are charged to its messages exactly and the
+bound is the bytes received rather than the bytes received less five a frame. Admission
+is per message, not per frame: a frame is admitted as far as it fits, in order. Nothing
+is torn by a refusal, since the framing decides where a message ends before any of this.
 
-*What it drops when it is full,* which §4 does not settle: **the arriving message is
-refused and nothing already admitted is dropped.** It is the conservative answer on three
-counts. Admission is final, so no message can be lost by something that arrives after it.
-The byte bound is never exceeded, where today's inbox admits entry-carrying messages over
-its bound and so is not bounded at all in the quantity it claims to bound. And a refused
-arrival is, to the protocol, a message the network lost, which this transport is allowed
-to do at any time (net.rs:3-6) and which Raft answers by sending again.
+*What it drops when it is full,* which §4 does not settle. This is **not the policy this
+entry first proposed**. It proposed refusing the arrival and dropping nothing, and that
+policy has two defects that its own probes did not look for:
 
-The alternatives, and what would have to be measured before taking one:
+- *A message larger than the whole bound is refused for ever.* An AppendEntries carrying
+  a 64 KiB command costs 65 627 bytes of frame; against the 16 kB inbox §4's arithmetic
+  suggests, it is refused **into an empty inbox**, and every retransmission of it is
+  refused identically, because the arrival is the same size every time and the inbox is
+  empty every time. That range never replicates again. Measured: 1 000 retransmissions,
+  1 000 refusals. `ananke_raft::node` does not have this defect — it admits entry-carriers
+  and InstallSnapshot chunks over its bound deliberately (node.rs:22-26, 2333-2337) — so
+  the first wording of this entry recast that clause as a defect of the tree when it is
+  the tree's liveness guarantee.
+- *Refusing the arrival starves the messages that carry data, systematically.* A pressured
+  inbox admits heartbeats indefinitely and refuses entry-carriers indefinitely: 63
+  heartbeats fill a 4 kB inbox, and over 100 rounds every heartbeat was admitted and all
+  101 entry-carriers refused. Heartbeats keep arriving, so nothing times out and no
+  election repairs it; the commit index simply stops. "A refusal costs one retransmission,
+  not a round" is true of one refusal and false of a standing one.
 
-- *Today's policy* — the oldest heartbeat of any sender first, then the oldest message of
-  the arriving one's kind and sender, never an entry-carrier. It needs the index of
-  heartbeats by sender and range that §11's raft item 11 names to admit in logarithmic
-  time; it destroys work the node has already done; and its "admitted over the bound"
-  clause is the thing a byte bound forbids.
-- *Classes* — refuse heartbeats before entry-carriers, all still under the bound. The same
-  index, and a fairness question between ranges that nothing in §4 or §8 settles.
+So the policy is **two rules and one guard**, which is what §11's raft item 11 asks for —
+"a kept size **and an index of heartbeats by sender and range**", of which the first
+wording built the size and dropped the index:
 
-What is given up by refusing the arrival: a flood of heartbeats can refuse an arriving
-AppendEntries that carries entries, which today's policy protects. Against it, the
-leader's next heartbeat is 20 ms away and its minimum election timeout 100 ms
-(core.rs:373-377), so a refusal costs one retransmission, not a round. **The node's stage
-measures it before any policy with an index is built:** refusals per kind and per range
-at four ranges a node, and whether any range's progress is held up over an election
-timeout by refusals alone. Until that measurement exists, this is the policy, marked
-`// PROPOSED(D-072)` where it is decided.
+- A message that *carries data* — an AppendEntries with entries, or an InstallSnapshot
+  chunk — is admitted by **making room**: the oldest heartbeat of the (sender, range) pair
+  holding the most of them is dropped, and again until it fits. It is never refused for
+  want of room a heartbeat is holding. This is what `ananke_raft::node` protects by
+  admitting these over its bound; dropping heartbeats for them keeps the protection and
+  keeps the bound.
+- Any other arrival — a heartbeat, a vote, a response — is refused when it does not fit.
+  It is the cheap one to lose: a heartbeat repeats every 20 ms against a minimum election
+  timeout of 100 ms (core.rs:373-377), and a follower taking entries has its timer reset
+  by the entries themselves, so heartbeats losing under pressure cannot start the election
+  that entry-carriers losing would need to repair. What it gives up is a follower's timer
+  reset and a leader's lease promise under sustained pressure, which is what the node's
+  stage measures.
+- And over both: **nothing is ever refused into an empty queue.** A message larger than
+  the whole bound is admitted over it rather than refused for ever. The bound is then
+  exceeded by an inbox holding exactly one message, which the next pop empties, so the
+  overshoot is one message and not a growing one. Measured: 1 000 retransmissions, 1 000
+  admissions, 0 refusals.
+
+A carrier that no room can make fit, into a queue that is not empty, *is* refused — and
+nothing is dropped for it, since whether the room can be made is decided before any of it
+is made. That refusal is transient by construction: the queue holds real work, draining
+it empties the queue, and the retransmission into the empty queue is admitted.
+
+*The index* is §11's: a map from (sender, range) to that pair's queued heartbeats in
+arrival order, and a ranking of those pairs by how many each holds, so the fullest pair's
+oldest heartbeat is two lookups and no scan. Choosing the noisiest pair is what keeps one
+range from being starved of its heartbeats by another's flood; ties go to the highest
+(sender, range), a total order, so the choice is the same on every node and in every run.
+
+*What is given up against today's policy* is that a heartbeat is lost where today a
+message of the arriving one's own kind and sender would have been; and that an arrival
+that carries no data can be refused where today something older goes for it. Both are
+measured by refusals and drops per kind and per range, which the node's stage takes at
+four ranges a node, together with whether any range's progress is held over an election
+timeout by refusals alone.
 
 *The studio.* moirae pairs a send with its delivery by `msgId`, so one frame is one
 `send` line and its `msg` is one object. The decoder therefore puts the frame's messages
@@ -8812,16 +8881,29 @@ it, on `moirae::Decoder` and in that module's doc table.
 
 **What §4 leaves open, settled here, each marked `// PROPOSED(D-072)` in the code.**
 
-1. *The drop policy and the oversized message*, above.
-2. *The cut leaves the overflowing message queued*, above: a flush is one frame a peer,
-   not as many frames as the queue needs.
+1. *The drop policy and the oversized message*, above: entry-carriers and snapshot
+   chunks make room by dropping heartbeats, other arrivals are refused, nothing is
+   refused into an empty queue, and a message larger than a frame is refused at the
+   outbox's push.
+2. *The cut leaves the overflowing range's message queued*, above: a flush is one frame a
+   peer, cut round-robin over the peer's ranges, not as many frames as the queue needs
+   and not one range's queue drained before another's is looked at. And the outbox is
+   bounded per peer, in bytes, dropping the oldest.
 3. *A message costs 4 bytes beyond Q10's 8.* The alternative is moving the message
    parser into this crate, which Q40 puts the other side of the boundary.
-4. *`decode` refuses a frame whole; `studio` shows it as far as its framing parses.* A
-   node that has to act on a frame one of whose messages it cannot parse is talking to
-   something that does not agree with it about the wire, and the messages beside the one
-   that failed are no more trustworthy than it; a viewer of a recorded trace has no such
-   problem and showing five of six messages is better than showing none.
+4. *Framing and content are refused separately, and `decode` now agrees with `studio`.*
+   Framing that does not parse — another version, a torn frame, a count that does not
+   match, trailing bytes — hides where every message of the frame ends, so `decode`
+   refuses the frame whole and never reads a prefix. A frame whose framing parses but one
+   of whose messages the codec refuses loses **that message only**, counted in
+   `Decoded::malformed` so the caller can trace it. This reverses the first wording of
+   this entry, which refused the frame whole for both. `slices` validates the framing
+   without reading a message, so the messages beside a bad one are exactly as delimited as
+   they were; and §4's largest idle frame carries 222 responses of one node pair, so
+   refusing it whole turns **1 lost message into 222**, of up to 222 different ranges,
+   for one message written badly. The argument for refusing whole — that a peer which
+   disagrees about one message is not to be trusted about the rest — proves too much when
+   the framing it wrote parsed exactly.
 5. *A version byte.* One byte a frame, so that a frame from something that does not
    write this format is refused rather than read as a count and a range.
 6. *Every message carries its sender, as `ananke-raft`'s codec writes it*, 8 bytes a
@@ -8830,28 +8912,96 @@ it, on `moirae::Decoder` and in that module's doc table.
    heartbeat costs, and it is what lets a frame's messages be handed on one at a time
    without the frame beside them.
 7. *The bound is in wire bytes, not in live heap.* A decoded command is a `Bytes` slice
-   of the frame it arrived in (message.rs:324), so one admitted message can keep its
-   whole frame alive: a 16 MiB frame of which one 65-byte message is admitted holds
-   16 MiB against 65 bytes of the bound. Bounding live heap instead would mean copying
-   every message out of its frame at admission — a copy per message on the receive path
-   — and the honest figure to decide that on is the inbox's live bytes against its bound,
-   which the node's stage measures with the refusal rates above. The bound this entry
-   sets is what the node took off the wire, which is also what a sender can be held to.
-   Today's server has the same exposure with one message a frame; batching changes its
-   size, not its kind.
+   of the frame it arrived in (message.rs:324), so one admitted message can keep its whole
+   frame alive. **A heartbeat cannot do it** — it holds no `Bytes` at all, so the frame
+   beside it costs it nothing — which is what the first wording of this entry got wrong by
+   illustrating the hazard with one. The message that pins a frame is the smallest one
+   *carrying a payload*: an AppendEntries with one entry costs **86 bytes of the bound**
+   with an empty command, and holds every byte of the frame it arrived in. Measured: a
+   92-byte carrier holding a 798 883-byte frame, **8 683×**; and the ratio is bounded by
+   `MAX_FRAME_LEN` over the smallest carrier, **195 083×**, which is the figure to put
+   against the bound rather than "batching changes its size, not its kind". A single
+   message a frame, as the server sends today, has the same exposure at a frame's size;
+   batching multiplies the *ratio* by how many messages share the frame, because any one
+   of them holds all of it. Bounding live heap instead would mean copying every message
+   out of its frame at admission — a copy per message on the receive path — and the figure
+   to decide that on is the inbox's live bytes against its bound, which the node's stage
+   measures with the refusal and drop rates above. The bound this entry sets is what the
+   node took off the wire, which is also what a sender can be held to.
+
+8. *A frame's header is charged to its first message.* A message's cost is its tag, its
+   own length, and for the first message of a frame that frame's 5 bytes, so a frame's
+   messages' costs sum to the frame exactly and the bound is the bytes received rather
+   than the bytes received less five a frame. The header goes to the first message because
+   a frame is carried for its first message as much as for its last; a frame of no
+   messages carries nobody and charges nobody.
+
+9. *An empty message is refused by the builder.* `Frame::decode` refuses zero bytes, so an
+   empty message is 12 bytes of frame that every reader of it drops. The caller has lost a
+   message before the frame is cut, which is its bug; it is told with a panic, as it is
+   for a message that does not fit.
+
+10. *A closed inbox refuses.* Nothing will drain it, so `Admitted` there is a message lost
+    under a word that says it was not.
+
+11. *A range id above `i64::MAX` exports as a JSON string*, as every other `u64` the trace
+    carries does (`ananke_raft::message::int`): JSON's numbers are `i64` and the
+    alternative is a negative range id in the studio. Pinned by a test that reads the same
+    value through both crates' exporters, so the two cannot drift apart.
+
+12. *`encoded_len` saturates*, as `Builder::fits` does: a length no frame could hold has
+    to compare as one rather than wrap to a small one that fits.
 
 **Measurements.**
 
 - *The admission's cost, in queue entries examined* — the figure Stage B's measurements
-  ask for (SHARD.md §12). At lengths 1, 2, 4, … 4 096, with room and on a full inbox,
-  one admission examines **0 queue entries at every length**, both ways. It is counted,
-  not timed: every look at a queued entry goes through one private module that counts it
-  and the `VecDeque` is private to that module, so the figure is a measurement and not an
-  estimate, and it is the same on any machine. The test asserts Q14's standard —
-  constant, or growing by at most a constant for every doubling — and, beside it, that
-  this implementation is constant at zero. Against it: today's admission examines the
-  whole queue once and up to twice more, so at the sweep's 128 messages a tick's 200
-  arrivals cost about 25 600 entry examinations and here cost none.
+  ask for (SHARD.md §12). At lengths 1, 2, 4, … 4 096: an admission with room examines
+  **0 queue entries at every length**, a refusal **0 at every length**, and one that makes
+  room **1 entry per heartbeat it drops** — 1 at every length in the measurement, where
+  one heartbeat is the room needed. Over a run of 2 000 rounds of mixed arrivals and
+  drains: 2 667 messages admitted, **2 667 queue entries examined in all**, since every
+  entry examined is a message leaving and a message leaves once. Against it: today's
+  admission examines the whole queue once and up to twice more, so at the sweep's 128
+  messages a tick's 200 arrivals cost about 25 600 entry examinations.
+
+  **What makes the figure a measurement and not a structural zero.** The first wording of
+  this entry counted probes only in `pop_front`, which `admit` never called, so the figure
+  was zero for *any* admission, linear ones included — the review planted a linear
+  admission through an accessor that did not count and it survived, still printing zero.
+  The guarantee is now the shape of `Slots`: its whole surface is `push_back`,
+  `pop_front`, `take_noisiest_heartbeat`, `len`, `heartbeats`, `heartbeat_bytes` and
+  `probes`, with no iterator, no indexing, no `front`, no `get` and no borrow of a queued
+  message, and each of the two methods that reaches a message counts it. So the only
+  traversals that *can* be written are those two, and a test writes both — a drain, and
+  one admission that has to take every heartbeat in the queue — and shows each costing one
+  probe an entry, 64 at length 64, a figure that fails the bound the measurement asserts.
+  That is the honest form of the claim: not "an admission examines nothing" as a law of
+  nature, but "every entry any admission examines is counted, and the counted figure is
+  constant".
+
+- *The head-of-line probe.* Eight in-flight AppendEntries for one range against 299 ranges
+  with one heartbeat each, to one peer, at a 24 kB frame cap: **every one of the 299
+  heartbeats leaves in the first frame**, and the backlogged range leads that frame too.
+  With one queue a peer they are behind all eight, up to eight flushes, 80 ms at Q41's
+  10 ms tick against a 100 ms minimum election timeout.
+
+- *The outbox's bound.* 100 000 pushes with no flush, into a 64 kB per-peer test bound:
+  98 992 dropped, **65 520 bytes queued**, the bound never passed, every dropped message
+  handed back to be traced, and another peer's queue untouched. On the outbox as this
+  entry first proposed it the same 100 000 pushes refused nothing and dropped nothing.
+
+- *The blocker and the starvation.* An AppendEntries carrying a 64 KiB command costs
+  **65 627 bytes** against a 16 kB inbox: 1 000 retransmissions, **1 000 admissions and 0
+  refusals**, where refusing the arrival gave 1 000 refusals. And under pressure — 63
+  heartbeats filling a 4 kB inbox, then 100 rounds of a heartbeat and an entry-carrier
+  arriving against a `raft` task draining two — **100 carriers admitted, 0 refused**, 14
+  heartbeats dropped to make their room, where refusing the arrival admitted every
+  heartbeat and refused all 101 carriers.
+
+- *What a byte of the bound can pin*, item 7 above: a 92-byte entry-carrier holding a
+  798 883-byte frame, 8 683×, against a bound of `MAX_FRAME_LEN` over the smallest
+  carrier's 86 bytes, 195 083×. Asserted from the addresses, not from the lengths: the
+  command is a slice of the frame it arrived in.
 - *The frame's arithmetic*, above: 65 and 78 bytes for §4's heartbeat and response inside
   a frame of several, against the 61 and 74 §4 counts, and 17.3 kB for its largest idle
   frame against 16.4 kB. Asserted in `frame.rs`, from `Frame::encode` rather than from
@@ -8878,14 +9028,15 @@ caught by the cost measurement alone, which is why that measurement is a test an
 printed figure, and row 7 is the range/server confusion `RangeId` exists to make hard.
 
 - *`scripts/gate.sh`*: green, as it must be before each of this PR's commits.
-- *`scripts/premerge.sh` at a thousand seeds*: **not run for this entry.** The machine
-  was on battery for the whole session — `pmset -g batt` says "Now drawing from 'Battery
-  Power'", 74 %, throughout — and this laptop throttles on battery, so a figure taken
+- *`scripts/premerge.sh` at a thousand seeds*: **not run for this entry, and still
+  owed.** The machine has been on battery for both sessions — `pmset -g batt` said "Now
+  drawing from 'Battery Power'" at 74 % when the wire was written and at 64 % when the
+  review's findings were fixed — and this laptop throttles on battery, so a figure taken
   here would be the incomparable kind D-070 exists to stop. It is to be run on AC power
   before the merge, with the machine state D-070's script prints quoted beside it. What
   the tier would be asked is unchanged by this PR in any case: nothing in `sim/` changes
-  behaviour, no schedule moves, and `ananke-shard`'s own tests are 17 unit tests that run
-  in 0.01 s at any tier.
+  behaviour, no schedule moves, and `ananke-shard`'s own tests are 34 unit tests that run
+  in 0.26 s at any tier.
 
 ---
 
