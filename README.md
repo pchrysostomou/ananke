@@ -24,7 +24,7 @@ flowchart LR
   subgraph node["one ananke node (crates/)"]
     direction TB
     sql["ananke-sql (planned)<br/>parser, planner, executor"] --> txn["ananke-txn (planned)<br/>MVCC, transactions"]
-    txn --> shard["ananke-shard (planned)<br/>ranges, multi-raft"]
+    txn --> shard["ananke-shard<br/>ranges, multi-raft"]
     shard --> raft["ananke-raft<br/>consensus"]
     raft --> storage["ananke-storage<br/>WAL, memtable, SSTables"]
     storage --> env["ananke-env<br/>Environment: clock, fs, net, rng, spawn"]
@@ -94,7 +94,8 @@ sweep of their own ([RAFT.md §5](docs/RAFT.md)); each sweep prints its catch ra
 | `ananke-server` | The node binary, Phase 0 protocol only: `ananke-server echo` runs the echo protocol on `RealEnv`, the same code the simulator runs, with a checksummed journal | `publish = false` |
 | `ananke-sim` (`sim/`) | The scenarios `echo`, `wal`, `engine`, `raft` and `membership`, the linearizability checker `lin.rs`, and the parallel sweep driver (D-040) | `publish = false` |
 | `ananke` | A placeholder reserving the name | 0.1.0, 0.2.0 and 0.3.0 on crates.io |
-| `ananke-shard`, `ananke-txn`, `ananke-sql` | Planned for Phases 3, 4 and 5. No code exists | None |
+| `ananke-shard` | Phase 3, begun. The node's wire: the batch frame, which carries several messages each tagged with its 8-byte range id and wraps the Raft codec unchanged; the per-peer outbox, one frame per peer per flush cut under `MAX_FRAME_LEN`; the node's inbox, bounded in bytes with constant-time admission; the studio decoder that shows every message of a frame. The node's tasks, descriptors, split, merge and the rebalancer are not built | None; not released |
+| `ananke-txn`, `ananke-sql` | Planned for Phases 4 and 5. No code exists | None |
 
 ## Phases
 
