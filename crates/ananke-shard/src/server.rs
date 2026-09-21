@@ -138,6 +138,15 @@ enum InFlight {
         client: u64,
         seq: u64,
     },
+    /// A read, by the id the core was given. A core that leads answers it later,
+    /// through `read_ready` or `read_dropped`, and the entry in [`Replica::reads`]
+    /// is taken there; a core that does not lead answers [`Output::Rejected`] and
+    /// nothing else, so the id it refused is only knowable here — and without it
+    /// the entry would be left behind for the life of the node.
+    ///
+    /// [`Output::Rejected`]: ananke_raft::core::Output::Rejected
+    // PROPOSED(D-076): a refused read's registration is taken back at the step.
+    Read { id: u64 },
 }
 
 /// One replica's bookkeeping: everything the host keeps about a range.
@@ -163,6 +172,34 @@ impl Replica {
             reads: BTreeMap::new(),
             next_read: 0,
             in_flight: None,
+        }
+    }
+
+    /// Registers a read the core is about to be given and returns the id it is
+    /// given under, with that id held as the work in flight for the step.
+    fn register_read(&mut self, from: SocketAddr, request: Request) -> u64 {
+        let id = self.next_read;
+        self.next_read += 1;
+        self.reads.insert(id, (from, request));
+        self.in_flight = Some(InFlight::Read { id });
+        id
+    }
+
+    /// Takes back the work in flight because the step refused it.
+    ///
+    /// `Some` is a client to answer `NotLeader` at once. `None` is a read — whose
+    /// registration is taken back here, because the core that refused it will never
+    /// name its id again — or a step with nothing in flight.
+    // PROPOSED(D-076): a refused read's registration is taken back at the step.
+    fn refuse(&mut self) -> Option<(SocketAddr, u64, u64)> {
+        match self.in_flight.take()? {
+            InFlight::Propose { from, client, seq } | InFlight::Change { from, client, seq } => {
+                Some((from, client, seq))
+            }
+            InFlight::Read { id } => {
+                self.reads.remove(&id);
+                None
+            }
         }
     }
 }
@@ -314,10 +351,11 @@ impl<E: Environment> Host for ServerHost<E> {
             // A read: served by the lease or after a heartbeat round, never through
             // the log.
             Command::Get { .. } => {
-                let id = state.next_read;
-                state.next_read += 1;
-                state.reads.insert(id, (from, request));
-                state.in_flight = None;
+                // A core that does not lead refuses the read with `Rejected` and
+                // never names the id again (`core::on_read`), so the id is carried
+                // to the step as the work in flight — where the registration is
+                // taken back rather than left behind (D-076).
+                let id = state.register_read(from, request);
                 Some(Input::Read {
                     id,
                     now: now_nanos(&self.env),
@@ -352,6 +390,10 @@ impl<E: Environment> Host for ServerHost<E> {
             return;
         };
         match in_flight {
+            // A read the core took on: it answers it later, through `read_ready` or
+            // `read_dropped`, and the registration is taken back there. Taking the
+            // slot here is what keeps a refused read's id from outliving its step.
+            InFlight::Read { .. } => {}
             InFlight::Change { from, client, seq } => {
                 drop(state);
                 self.answer_later(range, from, client, seq, Reply::Outcome(Outcome::Done));
@@ -500,13 +542,19 @@ impl<E: Environment> Host for ServerHost<E> {
         let Some(replica) = self.replica(range) else {
             return;
         };
-        let Some(in_flight) = lock(replica).in_flight.take() else {
+        // A read this replica does not lead takes the `None` arm: the core refused
+        // it with `Rejected` and will never name its id again, so `Replica::refuse`
+        // takes the registration `local_input` made — nothing else ever would, and a
+        // node that refuses reads for a living would otherwise carry a
+        // `(SocketAddr, Request)` for every one of them until it stopped.
+        //
+        // Its client is not answered at the step and waits for its own timeout:
+        // answering here queues a packet inside the round, which moves every
+        // schedule of the scenario this slice measured. That answer is the next
+        // slice's first job (D-076); what is fixed here is the entry left behind,
+        // which is a standing failure and not a latency wart.
+        let Some((from, client, seq)) = lock(replica).refuse() else {
             return;
-        };
-        let (from, client, seq) = match in_flight {
-            InFlight::Propose { from, client, seq } | InFlight::Change { from, client, seq } => {
-                (from, client, seq)
-            }
         };
         self.answer_later(range, from, client, seq, Reply::NotLeader { leader });
     }
@@ -952,4 +1000,101 @@ fn restate<E: Environment>(
         role: "follower",
         received: None,
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn client_addr() -> SocketAddr {
+        "10.0.0.9:7000".parse().expect("an address")
+    }
+
+    fn read(seq: u64) -> Request {
+        Request {
+            client: 1,
+            seq,
+            command: Command::Get {
+                key: Bytes::from_static(b"k0"),
+            },
+        }
+    }
+
+    /// A read a replica refuses leaves nothing behind (D-076).
+    ///
+    /// `local_input` registers every read it hands a core, because a core that
+    /// leads answers it later by id and the answer has to find the client again. A
+    /// core that does **not** lead answers `Output::Rejected` and never names the id
+    /// (`core::on_read`): no `ReadDropped` follows, so `answer_read` — the only other
+    /// place a registration is taken back — is never reached for it. The step's own
+    /// refusal is therefore the last moment the id is known, and taking the
+    /// registration there is what keeps a follower's `reads` map from growing for
+    /// the life of the node.
+    ///
+    /// The pair (CLAUDE.md:52-57) is the second half: the replica as it was, which
+    /// registered the read and held nothing in flight, leaves an entry behind for
+    /// every read it refuses — and this same check sees it.
+    #[test]
+    fn a_read_a_replica_refuses_leaves_nothing_behind() {
+        let mut replica = Replica::new();
+        for seq in 0..8 {
+            let id = replica.register_read(client_addr(), read(seq));
+            assert_eq!(id, seq, "the ids are handed out in order");
+            assert!(
+                replica.reads.contains_key(&id),
+                "a read is registered while the core has it"
+            );
+            assert!(
+                replica.refuse().is_none(),
+                "a refused read has no client to answer at the step"
+            );
+            assert!(
+                replica.reads.is_empty(),
+                "the refused read {id} was left behind: {:?}",
+                replica.reads.keys().collect::<Vec<_>>()
+            );
+        }
+        // A refused proposal still names its client, and leaves nothing either.
+        replica.in_flight = Some(InFlight::Propose {
+            from: client_addr(),
+            client: 1,
+            seq: 9,
+        });
+        assert_eq!(replica.refuse(), Some((client_addr(), 1, 9)));
+        assert!(replica.in_flight.is_none());
+        // The known-buggy replica, beside it: the read registered with nothing in
+        // flight, which is what this node did until the review of D-076.
+        let mut buggy = Replica::new();
+        for seq in 0..8 {
+            let id = buggy.next_read;
+            buggy.next_read += 1;
+            buggy.reads.insert(id, (client_addr(), read(seq)));
+            buggy.in_flight = None;
+            assert!(buggy.refuse().is_none());
+        }
+        assert_eq!(
+            buggy.reads.len(),
+            8,
+            "the buggy replica is the one that keeps every read it refuses"
+        );
+    }
+
+    /// A read the core *takes on* is answered by id later, so the step leaves the
+    /// registration alone: what `local_stepped` takes is the slot, not the entry.
+    #[test]
+    fn a_read_the_core_takes_on_keeps_its_registration() {
+        let mut replica = Replica::new();
+        let id = replica.register_read(client_addr(), read(0));
+        // The step accepted it: `local_stepped`'s `Read` arm takes the slot and
+        // nothing else.
+        let taken = replica.in_flight.take();
+        assert!(matches!(taken, Some(InFlight::Read { id: took }) if took == id));
+        assert!(
+            replica.reads.contains_key(&id),
+            "the read is still waiting on the core"
+        );
+        // `answer_read` takes it when the answer comes.
+        assert!(replica.reads.remove(&id).is_some());
+        assert!(replica.reads.is_empty());
+    }
 }

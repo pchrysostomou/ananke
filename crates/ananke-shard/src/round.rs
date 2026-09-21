@@ -187,6 +187,15 @@ pub struct Meters {
     /// at all. The trace event for it goes with the outbox's drops, in the slice that
     /// puts the node under the sweeps (PROPOSED D-073); the counter is here now.
     pub messages_for_ranges_not_held: u64,
+    /// Node-local inputs — a client's request, an index the `apply` task made
+    /// durable — held for a core whose persist was outstanding (SHARD.md §4).
+    ///
+    /// It says the holding path was *reached*, which nothing else does: a held input
+    /// is stepped a moment later and leaves no other mark, so a node that threw every
+    /// one of them away would look like this one to any check downstream of it.
+    // PROPOSED(D-076): a node-local input is held for a persisting core as a message
+    // of its range is.
+    pub locals_held: u64,
 }
 
 /// Every core on the node, keyed by range, and the order they are stepped in
@@ -275,6 +284,12 @@ impl Cores {
     // PROPOSED(D-076): a local input for a range not held is counted, never silent.
     pub fn count_input_for_a_range_not_held(&mut self) {
         self.meters.messages_for_ranges_not_held += 1;
+    }
+
+    /// Counts a node-local input held for a core whose persist is outstanding: the
+    /// only mark that path leaves ([`Meters::locals_held`]).
+    pub fn count_local_held(&mut self) {
+        self.meters.locals_held += 1;
     }
 
     /// What the node measured about its rounds.

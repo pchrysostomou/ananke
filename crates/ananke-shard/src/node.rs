@@ -235,6 +235,14 @@ pub struct Node<E: Environment, H: Host> {
     /// The node's own inputs held for a core whose persist is outstanding, in the
     /// order they arrived (SHARD.md §4).
     deferred: BTreeMap<RangeId, VecDeque<H::Local>>,
+    /// Ranges whose persist resolved *inside* [`Node::drive`] rather than through
+    /// [`Event::Resolved`], which is only the `PersistsOneAtATime` variant's doing.
+    /// The loop drains their held inputs when `drive` hands back, so that variant
+    /// strands nothing and is caught for what it is — a round that pays a sync per
+    /// persist — and not for holding a client's request until some later resolution.
+    // PROPOSED(D-076): a node-local input is held for a persisting core as a message
+    // of its range is.
+    resolved_inside: VecDeque<RangeId>,
 }
 
 impl<E: Environment, H: Host> Node<E, H> {
@@ -250,6 +258,7 @@ impl<E: Environment, H: Host> Node<E, H> {
             open: BTreeMap::new(),
             frames: Frames::default(),
             deferred: BTreeMap::new(),
+            resolved_inside: VecDeque::new(),
         }
     }
 
@@ -348,28 +357,48 @@ impl<E: Environment, H: Host> Node<E, H> {
                     self.drive(resolved, Some(round), &mut persists).await?;
                     // The node's own inputs for that core were held beside its
                     // messages, and are stepped in the order they arrived.
-                    while !self.cores.persisting(range) {
-                        let Some(mine) =
-                            self.deferred.get_mut(&range).and_then(VecDeque::pop_front)
-                        else {
-                            break;
-                        };
-                        self.local(mine, &mut persists).await?;
-                    }
+                    self.replay_held(range, &mut persists).await?;
+                    self.drain_resolved_inside(&mut persists).await?;
                     inbox.hold_at(self.cores.held_bytes());
                     continue;
                 }
                 Event::Local(mine) => {
                     self.local(mine, &mut persists).await?;
+                    self.drain_resolved_inside(&mut persists).await?;
                     inbox.hold_at(self.cores.held_bytes());
                     continue;
                 }
             };
             self.drive(round, None, &mut persists).await?;
+            self.drain_resolved_inside(&mut persists).await?;
             // A message held for a core whose persist is outstanding was taken from
             // the inbox and is still counted against the node's byte bound (Q14).
             inbox.hold_at(self.cores.held_bytes());
         }
+    }
+
+    /// The inputs held for `range` while its persist was outstanding, stepped in the
+    /// order they arrived, for as long as the core is not persisting again.
+    async fn replay_held(&mut self, range: RangeId, persists: &mut Persists) -> io::Result<()> {
+        while !self.cores.persisting(range) {
+            let Some(mine) = self.deferred.get_mut(&range).and_then(VecDeque::pop_front) else {
+                break;
+            };
+            self.local(mine, persists).await?;
+        }
+        Ok(())
+    }
+
+    /// The held inputs of every range whose persist resolved inside [`Node::drive`],
+    /// which is the `PersistsOneAtATime` variant's doing alone: on the correct node
+    /// this list is always empty, and this is a no-op. It is here so that the variant
+    /// is caught for the sync it pays per persist and not for stranding a client's
+    /// request until some later resolution of its range.
+    async fn drain_resolved_inside(&mut self, persists: &mut Persists) -> io::Result<()> {
+        while let Some(range) = self.resolved_inside.pop_front() {
+            self.replay_held(range, persists).await?;
+        }
+        Ok(())
     }
 
     /// One node-local input: a client's request, or an index the `apply` task made
@@ -385,6 +414,15 @@ impl<E: Environment, H: Host> Node<E, H> {
     async fn local(&mut self, mine: H::Local, persists: &mut Persists) -> io::Result<()> {
         let range = self.host.local_range(&mine);
         if self.cores.persisting(range) {
+            self.cores.count_local_held();
+            if self.config.variants.contains(NodeVariant::HeldLocalDropped) {
+                // The variant: the input is thrown away instead of held. A client
+                // retries and an `Applied` is superseded by the next one, so nothing
+                // downstream of a sweep can tell it from the correct node — which is
+                // why it is caught by a check of its own here (`a_local_input_for_a
+                // _persisting_core_is_held_and_stepped_in_order`).
+                return Ok(());
+            }
             self.deferred.entry(range).or_default().push_back(mine);
             return Ok(());
         }
@@ -877,6 +915,16 @@ mod tests {
         ReadDropped(RangeId, u64),
         /// A proposal or a read refused: this server does not lead the range.
         Rejected(RangeId),
+        /// A node-local input reached its core, and which one it was.
+        Local(RangeId, u64),
+    }
+
+    /// One node-local input the probe is fed: its range, and its place in the order
+    /// it was pushed in.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct Mine {
+        range: RangeId,
+        n: u64,
     }
 
     /// What one [`Note::Applied`] carries.
@@ -945,16 +993,21 @@ mod tests {
     }
 
     impl Host for Probe {
-        // The probe drives the round alone: no client and no `apply` task, so it
-        // has no node-local inputs of its own.
-        type Local = ();
+        // A node-local input, as the server's are: a range and a number of its own,
+        // so a check can feed the node inputs and read back which were stepped and
+        // in what order (`Note::Local`).
+        type Local = Mine;
 
-        fn local_range(&self, (): &Self::Local) -> RangeId {
-            RangeId(0)
+        fn local_range(&self, mine: &Self::Local) -> RangeId {
+            mine.range
         }
 
-        fn local_input(&self, (): Self::Local, _core: &Raft) -> Option<Input> {
-            None
+        fn local_input(&self, mine: Self::Local, _core: &Raft) -> Option<Input> {
+            self.note(Note::Local(mine.range, mine.n));
+            // Stepped as a client's proposal is, so that a held input goes through
+            // the same round as the message beside it. A follower refuses it and the
+            // note above is what the check reads.
+            Some(Input::Propose(Bytes::from_static(b"mine")))
         }
 
         fn local_stepped(&self, _range: RangeId, _core: &Raft, _decided: Decision) {}
@@ -1125,6 +1178,10 @@ mod tests {
         /// takes to reach the bound, which only a node that is already holding
         /// something can be at.
         feed: &'a [(Duration, Received)],
+        /// The node's own inputs, pushed on its local queue at these offsets from
+        /// the start: what it takes to reach the holding path, which only a core
+        /// whose persist is outstanding can be on.
+        locals: &'a [(Duration, Mine)],
         duration: Duration,
         /// How long the socket takes a frame.
         ship: Duration,
@@ -1141,6 +1198,7 @@ mod tests {
                 delays,
                 arrivals: &[],
                 feed: &[],
+                locals: &[],
                 duration: Duration::from_millis(80),
                 ship: Duration::ZERO,
                 seed: 11,
@@ -1178,11 +1236,15 @@ mod tests {
             assert!(inbox.admit(arrival.clone()).is_admitted());
         }
         let taken: Arc<Mutex<Option<(Meters, Frames)>>> = Arc::default();
+        // The node's local queue, held here so a check can push the node its own
+        // inputs while it runs. The `raft` task races it against the inbox and the
+        // ticker whether or not anything is ever pushed.
+        let local: Queue<Mine> = Queue::new();
         env.clone().spawn("raft", {
             let inbox = inbox.clone();
             let taken = taken.clone();
+            let local = local.clone();
             async move {
-                let local: Queue<()> = Queue::new();
                 let _ = node.raft(&inbox, &local).await;
                 *taken.lock().expect("the cell") = Some((node.meters(), node.frames()));
             }
@@ -1191,12 +1253,17 @@ mod tests {
         let mut charged_most = 0;
         let mut fed = Vec::new();
         let mut next = 0;
+        let mut next_local = 0;
         let step = Duration::from_millis(1);
         let mut elapsed = Duration::ZERO;
         while elapsed < setup.duration {
             while next < setup.feed.len() && setup.feed[next].0 <= elapsed {
                 fed.push(inbox.admit(setup.feed[next].1.clone()).is_admitted());
                 next += 1;
+            }
+            while next_local < setup.locals.len() && setup.locals[next_local].0 <= elapsed {
+                local.push(setup.locals[next_local].1);
+                next_local += 1;
             }
             sim.run_for(step);
             elapsed += step;
@@ -1260,6 +1327,102 @@ mod tests {
             },
             bytes: 64,
         }
+    }
+
+    /// A node-local input for a core whose persist is outstanding is **held**, and
+    /// stepped when that core's persist resolves, in the order it arrived — while a
+    /// local input for a core that is not persisting is stepped at once (SHARD.md
+    /// §4). It is the rule that makes a client of one range wait behind that range's
+    /// disk and behind no other's.
+    ///
+    /// The pair (CLAUDE.md:52-57): `HeldLocalDropped` is the node that throws a held
+    /// input away instead, and this check catches it — its inputs never reach their
+    /// core at all. Nothing downstream can: a client retries and an `Applied` is
+    /// superseded, so the node scenario's sweep passes that variant at a thousand
+    /// seeds, and this is the oracle the rule has.
+    ///
+    /// The order is asserted as well as the arrival, because a queue replayed
+    /// last-in-first-out is the same check's other failure: a client's two requests
+    /// would reach its core in the wrong order.
+    // PROPOSED(D-076): a node-local input is held for a persisting core as a message
+    // of its range is.
+    #[test]
+    fn a_local_input_for_a_persisting_core_is_held_and_stepped_in_order() {
+        // r1's disk is slow and r2's is never asked: an input for r1 arriving while
+        // its persist is outstanding is held, and one for r2 is stepped at once.
+        let arrivals = [arrival(R1, append(1, 1))];
+        let delays = [(R1, Duration::from_millis(40))];
+        let locals = [
+            (Duration::from_millis(1), Mine { range: R1, n: 1 }),
+            (Duration::from_millis(2), Mine { range: R2, n: 9 }),
+            (Duration::from_millis(3), Mine { range: R1, n: 2 }),
+            (Duration::from_millis(4), Mine { range: R1, n: 3 }),
+        ];
+        let setup = |variants| Setup {
+            arrivals: &arrivals,
+            locals: &locals,
+            duration: Duration::from_millis(120),
+            ..Setup::new(variants, &delays)
+        };
+        let correct = run_with(setup(NodeVariants::correct()));
+        assert_eq!(
+            correct.meters.locals_held, 3,
+            "the three inputs for the persisting core were held: {:?}",
+            correct.log
+        );
+        // r2 is not persisting, so its input was stepped where it arrived — before
+        // r1's persist resolved, and before any of r1's held inputs.
+        let resolved = position(&correct.log, &Note::Persisted(R1));
+        let free = position(&correct.log, &Note::Local(R2, 9));
+        assert!(
+            free < resolved,
+            "a local input for a core that is not persisting waited on another \
+             range's disk: {:?}",
+            correct.log
+        );
+        // r1's three were stepped after its own persist resolved, in the order they
+        // arrived.
+        let held: Vec<usize> = (1..=3)
+            .map(|n| position(&correct.log, &Note::Local(R1, n)))
+            .collect();
+        assert!(
+            held[0] > resolved,
+            "a held input was stepped before its core's persist resolved: {:?}",
+            correct.log
+        );
+        assert!(
+            held[0] < held[1] && held[1] < held[2],
+            "the held inputs were stepped out of order: {:?}",
+            correct.log
+        );
+
+        // The pair: the node that drops what it should hold. The path is reached
+        // exactly as often — the meter counts before the drop — and nothing of it
+        // arrives.
+        let buggy = run_with(setup(
+            NodeVariants::correct().with(NodeVariant::HeldLocalDropped),
+        ));
+        assert_eq!(buggy.meters.locals_held, 3, "the variant reaches the path");
+        assert_eq!(
+            buggy
+                .log
+                .iter()
+                .filter(|note| matches!(note, Note::Local(R1, _)))
+                .count(),
+            0,
+            "the variant is meant to drop every held input: {:?}",
+            buggy.log
+        );
+        assert_eq!(
+            buggy
+                .log
+                .iter()
+                .filter(|note| matches!(note, Note::Local(R2, _)))
+                .count(),
+            1,
+            "the variant drops only what is held: {:?}",
+            buggy.log
+        );
     }
 
     /// Q41's round, the whole of it, on two cores that both persist: nothing a core

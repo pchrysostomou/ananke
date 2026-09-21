@@ -700,7 +700,10 @@ waits in the inbox for the next:
   outstanding steps nothing: the messages for it are taken from the inbox and held,
   counted against the node's byte bound *and refused against it*, and a tick that falls
   due meanwhile is held as one tick, every missed tick stepped when the persist resolves
-  and none collapsed. The node's bound covers what it holds because the task drains its
+  and none collapsed. The node's own inputs for that core — a client's request, an index
+  the `apply` task made durable — are held the same way and in the order they arrived, so
+  a client of one range waits behind that range's disk and behind no other's (PROPOSED
+  D-076). The node's bound covers what it holds because the task drains its
   queue to empty on every wake, so a bound that asked only about the queue would bind
   nothing (D-074, proposed).
 
