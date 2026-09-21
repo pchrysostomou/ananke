@@ -63,6 +63,12 @@ const TICK_NANOS: u128 = 10_000_000;
 /// Replicas on a node at 1 000 ranges (SHARD.md:504).
 const REPLICAS_AT_1000: u128 = 300;
 
+/// Commands between two compactions in the *loaded* shape: §4's arithmetic assumes a
+/// leader's log of about 608 KiB, which at 64 bytes a command is this many entries. A
+/// leader in the sweeps is compacted by its threshold; a bench that never compacts
+/// measures a growing `Vec`, not a steady-state leader.
+const LOADED_LOG_CAP: Index = 9_500;
+
 const ME: ServerId = ServerId(1);
 const PEER: ServerId = ServerId(2);
 const THIRD: ServerId = ServerId(3);
@@ -161,7 +167,17 @@ fn response(term: u64, prev: Index, matched: Index) -> Message {
 }
 
 /// Runs `steps` steps of `next` and reports the nanoseconds each cost.
-fn measure<F>(env: &RealEnv, steps: u64, mut next: F) -> u128
+/// How many times each shape is run. The figure reported is the **minimum** of them,
+/// which is the statistic to take on a machine running other work: every run is this
+/// step's cost plus whatever interference it met, so the smallest is the closest to
+/// the cost and the spread beside it says how much interference there was. One run's
+/// figure is not reproducible — a quieter machine has been seen to give a *higher*
+/// number than a loaded one — and a figure quoted to two decimals off one run says
+/// more than it knows.
+const RUNS: usize = 5;
+
+/// A shape's cost in nanoseconds a step: the lowest and the highest of [`RUNS`] runs.
+fn measure<F>(env: &RealEnv, steps: u64, mut next: F) -> (u128, u128)
 where
     F: FnMut(u64),
 {
@@ -169,22 +185,30 @@ where
     for i in 0..steps.min(1_000) {
         next(i);
     }
-    let start = env.clock().now();
-    for i in 0..steps {
-        next(i);
+    let mut low = u128::MAX;
+    let mut high = 0;
+    for _ in 0..RUNS {
+        let start = env.clock().now();
+        for i in 0..steps {
+            next(i);
+        }
+        let elapsed = env.clock().now();
+        let per_step = nanos(elapsed).saturating_sub(nanos(start)) / u128::from(steps.max(1));
+        low = low.min(per_step);
+        high = high.max(per_step);
     }
-    let elapsed = env.clock().now();
-    nanos(elapsed).saturating_sub(nanos(start)) / u128::from(steps.max(1))
+    (low, high)
 }
 
 fn nanos(at: Instant) -> u128 {
     u128::from(at.as_nanos())
 }
 
-fn report(name: &str, per_step: u128) {
-    let tick = per_step * STEPS_PER_TICK_AT_1000;
+fn report(name: &str, (low, high): (u128, u128)) {
+    let tick = low * STEPS_PER_TICK_AT_1000;
     println!(
-        "{name:<14} {per_step:>7} ns/step   500 steps = {:>8.3} ms of a 10 ms tick ({:.1}%)",
+        "{name:<14} {low:>7} ns/step ({low}..{high} over {RUNS} runs)   \
+         500 steps = {:>8.3} ms of a 10 ms tick ({:.1}%)",
         tick as f64 / 1e6,
         tick as f64 * 100.0 / TICK_NANOS as f64,
     );
@@ -244,24 +268,39 @@ fn main() {
         });
 
         // The sweep's client load: a leader proposing 64-byte commands, its followers
-        // acknowledging each. Two steps a command, reported per step.
+        // acknowledging each. Three steps a command, reported per step.
+        //
+        // The log is compacted every `LOADED_LOG_CAP` commands, so the shape is a
+        // steady-state leader's and not a `Vec` growing to a million entries: §4's
+        // arithmetic assumes logs of about 608 KiB, which at 64-byte commands is the
+        // cap below. Without it the figure measures the growth as much as the step,
+        // and it is the figure that moves most between runs.
         let mut lead = leader(config());
         let term = lead.term();
         let command = Bytes::from(vec![b'c'; 64]);
         let mut index: Index = lead.last_index();
-        let loaded = measure(&env, steps / 2, |_| {
-            black_box(lead.step(Input::Propose(command.clone())));
-            index += 1;
-            for from in [PEER, THIRD] {
-                black_box(lead.step(Input::Message {
-                    from,
-                    message: response(term, index - 1, index),
-                    now: 0,
-                }));
-            }
-        }) / 3;
+        let loaded = {
+            let (low, high) = measure(&env, steps / 2, |_| {
+                black_box(lead.step(Input::Propose(command.clone())));
+                index += 1;
+                for from in [PEER, THIRD] {
+                    black_box(lead.step(Input::Message {
+                        from,
+                        message: response(term, index - 1, index),
+                        now: 0,
+                    }));
+                }
+                if index.is_multiple_of(LOADED_LOG_CAP) {
+                    // Applied, then checkpointed: a leader compacts to its last
+                    // checkpoint once every follower is past it (core.rs:1896-1935).
+                    lead.step(Input::Applied(index));
+                    lead.step(Input::SnapshotTaken { index, term });
+                }
+            });
+            (low / 3, high / 3)
+        };
 
-        // The log the proposals grew, so the figure is not of an empty core.
+        // The log the proposals left, which the cap holds near the steady state.
         let entries = lead.log().len();
 
         report("idle tick", idle);
@@ -269,6 +308,9 @@ fn main() {
         report("heartbeat in", heartbeat_in);
         report("response in", response_in);
         report("loaded", loaded);
+        // Everything derived below is from the lowest idle figure, which is the one
+        // closest to the step's own cost.
+        let (idle, idle_high) = idle;
         println!("\nthe leader's log at the end: {entries} entries");
 
         // The replay burst after a slow persist (SHARD.md §12): the ticks a core
@@ -293,15 +335,27 @@ fn main() {
              a sync of {} ms",
             breaks * TICK_NANOS / 1_000_000,
         );
+        // The margin is stated as an order of magnitude, not as a ratio: the ratio is
+        // a ratio of one machine's run to a computed constant, and it moves by tens of
+        // per cent between runs of the same tree.
+        let orders = |figure: u128| {
+            (IDLE_BOUND_NANOS as f64 / figure.max(1) as f64)
+                .log10()
+                .floor() as i64
+        };
         println!(
             "\nthe pass bound (SHARD.md §12): an idle step below {} ns. \
-             measured {idle} ns: {}",
+             measured {idle}..{idle_high} ns over {RUNS} runs: {} \
+             (the lowest figure is {} orders of magnitude under the bound, the \
+              highest {})",
             IDLE_BOUND_NANOS,
-            if idle < IDLE_BOUND_NANOS {
+            if idle_high < IDLE_BOUND_NANOS {
                 "PASS"
             } else {
                 "FAIL — one `raft` task per node cannot hold 1 000 ranges; to the owner"
-            }
+            },
+            orders(idle),
+            orders(idle_high),
         );
         // An entry that keeps the type from being unused when the shapes change.
         let _ = Entry {

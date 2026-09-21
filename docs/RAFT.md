@@ -675,11 +675,19 @@ waits in the inbox for the next:
   `Persist` — its sends, `Apply`, `ReadReady`, `ReadDropped`, snapshot actions and its
   trace events — waits for *that core's own* persist. A core whose persist is
   outstanding steps nothing: the messages for it are taken from the inbox and held,
-  counted against the node's byte bound, and a tick that falls due meanwhile is held as
-  one tick, every missed tick stepped when the persist resolves and none collapsed.
-  This is `ananke-shard`'s `round` and `node` modules, beside the one-group server
-  described here, which keeps working exactly as this section says until the sweeps
-  move to the node (D-073, proposed).
+  counted against the node's byte bound *and refused against it*, and a tick that falls
+  due meanwhile is held as one tick, every missed tick stepped when the persist resolves
+  and none collapsed. The node's bound covers what it holds because the task drains its
+  queue to empty on every wake, so a bound that asked only about the queue would bind
+  nothing (D-074, proposed).
+
+  The entries an `Apply` names are read from the core **at the step that named them**,
+  not when the node comes to execute it: a deferred `Apply` runs after the replay has
+  stepped that core further, where the one-group server's `execute` runs between two
+  steps of the one core. An index the core does not hold fails the node rather than
+  being passed over. This is `ananke-shard`'s `round` and `node` modules, beside the
+  one-group server described here, which keeps working exactly as this section says
+  until the sweeps move to the node (D-073, proposed).
 - `net`: receives frames, decodes, and hands messages to the `raft` task through a
   bounded queue, each with a stamp of when it was received, which a term change the
   message causes carries (D-050, proposed); a full queue drops the oldest heartbeat
@@ -688,8 +696,12 @@ waits in the inbox for the next:
   entry at a time, each a synced batch, and reports the applied index back; the core
   serves read-index reads only from applied state, so this task's lag is visible to
   the checker. On the node it is still one task, taking every range's jobs one at a
-  time in the order they were queued (SHARD.md §4, Q14; D-073, proposed). It also takes every snapshot, as a job between two applies, so it is the
-  task that writes checkpoint versions (§1, D-036, D-043).
+  time in the order they were queued (SHARD.md §4, Q14; D-073, proposed), and the node
+  keeps the highest index it has handed the task per range, so the jobs partition the
+  committed log — every index once, no gap and no repeat. It also takes every snapshot,
+  as a job between two applies — on the node too, where the node routes a
+  `SnapshotAction::Take` to this task and not to `snapshot` — so it is the task that
+  writes checkpoint versions (§1, D-036, D-043).
 - `snapshot`: streams checkpoints on the leader, one stream per designated follower,
   each pinned to the version it opened, and deletes the versions no stream reads after
   each take and each stream's end (§1, D-043); assembles and verifies arriving streams
