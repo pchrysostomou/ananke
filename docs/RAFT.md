@@ -256,6 +256,25 @@ follower, or one whose `next_index` falls at or below the compacted prefix, is f
 through the snapshot path; a successful append acknowledgement, a completed install or
 a change of the follower's store incarnation clears the designation.
 
+A follower compacts too, to its own applied index, and takes a checkpoint only when it
+must stream one (D-065). Once its log is more than `snapshot_threshold` entries past
+its prefix, its next tick asks the `apply` task for a snapshot *record* at the applied
+index: the record alone, written synced between applies, so its last index, that
+entry's term and the configuration in force at it are exact, as a take's are (D-036),
+and with no checkpoint under it. The step's persist then deletes the prefix, after the
+record is durable, in the order a leader's compaction uses. The prefix that swallows
+the configuration entry in force leaves that configuration as the revert floor, as it
+does on a leader (D-029). A follower waits for no follower and holds off for nothing:
+the leader's two-election-timeout hold-off exists because a checkpoint stalls every
+apply for its duration, and a record is one synced batch. A record with no checkpoint
+under it is a shape the store already held — an install's repair writes one, and a
+crash between a take's record and its checkpoint leaves one — so a server that later
+has to stream finds no complete version of that index and asks for a take, which is the
+path a leader has used since the first install. A follower's applied index never passes
+its commit index, so the prefix it drops holds nothing uncommitted. The leader's own
+rules are unchanged: its threshold take, its hold-off, and D-037's condition for
+compacting.
+
 **Timing.** Election timeouts are drawn per node per election from the node's
 protocol stream over `[election_timeout_min, 2 × election_timeout_min)`; heartbeats
 every `election_timeout_min / 5`. The simulator's clocks skew and drift per node, so
@@ -296,7 +315,7 @@ D-069); today a node runs one group, `node::SINGLE_GROUP`:
 | `RaftCommit` | the commit index advances | `index` |
 | `RaftApply` | an entry is applied | `index`, `entry_term`, `hash`, `key` where the entry names one, `effect`: `applied` for a client command executed in its range, `none` for a no-op or a configuration entry; SHARD.md §8's other five values belong to what later stages build (D-069) |
 | `RaftConfig` | a configuration entry takes effect | `index`, `old`, `new`, `joint` |
-| `RaftSnapshot` | a snapshot is taken or installed | `last_index`, `last_term`, `taken` |
+| `RaftSnapshot` | a snapshot is taken, installed, or recorded by a follower's compaction with no checkpoint under it (D-065) | `last_index`, `last_term`, `taken` |
 | `RaftRead` | a read is served, traced by the server that serves it, not by the core that confirmed it (D-069) | `index`, `lease`, `key`, `applied`: the applied index of the engine version the value was read at, taken at that one version |
 | `RaftLeaseRevoked` | the guard revoked a lease | `follower`, `offset_moved` |
 | `RaftQuorumLost` | a leader stepped down for want of a majority | `term`, `uncounted`: the refused followers whose rejections went uncounted for want of re-seed progress (D-049) |
