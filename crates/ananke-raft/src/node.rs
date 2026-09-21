@@ -1464,14 +1464,12 @@ fn spawn_apply<E: Environment>(
                         }
                     };
                     let recorded = store
-                        .record_snapshot(&SnapshotRecord {
-                            last_index: applied,
-                            last_term: applied_term,
-                            config: config.clone(),
-                            dir: String::new(),
-                            taken: false,
+                        .record_snapshot(&compaction_record(
+                            applied,
+                            applied_term,
+                            config.clone(),
                             take,
-                        })
+                        ))
                         .await;
                     match recorded {
                         // No `RaftSnapshot` here. That event says a snapshot was
@@ -1482,8 +1480,12 @@ fn spawn_apply<E: Environment>(
                         // the record and those deletes is reported where a take's
                         // crash window is, by the restatement at the next open.
                         // Tracing it as an installed snapshot would have quietly
-                        // turned `snapshots_installed` from 19 359 installs into
-                        // 75 742 over a thousand seeds, which is how this was found.
+                        // turned the sweep's count of `RaftSnapshot { taken: false }`
+                        // from 19 359 into 75 742 over a thousand seeds, which is how
+                        // this was found. That count is no longer called "installed"
+                        // either way: every replica that compacts re-states its prefix
+                        // at each later open, so the sweep splits the population into
+                        // installs and re-statements (`sim::raft::Report`).
                         Ok(()) => inbox.push(Event::Recorded {
                             index: applied,
                             term: applied_term,
@@ -2646,5 +2648,83 @@ impl<E: Environment> Server<E> {
             }
         }
         Ok(())
+    }
+}
+
+/// The snapshot record a replica's compaction writes (D-065).
+///
+/// It stands in for the prefix at `applied` with **no checkpoint under it**: the
+/// shape an install's repair already writes (`snapshot.rs`, `Repair`), which is
+/// what makes a server that later has to stream find no complete version at that
+/// index and ask for a take instead (`start_stream`). Three things are load-bearing
+/// and each is asserted below:
+///
+/// * `taken` is false. It is not a take: no checkpoint was written, and a `true`
+///   here would be restated as one at every later open, unpairing the sweep's
+///   takes from the checkpoints the fold finds them by — the D-060 failure the
+///   restatement's counters exist to catch.
+/// * `dir` is empty, for the same reason: there is no directory to open.
+/// * `take` is the store's counter carried forward, never reset, so a later take
+///   still numbers its version directory past every one this store has made
+///   (D-043). An install's repair writes 0 there because an install's versions
+///   start over; a compaction's do not.
+// PROPOSED(D-078): a follower compacts its log to its own applied index.
+fn compaction_record(
+    applied: Index,
+    applied_term: Term,
+    config: Configuration,
+    take: u64,
+) -> SnapshotRecord {
+    SnapshotRecord {
+        last_index: applied,
+        last_term: applied_term,
+        config,
+        dir: String::new(),
+        taken: false,
+        take,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compaction_record;
+    use crate::types::{Configuration, ServerId};
+
+    /// The pair for D-078's settled points 2 and 4, which nothing else in the tree
+    /// reaches: the record's own fields. A sweep cannot see them — it sees the
+    /// compaction, and a record written `taken: true` or with the counter reset
+    /// still compacts the same log — so they are asserted here, directly.
+    // PROPOSED(D-078): a follower compacts its log to its own applied index.
+    #[test]
+    fn a_compactions_record_is_not_a_take_and_carries_the_counter_forward() {
+        let config = Configuration::of(&[ServerId(1), ServerId(2), ServerId(3)]);
+        let record = compaction_record(41, 7, config.clone(), 5);
+        assert_eq!(record.last_index, 41);
+        assert_eq!(record.last_term, 7);
+        assert_eq!(record.config, config);
+        assert!(
+            !record.taken,
+            "a compaction takes no checkpoint, so its record is not a take: {record:?}"
+        );
+        assert!(
+            record.dir.is_empty(),
+            "a compaction writes no version directory: {record:?}"
+        );
+        assert_eq!(
+            record.take, 5,
+            "the store's take counter is carried forward, so the next take numbers \
+             its directory past every one this store has made (D-043)"
+        );
+    }
+
+    /// A store that has never taken one still records 0, and the next take is
+    /// still the first: carrying forward is not the same as inventing a version.
+    // PROPOSED(D-078): a follower compacts its log to its own applied index.
+    #[test]
+    fn a_compactions_record_invents_no_version() {
+        let record = compaction_record(1, 1, Configuration::of(&[ServerId(1)]), 0);
+        assert_eq!(record.take, 0);
+        assert!(record.dir.is_empty());
+        assert!(!record.taken);
     }
 }

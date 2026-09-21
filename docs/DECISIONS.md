@@ -9064,10 +9064,15 @@ one at that index.
 **It needed no new state and no new message, and that was verified as it was built.**
 
 - The record is written with `taken: false` and no directory: the shape an install's
-  repair already writes (`node.rs`, `Assembler::finish`), and the shape a crash between
-  a take's record and its checkpoint already leaves. `RaftStore::open` already deletes
-  log keys at or below the record, so a crash between the record and the persist's
-  deletes is completed at the next open, where a take's crash window already is.
+  repair writes (`snapshot.rs`, `Repair`, the record built once the staged store is
+  adopted), and the shape a crash between a take's record and its checkpoint already
+  leaves. It is that shape in the two fields that decide what a later stream does, and
+  in exactly one field it is *not*: the repair writes `take: 0`, because an install's
+  versions start over and a compaction's do not, so this carries the counter forward.
+  That one field is settled point 4 below, and calling the two "the same shape" — as
+  this entry first did — overstated it. `RaftStore::open` already deletes log keys at or
+  below the record, so a crash between the record and the persist's deletes is completed
+  at the next open, where a take's crash window already is.
 - A server that later has to stream finds no complete version of that index and asks
   for a take: `start_stream`'s existing "the record is an install's. Ask for a take"
   arm (`node.rs`), which answers `StreamFailed { retake: true }`, clears the core's
@@ -9095,15 +9100,35 @@ one at that index.
    thousand. **The record traces nothing of its own**: the transition is the
    compaction, which the core traces as `RaftCompacted` once the prefix's deletes are
    durable, and a crash between the two is reported by the restatement at the next open,
-   where a take's crash window is reported. That is the smaller change, the one that
-   leaves every existing counter meaning what it meant, and the one that keeps a
-   variant's catch where it was. A new event kind would have been the alternative; it is
-   not needed and would collide with §8's own.
+   where a take's crash window is reported. It is the smaller change and the one that
+   keeps a variant's catch where it was. A new event kind would have been the
+   alternative; it is not needed and would collide with §8's own.
+
+   It does **not** leave every existing counter meaning what it meant, as this entry
+   first claimed; the review of this slice was right to strike that. The record surfaces
+   in the trace one open later, as the re-statement of a durable prefix. Before D-065 a
+   replica that had neither taken nor installed opened with `snap_index == 0` and
+   re-stated no snapshot at all; now every replica that has compacted re-states
+   `RaftSnapshot { taken: false }` at every later open. The raft sweep counted that whole
+   population as `snapshots_installed`, so it reported installs that never happened —
+   **10 788 re-statements against 9 342 real installs** over a thousand seeds, which
+   together are the 20 130 this entry first printed as installs. The counter is now split
+   (`raft::Report::snapshots_installed_and_restated`, which reads a re-statement off its
+   position: the `apply` loop traces the durable log as a `RaftTruncate` to one past its
+   end and then, if there is a prefix, the snapshot standing in for it, with nothing of
+   that server's between the two). The sweep's `snapshots_installed > 0` assertion is a
+   statement about installs again, where any re-statement satisfied it before.
 3. *What a follower does when the record names an index its log no longer holds.* It
    cannot happen on the correct system and does under `ApplyBeforeCommit`.
    `maybe_compact` **returns rather than draining past the log's end**, so the variant is
    caught by the checks it is there to be caught by rather than by a panic in `drain`.
-   The real property is asserted over the trace instead, below.
+   The real property is asserted over the trace instead, below. No sweep reaches the
+   branch — at a thousand seeds `ApplyBeforeCommit` never gets there, and dropping the
+   guard changes nothing any sweep sees — so it is held by a directed test instead:
+   `a_record_past_the_log_compacts_nothing` in `crates/ananke-raft/tests/snapshot.rs`
+   hands a replica that is not leading a record five entries past an empty log and
+   asserts nothing is compacted, nothing is traced and the prefix does not move. Without
+   the guard that test panics in `drain`.
 4. *The take counter on a follower's record* (above): carried forward, never reset.
 
 **The assertion D-065 asks for.** "A follower's applied index never passes its commit
@@ -9137,26 +9162,54 @@ the same way by `git stash`. The command is
 `ANANKE_SEEDS=1000 cargo test --release -p ananke-sim --test raft <test> -- --exact --nocapture`.
 
 *The follower log (Stage B's exit; Q39).* The largest in-memory log any replica held
-while it was not leading, in entries, read off the trace as `last_index - snap_index`:
+while it was not leading, in entries, folded from the trace by `LogShape`. The fold is
+not quite `last_index - snap_index`: a take moves neither, and only the `RaftCompacted`
+that follows it does, for the reason the type's own notes give. The review of this slice
+measured the first build of the fold against the core itself and found it reading the log
+*shorter* than the core held it on 27 of 1 000 seeds, by up to 12 entries — the wrong
+direction for a bound — so a take no longer moves the fold's prefix.
 
-- **342 entries, 28.5 × `snapshot_threshold`**, on seed 514, over a thousand seeds
-  (load 9.70/5.78/11.36). The distribution of the per-seed maximum, in multiples of the
-  threshold: 1 × on 224 seeds, then 4 × to 8 × on 568, with a thin tail — 43 seeds reach
-  12 ×, 13 reach 16 ×, 6 reach 20 ×, 1 reaches 28 ×.
-- With the follower's trigger switched off and nothing else changed, the same sweep at
-  the same tier reached **878 entries, 73 ×**, its bulk at 20 × to 26 ×, and would have
-  gone on growing with a longer run: a follower's log had nothing to bound it
-  (SHARD.md:337-338). That is the mutation this bound is measured against.
+- **342 entries, 28.5 × `snapshot_threshold`**, on server 1 of seed 514, over a thousand
+  seeds (load 142/81/53, other agents' slices sweeping). The maximum is the same entry
+  and the same seed the review found by instrumenting the core directly, so the headline
+  is ground truth and not an artefact of the fold. The distribution of the per-seed
+  maximum, in multiples of the threshold: 1 × on 223 seeds, the bulk at 4 × to 8 × on
+  561, then 50 seeds at 12 × or more, 13 at 16 × or more, 8 at 20 × or more, and one at
+  28 ×.
+- With `Variant::FollowerNeverCompacts` — the server as it was built before D-065, now a
+  variant in the tree rather than a local edit — the same sweep at the same tier reaches
+  **878 entries, 73 ×**, on seed 512, and would have gone on growing with a longer run: a
+  follower's log had nothing to bound it (SHARD.md:339-340 — 337-338 are the sentence
+  about *how* a follower's log shrinks, not the one about its growth).
 - The bound asserted is **64 ×**, `raft::FOLLOWER_LOG_MULTIPLE`, on every seed at every
-  tier. The tail is close to geometric, so ten thousand seeds are expected to reach
-  about 38 × and to pass 48 × about one run in ten; 64 × leaves 2.25 × over the measured
-  maximum and puts the nightly's chance of reaching it near one run in 470. It is not a
-  vacuous bound: 64 × is 768 entries, below the 878 the same sweep reached with the
-  compaction off.
+  tier. 64 × is 768 entries: 2.25 × over the measured maximum and below the 878 the same
+  sweep reaches with the compaction off, so it is not a vacuous bound.
+- **The tail is not geometric, and this entry's first risk model was wrong.** It said ten
+  thousand seeds should reach about 38 × and pass 48 × about one run in ten, putting the
+  nightly's chance of reaching 64 × near one in 470. The nightly it cited says otherwise:
+  ten thousand seeds reached 28 ×, on seed 514 — the identical seed and the identical
+  maximum as one thousand. The tail is truncated, not geometric, and the margin is larger
+  than the model claimed, not smaller. No number is quoted for it here: the honest
+  statement is that neither a thousand nor ten thousand seeds has come within 2 × of the
+  bound, and the nightly on this tip re-states the distribution on the corrected fold.
 - The multiple is this scenario's, at its threshold of 12. What it really bounds is the
   follower's apply lag in entries, which the threshold does not scale; at the server's
   own 4 096 the same lag is a fraction of one threshold, so 64 × read as a production
-  figure is conservative. **This is the one number the owner may want to look at.**
+  figure is conservative, and SHARD.md's exit asks for the multiple of 4 096. **This is
+  the one number the owner may want to look at**, and the ten-thousand-seed figure above
+  says the conservatism is greater than this entry first claimed.
+- **Its pair.** `Variant::FollowerNeverCompacts` is caught on **5 of the first thousand
+  seeds** — 116, 429, 512, 577, 757 — and on every one of the five it is this bound that
+  catches it. Half a per cent is far too thin for the gate's twenty seeds, so the pair is
+  pinned rather than swept (D-061): `a_replica_that_never_compacts_outgrows_the_follower_log_bound`
+  runs **seed 512** both ways, asserts the violation names this bound and that the log is
+  past it, and asserts the correct half of the same seed passes inside it. 512 is the one
+  of the five with the most room — 878 entries against 768, where seed 116, the lowest of
+  the five, holds 788 — because a pin two per cent over a bound would go quiet at the
+  next schedule move and say nothing about it. Before this
+  variant existed the bound was unfalsifiable inside the tree: the review widened
+  `FOLLOWER_LOG_MULTIPLE` from 64 to 4 096 and the whole raft suite passed at 20 seeds
+  and at 200.
 
 *The three D-065 names to re-measure, before and after, at a thousand seeds.*
 
@@ -9183,25 +9236,48 @@ while it was not leading, in entries, read off the trace as `last_index - snap_i
   follower — a truncation never reaches below the prefix, and the prefix is now the
   applied index — but the variant truncates on *every* append, so a truncation that
   removes a committed entry is still found on all but one seed.
-- D-029's revert floor. The direct measure is new:
-  `follower_compactions_swallowing_the_config`, a compaction by a replica that is not
-  leading through an index at or past its last `RaftConfig`, so the floor is what it
-  would revert to from there. It is **58 228 of 58 228** follower compactions, on
-  **1 000 of 1 000** seeds: the floor is load-bearing on every follower of every run,
-  which is what D-065 predicted. What has *not* changed is how often a truncation
-  actually reaches it: `truncation_reverts_to_a_prefix` is 0 of 1 000 before and after,
-  and the 3-of-10 000 figure issue #56 records is the nightly's, which this branch's
-  nightly will re-state.
+- D-029's revert floor. **This entry's first figure for it was wrong, and in the way
+  D-039 warns of: it was structural, not observed.** It read
+  `follower_compactions_swallowing_the_config` as "a compaction through an index at or
+  past the server's *last* `RaftConfig`", and that is true of every compaction by
+  construction — `Raft::new` sets `membership_index` to `snap_index` when the log holds
+  no configuration entry, 0 at a first open — so the counter was a copy of the total
+  under another name. It read **58 228 of 58 228**, and it would have read 100 % on a
+  tree with D-029's floor code deleted. The review of this slice caught it. The measure
+  is now observational: a compaction that carried the prefix from `prev` to `through`
+  swallowed a configuration entry only when the server holds one at an index strictly
+  inside that step, `prev < index <= through`.
+- On the corrected measure, **the raft sweep cannot evidence this claim at all**: it is
+  **0 of 58 228**, because the raft scenario appends no configuration entries. The claim
+  is true, and it is true where configuration entries exist — the **membership**
+  scenario, at **5 437 of 33 270 follower compactions, 16.3 %**, on **1 000 of 1 000**
+  seeds. The review took the same figure from the other side, by instrumenting
+  `maybe_compact`'s own `drained.is_some()` in the core: 5 389 of 33 279, 16.2 %. The two
+  agree to about one per cent, which is the trace's view of a role lagging the core's.
+  That is what D-065 predicted, at its real size: the floor a leader's compaction reached
+  on 3 of 10 000 seeds is reached by about one follower compaction in six, on every run
+  that changes its membership. It is not "load-bearing on every follower of every run",
+  as this entry first said — on a run with no configuration entry it is load-bearing on
+  nothing.
+- What has *not* changed is how often a truncation actually reaches the floor:
+  `truncation_reverts_to_a_prefix` is 0 of 1 000 before and after, and the 3-of-10 000
+  figure issue #56 records is the nightly's, which this branch's nightly will re-state.
 
 The correct system's own figures are the same on the tree with the record's trace and on
 the tree without it, to the entry and the seed — the follower-log maximum, its whole
 distribution, every compaction count — because a trace event is an observation and draws
 nothing. Only what the checker could *see* moved.
 
-*What moved beside them, at the same tier:* `snapshots_installed` 19 359 → 20 130 (the
-restatements of the extra opens the moved schedules make, not a change of install
-behaviour), `snapshots_taken` 38 200 → 37 085, `applies` 1 362 871 → 1 309 687, `commits`
-994 478 → 973 363. Follower compactions: 58 228 over a thousand seeds, on every seed.
+*What moved beside them, at the same tier:* `snapshots_taken` 38 200 → 37 085, `applies`
+1 362 871 → 1 309 687, `commits` 994 478 → 973 363. Follower compactions: 58 228 over a
+thousand seeds, on every seed.
+
+`snapshots_installed` was first reported here as 19 359 → 20 130, "the restatements of
+the extra opens the moved schedules make, not a change of install behaviour". That was
+wrong on both halves and the review struck it: the 20 130 is **9 342 installs and 10 788
+re-statements**, and the rise is exactly this change putting a prefix under replicas that
+had none, not the schedules. The two are now counted apart (settled point 2 above), and
+`snapshot_prefixes_restated` is the sweep's name for the second.
 
 **What moved, and the re-audit.** This change moves every schedule: a follower writes a
 snapshot record and deletes log keys where it wrote and deleted nothing, so every
@@ -9264,6 +9340,17 @@ mechanism, or, with the reason, the situation's absence:
   time finds four gaps rather than three, the nightly's own still not among them, and the
   timer bound *is* asked of the run now, so the first of the four is that catch.
 
+**The review's fixes move no schedule, so no pinned seed is re-audited for them.** Every
+change made for the review is either read-only over the trace or inert on the correct
+system: `LogShape` and `follower_compactions` fold records and decide nothing;
+`snapshots_installed_and_restated` is a new fold; `compaction_record` is the record the
+`apply` task already wrote, given a name; and `Variant::FollowerNeverCompacts` guards the
+follower trigger with a set the correct server's is empty of, so the correct server takes
+the same branch it took before. The correct raft sweep fails 0 of 1 000 seeds, and the
+follower-log maximum is the same 342 on the same server of the same seed as before the
+fold was corrected. The re-audit below is the one the original commit owed, for the
+schedule move that D-065 itself makes, and it stands.
+
 **A search for a moved mechanism, as CLAUDE.md asks, and what it found.** Two findings
 go to the owner; neither is a bound the correct system trips and neither is a
 correct-server failure.
@@ -9296,11 +9383,99 @@ correct-server failure.
    the absence predates D-078 and is not this change's doing; it is reported because the
    pair is Phase 2's control for a wedge that needs both bugs (D-045).
 
+**The nightly on this branch's first tip was red, and the two failures are the owner's
+to rule on.** Run 35597322808 on `85412c6` failed shards 5 and 6 on three seeds above a
+thousand, which is why the premerge at a thousand was green. `origin/main` passes all
+three. Both were reproduced here from a `git archive` of each tree, in release, and both
+were diagnosed to the end. **Neither is a fault of this slice's code, and neither is
+fixed here**, because fixing either means changing a check that a merged decision owns —
+which is the owner's call under D-030 and D-039, not a slice's.
+
+1. **Membership seed 7205: `match_starts_are_first_rises` (D-069) tripped by the correct
+   system.** Filed as **issue #81**. Under leader 3 of term 2 the scenario drives grow,
+   shrink, grow: `change-accepted [1,2,3,4,5] applied 151`, then `[1,2,3] applied 156`,
+   then `[1,2,3,4,5] applied 161`. `on_change` treats a target that is not in
+   `self.membership.voters` as a learner and re-inserts its `Progress` with
+   `incarnation: None` and `match_started: false`, so the re-grow rebuilds server 4's
+   progress although its store incarnation never changed, and the next rise is traced as
+   a first rise under incarnation 1 for the second time. The leader really did begin
+   tracking server 4 afresh, and SHARD.md §8 says that is what the event is for — "on a
+   re-add, a success from the collected replica stamped with its own incarnation would
+   show here". The oracle's key, `(leader, term, follower, incarnation)`, is what is
+   incomplete. It is a model error in the check, latent on `origin/main`, which this
+   slice only moved a schedule onto. The review's reading — that D-065's revert floor
+   drops and re-adds a voter — is not what the trace shows; the shrink is an ordinary
+   membership change. The fix proposed in #81 is to have `on_change` trace
+   `RaftProgressReset` when it replaces a `Progress` it already held, and to have the
+   oracle forget that follower's keys when it sees one; the check keeps all of its power,
+   since D-069's own mutation leaves no reset between the repeated rises.
+2. **Raft seeds 3085 and 4065: the linearizability checker's search budget, not a
+   violation.** Filed as **issue #82**. Both histories **are** linearizable: with
+   `sim::lin::BUDGET` raised in a throwaway copy, 3085 linearizes at 4 000 000 states and
+   4065 at 400 000 000, against the 2 000 000 in the tree. The budget is not a knife
+   edge — `lin.rs` instrumented to report the deepest search of each run gives a worst
+   case of **2 562** states over a thousand seeds on this branch and **7 423** on
+   `origin/main`, three orders of magnitude inside the cap, with no seed on either tree
+   over 500 000. The cost distribution is close to bimodal: almost every history is free
+   and a very small minority explodes, and main's worst thousand-seed history is the more
+   expensive of the two, so nothing says this change makes histories harder. Two of ten
+   thousand schedules landed in the tail. `BUDGET` is **not** raised: at 400 000 000 the
+   checker is 200 × slower on every seed and the next tail history is past whatever
+   number is chosen (D-030, D-039). #82 proposes committing forced prefixes without
+   backtracking, dropping pending operations that cannot matter, and reporting an
+   exhausted search as *undecided* with a visible count rather than as a failure.
+
+Until the owner rules on both, **this branch's gate — a nightly green on its tip — is not
+met, and the pull request is not mergeable.** Everything else the review found is fixed
+below.
+
+**What the review changed, beyond the two above.** Every one of its findings that was a
+defect in this slice's own code, tests or entry is fixed, each with the mutation or run
+that proves it:
+
+- The D-029 measure, structural rather than observed (above). Now observational; the
+  raft figure is 0 and the claim is restated where it is true, in the membership
+  scenario.
+- `FOLLOWER_LOG_MULTIPLE` had no pair: `Variant::FollowerNeverCompacts` is the server as
+  it was before D-065, and seed 512 is pinned against it (above). The review's M11 —
+  widening the bound from 64 to 4 096 — now fails that test.
+- `snapshots_installed` no longer counted installs (settled point 2 above), and
+  RAFT.md's `RaftSnapshot` row said the compaction emits the event, which it does not.
+  Both corrected; the row and this entry now say the same thing.
+- The record's own shape and the past-end branch were untested, four mutation survivors.
+  `compaction_record` in `node.rs` is now a named function with its own unit tests
+  (`taken` false, no directory, the counter carried forward), and
+  `a_record_past_the_log_compacts_nothing` holds the guard. The follower trigger's two
+  clauses, which the review found "caught only by pinned-seed schedule sensitivity", are
+  now held by `a_replica_that_is_not_leading_records_at_its_applied_index`: a log exactly
+  the threshold past its prefix asks for nothing, a replica that has applied nothing asks
+  for nothing, and the record that lands compacts in the same step.
+- `LogShape` read a follower's log *shorter* than the core held it on 27 of 1 000 seeds
+  (above). A live take no longer moves the fold's prefix and a re-statement still does,
+  which is `Restating`; the maximum is unchanged at 342 on server 1 of seed 514, which is
+  the core's own ground truth. `LogShape.committed`, written by the fold and read by
+  nothing, is deleted.
+- The citations that did not land: the repair's record is `snapshot.rs`'s, not
+  `node.rs`'s, and it is *not* the same shape in `take`; SHARD.md's unbounded-growth
+  sentence is 339-340, not 337-338. Both corrected above.
+
+**One mutation is left untested, and is recorded as untested rather than as verified.**
+The review's M10 — `Event::Recorded` also clearing `fresh_take` — survives. The arm's
+reasoning is that no version was written, so nothing is swept and the flag is left as it
+was; whether clearing it too would change anything depends on the node loop's state, and
+reaching it needs a test over the loop, which this tree has no shape for. It is stated
+here as an untested decision. The other three survivors on this slice's code are killed
+by the tests above.
+
 **RAFT.md.** Updated where it describes what changed (D-053): the paragraph after "A
 leader compacts the Raft log to its last checkpoint…" now says what a follower does,
 which supersedes RAFT.md's rule that only a leader compacts, as Stage B's question 1
-asked; and `RaftSnapshot`'s row says a record with no checkpoint under it is the third
-thing it reports.
+asked, and adds that the record traces nothing of its own. `RaftSnapshot`'s row first
+said the event is emitted for "a snapshot recorded by a follower's compaction", which
+contradicted this entry's settled point 2 and was wrong: the compaction emits none. The
+row now says the event is a take, an install or a re-statement, and that a compaction's
+record surfaces only as the re-statement of the next open. The variants table gains
+`Variant::FollowerNeverCompacts` and its count of rows goes from sixteen to seventeen.
 
 **The premerge**, on this branch, quoting its own machine lines:
 `premerge: Darwin 25.6.0 arm64, Apple M2, 8 cores`;
@@ -9315,9 +9490,13 @@ way.
 
 **What is not done.**
 
-- The nightly on this branch is dispatched, not waited for; its ten thousand seeds are
-  what test the 64 × bound and what will re-state issue #56's 3-of-10 000 revert-floor
-  figure.
+- The nightly on the fixed tip is dispatched, not waited for; its ten thousand seeds are
+  what test the 64 × bound, what re-state the follower-log distribution on the corrected
+  fold, and what will re-state issue #56's 3-of-10 000 revert-floor figure. **It will
+  still be red on the three seeds above**, which are issues #81 and #82 and not this
+  slice's to fix.
+- Issues #81 and #82 are filed and open. Neither is fixed here, and the branch's gate is
+  not met until the owner rules on them.
 - The apply-task hold D-065 asks Stage B to measure "with and without follower
   compaction" is the node's measurement, on the node's four ranges, and is not this
   slice's: there is one range here, and C's whole point is that it takes no checkpoint,

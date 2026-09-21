@@ -2383,6 +2383,85 @@ fn a_server_that_applies_before_commit_compacts_past_its_commit_index() {
     );
 }
 
+/// The seed the follower-log bound's pair is pinned at. Five seeds of the first
+/// thousand carry a replica's log past [`raft::FOLLOWER_LOG_MULTIPLE`] under
+/// [`Variant::FollowerNeverCompacts`] — 116, 429, 512, 577 and 757 — and this is
+/// the one with the most room: 878 entries against the bound's 768, where seed
+/// 116, the lowest, holds 788. A pin two per cent over a bound would go quiet at
+/// the next schedule move and say nothing about it.
+// PROPOSED(D-078): Stage B's exit measures the largest in-memory log of any
+// follower replica.
+const FOLLOWER_LOG_SEED: u64 = 512;
+
+/// Stage B's exit bound on a follower's log, with the known-buggy variant beside
+/// it that the same check catches (CLAUDE.md's pair rule).
+///
+/// `FOLLOWER_NEVER_COMPACTS` is the server as it was built before D-065: a replica
+/// that is not leading never compacts, so its in-memory log keeps every entry
+/// since the last snapshot a leader gave it or it took itself, and grows with the
+/// run. That is the only thing in the tree that can make
+/// `Report::follower_log_is_bounded` fire, and before this variant existed the
+/// bound was unfalsifiable — widening `FOLLOWER_LOG_MULTIPLE` from 64 to 4 096
+/// changed no test at any tier, which is how the review of this slice found it.
+///
+/// **The rate, measured before it is asserted (D-061).** Over the first thousand
+/// seeds in release, the variant is caught on **5** — 116, 429, 512, 577 and 757 —
+/// and on every one of the five it is this bound that catches it; its largest
+/// follower log is 878 entries, 73 × the threshold, on seed 512. Half a per cent
+/// is far too thin for a sweep at the gate's twenty seeds, so this is pinned at a
+/// seed instead of swept: [`FOLLOWER_LOG_SEED`] asserts the mechanism by name, at
+/// every tier, and the sweep's own `follower_log_multiples` keeps the distribution
+/// in view.
+///
+/// The correct half of the pair is the same seed run correct: it passes, and its
+/// largest follower log is inside the bound with room.
+// PROPOSED(D-078): Stage B's exit measures the largest in-memory log of any
+// follower replica.
+#[test]
+fn a_replica_that_never_compacts_outgrows_the_follower_log_bound() {
+    let bound = raft::FOLLOWER_LOG_MULTIPLE * raft::SNAPSHOT_THRESHOLD;
+
+    let broken = raft::run(FOLLOWER_LOG_SEED, Variant::FollowerNeverCompacts);
+    let (longest, server) = broken.largest_follower_log();
+    let violation = broken.check().expect_err(&format!(
+        "seed {FOLLOWER_LOG_SEED} under FollowerNeverCompacts passed every check; its \
+         largest follower log was {longest} entries against the {bound} of the bound"
+    ));
+    assert!(
+        violation.contains("follower log:"),
+        "seed {FOLLOWER_LOG_SEED} under FollowerNeverCompacts is caught, but by something \
+         else first — the pin asserts this bound's own mechanism: {violation}"
+    );
+    assert!(
+        longest > bound,
+        "the violation names the bound, so the log must be past it: {longest} of {bound} \
+         on server {server}"
+    );
+    eprintln!(
+        "FollowerNeverCompacts: seed {FOLLOWER_LOG_SEED} held {longest} entries on server \
+         {server}, past the {bound} of {} × {}",
+        raft::FOLLOWER_LOG_MULTIPLE,
+        raft::SNAPSHOT_THRESHOLD
+    );
+
+    let correct = raft::run(FOLLOWER_LOG_SEED, Variants::default());
+    let (longest, server) = correct.largest_follower_log();
+    assert!(
+        correct.check().is_ok(),
+        "the correct half of the pair must pass: {:?}",
+        correct.check().err()
+    );
+    assert!(
+        longest <= bound,
+        "the correct server's own log is what the bound is about: {longest} of {bound} \
+         on server {server}"
+    );
+    eprintln!(
+        "Correct: seed {FOLLOWER_LOG_SEED} held {longest} entries on server {server}, \
+         inside the {bound} of the bound"
+    );
+}
+
 #[test]
 fn a_leader_that_commits_an_older_terms_entry_by_count_is_caught() {
     is_caught(Variant::CountOlderTermForCommit);
@@ -3200,7 +3279,13 @@ struct Coverage {
     /// silently empty once before, at D-060, and every assertion built on it
     /// passed while it did.
     takes_paired: usize,
+    /// Snapshots a server really installed, and prefixes a restart re-stated:
+    /// one event kind, split because D-065 made the second population large and
+    /// counting them together reported installs that never happened
+    /// ([`raft::Report::snapshots_installed_and_restated`]).
+    // PROPOSED(D-078): a follower compacts its log to its own applied index.
     snapshots_installed: usize,
+    snapshot_prefixes_restated: usize,
     snapshot_resumes: usize,
     snapshot_versions_deleted: usize,
     snapshot_takes_reused: usize,
@@ -3444,8 +3529,10 @@ impl Coverage {
         self.snapshots_taken +=
             report.count(|e| matches!(e, TraceEvent::RaftSnapshot { taken: true, .. }));
         self.takes_paired += report.snapshot_takes().len();
-        self.snapshots_installed +=
-            report.count(|e| matches!(e, TraceEvent::RaftSnapshot { taken: false, .. }));
+        // PROPOSED(D-078): a follower compacts its log to its own applied index.
+        let (installed, restated) = report.snapshots_installed_and_restated();
+        self.snapshots_installed += installed;
+        self.snapshot_prefixes_restated += restated;
         self.snapshot_resumes +=
             report.count(|e| matches!(e, TraceEvent::RaftSnapshotResumed { .. }));
         // D-043: versions swept, takes answered by the recorded

@@ -149,6 +149,16 @@ pub enum Variant {
     // D-049: a refused follower counts for check quorum only while its re-seed
     // stream progresses.
     RefusedNeverCounts,
+    /// A replica that is not leading never compacts: the server as built before
+    /// D-065. Its log keeps every entry since the last snapshot a leader gave it
+    /// or it took itself, so a replica that trails and is never streamed to grows
+    /// its in-memory log with the run. This is the variant
+    /// [`crate::core`]'s follower trigger is paired with: the bound Stage B's exit
+    /// asks for (`sim::raft::FOLLOWER_LOG_MULTIPLE`) is a statement about the
+    /// correct server that must be false of a server without the trigger, and
+    /// without this variant nothing in the tree could make the assertion fire.
+    // PROPOSED(D-078): a follower compacts its log to its own applied index.
+    FollowerNeverCompacts,
 }
 
 impl Variant {
@@ -173,6 +183,7 @@ impl Variant {
         Variant::RefusalNotDurable,
         Variant::RefusedCountsForQuorum,
         Variant::RefusedNeverCounts,
+        Variant::FollowerNeverCompacts,
     ];
 
     /// This variant's bit in a [`Variants`] set. [`Variant::Correct`] owns no
@@ -198,6 +209,7 @@ impl Variant {
             Variant::RefusalNotDurable => 1 << 13,
             Variant::RefusedCountsForQuorum => 1 << 14,
             Variant::RefusedNeverCounts => 1 << 15,
+            Variant::FollowerNeverCompacts => 1 << 16,
         }
     }
 }
@@ -1544,7 +1556,11 @@ impl Raft {
                 // this server never took.
                 // PROPOSED(D-078): a follower compacts its log to its own applied
                 // index.
-                if !self.take_pending
+                if !self
+                    .config
+                    .variants
+                    .contains(Variant::FollowerNeverCompacts)
+                    && !self.take_pending
                     && self.applied > self.snap_index
                     && self.last_index() - self.snap_index > self.config.snapshot_threshold
                 {
