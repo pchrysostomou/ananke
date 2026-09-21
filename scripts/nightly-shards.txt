@@ -10,11 +10,15 @@
 # longest-first into the lightest shard; the rows before them keep fc75f68's weights. D-068's
 # four were weighed on its tree, on an idle machine, on their high-rate share. D-069 renamed
 # seed 158's pin and added seed 102's, both weighed on its tree; the renamed row keeps its
-# shard and the new one went to the lightest, which was the same shard 6. D-076's six rows —
-# the node scenario, `ranges` — were weighed on its tree on an Apple M2 of 8 cores, on AC,
-# under load average 149 from the other Stage B slices building beside it, so their cpu_s are
-# if anything high; longest-first into the lightest shard put the two sweeps in 5 and 6 and
-# the four cheap ones in 2.
+# shard and the new one went to the lightest, which was the same shard 6. D-076's eight rows —
+# the node scenario, `ranges` — were weighed on its tree on an Apple M2 of 8 cores, on AC;
+# the first seven under load average 149 from the other Stage B slices building beside it, so
+# their cpu_s are if anything high, and the eighth (the directed scenario the review of D-076
+# added) on an idle machine at 0.05 cpu s, rounded up to 0.1 like the cheap rows beside it.
+# Longest-first into the lightest shard put the two sweeps in 5 and 6 and the six cheap ones
+# in 2. Re-weighed after the review's fixes, on an idle machine, the two sweeps came to 60.7
+# and 51.9 cpu s against the 59.0 and 53.9 recorded here: within the noise of the load they
+# were first measured under, so the rows keep their figures.
 #
 # shard	binary	cpu_s	test
 # shard 1: 1278.5 cpu s
@@ -32,7 +36,7 @@
 1	raft	0.2	seed_5909_which_the_nightly_found_stays_green
 1	raft	0.2	seed_164_which_a_local_ten_thousand_seed_run_found_stays_green
 1	wal	29.3	a_log_that_skips_the_checksum_is_caught
-# shard 2: 1276.8 cpu s
+# shard 2: 1276.9 cpu s
 2	echo	0.2	different_seeds_give_different_traces
 2	engine	34.6	a_checkpoint_that_copies_each_span_at_its_own_version_is_caught
 2	engine	581.7	the_live_install_crash_test_passes_every_seed
@@ -46,6 +50,7 @@
 2	ranges	0.2	a_ranges_replicas_are_created_with_one_descriptor_and_created_once
 2	ranges	0.1	every_frame_between_two_nodes_may_carry_several_ranges
 2	ranges	0.1	no_batch_frame_of_the_node_parses_as_a_frame_of_the_one_group_server
+2	ranges	0.1	the_ranges_of_one_node_draw_their_own_election_timeouts
 # shard 3: 1281.3 cpu s
 3	echo	0.2	trace_hash_matches_the_pinned_golden
 3	engine	39.8	an_install_whose_repair_follows_its_switch_is_caught

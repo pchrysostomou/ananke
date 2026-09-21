@@ -315,6 +315,10 @@ impl Report {
     ///
     /// `None` when the run is not one the bound is asked of, when no range had a
     /// majority, or when no key of a live range was written after the heal.
+    ///
+    /// The write is measured from its own call, as the check reads it (D-076): the
+    /// margin here is the margin of the check, and a figure read the other way would
+    /// be the clients' idleness as much as the node's latency.
     // PROPOSED(D-076): the write bound's margin with four ranges to a node.
     #[must_use]
     pub fn worst_write_after_heal(&self, asked: bool) -> Option<Duration> {
@@ -330,18 +334,157 @@ impl Report {
             .max()
     }
 
+    /// The longest a live range took after the last heal to complete a client write:
+    /// the recovery time proper, under the same bound and with the same meaning of
+    /// `asked` ([`raft::Report::writes_after_heal_by_range`]).
+    // PROPOSED(D-076): the recovery time proper is asked per range.
+    #[must_use]
+    pub fn worst_range_recovery(&self, asked: bool) -> Option<Duration> {
+        if asked && !self.checked.uniform() {
+            return None;
+        }
+        let live = self.checked.ranges_with_a_majority_up();
+        self.checked
+            .writes_after_heal_by_range()
+            .into_iter()
+            .filter(|(range, _)| live.contains(range))
+            .filter_map(|(_, took)| took)
+            .max()
+    }
+
     /// The bound that margin is measured against: ten maximum election timeouts.
     #[must_use]
     pub fn write_bound() -> Duration {
         election_max() * LIVENESS_TIMEOUTS
     }
 
-    /// Trace records per range per virtual second: the figure Stage B measures
-    /// against `TRACE_CAP`, which sizes the scenarios of Stages C to E.
+    /// The span the run's records actually cover: the last record's time less the
+    /// first's. It is what a rate is divided by, in place of the schedule's planned
+    /// total — they agree here, and a run stopped as a runaway is exactly the case
+    /// where they would not.
     #[must_use]
-    pub fn records_per_range_per_second(&self) -> f64 {
-        let seconds = self.schedule.total().as_secs_f64().max(f64::EPSILON);
+    pub fn observed(&self) -> Duration {
+        let records = self.records();
+        match (records.first(), records.last()) {
+            (Some(first), Some(last)) => last.at.duration_since(first.at),
+            _ => Duration::ZERO,
+        }
+    }
+
+    /// Trace records per virtual second, divided by the range count: the figure
+    /// Stage B measures against `TRACE_CAP`, which sizes the scenarios of Stages C
+    /// to E.
+    ///
+    /// The numerator is the **whole** trace — client operations, every
+    /// `MessageSent`/`MessageDelivered`, the engine's records — and only a small
+    /// part of it is about a range at all, so this is an upper bound on any range's
+    /// own rate and not that rate: [`Report::busiest_range_records_per_second`] is
+    /// the observed one, about sixteen times smaller. A cap sized from this figure
+    /// is sized conservatively, which is the direction to be wrong in; the name says
+    /// which figure it is.
+    // PROPOSED(D-076): the trace's rate against `TRACE_CAP`, per range.
+    #[must_use]
+    pub fn records_per_second_per_range(&self) -> f64 {
+        let seconds = self.observed().as_secs_f64().max(f64::EPSILON);
         self.records().len() as f64 / RANGES as f64 / seconds
+    }
+
+    /// The records that name a range, counted for the busiest range, per observed
+    /// virtual second: the rate a range's own records actually reach.
+    #[must_use]
+    pub fn busiest_range_records_per_second(&self) -> f64 {
+        let seconds = self.observed().as_secs_f64().max(f64::EPSILON);
+        let mut by_range: BTreeMap<u64, usize> = BTreeMap::new();
+        for record in self.records() {
+            if let Some(range) = raft::range_of(&record.event) {
+                *by_range.entry(range).or_default() += 1;
+            }
+        }
+        by_range.into_values().max().unwrap_or(0) as f64 / seconds
+    }
+
+    /// Every frame this run's nodes sent each other, decoded: how many messages it
+    /// carried and how many distinct ranges those messages were of.
+    ///
+    /// This is what says a frame between two nodes carries several ranges — the
+    /// parameter four is fixed for (SHARD.md §12) — read off the frames themselves.
+    /// Counting the ranges a *run* names says only that the run has four ranges,
+    /// which `bootstrap_creations` and `applies_by_range` already assert: a node
+    /// whose every frame carried exactly one message would pass that and fail this.
+    ///
+    /// A client's packet carries its range in the envelope this slice added and is
+    /// neither codec's; it is told apart by its first byte and left out here.
+    // PROPOSED(D-076): the batching claim is read off the frames.
+    #[must_use]
+    pub fn frames_carried(&self) -> (BTreeMap<usize, usize>, BTreeMap<usize, usize>) {
+        let mut messages: BTreeMap<usize, usize> = BTreeMap::new();
+        let mut ranges: BTreeMap<usize, usize> = BTreeMap::new();
+        for record in self.records() {
+            let TraceEvent::MessageSent { payload, .. } = &record.event else {
+                continue;
+            };
+            if ananke_shard::is_ranged(payload) {
+                continue;
+            }
+            let Ok(decoded) = ananke_shard::decode(payload) else {
+                continue;
+            };
+            *messages.entry(decoded.messages.len()).or_default() += 1;
+            let of: BTreeSet<RangeId> =
+                decoded.messages.iter().map(|tagged| tagged.range).collect();
+            *ranges.entry(of.len()).or_default() += 1;
+        }
+        (messages, ranges)
+    }
+
+    /// How many of this run's peer frames carried messages of more than one range.
+    #[must_use]
+    pub fn frames_of_several_ranges(&self) -> usize {
+        let (_, ranges) = self.frames_carried();
+        ranges
+            .iter()
+            .filter(|(carried, _)| **carried > 1)
+            .map(|(_, frames)| *frames)
+            .sum()
+    }
+
+    /// Every payload a node sent a node is a batch frame of this node's codec, and
+    /// no payload of it parses as a frame of the one-group server's.
+    ///
+    /// The two codecs' first bytes collide: a batch frame's version byte is 1 and
+    /// `ananke-raft`'s tag 1 is a pre-vote. A payload is read as a one-group frame
+    /// when it parses as one and as a batch frame otherwise (`raft::messages_of`),
+    /// which keeps every one-group scenario's replay exactly as it was — and is
+    /// sound only while no batch frame parses as a one-group frame. Over a run of
+    /// this scenario none does: a pre-vote is exactly 33 bytes, `Frame::decode`
+    /// refuses trailing bytes, and the smallest batch frame is 34. The direction is
+    /// pinned here, on the run's own frames, so that it is pinned on **every seed**
+    /// of every tier and not on the one seed a directed test would run.
+    ///
+    /// # Errors
+    ///
+    /// The first payload that parses the wrong way round, or not at all.
+    // PROPOSED(D-076): a payload is a one-group frame when it parses as one.
+    pub fn frames_are_this_nodes(&self) -> Result<(), String> {
+        for record in self.records() {
+            let TraceEvent::MessageSent { payload, .. } = &record.event else {
+                continue;
+            };
+            if ananke_shard::is_ranged(payload) {
+                continue;
+            }
+            if ananke_raft::message::Frame::decode(payload.clone()).is_ok() {
+                return Err(format!(
+                    "frames: a batch frame parses as a frame of the one-group server: {payload:?}"
+                ));
+            }
+            if let Err(error) = ananke_shard::decode(payload) {
+                return Err(format!(
+                    "frames: a payload this node sent is no batch frame ({error}): {payload:?}"
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// The descriptor a replica was created with, as check 7's first step compares
@@ -438,6 +581,8 @@ impl Report {
         let seed = self.seed;
         self.checked.check()?;
         self.creations_agree()
+            .map_err(|violation| format!("seed {seed}: {violation}"))?;
+        self.frames_are_this_nodes()
             .map_err(|violation| format!("seed {seed}: {violation}"))?;
         // The paths this slice's node does not have, asserted absent with the
         // reason (CLAUDE.md:58-67): the `snapshot` task keyed by range and follower,
@@ -536,6 +681,60 @@ fn spawn_node(sim: &Sim, at: NodeId, id: u64, variants: Variants, node: NodeVari
     env.spawn("node", async move {
         let _ = ananke_shard::server::run(inner, server_config(id, variants, node)).await;
     });
+}
+
+/// One node of four ranges, alone: the other two voters are configured and never
+/// started, so nothing ever resets an election timer and **every** core campaigns on
+/// its own.
+///
+/// It is the directed scenario for D-057's first caller (D-061's rule for a variant
+/// no seed of any tier catches): each core is seeded from `n{id}/r{range}/protocol`,
+/// per *range*, and a node that drew one seed for all four cores would give them one
+/// election timeout and campaign with all four at once. In the sweep that is
+/// invisible — the cores' timers are reset by the traffic of three live nodes, and a
+/// range whose leader is elsewhere never campaigns at all — so the case is built here
+/// instead, where the only thing that moves a timer is the timer.
+// PROPOSED(D-076): each core seeded per range, and the scenario that says so.
+#[must_use]
+pub fn alone(seed: u64, for_: Duration) -> Vec<TraceRecord> {
+    let schedule = Schedule {
+        warmup: for_,
+        faults: Vec::new(),
+        gaps: Vec::new(),
+        settle: Duration::ZERO,
+    };
+    let mut sim = Sim::new(config(seed, &schedule));
+    let node = sim.add_node();
+    spawn_node(&sim, node, 1, Variants::default(), NodeVariants::correct());
+    sim.run_for(for_);
+    sim.trace()
+}
+
+/// When each range first campaigned: the time of the first pre-vote its replica
+/// sent, read off the frames themselves.
+#[must_use]
+pub fn first_campaigns(records: &[TraceRecord]) -> BTreeMap<u64, Instant> {
+    let mut first: BTreeMap<u64, Instant> = BTreeMap::new();
+    for record in records {
+        let TraceEvent::MessageSent { payload, .. } = &record.event else {
+            continue;
+        };
+        if ananke_shard::is_ranged(payload) {
+            continue;
+        }
+        let Ok(decoded) = ananke_shard::decode(payload) else {
+            continue;
+        };
+        for tagged in decoded.messages {
+            if matches!(
+                tagged.frame.message,
+                ananke_raft::message::Message::PreVote { .. }
+            ) {
+                first.entry(tagged.range.get()).or_insert(record.at);
+            }
+        }
+    }
+    first
 }
 
 /// The leader of `range` now: the server of the latest `RaftLeader` of that range,

@@ -1482,26 +1482,49 @@ impl Report {
         self.ranges_with_a_majority_up().len() == self.ranges().len()
     }
 
-    /// How long after the last heal the first client write completed, if one did.
+    /// How long after the last heal the first client write completed, if one did:
+    /// the quickest range's recovery ([`Report::writes_after_heal_by_range`]).
     #[must_use]
     pub fn time_to_write_after_heal(&self) -> Option<Duration> {
-        self.writes_after_heal_by_key()
+        self.writes_after_heal_by_range()
             .into_values()
             .flatten()
             .min()
     }
 
-    /// Per key some client wrote to after the last heal, how long after the heal
-    /// the first of those writes completed, and `None` for a key whose post-heal
-    /// writes all stayed pending. The write bound is asked of each of these
-    /// (SHARD.md §8): one minimum over every write is passed by a wedged range
-    /// beside a live one, since the live one's writes complete.
+    /// Per key some client wrote to after the last heal, how long the quickest of
+    /// those writes took **from its own call** — `ret − max(call, last_heal)`, and
+    /// every write folded here was called at or after the heal — with `None` for a
+    /// key whose post-heal writes all stayed pending. The write bound is asked of
+    /// each of these (SHARD.md §8).
+    ///
+    /// The interval is the write's own and not the time since the heal, because the
+    /// time since the heal is not the cluster's alone: with eight keys, two clients
+    /// and a 60 % write mix, the first post-heal write to one particular key can
+    /// simply not be *issued* for two seconds, and reading `ret − last_heal`
+    /// charged that idle time to the cluster. With one range and two keys the two
+    /// readings all but coincided, which is why no sweep saw it before the node
+    /// scenario; with four ranges the nightly found six seeds of ten thousand where
+    /// the client's own idleness passed the bound on its own (run 35645688334,
+    /// seeds 2400, 4976, 5193, 6508, 6605 and 9204 — on each of the three
+    /// reproduced, the key was served in about 25 ms once anybody asked for it).
+    ///
+    /// What this reading keeps is every tooth about the *cluster*: a post-heal write
+    /// that takes longer than the bound to come back still fails it, and a key whose
+    /// post-heal writes all stay pending is still the wedge this check is here to
+    /// see. What it stops carrying is the recovery time proper — how long after the
+    /// heal the range became writable at all — which is read per range instead,
+    /// where no client's choice of key can lengthen it
+    /// ([`Report::writes_after_heal_by_range`]). Neither reading is widened: the
+    /// bound is the same bound, asked of two things the old one conflated.
     ///
     /// An operation the trace closed by its entry's apply counts as completed, as
     /// it does everywhere else the history is read: the client abandoned it, but
     /// the entry applied (`lin.rs`). A write no leader ever proposed is not in the
     /// history at all and is no key's evidence either way.
     // PROPOSED(D-071): the write bound is asked per key.
+    // PROPOSED(D-076): a post-heal write is measured from its own call, and the
+    // recovery time proper is asked per range.
     #[must_use]
     pub fn writes_after_heal_by_key(&self) -> BTreeMap<Bytes, Option<Duration>> {
         let mut by_key: BTreeMap<Bytes, Option<Duration>> = BTreeMap::new();
@@ -1511,7 +1534,9 @@ impl Report {
             .iter()
             .filter(|op| op.op.is_write() && op.call >= self.last_heal)
         {
-            let took = op.ret.map(|ret| ret.duration_since(self.last_heal));
+            let took = op
+                .ret
+                .map(|ret| ret.duration_since(op.call.max(self.last_heal)));
             let first = by_key.entry(op.op.key().clone()).or_default();
             *first = match (*first, took) {
                 (Some(one), Some(another)) => Some(one.min(another)),
@@ -1519,6 +1544,37 @@ impl Report {
             };
         }
         by_key
+    }
+
+    /// Per range some client wrote to a key of after the last heal, how long after
+    /// **the heal** the first of those writes completed, and `None` for a range
+    /// whose post-heal writes all stayed pending: the recovery time proper, which
+    /// the per-key reading above no longer carries.
+    ///
+    /// It is keyed by range and not by the cluster for D-071's reason — one minimum
+    /// over every write is passed by a wedged range beside a live one, since the
+    /// live one's writes complete — and not by key, because which key a client draws
+    /// next is the client's business and not the cluster's. Every range of a
+    /// scenario this is asked of is written to within milliseconds of any moment its
+    /// clients are running, so this minimum waits on no draw the way one key's does.
+    // PROPOSED(D-076): the recovery time proper is asked per range.
+    #[must_use]
+    pub fn writes_after_heal_by_range(&self) -> BTreeMap<u64, Option<Duration>> {
+        let mut by_range: BTreeMap<u64, Option<Duration>> = BTreeMap::new();
+        for op in self
+            .history
+            .ops
+            .iter()
+            .filter(|op| op.op.is_write() && op.call >= self.last_heal)
+        {
+            let took = op.ret.map(|ret| ret.duration_since(self.last_heal));
+            let first = by_range.entry((self.key_range)(op.op.key())).or_default();
+            *first = match (*first, took) {
+                (Some(one), Some(another)) => Some(one.min(another)),
+                (one, another) => one.or(another),
+            };
+        }
+        by_range
     }
 
     /// Every invariant the run must satisfy, or the first violation.
@@ -1583,6 +1639,13 @@ impl Report {
     /// their keys at random. A key whose post-heal writes all stayed pending is the
     /// wedge this check is here to see. With no range left with a majority nothing
     /// is asked, as nothing was when the check was the cluster's.
+    ///
+    /// The same bound is asked, per live range, of the recovery time proper: how
+    /// long after the heal the first write to any key of that range completed
+    /// ([`Report::writes_after_heal_by_range`]). The per-key reading measures each
+    /// write from its own call and so cannot carry that; the per-range one waits on
+    /// no client's choice of key and so is not the client's idleness read as the
+    /// cluster's (D-076).
     fn liveness(&self) -> Result<(), String> {
         let live = self.ranges_with_a_majority_up();
         if live.is_empty() {
@@ -1600,12 +1663,34 @@ impl Report {
                 Some(took) if took <= bound => {}
                 Some(took) => {
                     return Err(format!(
-                        "liveness: the first client write to {key} after the last heal took {took:?}, over {bound:?}"
+                        "liveness: the first client write to {key} after the last heal took {took:?} from its own call, over {bound:?}"
                     ));
                 }
                 None => {
                     return Err(format!(
                         "liveness: no client write to {key} completed after the last heal at {:?}",
+                        self.last_heal
+                    ));
+                }
+            }
+        }
+        for (range, took) in self.writes_after_heal_by_range() {
+            if !live.contains(&range) {
+                continue;
+            }
+            match took {
+                Some(took) if took <= bound => {}
+                Some(took) => {
+                    return Err(format!(
+                        "liveness: range {range} took {took:?} after the last heal to complete a client write, over {bound:?}"
+                    ));
+                }
+                // A range every one of whose post-heal writes stayed pending is
+                // already the per-key reading's wedge, key by key; this arm is here
+                // so the two readings cannot disagree about what pending means.
+                None => {
+                    return Err(format!(
+                        "liveness: no client write to range {range} completed after the last heal at {:?}",
                         self.last_heal
                     ));
                 }
@@ -6432,6 +6517,94 @@ mod tests {
                 "liveness: no client write to k1 completed after the last heal at Instant(0ns)"
                     .to_owned()
             )
+        );
+    }
+
+    /// The model error the nightly found on the node scenario (D-076): with eight
+    /// keys and two clients, the first post-heal write to one key may not be
+    /// *issued* for two seconds, and reading it as `ret − last_heal` charged that
+    /// idle time to a cluster that served the key in 25 ms when it was finally
+    /// asked. Measured from the write's own call the run passes, and the tooth the
+    /// old reading carried — a range that is slow to become writable — moves to the
+    /// per-range reading, where no client's choice of key can lengthen it.
+    ///
+    /// The pair (CLAUDE.md:52-57) is the second history here: a range that takes
+    /// 2.5 s after the heal to complete any write, while every *individual* write
+    /// that completes is quick, passes the per-key reading and is caught by the
+    /// per-range one. Neither bound is widened: both are `election_max() * 10`.
+    // PROPOSED(D-076): a post-heal write is measured from its own call, and the
+    // recovery time proper is asked per range.
+    #[test]
+    fn a_post_heal_write_is_measured_from_its_own_call_and_the_range_from_the_heal() {
+        let write = |key: &str, call: u64, ret: Option<u64>| lin::Op {
+            process: 1,
+            seq: 0,
+            call: ms(call),
+            ret: ret.map(ms),
+            op: ClientOp::Put {
+                key: Bytes::from(key.to_owned()),
+                value: Bytes::from_static(b"v"),
+            },
+            result: ret.map(|_| ananke_env::ClientResult::Done),
+        };
+        let live = vec![record(
+            ms(0),
+            ms(0),
+            Some(1),
+            term_of(1, SINGLE_GROUP, 1, "follower"),
+        )];
+        let with = |ops| Report {
+            history: History {
+                ops,
+                ..History::default()
+            },
+            ..report(live.clone(), Vec::new())
+        };
+        let bound = election_max() * LIVENESS_TIMEOUTS;
+        assert_eq!(
+            bound,
+            Duration::from_secs(2),
+            "the bound this case is about"
+        );
+        // Seed 2400's shape: k0 served all along, k1 asked for the first time
+        // 2.400 s after the heal and served in 24 ms. The cluster was never slow.
+        let idle = with(vec![
+            write("k0", 5, Some(30)),
+            write("k1", 2400, Some(2424)),
+        ]);
+        assert_eq!(
+            idle.writes_after_heal_by_key()[&Bytes::from_static(b"k1")],
+            Some(Duration::from_millis(24))
+        );
+        idle.liveness()
+            .expect("the client's idleness is not the cluster's");
+        // The reading it replaces would have failed this run at 2.424 s, which is
+        // what the nightly failed on six seeds of ten thousand.
+        assert!(
+            idle.history.ops.iter().any(|op| op
+                .ret
+                .expect("returned")
+                .duration_since(idle.last_heal)
+                > bound),
+            "the run this case is built from is one the old reading failed"
+        );
+        // The pair: every write that completes is quick, and the range still took
+        // 2.5 s after the heal to complete one. The per-key reading passes it.
+        let slow = with(vec![
+            write("k0", 10, None),
+            write("k0", 800, None),
+            write("k0", 2495, Some(2505)),
+        ]);
+        assert_eq!(
+            slow.writes_after_heal_by_key()[&Bytes::from_static(b"k0")],
+            Some(Duration::from_millis(10))
+        );
+        assert_eq!(
+            slow.liveness(),
+            Err(format!(
+                "liveness: range {SINGLE_GROUP} took 2.505s after the last heal to \
+                 complete a client write, over 2s"
+            ))
         );
     }
 
