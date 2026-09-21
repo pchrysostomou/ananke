@@ -1,0 +1,1968 @@
+//! The node's tasks (SHARD.md §4, §13 Q41; §11, raft 1, 2, 10, 11).
+//!
+//! Today's unit is a group: one server is one Raft group with a socket and a set of
+//! tasks of its own. The unit becomes a *node*, and this module is the two tasks that
+//! makes it one:
+//!
+//! - [`Node::raft`], one task holding every core on the node, keyed by range, driven by one
+//!   ticker. Each tick steps a `Tick` into every core; each message steps into its
+//!   range's core. A round is a tick's steps, or the messages drained since the last
+//!   round, and its order is Q41's ([`crate::round`]). Sends leave through the
+//!   per-peer [`Outbox`] the wire already has, one frame per peer per
+//!   flush.
+//! - [`apply()`], one task per node, applying every range's entries, snapshot takes and
+//!   structural batches **one at a time** (Q14). Under D-036 a take is a job between
+//!   two applies and applies wait behind the take, so one range's take stalls every
+//!   range's applies on the node; the task keeps that, and the stall is one of the
+//!   figures Stage B measures.
+//!
+//! What the tasks need of the node's disk, socket and state machine is [`Host`] and
+//! [`Applier`]. The node is the *schedule*; the host is what it drives. Splitting them
+//! is what lets a check drive the round with a host that resolves persists in an order
+//! it chooses, which is the only way to assert Q41's rule that each core's later
+//! outputs wait on *that core's own* persist.
+//!
+//! This slice runs one range, [`ananke_raft::node::SINGLE_GROUP`]. Bootstrap ranges
+//! and four ranges per node, the `snapshot` task, Q15's refusal and follower
+//! compaction are each a later slice of Stage B; nothing here assumes one range, and
+//! [`Cores`] is keyed by range throughout.
+
+use std::collections::{BTreeMap, VecDeque};
+use std::future::Future;
+use std::io;
+use std::pin::{Pin, pin};
+use std::task::{Context, Poll};
+use std::time::Duration;
+
+use ananke_env::{Clock, Decision, Either, Environment, Rng, race};
+use ananke_raft::core::SnapshotAction;
+use ananke_raft::queue::Queue;
+use ananke_raft::{Entry, Index, Input, Message, Output, Persist, ServerId};
+use bytes::Bytes;
+
+use crate::inbox::{Inbox, Received};
+use crate::outbox::Outbox;
+use crate::range::RangeId;
+use crate::round::{Act, Cores, Meters, Round};
+use crate::variant::{NodeVariant, NodeVariants};
+
+/// A future a host hands back, borrowing the host and awaited before the task takes
+/// its next step.
+pub type Boxed<'h, T> = Pin<Box<dyn Future<Output = T> + Send + 'h>>;
+
+/// What the node's `raft` task needs of the node's disk, socket and clients.
+///
+/// Every method takes `&self`: the task drives one host for the whole node, and the
+/// futures it hands back are held side by side while the round's persists share one
+/// group commit.
+pub trait Host {
+    /// Makes `range`'s state durable. The future does nothing until it is polled; the
+    /// round submits all of its persists and then polls every one of them in one pass
+    /// with no await between, so the WAL writer takes the round's records as one group
+    /// and syncs them once (wal.rs:16-20, D-018).
+    ///
+    /// It borrows nothing of the host, because the round holds several of them side
+    /// by side while it goes on stepping the cores that persisted nothing: a host
+    /// clones what the write needs — the store handle — into the future.
+    fn persist(&self, range: RangeId, persist: Persist) -> BoxedPersist;
+
+    /// Stamps a message on its way out: the clock where the lease reads it and the
+    /// store incarnation a response carries (RAFT.md §1, D-042). This is the node's
+    /// side of `send_message` in `ananke-raft`, which the node cannot do itself
+    /// because the incarnation is the store's.
+    fn stamp(&self, range: RangeId, message: &mut Message);
+
+    /// Puts one frame on the socket, addressed to `to`.
+    fn ship(&self, to: ServerId, frame: Bytes) -> Boxed<'_, ()>;
+
+    /// A read the core confirmed: serve it from the state machine and trace it
+    /// (SHARD.md §8, §11 raft 15).
+    fn read_ready(
+        &self,
+        range: RangeId,
+        id: u64,
+        index: Index,
+        lease: bool,
+    ) -> Boxed<'_, io::Result<()>>;
+
+    /// A read this server will not serve: it stopped leading first.
+    fn read_dropped(&self, range: RangeId, id: u64) -> Boxed<'_, ()>;
+
+    /// A proposal or a read refused because this server is not `range`'s leader.
+    fn rejected(&self, range: RangeId, leader: Option<ServerId>);
+
+    /// Hands the node's `apply` task a job. The host owns the queue, so that what the
+    /// node does with an `Apply` is one call in the order the round fixes: an `Apply`
+    /// handed out before its core's persist resolved would let the `apply` task make
+    /// an applied index durable above the durable log (SHARD.md §4).
+    fn apply(&self, job: ApplyJob);
+
+    /// Snapshot work for the `snapshot` task, which is a later slice's; a
+    /// [`SnapshotAction::Take`] goes to the `apply` task instead (RAFT.md §1), and the
+    /// node routes it there rather than here.
+    fn snapshot(&self, range: RangeId, action: SnapshotAction);
+
+    /// The node cannot go on: the disk failed under it. The host traces it; the task
+    /// returns the error.
+    fn failed(&self, reason: String);
+}
+
+/// What the node's `apply` task runs, one job at a time.
+pub trait Applier {
+    /// Runs one job. The task awaits it before it takes the next, whatever range the
+    /// next belongs to: that is the whole of Q14's rule, and D-036's consequence that
+    /// one range's take holds every range's applies.
+    fn run(&self, job: ApplyJob) -> Boxed<'_, ()>;
+}
+
+/// What the `apply` task does with one job.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ApplyWork {
+    /// Committed entries to apply in order.
+    Entries(Vec<Entry>),
+    /// Take a checkpoint at the applied index, between two applies (RAFT.md §1).
+    ///
+    /// D-043's *re*take — a fresh checkpoint even at the recorded index, because the
+    /// recorded one was found unusable — is the slice that reads checkpoints back, and
+    /// is one more kind of this `non_exhaustive` enum when it lands.
+    Take,
+}
+
+/// One job for the node's `apply` task, with the range it belongs to.
+///
+/// A split's or a merge's structural batch is a later stage's job kind; the rule this
+/// task keeps — one at a time, in the order queued, whatever the range — already
+/// covers it, which is why the enum is `non_exhaustive`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ApplyJob {
+    /// The range the job is for.
+    pub range: RangeId,
+    /// What to do.
+    pub work: ApplyWork,
+}
+
+/// How the node is configured.
+#[derive(Clone, Debug)]
+pub struct NodeConfig {
+    /// This server's id.
+    pub id: ServerId,
+    /// The ticker's interval: one tick steps every core on the node.
+    pub tick: Duration,
+    /// The node's known-buggy variants (CLAUDE.md's pair rule).
+    pub variants: NodeVariants,
+}
+
+/// The frames and flushes the node's rounds cost: the measurement §4 leaves to this
+/// stage (SHARD.md:490-492, §12).
+///
+/// A round flushes once before its sync, and again as each of its persists resolves.
+/// A flush at a resolution is credited to the round whose persist resolved; the
+/// replayed work's own outputs ride that flush, which is why the count is of the
+/// round's frames and not of one step's.
+// PROPOSED(D-073): a resolution's flush is credited to the round whose persist
+// resolved, and carries the replayed work's early outputs with it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Frames {
+    /// Frames shipped over the run.
+    pub frames: u64,
+    /// Flushes over the run; a flush with nothing queued ships no frame.
+    pub flushes: u64,
+    /// Rounds that submitted at least one persist.
+    pub rounds_with_persists: u64,
+    /// Rounds that submitted none.
+    pub rounds_without_persists: u64,
+    /// Rounds that put a frame on the wire *before* their sync and then persisted: the
+    /// rounds where the "1" of a round's `1 + p` frames per peer is a frame and not
+    /// only arithmetic (SHARD.md:490-492).
+    pub rounds_sending_before_their_sync: u64,
+    /// The most frames one round put on the wire toward one peer.
+    pub most_frames_to_a_peer_in_a_round: usize,
+    /// The most flushes one round took: one, plus one per persisting core.
+    pub most_flushes_in_a_round: usize,
+    /// Messages the outbox dropped over its per-peer bound (D-072).
+    pub outbox_dropped: u64,
+    /// Messages refused by the outbox because they would not fit a frame of their
+    /// own (D-072).
+    pub outbox_oversized: u64,
+}
+
+/// A round whose persists are still outstanding, and the frames it has cost so far.
+struct Open {
+    outstanding: usize,
+    frames: BTreeMap<ServerId, usize>,
+    flushes: usize,
+}
+
+/// A persist in flight: what [`Host::persist`] hands the round.
+pub type BoxedPersist = Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'static>>;
+
+/// The node: every core on it, its outbox, and what it has measured.
+pub struct Node<E: Environment, H: Host> {
+    env: E,
+    config: NodeConfig,
+    cores: Cores,
+    outbox: Outbox,
+    host: H,
+    next_round: u64,
+    open: BTreeMap<u64, Open>,
+    frames: Frames,
+}
+
+impl<E: Environment, H: Host> Node<E, H> {
+    /// A node with these cores on it, sending through `outbox` and driving `host`.
+    pub fn new(env: E, config: NodeConfig, cores: Cores, outbox: Outbox, host: H) -> Self {
+        Self {
+            env,
+            config,
+            cores,
+            outbox,
+            host,
+            next_round: 0,
+            open: BTreeMap::new(),
+            frames: Frames::default(),
+        }
+    }
+
+    /// What the node's rounds cost in frames and flushes.
+    #[must_use]
+    pub fn frames(&self) -> Frames {
+        self.frames
+    }
+
+    /// What the node measured about held work and replayed ticks.
+    #[must_use]
+    pub fn meters(&self) -> Meters {
+        self.cores.meters()
+    }
+
+    /// The cores, for a check that reads a range's state.
+    #[must_use]
+    pub fn cores(&self) -> &Cores {
+        &self.cores
+    }
+
+    /// The host, for a check that reads what the node drove it to do.
+    #[must_use]
+    pub fn host(&self) -> &H {
+        &self.host
+    }
+
+    /// Where the highest applied index handed out per range stands. It is the cores'
+    /// bookkeeping, because the entries an `Apply` names are read at the step that
+    /// named them, where the `after` has to be known ([`Cores::applied_sent`]).
+    #[must_use]
+    pub fn applied_sent(&self, range: RangeId) -> Index {
+        self.cores.applied_sent(range)
+    }
+
+    /// The `raft` task (SHARD.md §4): one ticker, every core, Q41's round.
+    ///
+    /// The loop takes whichever comes first of a message on the inbox, the ticker, and
+    /// one of the outstanding persists resolving. It never waits on a persist: while a
+    /// sync is outstanding the task goes on stepping the cores that persisted nothing,
+    /// so a later round's persists can be submitted behind it (SHARD.md §4, the loaded
+    /// case).
+    ///
+    /// # Errors
+    ///
+    /// The first persist that fails: a node whose disk failed under it cannot go on.
+    pub async fn raft(&mut self, inbox: &Inbox) -> io::Result<()> {
+        let mut persists = Persists::default();
+        let mut next_tick = self.env.clock().now() + self.config.tick;
+        loop {
+            let event = {
+                let pop = pin!(inbox.pop());
+                let timer = pin!(self.env.clock().sleep_until(next_tick));
+                let arrived = pin!(race(&self.env, pop, timer));
+                let resolved = pin!(persists.next(&self.env));
+                match race(&self.env, arrived, resolved).await {
+                    Either::Left(Either::Left(Some(first))) => Event::Messages(first),
+                    Either::Left(Either::Left(None)) => return Ok(()),
+                    Either::Left(Either::Right(())) => {
+                        next_tick += self.config.tick;
+                        Event::Tick
+                    }
+                    Either::Right(resolved) => Event::Resolved(resolved),
+                }
+            };
+            let round = match event {
+                // A round is a tick's steps, ...
+                Event::Tick => self.cores.tick(&self.env),
+                // ... or the messages drained since the last round: the one that woke
+                // the task and everything queued behind it now.
+                Event::Messages(first) => {
+                    let mut drained = vec![received(&self.env, first)];
+                    while let Some(next) = inbox.take() {
+                        drained.push(received(&self.env, next));
+                    }
+                    self.cores.messages(&self.env, drained)
+                }
+                Event::Resolved(Resolved {
+                    range,
+                    round,
+                    result,
+                }) => {
+                    if let Err(error) = result {
+                        self.host.failed(error.to_string());
+                        return Err(error);
+                    }
+                    // The core's later outputs, then the work held while its persist
+                    // was outstanding: the flush that follows is this round's.
+                    let resolved = self.cores.resolved(&self.env, range);
+                    self.drive(resolved, Some(round), &mut persists).await?;
+                    inbox.hold_at(self.cores.held_bytes());
+                    continue;
+                }
+            };
+            self.drive(round, None, &mut persists).await?;
+            // A message held for a core whose persist is outstanding was taken from
+            // the inbox and is still counted against the node's byte bound (Q14).
+            inbox.hold_at(self.cores.held_bytes());
+        }
+    }
+
+    /// Runs a round and everything it sets off, without recursion: a round whose
+    /// persists are awaited one at a time (the variant) queues the resolutions it
+    /// produces behind it.
+    async fn drive(
+        &mut self,
+        first: Round,
+        credit: Option<u64>,
+        persists: &mut Persists,
+    ) -> io::Result<()> {
+        let mut queue = VecDeque::from([(first, credit)]);
+        while let Some((round, credit)) = queue.pop_front() {
+            if round.is_empty() && credit.is_none() {
+                continue;
+            }
+            let sends_early = round.sends_early();
+            for act in round.early {
+                self.act(act).await?;
+            }
+            // The round's flush: before the round's sync when the round is its own,
+            // and the later flush of the core whose persist resolved when it is a
+            // resolution's.
+            let frames = self.flush().await;
+            match credit {
+                Some(id) => self.credit(id, &frames),
+                None if round.persists.is_empty() => {
+                    self.frames.rounds_without_persists += 1;
+                    self.fold(&frames, 1);
+                }
+                None => {}
+            }
+            if round.persists.is_empty() {
+                continue;
+            }
+            let id = self.next_round;
+            self.next_round += 1;
+            self.frames.rounds_with_persists += 1;
+            if sends_early && credit.is_none() {
+                self.frames.rounds_sending_before_their_sync += 1;
+            }
+            self.open.insert(
+                id,
+                Open {
+                    outstanding: round.persists.len(),
+                    frames: if credit.is_none() {
+                        frames
+                    } else {
+                        BTreeMap::new()
+                    },
+                    flushes: usize::from(credit.is_none()),
+                },
+            );
+            if self
+                .config
+                .variants
+                .contains(NodeVariant::PersistsOneAtATime)
+            {
+                // The variant: each persist pays a sync of its own, awaited here,
+                // rather than joining the round's group.
+                for submission in round.persists {
+                    let range = submission.range;
+                    if let Err(error) = self.host.persist(range, submission.persist).await {
+                        self.host.failed(error.to_string());
+                        return Err(error);
+                    }
+                    let resolved = self.cores.resolved(&self.env, range);
+                    queue.push_back((resolved, Some(id)));
+                }
+                continue;
+            }
+            // Submitted together, then armed in one pass with no await between them,
+            // so the WAL writer takes the round's records as one group and syncs them
+            // once — and never splits a round across two groups.
+            for submission in round.persists {
+                let range = submission.range;
+                let future = self.host.persist(range, submission.persist);
+                persists.submit(range, id, future);
+            }
+            if !self.config.variants.contains(NodeVariant::PersistsNotArmed) {
+                persists.arm().await;
+            }
+        }
+        Ok(())
+    }
+
+    /// One output of one core.
+    async fn act(&mut self, act: Act) -> io::Result<()> {
+        let Act {
+            range,
+            stamps,
+            output,
+            entries,
+        } = act;
+        match output {
+            Output::Persist(_) => {
+                debug_assert!(false, "a persist is submitted, never executed in order");
+            }
+            Output::Send { to, mut message } => {
+                self.host.stamp(range, &mut message);
+                let frame = ananke_raft::Frame {
+                    from: self.config.id,
+                    message,
+                };
+                // PROPOSED(D-073): the outbox's drops are counted here and not yet
+                // traced. `TraceEvent` has no kind for them; adding one belongs with
+                // the slice that puts the node under the sweeps, where the pinned
+                // trace hashes move anyway and the event can be seen to fire.
+                match self.outbox.push(to, range, &frame) {
+                    Ok(dropped) => self.frames.outbox_dropped += dropped.len() as u64,
+                    // A message that cannot fit a frame of its own is the wire's own
+                    // refusal (D-072): it is dropped, never cut.
+                    Err(_) => self.frames.outbox_oversized += 1,
+                }
+            }
+            Output::Apply { through } => {
+                // The entries were read from the core at the step that asked for the
+                // apply, not here: by now the replay may have stepped that core past a
+                // compaction, and `entry(..)` would answer for a log the `Apply` was
+                // never about (SHARD.md §4).
+                let entries = match entries {
+                    Some(Ok(entries)) => entries,
+                    // A gap in the applied stream: the core did not hold an index its
+                    // own `Apply` named. Passing over it would hand the state machine a
+                    // job with a hole in it and advance the node's applied index past
+                    // the hole; the node fails instead.
+                    Some(Err(index)) => {
+                        let reason = format!(
+                            "range {range:?}: an apply through {through} names index                              {index}, which the core does not hold"
+                        );
+                        self.host.failed(reason.clone());
+                        return Err(io::Error::other(reason));
+                    }
+                    None => {
+                        debug_assert!(false, "an apply carries the entries it names");
+                        return Ok(());
+                    }
+                };
+                if entries.is_empty() {
+                    return Ok(());
+                }
+                self.host.apply(ApplyJob {
+                    range,
+                    work: ApplyWork::Entries(entries),
+                });
+            }
+            Output::Rejected { leader } => self.host.rejected(range, leader),
+            Output::ReadReady { id, index, lease } => {
+                if let Err(error) = self.host.read_ready(range, id, index, lease).await {
+                    self.host.failed(error.to_string());
+                    return Err(error);
+                }
+            }
+            Output::ReadDropped { id } => self.host.read_dropped(range, id).await,
+            // A take is the `apply` task's, between two applies (RAFT.md §1): that is
+            // what makes D-036's consequence hold, that one range's take stalls every
+            // range's applies on the node.
+            Output::Snapshot(SnapshotAction::Take) => {
+                if self
+                    .config
+                    .variants
+                    .contains(NodeVariant::TakeToSnapshotTask)
+                {
+                    // The variant: the take goes to the `snapshot` task, so it no
+                    // longer runs between two applies.
+                    self.host.snapshot(range, SnapshotAction::Take);
+                } else {
+                    self.host.apply(ApplyJob {
+                        range,
+                        work: ApplyWork::Take,
+                    });
+                }
+            }
+            Output::Snapshot(action) => self.host.snapshot(range, action),
+            // D-047: decided at the step, traced now, which is when it is durable for
+            // every event that followed a persist.
+            Output::Trace(mut event) => {
+                if let ananke_env::TraceEvent::RaftTerm { received: at, .. } = &mut event {
+                    *at = stamps.received;
+                }
+                self.env.trace_decided(stamps.decided, event);
+            }
+        }
+        Ok(())
+    }
+
+    /// One flush of the outbox: one frame per peer with something queued.
+    async fn flush(&mut self) -> BTreeMap<ServerId, usize> {
+        let frames = self.outbox.flush();
+        let mut per_peer: BTreeMap<ServerId, usize> = BTreeMap::new();
+        for (to, frame) in frames {
+            *per_peer.entry(to).or_default() += 1;
+            self.frames.frames += 1;
+            self.host.ship(to, frame).await;
+        }
+        self.frames.flushes += 1;
+        per_peer
+    }
+
+    /// One of round `id`'s persists resolved: add what its later flush cost, and fold
+    /// the round into the measurements once the last of its persists has resolved.
+    fn credit(&mut self, id: u64, frames: &BTreeMap<ServerId, usize>) {
+        let done = {
+            let Some(open) = self.open.get_mut(&id) else {
+                return;
+            };
+            open.outstanding = open.outstanding.saturating_sub(1);
+            open.flushes += 1;
+            for (to, count) in frames {
+                *open.frames.entry(*to).or_default() += count;
+            }
+            open.outstanding == 0
+        };
+        if done && let Some(open) = self.open.remove(&id) {
+            self.fold(&open.frames, open.flushes);
+        }
+    }
+
+    /// Records a finished round's frames and flushes.
+    fn fold(&mut self, frames: &BTreeMap<ServerId, usize>, flushes: usize) {
+        let most = frames.values().copied().max().unwrap_or(0);
+        self.frames.most_frames_to_a_peer_in_a_round =
+            self.frames.most_frames_to_a_peer_in_a_round.max(most);
+        self.frames.most_flushes_in_a_round = self.frames.most_flushes_in_a_round.max(flushes);
+    }
+}
+
+/// What woke the `raft` task.
+enum Event {
+    /// The ticker.
+    Tick,
+    /// A message, and whatever is queued behind it.
+    Messages(Received),
+    /// A persist resolved.
+    Resolved(Resolved),
+}
+
+/// One message from the inbox as the round takes it.
+fn received<E: Environment>(
+    env: &E,
+    message: Received,
+) -> (RangeId, Input, Option<Decision>, usize) {
+    // PROPOSED(D-050): when the frame reached the node, for the term change the step
+    // may trace. The inbox does not carry the stamp yet, so the node takes one as it
+    // hands the message to its core; the wire's stamp is the wire slice's to add.
+    // PROPOSED(D-073): the receipt is taken here until the inbox carries the `net`
+    // task's.
+    let at = env.decision();
+    let bytes = message.bytes;
+    (
+        message.range,
+        Input::Message {
+            from: message.from,
+            message: message.message,
+            now: now_nanos(env),
+        },
+        Some(at),
+        bytes,
+    )
+}
+
+/// The node's clock in nanoseconds, where the core's lease arithmetic reads it: the
+/// same figure `send_message` and the one-group server's loop read (node.rs:152-155).
+fn now_nanos<E: Environment>(env: &E) -> u64 {
+    env.clock().now().as_nanos()
+}
+
+/// The `apply` task (SHARD.md §4, Q14): every range's jobs, one at a time.
+///
+/// One task per node, and no more: if applying is too slow, several ranges' ready
+/// applies are grouped into one synced batch *inside* this task, never into more
+/// tasks. The grouping is built only if the measured apply lag asks for it
+/// (SHARD.md §12), so this is the ungrouped task.
+pub async fn apply<A: Applier>(jobs: &Queue<ApplyJob>, applier: &A) {
+    while let Some(job) = jobs.pop().await {
+        applier.run(job).await;
+    }
+}
+
+/// The persists a round submitted together, resolved as each core's own resolves.
+///
+/// The futures are held side by side and every one of them is polled in one
+/// synchronous pass, with no await between, by [`arm`](Persists::arm) as the round
+/// submits them and by [`next`](Persists::next) on every poll. So a round's records
+/// reach the WAL writer together and are never split across two of its groups, and
+/// the writer syncs them once (wal.rs:16-20, D-018). A round submitted while an
+/// earlier sync is outstanding joins the group that sync's records did not take,
+/// which is what §4's loaded case describes (SHARD.md:519-533).
+///
+/// Which of several *ready* persists is reported first is drawn from the environment's
+/// scheduling stream, as [`race`] draws it: a fixed order would let one range's
+/// persists always be seen before another's, and the round's whole point is that no
+/// core waits on another's disk.
+// PROPOSED(D-073): the order several ready persists resolve in is the scheduling
+// stream's, not the range order.
+#[derive(Default)]
+pub struct Persists {
+    outstanding: Vec<Outstanding>,
+    /// Persists that resolved during a poll and have not been reported yet.
+    ready: VecDeque<Resolved>,
+}
+
+struct Outstanding {
+    range: RangeId,
+    round: u64,
+    future: BoxedPersist,
+}
+
+/// A persist that resolved.
+pub struct Resolved {
+    /// Whose it was.
+    pub range: RangeId,
+    /// The round that submitted it.
+    pub round: u64,
+    /// What the disk said.
+    pub result: io::Result<()>,
+}
+
+impl Persists {
+    /// Adds a persist to the outstanding set. It is not polled here: the round submits
+    /// all of its persists and then arms them in one pass, which is what puts its
+    /// records in one group.
+    pub fn submit(&mut self, range: RangeId, round: u64, future: BoxedPersist) {
+        self.outstanding.push(Outstanding {
+            range,
+            round,
+            future,
+        });
+    }
+
+    /// Polls every outstanding persist once, with the task's own waker, and resolves
+    /// at once: what the round awaits after submitting, so its records are enqueued
+    /// with the WAL writer before the task awaits anything that could let the writer
+    /// close a group without them.
+    pub fn arm(&mut self) -> Arm<'_> {
+        Arm(self)
+    }
+
+    /// How many persists are outstanding, the ones that resolved and are waiting to be
+    /// reported included.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.outstanding.len() + self.ready.len()
+    }
+
+    /// Whether none is.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Resolves with the next persist to resolve; pending for ever while none is
+    /// outstanding, so a task can race it against its inbox and its ticker.
+    pub fn next<'a, E: Environment>(&'a mut self, env: &'a E) -> Next<'a, E> {
+        Next { set: self, env }
+    }
+
+    /// Polls every outstanding persist once, in one pass with no await between, and
+    /// moves the ones that resolved to `ready`.
+    fn poll_all(&mut self, cx: &mut Context<'_>) {
+        let mut index = 0;
+        while index < self.outstanding.len() {
+            if let Poll::Ready(result) = self.outstanding[index].future.as_mut().poll(cx) {
+                let outstanding = self.outstanding.remove(index);
+                self.ready.push_back(Resolved {
+                    range: outstanding.range,
+                    round: outstanding.round,
+                    result,
+                });
+                continue;
+            }
+            index += 1;
+        }
+    }
+
+    /// One of the persists that have resolved, drawn from the scheduling stream where
+    /// there is more than one to choose from.
+    fn take_ready<E: Environment>(&mut self, env: &E) -> Option<Resolved> {
+        let len = self.ready.len();
+        if len == 0 {
+            return None;
+        }
+        // One draw only where there is a choice to make, so a node with one range
+        // draws nothing and its schedule is the one-group server's.
+        let index = if len > 1 {
+            usize::try_from(env.sched_rng().next_u64() % len as u64).unwrap_or(0)
+        } else {
+            0
+        };
+        self.ready.remove(index)
+    }
+}
+
+/// See [`Persists::arm`].
+#[must_use = "futures do nothing unless polled"]
+pub struct Arm<'a>(&'a mut Persists);
+
+impl Future for Arm<'_> {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.get_mut().0.poll_all(cx);
+        Poll::Ready(())
+    }
+}
+
+/// See [`Persists::next`].
+#[must_use = "futures do nothing unless polled"]
+pub struct Next<'a, E: Environment> {
+    set: &'a mut Persists,
+    env: &'a E,
+}
+
+impl<E: Environment> Future for Next<'_, E> {
+    type Output = Resolved;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        this.set.poll_all(cx);
+        match this.set.take_ready(this.env) {
+            Some(resolved) => Poll::Ready(resolved),
+            None => Poll::Pending,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use ananke_env::sim::{Sim, SimConfig, SimEnv};
+    use ananke_raft::message::Message;
+    use ananke_raft::types::{Configuration, Entry, Payload};
+    use ananke_raft::{Raft, RaftConfig};
+
+    use super::*;
+    use crate::frame::decode;
+    use crate::round::Stamps;
+
+    const R1: RangeId = RangeId(1);
+    const R2: RangeId = RangeId(2);
+    const ME: ServerId = ServerId(1);
+    const LEADER: ServerId = ServerId(2);
+    const TICK: Duration = Duration::from_millis(10);
+
+    /// What the node drove the host to do, in the order it did it. The log is the
+    /// whole oracle: Q41's round is an *order*, so a check of it is a check of this
+    /// list.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum Note {
+        /// A persist was polled for the first time: when it reached the WAL writer,
+        /// and so which persists share a group.
+        Submitted(RangeId),
+        /// A persist resolved.
+        Persisted(RangeId),
+        /// A frame left for a peer, carrying these ranges' messages.
+        Shipped(ServerId, Vec<RangeId>),
+        /// A job for the `apply` task, and **what the job carries**: the applied
+        /// stream is only checkable if the check can see the indices, which is what
+        /// tells re-applying the whole log from a job that partitions it.
+        Applied(RangeId, Job),
+        /// Work for the `snapshot` task.
+        Snapshotted(RangeId, &'static str),
+        /// A read the core confirmed.
+        ReadReady(RangeId, u64),
+        /// A read this server will not serve.
+        ReadDropped(RangeId, u64),
+        /// A proposal or a read refused: this server does not lead the range.
+        Rejected(RangeId),
+    }
+
+    /// What one [`Note::Applied`] carries.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum Job {
+        /// The indices of the entries, in the order the job carries them.
+        Entries(Vec<Index>),
+        /// A checkpoint, between two applies.
+        Take,
+    }
+
+    impl Job {
+        fn of(work: &ApplyWork) -> Self {
+            match work {
+                ApplyWork::Entries(entries) => {
+                    Job::Entries(entries.iter().map(|entry| entry.index).collect())
+                }
+                ApplyWork::Take => Job::Take,
+            }
+        }
+    }
+
+    /// What a message is, for a check that asks what left the node rather than only
+    /// how many frames did.
+    fn kind(message: &Message) -> &'static str {
+        match message {
+            Message::PreVote { .. } => "pre-vote",
+            Message::PreVoteResponse { .. } => "pre-vote-response",
+            Message::RequestVote { .. } => "request-vote",
+            Message::RequestVoteResponse { .. } => "request-vote-response",
+            Message::AppendEntries { entries, .. } if entries.is_empty() => "heartbeat",
+            Message::AppendEntries { .. } => "append",
+            Message::AppendEntriesResponse { .. } => "append-response",
+            Message::TimeoutNow { .. } => "timeout-now",
+            _ => "other",
+        }
+    }
+
+    /// A host whose persists take a time chosen per range, and which writes down
+    /// everything the node asks of it.
+    struct Probe {
+        env: SimEnv,
+        log: Arc<Mutex<Vec<Note>>>,
+        /// Every message that left the node, by range and kind, in order.
+        sent: Arc<Mutex<Vec<(RangeId, &'static str)>>>,
+        delays: BTreeMap<RangeId, Duration>,
+        /// How long the socket takes a frame: zero unless a check needs the node's
+        /// loop to come back round with something else already due.
+        ship: Duration,
+    }
+
+    impl Probe {
+        fn new(env: &SimEnv, delays: &[(RangeId, Duration)]) -> Self {
+            Self {
+                env: env.clone(),
+                log: Arc::new(Mutex::new(Vec::new())),
+                sent: Arc::default(),
+                delays: delays.iter().copied().collect(),
+                ship: Duration::ZERO,
+            }
+        }
+
+        fn note(&self, note: Note) {
+            self.log.lock().expect("the log").push(note);
+        }
+    }
+
+    impl Host for Probe {
+        fn persist(&self, range: RangeId, _persist: Persist) -> BoxedPersist {
+            let env = self.env.clone();
+            let log = self.log.clone();
+            let delay = self.delays.get(&range).copied().unwrap_or(TICK);
+            Box::pin(async move {
+                log.lock().expect("the log").push(Note::Submitted(range));
+                env.clock().sleep(delay).await;
+                log.lock().expect("the log").push(Note::Persisted(range));
+                Ok(())
+            })
+        }
+
+        fn stamp(&self, _range: RangeId, _message: &mut Message) {}
+
+        fn ship(&self, to: ServerId, frame: Bytes) -> Boxed<'_, ()> {
+            let decoded = decode(&frame).expect("the node's own frame decodes");
+            let ranges = decoded.messages.iter().map(|tagged| tagged.range).collect();
+            self.sent.lock().expect("the sent log").extend(
+                decoded
+                    .messages
+                    .iter()
+                    .map(|tagged| (tagged.range, kind(&tagged.frame.message))),
+            );
+            self.note(Note::Shipped(to, ranges));
+            let env = self.env.clone();
+            let ship = self.ship;
+            Box::pin(async move {
+                if !ship.is_zero() {
+                    env.clock().sleep(ship).await;
+                }
+            })
+        }
+
+        fn read_ready(
+            &self,
+            range: RangeId,
+            id: u64,
+            _index: Index,
+            _lease: bool,
+        ) -> Boxed<'_, io::Result<()>> {
+            self.note(Note::ReadReady(range, id));
+            Box::pin(async { Ok(()) })
+        }
+
+        fn read_dropped(&self, range: RangeId, id: u64) -> Boxed<'_, ()> {
+            self.note(Note::ReadDropped(range, id));
+            Box::pin(async {})
+        }
+
+        fn rejected(&self, range: RangeId, _leader: Option<ServerId>) {
+            self.note(Note::Rejected(range));
+        }
+
+        fn apply(&self, job: ApplyJob) {
+            self.note(Note::Applied(job.range, Job::of(&job.work)));
+        }
+
+        fn snapshot(&self, range: RangeId, action: SnapshotAction) {
+            let what = match action {
+                SnapshotAction::Take => "take",
+                _ => "stream",
+            };
+            self.note(Note::Snapshotted(range, what));
+        }
+
+        fn failed(&self, reason: String) {
+            panic!("the node failed: {reason}");
+        }
+    }
+
+    fn core(range: RangeId) -> Raft {
+        core_with(range, RaftConfig::default())
+    }
+
+    fn core_with(range: RangeId, config: RaftConfig) -> Raft {
+        let config = RaftConfig {
+            range: range.get(),
+            ..config
+        };
+        Raft::new(ME, Configuration::of(&[ME, LEADER, ServerId(3)]), config, 7)
+    }
+
+    /// The node's usual two followers.
+    fn two_followers() -> Vec<(RangeId, Raft)> {
+        vec![(R1, core(R1)), (R2, core(R2))]
+    }
+
+    /// r2 campaigns on the first tick it takes: a node whose loop comes back round
+    /// with a tick already due then has something to *do* with it that the host can
+    /// see.
+    fn r2_campaigns_at_once() -> Vec<(RangeId, Raft)> {
+        let quick = RaftConfig {
+            election_ticks: (1, 2),
+            ..RaftConfig::default()
+        };
+        vec![(R1, core(R1)), (R2, core_with(R2, quick))]
+    }
+
+    /// r1 with an election timeout of four ticks, so that a replay of the ticks it
+    /// missed behind a slow sync is *seen* in its timer and not only counted.
+    fn quick_to_campaign() -> Vec<(RangeId, Raft)> {
+        let config = RaftConfig {
+            election_ticks: (4, 5),
+            ..RaftConfig::default()
+        };
+        vec![(R1, core_with(R1, config)), (R2, core(R2))]
+    }
+
+    /// An AppendEntries carrying one entry: a follower that takes it appends, so its
+    /// step asks for a `Persist` and answers after it (RAFT.md §3).
+    fn append(index: Index, term: u64) -> Message {
+        Message::AppendEntries {
+            term,
+            prev_index: index - 1,
+            prev_term: if index > 1 { term } else { 0 },
+            entries: vec![Entry {
+                index,
+                term,
+                payload: Payload::Command(Bytes::from_static(b"x")),
+            }],
+            commit: 0,
+            sent: 0,
+        }
+    }
+
+    fn arrival(range: RangeId, message: Message) -> Received {
+        Received {
+            range,
+            from: LEADER,
+            message,
+            bytes: 64,
+        }
+    }
+
+    /// What one run of the node produced: its log, and what it measured once its
+    /// inbox closed.
+    struct Run {
+        log: Vec<Note>,
+        /// Every message that left, by range and kind, in order.
+        sent: Vec<(RangeId, &'static str)>,
+        meters: Meters,
+        frames: Frames,
+        held_bytes_seen: usize,
+        /// The most the inbox ever charged against the bound: the queue and what the
+        /// node holds together.
+        charged_most: usize,
+        /// Whether each of the setup's fed arrivals was admitted, in order.
+        fed: Vec<bool>,
+    }
+
+    /// How a run is set up. [`run`] is the usual one: two followers, a bound no check
+    /// reaches, and every arrival admitted before the node starts.
+    struct Setup<'a> {
+        variants: NodeVariants,
+        /// The node's byte bound.
+        bound: usize,
+        /// The cores the node starts with.
+        cores: fn() -> Vec<(RangeId, Raft)>,
+        /// How long each range's persists take.
+        delays: &'a [(RangeId, Duration)],
+        /// Admitted before the node starts.
+        arrivals: &'a [Received],
+        /// Admitted while the node runs, at these offsets from the start: what it
+        /// takes to reach the bound, which only a node that is already holding
+        /// something can be at.
+        feed: &'a [(Duration, Received)],
+        duration: Duration,
+        /// How long the socket takes a frame.
+        ship: Duration,
+        /// The simulation's seed, which is also the scheduling stream's.
+        seed: u64,
+    }
+
+    impl<'a> Setup<'a> {
+        fn new(variants: NodeVariants, delays: &'a [(RangeId, Duration)]) -> Self {
+            Self {
+                variants,
+                bound: 4096,
+                cores: two_followers,
+                delays,
+                arrivals: &[],
+                feed: &[],
+                duration: Duration::from_millis(80),
+                ship: Duration::ZERO,
+                seed: 11,
+            }
+        }
+    }
+
+    /// Runs a node for `duration`, then closes its inbox and takes its measurements.
+    fn run_with(setup: Setup<'_>) -> Run {
+        let variants = setup.variants;
+        let mut sim = Sim::new(SimConfig::new(setup.seed));
+        let id = sim.add_node();
+        let env = sim.env(id);
+        let mut probe = Probe::new(&env, setup.delays);
+        probe.ship = setup.ship;
+        let log = probe.log.clone();
+        let sent = probe.sent.clone();
+        let inbox = Inbox::new(setup.bound);
+        let mut cores = Cores::new(variants);
+        for (range, core) in (setup.cores)() {
+            cores.insert(range, core);
+        }
+        let mut node = Node::new(
+            env.clone(),
+            NodeConfig {
+                id: ME,
+                tick: TICK,
+                variants,
+            },
+            cores,
+            Outbox::new(),
+            probe,
+        );
+        for arrival in setup.arrivals {
+            assert!(inbox.admit(arrival.clone()).is_admitted());
+        }
+        let taken: Arc<Mutex<Option<(Meters, Frames)>>> = Arc::default();
+        env.clone().spawn("raft", {
+            let inbox = inbox.clone();
+            let taken = taken.clone();
+            async move {
+                let _ = node.raft(&inbox).await;
+                *taken.lock().expect("the cell") = Some((node.meters(), node.frames()));
+            }
+        });
+        let mut held_bytes_seen = 0;
+        let mut charged_most = 0;
+        let mut fed = Vec::new();
+        let mut next = 0;
+        let step = Duration::from_millis(1);
+        let mut elapsed = Duration::ZERO;
+        while elapsed < setup.duration {
+            while next < setup.feed.len() && setup.feed[next].0 <= elapsed {
+                fed.push(inbox.admit(setup.feed[next].1.clone()).is_admitted());
+                next += 1;
+            }
+            sim.run_for(step);
+            elapsed += step;
+            held_bytes_seen = held_bytes_seen.max(inbox.held_bytes());
+            charged_most = charged_most.max(inbox.charged_bytes());
+        }
+        inbox.close();
+        // Long enough for the task to see the closed inbox through whatever it is in
+        // the middle of, however slow the socket this check gave it.
+        sim.run_for(TICK * 4 + setup.ship * 60);
+        let (meters, frames) = taken.lock().expect("the cell").expect("the node stopped");
+        Run {
+            log: log.lock().expect("the log").clone(),
+            sent: sent.lock().expect("the sent log").clone(),
+            meters,
+            frames,
+            held_bytes_seen,
+            charged_most,
+            fed,
+        }
+    }
+
+    /// The usual run: two followers, arrivals admitted before the node starts.
+    fn run(
+        variants: NodeVariants,
+        delays: &[(RangeId, Duration)],
+        arrivals: &[Received],
+        duration: Duration,
+    ) -> Run {
+        run_with(Setup {
+            arrivals,
+            duration,
+            ..Setup::new(variants, delays)
+        })
+    }
+
+    fn position(log: &[Note], note: &Note) -> usize {
+        log.iter()
+            .position(|seen| seen == note)
+            .unwrap_or_else(|| panic!("{note:?} is not in {log:?}"))
+    }
+
+    /// Where the first note the predicate accepts is.
+    fn find(log: &[Note], what: &str, pred: impl Fn(&Note) -> bool) -> usize {
+        log.iter()
+            .position(pred)
+            .unwrap_or_else(|| panic!("no {what} in {log:?}"))
+    }
+
+    /// A pre-vote, which a core answers **without persisting**: the term is not
+    /// started and nothing of it is durable (thesis §9.6). It is how a round gets an
+    /// output before its sync.
+    fn prevote(range: RangeId) -> Received {
+        Received {
+            range,
+            from: LEADER,
+            message: Message::PreVote {
+                term: 1,
+                last_index: 0,
+                last_term: 0,
+            },
+            bytes: 64,
+        }
+    }
+
+    /// Q41's round, the whole of it, on two cores that both persist: nothing a core
+    /// produced after its `Persist` leaves before that core's own persist resolves,
+    /// and a core whose disk is quick does not wait for a core whose disk is slow.
+    ///
+    /// The pair (CLAUDE.md:52-57): `DeferredFlushedEarly` is the node that treats a
+    /// core's later outputs as the round's early ones, and this check catches it —
+    /// the frame leaves before either persist resolved.
+    #[test]
+    fn a_cores_later_outputs_wait_on_its_own_persist_and_on_no_others() {
+        let arrivals = [arrival(R1, append(1, 1)), arrival(R2, append(1, 1))];
+        let delays = [
+            (R1, Duration::from_millis(40)),
+            (R2, Duration::from_millis(5)),
+        ];
+        let correct = run(
+            NodeVariants::correct(),
+            &delays,
+            &arrivals,
+            Duration::from_millis(120),
+        );
+        // Both cores persisted, so the round's early flush had nothing to send: the
+        // first frame of the run is r2's response, after r2's persist resolved.
+        let first_ship = correct
+            .log
+            .iter()
+            .position(|note| matches!(note, Note::Shipped(..)))
+            .expect("a response leaves");
+        assert!(
+            first_ship > position(&correct.log, &Note::Persisted(R2)),
+            "a send after a core's persist left before it: {:?}",
+            correct.log
+        );
+        assert_eq!(
+            correct.log[first_ship],
+            Note::Shipped(LEADER, vec![R2]),
+            "the quick core's response is the first frame: {:?}",
+            correct.log
+        );
+        // And it left before the slow core's persist resolved: no core waits on
+        // another core's disk.
+        assert!(
+            first_ship < position(&correct.log, &Note::Persisted(R1)),
+            "the quick core waited on the slow one: {:?}",
+            correct.log
+        );
+        assert!(
+            position(&correct.log, &Note::Shipped(LEADER, vec![R1]))
+                > position(&correct.log, &Note::Persisted(R1)),
+            "the slow core's response left before its persist: {:?}",
+            correct.log
+        );
+
+        let buggy = run(
+            NodeVariants::correct().with(NodeVariant::DeferredFlushedEarly),
+            &delays,
+            &arrivals,
+            Duration::from_millis(120),
+        );
+        let first_ship = buggy
+            .log
+            .iter()
+            .position(|note| matches!(note, Note::Shipped(..)))
+            .expect("a response leaves");
+        assert!(
+            first_ship < position(&buggy.log, &Note::Persisted(R2)),
+            "the variant is meant to send before the persist resolves: {:?}",
+            buggy.log
+        );
+    }
+
+    /// The round's persists are submitted together, so the WAL writer's group commit
+    /// syncs them once: every persist of the round reaches the writer before any of
+    /// them resolves.
+    ///
+    /// The pair: `PersistsOneAtATime` submits the second only once the first has
+    /// resolved, and this check catches it.
+    #[test]
+    fn a_rounds_persists_are_submitted_together() {
+        let arrivals = [arrival(R1, append(1, 1)), arrival(R2, append(1, 1))];
+        let delays = [
+            (R1, Duration::from_millis(20)),
+            (R2, Duration::from_millis(20)),
+        ];
+        let correct = run(
+            NodeVariants::correct(),
+            &delays,
+            &arrivals,
+            Duration::from_millis(80),
+        );
+        let first_resolution = correct
+            .log
+            .iter()
+            .position(|note| matches!(note, Note::Persisted(_)))
+            .expect("a persist resolves");
+        let (first, second) = (
+            position(&correct.log, &Note::Submitted(R1)),
+            position(&correct.log, &Note::Submitted(R2)),
+        );
+        assert!(
+            first < first_resolution && second < first_resolution,
+            "the round's persists did not reach the writer as one group: {:?}",
+            correct.log
+        );
+        assert_eq!(
+            second,
+            first + 1,
+            "the round's persists reach the writer in one pass, with nothing between \
+             them that could let the writer close a group: {:?}",
+            correct.log
+        );
+
+        let buggy = run(
+            NodeVariants::correct().with(NodeVariant::PersistsOneAtATime),
+            &delays,
+            &arrivals,
+            Duration::from_millis(80),
+        );
+        let first_resolution = buggy
+            .log
+            .iter()
+            .position(|note| matches!(note, Note::Persisted(_)))
+            .expect("a persist resolves");
+        assert!(
+            position(&buggy.log, &Note::Submitted(R2)) > first_resolution,
+            "the variant is meant to submit the second persist after the first \
+             resolved: {:?}",
+            buggy.log
+        );
+    }
+
+    /// A core whose persist is outstanding steps nothing, and every tick it missed is
+    /// stepped when the persist resolves — none collapsed (SHARD.md §4).
+    ///
+    /// The pair: `CollapseHeldTicks` replays one tick for all of them, and
+    /// `StepWhilePersisting` steps the core while its persist is outstanding so it
+    /// holds nothing at all. The same check catches both.
+    #[test]
+    fn every_tick_a_core_missed_is_stepped_when_its_persist_resolves() {
+        // r1's persist outlasts three of the node's ticks; r2's resolves at once.
+        let delays = [
+            (R1, Duration::from_millis(35)),
+            (R2, Duration::from_millis(1)),
+        ];
+        let arrivals = [arrival(R1, append(1, 1))];
+        let correct = run(
+            NodeVariants::correct(),
+            &delays,
+            &arrivals,
+            Duration::from_millis(80),
+        );
+        assert_eq!(
+            correct.meters.ticks_replayed_most, 3,
+            "a 35 ms persist spans three 10 ms ticks, every one of them stepped: \
+             {:?}",
+            correct.meters
+        );
+        assert_eq!(correct.meters.cores_held_most, 1);
+
+        let collapsed = run(
+            NodeVariants::correct().with(NodeVariant::CollapseHeldTicks),
+            &delays,
+            &arrivals,
+            Duration::from_millis(80),
+        );
+        assert_eq!(
+            collapsed.meters.ticks_replayed_most, 1,
+            "the variant is meant to collapse the missed ticks into one: {:?}",
+            collapsed.meters
+        );
+
+        let stepped = run(
+            NodeVariants::correct().with(NodeVariant::StepWhilePersisting),
+            &delays,
+            &arrivals,
+            Duration::from_millis(80),
+        );
+        assert_eq!(
+            stepped.meters.ticks_replayed_most, 0,
+            "the variant is meant to step the core rather than hold its ticks: {:?}",
+            stepped.meters
+        );
+        assert_eq!(stepped.meters.held_most, 0);
+    }
+
+    /// And the ticks reach the *core*: a follower behind a slow sync is as many ticks
+    /// closer to its election timeout when the sync resolves as the sync cost it.
+    ///
+    /// The counter above says how many entries the replay popped; this says what they
+    /// did. It is the point of the rule — a core behind a slow sync must not have its
+    /// election and heartbeat timers run slow — and the arithmetic §4 leans on, that a
+    /// sync past the election timeout starts an election.
+    ///
+    /// The pair: `CollapseHeldTicks` replays one tick for all of them, so the
+    /// follower's timer is short by the whole sync and it does not campaign; a node
+    /// that popped the held tick without stepping it into the core would not either.
+    #[test]
+    fn the_ticks_a_core_missed_reach_its_timer_and_not_only_its_counter() {
+        // r1 campaigns after four ticks of silence, and its sync spans six of them:
+        // the replay must take it past its election timeout at the resolution.
+        let delays = [
+            (R1, Duration::from_millis(65)),
+            (R2, Duration::from_millis(1)),
+        ];
+        let arrivals = [arrival(R1, append(1, 1))];
+        let setup = |variants| Setup {
+            cores: quick_to_campaign,
+            arrivals: &arrivals,
+            // Long enough for the resolution at 65 ms and its replay, and short
+            // enough that a node whose timer stood still has not campaigned yet: it
+            // would need four more ticks, so 105 ms.
+            duration: Duration::from_millis(75),
+            ..Setup::new(variants, &delays)
+        };
+
+        let correct = run_with(setup(NodeVariants::correct()));
+        assert_eq!(
+            correct.meters.ticks_replayed_most, 6,
+            "a 65 ms sync spans six 10 ms ticks: {:?}",
+            correct.meters
+        );
+        let campaign = find(
+            &correct.log,
+            "campaign",
+            |note| matches!(note, Note::Shipped(_, ranges) if ranges.contains(&R1)),
+        );
+        assert!(
+            campaign > position(&correct.log, &Note::Persisted(R1)),
+            "the campaign left before the sync resolved: {:?}",
+            correct.log
+        );
+        assert!(
+            correct
+                .sent
+                .iter()
+                .any(|(range, what)| *range == R1 && *what == "pre-vote"),
+            "the replayed ticks did not reach r1's election timer: {:?}",
+            correct.sent
+        );
+
+        let collapsed = run_with(setup(
+            NodeVariants::correct().with(NodeVariant::CollapseHeldTicks),
+        ));
+        assert!(
+            !collapsed
+                .sent
+                .iter()
+                .any(|(range, what)| *range == R1 && *what == "pre-vote"),
+            "the variant is meant to leave r1's timer short by the whole sync, so it \
+             has not campaigned yet: {:?}",
+            collapsed.sent
+        );
+    }
+
+    /// A message for a core whose persist is outstanding is taken from the inbox and
+    /// held for that core, *counted against the node's byte bound*, **and the bound
+    /// refuses on it** (Q14).
+    ///
+    /// The second half is the whole of it. The `raft` task drains the queue to empty
+    /// on every wake, so at the moment a frame arrives the queue is always empty and
+    /// D-072's "nothing is refused into an empty queue" would exempt every arrival: a
+    /// bound that is arithmetic only, and a node that holds messages without limit for
+    /// the whole of a slow sync. So this check does not read the figure the node just
+    /// wrote — it puts arrivals against a bound a few messages wide and asks the
+    /// *inbox* whether they got in (PROPOSED D-074).
+    ///
+    /// The pair: `HeldNotCounted` takes the message and stops counting it, and this
+    /// check catches it — the node refuses nothing and holds everything.
+    #[test]
+    fn what_the_node_holds_fills_the_nodes_bound() {
+        // Four 64-byte messages fill the bound.
+        const BOUND: usize = 256;
+        // r1's sync outlasts every arrival; r2's disk is quick.
+        let delays = [
+            (R1, Duration::from_millis(65)),
+            (R2, Duration::from_millis(1)),
+        ];
+        // The first append puts r1's core behind a sync; each one after it arrives at
+        // a core that cannot step and is held.
+        let arrivals = [arrival(R1, append(1, 1))];
+        let feed: Vec<(Duration, Received)> = (2..=11u64)
+            .map(|index| (Duration::from_millis(index), arrival(R1, append(index, 1))))
+            .chain([(
+                // After the sync resolved at 65 ms and before the tick at 70 ms: what
+                // the node no longer holds it no longer charges, so this one gets in.
+                Duration::from_millis(67),
+                arrival(R1, append(12, 1)),
+            )])
+            .collect();
+        let setup = |variants| Setup {
+            bound: BOUND,
+            arrivals: &arrivals,
+            feed: &feed,
+            duration: Duration::from_millis(75),
+            ..Setup::new(variants, &delays)
+        };
+
+        let correct = run_with(setup(NodeVariants::correct()));
+        assert!(
+            correct.charged_most <= BOUND,
+            "the node was charged {} against a bound of {BOUND}",
+            correct.charged_most
+        );
+        assert!(
+            correct.held_bytes_seen >= BOUND - 64,
+            "what the node held never reached the bound, so the bound was never \
+             asked: {}",
+            correct.held_bytes_seen
+        );
+        let refused = correct.fed.iter().filter(|got_in| !**got_in).count();
+        assert!(
+            refused >= 1,
+            "every arrival got in: what the node holds does not bind it, and a node \
+             behind a slow sync holds messages without limit: {:?}",
+            correct.fed
+        );
+        assert_eq!(
+            correct.fed.last(),
+            Some(&true),
+            "an arrival after the sync resolved was refused, so the node goes on \
+             charging for what it has let go: {:?}",
+            correct.fed
+        );
+
+        let buggy = run_with(setup(
+            NodeVariants::correct().with(NodeVariant::HeldNotCounted),
+        ));
+        assert_eq!(
+            buggy.held_bytes_seen, 0,
+            "the variant is meant to stop counting what it holds: {}",
+            buggy.held_bytes_seen
+        );
+        assert!(
+            buggy.fed.iter().all(|got_in| *got_in),
+            "the variant is meant to refuse nothing: {:?}",
+            buggy.fed
+        );
+        assert!(
+            buggy.meters.held_most > correct.meters.held_most,
+            "the variant is meant to hold more than the bound allows: {:?} against \
+             {:?}",
+            buggy.meters,
+            correct.meters
+        );
+    }
+
+    /// The frames a round costs per peer (SHARD.md:490-492, §12): one flush before
+    /// the sync, and one as each persisting core's persist resolves.
+    #[test]
+    fn a_round_with_persists_costs_one_frame_per_peer_per_flush() {
+        let arrivals = [arrival(R1, append(1, 1)), arrival(R2, append(1, 1))];
+        let delays = [
+            (R1, Duration::from_millis(40)),
+            (R2, Duration::from_millis(5)),
+        ];
+        let measured = run(
+            NodeVariants::correct(),
+            &delays,
+            &arrivals,
+            Duration::from_millis(120),
+        );
+        // The arrivals' round persisted for both ranges and sent nothing early, so it
+        // took three flushes — its own and one per resolution — and put one frame on
+        // the wire toward the one peer at each resolution.
+        assert_eq!(
+            measured.frames.most_flushes_in_a_round, 3,
+            "one flush before the sync and one per persisting core: {:?}",
+            measured.frames
+        );
+        assert_eq!(
+            measured.frames.most_frames_to_a_peer_in_a_round, 2,
+            "one frame per peer per flush that has sends for it: {:?}",
+            measured.frames
+        );
+        assert!(measured.frames.rounds_with_persists >= 1);
+        assert_eq!(measured.frames.outbox_dropped, 0);
+        assert_eq!(measured.frames.outbox_oversized, 0);
+    }
+
+    /// The frames a round costs when the group commit resolves its persists
+    /// *together*, which is the case §4 leaves to this stage (SHARD.md:490-492): each
+    /// core's later outputs are still flushed when that core's own persist resolves,
+    /// so a round with `p` persisting cores costs up to `p` later flushes and, per
+    /// peer, one frame at each of them that has sends for it — not one frame for the
+    /// group.
+    #[test]
+    fn a_shared_sync_still_costs_one_later_flush_per_persisting_core() {
+        let arrivals = [arrival(R1, append(1, 1)), arrival(R2, append(1, 1))];
+        // Both persists resolve at the same instant, as one group commit's do.
+        let delays = [
+            (R1, Duration::from_millis(20)),
+            (R2, Duration::from_millis(20)),
+        ];
+        let measured = run(
+            NodeVariants::correct(),
+            &delays,
+            &arrivals,
+            Duration::from_millis(80),
+        );
+        assert_eq!(
+            measured.frames.most_flushes_in_a_round, 3,
+            "one flush before the sync and one per persisting core, even when the \
+             sync is one: {:?}",
+            measured.frames
+        );
+        assert_eq!(
+            measured.frames.most_frames_to_a_peer_in_a_round, 2,
+            "two persisting cores, two later flushes, two frames to the one peer: \
+             {:?}",
+            measured.frames
+        );
+    }
+
+    /// The "1" of a round's `1 + p` frames per peer is a *frame*, not only
+    /// arithmetic: a round that sends before its sync and then persists puts a frame
+    /// on the wire at its own flush and one more at each core's resolution
+    /// (SHARD.md:490-492, §12).
+    ///
+    /// The two checks above have rounds where every core persists on its first step,
+    /// so their pre-sync flush ships nothing and what they measure is the `p`. This is
+    /// the round that has both.
+    #[test]
+    fn a_round_that_sends_before_its_sync_costs_that_frame_too() {
+        // r2 answers a pre-vote, which persists nothing, so its response is one of the
+        // round's early outputs; r1's append persists.
+        let arrivals = [prevote(R2), arrival(R1, append(1, 1))];
+        let delays = [
+            (R1, Duration::from_millis(20)),
+            (R2, Duration::from_millis(1)),
+        ];
+        let measured = run(
+            NodeVariants::correct(),
+            &delays,
+            &arrivals,
+            Duration::from_millis(60),
+        );
+        assert_eq!(
+            measured.frames.rounds_sending_before_their_sync, 1,
+            "the round sent before its sync: {:?}",
+            measured.frames
+        );
+        assert_eq!(
+            measured.frames.most_flushes_in_a_round, 2,
+            "the round's own flush and the one persisting core's: {:?}",
+            measured.frames
+        );
+        assert_eq!(
+            measured.frames.most_frames_to_a_peer_in_a_round, 2,
+            "1 + p frames to the one peer, p = 1: the pre-sync flush's and the \
+             resolution's: {:?}",
+            measured.frames
+        );
+        assert_eq!(
+            measured.sent,
+            vec![(R2, "pre-vote-response"), (R1, "append-response")],
+            "the early send left first and the deferred one after its sync: {:?}",
+            measured.sent
+        );
+    }
+
+    /// The `apply` task takes every range's jobs one at a time, in the order they
+    /// were queued: one range's job never runs beside another's, which is Q14's rule
+    /// and D-036's consequence that one range's take holds every range's applies.
+    #[test]
+    fn the_apply_task_runs_every_ranges_jobs_one_at_a_time() {
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        enum Step {
+            Enter(RangeId),
+            Leave(RangeId),
+        }
+
+        struct Slow {
+            env: SimEnv,
+            log: Arc<Mutex<Vec<Step>>>,
+        }
+
+        impl Applier for Slow {
+            fn run(&self, job: ApplyJob) -> Boxed<'_, ()> {
+                let env = self.env.clone();
+                let log = self.log.clone();
+                Box::pin(async move {
+                    log.lock().expect("the log").push(Step::Enter(job.range));
+                    env.clock().sleep(Duration::from_millis(5)).await;
+                    log.lock().expect("the log").push(Step::Leave(job.range));
+                })
+            }
+        }
+
+        let mut sim = Sim::new(SimConfig::new(5));
+        let node = sim.add_node();
+        let env = sim.env(node);
+        let log: Arc<Mutex<Vec<Step>>> = Arc::default();
+        let jobs: Queue<ApplyJob> = Queue::new();
+        for range in [R1, R2, R1] {
+            jobs.push(ApplyJob {
+                range,
+                work: ApplyWork::Take,
+            });
+        }
+        env.clone().spawn("apply", {
+            let jobs = jobs.clone();
+            let applier = Slow {
+                env: env.clone(),
+                log: log.clone(),
+            };
+            async move { apply(&jobs, &applier).await }
+        });
+        sim.run_for(Duration::from_millis(40));
+        jobs.close();
+        sim.run_for(Duration::from_millis(10));
+        assert_eq!(
+            *log.lock().expect("the log"),
+            vec![
+                Step::Enter(R1),
+                Step::Leave(R1),
+                Step::Enter(R2),
+                Step::Leave(R2),
+                Step::Enter(R1),
+                Step::Leave(R1),
+            ],
+            "the jobs did not run one at a time in the order they were queued"
+        );
+    }
+
+    /// An `Apply` is one of the outputs that follow a core's `Persist`, so it reaches
+    /// the `apply` task only once that core's persist resolved: an `Apply` handed out
+    /// early would let the task make an applied index durable above the durable log
+    /// (SHARD.md §4). And the jobs it hands the task **partition** the committed log:
+    /// every index once, in order, no gap and no repeat.
+    ///
+    /// The second half is the node's own bookkeeping — the one-group server keeps it
+    /// in `ananke-raft` — so nothing else in the tree covers it. A job is also the
+    /// only place the entries an `Apply` names can be seen: without the indices a
+    /// check can only say *that* a job arrived, which a node re-applying its whole log
+    /// from index 1 also does.
+    ///
+    /// The pair: `DeferredFlushedEarly` hands the apply out before the persist
+    /// resolves; `AppliedNotAdvanced` forgets what it handed out, so every job starts
+    /// again at the first index. The same check catches both.
+    #[test]
+    fn the_applies_reach_the_task_after_their_persists_and_partition_the_log() {
+        /// An AppendEntries that commits what it carries: the follower appends and
+        /// pushes an `Apply` in the same step (core.rs:2514-2522).
+        fn committing(index: Index) -> Received {
+            let mut message = append(index, 1);
+            if let Message::AppendEntries { commit, .. } = &mut message {
+                *commit = index;
+            }
+            arrival(R1, message)
+        }
+
+        let arrivals = [committing(1)];
+        // Each append reaches a core whose previous persist has resolved, so each is
+        // its own round and each names one more index.
+        let feed = [
+            (Duration::from_millis(15), committing(2)),
+            (Duration::from_millis(30), committing(3)),
+        ];
+        let delays = [
+            (R1, Duration::from_millis(10)),
+            (R2, Duration::from_millis(1)),
+        ];
+        let setup = |variants| Setup {
+            arrivals: &arrivals,
+            feed: &feed,
+            duration: Duration::from_millis(60),
+            ..Setup::new(variants, &delays)
+        };
+
+        let correct = run_with(setup(NodeVariants::correct()));
+        let first_apply = find(&correct.log, "apply", |note| {
+            matches!(note, Note::Applied(..))
+        });
+        assert!(
+            first_apply > position(&correct.log, &Note::Persisted(R1)),
+            "an apply left before its core's persist resolved: {:?}",
+            correct.log
+        );
+        let jobs: Vec<Vec<Index>> = correct
+            .log
+            .iter()
+            .filter_map(|note| match note {
+                Note::Applied(_, Job::Entries(indices)) => Some(indices.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            jobs,
+            vec![vec![1], vec![2], vec![3]],
+            "the applied stream is not a partition of the committed log: {jobs:?}"
+        );
+
+        let early = run_with(setup(
+            NodeVariants::correct().with(NodeVariant::DeferredFlushedEarly),
+        ));
+        assert!(
+            find(&early.log, "apply", |note| matches!(
+                note,
+                Note::Applied(..)
+            )) < position(&early.log, &Note::Persisted(R1)),
+            "the variant is meant to hand the apply out early: {:?}",
+            early.log
+        );
+
+        let again = run_with(setup(
+            NodeVariants::correct().with(NodeVariant::AppliedNotAdvanced),
+        ));
+        let jobs: Vec<Vec<Index>> = again
+            .log
+            .iter()
+            .filter_map(|note| match note {
+                Note::Applied(_, Job::Entries(indices)) => Some(indices.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            jobs,
+            vec![vec![1], vec![1, 2], vec![1, 2, 3]],
+            "the variant is meant to hand the task the whole log again every time: \
+             {jobs:?}"
+        );
+    }
+
+    /// Where each of a step's outputs goes (SHARD.md §4, RAFT.md §1).
+    ///
+    /// A [`SnapshotAction::Take`] is the **`apply` task's**, a job between two
+    /// applies, and that routing is the whole of D-036's consequence: one range's take
+    /// stalls every range's applies on the node, which §12 asks Stage B to measure. A
+    /// take handed to the `snapshot` task instead would stall nothing, and the
+    /// measurement would measure a stall that no longer exists. Every other snapshot
+    /// action *is* the `snapshot` task's.
+    ///
+    /// The outputs are handed to [`Node::act`] rather than drawn out of a core: what
+    /// is under test is the node's routing table, and a core emits a take only after a
+    /// leader has run two election timeouts past its threshold, which is a scenario
+    /// the sweeps get to first (slice 4). A proposal's refusal and a read's answer are
+    /// here for the same reason — the node has no client path until that slice, so
+    /// nothing else in this crate executes them at all.
+    ///
+    /// The pair: `TakeToSnapshotTask` routes the take to the `snapshot` task, and this
+    /// check catches it.
+    #[test]
+    fn every_output_of_a_step_goes_where_section_four_sends_it() {
+        fn routed(variants: NodeVariants) -> Vec<Note> {
+            let mut sim = Sim::new(SimConfig::new(3));
+            let id = sim.add_node();
+            let env = sim.env(id);
+            let probe = Probe::new(&env, &[]);
+            let log = probe.log.clone();
+            let mut cores = Cores::new(variants);
+            cores.insert(R1, core(R1));
+            let mut node = Node::new(
+                env.clone(),
+                NodeConfig {
+                    id: ME,
+                    tick: TICK,
+                    variants,
+                },
+                cores,
+                Outbox::new(),
+                probe,
+            );
+            let stamps = Stamps {
+                decided: env.decision(),
+                received: None,
+            };
+            let outputs = vec![
+                (Output::Snapshot(SnapshotAction::Take), Some(Ok(Vec::new()))),
+                (
+                    Output::Snapshot(SnapshotAction::Install {
+                        to: LEADER,
+                        index: 1,
+                        term: 1,
+                    }),
+                    None,
+                ),
+                (
+                    Output::Apply { through: 1 },
+                    Some(Ok(vec![Entry {
+                        index: 1,
+                        term: 1,
+                        payload: Payload::Command(Bytes::from_static(b"x")),
+                    }])),
+                ),
+                (
+                    Output::Rejected {
+                        leader: Some(LEADER),
+                    },
+                    None,
+                ),
+                (
+                    Output::ReadReady {
+                        id: 7,
+                        index: 1,
+                        lease: true,
+                    },
+                    None,
+                ),
+                (Output::ReadDropped { id: 8 }, None),
+            ];
+            env.clone().spawn("acts", async move {
+                for (output, entries) in outputs {
+                    node.act(Act {
+                        range: R1,
+                        stamps,
+                        output,
+                        entries,
+                    })
+                    .await
+                    .expect("no act here fails");
+                }
+            });
+            sim.run_for(TICK);
+            log.lock().expect("the log").clone()
+        }
+
+        assert_eq!(
+            routed(NodeVariants::correct()),
+            vec![
+                Note::Applied(R1, Job::Take),
+                Note::Snapshotted(R1, "stream"),
+                Note::Applied(R1, Job::Entries(vec![1])),
+                Note::Rejected(R1),
+                Note::ReadReady(R1, 7),
+                Note::ReadDropped(R1, 8),
+            ],
+            "an output went somewhere §4 does not send it"
+        );
+
+        let buggy = routed(NodeVariants::correct().with(NodeVariant::TakeToSnapshotTask));
+        assert_eq!(
+            buggy.first(),
+            Some(&Note::Snapshotted(R1, "take")),
+            "the variant is meant to hand the take to the `snapshot` task: {buggy:?}"
+        );
+        assert!(
+            !buggy.contains(&Note::Applied(R1, Job::Take)),
+            "the variant is meant to keep the take off the `apply` queue: {buggy:?}"
+        );
+    }
+
+    /// The round arms its persists: they are polled in one pass **before the task
+    /// awaits anything else**, so the round's records are with the WAL writer before
+    /// anything can let it close a group without them (wal.rs:16-20, D-018).
+    ///
+    /// Submitting without arming is not a split round — the next poll still takes them
+    /// all — it is a *late* one: the task's loop races its inbox, its ticker and the
+    /// outstanding persists, and `race` returns the first side that is ready without
+    /// polling the other, so a round's records can sit unsubmitted while the task
+    /// handles a tick and a later round's work, and reach the writer behind it.
+    ///
+    /// Which side of that race wins is the scheduling stream's, so the directed
+    /// scenario is a set of seeds and not one: the correct node submits before its
+    /// next note on *every* seed, and `PersistsNotArmed` does not on at least one.
+    #[test]
+    fn a_rounds_persists_reach_the_writer_before_the_task_takes_anything_else() {
+        // r2 answers a pre-vote without persisting and r1 persists, so the round has
+        // an early flush — a `Shipped` — and then a submission. The flush's frame is
+        // shipped at the round's start; nothing may come between it and the
+        // submission.
+        let arrivals = [prevote(R2), arrival(R1, append(1, 1))];
+        let delays = [
+            (R1, Duration::from_millis(25)),
+            (R2, Duration::from_millis(1)),
+        ];
+        let submits_at_once = |variants, seed| {
+            let run = run_with(Setup {
+                // The socket takes longer than a tick, so the task's loop comes back
+                // round from the round's own flush with the ticker already due — and
+                // r2 campaigns on that tick, which the host sees.
+                cores: r2_campaigns_at_once,
+                ship: Duration::from_millis(12),
+                arrivals: &arrivals,
+                duration: Duration::from_millis(60),
+                seed,
+                ..Setup::new(variants, &delays)
+            });
+            let shipped = find(&run.log, "the round's early flush", |note| {
+                matches!(note, Note::Shipped(..))
+            });
+            let submitted = position(&run.log, &Note::Submitted(R1));
+            (submitted == shipped + 1, run.log)
+        };
+
+        for seed in 0..24 {
+            let (at_once, log) = submits_at_once(NodeVariants::correct(), seed);
+            assert!(
+                at_once,
+                "seed {seed}: the round's persist reached the writer only after the \
+                 task had taken another event: {log:?}"
+            );
+        }
+        let late = (0..24)
+            .filter(|seed| {
+                !submits_at_once(
+                    NodeVariants::correct().with(NodeVariant::PersistsNotArmed),
+                    *seed,
+                )
+                .0
+            })
+            .count();
+        assert!(
+            late > 0,
+            "the variant is meant to leave the round's persists unpolled until the \
+             loop happens to poll them, which on some seeds is after another event"
+        );
+    }
+}

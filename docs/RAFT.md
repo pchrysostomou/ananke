@@ -666,6 +666,28 @@ waits in the inbox for the next:
   proposals and completions; executes every output in order, awaiting each `Persist`
   before the `Send`s that follow it. It stamps a decision time before each step of the
   core and traces the step's events with it once they are durable (§2, D-047).
+
+  On the node (SHARD.md §4, Q41) one `raft` task holds *every* core, keyed by range, on
+  one ticker, and keeps that order per core rather than for the task: the outputs that
+  precede a core's `Persist` and all outputs of a core that persisted nothing leave
+  before the round's sync, the round's persists are submitted together so the WAL
+  writer's group commit syncs them once, and everything a core produced after its
+  `Persist` — its sends, `Apply`, `ReadReady`, `ReadDropped`, snapshot actions and its
+  trace events — waits for *that core's own* persist. A core whose persist is
+  outstanding steps nothing: the messages for it are taken from the inbox and held,
+  counted against the node's byte bound *and refused against it*, and a tick that falls
+  due meanwhile is held as one tick, every missed tick stepped when the persist resolves
+  and none collapsed. The node's bound covers what it holds because the task drains its
+  queue to empty on every wake, so a bound that asked only about the queue would bind
+  nothing (D-074, proposed).
+
+  The entries an `Apply` names are read from the core **at the step that named them**,
+  not when the node comes to execute it: a deferred `Apply` runs after the replay has
+  stepped that core further, where the one-group server's `execute` runs between two
+  steps of the one core. An index the core does not hold fails the node rather than
+  being passed over. This is `ananke-shard`'s `round` and `node` modules, beside the
+  one-group server described here, which keeps working exactly as this section says
+  until the sweeps move to the node (D-073, proposed).
 - `net`: receives frames, decodes, and hands messages to the `raft` task through a
   bounded queue, each with a stamp of when it was received, which a term change the
   message causes carries (D-050, proposed); a full queue drops the oldest heartbeat
@@ -673,8 +695,13 @@ waits in the inbox for the next:
 - `apply`: takes `Apply(through)` from the core, runs the state machine adapter one
   entry at a time, each a synced batch, and reports the applied index back; the core
   serves read-index reads only from applied state, so this task's lag is visible to
-  the checker. It also takes every snapshot, as a job between two applies, so it is the
-  task that writes checkpoint versions (§1, D-036, D-043).
+  the checker. On the node it is still one task, taking every range's jobs one at a
+  time in the order they were queued (SHARD.md §4, Q14; D-073, proposed), and the node
+  keeps the highest index it has handed the task per range, so the jobs partition the
+  committed log — every index once, no gap and no repeat. It also takes every snapshot,
+  as a job between two applies — on the node too, where the node routes a
+  `SnapshotAction::Take` to this task and not to `snapshot` — so it is the task that
+  writes checkpoint versions (§1, D-036, D-043).
 - `snapshot`: streams checkpoints on the leader, one stream per designated follower,
   each pinned to the version it opened, and deletes the versions no stream reads after
   each take and each stream's end (§1, D-043); assembles and verifies arriving streams

@@ -26,16 +26,36 @@
 //!   the noisiest (sender, range) pair's oldest heartbeat, and nothing is ever refused
 //!   into an empty queue.
 //!
-//! The `raft` and `apply` tasks, the round (Q41), the snapshot task, descriptors,
-//! split, merge and the rebalancer are each a later stage's; nothing here spawns
-//! anything or touches a clock, a disk or a socket.
+//! On the wire it builds the node's tasks:
+//!
+//! - [`mod@round`], Q41's round: the order one `raft` task keeps over every core on
+//!   the node — what leaves before the round's sync, what is submitted together, and
+//!   what waits for a core's own persist. It is the discipline alone: no clock, no
+//!   socket, no disk, so the order can be asserted without a simulation.
+//! - [`mod@node`], the two tasks: [`node::Node::raft`], one task holding every core
+//!   keyed by range on one ticker, and [`node::apply`], one task per node applying
+//!   every range's jobs one at a time.
+//! - [`mod@variant`], the node's known-buggy variants, each a plausible way to get
+//!   the round wrong, built beside the correct round (CLAUDE.md's pair rule).
+//!
+//! The snapshot task, descriptors, split, merge and the rebalancer are each a later
+//! slice's.
 
 pub mod frame;
 pub mod inbox;
+pub mod node;
 pub mod outbox;
 pub mod range;
+pub mod round;
+pub mod variant;
 
 pub use frame::{Decoded, Tagged, decode, encoded_len, studio};
 pub use inbox::{Admission, Inbox, Received, carries_data, is_heartbeat};
+pub use node::{
+    Applier, ApplyJob, ApplyWork, Boxed, BoxedPersist, Frames, Host, Node, NodeConfig, Persists,
+    apply,
+};
 pub use outbox::{Dropped, Outbox, Oversized};
 pub use range::RangeId;
+pub use round::{Act, Cores, Meters, Round, Stamps};
+pub use variant::{NodeVariant, NodeVariants};
