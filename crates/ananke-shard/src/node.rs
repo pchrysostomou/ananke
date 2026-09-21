@@ -43,7 +43,7 @@ use bytes::Bytes;
 use crate::inbox::{Inbox, Received};
 use crate::outbox::Outbox;
 use crate::range::RangeId;
-use crate::round::{Act, Cores, Meters, Round, entries_to_apply};
+use crate::round::{Act, Cores, Meters, Round};
 use crate::variant::{NodeVariant, NodeVariants};
 
 /// A future a host hands back, borrowing the host and awaited before the task takes
@@ -122,10 +122,11 @@ pub enum ApplyWork {
     /// Committed entries to apply in order.
     Entries(Vec<Entry>),
     /// Take a checkpoint at the applied index, between two applies (RAFT.md §1).
+    ///
+    /// D-043's *re*take — a fresh checkpoint even at the recorded index, because the
+    /// recorded one was found unusable — is the slice that reads checkpoints back, and
+    /// is one more kind of this `non_exhaustive` enum when it lands.
     Take,
-    /// Take a fresh checkpoint even at the recorded index: the recorded one was found
-    /// unusable (D-043).
-    Retake,
 }
 
 /// One job for the node's `apply` task, with the range it belongs to.
@@ -171,6 +172,10 @@ pub struct Frames {
     pub rounds_with_persists: u64,
     /// Rounds that submitted none.
     pub rounds_without_persists: u64,
+    /// Rounds that put a frame on the wire *before* their sync and then persisted: the
+    /// rounds where the "1" of a round's `1 + p` frames per peer is a frame and not
+    /// only arithmetic (SHARD.md:490-492).
+    pub rounds_sending_before_their_sync: u64,
     /// The most frames one round put on the wire toward one peer.
     pub most_frames_to_a_peer_in_a_round: usize,
     /// The most flushes one round took: one, plus one per persisting core.
@@ -199,8 +204,6 @@ pub struct Node<E: Environment, H: Host> {
     cores: Cores,
     outbox: Outbox,
     host: H,
-    /// The highest index handed to the `apply` task, per range.
-    applied_sent: BTreeMap<RangeId, Index>,
     next_round: u64,
     open: BTreeMap<u64, Open>,
     frames: Frames,
@@ -215,7 +218,6 @@ impl<E: Environment, H: Host> Node<E, H> {
             cores,
             outbox,
             host,
-            applied_sent: BTreeMap::new(),
             next_round: 0,
             open: BTreeMap::new(),
             frames: Frames::default(),
@@ -246,10 +248,12 @@ impl<E: Environment, H: Host> Node<E, H> {
         &self.host
     }
 
-    /// Where the highest applied index handed out per range stands.
+    /// Where the highest applied index handed out per range stands. It is the cores'
+    /// bookkeeping, because the entries an `Apply` names are read at the step that
+    /// named them, where the `after` has to be known ([`Cores::applied_sent`]).
     #[must_use]
     pub fn applied_sent(&self, range: RangeId) -> Index {
-        self.applied_sent.get(&range).copied().unwrap_or(0)
+        self.cores.applied_sent(range)
     }
 
     /// The `raft` task (SHARD.md §4): one ticker, every core, Q41's round.
@@ -332,6 +336,7 @@ impl<E: Environment, H: Host> Node<E, H> {
             if round.is_empty() && credit.is_none() {
                 continue;
             }
+            let sends_early = round.sends_early();
             for act in round.early {
                 self.act(act).await?;
             }
@@ -353,6 +358,9 @@ impl<E: Environment, H: Host> Node<E, H> {
             let id = self.next_round;
             self.next_round += 1;
             self.frames.rounds_with_persists += 1;
+            if sends_early && credit.is_none() {
+                self.frames.rounds_sending_before_their_sync += 1;
+            }
             self.open.insert(
                 id,
                 Open {
@@ -391,7 +399,9 @@ impl<E: Environment, H: Host> Node<E, H> {
                 let future = self.host.persist(range, submission.persist);
                 persists.submit(range, id, future);
             }
-            persists.arm().await;
+            if !self.config.variants.contains(NodeVariant::PersistsNotArmed) {
+                persists.arm().await;
+            }
         }
         Ok(())
     }
@@ -402,6 +412,7 @@ impl<E: Environment, H: Host> Node<E, H> {
             range,
             stamps,
             output,
+            entries,
         } = act;
         match output {
             Output::Persist(_) => {
@@ -425,15 +436,31 @@ impl<E: Environment, H: Host> Node<E, H> {
                 }
             }
             Output::Apply { through } => {
-                let after = self.applied_sent(range);
-                let Some(core) = self.cores.core(range) else {
-                    return Ok(());
+                // The entries were read from the core at the step that asked for the
+                // apply, not here: by now the replay may have stepped that core past a
+                // compaction, and `entry(..)` would answer for a log the `Apply` was
+                // never about (SHARD.md §4).
+                let entries = match entries {
+                    Some(Ok(entries)) => entries,
+                    // A gap in the applied stream: the core did not hold an index its
+                    // own `Apply` named. Passing over it would hand the state machine a
+                    // job with a hole in it and advance the node's applied index past
+                    // the hole; the node fails instead.
+                    Some(Err(index)) => {
+                        let reason = format!(
+                            "range {range:?}: an apply through {through} names index                              {index}, which the core does not hold"
+                        );
+                        self.host.failed(reason.clone());
+                        return Err(io::Error::other(reason));
+                    }
+                    None => {
+                        debug_assert!(false, "an apply carries the entries it names");
+                        return Ok(());
+                    }
                 };
-                let entries = entries_to_apply(core, after, through);
                 if entries.is_empty() {
                     return Ok(());
                 }
-                self.applied_sent.insert(range, through);
                 self.host.apply(ApplyJob {
                     range,
                     work: ApplyWork::Entries(entries),
@@ -447,11 +474,25 @@ impl<E: Environment, H: Host> Node<E, H> {
                 }
             }
             Output::ReadDropped { id } => self.host.read_dropped(range, id).await,
-            // A take is the `apply` task's, between two applies (RAFT.md §1).
-            Output::Snapshot(SnapshotAction::Take) => self.host.apply(ApplyJob {
-                range,
-                work: ApplyWork::Take,
-            }),
+            // A take is the `apply` task's, between two applies (RAFT.md §1): that is
+            // what makes D-036's consequence hold, that one range's take stalls every
+            // range's applies on the node.
+            Output::Snapshot(SnapshotAction::Take) => {
+                if self
+                    .config
+                    .variants
+                    .contains(NodeVariant::TakeToSnapshotTask)
+                {
+                    // The variant: the take goes to the `snapshot` task, so it no
+                    // longer runs between two applies.
+                    self.host.snapshot(range, SnapshotAction::Take);
+                } else {
+                    self.host.apply(ApplyJob {
+                        range,
+                        work: ApplyWork::Take,
+                    });
+                }
+            }
             Output::Snapshot(action) => self.host.snapshot(range, action),
             // D-047: decided at the step, traced now, which is when it is durable for
             // every event that followed a persist.
@@ -716,6 +757,7 @@ mod tests {
 
     use super::*;
     use crate::frame::decode;
+    use crate::round::Stamps;
 
     const R1: RangeId = RangeId(1);
     const R2: RangeId = RangeId(2);
@@ -735,8 +777,54 @@ mod tests {
         Persisted(RangeId),
         /// A frame left for a peer, carrying these ranges' messages.
         Shipped(ServerId, Vec<RangeId>),
-        /// A job for the `apply` task.
-        Applied(RangeId),
+        /// A job for the `apply` task, and **what the job carries**: the applied
+        /// stream is only checkable if the check can see the indices, which is what
+        /// tells re-applying the whole log from a job that partitions it.
+        Applied(RangeId, Job),
+        /// Work for the `snapshot` task.
+        Snapshotted(RangeId, &'static str),
+        /// A read the core confirmed.
+        ReadReady(RangeId, u64),
+        /// A read this server will not serve.
+        ReadDropped(RangeId, u64),
+        /// A proposal or a read refused: this server does not lead the range.
+        Rejected(RangeId),
+    }
+
+    /// What one [`Note::Applied`] carries.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum Job {
+        /// The indices of the entries, in the order the job carries them.
+        Entries(Vec<Index>),
+        /// A checkpoint, between two applies.
+        Take,
+    }
+
+    impl Job {
+        fn of(work: &ApplyWork) -> Self {
+            match work {
+                ApplyWork::Entries(entries) => {
+                    Job::Entries(entries.iter().map(|entry| entry.index).collect())
+                }
+                ApplyWork::Take => Job::Take,
+            }
+        }
+    }
+
+    /// What a message is, for a check that asks what left the node rather than only
+    /// how many frames did.
+    fn kind(message: &Message) -> &'static str {
+        match message {
+            Message::PreVote { .. } => "pre-vote",
+            Message::PreVoteResponse { .. } => "pre-vote-response",
+            Message::RequestVote { .. } => "request-vote",
+            Message::RequestVoteResponse { .. } => "request-vote-response",
+            Message::AppendEntries { entries, .. } if entries.is_empty() => "heartbeat",
+            Message::AppendEntries { .. } => "append",
+            Message::AppendEntriesResponse { .. } => "append-response",
+            Message::TimeoutNow { .. } => "timeout-now",
+            _ => "other",
+        }
     }
 
     /// A host whose persists take a time chosen per range, and which writes down
@@ -744,7 +832,12 @@ mod tests {
     struct Probe {
         env: SimEnv,
         log: Arc<Mutex<Vec<Note>>>,
+        /// Every message that left the node, by range and kind, in order.
+        sent: Arc<Mutex<Vec<(RangeId, &'static str)>>>,
         delays: BTreeMap<RangeId, Duration>,
+        /// How long the socket takes a frame: zero unless a check needs the node's
+        /// loop to come back round with something else already due.
+        ship: Duration,
     }
 
     impl Probe {
@@ -752,7 +845,9 @@ mod tests {
             Self {
                 env: env.clone(),
                 log: Arc::new(Mutex::new(Vec::new())),
+                sent: Arc::default(),
                 delays: delays.iter().copied().collect(),
+                ship: Duration::ZERO,
             }
         }
 
@@ -777,37 +872,55 @@ mod tests {
         fn stamp(&self, _range: RangeId, _message: &mut Message) {}
 
         fn ship(&self, to: ServerId, frame: Bytes) -> Boxed<'_, ()> {
-            let ranges = decode(&frame)
-                .expect("the node's own frame decodes")
-                .messages
-                .iter()
-                .map(|tagged| tagged.range)
-                .collect();
+            let decoded = decode(&frame).expect("the node's own frame decodes");
+            let ranges = decoded.messages.iter().map(|tagged| tagged.range).collect();
+            self.sent.lock().expect("the sent log").extend(
+                decoded
+                    .messages
+                    .iter()
+                    .map(|tagged| (tagged.range, kind(&tagged.frame.message))),
+            );
             self.note(Note::Shipped(to, ranges));
-            Box::pin(async {})
+            let env = self.env.clone();
+            let ship = self.ship;
+            Box::pin(async move {
+                if !ship.is_zero() {
+                    env.clock().sleep(ship).await;
+                }
+            })
         }
 
         fn read_ready(
             &self,
-            _range: RangeId,
-            _id: u64,
+            range: RangeId,
+            id: u64,
             _index: Index,
             _lease: bool,
         ) -> Boxed<'_, io::Result<()>> {
+            self.note(Note::ReadReady(range, id));
             Box::pin(async { Ok(()) })
         }
 
-        fn read_dropped(&self, _range: RangeId, _id: u64) -> Boxed<'_, ()> {
+        fn read_dropped(&self, range: RangeId, id: u64) -> Boxed<'_, ()> {
+            self.note(Note::ReadDropped(range, id));
             Box::pin(async {})
         }
 
-        fn rejected(&self, _range: RangeId, _leader: Option<ServerId>) {}
-
-        fn apply(&self, job: ApplyJob) {
-            self.note(Note::Applied(job.range));
+        fn rejected(&self, range: RangeId, _leader: Option<ServerId>) {
+            self.note(Note::Rejected(range));
         }
 
-        fn snapshot(&self, _range: RangeId, _action: SnapshotAction) {}
+        fn apply(&self, job: ApplyJob) {
+            self.note(Note::Applied(job.range, Job::of(&job.work)));
+        }
+
+        fn snapshot(&self, range: RangeId, action: SnapshotAction) {
+            let what = match action {
+                SnapshotAction::Take => "take",
+                _ => "stream",
+            };
+            self.note(Note::Snapshotted(range, what));
+        }
 
         fn failed(&self, reason: String) {
             panic!("the node failed: {reason}");
@@ -815,11 +928,41 @@ mod tests {
     }
 
     fn core(range: RangeId) -> Raft {
+        core_with(range, RaftConfig::default())
+    }
+
+    fn core_with(range: RangeId, config: RaftConfig) -> Raft {
         let config = RaftConfig {
             range: range.get(),
-            ..RaftConfig::default()
+            ..config
         };
         Raft::new(ME, Configuration::of(&[ME, LEADER, ServerId(3)]), config, 7)
+    }
+
+    /// The node's usual two followers.
+    fn two_followers() -> Vec<(RangeId, Raft)> {
+        vec![(R1, core(R1)), (R2, core(R2))]
+    }
+
+    /// r2 campaigns on the first tick it takes: a node whose loop comes back round
+    /// with a tick already due then has something to *do* with it that the host can
+    /// see.
+    fn r2_campaigns_at_once() -> Vec<(RangeId, Raft)> {
+        let quick = RaftConfig {
+            election_ticks: (1, 2),
+            ..RaftConfig::default()
+        };
+        vec![(R1, core(R1)), (R2, core_with(R2, quick))]
+    }
+
+    /// r1 with an election timeout of four ticks, so that a replay of the ticks it
+    /// missed behind a slow sync is *seen* in its timer and not only counted.
+    fn quick_to_campaign() -> Vec<(RangeId, Raft)> {
+        let config = RaftConfig {
+            election_ticks: (4, 5),
+            ..RaftConfig::default()
+        };
+        vec![(R1, core_with(R1, config)), (R2, core(R2))]
     }
 
     /// An AppendEntries carrying one entry: a follower that takes it appends, so its
@@ -852,28 +995,72 @@ mod tests {
     /// inbox closed.
     struct Run {
         log: Vec<Note>,
+        /// Every message that left, by range and kind, in order.
+        sent: Vec<(RangeId, &'static str)>,
         meters: Meters,
         frames: Frames,
         held_bytes_seen: usize,
+        /// The most the inbox ever charged against the bound: the queue and what the
+        /// node holds together.
+        charged_most: usize,
+        /// Whether each of the setup's fed arrivals was admitted, in order.
+        fed: Vec<bool>,
     }
 
-    /// Runs a node with two ranges for `duration`, handing it `arrivals` at the
-    /// start, then closes its inbox and takes its measurements.
-    fn run(
+    /// How a run is set up. [`run`] is the usual one: two followers, a bound no check
+    /// reaches, and every arrival admitted before the node starts.
+    struct Setup<'a> {
         variants: NodeVariants,
-        delays: &[(RangeId, Duration)],
-        arrivals: &[Received],
+        /// The node's byte bound.
+        bound: usize,
+        /// The cores the node starts with.
+        cores: fn() -> Vec<(RangeId, Raft)>,
+        /// How long each range's persists take.
+        delays: &'a [(RangeId, Duration)],
+        /// Admitted before the node starts.
+        arrivals: &'a [Received],
+        /// Admitted while the node runs, at these offsets from the start: what it
+        /// takes to reach the bound, which only a node that is already holding
+        /// something can be at.
+        feed: &'a [(Duration, Received)],
         duration: Duration,
-    ) -> Run {
-        let mut sim = Sim::new(SimConfig::new(11));
-        let node = sim.add_node();
-        let env = sim.env(node);
-        let probe = Probe::new(&env, delays);
+        /// How long the socket takes a frame.
+        ship: Duration,
+        /// The simulation's seed, which is also the scheduling stream's.
+        seed: u64,
+    }
+
+    impl<'a> Setup<'a> {
+        fn new(variants: NodeVariants, delays: &'a [(RangeId, Duration)]) -> Self {
+            Self {
+                variants,
+                bound: 4096,
+                cores: two_followers,
+                delays,
+                arrivals: &[],
+                feed: &[],
+                duration: Duration::from_millis(80),
+                ship: Duration::ZERO,
+                seed: 11,
+            }
+        }
+    }
+
+    /// Runs a node for `duration`, then closes its inbox and takes its measurements.
+    fn run_with(setup: Setup<'_>) -> Run {
+        let variants = setup.variants;
+        let mut sim = Sim::new(SimConfig::new(setup.seed));
+        let id = sim.add_node();
+        let env = sim.env(id);
+        let mut probe = Probe::new(&env, setup.delays);
+        probe.ship = setup.ship;
         let log = probe.log.clone();
-        let inbox = Inbox::new(4096);
+        let sent = probe.sent.clone();
+        let inbox = Inbox::new(setup.bound);
         let mut cores = Cores::new(variants);
-        cores.insert(R1, core(R1));
-        cores.insert(R2, core(R2));
+        for (range, core) in (setup.cores)() {
+            cores.insert(range, core);
+        }
         let mut node = Node::new(
             env.clone(),
             NodeConfig {
@@ -885,7 +1072,7 @@ mod tests {
             Outbox::new(),
             probe,
         );
-        for arrival in arrivals {
+        for arrival in setup.arrivals {
             assert!(inbox.admit(arrival.clone()).is_admitted());
         }
         let taken: Arc<Mutex<Option<(Meters, Frames)>>> = Arc::default();
@@ -898,28 +1085,78 @@ mod tests {
             }
         });
         let mut held_bytes_seen = 0;
+        let mut charged_most = 0;
+        let mut fed = Vec::new();
+        let mut next = 0;
         let step = Duration::from_millis(1);
         let mut elapsed = Duration::ZERO;
-        while elapsed < duration {
+        while elapsed < setup.duration {
+            while next < setup.feed.len() && setup.feed[next].0 <= elapsed {
+                fed.push(inbox.admit(setup.feed[next].1.clone()).is_admitted());
+                next += 1;
+            }
             sim.run_for(step);
             elapsed += step;
             held_bytes_seen = held_bytes_seen.max(inbox.held_bytes());
+            charged_most = charged_most.max(inbox.charged_bytes());
         }
         inbox.close();
-        sim.run_for(TICK);
+        // Long enough for the task to see the closed inbox through whatever it is in
+        // the middle of, however slow the socket this check gave it.
+        sim.run_for(TICK * 4 + setup.ship * 60);
         let (meters, frames) = taken.lock().expect("the cell").expect("the node stopped");
         Run {
             log: log.lock().expect("the log").clone(),
+            sent: sent.lock().expect("the sent log").clone(),
             meters,
             frames,
             held_bytes_seen,
+            charged_most,
+            fed,
         }
+    }
+
+    /// The usual run: two followers, arrivals admitted before the node starts.
+    fn run(
+        variants: NodeVariants,
+        delays: &[(RangeId, Duration)],
+        arrivals: &[Received],
+        duration: Duration,
+    ) -> Run {
+        run_with(Setup {
+            arrivals,
+            duration,
+            ..Setup::new(variants, delays)
+        })
     }
 
     fn position(log: &[Note], note: &Note) -> usize {
         log.iter()
             .position(|seen| seen == note)
             .unwrap_or_else(|| panic!("{note:?} is not in {log:?}"))
+    }
+
+    /// Where the first note the predicate accepts is.
+    fn find(log: &[Note], what: &str, pred: impl Fn(&Note) -> bool) -> usize {
+        log.iter()
+            .position(pred)
+            .unwrap_or_else(|| panic!("no {what} in {log:?}"))
+    }
+
+    /// A pre-vote, which a core answers **without persisting**: the term is not
+    /// started and nothing of it is durable (thesis §9.6). It is how a round gets an
+    /// output before its sync.
+    fn prevote(range: RangeId) -> Received {
+        Received {
+            range,
+            from: LEADER,
+            message: Message::PreVote {
+                term: 1,
+                last_index: 0,
+                last_term: 0,
+            },
+            bytes: 64,
+        }
     }
 
     /// Q41's round, the whole of it, on two cores that both persist: nothing a core
@@ -1106,56 +1343,164 @@ mod tests {
         assert_eq!(stepped.meters.held_most, 0);
     }
 
-    /// A message for a core whose persist is outstanding is taken from the inbox and
-    /// held for that core, *counted against the node's byte bound* (Q14).
+    /// And the ticks reach the *core*: a follower behind a slow sync is as many ticks
+    /// closer to its election timeout when the sync resolves as the sync cost it.
     ///
-    /// The pair: `HeldNotCounted` takes the message and stops counting it, and this
-    /// check catches it — the node's charged bytes fall back to the queue's.
+    /// The counter above says how many entries the replay popped; this says what they
+    /// did. It is the point of the rule — a core behind a slow sync must not have its
+    /// election and heartbeat timers run slow — and the arithmetic §4 leans on, that a
+    /// sync past the election timeout starts an election.
+    ///
+    /// The pair: `CollapseHeldTicks` replays one tick for all of them, so the
+    /// follower's timer is short by the whole sync and it does not campaign; a node
+    /// that popped the held tick without stepping it into the core would not either.
     #[test]
-    fn a_held_message_still_counts_against_the_nodes_bound() {
+    fn the_ticks_a_core_missed_reach_its_timer_and_not_only_its_counter() {
+        // r1 campaigns after four ticks of silence, and its sync spans six of them:
+        // the replay must take it past its election timeout at the resolution.
         let delays = [
-            (R1, Duration::from_millis(35)),
+            (R1, Duration::from_millis(65)),
             (R2, Duration::from_millis(1)),
         ];
-        // Two appends for the same range: the first makes it persist, the second
-        // arrives at a core that cannot step and is held.
-        let arrivals = [arrival(R1, append(1, 1)), arrival(R1, append(2, 1))];
-        let correct = run(
-            NodeVariants::correct(),
-            &delays,
-            &arrivals,
-            Duration::from_millis(80),
-        );
-        assert!(
-            correct.meters.held_most >= 1,
-            "the second append is held for the persisting core: {:?}",
+        let arrivals = [arrival(R1, append(1, 1))];
+        let setup = |variants| Setup {
+            cores: quick_to_campaign,
+            arrivals: &arrivals,
+            // Long enough for the resolution at 65 ms and its replay, and short
+            // enough that a node whose timer stood still has not campaigned yet: it
+            // would need four more ticks, so 105 ms.
+            duration: Duration::from_millis(75),
+            ..Setup::new(variants, &delays)
+        };
+
+        let correct = run_with(setup(NodeVariants::correct()));
+        assert_eq!(
+            correct.meters.ticks_replayed_most, 6,
+            "a 65 ms sync spans six 10 ms ticks: {:?}",
             correct.meters
         );
-        assert_eq!(
-            correct.held_bytes_seen, correct.meters.held_bytes_most,
-            "what the node holds is what the inbox charges"
+        let campaign = find(
+            &correct.log,
+            "campaign",
+            |note| matches!(note, Note::Shipped(_, ranges) if ranges.contains(&R1)),
         );
         assert!(
-            correct.held_bytes_seen >= 64,
-            "the held message's bytes were not charged against the bound: {}",
-            correct.held_bytes_seen
+            campaign > position(&correct.log, &Note::Persisted(R1)),
+            "the campaign left before the sync resolved: {:?}",
+            correct.log
+        );
+        assert!(
+            correct
+                .sent
+                .iter()
+                .any(|(range, what)| *range == R1 && *what == "pre-vote"),
+            "the replayed ticks did not reach r1's election timer: {:?}",
+            correct.sent
         );
 
-        let buggy = run(
-            NodeVariants::correct().with(NodeVariant::HeldNotCounted),
-            &delays,
-            &arrivals,
-            Duration::from_millis(80),
+        let collapsed = run_with(setup(
+            NodeVariants::correct().with(NodeVariant::CollapseHeldTicks),
+        ));
+        assert!(
+            !collapsed
+                .sent
+                .iter()
+                .any(|(range, what)| *range == R1 && *what == "pre-vote"),
+            "the variant is meant to leave r1's timer short by the whole sync, so it \
+             has not campaigned yet: {:?}",
+            collapsed.sent
+        );
+    }
+
+    /// A message for a core whose persist is outstanding is taken from the inbox and
+    /// held for that core, *counted against the node's byte bound*, **and the bound
+    /// refuses on it** (Q14).
+    ///
+    /// The second half is the whole of it. The `raft` task drains the queue to empty
+    /// on every wake, so at the moment a frame arrives the queue is always empty and
+    /// D-072's "nothing is refused into an empty queue" would exempt every arrival: a
+    /// bound that is arithmetic only, and a node that holds messages without limit for
+    /// the whole of a slow sync. So this check does not read the figure the node just
+    /// wrote — it puts arrivals against a bound a few messages wide and asks the
+    /// *inbox* whether they got in (PROPOSED D-074).
+    ///
+    /// The pair: `HeldNotCounted` takes the message and stops counting it, and this
+    /// check catches it — the node refuses nothing and holds everything.
+    #[test]
+    fn what_the_node_holds_fills_the_nodes_bound() {
+        // Four 64-byte messages fill the bound.
+        const BOUND: usize = 256;
+        // r1's sync outlasts every arrival; r2's disk is quick.
+        let delays = [
+            (R1, Duration::from_millis(65)),
+            (R2, Duration::from_millis(1)),
+        ];
+        // The first append puts r1's core behind a sync; each one after it arrives at
+        // a core that cannot step and is held.
+        let arrivals = [arrival(R1, append(1, 1))];
+        let feed: Vec<(Duration, Received)> = (2..=11u64)
+            .map(|index| (Duration::from_millis(index), arrival(R1, append(index, 1))))
+            .chain([(
+                // After the sync resolved at 65 ms and before the tick at 70 ms: what
+                // the node no longer holds it no longer charges, so this one gets in.
+                Duration::from_millis(67),
+                arrival(R1, append(12, 1)),
+            )])
+            .collect();
+        let setup = |variants| Setup {
+            bound: BOUND,
+            arrivals: &arrivals,
+            feed: &feed,
+            duration: Duration::from_millis(75),
+            ..Setup::new(variants, &delays)
+        };
+
+        let correct = run_with(setup(NodeVariants::correct()));
+        assert!(
+            correct.charged_most <= BOUND,
+            "the node was charged {} against a bound of {BOUND}",
+            correct.charged_most
         );
         assert!(
-            buggy.meters.held_most >= 1,
-            "the variant still holds the message: {:?}",
-            buggy.meters
+            correct.held_bytes_seen >= BOUND - 64,
+            "what the node held never reached the bound, so the bound was never \
+             asked: {}",
+            correct.held_bytes_seen
         );
+        let refused = correct.fed.iter().filter(|got_in| !**got_in).count();
+        assert!(
+            refused >= 1,
+            "every arrival got in: what the node holds does not bind it, and a node \
+             behind a slow sync holds messages without limit: {:?}",
+            correct.fed
+        );
+        assert_eq!(
+            correct.fed.last(),
+            Some(&true),
+            "an arrival after the sync resolved was refused, so the node goes on \
+             charging for what it has let go: {:?}",
+            correct.fed
+        );
+
+        let buggy = run_with(setup(
+            NodeVariants::correct().with(NodeVariant::HeldNotCounted),
+        ));
         assert_eq!(
             buggy.held_bytes_seen, 0,
             "the variant is meant to stop counting what it holds: {}",
             buggy.held_bytes_seen
+        );
+        assert!(
+            buggy.fed.iter().all(|got_in| *got_in),
+            "the variant is meant to refuse nothing: {:?}",
+            buggy.fed
+        );
+        assert!(
+            buggy.meters.held_most > correct.meters.held_most,
+            "the variant is meant to hold more than the bound allows: {:?} against \
+             {:?}",
+            buggy.meters,
+            correct.meters
         );
     }
 
@@ -1226,6 +1571,53 @@ mod tests {
         );
     }
 
+    /// The "1" of a round's `1 + p` frames per peer is a *frame*, not only
+    /// arithmetic: a round that sends before its sync and then persists puts a frame
+    /// on the wire at its own flush and one more at each core's resolution
+    /// (SHARD.md:490-492, §12).
+    ///
+    /// The two checks above have rounds where every core persists on its first step,
+    /// so their pre-sync flush ships nothing and what they measure is the `p`. This is
+    /// the round that has both.
+    #[test]
+    fn a_round_that_sends_before_its_sync_costs_that_frame_too() {
+        // r2 answers a pre-vote, which persists nothing, so its response is one of the
+        // round's early outputs; r1's append persists.
+        let arrivals = [prevote(R2), arrival(R1, append(1, 1))];
+        let delays = [
+            (R1, Duration::from_millis(20)),
+            (R2, Duration::from_millis(1)),
+        ];
+        let measured = run(
+            NodeVariants::correct(),
+            &delays,
+            &arrivals,
+            Duration::from_millis(60),
+        );
+        assert_eq!(
+            measured.frames.rounds_sending_before_their_sync, 1,
+            "the round sent before its sync: {:?}",
+            measured.frames
+        );
+        assert_eq!(
+            measured.frames.most_flushes_in_a_round, 2,
+            "the round's own flush and the one persisting core's: {:?}",
+            measured.frames
+        );
+        assert_eq!(
+            measured.frames.most_frames_to_a_peer_in_a_round, 2,
+            "1 + p frames to the one peer, p = 1: the pre-sync flush's and the \
+             resolution's: {:?}",
+            measured.frames
+        );
+        assert_eq!(
+            measured.sent,
+            vec![(R2, "pre-vote-response"), (R1, "append-response")],
+            "the early send left first and the deferred one after its sync: {:?}",
+            measured.sent
+        );
+    }
+
     /// The `apply` task takes every range's jobs one at a time, in the order they
     /// were queued: one range's job never runs beside another's, which is Q14's rule
     /// and D-036's consequence that one range's take holds every range's applies.
@@ -1293,40 +1685,284 @@ mod tests {
     /// An `Apply` is one of the outputs that follow a core's `Persist`, so it reaches
     /// the `apply` task only once that core's persist resolved: an `Apply` handed out
     /// early would let the task make an applied index durable above the durable log
-    /// (SHARD.md §4).
+    /// (SHARD.md §4). And the jobs it hands the task **partition** the committed log:
+    /// every index once, in order, no gap and no repeat.
+    ///
+    /// The second half is the node's own bookkeeping — the one-group server keeps it
+    /// in `ananke-raft` — so nothing else in the tree covers it. A job is also the
+    /// only place the entries an `Apply` names can be seen: without the indices a
+    /// check can only say *that* a job arrived, which a node re-applying its whole log
+    /// from index 1 also does.
+    ///
+    /// The pair: `DeferredFlushedEarly` hands the apply out before the persist
+    /// resolves; `AppliedNotAdvanced` forgets what it handed out, so every job starts
+    /// again at the first index. The same check catches both.
     #[test]
-    fn an_apply_reaches_the_task_only_once_its_cores_persist_resolved() {
-        // An AppendEntries that commits what it carries: the follower appends and
-        // pushes an `Apply` in the same step (core.rs:2514-2522).
-        let mut message = append(1, 1);
-        if let Message::AppendEntries { commit, .. } = &mut message {
-            *commit = 1;
+    fn the_applies_reach_the_task_after_their_persists_and_partition_the_log() {
+        /// An AppendEntries that commits what it carries: the follower appends and
+        /// pushes an `Apply` in the same step (core.rs:2514-2522).
+        fn committing(index: Index) -> Received {
+            let mut message = append(index, 1);
+            if let Message::AppendEntries { commit, .. } = &mut message {
+                *commit = index;
+            }
+            arrival(R1, message)
         }
-        let arrivals = [arrival(R1, message)];
-        let delays = [(R1, Duration::from_millis(30))];
-        let correct = run(
-            NodeVariants::correct(),
-            &delays,
-            &arrivals,
-            Duration::from_millis(80),
-        );
+
+        let arrivals = [committing(1)];
+        // Each append reaches a core whose previous persist has resolved, so each is
+        // its own round and each names one more index.
+        let feed = [
+            (Duration::from_millis(15), committing(2)),
+            (Duration::from_millis(30), committing(3)),
+        ];
+        let delays = [
+            (R1, Duration::from_millis(10)),
+            (R2, Duration::from_millis(1)),
+        ];
+        let setup = |variants| Setup {
+            arrivals: &arrivals,
+            feed: &feed,
+            duration: Duration::from_millis(60),
+            ..Setup::new(variants, &delays)
+        };
+
+        let correct = run_with(setup(NodeVariants::correct()));
+        let first_apply = find(&correct.log, "apply", |note| {
+            matches!(note, Note::Applied(..))
+        });
         assert!(
-            position(&correct.log, &Note::Applied(R1))
-                > position(&correct.log, &Note::Persisted(R1)),
+            first_apply > position(&correct.log, &Note::Persisted(R1)),
             "an apply left before its core's persist resolved: {:?}",
             correct.log
         );
+        let jobs: Vec<Vec<Index>> = correct
+            .log
+            .iter()
+            .filter_map(|note| match note {
+                Note::Applied(_, Job::Entries(indices)) => Some(indices.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            jobs,
+            vec![vec![1], vec![2], vec![3]],
+            "the applied stream is not a partition of the committed log: {jobs:?}"
+        );
 
-        let buggy = run(
+        let early = run_with(setup(
             NodeVariants::correct().with(NodeVariant::DeferredFlushedEarly),
-            &delays,
-            &arrivals,
-            Duration::from_millis(80),
+        ));
+        assert!(
+            find(&early.log, "apply", |note| matches!(
+                note,
+                Note::Applied(..)
+            )) < position(&early.log, &Note::Persisted(R1)),
+            "the variant is meant to hand the apply out early: {:?}",
+            early.log
+        );
+
+        let again = run_with(setup(
+            NodeVariants::correct().with(NodeVariant::AppliedNotAdvanced),
+        ));
+        let jobs: Vec<Vec<Index>> = again
+            .log
+            .iter()
+            .filter_map(|note| match note {
+                Note::Applied(_, Job::Entries(indices)) => Some(indices.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            jobs,
+            vec![vec![1], vec![1, 2], vec![1, 2, 3]],
+            "the variant is meant to hand the task the whole log again every time: \
+             {jobs:?}"
+        );
+    }
+
+    /// Where each of a step's outputs goes (SHARD.md §4, RAFT.md §1).
+    ///
+    /// A [`SnapshotAction::Take`] is the **`apply` task's**, a job between two
+    /// applies, and that routing is the whole of D-036's consequence: one range's take
+    /// stalls every range's applies on the node, which §12 asks Stage B to measure. A
+    /// take handed to the `snapshot` task instead would stall nothing, and the
+    /// measurement would measure a stall that no longer exists. Every other snapshot
+    /// action *is* the `snapshot` task's.
+    ///
+    /// The outputs are handed to [`Node::act`] rather than drawn out of a core: what
+    /// is under test is the node's routing table, and a core emits a take only after a
+    /// leader has run two election timeouts past its threshold, which is a scenario
+    /// the sweeps get to first (slice 4). A proposal's refusal and a read's answer are
+    /// here for the same reason — the node has no client path until that slice, so
+    /// nothing else in this crate executes them at all.
+    ///
+    /// The pair: `TakeToSnapshotTask` routes the take to the `snapshot` task, and this
+    /// check catches it.
+    #[test]
+    fn every_output_of_a_step_goes_where_section_four_sends_it() {
+        fn routed(variants: NodeVariants) -> Vec<Note> {
+            let mut sim = Sim::new(SimConfig::new(3));
+            let id = sim.add_node();
+            let env = sim.env(id);
+            let probe = Probe::new(&env, &[]);
+            let log = probe.log.clone();
+            let mut cores = Cores::new(variants);
+            cores.insert(R1, core(R1));
+            let mut node = Node::new(
+                env.clone(),
+                NodeConfig {
+                    id: ME,
+                    tick: TICK,
+                    variants,
+                },
+                cores,
+                Outbox::new(),
+                probe,
+            );
+            let stamps = Stamps {
+                decided: env.decision(),
+                received: None,
+            };
+            let outputs = vec![
+                (Output::Snapshot(SnapshotAction::Take), Some(Ok(Vec::new()))),
+                (
+                    Output::Snapshot(SnapshotAction::Install {
+                        to: LEADER,
+                        index: 1,
+                        term: 1,
+                    }),
+                    None,
+                ),
+                (
+                    Output::Apply { through: 1 },
+                    Some(Ok(vec![Entry {
+                        index: 1,
+                        term: 1,
+                        payload: Payload::Command(Bytes::from_static(b"x")),
+                    }])),
+                ),
+                (
+                    Output::Rejected {
+                        leader: Some(LEADER),
+                    },
+                    None,
+                ),
+                (
+                    Output::ReadReady {
+                        id: 7,
+                        index: 1,
+                        lease: true,
+                    },
+                    None,
+                ),
+                (Output::ReadDropped { id: 8 }, None),
+            ];
+            env.clone().spawn("acts", async move {
+                for (output, entries) in outputs {
+                    node.act(Act {
+                        range: R1,
+                        stamps,
+                        output,
+                        entries,
+                    })
+                    .await
+                    .expect("no act here fails");
+                }
+            });
+            sim.run_for(TICK);
+            log.lock().expect("the log").clone()
+        }
+
+        assert_eq!(
+            routed(NodeVariants::correct()),
+            vec![
+                Note::Applied(R1, Job::Take),
+                Note::Snapshotted(R1, "stream"),
+                Note::Applied(R1, Job::Entries(vec![1])),
+                Note::Rejected(R1),
+                Note::ReadReady(R1, 7),
+                Note::ReadDropped(R1, 8),
+            ],
+            "an output went somewhere §4 does not send it"
+        );
+
+        let buggy = routed(NodeVariants::correct().with(NodeVariant::TakeToSnapshotTask));
+        assert_eq!(
+            buggy.first(),
+            Some(&Note::Snapshotted(R1, "take")),
+            "the variant is meant to hand the take to the `snapshot` task: {buggy:?}"
         );
         assert!(
-            position(&buggy.log, &Note::Applied(R1)) < position(&buggy.log, &Note::Persisted(R1)),
-            "the variant is meant to hand the apply out early: {:?}",
-            buggy.log
+            !buggy.contains(&Note::Applied(R1, Job::Take)),
+            "the variant is meant to keep the take off the `apply` queue: {buggy:?}"
+        );
+    }
+
+    /// The round arms its persists: they are polled in one pass **before the task
+    /// awaits anything else**, so the round's records are with the WAL writer before
+    /// anything can let it close a group without them (wal.rs:16-20, D-018).
+    ///
+    /// Submitting without arming is not a split round — the next poll still takes them
+    /// all — it is a *late* one: the task's loop races its inbox, its ticker and the
+    /// outstanding persists, and `race` returns the first side that is ready without
+    /// polling the other, so a round's records can sit unsubmitted while the task
+    /// handles a tick and a later round's work, and reach the writer behind it.
+    ///
+    /// Which side of that race wins is the scheduling stream's, so the directed
+    /// scenario is a set of seeds and not one: the correct node submits before its
+    /// next note on *every* seed, and `PersistsNotArmed` does not on at least one.
+    #[test]
+    fn a_rounds_persists_reach_the_writer_before_the_task_takes_anything_else() {
+        // r2 answers a pre-vote without persisting and r1 persists, so the round has
+        // an early flush — a `Shipped` — and then a submission. The flush's frame is
+        // shipped at the round's start; nothing may come between it and the
+        // submission.
+        let arrivals = [prevote(R2), arrival(R1, append(1, 1))];
+        let delays = [
+            (R1, Duration::from_millis(25)),
+            (R2, Duration::from_millis(1)),
+        ];
+        let submits_at_once = |variants, seed| {
+            let run = run_with(Setup {
+                // The socket takes longer than a tick, so the task's loop comes back
+                // round from the round's own flush with the ticker already due — and
+                // r2 campaigns on that tick, which the host sees.
+                cores: r2_campaigns_at_once,
+                ship: Duration::from_millis(12),
+                arrivals: &arrivals,
+                duration: Duration::from_millis(60),
+                seed,
+                ..Setup::new(variants, &delays)
+            });
+            let shipped = find(&run.log, "the round's early flush", |note| {
+                matches!(note, Note::Shipped(..))
+            });
+            let submitted = position(&run.log, &Note::Submitted(R1));
+            (submitted == shipped + 1, run.log)
+        };
+
+        for seed in 0..24 {
+            let (at_once, log) = submits_at_once(NodeVariants::correct(), seed);
+            assert!(
+                at_once,
+                "seed {seed}: the round's persist reached the writer only after the \
+                 task had taken another event: {log:?}"
+            );
+        }
+        let late = (0..24)
+            .filter(|seed| {
+                !submits_at_once(
+                    NodeVariants::correct().with(NodeVariant::PersistsNotArmed),
+                    *seed,
+                )
+                .0
+            })
+            .count();
+        assert!(
+            late > 0,
+            "the variant is meant to leave the round's persists unpolled until the \
+             loop happens to poll them, which on some seeds is after another event"
         );
     }
 }

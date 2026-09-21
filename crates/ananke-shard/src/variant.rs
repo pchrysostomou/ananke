@@ -11,6 +11,9 @@
 //! each variant is caught by a deterministic check in this crate, which is the pair
 //! rule's requirement — the buggy variant is *seen to fail* the check the correct code
 //! passes — without a rate to measure (D-061 asks a tier of a *sweep's* assertion).
+//! [`NodeVariant::PersistsNotArmed`] is caught over a small fixed set of scheduling
+//! seeds rather than on one, because what it breaks depends on which side of the
+//! task's race is polled first: the directed scenario is the set, not a seed.
 
 use std::fmt;
 
@@ -44,6 +47,22 @@ pub enum NodeVariant {
     /// stops counting against the node's byte bound, so a node behind a slow sync
     /// holds messages without limit (SHARD.md §4, Q14).
     HeldNotCounted,
+    /// The round's persists are submitted but not armed: the futures are left unpolled
+    /// until the loop happens to poll them, so the round's records reach the WAL writer
+    /// only after the task has taken another event — and join whatever group is open
+    /// then, which may be a later round's (wal.rs:16-20, D-018).
+    PersistsNotArmed,
+    /// The index handed to the `apply` task is not remembered, so every `Apply` hands
+    /// the task the whole log again from the first index (SHARD.md §4, Q14): a
+    /// non-idempotent state machine applies every committed command twice.
+    AppliedNotAdvanced,
+    /// A [`SnapshotAction::Take`] is handed to the `snapshot` task rather than to the
+    /// `apply` task, so the take no longer runs between two applies and D-036's whole
+    /// consequence — one range's take stalls every range's applies on the node —
+    /// silently stops holding (RAFT.md §1, D-036).
+    ///
+    /// [`SnapshotAction::Take`]: ananke_raft::core::SnapshotAction::Take
+    TakeToSnapshotTask,
 }
 
 impl NodeVariant {
@@ -54,6 +73,9 @@ impl NodeVariant {
         NodeVariant::CollapseHeldTicks,
         NodeVariant::PersistsOneAtATime,
         NodeVariant::HeldNotCounted,
+        NodeVariant::PersistsNotArmed,
+        NodeVariant::AppliedNotAdvanced,
+        NodeVariant::TakeToSnapshotTask,
     ];
 
     /// The bit this variant takes in a [`NodeVariants`].
@@ -64,6 +86,9 @@ impl NodeVariant {
             NodeVariant::CollapseHeldTicks => 1 << 2,
             NodeVariant::PersistsOneAtATime => 1 << 3,
             NodeVariant::HeldNotCounted => 1 << 4,
+            NodeVariant::PersistsNotArmed => 1 << 5,
+            NodeVariant::AppliedNotAdvanced => 1 << 6,
+            NodeVariant::TakeToSnapshotTask => 1 << 7,
         }
     }
 
@@ -76,6 +101,9 @@ impl NodeVariant {
             NodeVariant::CollapseHeldTicks => "CollapseHeldTicks",
             NodeVariant::PersistsOneAtATime => "PersistsOneAtATime",
             NodeVariant::HeldNotCounted => "HeldNotCounted",
+            NodeVariant::PersistsNotArmed => "PersistsNotArmed",
+            NodeVariant::AppliedNotAdvanced => "AppliedNotAdvanced",
+            NodeVariant::TakeToSnapshotTask => "TakeToSnapshotTask",
         }
     }
 }
@@ -159,7 +187,7 @@ mod tests {
             assert_eq!(seen & variant.bit(), 0, "{variant} shares a bit");
             seen |= variant.bit();
         }
-        assert_eq!(NodeVariant::BUGS.len(), 5);
+        assert_eq!(NodeVariant::BUGS.len(), 8);
     }
 
     #[test]

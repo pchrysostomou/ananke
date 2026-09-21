@@ -16,7 +16,7 @@
 //! The order covers every output, not only sends: a core's `Apply`, `ReadReady`,
 //! `ReadDropped`, snapshot actions and the step's trace events all wait on that core's
 //! own persist, as `execute` waits on `store.persist(..)` today
-//! (ananke-raft node.rs:2083-2180). An `Apply` handed out early would let the `apply`
+//! (ananke-raft node.rs:2432-2562). An `Apply` handed out early would let the `apply`
 //! task make an applied index durable above the durable log; a trace event handed out
 //! early would put a `RaftAppend` in the trace before it is durable, which D-026 keeps
 //! from happening (DECISIONS.md:831-834).
@@ -31,7 +31,7 @@
 //! one tick. Once the persist resolves the held work is stepped in the order it
 //! arrived or fell due, *every missed tick stepped, none collapsed*, as today's loop
 //! steps each tick it missed while `execute` awaited a persist
-//! (ananke-raft node.rs:718-728).
+//! (ananke-raft node.rs:1032-1041).
 
 use std::collections::{BTreeMap, VecDeque};
 
@@ -65,6 +65,23 @@ pub struct Act {
     pub stamps: Stamps,
     /// What to do.
     pub output: Output,
+    /// For an [`Output::Apply`], the entries the `apply` task's job carries, read
+    /// from the core **at the step that produced the output** and not when the node
+    /// comes to execute it.
+    ///
+    /// The one-group server builds the job from a core that cannot step meanwhile —
+    /// one task, one core, `execute` between two steps. Here an `Apply` that follows a
+    /// core's `Persist` is executed after [`Cores::resolved`] has replayed every held
+    /// message and tick into that core, so the core has taken arbitrarily many further
+    /// steps by then; a step that compacted the log (an InstallSnapshot the node steps
+    /// straight into the core) would leave the entries the `Apply` names no longer
+    /// there. Reading them at the step is what keeps the job the job the core asked
+    /// for.
+    ///
+    /// `Err(index)` is the first index the core did not hold *even at the step*: a gap
+    /// in the applied stream, which the node fails on rather than passing over
+    /// (SHARD.md §4). `None` for every other output.
+    pub entries: Option<Result<Vec<ananke_raft::Entry>, Index>>,
 }
 
 /// A persist the round submits.
@@ -90,7 +107,10 @@ pub struct Round {
     /// produced: the outputs that precede a core's `Persist`, and all outputs of a
     /// core that persisted nothing.
     pub early: Vec<Act>,
-    /// The persists this round submits together, in range order.
+    /// The persists this round submits together, in the order the round's cores
+    /// persisted: range order for a tick's round, which steps every core in range
+    /// order, and arrival order for a round of messages. Submission order is the WAL
+    /// group's write order, so it is not decorative.
     pub persists: Vec<Submission>,
 }
 
@@ -160,6 +180,13 @@ pub struct Meters {
     pub held_most: usize,
     /// The bytes held for cores whose persists are outstanding, at their highest.
     pub held_bytes_most: usize,
+    /// Messages for a range this node does not hold, dropped.
+    ///
+    /// With four ranges to a node and a rebalancer moving them, a frame routed to the
+    /// wrong node or routed by a stale map must not be indistinguishable from no frame
+    /// at all. The trace event for it goes with the outbox's drops, in the slice that
+    /// puts the node under the sweeps (PROPOSED D-073); the counter is here now.
+    pub messages_for_ranges_not_held: u64,
 }
 
 /// Every core on the node, keyed by range, and the order they are stepped in
@@ -168,6 +195,10 @@ pub struct Cores {
     slots: BTreeMap<RangeId, Slot>,
     variants: NodeVariants,
     held_bytes: usize,
+    /// The highest index handed to the `apply` task for each range: the `after` of the
+    /// next job. It lives here, beside the cores, because the entries an `Apply` names
+    /// are read at the step that produced it, where `after` has to be known.
+    applied: BTreeMap<RangeId, Index>,
     meters: Meters,
 }
 
@@ -179,8 +210,16 @@ impl Cores {
             slots: BTreeMap::new(),
             variants,
             held_bytes: 0,
+            applied: BTreeMap::new(),
             meters: Meters::default(),
         }
+    }
+
+    /// The highest index this node has handed `range`'s state machine, which is the
+    /// `after` of the next job it hands it.
+    #[must_use]
+    pub fn applied_sent(&self, range: RangeId) -> Index {
+        self.applied.get(&range).copied().unwrap_or(0)
     }
 
     /// Puts `core` on the node as `range`'s, replacing whatever was there.
@@ -289,6 +328,8 @@ impl Cores {
         let collapse =
             variants.contains(NodeVariant::CollapseHeldTicks) && matches!(input, Input::Tick);
         let Some(slot) = self.slots.get_mut(&range) else {
+            // A message for a range this node does not hold: counted, never silent.
+            self.meters.messages_for_ranges_not_held += 1;
             return;
         };
         if collapse
@@ -323,8 +364,12 @@ impl Cores {
         // work that just arrived or of work that was held.
         let decided = env.decision();
         let stamps = Stamps { decided, received };
-        let early = self.variants.contains(NodeVariant::DeferredFlushedEarly);
+        let variants = self.variants;
+        let early = variants.contains(NodeVariant::DeferredFlushedEarly);
+        let mut applied = self.applied.get(&range).copied().unwrap_or(0);
         let Some(slot) = self.slots.get_mut(&range) else {
+            // A message for a range this node does not hold: counted, never silent.
+            self.meters.messages_for_ranges_not_held += 1;
             return;
         };
         let outputs = slot.core.step(input);
@@ -341,10 +386,29 @@ impl Cores {
                     });
                 }
                 output => {
+                    // The entries an `Apply` names are read here, at the step that
+                    // named them, because the node executes a deferred `Apply` only
+                    // after the replay has stepped this core further (see `Act`).
+                    let entries = match output {
+                        Output::Apply { through } => {
+                            let job = entries_to_apply(&slot.core, applied, through);
+                            if job.is_ok()
+                                && through > applied
+                                && !variants.contains(NodeVariant::AppliedNotAdvanced)
+                            {
+                                // The variant leaves it where it was, so the next
+                                // `Apply` hands the task the whole log again.
+                                applied = through;
+                            }
+                            Some(job)
+                        }
+                        _ => None,
+                    };
                     let act = Act {
                         range,
                         stamps,
                         output,
+                        entries,
                     };
                     if persisted && !early {
                         slot.deferred.push(act);
@@ -354,6 +418,7 @@ impl Cores {
                 }
             }
         }
+        self.applied.insert(range, applied);
         if persisted {
             // Steps that core no further until its persist resolves.
             slot.persisting = true;
@@ -422,14 +487,22 @@ pub fn describe(output: &Output) -> &'static str {
 }
 
 /// The entries an `Apply { through }` names, for the `apply` task: the core's log from
-/// `after` to `through`.
-#[must_use]
-pub fn entries_to_apply(core: &Raft, after: Index, through: Index) -> Vec<ananke_raft::Entry> {
+/// `after` to `through`, every index of it.
+///
+/// `Err(index)` is the first index the core did not hold. Dropping it and going on
+/// would hand the state machine a job with a hole in it while the node's `applied_sent`
+/// advanced past the hole — a gap in the applied stream with no error — so the gap is
+/// returned and the node fails on it (SHARD.md §4).
+pub fn entries_to_apply(
+    core: &Raft,
+    after: Index,
+    through: Index,
+) -> Result<Vec<ananke_raft::Entry>, Index> {
     if through <= after {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     (after + 1..=through)
-        .filter_map(|index| core.entry(index).cloned())
+        .map(|index| core.entry(index).cloned().ok_or(index))
         .collect()
 }
 
@@ -684,7 +757,95 @@ mod tests {
         cores.messages(&env, [(R1, append(1, 1), None, 64)]);
         cores.resolved(&env, R1);
         let core = cores.core(R1).expect("r1");
-        assert_eq!(entries_to_apply(core, 0, 1).len(), 1);
-        assert!(entries_to_apply(core, 1, 1).is_empty());
+        assert_eq!(
+            entries_to_apply(core, 0, 1)
+                .expect("the entry is there")
+                .len(),
+            1
+        );
+        assert!(
+            entries_to_apply(core, 1, 1)
+                .expect("nothing to hand out")
+                .is_empty()
+        );
+        // An index the core does not hold is a gap, named, never passed over: the
+        // node fails on it rather than handing the state machine a job with a hole in
+        // it while its applied index advances past the hole (SHARD.md §4).
+        assert_eq!(
+            entries_to_apply(core, 0, 3),
+            Err(2),
+            "the first index the core does not hold is the gap"
+        );
+    }
+
+    /// A deferred `Apply` carries the entries the core held *at the step that named
+    /// them*, not the ones it holds once the replay has stepped it further.
+    ///
+    /// This is the seam the one-group server does not have: there `execute` runs
+    /// between two steps of the one core, so the log cannot move under the job. Here
+    /// [`Cores::resolved`] replays every held message and tick before the node comes
+    /// to execute the deferred `Apply`, so the job is fixed here instead.
+    #[test]
+    fn a_deferred_apply_carries_the_entries_of_the_step_that_named_it() {
+        let env = env();
+        let mut cores = cores(NodeVariants::correct());
+        // An append that commits what it carries: the core appends (a `Persist`) and
+        // names an `Apply` after it, so the `Apply` is deferred.
+        let mut message = append(1, 1);
+        if let Input::Message {
+            message: Message::AppendEntries { commit, .. },
+            ..
+        } = &mut message
+        {
+            *commit = 1;
+        }
+        let round = cores.messages(&env, [(R1, message, None, 64)]);
+        assert_eq!(round.persists.len(), 1, "the append asks for a persist");
+        assert!(
+            round.early.is_empty(),
+            "the apply follows the persist: {:?}",
+            round.early
+        );
+        // The second append is held behind the persist and stepped in the replay, so
+        // the core has moved on by the time the node executes the deferred `Apply`.
+        cores.messages(&env, [(R1, append(2, 1), None, 64)]);
+        let resolved = cores.resolved(&env, R1);
+        let apply = resolved
+            .early
+            .iter()
+            .find(|act| matches!(act.output, Output::Apply { .. }))
+            .expect("the deferred apply");
+        assert_eq!(
+            apply.entries,
+            Some(Ok(vec![Entry {
+                index: 1,
+                term: 1,
+                payload: Payload::Command(Bytes::from_static(b"x")),
+            }])),
+            "the job is the one the step named, read at that step"
+        );
+        assert_eq!(
+            cores.applied_sent(R1),
+            1,
+            "and the node's applied index moved with it, once"
+        );
+    }
+
+    /// A message for a range this node does not hold is counted, not dropped in
+    /// silence: with four ranges to a node and a rebalancer moving them, a frame
+    /// routed by a stale map must not look like no frame at all.
+    #[test]
+    fn a_message_for_a_range_the_node_does_not_hold_is_counted() {
+        let env = env();
+        let mut cores = cores(NodeVariants::correct());
+        let round = cores.messages(&env, [(RangeId(9), append(1, 1), None, 64)]);
+        assert!(round.is_empty(), "no core stepped: {round:?}");
+        assert_eq!(cores.meters().messages_for_ranges_not_held, 1);
+        // And one that arrives for a range the node holds but cannot step yet is
+        // held, not counted as unrouted.
+        cores.messages(&env, [(R1, append(1, 1), None, 64)]);
+        cores.messages(&env, [(R1, append(2, 1), None, 64)]);
+        assert_eq!(cores.meters().messages_for_ranges_not_held, 1);
+        assert_eq!(cores.meters().held_most, 1);
     }
 }
