@@ -358,8 +358,20 @@ struct Inner {
     bytes: usize,
     refused: u64,
     dropped: u64,
+    /// The bytes of messages the node has taken from the queue and cannot step yet:
+    /// a message for a core whose persist is outstanding is held for that core and
+    /// still counted against the node's byte bound (SHARD.md §4, Q14).
+    // PROPOSED(D-073): held messages keep their charge against the bound.
+    held: usize,
     waker: Option<Waker>,
     closed: bool,
+}
+
+impl Inner {
+    /// What the bound is measured against: the queue and what the node holds.
+    fn charged(&self) -> usize {
+        self.bytes.saturating_add(self.held)
+    }
 }
 
 /// See the module documentation.
@@ -392,6 +404,7 @@ impl Inbox {
                 bytes: 0,
                 refused: 0,
                 dropped: 0,
+                held: 0,
                 waker: None,
                 closed: false,
             })),
@@ -431,7 +444,7 @@ impl Inbox {
                 inner.refused += 1;
                 return Admission::Refused(message);
             }
-            if inner.bytes.saturating_add(message.bytes) > self.bound {
+            if inner.charged().saturating_add(message.bytes) > self.bound {
                 // The room a message carrying data can make for itself is what the
                 // queued heartbeats hold; whether that is enough is decided here,
                 // before anything is dropped for it.
@@ -443,7 +456,9 @@ impl Inbox {
                 } else {
                     0
                 };
-                let fits_after = (inner.bytes - room).saturating_add(message.bytes) <= self.bound;
+                let fits_after = (inner.charged() - room.min(inner.charged()))
+                    .saturating_add(message.bytes)
+                    <= self.bound;
                 // PROPOSED(D-072): nothing is refused into an empty queue. A message
                 // larger than the whole bound would otherwise be refused for ever,
                 // every retransmission of it alike, and the range it is about would
@@ -454,7 +469,7 @@ impl Inbox {
                     inner.refused += 1;
                     return Admission::Refused(message);
                 }
-                while inner.bytes.saturating_add(message.bytes) > self.bound {
+                while inner.charged().saturating_add(message.bytes) > self.bound {
                     let Some(victim) = inner.items.take_noisiest_heartbeat() else {
                         break;
                     };
@@ -503,6 +518,45 @@ impl Inbox {
     #[must_use]
     pub fn queued_bytes(&self) -> usize {
         self.lock().bytes
+    }
+
+    /// The bytes the node holds for cores whose persists are outstanding.
+    #[must_use]
+    pub fn held_bytes(&self) -> usize {
+        self.lock().held
+    }
+
+    /// What the bound is measured against: the bytes queued and the bytes held.
+    #[must_use]
+    pub fn charged_bytes(&self) -> usize {
+        self.lock().charged()
+    }
+
+    /// Sets the bytes the node holds for cores whose persists are outstanding.
+    ///
+    /// A message for a core whose persist is outstanding is still taken from the
+    /// inbox and held for that core, *counted against the node's byte bound*
+    /// (SHARD.md §4, Q14). The queue cannot know when that happens, so the node tells
+    /// it, with the whole figure rather than a delta: the node knows what it holds
+    /// and a lost increment would leak the bound away.
+    ///
+    /// What is never changed is D-072's rule that nothing is refused into an empty
+    /// queue: a message larger than the whole bound, or arriving at a node whose held
+    /// bytes already fill it, is still admitted when the queue itself is empty, so no
+    /// range stops replicating for good.
+    // PROPOSED(D-073): held messages keep their charge against the bound.
+    pub fn hold_at(&self, bytes: usize) {
+        self.lock().held = bytes;
+    }
+
+    /// The next message if one is queued, without waiting: what the `raft` task
+    /// drains a round with (SHARD.md §4, "the messages drained since the last
+    /// round").
+    pub fn take(&self) -> Option<Received> {
+        let mut inner = self.lock();
+        let message = inner.items.pop_front()?;
+        inner.bytes -= message.bytes;
+        Some(message)
     }
 
     /// The messages queued.
