@@ -11,6 +11,10 @@
 //! each variant is caught by a deterministic check in this crate, which is the pair
 //! rule's requirement — the buggy variant is *seen to fail* the check the correct code
 //! passes — without a rate to measure (D-061 asks a tier of a *sweep's* assertion).
+//! The `snapshot` task's own are [`NodeVariant::SNAPSHOT`], each a way to get a
+//! snapshot keyed by range and follower wrong; they are caught the same way, by
+//! deterministic checks in [`mod@crate::snapshot`].
+//!
 //! [`NodeVariant::PersistsNotArmed`] is caught over a small fixed set of scheduling
 //! seeds rather than on one, because what it breaks depends on which side of the
 //! task's race is polled first: the directed scenario is the set, not a seed.
@@ -63,6 +67,38 @@ pub enum NodeVariant {
     ///
     /// [`SnapshotAction::Take`]: ananke_raft::core::SnapshotAction::Take
     TakeToSnapshotTask,
+    /// One staging directory for the whole engine directory, as the one-group
+    /// receiver has (snapshot.rs:92-94), instead of one per (range, sender): two
+    /// assemblies then write over each other's files (SHARD.md §11, raft 14).
+    SharedStagingDir,
+    /// One assembly for the whole node, abandoned for a chunk of another identity, as
+    /// the one-group snapshot task's is (snapshot.rs:859-864; node.rs:1430). The
+    /// re-seeds heading for one node then restart each other (SHARD.md §4, §11 raft
+    /// 14).
+    OneAssemblyPerNode,
+    /// A version directory named by index and take alone, `snap-<index>-<take>`
+    /// (snapshot.rs:112-114): two ranges' takes at one index share a directory.
+    VersionDirWithoutRange,
+    /// A sweep that deletes every unpinned version directory, whatever range it
+    /// belongs to, as today's does against the store's single snapshot record
+    /// (snapshot.rs:193-228): one range's sweep deletes another range's checkpoints.
+    SweepAcrossRanges,
+    /// A per-node cap on streams *sent*, so a leader feeds its designated followers
+    /// one at a time instead of all at once (Q14, D-043).
+    CapStreamsSent,
+    /// Snapshot chunks put through the per-peer outbox, where they are cut into frames
+    /// with whatever else is queued, instead of going in frames of their own on the
+    /// snapshot task's socket handle: a 256 KiB chunk then spends the frame a round's
+    /// heartbeats needed (Q41, SHARD.md §4).
+    ChunksInBatchFrames,
+    /// The install's manifest switch made without the range's repair carried in it, as
+    /// the stream's last chunk arrives (D-066; RAFT.md:225-233). It is
+    /// [`ananke_raft::Variant::SnapshotWithoutCurrentLast`] on the node's install path.
+    InstallWithoutRepair,
+    /// `RaftAdopted` traced for a replica's live install. On the node that event
+    /// records only a node taking a fresh directory after a whole-node refusal
+    /// (D-066), and a reader that counts adoptions would count every install as one.
+    AdoptedOnRangeInstall,
 }
 
 impl NodeVariant {
@@ -76,6 +112,31 @@ impl NodeVariant {
         NodeVariant::PersistsNotArmed,
         NodeVariant::AppliedNotAdvanced,
         NodeVariant::TakeToSnapshotTask,
+        NodeVariant::SharedStagingDir,
+        NodeVariant::OneAssemblyPerNode,
+        NodeVariant::VersionDirWithoutRange,
+        NodeVariant::SweepAcrossRanges,
+        NodeVariant::CapStreamsSent,
+        NodeVariant::ChunksInBatchFrames,
+        NodeVariant::InstallWithoutRepair,
+        NodeVariant::AdoptedOnRangeInstall,
+    ];
+
+    /// The `snapshot` task's own, in order: the eight ways to get a snapshot keyed by
+    /// range and follower wrong (SHARD.md §11, raft 14; D-066). Six of the eight are
+    /// mutations a single-range, single-follower world could not catch at all: with
+    /// one range and one stream, a shared staging directory, one assembly, a version
+    /// name without a range, a sweep across ranges and a cap of one stream sent are
+    /// each indistinguishable from the correct node.
+    pub const SNAPSHOT: &'static [NodeVariant] = &[
+        NodeVariant::SharedStagingDir,
+        NodeVariant::OneAssemblyPerNode,
+        NodeVariant::VersionDirWithoutRange,
+        NodeVariant::SweepAcrossRanges,
+        NodeVariant::CapStreamsSent,
+        NodeVariant::ChunksInBatchFrames,
+        NodeVariant::InstallWithoutRepair,
+        NodeVariant::AdoptedOnRangeInstall,
     ];
 
     /// The bit this variant takes in a [`NodeVariants`].
@@ -89,6 +150,14 @@ impl NodeVariant {
             NodeVariant::PersistsNotArmed => 1 << 5,
             NodeVariant::AppliedNotAdvanced => 1 << 6,
             NodeVariant::TakeToSnapshotTask => 1 << 7,
+            NodeVariant::SharedStagingDir => 1 << 8,
+            NodeVariant::OneAssemblyPerNode => 1 << 9,
+            NodeVariant::VersionDirWithoutRange => 1 << 10,
+            NodeVariant::SweepAcrossRanges => 1 << 11,
+            NodeVariant::CapStreamsSent => 1 << 12,
+            NodeVariant::ChunksInBatchFrames => 1 << 13,
+            NodeVariant::InstallWithoutRepair => 1 << 14,
+            NodeVariant::AdoptedOnRangeInstall => 1 << 15,
         }
     }
 
@@ -104,6 +173,14 @@ impl NodeVariant {
             NodeVariant::PersistsNotArmed => "PersistsNotArmed",
             NodeVariant::AppliedNotAdvanced => "AppliedNotAdvanced",
             NodeVariant::TakeToSnapshotTask => "TakeToSnapshotTask",
+            NodeVariant::SharedStagingDir => "SharedStagingDir",
+            NodeVariant::OneAssemblyPerNode => "OneAssemblyPerNode",
+            NodeVariant::VersionDirWithoutRange => "VersionDirWithoutRange",
+            NodeVariant::SweepAcrossRanges => "SweepAcrossRanges",
+            NodeVariant::CapStreamsSent => "CapStreamsSent",
+            NodeVariant::ChunksInBatchFrames => "ChunksInBatchFrames",
+            NodeVariant::InstallWithoutRepair => "InstallWithoutRepair",
+            NodeVariant::AdoptedOnRangeInstall => "AdoptedOnRangeInstall",
         }
     }
 }
@@ -187,7 +264,14 @@ mod tests {
             assert_eq!(seen & variant.bit(), 0, "{variant} shares a bit");
             seen |= variant.bit();
         }
-        assert_eq!(NodeVariant::BUGS.len(), 8);
+        assert_eq!(NodeVariant::BUGS.len(), 16);
+        for variant in NodeVariant::SNAPSHOT {
+            assert!(
+                NodeVariant::BUGS.contains(variant),
+                "{variant} is not in BUGS"
+            );
+        }
+        assert_eq!(NodeVariant::SNAPSHOT.len(), 8);
     }
 
     #[test]

@@ -35,11 +35,15 @@
 //! - [`mod@node`], the two tasks: [`node::Node::raft`], one task holding every core
 //!   keyed by range on one ticker, and [`node::apply`], one task per node applying
 //!   every range's jobs one at a time.
+//! - [`mod@snapshot`], the `snapshot` task: one task keyed by (range, follower) on the
+//!   way out and (range, sender) on the way in, its staging and version directories
+//!   and their sweep keyed by range, its chunks in frames of their own, and D-066's
+//!   live install of a range's spans with the repair carried in the switch.
 //! - [`mod@variant`], the node's known-buggy variants, each a plausible way to get
-//!   the round wrong, built beside the correct round (CLAUDE.md's pair rule).
+//!   the round or the snapshot task wrong, built beside the correct code (CLAUDE.md's
+//!   pair rule).
 //!
-//! The snapshot task, descriptors, split, merge and the rebalancer are each a later
-//! slice's.
+//! Descriptors, split, merge and the rebalancer are each a later slice's.
 
 pub mod frame;
 pub mod inbox;
@@ -47,6 +51,7 @@ pub mod node;
 pub mod outbox;
 pub mod range;
 pub mod round;
+pub mod snapshot;
 pub mod variant;
 
 pub use frame::{Decoded, Tagged, decode, encoded_len, studio};
@@ -58,4 +63,8 @@ pub use node::{
 pub use outbox::{Dropped, Outbox, Oversized};
 pub use range::RangeId;
 pub use round::{Act, Cores, Meters, Round, Stamps};
+pub use snapshot::{
+    Adopted, Identity, Install, Landing, Route, Snapshots, Started, Streams, parse_version,
+    staging_name, version_name,
+};
 pub use variant::{NodeVariant, NodeVariants};

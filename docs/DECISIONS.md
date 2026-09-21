@@ -9408,4 +9408,145 @@ any of them makes; all fourteen are unchanged and green. `sim/` does not depend 
 
 ---
 
-_Next entry: D-075. Add one before implementing anything not covered above._
+## PROPOSED D-075 — The `snapshot` task keyed by range and follower: one assembly per (range, sender), paths keyed by range, and every install D-066's live install
+
+**Context.** Stage B's node bullet asks for "one `snapshot` task keyed by range and
+follower, one assembly per (range, sender) under per-node receive caps, no cap on streams
+sent, and chunks in frames of their own on its own socket handle (Q14, Q41); staging,
+version directories and their sweep keyed by range" (SHARD.md:2224-2229; §11, raft 14).
+D-066 decided what an install on the node is. Today all of it is one group's: one staging
+directory per engine directory (snapshot.rs:92-94), a version directory named by index and
+take alone (snapshot.rs:112-114), one `Assembler` per snapshot task holding one stream and
+abandoning it for a chunk of another identity (snapshot.rs:859-864; node.rs:1430), and a
+sweep that deletes every unpinned version directory the store's single snapshot record does
+not name (snapshot.rs:193-228). On a node each of those is wrong in a way a single-range
+world cannot show: two ranges' takes at one index collide, one range's sweep deletes
+another range's checkpoints, and the re-seeds heading for one node restart each other.
+
+**What this entry builds.** `ananke-shard`'s `snapshot` module: the task's discipline over
+keys, caps, frames and switches, with no clock, no socket and no disk, asserted the way
+`round`'s is (D-073). The streams' bytes, the engine call an `Install` describes
+(`Engine::install_spans`, D-068) and the trace events are the node's wiring, which the
+slice that puts the node under the sweeps carries.
+
+- *Keyed both ways.* Sends are keyed by (range, follower) and receives by (range, sender).
+  Nothing caps the sends, so a leader feeds every designated follower of a range at once
+  (Q14, D-043). A per-node cap bounds the assemblies; a (range, sender) over it is answered
+  with a restart, writes nothing and disturbs no admitted assembly, and takes the first slot
+  that frees, in the order it asked. This is the re-seed shape's "wait for one another"
+  (SHARD.md:2257-2259).
+- *Paths keyed by range.* `version_name` is `snap-r<range>-<index>-<take>` and `staging_name`
+  is `staging-r<range>-s<sender>`. `Snapshots::sweep` is one range's sweep: it proposes for
+  deletion only version directories of the range it is sweeping, and among those only the
+  ones that range's own record does not pin.
+- *Chunks in frames of their own.* `Snapshots::route` builds a frame carrying exactly one
+  message, the chunk, for the task's own socket handle; a chunk that would not fit a frame
+  is refused as the outbox refuses an oversized message, never split (Q41).
+- *Installs are D-066's.* A completed stream yields an `Install`: the range's two key
+  intervals, sorted and disjoint (D-068), the staged source, the repair carried in the
+  switch, no engine reopen, and `adopted: false`. `RaftAdopted` is `Snapshots::adopt_fresh`
+  alone — a node taking a fresh directory after a whole-node refusal, traced before any
+  range installs into it.
+
+**What the design documents left open, and the conservative choice taken.**
+
+1. *Staging keyed by range, or by range and sender?* §11's raft item 14 asks for both
+   "staging, versions and the sweep need keying by range" and "one assembly per (range,
+   sender)". With two senders of one range — a leader and the stale leader it replaced —
+   those two are only consistent if the staging name carries the sender too: two assemblies
+   in one directory write over each other's files exactly as two ranges would. *Taken:* the
+   staging name carries both. It is the stricter of the two readings and keys nothing
+   together that the design wants apart.
+2. *The receive cap's default.* Q14 asks for "per-node caps on streams received and
+   assembled" and fixes no number; the re-seed shape sets two, below its four ranges, on
+   purpose. *Taken:* no default at all — `Snapshots::new` takes the cap — with the
+   recommendation that a scenario which is not about the cap sets it at or above the node's
+   range count, so no stream waits by accident. A wrong default would be invisible; a cap
+   that must be named is not.
+3. *What a stream over the cap is told.* Nothing settles whether an over-cap stream is
+   refused, queued or admitted by evicting another. *Taken:* refused with a restart, nothing
+   evicted, admission FIFO when a slot frees. Eviction would make the node the thing that
+   restarts streams, which is the bug §11 names.
+4. *The one-group layout's directories.* `snap-<index>-<take>` belongs to no range.
+   *Taken:* it parses as no range's, so no range's sweep proposes it for deletion. A sweep
+   never deletes a directory it cannot attribute; what becomes of an engine directory that
+   predates the node is its start's business, not its sweep's.
+5. *When overlapping spans are refused.* `Engine::install_spans` refuses them at the switch
+   (`SpansOverlap`, D-068). *Taken:* `Snapshots::host` asserts sorted, disjoint, non-empty
+   spans when the range is registered, so a node that has lost track of what a range holds
+   fails where it lost track, not at the switch of an install.
+6. *D-066's open question about `sim/quorum.rs`'s cap* — "set at or above its ranges, or
+   D-049's rule counts a queued stream as progress" — is not this slice's to close, since
+   that scenario is Q15's slice. *Recommendation:* set the cap at or above its ranges.
+   D-049's rule is a variant's catch condition, and changing what counts as progress to suit
+   a scenario's cap weakens the rule the variants are caught by.
+
+**The pair (CLAUDE.md:52-67), and the mutation standard.** Eight variants, each built beside
+the correct code and each failing a check here. Six of the eight are mutations that a
+single-range, single-follower world could not catch at all — with one range and one stream
+they are indistinguishable from the correct node:
+
+| Variant | The mutation | The check that fails under it |
+| --- | --- | --- |
+| `SharedStagingDir` | one staging directory per engine directory, as today | `two_ranges_assemble_into_directories_of_their_own` |
+| `OneAssemblyPerNode` | one assembly for the node, abandoned for a chunk of another sender | `a_chunk_of_another_stream_never_abandons_an_assembly` |
+| `VersionDirWithoutRange` | `snap-<index>-<take>`, as today | `two_ranges_takes_at_one_index_do_not_collide` |
+| `SweepAcrossRanges` | the sweep deletes every unpinned version, whatever range's | `a_ranges_sweep_leaves_every_other_ranges_versions` |
+| `CapStreamsSent` | a per-node cap on streams sent | `a_leader_feeds_every_designated_follower_at_once` |
+| `ChunksInBatchFrames` | chunks through the per-peer outbox | `a_chunk_travels_in_a_frame_of_its_own` |
+| `InstallWithoutRepair` | the switch made without the range's repair (D-066) | `an_install_is_a_live_install_of_the_ranges_spans_with_its_repair` |
+| `AdoptedOnRangeInstall` | `RaftAdopted` traced for a replica's install | `only_a_fresh_directory_after_a_refusal_is_adopted` |
+
+The first six need more than one range or more than one follower to be wrong about: that is
+the mutation standard applied to this slice. `ChunksInBatchFrames` and `InstallWithoutRepair`
+are wrong with one range too, and are here because Q41 and D-066 name them.
+
+**Tiers and rates (D-061).** Nothing here is asserted at a tier, because nothing here is a
+sweep: each check is deterministic and fails under its variant on every run. D-061 asks a
+tier of a *sweep's* assertion, and the slice that puts the node under the sweeps is where
+these variants meet seeds. No bound is asserted against a measured rate in this slice, so
+none was widened or lowered.
+
+**Measurements.** Machine: Apple M2, 8 cores, on battery (`pmset -g batt`: "Now drawing from
+'Battery Power'"), with other Stage B slices building in parallel — load averages 19.00 18.68
+30.98 at the time of the run. Counts, not times, so they are the same on any machine:
+
+| What | Figure | Where |
+| --- | --- | --- |
+| frames a chunk travels in | 1 per chunk, at any chunk size under the frame cap | `a_chunk_travels_in_a_frame_of_its_own` (`meters().chunks == meters().frames == 1`) |
+| assemblies abandoned for a chunk that is not their own | 0 on the correct node, over four interleaved (range, sender) streams | `a_chunk_of_another_stream_never_abandons_an_assembly` |
+| assemblies open under a cap of two with four ranges arriving | 2, with 2 waiting, and each freed slot taking the first waiter | `the_receive_cap_holds_and_a_freed_slot_admits_the_first_waiter` |
+| `RaftAdopted` events per replica install | 0; one per fresh directory | `only_a_fresh_directory_after_a_refusal_is_adopted` |
+
+Stage B's timed measurements — the step cost, the frames per peer in a round, the replay
+burst, the inbox's drops, the apply lag, the take's hold — belong to the tasks slice and the
+slice that runs the sweeps; this slice adds none and relies on none.
+
+**What moved.** Nothing outside `crates/ananke-shard` and the two documents. `sim/` does not
+depend on `ananke-shard`, so no schedule moves, no pinned trace hash moves and no pinned seed
+is re-audited: `crates/ananke-shard/src/variant.rs` gained eight variants at bits 8 to 15,
+which no existing code reads, and every other file of the crate is unchanged. The one-group
+server's `snapshot.rs` is untouched and keeps working exactly as RAFT.md §1 says; RAFT.md
+gains the node's naming, the node's assembly rule and the node's snapshot task beside it
+(D-053).
+
+**Alternatives.**
+- *Key the staging directory by range alone and let a second sender of a range restart the
+  first.* It is what today does, and it is the behaviour §11 calls out as wrong for re-seeds;
+  the argument that two senders of one range are rare is the argument that made one assembly
+  per task look safe.
+- *Put the range-keyed paths in `ananke-raft::snapshot` beside today's.* A `u64` group id is
+  inside Q40's line, and the crate would then own both layouts. Kept out: the node's layout
+  is the node's, and `ananke-raft` keeps a layout with no node in it until the one-group
+  server retires.
+- *Give the fresh-directory adoption an event of its own.* D-066 considered and rejected it;
+  this entry does not reopen it.
+
+**Consequences.** The node's `snapshot` task can be wired to a socket and a disk without
+another decision about keys, caps or frames. Nothing here has met a seed: every variant in
+`NodeVariant::SNAPSHOT` is caught by a deterministic check, and the tier each is caught at on
+the sweeps is the scenarios slice's to measure.
+
+---
+
+_Next entry: D-076. Add one before implementing anything not covered above._
