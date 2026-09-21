@@ -9602,6 +9602,22 @@ and not decoration: six other Stage B slices were building and running their own
 this laptop for the whole run, and a load average of 140 on eight cores is why 1 308 s sits
 beside D-068's 613 s and D-072's 779 s on the same machine. It is a green, not a timing.
 
+And again on the tip the review's fixes land with, which is what this entry's premerge
+figure now is:
+
+```
+premerge: Darwin 25.6.0 arm64, Apple M2, 8 cores
+premerge: before, load 26.23/25.48/24.17, AC Power, no thermal warning recorded
+premerge: after, load 48.89/30.80/26.39, AC Power, no thermal warning recorded
+premerge: green at 1000 seeds in 2558 s
+```
+
+AC throughout, no thermal warning, and a quieter machine than the first run's — load 26
+rising to 49 rather than 140. The 2 558 s against the first run's 1 308 s is not the fixes,
+which add a dozen checks that run in a millisecond and touch no sweep: the release build was
+cold for this tree and the other slices' sweeps had the cores for most of it. Both are
+greens, and neither is a timing.
+
 **What moved.** Nothing outside `crates/ananke-shard` and the two documents. `sim/` does not
 depend on `ananke-shard`, so no schedule moves, no pinned trace hash moves and no pinned seed
 is re-audited: `crates/ananke-shard/src/variant.rs` gained eleven variants at bits 8 to 18,
@@ -9609,8 +9625,8 @@ which no existing code reads, and the crate's other files are unchanged but for 
 description of this module. `Snapshots::new` takes the node's own `ServerId`, which only
 this module's own checks call. The one-group
 server's `snapshot.rs` is untouched and keeps working exactly as RAFT.md §1 says; RAFT.md
-gains the node's naming, the node's assembly rule and the node's snapshot task beside it
-(D-053).
+gains the node's naming, the node's assembly rule, the freed slot's rule, the restart's and
+the node's snapshot task beside it (D-053).
 
 **Alternatives.**
 - *Key the staging directory by range alone and let a second sender of a range restart the
