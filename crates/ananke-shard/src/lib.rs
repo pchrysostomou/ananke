@@ -48,15 +48,18 @@
 //!
 //! Descriptors, split, merge and the rebalancer are each a later slice's.
 
+pub mod client;
 pub mod frame;
 pub mod inbox;
 pub mod node;
 pub mod outbox;
 pub mod range;
 pub mod round;
+pub mod server;
 pub mod snapshot;
 pub mod variant;
 
+pub use client::{RangedRequest, RangedResponse, is_ranged};
 pub use frame::{Decoded, Tagged, decode, encoded_len, studio};
 pub use inbox::{Admission, Inbox, Received, carries_data, is_heartbeat};
 pub use node::{
@@ -66,6 +69,7 @@ pub use node::{
 pub use outbox::{Dropped, Outbox, Oversized};
 pub use range::RangeId;
 pub use round::{Act, Cores, Meters, Round, Stamps};
+pub use server::{Gaps, Local, Range, ServerConfig, ServerHost, run};
 pub use snapshot::{
     Adopted, Identity, Install, Landing, Route, Snapshots, Started, Streams, parse_version,
     staging_name, version_name,

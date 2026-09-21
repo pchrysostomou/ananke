@@ -269,6 +269,14 @@ impl Cores {
         self.held_bytes
     }
 
+    /// Counts a node-local input — a client's request, an applied index — for a
+    /// range this node does not hold. The node's own inputs are counted where its
+    /// peers' messages are, so neither is ever silently lost.
+    // PROPOSED(D-076): a local input for a range not held is counted, never silent.
+    pub fn count_input_for_a_range_not_held(&mut self) {
+        self.meters.messages_for_ranges_not_held += 1;
+    }
+
     /// What the node measured about its rounds.
     #[must_use]
     pub fn meters(&self) -> Meters {

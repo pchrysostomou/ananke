@@ -598,6 +598,27 @@ pub struct Schedule {
 }
 
 impl Schedule {
+    /// The empty schedule: no warmup, no trial, no fault, and every clock true.
+    ///
+    /// It is what a run driven by *another* scenario's faults carries, so that the
+    /// checks this scenario's [`Report`] makes can be asked of that run's trace
+    /// (see [`Report::over_a_run`]): the faults such a run ran are in its
+    /// `isolations` and its `last_heal`, which is all those checks read, and this
+    /// schedule claims none of its own rather than a drawn one it did not run.
+    // PROPOSED(D-076): the node scenario's report borrows these checks.
+    #[must_use]
+    pub fn none() -> Self {
+        Self {
+            warmup: Duration::ZERO,
+            trials: Vec::new(),
+            faults: Vec::new(),
+            gaps: Vec::new(),
+            settle: Duration::ZERO,
+            drifts: vec![0; SERVERS as usize],
+            skews: vec![0; SERVERS as usize],
+        }
+    }
+
     /// A schedule drawn from `seed`: three to six faults with random kinds,
     /// targets and durations, each followed by a quiet of at least two maximum
     /// election timeouts, so a check after a heal sees the heal's effect alone.
@@ -962,9 +983,106 @@ pub struct Report {
     pub history: History,
     /// The clients' counts.
     pub clients: ClientStats,
+    /// The ranges this run's configuration fixed at bootstrap (SHARD.md §2): the
+    /// one group of this scenario, four of the node's. The trace's payload oracle
+    /// asks that every record about a replica name one of them.
+    // PROPOSED(D-076): the run says which ranges it hosts.
+    pub ranges: Vec<u64>,
+    /// The range a key is served by in this run: the scenario's fixed map (SHARD.md,
+    /// Stage B), which the write bound and the liveness check read. One group's
+    /// scenario maps every key to it; the node's maps its keys over four ranges, and
+    /// that is what lets the liveness half of the majority carve-out be told from
+    /// the cluster-wide reading at all (D-071, item 6).
+    // PROPOSED(D-076): the scenario's key-to-range map is the run's, not a constant.
+    pub key_range: fn(&Bytes) -> u64,
+}
+
+/// What another scenario's run hands [`Report::over_a_run`].
+// PROPOSED(D-076): the node scenario is checked by the checks D-071 keyed.
+pub struct Run {
+    /// The seed.
+    pub seed: u64,
+    /// The cores' known-buggy variants.
+    pub variants: Variants,
+    /// How the run was scheduled (D-016).
+    pub policy: Policy,
+    /// What the moirae export needs besides the records.
+    pub header: RunHeader,
+    /// The trace as records.
+    pub records: Vec<TraceRecord>,
+    /// When the run's last fault healed.
+    pub last_heal: Instant,
+    /// Every isolation of one node: (node, from, until).
+    pub isolations: Vec<(u64, Instant, Instant)>,
+    /// The clients' history.
+    pub history: History,
+    /// The clients' counts.
+    pub clients: ClientStats,
+    /// The ranges the run's configuration fixed.
+    pub ranges: Vec<u64>,
+    /// The run's map from a key to the range that serves it.
+    pub key_range: fn(&Bytes) -> u64,
+    /// Why the run stopped early, if it did.
+    pub stopped: Option<String>,
 }
 
 impl Report {
+    /// A report over a run another scenario drove: the node scenario's
+    /// ([`crate::ranges`]), whose faults are its own and whose trace this scenario's
+    /// checks are asked of.
+    ///
+    /// Everything the checks read is the run's: the records, the isolations it made,
+    /// when it last healed, its clients' history, the ranges its configuration fixed
+    /// and the map from a key to its range. What is *not* the run's is
+    /// [`Report::schedule`], which is [`Schedule::none`] — the faults were not drawn
+    /// by [`Schedule::draw`] — and the fields of this scenario's own arms
+    /// (`trials_led_by_slowest`, `aimed_streams`), which are zero. No check reads
+    /// any of them: the schedule is read for the clock drift alone, which a run with
+    /// no skew and no drift has none of.
+    // PROPOSED(D-076): the node scenario is checked by the checks D-071 keyed.
+    #[must_use]
+    pub fn over_a_run(run: Run) -> Self {
+        let Run {
+            seed,
+            variants,
+            policy,
+            header,
+            records,
+            last_heal,
+            isolations,
+            history,
+            clients,
+            ranges,
+            key_range,
+            stopped,
+        } = run;
+        let refused: Vec<(u64, String)> = records
+            .iter()
+            .filter_map(|record| match &record.event {
+                TraceEvent::RaftRefused { server, reason } => Some((*server, reason.clone())),
+                _ => None,
+            })
+            .collect();
+        Self {
+            seed,
+            variants,
+            policy,
+            schedule: Schedule::none(),
+            records,
+            run: header,
+            last_heal,
+            isolations,
+            trials_led_by_slowest: 0,
+            aimed_streams: 0,
+            refused,
+            stopped,
+            history,
+            clients,
+            ranges,
+            key_range,
+        }
+    }
+
     /// The trace as moirae JSONL, written from [`Report::records`] under the run's
     /// header now, when it is asked for, rather than at the end of every run; the
     /// bytes are the ones the simulator's own export writes (D-052).
@@ -1081,8 +1199,10 @@ pub fn range_of_key(_key: &Bytes) -> u64 {
 /// Three folds over the records the run already walks, each naming the record it
 /// fails on:
 ///
-/// - every `Raft*` record about a replica carries [`SINGLE_GROUP`], the one range
-///   this stage runs (D-069). The three events about a node's *store* —
+/// - every `Raft*` record about a replica carries one of `hosted`, the ranges the
+///   run's configuration fixed — [`SINGLE_GROUP`] alone while a server runs one
+///   group, four of them on a node (D-069, D-076). The three events about a node's
+///   *store* —
 ///   `RaftRefused`, `RaftAdopted`, `RaftServerFailed` — carry none, which their
 ///   types say, so there is nothing to fold for them;
 /// - a [`TraceEvent::RaftApply`] with [`ApplyEffect::Applied`] carries the key it
@@ -1100,15 +1220,15 @@ pub fn range_of_key(_key: &Bytes) -> u64 {
 ///
 /// The first record that breaks one of the three, in words naming it.
 // PROPOSED(D-069): the payload of SHARD.md §8's trace has an oracle here.
-pub fn payload_is_well_formed(records: &[TraceRecord]) -> Result<(), String> {
+pub fn payload_is_well_formed(records: &[TraceRecord], hosted: &[u64]) -> Result<(), String> {
     for record in records {
         let range = range_of(&record.event);
         if let Some(range) = range
-            && range != SINGLE_GROUP
+            && !hosted.contains(&range)
         {
             return Err(format!(
-                "the trace's payload: a replica's record carries range {range}, not the \
-                 {SINGLE_GROUP} this stage runs: {:?}",
+                "the trace's payload: a replica's record carries range {range}, which is not \
+                 one of the ranges {hosted:?} this run hosts: {:?}",
                 record.event
             ));
         }
@@ -1159,11 +1279,55 @@ pub fn payload_is_well_formed(records: &[TraceRecord]) -> Result<(), String> {
     Ok(())
 }
 
+/// The messages one delivered payload carries, each with the range it is about.
+///
+/// A one-group server's frame is one message of [`SINGLE_GROUP`]; a node's frame is
+/// a batch, several messages each tagged with its range (D-072). A payload that is
+/// neither — a client's request, a packet the network mangled — carries none.
+// PROPOSED(D-076): the trace's checks read a batch frame's messages.
+#[must_use]
+pub fn messages_of(payload: &Bytes) -> Vec<(u64, Message)> {
+    // The one-group frame is tried first, and the order is not a preference: the two
+    // codecs' first bytes collide. A batch frame's version is 1 and `ananke-raft`'s
+    // tag 1 is a pre-vote, so a pre-vote frame — 33 bytes of `1 | from | term |
+    // last index | last term` — parses as a batch frame of two messages the codec
+    // then refuses, and read batch-first every pre-vote delivery of every one-group
+    // scenario would reset no timer at all. It cannot go the other way: a batch
+    // frame's first byte is 1, a pre-vote is exactly 33 bytes, `Frame::decode`
+    // refuses trailing bytes, and the smallest batch frame is 34 — its five-byte
+    // header, a twelve-byte tag and a message of at least seventeen. The node
+    // scenario's sweep pins that direction
+    // (`no_batch_frame_of_the_node_parses_as_a_frame_of_the_one_group_server`).
+    // PROPOSED(D-076): a payload is a one-group frame when it parses as one, and a
+    // batch frame otherwise.
+    if let Ok(frame) = Frame::decode(payload.clone()) {
+        return vec![(SINGLE_GROUP, frame.message)];
+    }
+    match ananke_shard::decode(payload) {
+        Ok(decoded) => decoded
+            .messages
+            .into_iter()
+            .map(|tagged| (tagged.range.get(), tagged.frame.message))
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
 /// A leader traces one [`TraceEvent::RaftMatchStarted`] per (leader, term,
 /// follower, incarnation): the rule the event's own definition states — the *first*
 /// rise of `matched` under the store incarnation the follower's answer carried
 /// (SHARD.md §8) — folded per run, so that a leader emitting one on every rise is
 /// seen.
+///
+/// The rule is a *replica's*, and so is every map here: the leader is the record's
+/// node **and the range the record names**, and its term is the latest term record
+/// of that replica. Keyed by the node alone — as this fold was written, when a node
+/// ran one group — a node leading four ranges reads whichever range's term record
+/// came last for all four, and one leader's four first rises under one follower
+/// collapse into one key. The node scenario's sweep fails on every seed under that
+/// key and no one-range sweep can tell the two apart (D-076).
+// PROPOSED(D-076): the fold is keyed by `(range, leader, term, follower,
+// incarnation)`.
 ///
 /// The counters cannot see that: dropping the `match_started` clause from the
 /// core's guard raises this sweep's count from 1 840 to 63 164 at a hundred seeds,
@@ -1179,26 +1343,38 @@ pub fn payload_is_well_formed(records: &[TraceRecord]) -> Result<(), String> {
 /// The first repeat, naming the leader, the term, the follower and the incarnation.
 // PROPOSED(D-069): `RaftMatchStarted` is the first rise, and this is what says so.
 pub fn match_starts_are_first_rises(records: &[TraceRecord]) -> Result<(), String> {
-    let mut terms: BTreeMap<u64, u64> = BTreeMap::new();
-    let mut started: BTreeSet<(u64, u64, u64, u64)> = BTreeSet::new();
+    let mut terms: BTreeMap<(u64, u64), u64> = BTreeMap::new();
+    let mut started: BTreeSet<(u64, u64, u64, u64, u64)> = BTreeSet::new();
     for record in records {
         match &record.event {
-            TraceEvent::RaftTerm { server, term, .. }
-            | TraceEvent::RaftRecovered { server, term, .. } => {
-                terms.insert(*server, *term);
+            TraceEvent::RaftTerm {
+                server,
+                range,
+                term,
+                ..
+            }
+            | TraceEvent::RaftRecovered {
+                server,
+                range,
+                term,
+                ..
+            } => {
+                terms.insert((*range, *server), *term);
             }
             TraceEvent::RaftMatchStarted {
+                range,
                 follower,
                 incarnation,
                 matched,
                 ..
             } => {
                 let leader = record.node.map_or(0, |node| u64::from(node.get()));
-                let term = terms.get(&leader).copied().unwrap_or_default();
-                if !started.insert((leader, term, *follower, *incarnation)) {
+                let term = terms.get(&(*range, leader)).copied().unwrap_or_default();
+                if !started.insert((*range, leader, term, *follower, *incarnation)) {
                     return Err(format!(
-                        "match starts: leader {leader} of term {term} traced a second first rise \
-                         of {follower}'s match under incarnation {incarnation} (at {matched})"
+                        "match starts: leader {leader} of term {term} of group {range} traced a \
+                         second first rise of {follower}'s match under incarnation \
+                         {incarnation} (at {matched})"
                     ));
                 }
             }
@@ -1375,7 +1551,7 @@ impl Report {
         }
         // PROPOSED(D-069): the trace SHARD.md §8 asks for has an oracle, so that a
         // field stamped wrong fails a sweep before §8's checks are written.
-        if let Err(violation) = payload_is_well_formed(&self.records) {
+        if let Err(violation) = payload_is_well_formed(&self.records, &self.ranges) {
             return fail(violation);
         }
         if let Err(violation) = match_starts_are_first_rises(&self.records) {
@@ -1415,7 +1591,7 @@ impl Report {
         let bound = election_max() * LIVENESS_TIMEOUTS;
         let mut asked = 0usize;
         for (key, took) in self.writes_after_heal_by_key() {
-            if !live.contains(&range_of_key(&key)) {
+            if !live.contains(&(self.key_range)(&key)) {
                 continue;
             }
             asked += 1;
@@ -2082,25 +2258,41 @@ impl Report {
                     // quorum, with no leader in the cluster at all
                     // (`Report::snapshot_fed_timer_gaps`).
                     //
-                    // The message resets the timer of the replica it is addressed
-                    // to: a frame carries one message of one group today, and the
-                    // batch frame of §4 tags each message it holds with its range
-                    // (SHARD.md §11, raft 1), which the decode reads there.
-                    let range = SINGLE_GROUP;
+                    // The message resets the timer of **the replica it is addressed
+                    // to**, which is a (range, server) and not a server: a frame of
+                    // the one-group server carries one message of one group, and a
+                    // node's batch frame tags each message it holds with its range
+                    // (SHARD.md §4; §11, raft 1), which the decode reads there
+                    // (D-072's codec, `ananke_shard::decode`).
+                    //
+                    // Read as one group's — as this replay stood, when no node sent
+                    // a batch frame — every heartbeat a node receives for any of its
+                    // four ranges either resets one range's timer or, since a batch
+                    // frame does not parse as a single one, resets nothing at all:
+                    // on the node scenario's traces the second is what happens, and
+                    // every follower replica reads as having heard from no leader
+                    // between its own appends. The node sweep fails on half its
+                    // seeds under that reading and no one-range sweep can tell the
+                    // two apart (D-076).
+                    // PROPOSED(D-076): a batch frame resets the timer of each range
+                    // it carries.
                     if let Some(server) = server_of(*to)
                         && let Some(payload) = payloads.get(id)
-                        && let Ok(frame) = Frame::decode(payload.clone())
-                        && frame.message.term() >= terms.get(&(range, server)).copied().unwrap_or(0)
                     {
-                        match frame.message {
-                            Message::AppendEntries { .. } => clocks.reset((range, server), at),
-                            Message::InstallSnapshot { .. } if resets.install_snapshot => {
-                                clocks.reset((range, server), at);
+                        for (range, message) in messages_of(payload) {
+                            if message.term() < terms.get(&(range, server)).copied().unwrap_or(0) {
+                                continue;
                             }
-                            Message::InstallSnapshot { .. } => {
-                                *clocks.installs.entry((range, server)).or_default() += 1;
+                            match message {
+                                Message::AppendEntries { .. } => clocks.reset((range, server), at),
+                                Message::InstallSnapshot { .. } if resets.install_snapshot => {
+                                    clocks.reset((range, server), at);
+                                }
+                                Message::InstallSnapshot { .. } => {
+                                    *clocks.installs.entry((range, server)).or_default() += 1;
+                                }
+                                _ => {}
                             }
-                            _ => {}
                         }
                     }
                 }
@@ -4971,6 +5163,8 @@ pub fn run_with(seed: u64, schedule: Schedule, variants: impl Into<Variants>) ->
         stopped: watch.stopped,
         history,
         clients: clients_total,
+        ranges: vec![SINGLE_GROUP],
+        key_range: range_of_key,
     }
 }
 
@@ -5454,6 +5648,8 @@ mod tests {
             stopped: None,
             history: History::default(),
             clients: ClientStats::default(),
+            ranges: (SINGLE_GROUP..SINGLE_GROUP + 4).collect(),
+            key_range: range_of_key,
         }
     }
 
@@ -6234,6 +6430,80 @@ mod tests {
             wedged.liveness(),
             Err(
                 "liveness: no client write to k1 completed after the last heal at Instant(0ns)"
+                    .to_owned()
+            )
+        );
+    }
+
+    /// The liveness half of the majority carve-out, which D-071 owed a case of its
+    /// own: "the stage that gives `range_of_key` a map owes the liveness half its
+    /// own two-range case in the same PR" (D-071, item 6). With every key in one
+    /// range no history could put a live range and a range without a majority on two
+    /// different keys, so `Report::liveness`'s per-range reading could not be told
+    /// from the cluster-wide one by any test. The node scenario's map can
+    /// (`ranges::range_of_key`), and this is that case: the wedged range's key is
+    /// not asked of, and the live range's is.
+    // PROPOSED(D-076): the liveness half of the carve-out, keyed by the run's map.
+    #[test]
+    fn a_wedged_ranges_key_is_not_asked_of_while_the_range_beside_it_is_live() {
+        fn two_ranges(key: &Bytes) -> u64 {
+            if key.as_ref() == b"k0" {
+                SINGLE_GROUP
+            } else {
+                OTHER
+            }
+        }
+        let write = |key: &str, ret: Option<u64>| lin::Op {
+            process: 1,
+            seq: 0,
+            call: ms(1),
+            ret: ret.map(ms),
+            op: ClientOp::Put {
+                key: Bytes::from(key.to_owned()),
+                value: Bytes::from_static(b"v"),
+            },
+            result: ret.map(|_| ananke_env::ClientResult::Done),
+        };
+        let quarantined = |server, range| TraceEvent::RaftReseeded { server, range };
+        // `OTHER` is one replica short of a majority; `SINGLE_GROUP` is whole.
+        let records = vec![
+            record(
+                ms(0),
+                ms(0),
+                Some(1),
+                term_of(1, SINGLE_GROUP, 1, "follower"),
+            ),
+            record(ms(0), ms(0), Some(1), term_of(1, OTHER, 1, "follower")),
+            record(ms(1), ms(1), Some(1), quarantined(1, OTHER)),
+            record(ms(2), ms(2), Some(2), quarantined(2, OTHER)),
+        ];
+        let with = |ops| Report {
+            history: History {
+                ops,
+                ..History::default()
+            },
+            key_range: two_ranges,
+            ..report(records.clone(), Vec::new())
+        };
+        let wedged = with(vec![write("k0", Some(100)), write("k1", None)]);
+        assert_eq!(
+            wedged.ranges_with_a_majority_up(),
+            BTreeSet::from([SINGLE_GROUP])
+        );
+        // The wedged range's key never completed a write, and the check does not
+        // ask: RAFT.md §2 withholds liveness from a range without a majority. Read
+        // cluster-wide — `live.contains` replaced by `true`, which is the mutation
+        // this case exists for — the same history fails on k1.
+        wedged
+            .liveness()
+            .expect("the wedged range's key is not asked of");
+        // And the live range's key is asked of: keying has not widened the check
+        // into a check of nothing.
+        let live_wedged = with(vec![write("k0", None), write("k1", Some(100))]);
+        assert_eq!(
+            live_wedged.liveness(),
+            Err(
+                "liveness: no client write to k0 completed after the last heal at Instant(0ns)"
                     .to_owned()
             )
         );

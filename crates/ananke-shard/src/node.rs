@@ -37,7 +37,7 @@ use std::time::Duration;
 use ananke_env::{Clock, Decision, Either, Environment, Rng, race};
 use ananke_raft::core::SnapshotAction;
 use ananke_raft::queue::Queue;
-use ananke_raft::{Entry, Index, Input, Message, Output, Persist, ServerId};
+use ananke_raft::{Entry, Index, Input, Message, Output, Persist, Raft, ServerId};
 use bytes::Bytes;
 
 use crate::inbox::{Inbox, Received};
@@ -56,6 +56,31 @@ pub type Boxed<'h, T> = Pin<Box<dyn Future<Output = T> + Send + 'h>>;
 /// futures it hands back are held side by side while the round's persists share one
 /// group commit.
 pub trait Host {
+    /// What the node's own tasks and its clients hand the `raft` task besides the
+    /// peer messages on its inbox: a client's request (a range is on every client
+    /// message, SHARD.md §4), an index the `apply` task made durable. A host with no
+    /// such inputs sets it to `()`.
+    // PROPOSED(D-076): the node's local inputs are the host's own type, so the
+    // client protocol and the applied feedback stay on the server's side of Q40's
+    // boundary and the `raft` task keeps one loop.
+    type Local: Send + 'static;
+
+    /// Which range a node-local event is for. It is asked before the event is
+    /// stepped or held, so a client's request waits for its own range's persist and
+    /// for no other's (SHARD.md §4).
+    fn local_range(&self, local: &Self::Local) -> RangeId;
+
+    /// The input a node-local event steps into its range's core, with that core as
+    /// it stands. `None` when there is nothing to step: a duplicate request whose
+    /// entry is still in the log, or an event for a range this node does not hold.
+    /// The host keeps whatever it needs to answer the client.
+    fn local_input(&self, local: Self::Local, core: &Raft) -> Option<Input>;
+
+    /// The local input was stepped and its round driven, with the core as the step
+    /// left it: where the host reads the index and term a proposal took. `decided`
+    /// is the stamp the step was taken at (D-047).
+    fn local_stepped(&self, range: RangeId, core: &Raft, decided: Decision);
+
     /// Makes `range`'s state durable. The future does nothing until it is polled; the
     /// round submits all of its persists and then polls every one of them in one pass
     /// with no await between, so the WAL writer takes the round's records as one group
@@ -207,6 +232,9 @@ pub struct Node<E: Environment, H: Host> {
     next_round: u64,
     open: BTreeMap<u64, Open>,
     frames: Frames,
+    /// The node's own inputs held for a core whose persist is outstanding, in the
+    /// order they arrived (SHARD.md §4).
+    deferred: BTreeMap<RangeId, VecDeque<H::Local>>,
 }
 
 impl<E: Environment, H: Host> Node<E, H> {
@@ -221,6 +249,7 @@ impl<E: Environment, H: Host> Node<E, H> {
             next_round: 0,
             open: BTreeMap::new(),
             frames: Frames::default(),
+            deferred: BTreeMap::new(),
         }
     }
 
@@ -267,7 +296,7 @@ impl<E: Environment, H: Host> Node<E, H> {
     /// # Errors
     ///
     /// The first persist that fails: a node whose disk failed under it cannot go on.
-    pub async fn raft(&mut self, inbox: &Inbox) -> io::Result<()> {
+    pub async fn raft(&mut self, inbox: &Inbox, local: &Queue<H::Local>) -> io::Result<()> {
         let mut persists = Persists::default();
         let mut next_tick = self.env.clock().now() + self.config.tick;
         loop {
@@ -276,14 +305,20 @@ impl<E: Environment, H: Host> Node<E, H> {
                 let timer = pin!(self.env.clock().sleep_until(next_tick));
                 let arrived = pin!(race(&self.env, pop, timer));
                 let resolved = pin!(persists.next(&self.env));
-                match race(&self.env, arrived, resolved).await {
-                    Either::Left(Either::Left(Some(first))) => Event::Messages(first),
-                    Either::Left(Either::Left(None)) => return Ok(()),
-                    Either::Left(Either::Right(())) => {
+                let peers = pin!(race(&self.env, arrived, resolved));
+                let mine = pin!(local.pop());
+                match race(&self.env, peers, mine).await {
+                    Either::Left(Either::Left(Either::Left(Some(first)))) => Event::Messages(first),
+                    Either::Left(Either::Left(Either::Left(None))) => return Ok(()),
+                    Either::Left(Either::Left(Either::Right(()))) => {
                         next_tick += self.config.tick;
                         Event::Tick
                     }
-                    Either::Right(resolved) => Event::Resolved(resolved),
+                    Either::Left(Either::Right(resolved)) => Event::Resolved(resolved),
+                    Either::Right(Some(mine)) => Event::Local(mine),
+                    // The node's own tasks are done with it: nothing local can
+                    // arrive again, and the loop goes on serving its peers.
+                    Either::Right(None) => return Ok(()),
                 }
             };
             let round = match event {
@@ -311,6 +346,21 @@ impl<E: Environment, H: Host> Node<E, H> {
                     // was outstanding: the flush that follows is this round's.
                     let resolved = self.cores.resolved(&self.env, range);
                     self.drive(resolved, Some(round), &mut persists).await?;
+                    // The node's own inputs for that core were held beside its
+                    // messages, and are stepped in the order they arrived.
+                    while !self.cores.persisting(range) {
+                        let Some(mine) =
+                            self.deferred.get_mut(&range).and_then(VecDeque::pop_front)
+                        else {
+                            break;
+                        };
+                        self.local(mine, &mut persists).await?;
+                    }
+                    inbox.hold_at(self.cores.held_bytes());
+                    continue;
+                }
+                Event::Local(mine) => {
+                    self.local(mine, &mut persists).await?;
                     inbox.hold_at(self.cores.held_bytes());
                     continue;
                 }
@@ -320,6 +370,42 @@ impl<E: Environment, H: Host> Node<E, H> {
             // the inbox and is still counted against the node's byte bound (Q14).
             inbox.hold_at(self.cores.held_bytes());
         }
+    }
+
+    /// One node-local input: a client's request, or an index the `apply` task made
+    /// durable.
+    ///
+    /// A core whose persist is outstanding holds its own node's inputs exactly as it
+    /// holds the messages of its range (SHARD.md §4): they are stepped, in the order
+    /// they arrived, once that core's persist resolves. A client of one range
+    /// therefore waits behind that range's disk and behind no other range's, which
+    /// is the whole point of Q41's round.
+    // PROPOSED(D-076): a node-local input is held for a persisting core as a message
+    // of its range is.
+    async fn local(&mut self, mine: H::Local, persists: &mut Persists) -> io::Result<()> {
+        let range = self.host.local_range(&mine);
+        if self.cores.persisting(range) {
+            self.deferred.entry(range).or_default().push_back(mine);
+            return Ok(());
+        }
+        let Some(core) = self.cores.core(range) else {
+            // A local input for a range this node does not hold: counted, never
+            // silent, as a message for one is.
+            self.cores.count_input_for_a_range_not_held();
+            return Ok(());
+        };
+        let Some(input) = self.host.local_input(mine, core) else {
+            return Ok(());
+        };
+        // D-047: the step's decision time. The stamp reads the time and nothing
+        // else, so taking it here rather than inside the step moves no schedule.
+        let decided = self.env.decision();
+        let round = self.cores.messages(&self.env, [(range, input, None, 0)]);
+        self.drive(round, None, persists).await?;
+        if let Some(core) = self.cores.core(range) {
+            self.host.local_stepped(range, core, decided);
+        }
+        Ok(())
     }
 
     /// Runs a round and everything it sets off, without recursion: a round whose
@@ -548,13 +634,15 @@ impl<E: Environment, H: Host> Node<E, H> {
 }
 
 /// What woke the `raft` task.
-enum Event {
+enum Event<L> {
     /// The ticker.
     Tick,
     /// A message, and whatever is queued behind it.
     Messages(Received),
     /// A persist resolved.
     Resolved(Resolved),
+    /// One of the node's own inputs: a client's request, an applied index.
+    Local(L),
 }
 
 /// One message from the inbox as the round takes it.
@@ -857,6 +945,20 @@ mod tests {
     }
 
     impl Host for Probe {
+        // The probe drives the round alone: no client and no `apply` task, so it
+        // has no node-local inputs of its own.
+        type Local = ();
+
+        fn local_range(&self, (): &Self::Local) -> RangeId {
+            RangeId(0)
+        }
+
+        fn local_input(&self, (): Self::Local, _core: &Raft) -> Option<Input> {
+            None
+        }
+
+        fn local_stepped(&self, _range: RangeId, _core: &Raft, _decided: Decision) {}
+
         fn persist(&self, range: RangeId, _persist: Persist) -> BoxedPersist {
             let env = self.env.clone();
             let log = self.log.clone();
@@ -1080,7 +1182,8 @@ mod tests {
             let inbox = inbox.clone();
             let taken = taken.clone();
             async move {
-                let _ = node.raft(&inbox).await;
+                let local: Queue<()> = Queue::new();
+                let _ = node.raft(&inbox, &local).await;
                 *taken.lock().expect("the cell") = Some((node.meters(), node.frames()));
             }
         });

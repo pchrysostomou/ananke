@@ -184,7 +184,7 @@ take rewrites a directory a stream is reading (D-043). On the node that name gai
 range, `snap-r<range>-<index>-<take>`, and the staging directory gains the range and the
 sender, `staging-r<range>-s<sender>`, because a node's ranges apply streams of commands
 of their own and two of them taking at one index is ordinary; a range's sweep then
-proposes only its own versions for deletion (SHARD.md §11 raft 14; D-075, proposed).
+proposes only its own versions for deletion (SHARD.md §11 raft 14; D-076, proposed).
 A take asked for at the index
 the record already names answers with the recorded version when this store took it
 and it is complete; a take asked for because a stream found no usable checkpoint is
@@ -211,7 +211,7 @@ cap wait rather than restarting one another. A slot the cap frees is granted to 
 that is asking for it, never reserved for one that asked earlier and may since have been
 replaced as leader; and a chunk that starts an assembly over is answered with that
 restart even when it is its stream's last, since the directory it would be installed from
-has just been started over (Q14; D-075, proposed). An
+has just been started over (Q14; D-076, proposed). An
 acknowledgement that takes a stream past the furthest point any acknowledgement had
 taken it is that stream's progress, and the task marks the follower for the core, which
 reads the marks before each tick; a duplicate, the answer a resend gets and ground a
@@ -297,7 +297,10 @@ Raft emits a trace event for every state transition that the invariants read. Th
 events, each recorded with its node and two times (D-047). Every event about a
 replica carries `range`, the group it is of, and the three about the node's store —
 `RaftRefused`, `RaftAdopted` and `RaftServerFailed` — carry none (SHARD.md §8,
-D-069); today a node runs one group, `node::SINGLE_GROUP`:
+D-069). The one-group server runs `node::SINGLE_GROUP` and every event of its runs
+carries it; the node (`ananke_shard::server::run`) runs four ranges on each of its
+nodes in the scenario that drives it, and a core's events carry the range its
+`RaftConfig::range` names (PROPOSED D-076):
 
 | Event | When | Fields |
 |---|---|---|
@@ -529,9 +532,16 @@ reserved tenant, tenant 0 in the §2.6 key encoding. A store is opened for one R
 *group*, under the key prefix `0 / <group: u64 BE>`; every key of the group is
 `prefix / <purpose: u64 BE> / name`, with SHARD.md §13's Q5 purposes in the place
 RAFT.md's table ids had, so a group's whole Raft state is one key interval and
-several groups share one engine without sharing a key. Today's one group is group
-2, SHARD.md §2's range 2 (`node::SINGLE_GROUP`); Stage B gives a server a group per
-range. The layout, the group and the format record below are D-060, PROPOSED, which
+several groups share one engine without sharing a key. `ananke_raft::run`, the
+one-group server, runs group 2, SHARD.md §2's range 2 (`node::SINGLE_GROUP`);
+`ananke_shard::server::run`, the node, opens one engine and **a store per range** on
+it, each under its own prefix, with the ranges fixed at bootstrap from configuration
+(`RaftStore::open_sibling`; SHARD.md §2, PROPOSED D-076). The two checks
+`RaftStore::open` makes before it reads a key — that the directory's format was read
+for this engine (D-059) and that the recovery lost nothing in the middle (D-044) —
+are the engine's and are made once for every store on it; everything else, the
+incarnation key a fresh store writes and the stale log keys a crash left, is per
+prefix. The layout, the group and the format record below are D-060, PROPOSED, which
 this section describes and which the entry decides (Stage A item 6, Q5 and Q40).
 
 | Key | Value |
@@ -732,7 +742,7 @@ waits in the inbox for the next:
   the running engine, with the range's repair carried in the same manifest switch, and
   no incarnation ends and no engine reopens. `RaftAdopted` on the node records only a
   node taking a fresh directory as its store after a whole-node refusal, and never a
-  replica's install (D-066; D-075, proposed).
+  replica's install (D-066; D-076, proposed).
 
 The `net` and `raft` tasks are separate so that a message arriving while the core is
 awaiting a persist is a queued message, not a lost one, and so that the interleaving
