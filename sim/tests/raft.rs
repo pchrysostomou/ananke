@@ -618,8 +618,10 @@ fn assert_no_stream_wedge(report: &raft::Report) {
 /// D-043's alone, above.)
 #[test]
 fn seed_132_which_pinned_the_combined_variant_before_the_layout_reaches_no_wedge() {
-    let both = Variants::of(&[Variant::IgnoreIncarnation, Variant::SharedSnapshotDir]);
-    let paired = raft::run(132, both);
+    let paired = raft::run(
+        132,
+        Variants::of(&[Variant::IgnoreIncarnation, Variant::SharedSnapshotDir]),
+    );
     let stream = raft::run(132, Variant::SharedSnapshotDir);
     let incarnation = raft::run(132, Variant::IgnoreIncarnation);
     let correct = raft::run(132, Variant::Correct);
@@ -710,7 +712,6 @@ fn seed_132_which_pinned_the_combined_variant_before_the_layout_reaches_no_wedge
         "seed 132 under the correct server no longer refuses server 2, resets the leader's \
          progress for it and re-seeds it: re-audit the pin"
     );
-    let _ = both;
 }
 
 /// Seed 680, which pinned the combined variant before D-056's send queue moved every

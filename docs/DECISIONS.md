@@ -9087,14 +9087,18 @@ one at that index.
    the leader's is a checkpoint that stalls every range's applies for its duration
    (D-036), and a record is one synced batch. Stated in RAFT.md.
 2. *What the trace says about the record.* The first build traced
-   `RaftSnapshot { taken: false }` for it, which is what an install traces, and that
-   quietly turned the raft sweep's `snapshots_installed` from 19 359 into 75 742 over a
-   thousand seeds. **The record traces nothing of its own**: the transition is the
+   `RaftSnapshot { taken: false }` for it, which is what an install traces. That quietly
+   turned the raft sweep's `snapshots_installed` from 19 359 into 75 742 over a thousand
+   seeds, and — worse — it fed the checker's applied floor (D-030), so a follower's
+   compaction raised the floor past what `ApplyBeforeCommit` had applied without
+   committing and state machine safety stopped seeing the variant on 125 seeds of a
+   thousand. **The record traces nothing of its own**: the transition is the
    compaction, which the core traces as `RaftCompacted` once the prefix's deletes are
    durable, and a crash between the two is reported by the restatement at the next open,
-   where a take's crash window is reported. That is the smaller change and the one that
-   leaves every existing counter meaning what it meant. A new event kind would have been
-   the alternative; it is not needed and would collide with §8's own.
+   where a take's crash window is reported. That is the smaller change, the one that
+   leaves every existing counter meaning what it meant, and the one that keeps a
+   variant's catch where it was. A new event kind would have been the alternative; it is
+   not needed and would collide with §8's own.
 3. *What a follower does when the record names an index its log no longer holds.* It
    cannot happen on the correct system and does under `ApplyBeforeCommit`.
    `maybe_compact` **returns rather than draining past the log's end**, so the variant is
@@ -9158,7 +9162,7 @@ while it was not leading, in entries, read off the trace as `last_index - snap_i
 
 | | before (`ae75bdf`) | after |
 | --- | --- | --- |
-| `ApplyBeforeCommit` caught | 882 of 1 000 | 875 of 1 000 |
+| `ApplyBeforeCommit` caught | 882 of 1 000 | **1 000 of 1 000** |
 | `TruncateOnEveryAppend` caught | 999 of 1 000 | 999 of 1 000 |
 | membership `reverts_to_a_prefix` | 25 | 35 |
 | membership `truncation_reverts_to_a_prefix` (the core's revert floor) | 0 | 0 |
@@ -9166,10 +9170,15 @@ while it was not leading, in entries, read off the trace as `last_index - snap_i
 | membership compactions | 15 339 | 48 411 |
 | raft-sweep compactions | 35 031 | 91 386 |
 
-- `ApplyBeforeCommit`'s catch has not moved materially: 882 → 875 of 1 000, within the
-  seed-to-seed noise of a sweep whose schedules all moved. The new fold catches it on
-  its own as well; that rate is printed by its own test and is the figure the tier of
-  that assertion rests on.
+- `ApplyBeforeCommit`'s catch rises to every seed, and the way it got there is the
+  evidence for the second settled point above. With the record traced as
+  `RaftSnapshot { taken: false }` — the first build — the rate was **875** of 1 000,
+  where `ae75bdf` gives 882. The checker sets its applied floor from that event
+  (D-030), so every follower compaction was raising the floor past entries the variant
+  had applied and never committed, and state machine safety could no longer see them:
+  the trace was hiding the bug. With the event gone and the compaction reported by
+  `RaftCompacted` alone, the rate is **1 000** of 1 000. The new fold catches the variant
+  on 999 of 1 000 by itself, printed by its own test.
 - `TruncateOnEveryAppend` is unchanged at 999 of 1 000. Its window does shrink on a
   follower — a truncation never reaches below the prefix, and the prefix is now the
   applied index — but the variant truncates on *every* append, so a truncation that
@@ -9183,6 +9192,11 @@ while it was not leading, in entries, read off the trace as `last_index - snap_i
   actually reaches it: `truncation_reverts_to_a_prefix` is 0 of 1 000 before and after,
   and the 3-of-10 000 figure issue #56 records is the nightly's, which this branch's
   nightly will re-state.
+
+The correct system's own figures are the same on the tree with the record's trace and on
+the tree without it, to the entry and the seed — the follower-log maximum, its whole
+distribution, every compaction count — because a trace event is an observation and draws
+nothing. Only what the checker could *see* moved.
 
 *What moved beside them, at the same tier:* `snapshots_installed` 19 359 → 20 130 (the
 restatements of the extra opens the moved schedules make, not a change of install
@@ -9287,6 +9301,17 @@ leader compacts the Raft log to its last checkpoint…" now says what a follower
 which supersedes RAFT.md's rule that only a leader compacts, as Stage B's question 1
 asked; and `RaftSnapshot`'s row says a record with no checkpoint under it is the third
 thing it reports.
+
+**The premerge**, on this branch, quoting its own machine lines:
+`premerge: Darwin 25.6.0 arm64, Apple M2, 8 cores`;
+`premerge: before, load 20.95/28.30/31.01, AC Power, no thermal warning recorded`;
+`premerge: after, load 48.04/52.17/56.40, AC Power, no thermal warning recorded`;
+`premerge: green at 1000 seeds in 1410 s`. **On AC power** throughout, and slow for the
+reason the loads say: other slices of this stage were building and sweeping on the same
+laptop, at load averages between 20 and 135 over the run. The figure is not comparable
+with D-071's 625 s on an otherwise idle machine, and is recorded with its loads for that
+reason (D-070). Every rate quoted above is from that output or from a run made the same
+way.
 
 **What is not done.**
 
