@@ -9833,7 +9833,7 @@ beside it: the load averages are recorded with each figure and are high for that
 | `StepWhilePersisting` (the node's pair) | the same command, `a_node_that_steps_a_core_while_its_persist_is_outstanding_is_caught` | caught on **639 of 1 000 seeds (63.9 %)**, which is why it is asserted at every tier (D-061) |
 | The write bound's margin, four ranges | `ANANKE_SEEDS=1000` over the node sweep | see below |
 | The recovery time's margin, per range | `ANANKE_SEEDS=1000` over the node sweep | see below |
-| The premerge on this branch's tip | `scripts/premerge.sh` | **green at a thousand seeds in 1 252 s**: `premerge: Darwin 25.6.0 arm64, Apple M2, 8 cores`; `before, load 41.40/56.73/59.91, AC Power, no thermal warning recorded`; `after, load 43.04/48.76/50.33, AC Power, no thermal warning recorded` |
+| The premerge on this branch's tip | `scripts/premerge.sh` | first tip: **green at a thousand seeds in 1 252 s** (`before, load 41.40/56.73/59.91, AC Power, no thermal warning recorded`; `after, load 43.04/48.76/50.33, AC Power`). Fixed tip, after the review: **green at a thousand seeds in 673 s** — `premerge: Darwin 25.6.0 arm64, Apple M2, 8 cores`; `premerge: before, load 10.70/10.18/7.46, AC Power, no thermal warning recorded`; `premerge: after, load 19.29/15.63/11.89, AC Power, no thermal warning recorded` |
 
 **The write bound's margin is the figure for the owner**, and the reading it is taken
 under changed under the review of this entry (settled point 9 above): a post-heal write
@@ -9866,9 +9866,17 @@ the cluster does.
 **What the narrowing that is left is.** The recovery margin, 836.8 ms at a thousand
 seeds, is the one to watch: four ranges elect, replicate and apply through one `raft`
 task, one `apply` task and one engine on each node, so a range's recovery after a heal
-waits behind the other three ranges' work as well as its own. The one-range scenario's
-own reading of the same thing is a few hundred milliseconds. **The bound is not widened**
-(D-030, D-039). If the nightly at ten thousand seeds finds a seed past it, that is a
+waits behind the other three ranges' work as well as its own. The one-range scenarios
+read under the same two readings, on the premerge of this branch's fixed tip at a
+thousand seeds, are the comparison:
+
+| Reading | One range | Four ranges to a node |
+|---|---|---|
+| A post-heal write from its own call | **44.623736 ms** (`sim/raft.rs`'s sweep, `Coverage::slowest_write_after_heal`) | 30.554792 ms |
+| A range's recovery from the heal | **664.94607 ms** (`sim/membership.rs`'s sweep, whose figure is `Report::time_to_write_after_heal`) | 1.163172939 s |
+
+So a range on the node recovers in about 1.75 times what one group takes, and an
+individual write is no slower. **The bound is not widened** (D-030, D-039). If the nightly at ten thousand seeds finds a seed past it, that is a
 recovery genuinely over ten election timeouts and a finding for the owner, not a bound to
 move: the recommendation would be to look at the node's round and its engine, not at the
 number.
