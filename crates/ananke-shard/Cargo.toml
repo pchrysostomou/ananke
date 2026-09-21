@@ -1,0 +1,21 @@
+[package]
+name = "ananke-shard"
+description = "The range layer of ananke: many Raft groups on one node — range-tagged batch frames, the per-peer outbox and the node's inbox, under deterministic simulation"
+readme = "README.md"
+keywords = ["raft", "multi-raft", "sharding", "distributed", "dst"]
+categories = ["database-implementations", "simulation"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+ananke-env = { path = "../ananke-env", version = "0.3" }
+ananke-raft = { path = "../ananke-raft", version = "0.3" }
+bytes.workspace = true
+moirae-trace.workspace = true
+
+[lints]
+workspace = true

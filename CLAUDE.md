@@ -95,6 +95,7 @@ crates/ananke-env/     Environment trait; real/ (RealEnv on tokio); sim/ (Sim + 
 crates/ananke-server/  Node binary + library of the protocols it runs (echo for Phase 0)
 crates/ananke-storage/ Storage engine: crc32c, wal, memtable, sst, manifest, engine (Phase 1)
 crates/ananke-raft/    Raft: core (pure step function), message (codec, studio decoder), store (tenant 0), apply, invariants (Phase 2)
+crates/ananke-shard/   The range layer (Phase 3): the node's wire — range-tagged batch frames, the per-peer outbox, the node's inbox
 sim/                   Simulation scenarios; scenario files sit directly in sim/ (echo.rs, engine.rs, wal.rs, raft.rs) with the linearizability checker lin.rs
 docs/                  SPEC, DECISIONS, BACKLOG, BOOTSTRAP_PROMPT, devlog/
 scripts/               gate.sh (run before every commit), check-direct-io.sh

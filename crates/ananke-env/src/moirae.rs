@@ -59,6 +59,14 @@
 //! writes its keys, and a key a client named as text, as `ananke.client.invoke` writes
 //! its own.
 //!
+//! A `send` line's `msg` is whatever the export's [`Decoder`] makes of the payload. One
+//! frame is one `send` line, since moirae pairs a send with its delivery by `msgId`, so
+//! a frame that carries several messages — a node's batch frame, which holds the
+//! messages of every range it has for that peer (SHARD.md §4) — puts them in a `msgs`
+//! array inside that one object, each with its own `type` and `range`. A frame of six
+//! messages of three ranges then reads in the studio as six messages and not as one
+//! (`ananke_shard::frame::studio`).
+//!
 //! `t` is global virtual time in nanoseconds and the header says `unit: "ns"`. Node ids
 //! pass through unchanged: ananke numbers nodes from 1 exactly because moirae does
 //! (see [`NodeId`]). Addresses become node ids through the table of every address a
@@ -92,6 +100,10 @@ use crate::{ClientOp, ClientResult, DirEntryOp, DropReason, NodeId, TraceEvent, 
 
 /// Turns a message payload into the `msg` object of a `send` line: an object whose
 /// `type` is a string, which is what the studio labels and filters by.
+///
+/// A decoder for a frame that carries several messages puts them in a `msgs` array of
+/// that object, each with its own `type`, rather than describing the frame alone; see
+/// the module documentation.
 pub type Decoder = dyn Fn(&[u8]) -> Json + Send + Sync;
 
 /// The decoder for payloads nobody can read: `{"type":"bytes","len":N}`.

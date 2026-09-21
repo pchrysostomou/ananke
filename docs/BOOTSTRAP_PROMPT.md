@@ -308,10 +308,27 @@ _Update this section at the end of every session._
   the node's PR to close. The premerge at a thousand seeds on the fixed tree: green in
   625.01 s on AC power, with `slowest_write_after_heal` and every variant rate identical,
   so nothing moved.
-- Next concrete task: Phase 3 Stage B (SHARD.md §12), the node: many groups on one
-  socket, one ticker and one engine — after the owner's review of Stage A at its exit
-  criteria. Issue #37: a refused server's silence while it verifies, repairs and
-  adopts its re-seed deposes the leader when the third server is away.
+- Phase 3 Stage B, first slice (2026-09-21), branch `phase-3-stage-b-wire`: the node's
+  wire, as PROPOSED D-072. The crate `ananke-shard` exists (Q40) and holds four modules
+  and nothing else: `RangeId`; the batch frame, which carries several messages each
+  tagged with its 8-byte range id (Q10) and wraps `ananke-raft`'s codec byte for byte, at
+  12 bytes a message and 5 a frame; the per-peer outbox, one frame a peer a flush cut
+  under `MAX_FRAME_LEN`, with the overflowing message left to start the next flush's
+  frame and a message larger than a frame refused at the push; and the node's inbox, one
+  per node, bounded in the wire bytes each message occupied, admitting in constant time
+  and refusing the arrival rather than dropping anything it has admitted. The studio
+  decoder shows a frame of six messages of three ranges as six messages. `ananke-raft`
+  does not depend on the new crate and still names no range. The admission examines 0
+  queue entries at every length from 1 to 4 096, with room and full — the measurement
+  Stage B asks for, counted rather than timed — against today's admission, which scans
+  the queue. Ten planted bugs, ten caught, no survivors (the table is in D-072). Nothing
+  in `sim/` changes and the single-group server is untouched. The premerge is still owed
+  on AC power: the laptop was on battery throughout (D-070).
+- Next concrete task: Phase 3 Stage B's second slice, the node's tasks — the `raft` task
+  over many cores on one ticker in Q41's round, the `apply` task, the snapshot task, and
+  the scenarios' four ranges a node — on top of the wire above. Issue #72 is open on the
+  first live install (D-069). Issue #37: a refused server's silence while it verifies,
+  repairs and adopts its re-seed deposes the leader when the third server is away.
   Open follow-ups: issue #32 (the pre-vote check: a message delivered before an
   isolation but stepped inside it) and issue #33
   (assert the timer catches that decision time removes, not only print them).

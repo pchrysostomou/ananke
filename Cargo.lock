@@ -41,6 +41,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ananke-shard"
+version = "0.3.0"
+dependencies = [
+ "ananke-env",
+ "ananke-raft",
+ "bytes",
+ "moirae-trace",
+]
+
+[[package]]
 name = "ananke-sim"
 version = "0.3.0"
 dependencies = [
