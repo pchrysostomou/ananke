@@ -73,24 +73,30 @@ fn checked(report: &raft::Report) -> Result<(), String> {
     let actions = report.snapshot_actions();
     if actions > 0 {
         return Err(format!(
-            "seed {seed}: {actions} snapshot actions were traced, a path this node does not \
-             have: `ananke_shard::snapshot` is not wired to \
-             `ananke_shard::server::ServerHost`. The install-path variants are not \
-             re-asserted here, and a run that reaches this must say so rather than pass"
+            "seed {seed}: {actions} snapshot actions were traced, a path this cluster does \
+             not reach: its `snapshot_threshold` is held far above what its clients \
+             write, on purpose. The wiring itself exists since PROPOSED D-083 and is \
+             exercised by `sim/tests/install.rs`; what is not re-asserted *here* is the \
+             install-path variants, and a run that reaches this must say so rather \
+             than pass"
         ));
     }
-    // The absence proper. A `RaftSnapshot` record is not evidence on its own: the
-    // node's `Host::snapshot` bumps `Gaps::snapshot_actions` and traces nothing, so a
-    // take the node dropped on the floor would leave the line above green against a
-    // silence. What is asserted here is the condition behind every action a core can
-    // ask for — a log longer than `snapshot_threshold` — which the trace does carry.
+    // The absence proper: the *condition* behind every action a core can ask for — a
+    // log longer than `snapshot_threshold` — which the trace carries and the count
+    // above does not settle on its own.
+    //
+    // Since PROPOSED D-083 the wiring exists, so a snapshot action on this cluster
+    // would no longer be dropped in silence; what this clause still guards is the
+    // thing that has not changed. These arms assert nothing about a stream or an
+    // install, and a run that started taking them would be exercising a path with no
+    // check over it while looking green. The install-path variants are re-asserted in
+    // the slice that owns them, over `sim/tests/install.rs`'s situation, not here.
     let highest = report.highest_index();
     if highest >= raft::NODE_SNAPSHOT_THRESHOLD {
         return Err(format!(
             "seed {seed}: a replica reached index {highest}, at or past the {} this cluster \
              sets `snapshot_threshold` to, so a core could ask for a take, a record or an \
-             install and the node would drop it in silence: the snapshot path is not wired \
-             here",
+             install and these arms would assert nothing about what followed",
             raft::NODE_SNAPSHOT_THRESHOLD
         ));
     }

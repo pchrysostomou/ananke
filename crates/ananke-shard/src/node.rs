@@ -122,14 +122,82 @@ pub trait Host {
     /// an applied index durable above the durable log (SHARD.md §4).
     fn apply(&self, job: ApplyJob);
 
-    /// Snapshot work for the `snapshot` task, which is a later slice's; a
-    /// [`SnapshotAction::Take`] goes to the `apply` task instead (RAFT.md §1), and the
-    /// node routes it there rather than here.
+    /// Snapshot work for the node's `snapshot` task: a stream to a follower behind the
+    /// compacted prefix. A [`SnapshotAction::Take`] goes to the `apply` task instead
+    /// (RAFT.md §1), and the node routes it there rather than here.
     fn snapshot(&self, range: RangeId, action: SnapshotAction);
+
+    /// What a node-local input asks of the range's *core*, beyond being stepped into
+    /// it.
+    ///
+    /// Every local input the node had before the snapshot wiring was a step: a
+    /// client's request, an index the `apply` task made durable. A live install is not
+    /// (D-066). It replaces one range's replica with the state a manifest switch made
+    /// durable, and it has to hold that range from the moment the install is decided
+    /// until the switch is done, or a step of the replica being replaced writes into
+    /// the store above the state the switch is about to install. A server gets both
+    /// for free: it ends its run-loop incarnation and comes back on the switched store
+    /// (RAFT.md §1). A node cannot, because that would restart every range on it
+    /// (SHARD.md §11, storage 5) — so this is the one range's version of it.
+    ///
+    /// The default is [`CoreWork::Step`]: a host with no install path answers it for
+    /// every input, and nothing about the round changes for it.
+    // PROPOSED(D-083): a live install holds one range and replaces its replica.
+    fn local_core(&self, local: &Self::Local, core: &Raft) -> CoreWork {
+        let _ = (local, core);
+        CoreWork::Step
+    }
+
+    /// Whether this local input is what *releases* a range's hold — a live install's
+    /// switch, or its abandonment — and so must be taken while that range is held
+    /// rather than queued behind the hold it ends.
+    ///
+    /// It is separate from [`local_core`](Self::local_core), and pure, for a reason
+    /// that is a bug this had: `local_core` may have a side effect of its own (the
+    /// install's repair is built there and handed to the `snapshot` task), and the
+    /// node has to know whether an input is held *before* it asks what the input
+    /// wants. Asking first and holding afterwards would build a repair, and let the
+    /// switch that carries it proceed, for a range whose own persist was still in
+    /// flight — which is the one thing the hold exists to prevent.
+    // PROPOSED(D-083): a live install holds one range and replaces its replica.
+    fn local_releases(&self, local: &Self::Local) -> bool {
+        let _ = local;
+        false
+    }
 
     /// The node cannot go on: the disk failed under it. The host traces it; the task
     /// returns the error.
     fn failed(&self, reason: String);
+}
+
+/// What a node-local input asks of the range's core ([`Host::local_core`]).
+///
+/// It is deliberately not an `Input`: the two things a live install needs of a core
+/// are not steps of it, and expressing them as steps would put the install's
+/// bookkeeping inside the Raft core, which knows nothing about a node's engine.
+// PROPOSED(D-083): a live install holds one range and replaces its replica.
+pub enum CoreWork {
+    /// An ordinary local input: step it into the core ([`Host::local_input`]).
+    Step,
+    /// Hold the range: its messages and its node-local inputs queue where a persisting
+    /// core's already queue, and nothing steps it until a [`Restore`](Self::Restore)
+    /// arrives. A hold asked for while that range's persist is outstanding waits its
+    /// turn behind it, like any other local input, so the install never switches under
+    /// a write that is still in flight.
+    Hold,
+    /// The install switched: this is the replica it built, and it replaces the one that
+    /// was there. The hold is released with it and the range's held work is stepped
+    /// into the new core, in the order it arrived.
+    Restore(Box<Raft>),
+    /// The install did not switch — the staged directory was short, or the engine
+    /// refused it — so the range goes on with the replica it has. The hold is released
+    /// and the held work is stepped into that core.
+    ///
+    /// It is a separate answer from [`Restore`](Self::Restore) of the core that is
+    /// already there, because the two differ in what they leave behind: a restore
+    /// replaces the replica and a release does not, and a release that quietly
+    /// re-restored would hide an install that failed as one that worked.
+    Release,
 }
 
 /// What the node's `apply` task runs, one job at a time.
@@ -152,6 +220,13 @@ pub enum ApplyWork {
     /// recorded one was found unusable — is the slice that reads checkpoints back, and
     /// is one more kind of this `non_exhaustive` enum when it lands.
     Take,
+    /// Write the range's snapshot record at the applied index with no checkpoint under
+    /// it: a follower's compaction point (D-065, D-078). It runs in the `apply` task
+    /// between two applies for the same reason a take does — so the index, the term
+    /// and the configuration the record carries are exactly the state a snapshot at
+    /// that index would capture (D-036).
+    // PROPOSED(D-083): a follower's compaction record is the `apply` task's job too.
+    Record,
 }
 
 /// One job for the node's `apply` task, with the range it belongs to.
@@ -380,7 +455,7 @@ impl<E: Environment, H: Host> Node<E, H> {
     /// The inputs held for `range` while its persist was outstanding, stepped in the
     /// order they arrived, for as long as the core is not persisting again.
     async fn replay_held(&mut self, range: RangeId, persists: &mut Persists) -> io::Result<()> {
-        while !self.cores.persisting(range) {
+        while !self.cores.held(range) {
             let Some(mine) = self.deferred.get_mut(&range).and_then(VecDeque::pop_front) else {
                 break;
             };
@@ -413,7 +488,30 @@ impl<E: Environment, H: Host> Node<E, H> {
     // of its range is.
     async fn local(&mut self, mine: H::Local, persists: &mut Persists) -> io::Result<()> {
         let range = self.host.local_range(&mine);
-        if self.cores.persisting(range) {
+        // A live install's two asks of the core are not steps of it (D-066). The
+        // replacement is taken *before* the hold is consulted, because it is what
+        // releases the hold; the hold is taken after it, so an install decided while
+        // that range's persist is outstanding waits behind that persist like any other
+        // local input, and never switches under a write still in flight.
+        // PROPOSED(D-083): a live install holds one range and replaces its replica.
+        // A held range holds its own inputs as it holds its messages (SHARD.md §4).
+        // `StepWhileInstalling` is honoured here as `Cores::drive` honours it for a
+        // message, because the step that matters is any step that can persist, and a
+        // client's proposal persists exactly as an append does.
+        //
+        // This is asked *before* the host is asked what the input wants, because that
+        // question has a side effect — a live install's repair is built there — and an
+        // install whose repair was built and handed on while its own range's persist
+        // was still in flight would switch the store under that write. What ends a
+        // hold is the one thing that must not be queued behind it.
+        // PROPOSED(D-083): a live install holds one range and replaces its replica.
+        let held = self.cores.persisting(range)
+            || (self.cores.installing(range)
+                && !self
+                    .config
+                    .variants
+                    .contains(NodeVariant::StepWhileInstalling));
+        if held && !self.host.local_releases(&mine) {
             self.cores.count_local_held();
             if self.config.variants.contains(NodeVariant::HeldLocalDropped) {
                 // The variant: the input is thrown away instead of held. A client
@@ -425,6 +523,21 @@ impl<E: Environment, H: Host> Node<E, H> {
             }
             self.deferred.entry(range).or_default().push_back(mine);
             return Ok(());
+        }
+        let work = match self.cores.core(range) {
+            Some(core) => self.host.local_core(&mine, core),
+            // A local input for a range this node does not hold is counted below,
+            // where every other one of them is.
+            None => CoreWork::Step,
+        };
+        match work {
+            CoreWork::Restore(core) => return self.restore(range, Some(*core), persists).await,
+            CoreWork::Release => return self.restore(range, None, persists).await,
+            CoreWork::Hold => {
+                self.hold_for_install(range);
+                return Ok(());
+            }
+            CoreWork::Step => {}
         }
         let Some(core) = self.cores.core(range) else {
             // A local input for a range this node does not hold: counted, never
@@ -442,6 +555,79 @@ impl<E: Environment, H: Host> Node<E, H> {
         self.drive(round, None, persists).await?;
         if let Some(core) = self.cores.core(range) {
             self.host.local_stepped(range, core, decided);
+        }
+        Ok(())
+    }
+
+    /// Holds `range` across its live install, from the install's decision to its
+    /// manifest switch ([`CoreWork::Hold`]).
+    // PROPOSED(D-083): the hold is one range's.
+    fn hold_for_install(&mut self, range: RangeId) {
+        if self
+            .config
+            .variants
+            .contains(NodeVariant::InstallHoldsEveryRange)
+        {
+            // The variant: the node reaches for the incarnation a server ends and
+            // stops every range it hosts, so one range's install costs every other
+            // range on the node the length of a stream's switch — which is the cost
+            // the live install exists to avoid (SHARD.md §11, storage 5).
+            for other in self.cores.ranges().collect::<Vec<_>>() {
+                self.cores.hold_for_install(other);
+            }
+            return;
+        }
+        self.cores.hold_for_install(range);
+    }
+
+    /// `range`'s live install switched: `core` is the replica it built. It takes the
+    /// place of the one it replaced, the hold goes, and the work held while the install
+    /// ran is stepped into it ([`CoreWork::Restore`]).
+    // PROPOSED(D-083): the replica a switch builds replaces the one it replaced.
+    async fn restore(
+        &mut self,
+        range: RangeId,
+        core: Option<Raft>,
+        persists: &mut Persists,
+    ) -> io::Result<()> {
+        let round = match core {
+            Some(core)
+                if !self
+                    .config
+                    .variants
+                    .contains(NodeVariant::InstallKeepsTheOldCore) =>
+            {
+                self.cores.installed(&self.env, range, core)
+            }
+            // The variant: the switch is made and the replica is not replaced, so the
+            // store holds the snapshot and the core goes on from the log it had — the
+            // half of an install a server gets for free by reopening its store (D-066).
+            // And the ordinary failure path, which replaces nothing on purpose.
+            _ => self.cores.release_install(&self.env, range),
+        };
+        self.drive(round, None, persists).await?;
+        // The range's *own* inputs were held beside its messages and are stepped in
+        // the order they arrived, exactly as a resolution replays them. Boxed because
+        // the replay steps local inputs and a local input is what called this: a
+        // *held* one is never a restore — a restore is taken before the hold is
+        // consulted — but the type system cannot see that.
+        Box::pin(self.replay_held(range, persists)).await?;
+        if self
+            .config
+            .variants
+            .contains(NodeVariant::InstallHoldsEveryRange)
+        {
+            // The variant's hold is the node's, so its release is too: every other
+            // range is let go here, which is what keeps the variant a cost and not a
+            // wedge, and is what makes the figure it is caught by a figure.
+            for other in self.cores.ranges().collect::<Vec<_>>() {
+                if other == range {
+                    continue;
+                }
+                let round = self.cores.release_install(&self.env, other);
+                self.drive(round, None, persists).await?;
+                Box::pin(self.replay_held(other, persists)).await?;
+            }
         }
         Ok(())
     }
@@ -878,7 +1064,7 @@ mod tests {
 
     use ananke_env::sim::{Sim, SimConfig, SimEnv};
     use ananke_raft::message::Message;
-    use ananke_raft::types::{Configuration, Entry, Payload};
+    use ananke_raft::types::{Configuration, Entry, Payload, Term};
     use ananke_raft::{Raft, RaftConfig};
 
     use super::*;
@@ -917,7 +1103,25 @@ mod tests {
         Rejected(RangeId),
         /// A node-local input reached its core, and which one it was.
         Local(RangeId, u64),
+        /// The host asked for a range to be held across its live install.
+        Held(RangeId),
+        /// The host handed back the replica a switch built.
+        Restored(RangeId),
     }
+
+    /// What one node-local input asks of its range's core, so a check can drive the
+    /// two halves of a live install through the node.
+    // PROPOSED(D-083): a live install holds one range and replaces its replica.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Work {
+        Step,
+        Hold,
+        Restore,
+    }
+
+    /// The term the replica a switch builds carries, so a check can tell it from the
+    /// core it replaced without reaching inside either.
+    const INSTALLED_TERM: Term = 9;
 
     /// One node-local input the probe is fed: its range, and its place in the order
     /// it was pushed in.
@@ -925,6 +1129,7 @@ mod tests {
     struct Mine {
         range: RangeId,
         n: u64,
+        work: Work,
     }
 
     /// What one [`Note::Applied`] carries.
@@ -934,6 +1139,9 @@ mod tests {
         Entries(Vec<Index>),
         /// A checkpoint, between two applies.
         Take,
+        /// A follower's compaction record, between two applies: no checkpoint under
+        /// it (D-065, D-078).
+        Record,
     }
 
     impl Job {
@@ -943,6 +1151,7 @@ mod tests {
                     Job::Entries(entries.iter().map(|entry| entry.index).collect())
                 }
                 ApplyWork::Take => Job::Take,
+                ApplyWork::Record => Job::Record,
             }
         }
     }
@@ -1000,6 +1209,40 @@ mod tests {
 
         fn local_range(&self, mine: &Self::Local) -> RangeId {
             mine.range
+        }
+
+        fn local_releases(&self, mine: &Self::Local) -> bool {
+            matches!(mine.work, Work::Restore)
+        }
+
+        fn local_core(&self, mine: &Self::Local, _core: &Raft) -> CoreWork {
+            match mine.work {
+                Work::Step => CoreWork::Step,
+                Work::Hold => {
+                    self.note(Note::Held(mine.range));
+                    CoreWork::Hold
+                }
+                Work::Restore => {
+                    self.note(Note::Restored(mine.range));
+                    // The check drives this while the range is held; `local_releases`
+                    // above is what lets it through.
+                    // The replica a switch built: a core of its own, at a term no
+                    // core this node started with holds, so a check can say which of
+                    // the two the node is running afterwards.
+                    CoreWork::Restore(Box::new(Raft::restore(
+                        ME,
+                        Configuration::of(&[ME, LEADER, ServerId(3)]),
+                        RaftConfig {
+                            range: mine.range.get(),
+                            ..RaftConfig::default()
+                        },
+                        7,
+                        INSTALLED_TERM,
+                        None,
+                        Vec::new(),
+                    )))
+                }
+            }
         }
 
         fn local_input(&self, mine: Self::Local, _core: &Raft) -> Option<Input> {
@@ -1150,6 +1393,9 @@ mod tests {
     /// inbox closed.
     struct Run {
         log: Vec<Note>,
+        /// Each range's term when the run ended: what says whether the replica a
+        /// switch built is the one the node is running.
+        terms: BTreeMap<RangeId, Term>,
         /// Every message that left, by range and kind, in order.
         sent: Vec<(RangeId, &'static str)>,
         meters: Meters,
@@ -1161,6 +1407,11 @@ mod tests {
         /// Whether each of the setup's fed arrivals was admitted, in order.
         fed: Vec<bool>,
     }
+
+    /// What the `raft` task leaves behind when it stops: what it measured, and each
+    /// range's term, which says whether the replica a switch built is the one the node
+    /// is running.
+    type Taken = (Meters, Frames, BTreeMap<RangeId, Term>);
 
     /// How a run is set up. [`run`] is the usual one: two followers, a bound no check
     /// reaches, and every arrival admitted before the node starts.
@@ -1235,7 +1486,7 @@ mod tests {
         for arrival in setup.arrivals {
             assert!(inbox.admit(arrival.clone()).is_admitted());
         }
-        let taken: Arc<Mutex<Option<(Meters, Frames)>>> = Arc::default();
+        let taken: Arc<Mutex<Option<Taken>>> = Arc::default();
         // The node's local queue, held here so a check can push the node its own
         // inputs while it runs. The `raft` task races it against the inbox and the
         // ticker whether or not anything is ever pushed.
@@ -1246,7 +1497,12 @@ mod tests {
             let local = local.clone();
             async move {
                 let _ = node.raft(&inbox, &local).await;
-                *taken.lock().expect("the cell") = Some((node.meters(), node.frames()));
+                let terms = node
+                    .cores()
+                    .ranges()
+                    .filter_map(|range| node.cores().core(range).map(|core| (range, core.term())))
+                    .collect();
+                *taken.lock().expect("the cell") = Some((node.meters(), node.frames(), terms));
             }
         });
         let mut held_bytes_seen = 0;
@@ -1274,9 +1530,14 @@ mod tests {
         // Long enough for the task to see the closed inbox through whatever it is in
         // the middle of, however slow the socket this check gave it.
         sim.run_for(TICK * 4 + setup.ship * 60);
-        let (meters, frames) = taken.lock().expect("the cell").expect("the node stopped");
+        let (meters, frames, terms) = taken
+            .lock()
+            .expect("the cell")
+            .take()
+            .expect("the node stopped");
         Run {
             log: log.lock().expect("the log").clone(),
+            terms,
             sent: sent.lock().expect("the sent log").clone(),
             meters,
             frames,
@@ -1346,6 +1607,159 @@ mod tests {
     /// would reach its core in the wrong order.
     // PROPOSED(D-076): a node-local input is held for a persisting core as a message
     // of its range is.
+    /// A live install holds **one** range across its switch, and the replica the
+    /// switch built is the one the node runs afterwards (D-066, D-083).
+    ///
+    /// A server ends its whole run-loop incarnation across an install and comes back
+    /// on the switched store (RAFT.md §1). A node cannot: reopening the engine would
+    /// restart every range on it (SHARD.md §11, storage 5). So the node holds the one
+    /// range, steps every other range's work meanwhile, and replaces that range's core
+    /// when the switch is durable.
+    ///
+    /// Three variants are caught here, and the third is a mutation a node of one range
+    /// could not be wrong about at all.
+    // PROPOSED(D-083): a live install holds one range and replaces its replica.
+    #[test]
+    fn a_live_install_holds_its_range_alone_and_replaces_that_ranges_replica() {
+        // r1 is held from 1 ms to 40 ms. Work arrives for both ranges inside the hold:
+        // r1's must wait for the switch, r2's must not.
+        let locals = [
+            (
+                Duration::from_millis(1),
+                Mine {
+                    range: R1,
+                    n: 0,
+                    work: Work::Hold,
+                },
+            ),
+            (
+                Duration::from_millis(5),
+                Mine {
+                    range: R1,
+                    n: 1,
+                    work: Work::Step,
+                },
+            ),
+            (
+                Duration::from_millis(6),
+                Mine {
+                    range: R2,
+                    n: 9,
+                    work: Work::Step,
+                },
+            ),
+            (
+                Duration::from_millis(40),
+                Mine {
+                    range: R1,
+                    n: 2,
+                    work: Work::Restore,
+                },
+            ),
+        ];
+        let setup = |variants| Setup {
+            locals: &locals,
+            duration: Duration::from_millis(90),
+            ..Setup::new(variants, &[])
+        };
+
+        let correct = run_with(setup(NodeVariants::correct()));
+        assert_eq!(
+            correct.meters.ranges_held_for_install, 1,
+            "one range was held, not {}: {:?}",
+            correct.meters.ranges_held_for_install, correct.log
+        );
+        let held = position(&correct.log, &Note::Held(R1));
+        let restored = position(&correct.log, &Note::Restored(R1));
+        let r1_work = position(&correct.log, &Note::Local(R1, 1));
+        let r2_work = position(&correct.log, &Note::Local(R2, 9));
+        assert!(
+            r1_work > restored,
+            "the held range was stepped inside its own install's window: {:?}",
+            correct.log
+        );
+        assert!(
+            r2_work > held && r2_work < restored,
+            "another range waited on this range's install, which is the cost a live \
+             install exists to avoid: {:?}",
+            correct.log
+        );
+        assert_eq!(
+            correct.terms.get(&R1),
+            Some(&INSTALLED_TERM),
+            "the node is not running the replica the switch built: {:?}",
+            correct.terms
+        );
+        assert_eq!(
+            correct.terms.get(&R2),
+            Some(&0),
+            "a range that did not install had its replica replaced: {:?}",
+            correct.terms
+        );
+
+        // The pair, one variant at a time.
+        //
+        // `StepWhileInstalling`: the range is stepped inside the window. The replica
+        // being replaced is behind its leader by definition, so a step of it there
+        // appends at indices the switch is about to compact past.
+        let stepping = run_with(setup(
+            NodeVariants::correct().with(NodeVariant::StepWhileInstalling),
+        ));
+        assert!(
+            position(&stepping.log, &Note::Local(R1, 1))
+                < position(&stepping.log, &Note::Restored(R1)),
+            "the variant is meant to step the installing range: {:?}",
+            stepping.log
+        );
+
+        // `InstallKeepsTheOldCore`: the switch is made and the replica is not
+        // replaced. The store holds the snapshot and the core goes on from the log it
+        // had — the half of an install a server gets for free by reopening its store.
+        let kept = run_with(setup(
+            NodeVariants::correct().with(NodeVariant::InstallKeepsTheOldCore),
+        ));
+        assert_eq!(
+            kept.terms.get(&R1),
+            Some(&0),
+            "the variant is meant to keep the core it should have replaced: {:?}",
+            kept.terms
+        );
+        assert!(
+            position(&kept.log, &Note::Local(R1, 1)) > position(&kept.log, &Note::Restored(R1)),
+            "the variant still releases the hold, so only the replacement is missing: {:?}",
+            kept.log
+        );
+
+        // `InstallHoldsEveryRange`: **the mutation a single-range world cannot see.**
+        // The node reaches for the incarnation a server ends and stops every range it
+        // hosts, so one range's install costs every other range on the node the length
+        // of a stream's switch. With one range on the node, holding "every" range and
+        // holding "this" range are the same hold, and nothing distinguishes them; with
+        // two, r2's work waits behind r1's install.
+        let every = run_with(setup(
+            NodeVariants::correct().with(NodeVariant::InstallHoldsEveryRange),
+        ));
+        assert_eq!(
+            every.meters.ranges_held_for_install, 2,
+            "the variant is meant to hold every range on the node: {:?}",
+            every.log
+        );
+        assert!(
+            position(&every.log, &Note::Local(R2, 9)) > position(&every.log, &Note::Restored(R1)),
+            "the variant is meant to make another range wait on this one's install: {:?}",
+            every.log
+        );
+        // And it is still only a cost: every range is let go with the install, so the
+        // node does not wedge. A variant that wedged would be caught for the wrong
+        // reason.
+        assert_eq!(
+            every.terms.get(&R2),
+            Some(&0),
+            "the variant replaced a replica it only held: {:?}",
+            every.terms
+        );
+    }
+
     #[test]
     fn a_local_input_for_a_persisting_core_is_held_and_stepped_in_order() {
         // r1's disk is slow and r2's is never asked: an input for r1 arriving while
@@ -1353,10 +1767,38 @@ mod tests {
         let arrivals = [arrival(R1, append(1, 1))];
         let delays = [(R1, Duration::from_millis(40))];
         let locals = [
-            (Duration::from_millis(1), Mine { range: R1, n: 1 }),
-            (Duration::from_millis(2), Mine { range: R2, n: 9 }),
-            (Duration::from_millis(3), Mine { range: R1, n: 2 }),
-            (Duration::from_millis(4), Mine { range: R1, n: 3 }),
+            (
+                Duration::from_millis(1),
+                Mine {
+                    range: R1,
+                    n: 1,
+                    work: Work::Step,
+                },
+            ),
+            (
+                Duration::from_millis(2),
+                Mine {
+                    range: R2,
+                    n: 9,
+                    work: Work::Step,
+                },
+            ),
+            (
+                Duration::from_millis(3),
+                Mine {
+                    range: R1,
+                    n: 2,
+                    work: Work::Step,
+                },
+            ),
+            (
+                Duration::from_millis(4),
+                Mine {
+                    range: R1,
+                    n: 3,
+                    work: Work::Step,
+                },
+            ),
         ];
         let setup = |variants| Setup {
             arrivals: &arrivals,

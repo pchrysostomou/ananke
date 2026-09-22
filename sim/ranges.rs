@@ -72,6 +72,14 @@ pub const CLIENTS: u64 = 2;
 pub const DIR: &str = "/node";
 /// The node's inbox bound, in bytes (D-072).
 pub const INBOX_BYTES: usize = 64 * 1024;
+
+/// The node's cap on snapshot streams received and assembled at once (Q14, D-075).
+///
+/// D-075 fixes no default and recommends that a scenario which is not about the cap
+/// set it at or above the node's range count, so no stream waits by accident. These
+/// scenarios are not about the cap: they set it at [`RANGES`]. The re-seed shape, which
+/// *is* about the cap, sets it to two on purpose (SHARD.md §12).
+pub const SNAPSHOT_CAP: usize = RANGES as usize;
 /// How many trace records a run may hold before it is stopped as a runaway
 /// (`raft::TRACE_CAP`, and the figure Stage B measures per range).
 pub const TRACE_CAP: usize = raft::TRACE_CAP;
@@ -671,6 +679,7 @@ pub fn server_config(id: u64, variants: impl Into<Variants>, node: NodeVariants)
         },
         engine,
         inbox_bytes: INBOX_BYTES,
+        snapshot_cap: SNAPSHOT_CAP,
         node,
     }
 }

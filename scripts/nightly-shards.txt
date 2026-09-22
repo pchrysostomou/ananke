@@ -52,6 +52,13 @@
 # by shard 2. The next row added goes into the lightest, which is shard 3.
 #
 # shard	binary	cpu_s	test
+# D-083's three rows are the node's snapshot wiring, weighed on its own tree in release,
+# run alone, as user+sys of the test binary. They are small and they stay small: that
+# binary does not read ANANKE_SEEDS, because its situation is reached by construction on
+# every seed rather than searched for, so it runs the same eight seeds at every tier.
+# Putting it under the tiers is owed and is recorded as owed in D-083; the machine these
+# three were measured on was not idle, which for figures of two or three CPU seconds
+# against shards of thirteen hundred changes no assignment.
 # shard 1: 1432.8 cpu s
 1	engine	625.1	an_install_in_two_switches_is_caught
 1	engine	36.8	an_install_whose_repair_precedes_its_switch_is_caught
@@ -84,7 +91,7 @@
 2	ranges	0.1	no_batch_frame_of_the_node_parses_as_a_frame_of_the_one_group_server
 2	ranges	0.1	the_ranges_of_one_node_draw_their_own_election_timeouts
 2	node	163.5	every_seed_passes_on_the_correct_node_under_the_raft_sweeps_arms
-# shard 3: 1299.2 cpu s
+# shard 3: 1301.9 cpu s
 3	echo	0.2	trace_hash_matches_the_pinned_golden
 3	engine	417.5	the_range_delete_crash_test_passes_every_seed
 3	engine	235.9	the_seek_crash_test_passes_every_seed
@@ -131,7 +138,7 @@
 5	raft	139.6	the_correct_server_passes_the_membership_scenario_on_every_seed
 5	raft	50.7	a_server_that_applies_before_commit_compacts_past_its_commit_index
 5	ranges	59.0	every_seed_passes_on_the_correct_node
-# shard 6: 1299.2 cpu s
+# shard 6: 1301.8 cpu s
 6	echo	0.1	a_busy_looping_task_fails_the_scenario_instead_of_hanging
 6	engine	310.3	an_engine_that_acknowledges_before_the_log_is_caught
 6	engine	204.5	an_engine_that_releases_a_memtable_before_the_manifest_is_caught
@@ -157,3 +164,6 @@
 6	node	0.3	a_seed_replays_to_the_same_trace_on_the_node
 6	node	0.1	a_node_under_the_raft_sweeps_arms_runs_every_range
 6	node	0.1	the_nodes_arms_aim_at_every_range_and_not_at_one
+3	install	2.7	every_wiring_variant_is_caught
+6	install	2.4	the_correct_node_installs_on_every_seed
+6	install	0.2	a_stream_flows_and_an_install_completes_on_every_range_and_every_follower

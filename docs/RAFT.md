@@ -185,6 +185,14 @@ range, `snap-r<range>-<index>-<take>`, and the staging directory gains the range
 sender, `staging-r<range>-s<sender>`, because a node's ranges apply streams of commands
 of their own and two of them taking at one index is ordinary; a range's sweep then
 proposes only its own versions for deletion (SHARD.md §11 raft 14; D-076, proposed).
+On the node the take is still the `apply` task's, and it checkpoints the range's own
+key intervals rather than the engine directory (`Engine::checkpoint_spans`): one engine
+holds every range on the node, and a take that copied all of it would stream three other
+ranges' state to a follower of this one. It copies the range's Raft state **except its
+log** and the range's user keys; the leader's log is not part of what a snapshot
+describes, and the install's switch removes the receiver's own log with the rest of the
+span, so the repair's kept tail is all that goes back and nothing is streamed to be
+tombstoned again (D-083, proposed).
 A take asked for at the index
 the record already names answers with the recorded version when this store took it
 and it is complete; a take asked for because a stream found no usable checkpoint is
@@ -211,7 +219,12 @@ cap wait rather than restarting one another. A slot the cap frees is granted to 
 that is asking for it, never reserved for one that asked earlier and may since have been
 replaced as leader; and a chunk that starts an assembly over is answered with that
 restart even when it is its stream's last, since the directory it would be installed from
-has just been started over (Q14; D-076, proposed). An
+has just been started over (Q14; D-076, proposed). On the node a chunk and its
+response are taken off the wire by the `net` task and handed to the `snapshot` task
+before the node's inbox sees them, so they are charged to that task's receive cap and
+not to the inbox's byte bound, and so they arrive at all: the core's arm for them is
+empty because the server is expected to route them away first, which the one-group
+server does and the node did not until D-083 (issue #96, proposed). An
 acknowledgement that takes a stream past the furthest point any acknowledgement had
 taken it is that stream's progress, and the task marks the follower for the core, which
 reads the marks before each tick; a duplicate, the answer a resend gets and ground a
@@ -258,6 +271,29 @@ and only then are the old store's files removed, then the staging directory's ow
 staging. Until the switch is durable the old `CURRENT` names the old store whole, and a
 crash anywhere before the staging `CURRENT` is gone re-runs the adoption on the same
 staged bytes.
+
+**On the node, none of the two paragraphs above happens.** An install there is Stage A's
+live install into the running engine (D-066), because ending an incarnation and
+reopening the engine would restart every range on it: the completed stream's staged
+directory is opened as a span source — which is also the check that it is whole, so one
+left short by a crash is refused there and the stream restarts — and the range's two key
+intervals and its repair go into the engine in **one** manifest switch, with the engine
+left open and the node's other ranges untouched. The repair is the same list, built by
+the same function, with no log tombstones because no log key was streamed. The node
+adopts no staged store at its start, so a staging `CURRENT` is never found damaged
+there and `RaftAdopted` on the node records only a node taking a fresh directory after a
+whole-node refusal.
+
+Two things a server gets for free from ending its incarnation, the node has to do for
+the one range. It **holds** that range from the install's decision to its switch — its
+messages and its node-local inputs queue exactly where a persisting core's already
+queue, and every other range on the node goes on stepping — because the replica being
+replaced is behind its leader by definition, and a step of it in that window would
+append at indices the switch is about to compact past. And it **replaces** that range's
+replica with one restored on the state the repair wrote, which takes the held work in
+the order it arrived, and carries with it the highest index handed to the `apply` task,
+since an `Apply` naming an index below the installed snapshot is one the new replica
+cannot serve (D-083, proposed).
 
 A leader compacts the Raft log to its last checkpoint once every follower has matched
 it, is being streamed the snapshot, or is designated snapshot-fed (D-037). A follower is

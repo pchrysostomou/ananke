@@ -42,6 +42,14 @@
 //!   over the receive cap takes a slot by asking again once one is free, and a stream
 //!   that starts its assembly over is restarted from its first byte rather than
 //!   installed from a directory that has just been cleared.
+//! - [`mod@install`], the `snapshot` task itself: the streams' bytes, the engine's
+//!   calls and the trace events the planner has none of, on a fourth handle of the
+//!   node's one socket. It is what makes an install *complete* on the node — a take
+//!   of the range's own key intervals, a stream per (range, follower), a chunk
+//!   diverted before the node's inbox rather than admitted and then dropped
+//!   (issue #96), and D-066's live install of the range's two spans in one manifest
+//!   switch, with the range held across it and its replica replaced by the one the
+//!   switch built.
 //! - [`mod@variant`], the node's known-buggy variants, each a plausible way to get
 //!   the round or the snapshot task wrong, built beside the correct code (CLAUDE.md's
 //!   pair rule).
@@ -51,6 +59,7 @@
 pub mod client;
 pub mod frame;
 pub mod inbox;
+pub mod install;
 pub mod node;
 pub mod outbox;
 pub mod range;

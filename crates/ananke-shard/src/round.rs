@@ -146,6 +146,19 @@ struct Slot {
     core: Raft,
     /// A persist of this core is outstanding: it steps nothing until it resolves.
     persisting: bool,
+    /// A live install of this range is between its decision and its manifest switch:
+    /// it steps nothing until the switch is durable and the replica is replaced
+    /// ([`Cores::hold_for_install`]).
+    ///
+    /// A server ends its whole run-loop incarnation across an install and comes back
+    /// on the store the switch built (RAFT.md §1); a node cannot, because that would
+    /// restart every range on it (SHARD.md §11, storage 5). This flag is the node's
+    /// answer: the hold is one range's, and it is the *same* hold a persisting core
+    /// takes, so the messages and node-local inputs of that range queue where they
+    /// already queue and every other range on the node goes on stepping.
+    // PROPOSED(D-083): a range is held across its live install as it is held across a
+    // persist, so no step of the replaced core writes above the installed state.
+    installing: bool,
     /// The outputs that follow this core's `Persist`, in order, to be executed when
     /// that persist resolves.
     deferred: Vec<Act>,
@@ -159,6 +172,7 @@ impl Slot {
         Self {
             core,
             persisting: false,
+            installing: false,
             deferred: Vec::new(),
             held: VecDeque::new(),
         }
@@ -196,6 +210,16 @@ pub struct Meters {
     // PROPOSED(D-076): a node-local input is held for a persisting core as a message
     // of its range is.
     pub locals_held: u64,
+    /// Ranges held across a live install of their own ([`Cores::hold_for_install`]).
+    ///
+    /// It says the hold was *taken*, which nothing downstream of it does: an install
+    /// that skipped the hold and got away with it — no message of that range arrived
+    /// in its window — leaves a trace identical to a held one's. The figure is what
+    /// [`NodeVariant::InstallHoldsEveryRange`] is caught by — it reads 4 where the
+    /// correct node reads 1 — and what would catch a node that took no hold at all if
+    /// the window it skipped happened to be empty.
+    // PROPOSED(D-083): a range is held across its live install.
+    pub ranges_held_for_install: u64,
 }
 
 /// Every core on the node, keyed by range, and the order they are stepped in
@@ -264,6 +288,116 @@ impl Cores {
     #[must_use]
     pub fn persisting(&self, range: RangeId) -> bool {
         self.slots.get(&range).is_some_and(|slot| slot.persisting)
+    }
+
+    /// Whether `range` is held across a live install of its own (D-066): between the
+    /// stream's completion and the replica the switch builds.
+    #[must_use]
+    pub fn installing(&self, range: RangeId) -> bool {
+        self.slots.get(&range).is_some_and(|slot| slot.installing)
+    }
+
+    /// Whether `range`'s core steps nothing now: its persist is outstanding, or its
+    /// live install is between its decision and its switch. Both hold the same way
+    /// and queue the same work.
+    #[must_use]
+    pub fn held(&self, range: RangeId) -> bool {
+        self.slots
+            .get(&range)
+            .is_some_and(|slot| slot.persisting || slot.installing)
+    }
+
+    /// Holds `range` across a live install: from here its messages and its node-local
+    /// inputs queue as a persisting core's do, and nothing steps that core until
+    /// [`installed`](Self::installed) replaces it.
+    ///
+    /// The hold is what keeps the window between the install's decision and its
+    /// manifest switch from being a hole: the replica being replaced is behind its
+    /// leader by definition, so a step of it in that window appends entries at
+    /// indices the switch has just compacted past, and the store comes back with a
+    /// log below its own snapshot. Every *other* range on the node keeps stepping,
+    /// which is the whole reason a node does not end an incarnation for this
+    /// (SHARD.md §11, storage 5).
+    // PROPOSED(D-083): a range is held across its live install.
+    pub fn hold_for_install(&mut self, range: RangeId) {
+        let Some(slot) = self.slots.get_mut(&range) else {
+            self.meters.messages_for_ranges_not_held += 1;
+            return;
+        };
+        slot.installing = true;
+        self.meters.ranges_held_for_install += 1;
+    }
+
+    /// Lets `range` go without replacing its core: the hold was taken on a range that
+    /// was not the one installing, which is [`NodeVariant::InstallHoldsEveryRange`]
+    /// alone. The work held meanwhile is stepped into the core that was there all
+    /// along, so the variant costs that range the install's length and nothing else.
+    // PROPOSED(D-083): the hold is one range's.
+    pub fn release_install<E: Environment>(&mut self, env: &E, range: RangeId) -> Round {
+        let mut round = Round::default();
+        let Some(slot) = self.slots.get_mut(&range) else {
+            return round;
+        };
+        slot.installing = false;
+        while let Some(slot) = self.slots.get_mut(&range) {
+            if slot.persisting || slot.installing {
+                break;
+            }
+            let Some(held) = slot.held.pop_front() else {
+                break;
+            };
+            self.held_bytes = self.held_bytes.saturating_sub(held.bytes);
+            self.step(env, range, held.input, held.received, &mut round);
+        }
+        self.remember();
+        round
+    }
+
+    /// `range`'s live install switched: `core` is the replica the switch built, and
+    /// the work held while it ran is stepped into it, in the order it arrived.
+    ///
+    /// The held work is *not* thrown away. A message of this range that arrived
+    /// during the install is an ordinary message to the installed replica — an
+    /// AppendEntries the new core answers from its new log, a vote request it answers
+    /// from its new term — and dropping them would make an install look like a
+    /// partition to every peer that spoke during it.
+    // PROPOSED(D-083): the replica a switch builds takes the range's held work.
+    pub fn installed<E: Environment>(&mut self, env: &E, range: RangeId, core: Raft) -> Round {
+        let mut round = Round::default();
+        let Some(slot) = self.slots.get_mut(&range) else {
+            self.meters.messages_for_ranges_not_held += 1;
+            return round;
+        };
+        // The highest index handed to the `apply` task moves with the replica. It is
+        // kept here, beside the cores, because the entries an `Apply` names are read
+        // at the step that named them (`applied_sent`) — and a switch that left it
+        // where the *replaced* core stood would have the next `Apply` name an index
+        // below the installed snapshot, which the new core does not hold. The node
+        // then fails that range and stops, which is how this was found: the directed
+        // scenario's second install on a node reported "an apply through 81 names
+        // index 1, which the core does not hold".
+        // PROPOSED(D-083): the applied watermark moves with the replica a switch
+        // builds.
+        self.applied.insert(range, core.applied());
+        slot.core = core;
+        slot.installing = false;
+        // The outputs of the replaced core's last persist are not the new core's:
+        // that core is gone, and what it was waiting to do with a log the switch has
+        // replaced cannot be executed against the replica that replaced it.
+        slot.deferred.clear();
+        slot.persisting = false;
+        while let Some(slot) = self.slots.get_mut(&range) {
+            if slot.persisting || slot.installing {
+                break;
+            }
+            let Some(held) = slot.held.pop_front() else {
+                break;
+            };
+            self.held_bytes = self.held_bytes.saturating_sub(held.bytes);
+            self.step(env, range, held.input, held.received, &mut round);
+        }
+        self.remember();
+        round
     }
 
     /// How many cores are waiting on a persist.
@@ -343,7 +477,8 @@ impl Cores {
         round: &mut Round,
     ) {
         let variants = self.variants;
-        let hold = self.persisting(range) && !variants.contains(NodeVariant::StepWhilePersisting);
+        let hold = (self.persisting(range) && !variants.contains(NodeVariant::StepWhilePersisting))
+            || (self.installing(range) && !variants.contains(NodeVariant::StepWhileInstalling));
         if !hold {
             self.step(env, range, input, received, round);
             return;

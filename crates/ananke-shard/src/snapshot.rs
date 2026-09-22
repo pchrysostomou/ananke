@@ -49,7 +49,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::ops::Range as KeyRange;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use ananke_env::MAX_FRAME_LEN;
 use ananke_raft::types::{Index, ServerId, Term};
@@ -102,6 +102,30 @@ pub fn parse_version(name: &str) -> Option<(RangeId, Index, u64)> {
         index.parse().ok()?,
         take.parse().ok()?,
     ))
+}
+
+/// The version directory a range's take at `index` writes, under `engine_dir`.
+///
+/// It is a free function as well as [`Snapshots::version`] because the take does not
+/// run in the `snapshot` task: a take is the `apply` task's, between two applies
+/// (RAFT.md §1, D-036), and that task has no planner. One statement of the name, two
+/// callers — which is the point, since the name is what two ranges taking at one
+/// index collide on.
+// PROPOSED(D-083): the version name is reachable from the `apply` task, which takes.
+#[must_use]
+pub fn version_dir(
+    engine_dir: &Path,
+    range: RangeId,
+    index: Index,
+    take: u64,
+    variants: NodeVariants,
+) -> PathBuf {
+    if variants.contains(NodeVariant::VersionDirWithoutRange) {
+        // The variant: today's `snap-<index>-<take>` (snapshot.rs:119-121), which two
+        // ranges taking at one index share.
+        return engine_dir.join(format!("snap-{index}-{take}"));
+    }
+    engine_dir.join(version_name(range, index, take))
 }
 
 /// What a chunk names its stream by: the leader's term and the snapshot's last index
@@ -413,12 +437,7 @@ impl Snapshots {
     /// The version directory a range's take at `index` writes.
     #[must_use]
     pub fn version(&self, range: RangeId, index: Index, take: u64) -> PathBuf {
-        if self.variants.contains(NodeVariant::VersionDirWithoutRange) {
-            // The variant: today's `snap-<index>-<take>` (snapshot.rs:119-121), which
-            // two ranges taking at one index share.
-            return self.engine_dir.join(format!("snap-{index}-{take}"));
-        }
-        self.engine_dir.join(version_name(range, index, take))
+        version_dir(&self.engine_dir, range, index, take, self.variants)
     }
 
     /// What a sweep of `range` deletes, given every name in the engine directory and

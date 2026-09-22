@@ -134,6 +134,77 @@ pub enum NodeVariant {
     /// install, never that the staging directory must start over, so the install takes
     /// the abandoned stream's files for the new snapshot's (RAFT.md:203-207).
     CompleteOnRestart,
+    /// A range whose live install is between its decision and its manifest switch is
+    /// stepped anyway, rather than held. The replica being replaced is behind its
+    /// leader by definition, so a step of it in that window appends entries at indices
+    /// the switch is about to compact past, and the store comes back with a log below
+    /// its own snapshot record (RAFT.md §1; D-066).
+    ///
+    /// A server ends its whole run-loop incarnation across an install and so has no
+    /// such window; a node holds one range instead (SHARD.md §11, storage 5). This is
+    /// that hold removed.
+    // PROPOSED(D-083): a range is held across its live install.
+    StepWhileInstalling,
+    /// The install's manifest switch is made and the range's replica is *not* replaced:
+    /// the store holds the snapshot and the old core goes on from the log it had. A
+    /// server gets the replacement for free by reopening its store; a node has to do it
+    /// for the one range, and this is that left undone (D-066).
+    // PROPOSED(D-083): the replica a switch builds replaces the one it replaced.
+    InstallKeepsTheOldCore,
+    /// `InstallSnapshot` and its response admitted to the node's byte-bounded inbox
+    /// instead of diverted to the `snapshot` task: the chunk costs a heartbeat its
+    /// place under the bound ([`carries_data`]) and then vanishes, because
+    /// `Raft::on_message`'s arm for it is empty — the core is told the server routed it
+    /// away, which the one-group server's `net` loop does and the node's did not. The
+    /// node as it stood, and the hole filed as **issue #96**.
+    ///
+    /// [`carries_data`]: crate::inbox::carries_data
+    // PROPOSED(D-083): the `net` task diverts snapshot chunks before the inbox.
+    ChunksToTheInbox,
+    /// A take checkpoints the whole engine directory rather than the range's own key
+    /// intervals, as the one-group take does (`Engine::checkpoint`, snapshot.rs:688).
+    /// Every range's take then carries every *other* range's keys, and installing one
+    /// on a follower writes three ranges' state it was never sent (D-066, D-068).
+    ///
+    /// With one range on the node the whole engine *is* that range's spans, so this
+    /// variant and the correct take produce the same bytes: it is a mutation only a
+    /// node of several ranges can be wrong about.
+    // PROPOSED(D-083): a take checkpoints the range's spans, not the node's store.
+    TakeCheckpointsTheWholeNode,
+    /// The hold across a live install is taken on every range the node hosts rather
+    /// than on the one installing, which is the node reaching for the incarnation a
+    /// server ends. One range's install then stops every other range on the node for
+    /// the length of a stream's switch — the exact cost SHARD.md §11, storage 5 says a
+    /// live install exists to avoid.
+    ///
+    /// With one range it is the correct hold exactly, and nothing can tell them apart.
+    // PROPOSED(D-083): the hold is one range's.
+    InstallHoldsEveryRange,
+    /// A completed install clears every staging directory under the engine directory
+    /// rather than the one its own (range, sender) assembled in. Another range's
+    /// half-assembled stream is destroyed by a neighbour's install, and its sender is
+    /// never told, so it streams the rest of a snapshot into a directory that no longer
+    /// holds its first bytes (D-075's keys, undone at the moment they matter).
+    ///
+    /// With one range and one sender there is only ever one staging directory, and
+    /// clearing "every" one is clearing the right one.
+    // PROPOSED(D-083): an install clears its own assembly's directory and no other.
+    InstallSweepsEveryStaging,
+    /// A stream's acknowledgement stepped into **every** core on the node rather than
+    /// into the one range's.
+    ///
+    /// `Input::SnapshotAcked { to }` names the follower and not the range, which is
+    /// complete information for a server with one core and incomplete for a node with
+    /// four. Under this variant one range's chunks set `stream_acked` on every range's
+    /// progress for that follower, so a *refused* follower keeps counting for check
+    /// quorum on ranges whose stream was never opened, and D-049's rule — a refused
+    /// follower counts only while its re-seed stream progresses (core.rs:1607-1613) —
+    /// is silently void while every test stays green. **Issue #103.**
+    ///
+    /// With one range on the node, every core *is* the range's core, and the fan-out
+    /// and the correct route are the same route.
+    // PROPOSED(D-083): a stream's answers are stepped into the stream's range alone.
+    SnapshotAckToEveryCore,
 }
 
 impl NodeVariant {
@@ -159,6 +230,13 @@ impl NodeVariant {
         NodeVariant::StagingByRangeAlone,
         NodeVariant::SlotReservedForWaiter,
         NodeVariant::CompleteOnRestart,
+        NodeVariant::StepWhileInstalling,
+        NodeVariant::InstallKeepsTheOldCore,
+        NodeVariant::ChunksToTheInbox,
+        NodeVariant::TakeCheckpointsTheWholeNode,
+        NodeVariant::InstallHoldsEveryRange,
+        NodeVariant::InstallSweepsEveryStaging,
+        NodeVariant::SnapshotAckToEveryCore,
     ];
 
     /// The `snapshot` task's own, in order: the eleven ways to get a snapshot keyed by
@@ -180,6 +258,26 @@ impl NodeVariant {
         NodeVariant::StagingByRangeAlone,
         NodeVariant::SlotReservedForWaiter,
         NodeVariant::CompleteOnRestart,
+    ];
+
+    /// The node's snapshot *wiring*: the six ways to get the running of
+    /// [`mod@crate::snapshot`] inside the node's server wrong, as against the eleven
+    /// ways to get its discipline wrong ([`SNAPSHOT`](Self::SNAPSHOT)). Three of the
+    /// six — [`TakeCheckpointsTheWholeNode`](Self::TakeCheckpointsTheWholeNode),
+    /// [`InstallHoldsEveryRange`](Self::InstallHoldsEveryRange) and
+    /// [`InstallSweepsEveryStaging`](Self::InstallSweepsEveryStaging) — and
+    /// [`SnapshotAckToEveryCore`](Self::SnapshotAckToEveryCore), issue #103's, are the
+    /// correct wiring exactly on a node of one range, and can only be caught where a
+    /// node hosts several.
+    // PROPOSED(D-083): the node's snapshot wiring.
+    pub const WIRING: &'static [NodeVariant] = &[
+        NodeVariant::StepWhileInstalling,
+        NodeVariant::InstallKeepsTheOldCore,
+        NodeVariant::ChunksToTheInbox,
+        NodeVariant::TakeCheckpointsTheWholeNode,
+        NodeVariant::InstallHoldsEveryRange,
+        NodeVariant::InstallSweepsEveryStaging,
+        NodeVariant::SnapshotAckToEveryCore,
     ];
 
     /// The bit this variant takes in a [`NodeVariants`].
@@ -205,6 +303,13 @@ impl NodeVariant {
             NodeVariant::StagingByRangeAlone => 1 << 16,
             NodeVariant::SlotReservedForWaiter => 1 << 17,
             NodeVariant::CompleteOnRestart => 1 << 18,
+            NodeVariant::StepWhileInstalling => 1 << 20,
+            NodeVariant::InstallKeepsTheOldCore => 1 << 21,
+            NodeVariant::ChunksToTheInbox => 1 << 22,
+            NodeVariant::TakeCheckpointsTheWholeNode => 1 << 23,
+            NodeVariant::InstallHoldsEveryRange => 1 << 24,
+            NodeVariant::InstallSweepsEveryStaging => 1 << 25,
+            NodeVariant::SnapshotAckToEveryCore => 1 << 26,
         }
     }
 
@@ -232,6 +337,13 @@ impl NodeVariant {
             NodeVariant::StagingByRangeAlone => "StagingByRangeAlone",
             NodeVariant::SlotReservedForWaiter => "SlotReservedForWaiter",
             NodeVariant::CompleteOnRestart => "CompleteOnRestart",
+            NodeVariant::StepWhileInstalling => "StepWhileInstalling",
+            NodeVariant::InstallKeepsTheOldCore => "InstallKeepsTheOldCore",
+            NodeVariant::ChunksToTheInbox => "ChunksToTheInbox",
+            NodeVariant::TakeCheckpointsTheWholeNode => "TakeCheckpointsTheWholeNode",
+            NodeVariant::InstallHoldsEveryRange => "InstallHoldsEveryRange",
+            NodeVariant::InstallSweepsEveryStaging => "InstallSweepsEveryStaging",
+            NodeVariant::SnapshotAckToEveryCore => "SnapshotAckToEveryCore",
         }
     }
 }
@@ -315,14 +427,24 @@ mod tests {
             assert_eq!(seen & variant.bit(), 0, "{variant} shares a bit");
             seen |= variant.bit();
         }
-        assert_eq!(NodeVariant::BUGS.len(), 20);
-        for variant in NodeVariant::SNAPSHOT {
+        assert_eq!(NodeVariant::BUGS.len(), 27);
+        for variant in NodeVariant::SNAPSHOT.iter().chain(NodeVariant::WIRING) {
             assert!(
                 NodeVariant::BUGS.contains(variant),
                 "{variant} is not in BUGS"
             );
         }
         assert_eq!(NodeVariant::SNAPSHOT.len(), 11);
+        assert_eq!(NodeVariant::WIRING.len(), 7);
+        // The discipline and the wiring are disjoint: a variant is a way to get the
+        // `snapshot` task's keys, caps and frames wrong, or a way to get its running
+        // inside the node wrong, and never both.
+        for variant in NodeVariant::WIRING {
+            assert!(
+                !NodeVariant::SNAPSHOT.contains(variant),
+                "{variant} is in both sets"
+            );
+        }
     }
 
     #[test]
