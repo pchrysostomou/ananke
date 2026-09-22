@@ -205,6 +205,34 @@ pub enum NodeVariant {
     /// and the correct route are the same route.
     // PROPOSED(D-083): a stream's answers are stepped into the stream's range alone.
     SnapshotAckToEveryCore,
+    /// A take copies the range's Raft state and **drops its user keys**, so the
+    /// install's switch removes the receiver's user keys and puts nothing in their
+    /// place: total, silent state-machine loss on every range installed from it.
+    ///
+    /// A range lives in two key intervals (D-066) and the take has to carry both. This
+    /// carries one. Every event a correct install emits, it emits — the stream flows,
+    /// the switch is made, the replica is created — which is why a check that counts
+    /// events cannot see it and one that reads the installed state can.
+    // PROPOSED(D-083): what an install installed is read back and traced.
+    TakeSkipsTheUserKeys,
+    /// A take copies the **whole** Raft interval, the log purpose included, as the
+    /// one-group take does. The live install then puts the *leader's* log keys into
+    /// the receiver's store, and nothing tombstones them back out: the node's repair
+    /// carries no log tombstones precisely because the take carries no log keys
+    /// (D-083's first departure from D-082). The two halves of that argument have to
+    /// agree, and this is what catches them disagreeing.
+    // PROPOSED(D-083): the stream carries no log key, so the repair tombstones none.
+    TakeStreamsTheLogToo,
+    /// The host is asked what a local input wants of its core **before** the node has
+    /// checked whether that range is held.
+    ///
+    /// `Host::local_core` is not a pure question: a live install's repair is built in
+    /// its `Ready` arm and handed to the `snapshot` task there. Asked first and held
+    /// afterwards, a stream whose `Ready` arrives while its own range's persist is
+    /// still outstanding builds a repair and lets the switch carrying it proceed
+    /// against a write in flight — which is the one thing the hold exists to prevent.
+    // PROPOSED(D-083): a live install holds one range and replaces its replica.
+    AsksTheHostBeforeTheHold,
 }
 
 impl NodeVariant {
@@ -237,6 +265,9 @@ impl NodeVariant {
         NodeVariant::InstallHoldsEveryRange,
         NodeVariant::InstallSweepsEveryStaging,
         NodeVariant::SnapshotAckToEveryCore,
+        NodeVariant::TakeSkipsTheUserKeys,
+        NodeVariant::TakeStreamsTheLogToo,
+        NodeVariant::AsksTheHostBeforeTheHold,
     ];
 
     /// The `snapshot` task's own, in order: the eleven ways to get a snapshot keyed by
@@ -278,6 +309,9 @@ impl NodeVariant {
         NodeVariant::InstallHoldsEveryRange,
         NodeVariant::InstallSweepsEveryStaging,
         NodeVariant::SnapshotAckToEveryCore,
+        NodeVariant::TakeSkipsTheUserKeys,
+        NodeVariant::TakeStreamsTheLogToo,
+        NodeVariant::AsksTheHostBeforeTheHold,
     ];
 
     /// The bit this variant takes in a [`NodeVariants`].
@@ -310,6 +344,9 @@ impl NodeVariant {
             NodeVariant::InstallHoldsEveryRange => 1 << 24,
             NodeVariant::InstallSweepsEveryStaging => 1 << 25,
             NodeVariant::SnapshotAckToEveryCore => 1 << 26,
+            NodeVariant::TakeSkipsTheUserKeys => 1 << 27,
+            NodeVariant::TakeStreamsTheLogToo => 1 << 28,
+            NodeVariant::AsksTheHostBeforeTheHold => 1 << 29,
         }
     }
 
@@ -344,6 +381,9 @@ impl NodeVariant {
             NodeVariant::InstallHoldsEveryRange => "InstallHoldsEveryRange",
             NodeVariant::InstallSweepsEveryStaging => "InstallSweepsEveryStaging",
             NodeVariant::SnapshotAckToEveryCore => "SnapshotAckToEveryCore",
+            NodeVariant::TakeSkipsTheUserKeys => "TakeSkipsTheUserKeys",
+            NodeVariant::TakeStreamsTheLogToo => "TakeStreamsTheLogToo",
+            NodeVariant::AsksTheHostBeforeTheHold => "AsksTheHostBeforeTheHold",
         }
     }
 }
@@ -427,7 +467,7 @@ mod tests {
             assert_eq!(seen & variant.bit(), 0, "{variant} shares a bit");
             seen |= variant.bit();
         }
-        assert_eq!(NodeVariant::BUGS.len(), 27);
+        assert_eq!(NodeVariant::BUGS.len(), 30);
         for variant in NodeVariant::SNAPSHOT.iter().chain(NodeVariant::WIRING) {
             assert!(
                 NodeVariant::BUGS.contains(variant),
@@ -435,7 +475,7 @@ mod tests {
             );
         }
         assert_eq!(NodeVariant::SNAPSHOT.len(), 11);
-        assert_eq!(NodeVariant::WIRING.len(), 7);
+        assert_eq!(NodeVariant::WIRING.len(), 10);
         // The discipline and the wiring are disjoint: a variant is a way to get the
         // `snapshot` task's keys, caps and frames wrong, or a way to get its running
         // inside the node wrong, and never both.

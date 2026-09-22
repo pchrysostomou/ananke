@@ -993,6 +993,19 @@ impl<E: Environment> RaftStore<E> {
         self.applied.load(Ordering::Acquire)
     }
 
+    /// Tells the store its applied index moved without an [`apply`](Self::apply):
+    /// a live install wrote the applied-index key inside its own manifest switch
+    /// (`Engine::install_spans`, D-066, D-068) rather than through an apply batch, so
+    /// the cached value this returns would otherwise still be the replaced replica's.
+    ///
+    /// A server never needs this: its install ends the run-loop incarnation and the
+    /// next start reads the key off the disk. A node keeps the store open across the
+    /// switch, so it has to say so.
+    // PROPOSED(D-083): a live install moves the store's applied index with it.
+    pub fn installed_at(&self, index: Index) {
+        self.applied.store(index, Ordering::Release);
+    }
+
     /// The applied index as of `snapshot`: the value under the applied-index key
     /// at that engine version, which the apply batch that wrote it wrote with the
     /// entry's own writes. A read taken at the same snapshot is therefore the

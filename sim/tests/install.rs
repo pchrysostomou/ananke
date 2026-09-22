@@ -41,16 +41,28 @@ fn a_stream_flows_and_an_install_completes_on_every_range_and_every_follower() {
     let owed = Report::owed();
     println!(
         "install: {} streams opened, {} installs completed, {} replicas created by \
-         their install, {} streams at once on one leader; {} owed",
+         their install, {} states read back, {} writes committed before the late nodes \
+         joined, {} streams at once on one leader; {} owed",
         report.streams().len(),
         report.installs().len(),
         report.created_by_install().len(),
+        report.states().len(),
+        report.wrote,
         report.streams_at_once(),
         owed.len()
     );
     assert!(
         report.installs().len() >= owed.len(),
         "the run installed on fewer (server, range) pairs than it owed"
+    );
+    // The client made progress at all: without this the whole run could have elected,
+    // idled, taken nothing and installed nothing, and every clause above would be
+    // vacuous. It is an observation, not a tuned figure — seed 1 committed well over a
+    // thousand writes — so what is asserted is that it is not zero.
+    assert!(
+        report.wrote > 0,
+        "the client committed nothing before the late nodes joined, so every range's \
+         log was empty and nothing above is evidence of anything"
     );
 }
 
@@ -67,12 +79,21 @@ fn a_stream_flows_and_an_install_completes_on_every_range_and_every_follower() {
 /// (D-064), bought against a catch that does not vary.
 ///
 /// Putting it under the four tiers, with the weight D-064's table wants measured on a
-/// quiet machine, is owed and is recorded as owed in D-083 — not quietly taken here.
-/// A figure measured on this laptop, with several Stage B slices building on it, would
-/// be exactly the incomparable kind D-070 exists to stop.
-const SEEDS: u64 = 8;
+/// quiet machine, is owed and is recorded as owed in D-083 and as issue #108 — not
+/// quietly taken here. A figure measured on this laptop, with several Stage B slices
+/// building on it, would be exactly the incomparable kind D-070 exists to stop.
+///
+/// **Thirty-two is what this binary runs; two hundred and fifty is what the claim was
+/// measured at.** An earlier draft ran eight and said "every seed", and the review of
+/// #107 found four seeds in two hundred and fifty where an install never landed. The
+/// figure below is the gate's budget; the evidence behind the claim is the 250-seed
+/// run recorded in D-083, re-taken after the fixes that review produced — green both
+/// with this scenario's writer stopped and with it left running, which is what says a
+/// product fix and not a scenario tweak is what moved it.
+const SEEDS: u64 = 32;
 
-/// Every one of [`SEEDS`] reaches the path and completes every install.
+/// Every one of [`SEEDS`] reaches the path and completes every install; and the claim
+/// behind it was measured at 250 (D-083).
 ///
 /// The first clause is the one that matters most: a scenario built to exercise a path
 /// is worth nothing if a seed quietly fails to reach it, and `Report::reached` fails
@@ -131,6 +152,13 @@ fn every_wiring_variant_is_caught() {
         NodeVariant::CapStreamsSent,
         // Wrong with one range too, and here because issue #96 is.
         NodeVariant::ChunksToTheInbox,
+        // The two the reviewer of #107 wrote, which the event-counting check could not
+        // see and the state read-back can. Both are wrong with one range too; they are
+        // here because "an install completed" and "the right thing was installed" are
+        // different claims and this binary is the only place in the tree that makes
+        // either.
+        NodeVariant::TakeSkipsTheUserKeys,
+        NodeVariant::TakeStreamsTheLogToo,
     ];
     for variant in caught {
         let results: Vec<Result<(), String>> = seeds

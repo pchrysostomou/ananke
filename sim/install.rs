@@ -31,14 +31,24 @@
 //! - each late node's four replicas were *created by their installs*
 //!   (`RangeCreated { cause: snapshot }`, §8), which is the event that says the install
 //!   gave the range state on a node that held none;
-//! - each range's take was a checkpoint of **that range's** key intervals: the install
-//!   of one range changed no other range's applied index on the receiver;
-//! - the four ranges' installs interleaved — no range's replica waited on another
-//!   range's switch, which is the whole of SHARD.md §11, storage 5.
+//! - **what landed is what was taken**: each installed (server, range) is read back
+//!   out of the engine and compared with the take that fed it, paired by the
+//!   snapshot's identity — the user keys and their digest, the applied index, and the
+//!   log keys the repair is supposed to account for. Counting events says a stream
+//!   flowed; it says nothing about what is in the store, and a take that dropped the
+//!   range's user keys emits every event a correct one does.
+//!
+//! What it deliberately does **not** assert: that the four ranges' installs
+//! interleaved. That claim is SHARD.md §11 storage 5's, and it rests on
+//! `InstallHoldsEveryRange`'s deterministic check in `ananke_shard::node`, where the
+//! hold's scope is asserted directly — not on anything measurable here.
+//! `streams_at_once` counts streams on the *sender*, which is a different thing, and
+//! an earlier draft of this file described an assertion it had not written.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::pin::pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -81,6 +91,33 @@ const BEFORE: Duration = Duration::from_secs(6);
 /// How long the five run together: long enough for eight streams and eight installs.
 const AFTER: Duration = Duration::from_secs(14);
 
+/// Which replica's claim one state report belongs to: a take writes one and the install
+/// it feeds lands one, and they are paired by this.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct StateKey {
+    /// The server that reported it.
+    pub server: u64,
+    /// The range.
+    pub range: u64,
+    /// The snapshot's last index.
+    pub last_index: u64,
+    /// That entry's term.
+    pub last_term: u64,
+}
+
+/// What a replica held when it made that claim.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Held {
+    /// The applied index.
+    pub applied: u64,
+    /// The range's user keys.
+    pub user_keys: u64,
+    /// An order-free digest of those keys and their values.
+    pub user_digest: u64,
+    /// The Raft log keys it holds.
+    pub log_keys: u64,
+}
+
 /// What one run of the scenario found.
 #[derive(Clone, Debug)]
 pub struct Report {
@@ -88,6 +125,9 @@ pub struct Report {
     pub seed: u64,
     /// The node's variants.
     pub node_variants: NodeVariants,
+    /// Writes the client saw committed before the late nodes joined: what says the run
+    /// put work through the cluster at all, rather than electing and idling.
+    pub wrote: u64,
     /// The run's trace.
     pub records: Vec<TraceRecord>,
     /// Which server each simulated node is. `RangeCreated` names a range and a cause
@@ -174,6 +214,41 @@ impl Report {
                     .node
                     .and_then(|node| self.node_of.get(&node))
                     .map(|server| (*server, *range)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// What each replica held when it claimed a snapshot's state: the take that wrote
+    /// one and the install that landed one both report it, so the two can be compared.
+    #[must_use]
+    pub fn states(&self) -> BTreeMap<StateKey, Held> {
+        self.records
+            .iter()
+            .filter_map(|record| match &record.event {
+                TraceEvent::RaftSnapshotState {
+                    server,
+                    range,
+                    last_index,
+                    last_term,
+                    applied,
+                    user_keys,
+                    user_digest,
+                    log_keys,
+                } => Some((
+                    StateKey {
+                        server: *server,
+                        range: *range,
+                        last_index: *last_index,
+                        last_term: *last_term,
+                    },
+                    Held {
+                        applied: *applied,
+                        user_keys: *user_keys,
+                        user_digest: *user_digest,
+                        log_keys: *log_keys,
+                    },
+                )),
                 _ => None,
             })
             .collect()
@@ -273,6 +348,9 @@ impl Report {
         // A leader with two followers behind its compacted prefix feeds both at once
         // (Q14, D-043). One at a time is `CapStreamsSent`, and with a single follower
         // behind the prefix the two would be the same run.
+        // The number itself is an observation and varies with the schedule — six on
+        // seed 1 — so what is asserted is the property that makes `CapStreamsSent`
+        // distinguishable at all: more than one at once, ever.
         if self.streams_at_once() < 2 {
             return Err(format!(
                 "seed {seed}: no leader ever had two streams running at once, so a \
@@ -280,7 +358,94 @@ impl Report {
                  looked exactly like this one (Q14, D-043)"
             ));
         }
+
+        // And the part no count of events can reach: **what landed**. Each installed
+        // (server, range) is compared with the take that fed it, paired by the
+        // snapshot's identity. A take that dropped the range's user keys, or carried
+        // the leader's log with them, emits every event a correct one does.
+        // PROPOSED(D-083): what an install installed is read back and checked.
+        let states = self.states();
+        for (server, range) in &owed {
+            let installed = states
+                .iter()
+                .find(|(key, _)| key.server == *server && key.range == *range);
+            let Some((key, held)) = installed else {
+                return Err(format!(
+                    "seed {seed}: server {server} installed range {range} and reported no \
+                     state for it, so nothing says what it installed"
+                ));
+            };
+            // The replica's applied index is the snapshot's last index: an install
+            // that left it anywhere else has a state machine out of step with the
+            // metadata describing it.
+            let (last_index, last_term) = (key.last_index, key.last_term);
+            if held.applied != last_index {
+                return Err(format!(
+                    "seed {seed}: server {server}'s range {range} installed the snapshot at \
+                     {last_index} and came back applied at {}",
+                    held.applied
+                ));
+            }
+            // The bytes that landed are the bytes that were taken.
+            let taken = states.iter().find(|(other, _)| {
+                other.server != *server
+                    && other.range == *range
+                    && other.last_index == last_index
+                    && other.last_term == last_term
+            });
+            let Some((source, want)) = taken else {
+                return Err(format!(
+                    "seed {seed}: server {server}'s range {range} installed a snapshot at \
+                     ({last_index}, {last_term}) that no take on any other server reported \
+                     writing, so there is nothing to compare it with"
+                ));
+            };
+            if held.user_keys != want.user_keys || held.user_digest != want.user_digest {
+                return Err(format!(
+                    "seed {seed}: server {server}'s range {range} installed the snapshot \
+                     server {} took at ({last_index}, {last_term}) and holds {} user keys \
+                     (digest {}) where the take held {} (digest {}): the bytes that landed \
+                     are not the bytes that were taken",
+                    source.server,
+                    held.user_keys,
+                    held.user_digest,
+                    want.user_keys,
+                    want.user_digest
+                ));
+            }
+            // A live install streams no log key, so what the receiver holds is its
+            // kept tail and nothing else. A take that carried the leader's log would
+            // leave those keys here, untombstoned (D-083's first departure).
+            if held.log_keys > 0 {
+                let tail_bound = self.highest_index(*range).saturating_sub(last_index);
+                if held.log_keys > tail_bound {
+                    return Err(format!(
+                        "seed {seed}: server {server}'s range {range} holds {} log keys \
+                         after installing at {last_index}, more than the {tail_bound} its \
+                         kept tail can account for: the stream carried log keys the repair \
+                         does not tombstone",
+                        held.log_keys
+                    ));
+                }
+            }
+        }
         Ok(())
+    }
+
+    /// The highest index any replica of `range` reached: the bound on what a kept tail
+    /// past a snapshot can hold.
+    #[must_use]
+    pub fn highest_index(&self, range: u64) -> u64 {
+        self.records
+            .iter()
+            .filter_map(|record| match &record.event {
+                TraceEvent::RaftAppend {
+                    range: what, index, ..
+                } if *what == range => Some(*index),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0)
     }
 }
 
@@ -332,15 +497,38 @@ pub fn config(seed: u64) -> SimConfig {
     config
 }
 
-/// A writer that keeps every range's log growing: enough entries per range to pass
-/// `snapshot_threshold` while the first three nodes run alone.
-async fn writer<E: Environment>(env: E, up_to: Arc<Mutex<u64>>) {
+/// A writer that keeps every range's log growing until it is told to stop.
+///
+/// **It stops when the late nodes join**, and that is what makes this scenario
+/// deterministic about the situation it claims. While it writes, every leader retakes
+/// every `SNAPSHOT_THRESHOLD` entries; each retake gives the range a new snapshot
+/// identity, the node's receiver answers the old stream `start_over`, and the stream
+/// begins again at offset zero. Measured on the tree that found it, no stream in this
+/// scenario ever resumed from a non-zero offset on any seed, and a stream was
+/// re-opened up to twenty-one times before it landed — so whether all eight installs
+/// completed inside the run was a race, not a property. Four seeds in two hundred and
+/// fifty lost it, and tripling the window did not help.
+///
+/// Stopping the writer removes the race from *this* scenario. It does not remove it
+/// from the node: a stream that keeps being told to start over never exhausts
+/// `CHUNK_RESENDS`, because the restart path resets that counter, and the node has no
+/// restart bound of its own — which RAFT.md:210-212 specifies and the one-group server
+/// honours. That is a finding about the product, recorded in D-083 and put to the
+/// owner, and it is deliberately **not** papered over here: this scenario is about
+/// whether an install lands and what it lands, and it should not also be the only
+/// thing standing between a livelock and a green run.
+// PROPOSED(D-083): the scenario is deterministic about the situation it claims.
+async fn writer<E: Environment>(env: E, up_to: Arc<Mutex<u64>>, stop: Arc<AtomicBool>) {
     let Ok(sock) = env.net().bind(client_addr(1)).await else {
         return;
     };
     let mut leaders: BTreeMap<u64, u64> = BTreeMap::new();
     let mut seq = 0u64;
     loop {
+        if stop.load(Ordering::Relaxed) {
+            env.clock().sleep(Duration::from_millis(20)).await;
+            continue;
+        }
         // Round-robin over the ranges, not over the keys. A writer that drew a key at
         // random would leave a range short of `snapshot_threshold` on some seeds, and
         // that range's late replica would then catch up by AppendEntries and need no
@@ -403,6 +591,7 @@ pub fn run(seed: u64, variants: impl Into<Variants>, node_variants: NodeVariants
     let nodes: Vec<_> = (0..NODES as usize).map(|_| sim.add_node()).collect();
     let client = sim.add_node();
     let committed: Arc<Mutex<u64>> = Arc::default();
+    let stop: Arc<AtomicBool> = Arc::default();
     for id in 1..=NODES_AT_ONCE {
         spawn(&sim, nodes[id as usize - 1], id, variants, node_variants);
     }
@@ -410,10 +599,17 @@ pub fn run(seed: u64, variants: impl Into<Variants>, node_variants: NodeVariants
         let env = sim.env(client);
         let inner = env.clone();
         let committed = committed.clone();
-        env.spawn("client", writer(inner, committed));
+        let stop = stop.clone();
+        env.spawn("client", writer(inner, committed, stop));
     }
     // The three run alone: every range elects, writes past its threshold and compacts.
     sim.run_for(BEFORE);
+    // The writer stops here, so every leader's last take stands for the rest of the
+    // run and no stream races a retake of its own snapshot. What each range holds is
+    // now fixed, which is also what makes the installed state comparable with the take
+    // that fed it.
+    stop.store(true, Ordering::Relaxed);
+    let wrote = *committed.lock().expect("the counter");
     // And the other two arrive, behind every range's compacted prefix.
     for id in NODES_AT_ONCE + 1..=NODES {
         spawn(&sim, nodes[id as usize - 1], id, variants, node_variants);
@@ -422,6 +618,7 @@ pub fn run(seed: u64, variants: impl Into<Variants>, node_variants: NodeVariants
     Report {
         seed,
         node_variants,
+        wrote,
         records: sim.trace(),
         node_of: nodes
             .iter()

@@ -584,7 +584,7 @@ pub async fn heal_format<E: Environment>(
 ///
 /// The filesystem's.
 // PROPOSED(D-060)
-pub(crate) async fn write_checkpoint_record<E: Environment>(env: &E, dir: &Path) -> io::Result<()> {
+pub async fn write_checkpoint_record<E: Environment>(env: &E, dir: &Path) -> io::Result<()> {
     let fs = env.fs();
     let file = fs
         .open(

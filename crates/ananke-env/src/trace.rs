@@ -743,6 +743,57 @@ pub enum TraceEvent {
         // PROPOSED(D-069): `range` on every `Raft*` event about a replica.
         range: u64,
     },
+    /// A receiver told a sender to start its snapshot stream over (RAFT.md:203-212),
+    /// and **why**.
+    ///
+    /// The node has two reasons to say it and the sender cannot tell them apart from
+    /// the message alone: the stream's identity changed under the assembly, or the
+    /// node is assembling as many streams as its per-node cap allows and this is not
+    /// one of them (Q14, D-075). They mean different things — the first is a stream
+    /// that must begin again, the second is a stream that must wait — and a trace that
+    /// did not separate them could not tell a node making no progress from a node
+    /// politely queueing. Without this event the whole path is invisible: a run that
+    /// restarted a stream six hundred times looked exactly like one that restarted
+    /// none.
+    // PROPOSED(D-083): the node's start-over is traced, with its reason.
+    RaftSnapshotStartOver {
+        /// The receiving server.
+        server: u64,
+        /// The range the replica is of (SHARD.md §8).
+        range: u64,
+        /// The sender being told to start over.
+        from: u64,
+        /// Why: see [`StartOver`].
+        reason: StartOver,
+    },
+    /// What a range's replica holds after a live install switched (D-066), read back
+    /// from the engine at the switch and reported so a check can compare it with what
+    /// the take that fed it put in.
+    ///
+    /// Counting events says a stream flowed; it says nothing about what landed. A take
+    /// that dropped the range's user keys, or one that carried the leader's log into
+    /// the receiver's store, produces exactly the same events as a correct one — which
+    /// is why this carries the state rather than the fact.
+    // PROPOSED(D-083): what an install installed is read back and traced.
+    RaftSnapshotState {
+        /// The server.
+        server: u64,
+        /// The range.
+        range: u64,
+        /// The snapshot's last index: what pairs this with the take that made it.
+        last_index: u64,
+        /// That entry's term.
+        last_term: u64,
+        /// The applied index the replica carries after the switch.
+        applied: u64,
+        /// How many of the range's user keys it holds.
+        user_keys: u64,
+        /// An order-independent digest of those keys and their values.
+        user_digest: u64,
+        /// How many Raft log keys it holds. A live install streams none, so this is
+        /// the kept tail's length and nothing else (D-083).
+        log_keys: u64,
+    },
     /// A snapshot stream was resumed (RAFT.md §1): the sender re-sent from the last
     /// acknowledged offset of the last file after loss, rather than from zero.
     RaftSnapshotResumed {
@@ -1305,6 +1356,36 @@ impl RangeCause {
             RangeCause::Bootstrap => "bootstrap",
             RangeCause::Split => "split",
             RangeCause::Snapshot => "snapshot",
+        }
+    }
+}
+
+/// Why a receiver told a sender to start its stream over
+/// ([`TraceEvent::RaftSnapshotStartOver`]).
+// PROPOSED(D-083): the node's start-over is traced, with its reason.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
+pub enum StartOver {
+    /// The chunk's identity is not the one this (range, sender)'s assembly holds, so
+    /// the assembly starts again, empty (RAFT.md:203-207).
+    Identity,
+    /// The node is assembling as many streams as its per-node cap allows and this is
+    /// not one of them. Nothing was written and no other assembly was disturbed; the
+    /// stream takes a slot by asking again once one is free (Q14, D-075).
+    Cap,
+    /// The staged bytes could not be used: the directory was short, the engine refused
+    /// the source, or the stream carried no snapshot record for this range.
+    Unusable,
+}
+
+impl StartOver {
+    /// The name the moirae bridge writes.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StartOver::Identity => "identity",
+            StartOver::Cap => "cap",
+            StartOver::Unusable => "unusable",
         }
     }
 }

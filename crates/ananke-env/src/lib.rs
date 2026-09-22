@@ -52,5 +52,5 @@ pub use time::{Instant, WallTime, WallTimeOutOfRange};
 pub use trace::{
     ApplyEffect, ClientOp, ClientResult, Decision, DirEntryOp, DropReason, MessageId,
     MetaDescriptor, MismatchAt, RangeCause, RangeRemovedCause, RangeState, RebalancePhase,
-    TraceEvent, WalStop, WalStopReason,
+    StartOver, TraceEvent, WalStop, WalStopReason,
 };

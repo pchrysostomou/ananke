@@ -44,8 +44,8 @@ use ananke_raft::node::{Start, StartOrder, start_store};
 use ananke_raft::queue::Queue;
 use ananke_raft::snapshot::Repair;
 use ananke_raft::store::{
-    FIRST_INCARNATION, KeyPrefix, PURPOSE_CONFIG, PURPOSE_META, RaftStore, SnapshotRecord,
-    mark_store_lost,
+    FIRST_INCARNATION, KeyPrefix, PURPOSE_CONFIG, PURPOSE_LOG, PURPOSE_META, RaftStore,
+    SnapshotRecord, mark_store_lost,
 };
 use ananke_raft::types::{Configuration, Entry, Index, Payload, ServerId, Term};
 use ananke_raft::{Input, Message, Persist, Raft};
@@ -816,11 +816,16 @@ impl<E: Environment> Host for ServerHost<E> {
 /// makes that true on a node.
 // PROPOSED(D-083): the node's `apply` task carries per range what the one-group task
 // carries for its one group.
+/// Where one range's applies stand, shared between the node's `apply` task and its
+/// `snapshot` task: a live install moves all three without an apply (D-083).
 #[derive(Clone, Debug)]
-struct Applied {
-    index: Index,
-    term: Term,
-    config: Configuration,
+pub struct Applied {
+    /// The applied index.
+    pub index: Index,
+    /// The term of the entry at it.
+    pub term: Term,
+    /// The configuration in force at it.
+    pub config: Configuration,
 }
 
 /// The node's `apply` task: every range's entries, one job at a time (Q14, D-036).
@@ -835,7 +840,10 @@ struct ServerApplier<E: Environment> {
     ranges: Vec<Range>,
     engine_dir: PathBuf,
     node_variants: NodeVariants,
-    applied: Mutex<BTreeMap<RangeId, Applied>>,
+    /// Shared with the `snapshot` task: a live install moves a range's applied index,
+    /// term and configuration without an apply, and both tasks read this.
+    // PROPOSED(D-083): a live install moves the apply task's state with it.
+    applied: Arc<Mutex<BTreeMap<RangeId, Applied>>>,
 }
 
 impl<E: Environment> ServerApplier<E> {
@@ -914,6 +922,19 @@ impl<E: Environment> ServerApplier<E> {
             if taken.is_err() {
                 return self.take_failed(range);
             }
+            // The checkpoint's own format record, after the engine's checkpoint, which
+            // requires an empty directory. A checkpoint is complete only with both its
+            // `CURRENT` and this (D-060), and completeness is what a stream opens on:
+            // without it every version of this node's looked half-written and no
+            // stream would open at all.
+            // PROPOSED(D-083): the node's take writes the checkpoint's format record,
+            // as a server's does.
+            if ananke_raft::format::write_checkpoint_record(&self.env, &dir)
+                .await
+                .is_err()
+            {
+                return self.take_failed(range);
+            }
             self.env.trace_decided(
                 took,
                 TraceEvent::RaftSnapshot {
@@ -924,6 +945,13 @@ impl<E: Environment> ServerApplier<E> {
                     taken: true,
                 },
             );
+            // What this take put into the checkpoint, read back from the engine, so a
+            // check can pair it with the install it feeds and say the bytes that
+            // landed are the bytes that were taken. A take that dropped the range's
+            // user keys, or carried the leader's log along with them, traces the same
+            // `RaftSnapshot` as a correct one (D-083).
+            // PROPOSED(D-083): what a take took is read back and traced.
+            self.state_of(range, state.index, state.term, store).await;
             // The versions nothing reads any more can go, and only this range's
             // (D-043, D-075).
             self.snaps.push(SnapJob::Taken { range });
@@ -937,6 +965,51 @@ impl<E: Environment> ServerApplier<E> {
             index: state.index,
             term: state.term,
         }));
+    }
+
+    /// Reads a range's replica back out of the engine and traces what it holds, as the
+    /// `snapshot` task does after an install: the two are paired by
+    /// `(range, last_index, last_term)`.
+    // PROPOSED(D-083): what a take took is read back and traced.
+    async fn state_of(
+        &self,
+        range: RangeId,
+        last_index: Index,
+        last_term: Term,
+        store: &Arc<RaftStore<E>>,
+    ) {
+        let Some(span) = self.ranges.iter().find(|one| one.id == range) else {
+            return;
+        };
+        let user_span = user_key(&span.start)..user_key(&span.end);
+        let version = store.engine().snapshot();
+        let Ok(user) = store
+            .engine()
+            .scan(&user_span.start[..]..&user_span.end[..], &version)
+            .await
+        else {
+            return;
+        };
+        let log_span = store.prefix().purpose_span(PURPOSE_LOG);
+        let log = store
+            .engine()
+            .scan(&log_span.start[..]..&log_span.end[..], &version)
+            .await
+            .unwrap_or_default();
+        drop(version);
+        let digest = user.iter().fold(0u64, |acc, (key, value)| {
+            acc.wrapping_add(install::fnv(key).rotate_left(1) ^ install::fnv(value))
+        });
+        self.env.trace(TraceEvent::RaftSnapshotState {
+            server: self.id.0,
+            range: range.get(),
+            last_index,
+            last_term,
+            applied: store.applied(),
+            user_keys: user.len() as u64,
+            user_digest: digest,
+            log_keys: log.len() as u64,
+        });
     }
 
     /// A take that could not be made: the core is told, and the next need takes a
@@ -965,6 +1038,31 @@ impl<E: Environment> ServerApplier<E> {
     fn checkpoint_spans(&self, range: RangeId) -> Option<Vec<std::ops::Range<Bytes>>> {
         let span = self.ranges.iter().find(|r| r.id == range)?;
         let prefix = KeyPrefix::group(range.get());
+        if self
+            .node_variants
+            .contains(NodeVariant::TakeStreamsTheLogToo)
+        {
+            // The variant: the whole Raft interval, the log purpose included, as the
+            // one-group take does. The install then puts the *leader's* log keys into
+            // the receiver's store, and the node's repair tombstones none of them
+            // because it is built on the promise that none were sent (D-083).
+            return Some(vec![
+                prefix.span(),
+                user_key(&span.start)..user_key(&span.end),
+            ]);
+        }
+        if self
+            .node_variants
+            .contains(NodeVariant::TakeSkipsTheUserKeys)
+        {
+            // The variant: the range's Raft state alone. The install's spans still
+            // cover the user interval, so the switch removes the receiver's user keys
+            // and puts nothing back — the state machine, gone silently.
+            return Some(vec![
+                prefix.purpose_span(PURPOSE_META),
+                prefix.key(PURPOSE_CONFIG, &[])..prefix.span().end,
+            ]);
+        }
         Some(vec![
             prefix.purpose_span(PURPOSE_META),
             prefix.key(PURPOSE_CONFIG, &[])..prefix.span().end,
@@ -992,12 +1090,12 @@ impl<E: Environment> Applier for ServerApplier<E> {
                 ApplyWork::Record => return self.take(range, store, false).await,
             };
             for entry in entries {
-                let mut applied = lock(&self.applied)
+                // The store's own applied index wins when it is ahead: a live install
+                // moved it inside a manifest switch, without an apply (D-083).
+                let applied = lock(&self.applied)
                     .get(&range)
-                    .map_or(0, |state| state.index);
-                if applied == 0 {
-                    applied = store.applied();
-                }
+                    .map_or(0, |state| state.index)
+                    .max(store.applied());
                 if entry.index <= applied {
                     continue;
                 }
@@ -1326,6 +1424,7 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
         cores.insert(id_of, core);
     }
 
+    let applied_at = Arc::new(Mutex::new(applied_at));
     let host = ServerHost {
         env: env.clone(),
         id,
@@ -1365,7 +1464,7 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
             ranges: ranges.clone(),
             engine_dir: engine.dir.clone(),
             node_variants,
-            applied: Mutex::new(applied_at),
+            applied: applied_at.clone(),
         };
         let jobs = jobs.clone();
         async move {
@@ -1397,6 +1496,8 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
             raft.clone(),
             node_variants,
             engine.dir.clone(),
+            ranges.clone(),
+            applied_at.clone(),
             plan,
             local.clone(),
             snaps.clone(),
