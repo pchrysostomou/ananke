@@ -35,14 +35,18 @@
 # added goes into the lightest, which is shard 2.
 #
 # D-082's seventeen rows — the raft sweep's arms on the node, `node` — were weighed on
-# its own tree at ANANKE_SEEDS=1000 in release **with CARGO_INCREMENTAL=0** (issue
-# #102: a seed's run depends on whether rustc compiled incrementally, so a figure taken
-# under a warm incremental cache is not comparable with one taken without), from the
+# its own tree at ANANKE_SEEDS=1000 in release, from the
 # built binary (`node-<hash> <test> --exact`) rather than through cargo, so each figure
 # is the test's own cost and not a build's. On an Apple M2 of 8 cores, on AC Power, no
 # thermal warning, with other agents' slices building beside it: load averages
 # 53.69/47.43/54.61 before and 80.57/65.30/60.65 after, which is why these are cpu
 # seconds (user + sys) and not wall time (D-070). They total 446.31 cpu s.
+# Issue #102's discipline applies to the mutation figures these rows sit beside, and it
+# is not what it first looked like: incremental compilation is not the cause, and five
+# distinct binaries of one tree give byte-identical traces. What bites is a mutation
+# harness that restores a file with an mtime *older* than the build that compiled the
+# mutant — cargo then calls the unit fresh and the tree goes on running the mutant. Back
+# up by copy, touch on restore, and confirm the next build recompiled.
 # Six of the seventeen are the variants the node has no path for yet, one test each so
 # that `cargo test --list` and this table carry the debt rather than a paragraph of
 # prose; each runs its variant over `high_rate_share()` and asserts the path absent.

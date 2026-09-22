@@ -10679,10 +10679,15 @@ quiet machine, and this laptop has not been quiet, so under D-070 a premerge fig
 taken here would say nothing. The owner is scheduling it. A thousand-seed figure below
 is one test's own run at `ANANKE_SEEDS=1000`, not a premerge.
 
-**Everything above was run with `CARGO_INCREMENTAL=0`** — issue #102: a seed's run
-depends on whether rustc compiled incrementally, so a measurement taken under a warm
-incremental cache is not comparable with one taken without, and a mutation planted and
-reverted across two builds would be measuring the build.
+**Issue #102's discipline, correctly stated.** The figures above were taken with
+`CARGO_INCREMENTAL=0` out of caution, and that was the wrong diagnosis: incremental
+compilation is not the cause, and five distinct binaries of one tree give
+byte-identical traces. What bites a mutation campaign is a harness that restores a file
+with an mtime **older** than the build that compiled the mutant — cargo then calls the
+unit fresh and the tree goes on running the mutant while the log says it was reverted.
+The rule is to back up by copy, `touch` on restore, and confirm the next build
+recompiled. This slice's restores set the destination's mtime to the restore time, and
+each mutant is visible in its own output, so the figures stand.
 
 ### The rates, every one measured before its assertion was written (D-061)
 
@@ -10818,25 +10823,51 @@ one, and a sweep cannot be it.
 | 100 seeds | 2.073987 ms | **178.568102 ms** | 5 317 | 6 |
 | 1 000 seeds | 2.082127 ms | **504.250728 ms** | 53 284 | 101 |
 
-The maxima that remain were checked one by one and are real. At 100 seeds the largest
-is seed 4, server 1, range 2's index 164 waiting from 10.785397456 s to 10.963965558 s
-while the node's `apply` task worked through range 3's index 55 and **28 events, almost
-all WAL syncs**: the node is busy, not idle and not dead. The next five are the same
-shape at 80.5, 61.3, 58.3, 45.0 and 34.3 ms.
+**What the maxima that remain actually are, read back record by record.** Neither is a
+crash, an isolation or a partition — both windows hold no fault at all — and neither is
+an idle node. But neither is dominated by apply work either, and the entry said
+otherwise once:
+
+- **100 seeds, 178.568102 ms**: seed 4, server 1, range 2's index 164 held from
+  10.785397456 s to 10.963965558 s by the apply of **range 4 index 52**. The window
+  holds **282 records on that node**: 159 `TaskPolled`, 50 `MessageSent`, 32
+  `MessageDelivered`, 6 `WalSynced`, 6 `RaftTerm`, 5 `SstDeleted`, 2 each of
+  `RaftAppend`, `RaftApply`, `RaftLeader`, `ManifestWritten`, `CurrentSwitched` and
+  `SstWritten`, and one each of `RaftCommit`, `RaftVote`, `MemtableFlushed`,
+  `MemtableRotated` and `CompactionWritten`. **The node was flushing a memtable and
+  running a compaction.**
+- **1 000 seeds, 504.250728 ms**: seed 995, server 2, from 10.307653401 s to
+  10.811904129 s. **290 records, and it is an election**: 9 `RaftVote`, 3 `RaftTerm`,
+  1 `RaftLeader`, with 59 delivered and 53 sent, 4 `WalSynced`, 1 `RaftAppend` and 2
+  applies.
+
+**So the figure is not "one range's apply job holding another", and this entry should
+not be read as saying it is.** What the fold measures, and what its own documentation
+says, is an upper bound on one job's hold and a lower bound on the wait's total — and
+at the extremes the bound is loose in the direction that flatters it: **the largest
+survivors are dominated by non-apply work, so the maximum reads as an inter-apply gap
+on a live but busy node rather than as an apply job's own length.** The **median**,
+2.08 ms, is the figure that describes the apply task, and it is two orders of magnitude
+under the threshold.
+
+The next five at the hundred-seed tier are 80.5, 61.3, 58.3, 45.0 and 34.3 ms.
 
 **The median is far under a heartbeat interval; the maximum is far over it at both
-tiers, and it grows with the tier — so the maximum goes to the owner**, which is what
-§12 says to do with this figure. Three things to weigh with it:
+tiers and grows with the tier. The maximum goes to the owner**, which is what §12 says
+to do with this figure — but it goes with what it is, and it is weaker evidence than
+the bare number looks:
 
-- **The maximum is a sample order statistic, not a bound.** 178.6 ms over a hundred
-  seeds and 504.3 ms over a thousand is the tail being sampled more deeply, not the
-  system getting worse. A bound would have to be argued, and this entry does not argue
-  one.
-- It is the hold by an **ordinary apply**, and D-036's subject is a **take**, which is
-  strictly longer: this is a floor under the thing §12 asks about, not a substitute.
-- Grouping applies does not shorten it — a job that takes half a second takes half a
-  second whichever way the task batches it — so it bears on §11's storage item 6 and
-  not on Q14's grouped applies, exactly as §12 says.
+- **It is not a hold by an apply job.** Both extremes are windows on a live node whose
+  work was an election or a compaction, not a long apply. A reader who takes 504 ms as
+  the length of one range's apply job is reading it wrong.
+- **It is a sample order statistic, not a bound.** 178.6 ms over a hundred seeds and
+  504.3 ms over a thousand is the tail sampled more deeply, not the system getting
+  worse. No bound is argued here.
+- It is the hold by an **ordinary apply** where D-036's subject is a **take**, which is
+  strictly longer: a floor under the thing §12 asks about, not a substitute.
+- Grouping applies would not shorten it — a gap of half a second is a gap of half a
+  second whichever way the task batches — so it bears on §11's storage item 6 and not
+  on Q14's grouped applies, exactly as §12 says.
 
 **The inbox's drops under its byte bound.** At 20 seeds, at 100 and at 1 000: **none
 at all**, of any kind, of any range. The coverage line prints `{}`.
@@ -10885,8 +10916,8 @@ conservative one.
 
 The owner's standing demand on this stage is that a check with more than one range to
 be wrong about show the mutation a single-range world could not catch. Ten mutations were
-planted **one at a time**, each run at **100 seeds** with `CARGO_INCREMENTAL=0`
-(issue #102), each reverted before the next. Every one of them is a no-op on one group: with a single range,
+planted **one at a time**, each run at **100 seeds**, each reverted before the next
+under issue #102's discipline (above). Every one of them is a no-op on one group: with a single range,
 `range_of` answers the only range there is, the key map has one answer, the client's
 per-range leader map has one key and the trial hands over the one range.
 
@@ -11152,15 +11183,18 @@ on its own, and it is put to the owner with the wiring rather than decided here.
   hold anything. What is measured instead, above, is the hold by an ordinary apply —
   the same mechanism, one `apply` task per node taking every range's jobs one at a
   time (Q14), with the take's own hold owed by the slice that wires it.
-- **That hold's maximum goes to the owner**, which is what §12 says to do with this
-  figure when it exceeds a heartbeat interval — **and the number is not the one this
-  entry first carried.** The fold counted windows in which the node had crashed, and
-  its four largest were crashes. With those dropped the median is **2.08 ms** and the
-  maximum **178.568102 ms at a hundred seeds and 504.250728 ms at a thousand**, against
-  20 ms. The maxima that remain were checked one by one and are the apply task busy on
-  another range's job, not idle and not dead. It is a sample order statistic and not a
-  bound, it is the hold by an ordinary apply where D-036's subject is a take, and
-  grouping applies would not shorten it, so it bears on §11's storage item 6.
+- **That hold's maximum goes to the owner, and with two corrections to what it is.**
+  The fold counted windows in which the node had crashed, and its four largest were
+  crashes; with those dropped the median is **2.08 ms** and the maximum
+  **178.568102 ms at a hundred seeds and 504.250728 ms at a thousand**, against 20 ms.
+  Then the maxima that remain were read back record by record, and **neither is an
+  apply job holding another range**: at a hundred seeds the node was flushing a
+  memtable and running a compaction, and at a thousand the window is an election — 9
+  `RaftVote`, 3 `RaftTerm`, 1 `RaftLeader`, 2 applies. The number is an inter-apply gap
+  on a live but busy node. It is a sample order statistic and not a bound, it is an
+  ordinary apply's hold where D-036's subject is a take, and grouping applies would not
+  shorten it, so it bears on §11's storage item 6. The **median** is the figure that
+  describes the apply task, and it is 2.08 ms.
 - **Follower compaction (D-078) does not run on the node, and the bound is no longer
   asked of it.** The core's compaction asks the `apply` task for
   `SnapshotAction::Record`; this host counts that action and drops it, so no record is

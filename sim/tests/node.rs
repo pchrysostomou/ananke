@@ -151,7 +151,7 @@ fn a_node_under_the_raft_sweeps_arms_runs_every_range() {
 /// It carries the node's arms, which are `sim/raft.rs`'s less the four
 /// `Schedule::draw_on_the_node` removes.
 // PROPOSED(D-082): the node's sweep has a coverage of its own.
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct Coverage {
     seeds: u64,
     uniform_seeds: u64,
@@ -204,6 +204,76 @@ struct Coverage {
     /// asserted, because this node has no follower compaction to bound it.
     largest_follower_log: u64,
     follower_log_multiples: BTreeMap<u64, u64>,
+}
+
+/// Everything but the two sample vectors, which are summarised.
+///
+/// `lags_by_range` holds one duration per apply: 133 464 of them at a hundred seeds
+/// and **1 327 475 at a thousand**, and `holds` tens of thousands beside it. Deriving
+/// `Debug` and printing the struct put all of them in the sweep's output and so into
+/// every nightly log — some three hundred kilobytes of durations that no reader was
+/// ever going to read. The summary is what the coverage is for: how many samples, and
+/// what they came to.
+// PROPOSED(D-082): the coverage prints its samples' shape, not its samples.
+impl std::fmt::Debug for Coverage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let lag_samples: usize = self.lags_by_range.values().map(Vec::len).sum();
+        let (median_lag, per_range) = medians(&self.lags_by_range);
+        let mut holds = self.holds.clone();
+        holds.sort_unstable();
+        f.debug_struct("Coverage")
+            .field("seeds", &self.seeds)
+            .field("uniform_seeds", &self.uniform_seeds)
+            .field("partitions", &self.partitions)
+            .field("one_way_blocks", &self.one_way_blocks)
+            .field("crashes", &self.crashes)
+            .field("isolate_leader_faults", &self.isolate_leader_faults)
+            .field("leader_crashes", &self.leader_crashes)
+            .field("stale_sender_faults", &self.stale_sender_faults)
+            .field("figure_eight_faults", &self.figure_eight_faults)
+            .field("burst_puts", &self.burst_puts)
+            .field("drift_exceeded_seeds", &self.drift_exceeded_seeds)
+            .field("lease_reads", &self.lease_reads)
+            .field("read_index_reads", &self.read_index_reads)
+            .field("lease_revokes", &self.lease_revokes)
+            .field("quorum_losses", &self.quorum_losses)
+            .field("duplicates", &self.duplicates)
+            .field("drops", &self.drops)
+            .field("leaders", &self.leaders)
+            .field("terms_above_one", &self.terms_above_one)
+            .field("truncations", &self.truncations)
+            .field("commits", &self.commits)
+            .field("applies", &self.applies)
+            .field("inbox_drops", &self.inbox_drops)
+            .field("snapshot_actions", &self.snapshot_actions)
+            .field("refusals", &self.refusals)
+            .field("highest_index", &self.highest_index)
+            .field("puts", &self.puts)
+            .field("gets", &self.gets)
+            .field("deletes", &self.deletes)
+            .field("cas", &self.cas)
+            .field("completed", &self.completed)
+            .field("abandoned", &self.abandoned)
+            .field("redirected", &self.redirected)
+            .field("leaders_by_range", &self.leaders_by_range)
+            .field("applies_by_range", &self.applies_by_range)
+            .field("multi_range_frames", &self.multi_range_frames)
+            .field("arms_hit", &self.arms_hit)
+            .field("arms_fired", &self.arms_fired)
+            .field("apply_lag_samples", &lag_samples)
+            .field("apply_lag_median", &median_lag)
+            .field("apply_lag_median_per_range", &per_range)
+            .field("holds", &holds.len())
+            .field("hold_median", &median_of(&holds))
+            .field("hold_max", &holds.last())
+            .field("holds_dropped_for_a_crash", &self.holds_dropped_for_a_crash)
+            .field("records", &self.records)
+            .field("per_range_per_second", &self.per_range_per_second)
+            .field("busiest_range_per_second", &self.busiest_range_per_second)
+            .field("largest_follower_log", &self.largest_follower_log)
+            .field("follower_log_multiples", &self.follower_log_multiples)
+            .finish()
+    }
 }
 
 impl Coverage {

@@ -1582,9 +1582,25 @@ impl Report {
             clients,
             ranges,
             key_range,
-            // A run another scenario drove is `sim/ranges.rs`'s, whose node this is
-            // not; the field is read for one thing only, the follower-log bound, and
-            // `ranges::Report::check` makes that judgement for itself.
+            // A run another scenario drove is `sim/ranges.rs`'s, and this says
+            // `OneGroup` so that the follower-log bound is still asked of it.
+            //
+            // That is deliberate and it is *not* the same judgement as the one this
+            // scenario's node cluster gets. `ranges::Report::check` calls
+            // `self.checked.check()` and adds its own clauses; it does not opt out of
+            // this one, so naming the cluster here is the whole of the decision.
+            // Asking the bound there is safe and worth keeping: that scenario's node
+            // has no follower compaction either, but it also has no client load worth
+            // the name against this one: the review of this slice measured its largest
+            // follower log at **66 entries over a hundred seeds and 74 over a
+            // thousand** against the bound's 768 — a margin over ten times the figure,
+            // barely growing with the tier, where this scenario's node reaches 610. A bound with that much room is a
+            // tripwire rather than a claim about a mechanism, and a tripwire on a
+            // scenario that should never approach it is worth having. The day it
+            // tightens, the judgement moves to `ranges::Report::check` where the
+            // scenario can make it for itself.
+            // PROPOSED(D-082): the follower-log bound is the one-group server's, and
+            // the node scenario's run is named `OneGroup` here so it keeps it.
             cluster: Cluster::OneGroup,
             aimed: Vec::new(),
         }
