@@ -1328,11 +1328,18 @@ pub struct Report {
     /// the cluster-wide reading at all (D-071, item 6).
     // PROPOSED(D-076): the scenario's key-to-range map is the run's, not a constant.
     pub key_range: fn(&Bytes) -> u64,
-    /// Every leader-relative arm that fired, as (the range it drew, the server it
-    /// hit, when it hit it).
+    /// Which system the run was driven against.
+    // PROPOSED(D-082): the arms are shared and the node is a second cluster of them.
+    pub cluster: Cluster,
+    /// Every leader-relative arm that fired, as (the range it drew, the leader of
+    /// that range it resolved, when it resolved it).
     ///
-    /// What [`Report::arms_hit_their_ranges`] reads. Empty for a run another
-    /// scenario drove.
+    /// What [`Report::arms_hit_their_ranges`] reads. All four of the arms that
+    /// resolve a leader per range are here — [`Fault::IsolateLeader`] and
+    /// [`Fault::CrashLeader`], which aim at the leader itself, and
+    /// [`Fault::StaleSender`] and [`Fault::FigureEight`], which choose a victim
+    /// *relative* to it and would pick the wrong follower just as silently. Empty for
+    /// a run another scenario drove.
     // PROPOSED(D-082): a leader-relative arm resolves its leader per range.
     pub aimed: Vec<(u64, u64, Instant)>,
 }
@@ -1575,6 +1582,10 @@ impl Report {
             clients,
             ranges,
             key_range,
+            // A run another scenario drove is `sim/ranges.rs`'s, whose node this is
+            // not; the field is read for one thing only, the follower-log bound, and
+            // `ranges::Report::check` makes that judgement for itself.
+            cluster: Cluster::OneGroup,
             aimed: Vec::new(),
         }
     }
@@ -1779,7 +1790,8 @@ impl Report {
     }
 
     /// How long a range's ready apply waited through **another** range's apply job
-    /// on the same node, in virtual time.
+    /// on the same node, in virtual time, over windows in which that node was up
+    /// throughout.
     ///
     /// D-036's figure as far as this node can produce it. One `apply` task per node
     /// takes every range's jobs one at a time (Q14), so "one range's take holds the
@@ -1792,21 +1804,51 @@ impl Report {
     /// The fold, over one node's applies in time order. For three consecutive applies
     /// at `t0 < t1 < t2` where the one at `t2` is of a different range than the one at
     /// `t1`, and `t2`'s entry became committed at `r <= t1`: the hold is
-    /// `t1 - max(r, t0)`. That is the part of the job that ran from `t0` to `t1` —
-    /// another range's — that the range applied at `t2` spent waiting with its own
-    /// entry already committed.
+    /// `t1 - max(r, t0)` — the part of the job that ran from `t0` to `t1`, another
+    /// range's, that the range applied at `t2` spent waiting with its own entry
+    /// already committed.
     ///
-    /// `max(r, t0)` is what keeps the figure about the apply task. An entry that
-    /// became committed and then sat through a crash, an isolation or an election
-    /// waited on its own account and not on the task's, and clamping to `t0` bounds
-    /// every hold by one job's own span, which is the thing D-036 is about.
+    /// **A window in which the node crashed is not a hold, and is dropped.** Clamping
+    /// to `t0` was once thought to rule a crash out, and it does not: a node that
+    /// crashes just after `t0` and restarts before `t1` leaves two applies far apart
+    /// with no work between them, and the gap is the node being dead, not one range
+    /// holding another. The review of this slice found the maximum this fold reported
+    /// was exactly that — seed 71, server 1, window 8.067849144 s to 8.640712611 s,
+    /// with `NodeCrashed` at 8.068 s and `NodeRestarted` at 8.413 s inside it, 345 ms
+    /// of the 573 spent down — and the next three maxima were the same shape. So a
+    /// hold whose window holds a `NodeCrashed` or a `NodeRestarted` of that server is
+    /// not counted, and the count of what was dropped is returned beside the holds,
+    /// because a fold that quietly drops its input is a fold that says nothing.
+    ///
+    /// What is left is still an **upper bound on one job's hold and a lower bound on
+    /// the wait's total**, because an apply's completion is all the trace carries.
     // PROPOSED(D-082): how long one range's applies hold the node's others.
     #[must_use]
     pub fn cross_range_apply_holds(&self) -> Vec<Duration> {
+        self.cross_range_apply_holds_counted().0
+    }
+
+    /// The holds, and how many windows were dropped for holding a crash or a restart
+    /// of their node.
+    // PROPOSED(D-082): a window in which the node crashed is not a hold.
+    #[must_use]
+    pub fn cross_range_apply_holds_counted(&self) -> (Vec<Duration>, usize) {
+        // Every crash and restart, by the node that suffered it, in time order.
+        let mut downs: BTreeMap<u64, Vec<Instant>> = BTreeMap::new();
+        for record in &self.records {
+            let node = match &record.event {
+                TraceEvent::NodeCrashed { node } | TraceEvent::NodeRestarted { node } => {
+                    u64::from(node.get())
+                }
+                _ => continue,
+            };
+            downs.entry(node).or_default().push(record.at);
+        }
         let mut committed: BTreeMap<(u64, u64), (u64, BTreeMap<u64, Instant>)> = BTreeMap::new();
         // The two most recent applies on each node: (t0, t1) with t1's range.
         let mut last: BTreeMap<u64, (Option<Instant>, Instant, u64)> = BTreeMap::new();
         let mut holds = Vec::new();
+        let mut dropped = 0usize;
         for record in &self.records {
             match &record.event {
                 TraceEvent::RaftCommit {
@@ -1837,7 +1879,16 @@ impl Report {
                             Some(t0) if t0 > ready => t0,
                             _ => ready,
                         };
-                        holds.push(t1.duration_since(from));
+                        // A node's own server id is its node id in these scenarios
+                        // (`node_of_server`), so the crash records are looked up by it.
+                        let crashed = downs
+                            .get(server)
+                            .is_some_and(|at| at.iter().any(|&a| a >= from && a <= t1));
+                        if crashed {
+                            dropped += 1;
+                        } else {
+                            holds.push(t1.duration_since(from));
+                        }
                     }
                     let t0 = last.get(server).map(|&(_, t1, _)| t1);
                     last.insert(*server, (t0, record.at, *range));
@@ -1845,7 +1896,7 @@ impl Report {
                 _ => {}
             }
         }
-        holds
+        (holds, dropped)
     }
 
     /// Every peer frame this run's nodes sent, decoded: how many messages it
@@ -2647,7 +2698,21 @@ impl Report {
         if let Err(violation) = compaction_stays_committed(&self.records) {
             return fail(violation);
         }
-        if let Err(violation) = self.follower_log_is_bounded() {
+        // Asked of the one-group server alone, and the reason is the node's, not a
+        // convenience. D-078's follower compaction is the core asking its `apply` task
+        // for a `SnapshotAction::Record`, and the node's host counts that action and
+        // drops it: no record is written, no prefix is dropped, and a follower replica
+        // on the node has nothing bounding its in-memory log but the run's length. The
+        // bound is a bound on a mechanism this node does not run, so asking it here
+        // would be asserting a property nobody built — measured at 372 entries over a
+        // hundred seeds against the bound's 768, and growing with the tier, which is a
+        // nightly waiting to turn red on a claim the entry itself denies. The node's
+        // sweep prints the distribution instead, and the slice that wires the
+        // `snapshot` task owes the node its own bound.
+        // PROPOSED(D-082): the follower-log bound is the one-group server's.
+        if self.cluster == Cluster::OneGroup
+            && let Err(violation) = self.follower_log_is_bounded()
+        {
             return fail(violation);
         }
         // Both are asked only of a range whose unimpaired replicas form a majority
@@ -6366,6 +6431,7 @@ pub fn run_on(
                 down,
             } => {
                 let leader = leader_now(&sim);
+                aimed.push((aimed_range, leader, sim.now()));
                 let stale = if *server == leader {
                     server % SERVERS + 1
                 } else {
@@ -6400,6 +6466,7 @@ pub fn run_on(
                 steer,
             } => {
                 let leader = leader_now(&sim);
+                aimed.push((aimed_range, leader, sim.now()));
                 let behind = if *follower == leader {
                     follower % SERVERS + 1
                 } else {
@@ -6530,6 +6597,7 @@ pub fn run_on(
         clients: clients_total,
         ranges: cluster.ranges(),
         key_range: cluster.key_range(),
+        cluster,
         aimed,
     }
 }
@@ -6997,6 +7065,108 @@ mod tests {
 
     /// A report around `records` and `isolations`, three servers whose clocks run
     /// true, so each server's timer bound is 400 ms.
+    /// The cross-range hold fold, on records built by hand: it counts a wait across
+    /// ranges, it counts nothing across a crash, and it counts nothing at all within
+    /// one range.
+    ///
+    /// Both clauses were mutated and only one was caught by the sweeps. Dropping the
+    /// crash windows moved the maximum this fold reports from 572.9 ms to 178.6 ms —
+    /// the figure §12 sends to the owner — and dropping `of != range` moved the count
+    /// from 5 317 waits to 54 808 and the median from 2.07 ms to 2.50 ms **with every
+    /// test still green**, because both figures are printed and neither is asserted.
+    /// A number that goes to the owner needs an oracle of its own, and a sweep cannot
+    /// be it: this is that oracle.
+    // PROPOSED(D-082): how long one range's applies hold the node's others.
+    #[test]
+    fn the_hold_fold_counts_a_wait_across_ranges_and_nothing_across_a_crash() {
+        let commit = |server, range, index| TraceEvent::RaftCommit {
+            server,
+            range,
+            term: 1,
+            index,
+        };
+        let apply = |server, range, index| TraceEvent::RaftApply {
+            server,
+            range,
+            index,
+            entry_term: 1,
+            hash: 0,
+            key: None,
+            effect: ApplyEffect::None,
+        };
+        let held = |records: Vec<TraceRecord>| {
+            let (holds, dropped) = report(records, Vec::new()).cross_range_apply_holds_counted();
+            (holds, dropped)
+        };
+
+        // Range 3's index 1 is committed at 10 ms; range 2 applies at 20 ms and again
+        // at 40 ms; range 3 applies at 60 ms. Its wait ran through the job that ended
+        // at 40 ms, so the hold is 40 − 20 = 20 ms.
+        let across = vec![
+            record(ms(10), ms(10), Some(1), commit(1, 3, 1)),
+            record(ms(20), ms(20), Some(1), apply(1, 2, 1)),
+            record(ms(40), ms(40), Some(1), apply(1, 2, 2)),
+            record(ms(60), ms(60), Some(1), apply(1, 3, 1)),
+        ];
+        let (holds, dropped) = held(across.clone());
+        assert_eq!(
+            (holds.as_slice(), dropped),
+            (&[Duration::from_millis(20)][..], 0),
+            "a wait across ranges is one hold of the job it waited through"
+        );
+
+        // The same trace with the node crashing inside the window: not a hold at all,
+        // and counted as dropped rather than passed over.
+        let mut crashed = across.clone();
+        crashed.insert(
+            2,
+            record(
+                ms(25),
+                ms(25),
+                Some(1),
+                TraceEvent::NodeCrashed {
+                    node: NodeId::new(1),
+                },
+            ),
+        );
+        let (holds, dropped) = held(crashed);
+        assert_eq!(
+            (holds.as_slice(), dropped),
+            (&[][..], 1),
+            "a window the node spent crashed in is not one range holding another"
+        );
+
+        // One range applying three times in a row holds nothing: there is no other
+        // range's job in the window, and a fold that counted this would report a
+        // range's own apply latency as a cross-range hold.
+        let alone = vec![
+            record(ms(10), ms(10), Some(1), commit(1, 2, 3)),
+            record(ms(20), ms(20), Some(1), apply(1, 2, 1)),
+            record(ms(40), ms(40), Some(1), apply(1, 2, 2)),
+            record(ms(60), ms(60), Some(1), apply(1, 2, 3)),
+        ];
+        let (holds, dropped) = held(alone);
+        assert_eq!(
+            (holds.as_slice(), dropped),
+            (&[][..], 0),
+            "one range's own applies are not a hold by another range"
+        );
+
+        // And a wait on another *node* is not this node's: the fold is per node.
+        let elsewhere = vec![
+            record(ms(10), ms(10), Some(2), commit(2, 3, 1)),
+            record(ms(20), ms(20), Some(1), apply(1, 2, 1)),
+            record(ms(40), ms(40), Some(1), apply(1, 2, 2)),
+            record(ms(60), ms(60), Some(2), apply(2, 3, 1)),
+        ];
+        let (holds, dropped) = held(elsewhere);
+        assert_eq!(
+            (holds.as_slice(), dropped),
+            (&[][..], 0),
+            "a hold is one node's apply task holding its own ranges"
+        );
+    }
+
     fn report(records: Vec<TraceRecord>, isolations: Vec<(u64, Instant, Instant)>) -> Report {
         let sim = Sim::new(SimConfig::new(0));
         Report {
@@ -7016,6 +7186,7 @@ mod tests {
             clients: ClientStats::default(),
             ranges: (SINGLE_GROUP..SINGLE_GROUP + 4).collect(),
             key_range: range_of_key,
+            cluster: Cluster::OneGroup,
             aimed: Vec::new(),
         }
     }

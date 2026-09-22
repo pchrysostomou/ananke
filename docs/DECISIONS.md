@@ -10666,50 +10666,100 @@ harness. What each has to do, and what it gets for free:
   `draw_on_the_node`; a directed scenario builds its own `Schedule` as it does today and
   fills `range_picks` itself.
 
-**The machine, for every figure below** (D-070). Darwin 25.6.0 arm64, Apple M2,
-8 cores, **on AC Power**, no thermal warning recorded, with four other agents' slices
-building on it throughout: load averages **72.97/133.34/149.19** before the run and
-**67.23/128.14/146.95** after. **Every figure in this entry is a gate-tier (20 seed) or
-CI-tier (100 seed) figure and is labelled as one. `scripts/premerge.sh` has not run**:
-a thousand-seed figure taken at load 150 says nothing under D-070, and the owner is
-scheduling it for a quiet machine. Nothing here may be read as a thousand-seed
-measurement.
+**The machine, and what every figure is a figure of** (D-070). Darwin 25.6.0 arm64,
+Apple M2, 8 cores, **on AC Power**, no thermal warning recorded, with other agents'
+slices building on it throughout. The 100-seed run: load **72.97/133.34/149.19** before
+and **67.23/128.14/146.95** after. The 1 000-seed run: **53.69/47.43/54.61** before and
+**80.57/65.30/60.65** after.
+
+**Every figure in this entry is a gate-tier (20 seed), CI-tier (100 seed) or
+thousand-seed figure, and each is labelled by the seeds actually run.
+`scripts/premerge.sh` has not run**: that is the whole suite at a thousand seeds on a
+quiet machine, and this laptop has not been quiet, so under D-070 a premerge figure
+taken here would say nothing. The owner is scheduling it. A thousand-seed figure below
+is one test's own run at `ANANKE_SEEDS=1000`, not a premerge.
+
+**Everything above was run with `CARGO_INCREMENTAL=0`** — issue #102: a seed's run
+depends on whether rustc compiled incrementally, so a measurement taken under a warm
+incremental cache is not comparable with one taken without, and a mutation planted and
+reverted across two builds would be measuring the build.
 
 ### The rates, every one measured before its assertion was written (D-061)
 
-Phase 2's seven variants on `sim/raft.rs`'s arms, on the node, **at 100 seeds**. Six
-run `high_rate_share()`, a tenth of the tier and never fewer than twenty, as
-`sim/tests/engine.rs`'s variants do (D-055); the share at this tier is 20, and the rate
-is over the share, as D-061 requires.
+Phase 2's seven variants on `sim/raft.rs`'s arms, on the node. Six run
+`high_rate_share()`, a tenth of the tier and never fewer than twenty, as
+`sim/tests/engine.rs`'s variants do (D-055), and the rate is over the share as D-061
+requires — **so the share is 20 at the gate and at CI alike, and 100 at the
+thousand-seed tier.** Both columns are labelled by the seeds actually run, because "100
+seeds" over a share of 20 would read stronger than the number is.
 
-| Variant | On the node | Tier asserted | Phase 2's own standard |
-|---|---|---|---|
-| `SendBeforePersist` | **20/20 (100 %)** | every tier | every tier — matched |
-| `ApplyBeforeCommit` | **20/20 (100 %)** | every tier | every tier — matched |
-| `NoPreVote` | **20/20 (100 %)** | every tier | every tier — matched |
-| `TruncateOnEveryAppend` | **20/20 (100 %)** | every tier | every tier — matched |
-| `CountOlderTermForCommit` | **14/20 (70 %)** | every tier | every tier — matched |
-| `ResetTimerOnAnyRpc` | **10/20 (50 %)** | every tier | every tier — matched |
-| `LeaseTrustsTheClock` | **0/100 (0 %)** | `seeds() >= 1000` | `seeds() >= 1000` — matched |
+**The catch is attributed and not merely counted.** A count cannot tell a catch by the
+check the variant is about from a catch by whatever went wrong first, and §12 asks each
+variant to be re-asserted "to the standard its Phase 2 test asserts and no stronger" —
+two of Phase 2's tests assert the mechanism by name.
 
-`SendBeforePersist`'s row is the one to read twice. Before the round was taught to
-honour it, it was **0/20** — not because the node was right, but because the node had
-never been asked. The variant is implemented in the one-group server's `execute`, and
-the node has an `execute` of its own.
+| Variant | Share of 20 | Share of 100 | Caught by | Tier asserted |
+|---|---|---|---|---|
+| `SendBeforePersist` | 20/20 | 100/100 | commit by majority, all of them | every tier |
+| `NoPreVote` | 20/20 | 100/100 | **pre-vote's own property, all of them** | every tier |
+| `TruncateOnEveryAppend` | 20/20 | 100/100 | committed entries stay (97), commit by majority (3) | every tier |
+| `ApplyBeforeCommit` | 20/20 | 96/100 | state machine safety (90), **the node failing (6)** | every tier |
+| `CountOlderTermForCommit` | 14/20 (70 %) | 78/100 (78 %) | commit by current term, all of them | every tier |
+| `ResetTimerOnAnyRpc` | 10/20 (50 %) | 50/100 (50 %) | timers, all of them | every tier |
+| `LeaseTrustsTheClock` | — | **9/1 000 (0.9 %)** | linearizability, a stale read | `seeds() >= 1000` today |
 
-`LeaseTrustsTheClock` at 0/100 is not a failure and not a weakening: its catch is a
-stale read, caught on 4.0 % of the first thousand seeds on one group, and D-061 puts a
-catch under 5 % at the thousand-seed tier. What *is* asserted at every tier is the
-fault's firing, and it fires hard: the drift bound was exceeded on **52 of 100** seeds,
-the correct node's guard revoked on **100 of 100**, and **8 039** reads were served by
-a lease against **21 804** after a heartbeat round. A tier where the guard never
-revoked would fail here rather than report a catch of nothing.
+Three rows want a sentence.
 
-**The shape the keyed checks need**, at 100 seeds: leaders by range
-{2: 767, 3: 747, 4: 773, 5: 722}; applies by range
-{2: 31 264, 3: 36 021, 4: 32 403, 5: 33 776}; **270 688 peer frames carried messages of
-more than one range**, about 2 707 a seed, read off the frames themselves; and
-**115 of 115 leader-relative arms hit the leader of the range they drew**.
+**`SendBeforePersist`** was **0/20** before Q41's round was taught to honour it — not
+because the node was right but because the node had never been asked. Read the row
+twice.
+
+**`NoPreVote`** is now asserted by its mechanism. Its Phase 2 test asserts
+`by_pre_vote > 0`, not a bare catch, and a bare catch here would have been *weaker*
+than Phase 2's, which §12 forbids as plainly as it forbids stronger. All 100 catches at
+the thousand-seed tier are pre-vote's own property.
+
+**`ApplyBeforeCommit`** is caught 6 times in 100 not by a safety fold but by the node
+failing: `server 1 failed: range 2: apply of 189 after 186` — the node's own `apply`
+task refusing a hole in its applied stream. That is a real catch of the real bug by an
+oracle the one-group server does not have in the same place, and it is said here rather
+than left inside a count.
+
+**`LeaseTrustsTheClock`'s tier is a question for the owner, with a number.** Its
+assertion fires at `seeds() >= 1000`, and until this entry nobody had recorded what the
+node does at that tier. It is **9 of 1 000, 0.9 %**, against one group's 4.0 %. The
+arithmetic D-061 reasons with: at 0.9 % a thousand seeds catch none with probability
+0.991^1000 ≈ **1.2e-4**, about one run in eight thousand, where one group's 4 % gives
+≈1e-18; ten thousand seeds give ≈1e-39. So the assertion as it stands is roughly a
+hundred thousand times likelier to fail a tree with nothing wrong than the one-group
+assertion it was copied from.
+
+*The recommendation, not a decision taken here:* move this one assertion to the
+nightly's ten thousand, as `SharedSnapshotDir`'s liveness catch already is (§10), and
+keep printing the rate at every tier. The tier is the owner's to set and this slice has
+not moved it. Note also that the rate is **not** explained by a narrower window: the
+node's lease trial hands over *every* range the node holds, not one, so the window is
+if anything wider than the one-group trial's.
+
+**The shape the keyed checks need.** At 1 000 seeds: leaders by range
+{2: 7 486, 3: 7 464, 4: 7 484, 5: 7 415}; applies by range
+{2: 320 398, 3: 331 703, 4: 345 938, 5: 329 436}, least over busiest **0.93**;
+**2 747 963 peer frames carried messages of more than one range**, about 2 748 a seed,
+read off the frames themselves; and **2 816 of 2 816 leader-relative arms hit the
+leader of the range they drew**.
+
+**And the sweep has a coverage of its own**, which it did not until the review of this
+slice: `sim/tests/raft.rs` has had one since Phase 2 for the reason this slice proved
+again, and the node's sweep asserted seven things and counted none of its arms.
+`StaleSender` and `FigureEight` in particular reach their situations on a budget that
+may run out, and the Figure 8 driver's burst is the one whose silence would be
+invisible — the review aimed the burst at another range entirely and
+`CountOlderTermForCommit` fell from 14/20 to 11/20 **with every test green**. What the
+correct node saw over 100 seeds, each floor set at about a quarter of it: partitions
+432, crashes 277, one-way blocks 51, leader isolations 58, leader crashes 57,
+**stale-sender arms 45**, **figure-8 arms 119**, **burst puts 16 910**, truncations
+2 491, quorum losses 1 122, lease reads 8 039, read-index reads 21 804, client
+redirects 5 466, with every client operation kind invoked and both outcomes seen.
 
 ### The measurements SHARD.md §12 asks for under the sweeps
 
@@ -10722,16 +10772,23 @@ to that node's `RaftApply` of it, in virtual time, which the sweep's disk latenc
 drive. §4's threshold is on the **median** and is one heartbeat interval, 20 ms: Q14's
 grouped applies are built if it is exceeded.
 
-At **100 seeds**, over **133 464 applies**: the median over every range is
-**3.044002 ms**, and per range **2.855565 ms** (range 2), **3.272496 ms** (3),
-**2.961882 ms** (4) and **3.11965 ms** (5). At the gate's 20 seeds it was
-**2.811332 ms** over 23 888 applies, which is the same figure at a sixth of the
-evidence.
+**It is asked per range, and the headline is the per-range maximum**, not the pooled
+median. The pooled figure hides a breach, which the mutation campaign demonstrated with
+the row this entry lists as caught: with the scenario's key map answering one range,
+**three of the four ranges' medians go past 20 ms** — 27.6, 26.8 and 26.0 ms at a
+hundred seeds — while the pooled median still reads 3.04 ms, because the one busy range
+carries 85 % of the applies and so 85 % of the samples. Only the apply-spread floor
+failed. The sweep now asserts each range's own median.
 
-**It is not exceeded — 3.04 ms against 20 ms, a margin of 6.6× — so Q14's grouped
-applies are not built**, and nothing goes to the owner on this one. The four ranges
-agree with each other to within 15 %, which is what says the one `apply` task is not
-starving one of them.
+| Tier | Per range | **Worst range** | Pooled | Applies |
+|---|---|---|---|---|
+| 100 seeds | 2.855565 / 3.272496 / 2.961882 / 3.11965 ms | **3.272496 ms** | 3.044002 ms | 133 464 |
+| 1 000 seeds | 2.87122 / 2.993937 / 3.113924 / 3.039129 ms | **3.113924 ms** | 3.000927 ms | 1 327 475 |
+
+**Not exceeded — 3.11 ms against 20 ms, a margin of 6.4× on the worst range at the
+thousand-seed tier — so Q14's grouped applies are not built**, and nothing goes to the
+owner on this one. The four ranges agree with each other to within 9 %, which is what
+says the one `apply` task is not starving one of them.
 
 **How long one range's applies hold the node's others (D-036).** The take's own hold
 **cannot be measured here**: this node takes no snapshot, so there is no take to hold
@@ -10740,26 +10797,49 @@ measured is the hold by an ordinary apply, which is the same mechanism — one `
 task per node taking every range's jobs one at a time (Q14) — and which no single-range
 scenario could produce at all.
 
-At **100 seeds**, over **5 323 waits that crossed a range**: the median hold is
-**2.074936 ms** and the **largest is 572.863467 ms**.
+**This figure was wrong once and the correction is the point.** The fold clamped each
+hold to `max(ready, t0)` and that was thought to rule out a node that crashed inside
+the window. It does not: a node that crashes just after `t0` and restarts before `t1`
+leaves two applies far apart with *no work between them*, and the gap is the node being
+dead. The adversarial review of this slice found the maximum the fold reported was
+exactly that — **seed 71, server 1, window 8.067849144 s to 8.640712611 s, held entry
+range 2 index 145, holding apply of range 4, with `NodeCrashed{1}` at 8.068 s and
+`NodeRestarted{1}` at 8.413 s inside it**: 345 ms of the 573 spent down, two applies by
+that server in the whole window. The next three maxima were the same shape. The fold now
+drops any window holding a `NodeCrashed` or `NodeRestarted` of that server and reports
+how many it dropped, and `the_hold_fold_counts_a_wait_across_ranges_and_nothing_across_a_crash`
+is its oracle on records built by hand — because a number that goes to the owner needs
+one, and a sweep cannot be it.
 
-**The median is well under a heartbeat interval and the maximum is far over it, so the
-maximum goes to the owner**, which is what SHARD.md §12 says to do with this figure.
-What the maximum is: a single apply job of one range that ran for more than half a
-second of virtual time — a follower's catch-up batch, applied as one synced job — with
-another range's already-committed entry waiting behind it the whole time. The fold
-clamps every hold to one job's own span, so this is not a crash or an isolation read as
-a hold; it is one job.
+**The figures, with the crash windows out.**
 
-Two things the owner should weigh with it. First, this is the hold by an **ordinary
-apply**, and D-036's subject is a **take**, which is strictly longer: the figure is a
-floor under the thing §12 actually asks about, not a substitute for it. Second,
-grouping applies does not shorten a take and does not shorten this either — a batch
-that takes 573 ms takes 573 ms whichever way the task batches it — so what the figure
-bears on is §11's storage item 6 and not Q14's grouped applies, exactly as §12 says.
+| Tier | Median | Maximum | Waits | Windows dropped |
+|---|---|---|---|---|
+| 100 seeds | 2.073987 ms | **178.568102 ms** | 5 317 | 6 |
+| 1 000 seeds | 2.082127 ms | **504.250728 ms** | 53 284 | 101 |
 
-**The inbox's drops under its byte bound.** At 100 seeds, and at 20: **none at all**,
-of any kind, of any range. The coverage line prints `{}`.
+The maxima that remain were checked one by one and are real. At 100 seeds the largest
+is seed 4, server 1, range 2's index 164 waiting from 10.785397456 s to 10.963965558 s
+while the node's `apply` task worked through range 3's index 55 and **28 events, almost
+all WAL syncs**: the node is busy, not idle and not dead. The next five are the same
+shape at 80.5, 61.3, 58.3, 45.0 and 34.3 ms.
+
+**The median is far under a heartbeat interval; the maximum is far over it at both
+tiers, and it grows with the tier — so the maximum goes to the owner**, which is what
+§12 says to do with this figure. Three things to weigh with it:
+
+- **The maximum is a sample order statistic, not a bound.** 178.6 ms over a hundred
+  seeds and 504.3 ms over a thousand is the tail being sampled more deeply, not the
+  system getting worse. A bound would have to be argued, and this entry does not argue
+  one.
+- It is the hold by an **ordinary apply**, and D-036's subject is a **take**, which is
+  strictly longer: this is a floor under the thing §12 asks about, not a substitute.
+- Grouping applies does not shorten it — a job that takes half a second takes half a
+  second whichever way the task batches it — so it bears on §11's storage item 6 and
+  not on Q14's grouped applies, exactly as §12 says.
+
+**The inbox's drops under its byte bound.** At 20 seeds, at 100 and at 1 000: **none
+at all**, of any kind, of any range. The coverage line prints `{}`.
 
 This is a measurement that reached nothing, and saying so carefully is the
 measurement. **Zero drops at three nodes of four ranges means the bound was never
@@ -10787,14 +10867,14 @@ by range.
 
 **The trace records a run holds per range per virtual second, against `TRACE_CAP`.**
 
-At **100 seeds**, over **9 037 027 records**: at most **1 728 records per virtual
-second per range** by the conservative reading — the whole trace, every client
-operation and every `MessageSent` and `MessageDelivered` included, divided by the four
-ranges — and at most **264** of the busiest range's own records per virtual second,
-about a seventh of it. `TRACE_CAP` is **400 000**.
+At **100 seeds**, over 9 037 027 records: at most **1 728** records per virtual second
+per range by the conservative reading — the whole trace, every client operation and
+every `MessageSent` and `MessageDelivered` included, divided by the four ranges — and
+at most **264** of the busiest range's own. At **1 000 seeds**, over 90 393 121
+records: **1 833** and **347**. `TRACE_CAP` is **400 000**.
 
-So four ranges under these arms hold **about 231 virtual seconds** before the cap on
-the conservative reading, and about 1 500 on the observed one; a run of this scenario is
+So four ranges under these arms hold **about 218 virtual seconds** before the cap on
+the conservative reading, and about 1 150 on the observed one; a run of this scenario is
 a few virtual seconds long.
 
 **Four ranges fit under `TRACE_CAP` with room**, so Stage B's range count does not go
@@ -10804,9 +10884,9 @@ conservative one.
 ### The mutation table: what a single-range world could not catch
 
 The owner's standing demand on this stage is that a check with more than one range to
-be wrong about show the mutation a single-range world could not catch. Seven mutations
-were planted in the harness **one at a time**, each run at **100 seeds**, each reverted
-before the next. Every one of them is a no-op on one group: with a single range,
+be wrong about show the mutation a single-range world could not catch. Ten mutations were
+planted **one at a time**, each run at **100 seeds** with `CARGO_INCREMENTAL=0`
+(issue #102), each reverted before the next. Every one of them is a no-op on one group: with a single range,
 `range_of` answers the only range there is, the key map has one answer, the client's
 per-range leader map has one key and the trial hands over the one range.
 
@@ -10819,12 +10899,17 @@ per-range leader map has one key and the trial hands over the one range.
 | **M5** | the Figure 8 burst writes the first range's key whatever the arm drew | nothing: one range | **not caught**, and on reflection it should not be. `CountOlderTermForCommit` stays at 14/20: the driver needs *a* backlog of more than `max_batch` uncommitted entries behind an isolated follower, and a backlog is a backlog whichever range carries it. What the aimed key buys is that the backlog is on the range whose leader the arm steered, which is tidier but is not what the window depends on |
 | **M6** | the lease trial hands over one range, not every range the node holds | nothing: one range | **not caught.** `LeaseTrustsTheClock` is 0/100 either way at this tier, so there is no rate to move, and the lease coverage stays above its floors. The place this would show is the thousand-seed tier, where the variant's catch lives; it is recorded so the premerge can be read against it |
 | **M7** | Q41's round stops honouring `Variant::SendBeforePersist` | n/a — this is the hole this branch closed | **`a_server_that_sends_before_it_persists_is_caught_on_the_node`**, 0/20, which is exactly what the branch found before it was fixed |
+| **M8** | the node flushes its outbox after every push, so a frame carries one message | nothing: one range's messages are one range's however they are cut | **the multi-range frame floor.** 270 688 such frames over a hundred seeds correct, **0** mutated, against a floor of 100 a seed. The trace also grows, 1 728 records per range per second to 2 116, which is batching's cost read from the other side |
+| **M9** | `apply_lags` keys its committed-index map by server alone, pooling the ranges | nothing: one range, one key | **the per-range median assertion.** Per range 2.86 / 3.27 / 2.96 / 3.12 ms correct, **467.7 / 234.1 / 239.1 / 259.7 ms** mutated, against 20 ms. It was *not* caught before M2's fix: the pooled median moved to 275 ms and nothing asserted it |
+| **M10** | `cross_range_apply_holds` stops requiring the two applies to be of different ranges | nothing: one range | **the fold's own unit test**, on records built by hand. It was **not caught by any sweep**: the waits went from 5 317 to 54 808 and the median from 2.074 to 2.498 ms, the figure §12 hands the owner moved, **and every test stayed green**. A number that goes to the owner needs an oracle of its own |
 
-**Four of seven caught, three recorded and not covered.** Two of the four — M1 and M3 —
-were *not* caught when the campaign began: both figures were printed and neither had a
-floor, and the campaign is what turned two prints into two bounds. That is the campaign
-earning its cost, and it is the honest reading of the table: a mutation campaign whose
-every row is caught has usually been written after the checks rather than against them.
+**Seven of ten caught, three recorded and not covered.** Four of the seven — M1, M3, M9
+and M10 — were *not* caught when the campaign began. M1 and M3 were figures printed
+without a floor; M9 and M10 were figures with no oracle at all, and M10 is the one that
+matters most, because the number it moved is the number this entry escalates. Each was
+found by planting the mutation and none by reading the code. That is the honest reading
+of the table: a campaign whose every row is caught has usually been written after the
+checks rather than against them.
 
 ### The pinned seeds, re-audited
 
@@ -11011,6 +11096,12 @@ on its own, and it is put to the owner with the wiring rather than decided here.
   in `sim/tests/node.rs` fails a seed two ways: on a snapshot action traced, and — the
   one that matters — on any replica reaching an index at or past this cluster's
   `snapshot_threshold`, which is the condition behind every action a core can ask for.
+  **And each blocked variant now has a test of its own**, named for it, running it over
+  the share and asserting that it catches nothing and that the path is still unreached,
+  so `cargo test --list` and the nightly's shard table carry the debt rather than a
+  paragraph of prose. Each fails the day the wiring lands — either the variant starts
+  being caught, and the test asks to be turned into §10's assertion, or the path
+  counters move and it says so.
   The second is there because the first is not evidence on its own: the node's
   `Host::snapshot` bumps `Gaps::snapshot_actions` and traces nothing, so an action the
   node dropped on the floor would leave the first clause green against a silence. A
@@ -11062,18 +11153,29 @@ on its own, and it is put to the owner with the wiring rather than decided here.
   the same mechanism, one `apply` task per node taking every range's jobs one at a
   time (Q14), with the take's own hold owed by the slice that wires it.
 - **That hold's maximum goes to the owner**, which is what §12 says to do with this
-  figure when it exceeds a heartbeat interval. At 100 seeds the median is 2.07 ms and
-  the **maximum is 572.9 ms**, against 20 ms. It is one apply job of one range —
-  clamped to a single job's span by the fold, so not a crash or an isolation misread —
-  with another range's committed entry waiting behind it throughout. It bears on §11's
-  storage item 6 rather than on Q14's grouped applies, since grouping does not shorten
-  a job, and it is a **floor** under D-036's real subject: a take is strictly longer
-  than an ordinary apply.
-- **Follower compaction (D-078) does not run on the node either.** The core's
-  compaction asks the `apply` task for `SnapshotAction::Record`, which this host
-  counts and drops, so the follower-log bound Stage B's exit asks for cannot be
-  asserted on the node. It stays asserted on `Cluster::OneGroup`, where D-078 measured
-  it.
+  figure when it exceeds a heartbeat interval — **and the number is not the one this
+  entry first carried.** The fold counted windows in which the node had crashed, and
+  its four largest were crashes. With those dropped the median is **2.08 ms** and the
+  maximum **178.568102 ms at a hundred seeds and 504.250728 ms at a thousand**, against
+  20 ms. The maxima that remain were checked one by one and are the apply task busy on
+  another range's job, not idle and not dead. It is a sample order statistic and not a
+  bound, it is the hold by an ordinary apply where D-036's subject is a take, and
+  grouping applies would not shorten it, so it bears on §11's storage item 6.
+- **Follower compaction (D-078) does not run on the node, and the bound is no longer
+  asked of it.** The core's compaction asks the `apply` task for
+  `SnapshotAction::Record`; this host counts that action and drops it, so no record is
+  written, no prefix goes, and a follower replica on the node has nothing bounding its
+  in-memory log but the run's length. `Report::check` ran `follower_log_is_bounded` for
+  **both** clusters until the review of this slice, which is a bound on a mechanism
+  nobody built: measured on the node, the largest follower log is **372 entries over a
+  hundred seeds and 610 over a thousand** against the bound's 768 — 1.26 × — with the
+  sample maximum having grown 1.64 × from one tier to the next, and the shard table
+  schedules this sweep at ten thousand. That is a nightly waiting to turn red on a
+  claim this entry itself denies. The clause is now `Cluster::OneGroup`'s, with the
+  reason in the code, and the node's sweep prints the distribution instead: over a
+  thousand seeds the per-seed largest log runs from 4 × `snapshot_threshold` to 50 ×,
+  with its bulk at 14 × to 20 ×. The slice that wires the `snapshot` task owes the node
+  a bound measured from the node.
 
 ---
 
