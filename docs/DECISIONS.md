@@ -11354,7 +11354,7 @@ At **100 seeds**, all pass; at **1 000**, 999 pass and one is issue #81, below.
 | uniformly scheduled | 50 | 500 |
 | grow completed **on every range** | 100/100 | 1000/1000 |
 | shrink completed on every range | 100/100 | 1000/1000 |
-| a node jointly configured on two ranges at once, **witnessed** | **100/100** | **1000/1000** |
+| a node jointly configured on two ranges at once, **witnessed** | **100/100** | **1000/1000** (and **9 997/10 000** — see below) |
 | both joiners admitted to **every** range | 100/100 | 1000/1000 |
 | partitions that cut off the drawn range's leader, **side checked** | **200/200** | **2000/2000** |
 | ranges a leadership transfer was asked for | **all four** | **all four** |
@@ -11444,6 +11444,48 @@ Six seconds is most of an eight-second run, and that is said rather than hidden:
 clause with teeth is the one beside the bound** — that *no* write of that range
 completed after the heal at all — which has nothing to tune and no margin to get
 wrong. The bound is the backstop under it.
+
+### The overlap is not on every seed at ten thousand, and that goes to the owner
+
+The nightly on this branch's tip (run 35782897735) is red on shard 3, and **three of its
+thirty-three failing seeds are this slice's own overlap clause, not issue #81**. Every
+one of the thirty-three was re-run locally and classified: **30 are #81's
+`match starts:` fold, 3 are `no node ever held two ranges' joint configurations at
+once` — seeds 6097, 7759 and 7887.** So the overlap is reached on **9 997 of 10 000**
+seeds, not on all of them, and the per-seed assertion this entry makes is stronger than
+the measurement supports at that tier. Nothing above changes: it is 100 of 100 and
+1 000 of 1 000, and those figures stand.
+
+**The mechanism, read off the three traces, is this slice's parameter and not the
+system.** On all three the run is healthy — grow and shrink complete, eight joint
+configurations per server, nothing stopped — and the maximum number of ranges jointly
+configured at once on any server is **1**: each range's joint phase opens and closes
+before the next one opens. Their staggers are the reason. They total 74 ms, 69 ms and
+64 ms across the four ranges, against 31 ms on seed 449 and 36 ms on seed 0; the gaps
+between consecutive requests are 20–25 ms, and `RANGE_STAGGER_MAX_MS`'s own doc comment
+says a joint configuration with no partition over it "lives for a round trip or two —
+tens of milliseconds". **The constant was set at 25 ms, which is the top of the range
+its own comment identifies as the one that serialises the changes.**
+
+**This is a bound the correct system trips, so it is not widened here** (D-030, D-039;
+CLAUDE.md). It is reported instead, with the two candidate fixes and the reason neither
+is taken unilaterally:
+
+- **The parameter is wrong.** The stagger exists to make the four changes *interleave*;
+  a value that serialises them defeats its own purpose. Capping it well below a joint
+  phase's life would make the overlap structural rather than probabilistic, and there
+  is direct evidence it would: measured with the stagger at **zero**, the overlap is
+  witnessed on 100 of 100 seeds. This is the reading this slice favours, because it
+  fixes the model rather than the assertion.
+- **Or the tier is wrong**, and the clause should take the shape D-058 gave
+  `elections_while_joint` and `reverts_to_a_prefix`: asserted per seed at the tiers
+  where it is 100 %, and as a rate at ten thousand, printed at every tier.
+
+Choosing between them needs a ten-thousand-seed run of whichever is chosen, which is
+the owner's to schedule and not this laptop's. **Until it is chosen the clause is left
+asserting per seed and the nightly stays red on those three seeds**, which is the
+behaviour CLAUDE.md asks for: a check that cannot reach its situation says so per seed
+and fails, rather than passing quietly.
 
 ### The trace records a run holds per range per virtual second, against `TRACE_CAP`
 

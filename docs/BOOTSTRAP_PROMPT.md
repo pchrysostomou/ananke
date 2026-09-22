@@ -121,9 +121,16 @@ _Update this section at the end of every session._
   three checks asserting less than their names claimed, and the fixes are a **witness**
   on the overlap fold (the answer checked against the trace read backwards — 0 of 100
   unwitnessed correct, 38 of 100 for a fold that never clears its state), the side the
-  partition actually cut, and the ranges the transfer was asked for. **Finding:** at
-  the thousand-seed tier, seed 449 reaches **issue #81** — a voter removed and re-added
-  inside one leader's term — whose fix is PR #89; the gate and CI tiers are green.
+  partition actually cut, and the ranges the transfer was asked for. **Two findings**,
+  both from the nightly's shard 3, red on 33 of 10 000 seeds, each seed re-run and
+  classified: 30 are **issue #81** — a voter removed and re-added inside one leader's
+  term, whose fix is PR #89 — and **3, seeds 6097, 7759 and 7887, are this slice's own
+  per-seed overlap clause**, which the correct system therefore trips. Its cause is
+  this slice's `RANGE_STAGGER_MAX_MS` at 25 ms, the top of the range its own doc
+  comment names as the one that serialises the four changes; with the stagger at zero
+  the overlap is 100 of 100. **Not widened**: it goes to the owner with two candidate
+  fixes (the parameter, or D-058's tiering) and the clause left failing. The gate and
+  CI tiers are green.
 - Merge update (2026-09-22): branch `phase-3-stage-b-compaction` merged `origin/main`
   to resolve PR conflicts, carrying in PROPOSED D-073 and D-074 from main and keeping
   this branch's PROPOSED D-078.
