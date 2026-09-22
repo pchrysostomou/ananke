@@ -37,7 +37,7 @@ use std::time::Duration;
 use ananke_env::{Clock, Decision, Either, Environment, Rng, race};
 use ananke_raft::core::SnapshotAction;
 use ananke_raft::queue::Queue;
-use ananke_raft::{Entry, Index, Input, Message, Output, Persist, Raft, ServerId, Term};
+use ananke_raft::{Entry, Index, Input, Message, Output, Persist, Raft, ServerId};
 use bytes::Bytes;
 
 use crate::inbox::{Inbox, Received};
@@ -227,21 +227,6 @@ pub enum ApplyWork {
     /// that index would capture (D-036).
     // PROPOSED(D-083): a follower's compaction record is the `apply` task's job too.
     Record,
-    /// A live install's switch is durable at this index and term: the state machine
-    /// the `apply` task keeps for the range is now the installed one, and the next
-    /// entry it is handed is the one after this index.
-    ///
-    /// It is a job and not a call because the `apply` task takes one job at a time in
-    /// the order they were queued (Q14): an install that told the task out of band
-    /// would move the watermark under a job already queued for the replica the switch
-    /// replaced.
-    // PROPOSED(D-081): the `apply` task learns an install's watermark in order.
-    Installed {
-        /// The snapshot's last applied index.
-        index: Index,
-        /// That entry's term.
-        term: Term,
-    },
 }
 
 /// One job for the node's `apply` task, with the range it belongs to.
@@ -526,6 +511,20 @@ impl<E: Environment, H: Host> Node<E, H> {
                     .config
                     .variants
                     .contains(NodeVariant::StepWhileInstalling));
+        if self
+            .config
+            .variants
+            .contains(NodeVariant::AsksTheHostBeforeTheHold)
+        {
+            // The variant: the host is asked what the input wants before the node has
+            // checked whether the range is held. `local_core` builds a live install's
+            // repair as a side effect, so a `Ready` that arrives while its own range's
+            // persist is outstanding hands that repair on and lets the switch carrying
+            // it proceed against a write still in flight.
+            if let Some(core) = self.cores.core(range) {
+                let _ = self.host.local_core(&mine, core);
+            }
+        }
         if held && !self.host.local_releases(&mine) {
             self.cores.count_local_held();
             if self.config.variants.contains(NodeVariant::HeldLocalDropped) {
@@ -1146,6 +1145,10 @@ mod tests {
         Rejected(RangeId),
         /// A node-local input reached its core, and which one it was.
         Local(RangeId, u64),
+        /// The host was asked what a local input wants of its core. It is a note of
+        /// its own because the question is not pure — a live install's repair is built
+        /// in answering it — so *when* it is asked is a property worth checking.
+        Asked(RangeId),
         /// The host asked for a range to be held across its live install.
         Held(RangeId),
         /// The host handed back the replica a switch built.
@@ -1185,8 +1188,6 @@ mod tests {
         /// A follower's compaction record, between two applies: no checkpoint under
         /// it (D-065, D-078).
         Record,
-        /// A live install's switch, at the index it made durable.
-        Installed(Index),
     }
 
     impl Job {
@@ -1197,7 +1198,6 @@ mod tests {
                 }
                 ApplyWork::Take => Job::Take,
                 ApplyWork::Record => Job::Record,
-                ApplyWork::Installed { index, .. } => Job::Installed(*index),
             }
         }
     }
@@ -1262,6 +1262,7 @@ mod tests {
         }
 
         fn local_core(&self, mine: &Self::Local, _core: &Raft) -> CoreWork {
+            self.note(Note::Asked(mine.range));
             match mine.work {
                 Work::Step => CoreWork::Step,
                 Work::Hold => {
@@ -1381,6 +1382,12 @@ mod tests {
             ..config
         };
         Raft::new(ME, Configuration::of(&[ME, LEADER, ServerId(3)]), config, 7)
+    }
+
+    /// One range on the node: what a mutation about *which* ranges are touched has to
+    /// be run against before it may claim a single-range world could not catch it.
+    fn one_range() -> Vec<(RangeId, Raft)> {
+        vec![(R1, core(R1))]
     }
 
     /// The node's usual two followers.
@@ -1653,7 +1660,72 @@ mod tests {
     /// would reach its core in the wrong order.
     // PROPOSED(D-076): a node-local input is held for a persisting core as a message
     // of its range is.
-    /// A live install holds **one** range across its switch, and the replica the
+    /// The host is asked what a local input wants of its core only **after** the node
+    /// has checked whether that range is held.
+    ///
+    /// `Host::local_core` is not a pure question: a live install's repair is built in
+    /// answering it, from the core, and handed to the `snapshot` task there. Asked
+    /// first and held afterwards, a stream whose `Ready` arrives while its own range's
+    /// persist is still outstanding hands that repair on and lets the switch carrying
+    /// it proceed against a write in flight — the one thing the hold exists to
+    /// prevent.
+    ///
+    /// The situation is reached: instrumenting the node's directed scenario found a
+    /// stream's `Ready` arriving for a persisting range six times across eight seeds.
+    /// The scenario cannot see it, because the repair it builds early is the same
+    /// repair and the run goes on looking identical; this can, because it asks when
+    /// the question was put.
+    // PROPOSED(D-083): a live install holds one range and replaces its replica.
+    #[test]
+    fn the_host_is_asked_what_an_input_wants_only_after_the_hold_is_checked() {
+        // r1's disk is slow. A `Hold` — a stream ready to switch — arrives while r1's
+        // persist is outstanding.
+        let arrivals = [arrival(R1, append(1, 1))];
+        let delays = [(R1, Duration::from_millis(40))];
+        let locals = [(
+            Duration::from_millis(2),
+            Mine {
+                range: R1,
+                n: 1,
+                work: Work::Hold,
+            },
+        )];
+        let setup = |variants| Setup {
+            arrivals: &arrivals,
+            locals: &locals,
+            duration: Duration::from_millis(120),
+            ..Setup::new(variants, &delays)
+        };
+
+        let correct = run_with(setup(NodeVariants::correct()));
+        let persisted = position(&correct.log, &Note::Persisted(R1));
+        let asked = position(&correct.log, &Note::Asked(R1));
+        assert!(
+            asked > persisted,
+            "the host was asked what the input wanted while r1's persist was still \
+             outstanding, so a live install's repair would have been built and handed \
+             on against a write in flight: {:?}",
+            correct.log
+        );
+        // And the hold is still taken, once the persist is out of the way.
+        assert_eq!(
+            correct.meters.ranges_held_for_install, 1,
+            "the held input was not stepped at all after its persist resolved: {:?}",
+            correct.log
+        );
+
+        // The pair: the question asked before the hold is checked.
+        let buggy = run_with(setup(
+            NodeVariants::correct().with(NodeVariant::AsksTheHostBeforeTheHold),
+        ));
+        assert!(
+            position(&buggy.log, &Note::Asked(R1)) < position(&buggy.log, &Note::Persisted(R1)),
+            "the variant is meant to ask before the hold is checked: {:?}",
+            buggy.log
+        );
+    }
+
+    /// A live install holds **one** range across its switch, and the replica the    /// A live install holds **one** range across its switch, and the replica the
     /// switch built is the one the node runs afterwards (D-066, D-083).
     ///
     /// A server ends its whole run-loop incarnation across an install and comes back
@@ -1803,6 +1875,30 @@ mod tests {
             Some(&0),
             "the variant replaced a replica it only held: {:?}",
             every.terms
+        );
+
+        // The claim that this mutation needs more than one range, asserted rather than
+        // asserted-in-a-comment: on a node of one range the variant holds exactly what
+        // the correct node holds, and the two runs are indistinguishable.
+        let alone = |variants| Setup {
+            locals: &locals,
+            duration: Duration::from_millis(90),
+            cores: one_range,
+            ..Setup::new(variants, &[])
+        };
+        let one_correct = run_with(alone(NodeVariants::correct()));
+        let one_buggy = run_with(alone(
+            NodeVariants::correct().with(NodeVariant::InstallHoldsEveryRange),
+        ));
+        assert_eq!(
+            one_correct.meters.ranges_held_for_install, one_buggy.meters.ranges_held_for_install,
+            "with one range the variant is meant to be the correct hold exactly, which \
+             is what makes it a mutation only a node of several ranges can be wrong about"
+        );
+        assert_eq!(
+            one_correct.terms.get(&R1),
+            one_buggy.terms.get(&R1),
+            "with one range the two runs left different replicas running"
         );
     }
 

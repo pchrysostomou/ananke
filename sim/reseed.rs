@@ -22,31 +22,36 @@
 //!   is written into the new engine and before that replica answers anything other
 //!   than its re-seed stream — and restarts it.
 //!
-//! **What it asserts, per seed, on the correct system** ([`Report::check`]):
+//! **What it asserts, per seed, on the correct system** ([`Report::check`]), in this
+//! order:
 //!
-//! - **(a)** each of the refused node's four ranges traces its
-//!   `RangeCreated { cause: snapshot }`, with no restart of the node between the
-//!   refusal and that install other than the arm's, and no `RaftAdopted`: every range
-//!   was installed **live**, into the directory the re-seed built;
-//! - **(b)** every re-seed stream completes into an install, none abandoned for a
-//!   chunk of another identity — the four ranges share two slots and take turns,
-//!   rather than restarting each other (SHARD.md:573-576);
-//! - **(c)** each replica's refused mark is durable before that replica's first answer
-//!   other than its re-seed stream, the mark being the `RaftReseeded` D-077 traces
-//!   when `RaftStore::mark_reseeded`'s synced batch returns. This is the criterion PR
-//!   #86 could asserted only as an absence: with no install in that tree a re-seeded
-//!   replica answered *nothing*, so the fold's other side was empty and said so. Here
-//!   it is not: every one of the four answers after its mark, and
-//!   [`Read::answered_after_the_mark`] is asserted full rather than empty;
-//! - **(d)** after the arm's crash the replica whose mark was written as refused
-//!   restarts **as refused** — `RaftRecovered`'s state, which D-067 asked this trace
-//!   for — and is re-seeded by an install that lands after the restart;
-//! - **(e)** the run ends with the refused directory still marked lost and not one
-//!   byte of it changed since the refusal, so it never opened fresh (D-041).
+//! - **the node is still running**, because a node that stopped still has every stream,
+//!   install and creation it managed in its trace;
+//! - **(c), first half**: no replica answered anything other than its own re-seed stream
+//!   before its refused mark was durable. First, because it is an ordering, and because
+//!   `ServeBeforeRefusedMark` is its plant and was caught by (a) while (a) came first;
+//! - **(a)** each of the four ranges traces its `RangeCreated { cause: snapshot }`, with
+//!   exactly one start of the node between the refusal and the last install — the arm's —
+//!   and no `RaftAdopted` at all: every range installed **live**, into the directory the
+//!   re-seed built;
+//! - **(b)** every re-seed stream completes into an install; the four were owed at once;
+//!   and the cap held at least one stream back, read off `RaftSnapshotStartOver` with
+//!   reason `Cap`. Raise the cap to the range count and that last clause is the one that
+//!   fails, which is what makes it an assertion about the cap;
+//! - **(c), second half**: every replica answered something after **its own install**.
+//!   This is the half PR #86 could assert only as an absence, and it is keyed on the
+//!   install rather than on the mark because a replica that was never re-seeded answers
+//!   too — with the rejections of an empty log — so the mark-keyed set is a constant;
+//! - **(d)** after the arm's crash the replica whose mark was written as refused restarts
+//!   **as refused** — `RaftRecovered`'s state, which D-067 asked this trace for — and is
+//!   re-seeded by an install that lands after the restart;
+//! - **(e)** the run ends with the refused directory still marked lost and not one byte
+//!   of it changed since the arm's crash (D-041). The baseline is read there and not at
+//!   the refusal: an audit costs simulated disk time, and one taken at the refusal would
+//!   push the arm's crash past the syncs D-067 requires it to precede.
 //!
-//! The arm's firing is asserted on every seed. `NodeVariant::ReseedMarkNotSynced`
-//! (D-067) is caught at the tier its measured rate supports (D-061), and the rate is
-//! printed by the test that runs it.
+//! The arm's firing is asserted on every seed. `NodeVariant::ReseedMarkNotSynced` (D-067)
+//! is caught at 48 % of a hundred seeds, so at every tier, and the rate is printed.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -57,7 +62,7 @@ use std::time::Duration;
 use ananke_env::sim::{Sim, SimConfig, TraceRecord};
 use ananke_env::{
     Clock, Either, Environment, File, FileSystem, Instant, Network, NodeId, OpenOptions,
-    RangeCause, RecoveredAs, Rng, Socket, TraceEvent, race,
+    RangeCause, RecoveredAs, Rng, Socket, StartOver, TraceEvent, race,
 };
 use ananke_raft::ServerId;
 use ananke_raft::apply::Command;
@@ -129,7 +134,7 @@ const GONE: Duration = Duration::from_secs(4);
 const DOWN: Duration = Duration::from_millis(300);
 /// How long the run goes on after the arm's restart: long enough for four streams
 /// through two slots, and the installs they complete.
-const AFTER: Duration = Duration::from_secs(8);
+const AFTER: Duration = Duration::from_secs(7);
 /// The longest the arm waits for the refusal, and then for the mark it crashes on.
 /// A wait that runs out is an arm that did not fire, which [`Report::check`] fails on
 /// rather than passing quietly.
@@ -239,13 +244,6 @@ impl Report {
                 read.replicas_refused
             ));
         }
-        if read.marked != every {
-            return Err(format!(
-                "seed {seed}: {:?} of {every:?} replicas were marked refused in the \
-                 new engine",
-                read.marked
-            ));
-        }
         // The arm is a fault, and a fault that did not fire is a run that tested the
         // schedule and not the crash (D-031). It is asserted here, per seed, as
         // SHARD.md §12 asks.
@@ -288,6 +286,21 @@ impl Report {
             ));
         }
 
+        // (c), first half, and it is first because it is an *ordering*: a replica that
+        //     answered before its mark is one that answered whether or not anything
+        //     else about the run went right, and the clause must be what catches it.
+        //     `ServeBeforeRefusedMark` — a node that writes no mark at all — is this
+        //     clause's plant, and while (a) came first the variant was caught by (a)
+        //     instead, which tests the wrong sentence.
+        if !read.served_before_the_mark.is_empty() {
+            return Err(format!(
+                "seed {seed}: (c) {:?} answered before their refused mark was durable: \
+                 a replica in a fresh engine that answers before its mark is one that \
+                 may vote again on state its node lost (D-035, D-042)",
+                read.served_before_the_mark
+            ));
+        }
+
         // (a) Every range installed live into the new directory.
         let missing: Vec<u64> = every
             .difference(&read.created_by_install)
@@ -303,15 +316,23 @@ impl Report {
                 every.len()
             ));
         }
-        // A restart of the node between the refusal and the installs would mean the
+        // A restart of the node between the refusal and its installs would mean the
         // ranges came back at a start rather than being installed into a running
-        // engine. The arm's is the one restart allowed, and it is the one counted.
-        let restarts = read.starts_after_refusal;
+        // engine. The arm's is the one restart allowed in that window, and it is the
+        // one counted: the run's own second restart, which puts the node back over
+        // replicas the installs had already filled, comes after them and is not in it.
+        let last_install = read.installed_at.values().max().copied().unwrap_or(0);
+        let restarts = read
+            .starts_after_refusal
+            .iter()
+            .filter(|at| **at < last_install)
+            .count();
         if restarts != 1 {
             return Err(format!(
-                "seed {seed}: (a) node {VICTIM} started {restarts} times after its \
-                 refusal, not once for the arm alone: an install that follows a start \
-                 of the node is not an install into a *live* engine (§11, storage 5)"
+                "seed {seed}: (a) node {VICTIM} started {restarts} times between its \
+                 refusal and its last install, not once for the arm alone: an install \
+                 that follows a start of the node is not an install into a *live* \
+                 engine (§11, storage 5)"
             ));
         }
         if read.adoptions != 0 {
@@ -342,49 +363,73 @@ impl Report {
                 every.len()
             ));
         }
-        // And the four of them were owed at once, against two slots. The node is
-        // refused whole, so every one of its ranges is marked before any of them can
-        // be installed: if the first install lands after the last mark, the node owed
-        // four re-seeds and could assemble [`RECEIVE_CAP`] of them, which is the
-        // situation the cap exists to make and the one a node with a single staging
-        // directory abandons its way through (SHARD.md:573-576).
+        // And they shared the node's slots. Two things are asserted, because the first
+        // is structural and the second is not: the four re-seeds were *owed* at once —
+        // the node is refused whole, so every mark precedes the first install — and
+        // more than [`RECEIVE_CAP`] of them were in flight at once, which is the cap
+        // actually holding a stream back rather than four streams arriving to an idle
+        // receiver. Raise the cap to the range count and the second fails, which is
+        // what makes it an assertion about the cap rather than prose beside one.
         let last_mark = read.marked_at.values().max().copied();
         let first_install = read.installed_at.values().min().copied();
         match (last_mark, first_install) {
             (Some(mark), Some(install)) if install > mark => {}
             (mark, install) => {
                 return Err(format!(
-                    "seed {seed}: (b) the four re-seeds were not owed at once: the \
-                     last refused mark is at {mark:?} and the first install at \
-                     {install:?}, so the node's cap of {RECEIVE_CAP} was never asked \
-                     to hold {} streams back",
+                    "seed {seed}: (b) the four re-seeds were not owed at once: the last \
+                     refused mark is at {mark:?} and the first install at {install:?}, \
+                     so the node's cap of {RECEIVE_CAP} was never asked to hold {} \
+                     streams back",
                     every.len()
                 ));
             }
         }
-
-        // (c) The mark is durable before the replica's first answer that is not its
-        //     own re-seed stream — and every replica did answer, so the fold has both
-        //     sides. PR #86 could asserted only the empty one, with its reason.
-        if !read.served_before_the_mark.is_empty() {
+        // And the cap held a stream back: the node answered at least one chunk with
+        // `StartOver { reason: Cap }` because its slots were full. That is the receive
+        // cap doing the thing this shape sets it to two for, read off the node's own
+        // trace rather than argued from the range count — raise the cap to the range
+        // count and this is the clause that fails.
+        if read.waited_for_a_slot.is_empty() {
             return Err(format!(
-                "seed {seed}: (c) {:?} answered before their refused mark was durable: \
-                 a replica in a fresh engine that answers before its mark is one that \
-                 may vote again on state its node lost (D-035, D-042)",
-                read.served_before_the_mark
+                "seed {seed}: (b) no stream toward node {VICTIM} was ever held back by \
+                 its cap of {RECEIVE_CAP}: four re-seeds went through {} slots without \
+                 one of them waiting, so the run says nothing about them sharing \
+                 ({} were in flight at once)",
+                RECEIVE_CAP,
+                read.in_flight_at_once()
+            ));
+        }
+
+        // (c) The mark is durable before the replica's first answer that is not its own
+        //     re-seed stream — and every replica answered *after its own install*, so
+        //     the fold has both sides. PR #86 could assert only the empty one, with its
+        //     reason.
+        //
+        //     The ordering clause runs before the marks are counted, so a node that
+        //     wrote no mark at all fails *here*, on the order, rather than on the
+        //     situation: `ServeBeforeRefusedMark` is this clause's plant, and it was
+        //     caught by `reached` and never by (c) while the count came first.
+        if read.marked != every {
+            return Err(format!(
+                "seed {seed}: (c) {:?} of {every:?} replicas were marked refused in \
+                 the new engine",
+                read.marked
             ));
         }
         let silent: Vec<u64> = every
-            .difference(&read.answered_after_the_mark)
+            .difference(&read.answered_after_the_install)
             .copied()
             .collect();
         if !silent.is_empty() {
             return Err(format!(
-                "seed {seed}: (c) {silent:?} answered nothing at all other than their \
-                 re-seed stream, so the order (c) asserts is asserted about nothing \
-                 for them. This is the vacuous half PR #86 recorded as owed: with the \
-                 wiring a re-seeded replica has something to answer, and a run where \
-                 it does not is a run that did not re-seed it"
+                "seed {seed}: (c) {silent:?} answered nothing at all, other than their \
+                 re-seed stream, after their own install completed, so the order (c) \
+                 asserts is asserted about nothing for them. It is read against the \
+                 install and not against the mark on purpose: a replica that was never \
+                 re-seeded still answers, with the rejections of an empty log, and a \
+                 set keyed on the mark alone is full on exactly the runs this is meant \
+                 to fail ({:?} answered after their mark)",
+                read.answered_after_the_mark
             ));
         }
 
@@ -488,8 +533,22 @@ pub struct Read {
     /// its mark was durable: what (c) forbids.
     pub served_before_the_mark: BTreeSet<u64>,
     /// The ranges whose replica sent something other than its re-seed stream after
-    /// its mark was durable: what makes (c)'s fold non-vacuous.
+    /// its mark was durable.
+    ///
+    /// On its own this set is a constant: an empty replica answers AppendEntries with
+    /// rejections whether or not its re-seed ever completed, so a full set here says
+    /// nothing about the install. [`Read::answered_after_the_install`] is the one the
+    /// check reads.
     pub answered_after_the_mark: BTreeSet<u64>,
+    /// The ranges whose replica sent something other than its re-seed stream **after
+    /// its own install completed**: what makes (c)'s fold non-vacuous.
+    ///
+    /// This is the half PR #86 could not assert at all, and it is asserted against the
+    /// install rather than against the mark because only the second is evidence that
+    /// the re-seed worked. A replica that was never installed still answers — with the
+    /// rejections of an empty log — so a set keyed on the mark alone is full on runs
+    /// where a range was never re-seeded at all.
+    pub answered_after_the_install: BTreeSet<u64>,
     /// The ranges whose replica answered a chunk of its own re-seed stream, which is
     /// the answer (c) excludes by name.
     pub stream_answers: BTreeSet<u64>,
@@ -501,11 +560,16 @@ pub struct Read {
     pub installed_at: BTreeMap<u64, usize>,
     /// Streams opened toward the victim, per range.
     pub streams_to_victim: BTreeMap<u64, usize>,
+    /// The ranges whose stream the node held back because its slots were full, from
+    /// `RaftSnapshotStartOver { reason: Cap }` (D-083's event): the receive cap doing
+    /// the thing the shape sets it to two for.
+    pub waited_for_a_slot: BTreeMap<u64, usize>,
     /// Where each range's first stream toward the victim after the refusal stands in
     /// the trace.
     pub stream_opened_at: BTreeMap<u64, usize>,
-    /// How many times the victim's node task started after the refusal.
-    pub starts_after_refusal: usize,
+    /// Where each start of the victim's node task after the refusal stands in the
+    /// trace.
+    pub starts_after_refusal: Vec<usize>,
     /// Each restatement of a victim's replica: where it stands, its range, and the
     /// state the disk said it was in (D-067).
     pub restatements: Vec<(usize, u64, RecoveredAs)>,
@@ -528,8 +592,20 @@ impl Read {
     #[must_use]
     pub fn in_flight_at_once(&self) -> usize {
         let mut marks: Vec<(usize, i64)> = Vec::new();
-        for (range, opened) in &self.stream_opened_at {
-            marks.push((*opened, 1));
+        for range in self.installed_at.keys() {
+            // From the range's own refused mark, not from the stream's opening: a
+            // leader that opened a stream while the node was down opened it before the
+            // refusal, and a re-seed is owed from the moment its replica is marked.
+            let from = self
+                .stream_opened_at
+                .get(range)
+                .copied()
+                .min(self.marked_at.get(range).copied())
+                .or_else(|| self.marked_at.get(range).copied());
+            let Some(from) = from else {
+                continue;
+            };
+            marks.push((from, 1));
             if let Some(installed) = self.installed_at.get(range) {
                 marks.push((*installed, -1));
             }
@@ -581,6 +657,14 @@ pub fn read(records: &[TraceRecord], victim: u64, node_of: BTreeMap<NodeId, u64>
             TraceEvent::RaftServerFailed { server, reason } if *server == victim => {
                 out.failures.push(reason.clone());
             }
+            TraceEvent::RaftSnapshotStartOver {
+                server,
+                range,
+                reason: StartOver::Cap,
+                ..
+            } if *server == victim => {
+                *out.waited_for_a_slot.entry(*range).or_default() += 1;
+            }
             TraceEvent::RaftSnapshotStreams { to, range, .. } if *to == victim && refused => {
                 *out.streams_to_victim.entry(*range).or_default() += 1;
                 out.stream_opened_at.entry(*range).or_insert(at);
@@ -609,7 +693,7 @@ pub fn read(records: &[TraceRecord], victim: u64, node_of: BTreeMap<NodeId, u64>
             // install is what (a) forbids.
             TraceEvent::TaskSpawned { name, .. } if *name == "node" && is_victim(record) => {
                 if refused {
-                    out.starts_after_refusal += 1;
+                    out.starts_after_refusal.push(at);
                 }
             }
             // A message on the wire is the replica answering. Read off the frames
@@ -637,6 +721,9 @@ pub fn read(records: &[TraceRecord], victim: u64, node_of: BTreeMap<NodeId, u64>
                     }
                     if out.marked.contains(&range) {
                         out.answered_after_the_mark.insert(range);
+                        if out.installed_at.contains_key(&range) {
+                            out.answered_after_the_install.insert(range);
+                        }
                     } else {
                         out.served_before_the_mark.insert(range);
                     }
@@ -815,13 +902,18 @@ pub fn run(seed: u64, variants: impl Into<Variants>, node_variants: NodeVariants
         let mut scanned = sim.trace_len();
         let mut waited = Duration::ZERO;
         let mut refused = false;
+        let mut refused_seen = false;
         while waited < ARM_WAIT_BUDGET && !arm.fired {
             sim.run_for(ARM_STEP);
             waited += ARM_STEP;
             let records = sim.trace_from(scanned);
+            scanned += records.len();
             for record in &records {
                 match &record.event {
-                    TraceEvent::RaftRefused { server, .. } if *server == VICTIM => refused = true,
+                    TraceEvent::RaftRefused { server, .. } if *server == VICTIM => {
+                        refused = true;
+                        refused_seen = true;
+                    }
                     TraceEvent::RaftReseeded { server, range } if *server == VICTIM && refused => {
                         arm.marked = Some(*range);
                         arm.fired = true;
@@ -830,28 +922,37 @@ pub fn run(seed: u64, variants: impl Into<Variants>, node_variants: NodeVariants
                     _ => {}
                 }
             }
-            scanned += records.len();
+        }
+        // A crash at the budget's end when no mark ever arrives, as `Fault::CrashRefused`
+        // crashes a victim that never flushes (D-044): the arm is a crash, and a run
+        // where the node was never crashed asserts nothing about (d). It is also what
+        // gives (c) its plant — `ServeBeforeRefusedMark` writes no mark at all, so
+        // without this the arm would never fire on it and the variant would be caught by
+        // the situation rather than by the clause it breaks.
+        if !arm.fired && refused_seen {
+            arm.fired = true;
         }
         if arm.fired {
             arm.at = Some(sim.now());
             arm.crashed_after = sim.trace_len();
             sim.crash(at);
+            // The refused directory, read with the node down so nothing on it can be
+            // writing. This is the first moment after the refusal at which that is
+            // true, and it is *not* the refusal itself: an audit there advances the run
+            // while it reads — every read pays the disk — and the re-seed's remaining
+            // stores would open, and sync, inside it. D-067 requires this crash to land
+            // on the mark's own trace event, before anything else syncs the new
+            // engine's log, and that requirement wins: measured both ways,
+            // `ReseedMarkNotSynced`'s catch is 39 % with the crash on the mark and 1 %
+            // with an audit in front of it. What (e) therefore does not cover is the
+            // few milliseconds between `RaftRefused` and this crash, in which the node
+            // is opening the *new* directory and the refused engine is already quiesced
+            // (D-044 marks and quiesces before the event is traced). The entry says so.
+            refused_at_refusal = audit(&mut sim, at, Path::new(DIR));
             sim.run_for(DOWN);
             sim.restart(at);
             spawn(&sim, at, VICTIM, variants, node_variants, false);
             arm.restarted = Some(sim.now());
-            // The refused directory as the node's second life found it. (e) is this
-            // against what the run leaves, and the window it covers is that whole
-            // second life — the one in which the node opens the directory the re-seed
-            // built, installs four ranges into it, and must never touch this one
-            // again (D-041).
-            //
-            // Taken here and not before the loss: the open that *discovers* the loss
-            // is an open, and an engine's recovery writes as it runs — a manifest
-            // written, an orphan removed — before anything can know the store is
-            // damaged. Those writes are the refusal itself, not writes after it, and
-            // a comparison from before the open would report them as (e) failing.
-            refused_at_refusal = audit(&mut sim, at, Path::new(DIR));
         }
     }
 

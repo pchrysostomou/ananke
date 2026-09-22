@@ -1011,22 +1011,17 @@ impl<E: Environment> RaftStore<E> {
         self.applied.load(Ordering::Acquire)
     }
 
-    /// Takes the applied index an install's manifest switch made durable.
+    /// Tells the store its applied index moved without an [`apply`](Self::apply):
+    /// a live install wrote the applied-index key inside its own manifest switch
+    /// (`Engine::install_spans`, D-066, D-068) rather than through an apply batch, so
+    /// the cached value this returns would otherwise still be the replaced replica's.
     ///
-    /// A live install writes this replica's whole state — the applied index with it —
-    /// in one switch through the engine, not through [`apply`](Self::apply), so the
-    /// number this store carries in memory is the one from before the install unless
-    /// it is told. A server never needed telling: it ends its run-loop incarnation
-    /// across an install and reopens the store, which reads the key back. A node
-    /// cannot reopen, because that would restart every range on it (SHARD.md §11,
-    /// storage 5), so it says so here.
-    ///
-    /// It never moves the index backwards: an install onto a live replica installs at
-    /// or above what the replica had applied, and a stale answer must not undo a
-    /// later apply.
-    // PROPOSED(D-081): a live install's applied index reaches the store it landed in.
+    /// A server never needs this: its install ends the run-loop incarnation and the
+    /// next start reads the key off the disk. A node keeps the store open across the
+    /// switch, so it has to say so.
+    // PROPOSED(D-083): a live install moves the store's applied index with it.
     pub fn installed_at(&self, index: Index) {
-        self.applied.fetch_max(index, Ordering::AcqRel);
+        self.applied.store(index, Ordering::Release);
     }
 
     /// The applied index as of `snapshot`: the value under the applied-index key

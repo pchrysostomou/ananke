@@ -205,6 +205,34 @@ pub enum NodeVariant {
     /// and the correct route are the same route.
     // PROPOSED(D-083): a stream's answers are stepped into the stream's range alone.
     SnapshotAckToEveryCore,
+    /// A take copies the range's Raft state and **drops its user keys**, so the
+    /// install's switch removes the receiver's user keys and puts nothing in their
+    /// place: total, silent state-machine loss on every range installed from it.
+    ///
+    /// A range lives in two key intervals (D-066) and the take has to carry both. This
+    /// carries one. Every event a correct install emits, it emits — the stream flows,
+    /// the switch is made, the replica is created — which is why a check that counts
+    /// events cannot see it and one that reads the installed state can.
+    // PROPOSED(D-083): what an install installed is read back and traced.
+    TakeSkipsTheUserKeys,
+    /// A take copies the **whole** Raft interval, the log purpose included, as the
+    /// one-group take does. The live install then puts the *leader's* log keys into
+    /// the receiver's store, and nothing tombstones them back out: the node's repair
+    /// carries no log tombstones precisely because the take carries no log keys
+    /// (D-083's first departure from D-082). The two halves of that argument have to
+    /// agree, and this is what catches them disagreeing.
+    // PROPOSED(D-083): the stream carries no log key, so the repair tombstones none.
+    TakeStreamsTheLogToo,
+    /// The host is asked what a local input wants of its core **before** the node has
+    /// checked whether that range is held.
+    ///
+    /// `Host::local_core` is not a pure question: a live install's repair is built in
+    /// its `Ready` arm and handed to the `snapshot` task there. Asked first and held
+    /// afterwards, a stream whose `Ready` arrives while its own range's persist is
+    /// still outstanding builds a repair and lets the switch carrying it proceed
+    /// against a write in flight — which is the one thing the hold exists to prevent.
+    // PROPOSED(D-083): a live install holds one range and replaces its replica.
+    AsksTheHostBeforeTheHold,
     /// A loss in the shared engine treated as one range's: only the range whose store
     /// open failed is refused — traced as refused, and given a refused mark — and the
     /// node's other replicas are neither. A node owns one engine (Q2), so a loss in it
@@ -283,31 +311,6 @@ pub enum NodeVariant {
     /// [`SnapshotAction::Record`]: ananke_raft::core::SnapshotAction::Record
     // PROPOSED(D-081): a follower's compaction record reaches the `apply` task.
     RecordNeverQueued,
-    /// The `snapshot` task's chunk deadlines served only when its queue is idle: the
-    /// node as it stood, where the loop raced a job against the nearest deadline and a
-    /// job that kept arriving won every race.
-    ///
-    /// On a server with one range the queue goes quiet between streams and the timer
-    /// fires; on a node of four it need not, and a stream whose chunk was lost is then
-    /// never resent and never given up. Its leader keeps `installing` set for that
-    /// follower and sends it heartbeats and nothing else, so the replica is fed
-    /// nothing for the rest of the run: one range's traffic starves another range's
-    /// re-seed.
-    // PROPOSED(D-081): a busy queue does not starve a stream's resend.
-    DueOnlyWhenIdle,
-    /// The applied index a live install's switch made durable told to neither the store
-    /// nor the `apply` task: both keep a number of their own, and the switch writes the
-    /// key under both of them.
-    ///
-    /// A server never needed telling — it ends its run-loop incarnation across an
-    /// install and reopens its store, which reads the key back — and a node cannot
-    /// reopen (SHARD.md §11, storage 5). Untold, the task hands the state machine the
-    /// entry after the index it *thinks* it applied, which is the entry after nothing,
-    /// and `RaftStore::apply` refuses it: the node applies nothing more for that range
-    /// and traces `RaftServerFailed` at every commit after the install.
-    // PROPOSED(D-081): an install's applied index reaches the store it landed in and
-    // the task that applies after it.
-    InstallWatermarkNotTold,
 }
 
 impl NodeVariant {
@@ -340,6 +343,9 @@ impl NodeVariant {
         NodeVariant::InstallHoldsEveryRange,
         NodeVariant::InstallSweepsEveryStaging,
         NodeVariant::SnapshotAckToEveryCore,
+        NodeVariant::TakeSkipsTheUserKeys,
+        NodeVariant::TakeStreamsTheLogToo,
+        NodeVariant::AsksTheHostBeforeTheHold,
         NodeVariant::RefuseOneRangeOnly,
         NodeVariant::ReseedIntoRefusedDir,
         NodeVariant::ReuseLostGeneration,
@@ -349,8 +355,6 @@ impl NodeVariant {
         NodeVariant::ReseedMarkNotSynced,
         NodeVariant::RestartAppliesFromZero,
         NodeVariant::RecordNeverQueued,
-        NodeVariant::DueOnlyWhenIdle,
-        NodeVariant::InstallWatermarkNotTold,
     ];
 
     /// The directed re-seed shape's own, outside §10's count of range-layer variants:
@@ -358,8 +362,8 @@ impl NodeVariant {
     /// Q15's *durability* wrong as against the six ways to get the refusal itself wrong
     /// ([`RESEED`](Self::RESEED)), and the four holes the shape found in the node when
     /// a refusal and the wiring first met on one tree — the applied index an install
-    /// makes durable, the watermark a start begins at, a follower's compaction record,
-    /// and a resend starved by a busy queue (D-081).
+    /// makes durable — no, that one is D-083's — the watermark a start begins at, a
+    /// follower's compaction record, and the watermark a start begins at (D-081).
     ///
     /// `ReseedMarkNotSynced` is a mutation a single-range world could not catch
     /// either, for a reason of its own: the shape crashes the node on one replica's
@@ -371,8 +375,6 @@ impl NodeVariant {
         NodeVariant::ReseedMarkNotSynced,
         NodeVariant::RestartAppliesFromZero,
         NodeVariant::RecordNeverQueued,
-        NodeVariant::DueOnlyWhenIdle,
-        NodeVariant::InstallWatermarkNotTold,
     ];
 
     /// Q15's whole-node refusal and re-seed, in order: the six ways to get a node's
@@ -430,6 +432,9 @@ impl NodeVariant {
         NodeVariant::InstallHoldsEveryRange,
         NodeVariant::InstallSweepsEveryStaging,
         NodeVariant::SnapshotAckToEveryCore,
+        NodeVariant::TakeSkipsTheUserKeys,
+        NodeVariant::TakeStreamsTheLogToo,
+        NodeVariant::AsksTheHostBeforeTheHold,
     ];
 
     /// The bit this variant takes in a [`NodeVariants`].
@@ -462,17 +467,18 @@ impl NodeVariant {
             NodeVariant::InstallHoldsEveryRange => 1 << 24,
             NodeVariant::InstallSweepsEveryStaging => 1 << 25,
             NodeVariant::SnapshotAckToEveryCore => 1 << 26,
-            NodeVariant::RefuseOneRangeOnly => 1 << 27,
-            NodeVariant::ReseedIntoRefusedDir => 1 << 28,
-            NodeVariant::ReuseLostGeneration => 1 << 29,
-            NodeVariant::OpenNewestEvenIfLost => 1 << 30,
-            NodeVariant::ServeBeforeRefusedMark => 1 << 31,
-            NodeVariant::IncarnationPerRangeStream => 1 << 32,
-            NodeVariant::ReseedMarkNotSynced => 1 << 33,
-            NodeVariant::RestartAppliesFromZero => 1 << 34,
-            NodeVariant::RecordNeverQueued => 1 << 35,
-            NodeVariant::DueOnlyWhenIdle => 1 << 36,
-            NodeVariant::InstallWatermarkNotTold => 1 << 37,
+            NodeVariant::TakeSkipsTheUserKeys => 1 << 27,
+            NodeVariant::TakeStreamsTheLogToo => 1 << 28,
+            NodeVariant::AsksTheHostBeforeTheHold => 1 << 29,
+            NodeVariant::RefuseOneRangeOnly => 1 << 30,
+            NodeVariant::ReseedIntoRefusedDir => 1 << 31,
+            NodeVariant::ReuseLostGeneration => 1 << 32,
+            NodeVariant::OpenNewestEvenIfLost => 1 << 33,
+            NodeVariant::ServeBeforeRefusedMark => 1 << 34,
+            NodeVariant::IncarnationPerRangeStream => 1 << 35,
+            NodeVariant::ReseedMarkNotSynced => 1 << 36,
+            NodeVariant::RestartAppliesFromZero => 1 << 37,
+            NodeVariant::RecordNeverQueued => 1 << 38,
         }
     }
 
@@ -507,6 +513,9 @@ impl NodeVariant {
             NodeVariant::InstallHoldsEveryRange => "InstallHoldsEveryRange",
             NodeVariant::InstallSweepsEveryStaging => "InstallSweepsEveryStaging",
             NodeVariant::SnapshotAckToEveryCore => "SnapshotAckToEveryCore",
+            NodeVariant::TakeSkipsTheUserKeys => "TakeSkipsTheUserKeys",
+            NodeVariant::TakeStreamsTheLogToo => "TakeStreamsTheLogToo",
+            NodeVariant::AsksTheHostBeforeTheHold => "AsksTheHostBeforeTheHold",
             NodeVariant::RefuseOneRangeOnly => "RefuseOneRangeOnly",
             NodeVariant::ReseedIntoRefusedDir => "ReseedIntoRefusedDir",
             NodeVariant::ReuseLostGeneration => "ReuseLostGeneration",
@@ -516,8 +525,6 @@ impl NodeVariant {
             NodeVariant::ReseedMarkNotSynced => "ReseedMarkNotSynced",
             NodeVariant::RestartAppliesFromZero => "RestartAppliesFromZero",
             NodeVariant::RecordNeverQueued => "RecordNeverQueued",
-            NodeVariant::DueOnlyWhenIdle => "DueOnlyWhenIdle",
-            NodeVariant::InstallWatermarkNotTold => "InstallWatermarkNotTold",
         }
     }
 }
@@ -603,10 +610,10 @@ mod tests {
             assert_eq!(seen & variant.bit(), 0, "{variant} shares a bit");
             seen |= variant.bit();
         }
-        // Twenty of the round's, the snapshot task's seven for the wiring, D-077's
-        // six for Q15's whole-node refusal and re-seed, and D-067's one for the
-        // re-seed shape.
-        assert_eq!(NodeVariant::BUGS.len(), 38);
+        // Upstream's thirty — the round's twenty and the snapshot task's ten for the
+        // wiring — with D-077's six for Q15's whole-node refusal and re-seed and
+        // D-081's four for the re-seed shape.
+        assert_eq!(NodeVariant::BUGS.len(), 39);
         for variant in NodeVariant::SNAPSHOT
             .iter()
             .chain(NodeVariant::WIRING)
@@ -619,9 +626,9 @@ mod tests {
             );
         }
         assert_eq!(NodeVariant::SNAPSHOT.len(), 11);
-        assert_eq!(NodeVariant::WIRING.len(), 7);
+        assert_eq!(NodeVariant::WIRING.len(), 10);
         assert_eq!(NodeVariant::RESEED.len(), 6);
-        assert_eq!(NodeVariant::SHAPE.len(), 5);
+        assert_eq!(NodeVariant::SHAPE.len(), 3);
         // The discipline, the wiring and the re-seed are disjoint: a variant is a way
         // to get the `snapshot` task's keys, caps and frames wrong, a way to get its
         // running inside the node wrong, or a way to get Q15's refusal wrong, and
