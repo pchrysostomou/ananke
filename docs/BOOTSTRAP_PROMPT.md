@@ -123,11 +123,13 @@ _Update this section at the end of every session._
   and every fold of its symptom read zero. With it fixed the variant's fault fires on every seed and its
   wedge is caught by the liveness check on 30 of 100 — where one group's is 4 of 10 000
   — so it is asserted at Phase 2's own tiers and no stronger. With the five fixed the
-  correct node passes every seed at the gate's twenty and CI's hundred, over 6 250
-  snapshot actions. `Cluster::OneGroup` is untouched: seed 42's JSONL still hashes to
+  correct node passes every seed at the gate's twenty and CI's hundred, over 5 912
+  snapshot actions at a hundred seeds (59.1 a seed, fewest on any one seed 30). `Cluster::OneGroup` is untouched: seed 42's JSONL still hashes to
   `445f970010f9d493d489d7627543b77cccba863cb5675af4602686f5de182217`.
   **The variant tiers go to the owner**: `SnapshotWithoutCurrentLast` is caught on 0/100
-  with its arm firing on 1/100, so its catch is not re-asserted; `SharedSnapshotDir`'s
+  and 0/1 000 with its arm firing on 0/100 and 1/1 000, so its catch is not re-asserted
+  and its one arm assertion moves to ten thousand — **nothing below the nightly asserts
+  that variant**; `SharedSnapshotDir`'s
   fault fires on every seed and is asserted at every tier, its liveness catch (30/100)
   sits at Phase 2's own ten thousand, and two assertions move up on this cluster's
   measured rates — the scramble (17/100) to a thousand and the aimed arm (1/100, 21 of
