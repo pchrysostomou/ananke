@@ -10284,6 +10284,31 @@ day a schedule moves that window away the assertion says so and the pin is re-au
 against a seed that still reaches it, rather than quietly kept as a bare green
 (CLAUDE.md).
 
+**The premerge**, at a thousand seeds in release on this branch's tip, quoting its own
+machine lines (D-070):
+`premerge: Darwin 25.6.0 arm64, Apple M2, 8 cores`;
+`premerge: before, load 118.95/193.10/164.07, AC Power, no thermal warning recorded`;
+`premerge: after, load 168.58/167.98/160.16, AC Power, no thermal warning recorded`;
+`premerge: green at 1000 seeds in 1899 s`. **On AC power** throughout, with five or six
+other agents' slices sweeping and building on the same laptop the whole time — the load
+average never fell below 118 — so the figure is not comparable with D-071's 625 s on an
+idle machine or with D-078's 1 279 s, and it says nothing about whether this change made
+the checker faster. It could not say much either way: the checker is a few milliseconds
+of a run that takes a second and a half, and the saving is on two seeds in ten thousand.
+The case for this change is the tail it removes, not a premerge clock.
+
+**One reported rate moves by one seed, and it moves the right way.** The lease sweep's
+`a_leader_that_trusts_the_clock_is_caught_and_the_guard_revokes` counts a catch as
+"`check()` returned an error mentioning linearizability", which the old search's budget
+exhaustion also does. The same thousand seeds on the same tree give 42 stale reads with
+the search as it was and **41** with the search as it is; the one dropped is seed 18,
+where the old search proved nothing and merely gave up, and whose history D-080 decides
+as linearizable. `is_caught` reads a catch the same way, so the same applies to every
+variant — though on seeds 0..300 no other variant had an exhaustion to lose. The comment
+in that test carries both numbers and the reason. D-061's margin is unaffected: 4.2 % and
+4.1 % both sit at the 4 % the assertion's arithmetic is written for, and it runs from the
+thousand-seed tier.
+
 **What is not settled.** The reduction is a partial-order reduction over *reads*; a
 history whose concurrency is all in its writes would still branch as before, and this
 change does not bound that. No such history has been seen: over seeds 0..1000 the worst

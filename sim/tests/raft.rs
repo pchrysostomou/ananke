@@ -3289,11 +3289,21 @@ fn a_leader_that_trusts_the_clock_is_caught_and_the_guard_revokes() {
     // D-061, the owner's rule of 2026-09-15: a variant caught on under 5 % of seeds
     // asserts its catch from the thousand-seed tier (the premerge and the nightly), its
     // firing at every tier above, and its rate printed at every tier. The stale read is
-    // caught on 40 of the first thousand seeds on this tree, 4.0 % (37, 3.7 %, before
-    // the read moved to the server it is served on, D-069; 41, 4.1 %, on the tree with
-    // D-056's send queue alone, before the key layout redrew them), and was on 472 of
-    // the ten thousand of the nightlies before the queue, 4.72 %; the drift exceeds the
-    // bound on 503 of the thousand seeds and the guard revokes on every one of them.
+    // caught on 41 of the first thousand seeds on this tree, 4.1 % (40, 4.0 %, on the
+    // tree D-069 left; 37, 3.7 %, before the read moved to the server it is served on;
+    // 41, 4.1 %, on the tree with D-056's send queue alone, before the key layout redrew
+    // them), and was on 472 of the ten thousand of the nightlies before the queue,
+    // 4.72 %; the drift exceeds the bound on 503 of the thousand seeds and the guard
+    // revokes on every one of them.
+    //
+    // The count on this tree is one lower than the same thousand seeds give with the
+    // search D-080 replaced, which reported 42. The one it drops is seed 18, where the
+    // old search ran out of its budget rather than proving anything: an undecided search
+    // returns an error that says "linearizability", which this counter and `is_caught`
+    // both read as a catch. D-080 decides that history, and it is linearizable, so the
+    // catch was never the variant's. The rate is the honest one, and the margin below is
+    // computed at 4 %, which both figures round to.
+    // PROPOSED(D-080): the read-only candidates go first, together.
     // The rate that carries the assertion is over the tier's seeds, as every row of
     // D-061's table is: at 4.0 % the gate's twenty catch none with probability
     // 0.96^20 = 0.44 and a hundred with 0.96^100 = 0.017, so the assertion there would
