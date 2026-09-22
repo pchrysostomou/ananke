@@ -803,6 +803,16 @@ mod tests {
     /// would have swapped, and it reported that it did not. Nothing can place it,
     /// and the search must not commit it outright on the strength of its result
     /// alone. Without the check on the value this history is called linearizable.
+    ///
+    /// It is a one-sided pin, deliberately: it fails when [`reads_only`] forces too
+    /// much, and it passes when [`reads_only`] refuses too much — with no
+    /// compare-and-set counted read-only at all, this and every other test here
+    /// stays green. That direction is the harmless one. Refusing to commit an
+    /// operation that is in fact read-only only makes the search branch where it
+    /// could have committed: it costs states and can never cost soundness. Nothing
+    /// in the tree measures that cost, since the module exposes no state counter
+    /// (D-080), so a reduction that quietly stopped firing would show as the tail
+    /// coming back at the nightly rather than as a failing test.
     #[test]
     fn a_compare_and_set_that_reported_no_swap_is_not_forced_where_it_would_swap() {
         let contradicted = history(vec![cas(1, 0, 1, None, "b", false)]);

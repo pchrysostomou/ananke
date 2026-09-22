@@ -10269,6 +10269,14 @@ therefore falls by one seed in three hundred, which is the number getting more h
 not less. It is well inside D-061's margin: the stale read is caught on about 4 % of
 seeds and the assertion that carries it runs from the thousand-seed tier.
 
+That this was possible at all is wider than this change and is **issue #92**:
+`Violation::exhausted` is set, and no reader outside `lin` looks at it, so every counter
+that scores a catch by matching the violation's text scores an undecided search as one —
+six of them do. D-080 removes the two seeds that were tripping it and leaves the defect
+standing; the lease sweep's 42 against 41 over the same thousand seeds is its
+demonstration, and it is recorded here as the measurement of a bug, not as a result of
+this one.
+
 *The hand-built histories are still rejected*, as unit tests in `sim/lin.rs`: a stale
 read after a committed write (`a_read_is_forced_only_where_it_saw_this_value`, which
 asserts the matching read is accepted in the same breath), a lost write
@@ -10305,7 +10313,20 @@ no swap, met at a value where it would have swapped — had no test of its own, 
 the backtrack out of a forced commit nor the order the search returns was asserted
 anywhere. The order in particular was invisible to the whole tree, since `check`'s
 timelines are dropped at all three call sites (`sim/raft.rs`, `sim/membership.rs`,
-`sim/quorum.rs`); that half is its own issue, and the test is here.
+`sim/quorum.rs`) — that half is **issue #93**, and the test that closes the gap for
+D-080's own bookkeeping is here.
+
+**What the mutations do not bound: the reduction refusing too much.** Every one of M-1 to
+M-8 is a `reads_only` that forces something it should not, or a commit that loses track of
+what it forced, and each is caught because it changes a *verdict*. The opposite mistake —
+a `reads_only` too strict, refusing to commit an operation that is in fact read-only — no
+test in the tree can see. Planting one that calls no compare-and-set read-only leaves all
+forty tests green, and it would: over-strictness costs states and can never cost
+soundness, since the search then simply branches where it could have committed. The cost
+is real but unmeasured, because `lin` exposes no state counter and the figures in this
+entry came from an instrumented throwaway copy. A reduction that quietly stopped firing
+would show as the tail coming back at the nightly, which is the same signal that found
+this, rather than as a failing test.
 
 **The pinned seeds assert the mechanism, not the green.** `sim/tests/raft.rs` pins 3085
 and 4065 and asserts, before the check, that each key still holds the window of
