@@ -124,13 +124,14 @@ _Update this section at the end of every session._
   partition actually cut, and the ranges the transfer was asked for. **Two findings**,
   both from the nightly's shard 3, red on 33 of 10 000 seeds, each seed re-run and
   classified: 30 are **issue #81** — a voter removed and re-added inside one leader's
-  term, whose fix is PR #89 — and **3, seeds 6097, 7759 and 7887, are this slice's own
-  per-seed overlap clause**, which the correct system therefore trips. Its cause is
-  this slice's `RANGE_STAGGER_MAX_MS` at 25 ms, the top of the range its own doc
-  comment names as the one that serialises the four changes; with the stagger at zero
-  the overlap is 100 of 100. **Not widened**: it goes to the owner with two candidate
-  fixes (the parameter, or D-058's tiering) and the clause left failing. The gate and
-  CI tiers are green.
+  term, whose fix is PR #89 — and **3, seeds 6097, 7759 and 7887, were this slice's own
+  per-seed overlap clause**, tripped by **the scenario's own parameter and not by the
+  node**. `RANGE_STAGGER_MAX_MS` was 25 ms, the top of the range its own doc comment
+  names as the one that serialises the four changes. **The parameter was fixed, not the
+  clause** (D-030, D-039), and the value chosen on a ten-candidate measurement at 1 000
+  seeds: 2 ms, one of only two caps leaving no seed one step from failure, against
+  16.6 % of seeds at 25 ms. At 2 ms the overlap is witnessed on 1 000 of 1 000 and the
+  gate and CI are green; the ten-thousand tier is re-run on the fixed tip.
 - Merge update (2026-09-22): branch `phase-3-stage-b-compaction` merged `origin/main`
   to resolve PR conflicts, carrying in PROPOSED D-073 and D-074 from main and keeping
   this branch's PROPOSED D-078.

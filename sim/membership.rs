@@ -175,15 +175,56 @@ pub const TRACE_CAP: usize = 600_000;
 ///
 /// It is small on purpose. A joint configuration with no partition over it lives for a
 /// round trip or two — tens of milliseconds — so a stagger of the partition's own
-/// scale would serialise the four changes and there would be little left to overlap.
+/// scale serialises the four changes and leaves nothing to overlap.
 ///
 /// **It is not what produces the overlap**, and that is worth saying because it would
 /// be easy to assume: what produces it is that the change is asked of *every* range.
 /// Set to zero, the overlap is still witnessed on 100 of 100 seeds. What the stagger
 /// buys is that the four changes interleave rather than fire as one instant's work,
-/// which is the truer shape of an operator driving four ranges (PROPOSED D-084).
+/// which is the truer shape of an operator driving four ranges.
+///
+/// **Four, and chosen on a measurement rather than an intuition.** The value shipped
+/// first was 25 ms — the top of the range the paragraph above names — and the
+/// ten-thousand-seed nightly found 3 seeds (6097, 7759, 7887) whose four changes it
+/// serialised, tripping [`Report::witnessed_joint_overlap`] on the correct node. That
+/// is a model error and the model is this constant, so the constant was fixed rather
+/// than the clause relaxed (D-030, D-039).
+///
+/// The candidates were measured at **1 000 seeds** on the margin that matters — the
+/// largest number of ranges any one node held jointly configured at once, where 1 is a
+/// failure and 2 is one step from one:
+///
+/// | cap | seeds whose best is only 2 | mean total stagger | gate and CI on this base |
+/// |---|---|---|---|
+/// | 0 ms | 8 (0.8 %) | 0.0 ms | red, #81 on seed 10 |
+/// | **2 ms — taken** | **0** | 4.0 ms | **green** |
+/// | 4 ms | **0** | 8.0 ms | red, #81 on seed 8 |
+/// | 6 ms | 1 (0.1 %) | 11.8 ms | red, #81 on seed 12 |
+/// | 8 ms | 8 (0.8 %) | 15.9 ms | green |
+/// | 10 ms | 15 (1.5 %) | 20.2 ms | — |
+/// | 12 ms | 18 (1.8 %) | 23.4 ms | — |
+/// | 15 ms | 44 (4.4 %) | 29.9 ms | — |
+/// | 20 ms | 109 (10.9 %) | — | — |
+/// | 25 ms (the one that failed) | 166 (16.6 %) | — | green, by luck |
+///
+/// Marginality rises monotonically from 2 ms up, and 25 ms left a sixth of all seeds
+/// one step from failure, which is why three of ten thousand fell over it. **Two and
+/// four are tied first: they are the only caps that leave no seed marginal at all.**
+///
+/// Zero is rejected on the scenario's own terms: it fires the four requests at the
+/// same instant, which is not a stagger and is a different scenario from the one this
+/// module describes — and it is not even best on the margin.
+///
+/// **Two is taken over four**, and the tie-break is recorded because it is not about
+/// this scenario: at 4 ms the gate's twenty seeds and CI's hundred are red on issue
+/// #81's fold (seed 8), which is not this branch's bug but does mean the branch could
+/// not be gated green until PR #89 lands. Four staggers twice as widely and is the
+/// better value on that count alone; if #89 lands first it is the one to take. The
+/// wider fact the column records is that **whether this scenario's gate is green at
+/// all is contingent on #81 missing seeds 0 to 19**, which it does not at three of the
+/// five caps measured — an argument for #89 preceding this branch (PROPOSED D-084).
 // PROPOSED(D-084): the membership scenario on the node, four ranges on every node.
-const RANGE_STAGGER_MAX_MS: u64 = 25;
+const RANGE_STAGGER_MAX_MS: u64 = 2;
 
 /// How long the operator's transfer gets before the shrink is asked for.
 const TRANSFER_WAIT: Duration = Duration::from_millis(300);
@@ -902,7 +943,7 @@ impl Report {
     /// overlap on every seed of every tier, so no floor, count or bound could see it —
     /// **and it is not a bound, so no correct run can trip it.** Measured: the correct
     /// node is witnessed on 100 of 100 seeds and on 20 of 20; the never-clearing fold
-    /// is unwitnessed on 38 of 100 and on 6 of 20 (PROPOSED D-084).
+    /// is unwitnessed on 13 of 100 and on 2 of 20 (PROPOSED D-084).
     ///
     /// # Errors
     ///

@@ -586,7 +586,7 @@ fn membership_checked(report: &membership::Report) -> Result<(), String> {
     // everything. The witness reads the same trace backwards at the record the fold
     // stopped on and asks whether both ranges really were joint there. It cannot be
     // satisfied by construction and it is not a bound, so the correct node cannot trip
-    // it: 100 of 100 witnessed, against 62 of 100 for the never-clearing fold.
+    // it: 100 of 100 witnessed, against 87 of 100 for the never-clearing fold.
     // PROPOSED(D-084): the answer is witnessed, which is what guards the fold.
     if let Err(why) = report.witnessed_joint_overlap() {
         return Err(format!("seed {seed}: {why}"));
@@ -932,8 +932,8 @@ impl NodeMembershipCoverage {
         );
         // The applies are spread over the ranges rather than piled on one. The floor
         // is the least range's share of the busiest, measured **on this scenario** at
-        // **0.967** at a hundred seeds ({2: 11 394, 3: 11 436, 4: 11 324, 5: 11 054})
-        // and 0.912 at the gate's twenty; D-082 set the same floor at 0.5 against its
+        // **0.976** at a hundred seeds ({2: 11 396, 3: 11 438, 4: 11 161, 5: 11 229})
+        // and 0.920 at the gate's twenty; D-082 set the same floor at 0.5 against its
         // own sweep's 0.87, for the same reason, that `contains_key` passes a range
         // which applied only its leader's no-ops.
         // Every range was aimed at by some partition over the tier. Without this a
@@ -992,7 +992,7 @@ impl NodeMembershipCoverage {
         // And the transfers were followed by the server they named leading that range,
         // which is what sets the step-down up. Not at one — a transfer is one shot and
         // best effort, as the sweep's lease trial is — but at a floor measured on the
-        // correct node: 140 of 192 (72.9 %) at a hundred seeds and 25 of 32 (78.1 %) at
+        // correct node: 140 of 192 (72.9 %) at a hundred seeds and 23 of 32 (71.9 %) at
         // the gate's twenty.
         let landed = self.transfers_landed as f64 / self.transfers_made as f64;
         assert!(
@@ -1052,7 +1052,7 @@ impl NodeMembershipCoverage {
         }
         // The one-group control's tiering for the two states that need the partition to
         // land inside a narrow phase of a change. On the node they are commoner —
-        // 219 step-downs and 33 reverts at a hundred seeds, 44 and 3 at the gate's
+        // 212 step-downs and 47 reverts at a hundred seeds, 41 and 0 at the gate's
         // twenty — because four ranges give four changes a seed; the tier is kept the
         // one-group one rather than tightened, since nothing here measured the rate a
         // tighter tier would rest on.
@@ -1072,8 +1072,8 @@ impl NodeMembershipCoverage {
         }
         // An election while joint needs the partition to cut a leader off inside the
         // joint phase itself, and the one-group control asserts it from the
-        // thousand-seed tier under D-061 (3.4 % of its seeds). On the node it is 6
-        // elections over a hundred seeds and none over the gate's twenty, so the same
+        // thousand-seed tier under D-061 (3.4 % of its seeds). On the node it is 13
+        // elections over a hundred seeds and 2 over the gate's twenty, so the same
         // tier is kept.
         if self.seeds >= 1000 {
             assert!(

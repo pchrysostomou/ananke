@@ -11275,16 +11275,16 @@ cluster's ranges is the identity, and there is no second range to overlap with.
 
 | | Mutation | What it does on one group | Caught by |
 |---|---|---|---|
-| **M1** | `Driver::change_complete` ignores its `range` | nothing: one range | **the joiners clause.** `seed 3: the grow completed, but server 4 became a voter of {2, 3, 5} and not of every range this node holds` — 8 of 100 seeds. The driver stops polling when the *first* range finishes and leaves the others mid-change |
-| **M2** | `Report::longest_completion_gap_of` folds over the whole history | nothing: the whole history is the one range's | **the per-range-against-cluster floor.** Correct: worst range **996.309655 ms** against the cluster's **329.015134 ms**. Mutated: equal, and the floor fails. The bound itself catches nothing — a widened fold only ever passes — which is why the floor and not the bound is the catcher |
-| **M3** | `Report::time_to_write_after_heal_of` folds over the whole history | nothing, likewise | **the same floor for liveness.** Correct: **1.129614604 s** against the cluster's **344.163046 ms**; mutated, equal |
-| **M4** | the partition cuts off `leader_of_the_cluster` instead of the drawn range's leader | nothing: one range, one leader | **the partitions-hit floor.** 200/200 (**100 %**) correct, **130/200 (65.0 %)** mutated, against a 90 % floor. Not one in four, because five nodes hold four ranges and the leaders often coincide — which is why this needed a measured floor and not an intuition |
+| **M1** | `Driver::change_complete` ignores its `range` | nothing: one range | **the joiners clause.** `seed 17: the grow completed, but server 4 became a voter of {2, 4} and not of every range this node holds`. The driver stops polling when the *first* range finishes and leaves the others mid-change |
+| **M2** | `Report::longest_completion_gap_of` folds over the whole history | nothing: the whole history is the one range's | **the per-range-against-cluster floor.** Correct: worst range **1.088502703 s** against the cluster's **509.36564 ms**. Mutated: equal, and the floor fails. The bound itself catches nothing — a widened fold only ever passes — which is why the floor and not the bound is the catcher |
+| **M3** | `Report::time_to_write_after_heal_of` folds over the whole history | nothing, likewise | **the same floor for liveness.** Correct: **1.211944959 s** against the cluster's **430.545463 ms**; mutated, equal |
+| **M4** | the partition cuts off `leader_of_the_cluster` instead of the drawn range's leader | nothing: one range, one leader | **the partitions-hit floor.** 200/200 (**100 %**) correct, **132/200 (66.0 %)** mutated, against a 90 % floor. Not one in four, because five nodes hold four ranges and the leaders often coincide — which is why this needed a measured floor and not an intuition |
 | **M5** | `Schedule::focus_of` always answers the first range | nothing: the first range is the only range | **the aimed-ranges set.** `the partitions aimed at {2} and not at every range this node holds`. The hit floor cannot catch this: hits are counted against what was aimed at, so a draw that always aims at one range hits it every time |
 | **M6** | `Report::ranges` answers one range | nothing: it already did | **`payload_is_well_formed`**, on every seed, and `a_node_changes_two_of_its_ranges_at_once` |
-| **M7** | `Report::joint_overlap` keyed by nothing instead of by node | nothing: one node's state is the cluster's | **the per-seed overlap clause**, on seeds 6 and 95. The merge makes the fold *stricter*, not looser — any node leaving a range's joint configuration clears it for all — so the overlap it reports is 98 of 100 |
-| **M8** | `Report::joint_overlap` never clears a range, so any two ranges ever joint on a node count | nothing, likewise | **the witness.** 38 of 100 seeds unwitnessed and **6 of 20**, against 0 of 100 and 0 of 20 on the correct node. It was recorded as *not caught* in this entry's first draft, on reasoning the section above retracts |
-| **M9** | `Driver::transfer` hands over one range: `self.cluster.ranges()` → `.into_iter().take(1)` | nothing: `take(1)` of a list of one is that list | **`transfer_ranges`.** `leadership was handed over for {2} and not for every range this node holds`, at 20 seeds and at 100. Not a no-op on the node either: leaders by range go from {2: 295, 3: 284, 4: 299, 5: 295} to **{2: 292, 3: 232, 4: 245, 5: 233}**, three ranges losing about fifty elections each — and **every floor this entry had before the review is met by that run**, which is why the claim needed a check of its own |
-| **M10** | the partition isolates a different server while `aimed` still records the drawn range's leader: `side_servers.insert(leader)` → `insert(leader % INITIAL_VOTERS + 1)` | nothing: three servers, and the scenario's one group has the same leader either way | **the partitions-hit floor**, once it reads the side. **0.075 at 100 seeds and 0.125 at 20**, against the 0.900 floor. Before the side was carried the floor stayed at 200/200 and the only thing that fired was seed 12's `match starts` verdict — issue #81's broken fold, an accidental catch by a false positive. Demonstrated by standing #81's fold down, which is what PR #89 makes true: the mutation then fails on the floor alone at both tiers, and the correct node with #81 stood down passes both |
+| **M7** | `Report::joint_overlap` keyed by nothing instead of by node | nothing: one node's state is the cluster's | **the witness**, from seed 0. The merge makes the fold *stricter*, not looser — any node leaving a range's joint configuration clears it for all — so what it reports is a pair the trace does not bear out |
+| **M8** | `Report::joint_overlap` never clears a range, so any two ranges ever joint on a node count | nothing, likewise | **the witness.** 13 of 100 seeds unwitnessed and **2 of 20**, against 0 of 100 and 0 of 20 on the correct node. It was recorded as *not caught* in this entry's first draft, on reasoning the section above retracts |
+| **M9** | `Driver::transfer` hands over one range: `self.cluster.ranges()` → `.into_iter().take(1)` | nothing: `take(1)` of a list of one is that list | **`transfer_ranges`.** `leadership was handed over for {2} and not for every range this node holds`, at 20 seeds and at 100. Not a no-op on the node either: three ranges lose about fifty elections each and the transfers made fall from 192 to 48 — and **every floor this entry had before the review is met by that run**, which is why the claim needed a check of its own |
+| **M10** | the partition isolates a different server while `aimed` still records the drawn range's leader: `side_servers.insert(leader)` → `insert(leader % INITIAL_VOTERS + 1)` | nothing: three servers, and the scenario's one group has the same leader either way | **the partitions-hit floor**, once it reads the side. **0.080 at 100 seeds and 0.100 at 20**, against the 0.900 floor. Before the side was carried the floor stayed at 200/200 and the only thing that fired was a `match starts` verdict — issue #81's broken fold, an accidental catch by a false positive. Demonstrated by standing #81's fold down, which is what PR #89 makes true: the mutation then fails on the floor alone at both tiers, and the correct node with #81 stood down passes both |
 
 **Ten of eleven caught, one — M7's stricter variant — caught for a reason worth
 reading.** Six of the ten are caught only because a guard was added *for* them: M2, M3
@@ -11332,18 +11332,19 @@ asserted here — to that standard and no stronger, at the tier it uses today (�
 
 The rate is **above D-061's five per cent**, so the rule leaves the variant where it
 is and the tier is not moved; the tier a variant keeps is the owner's in any case. The
-node's rate is about three quarters of the one-group server's, which is what four
-ranges' extra elections and extra joint windows do to a fault whose catch is a
-committed entry a later leader does not hold.
+node's rate is about four fifths of the one-group server's, which is what four ranges'
+extra elections and extra joint windows do to a fault whose catch is a committed entry
+a later leader does not hold.
 
-One thing worth saying plainly, because a rate of 14 % invites the arithmetic: the
+One thing worth saying plainly, because a rate of 15 % invites the arithmetic: the
 gate's twenty seeds are **seeds 0 to 19, fixed**, not twenty drawn at random, so the
-catch at the gate is a deterministic fact and not a one-in-twenty coin. Seeds 3 and 15
-catch it, and a green gate here is a gate that injected the fault. What the rate does
-bound is how much room a later change has to move the catch off those two seeds before
-the gate goes quiet, and that is the reason to record it rather than only the verdict.
-The seeds caught over the first hundred are 3, 15, 25, 44, 48, 63, 72, 73, 75, 77, 78,
-86, 93 and 98.
+catch at the gate is a deterministic fact and not a one-in-twenty coin, and a green
+gate here is a gate that injected the fault. **One of twenty is thin, and is recorded
+as such**: a single seed carries the catch at the gate's tier, and a later change to
+this scenario's schedule could move it off those twenty without moving the rate at all.
+What the assertion rests on is the rate over a hundred, and what the gate figure bounds
+is how much room a later change has before the gate goes quiet — which is the reason to
+record it rather than only the verdict.
 
 ### The correct node, and the shape the keyed checks need
 
@@ -11445,47 +11446,68 @@ clause with teeth is the one beside the bound** — that *no* write of that rang
 completed after the heal at all — which has nothing to tune and no margin to get
 wrong. The bound is the backstop under it.
 
-### The overlap is not on every seed at ten thousand, and that goes to the owner
+### The overlap was not on every seed at ten thousand: the scenario's own parameter, fixed
 
-The nightly on this branch's tip (run 35782897735) is red on shard 3, and **three of its
-thirty-three failing seeds are this slice's own overlap clause, not issue #81**. Every
-one of the thirty-three was re-run locally and classified: **30 are #81's
-`match starts:` fold, 3 are `no node ever held two ranges' joint configurations at
-once` — seeds 6097, 7759 and 7887.** So the overlap is reached on **9 997 of 10 000**
-seeds, not on all of them, and the per-seed assertion this entry makes is stronger than
-the measurement supports at that tier. Nothing above changes: it is 100 of 100 and
-1 000 of 1 000, and those figures stand.
+**Plainly, for whoever reads this next: the per-seed overlap clause was tripped by this
+scenario's own stagger parameter, not by the node.** The node was doing exactly what it
+should on all three seeds.
 
-**The mechanism, read off the three traces, is this slice's parameter and not the
-system.** On all three the run is healthy — grow and shrink complete, eight joint
-configurations per server, nothing stopped — and the maximum number of ranges jointly
-configured at once on any server is **1**: each range's joint phase opens and closes
-before the next one opens. Their staggers are the reason. They total 74 ms, 69 ms and
-64 ms across the four ranges, against 31 ms on seed 449 and 36 ms on seed 0; the gaps
-between consecutive requests are 20–25 ms, and `RANGE_STAGGER_MAX_MS`'s own doc comment
-says a joint configuration with no partition over it "lives for a round trip or two —
-tens of milliseconds". **The constant was set at 25 ms, which is the top of the range
-its own comment identifies as the one that serialises the changes.**
+The nightly on `4efef15` was red on shard 3 with 33 of 10 000 seeds failing. `verdict()`
+prints the first failing seed's message and then only the *numbers* of the others, so
+"33 failed" is not "33 failed for that reason": every one was re-run and classified.
+**Thirty are issue #81's `match starts:` fold, which PR #89 fixes. Three — seeds 6097,
+7759 and 7887 — were this slice's own overlap clause.**
 
-**This is a bound the correct system trips, so it is not widened here** (D-030, D-039;
-CLAUDE.md). It is reported instead, with the two candidate fixes and the reason neither
-is taken unilaterally:
+**The mechanism.** On all three the run was healthy — grow and shrink complete, eight
+joint configurations per server, nothing stopped — and the maximum number of ranges any
+one node held jointly configured at once was **1**: each range's joint phase opened and
+closed before the next one opened. Their staggers totalled 74 ms, 69 ms and 64 ms across
+the four ranges, against 31 ms on seed 449 and 36 ms on seed 0, with 20–25 ms between
+consecutive requests. `RANGE_STAGGER_MAX_MS`'s own doc comment says a joint
+configuration with no partition over it lives for "a round trip or two — tens of
+milliseconds". The constant was **25 ms — the top of the range that comment identifies
+as the one that serialises the changes.**
 
-- **The parameter is wrong.** The stagger exists to make the four changes *interleave*;
-  a value that serialises them defeats its own purpose. Capping it well below a joint
-  phase's life would make the overlap structural rather than probabilistic, and there
-  is direct evidence it would: measured with the stagger at **zero**, the overlap is
-  witnessed on 100 of 100 seeds. This is the reading this slice favours, because it
-  fixes the model rather than the assertion.
-- **Or the tier is wrong**, and the clause should take the shape D-058 gave
-  `elections_while_joint` and `reverts_to_a_prefix`: asserted per seed at the tiers
-  where it is 100 %, and as a rate at ten thousand, printed at every tier.
+**The fix is the parameter, not the clause** (D-030, D-039: a bound the correct system
+trips is a *model* error, and here the model is the scenario's own constant). Both
+readings were written out and the first is the one taken:
 
-Choosing between them needs a ten-thousand-seed run of whichever is chosen, which is
-the owner's to schedule and not this laptop's. **Until it is chosen the clause is left
-asserting per seed and the nightly stays red on those three seeds**, which is the
-behaviour CLAUDE.md asks for: a check that cannot reach its situation says so per seed
-and fails, rather than passing quietly.
+- **Taken — the parameter is wrong.** The stagger exists to make the four changes
+  interleave; a value that serialises them defeats the purpose its own comment gives it.
+- **Not taken — the tier is wrong**, which would have given the clause D-058's shape for
+  `elections_while_joint`: per seed where it is 100 %, a rate at ten thousand. It is
+  recorded so the owner can overturn the choice on sight, but the documents settle it:
+  relaxing an assertion the correct system trips is exactly what D-030 forbids when the
+  model is the thing at fault.
+
+**The value was chosen on a measurement, not an intuition.** Ten candidate caps were
+measured at **1 000 seeds** on the margin that matters — the largest number of ranges
+any one node held jointly configured at once, where 1 is a failure and 2 is one step
+from one. The full table, rejected values included, is on `RANGE_STAGGER_MAX_MS`.
+**Two and four are tied first and are the only caps that leave no seed marginal at
+all**; marginality then rises monotonically to 16.6 % at the 25 ms that failed. Zero is
+rejected on the scenario's own terms — it fires the four requests at one instant, which
+is not a stagger — and is not best on the margin either.
+
+**Two is taken over four**, and the tie-break is recorded because it is not about this
+scenario: at 4 ms the gate's twenty seeds and CI's hundred are red on **issue #81's**
+fold (seed 8), so the branch could not be gated green until PR #89 lands. Four staggers
+twice as widely and is the better value on that count alone; if #89 lands first it is
+the one to take.
+
+**One thing the candidate table says that is worth more than the choice**: whether this
+scenario's gate is green *at all* is contingent on #81 missing seeds 0 to 19, and it
+does not miss them at three of the five caps measured — 0 ms (seed 10), 4 ms (seed 8)
+and 6 ms (seed 12). The 25 ms that shipped was green at the gate by luck, not by
+construction. That is an argument for #89 preceding this branch and it is put here
+rather than left implicit.
+
+**At 2 ms, over 1 000 seeds: the overlap is witnessed on 1 000 of 1 000**, and the only
+failures are four seeds of #81's fold (359, 477, 907 and one before them). The
+ten-thousand-seed tier is where the problem was found, so that is where the fix is
+tested: a nightly is dispatched on the fixed tip and its id is in the pull request. If
+three seeds survive there with a properly chosen stagger, that is a different finding
+and it goes to the owner with its numbers.
 
 ### The trace records a run holds per range per virtual second, against `TRACE_CAP`
 
