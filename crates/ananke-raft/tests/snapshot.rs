@@ -289,6 +289,143 @@ fn a_leader_compacts_only_when_every_follower_is_past_the_checkpoint() {
     assert_eq!(leader.last_index(), 6);
 }
 
+/// D-065's trigger, directly: a replica that is not leading asks for a *record* —
+/// not a take — once its log has outgrown its prefix by the threshold, and only
+/// once it has applied something to record.
+///
+/// The sweep sees the consequence of this rule, not the rule. Both of its clauses
+/// are load-bearing and neither shows in a trace: a server that asked at
+/// `applied == snap_index` would record a prefix it has not applied, and one that
+/// asked at exactly the threshold would ask a tick early. Each is asserted here,
+/// against a replica built to sit on that boundary.
+// PROPOSED(D-078): a follower compacts its log to its own applied index.
+#[test]
+fn a_replica_that_is_not_leading_records_at_its_applied_index() {
+    let config = RaftConfig {
+        snapshot_threshold: 2,
+        ..RaftConfig::default()
+    };
+    let records = |outputs: &[Output]| {
+        outputs
+            .iter()
+            .filter(|o| matches!(o, Output::Snapshot(SnapshotAction::Record)))
+            .count()
+    };
+    // A follower of a leader that has proposed `commands`, plus the no-op of the
+    // term: its log runs to `commands + 1` and its prefix is empty.
+    let replica = |commands: usize| -> Raft {
+        let mut leader = Raft::new(s(1), members(&[1, 2, 3]), config.clone(), 23);
+        let mut follower = Raft::new(s(2), members(&[1, 2, 3]), config.clone(), 29);
+        elect(&mut leader, &mut follower);
+        for n in 0..commands {
+            let outputs = leader.step(Input::Propose(Bytes::from(format!("c{n}"))));
+            let from = leader.id();
+            let outbound: Vec<_> = sends(&outputs)
+                .into_iter()
+                .map(|(to, message)| (from, to, message))
+                .collect();
+            settle(&mut leader, &mut follower, outbound, &mut Vec::new());
+        }
+        assert_ne!(
+            follower.role(),
+            Role::Leader,
+            "the trigger is the follower's"
+        );
+        assert_eq!(follower.snapshot(), (0, 0));
+        follower
+    };
+
+    // Exactly the threshold past the prefix is not past it.
+    let mut at_threshold = replica(1);
+    assert_eq!(at_threshold.last_index(), 2, "a no-op and one command");
+    let _ = at_threshold.step(Input::Applied(2));
+    assert_eq!(
+        records(&at_threshold.step(Input::Tick)),
+        0,
+        "a log exactly the threshold past its prefix has not outgrown it"
+    );
+
+    // Past the threshold, but with nothing applied there is no index to record.
+    let mut unapplied = replica(3);
+    assert_eq!(unapplied.last_index(), 4);
+    assert_eq!(
+        records(&unapplied.step(Input::Tick)),
+        0,
+        "a replica that has applied nothing records nothing, whatever its log"
+    );
+
+    // Past the threshold and applied: the record is asked for, once.
+    let mut behind = replica(3);
+    let _ = behind.step(Input::Applied(3));
+    let outputs = behind.step(Input::Tick);
+    assert_eq!(
+        records(&outputs),
+        1,
+        "the tick past the threshold asks for a record: {outputs:?}"
+    );
+    assert!(
+        !outputs
+            .iter()
+            .any(|o| matches!(o, Output::Snapshot(SnapshotAction::Take))),
+        "a replica that is not leading asks for a record, never a take: {outputs:?}"
+    );
+    assert_eq!(
+        records(&behind.step(Input::Tick)),
+        0,
+        "one record at a time"
+    );
+
+    // The record lands. A replica that is not leading has no follower to wait
+    // for, so the same step compacts to it: D-037's condition is the leader's
+    // alone (D-065).
+    let outputs = behind.step(Input::SnapshotTaken { index: 3, term: 2 });
+    let compacted = outputs.iter().find_map(|o| match o {
+        Output::Persist(Persist { compact_to, .. }) => *compact_to,
+        _ => None,
+    });
+    assert_eq!(compacted, Some(3), "{outputs:?}");
+    assert_eq!(behind.snapshot(), (3, 2));
+    assert_eq!(behind.first_index(), 4);
+}
+
+/// D-078's settled point 3, directly: a record naming an index the log no longer
+/// holds compacts nothing.
+///
+/// It cannot happen on the correct system — a record is written at the applied
+/// index, which never passes the commit index, and a committed entry is never
+/// truncated — and it does happen under [`Variant::ApplyBeforeCommit`]. What the
+/// guard buys is that the broken server is then caught by the checks it is there
+/// to be caught by rather than by a panic in `drain`, and nothing else in the tree
+/// reaches the branch: at a thousand seeds the variant never gets there, so
+/// dropping the guard changes no sweep. This is what holds it.
+// PROPOSED(D-078): a follower compacts its log to its own applied index.
+#[test]
+fn a_record_past_the_log_compacts_nothing() {
+    let mut core = Raft::new(s(2), members(&[1, 2, 3]), RaftConfig::default(), 29);
+    assert_eq!(core.last_index(), 0);
+    assert_ne!(core.role(), Role::Leader);
+    // A record five entries past the end of an empty log: `drain` would panic.
+    let outputs = core.step(Input::SnapshotTaken { index: 5, term: 1 });
+    assert!(
+        !outputs.iter().any(|o| matches!(
+            o,
+            Output::Persist(Persist {
+                compact_to: Some(_),
+                ..
+            })
+        )),
+        "a record past the log's end compacts nothing: {outputs:?}"
+    );
+    assert!(
+        !outputs
+            .iter()
+            .any(|o| matches!(o, Output::Trace(TraceEvent::RaftCompacted { .. }))),
+        "and traces no compaction: {outputs:?}"
+    );
+    assert_eq!(core.snapshot(), (0, 0), "the prefix is where it was");
+    assert_eq!(core.last_index(), 0);
+}
+
 #[test]
 fn a_lagging_follower_blocks_compaction_until_it_is_designated() {
     let config = RaftConfig {
