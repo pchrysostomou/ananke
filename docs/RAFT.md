@@ -320,6 +320,7 @@ nodes in the scenario that drives it, and a core's events carry the range its
 | `RaftRecovered` | a server starts on what its store held | `term`, `applied`, `last_index`, `incarnation` |
 | `RaftProposed` | a leader made a client's request an entry | `client`, `seq`, `index`, `term` |
 | `RaftRefused` | a server's store lost state, or its staged install is damaged, and it waits to be re-seeded (§3) | `reason` |
+| `RaftReplicaRefused` | one replica a refusal took down, traced with it, one per range the server held: this server hosts one group and traces one, the node of SHARD.md §4 one per range. It carries `range` where `RaftRefused` does not, because a refusal is traced *before* the store opens and the ranges a server holds are known then only from its configuration (PROPOSED D-077) | `range` |
 | `RaftServerFailed` | a server stopped on an I/O error | `reason` |
 | `RaftInboxDropped` | a full inbox dropped a message | `kind` |
 | `RaftReseeded` | a server starts on a store a re-seed rebuilt (D-035) | — |
@@ -431,7 +432,11 @@ re-seeded by a leader and a re-seeded one never votes, so a range whose impaired
 replicas are not a minority cannot elect a leader if it loses the one it has, which is
 the availability D-035 gives up and not a liveness failure (D-030, D-035), and it is
 also where `IgnoreIncarnation`'s wedge would stall a commit (§5, D-042). A node's
-refusal is its whole store's, so every replica on it counts as refused. After the last
+refusal is its whole store's, so every replica *on it* counts as refused — the replicas
+its `RaftReplicaRefused` events name, and not every range of the run: a refusal that
+marked its node down for ranges it never held would exempt those ranges from both these
+checks, which with four ranges on a node is three ranges exempted by one refusal
+(PROPOSED D-077). After the last
 fault heals, a client write to **every key** of such a range completes within ten
 maximum election timeouts: a single minimum over every write is passed by a wedged
 range beside a live one, so the bound is asked of each key some client wrote to after
