@@ -35,7 +35,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use ananke_env::{ApplyEffect, FileSystem, RangeCause};
+use ananke_env::{ApplyEffect, FileSystem, RangeCause, RecoveredAs};
 use ananke_env::{Clock, Decision, Environment, Network, Rng, Socket, TraceEvent};
 use ananke_raft::apply::{Command, Outcome, apply_command, user_key};
 use ananke_raft::client::{Reply, Request, Response};
@@ -282,6 +282,10 @@ pub struct ServerHost<E: Environment> {
     initial_voters: Vec<ServerId>,
     raft: RaftConfig,
     variants: ananke_raft::core::Variants,
+    /// The node's known-buggy variants, for the ones the `raft` task's side of an
+    /// answer decides (CLAUDE.md's pair rule).
+    // PROPOSED(D-081): an install's applied index reaches the store and the task.
+    node_variants: NodeVariants,
     gaps: Mutex<Gaps>,
 }
 
@@ -455,6 +459,15 @@ impl<E: Environment> ServerHost<E> {
                 .stores
                 .get(&range)
                 .map_or(FIRST_INCARNATION, |store| store.incarnation()),
+            // The install has filled it: a quarantined replica here is one the
+            // re-seed marked and the stream then gave state to, which is
+            // `Quarantined` and no longer `Refused` (D-035).
+            // PROPOSED(D-081): a restatement says how the replica restated (D-067).
+            state: if restored.quarantined() {
+                RecoveredAs::Quarantined
+            } else {
+                RecoveredAs::Neither
+            },
         });
         Some(restored)
     }
@@ -593,6 +606,33 @@ impl<E: Environment> Host for ServerHost<E> {
             }
             // The switch is durable: this is the replica it built.
             SnapAnswer::Switched { range, at, config } => {
+                // The switch wrote this replica's whole state in one manifest
+                // switch, the applied index with it, without going through
+                // `RaftStore::apply` or the `apply` task. Both keep a number of
+                // their own, and both are behind the switch until they are told:
+                // the store's is what `apply` checks the next index against, and
+                // the task's is what a take's record carries (D-036). Left
+                // untold, the node applies nothing more for this range and traces
+                // `RaftServerFailed` at every commit after the install — which is
+                // what the directed re-seed shape found, and what `sim/install.rs`
+                // was producing more than a thousand of a seed without asking.
+                // PROPOSED(D-081): an install's applied index reaches the store it
+                // landed in and the task that applies after it.
+                if !self
+                    .node_variants
+                    .contains(NodeVariant::InstallWatermarkNotTold)
+                {
+                    if let Some(store) = self.stores.get(range) {
+                        store.installed_at(at.last_index);
+                    }
+                    self.apply(ApplyJob {
+                        range: *range,
+                        work: ApplyWork::Installed {
+                            index: at.last_index,
+                            term: at.last_term,
+                        },
+                    });
+                }
                 match self.installed(*range, core, at, config) {
                     Some(installed) => CoreWork::Restore(Box::new(installed)),
                     None => CoreWork::Release,
@@ -991,6 +1031,35 @@ impl<E: Environment> Applier for ServerApplier<E> {
                 // PROPOSED(D-083): the take and the record are the `apply` task's.
                 ApplyWork::Take => return self.take(range, store, true).await,
                 ApplyWork::Record => return self.take(range, store, false).await,
+                // A live install's switch is durable: the state machine for this
+                // range is the installed one, and what the task keeps of it — the
+                // index the next entry follows, and the term and configuration a
+                // take's record carries (D-036) — is taken from the switch. The
+                // configuration comes from the snapshot record the switch itself
+                // wrote, so it is the one the installed state was taken at and not
+                // one read from anywhere else.
+                // PROPOSED(D-081): the `apply` task learns an install's watermark.
+                ApplyWork::Installed { index, term } => {
+                    let installed = match store.snapshot_record().await {
+                        Ok(Some(record)) => Some(record.config),
+                        Ok(None) | Err(_) => None,
+                    };
+                    let mut applied = lock(&self.applied);
+                    let config =
+                        installed.or_else(|| applied.get(&range).map(|state| state.config.clone()));
+                    let Some(config) = config else {
+                        return;
+                    };
+                    applied.insert(
+                        range,
+                        Applied {
+                            index,
+                            term,
+                            config,
+                        },
+                    );
+                    return;
+                }
             };
             for entry in entries {
                 let mut applied = lock(&self.applied)
@@ -1373,6 +1442,7 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
         initial_voters: initial_voters.clone(),
         raft: raft.clone(),
         variants,
+        node_variants,
         gaps: Mutex::new(Gaps::default()),
     };
     let answers = host.answers.clone();
@@ -1632,7 +1702,13 @@ async fn reseed<E: Environment>(
             }
             .max(FIRST_INCARNATION + 1);
             if !node_variants.contains(NodeVariant::ServeBeforeRefusedMark) {
-                store.mark_reseeded(incarnation).await?;
+                // D-067: `ReseedMarkNotSynced` writes the same two keys, traces the
+                // same event and answers as the correct node would; the batch is
+                // simply not synced, so a crash before anything else syncs this
+                // engine's log may leave the replica with no mark at all.
+                // PROPOSED(D-081): the re-seed shape's variant.
+                let synced = !node_variants.contains(NodeVariant::ReseedMarkNotSynced);
+                store.mark_reseeded(incarnation, synced).await?;
                 recovered.quarantined = true;
             }
         }
@@ -1718,6 +1794,19 @@ fn restate<E: Environment>(
         applied: store.applied(),
         last_index: core.last_index(),
         incarnation: store.incarnation(),
+        // What the disk said this replica is (D-067). The mark Q15 writes is the
+        // quarantine flag and a fresh incarnation (D-077), so a marked replica with
+        // nothing installed yet is one waiting for its re-seed — `Refused` — and a
+        // marked replica that holds a snapshot has had its stream — `Quarantined`.
+        // The two are one flag and two moments, and (d) is about the first of them.
+        // PROPOSED(D-081): a restatement says how the replica restated (D-067).
+        state: if !quarantined {
+            RecoveredAs::Neither
+        } else if snap_index > 0 {
+            RecoveredAs::Quarantined
+        } else {
+            RecoveredAs::Refused
+        },
     });
     env.trace(TraceEvent::RaftTerm {
         server,

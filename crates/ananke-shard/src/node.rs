@@ -37,7 +37,7 @@ use std::time::Duration;
 use ananke_env::{Clock, Decision, Either, Environment, Rng, race};
 use ananke_raft::core::SnapshotAction;
 use ananke_raft::queue::Queue;
-use ananke_raft::{Entry, Index, Input, Message, Output, Persist, Raft, ServerId};
+use ananke_raft::{Entry, Index, Input, Message, Output, Persist, Raft, ServerId, Term};
 use bytes::Bytes;
 
 use crate::inbox::{Inbox, Received};
@@ -227,6 +227,21 @@ pub enum ApplyWork {
     /// that index would capture (D-036).
     // PROPOSED(D-083): a follower's compaction record is the `apply` task's job too.
     Record,
+    /// A live install's switch is durable at this index and term: the state machine
+    /// the `apply` task keeps for the range is now the installed one, and the next
+    /// entry it is handed is the one after this index.
+    ///
+    /// It is a job and not a call because the `apply` task takes one job at a time in
+    /// the order they were queued (Q14): an install that told the task out of band
+    /// would move the watermark under a job already queued for the replica the switch
+    /// replaced.
+    // PROPOSED(D-081): the `apply` task learns an install's watermark in order.
+    Installed {
+        /// The snapshot's last applied index.
+        index: Index,
+        /// That entry's term.
+        term: Term,
+    },
 }
 
 /// One job for the node's `apply` task, with the range it belongs to.
@@ -803,6 +818,34 @@ impl<E: Environment, H: Host> Node<E, H> {
                     });
                 }
             }
+            // A follower's compaction record is the `apply` task's too, and for the
+            // same reason: it is written between two applies, so the index, the term
+            // and the configuration it carries are exactly the state a snapshot at
+            // that index would capture (D-065, D-078; D-036).
+            //
+            // The node dropped it. `Host::snapshot` counts the action and
+            // `install::job_of` answers `None` for a record, so the core that asked
+            // for one set `take_pending` and was never told it was done — and a core
+            // with `take_pending` stuck asks for nothing again for the rest of its
+            // life on that node. It never compacts, so its log grows without bound
+            // (the whole of D-065), and when it later takes office it never takes a
+            // snapshot either, so it cannot stream one: a re-seeded replica of a range
+            // whose new leader had been a follower waits forever. The directed
+            // re-seed shape found it that way, one or two of its four ranges never
+            // installed on every seed.
+            // PROPOSED(D-081): a follower's compaction record reaches the `apply`
+            // task.
+            Output::Snapshot(SnapshotAction::Record)
+                if !self
+                    .config
+                    .variants
+                    .contains(NodeVariant::RecordNeverQueued) =>
+            {
+                self.host.apply(ApplyJob {
+                    range,
+                    work: ApplyWork::Record,
+                });
+            }
             Output::Snapshot(action) => self.host.snapshot(range, action),
             // D-047: decided at the step, traced now, which is when it is durable for
             // every event that followed a persist.
@@ -1142,6 +1185,8 @@ mod tests {
         /// A follower's compaction record, between two applies: no checkpoint under
         /// it (D-065, D-078).
         Record,
+        /// A live install's switch, at the index it made durable.
+        Installed(Index),
     }
 
     impl Job {
@@ -1152,6 +1197,7 @@ mod tests {
                 }
                 ApplyWork::Take => Job::Take,
                 ApplyWork::Record => Job::Record,
+                ApplyWork::Installed { index, .. } => Job::Installed(*index),
             }
         }
     }

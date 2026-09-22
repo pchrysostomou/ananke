@@ -327,7 +327,31 @@ impl<E: Environment> Task<E> {
                 },
             };
             match job {
-                Some(job) => self.job(job).await,
+                Some(job) => {
+                    self.job(job).await;
+                    // And then whatever is due, because the race above fires the timer
+                    // only when the queue is *empty*. On a node of four ranges it
+                    // rarely is: a chunk of one range, an answer of another and the
+                    // `raft` task's repairs keep arriving, the timer loses every race,
+                    // and a stream whose chunk was lost is never resent and never
+                    // given up. Its leader has `installing` set and will not ask again
+                    // until it is told, so that replica is fed nothing for the rest of
+                    // the run — one range's traffic starving another range's re-seed.
+                    //
+                    // The directed re-seed shape found it: four re-seeds against a cap
+                    // of two, where two ranges' streams keep the queue busy while the
+                    // two waiting for a slot go quiet. `due` acts only on streams whose
+                    // deadline has passed, so asking it after every job costs a
+                    // comparison per job.
+                    // PROPOSED(D-081): a busy queue does not starve a stream's resend.
+                    if !self.variants.contains(NodeVariant::DueOnlyWhenIdle)
+                        && self
+                            .deadline()
+                            .is_some_and(|deadline| deadline <= self.env.clock().now())
+                    {
+                        self.due().await;
+                    }
+                }
                 None => self.due().await,
             }
         }

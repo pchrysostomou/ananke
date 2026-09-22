@@ -1011,6 +1011,24 @@ impl<E: Environment> RaftStore<E> {
         self.applied.load(Ordering::Acquire)
     }
 
+    /// Takes the applied index an install's manifest switch made durable.
+    ///
+    /// A live install writes this replica's whole state — the applied index with it —
+    /// in one switch through the engine, not through [`apply`](Self::apply), so the
+    /// number this store carries in memory is the one from before the install unless
+    /// it is told. A server never needed telling: it ends its run-loop incarnation
+    /// across an install and reopens the store, which reads the key back. A node
+    /// cannot reopen, because that would restart every range on it (SHARD.md §11,
+    /// storage 5), so it says so here.
+    ///
+    /// It never moves the index backwards: an install onto a live replica installs at
+    /// or above what the replica had applied, and a stale answer must not undo a
+    /// later apply.
+    // PROPOSED(D-081): a live install's applied index reaches the store it landed in.
+    pub fn installed_at(&self, index: Index) {
+        self.applied.fetch_max(index, Ordering::AcqRel);
+    }
+
     /// The applied index as of `snapshot`: the value under the applied-index key
     /// at that engine version, which the apply batch that wrote it wrote with the
     /// entry's own writes. A read taken at the same snapshot is therefore the
@@ -1112,18 +1130,27 @@ impl<E: Environment> RaftStore<E> {
     /// replica quarantined at incarnation 1 — indistinguishable, to its leader,
     /// from the replica that never lost anything.
     ///
+    /// `sync` is the batch's durability, and `false` is the caller's known-buggy
+    /// path, never a mode the correct node takes: `NodeVariant::ReseedMarkNotSynced`
+    /// writes these same two keys in a batch that is not synced, so what the mark
+    /// survives a crash as is the disk's draw (D-067). The parameter is here rather
+    /// than in a second method because the *only* difference between the correct
+    /// mark and the variant's is this flag, and a reader of the variant should see
+    /// that and nothing else.
+    ///
     /// # Errors
     ///
     /// The engine's.
     // PROPOSED(D-077): Q15's whole-node refusal, and the re-seed per replica.
-    pub async fn mark_reseeded(&mut self, incarnation: u64) -> io::Result<()> {
+    // PROPOSED(D-081): the mark's durability is the variant's one difference (D-067).
+    pub async fn mark_reseeded(&mut self, incarnation: u64, sync: bool) -> io::Result<()> {
         let mut batch = WriteBatch::new();
         batch.put(self.prefix.quarantine_key(), Bytes::from_static(&[1]));
         batch.put(
             self.prefix.incarnation_key(),
             encode_incarnation(incarnation),
         );
-        self.engine.write(batch, true).await?;
+        self.engine.write(batch, sync).await?;
         // The store carries its incarnation for its own life (D-042), and from here
         // that life is the re-seeded replica's: every message this store stamps must
         // carry the number now on the disk, not the 1 a fresh store opened at.

@@ -982,6 +982,7 @@ fn convert(
             applied,
             last_index,
             incarnation,
+            state,
         } => log(
             "ananke.raft.recovered",
             Some(Json::obj(vec![
@@ -991,6 +992,7 @@ fn convert(
                 ("applied", int(*applied)),
                 ("lastIndex", int(*last_index)),
                 ("incarnation", int(*incarnation)),
+                ("state", Json::str(state.as_str())),
             ])),
         ),
         TraceEvent::RaftProposed {

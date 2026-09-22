@@ -243,6 +243,71 @@ pub enum NodeVariant {
     /// number its predecessor drew, and a leader that compares incarnations for
     /// inequality only (D-042) never resets (Q26; SHARD.md:1372-1379).
     IncarnationPerRangeStream,
+    /// Each replica's durable refused mark written in a batch that is **not synced**
+    /// (D-067). Everything else is the correct node's: the same two keys, the same
+    /// `RaftReseeded` when the write returns, and the same silence until the install.
+    ///
+    /// What a crash keeps of an unsynced write is the disk's draw, so the mark is
+    /// there on some seeds and gone on others; where it is gone the replica opens
+    /// fresh — term 0, no vote, incarnation 1 — and votes from then on, which is
+    /// D-035's hole reopened. Its standard is therefore *rate* and not every seed,
+    /// as `RemovalNotDurable`'s is (§10, a variant of a later stage), and the re-seed
+    /// shape's arm crashes on the mark's own trace event so that nothing else has
+    /// synced the new engine's log by then.
+    // PROPOSED(D-081): the re-seed shape's variant, approved as D-067.
+    ReseedMarkNotSynced,
+    /// The highest index handed to the `apply` task left at zero when a core is put
+    /// on the node at its start, rather than started where the replica's own applied
+    /// index stands (`Cores::insert`).
+    ///
+    /// It is D-083's watermark bug one moment earlier: that one left the watermark
+    /// where the *replaced* replica stood across a live install, this one never sets
+    /// it at all. A node whose replica's log was compacted past its applied index —
+    /// every replica a snapshot has filled — then names, in its first `Apply` after a
+    /// restart, indices the core no longer holds, and the node fails that range and
+    /// stops. Where the log does still hold them the state machine simply does its
+    /// whole life's work again.
+    // PROPOSED(D-081): the applied watermark starts where the replica does.
+    RestartAppliesFromZero,
+    /// A follower's compaction record ([`SnapshotAction::Record`]) asked for by a core
+    /// and queued nowhere: the node as it stood, where `Host::snapshot` counted the
+    /// action and `install::job_of` answered `None` for it.
+    ///
+    /// The core sets `take_pending` when it asks and clears it when it is told the
+    /// record was written, so a record that goes nowhere leaves that core asking for
+    /// nothing ever again. It never compacts, which is the whole of D-065 undone and
+    /// the follower-log bound with it; and a replica that has never taken a snapshot
+    /// cannot stream one when it takes office, so a re-seed toward a range whose new
+    /// leader had been a follower waits forever.
+    ///
+    /// [`SnapshotAction::Record`]: ananke_raft::core::SnapshotAction::Record
+    // PROPOSED(D-081): a follower's compaction record reaches the `apply` task.
+    RecordNeverQueued,
+    /// The `snapshot` task's chunk deadlines served only when its queue is idle: the
+    /// node as it stood, where the loop raced a job against the nearest deadline and a
+    /// job that kept arriving won every race.
+    ///
+    /// On a server with one range the queue goes quiet between streams and the timer
+    /// fires; on a node of four it need not, and a stream whose chunk was lost is then
+    /// never resent and never given up. Its leader keeps `installing` set for that
+    /// follower and sends it heartbeats and nothing else, so the replica is fed
+    /// nothing for the rest of the run: one range's traffic starves another range's
+    /// re-seed.
+    // PROPOSED(D-081): a busy queue does not starve a stream's resend.
+    DueOnlyWhenIdle,
+    /// The applied index a live install's switch made durable told to neither the store
+    /// nor the `apply` task: both keep a number of their own, and the switch writes the
+    /// key under both of them.
+    ///
+    /// A server never needed telling — it ends its run-loop incarnation across an
+    /// install and reopens its store, which reads the key back — and a node cannot
+    /// reopen (SHARD.md §11, storage 5). Untold, the task hands the state machine the
+    /// entry after the index it *thinks* it applied, which is the entry after nothing,
+    /// and `RaftStore::apply` refuses it: the node applies nothing more for that range
+    /// and traces `RaftServerFailed` at every commit after the install.
+    // PROPOSED(D-081): an install's applied index reaches the store it landed in and
+    // the task that applies after it.
+    InstallWatermarkNotTold,
 }
 
 impl NodeVariant {
@@ -281,6 +346,33 @@ impl NodeVariant {
         NodeVariant::OpenNewestEvenIfLost,
         NodeVariant::ServeBeforeRefusedMark,
         NodeVariant::IncarnationPerRangeStream,
+        NodeVariant::ReseedMarkNotSynced,
+        NodeVariant::RestartAppliesFromZero,
+        NodeVariant::RecordNeverQueued,
+        NodeVariant::DueOnlyWhenIdle,
+        NodeVariant::InstallWatermarkNotTold,
+    ];
+
+    /// The directed re-seed shape's own, outside §10's count of range-layer variants:
+    /// D-067's [`ReseedMarkNotSynced`](Self::ReseedMarkNotSynced), the one way to get
+    /// Q15's *durability* wrong as against the six ways to get the refusal itself wrong
+    /// ([`RESEED`](Self::RESEED)), and the four holes the shape found in the node when
+    /// a refusal and the wiring first met on one tree — the applied index an install
+    /// makes durable, the watermark a start begins at, a follower's compaction record,
+    /// and a resend starved by a busy queue (D-081).
+    ///
+    /// `ReseedMarkNotSynced` is a mutation a single-range world could not catch
+    /// either, for a reason of its own: the shape crashes the node on one replica's
+    /// mark, and what the *other three* replicas restate afterwards is the evidence.
+    /// With one range there is one mark, the crash is on the only replica there is,
+    /// and a node that lost it has nothing left to compare it against.
+    // PROPOSED(D-081): the re-seed shape's variant, approved as D-067.
+    pub const SHAPE: &'static [NodeVariant] = &[
+        NodeVariant::ReseedMarkNotSynced,
+        NodeVariant::RestartAppliesFromZero,
+        NodeVariant::RecordNeverQueued,
+        NodeVariant::DueOnlyWhenIdle,
+        NodeVariant::InstallWatermarkNotTold,
     ];
 
     /// Q15's whole-node refusal and re-seed, in order: the six ways to get a node's
@@ -376,6 +468,11 @@ impl NodeVariant {
             NodeVariant::OpenNewestEvenIfLost => 1 << 30,
             NodeVariant::ServeBeforeRefusedMark => 1 << 31,
             NodeVariant::IncarnationPerRangeStream => 1 << 32,
+            NodeVariant::ReseedMarkNotSynced => 1 << 33,
+            NodeVariant::RestartAppliesFromZero => 1 << 34,
+            NodeVariant::RecordNeverQueued => 1 << 35,
+            NodeVariant::DueOnlyWhenIdle => 1 << 36,
+            NodeVariant::InstallWatermarkNotTold => 1 << 37,
         }
     }
 
@@ -416,6 +513,11 @@ impl NodeVariant {
             NodeVariant::OpenNewestEvenIfLost => "OpenNewestEvenIfLost",
             NodeVariant::ServeBeforeRefusedMark => "ServeBeforeRefusedMark",
             NodeVariant::IncarnationPerRangeStream => "IncarnationPerRangeStream",
+            NodeVariant::ReseedMarkNotSynced => "ReseedMarkNotSynced",
+            NodeVariant::RestartAppliesFromZero => "RestartAppliesFromZero",
+            NodeVariant::RecordNeverQueued => "RecordNeverQueued",
+            NodeVariant::DueOnlyWhenIdle => "DueOnlyWhenIdle",
+            NodeVariant::InstallWatermarkNotTold => "InstallWatermarkNotTold",
         }
     }
 }
@@ -501,13 +603,15 @@ mod tests {
             assert_eq!(seen & variant.bit(), 0, "{variant} shares a bit");
             seen |= variant.bit();
         }
-        // Twenty of the round's, the snapshot task's seven for the wiring, and
-        // D-077's six for Q15's whole-node refusal and re-seed.
-        assert_eq!(NodeVariant::BUGS.len(), 33);
+        // Twenty of the round's, the snapshot task's seven for the wiring, D-077's
+        // six for Q15's whole-node refusal and re-seed, and D-067's one for the
+        // re-seed shape.
+        assert_eq!(NodeVariant::BUGS.len(), 38);
         for variant in NodeVariant::SNAPSHOT
             .iter()
             .chain(NodeVariant::WIRING)
             .chain(NodeVariant::RESEED)
+            .chain(NodeVariant::SHAPE)
         {
             assert!(
                 NodeVariant::BUGS.contains(variant),
@@ -517,6 +621,7 @@ mod tests {
         assert_eq!(NodeVariant::SNAPSHOT.len(), 11);
         assert_eq!(NodeVariant::WIRING.len(), 7);
         assert_eq!(NodeVariant::RESEED.len(), 6);
+        assert_eq!(NodeVariant::SHAPE.len(), 5);
         // The discipline, the wiring and the re-seed are disjoint: a variant is a way
         // to get the `snapshot` task's keys, caps and frames wrong, a way to get its
         // running inside the node wrong, or a way to get Q15's refusal wrong, and
@@ -527,9 +632,15 @@ mod tests {
                 "{variant} is in both sets"
             );
         }
-        for variant in NodeVariant::RESEED {
+        for variant in NodeVariant::RESEED.iter().chain(NodeVariant::SHAPE) {
             assert!(
                 !NodeVariant::SNAPSHOT.contains(variant) && !NodeVariant::WIRING.contains(variant),
+                "{variant} is in two sets"
+            );
+        }
+        for variant in NodeVariant::SHAPE {
+            assert!(
+                !NodeVariant::RESEED.contains(variant),
                 "{variant} is in two sets"
             );
         }

@@ -10890,6 +10890,162 @@ those outputs or from a run made the same way.
 
 ---
 
+## PROPOSED D-081 — The directed re-seed shape: four ranges installed live into the directory a refusal built, and what the shape found on the way
+
+**Context.** Stage B's exit criterion for Q15's path (SHARD.md §12; §11, storage 8). Two
+open slices meet here and neither reaches the situation alone. D-077 (PR #86) refuses a
+node whose shared engine lost state and rebuilds its four replicas in a fresh engine
+beside the refused directory, where each waits, empty and marked, for a stream that
+nothing in that tree could send; its entry records (a), (b) and (d) as owed with the
+wiring, and leaves (c) asserted as an *absence* with its reason, because a re-seeded
+replica there answered nothing at all. D-083 (PR #107) makes streams flow and installs
+complete on a node that was never refused. This slice is the two together, and it is
+where (c) stops being vacuous.
+
+**The number.** D-081 is the one gap in the sequence, left when this slice was blocked:
+D-079 and D-080 are taken by PRs #89 and #87, D-082 and D-083 by the branches below this
+one. Taking it closes the gap, and the footer does not move.
+
+**The branch.** This branch merges `phase-3-stage-b-reseed` (#86) into
+`phase-3-stage-b-wiring` (#107) and builds on the union, because the criterion is about
+both at once: a node refused, and re-seeded by four installs at once. The merge is a
+commit of its own and is described there; the only thing it decides is that
+`NodeVariants` carries 64 bits, because the node's variants outgrew a `u32` when the
+wiring's seven and Q15's six met on one tree.
+
+**Decided — the shape** (`sim/reseed.rs`, `sim/tests/reseed.rs`). Three servers of four
+ranges each; the node refused by its store's lost mark at a restart, as `sim/quorum.rs`
+refuses a server (D-049), so what is refused is a directory that really held a store and
+really lost it; its cap on streams *received* set to two, below its four ranges, so the
+re-seeds share two slots (Q14, D-075); and a crash arm on a stream of its own,
+`reseed-crash` (D-031), that crashes the node on the trace event of one replica's refused
+mark and restarts it. The arm draws nothing, so it lengthens no schedule stream.
+
+Per seed, on the correct system, `Report::check` asserts, in this order:
+
+- **the node is still running.** A node that stopped answers nothing further, and every
+  criterion below would be asserted about a run that ended early.
+- **(a)** each of the four ranges traces its `RangeCreated { cause: snapshot }`; exactly
+  one start of the node lies between the refusal and those installs, the arm's; and no
+  `RaftAdopted` is traced at all. Live installs into the directory the re-seed built,
+  which is what `RaftAdopted`'s absence says on a node (D-066).
+- **(b)** every one of the four streams completes into an install, and the four were owed
+  *at once*: every replica's refused mark precedes the first install, so the node's cap
+  of two was asked to hold two of the four back. A node with one staging directory
+  abandons its way through exactly this situation (SHARD.md:573-576).
+- **(c)** no replica sent anything other than its own re-seed stream before its refused
+  mark was durable, **and every one of the four sent something after it**. The second
+  half is the point: PR #86 could assert only the empty side of this fold, with its
+  reason, because a re-seeded replica there had nothing to answer. Here it has, and the
+  fold's other side is asserted full. A chunk and its acknowledgement are excluded by
+  name, as the criterion excludes them; everything else — an AppendEntries answer, a vote
+  answer — is the replica answering.
+- **(d)** the replica whose mark drew the crash restates **as refused** after it, every
+  other replica of the node restates refused or quarantined and never neither, and that
+  replica's install lands after the restart. This is what D-067 asked the trace for.
+- **(e)** the refused directory's marker still says lost and not one byte of it changed
+  over the node's whole second life (D-041).
+
+The arm's firing is asserted per seed: a run whose refusal or whose first mark did not
+arrive inside the arm's budget fails, rather than passing as a run with no crash in it.
+
+**Decided — `RaftRecovered` says how a replica restated.** D-067 asks for it by name:
+"`RaftRecovered`, per replica, gains the replica's state at its restatement: refused,
+quarantined, or neither". The three are `RecoveredAs::{Refused, Quarantined, Neither}`,
+and on the node they are one flag and two moments, which the entry states because the
+store cannot tell more: Q15's mark *is* D-035's quarantine flag with a fresh incarnation
+(D-077), so a marked replica that no install has filled is `Refused` — waiting for its
+re-seed — and a marked replica that holds a snapshot is `Quarantined`. A replica whose
+store carries no mark is `Neither`, which is every replica that never lost anything and,
+on a node that wrote its mark unsynced, the replica that lost it in a crash. The
+one-group server traces `Quarantined` or `Neither` and never `Refused`: it adopts its
+staged store at its start, so it never restates in the state a node's replica waits in.
+No pinned trace hash moves — the only pinned hash in the tree is `echo`'s, which carries
+no Raft event — and no schedule moves, because a field on a record draws nothing.
+
+**Decided — D-067's variant.** `RaftStore::mark_reseeded` takes the batch's durability as
+a parameter, and `false` is the node's `ReseedMarkNotSynced` path and nothing else. The
+parameter rather than a second method because the only difference between the correct
+mark and the variant's *is* that flag, and a reader of the variant should see that and
+nothing else. The arm crashes on the mark's own trace event, which is the window D-067
+requires: before anything else syncs the new engine's log.
+
+**Measured before asserted** (D-039, D-061), at a hundred seeds in release on this tree:
+
+| variant | caught | tier it is asserted from |
+| --- | --- | --- |
+| `ReseedMarkNotSynced` (D-067) | 47 % | every tier |
+| `RecordNeverQueued` | 77 % | every tier |
+| `InstallWatermarkNotTold` | 100 % | every tier |
+| `DueOnlyWhenIdle` | 4 % | the thousand-seed tier, with seed 14 pinned below it |
+
+The two high-rate variants and the hundred-per-cent one run a tenth of the tier, as
+D-082's do. `DueOnlyWhenIdle` is under D-061's five per cent, so its sweep asserts from
+the thousand-seed tier and seed 14 is pinned with its mechanism for the tiers below —
+and under the cap below the sweep never reaches that tier, so the pin is what asserts it
+today. `RestartAppliesFromZero` is not in the table: the shape reaches its situation only
+when an install happens to land before the arm's crash, so its pair is a unit test in
+`ananke_shard::round`, where the situation is one line of state.
+
+**Proposed, not taken — this binary's tiers.** The shape is the most expensive scenario
+in the tree per seed: four nodes, twenty simulated seconds, about a quarter of a million
+trace records and 0.9 CPU seconds a seed in release. At the nightly's ten thousand the
+correct system's sweep alone would be some nine thousand CPU seconds, about seven times
+what a whole nightly shard carries (D-064). The binary therefore caps its sweeps at two
+hundred seeds, and the cap is put to the owner rather than taken: SHARD.md §12 excepts
+`sim/balance.rs` by name for exactly this reason, and D-083 recorded `sim/install.rs`'s
+tiers as owed. The gate's twenty and CI's hundred run in full. Weighed at
+ANANKE_SEEDS=1000 in release from the built binary, the seven rows come to 195.5 CPU s
+and are placed longest-first in `scripts/nightly-shards.txt`.
+
+**What the shape found.** Four holes, each reachable only with both slices on one tree,
+each fixed here with a known-buggy variant beside the fix (CLAUDE.md's pair rule).
+
+1. **An install's applied index reached neither the store nor the `apply` task.** The
+   switch writes the key through the engine, not through `RaftStore::apply`, and both
+   keep a number of their own. Untold, the task hands the state machine the entry after
+   the index it thinks it applied, `RaftStore::apply` refuses it, and the node applies
+   nothing more for that range. `sim/install.rs`, the wiring's own scenario, was tracing
+   **1 205 `RaftServerFailed` a seed** and its check passed: it asserts streams, installs
+   and creations, and nothing asked whether the node was still working. It is zero now.
+   `InstallWatermarkNotTold` keeps the hole, and `ApplyWork::Installed` is the job that
+   tells the task in order with its other work.
+2. **The applied watermark at a node's start.** `Cores::insert` left it at zero, so the
+   first `Apply` after a restart named every index from 1: where the log still held them,
+   the state machine did its whole life's work again; where the log was compacted past
+   them — every replica a snapshot has filled — the node failed that range and stopped.
+   D-083 fixed the same watermark across a live install; this is the same number one
+   moment earlier. `RestartAppliesFromZero`.
+3. **A follower's compaction record went nowhere.** `Output::Snapshot(Record)` reached
+   `Host::snapshot`, which counted it, and `install::job_of` answered `None`: the core
+   set `take_pending` and was never told, so it never asked again, never compacted — the
+   whole of D-065 undone, and the follower-log bound of D-078 with it — and, once it took
+   office over a range it had been following, never took a snapshot and so could not
+   stream one. A re-seed toward such a range waited forever. `RecordNeverQueued`.
+4. **A busy queue starved a stream's resend.** The `snapshot` task raced a job against
+   the nearest chunk deadline; on a node of four ranges a job keeps arriving and the
+   timer loses every race, so a stream whose chunk was lost was never resent and never
+   given up, and its leader — holding `installing` for that follower — fed the replica
+   heartbeats and nothing else. `DueOnlyWhenIdle`.
+
+**What is not met, and is not hidden.** At a hundred seeds the correct system fails (a)
+on **seed 56**: one of the four re-seeds never completes, its stream restarted by the
+receiver for the whole run (417 chunks sent, no install), because the node's two assembly
+slots are held by assemblies whose senders stopped. D-075 decided that a *waiter* is not
+held a slot; it says nothing about reclaiming a slot from an admitted assembly that goes
+quiet, and nothing does. That is a gap in the snapshot wiring and a question for its
+owner — a reclamation policy is a decision, not a patch — and **Stage B's re-seed
+criterion is not met until it is answered**. The shape fails that seed loudly rather than
+passing quietly, which is what the criterion is for.
+
+**Consequences.** `ananke-raft` gains `RaftStore::installed_at` and a durability
+parameter on `mark_reseeded`. `ananke-shard` gains one `ApplyWork` kind, one `Host` field
+and five variants, and `NodeVariants` is 64 bits wide. `ananke-env` gains `RecoveredAs`
+and one field on `RaftRecovered`. `sim/` gains one scenario and one test binary. The
+premerge is owed: it is the owner's to schedule on a quiet machine (D-070).
+
+---
+
 ## PROPOSED D-082 — `sim/raft.rs`'s arms on the node: one set of arms, two clusters
 
 **The number.** SHARD.md's Stage B plan does not number this entry, and the footer on
