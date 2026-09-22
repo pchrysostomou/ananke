@@ -10890,4 +10890,263 @@ those outputs or from a run made the same way.
 
 ---
 
-_Next entry: D-079. Add one before implementing anything not covered above._
+## PROPOSED D-080 — The linearizability search commits its read-only candidates outright
+
+**The failure this answers.** The ten-thousand-seed nightly of 2026-09-22 (GitHub run
+35705563274, on 7127745) failed `the_correct_server_passes_every_seed` on two seeds of
+ten thousand, and on neither was there anything wrong with the server:
+
+```
+seed 3085: linearizability: key "k1": 332 of 397 operations placed before the
+           search budget ran out; could not place [...]
+seed 4065: linearizability: key "k0": 376 of 438 operations placed before the
+           search budget ran out; could not place [...]
+```
+
+The checker reported **its own search**, not a violation. Both histories are
+linearizable: a throwaway copy with `lin::BUDGET` raised decides 3085 at 4 000 000
+states and 4065 at 400 000 000, against the 2 000 000 in the tree (issue #82).
+
+**The search as it was.** `Search::dfs` is a depth-first walk over states
+`(the set of operations linearized so far, the register's value)`, with a `seen` set
+so a state is expanded once. At each state it takes `min_ret`, the earliest return
+among the operations not yet linearized, and the candidates are every unlinearized
+operation invoked at or before it — Wing and Gong's search under Lowe's real-time
+rule, in porcupine's shape. It then **branches over every one of them**, completed
+operations before pending ones, and recurses.
+
+That last step is where the cost is. Branching over every candidate means a window of
+*w* concurrent operations is explored as up to 2^w sets, and the memo cannot collapse
+them: `{g₁}` and `{g₂}` are genuinely different sets of linearized operations, so they
+are different states, even when both reach the same register value because both `g₁`
+and `g₂` are reads. The failing histories are exactly that shape. On 7127745, seed
+3085's key `"k1"` holds 397 operations — 199 of them gets, 149 distinct values written,
+20 windows open at once at the widest — and seed 4065's `"k0"` holds 438, 244 of them
+gets, 22 open at once. Both stall about sixty operations from the end.
+
+**The search as it is.** A candidate that only *reads* the register never needs a
+branch point. Let `o` be such an operation at some state, and suppose a linearization
+`L` of the rest exists from there. Then `L` with `o` moved to its front is one too:
+
+- **Real-time.** `o` is a candidate, so `o.call` is at or before the earliest return
+  among the unlinearized operations; every `x` in `L` therefore has `o.call <= x.ret`,
+  and the order forbids `o` before `x` only where `x.ret < o.call`.
+- **Values.** `o` does not write, so every other operation of `L` meets exactly the
+  values it met before, in the same order; and `o` itself applies at this state's
+  value, which is what made it read-only.
+- **Pending.** Where `o` never returned and `L` left it out, `o` prepended to `L` is a
+  linearization, by the same two points.
+
+So the search commits **every** read-only candidate at once, keeping no alternative,
+and branches only over the operations that write. Taking one read leaves the value
+alone, so the others are read-only still; and dropping one from the unlinearized set
+can only move `min_ret` later, so the others are candidates still — which is why they
+go together rather than one per level. `lin::reads_only` carries the argument in its
+documentation, beside the code.
+
+**Which operations are read-only, and which are deliberately not.** A get, with a
+result or without one — it never writes, and with a result it must have met this value,
+which `apply` checks. A compare-and-set **known not to have swapped**: it applies only
+where the value differs from what it expected, and it leaves that value alone, so it is
+a read assertion. Nothing else:
+
+- A put or a delete writes.
+- A compare-and-set that swapped writes.
+- A compare-and-set **with no result** — abandoned, closed at its entry's apply — is
+  not read-only even where it happens not to swap at the value in hand. Deferred, it
+  may meet a different value, swap *there*, and be the write some later read needs. The
+  exchange argument's second point fails for it, and `an_abandoned_compare_and_set_is_not_read_only`
+  is the history that shows it: a compare-and-set expecting `"b"` where the value is
+  absent, a put of `"b"` beside it, and a read of `"c"` after both.
+
+**The cost, before and after.** All on an 8-core Apple M2, **on AC power**, in release,
+measured by instrumenting the search itself. The figure per seed is the seed's most
+expensive key.
+
+**Two counters, and which one each figure is.** A *state* is an entry of the `seen`
+memo — a distinct `(set of operations linearized, value)` — and every table below counts
+**distinct states**, which is `seen.len()`. A *visit* is one call of `dfs` that got past
+the `done` and budget checks, and `BUDGET` is charged **per visit, memo hits included**,
+because the decrement precedes the `seen.insert`. The two are not the same number on the
+old search and they are on the new one, so the tables are like-for-like in states but not
+in budget:
+
+| | distinct states | visits (what `BUDGET` charges) | visits per state |
+|---|---|---|---|
+| seed 3085 `"k1"`, as it was | 296 345 | 2 000 000, then exhausted | 6.7 |
+| seed 4065 `"k0"`, as it was | 287 535 | 2 000 000, then exhausted | 7.0 |
+| seed 3085 `"k1"`, as it is | **383** | **383** (0 memo hits) | 1.0 |
+| seed 4065 `"k0"`, as it is | **408** | **408** (0 memo hits) | 1.0 |
+
+So a state figure is not a budget figure. On the old search each state cost more than one
+charge against the cap — 6.7 and 7.0 on the two tail keys, which are the only keys whose
+visit count was recorded — so the headroom a state count suggests is several times what
+the cap actually allows. On the new search the two coincide, because the reduction removes
+the revisits along with the branches. Where a figure below is a state count it is stated
+as one, and no visit figure is quoted that was not measured.
+
+| seeds 0..1000, **distinct states** of the worst key | p50 | p90 | p99 | worst |
+|---|---|---|---|---|
+| the search as it was | 448 | 632 | 916 | 1 395 |
+| the search as it is | 390 | 526 | 634 | **778** |
+
+| seeds 3000..5000, **distinct states**, the band the two failures are in | p50 | p90 | p99 | worst | budget exhausted |
+|---|---|---|---|---|---|
+| the search as it was | 437 | 615 | 871 | 296 345 | 2 of 2000: 3085, 4065 |
+| the search as it is | 381 | 514 | 645 | **1 145** | **none** |
+
+The typical history barely moves, which is the point: it was never the problem. The two
+tail histories fall by about 750× in states, from past the budget to under a thousand,
+and the budget is untouched at 2 000 000. A history's cost now tracks the **writes** in a
+window rather than the operations, which is why the worst of two thousand seeds is 1 145
+distinct states and not a number four orders of magnitude out — and, since the new
+search's visits and states coincide, 1 145 is also what it charges the cap.
+
+**`BUDGET` is not raised, and that is deliberate.** Raising it to 400 000 000 buys the
+worst seed known today and nothing past it: the distribution is close to bimodal —
+almost every history is free and a very small minority explodes — so no finite number
+separates the two, and a larger one only makes the next tail history a slower failure
+instead of a faster one. It would also cost the memory: the `seen` set is one entry per
+expanded state, and at 300 000 states it is already tens of megabytes per key, with
+eight seeds sweeping at once. D-030 and D-039 say a bound the correct system trips is
+never widened to make a run green, and this is that rule applied to the checker's own
+bound. The question was what made the search hard, and the answer was the search.
+
+**The oracle is no weaker, and that is the part that had to be proved.** A pruning rule
+that is subtly wrong reports "linearizable" for a history that is not, which would
+silently disarm the strongest oracle in the project.
+
+*Every buggy variant still trips it, on the same seeds.* All sixteen variants, the
+correct server among them, were run over seeds 0..300 — 4 800 runs — and **both**
+searches were run on the same history, key by key, in one process, so the comparison is
+over identical inputs rather than over two runs. The tree's real `lin::check` was run
+beside the copy of the old search on every one of the 4 800 and agreed with it on every
+seed, so the copy is known faithful. Two variants trip linearizability at all, and both
+trip it on exactly the same seeds before and after:
+
+| variant | keys the old search proved bad | the new one | same seeds | exhausted, old → new |
+|---|---|---|---|---|
+| `ApplyBeforeCommit` | 107 of 300 | 107 | yes | 0 → 0 |
+| `LeaseTrustsTheClock` | 19 of 300 | 19 | yes | **1 → 0** (seed 18) |
+| the other 13, and `Correct` | 0 | 0 | yes | 0 → 0 |
+
+A key the old search proves bad and the new one calls good — the blind case — appeared
+nowhere, on any variant, on any seed.
+
+*And one catch the old search was making was false.* `LeaseTrustsTheClock` seed 18 is the
+last row's `1 → 0`. `is_caught` and the lease sweep's `stale` counter both read a catch as
+"`check()` returned an error mentioning linearizability", and the old search's **budget
+exhaustion says exactly that** — so a history the checker could not decide was counted as
+a stale read the variant had been caught by. D-080 decides that history, and it is
+linearizable: the catch was the checker giving up, not the bug. The count for that variant
+therefore falls by one seed in three hundred, which is the number getting more honest and
+not less. It is well inside D-061's margin: the stale read is caught on about 4 % of
+seeds and the assertion that carries it runs from the thousand-seed tier.
+
+That this was possible at all is wider than this change and is **issue #92**:
+`Violation::exhausted` is set, and no reader outside `lin` looks at it, so every counter
+that scores a catch by matching the violation's text scores an undecided search as one —
+six of them do. D-080 removes the two seeds that were tripping it and leaves the defect
+standing; the lease sweep's 42 against 41 over the same thousand seeds is its
+demonstration, and it is recorded here as the measurement of a bug, not as a result of
+this one.
+
+*The hand-built histories are still rejected*, as unit tests in `sim/lin.rs`: a stale
+read after a committed write (`a_read_is_forced_only_where_it_saw_this_value`, which
+asserts the matching read is accepted in the same breath), a lost write
+(`a_lost_write_is_a_violation`, with the concurrent version accepted beside it), a read
+of a value nobody wrote (`a_value_nobody_wrote_is_a_violation`), a double apply
+(`a_double_apply_shows_as_a_wrong_swap`), and a violation *after* a window of forced
+reads (`forcing_a_window_of_reads_hides_no_later_violation`).
+
+*Five mutations of the new code, and what each breaks.* Each is a single edit to
+`reads_only` or to the commit itself; every one is caught, and none is left standing.
+
+| | the mutation | what fails |
+|---|---|---|
+| **M-1** | a get is forced without checking it met this value | `a_read_is_forced_only_where_it_saw_this_value`, `a_stale_read_is_a_violation_with_the_shortest_prefix`, `a_value_nobody_wrote_is_a_violation`, `a_lost_write_is_a_violation`, `forcing_a_window_of_reads_hides_no_later_violation` and 5 more |
+| **M-2** | any compare-and-set that applies counts as read-only | `a_swapping_compare_and_set_is_not_read_only`, `a_double_apply_shows_as_a_wrong_swap`, `a_sequential_history_is_linearizable_and_leaves_a_timeline` |
+| **M-3** | an abandoned compare-and-set counts as read-only where it would not swap | `an_abandoned_compare_and_set_is_not_read_only` |
+| **M-4** | a put or a delete that applies counts as read-only | `a_write_is_never_forced_so_its_value_is_never_lost` and 14 more |
+| **M-5** | nothing is ever forced (the reduction removed) | `seeds_3085_and_4065_which_the_nightly_found_linearize_inside_the_budget` |
+| **M-6** | the compare-and-set arm drops its check on the value | `a_compare_and_set_that_reported_no_swap_is_not_forced_where_it_would_swap` |
+| **M-7** | the forced commit is never undone on the way out | `a_forced_window_is_undone_when_the_search_backtracks_past_it` |
+| **M-8** | the forced operations are marked but never put in the order | `the_order_a_search_returns_replays_under_the_specification`, `a_forced_window_is_undone_when_the_search_backtracks_past_it` |
+
+M-5 is the one that matters in the other direction: it fails **only** the pinned seeds,
+which is the evidence that the pin is a real regression test for this change and that
+none of the small histories needs the reduction to be decided. Its converse is that
+`a_wide_window_of_concurrent_reads_is_decided` is **not** evidence for the reduction and
+must not be read as any — it passes unchanged under M-5, because a depth-first search
+trying its candidates in index order walks that window without a second branch. Its
+comment says so.
+
+M-6 to M-8 were added by the adversarial review of this change, which found each of them
+standing: the boundary this entry's own prose names — a compare-and-set whose result says
+no swap, met at a value where it would have swapped — had no test of its own, and neither
+the backtrack out of a forced commit nor the order the search returns was asserted
+anywhere. The order in particular was invisible to the whole tree, since `check`'s
+timelines are dropped at all three call sites (`sim/raft.rs`, `sim/membership.rs`,
+`sim/quorum.rs`) — that half is **issue #93**, and the test that closes the gap for
+D-080's own bookkeeping is here.
+
+**What the mutations do not bound: the reduction refusing too much.** Every one of M-1 to
+M-8 is a `reads_only` that forces something it should not, or a commit that loses track of
+what it forced, and each is caught because it changes a *verdict*. The opposite mistake —
+a `reads_only` too strict, refusing to commit an operation that is in fact read-only — no
+test in the tree can see. Planting one that calls no compare-and-set read-only leaves all
+forty tests green, and it would: over-strictness costs states and can never cost
+soundness, since the search then simply branches where it could have committed. The cost
+is real but unmeasured, because `lin` exposes no state counter and the figures in this
+entry came from an instrumented throwaway copy. A reduction that quietly stopped firing
+would show as the tail coming back at the nightly, which is the same signal that found
+this, rather than as a failing test.
+
+**The pinned seeds assert the mechanism, not the green.** `sim/tests/raft.rs` pins 3085
+and 4065 and asserts, before the check, that each key still holds the window of
+concurrent reads the reduction is what carries — at least 300 operations, 150 of them
+gets, 12 open at once, against the 397/199/20 and 438/244/22 the pin was taken at. The
+day a schedule moves that window away the assertion says so and the pin is re-audited
+against a seed that still reaches it, rather than quietly kept as a bare green
+(CLAUDE.md). Those three are **floors, deliberately loose** — about 40 % below what the
+seeds measure — so an ordinary redraw of the schedules does not fail a tree with nothing
+wrong; they catch a window that has gone, not one that has shifted. `most_open_at_once`
+is conservative in the same direction: it sorts `(Instant, i64)`, so a window closing at
+*t* is counted before one opening at *t*, and two windows that merely touch are never
+counted as overlapping. It under-counts, never over-counts, which is the safe way round
+for a floor.
+
+**The premerge**, at a thousand seeds in release on this branch's tip, quoting its own
+machine lines (D-070):
+`premerge: Darwin 25.6.0 arm64, Apple M2, 8 cores`;
+`premerge: before, load 118.95/193.10/164.07, AC Power, no thermal warning recorded`;
+`premerge: after, load 168.58/167.98/160.16, AC Power, no thermal warning recorded`;
+`premerge: green at 1000 seeds in 1899 s`. **On AC power** throughout, with five or six
+other agents' slices sweeping and building on the same laptop the whole time — the load
+average never fell below 118 — so the figure is not comparable with D-071's 625 s on an
+idle machine or with D-078's 1 279 s, and it says nothing about whether this change made
+the checker faster. It could not say much either way: the checker is a few milliseconds
+of a run that takes a second and a half, and the saving is on two seeds in ten thousand.
+The case for this change is the tail it removes, not a premerge clock.
+
+**One reported rate moves by one seed, and it moves the right way.** The lease sweep's
+`a_leader_that_trusts_the_clock_is_caught_and_the_guard_revokes` counts a catch as
+"`check()` returned an error mentioning linearizability", which the old search's budget
+exhaustion also does. The same thousand seeds on the same tree give 42 stale reads with
+the search as it was and **41** with the search as it is; the one dropped is seed 18,
+where the old search proved nothing and merely gave up, and whose history D-080 decides
+as linearizable. `is_caught` reads a catch the same way, so the same applies to every
+variant — though on seeds 0..300 no other variant had an exhaustion to lose. The comment
+in that test carries both numbers and the reason. D-061's margin is unaffected: 4.2 % and
+4.1 % both sit at the 4 % the assertion's arithmetic is written for, and it runs from the
+thousand-seed tier.
+
+**What is not settled.** The reduction is a partial-order reduction over *reads*; a
+history whose concurrency is all in its writes would still branch as before, and this
+change does not bound that. No such history has been seen: over seeds 0..1000 the worst
+key expands 778 states, and the two tail histories were read windows. If one appears,
+the next step is the pending operations, not the budget.
+
+---
+
+_Next entry: D-081. Add one before implementing anything not covered above._
