@@ -527,3 +527,57 @@ fn a_seed_replays_to_the_same_trace_on_the_node() {
         assert_eq!(a.event, b.event);
     }
 }
+
+/// How many seeds the probe below runs, whatever the tier. There is no rate here to
+/// price (D-061): whether the node has a re-seed path or a snapshot wiring is a
+/// property of the tree and not of a seed, and what a seed varies is only the
+/// schedule that carries the run to the refusal. Twenty is enough to show the
+/// refusal lands on every one of them, which is the clause that makes the absences
+/// evidence, and a directed check whose cost does not grow with the tier is what
+/// D-077's own scenario is for the same reason.
+// PROPOSED(D-085): a directed absence, not a sweep.
+const NODE_PATH_SEEDS: u64 = 20;
+
+/// The two paths `sim/quorum.rs` is made of, asserted **absent on the node on every
+/// seed, each with the slice that owns it** (CLAUDE.md:58-67; PROPOSED D-085).
+///
+/// Stage B's first exit criterion asks `sim/quorum.rs` to run on the node beside
+/// `sim/raft.rs`'s arms and `sim/membership.rs` (SHARD.md:2280-2290), and D-082
+/// recorded why that one cannot follow the other two yet: it "is a re-seed scenario
+/// from end to end", so it stacks on PR #86 and on the node's snapshot wiring,
+/// neither of which is in this tree. This is that claim as a run rather than as a
+/// paragraph, and as a tripwire rather than a note: it drives the refusal at the
+/// node exactly as the scenario drives it at a server — crash, restart on a store
+/// marked lost — and asserts that the refused node answers nothing, is never
+/// re-seeded, and has no stream opened toward it.
+///
+/// The first clause is the one to read twice. It asserts the run **did** refuse the
+/// node, because an absence read off a run that never refused anything is no
+/// evidence at all — the same trap D-082's `checked` avoids by asserting the
+/// condition behind a snapshot action rather than the silence of one.
+///
+/// The day either path lands this test fails, and its message says which half of
+/// the sharded scenario can then be built. That is the intended failure: a
+/// re-assertion has to be run and not argued (D-082), and a sharded `sim/quorum.rs`
+/// written against a node that answers nothing would assert nothing.
+// PROPOSED(D-085): the sharded scenario's two dependencies, asserted absent per seed.
+#[test]
+fn the_quorum_scenarios_two_paths_are_absent_on_the_node_and_this_says_when_they_arrive() {
+    let paths: Vec<ananke_sim::quorum::NodePaths> =
+        sweep(NODE_PATH_SEEDS, ananke_sim::quorum::node_paths);
+    for path in &paths {
+        path.the_two_paths_are_absent()
+            .unwrap_or_else(|e| panic!("{e}"));
+    }
+    let refused: usize = paths.iter().map(|p| p.refused).sum();
+    println!(
+        "node: over {} seeds, {refused} whole-node refusals, and of the paths a sharded \
+         sim/quorum.rs needs: {} answers from a refused node (PR #86), {} re-seeds (PR #86), \
+         {} streams opened toward it and {} installs (the snapshot wiring, D-082)",
+        paths.len(),
+        paths.iter().map(|p| p.answers).sum::<usize>(),
+        paths.iter().map(|p| p.reseeded).sum::<usize>(),
+        paths.iter().map(|p| p.streams).sum::<usize>(),
+        paths.iter().map(|p| p.installs).sum::<usize>(),
+    );
+}

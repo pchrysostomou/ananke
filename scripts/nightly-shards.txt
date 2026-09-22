@@ -51,6 +51,17 @@
 # longest-first gives when two rows are an eighth of a shard each. The night is bounded
 # by shard 2. The next row added goes into the lightest, which is shard 3.
 #
+# D-085's one row -- the two paths a sharded `sim/quorum.rs` needs, asserted absent on
+# the node -- was weighed on its own tree from the built release binary
+# (`node-<hash> <test> --exact`) at ANANKE_SEEDS=1000 ANANKE_DEEP_SEEDS=100, so the
+# figure is the test's own cost and not a build's: 0.40 user + 0.04 sys = 0.4 cpu s, on
+# an Apple M2 of 8 cores on AC Power with the other Stage B slices building beside it
+# (load average 79.71/78.56/77.33). The tier does not move it -- it is a directed
+# absence that runs a fixed twenty seeds whatever the tier, for the reason
+# `NODE_PATH_SEEDS` gives -- so this is the figure at every tier. Shards 3 and 6 were
+# the lightest at 1299.2 and it goes to the lower-numbered of the two, to 1299.6, as
+# D-078's row did. The next row added goes into the lightest, which is shard 6.
+#
 # shard	binary	cpu_s	test
 # shard 1: 1432.8 cpu s
 1	engine	625.1	an_install_in_two_switches_is_caught
@@ -84,7 +95,7 @@
 2	ranges	0.1	no_batch_frame_of_the_node_parses_as_a_frame_of_the_one_group_server
 2	ranges	0.1	the_ranges_of_one_node_draw_their_own_election_timeouts
 2	node	163.5	every_seed_passes_on_the_correct_node_under_the_raft_sweeps_arms
-# shard 3: 1299.2 cpu s
+# shard 3: 1299.6 cpu s
 3	echo	0.2	trace_hash_matches_the_pinned_golden
 3	engine	417.5	the_range_delete_crash_test_passes_every_seed
 3	engine	235.9	the_seek_crash_test_passes_every_seed
@@ -105,6 +116,7 @@
 3	node	13.2	a_server_without_pre_vote_is_caught_on_the_node
 3	node	4.2	a_server_that_applies_before_commit_is_caught_on_the_node
 3	node	0.5	a_server_that_sends_before_it_persists_is_caught_on_the_node
+3	node	0.4	the_quorum_scenarios_two_paths_are_absent_on_the_node_and_this_says_when_they_arrive
 # shard 4: 1302.4 cpu s
 4	echo	0.1	same_seed_gives_byte_identical_trace
 4	engine	210.8	the_correct_engine_passes_every_seed

@@ -11077,4 +11077,357 @@ on its own, and it is put to the owner with the wiring rather than decided here.
 
 ---
 
-_Next entry: D-083. Add one before implementing anything not covered above._
+## PROPOSED D-085 — A sharded `sim/quorum.rs`: what "sharded" means here, and why it is blocked behind two paths that do not exist yet
+
+**The number.** SHARD.md's Stage B plan does not number this entry. D-082, the raft
+arms slice this branch is stacked on, took **D-082** and moved the footer to D-083;
+the membership sweep is in flight on a branch of its own against the same file and
+takes the number after it. This entry takes **D-085**, past both, and the footer moves to
+D-086. Every code site carries `// PROPOSED(D-085)`. The integrator may renumber it
+at the merge; nothing in the tree depends on the number beyond those markers, this
+heading and the footer.
+
+**Context.** SHARD.md §12's Stage B has, as its first exit criterion,
+"`sim/raft.rs`'s arms, `sim/membership.rs` with #46's extension, and `sim/quorum.rs`,
+each run on the node with four ranges on every node, each range placed as today's one
+group is (§10): the correct system passes every seed at every tier"
+(SHARD.md:2280-2290). §10 asks for `RefusedCountsForQuorum` and `RefusedNeverCounts`
+"on a sharded `sim/quorum.rs`, caught on every seed at every tier"
+(SHARD.md:2404-2406; sim/tests/raft.rs:2814-2861; D-049). D-082 moved the arms and
+handed this one on, with a warning attached:
+
+> **`sim/quorum.rs`** is a re-seed scenario from end to end: it refuses a server by
+> its store's lost mark at a restart and counts what the leader does while the
+> re-seed runs. It therefore **stacks on the re-seed slice (PR #86)**, which builds
+> the whole-node refusal and the per-replica marks, and it cannot start before that
+> lands.
+
+This entry is that slice. It reports what "sharded" means for this scenario, what
+the scenario needs from the node, that **neither of the two things it needs exists in
+any tree yet**, the evidence for that read off runs rather than off source, the
+design the scenario will take the day they do, and what is built here instead: the
+absence of both paths as a **tripwire**, asserted per seed with the slice that owns
+each, so the day either lands the tree says so.
+
+### What "sharded" means for this scenario
+
+§12 says "run on the node with four ranges on every node, each range placed as
+today's one group is"; §10 says "a sharded `sim/quorum.rs`"; D-082 says it "wants
+four ranges' re-seeds against a node's receive cap, which is the shape SHARD.md's
+Stage B calls the directed re-seed shape". Read together with the directed re-seed
+shape itself (SHARD.md:2258-2268) — "three servers, each hosting all four ranges of
+the scenario; a node refused by its store's lost mark at a restart, as
+`sim/quorum.rs` refuses a server (D-049); the node's cap on streams received set to
+two, below its four ranges" — the reading this entry proposes is:
+
+**Sharded does not mean the scenario run four times. It means one fault, four
+answers.** Four things change in kind, and not one of them can be said in a
+single-range world:
+
+1. **The refusal is the node's, not a replica's.** D-077 makes a loss in the shared
+   engine refuse the whole node and mark down every range the node held. So the one
+   `mark_store_lost` at the victim's restart refuses **four replicas at once**, and
+   check quorum is then asked separately of each of the four ranges' leaders about
+   the same refused node. On one group "the refused server" and "the refused
+   replica" are the same sentence.
+2. **The leader is per range.** Four ranges on three nodes need not agree on a
+   leader, so `Cast` becomes one per range — each with its own term, its own commit
+   index at the cut, its own check-quorum window on its own clock, and its own
+   step-down — and `Hold` with it. `leader_of_range` (D-082) is what resolves them.
+3. **The fault is per link and is therefore shared by all four ranges.** The cut of
+   the leader's other follower is one partition, and the blocked half's black hole is
+   one `Sim::limit_frames` on one direction of one link — which on the node is **one
+   socket carrying every range's frames** (Q10, D-072). The scenario's premise, that
+   the limit "loses every chunk and passes the heartbeats and their rejections",
+   survives on the node **only because the wiring puts each chunk in a frame of its
+   own** (Q41; D-082's wiring design, item 3). That is a dependency on a property of
+   a slice that has not been written, and the sharded scenario must assert it per
+   seed rather than assume it: chunks lost as oversized *and* rejections of every
+   range still arriving.
+4. **The receive cap of two, below the node's four ranges, is the point.** It makes,
+   on every seed, a state one group cannot produce: at one instant the refused node
+   has two ranges' re-seeds streaming and two waiting for a slot. D-049's own context
+   names "a stream not yet opened" as a case where a refused follower's rejections
+   must *not* count. So on the node the open half carries **both outcomes at once**,
+   by the rule, on the same node and the same instant: the leaders of the two
+   admitted ranges keep their office through the install and commit after it, and the
+   leaders of the two waiting ranges step down naming the refused follower. A single
+   range can assert one or the other and never both.
+
+"Each range placed as today's one group is" needs no code: `node_server_config`
+already gives every range the same three voters, servers 1 to 3, which is exactly
+where the one group's replicas sit.
+
+### The finding: the scenario is blocked behind two paths, and neither is in any tree
+
+`sim/quorum.rs` asks one question — do a refused follower's rejections keep its
+leader in office while the re-seed stream to it progresses? — and there are two
+pieces of machinery under it. **The node has neither.**
+
+- **A refused follower must go on answering.** A refused server answers every
+  AppendEntries with a rejection stamped incarnation 0 and goes on answering whatever
+  becomes of its re-seed (D-049; RAFT.md §3); those rejections are the thing check
+  quorum either counts or does not. On the node, `ananke_shard::server::run`'s
+  refusal arm marks the loss, traces `RaftRefused` and **returns**: the node stops.
+  Q15's whole-node refusal and the re-seed beside it are PR #86's
+  (`phase-3-stage-b-reseed`, PROPOSED D-077), which is open and unmerged.
+- **There must be a stream**, whose chunks the blocked half loses and whose
+  acknowledgements the open half counts — the `stream_acked` mark is the whole of
+  D-049's rule. `ananke_shard::snapshot` (D-075) is **not wired** to `ServerHost`: a
+  core that asks for a snapshot action bumps `Gaps::snapshot_actions` and nothing
+  else happens (server.rs:566-571). D-082 designed that wiring in full and gave it to
+  the branch after it; it is not in `main` and not on any pushed branch.
+
+**And PR #86 alone is not enough**, which is the part worth stating plainly, because
+the work order allowed that the store-level refusal `sim/quorum.rs` already drives
+might be. D-077 says of its own slice, in as many words: "no snapshot stream reaches
+the node, from a leader or from anywhere, and no install can complete on it … nothing
+here stands in for an install, and no check asserts one happened." A refused node
+that answers rejections and is never streamed to gives the blocked half's answer to
+both halves, and the open half of this scenario — the half that catches
+`RefusedNeverCounts` — cannot be built at all. **The scenario needs both slices.**
+
+**The evidence, read off runs.** `quorum::node_paths` drives the refusal at the node
+exactly as `quorum::run_on` drives it at a server — three nodes of four ranges, the
+victim crashed and restarted on a store directory marked lost (D-044) — and reads the
+trace back. Over **20 seeds at the gate**, on this tree:
+
+| | Count over 20 seeds |
+|---|---|
+| whole-node refusals of the victim (`RaftRefused`) | **20** |
+| messages the refused node put on the wire afterwards | **0** |
+| `RaftReseeded` of it | **0** |
+| snapshot streams opened toward it (`RaftSnapshotStreams`) | **0** |
+| replicas created by an install (`RangeCreated { cause: snapshot }`) | **0** |
+
+The first row is what makes the other four evidence rather than silence: the run did
+refuse the node on every seed, and the node then said nothing at all. The scenario's
+own setup gate — `run_until_record` waiting `STREAM_WAIT` for a leader to open a
+stream to the victim — would time out on every seed, and `Hold::chunk_acks`,
+`Hold::refused_rejections` and `Hold::oversized` would all be zero on every seed.
+There is no standard to lower here and no weaker half to run: there is no situation.
+
+### What is built here
+
+Three things, and deliberately not a fourth.
+
+1. **The absence as a tripwire, per seed, with the slice that owns each half**:
+   `quorum::node_paths`, `quorum::NodePaths::the_two_paths_are_absent` and
+   `the_quorum_scenarios_two_paths_are_absent_on_the_node_and_this_says_when_they_arrive`
+   in `sim/tests/node.rs`. It asserts the refusal landed — an absence read off a run
+   that never refused anything is no evidence at all, the same trap D-082's `checked`
+   avoids by asserting the condition behind a snapshot action rather than the silence
+   of one — and then that the node answered nothing, was never re-seeded and had no
+   stream opened toward it. **The day either path lands, this test fails**, and its
+   message names which half of the sharded scenario can then be built. That failure is
+   the feature: a re-assertion has to be run and not argued (D-082), and a sharded
+   `sim/quorum.rs` written against a node that answers nothing would assert nothing
+   while looking green.
+2. **`quorum`'s `spawn` takes a `Cluster`**, so the scenario's refusal can be driven
+   at either system from one piece of code rather than from a copy of it — the
+   discipline D-082 fixed for the arms, applied to the one line of `sim/quorum.rs`
+   that differs between the two.
+3. **`sim/quorum.rs` is otherwise untouched**, and its runs are **byte-identical**.
+   Seed 42's moirae JSONL, under `Variant::Correct`, is 3 134 336 bytes for the
+   blocked half and 3 576 062 for the open one, and hashes to
+   `a387074aa5fb1915f2418ada3dfad6b2704086378ab3da500d5eb20d809b3f62` and
+   `ae5b513a0267bec8b815d2e7721150f03cbb86428f2466fa462e6bbaba341916` on
+   `origin/phase-3-stage-b-sweeps` and on this branch alike, from the same test run
+   against each version of the file in turn. So every figure D-049 measured and every
+   assertion its four tests make still stand on the run they were made on.
+
+**Why the absence passes rather than fails.** The rule this slice was held to is
+that "a variant or check that cannot reach its situation must say so per seed and
+fail — never pass quietly". The tripwire says so per seed, and it passes, and the
+distinction is worth being exact about: the rule bites on a *check inside a scenario
+that is running*, which must not report success over a situation it never built. No
+sharded `sim/quorum.rs` is landed here, so there is no such check; what is landed is
+the absence itself, asserted, which is the same pattern D-082's `checked` and D-076
+use for the paths the node has not got. The alternative reading — land the sharded
+scenario so that it fails on every seed — would leave the gate red on every tree
+until two other branches merge, which CLAUDE.md forbids outright. The tripwire is the
+reading that keeps the fact machine-checked without a red gate, and it flips to a
+failure the moment the situation becomes reachable.
+
+**The fourth thing, not built: the scenario is not parameterised on `Cluster` beyond
+that spawn.** The temptation is to land the harness now and fill the checks in later,
+and the reason not to is that the harness *is* the checks: what changes on the node is
+`Cast` and `Hold` becoming per range and the open half carrying two outcomes at once,
+and none of that can be measured against a node that produces no situation. D-082 set
+the precedent from the other side — it designed the snapshot wiring in full and built
+it on the branch after, rather than ship a wiring one reviewer could not hold — and
+the same reading applies here: a shape chosen against a scenario that cannot run is a
+shape that gets redone. The design is below so the owner can rule on it before a line
+of it is written. **If the owner would rather have the harness landed ahead of the
+paths, that is a ruling this entry asks for rather than assumes.**
+
+### The design: the sharded scenario, the day both paths land
+
+Built on D-082's harness — `Cluster`, `config_on`, `node_server_config`,
+`leader_of_range`, `client_on`, `spread_on` and the node's key map — as a **directed**
+scenario that drives its own faults, which is how D-082 says `sim/membership.rs` and
+this one take it.
+
+1. **The cast.** Three nodes, four ranges on each, every range on all three
+   (`node_server_config`, voters 1 to 3). The fill is `spread_on` against each range's
+   own leader, so every range has a checkpoint that streams in many chunks rather than
+   one — `FILL` per range, keyed by the range's first key so the fixed map routes it.
+   The victim is a node that leads none of the four if one exists, else any follower of
+   the first range; the "other" is the third node. `Cast` becomes
+   `BTreeMap<u64, RangeCast>`: per range, its leader and the refused replica.
+2. **The refusal** is the node's: crash, restart, `mark_store_lost` on the configured
+   directory. Under D-077 the restart then takes the newest generation not marked
+   lost, so the node re-seeds into `base-g1` and marks each of its four replicas
+   refused before any of them answers.
+3. **The receive cap is two**, below the node's four ranges, which is what the
+   directed re-seed shape fixes and what makes two of the four wait.
+4. **The cut and the block.** The other node is partitioned off from the rest at the
+   moment the first stream opens, for `HOLD`; in the blocked half the same instant
+   puts the `MTU` black hole on the direction from each streaming leader to the
+   victim.
+5. **`Hold` becomes per range**, and `check` asks per range:
+   - *blocked*: every range's leader stepped down within two windows and three ticks
+     of the cut by its own clock, naming the refused node in `uncounted`; and, the
+     clause the node adds, **every range's rejections still arrived while chunks were
+     lost as oversized** — which is the assertion that the limit separated the chunks
+     from the heartbeats rather than taking both, and which is only a question when a
+     frame could have carried more than one range;
+   - *open*: the ranges whose streams the cap admitted keep their leader through the
+     install and commit an entry of their term past their commit index at the cut; the
+     ranges whose streams the cap made wait have their leaders step down naming the
+     refused node, since a stream whose chunks the cap leaves unacknowledged is no
+     progress (D-049). Both, on every seed, on one node.
+     **The consequence, stated rather than left to be found:** a waiting range that
+     loses its leader cannot elect another while the third node is away and the
+     re-seeded replica does not vote (D-035), so that range is leaderless for the
+     rest of the hold and its install completes only after the heal. That is the
+     rule working, not the scenario failing — but it means this scenario asserts the
+     *step-down* for those ranges and leaves "every range is eventually installed" to
+     the directed re-seed shape, which owns exit criterion (a).
+   - A range that reaches neither situation **fails**, per seed, naming the range: the
+     scenario must not pass by not asking.
+6. **The disk stays `Disk::Instant`** for the halves, for D-049's reason, which the
+   node makes stronger rather than weaker: the silence while a refused server
+   verifies, repairs and adopts is now the *node's* silence, four stores' worth, and
+   it is shared by all four ranges at once. `Disk::Sweep`'s control test becomes a
+   per-node figure.
+7. **Tier.** *Every seed at every tier*, unchanged: the situation is built directly,
+   the scenario asserts per seed that it was built, and both variants are caught on
+   every seed — which is §10's standard for this pair and is not lowered.
+
+### A requirement this design puts on the snapshot wiring, which nothing else would catch
+
+D-049's rule keeps three marks per follower in `Progress`, and the one that carries
+re-seed progress, `stream_acked`, is set by `Input::SnapshotAcked { to }`
+(core.rs:515, 1166, 1913). **That input names the follower and not the range.** On one
+group that is complete information, because the node has one core. On the node it is
+not: the wiring's snapshot task must step `SnapshotAcked` into **the core of the range
+whose stream was acknowledged**, and a wiring that stepped it into every core of the
+node — the cheap reading, "that follower's stream made progress" — would let range 2's
+chunks keep range 5's leader in office over a stream that has not been opened.
+
+With the receive cap at two below four ranges, the sharded open half catches that on
+every seed, because two ranges always have progress and two never do. **No single-range
+scenario can catch it, and no scenario in the tree today can reach it.** It is recorded
+here as a requirement on the branch that builds the wiring, and filed as an issue, so
+that it is not discovered by its absence (**issue #103**): if the wiring ships it wrong and nothing asks,
+D-049's rule is silently void on the node while every test in the tree stays green.
+
+The same paragraph applies, more weakly, to the second half of the blocked clause
+above: `Snapshots::route` must cut each chunk into a frame of its own, or the frame
+that batches a chunk with another range's heartbeat is oversized and the black hole
+takes the heartbeat too.
+
+### The mutation table — **designed, not measured**
+
+The owner's standing demand on this stage is that a check with more than one range to
+be wrong about show the mutation a single-range world could not catch. **Not one row
+below has been run**, and the reason is the finding above: there is no scenario to
+plant a mutation in. They are stated now, against the checks as designed, so that the
+campaign is written against the checks rather than after them — which is the failure
+mode D-082 named of a table whose every row is caught. Each says what it does on one
+group, and the two that a one-group world makes meaningless are marked.
+
+| | Mutation | On one group | Caught by |
+|---|---|---|---|
+| **Q1** | `leader_of_range` ignores its `range`: one leader named for all four | nothing — one range, one leader | the blocked half, per range: the range whose leader is misnamed traces no `RaftQuorumLost` for it. **One-group-blind** |
+| **Q2** | `Hold`'s chunk acknowledgements and rejections counted per *node* rather than per (range, follower) | nothing — one range, one follower | the open half: the two waiting ranges show acknowledgements they never had, and their leaders are then expected to keep office and do not. **One-group-blind** |
+| **Q3** | the wiring steps `SnapshotAcked` into every core of the node, not the acknowledged range's | n/a — one core | the open half's waiting-range clause, on every seed. **One-group-blind**, and the reason the paragraph above exists |
+| **Q4** | the refusal marks down only the range whose store open failed (`RefuseOneRangeOnly`, D-077) | nothing — refusing the one range *is* refusing the node | the blocked half: three of the four ranges see no refused follower at all, so their rejection counts are zero and their leaders never step down for one. **One-group-blind**, and a second catch for a variant D-077 catches elsewhere |
+| **Q5** | the wiring batches a chunk with other messages into one frame | nothing — one range has nothing to batch with | the blocked half's second clause: rejections stop arriving when chunks do. **One-group-blind** |
+| **Q6** | the receive cap is read as per range rather than per node, so all four stream at once | nothing — two is above one either way | the open half: no range waits, so the clause that asserts two of them did fails, per seed. **One-group-blind** |
+| **Q7** | the client keeps one leader for the cluster rather than per range (D-082's M4, recorded there and not covered) | nothing | expected **not caught** here either: the open half's commit clause is about the range's own key, so a client that asks the wrong node first only takes longer. Recorded so the campaign does not claim it |
+
+### The pinned seeds, re-audited
+
+CLAUDE.md:58-67 asks that every pinned seed whose schedule or mechanism a change
+moves be re-audited to assert its mechanism, or the situation's absence with the
+reason. **This change moves no schedule and no mechanism**, and the audit begins with
+the evidence rather than the assurance:
+
+- `sim/quorum.rs`'s own runs are byte-identical, seed 42 both halves, hashes and
+  lengths above, taken from the same test run against this branch's file and against
+  `origin/phase-3-stage-b-sweeps`'s in turn. The only change to that file is a
+  parameter on `spawn` whose one-group arm spawns the same future under the same task
+  name and draws nothing; the node arm is reached only by `node_paths`, which is a new
+  run of its own.
+- No production crate is touched: the diff is `sim/quorum.rs`, `sim/tests/node.rs`,
+  `scripts/nightly-shards.txt` and this file. Nothing changes a draw, a tick, a trace
+  event or a persist, so no pinned trace hash and no pinned schedule in
+  `sim/tests/raft.rs`, `sim/tests/node.rs`, `sim/tests/ranges.rs`, `sim/tests/echo.rs`
+  or `sim/tests/wal.rs` can move.
+- `sim/tests/raft.rs`'s four D-049 tests —
+  `the_correct_leader_steps_down_on_a_blocked_reseed_and_commits_through_an_open_one`,
+  `a_leader_that_counts_a_refused_followers_rejections_whatever_its_stream_does_is_caught`,
+  `a_leader_that_counts_nothing_from_a_refused_follower_is_caught` and
+  `on_the_sweeps_disk_the_install_silence_deposes_the_leader_under_either_count` —
+  keep asserting exactly what they assert today, on the runs they assert it on, and
+  ran green at the gate on the tree committed. They are the pins this slice is nearest
+  to, and each asserts a **mechanism**: a step-down within a measured bound naming the
+  uncounted follower, an office kept through a blocked stream, a step-down mid-re-seed,
+  and a silence that deposes the leader under either count.
+- D-082's own audit of the twenty-three pinned seeds in `sim/tests/raft.rs` stands
+  unchanged and is not repeated here; this branch moves none of them.
+
+### The tier, and the machine (D-070)
+
+**Every figure in this entry is a gate-tier (20 seed) figure and is labelled as one.
+`scripts/premerge.sh` has not run** — the laptop is saturated and a thousand-seed
+figure taken under load says nothing under D-070 — and the premerge is the owner's to
+schedule on a quiet machine. Nothing here may be read as a thousand-seed measurement.
+Machine: Darwin 25.6.0 arm64, Apple M2, 8 cores, **on AC Power**, with other Stage B
+slices building beside it throughout: load averages **85.94/73.73/75.41**.
+
+### The nightly shards row
+
+One row, `node` / `the_quorum_scenarios_two_paths_are_absent_on_the_node_and_this_says_when_they_arrive`,
+weighed as `scripts/nightly-shards.txt` prescribes: from the built release binary
+(`node-<hash> <test> --exact`) rather than through cargo, so the figure is the test's
+own cost and not a build's, at `ANANKE_SEEDS=1000 ANANKE_DEEP_SEEDS=100`. The test
+runs a fixed twenty seeds whatever the tier, for the reason `NODE_PATH_SEEDS` gives:
+there is no rate here to price (D-061), and what a seed varies is only the schedule
+that carries the run to the refusal. Placed longest-first into the lightest shard,
+which D-082's note leaves as shard 3.
+
+### What goes to the owner
+
+- **Stage B's first exit criterion stays owed for `sim/quorum.rs`, and for a reason
+  outside this slice**: it needs PR #86 and the snapshot wiring, and the wiring is not
+  yet on any branch. The two other thirds — the arms (#101) and the membership sweep —
+  are not blocked by it.
+- **The order of the queue.** The wiring is the long pole for this scenario *and* for
+  the re-seed shape, `AdoptionAsBuilt`, `RefusalNotDurable`, `SnapshotWithoutCurrentLast`
+  and the `{IgnoreIncarnation, SharedSnapshotDir}` pair on the node. Everything Stage B
+  still owes on the node runs through it.
+- **The per-(range, follower) requirement on `SnapshotAcked`** above, which is a
+  correctness requirement on a slice that has not been written and which no test in
+  the tree can reach. Filed as **issue #103**.
+- **Whether to land the harness ahead of the paths**, against this entry's reading
+  that a shape chosen against a scenario that cannot run is a shape that gets redone.
+- **Nothing was widened and no bound was lowered.** No bound was tripped by the
+  correct system anywhere in this slice, and §10's standard for the pair —
+  *every seed at every tier* — is carried into the design unchanged.
+
+---
+
+_Next entry: D-086. Add one before implementing anything not covered above._

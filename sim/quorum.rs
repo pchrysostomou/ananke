@@ -41,16 +41,18 @@ use std::time::Duration;
 
 use ananke_env::moirae::Export;
 use ananke_env::sim::{RunHeader, Sim, SimConfig, TraceRecord};
-use ananke_env::{DropReason, Environment, Instant, NodeId, TraceEvent};
+use ananke_env::{DropReason, Environment, Instant, NodeId, RangeCause, TraceEvent};
 use ananke_raft::core::Variants;
 use ananke_raft::message::{self, Frame, Message, SnapshotStatus};
 use ananke_raft::store::mark_store_lost;
 use ananke_raft::{invariants, run as run_server};
+use ananke_shard::variant::NodeVariants;
 use moirae_sched::Policy;
 
 use crate::lin::{self, History};
 use crate::raft::{
-    self, CLIENTS, ClientStats, DIR, ELECTION_MIN, SERVERS, TICK, node_config, server_of,
+    self, CLIENTS, ClientStats, Cluster, DIR, ELECTION_MIN, SERVERS, Schedule, TICK, config_on,
+    node_config, node_server_config, server_of,
 };
 
 /// The frames the blocked link direction still carries, in bytes: a heartbeat and a
@@ -169,13 +171,24 @@ fn node(id: u64) -> NodeId {
     NodeId::new(u32::try_from(id).expect("small"))
 }
 
-/// A server's start: with `lost`, it first records in its store directory that
-/// the store lost state, the mark a refusal leaves (D-044), so the open that
-/// follows is refused.
-fn spawn(sim: &Sim, id: u64, variants: Variants, lost: bool) {
+/// A server's start on `cluster`: with `lost`, it first records in its store
+/// directory that the store lost state, the mark a refusal leaves (D-044), so the
+/// open that follows is refused.
+///
+/// The cluster is [`Cluster::OneGroup`] for every run of this scenario
+/// ([`run_on`]), which is what keeps its draws and its pinned figures exactly
+/// Phase 2's; [`Cluster::Node`] is reached only by [`node_paths`], which drives
+/// the refusal at the node to read back what the node does with it.
+// PROPOSED(D-085): the refusal is driven at either cluster; only the probe uses the node.
+fn spawn(sim: &Sim, cluster: Cluster, id: u64, variants: Variants, lost: bool) {
     let env = sim.env(node(id));
     let inner = env.clone();
-    env.spawn("raft", async move {
+    // The one-group task keeps the name it always had, so its runs are unmoved.
+    let task = match cluster {
+        Cluster::OneGroup => "raft",
+        Cluster::Node => "node",
+    };
+    env.spawn(task, async move {
         if lost
             && mark_store_lost(&inner, Path::new(DIR), "the scenario lost this store")
                 .await
@@ -183,7 +196,18 @@ fn spawn(sim: &Sim, id: u64, variants: Variants, lost: bool) {
         {
             return;
         }
-        let _ = run_server(inner, node_config(id, variants)).await;
+        match cluster {
+            Cluster::OneGroup => {
+                let _ = run_server(inner, node_config(id, variants)).await;
+            }
+            Cluster::Node => {
+                let _ = ananke_shard::server::run(
+                    inner,
+                    node_server_config(id, variants, NodeVariants::correct()),
+                )
+                .await;
+            }
+        }
     });
 }
 
@@ -207,6 +231,155 @@ fn run_until_record(
         }
     }
     None
+}
+
+/// How long [`node_paths`] lets the node's ranges elect before it refuses one of
+/// them, and how long it then watches: the stream wait this scenario gives a leader
+/// to open a stream, and the hold it would then run for.
+const NODE_WARMUP: Duration = Duration::from_millis(2000);
+
+/// What the node has of the two paths this scenario is made of, read off a run that
+/// refuses a node exactly as [`run_on`] refuses a server: crashed, restarted with
+/// its store directory marked lost (D-044), and then watched.
+///
+/// The scenario asks one question — do a refused follower's rejections keep its
+/// leader in office while the re-seed stream to it progresses? — and that question
+/// has two halves of machinery under it. **Neither is in this tree**, and this is
+/// what reads that back from a run rather than from the source:
+///
+/// - the refused follower must go on *answering*. A refused server answers every
+///   AppendEntries with a rejection stamped incarnation 0 and goes on answering
+///   whatever becomes of its re-seed (D-049, RAFT.md §3). On the node, a loss in the
+///   shared engine refuses the whole node, and Q15's re-seed beside it is PR #86's
+///   (`phase-3-stage-b-reseed`, PROPOSED D-077); until it lands
+///   `ananke_shard::server::run` marks the loss, traces `RaftRefused` and **returns**,
+///   so the node answers nothing at all and there is no rejection for check quorum to
+///   count either way;
+/// - there must be a *stream*, whose chunks the blocked half loses and whose
+///   acknowledgements the open half counts. `ananke_shard::snapshot` is not wired to
+///   `ServerHost` (PROPOSED D-082): a core that asks for a snapshot action bumps
+///   `Gaps::snapshot_actions` and nothing else happens, so no leader opens a stream,
+///   nothing is acknowledged and `Sim::limit_frames` has no chunk to drop.
+///
+/// [`NodePaths::the_two_paths_are_absent`] asserts both absent with their reason, so
+/// the day either arrives this says so instead of a sharded scenario passing over
+/// it (CLAUDE.md).
+// PROPOSED(D-085): the sharded scenario's two dependencies, asserted absent per seed.
+#[must_use]
+pub fn node_paths(seed: u64) -> NodePaths {
+    let cluster = Cluster::Node;
+    let schedule = Schedule::none();
+    let mut sim = Sim::new(config_on(cluster, seed, &schedule));
+    for i in 0..usize::try_from(SERVERS).expect("small") {
+        sim.add_node_with_clock(schedule.skews[i], schedule.drifts[i]);
+    }
+    for id in 1..=SERVERS {
+        spawn(&sim, cluster, id, Variants::default(), false);
+    }
+    sim.run_for(NODE_WARMUP);
+    // The victim is a follower of the node's first range, as `run_on` takes a
+    // follower of the one group: which follower does not matter here, since a
+    // whole-node refusal is about the node and not about the range whose open
+    // failed (D-077).
+    let first = cluster.ranges()[0];
+    let leader = raft::leader_of_range(&sim, first);
+    let victim = (1..=SERVERS).find(|&s| s != leader).expect("a follower");
+    let before = sim.trace_len();
+    sim.crash(node(victim));
+    sim.run_for(Duration::from_millis(20));
+    sim.restart(node(victim));
+    spawn(&sim, cluster, victim, Variants::default(), true);
+    sim.run_for(STREAM_WAIT + HOLD);
+    let records = sim.trace();
+    let after = &records[before..];
+    let count = |f: &dyn Fn(&TraceEvent) -> bool| after.iter().filter(|r| f(&r.event)).count();
+    NodePaths {
+        seed,
+        victim,
+        refused: count(&|e| matches!(e, TraceEvent::RaftRefused { server, .. } if *server == victim)),
+        answers: after
+            .iter()
+            .filter(|r| {
+                matches!(&r.event, TraceEvent::MessageSent { from, .. } if server_of(*from) == Some(victim))
+            })
+            .count(),
+        reseeded: count(&|e| matches!(e, TraceEvent::RaftReseeded { server, .. } if *server == victim)),
+        streams: count(
+            &|e| matches!(e, TraceEvent::RaftSnapshotStreams { to, .. } if *to == victim),
+        ),
+        installs: count(
+            &|e| matches!(e, TraceEvent::RangeCreated { cause, .. } if *cause == RangeCause::Snapshot),
+        ),
+    }
+}
+
+/// What [`node_paths`] read off the node.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+// PROPOSED(D-085): the sharded scenario's two dependencies, asserted absent per seed.
+pub struct NodePaths {
+    /// The seed.
+    pub seed: u64,
+    /// The node refused, a follower of the first range.
+    pub victim: u64,
+    /// `RaftRefused` of the victim: the setup's own non-vacuity, since an absence
+    /// read off a run that never refused anything is no evidence at all.
+    pub refused: usize,
+    /// Messages the victim put on the wire after its refusal — the rejections
+    /// stamped incarnation 0 that check quorum would count, among anything else.
+    pub answers: usize,
+    /// `RaftReseeded` of the victim: PR #86's path.
+    pub reseeded: usize,
+    /// Snapshot streams any leader opened toward the victim: the wiring's path.
+    pub streams: usize,
+    /// Replicas created by an install anywhere: the wiring's path, at its far end.
+    pub installs: usize,
+}
+
+impl NodePaths {
+    /// That the run refused the node and that neither path this scenario needs
+    /// exists on it, each named with the slice that owns it.
+    ///
+    /// # Errors
+    ///
+    /// A message naming the seed and what arrived.
+    pub fn the_two_paths_are_absent(&self) -> Result<(), String> {
+        let Self {
+            seed,
+            victim,
+            refused,
+            answers,
+            reseeded,
+            streams,
+            installs,
+        } = *self;
+        if refused == 0 {
+            return Err(format!(
+                "seed {seed}: node {victim} was restarted on a store marked lost and was not \
+                 refused, so this seed is evidence of nothing: the probe itself has gone stale"
+            ));
+        }
+        if answers > 0 || reseeded > 0 {
+            return Err(format!(
+                "seed {seed}: refused node {victim} answered {answers} messages and traced \
+                 {reseeded} `RaftReseeded`, where this tree's node marks the loss and returns. \
+                 Q15's whole-node refusal and re-seed (PR #86, PROPOSED D-077) have landed, and \
+                 the sharded `sim/quorum.rs` of PROPOSED D-085 can take its first half: a \
+                 refused follower that goes on answering is what check quorum has to count"
+            ));
+        }
+        if streams > 0 || installs > 0 {
+            return Err(format!(
+                "seed {seed}: {streams} snapshot streams were opened toward refused node \
+                 {victim} and {installs} replicas were created by an install, where this tree's \
+                 `ananke_shard::server::ServerHost` counts a snapshot action and drops it. The \
+                 node's snapshot wiring (PROPOSED D-082, built on `phase-3-stage-b-wiring`) has \
+                 landed, and the sharded `sim/quorum.rs` of PROPOSED D-085 can take its second \
+                 half: the stream whose chunks the blocked half loses and whose \
+                 acknowledgements the open half counts"
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Runs one half of the scenario on `seed` under `variants`, on the instant disk.
@@ -253,7 +426,7 @@ pub fn run_on(seed: u64, variants: impl Into<Variants>, half: Half, disk: Disk) 
     let clients: Vec<NodeId> = (0..CLIENTS).map(|_| sim.add_node()).collect();
     let admin = sim.add_node();
     for id in 1..=SERVERS {
-        spawn(&sim, id, variants, false);
+        spawn(&sim, Cluster::OneGroup, id, variants, false);
     }
     for (i, &client) in clients.iter().enumerate() {
         let env = sim.env(client);
@@ -289,7 +462,7 @@ pub fn run_on(seed: u64, variants: impl Into<Variants>, half: Half, disk: Disk) 
     sim.crash(node(victim));
     sim.run_for(Duration::from_millis(20));
     sim.restart(node(victim));
-    spawn(&sim, victim, variants, true);
+    spawn(&sim, Cluster::OneGroup, victim, variants, true);
     let opened = run_until_record(
         &mut sim,
         STREAM_WAIT,
