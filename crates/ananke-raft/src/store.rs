@@ -1059,6 +1059,42 @@ impl<E: Environment> RaftStore<E> {
         self.last_index.load(Ordering::Acquire)
     }
 
+    /// Restates the cached hard state, log bounds and applied index after a **live
+    /// span install** has written this range's keys behind them.
+    ///
+    /// Every one of those fields is an in-memory cache of a key this store writes
+    /// itself: [`persist`](Self::persist) writes the hard state and the log, and
+    /// [`apply`](Self::apply) the applied index, each updating its cache as it goes.
+    /// A live install (`Engine::install_spans`, D-066, D-068) writes all of them in
+    /// one manifest switch that passes through neither, so the caches are left
+    /// describing the replica the switch replaced — and the store then refuses the
+    /// range's next apply, "applying 13 after 10", on an applied index that is the
+    /// old replica's.
+    ///
+    /// A server needs none of this: it ends its run-loop incarnation across an
+    /// install and opens the store again (RAFT.md §1), which builds every cache from
+    /// the keys. A node cannot, because reopening the engine would restart every
+    /// range on it (SHARD.md §11, storage 5), so the values the switch made durable
+    /// are handed back here instead. They are the repair's own, which is why this
+    /// takes them rather than reading them again: the caller has just written them.
+    // PROPOSED(D-086): a live install restates the caches a server gets from
+    // reopening its store.
+    pub fn restate_after_install(
+        &self,
+        term: Term,
+        vote: Option<ServerId>,
+        first_index: Index,
+        last_index: Index,
+        applied: Index,
+    ) {
+        self.term.store(term, Ordering::Release);
+        self.vote
+            .store(vote.map_or(NO_VOTE, |id| id.0), Ordering::Release);
+        self.first_index.store(first_index, Ordering::Release);
+        self.last_index.store(last_index, Ordering::Release);
+        self.applied.store(applied, Ordering::Release);
+    }
+
     /// Writes the snapshot record (RAFT.md §3), synced: called by the snapshot task
     /// before it takes the checkpoint, so the checkpoint's copy carries the
     /// snapshot's own identity before the checkpoint's `CURRENT` is written

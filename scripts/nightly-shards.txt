@@ -59,6 +59,19 @@
 # Putting it under the tiers is owed and is recorded as owed in D-083; the machine these
 # three were measured on was not idle, which for figures of two or three CPU seconds
 # against shards of thirteen hundred changes no assignment.
+# D-086's four rows are Phase 2's four stream variants on the node, weighed on its own
+# tree at ANANKE_SEEDS=1000 in release, from the built binary (`node-<hash> <test>
+# --exact`) rather than through cargo, so each figure is the test's own cost and not a
+# build's. Apple M2, 8 cores, on AC Power, load average 7.96/11.11/16.52 with other
+# agents' slices building beside it. Two run the whole tier because what they measure is
+# a rate over it (261.0 and 265.8 cpu s); two run `high_rate_share()` because what they
+# assert is a structural equality and an absence rather than a rate (43.4 and 73.9).
+# Placed longest-first into the lightest shard, which took them to 6, 3, 4 and 5: the
+# shards now run 1376.3 to 1567.6 cpu s against 1301.8 to 1440.4 before, so the night is
+# bounded by shard 6 at about 6 % over the ideal. The next row added goes into the
+# lightest, which is shard 4. On `scripts/premerge.sh` the four add 644.1 cpu s, about
+# 80 s of wall on eight cores, which puts it near 455 s against the 374.64 s D-052
+# recorded — inside the quarter of an hour D-040 sets (Q39).
 # shard 1: 1432.8 cpu s
 1	engine	625.1	an_install_in_two_switches_is_caught
 1	engine	36.8	an_install_whose_repair_precedes_its_switch_is_caught
@@ -128,6 +141,7 @@
 4	wal	0.2	the_seed_42_trace_is_written_for_the_studio
 4	node	13.5	a_server_that_resets_its_timer_on_any_message_is_caught_on_the_node
 4	node	8.7	a_leader_that_commits_an_older_terms_entry_by_count_is_caught_on_the_node
+4	node	73.9	the_pair_on_the_node_is_the_stream_half_alone_until_the_reseed_lands
 # shard 5: 1351.7 cpu s
 5	echo	6.0	every_seed_satisfies_the_invariants_and_the_sweep_exercises_the_disk_faults
 5	engine	19.5	a_seek_that_counts_tombstones_is_caught
@@ -138,6 +152,7 @@
 5	raft	139.6	the_correct_server_passes_the_membership_scenario_on_every_seed
 5	raft	50.7	a_server_that_applies_before_commit_compacts_past_its_commit_index
 5	ranges	59.0	every_seed_passes_on_the_correct_node
+5	node	43.4	a_leader_that_ignores_incarnations_has_no_incarnation_to_ignore_on_the_node_yet
 # shard 6: 1301.8 cpu s
 6	echo	0.1	a_busy_looping_task_fails_the_scenario_instead_of_hanging
 6	engine	310.3	an_engine_that_acknowledges_before_the_log_is_caught
@@ -165,5 +180,7 @@
 6	node	0.1	a_node_under_the_raft_sweeps_arms_runs_every_range
 6	node	0.1	the_nodes_arms_aim_at_every_range_and_not_at_one
 3	install	2.7	every_wiring_variant_is_caught
+3	node	261.0	a_server_that_installs_without_current_last_is_injected_on_the_node
 6	install	2.4	the_correct_node_installs_on_every_seed
 6	install	0.2	a_stream_flows_and_an_install_completes_on_every_range_and_every_follower
+6	node	265.8	a_leader_that_shares_one_snapshot_directory_is_caught_on_the_node

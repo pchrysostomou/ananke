@@ -282,6 +282,22 @@ pub struct ServerHost<E: Environment> {
     raft: RaftConfig,
     variants: ananke_raft::core::Variants,
     gaps: Mutex<Gaps>,
+    /// What the `apply` task has applied per range, shared with that task.
+    ///
+    /// It is the `apply` task's own state and is written there on every entry. The
+    /// host holds the same map because a **live install replaces a range's state
+    /// machine with no entry passing through that task**: the switch installs the
+    /// snapshot's spans and the repair's applied index, and the task, still holding
+    /// what it applied before the install, fails the range's next job on the gap
+    /// between them — "range 2: apply of 13 after 10".
+    ///
+    /// A server needs no such sharing and this is one more place a node cannot copy
+    /// it: a server ends its run-loop incarnation across an install and builds this
+    /// map again from the store it comes back on (RAFT.md §1), where a node keeps
+    /// running every other range (SHARD.md §11, storage 5).
+    // PROPOSED(D-086): a live install moves the `apply` task's applied state with the
+    // replica, as it moves the core's.
+    applied: Arc<Mutex<BTreeMap<RangeId, Applied>>>,
 }
 
 fn lock<T>(what: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -418,6 +434,35 @@ impl<E: Environment> ServerHost<E> {
             tail,
             core.quarantined(),
         );
+        // The `apply` task's applied state moves with the replica, as the core's
+        // watermark does (`Cores::installed`). The switch replaced this range's state
+        // machine wholesale and no entry passed through that task, so a task still
+        // holding what it applied before the install fails the range's next job on the
+        // gap — "range 2: apply of 13 after 10". The term and the configuration move
+        // with the index because the take reads all three for its snapshot record, and
+        // a record whose term or configuration is off is one D-029's revert floor reads
+        // wrong.
+        // PROPOSED(D-086): a live install moves the `apply` task's applied state.
+        lock(&self.applied).insert(
+            range,
+            Applied {
+                index: at.last_index,
+                term: at.last_term,
+                config: config.clone(),
+            },
+        );
+        // And the store's own caches, for the same reason one layer down: the switch
+        // wrote this range's hard state, log bounds and applied index without passing
+        // through `persist` or `apply`, which are what keep them (PROPOSED D-086).
+        if let Some(store) = self.stores.get(&range) {
+            store.restate_after_install(
+                restored.term(),
+                restored.vote(),
+                at.last_index + 1,
+                restored.last_index(),
+                at.last_index,
+            );
+        }
         if created {
             self.env.trace(TraceEvent::RangeCreated {
                 range: range.get(),
@@ -835,7 +880,12 @@ struct ServerApplier<E: Environment> {
     ranges: Vec<Range>,
     engine_dir: PathBuf,
     node_variants: NodeVariants,
-    applied: Mutex<BTreeMap<RangeId, Applied>>,
+    /// The cores' variants: read here for Phase 2's `SharedSnapshotDir`, whose bit
+    /// names the version directory a take writes (Q37, PROPOSED D-086).
+    cores: ananke_raft::core::Variants,
+    /// Shared with [`ServerHost`], which moves a range's entry when a live install
+    /// replaces that range's state machine (PROPOSED D-086).
+    applied: Arc<Mutex<BTreeMap<RangeId, Applied>>>,
 }
 
 impl<E: Environment> ServerApplier<E> {
@@ -872,6 +922,7 @@ impl<E: Environment> ServerApplier<E> {
             state.index,
             take,
             self.node_variants,
+            self.cores,
         );
         let record = SnapshotRecord {
             last_index: state.index,
@@ -1258,7 +1309,10 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
 
     let mut cores = Cores::new(node_variants);
     let mut replicas: BTreeMap<RangeId, Arc<Mutex<Replica>>> = BTreeMap::new();
-    let mut applied_at: BTreeMap<RangeId, Applied> = BTreeMap::new();
+    // Shared by the `apply` task and the host: the task writes it on every entry,
+    // and the host moves a range's entry when a live install replaces that range's
+    // state machine with no entry passing through the task (PROPOSED D-086).
+    let applied_at: Arc<Mutex<BTreeMap<RangeId, Applied>>> = Arc::default();
     for (range, store, recovered) in opened {
         let id_of = range.id;
         stores.insert(id_of, store.clone());
@@ -1297,7 +1351,7 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
         );
         let applied = store.applied();
         core.step(Input::Applied(applied));
-        applied_at.insert(
+        lock(&applied_at).insert(
             id_of,
             Applied {
                 index: applied,
@@ -1341,6 +1395,7 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
         raft: raft.clone(),
         variants,
         gaps: Mutex::new(Gaps::default()),
+        applied: applied_at.clone(),
     };
     let answers = host.answers.clone();
     env.spawn("answers", {
@@ -1365,7 +1420,8 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
             ranges: ranges.clone(),
             engine_dir: engine.dir.clone(),
             node_variants,
-            applied: Mutex::new(applied_at),
+            cores: variants,
+            applied: applied_at.clone(),
         };
         let jobs = jobs.clone();
         async move {
@@ -1377,7 +1433,13 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
     // would give it a different address and make it a different peer (D-082). It owns
     // the node's `Snapshots` as its planner and keeps the I/O the planner has none of.
     // PROPOSED(D-083): `ananke_shard::snapshot` is run inside the node's server.
-    let mut plan = Snapshots::new(engine.dir.clone(), id, snapshot_cap, node_variants);
+    let mut plan = Snapshots::with_cores(
+        engine.dir.clone(),
+        id,
+        snapshot_cap,
+        node_variants,
+        variants,
+    );
     for range in &ranges {
         plan.host(
             range.id,

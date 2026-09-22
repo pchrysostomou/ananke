@@ -261,18 +261,23 @@ pub enum Cluster {
     Node,
 }
 
-/// The node cluster's `snapshot_threshold`, far above what a run writes.
+/// The node cluster's `snapshot_threshold`: the one-group sweep's own, 12, and
+/// `sim/install.rs`'s (D-083).
 ///
-/// Every snapshot action a core can ask for is behind this number. A leader asks for
-/// a take when its log has outgrown its compacted prefix by the threshold
-/// (`core.rs`), a follower asks for a record on the same condition (D-078), and a
-/// leader asks for an install only for a follower whose `next` has fallen at or below
-/// the compacted prefix — which with nothing compacted is index 0, and no follower's
-/// `next` is ever that. So a run whose highest index stays below this asked for
-/// nothing, and that is what [`Report::highest_index`] lets a sweep assert rather
-/// than assume.
-// PROPOSED(D-082): what the node cluster does not reach yet, asserted absent.
-pub const NODE_SNAPSHOT_THRESHOLD: u64 = 1 << 30;
+/// It was `1 << 30` from PROPOSED D-082 until this slice, and that number was an
+/// absence rather than a setting: the `snapshot` task was not wired to the node's
+/// host, so a small threshold would have produced a stream of takes nobody served
+/// and followers behind a prefix nobody streamed, and the sweep asserted on every
+/// seed that no action had been asked for. PROPOSED D-083 wired the task, and this
+/// slice puts the four stream variants of §10 under these arms, which needs the
+/// path *reached*: a leader asks for a take when its log has outgrown its compacted
+/// prefix by the threshold, a follower asks for a record on the same condition
+/// (D-078), and a leader asks for an install only for a follower whose `next` has
+/// fallen at or below the compacted prefix. At 12 all three happen on every seed,
+/// and the sweep asserts that rather than the absence it asserted before
+/// (PROPOSED D-086).
+// PROPOSED(D-086): the node reaches the stream path, and the absence becomes a reach.
+pub const NODE_SNAPSHOT_THRESHOLD: u64 = 12;
 
 /// The keys the node cluster's clients draw from: two per range, as the node
 /// scenario's are ([`crate::ranges::KEYS`]), so a range's liveness is about a key
@@ -759,27 +764,34 @@ pub const ADOPTION_WAIT_BUDGET: Duration = Duration::from_millis(100);
 const EMPTY_STORE_DELAY: Duration = Duration::from_millis(3);
 
 impl Fault {
-    /// Whether this arm aims at a path [`Cluster::Node`] has not got: the snapshot
-    /// install, the adoption of a staged store, or the refusal of a store that lost
-    /// state.
+    /// Whether this arm aims at a path [`Cluster::Node`] has not got: the adoption of
+    /// a staged store, or the refusal of a store that lost state.
     ///
-    /// Each of the four is an arm whose whole aim is one of those paths — a crash
-    /// timed at an install's last chunk, at an adoption's first durable change, at
-    /// the window a refusal can be laundered in, or at a leader re-taking under a
-    /// live stream. On a node that takes no snapshot and cannot be refused, each
-    /// would wait out its budget and fire as an ordinary isolation or crash, which
+    /// Each is an arm whose whole aim is one of those paths — a crash timed at an
+    /// adoption's first durable change, or at the window a refusal can be laundered
+    /// in. On a node that adopts no staged store and cannot be refused, each would
+    /// wait out its budget and fire as an ordinary isolation or crash, which
     /// [`Schedule::draw`] draws anyway. [`Schedule::draw_on_the_node`] leaves them
     /// out and says why.
-    // PROPOSED(D-082): the arms are shared and the node is a second cluster of them.
+    ///
+    /// **Two arms left this list in PROPOSED D-086.** [`Fault::CrashInstalling`] and
+    /// [`Fault::RetakeUnderStream`] were here until the `snapshot` task was wired to
+    /// the node (PROPOSED D-083): they aim at an install's last chunk and at a leader
+    /// re-taking under a live stream, and the node now has both. They carry
+    /// `SnapshotWithoutCurrentLast` and `SharedSnapshotDir`, which is why the two
+    /// variants could not be re-asserted on the node before and can be now.
+    ///
+    /// The two that stay are not a preference. [`Fault::CrashAdopting`] aims at "the
+    /// moment the adoption's first change to the store directory is durable", and a
+    /// node adopts no staged store at its start — the rule has no subject here, which
+    /// D-082 recorded with the owner's ruling that `AdoptionAsBuilt` is re-asserted on
+    /// the two rules that remain. [`Fault::CrashRefused`] aims at a refused store, and
+    /// Q15's whole-node refusal is PR #86's.
+    // PROPOSED(D-086): the two stream arms come back; the adoption and refusal arms
+    // keep waiting for the slices that own their paths.
     #[must_use]
     pub fn needs_a_path_the_node_has_not_got(&self) -> bool {
-        matches!(
-            self,
-            Self::CrashInstalling { .. }
-                | Self::CrashAdopting { .. }
-                | Self::CrashRefused { .. }
-                | Self::RetakeUnderStream { .. }
-        )
+        matches!(self, Self::CrashAdopting { .. } | Self::CrashRefused { .. })
     }
 }
 
@@ -1307,6 +1319,10 @@ pub struct Report {
     /// the follower it isolated was caught up by entries instead never held a
     /// stream to re-take under. What the sweep asserts fired. (D-043).
     pub aimed_streams: usize,
+    /// How many [`Fault::CrashInstalling`] arms reached the final chunk of the range
+    /// they drew and crashed their victim there: the arm's firing
+    /// (PROPOSED D-086).
+    pub aimed_installs: usize,
     /// Servers refused at a restart, with the reason.
     pub refused: Vec<(u64, String)>,
     /// Why the run stopped early, if it did: a safety violation the folds saw at a
@@ -1569,6 +1585,7 @@ impl Report {
             isolations,
             trials_led_by_slowest: 0,
             aimed_streams: 0,
+            aimed_installs: 0,
             refused,
             stopped,
             history,
@@ -4464,33 +4481,48 @@ impl Report {
         restarts
     }
 
-    /// Every message one server sent another, decoded, with the index of its
-    /// record: what the stream predicates read.
+    /// Every message one server sent another, decoded, with the range it is about
+    /// and the index of its record: what the stream predicates read.
+    ///
+    /// It reads through [`messages_of`], which takes a one-group frame as one message
+    /// of [`SINGLE_GROUP`] and a node's batch frame as the several messages it
+    /// carries, each tagged with its range (D-072, D-076). It decoded a one-group
+    /// frame *only* until PROPOSED D-086, which meant every fold built on it —
+    /// [`Report::retakes_under_streams`] and [`Report::duplicate_chunk_loop`], the two
+    /// `SharedSnapshotDir`'s catch is read from — answered **empty on every seed of
+    /// the node cluster**, whatever the node did. That is not a wrong number; it is a
+    /// fold that cannot report, and an assertion over it would have been green because
+    /// nothing was read rather than because nothing was wrong.
+    // PROPOSED(D-086): the stream folds read the node's batch frames, not one-group
+    // frames alone.
     fn raft_messages(&self) -> Vec<SentMessage> {
-        self.records
-            .iter()
-            .enumerate()
-            .filter_map(|(index, record)| match &record.event {
-                TraceEvent::MessageSent {
-                    id,
+        let mut sent = Vec::new();
+        for (index, record) in self.records.iter().enumerate() {
+            let TraceEvent::MessageSent {
+                id,
+                from,
+                to,
+                payload,
+            } = &record.event
+            else {
+                continue;
+            };
+            let (Some(from), Some(to)) = (server_of(*from), server_of(*to)) else {
+                continue;
+            };
+            for (range, message) in messages_of(payload) {
+                sent.push(SentMessage {
+                    id: *id,
+                    record: index,
+                    at: record.at,
                     from,
                     to,
-                    payload,
-                } => {
-                    let (from, to) = (server_of(*from)?, server_of(*to)?);
-                    let frame = Frame::decode(payload.clone()).ok()?;
-                    Some(SentMessage {
-                        id: *id,
-                        record: index,
-                        at: record.at,
-                        from,
-                        to,
-                        message: frame.message,
-                    })
-                }
-                _ => None,
-            })
-            .collect()
+                    range,
+                    message,
+                });
+            }
+        }
+        sent
     }
 
     /// Every snapshot a server took: its `RaftSnapshot` with `taken` set, paired
@@ -4527,6 +4559,7 @@ impl Report {
                 }
                 TraceEvent::RaftSnapshot {
                     server,
+                    range,
                     last_index,
                     taken: true,
                     ..
@@ -4534,6 +4567,16 @@ impl Report {
                     if let Some((at, dir)) = written.remove(server) {
                         takes.push(SnapshotTake {
                             server: *server,
+                            // The take's range, from its own record. Pairing the
+                            // checkpoint with the node's next `RaftSnapshot` stays
+                            // sound on a node of four ranges because a take is the
+                            // `apply` task's and that task runs one job at a time
+                            // (Q14, D-083), so two ranges' takes cannot interleave
+                            // on one node. What is *not* sound without this field is
+                            // asking whether a server took at an index it had taken
+                            // at before: four ranges cross the threshold at about one
+                            // index (PROPOSED D-086).
+                            range: *range,
                             index: *last_index,
                             dir,
                             at,
@@ -4564,14 +4607,17 @@ impl Report {
     #[must_use]
     pub fn retakes_under_streams(&self) -> Vec<RetakeUnderStream> {
         let messages = self.raft_messages();
-        let openings: Vec<(usize, Instant, u64, u64)> = self
+        // Keyed by (server, range, follower) throughout, not by (server, follower):
+        // a node streams four ranges to one follower at once, and a stream of range 3
+        // opening to server 2 says nothing about a take of range 5 (PROPOSED D-086).
+        let openings: Vec<(usize, Instant, u64, u64, u64)> = self
             .records
             .iter()
             .enumerate()
             .filter_map(|(index, r)| match &r.event {
-                TraceEvent::RaftSnapshotStreams { server, to, .. } => {
-                    Some((index, r.at, *server, *to))
-                }
+                TraceEvent::RaftSnapshotStreams {
+                    server, range, to, ..
+                } => Some((index, r.at, *server, *range, *to)),
                 _ => None,
             })
             .collect();
@@ -4580,7 +4626,9 @@ impl Report {
         for (n, take) in takes.iter().enumerate() {
             let earlier: Vec<&SnapshotTake> = takes[..n]
                 .iter()
-                .filter(|t| t.server == take.server && t.index == take.index)
+                .filter(|t| {
+                    t.server == take.server && t.range == take.range && t.index == take.index
+                })
                 .collect();
             if earlier.is_empty() {
                 continue;
@@ -4589,12 +4637,14 @@ impl Report {
             let chunk = |m: &SentMessage, follower: u64| {
                 m.from == take.server
                     && m.to == follower
+                    && m.range == take.range
                     && matches!(m.message, Message::InstallSnapshot { last_index, .. }
                         if last_index == take.index)
             };
             let installed = |m: &SentMessage, follower: u64| {
                 m.from == follower
                     && m.to == take.server
+                    && m.range == take.range
                     && matches!(m.message, Message::InstallSnapshotResponse {
                         last_index,
                         status: message::SnapshotStatus::Installed,
@@ -4612,8 +4662,11 @@ impl Report {
                 let opened = openings
                     .iter()
                     .rev()
-                    .find(|&&(record, _, server, to)| {
-                        record < take.record && server == take.server && to == follower
+                    .find(|&&(record, _, server, range, to)| {
+                        record < take.record
+                            && server == take.server
+                            && range == take.range
+                            && to == follower
                     })
                     .map(|&(record, at, ..)| (record, at));
                 let sent = messages
@@ -4624,8 +4677,12 @@ impl Report {
                 let Some((since, before)) = opened.max(sent) else {
                     continue;
                 };
-                let reopened = openings.iter().any(|&(_, at, server, to)| {
-                    server == take.server && to == follower && before < at && at <= after.at
+                let reopened = openings.iter().any(|&(_, at, server, range, to)| {
+                    server == take.server
+                        && range == take.range
+                        && to == follower
+                        && before < at
+                        && at <= after.at
                 });
                 let installed_between = messages
                     .iter()
@@ -4635,6 +4692,7 @@ impl Report {
                 }
                 retakes.push(RetakeUnderStream {
                     leader: take.server,
+                    range: take.range,
                     follower,
                     index: take.index,
                     same_dir,
@@ -5086,21 +5144,33 @@ impl Report {
     }
 
     /// The duplicate-file loop of a stream under one identity (D-043's
-    /// Decision): how many deliveries to `follower`, after `since`, of a chunk at
-    /// offset 0 from `leader` the follower answered — its next answer to the
-    /// leader — with `More` naming a different file. That is a file the receiver
+    /// Decision): how many deliveries to `follower`, after `since`, of a chunk of
+    /// `range` at offset 0 from `leader` the follower answered — its next answer to
+    /// the leader — with `More` naming a different file. That is a file the receiver
     /// had already assembled under the stream's identity, so it points the sender
     /// back at the file before, whose acknowledgement sends the same chunk again,
     /// and every `More` keeps the stream from timing out.
+    ///
+    /// `range` is the stream's, and both halves are filtered by it: a node feeds four
+    /// ranges to one follower at once, and a `More` of range 3 says nothing about the
+    /// chunk of range 5 that was delivered just before it. The answer side reads
+    /// through [`messages_of`] for the same reason `Report::raft_messages` does —
+    /// `Frame::decode` alone sees none of a node's frames (PROPOSED D-086).
     #[must_use]
-    pub fn duplicate_chunk_loop(&self, leader: u64, follower: u64, since: Instant) -> usize {
+    pub fn duplicate_chunk_loop(
+        &self,
+        leader: u64,
+        range: u64,
+        follower: u64,
+        since: Instant,
+    ) -> usize {
         let chunks: BTreeMap<ananke_env::MessageId, Bytes> = self
             .raft_messages()
             .into_iter()
             .filter_map(|m| match m.message {
                 Message::InstallSnapshot {
                     file, offset: 0, ..
-                } if m.from == leader && m.to == follower => Some((m.id, file)),
+                } if m.from == leader && m.to == follower && m.range == range => Some((m.id, file)),
                 _ => None,
             })
             .collect();
@@ -5115,16 +5185,17 @@ impl Report {
                     from, to, payload, ..
                 } if server_of(*from) == Some(follower) && server_of(*to) == Some(leader) => {
                     if let Some(file) = pending
-                        && let Ok(Frame {
-                            message:
-                                Message::InstallSnapshotResponse {
-                                    file: answered,
-                                    status: message::SnapshotStatus::More,
-                                    ..
-                                },
-                            ..
-                        }) = Frame::decode(payload.clone())
-                        && answered != *file
+                        && messages_of(payload).into_iter().any(|(of, message)| {
+                            of == range
+                                && matches!(
+                                    message,
+                                    Message::InstallSnapshotResponse {
+                                        file: ref answered,
+                                        status: message::SnapshotStatus::More,
+                                        ..
+                                    } if answered != file
+                                )
+                        })
                     {
                         looped += 1;
                     }
@@ -5247,6 +5318,9 @@ struct SentMessage {
     at: Instant,
     from: u64,
     to: u64,
+    /// The range the message is about: [`SINGLE_GROUP`] on a one-group frame, and the
+    /// batch frame's own tag on the node (PROPOSED D-086).
+    range: u64,
     message: Message,
 }
 
@@ -5255,6 +5329,17 @@ struct SentMessage {
 pub struct SnapshotTake {
     /// The server.
     pub server: u64,
+    /// The range the snapshot is of.
+    ///
+    /// A server of one group takes one range's snapshots and `(server, index)` names
+    /// a take uniquely there. A node takes four ranges' — and four ranges whose
+    /// clients write at about one rate cross `snapshot_threshold` at about one index,
+    /// so `(server, index)` names two different snapshots of two different ranges over
+    /// and over. Every fold that asks "did this server take at an index it had already
+    /// taken at" — `SharedSnapshotDir`'s whole symptom — keys on `(server, range,
+    /// index)` because of this (PROPOSED D-086).
+    // PROPOSED(D-086): a take is a range's, and two ranges take at one index.
+    pub range: u64,
     /// The snapshot's last index.
     pub index: u64,
     /// The checkpoint directory it wrote.
@@ -5270,6 +5355,9 @@ pub struct SnapshotTake {
 pub struct RetakeUnderStream {
     /// The server that took, and was streaming.
     pub leader: u64,
+    /// The range taken again, whose stream it was.
+    // PROPOSED(D-086): a take is a range's, and two ranges take at one index.
+    pub range: u64,
     /// The follower the stream fed.
     pub follower: u64,
     /// The index taken again.
@@ -6139,6 +6227,11 @@ pub fn run_on(
     let mut bursts = 0u64;
     let mut fills = 0u64;
     let mut aimed_streams = 0usize;
+    // How many `Fault::CrashInstalling` arms got as far as the final chunk of the
+    // range they drew and crashed their victim there: the arm's firing, which
+    // `SnapshotWithoutCurrentLast`'s test asserts at every tier so that a sweep which
+    // passes is known to have injected the fault (PROPOSED D-086).
+    let mut aimed_installs = 0usize;
     for (i, (fault, gap)) in schedule.faults.iter().zip(schedule.gaps.iter()).enumerate() {
         if watch.stopped.is_some() {
             break;
@@ -6216,7 +6309,8 @@ pub fn run_on(
                 advance(&mut sim, *isolate, &mut watch);
                 sim.heal();
                 isolations.push((victim, from, sim.now()));
-                if install_landing(&mut sim, &mut watch, victim) {
+                if install_landing(&mut sim, &mut watch, victim, aimed_range) {
+                    aimed_installs += 1;
                     advance(&mut sim, *grace, &mut watch);
                     sim.crash(node_of_server(victim));
                     advance(&mut sim, *down, &mut watch);
@@ -6342,7 +6436,7 @@ pub fn run_on(
                 advance(&mut sim, *isolate, &mut watch);
                 sim.heal();
                 isolations.push((fed, from, sim.now()));
-                if stream_opened(&mut sim, &mut watch, fed) {
+                if stream_opened(&mut sim, &mut watch, fed, aimed_range) {
                     aimed_streams += 1;
                     // The leader's other follower away: the fed one keeps the
                     // leader's quorum alive by answering heartbeats, and there
@@ -6525,6 +6619,7 @@ pub fn run_on(
         isolations,
         trials_led_by_slowest,
         aimed_streams,
+        aimed_installs,
         refused,
         stopped: watch.stopped,
         history,
@@ -6565,7 +6660,7 @@ impl Default for Watch {
 /// since its last look — but the trace cap still stops a runaway. The watch reads
 /// the records since its own last look rather than a copy of the whole trace, for
 /// the reason the checker keeps its state (D-046).
-fn install_landing(sim: &mut Sim, watch: &mut Watch, victim: u64) -> bool {
+fn install_landing(sim: &mut Sim, watch: &mut Watch, victim: u64, of: u64) -> bool {
     if watch.stopped.is_some() {
         return false;
     }
@@ -6600,10 +6695,18 @@ fn install_landing(sim: &mut Sim, watch: &mut Watch, victim: u64) -> bool {
                     payloads.insert(*id, payload.clone());
                 }
                 TraceEvent::MessageDelivered { id, to, .. } => {
+                    // The final chunk **of the range this arm drew**, not of whichever
+                    // range's stream landed first. A node feeds four ranges to one
+                    // follower at once, so a range-blind watch would crash the victim
+                    // at some other range's install and the arm would be aiming at
+                    // nothing (PROPOSED D-086). On one group `of` is the only range
+                    // there is and this is the watch it always was.
                     if server_of(*to) == Some(victim)
                         && let Some(payload) = payloads.get(id)
-                        && let Ok(frame) = Frame::decode(payload.clone())
-                        && matches!(frame.message, Message::InstallSnapshot { done: true, .. })
+                        && messages_of(payload).into_iter().any(|(range, message)| {
+                            range == of
+                                && matches!(message, Message::InstallSnapshot { done: true, .. })
+                        })
                     {
                         return true;
                     }
@@ -6667,7 +6770,7 @@ fn install_completed(sim: &mut Sim, watch: &mut Watch, victim: u64) -> bool {
 /// until the heal just before, so no earlier stream of the run can stand in for
 /// this one. As with [`install_landing`], the safety folds are skipped inside
 /// the small slices and the trace cap still stops a runaway. (D-043).
-fn stream_opened(sim: &mut Sim, watch: &mut Watch, victim: u64) -> bool {
+fn stream_opened(sim: &mut Sim, watch: &mut Watch, victim: u64, of: u64) -> bool {
     if watch.stopped.is_some() {
         return false;
     }
@@ -6687,10 +6790,14 @@ fn stream_opened(sim: &mut Sim, watch: &mut Watch, victim: u64) -> bool {
         }
         let records = sim.trace_from(scanned);
         scanned += records.len();
+        // The opening of a stream **of the range this arm drew** (PROPOSED D-086):
+        // the freeze that follows holds the leader's applied index of *that* range at
+        // the index the running stream is reading, and a stream of another range is
+        // not the one it is about.
         if records.iter().any(|r| {
             matches!(
                 &r.event,
-                TraceEvent::RaftSnapshotStreams { to, .. } if *to == victim
+                TraceEvent::RaftSnapshotStreams { to, range, .. } if *to == victim && *range == of
             )
         }) {
             return true;
@@ -7011,6 +7118,7 @@ mod tests {
             isolations,
             trials_led_by_slowest: 0,
             aimed_streams: 0,
+            aimed_installs: 0,
             refused: Vec::new(),
             stopped: None,
             history: History::default(),

@@ -119,7 +119,25 @@ pub fn version_dir(
     index: Index,
     take: u64,
     variants: NodeVariants,
+    cores: ananke_raft::core::Variants,
 ) -> PathBuf {
+    if cores.contains(ananke_raft::core::Variant::SharedSnapshotDir) {
+        // Phase 2's `SharedSnapshotDir` on the node, by its own bit (Q37): one mutable
+        // directory **per range and index**, with no take counter, so every take at an
+        // index rewrites the directory a stream of that index may have open — the
+        // leader as built before D-043 (`snapshot::checkpoint_dir`, node.rs:1505-1509).
+        //
+        // The range stays in the name and the take counter goes, which is the node's
+        // reading of Phase 2's rule and not a weakening of it. Phase 2's server holds
+        // one range, so "one directory per index" and "one directory per (range,
+        // index)" are the same directory there; on a node they are not, and dropping
+        // the range as well would be [`NodeVariant::VersionDirWithoutRange`], which is
+        // D-075's separate variant about two *ranges* colliding. What this variant is
+        // about is a re-take at one index scrambling the stream reading it, and that
+        // is what the missing take counter does.
+        // PROPOSED(D-086): Phase 2's `SharedSnapshotDir` on the node's version names.
+        return engine_dir.join(format!("snap-{range}-{index}"));
+    }
     if variants.contains(NodeVariant::VersionDirWithoutRange) {
         // The variant: today's `snap-<index>-<take>` (snapshot.rs:119-121), which two
         // ranges taking at one index share.
@@ -334,6 +352,11 @@ pub struct Snapshots {
     me: ServerId,
     cap: usize,
     variants: NodeVariants,
+    /// The **cores'** variants, for the two Phase 2 bits this planner reads:
+    /// `SharedSnapshotDir`'s one directory per index and its one stream at a time
+    /// (Q37 keeps a re-asserted Phase 2 variant's bit). Everything else here is a
+    /// [`NodeVariants`] (PROPOSED D-086).
+    cores: ananke_raft::core::Variants,
     hosted: BTreeMap<RangeId, Vec<KeyRange<Bytes>>>,
     sending: BTreeMap<(RangeId, ServerId), Sending>,
     receiving: BTreeMap<(RangeId, ServerId), Assembly>,
@@ -371,11 +394,34 @@ impl Snapshots {
         cap: usize,
         variants: NodeVariants,
     ) -> Self {
+        Self::with_cores(
+            engine_dir,
+            me,
+            cap,
+            variants,
+            ananke_raft::core::Variants::default(),
+        )
+    }
+
+    /// As [`Snapshots::new`], with the cores' variants too: the two Phase 2 bits this
+    /// planner reads are `SharedSnapshotDir`'s (PROPOSED D-086). Every existing caller
+    /// and every test of this module uses [`Snapshots::new`], whose cores are correct,
+    /// so nothing about the node's own variants moves.
+    // PROPOSED(D-086): the planner reads Phase 2's `SharedSnapshotDir` by its own bit.
+    #[must_use]
+    pub fn with_cores(
+        engine_dir: impl Into<PathBuf>,
+        me: ServerId,
+        cap: usize,
+        variants: NodeVariants,
+        cores: ananke_raft::core::Variants,
+    ) -> Self {
         Self {
             engine_dir: engine_dir.into(),
             me,
             cap,
             variants,
+            cores,
             hosted: BTreeMap::new(),
             sending: BTreeMap::new(),
             receiving: BTreeMap::new(),
@@ -437,7 +483,14 @@ impl Snapshots {
     /// The version directory a range's take at `index` writes.
     #[must_use]
     pub fn version(&self, range: RangeId, index: Index, take: u64) -> PathBuf {
-        version_dir(&self.engine_dir, range, index, take, self.variants)
+        version_dir(
+            &self.engine_dir,
+            range,
+            index,
+            take,
+            self.variants,
+            self.cores,
+        )
     }
 
     /// What a sweep of `range` deletes, given every name in the engine directory and
@@ -478,7 +531,17 @@ impl Snapshots {
     /// (range, follower) at another identity is replaced, which is the leader having
     /// moved on.
     pub fn stream(&mut self, range: RangeId, to: ServerId, at: Identity) -> Started {
-        if self.variants.contains(NodeVariant::CapStreamsSent)
+        // The node's own `CapStreamsSent` (D-075) and Phase 2's `SharedSnapshotDir`
+        // meet here: D-043's rule is one rule, and the half of the Phase 2 variant
+        // that is about streams — "one snapshot stream at a time, every other
+        // designated follower queued behind it" (core.rs:100-112) — *is* this cap.
+        // Both bits are read because each is asserted on its own: the node's variant
+        // by D-083's deterministic checks, Phase 2's under `Fault::RetakeUnderStream`
+        // at its Phase 2 tier (PROPOSED D-086).
+        if (self.variants.contains(NodeVariant::CapStreamsSent)
+            || self
+                .cores
+                .contains(ananke_raft::core::Variant::SharedSnapshotDir))
             && self.sending.len() >= BUGGY_SEND_CAP
             && !self.sending.contains_key(&(range, to))
         {

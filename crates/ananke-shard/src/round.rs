@@ -255,8 +255,27 @@ impl Cores {
         self.applied.get(&range).copied().unwrap_or(0)
     }
 
-    /// Puts `core` on the node as `range`'s, replacing whatever was there.
+    /// Puts `core` on the node as `range`'s, replacing whatever was there, and takes
+    /// the applied watermark from it.
+    ///
+    /// The watermark is `core.applied()` and not zero, for the same reason
+    /// [`Cores::installed`] moves it: the entries an `Apply` names are read at the step
+    /// that named them, from `applied_sent` to `through`, and a core whose log begins
+    /// above index 1 does not hold what a watermark of zero would ask for.
+    ///
+    /// **This is the start path, and it was zero until PROPOSED D-086.** D-083 found
+    /// the same fault on the install path and fixed it there; the start path was not
+    /// reached by any scenario in the tree, because a node whose log is never compacted
+    /// restarts on a log that still begins at index 1 and a watermark of zero is
+    /// correct for it. The raft sweep's arms crash and restart a node, this slice gives
+    /// that node a `snapshot_threshold` its clients pass, and the first restart after a
+    /// compaction asked for index 1 and stopped the node: "an apply through 41 names
+    /// index 1, which the core does not hold", on 17 of the gate's 20 seeds. A sweep
+    /// that reaches a path is what finds this; an argument that the install path's fix
+    /// covered the start path would have been wrong.
+    // PROPOSED(D-086): the applied watermark is the core's at every start, not zero.
     pub fn insert(&mut self, range: RangeId, core: Raft) {
+        self.applied.insert(range, core.applied());
         self.slots.insert(range, Slot::new(core));
     }
 

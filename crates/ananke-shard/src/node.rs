@@ -803,6 +803,36 @@ impl<E: Environment, H: Host> Node<E, H> {
                     });
                 }
             }
+            // A follower's compaction record is the `apply` task's too, for the same
+            // reason and by the same route: it is written between two applies so the
+            // index and term it records are exact (D-065, D-078, D-036).
+            //
+            // **It went to the `snapshot` task until PROPOSED D-086, which dropped
+            // it**: `install::job_of` answers `None` for `Record` as it does for
+            // `Take`, and only `Take` had an arm here, so a follower's compaction was
+            // asked for and nothing happened. The cost is not a missing compaction. The
+            // core sets `take_pending` when it asks (`core.rs`), and only an answer —
+            // `SnapshotTaken` or `SnapshotFailed` — clears it, so a replica that asked
+            // once **never asked for another snapshot for the rest of its life**. When
+            // that replica later leads and a follower falls behind its log, `replicate`
+            // finds `taken` empty and `take_pending` set, asks for nothing, and sends
+            // an empty AppendEntries at its own last index forever while the follower
+            // rejects with a hint the leader is not in a branch to read. The range
+            // commits nothing again: the liveness bound, on the correct node, on seeds
+            // 17, 20 and 64 of the first hundred.
+            //
+            // Nothing before this slice could see it. `sim/install.rs` has no follower
+            // that compacts and later leads, and every other node scenario holds
+            // `snapshot_threshold` above what its clients write, so `Record` was never
+            // asked for at all.
+            // PROPOSED(D-086): the follower's compaction record reaches the `apply`
+            // task, and the core is answered.
+            Output::Snapshot(SnapshotAction::Record) => {
+                self.host.apply(ApplyJob {
+                    range,
+                    work: ApplyWork::Record,
+                });
+            }
             Output::Snapshot(action) => self.host.snapshot(range, action),
             // D-047: decided at the step, traced now, which is when it is durable for
             // every event that followed a persist.

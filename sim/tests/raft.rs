@@ -3018,7 +3018,12 @@ fn a_leader_that_shares_one_snapshot_directory_and_streams_one_follower_at_a_tim
         let looped = scrambled
             .iter()
             .map(|retake| {
-                report.duplicate_chunk_loop(retake.leader, retake.follower, retake.retook)
+                report.duplicate_chunk_loop(
+                    retake.leader,
+                    retake.range,
+                    retake.follower,
+                    retake.retook,
+                )
             })
             .sum();
         (

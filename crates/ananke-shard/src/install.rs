@@ -415,9 +415,6 @@ impl<E: Environment> Task<E> {
             last_index: index,
             last_term: term,
         };
-        if self.plan.is_streaming(range, to, at) {
-            return;
-        }
         let Some(store) = self.stores.get(&range).cloned() else {
             return;
         };
@@ -426,10 +423,40 @@ impl<E: Environment> Task<E> {
         // take — the store compacted without checkpointing (D-065, D-078), or a crash
         // landed between the record and the checkpoint — is not a stream to open but a
         // take to ask for, which `retake` does.
-        let dir = match store.snapshot_record().await {
-            Ok(Some(record)) if record.taken && record.last_index == index => record.dir,
+        //
+        // **The record is matched at or past the index the core asked for, not at it.**
+        // The `apply` task takes between two applies and rewrites this record each
+        // time, while the `Install` the core asked for carries the index its `taken`
+        // held when it asked; the two are written and read by different tasks, so a
+        // take that lands between the ask and this read moves the record past the ask.
+        // Matched exactly, that was a `retake` — which clears the core's `taken`, has
+        // it take again, ask again, and lose the race again: a cascade that on
+        // `sim/install.rs`'s seed 7 left one install of eight never completing, however
+        // long the run was given. A newer snapshot is not a worse answer for a follower
+        // behind the compacted prefix; it is a better one, and the stream is opened on
+        // the record's own identity so the receiver's assembly and the chunks agree,
+        // with `Input::SnapshotInstalled` carrying the index actually installed
+        // (`Raft::on_snapshot_installed` takes `matched.max(index)`).
+        //
+        // It stayed hidden while `SnapshotAction::Record` was dropped on the floor,
+        // because a replica that asked for one never asked for another snapshot again
+        // and takes were rare (PROPOSED D-086).
+        // PROPOSED(D-086): a stream opens on the record it finds at or past the ask.
+        let (dir, at) = match store.snapshot_record().await {
+            Ok(Some(record)) if record.taken && record.last_index >= index => (
+                record.dir,
+                Identity {
+                    term: at.term,
+                    last_index: record.last_index,
+                    last_term: record.last_term,
+                },
+            ),
             _ => return self.retake(range, to),
         };
+        if self.plan.is_streaming(range, to, at) {
+            return;
+        }
+        let (index, term) = (at.last_index, at.last_term);
         let started = self.plan.stream(range, to, at);
         if matches!(started, Started::Waiting) {
             // Only `CapStreamsSent` answers this: Q14 puts no cap on streams sent.
@@ -711,7 +738,27 @@ impl<E: Environment> Task<E> {
             // the repair's tail is all that goes back (D-083).
             &BTreeSet::new(),
         );
-        let switched = if install.repair_in_switch {
+        // Phase 2's `SnapshotWithoutCurrentLast` on the node's install path, by its own
+        // bit (Q37). RAFT.md:694 has it break "the staged `CURRENT` written last, after
+        // the repair"; on the node the commit point of an install is this manifest
+        // switch, and the rule becomes that the switch is made only with the range's
+        // repair carried in it (SHARD.md §12, question 2; D-066). That is exactly what
+        // [`NodeVariant::InstallWithoutRepair`] does, and D-075 named it "the node's
+        // translation" of the Phase 2 variant — but nothing read the Phase 2 bit, so a
+        // node whose cores carried it installed correctly. This is the same shape D-082
+        // found `SendBeforePersist` in: a bit set, carried, and read by nothing.
+        //
+        // The two are kept apart rather than merged. `InstallWithoutRepair` is the
+        // node's own variant and is asserted deterministically by D-083's checks; this
+        // is Phase 2's, re-asserted under `Fault::CrashInstalling` at its Phase 2 tier,
+        // and either alone breaks the rule.
+        // PROPOSED(D-086): Phase 2's `SnapshotWithoutCurrentLast` on the node's switch.
+        let with_repair = install.repair_in_switch
+            && !self
+                .config
+                .variants
+                .contains(ananke_raft::core::Variant::SnapshotWithoutCurrentLast);
+        let switched = if with_repair {
             store
                 .engine()
                 .install_spans(install.spans.clone(), source, batch)

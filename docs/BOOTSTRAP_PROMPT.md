@@ -101,6 +101,32 @@ ananke/
 
 _Update this section at the end of every session._
 
+- Branch `phase-3-stage-b-stream-variants`, stacked on the snapshot wiring
+  (2026-09-22): **the node reaches the stream path**, and Phase 2's four stream
+  variants are measured on it (PROPOSED D-086). The node's `snapshot_threshold` drops
+  from `1 << 30` to the one-group sweep's 12 and `Fault::CrashInstalling` and
+  `Fault::RetakeUnderStream` come back to `Schedule::draw_on_the_node`, so
+  `sim/tests/node.rs` asserts the snapshot path **reached** on every seed where D-082
+  asserted it absent. Reaching it found **four node bugs, all fixed here and none of
+  them a bound widened**: the applied watermark left at zero at every start
+  (`Cores::insert`), a live install leaving the `apply` task's applied state behind and
+  the store's own caches stale (`RaftStore::restate_after_install`), and
+  `SnapshotAction::Record` — D-078's follower compaction — routed to the `snapshot`
+  task, which drops it, so a replica that asked once never asked for another snapshot
+  again and wedged its range the moment it led. That last one tripped the **liveness
+  bound on the correct node** on 3 of the first 100 seeds, and fixing it uncovered a
+  fifth: a stream opened only on a snapshot record whose index matched the ask exactly,
+  and the `apply` task rewrites that record on every take, so an install could lose the
+  race forever — `sim/install.rs`'s seed 7, at any run length. With the four fixed the
+  correct node passes every seed at the gate's twenty and CI's hundred, over 6 250
+  snapshot actions. `Cluster::OneGroup` is untouched: seed 42's JSONL still hashes to
+  `445f970010f9d493d489d7627543b77cccba863cb5675af4602686f5de182217`.
+  **Two of the four variants are not re-asserted at their Phase 2 tier and the numbers
+  go to the owner**: `SnapshotWithoutCurrentLast` is caught on 0/100 with its arm firing
+  on 1/100, `SharedSnapshotDir` on 0/100 with its re-take half not built at all, and
+  `IgnoreIncarnation` and the pair are blocked on PR #86's whole-node refusal, since a
+  live install deliberately keeps a store's incarnation and only a re-seed changes one.
+
 - Merge update (2026-09-22): branch `phase-3-stage-b-compaction` merged `origin/main`
   to resolve PR conflicts, carrying in PROPOSED D-073 and D-074 from main and keeping
   this branch's PROPOSED D-078.
