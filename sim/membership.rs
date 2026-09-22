@@ -440,7 +440,9 @@ impl Report {
         // `RaftMatchStarted` states, folded here as in the raft sweep — this is the
         // scenario that drives changes, so it is where learners and re-tracked
         // followers raise a match.
-        if let Err(violation) = raft::payload_is_well_formed(&self.records) {
+        if let Err(violation) =
+            raft::payload_is_well_formed(&self.records, &[ananke_raft::node::SINGLE_GROUP])
+        {
             return fail(violation);
         }
         if let Err(violation) = raft::match_starts_are_first_rises(&self.records) {

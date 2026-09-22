@@ -46,6 +46,7 @@ version = "0.3.0"
 dependencies = [
  "ananke-env",
  "ananke-raft",
+ "ananke-storage",
  "bytes",
  "moirae-trace",
 ]
@@ -57,6 +58,7 @@ dependencies = [
  "ananke-env",
  "ananke-raft",
  "ananke-server",
+ "ananke-shard",
  "ananke-storage",
  "bytes",
  "moirae-sched",

@@ -7,13 +7,17 @@
 //! core is untouched — so they are a set of their own rather than more of the core's,
 //! and they do not appear in [`ananke_raft::Variant::BUGS`] or in §10's count.
 //!
-//! The node is not yet under the sweeps: slice 4 of Stage B puts it there. Until then
-//! each variant is caught by a deterministic check in this crate, which is the pair
-//! rule's requirement — the buggy variant is *seen to fail* the check the correct code
-//! passes — without a rate to measure (D-061 asks a tier of a *sweep's* assertion).
-//! The `snapshot` task's own are [`NodeVariant::SNAPSHOT`], each a way to get a
-//! snapshot keyed by range and follower wrong; they are caught the same way, by
-//! deterministic checks in [`mod@crate::snapshot`].
+//! Most are caught by a deterministic check in this crate, which is the pair rule's
+//! requirement — the buggy variant is *seen to fail* the check the correct code passes
+//! — without a rate to measure (D-061 asks a tier of a *sweep's* assertion). Since
+//! D-076 the node is under a sweep of its own as well (`sim/tests/ranges.rs`), and
+//! [`NodeVariant::StepWhilePersisting`] is caught there on 63.9 % of seeds, asserted at
+//! every tier. A variant no sweep can see keeps its deterministic check and says so:
+//! [`NodeVariant::HeldLocalDropped`] is one, because a client retries a request it
+//! loses and an `Applied` is superseded by the next one, so the sweep passes it at a
+//! thousand seeds. The `snapshot` task's own are [`NodeVariant::SNAPSHOT`], each a way
+//! to get a snapshot keyed by range and follower wrong; they are caught the same way,
+//! by deterministic checks in [`mod@crate::snapshot`].
 //!
 //! [`NodeVariant::PersistsNotArmed`] is caught over a small fixed set of scheduling
 //! seeds rather than on one, because what it breaks depends on which side of the
@@ -51,6 +55,20 @@ pub enum NodeVariant {
     /// stops counting against the node's byte bound, so a node behind a slow sync
     /// holds messages without limit (SHARD.md §4, Q14).
     HeldNotCounted,
+    /// A node-local input — a client's request, an index the `apply` task made
+    /// durable — arriving for a core whose persist is outstanding is thrown away
+    /// instead of held, so a client of that range loses its request and the core is
+    /// never told that index applied (SHARD.md §4).
+    ///
+    /// Holding a *local* input exactly as a message of its range is held is the
+    /// node's own rule, and nothing downstream of it can see the difference: a client
+    /// retries, and an `Applied` is superseded by the next one. That is why this
+    /// variant is caught by a check of its own in [`mod@crate::node`] rather than by
+    /// a sweep — the node scenario's checks pass it at a thousand seeds — and why
+    /// [`Meters::locals_held`] exists to say the path was reached at all.
+    ///
+    /// [`Meters::locals_held`]: crate::round::Meters::locals_held
+    HeldLocalDropped,
     /// The round's persists are submitted but not armed: the futures are left unpolled
     /// until the loop happens to poll them, so the round's records reach the WAL writer
     /// only after the task has taken another event — and join whatever group is open
@@ -126,6 +144,7 @@ impl NodeVariant {
         NodeVariant::CollapseHeldTicks,
         NodeVariant::PersistsOneAtATime,
         NodeVariant::HeldNotCounted,
+        NodeVariant::HeldLocalDropped,
         NodeVariant::PersistsNotArmed,
         NodeVariant::AppliedNotAdvanced,
         NodeVariant::TakeToSnapshotTask,
@@ -171,6 +190,7 @@ impl NodeVariant {
             NodeVariant::CollapseHeldTicks => 1 << 2,
             NodeVariant::PersistsOneAtATime => 1 << 3,
             NodeVariant::HeldNotCounted => 1 << 4,
+            NodeVariant::HeldLocalDropped => 1 << 19,
             NodeVariant::PersistsNotArmed => 1 << 5,
             NodeVariant::AppliedNotAdvanced => 1 << 6,
             NodeVariant::TakeToSnapshotTask => 1 << 7,
@@ -197,6 +217,7 @@ impl NodeVariant {
             NodeVariant::CollapseHeldTicks => "CollapseHeldTicks",
             NodeVariant::PersistsOneAtATime => "PersistsOneAtATime",
             NodeVariant::HeldNotCounted => "HeldNotCounted",
+            NodeVariant::HeldLocalDropped => "HeldLocalDropped",
             NodeVariant::PersistsNotArmed => "PersistsNotArmed",
             NodeVariant::AppliedNotAdvanced => "AppliedNotAdvanced",
             NodeVariant::TakeToSnapshotTask => "TakeToSnapshotTask",
@@ -294,7 +315,7 @@ mod tests {
             assert_eq!(seen & variant.bit(), 0, "{variant} shares a bit");
             seen |= variant.bit();
         }
-        assert_eq!(NodeVariant::BUGS.len(), 19);
+        assert_eq!(NodeVariant::BUGS.len(), 20);
         for variant in NodeVariant::SNAPSHOT {
             assert!(
                 NodeVariant::BUGS.contains(variant),

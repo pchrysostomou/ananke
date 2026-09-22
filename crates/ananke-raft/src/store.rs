@@ -789,6 +789,35 @@ impl<E: Environment> RaftStore<E> {
         if let Some(lost) = LostState::of(recovery) {
             return Err(io::Error::new(io::ErrorKind::InvalidData, lost));
         }
+        Self::open_checked(engine, prefix).await
+    }
+
+    /// Another range's store on the engine this one already opened (SHARD.md §2,
+    /// §4): the node has one engine and a store per range, each under its own
+    /// prefix.
+    ///
+    /// The two checks [`open`](Self::open) makes first are the *engine's* and not
+    /// the store's — that the directory's format was read for this engine (D-059)
+    /// and that the engine's recovery lost nothing in the middle (D-044) — and
+    /// both were made when the engine was opened, for every store on it. Nothing
+    /// here re-reads them; everything else — the incarnation key a fresh store
+    /// writes, the stale log keys a crash left, the configuration key read back
+    /// against the log — is per prefix and is done again for this one.
+    ///
+    /// # Errors
+    ///
+    /// The engine's, or `InvalidData` for a value that is not what was written.
+    // PROPOSED(D-076): one engine, a store per range.
+    pub async fn open_sibling(&self, prefix: KeyPrefix) -> io::Result<(Self, Recovered)> {
+        Self::open_checked(self.engine.clone(), prefix).await
+    }
+
+    /// The part of [`open`](Self::open) that is about the prefix: everything after
+    /// the two checks the engine answers for.
+    async fn open_checked(
+        engine: Arc<Engine<E>>,
+        prefix: KeyPrefix,
+    ) -> io::Result<(Self, Recovered)> {
         let (term, vote) = match engine.get(&prefix.hard_key()).await? {
             None => (0, None),
             Some(bytes) => decode_hard(bytes)?,

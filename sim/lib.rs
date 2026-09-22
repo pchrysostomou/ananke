@@ -26,6 +26,7 @@ pub mod membership;
 pub mod parallel;
 pub mod quorum;
 pub mod raft;
+pub mod ranges;
 pub mod wal;
 
 pub use parallel::{sweep, verdict};
