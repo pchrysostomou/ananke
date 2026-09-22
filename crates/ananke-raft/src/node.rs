@@ -776,6 +776,22 @@ pub async fn run<E: Environment>(env: E, config: NodeConfig) -> io::Result<()> {
                         reason: error.to_string(),
                     },
                 );
+                // The replica the refusal took down, named beside it. This server
+                // hosts one group, so there is exactly one; the node hosting many
+                // traces one per range it holds. A reader takes "the ranges this
+                // server held" from these and not from the ranges of the run, which
+                // on a node would include ranges it never held (D-077,
+                // `Report::ranges_with_a_majority_up`). It is traced with the
+                // refusal's own decision stamp: the same instant decided both.
+                // PROPOSED(D-077): Q15's whole-node refusal, and the re-seed per
+                // replica.
+                env.trace_decided(
+                    refused,
+                    TraceEvent::RaftReplicaRefused {
+                        server,
+                        range: SINGLE_GROUP,
+                    },
+                );
                 // Re-seed mode (RAFT.md §3): the store is gone; wait for a
                 // leader's snapshot to rebuild it, taking part in nothing else.
                 match reseed(

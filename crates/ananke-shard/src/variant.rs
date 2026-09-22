@@ -205,6 +205,44 @@ pub enum NodeVariant {
     /// and the correct route are the same route.
     // PROPOSED(D-083): a stream's answers are stepped into the stream's range alone.
     SnapshotAckToEveryCore,
+    /// A loss in the shared engine treated as one range's: only the range whose store
+    /// open failed is refused — traced as refused, and given a refused mark — and the
+    /// node's other replicas are neither. A node owns one engine (Q2), so a loss in it
+    /// is every replica's: this is the whole of Q15 got wrong (SHARD.md §11, storage 8).
+    ///
+    /// What the three unrefused replicas then do is worth stating exactly, because the
+    /// obvious sentence — that they "carry on over the same engine" — is not available
+    /// to any implementation: the refused directory's marker says lost, so nothing can
+    /// open it at all. They are re-created in the *new* engine instead, and because
+    /// nothing refused them they are created there as a first start would create them:
+    /// quarantine clear, incarnation 1, empty. That is the same harm one range along —
+    /// three replicas voting again on state their node lost (D-035) and three leaders
+    /// keeping a `matched` the rebuilt log cannot honour (D-042) — reached by the
+    /// mistake a reader of §11 would actually make.
+    RefuseOneRangeOnly,
+    /// The re-seed built in the refused directory instead of a new one beside it,
+    /// which opens fresh a directory that held a store (D-041).
+    ReseedIntoRefusedDir,
+    /// The re-seed's new directory taking the lowest generation not in use rather than
+    /// the one past the highest present: a node refused twice hands back its first
+    /// refusal's directory (D-041).
+    ReuseLostGeneration,
+    /// A start opening the newest directory whatever its marker says, instead of the
+    /// newest not marked lost (D-066). A node refused into a new directory that
+    /// crashed before that directory held anything then reopens the refused one.
+    OpenNewestEvenIfLost,
+    /// A replica of a re-seeded node answering before its durable refused mark is
+    /// written into the new engine. Every replica in a fresh engine would otherwise
+    /// open as a first start — quarantine clear, incarnation 1 — so a replica that
+    /// answers first is a replica that may vote again on state its node lost (D-035)
+    /// and whose leader keeps a `matched` the rebuilt log cannot honour (D-042).
+    ServeBeforeRefusedMark,
+    /// The replica's incarnation drawn from the per-range protocol stream rather than
+    /// from the node's own generator. `SimEnv` derives a named stream from the seed and
+    /// the name alone, so a replica created again for the same (range, node) draws the
+    /// number its predecessor drew, and a leader that compares incarnations for
+    /// inequality only (D-042) never resets (Q26; SHARD.md:1372-1379).
+    IncarnationPerRangeStream,
 }
 
 impl NodeVariant {
@@ -237,6 +275,28 @@ impl NodeVariant {
         NodeVariant::InstallHoldsEveryRange,
         NodeVariant::InstallSweepsEveryStaging,
         NodeVariant::SnapshotAckToEveryCore,
+        NodeVariant::RefuseOneRangeOnly,
+        NodeVariant::ReseedIntoRefusedDir,
+        NodeVariant::ReuseLostGeneration,
+        NodeVariant::OpenNewestEvenIfLost,
+        NodeVariant::ServeBeforeRefusedMark,
+        NodeVariant::IncarnationPerRangeStream,
+    ];
+
+    /// Q15's whole-node refusal and re-seed, in order: the six ways to get a node's
+    /// refusal wrong (SHARD.md §11, storage 8; D-077). Four of the six are mutations a
+    /// single-range world could not catch at all — with one range on a node, refusing
+    /// only that range *is* refusing the node, and a per-range incarnation stream is
+    /// the node's own generator drawn once — and the two about directories need a node
+    /// refused twice in a run, which one range reaches no sooner but which no check
+    /// before this slice asked of any node.
+    pub const RESEED: &'static [NodeVariant] = &[
+        NodeVariant::RefuseOneRangeOnly,
+        NodeVariant::ReseedIntoRefusedDir,
+        NodeVariant::ReuseLostGeneration,
+        NodeVariant::OpenNewestEvenIfLost,
+        NodeVariant::ServeBeforeRefusedMark,
+        NodeVariant::IncarnationPerRangeStream,
     ];
 
     /// The `snapshot` task's own, in order: the eleven ways to get a snapshot keyed by
@@ -281,7 +341,7 @@ impl NodeVariant {
     ];
 
     /// The bit this variant takes in a [`NodeVariants`].
-    const fn bit(self) -> u32 {
+    const fn bit(self) -> u64 {
         match self {
             NodeVariant::DeferredFlushedEarly => 1,
             NodeVariant::StepWhilePersisting => 1 << 1,
@@ -310,6 +370,12 @@ impl NodeVariant {
             NodeVariant::InstallHoldsEveryRange => 1 << 24,
             NodeVariant::InstallSweepsEveryStaging => 1 << 25,
             NodeVariant::SnapshotAckToEveryCore => 1 << 26,
+            NodeVariant::RefuseOneRangeOnly => 1 << 27,
+            NodeVariant::ReseedIntoRefusedDir => 1 << 28,
+            NodeVariant::ReuseLostGeneration => 1 << 29,
+            NodeVariant::OpenNewestEvenIfLost => 1 << 30,
+            NodeVariant::ServeBeforeRefusedMark => 1 << 31,
+            NodeVariant::IncarnationPerRangeStream => 1 << 32,
         }
     }
 
@@ -344,6 +410,12 @@ impl NodeVariant {
             NodeVariant::InstallHoldsEveryRange => "InstallHoldsEveryRange",
             NodeVariant::InstallSweepsEveryStaging => "InstallSweepsEveryStaging",
             NodeVariant::SnapshotAckToEveryCore => "SnapshotAckToEveryCore",
+            NodeVariant::RefuseOneRangeOnly => "RefuseOneRangeOnly",
+            NodeVariant::ReseedIntoRefusedDir => "ReseedIntoRefusedDir",
+            NodeVariant::ReuseLostGeneration => "ReuseLostGeneration",
+            NodeVariant::OpenNewestEvenIfLost => "OpenNewestEvenIfLost",
+            NodeVariant::ServeBeforeRefusedMark => "ServeBeforeRefusedMark",
+            NodeVariant::IncarnationPerRangeStream => "IncarnationPerRangeStream",
         }
     }
 }
@@ -355,9 +427,11 @@ impl fmt::Display for NodeVariant {
 }
 
 /// A set of [`NodeVariant`]s, shaped like [`ananke_raft::core::Variants`] so the two
-/// read alike where a scenario configures both.
+/// read alike where a scenario configures both. The word is 64 bits and Raft's is 32:
+/// the node's thirty-three variants outgrew a `u32` when the snapshot wiring's seven
+/// and Q15's six met on one tree, and nothing but this module reads the bits.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct NodeVariants(u32);
+pub struct NodeVariants(u64);
 
 impl NodeVariants {
     /// The correct node: no variant.
@@ -422,13 +496,19 @@ mod tests {
 
     #[test]
     fn every_variant_takes_a_bit_of_its_own() {
-        let mut seen = 0u32;
+        let mut seen = 0u64;
         for variant in NodeVariant::BUGS {
             assert_eq!(seen & variant.bit(), 0, "{variant} shares a bit");
             seen |= variant.bit();
         }
-        assert_eq!(NodeVariant::BUGS.len(), 27);
-        for variant in NodeVariant::SNAPSHOT.iter().chain(NodeVariant::WIRING) {
+        // Twenty of the round's, the snapshot task's seven for the wiring, and
+        // D-077's six for Q15's whole-node refusal and re-seed.
+        assert_eq!(NodeVariant::BUGS.len(), 33);
+        for variant in NodeVariant::SNAPSHOT
+            .iter()
+            .chain(NodeVariant::WIRING)
+            .chain(NodeVariant::RESEED)
+        {
             assert!(
                 NodeVariant::BUGS.contains(variant),
                 "{variant} is not in BUGS"
@@ -436,13 +516,21 @@ mod tests {
         }
         assert_eq!(NodeVariant::SNAPSHOT.len(), 11);
         assert_eq!(NodeVariant::WIRING.len(), 7);
-        // The discipline and the wiring are disjoint: a variant is a way to get the
-        // `snapshot` task's keys, caps and frames wrong, or a way to get its running
-        // inside the node wrong, and never both.
+        assert_eq!(NodeVariant::RESEED.len(), 6);
+        // The discipline, the wiring and the re-seed are disjoint: a variant is a way
+        // to get the `snapshot` task's keys, caps and frames wrong, a way to get its
+        // running inside the node wrong, or a way to get Q15's refusal wrong, and
+        // never two of the three.
         for variant in NodeVariant::WIRING {
             assert!(
                 !NodeVariant::SNAPSHOT.contains(variant),
                 "{variant} is in both sets"
+            );
+        }
+        for variant in NodeVariant::RESEED {
+            assert!(
+                !NodeVariant::SNAPSHOT.contains(variant) && !NodeVariant::WIRING.contains(variant),
+                "{variant} is in two sets"
             );
         }
     }

@@ -2464,9 +2464,35 @@ impl Report {
     /// every schedule has been redrawn since, and seed 60 of this tree has its
     /// range live.)
     ///
-    /// A node's refusal is its whole store's, so every replica on it counts as
+    /// A node's refusal is its whole store's, so every replica *on it* counts as
     /// refused (SHARD.md §8); its re-seed and its quarantine are per replica.
+    ///
+    /// "On it" is the load-bearing word, and until D-077 this read it as *every range
+    /// in the run*. With one group on a server the two are the same sentence. With four
+    /// ranges on a node they are not: a refusal marked its node down for ranges it never
+    /// held and for ranges created after it was refused, and since a range whose
+    /// impaired replicas reach half is dropped from this set, each of those ranges was
+    /// silently exempted from the checks about time — the bound, the recovery margin,
+    /// every tooth §8 has. One refusal on a four-range node exempted the three ranges
+    /// the refusal did not touch. The direction is the dangerous one: the checks pass
+    /// because they are not asked.
+    ///
+    /// The ranges a refusal takes down are now the ones the node says it held, from the
+    /// `RaftReplicaRefused` its refusal traces per replica. They cannot come from the
+    /// node's *store*, and this is why the event exists: `RaftRefused` is traced before
+    /// the store opens — the refusal is what stops it opening — so at that instant there
+    /// is nothing to ask. What the node does have is the ranges §2 fixed at bootstrap,
+    /// in its configuration before it touches a disk, and those are what it names.
+    ///
+    /// A `RaftRefused` with no `RaftReplicaRefused` beside it therefore takes nothing
+    /// down. That is not a gap but the one-group server, which hosts a group rather than
+    /// holding ranges and whose refusal `sim/quorum.rs` and the `raft` arms still raise:
+    /// its range is `SINGLE_GROUP`, the only range of those runs, and it is marked down
+    /// by its own per-replica event once the node traces one. Until a scenario runs the
+    /// node, the sole reader of this is the node's own sweep.
     // PROPOSED(D-071): the checks about time are asked per range.
+    // PROPOSED(D-077): a refusal marks down the ranges its node held, which its
+    // per-replica refusal events name, and not every range in the run.
     #[must_use]
     pub fn ranges_with_a_majority_up(&self) -> BTreeSet<u64> {
         let ranges = self.ranges();
@@ -2474,8 +2500,8 @@ impl Report {
         let mut quarantined: BTreeSet<(u64, u64)> = BTreeSet::new();
         for record in &self.records {
             match &record.event {
-                TraceEvent::RaftRefused { server, .. } => {
-                    down.extend(ranges.iter().map(|range| (*range, *server)));
+                TraceEvent::RaftReplicaRefused { server, range } => {
+                    down.insert((*range, *server));
                 }
                 TraceEvent::RaftRecovered { server, range, .. } => {
                     down.remove(&(*range, *server));
@@ -7021,6 +7047,17 @@ mod tests {
         }
     }
 
+    fn refused(server: u64) -> TraceEvent {
+        TraceEvent::RaftRefused {
+            server,
+            reason: "a table the manifest names is gone".to_owned(),
+        }
+    }
+
+    fn replica_refused(server: u64, range: u64) -> TraceEvent {
+        TraceEvent::RaftReplicaRefused { server, range }
+    }
+
     fn vote(server: u64) -> TraceEvent {
         TraceEvent::RaftVote {
             server,
@@ -7662,7 +7699,8 @@ mod tests {
     /// form a majority (SHARD.md §8), where RAFT.md §2 asked it of the cluster: two
     /// of one range's three replicas quarantined by a re-seed leave that range with
     /// no majority, and say nothing about the range beside it. A node's refusal is
-    /// its whole store's and impairs every range on it.
+    /// its whole store's and impairs every range **on it**, which its per-replica
+    /// refusals name (D-077).
     #[test]
     fn a_majority_is_asked_of_each_range_and_a_refusal_is_the_whole_nodes() {
         let quarantined = |server, range| TraceEvent::RaftReseeded { server, range };
@@ -7685,10 +7723,9 @@ mod tests {
             BTreeSet::from([OTHER]),
             "one range short of a majority, the other not"
         );
-        let refused = |server| TraceEvent::RaftRefused {
-            server,
-            reason: "a table the manifest names is gone".to_owned(),
-        };
+        // A node refused while holding both ranges takes both of its replicas down,
+        // and two such nodes leave neither range a majority. The refusal says the
+        // node; the per-replica events say which replicas went with it.
         let whole_node = report(
             vec![
                 record(
@@ -7699,11 +7736,130 @@ mod tests {
                 ),
                 record(ms(0), ms(0), Some(1), term_of(1, OTHER, 1, "follower")),
                 record(ms(1), ms(1), Some(1), refused(1)),
+                record(ms(1), ms(1), Some(1), replica_refused(1, SINGLE_GROUP)),
+                record(ms(1), ms(1), Some(1), replica_refused(1, OTHER)),
                 record(ms(2), ms(2), Some(2), refused(2)),
+                record(ms(2), ms(2), Some(2), replica_refused(2, SINGLE_GROUP)),
+                record(ms(2), ms(2), Some(2), replica_refused(2, OTHER)),
             ],
             Vec::new(),
         );
         assert_eq!(whole_node.ranges_with_a_majority_up(), BTreeSet::new());
+    }
+
+    /// The case the old reading got wrong, and the reason D-077 changed it.
+    ///
+    /// Before D-077 a `RaftRefused` marked its node down for *every range in the run*.
+    /// At one group per server that was the same sentence; with four ranges on a node
+    /// it is not. Here two nodes are refused holding one range each, and the ranges
+    /// they never held — one that existed all along, one created after they were
+    /// refused — are untouched by the refusal and must still be asked the checks about
+    /// time. Under the old reading every one of them was marked down on both servers,
+    /// dropped from this set, and so exempted from the bound, the recovery margin and
+    /// every other tooth §8 has: the checks passed because they were never asked.
+    ///
+    /// The assertion below is the fix's evidence in both directions: the range the
+    /// nodes *did* hold is short of a majority and correctly dropped, and the two they
+    /// did not are kept. On the old code the expected set was empty.
+    // PROPOSED(D-077): a refusal marks down the ranges its node held.
+    #[test]
+    fn a_refusal_marks_down_only_the_ranges_its_node_held() {
+        const LATER: u64 = SINGLE_GROUP + 2;
+        let report = report(
+            vec![
+                record(
+                    ms(0),
+                    ms(0),
+                    Some(1),
+                    term_of(1, SINGLE_GROUP, 1, "follower"),
+                ),
+                // A range that existed all along on other nodes, never on 1 or 2.
+                record(ms(0), ms(0), Some(3), term_of(3, OTHER, 1, "follower")),
+                // Both nodes hold SINGLE_GROUP alone, and are refused holding it.
+                record(ms(1), ms(1), Some(1), refused(1)),
+                record(ms(1), ms(1), Some(1), replica_refused(1, SINGLE_GROUP)),
+                record(ms(2), ms(2), Some(2), refused(2)),
+                record(ms(2), ms(2), Some(2), replica_refused(2, SINGLE_GROUP)),
+                // A range created after both refusals, on a node that was not refused.
+                record(ms(3), ms(3), Some(3), term_of(3, LATER, 1, "follower")),
+            ],
+            Vec::new(),
+        );
+        assert_eq!(
+            report.ranges_with_a_majority_up(),
+            BTreeSet::from([OTHER, LATER]),
+            "a refusal takes down the ranges its node held, and no others"
+        );
+    }
+
+    /// The other half of the same reading: a replica that comes back is *lifted* out
+    /// of the down set, so its range is asked the checks about time again.
+    ///
+    /// Nothing asserted this half until the review of D-077 planted it. Making the
+    /// `RaftRecovered` arm a no-op — every refused replica down for the rest of its
+    /// run — passes the whole tree, sweeps included, and it has to: a down set that is
+    /// too *large* drops ranges from [`Report::ranges_with_a_majority_up`], and a range
+    /// not in that set is one the checks about time are never asked about. The failure
+    /// direction is green. That is the same silent exemption D-077 exists to close, one
+    /// event along, so the lifting is asserted here rather than left to a sweep that
+    /// cannot fail on it.
+    // PROPOSED(D-077): a refusal marks down the ranges its node held.
+    #[test]
+    fn a_recovered_replica_is_lifted_out_and_its_range_is_asked_again() {
+        let recovered = |server, range| TraceEvent::RaftRecovered {
+            server,
+            range,
+            term: 1,
+            applied: 0,
+            last_index: 0,
+            incarnation: 2,
+        };
+        let with = |lift: Vec<TraceRecord>| {
+            let mut all = vec![
+                record(
+                    ms(0),
+                    ms(0),
+                    Some(1),
+                    term_of(1, SINGLE_GROUP, 1, "follower"),
+                ),
+                record(ms(1), ms(1), Some(1), refused(1)),
+                record(ms(1), ms(1), Some(1), replica_refused(1, SINGLE_GROUP)),
+                record(ms(2), ms(2), Some(2), refused(2)),
+                record(ms(2), ms(2), Some(2), replica_refused(2, SINGLE_GROUP)),
+            ];
+            all.extend(lift);
+            report(all, Vec::new())
+        };
+
+        // Two of the three replicas down: the range is not asked.
+        assert_eq!(
+            with(Vec::new()).ranges_with_a_majority_up(),
+            BTreeSet::new(),
+            "two replicas down leaves the range short of a majority"
+        );
+
+        // One of them re-seeded and restated: one replica down, a majority again.
+        assert_eq!(
+            with(vec![record(
+                ms(3),
+                ms(3),
+                Some(1),
+                recovered(1, SINGLE_GROUP)
+            )])
+            .ranges_with_a_majority_up(),
+            BTreeSet::from([SINGLE_GROUP]),
+            "a recovered replica is no longer down, and its range is asked again"
+        );
+
+        // A recovery of another range on the same server lifts nothing here: the set
+        // is keyed by replica, not by server. That range is one of the run's, and
+        // nothing took it down, so it is up — and this one is still short.
+        assert_eq!(
+            with(vec![record(ms(3), ms(3), Some(1), recovered(1, OTHER))])
+                .ranges_with_a_majority_up(),
+            BTreeSet::from([OTHER]),
+            "a recovery names one replica, and server 1's replica of this range is not it"
+        );
     }
 
     /// And the carve-out is read where it is *used*, not only where it is
