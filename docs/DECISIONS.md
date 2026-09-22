@@ -10937,12 +10937,22 @@ Per seed, on the correct system, `Report::check` asserts, in this order:
 - **(a)** each of the four ranges traces its `RangeCreated { cause: snapshot }`; exactly
   one start of the node lies between the refusal and the last install, the arm's; and no
   `RaftAdopted` is traced at all, which is what "live" means on a node (D-066).
-- **(b)** every one of the four streams completes into an install; the four were owed *at
-  once*, every mark preceding the first install; and **the cap held at least one stream
-  back**, read off `RaftSnapshotStartOver { reason: Cap }`, D-083's own event. The last is
-  the clause that makes the cap of two more than prose: raise the cap to the range count
-  and it is the one that fails. On seed 1 the node held seven chunks back, across two of
-  its four ranges.
+- **(b)** every one of the four streams completes into an install, and the four were owed
+  *at once*, every mark preceding the first install. **The cap holding a stream back is a
+  rate, not an every-seed property**, and that is measured rather than preferred: over 200
+  seeds the node answers `StartOver { reason: Cap }` — D-083's own event — on **199**,
+  with a median of 9 held-back chunks and quartiles of 7 and 13, and the seed it does not,
+  113, is a legitimate run in which the four re-seeds arrive spread out enough that each
+  slot is free again before the next chunk comes. Asserted per seed it failed exactly
+  there, on the nightly, which is a model error in the assertion and not a bound to widen
+  (D-030, D-039). So §10's *rate* standard applies: `sim/tests/reseed.rs` prints the rate
+  at every tier, asserts it against a floor of 80 % measured against that 99.5 %, and pins
+  the mechanism on seed 1, where the node holds seven chunks back across two ranges. Raise
+  `RECEIVE_CAP` to the range count and the rate is 0 % and the floor fails. Two levers
+  were measured first and changed nothing: a chunk size of 4 KiB and of 512 B, which take
+  each stream from one chunk to sixty or eighty, leave the rate at 199 of 200 — what
+  decides it is how far apart the four leaders open their streams, which the scenario does
+  not control.
 - **(c), second half.** Every replica sent something other than its re-seed stream
   **after its own install completed**. Keyed on the *mark* instead, this set is a
   constant — an empty replica answers AppendEntries with rejections whether or not its

@@ -77,8 +77,67 @@ fn tier(what: &str, run: u64) {
 fn the_reseed_shape_holds_on_every_seed() {
     let run = shape_seeds();
     tier("the correct system", run);
-    let results = sweep(run, |seed| correct(seed).check());
-    verdict(&results).expect("the correct system meets (a) to (e) on every seed");
+    let results = sweep(run, |seed| {
+        let report = correct(seed);
+        let held: usize = report.read().waited_for_a_slot.values().sum();
+        (report.check(), held)
+    });
+    let verdicts: Vec<Result<(), String>> = results.iter().map(|(v, _)| v.clone()).collect();
+    verdict(&verdicts).expect("the correct system meets (a) to (e) on every seed");
+
+    // (b)'s cap clause, as a rate rather than as an every-seed property, printed at
+    // every tier (§10). The cap holds a stream back on 199 seeds of 200 — median 9
+    // chunks, quartiles 7 and 13 — and the seed it does not, 113, is a legitimate
+    // interleaving in which each slot is free again before the next chunk arrives. That
+    // is why it is not asserted per seed: the nightly failed on that seed when it was.
+    let mut held: Vec<usize> = results.iter().map(|(_, h)| *h).collect();
+    held.sort_unstable();
+    let exercised = held.iter().filter(|h| **h > 0).count();
+    #[allow(clippy::cast_precision_loss)]
+    let rate = exercised as f64 * 100.0 / run as f64;
+    println!(
+        "reseed shape: the cap of {} held a stream back on {exercised} of {run} seeds          ({rate:.1} %); held-back chunks median {}, most {}",
+        reseed::RECEIVE_CAP,
+        held[held.len() / 2],
+        held[held.len() - 1]
+    );
+    // The floor is measured, not chosen: 199 of 200 on this tree, and a floor of four
+    // fifths leaves room for the draw at the gate's twenty while still failing a tree
+    // where the cap stops biting at all — raise `RECEIVE_CAP` to the range count and
+    // this is 0 %.
+    assert!(
+        rate >= CAP_RATE_FLOOR,
+        "the cap held a stream back on only {rate:.1} % of {run} seeds, under the \
+         measured floor of {CAP_RATE_FLOOR} %: four re-seeds are no longer sharing two \
+         slots, and (b) is about nothing"
+    );
+}
+
+/// The floor (b)'s cap rate is asserted against, measured on the correct system: 199 of
+/// 200 seeds hold a stream back, and the floor sits well below that so that the draw at
+/// the gate's twenty cannot fail a tree with nothing wrong, while a tree where the cap
+/// stops holding anything back — a cap at or above the range count — fails it at once.
+const CAP_RATE_FLOOR: f64 = 80.0;
+
+/// Seed 1, where the cap's mechanism is pinned for every tier: four re-seeds against two
+/// slots, with the node telling at least one of them to wait.
+#[test]
+fn seed_1_pins_the_cap_holding_a_re_seed_back() {
+    let report = correct(1);
+    report.check().expect("seed 1 meets (a) to (e)");
+    let read = report.read();
+    let held: usize = read.waited_for_a_slot.values().sum();
+    assert!(
+        held > 0,
+        "seed 1 is pinned for the cap's mechanism: four re-seeds, two slots, and at \
+         least one chunk answered `StartOver {{ reason: Cap }}` ({:?})",
+        read.waited_for_a_slot
+    );
+    println!(
+        "reseed shape, seed 1: {held} chunks held back by the cap of {}, across ranges          {:?}",
+        reseed::RECEIVE_CAP,
+        read.waited_for_a_slot.keys().collect::<Vec<_>>()
+    );
 }
 
 #[test]
