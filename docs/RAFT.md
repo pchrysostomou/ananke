@@ -269,6 +269,29 @@ follower, or one whose `next_index` falls at or below the compacted prefix, is f
 through the snapshot path; a successful append acknowledgement, a completed install or
 a change of the follower's store incarnation clears the designation.
 
+A follower compacts too, to its own applied index, and takes a checkpoint only when it
+must stream one (D-065). Once its log is more than `snapshot_threshold` entries past
+its prefix, its next tick asks the `apply` task for a snapshot *record* at the applied
+index: the record alone, written synced between applies, so its last index, that
+entry's term and the configuration in force at it are exact, as a take's are (D-036),
+and with no checkpoint under it. The step's persist then deletes the prefix, after the
+record is durable, in the order a leader's compaction uses. The prefix that swallows
+the configuration entry in force leaves that configuration as the revert floor, as it
+does on a leader (D-029). A follower waits for no follower and holds off for nothing:
+the leader's two-election-timeout hold-off exists because a checkpoint stalls every
+apply for its duration, and a record is one synced batch. A record with no checkpoint
+under it is a shape the store already held — an install's repair writes one, and a
+crash between a take's record and its checkpoint leaves one — so a server that later
+has to stream finds no complete version of that index and asks for a take, which is the
+path a leader has used since the first install. A follower's applied index never passes
+its commit index, so the prefix it drops holds nothing uncommitted. The record itself
+traces nothing of its own: the transition is the compaction, which the core traces as
+`RaftCompacted` once the prefix's deletes are durable, and a crash between the two is
+reported by the re-statement of the next open, where a take's crash window is
+reported. The leader's own
+rules are unchanged: its threshold take, its hold-off, and D-037's condition for
+compacting.
+
 **Timing.** Election timeouts are drawn per node per election from the node's
 protocol stream over `[election_timeout_min, 2 × election_timeout_min)`; heartbeats
 every `election_timeout_min / 5`. The simulator's clocks skew and drift per node, so
@@ -312,7 +335,7 @@ nodes in the scenario that drives it, and a core's events carry the range its
 | `RaftCommit` | the commit index advances | `index` |
 | `RaftApply` | an entry is applied | `index`, `entry_term`, `hash`, `key` where the entry names one, `effect`: `applied` for a client command executed in its range, `none` for a no-op or a configuration entry; SHARD.md §8's other five values belong to what later stages build (D-069) |
 | `RaftConfig` | a configuration entry takes effect | `index`, `old`, `new`, `joint` |
-| `RaftSnapshot` | a snapshot is taken or installed | `last_index`, `last_term`, `taken` |
+| `RaftSnapshot` | a snapshot is taken or installed, or a durable prefix is re-stated at an open. A replica's compaction emits none of its own: it writes a record and the core traces `RaftCompacted`, and the record surfaces here only as the re-statement of the next open, with `taken` false (D-065) | `last_index`, `last_term`, `taken` |
 | `RaftRead` | a read is served, traced by the server that serves it, not by the core that confirmed it (D-069) | `index`, `lease`, `key`, `applied`: the applied index of the engine version the value was read at, taken at that one version |
 | `RaftLeaseRevoked` | the guard revoked a lease | `follower`, `offset_moved` |
 | `RaftQuorumLost` | a leader stepped down for want of a majority | `term`, `uncounted`: the refused followers whose rejections went uncounted for want of re-seed progress (D-049) |
@@ -855,7 +878,7 @@ a hundred seeds, that the sweep reached the state its wedge is built on (D-042).
 test prints its catch rate. A variant the sweep does not catch is a hole in the sweep,
 not a variant to delete.
 
-The table's sixteen rows are `Variant::BUGS` (D-053). Two rules have no variant of their
+The table's seventeen rows are `Variant::BUGS` (D-053). Two rules have no variant of their
 own. The term and the vote durable before a vote is answered is `SendBeforePersist`'s
 rule, since that variant sends every message of a step, a vote's answer included, before
 the step's persist. The applied index written in the batch of its entry's writes (§3) has
@@ -881,6 +904,7 @@ no known-buggy variant: its crash test,
 | `RefusalNotDurable` | §3: a refusal is marked in the store directory before anything else, and a refused engine does no work (D-044); the variant keeps the refusal in the process alone and its engine flushing | state machine safety: a server restarts on a store its refused engine flushed into self-consistency, a `RaftRecovered` after a `RaftRefused` with no install between, whose applied index its log does not hold | `Fault::CrashRefused`, on every seed: three to five rounds, each crashing the victim inside a memtable flush it has begun or, when it already sits refused, sixty to a hundred and sixty milliseconds into the round, and restarting it (D-044) |
 | `RefusedCountsForQuorum` | §1: a refused follower's rejection counts for check quorum only in a window in which the leader's re-seed stream to it had a chunk acknowledged (D-049); the variant counts it whatever the stream does, the leader as built | the re-seed scenario's blocked half: with the leader's other follower cut off and the stream to the refused one lost to a path-MTU black hole, the leader keeps its office through the whole hold where the correct leader steps down within two windows and three ticks | a follower refused and being re-seeded while the leader's other follower is away, which `sim/quorum.rs` builds on every seed: the refusal made by the store's lost mark at a restart, the other follower cut off the moment the leader opens the stream |
 | `RefusedNeverCounts` | the same rule from the other side: nothing from a refused follower counts, the alternative D-049 rejected | the re-seed scenario's open half: the leader steps down mid-re-seed and, the re-seeded server never voting (D-035) and the other follower away, commits nothing after the install, where the correct leader keeps its office and commits | the same, with the stream open, on a disk that takes no time, since on the sweep's the refused server's silence while it repairs and adopts deposes the leader under any counting |
+| `FollowerNeverCompacts` | §1 above: a replica that is not leading compacts to its own applied index once its log is more than `snapshot_threshold` entries past its prefix (D-065); the variant is the server as it was built before that, whose follower log shrinks only by truncation or install | the follower-log bound, `raft::FOLLOWER_LOG_MULTIPLE` × `SNAPSHOT_THRESHOLD`, asked of every replica on every seed: caught on 5 of the first 1 000 seeds (116, 429, 512, 577, 757), by that bound on all five, with 878 entries — 73 × the threshold — the largest, on seed 512. The rate is half a per cent, far under the gate's twenty seeds, so the pair is pinned at seed 512 rather than swept (D-061): `a_replica_that_never_compacts_outgrows_the_follower_log_bound` | a replica that trails its leader and is never streamed a snapshot, over a run long enough for the lag to pass 64 × the threshold |
 
 The checks about time in §2 are bounds, not properties: a client write within ten
 maximum election timeouts of the last heal, and an election within two of a server's

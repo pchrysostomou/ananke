@@ -136,6 +136,47 @@ pub const CHECK_EVERY: u32 = 10;
 /// the correct server produces a few tens of thousands.
 pub const TRACE_CAP: usize = 400_000;
 
+/// This scenario's `snapshot_threshold`: the entries a log may outgrow its
+/// prefix by before its replica compacts. 4 096 in the server's default
+/// (`core.rs`); 12 here, so that compaction and the snapshot path are reached
+/// inside a run.
+// PROPOSED(D-078): the follower log bound is stated as a multiple of this.
+pub const SNAPSHOT_THRESHOLD: u64 = 12;
+
+/// The bound on the largest in-memory log of any follower replica, in entries,
+/// as a multiple of [`SNAPSHOT_THRESHOLD`] (Stage B's exit; Q39).
+///
+/// Measured before it was asserted, on the correct system under this scenario's
+/// client writes; D-078 records the sweep, the command and the machine. At a
+/// thousand seeds the largest was **342 entries, 28.5 ×** the threshold, on server
+/// 1 of seed 514, over a distribution whose bulk sits at 4 to 8 ×: 50 seeds of a
+/// thousand reach 12 ×, 13 reach 16 ×, 8 reach 20 × and 1 reaches 28 ×. **64 ×**
+/// leaves 2.25 × over that maximum.
+///
+/// The tail is **not** geometric, and the risk model this comment first carried —
+/// ten thousand seeds reaching about 38 ×, passing 48 × one run in ten, 64 ×
+/// about one run in 470 — was refuted by the nightly it was written beside: ten
+/// thousand seeds reached 28 ×, on seed 514, the identical seed and the identical
+/// maximum as one thousand. What can honestly be said is that neither tier has
+/// come within 2 × of this bound.
+///
+/// It is not a vacuous bound, and it is not an unfalsifiable one. Under
+/// [`ananke_raft::core::Variant::FollowerNeverCompacts`] — the server as it was
+/// built before D-065 — the same sweep at the same tier reaches **878 entries,
+/// 73 ×**, on seed 512, and would have kept growing with a longer run: a
+/// follower's log had nothing to bound it at all (SHARD.md:339-340). That variant
+/// is caught on 5 of the first thousand seeds, by this bound on all five, and
+/// `a_replica_that_never_compacts_outgrows_the_follower_log_bound` pins seed 512
+/// against it. A bound the correct system trips is a model error to take to the
+/// owner, never a number to widen (D-030, D-039).
+///
+/// The multiple is this scenario's, at its threshold of 12. What the bound really
+/// measures is the follower's apply lag in entries, which the threshold does not
+/// scale: at the server's own 4 096 the same lag would be a fraction of one
+/// threshold, so 64 × is conservative read as a production figure.
+// PROPOSED(D-078): a follower compacts its log to its own applied index.
+pub const FOLLOWER_LOG_MULTIPLE: u64 = 64;
+
 /// The maximum election timeout.
 #[must_use]
 pub fn election_max() -> Duration {
@@ -1026,6 +1067,161 @@ pub struct Run {
     pub stopped: Option<String>,
 }
 
+/// Which replica a per-replica record is about, for the folds that follow one
+/// server's records in order.
+// PROPOSED(D-078): a follower compacts its log to its own applied index.
+fn replica_of(event: &TraceEvent) -> Option<u64> {
+    match event {
+        TraceEvent::RaftAppend { server, .. }
+        | TraceEvent::RaftTruncate { server, .. }
+        | TraceEvent::RaftCompacted { server, .. }
+        | TraceEvent::RaftSnapshot { server, .. }
+        | TraceEvent::RaftCommit { server, .. }
+        | TraceEvent::RaftApply { server, .. }
+        | TraceEvent::RaftConfig { server, .. }
+        | TraceEvent::RaftRecovered { server, .. }
+        | TraceEvent::RaftReseeded { server, .. }
+        | TraceEvent::RaftTerm { server, .. }
+        | TraceEvent::RaftLeader { server, .. } => Some(*server),
+        _ => None,
+    }
+}
+
+/// Tells a re-statement's `RaftSnapshot` from one the run just made, and with it
+/// which snapshots move a replica's compacted prefix.
+///
+/// The distinction matters twice over, and both times the answer is not `taken`.
+/// A **take** writes a checkpoint and leaves the log alone: the core holds the
+/// prefix until `maybe_compact` drops it, which on a leader waits for every
+/// follower's match (D-037), and the compaction is what `RaftCompacted` reports.
+/// An **install** replaces the log under the snapshot at once. A **re-statement**
+/// stands in for a prefix that is already gone from the store, whether the record
+/// under it was a take's or an install's — so a re-stated take moves the prefix
+/// where a live take does not.
+///
+/// A re-statement is read off its position: the `apply` loop traces the durable log
+/// as a `RaftTruncate` to one past its end and then, if there is a prefix, the
+/// snapshot standing in for it (`node.rs`), with nothing of that server's between
+/// the two. An install's snapshot never follows that server's own truncation with
+/// nothing in between. The split this reads was checked against the counts the
+/// review of this slice took by instrumenting the two emission sites themselves —
+/// 9 342 installs and 10 788 re-statements over a thousand raft seeds — and agrees
+/// with both.
+// PROPOSED(D-078): a follower compacts its log to its own applied index.
+#[derive(Default)]
+struct Restating {
+    after_truncate: BTreeSet<u64>,
+    restated: bool,
+}
+
+impl Restating {
+    /// Folds one record in. Call it once per record, before asking anything.
+    fn saw(&mut self, event: &TraceEvent) {
+        self.restated = false;
+        match event {
+            TraceEvent::RaftTruncate { server, .. } => {
+                self.after_truncate.insert(*server);
+            }
+            TraceEvent::RaftSnapshot { server, .. } => {
+                self.restated = self.after_truncate.remove(server);
+            }
+            other => {
+                if let Some(server) = replica_of(other) {
+                    self.after_truncate.remove(&server);
+                }
+            }
+        }
+    }
+
+    /// Whether the record just folded in is a re-statement's snapshot.
+    fn restated(&self) -> bool {
+        self.restated
+    }
+
+    /// Whether the record just folded in leaves the replica's log starting past the
+    /// snapshot it names: an install or a re-statement, never a live take.
+    fn moves_the_prefix(&self, event: &TraceEvent) -> bool {
+        match event {
+            TraceEvent::RaftSnapshot { taken, .. } => self.restated || !taken,
+            _ => false,
+        }
+    }
+}
+
+/// The compactions a replica made while it was not leading, and of those the
+/// ones whose prefix swallowed the configuration entry in force, so that
+/// D-029's revert floor — the configuration held at the new prefix's end —
+/// is what the replica would revert to from there.
+///
+/// The second is the direct measure of what D-065 said would happen: the
+/// floor, reached on 3 of 10 000 seeds before this and deferred to issue #56,
+/// becomes a routine path on a follower. It is *observed*, not inferred: a
+/// compaction that carried the prefix from `prev` to `through` swallowed a
+/// configuration entry only when this server holds one at an index strictly
+/// inside that step, `prev < index <= through`. The indices are the
+/// `RaftConfig` records, which the core traces at the index of every
+/// configuration entry it puts in force (`core.rs`, `adopt`); index 0 is the
+/// initial configuration, which is no entry and can be swallowed by nothing.
+///
+/// The first build of this measure asked instead whether the server's *last*
+/// `RaftConfig` index was at or below `through`. That holds for every
+/// compaction by construction — `Raft::new` sets `membership_index` to
+/// `snap_index` when the log holds no configuration entry, 0 at a first open —
+/// so the count was a copy of the total under another name, and would have
+/// read 100 % on a tree with D-029's floor deleted. It is the shape D-039
+/// warns of, a measurement that is structural rather than observed; the
+/// review of this slice caught it, and the figures it produced are struck
+/// from D-078.
+// PROPOSED(D-078): a follower compacts its log to its own applied index.
+#[must_use]
+pub fn follower_compactions(records: &[TraceRecord]) -> (usize, usize) {
+    let mut leading: BTreeMap<u64, bool> = BTreeMap::new();
+    let mut configs: BTreeMap<u64, BTreeSet<u64>> = BTreeMap::new();
+    let mut prefix: BTreeMap<u64, u64> = BTreeMap::new();
+    let mut restating = Restating::default();
+    let (mut count, mut swallowed) = (0usize, 0usize);
+    for record in records {
+        restating.saw(&record.event);
+        match &record.event {
+            TraceEvent::RaftRecovered { server, .. } => {
+                leading.insert(*server, false);
+            }
+            TraceEvent::RaftTerm { server, role, .. } => {
+                leading.insert(*server, *role == "leader");
+            }
+            TraceEvent::RaftLeader { server, .. } => {
+                leading.insert(*server, true);
+            }
+            TraceEvent::RaftConfig { server, index, .. } if *index > 0 => {
+                configs.entry(*server).or_default().insert(*index);
+            }
+            // A take leaves the prefix where it was until `maybe_compact` drops
+            // it; an install and a re-statement stand in for one already gone
+            // ([`LogShape`]'s own notes).
+            TraceEvent::RaftSnapshot {
+                server, last_index, ..
+            } if restating.moves_the_prefix(&record.event) => {
+                let at = prefix.entry(*server).or_default();
+                *at = (*at).max(*last_index);
+            }
+            TraceEvent::RaftCompacted {
+                server, through, ..
+            } => {
+                let at = prefix.entry(*server).or_default();
+                let prev = std::mem::replace(at, (*at).max(*through));
+                if !leading.get(server).copied().unwrap_or_default() {
+                    count += 1;
+                    swallowed += usize::from(configs.get(server).is_some_and(|set| {
+                        set.iter().any(|index| *index > prev && index <= through)
+                    }));
+                }
+            }
+            _ => {}
+        }
+    }
+    (count, swallowed)
+}
+
 impl Report {
     /// A report over a run another scenario drove: the node scenario's
     /// ([`crate::ranges`]), whose faults are its own and whose trace this scenario's
@@ -1384,11 +1580,206 @@ pub fn match_starts_are_first_rises(records: &[TraceRecord]) -> Result<(), Strin
     Ok(())
 }
 
+/// What one replica's log looks like as the trace tells it, and whether the
+/// replica was leading when it looked that way.
+///
+/// The core keeps the entries past its compacted prefix in memory (D-025), so the
+/// length is `last - snap`: `last` moves on an append and on a truncation, and
+/// `snap` on a compaction and on a snapshot restated or installed.
+///
+/// A *take* does not move it. `RaftSnapshot { taken: true }` says a checkpoint was
+/// written, not that the log was cut: the core still holds the prefix until
+/// `maybe_compact` drops it, which a leader does only once every follower's match
+/// is past it (D-037), and the compaction is what `RaftCompacted` reports. The
+/// first build of this fold moved `snap` there too, and so read the log as shorter
+/// than the core held it for the window between the two — on 27 of 1 000 raft
+/// seeds, by as much as 12 entries. The maximum was unaffected, but under-reading
+/// is the wrong direction for a bound, so a take is no longer counted here.
+///
+/// A *re-stated* take is the other way round: the prefix it names really is gone
+/// from the store by then, whether the record under it was a take's or an
+/// install's, so it does move `snap`. [`Restating`] is what tells the two apart,
+/// and it is the same rule the compaction counters read.
+// PROPOSED(D-078): Stage B's exit measures the largest in-memory log of any
+// follower replica.
+#[derive(Clone, Copy, Default)]
+struct LogShape {
+    snap: u64,
+    last: u64,
+    leading: bool,
+}
+
+impl LogShape {
+    fn len(self) -> u64 {
+        self.last.saturating_sub(self.snap)
+    }
+}
+
+/// Folds every replica's log shape over the trace, calling `saw` after each
+/// record that changed one, with the server and its shape.
+// PROPOSED(D-078): Stage B's exit measures the largest in-memory log of any
+// follower replica.
+fn fold_logs(
+    records: &[TraceRecord],
+    mut saw: impl FnMut(u64, LogShape) -> Result<(), String>,
+) -> Result<(), String> {
+    let mut shapes: BTreeMap<u64, LogShape> = BTreeMap::new();
+    let mut restating = Restating::default();
+    for record in records {
+        restating.saw(&record.event);
+        let server = match &record.event {
+            TraceEvent::RaftAppend { server, .. }
+            | TraceEvent::RaftTruncate { server, .. }
+            | TraceEvent::RaftCompacted { server, .. }
+            | TraceEvent::RaftSnapshot { server, .. }
+            | TraceEvent::RaftRecovered { server, .. }
+            | TraceEvent::RaftTerm { server, .. }
+            | TraceEvent::RaftLeader { server, .. } => *server,
+            _ => continue,
+        };
+        let shape = shapes.entry(server).or_default();
+        match &record.event {
+            TraceEvent::RaftAppend { index, .. } => shape.last = shape.last.max(*index),
+            // A restatement re-states the durable log as a truncation to one past
+            // its end, then the snapshot, then the entries; a conflict truncates.
+            TraceEvent::RaftTruncate { from_index, .. } => {
+                shape.last = from_index.saturating_sub(1).max(shape.snap);
+            }
+            // A prefix only ever moves forward: `maybe_compact` compacts to an
+            // index past `snap_index` or returns. `max` rather than assignment so
+            // the fold says that rather than relying on it.
+            TraceEvent::RaftCompacted { through, .. } => {
+                shape.snap = shape.snap.max(*through);
+                shape.last = shape.last.max(*through);
+            }
+            // An install and a re-statement stand in for a prefix the log no
+            // longer holds; a live take leaves the log as it was ([`Restating`]).
+            TraceEvent::RaftSnapshot { last_index, .. }
+                if restating.moves_the_prefix(&record.event) =>
+            {
+                shape.snap = shape.snap.max(*last_index);
+                shape.last = shape.last.max(shape.snap);
+            }
+            // A restart begins as a follower, whatever the last incarnation was.
+            TraceEvent::RaftRecovered { .. } => shape.leading = false,
+            TraceEvent::RaftTerm { role, .. } => shape.leading = *role == "leader",
+            TraceEvent::RaftLeader { .. } => shape.leading = true,
+            _ => {}
+        }
+        let shape = *shape;
+        saw(server, shape)?;
+    }
+    Ok(())
+}
+
+/// Every compaction is at or below an index the compacting server knew committed
+/// (D-065): a follower compacts to its own applied index, and on the correct
+/// system a follower's applied index never passes its commit index, so the prefix
+/// it drops holds nothing uncommitted.
+///
+/// This is the assertion D-065 asks for, and it is the one the leader's rule has
+/// always met too — a take is at the applied index, which is at or below the
+/// commit index — so it is asked of every server, not only of followers.
+///
+/// # Errors
+///
+/// The first compaction past what its server knew committed.
+// PROPOSED(D-078): a follower compacts its log to its own applied index.
+pub fn compaction_stays_committed(records: &[TraceRecord]) -> Result<(), String> {
+    let mut committed: BTreeMap<u64, u64> = BTreeMap::new();
+    for record in records {
+        match &record.event {
+            TraceEvent::RaftCommit { server, index, .. } => {
+                let seen = committed.entry(*server).or_default();
+                *seen = (*seen).max(*index);
+            }
+            TraceEvent::RaftSnapshot {
+                server, last_index, ..
+            } => {
+                let seen = committed.entry(*server).or_default();
+                *seen = (*seen).max(*last_index);
+            }
+            TraceEvent::RaftCompacted {
+                server, through, ..
+            } => {
+                let seen = committed.get(server).copied().unwrap_or_default();
+                if *through > seen {
+                    return Err(format!(
+                        "compaction: server {server} compacted through {through}, past the {seen} \
+                         it knew committed"
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 impl Report {
     /// The events, without their times.
     #[must_use]
     pub fn events(&self) -> Vec<TraceEvent> {
         self.records.iter().map(|r| r.event.clone()).collect()
+    }
+
+    /// The largest in-memory log any replica of this run held while it was not
+    /// leading, in entries, and the server that held it (Stage B's exit; Q39).
+    ///
+    /// The log the core keeps in memory is the tail past its compacted prefix
+    /// (D-025), so this is `last_index - snap_index` at its highest over the run,
+    /// read off the trace. A leader's log is not counted: what the exit bounds is
+    /// the follower's, which before D-065 had nothing to bound it.
+    // PROPOSED(D-078): Stage B's exit measures the largest in-memory log of any
+    // follower replica.
+    #[must_use]
+    pub fn largest_follower_log(&self) -> (u64, u64) {
+        let mut worst = (0u64, 0u64);
+        let _ = fold_logs(&self.records, |server, shape| {
+            if !shape.leading && shape.len() > worst.0 {
+                worst = (shape.len(), server);
+            }
+            Ok(())
+        });
+        worst
+    }
+
+    /// The compactions this run's replicas made while not leading, and of those
+    /// the ones whose prefix swallowed the configuration entry in force
+    /// ([`follower_compactions`]).
+    // PROPOSED(D-078): a follower compacts its log to its own applied index.
+    #[must_use]
+    pub fn follower_compactions(&self) -> (usize, usize) {
+        follower_compactions(&self.records)
+    }
+
+    /// The `RaftSnapshot { taken: false }` records split into the installs a
+    /// server really made and the prefixes a restart re-stated (`Restating`, which
+    /// is where the rule that tells the two apart is written).
+    ///
+    /// The two are one event kind, and counting them together stopped being honest
+    /// with D-065: before a follower compacted, a replica that had neither taken
+    /// nor installed opened with `snap_index == 0` and re-stated no snapshot at
+    /// all, so the `taken: false` records were installs and the re-statements of
+    /// installs. Now every replica that has compacted re-states one at every later
+    /// open, and a sweep that calls the whole population "installed" reports
+    /// installs that never happened — which is what D-078 first did.
+    // PROPOSED(D-078): a follower compacts its log to its own applied index.
+    #[must_use]
+    pub fn snapshots_installed_and_restated(&self) -> (usize, usize) {
+        let mut restating = Restating::default();
+        let (mut installed, mut restated) = (0usize, 0usize);
+        for record in &self.records {
+            restating.saw(&record.event);
+            if let TraceEvent::RaftSnapshot { taken: false, .. } = &record.event {
+                if restating.restated() {
+                    restated += 1;
+                } else {
+                    installed += 1;
+                }
+            }
+        }
+        (installed, restated)
     }
 
     /// How many records satisfy `f`.
@@ -1616,6 +2007,15 @@ impl Report {
         if let Err(violation) = self.isolation_keeps_the_term() {
             return fail(violation);
         }
+        // D-065's two, last of the safety folds so that a run a Phase 2 variant
+        // already fails still fails with the violation its pinned seed names.
+        // PROPOSED(D-078): a follower compacts its log to its own applied index.
+        if let Err(violation) = compaction_stays_committed(&self.records) {
+            return fail(violation);
+        }
+        if let Err(violation) = self.follower_log_is_bounded() {
+            return fail(violation);
+        }
         // Both are asked only of a range whose unimpaired replicas form a majority
         // (SHARD.md §8), which each reads for itself: with none, both pass.
         if self.uniform() {
@@ -1625,6 +2025,29 @@ impl Report {
             if let Err(violation) = self.timers_fire() {
                 return fail(violation);
             }
+        }
+        Ok(())
+    }
+
+    /// The largest in-memory log of any follower replica, against the bound
+    /// [`FOLLOWER_LOG_MULTIPLE`] states as a multiple of
+    /// [`SNAPSHOT_THRESHOLD`] (Stage B's exit; Q39).
+    ///
+    /// A follower compacts one tick after its log passes the threshold, and the
+    /// entries of that tick's round, of the persist the compaction waits behind
+    /// and of a catch-up batch a follower far behind takes in one go all land on
+    /// top of the threshold — so the bound is a multiple of it, not the threshold
+    /// itself.
+    // PROPOSED(D-078): a follower compacts its log to its own applied index.
+    fn follower_log_is_bounded(&self) -> Result<(), String> {
+        let bound = FOLLOWER_LOG_MULTIPLE * SNAPSHOT_THRESHOLD;
+        let (longest, server) = self.largest_follower_log();
+        if longest > bound {
+            return Err(format!(
+                "follower log: server {server} held {longest} entries in memory while not \
+                 leading, over the {bound} entries of {FOLLOWER_LOG_MULTIPLE} × \
+                 {SNAPSHOT_THRESHOLD}"
+            ));
         }
         Ok(())
     }
@@ -4469,7 +4892,7 @@ pub fn node_config(id: u64, variants: impl Into<Variants>) -> NodeConfig {
             variants,
             tick_nanos: u64::try_from(TICK.as_nanos()).expect("small"),
             drift_bound_ppm: DRIFT_BOUND_PPM,
-            snapshot_threshold: 12,
+            snapshot_threshold: SNAPSHOT_THRESHOLD,
             snapshot_chunk: 4096,
             ..RaftConfig::default()
         },
