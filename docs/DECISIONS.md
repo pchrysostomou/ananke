@@ -10721,8 +10721,9 @@ it is green at ten thousand seeds:
 Ten thousand seeds of the scenario that drives changes, every one of them showing a match
 start, with the fold's rule holding on all of them — that is what the run is cited for,
 and citing the run as a whole would be citing a red one. A fresh nightly on the tip that
-carries the review's fixes is dispatched as NIGHTLY_PLACEHOLDER; its shard 6 is expected
-to stay red on #82, which PR #87 fixes, and its shard 5 is the one that must be green.
+carries the review's fixes is dispatched as run 35740760759, on `b2ad5de`; its shard 6
+is expected to stay red on #82, which PR #87 fixes, and its shard 5 is the one that must
+be green.
 
 ---
 
