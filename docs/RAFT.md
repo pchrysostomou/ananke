@@ -715,7 +715,11 @@ waits in the inbox for the next:
   due meanwhile is held as one tick, every missed tick stepped when the persist resolves
   and none collapsed. The node's bound covers what it holds because the task drains its
   queue to empty on every wake, so a bound that asked only about the queue would bind
-  nothing (D-074, proposed).
+  nothing (D-074, proposed). What the hold does *not* bind is a message larger than the
+  whole bound: no emptying could ever make room for one, so it is admitted whatever the
+  node holds, exactly as it is into an empty queue (D-072). Binding that case on the hold
+  refuses every retransmission of it alike — a node behind any outstanding sync is
+  holding something — and the range would never replicate again.
 
   The entries an `Apply` names are read from the core **at the step that named them**,
   not when the node comes to execute it: a deferred `Apply` runs after the replay has
