@@ -9705,9 +9705,27 @@ which add a dozen checks that run in a millisecond and touch no sweep: the relea
 cold for this tree and the other slices' sweeps had the cores for most of it. Both are
 greens, and neither is a timing.
 
+And once more on the tip the second review's fixes land with, which is the figure this
+entry now carries:
+
+```
+premerge: Darwin 25.6.0 arm64, Apple M2, 8 cores
+premerge: before, load 19.32/24.72/34.53, AC Power, no thermal warning recorded
+premerge: after, load 25.17/30.59/32.86, AC Power, no thermal warning recorded
+premerge: green at 1000 seeds in 820 s
+```
+
+AC throughout, no thermal warning, on the quietest machine of the three — load 19 rising to
+25, against the first run's 140 — and with a warm release build. 820 s beside 1 308 s and
+2 558 s on one laptop is the spread D-070 exists to make legible; all three are greens, none
+is a timing, and the fixes add no sweep. The eleven checks this pass adds and the five it
+strengthens are deterministic and run in milliseconds.
+
 **What moved.** Nothing outside `crates/ananke-shard` and the two documents. `sim/` does not
 depend on `ananke-shard`, so no schedule moves, no pinned trace hash moves and no pinned seed
-is re-audited: `crates/ananke-shard/src/variant.rs` gained eleven variants at bits 8 to 18,
+is re-audited — which holds for the review's fixes too, since they move nothing outside this
+crate and the two documents. `crates/ananke-shard/src/variant.rs` gained eleven variants at
+bits 8 to 18, and four more at bits 20 to 23 (19 is `HeldLocalDropped`, D-074's),
 which no existing code reads, and the crate's other files are unchanged but for `lib.rs`'s
 description of this module. `Snapshots::new` takes the node's own `ServerId`, which only
 this module's own checks call. The one-group
