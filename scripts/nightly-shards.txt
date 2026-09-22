@@ -19,6 +19,10 @@
 # in 2. Re-weighed after the review's fixes, on an idle machine, the two sweeps came to 60.7
 # and 51.9 cpu s against the 59.0 and 53.9 recorded here: within the noise of the load they
 # were first measured under, so the rows keep their figures.
+# D-077's row — the directed re-seed scenario — was weighed on its tree on the same Apple M2
+# of 8 cores, on AC under load average 6.1, at 0.01 cpu s on the built binary (the test runs
+# one 600 ms scenario five times and no sweep); it is rounded up to 0.1 like the cheap rows
+# beside it, and longest-first into the lightest shard put it in shard 2.
 #
 # shard	binary	cpu_s	test
 # shard 1: 1278.5 cpu s
@@ -51,6 +55,7 @@
 2	ranges	0.1	every_frame_between_two_nodes_may_carry_several_ranges
 2	ranges	0.1	no_batch_frame_of_the_node_parses_as_a_frame_of_the_one_group_server
 2	ranges	0.1	the_ranges_of_one_node_draw_their_own_election_timeouts
+2	ranges	0.1	a_loss_in_the_shared_engine_refuses_the_whole_node_and_reseeds_beside_it
 # shard 3: 1281.3 cpu s
 3	echo	0.2	trace_hash_matches_the_pinned_golden
 3	engine	39.8	an_install_whose_repair_follows_its_switch_is_caught
