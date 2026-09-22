@@ -180,7 +180,12 @@ the entry it last applied, synced, and then checkpoints, so no apply lands betwe
 record and the copy and the record is exact by construction; applies wait behind the
 take. Every take goes to a directory of its own, `snap-<index>-<take>`, numbered by a
 take counter the record carries, so two takes at one index are two directories and no
-take rewrites a directory a stream is reading (D-043). A take asked for at the index
+take rewrites a directory a stream is reading (D-043). On the node that name gains the
+range, `snap-r<range>-<index>-<take>`, and the staging directory gains the range and the
+sender, `staging-r<range>-s<sender>`, because a node's ranges apply streams of commands
+of their own and two of them taking at one index is ordinary; a range's sweep then
+proposes only its own versions for deletion (SHARD.md §11 raft 14; D-075, proposed).
+A take asked for at the index
 the record already names answers with the recorded version when this store took it
 and it is complete; a take asked for because a stream found no usable checkpoint is
 always a fresh version, unless a take is already in flight, which the stream then
@@ -198,7 +203,15 @@ last file rather than from zero. Eight resends give the stream up; a receiver th
 to start over has the stream restarted from its first byte, twice, and at the third
 such ask the leader counts the checkpoint as unusable. A stream's identity is its
 sender, the leader's term and the snapshot's last index and term, and a change of any
-of them, a new leader's stream included, starts the receiver's staging over (D-030). An
+of them, a new leader's stream included, starts the receiver's staging over (D-030). The
+one-group receiver holds one stream and abandons it for a chunk of another identity; the
+node holds one assembly per (range, sender), under a per-node cap on what is assembled at
+once, so a chunk that is not an assembly's own never disturbs it and the streams over the
+cap wait rather than restarting one another. A slot the cap frees is granted to a stream
+that is asking for it, never reserved for one that asked earlier and may since have been
+replaced as leader; and a chunk that starts an assembly over is answered with that
+restart even when it is its stream's last, since the directory it would be installed from
+has just been started over (Q14; D-075, proposed). An
 acknowledgement that takes a stream past the furthest point any acknowledgement had
 taken it is that stream's progress, and the task marks the follower for the core, which
 reads the marks before each tick; a duplicate, the answer a resend gets and ground a
@@ -730,6 +743,19 @@ waits in the inbox for the next:
   each take and each stream's end (§1, D-043); assembles and verifies arriving streams
   on a follower and, once the `raft` task has quiesced `apply` and handed it the
   receiver's identity, writes the repair and the staged `CURRENT` (§1, D-038).
+
+  On the node (SHARD.md §4; Q14, Q41) it is one task keyed by (range, follower) on the
+  way out and (range, sender) on the way in. Nothing caps the streams it sends, so a
+  leader feeds every designated follower of a range at once (D-043); a per-node cap
+  bounds what it assembles, and a (range, sender) over the cap is told to restart and
+  takes the first slot that frees. Its chunks go in frames of their own on a socket
+  handle of its own, never through the per-peer outbox, so a 256 KiB chunk never spends
+  the frame a round's heartbeats needed (Q41). Its install is not the adoption of §1:
+  every install on the node is the live install of the range's two key intervals into
+  the running engine, with the range's repair carried in the same manifest switch, and
+  no incarnation ends and no engine reopens. `RaftAdopted` on the node records only a
+  node taking a fresh directory as its store after a whole-node refusal, and never a
+  replica's install (D-066; D-075, proposed).
 
 The `net` and `raft` tasks are separate so that a message arriving while the core is
 awaiting a persist is a queued message, not a lost one, and so that the interleaving
