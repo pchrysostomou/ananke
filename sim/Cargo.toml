@@ -18,6 +18,7 @@ path = "lib.rs"
 ananke-env = { path = "../crates/ananke-env" }
 ananke-raft = { path = "../crates/ananke-raft" }
 ananke-server = { path = "../crates/ananke-server" }
+ananke-shard = { path = "../crates/ananke-shard" }
 ananke-storage = { path = "../crates/ananke-storage" }
 bytes.workspace = true
 moirae-sched.workspace = true
