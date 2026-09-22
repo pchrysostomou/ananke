@@ -11140,6 +11140,11 @@ and the departures are three, each stated below with its reason.
    the shrink's leader is outside `C_new` and the step-down is exercised; a node
    leading one range of four would leave three led from inside `C_new`. One group
    holds one range, so this is exactly the one transfer it always sent.
+   **The claim is checked and not merely made**: `Report::transfer_ranges` asserts
+   every range was asked for and `Report::transfers_landed` that the server named led
+   it afterwards, at a measured floor (140 of 192, 72.9 %, at a hundred seeds; 25 of 32
+   at the gate's twenty, against a floor of 0.5). In this entry's first draft the claim
+   stood in this list and nowhere else, and M9 below is what that cost.
 7. **What the node has not got is asserted absent, with its reason, on every seed**
    (CLAUDE.md:58-67): `snapshot_threshold` is `NODE_SNAPSHOT_THRESHOLD`, the disk does
    not rot, and `Report::check`'s node clauses fail any seed that traces a snapshot
@@ -11197,23 +11202,76 @@ Six, each written so that the range is part of the question rather than beside i
    of. The grow admits 4 and 5 to *every* range; "a configuration holding 4 and 5 took
    effect somewhere" cannot tell that from one range in four.
 5. **`Report::partitions_hit_their_ranges`** — whether each partition cut off the
-   leader of the range it drew, folded forward over the finished trace rather than by
-   the backward windowed search the driver used.
-6. **`Report::joint_overlap`** — two ranges' joint configurations in force **on one
-   node** at one instant, which is issue #46's extension on the node and has no subject
-   at all on one group.
+   leader of the range it drew. Two things, not one: that the server the driver read
+   really was that range's leader, folded forward over the finished trace rather than
+   by the backward windowed search the driver used; **and that the partition actually
+   cut that server off**, read from the side the driver handed `Sim::partition`, which
+   `Aimed::side` carries for the purpose. Without the second the fold reads the
+   driver's own two variables against each other; see M10 below.
+6. **`Report::witnessed_joint_overlap`** — two ranges' joint configurations in force
+   **on one node** at one instant, which is issue #46's extension on the node and has
+   no subject at all on one group, **checked against the same trace read backwards**.
+   See "The witness" below: the forward fold is not asserted on its own.
+7. **`Report::transfer_ranges` and `Report::transfers_landed`** — that leadership was
+   handed over for *every* range the node holds, which is this entry's own item 6 and
+   which nothing else in the run records.
 
 The invariants underneath them were already keyed by range (D-071), and
 `raft::payload_is_well_formed` is now asked of the cluster's ranges rather than of
 `SINGLE_GROUP`.
 
+### The witness: the one check this slice adds, and the guard on it
+
+`joint_overlap` is the check this slice exists to add — #46's extension on the node —
+and in the first draft of this entry it was **the one check with no guard against its
+own widening**. It is a forward fold carrying state, and dropping the single line that
+clears a range when its joint configuration ends turns it into "any two ranges ever
+joint on this node", which answers on every seed of every tier. No floor, count or
+bound can see that, because a fold that always answers passes everything. The first
+draft recorded the gap as permanent (M8, "not caught") on the reasoning that the only
+alternatives were a duration measurement or a ceiling on a count that partitions
+legitimately raise, and that such a ceiling is a bound the correct system would trip.
+
+**That reasoning was wrong, and the review of this branch showed it.** There is a third
+formulation with no number in it at all: **assert the answer is witnessed.** At the
+record the fold stopped on, each of the two ranges' *last* `RaftConfig` for that server,
+at or before that record, must be joint. That is a backwards read of a trace the forward
+fold does not write, so nothing the fold does can satisfy it by construction; and it is
+not a bound, so D-030 does not reach it and no correct run can trip it.
+
+`Report::witnessed_joint_overlap` is that read, and it is what the sweep asserts;
+`joint_overlap` remains as the answer it checks. Measured, each figure reproduced here
+independently of the review that proposed it:
+
+| | Witnessed | Unwitnessed |
+|---|---|---|
+| the correct node, 100 seeds | **100/100** | **0** |
+| the correct node, 20 seeds | **20/20** | **0** |
+| the never-clearing fold (M8), 100 seeds | 62/100 | **38/100** |
+| the never-clearing fold (M8), 20 seeds | 14/20 | **6/20**, deterministic |
+
+M8's first unwitnessed seed is 0, and the message names what is wrong: *server 3 is
+reported jointly configured on ranges 2 and 5 at 1.122087193 s, but its last
+configuration of range 2 there is the non-joint one at index 6*.
+
+Two things follow and both are stated because the first draft got them wrong. **Nothing
+goes to the owner from this**: the gap is closed, not deferred, and the bullet that
+asked the owner to accept it is gone from "What is not built here". And the duration
+*is* measurable, which was the other half of the first draft's excuse: folding an
+episode as the interval during which some node holds two or more ranges jointly
+configured gives, over 100 seeds, **1 335 episodes, the longest 2.824686149 s, at most
+21 on a seed**. (The review's own fold, on its own episode boundary, gave 383 and
+2.905584836 s; the definitions differ and the figure is recorded here on the one this
+tree measured. Neither is shipped — the witness is the guard, and it needs no number.)
+
 ### The mutation table: what a single-range world could not catch
 
-The owner's standing demand on this stage. Eight mutations were planted **one at a
-time**, each run at **100 seeds** in release, each reverted before the next. Every one
-of them is a no-op on one group: with a single range, `change_complete`'s range
-argument has one value, the key map has one answer, `focus_of` answers the only range,
-`ranges()` is a list of one, and there is no second range to overlap with.
+The owner's standing demand on this stage. **Eleven** mutations were planted **one at a
+time**, each run at **100 seeds** in release and the last three at 20 as well, each
+reverted before the next. Every one of them is a no-op on one group: with a single
+range, `change_complete`'s range argument has one value, the key map has one answer,
+`focus_of` answers the only range, `ranges()` is a list of one, `take(1)` over the
+cluster's ranges is the identity, and there is no second range to overlap with.
 
 | | Mutation | What it does on one group | Caught by |
 |---|---|---|---|
@@ -11224,15 +11282,26 @@ argument has one value, the key map has one answer, `focus_of` answers the only 
 | **M5** | `Schedule::focus_of` always answers the first range | nothing: the first range is the only range | **the aimed-ranges set.** `the partitions aimed at {2} and not at every range this node holds`. The hit floor cannot catch this: hits are counted against what was aimed at, so a draw that always aims at one range hits it every time |
 | **M6** | `Report::ranges` answers one range | nothing: it already did | **`payload_is_well_formed`**, on every seed, and `a_node_changes_two_of_its_ranges_at_once` |
 | **M7** | `Report::joint_overlap` keyed by nothing instead of by node | nothing: one node's state is the cluster's | **the per-seed overlap clause**, on seeds 6 and 95. The merge makes the fold *stricter*, not looser — any node leaving a range's joint configuration clears it for all — so the overlap it reports is 98 of 100 |
-| **M8** | `Report::joint_overlap` never clears a range, so any two ranges ever joint on a node count | nothing, likewise | **not caught.** Every check passes and the overlap is 100 of 100 either way. What would catch it is a measurement of how *long* two ranges are jointly configured together, or a ceiling on the count of overlapping instants — and a ceiling on a count that partitions legitimately raise is a bound the correct system would trip (D-030). Recorded, not covered |
+| **M8** | `Report::joint_overlap` never clears a range, so any two ranges ever joint on a node count | nothing, likewise | **the witness.** 38 of 100 seeds unwitnessed and **6 of 20**, against 0 of 100 and 0 of 20 on the correct node. It was recorded as *not caught* in this entry's first draft, on reasoning the section above retracts |
+| **M9** | `Driver::transfer` hands over one range: `self.cluster.ranges()` → `.into_iter().take(1)` | nothing: `take(1)` of a list of one is that list | **`transfer_ranges`.** `leadership was handed over for {2} and not for every range this node holds`, at 20 seeds and at 100. Not a no-op on the node either: leaders by range go from {2: 295, 3: 284, 4: 299, 5: 295} to **{2: 292, 3: 232, 4: 245, 5: 233}**, three ranges losing about fifty elections each — and **every floor this entry had before the review is met by that run**, which is why the claim needed a check of its own |
+| **M10** | the partition isolates a different server while `aimed` still records the drawn range's leader: `side_servers.insert(leader)` → `insert(leader % INITIAL_VOTERS + 1)` | nothing: three servers, and the scenario's one group has the same leader either way | **the partitions-hit floor**, once it reads the side. **0.075 at 100 seeds and 0.125 at 20**, against the 0.900 floor. Before the side was carried the floor stayed at 200/200 and the only thing that fired was seed 12's `match starts` verdict — issue #81's broken fold, an accidental catch by a false positive. Demonstrated by standing #81's fold down, which is what PR #89 makes true: the mutation then fails on the floor alone at both tiers, and the correct node with #81 stood down passes both |
 
-**Seven of eight caught, one recorded and not covered.** Three of the seven — M2, M3
-and M5 — are only caught because three floors were added *for* them: the two
-comparisons of a per-range fold against the cluster's, and the set of ranges the
-partitions aimed at. **Without those three floors M2, M3 and M5 pass every tier**, and
-saying so is the honest reading of the table. The bounds could not have caught them:
-a fold widened back to the whole history only ever passes a bound, so what catches a
-widening is a floor that says the narrow fold saw something the wide one could not.
+**Ten of eleven caught, one — M7's stricter variant — caught for a reason worth
+reading.** Six of the ten are caught only because a guard was added *for* them: M2, M3
+and M5 by the three floors this entry's first draft added (the two comparisons of a
+per-range fold against the cluster's, and the set of ranges the partitions aimed at),
+and M8, M9 and M10 by the witness, the transfer's ranges and the partition's side,
+which the review of this branch is what produced. **Without those six guards, six of
+these mutations pass every tier.** Saying so is the honest reading: the guards are the
+campaign's output, not its premise, and the two rounds of it found three checks that
+asserted less than their names claimed.
+
+Bounds could not have caught any of the six. A fold widened back to the whole history,
+a fold that never clears its state, a transfer that reaches one range and a partition
+that cuts the wrong server all *pass* every bound — what catches them is a floor that
+says the narrow fold saw something the wide one could not, a set that says every range
+was reached, a side that says what was actually cut, and a backwards read that says the
+answer is true.
 
 **The machine, for every figure below** (D-070). Darwin 25.6.0 arm64, Apple M2, 8
 cores, **on AC Power**, no thermal warning recorded, with four other agents' slices
@@ -11285,9 +11354,12 @@ At **100 seeds**, all pass; at **1 000**, 999 pass and one is issue #81, below.
 | uniformly scheduled | 50 | 500 |
 | grow completed **on every range** | 100/100 | 1000/1000 |
 | shrink completed on every range | 100/100 | 1000/1000 |
-| a node jointly configured on two ranges at once | **100/100** | **1000/1000** |
+| a node jointly configured on two ranges at once, **witnessed** | **100/100** | **1000/1000** |
 | both joiners admitted to **every** range | 100/100 | 1000/1000 |
-| partitions that cut off the drawn range's leader | **200/200** | **2000/2000** |
+| partitions that cut off the drawn range's leader, **side checked** | **200/200** | **2000/2000** |
+| ranges a leadership transfer was asked for | **all four** | **all four** |
+| transfers the named server then led the range after | 140/192 (72.9 %) | 1 579/2 048 (77.1 %) |
+| step-downs outside `C_new` / configuration reverts / elections while joint | 219 / 33 / 6 | 2 316 / 456 / 106 |
 | snapshot actions traced | **0** | **0** |
 | highest index any replica reached | **52** | **61** |
 | leaders by range | {2: 295, 3: 284, 4: 299, 5: 295} | {2: 2982, 3: 2930, 4: 2967, 5: 2936} |
@@ -11296,7 +11368,56 @@ At **100 seeds**, all pass; at **1 000**, 999 pass and one is issue #81, below.
 The four ranges agree with each other to within 4 % on applies at a hundred seeds and
 1.4 % at a thousand, which is what says one range is not being starved by the node's
 one `apply` task — and it is the figure D-082's own M3 showed that
-`applies.contains_key(&range)` cannot see.
+`applies.contains_key(&range)` cannot see. The least range's share of the busiest is
+**0.967** at a hundred seeds here and 0.912 at the gate's twenty, against a floor of
+0.5. (An earlier draft quoted 0.87 for this: that is D-082's figure for the *raft
+sweep's* node, carried in from another scenario. The floor is the same and the figure
+was wrong.)
+
+### What the node's positive control asks, against what the one-group one asks
+
+The one-group control (`MembershipCoverage::assert_complete`) is the standard this one
+is measured against, and in this entry's first draft the node's control dropped about
+ten of its assertions without saying so — in an entry whose own claim is that "the
+shape D-082 named is the shape taken, in every particular". They are carried here now,
+with the one-group tiering, since all are reachable on the node and none needs a
+snapshot path. Figures at 100 seeds / at the gate's 20:
+
+| Asserted | Tier | On the node |
+|---|---|---|
+| joint configurations taken | every tier, > 0 | 4 025 / 799 |
+| new configurations taken | every tier, > 0 | 3 849 / 763 |
+| learners promoted | every tier, > 0 | 822 / 162 |
+| learner rounds that caught up | every tier, > 0 | 822 / 162 |
+| partitions, completed operations, uniform seeds | every tier, > 0 | 200 / 40, 17 266 / 3 460, 50 / 10 |
+| a match rise under a follower's incarnation | every seed | **100/100, 20/20** |
+| a learner's catch-up round | every seed | **100/100, 20/20** |
+| an accepted change | every seed | **100/100, 20/20** |
+| step-downs of a leader outside `C_new` | `seeds >= 100`, > 0 | 219 / 44 |
+| configuration reverts | `seeds >= 100`, > 0 | 33 / 3 |
+| elections while joint | `seeds >= 1000`, > 0 | 6 / 0 |
+
+**What the node's control keeps:** every one of the above, at the one-group tier. Two of
+them — step-downs and reverts — are commoner here than on one group, because four ranges
+give four changes a seed; the tier is kept the one-group one rather than tightened,
+since nothing here measured the rate a tighter tier would rest on.
+
+**What it drops, and why** — three, each an absence this entry already documents rather
+than a silence:
+
+- `seeds_with_a_snapshot_fed_joiner == seeds`, `adoptions > 0` and the refusal-clause
+  assertion: the node has no snapshot path and no refusal path, and
+  `Report::check` fails any seed that reaches either. These are the absences, asserted.
+- `reverts_to_a_prefix > 0` at the thousand-seed tier: a revert to a *compacted or
+  installed* prefix needs a snapshot, so it has no subject here. `config_reverts` — the
+  general case, which does not — is kept.
+- the compaction counters and `longest_compaction_wait`: no leader compacts here, for
+  the same reason, and `feeds_joiners_by_snapshot` is what says so.
+
+**What it adds** that the one-group control cannot have: the witness, the transfer's
+ranges and landing floor, the partitions' aimed ranges and side-checked hit floor, the
+two per-range-against-cluster floors, and the apply spread — seven guards with no
+subject on a single range.
 
 ### The bounds, measured before they were asserted
 
@@ -11404,8 +11525,10 @@ of those and left the second, and this slice keeps that division exactly:
   joiner. Each names the slice that owns the wiring. **The day it lands the sweep says
   so instead of passing over it.**
 - **Still deferred, and not pretended done.** The truncation revert floor and the
-  kept-tail repair are issue #46's remainder and are not touched here, on either
-  cluster.
+  kept-tail key repair are **issue #56**, split out of #46 on 2026-09-15 and recorded
+  as such in D-058 (DECISIONS.md:5409); they are not touched here, on either cluster.
+  Calling them "#46's remainder" — as this entry's first draft did — names a ticket
+  that is not the one that holds them.
 
 So the half of #46 four ranges make *possible* — a change of a range while another
 range on the same node is changing — is built and asserted on every seed, and the half
@@ -11451,6 +11574,14 @@ the other.
 - **The membership scenario's per-range liveness and availability bounds are new**, and
   are the only bounds this branch introduces. Both are measured and both are stated
   above. Nothing existing was widened.
+- **The minority a partition cuts to is a minority of the *old voters*, not of the five
+  servers**, and the side-checking fold is what found it. The first run of
+  `partitions_hit_their_ranges` with the side in it reported 83 of 200 rather than 200
+  of 200, because the with-movers half of every schedule puts three of five servers on
+  the cut-off side — and one of the three voters in force, which is the scenario's own
+  shape and the reason that half exists (the module's "a merged majority is disjoint
+  from the old voters'"). The fold counts voters, not servers. Nothing in the scenario
+  changed; a fold written against the wrong reading of it did.
 
 ### What is not built here
 
@@ -11462,11 +11593,6 @@ the other.
 - **Follower compaction, the install path's variants and Q15's refusal** are not
   reachable on this node either, for the reasons D-082 gave, and this scenario asserts
   the same absences with the same words.
-- **A bound on how long two of a node's ranges are jointly configured together.** M8
-  shows the overlap fold can be widened unnoticed, and the measurement that would catch
-  it — the duration of the overlap, or a ceiling on its count — is not built here,
-  because a ceiling on a count that partitions legitimately raise is a bound the
-  correct system would trip. It is recorded in the table and goes to the owner with it.
 
 ---
 

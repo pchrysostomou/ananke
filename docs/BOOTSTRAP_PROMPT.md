@@ -116,8 +116,12 @@ _Update this section at the end of every session._
   node at 14 of 100 seeds against the one-group server's 19, above D-061's five per
   cent, so its tier does not move. Liveness and availability became **per range** on
   measured bounds (a range's gap 1.33 s at 1 000 seeds against 5 s; its first write
-  after a heal 1.81 s against 6 s). Eight mutations were planted one at a time and
-  seven caught, three of them only because floors were added for them. **Finding:** at
+  after a heal 1.81 s against 6 s). Eleven mutations were planted one at a time and ten
+  caught, six of them only because a guard was added for them; the review's round found
+  three checks asserting less than their names claimed, and the fixes are a **witness**
+  on the overlap fold (the answer checked against the trace read backwards — 0 of 100
+  unwitnessed correct, 38 of 100 for a fold that never clears its state), the side the
+  partition actually cut, and the ranges the transfer was asked for. **Finding:** at
   the thousand-seed tier, seed 449 reaches **issue #81** — a voter removed and re-added
   inside one leader's term — whose fix is PR #89; the gate and CI tiers are green.
 - Merge update (2026-09-22): branch `phase-3-stage-b-compaction` merged `origin/main`

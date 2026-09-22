@@ -39,11 +39,14 @@
 //!
 //! **What four ranges make possible and one group could not** is the other half of
 //! issue #46's extension: *a change of one range while another range on the same node
-//! is changing*. The node asks for the grow, and later the shrink, of **every** range,
-//! staggered by a gap of each range's own drawing, so a node carries several ranges'
-//! joint configurations at once; [`Report::joint_overlap`] is asked of every seed and
-//! names the node and the two ranges. On one group there is one range and no overlap
-//! to have, which is why this could not be asserted before.
+//! is changing*. **What produces it is that the grow, and later the shrink, is asked
+//! of every range** — a node then carries several ranges' joint configurations at
+//! once. The stagger interleaves the four requests rather than firing them as one,
+//! which is a truer shape, but it is **not** the cause:
+//! measured with the stagger set to zero, the overlap is still on 100 of 100 seeds.
+//! [`Report::witnessed_joint_overlap`] is asked of every seed and names the node and
+//! the two ranges. On one group there is one range and no overlap to have, which is
+//! why this could not be asserted before.
 //!
 //! **What the node has not got is asserted absent, with its reason, on every seed**
 //! (CLAUDE.md): `ananke_shard::snapshot` is not wired to
@@ -172,9 +175,13 @@ pub const TRACE_CAP: usize = 600_000;
 ///
 /// It is small on purpose. A joint configuration with no partition over it lives for a
 /// round trip or two — tens of milliseconds — so a stagger of the partition's own
-/// scale would serialise the four changes and there would be nothing to overlap. The
-/// overlap it produces is *measured* and printed by the sweep, never assumed
-/// (PROPOSED D-084).
+/// scale would serialise the four changes and there would be little left to overlap.
+///
+/// **It is not what produces the overlap**, and that is worth saying because it would
+/// be easy to assume: what produces it is that the change is asked of *every* range.
+/// Set to zero, the overlap is still witnessed on 100 of 100 seeds. What the stagger
+/// buys is that the four changes interleave rather than fire as one instant's work,
+/// which is the truer shape of an operator driving four ranges (PROPOSED D-084).
 // PROPOSED(D-084): the membership scenario on the node, four ranges on every node.
 const RANGE_STAGGER_MAX_MS: u64 = 25;
 
@@ -188,6 +195,27 @@ const ATTEMPTS: u32 = 4;
 const POLL_BUDGET: u32 = 10;
 /// How long the driver advances between completion polls.
 const POLL: Duration = Duration::from_millis(200);
+
+/// One partition, as the driver made it: what it aimed at, and what it cut.
+///
+/// The side is here because the claim [`Report::partitions_hit_their_ranges`] makes is
+/// not "the drawn range's leader was `server`" but "the drawn range's leader was cut
+/// off", and only the set the driver handed `Sim::partition` can say the second. A
+/// fold that read `server` alone against the trace's leaders would be blind to a
+/// partition that isolated somebody else entirely, which is a mutation a single-range
+/// world could not make and this one can (PROPOSED D-084).
+// PROPOSED(D-084): a leader-relative fault resolves its leader per range.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Aimed {
+    /// The range the phase drew, whose leader the partition means to cut off.
+    pub range: u64,
+    /// The server the driver read as that range's leader.
+    pub server: u64,
+    /// When the partition was made.
+    pub at: Instant,
+    /// The servers on the cut-off side, exactly as handed to `Sim::partition`.
+    pub side: BTreeSet<u64>,
+}
 
 /// The partition drawn for one change.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -590,11 +618,15 @@ pub struct Report {
     pub run: RunHeader,
     /// The partitions made, as (from, until).
     pub partitions: Vec<(Instant, Instant)>,
-    /// What each partition aimed at, as (the range drawn, the server cut off as its
-    /// leader, when the partition was made): the teeth of SHARD.md §11's env item 8
-    /// for this scenario, read by [`Report::partitions_hit_their_ranges`].
+    /// What each partition aimed at and what it actually cut: the teeth of SHARD.md
+    /// §11's env item 8 for this scenario, read by
+    /// [`Report::partitions_hit_their_ranges`].
     // PROPOSED(D-084): a leader-relative fault resolves its leader per range.
-    pub aimed: Vec<(u64, u64, Instant)>,
+    pub aimed: Vec<Aimed>,
+    /// Every range a leadership transfer was asked for, as (range, the server asked
+    /// for, when): the claim the driver's transfer makes, which nothing else records.
+    // PROPOSED(D-084): the transfer hands over every range the node holds.
+    pub transfers: Vec<(u64, u64, Instant)>,
     /// When the last partition healed.
     pub last_heal: Instant,
     /// Whether {1, 2, 3, 4, 5} took effect, non-joint, on a majority of it — on
@@ -740,14 +772,21 @@ impl Report {
     /// A gap folded over every range at once is a gap in the *cluster's* service, and
     /// four ranges can hide a range's outage inside it: while one range serves
     /// nothing, the other three keep completing operations a few milliseconds apart
-    /// and the whole-history gap never opens. This is the check with the most to be
-    /// wrong about on a node and the least on one group, where the whole history is
-    /// the one range's and this is [`Report::longest_completion_gap`] itself.
+    /// and the whole-history gap never opens. On one group the whole history is the
+    /// one range's and this is [`Report::longest_completion_gap`] itself.
     ///
     /// Its bound is [`range_availability_bound`], measured on the correct node before
     /// it was asserted (PROPOSED D-084): a range sees about a quarter of the clients'
     /// operations, so its gaps are wider than the cluster's by construction and the
     /// cluster's bound could not be reused without measuring.
+    ///
+    /// **What this does not catch**, and the liveness clause beside it does: a range
+    /// wedged to nothing. With fewer than two completions there is no gap to measure
+    /// and this answers `None`, so the range that served *least* is the one this says
+    /// least about. That is not a hole — `time_to_write_after_heal_of` fails such a
+    /// range outright, with no bound to tune — but it is why this is the weaker of the
+    /// two and not, as an earlier draft of this comment had it, the one with the most
+    /// to be wrong about.
     // PROPOSED(D-084): an availability check of a node is a check of each of its ranges.
     #[must_use]
     pub fn longest_completion_gap_of(&self, range: u64) -> Option<Duration> {
@@ -801,12 +840,29 @@ impl Report {
     /// ordinary state of a cluster mid-change and says nothing about a node carrying
     /// several groups: what Q41's round, the one inbox, the one engine and the one
     /// apply task are asked to hold is *two of one node's ranges* changing together.
+    ///
+    /// **The answer this returns is not asserted on its own**, because a forward fold
+    /// can be widened into always answering — drop the line that clears a range when
+    /// its joint configuration ends and every pair of ranges ever joint on a node
+    /// counts. [`Report::witnessed_joint_overlap`] is what the sweep asks, and it
+    /// checks this answer against the same trace read backwards.
     // PROPOSED(D-084): #46's extension the node makes possible — one node, two ranges
     // changing at once.
     #[must_use]
     pub fn joint_overlap(&self) -> Option<(u64, u64, u64, Instant)> {
+        self.joint_overlap_at()
+            .map(|(server, first, second, at, _)| (server, first, second, at))
+    }
+
+    /// [`Report::joint_overlap`], with the index of the record the answer rests on, so
+    /// the witness below can read the trace *up to that record* rather than up to that
+    /// instant — several configurations can share an instant, and a witness that could
+    /// not tell them apart would be answering a different question from the fold.
+    // PROPOSED(D-084): #46's extension the node makes possible — one node, two ranges
+    // changing at once.
+    fn joint_overlap_at(&self) -> Option<(u64, u64, u64, Instant, usize)> {
         let mut joint: BTreeMap<u64, BTreeSet<u64>> = BTreeMap::new();
-        for record in &self.records {
+        for (i, record) in self.records.iter().enumerate() {
             let TraceEvent::RaftConfig {
                 server,
                 range,
@@ -822,11 +878,118 @@ impl Report {
                 continue;
             }
             if let Some(&other) = on.iter().find(|&&other| other != *range) {
-                return Some((*server, other, *range, record.at));
+                return Some((*server, other, *range, record.at, i));
             }
             on.insert(*range);
         }
         None
+    }
+
+    /// [`Report::joint_overlap`]'s answer, **witnessed by the trace read backwards**,
+    /// or why it is not.
+    ///
+    /// The forward fold above produces the answer by carrying state; this asks the
+    /// trace itself whether the answer is true, and asks it the other way round: at
+    /// the record the fold stopped on, each of the two ranges' **last** `RaftConfig`
+    /// for that server, at or before that record, must be joint. Nothing the forward
+    /// fold does can satisfy that by construction — it is a different traversal of a
+    /// trace the fold does not write — so it is a guard on the fold and not a restating
+    /// of it.
+    ///
+    /// This is what the sweep asserts, and the reason it exists is the reason to write
+    /// it down: `joint_overlap` is the one check this slice adds that had no guard
+    /// against its own widening. A fold that never cleared a range would report an
+    /// overlap on every seed of every tier, so no floor, count or bound could see it —
+    /// **and it is not a bound, so no correct run can trip it.** Measured: the correct
+    /// node is witnessed on 100 of 100 seeds and on 20 of 20; the never-clearing fold
+    /// is unwitnessed on 38 of 100 and on 6 of 20 (PROPOSED D-084).
+    ///
+    /// # Errors
+    ///
+    /// That no overlap was found at all, or that one of the two ranges was not in fact
+    /// jointly configured there.
+    // PROPOSED(D-084): the answer is witnessed, which is what guards the fold.
+    pub fn witnessed_joint_overlap(&self) -> Result<(u64, u64, u64, Instant), String> {
+        let Some((server, first, second, at, upto)) = self.joint_overlap_at() else {
+            return Err(
+                "no node ever held two ranges' joint configurations at once, so the changes did \
+                 not overlap and this run exercised nothing one group could not"
+                    .to_owned(),
+            );
+        };
+        for range in [first, second] {
+            let last = self.records[..=upto]
+                .iter()
+                .rev()
+                .find_map(|record| match &record.event {
+                    TraceEvent::RaftConfig {
+                        server: who,
+                        range: of,
+                        joint,
+                        index,
+                        ..
+                    } if *who == server && *of == range => Some((*joint, *index)),
+                    _ => None,
+                });
+            match last {
+                Some((true, _)) => {}
+                Some((false, index)) => {
+                    return Err(format!(
+                        "server {server} is reported jointly configured on ranges {first} and \
+                         {second} at {at:?}, but its last configuration of range {range} there \
+                         is the non-joint one at index {index}: the overlap is not witnessed by \
+                         the trace"
+                    ));
+                }
+                None => {
+                    return Err(format!(
+                        "server {server} is reported jointly configured on ranges {first} and \
+                         {second} at {at:?}, but it had traced no configuration of range \
+                         {range} by then: the overlap is not witnessed by the trace"
+                    ));
+                }
+            }
+        }
+        Ok((server, first, second, at))
+    }
+
+    /// Every range a leadership transfer was asked for over the run.
+    ///
+    /// The driver's transfer hands over **every** range the node holds, so that the
+    /// shrink's leader is outside `C_new` on each of them and the step-down is
+    /// exercised there. That claim is the driver's alone: a transfer that reached one
+    /// range of four still leaves the run passing every check, and the leaders it costs
+    /// the other three are lost among the elections faults cause anyway. This is what
+    /// says the claim was kept.
+    // PROPOSED(D-084): the transfer hands over every range the node holds.
+    #[must_use]
+    pub fn transfer_ranges(&self) -> BTreeSet<u64> {
+        self.transfers.iter().map(|&(range, _, _)| range).collect()
+    }
+
+    /// How many of this run's transfers were followed by the asked-for server leading
+    /// that range, and how many were asked: what says the step-down the shrink needs
+    /// was actually set up.
+    ///
+    /// Not asserted at one — a transfer is one shot and best effort, as the sweep's
+    /// lease trial is — but at a floor measured on the correct node.
+    // PROPOSED(D-084): the transfer hands over every range the node holds.
+    #[must_use]
+    pub fn transfers_landed(&self) -> (usize, usize) {
+        let mut landed = 0;
+        for &(range, to, at) in &self.transfers {
+            let took = self.records.iter().any(|record| {
+                record.at >= at
+                    && matches!(
+                        record.event,
+                        TraceEvent::RaftLeader {
+                            server, range: of, ..
+                        } if server == to && of == range
+                    )
+            });
+            landed += usize::from(took);
+        }
+        (landed, self.transfers.len())
     }
 
     /// Every range `joiner` became a voter of, as a non-joint configuration naming it
@@ -861,22 +1024,31 @@ impl Report {
     /// leader on the minority side. A partition that resolved "the leader" without
     /// the range — the node leading most of them, say — would cut off a perfectly
     /// good server and no check of the run would report it, so this is what reports
-    /// it. The fold is a forward walk of the finished trace keeping the latest
-    /// `RaftLeader` per range, which is not the backward windowed search the driver
-    /// itself used.
+    /// it.
+    ///
+    /// **Two things are asked of each partition, and the second is the one the name
+    /// promises.** First, that the server the driver read really was that range's
+    /// leader: a forward walk of the finished trace keeping the latest `RaftLeader`
+    /// per range, which is not the backward windowed search the driver used. Second,
+    /// that the partition **actually cut that server off** — that it is on the side
+    /// [`Aimed::side`] recorded, and that that side is the minority of the servers.
+    /// Without the second the fold reads the driver's own two variables against each
+    /// other and a partition that isolated somebody else entirely passes it, which is
+    /// a mutation this scenario can make and a single-range one cannot.
     ///
     /// It is not asserted at one: a leadership change between the driver's read and
     /// the partition is ordinary, and on one group every partition aims at the only
     /// range there is. What the sweep asserts is a floor measured on the correct
     /// system.
-    // PROPOSED(D-084): a leader-relative fault resolves its leader per range.
+    // PROPOSED(D-084): a leader-relative fault resolves its leader per range, and is
+    // seen to cut it off.
     #[must_use]
     pub fn partitions_hit_their_ranges(&self) -> (usize, usize) {
         let mut hit = 0;
-        for (range, server, at) in &self.aimed {
+        for aimed in &self.aimed {
             let mut leader = None;
             for record in &self.records {
-                if record.at > *at {
+                if record.at > aimed.at {
                     break;
                 }
                 if let TraceEvent::RaftLeader {
@@ -884,12 +1056,27 @@ impl Report {
                     range: of,
                     ..
                 } = &record.event
-                    && of == range
+                    && *of == aimed.range
                 {
                     leader = Some(*who);
                 }
             }
-            hit += usize::from(leader == Some(*server));
+            // A minority **of the old voters**, which is this scenario's own meaning
+            // and not a minority of all five servers: the side is either the leader
+            // alone or the leader with servers 4 and 5, and the second is three of
+            // five but still one of the three voters in force — the shape where a
+            // broken joint-majority rule commits against a disjoint majority (the
+            // module's own description). Counting all five here would call the
+            // with-movers half of every schedule a miss, which is what the first run
+            // of this fold did: 83 of 200 rather than 200 of 200.
+            let voters_cut_off = aimed
+                .side
+                .iter()
+                .filter(|&&server| server <= INITIAL_VOTERS)
+                .count();
+            let cut_off = aimed.side.contains(&aimed.server)
+                && voters_cut_off * 2 < usize::try_from(INITIAL_VOTERS).expect("small");
+            hit += usize::from(leader == Some(aimed.server) && cut_off);
         }
         (hit, self.aimed.len())
     }
@@ -1196,7 +1383,8 @@ struct Driver {
     clients: Vec<NodeId>,
     admin: NodeId,
     partitions: Vec<(Instant, Instant)>,
-    aimed: Vec<(u64, u64, Instant)>,
+    aimed: Vec<Aimed>,
+    transfers: Vec<(u64, u64, Instant)>,
     last_heal: Instant,
     admin_seq: u64,
     leadership: Leadership,
@@ -1373,6 +1561,9 @@ impl Driver {
             self.admin_seq += 1;
             let seq = self.admin_seq;
             let leader = leader_of_range(&self.sim, range);
+            // PROPOSED(D-084): the transfer hands over every range the node holds, and
+            // says which ranges it asked for so the claim can be checked.
+            self.transfers.push((range, to, self.sim.now()));
             let cluster = self.cluster;
             let env = self.sim.env(self.admin);
             let inner = env.clone();
@@ -1483,13 +1674,22 @@ impl Driver {
                 // PROPOSED(D-084): a leader-relative fault resolves its leader per range.
                 let focus = schedule.focus_of(self.cluster, which);
                 let leader = leader_of_range(&self.sim, focus);
-                self.aimed.push((focus, leader, self.sim.now()));
                 let mut side_servers: BTreeSet<u64> = BTreeSet::new();
                 side_servers.insert(leader);
                 if phase.with_movers {
                     side_servers.insert(4);
                     side_servers.insert(5);
                 }
+                // The side is recorded *after* it is built, from the set the partition
+                // below is handed, so that what the fold reads is what the simulator
+                // cut and not what the driver meant to cut.
+                // PROPOSED(D-084): a leader-relative fault resolves its leader per range.
+                self.aimed.push(Aimed {
+                    range: focus,
+                    server: leader,
+                    at: self.sim.now(),
+                    side: side_servers.clone(),
+                });
                 let side: Vec<NodeId> = side_servers
                     .iter()
                     .map(|&s| self.servers[s as usize - 1])
@@ -1591,6 +1791,7 @@ pub fn run_on_with(
         admin,
         partitions: Vec::new(),
         aimed: Vec::new(),
+        transfers: Vec::new(),
         last_heal,
         admin_seq: 0,
         leadership: Leadership::default(),
@@ -1631,6 +1832,7 @@ pub fn run_on_with(
         records,
         partitions: driver.partitions,
         aimed: driver.aimed,
+        transfers: driver.transfers,
         last_heal: driver.last_heal,
         grow_completed,
         shrink_completed,
