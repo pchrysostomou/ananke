@@ -9615,6 +9615,33 @@ causes were already **#81** and **#82**. Nothing is disagreed with: every findin
   to the review described `85412c6` while the tip was `b66fd7f`, so several figures it was asked
   to check had already been struck by this entry. A review brief is written against the tip.
 
+**The second review's premerge**, on the tip that carries its fixes, quoting the
+script's own machine lines:
+`premerge: Darwin 25.6.0 arm64, Apple M2, 8 cores`;
+`premerge: before, load 171.02/173.15/164.43, AC Power, no thermal warning recorded`;
+`premerge: after, load 137.36/116.70/128.83, AC Power, no thermal warning recorded`;
+`premerge: green at 1000 seeds in 1610 s`. **On AC power** throughout. It is the slowest
+of this slice's three premerges — 1 279 s, then 1 610 s — and the loads say why: this run
+began at a load of 171 and never fell below 88, where the previous one began at 10. None
+of the three is comparable with D-071's 625 s on an idle machine (D-070).
+
+Its own output re-states every figure the second review's fixes touch, on the tree that
+ships:
+
+- The raft sweep: `follower_compactions: 58228, seeds_with_a_follower_compaction: 1000,
+  follower_compactions_swallowing_the_config: 0, largest_follower_log: 342,
+  largest_follower_log_seed: 514`, and `snapshots_installed: 9342,
+  snapshot_prefixes_restated: 10788` — every one identical to the figures recorded above,
+  which is the check that completing `replica_of` and reading the emitting node
+  reclassified nothing.
+- The membership sweep: `follower_compactions: 33270,
+  follower_compactions_swallowing_the_config: 5437, seeds_with_a_swallowed_config: 1000`.
+  D-029's revert floor on a follower, 16.3 % of compactions and **every seed**, now
+  asserted at every tier from the scenario where it is reachable.
+- `ApplyBeforeCommit: the compaction fold caught it on 999 of 1000 seeds, first: seed 0:
+  compaction: server 2 compacted through 13, past the 12 it knew committed` — the
+  narrowed oracle, word for word what the un-narrowed one printed.
+
 **What is not done.**
 
 - The nightly on the fixed tip is dispatched, not waited for; its ten thousand seeds are
