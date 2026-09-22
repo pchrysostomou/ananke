@@ -1001,23 +1001,35 @@ mod tests {
 
     #[test]
     fn a_ranges_sweep_leaves_every_other_ranges_versions() {
+        // Two takes at index 11, which D-043 makes two directories: the record pins
+        // take 1, and a stream that opened take 0 has ended. The take is half the pin —
+        // a sweep that read the index alone would delete the take a stream is reading.
         let names: Vec<String> = [
             version_name(R1, 9, 0),  // R1's, unpinned: debris R1 sweeps
-            version_name(R1, 11, 0), // R1's, pinned: kept
+            version_name(R1, 11, 0), // R1's other take at the pinned index: debris too
+            version_name(R1, 11, 1), // R1's, pinned: kept
             version_name(R2, 9, 0),  // R2's, and R2's record is not R1's
-            version_name(R2, 11, 0),
+            version_name(R2, 11, 1),
             "staging-r2-s1".to_owned(),
         ]
         .into_iter()
         .collect();
-        let keep: BTreeSet<(Index, u64)> = [(11, 0)].into_iter().collect();
+        let keep: BTreeSet<(Index, u64)> = [(11, 1)].into_iter().collect();
 
         let swept = correct().sweep(&names, R1, &keep);
-        assert_eq!(swept, vec![version_name(R1, 9, 0)]);
+        assert_eq!(
+            swept,
+            vec![version_name(R1, 9, 0), version_name(R1, 11, 0)],
+            "the take the record does not name is debris at the pinned index too"
+        );
+        assert!(
+            !swept.contains(&version_name(R1, 11, 1)),
+            "the pinned take is kept: {swept:?}"
+        );
 
         let swept = buggy(NodeVariant::SweepAcrossRanges).sweep(&names, R1, &keep);
         assert!(
-            swept.contains(&version_name(R2, 11, 0)),
+            swept.contains(&version_name(R2, 11, 1)),
             "the variant is meant to sweep other ranges' versions: {swept:?}"
         );
     }
@@ -1188,6 +1200,22 @@ mod tests {
             Landing::Waiting { ahead: 0 }
         );
         assert_eq!(task.meters().waiting, 2, "a resend queues nothing new");
+        // A waiter the node gives up on leaves the queue. `finish` on a (range, sender)
+        // holding no assembly frees no slot and hints at nothing, but the queue falls
+        // with it — otherwise a stream that stopped inflates `ahead` for every waiter
+        // behind it, for ever.
+        assert_eq!(
+            task.finish(RangeId(4), S1),
+            None,
+            "a waiter holds no slot to free"
+        );
+        assert_eq!(task.meters().waiting, 1);
+        assert_eq!(
+            task.on_chunk(RangeId(4), S1, AT, 16, false),
+            Landing::Waiting { ahead: 1 },
+            "and when it asks again it queues behind the one still asking"
+        );
+        assert_eq!(task.meters().waiting, 2);
         // Nothing the waiters sent disturbed the two that were admitted.
         assert!(matches!(
             task.on_chunk(RangeId(1), S1, AT, 16, false),
@@ -1367,6 +1395,14 @@ mod tests {
         assert_eq!(refused.range, R1);
         assert_eq!(refused.to, S2);
         assert_eq!(refused.len, MAX_FRAME_LEN);
+        // And the first byte over the limit, not only a chunk far over it: the guard is
+        // `encoded_len(chunk) > MAX_FRAME_LEN`, and one that forgot `HEADER_LEN` would
+        // hand this chunk to `Builder::push`, whose own `fits` assertion panics on it.
+        let over = MAX_FRAME_LEN - encoded_len(0) + 1;
+        let refused = task
+            .route(R1, S2, &vec![7u8; over])
+            .expect_err("one byte over what fits a frame");
+        assert_eq!(refused.len, over);
         assert_eq!(task.meters().frames, 0);
         assert_eq!(task.meters().chunks, 0, "a refused chunk is not counted");
     }
@@ -1496,7 +1532,13 @@ mod tests {
 
     #[test]
     fn only_a_fresh_directory_after_a_refusal_is_adopted() {
-        let mut task = correct();
+        // A cap of one, so the queue is not empty when the adoption drops it: a waiter
+        // names a directory under the refused store exactly as an assembly does, and an
+        // adoption asserted on an empty queue asserts nothing about it.
+        let mut task = Snapshots::new("/n1", ME, 1, NodeVariants::correct());
+        for range in [R1, R2] {
+            task.host(range, spans(range));
+        }
         // Every range's install on the node traces no adoption.
         for range in [R1, R2] {
             receive(&mut task, range, S2, AT);
@@ -1512,10 +1554,22 @@ mod tests {
             2,
             "two ranges installed, not adopted"
         );
-        // An assembly is open and a stream is being sent: both name directories under
-        // the refused store, and the adoption drops them.
+        // An assembly is open, a stream is waiting for its slot and a stream is being
+        // sent: all three name directories under the refused store, and the adoption
+        // drops them.
         receive(&mut task, R1, S3, AT);
+        assert_eq!(
+            task.on_chunk(R2, S3, AT, 16, false),
+            Landing::Waiting { ahead: 0 },
+            "the cap of one puts R2's stream in the queue"
+        );
         task.stream(R2, S1, AT);
+        let meters = task.meters();
+        assert_eq!(
+            (meters.receiving, meters.waiting, meters.sending),
+            (1, 1, 1),
+            "one of each before the adoption"
+        );
         // The one thing that traces an adoption: the node taking a fresh directory
         // (Q15). Nothing has installed into *that* directory, which is what the figure
         // says and what the assertion checks.
@@ -1583,7 +1637,12 @@ mod tests {
             matches!(landing, Landing::Staged { staged: 1_032, .. }),
             "S1's stream counts its own bytes: {landing:?}"
         );
-        assert_eq!(correct.meters().receiving, 2);
+        assert_eq!(
+            correct.meters().receiving,
+            2,
+            "two senders of one range are two assemblies, and so two slots under the \
+             cap: the arithmetic open choice 2's recommendation rests on"
+        );
         assert_eq!(correct.meters().abandoned, 0);
 
         let mut buggy = buggy(NodeVariant::StagingByRangeAlone);
