@@ -10602,10 +10602,26 @@ was make the entry's claim untrue, and a claim of exactness that is only true on
 band it was measured on is worth nothing.
 
 A term record of the leader's own now ends the phase as a configuration does, and that
-is exactly faithful rather than merely safer: every `RaftTerm` a replica traces is a
-`set_role`, and both roles that reach one from leading — `become_leader` and
-`become_follower` — clear the change on the way, so `last_accepted` is non-empty exactly
-while the core holds a change. Re-measured with the core counting every `Progress` it
+is exactly faithful rather than merely safer. The records that bear on it are
+`set_role`'s (core.rs:1384-1396): both ways out of leading — `become_leader` and
+`become_follower` — clear the change on the way, so a leader's `last_accepted` is
+non-empty exactly while the core holds one.
+
+**A restatement traces a term record too, and this entry first denied it**, saying that
+every `RaftTerm` a replica traces is a `set_role`. That is false: `node.rs:1016` restates
+one for the single-group server and `shard/src/server.rs:996` for a node's replicas. It
+was written from a grep of `ananke-raft/src/core.rs` alone, generalised to "a replica" —
+and two paragraphs above, this entry withdraws a claim of exactness for being true only
+of the band it was measured over. A claim of exclusivity true of only the file it was
+grepped from is the same fault, and in an entry about that fault it is the one thing that
+must not stand.
+
+It changes nothing, which is why no measurement caught it. A restatement's core is
+freshly built and holds no change, and the fold clears at the `RaftConfig` and the
+`RaftRecovered` that precede the term record in the same restatement in any case, so the
+clearing there is redundant rather than wrong. Nor was the path untested: the membership
+scenario runs `node.rs`'s restatement, so every seed of the audit below exercised it, and
+the audit came out 1:1. Re-measured with the core counting every `Progress` it
 re-inserts and the fold counting every window it opens: **seeds 0 to 3 000, 11 220
 against 11 220; seeds 7 000 to 7 500, 1 880 against 1 880; no seed differing.** Over the
 whole raft sweep at a thousand seeds the fold opens **no window at all**, that scenario
@@ -10720,10 +10736,15 @@ it is green at ten thousand seeds:
 
 Ten thousand seeds of the scenario that drives changes, every one of them showing a match
 start, with the fold's rule holding on all of them — that is what the run is cited for,
-and citing the run as a whole would be citing a red one. A fresh nightly on the tip that
-carries the review's fixes is dispatched as run 35740760759, on `b2ad5de`; its shard 6
-is expected to stay red on #82, which PR #87 fixes, and its shard 5 is the one that must
-be green.
+and citing the run as a whole would be citing a red one.
+
+**The nightly on the tip that carries the review's fixes has since run**, 35740760759 on
+`b2ad5de`, and came out where it was expected to. Shard 6 is red on raft seed 3085, the
+same #82 that PR #87 fixes. **Every other shard is green, shard 5 among them**, with the
+membership counters unmoved — `match_starts: 116305`, `changes_accepted: 31906`,
+`seeds_with_a_match_start: 10000` — so the fold keyed by range, clearing at a term
+record, holds on ten thousand seeds of the scenario that drives changes and reports the
+same numbers as the fold before it. The two tips differ by this file alone.
 
 ---
 
