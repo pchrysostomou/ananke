@@ -211,7 +211,18 @@ cap wait rather than restarting one another. A slot the cap frees is granted to 
 that is asking for it, never reserved for one that asked earlier and may since have been
 replaced as leader; and a chunk that starts an assembly over is answered with that
 restart even when it is its stream's last, since the directory it would be installed from
-has just been started over (Q14; D-075, proposed). An
+has just been started over (Q14; D-075, proposed). A chunk naming a range the node
+does not host is refused before it is admitted, so a leader that has not learned the
+range moved and a garbled range id each cost one answer and no slot, while the node's
+own send half fails instead, where the range streamed is the node's claim and not a
+peer's. A last chunk resent because its answer was lost is answered installed and
+installs once: the receiver remembers the identity each assembly completed until the
+node ends that assembly, which it does only once it has answered the sender. The slot
+an admitted assembly holds is given up when that range's own Raft supersedes its
+sender — a chunk of that range from a leader at a higher term takes it — and on a
+leader change the node observes for a range, the node ends the assembly the old leader
+held, since a chunk of one range is no evidence about who leads another (Q14; D-075,
+proposed). An
 acknowledgement that takes a stream past the furthest point any acknowledgement had
 taken it is that stream's progress, and the task marks the follower for the core, which
 reads the marks before each tick; a duplicate, the answer a resend gets and ground a

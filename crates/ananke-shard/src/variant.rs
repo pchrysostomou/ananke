@@ -92,7 +92,7 @@ pub enum NodeVariant {
     /// heartbeats needed (Q41, SHARD.md §4).
     ChunksInBatchFrames,
     /// The install's manifest switch made without the range's repair carried in it, as
-    /// the stream's last chunk arrives (D-066; RAFT.md:225-233). It is
+    /// the stream's last chunk arrives (D-066; RAFT.md:238-246). It is
     /// [`ananke_raft::Variant::SnapshotWithoutCurrentLast`] on the node's install path.
     InstallWithoutRepair,
     /// `RaftAdopted` traced for a replica's live install. On the node that event
@@ -116,6 +116,30 @@ pub enum NodeVariant {
     /// install, never that the staging directory must start over, so the install takes
     /// the abandoned stream's files for the new snapshot's (RAFT.md:203-207).
     CompleteOnRestart,
+    /// An install that carries the node's *first hosted* range's spans instead of the
+    /// completed range's. `Engine::install_spans` removes every key of the spans it is
+    /// given and adds the staged tables in one switch (D-068), so a re-seed of one
+    /// range then deletes another range's Raft state and user keys while that range is
+    /// running — silently, on a node whose ranges are otherwise correct (D-066,
+    /// D-075).
+    InstallWrongRangesSpans,
+    /// A chunk naming a range the node does not host taken in and given an assembly,
+    /// instead of refused on arrival. `range` is a peer's word: a leader that has not
+    /// learned the rebalancer moved the range (Q33), or a garbled range id, then holds
+    /// a slot under the node's receive cap and starves the ranges the node does host
+    /// (SHARD.md §11 raft 14; D-075).
+    AdmitsAnUnhostedRange,
+    /// An assembly kept until it finishes even when the range's own Raft has
+    /// superseded its sender: a chunk of that range from a leader at a higher term
+    /// waits behind an assembly no stream will ever complete. Where
+    /// [`NodeVariant::SlotReservedForWaiter`] wedges the node on a *waiter's* slot,
+    /// this wedges it on an admitted one (Q14; D-075).
+    AssemblyHeldForDepartedSender,
+    /// A resent last chunk installed a second time. A chunk unanswered for half a
+    /// minimum election timeout is resent as a matter of course (RAFT.md:200-202), so
+    /// the node makes a second manifest switch from a staging directory the first
+    /// switch may already have consumed (D-068, D-075).
+    InstallsADuplicateLastChunk,
 }
 
 impl NodeVariant {
@@ -140,15 +164,21 @@ impl NodeVariant {
         NodeVariant::StagingByRangeAlone,
         NodeVariant::SlotReservedForWaiter,
         NodeVariant::CompleteOnRestart,
+        NodeVariant::InstallWrongRangesSpans,
+        NodeVariant::AdmitsAnUnhostedRange,
+        NodeVariant::AssemblyHeldForDepartedSender,
+        NodeVariant::InstallsADuplicateLastChunk,
     ];
 
-    /// The `snapshot` task's own, in order: the eleven ways to get a snapshot keyed by
-    /// range and follower wrong (SHARD.md §11, raft 14; D-066). Seven of the eleven
+    /// The `snapshot` task's own, in order: the fifteen ways to get a snapshot keyed by
+    /// range and follower wrong (SHARD.md §11, raft 14; D-066). Nine of the fifteen
     /// are mutations a single-range, single-follower world could not catch at all:
     /// with one range and one stream, a shared staging directory, a staging directory
     /// keyed by range alone, one assembly, a version name without a range, a sweep
     /// across ranges, a cap of one stream sent and a slot reserved for a waiter are
-    /// each indistinguishable from the correct node.
+    /// each indistinguishable from the correct node, and so are an install carrying
+    /// the node's first hosted range's spans and an assembly held for a sender its
+    /// range has superseded.
     pub const SNAPSHOT: &'static [NodeVariant] = &[
         NodeVariant::SharedStagingDir,
         NodeVariant::OneAssemblyPerNode,
@@ -161,6 +191,10 @@ impl NodeVariant {
         NodeVariant::StagingByRangeAlone,
         NodeVariant::SlotReservedForWaiter,
         NodeVariant::CompleteOnRestart,
+        NodeVariant::InstallWrongRangesSpans,
+        NodeVariant::AdmitsAnUnhostedRange,
+        NodeVariant::AssemblyHeldForDepartedSender,
+        NodeVariant::InstallsADuplicateLastChunk,
     ];
 
     /// The bit this variant takes in a [`NodeVariants`].
@@ -185,6 +219,12 @@ impl NodeVariant {
             NodeVariant::StagingByRangeAlone => 1 << 16,
             NodeVariant::SlotReservedForWaiter => 1 << 17,
             NodeVariant::CompleteOnRestart => 1 << 18,
+            // 1 << 19 is `HeldLocalDropped`, which D-074's slice took on `main`; the
+            // snapshot task's later variants start above it so the two agree.
+            NodeVariant::InstallWrongRangesSpans => 1 << 20,
+            NodeVariant::AdmitsAnUnhostedRange => 1 << 21,
+            NodeVariant::AssemblyHeldForDepartedSender => 1 << 22,
+            NodeVariant::InstallsADuplicateLastChunk => 1 << 23,
         }
     }
 
@@ -211,6 +251,10 @@ impl NodeVariant {
             NodeVariant::StagingByRangeAlone => "StagingByRangeAlone",
             NodeVariant::SlotReservedForWaiter => "SlotReservedForWaiter",
             NodeVariant::CompleteOnRestart => "CompleteOnRestart",
+            NodeVariant::InstallWrongRangesSpans => "InstallWrongRangesSpans",
+            NodeVariant::AdmitsAnUnhostedRange => "AdmitsAnUnhostedRange",
+            NodeVariant::AssemblyHeldForDepartedSender => "AssemblyHeldForDepartedSender",
+            NodeVariant::InstallsADuplicateLastChunk => "InstallsADuplicateLastChunk",
         }
     }
 }
@@ -294,14 +338,14 @@ mod tests {
             assert_eq!(seen & variant.bit(), 0, "{variant} shares a bit");
             seen |= variant.bit();
         }
-        assert_eq!(NodeVariant::BUGS.len(), 19);
+        assert_eq!(NodeVariant::BUGS.len(), 23);
         for variant in NodeVariant::SNAPSHOT {
             assert!(
                 NodeVariant::BUGS.contains(variant),
                 "{variant} is not in BUGS"
             );
         }
-        assert_eq!(NodeVariant::SNAPSHOT.len(), 11);
+        assert_eq!(NodeVariant::SNAPSHOT.len(), 15);
     }
 
     #[test]
