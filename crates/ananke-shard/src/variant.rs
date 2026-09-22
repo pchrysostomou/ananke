@@ -134,6 +134,44 @@ pub enum NodeVariant {
     /// install, never that the staging directory must start over, so the install takes
     /// the abandoned stream's files for the new snapshot's (RAFT.md:203-207).
     CompleteOnRestart,
+    /// A loss in the shared engine treated as one range's: only the range whose store
+    /// open failed is refused — traced as refused, and given a refused mark — and the
+    /// node's other replicas are neither. A node owns one engine (Q2), so a loss in it
+    /// is every replica's: this is the whole of Q15 got wrong (SHARD.md §11, storage 8).
+    ///
+    /// What the three unrefused replicas then do is worth stating exactly, because the
+    /// obvious sentence — that they "carry on over the same engine" — is not available
+    /// to any implementation: the refused directory's marker says lost, so nothing can
+    /// open it at all. They are re-created in the *new* engine instead, and because
+    /// nothing refused them they are created there as a first start would create them:
+    /// quarantine clear, incarnation 1, empty. That is the same harm one range along —
+    /// three replicas voting again on state their node lost (D-035) and three leaders
+    /// keeping a `matched` the rebuilt log cannot honour (D-042) — reached by the
+    /// mistake a reader of §11 would actually make.
+    RefuseOneRangeOnly,
+    /// The re-seed built in the refused directory instead of a new one beside it,
+    /// which opens fresh a directory that held a store (D-041).
+    ReseedIntoRefusedDir,
+    /// The re-seed's new directory taking the lowest generation not in use rather than
+    /// the one past the highest present: a node refused twice hands back its first
+    /// refusal's directory (D-041).
+    ReuseLostGeneration,
+    /// A start opening the newest directory whatever its marker says, instead of the
+    /// newest not marked lost (D-066). A node refused into a new directory that
+    /// crashed before that directory held anything then reopens the refused one.
+    OpenNewestEvenIfLost,
+    /// A replica of a re-seeded node answering before its durable refused mark is
+    /// written into the new engine. Every replica in a fresh engine would otherwise
+    /// open as a first start — quarantine clear, incarnation 1 — so a replica that
+    /// answers first is a replica that may vote again on state its node lost (D-035)
+    /// and whose leader keeps a `matched` the rebuilt log cannot honour (D-042).
+    ServeBeforeRefusedMark,
+    /// The replica's incarnation drawn from the per-range protocol stream rather than
+    /// from the node's own generator. `SimEnv` derives a named stream from the seed and
+    /// the name alone, so a replica created again for the same (range, node) draws the
+    /// number its predecessor drew, and a leader that compares incarnations for
+    /// inequality only (D-042) never resets (Q26; SHARD.md:1372-1379).
+    IncarnationPerRangeStream,
 }
 
 impl NodeVariant {
@@ -159,6 +197,28 @@ impl NodeVariant {
         NodeVariant::StagingByRangeAlone,
         NodeVariant::SlotReservedForWaiter,
         NodeVariant::CompleteOnRestart,
+        NodeVariant::RefuseOneRangeOnly,
+        NodeVariant::ReseedIntoRefusedDir,
+        NodeVariant::ReuseLostGeneration,
+        NodeVariant::OpenNewestEvenIfLost,
+        NodeVariant::ServeBeforeRefusedMark,
+        NodeVariant::IncarnationPerRangeStream,
+    ];
+
+    /// Q15's whole-node refusal and re-seed, in order: the six ways to get a node's
+    /// refusal wrong (SHARD.md §11, storage 8; D-077). Four of the six are mutations a
+    /// single-range world could not catch at all — with one range on a node, refusing
+    /// only that range *is* refusing the node, and a per-range incarnation stream is
+    /// the node's own generator drawn once — and the two about directories need a node
+    /// refused twice in a run, which one range reaches no sooner but which no check
+    /// before this slice asked of any node.
+    pub const RESEED: &'static [NodeVariant] = &[
+        NodeVariant::RefuseOneRangeOnly,
+        NodeVariant::ReseedIntoRefusedDir,
+        NodeVariant::ReuseLostGeneration,
+        NodeVariant::OpenNewestEvenIfLost,
+        NodeVariant::ServeBeforeRefusedMark,
+        NodeVariant::IncarnationPerRangeStream,
     ];
 
     /// The `snapshot` task's own, in order: the eleven ways to get a snapshot keyed by
@@ -205,6 +265,12 @@ impl NodeVariant {
             NodeVariant::StagingByRangeAlone => 1 << 16,
             NodeVariant::SlotReservedForWaiter => 1 << 17,
             NodeVariant::CompleteOnRestart => 1 << 18,
+            NodeVariant::RefuseOneRangeOnly => 1 << 20,
+            NodeVariant::ReseedIntoRefusedDir => 1 << 21,
+            NodeVariant::ReuseLostGeneration => 1 << 22,
+            NodeVariant::OpenNewestEvenIfLost => 1 << 23,
+            NodeVariant::ServeBeforeRefusedMark => 1 << 24,
+            NodeVariant::IncarnationPerRangeStream => 1 << 25,
         }
     }
 
@@ -232,6 +298,12 @@ impl NodeVariant {
             NodeVariant::StagingByRangeAlone => "StagingByRangeAlone",
             NodeVariant::SlotReservedForWaiter => "SlotReservedForWaiter",
             NodeVariant::CompleteOnRestart => "CompleteOnRestart",
+            NodeVariant::RefuseOneRangeOnly => "RefuseOneRangeOnly",
+            NodeVariant::ReseedIntoRefusedDir => "ReseedIntoRefusedDir",
+            NodeVariant::ReuseLostGeneration => "ReuseLostGeneration",
+            NodeVariant::OpenNewestEvenIfLost => "OpenNewestEvenIfLost",
+            NodeVariant::ServeBeforeRefusedMark => "ServeBeforeRefusedMark",
+            NodeVariant::IncarnationPerRangeStream => "IncarnationPerRangeStream",
         }
     }
 }
@@ -315,7 +387,9 @@ mod tests {
             assert_eq!(seen & variant.bit(), 0, "{variant} shares a bit");
             seen |= variant.bit();
         }
-        assert_eq!(NodeVariant::BUGS.len(), 20);
+        // Twenty of the round's and the snapshot task's, and D-077's six for Q15's
+        // whole-node refusal and re-seed.
+        assert_eq!(NodeVariant::BUGS.len(), 26);
         for variant in NodeVariant::SNAPSHOT {
             assert!(
                 NodeVariant::BUGS.contains(variant),
@@ -323,6 +397,17 @@ mod tests {
             );
         }
         assert_eq!(NodeVariant::SNAPSHOT.len(), 11);
+        for variant in NodeVariant::RESEED {
+            assert!(
+                NodeVariant::BUGS.contains(variant),
+                "{variant} is not in BUGS"
+            );
+            assert!(
+                !NodeVariant::SNAPSHOT.contains(variant),
+                "{variant} is in two sets"
+            );
+        }
+        assert_eq!(NodeVariant::RESEED.len(), 6);
     }
 
     #[test]
