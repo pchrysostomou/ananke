@@ -11,6 +11,15 @@
 # four were weighed on its tree, on an idle machine, on their high-rate share. D-069 renamed
 # seed 158's pin and added seed 102's, both weighed on its tree; the renamed row keeps its
 # shard and the new one went to the lightest, which was the same shard 6.
+# D-078 added one row, weighed on its tree at ANANKE_SEEDS=1000 ANANKE_DEEP_SEEDS=100 in
+# release, alone in the command but with other agents' slices building on the same laptop
+# (load average 69.71/57.02/39.49): 48.20 user + 2.46 sys = 50.7 cpu s. Shards 5 and 6 were
+# the lightest at 1242.0 and it went to the lower-numbered of the two.
+# D-078's review added a second row, the follower-log bound's pinned pair. It is pinned at
+# one seed, not swept, so the tier does not move it: weighed from the built test binary
+# (`raft-<hash> <test> --exact`) rather than through cargo, so the figure is the test's own
+# cost and not a build's, at 0.415 user + 0.033 sys = 0.4 cpu s, load 50.28/59.22/56.19.
+# Shard 6 was the lightest at 1242.0 and takes it, to 1242.4.
 #
 # shard	binary	cpu_s	test
 # shard 1: 1278.5 cpu s
@@ -69,7 +78,7 @@
 4	raft	0.2	seed_2023_which_the_nightly_failed_on_a_trace_timestamp_no_longer_straddles_an_isolation
 4	wal	36.9	the_correct_log_passes_every_seed
 4	wal	0.2	the_seed_42_trace_is_written_for_the_studio
-# shard 5: 1242.0 cpu s
+# shard 5: 1292.7 cpu s
 5	echo	6.0	every_seed_satisfies_the_invariants_and_the_sweep_exercises_the_disk_faults
 5	engine	19.5	a_seek_that_counts_tombstones_is_caught
 5	raft	332.9	a_term_change_stepped_inside_an_isolation_from_a_message_received_before_it_is_excused
@@ -77,7 +86,8 @@
 5	raft	252.2	a_server_without_pre_vote_is_caught
 5	raft	187.0	a_leader_that_commits_an_older_terms_entry_by_count_is_caught
 5	raft	139.6	the_correct_server_passes_the_membership_scenario_on_every_seed
-# shard 6: 1242.0 cpu s
+5	raft	50.7	a_server_that_applies_before_commit_compacts_past_its_commit_index
+# shard 6: 1242.4 cpu s
 6	echo	0.1	a_busy_looping_task_fails_the_scenario_instead_of_hanging
 6	engine	310.3	an_engine_that_acknowledges_before_the_log_is_caught
 6	engine	204.5	an_engine_that_releases_a_memtable_before_the_manifest_is_caught
@@ -95,5 +105,6 @@
 6	raft	0.2	seed_102_pins_the_refusal_that_is_not_durable_which_a_hundred_seeds_can_miss
 6	raft	0.2	seed_4_of_the_term_raise_schedule_steps_a_message_received_before_its_isolation
 6	raft	0.2	seed_7381_which_the_first_nightly_found_stays_green
+6	raft	0.4	a_replica_that_never_compacts_outgrows_the_follower_log_bound
 6	wal	34.4	a_log_that_skips_sync_dir_on_rotation_is_caught
 6	wal	0.3	same_seed_gives_byte_identical_trace

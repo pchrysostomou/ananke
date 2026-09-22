@@ -171,14 +171,23 @@ fn seed_385_which_a_local_ten_thousand_seed_run_found_stays_green() {
 /// window now overlaps a stretch the timer replay flags. The test asserts both, the
 /// windows being there and the replay being empty, so neither half can go vacuous.
 ///
-/// The pair has moved off this seed too. `ResetTimerOnAnyRpc`, the variant the timer
-/// rule is written for (RAFT.md §5, moirae rule 5), is no longer caught here: the
-/// replay still finds two gaps, neither holding a completed install, but the run's
-/// majority is not up at its end, so RAFT.md §2's carve-out (D-035) withholds the timer
-/// bound from the run and no gap is a catch. That is asserted too, so the day the
-/// majority holds and the catch returns this test says so. The variant's catch is
-/// asserted at every tier by its own sweep,
-/// `a_server_that_resets_its_timer_on_any_message_is_caught`.
+/// Re-audited again under D-078, which moves every schedule once more: a follower now
+/// writes a snapshot record and deletes log keys where it wrote and deleted nothing, so
+/// every simulated disk draw from the first compaction on is another draw and the run
+/// after it is another run. The correct half is where it was — the run holds **20**
+/// adoption windows now, the replay without D-063's arm still finds no gap at all, and
+/// no adoption window overlaps a flagged stretch — so this pin keeps asserting that
+/// absence with its reason, and both halves are still asserted so neither goes vacuous.
+///
+/// **The pair has come back.** `ResetTimerOnAnyRpc`, the variant the timer rule is
+/// written for (RAFT.md §5, moirae rule 5), *is* caught here again: the run's majority
+/// is up at its end now, so RAFT.md §2's carve-out (D-035) no longer withholds the
+/// bound, and the replay's five gaps — none of them holding a completed install, so
+/// D-063's arm exempts none — make the first of them the run's violation. The pin
+/// asserts the catch, in the words the check reports it in, as CLAUDE.md:58-67 asks of
+/// a pin whose mechanism is reachable again: the absence it asserted before D-078 was
+/// the weaker statement and is gone. The variant's catch is asserted at every tier by
+/// its own sweep, `a_server_that_resets_its_timer_on_any_message_is_caught`.
 #[test]
 // PROPOSED(D-063): a server adopting a completed install has no election timer.
 fn seed_2605_which_the_nightly_found_is_an_adoption_window_and_still_catches_the_variant() {
@@ -201,24 +210,32 @@ fn seed_2605_which_the_nightly_found_is_an_adoption_window_and_still_catches_the
          arm may or may not exempt: re-audit the pin"
     );
 
-    // The pair, absent with its reason: the replay finds the variant out, but the run's
-    // majority is not up, so the timer bound is not asked of it (RAFT.md §2, D-035).
+    // The pair, a catch again since D-078: the majority is up at the run's end, so the
+    // timer bound is asked of it, and the replay's first gap is the violation.
+    // PROPOSED(D-078): a follower compacts its log to its own applied index.
     let buggy = raft::run(2605, Variant::ResetTimerOnAnyRpc);
     assert_eq!(
         buggy.check(),
-        Ok(()),
-        "ResetTimerOnAnyRpc is caught on seed 2605 again: pin the catch rather than this absence"
+        Err(
+            "seed 2605: timers: server 2's replica of range 2 heard from no leader of its term \
+             and granted no vote since Instant(2.285324846s) and had not campaigned by \
+             Instant(2.600034004s)"
+                .to_owned()
+        ),
+        "seed 2605's catch of ResetTimerOnAnyRpc has moved: re-audit the pin"
+    );
+    assert!(
+        buggy.majority_up(),
+        "seed 2605 under ResetTimerOnAnyRpc no longer ends with its majority up, so the timer \
+         bound is withheld from the run (D-035) and the catch above cannot be the reason: \
+         re-audit the pin"
     );
     let gaps = buggy.timer_gaps(TimerResets::ALL);
     assert_eq!(
         gaps.len(),
-        2,
-        "seed 2605's replay no longer finds the variant out twice over: {gaps:?}; re-audit the pin"
-    );
-    assert!(
-        !buggy.majority_up(),
-        "seed 2605 under ResetTimerOnAnyRpc ends with its majority up, so the timer bound is \
-         asked of the run and its two gaps are catches: pin the catch"
+        5,
+        "seed 2605's replay no longer finds the variant out five times over: {gaps:?}; \
+         re-audit the pin"
     );
     assert!(
         gaps.iter().all(|gap| gap.adoptions == 0),
@@ -428,6 +445,20 @@ fn seed_5909_which_the_nightly_found_stays_green() {
 /// (With D-056's queue alone only `IgnoreIncarnation` reached its half, on server 3 from
 /// 9.503 s, and the pair reached neither. Before the queue each variant reached its own
 /// half and the pair both, one after the other.)
+///
+/// Re-audited under D-078, which moves every schedule again — a follower writes a
+/// snapshot record and deletes log keys where it wrote and deleted nothing, so every
+/// disk draw from the first compaction on is another draw. The stream half is still out
+/// of reach under every variant, and asserted so with its non-vacuity: 18 to 27 takes a
+/// run, no index taken twice, nothing re-taken under a stream. D-042's half has moved
+/// again: `IgnoreIncarnation` still leaves the leader's progress for server 3 stale, and
+/// the pair now leaves nothing stale where it left server 1 stale before. **No variant
+/// leaves anything uncounted after the last heal now** — the refusals land where the
+/// leader's check-quorum window has already closed on them — so the uncounted set is
+/// asserted empty everywhere, and the day one comes back the test says so and the pin
+/// can be upgraded. The stale set is what still carries D-042's half here, and it is
+/// asserted per variant, so a move either way is seen (CLAUDE.md:58-67).
+// PROPOSED(D-078): a follower compacts its log to its own applied index.
 #[test]
 fn seed_5909_passes_under_both_bugs_together_which_is_the_finding() {
     let both = Variants::of(&[Variant::IgnoreIncarnation, Variant::SharedSnapshotDir]);
@@ -462,9 +493,7 @@ fn seed_5909_passes_under_both_bugs_together_which_is_the_finding() {
         // left stale, and at most that one follower uncounted after the last heal.
         let (expected_stale, expected_uncounted): (&[u64], &[u64]) =
             if variants == Variants::from(Variant::IgnoreIncarnation) {
-                (&[3], &[3])
-            } else if variants == both {
-                (&[1], &[1])
+                (&[3], &[])
             } else {
                 (&[], &[])
             };
@@ -589,8 +618,10 @@ fn assert_no_stream_wedge(report: &raft::Report) {
 /// D-043's alone, above.)
 #[test]
 fn seed_132_which_pinned_the_combined_variant_before_the_layout_reaches_no_wedge() {
-    let both = Variants::of(&[Variant::IgnoreIncarnation, Variant::SharedSnapshotDir]);
-    let paired = raft::run(132, both);
+    let paired = raft::run(
+        132,
+        Variants::of(&[Variant::IgnoreIncarnation, Variant::SharedSnapshotDir]),
+    );
     let stream = raft::run(132, Variant::SharedSnapshotDir);
     let incarnation = raft::run(132, Variant::IgnoreIncarnation);
     let correct = raft::run(132, Variant::Correct);
@@ -602,43 +633,64 @@ fn seed_132_which_pinned_the_combined_variant_before_the_layout_reaches_no_wedge
              variant should be pinned here once more",
             report.variants
         );
-        // The reason the stream half is out of reach: every take is at an index the
-        // server had not taken before, so nothing can be re-taken under a stream.
-        // Asserted with its own non-vacuity, since a fold that found no take at all
-        // would pass it silently (D-060's re-audit).
+        // PROPOSED(D-078): the reason the stream half is out of reach has moved down
+        // one step. An index *is* taken twice now, under the runs that carry
+        // `SharedSnapshotDir` and only those — that is the variant doing its work, one
+        // mutable directory per index — but no such re-take lands under a live stream,
+        // which is the second half the wedge needs. `retakes_under_streams` says that
+        // directly, so this is a stronger statement than the one it replaces, and it is
+        // asserted with its non-vacuity: a fold that found no take at all would pass it
+        // silently (D-060's re-audit).
         let takes = report.snapshot_takes();
         assert!(
             !takes.is_empty(),
-            "seed 132 under {:?} takes no snapshot at all, so the reason this pin gives — that \
-             no index is taken twice — says nothing: re-audit the pin and `snapshot_takes`",
+            "seed 132 under {:?} takes no snapshot at all, so the claims below say nothing: \
+             re-audit the pin and `snapshot_takes`",
+            report.variants
+        );
+        assert_eq!(
+            took_an_index_twice(&takes),
+            report.variants.contains(Variant::SharedSnapshotDir),
+            "seed 132 under {:?} no longer takes an index twice exactly when it shares one \
+             directory per index: re-audit the pin",
             report.variants
         );
         assert!(
-            !took_an_index_twice(&takes),
-            "seed 132 under {:?} takes an index twice again, so a re-take under a live stream \
-             is reachable here: re-audit the pin",
-            report.variants
+            report.retakes_under_streams().is_empty(),
+            "seed 132 under {:?} re-takes under a live stream again ({:?}), so the wedge's \
+             second half is reachable here: re-audit the pin",
+            report.variants,
+            report.retakes_under_streams()
         );
         assert_no_stream_wedge(report);
     }
-    // PROPOSED(D-069): every run of the seed now refuses server 2, so
-    // `IgnoreIncarnation` has something to ignore and the pair is no longer the stream
-    // half record for record. D-042's half is reached under the pair and only there,
-    // and it leaves one follower uncounted, not the wedge's two. Each run's stale set
-    // and uncounted set is asserted, so a move either way is seen; the refusals
-    // themselves are asserted non-empty everywhere, which is what makes the stale sets
-    // mean anything.
+    // PROPOSED(D-078): the refusals have moved with the schedules. The correct server
+    // and `IgnoreIncarnation` still refuse a store here; the two runs that share one
+    // snapshot directory no longer refuse any, so `IgnoreIncarnation` has nothing to
+    // ignore under the pair and D-042's half is reached under `IgnoreIncarnation`
+    // alone, on server 2, where it was reached under the pair before. Nothing is left
+    // uncounted after the last heal on any run now: the refusal here outlives no
+    // check-quorum window. Each run's stale set, uncounted set and refusal count is
+    // asserted, so a move either way is seen (CLAUDE.md:58-67), and the stale sets of
+    // the runs that refuse nothing are asserted empty *for that reason*, not silently.
     for report in [&paired, &stream, &incarnation, &correct] {
-        assert!(
-            !refusals(report).is_empty(),
-            "seed 132 under {:?} refuses no store any more, so the stale sets below say \
-             nothing: re-audit the pin and the refusal matcher",
-            report.variants
+        let refuses = !refusals(report).is_empty();
+        assert_eq!(
+            refuses,
+            !report.variants.contains(Variant::SharedSnapshotDir),
+            "seed 132 under {:?} no longer refuses a store exactly when it does not share one \
+             snapshot directory ({:?}): re-audit the pin and the refusal matcher",
+            report.variants,
+            refusals(report)
         );
         let stale: Vec<u64> = (1..=raft::SERVERS)
             .filter(|&s| report.stale_progress(s).is_some())
             .collect();
-        let expected: &[u64] = if report.variants == both { &[2] } else { &[] };
+        let expected: &[u64] = if report.variants == Variants::from(Variant::IgnoreIncarnation) {
+            &[2]
+        } else {
+            &[]
+        };
         assert_eq!(
             stale, expected,
             "seed 132 under {:?} no longer leaves exactly {expected:?} stale: re-audit the pin",
@@ -653,16 +705,13 @@ fn seed_132_which_pinned_the_combined_variant_before_the_layout_reaches_no_wedge
         );
     }
     // And the fix, where the leader is the correct one: the refusal, the leader's reset
-    // and the re-seed, on the two runs whose leader keeps D-042's rule and whose
-    // refusal it outlives.
-    for report in [&stream, &correct] {
-        assert!(
-            report.refusal_reset_reseed(2).is_some(),
-            "seed 132 under {:?} no longer refuses server 2, resets the leader's progress for \
-             it and re-seeds it: re-audit the pin",
-            report.variants
-        );
-    }
+    // and the re-seed, on the run whose leader keeps D-042's rule and whose refusal it
+    // outlives. `SharedSnapshotDir` refuses nothing here any more, so it is not asked.
+    assert!(
+        correct.refusal_reset_reseed(2).is_some(),
+        "seed 132 under the correct server no longer refuses server 2, resets the leader's \
+         progress for it and re-seeds it: re-audit the pin"
+    );
 }
 
 /// Seed 680, which pinned the combined variant before D-056's send queue moved every
@@ -703,6 +752,28 @@ fn seed_132_which_pinned_the_combined_variant_before_the_layout_reaches_no_wedge
 /// twenty times over for a staging `CURRENT` that cannot be read, a refusal no leader's
 /// progress outlives, and nothing goes stale. The correct server resets and re-seeds
 /// server 3 after its own refusal at 12.162591955 s.
+///
+/// **Re-audited under D-078, which moves every schedule again** — a follower writes a
+/// snapshot record and deletes log keys where it wrote and deleted nothing, so every
+/// disk draw from the first compaction on is another draw. Both halves have left this
+/// seed. No run of it takes an index twice now (29 to 41 takes a run, each into its own
+/// version directory even under `SharedSnapshotDir`, whose one mutable directory per
+/// index is never revisited), so nothing is re-taken under a live stream; and no run
+/// leaves a follower uncounted after the last heal or a leader's progress stale, under
+/// the pair or under either half. The test asserts both absences with their
+/// non-vacuity — the takes are asserted non-empty, and server 3's refusals asserted
+/// present under the runs whose leader's reset is asked about — so the day either half
+/// comes back it says so and the pin can be upgraded (CLAUDE.md:58-67).
+///
+/// **The search SHARD.md §12 asks for at such a move was run, and its answer goes to
+/// the owner.** Over seeds 0..1000 in release on this tree the pair is caught on four —
+/// 332, 796 and 848 by liveness and 847 by linearizability — and on *every one of them
+/// `SharedSnapshotDir` alone is caught too*, so none is a wedge that needs both bugs.
+/// The same search on the tree this branch is cut from (`ae75bdf`) finds one, seed 954,
+/// and `SharedSnapshotDir` alone is caught there as well. So the pair has no wedge seed
+/// in the first thousand either before or after D-078: the absence is not this change's
+/// doing, and it is reported rather than papered over, since the pair is Phase 2's
+/// control for a wedge that needs both bugs (D-045).
 #[test]
 fn seed_680_which_pinned_the_combined_variant_before_d056_no_longer_wedges() {
     for variants in [
@@ -727,45 +798,32 @@ fn seed_680_which_pinned_the_combined_variant_before_d056_no_longer_wedges() {
             "seed 680 under {variants:?} takes no snapshot at all: every claim below is \
              vacuous, so re-audit the pin and `snapshot_takes`"
         );
+        // PROPOSED(D-078): the stream half's shape has left this seed. No run takes
+        // an index twice, so nothing can be re-taken under a live stream; both are
+        // asserted, over takes asserted non-empty just above, so neither goes vacuous.
         let under = report.retakes_under_streams();
-        if variants.contains(Variant::SharedSnapshotDir) {
-            assert!(
-                took_an_index_twice(&takes) && !under.is_empty(),
-                "seed 680 under {variants:?} no longer re-takes at an index already taken \
-                 ({takes:?}) under a live stream ({under:?}): the shape this pin asserts the \
-                 harmlessness of is gone, so re-audit the pin"
-            );
-            assert!(
-                under.iter().all(|retake| retake.installed_after),
-                "seed 680 under {variants:?} re-takes under a stream the follower never \
-                 installs after: that is D-043's wedge, so pin it"
-            );
-        } else {
-            assert!(
-                !took_an_index_twice(&takes) && under.is_empty(),
-                "seed 680 under {variants:?} takes an index twice ({takes:?}) or re-takes \
-                 under a stream ({under:?}) without the variant that shares one directory \
-                 per index: re-audit the pin"
-            );
-        }
+        assert!(
+            !took_an_index_twice(&takes) && under.is_empty(),
+            "seed 680 under {variants:?} takes an index twice ({takes:?}) or re-takes under a \
+             live stream ({under:?}) again: the shape this pin asserts the absence of is back, \
+             so pin it rather than the absence"
+        );
+        // PROPOSED(D-078): and so has D-042's half, under the pair as under either
+        // half alone. The day a follower is left uncounted here again, pin it.
         let uncounted = report.uncounted_after_heal();
-        if variants == Variants::of(&[Variant::IgnoreIncarnation, Variant::SharedSnapshotDir]) {
-            // D-042's half under the pair: stale progress for the one refused
-            // follower, and only it uncounted after the heal.
-            let stale = report.stale_progress(3);
-            assert!(
-                stale.is_some() && uncounted == BTreeSet::from([3]),
-                "seed 680 under {variants:?} no longer leaves the leader's progress for the \
-                 refused server 3 stale ({stale:?}) and only it uncounted after the heal \
-                 ({uncounted:?}): re-audit the pin"
-            );
-        } else {
-            assert!(
-                uncounted.is_empty(),
-                "seed 680 under {variants:?} leaves a follower uncounted after the last heal \
-                 again ({uncounted:?}): re-audit the pin"
-            );
-        }
+        assert!(
+            uncounted.is_empty(),
+            "seed 680 under {variants:?} leaves a follower uncounted after the last heal again \
+             ({uncounted:?}): pin it rather than this absence"
+        );
+        let stale: Vec<u64> = (1..=raft::SERVERS)
+            .filter(|&s| report.stale_progress(s).is_some())
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "seed 680 under {variants:?} leaves a leader's progress stale again ({stale:?}): \
+             pin it rather than this absence"
+        );
         if variants.contains(Variant::IgnoreIncarnation) {
             // The absence means nothing unless server 3 is refused at all, and
             // `refusal_reset_reseed` answers `None` to both: under the pair server 3
@@ -848,10 +906,32 @@ fn seed_680_which_pinned_the_combined_variant_before_d056_no_longer_wedges() {
 /// was dropped at all. With D-056's queue alone the seed reached both halves, as built
 /// over table 28 from 16.504 s and under the correct server over table 56 from
 /// 19.101 s. Before the queue it reached neither.)
+///
+/// **Re-audited under D-078**, which moves every schedule again — a follower writes a
+/// snapshot record and deletes log keys where it wrote and deleted nothing. The fix's
+/// half is still here and is still asserted record by record, but it has moved to
+/// **server 1** and its last step has changed. The open at 18.853009241 s drops table
+/// 74, the engine is quiesced at 18.876708665 s, the schedule restarts the node at
+/// 18.896 s, and that open drops table 74 again at 18.936568683 s, quiesces again at
+/// 18.954351937 s and refuses the store at 18.958974816 s — **for the loss it found
+/// itself**, `the engine's recovery lost state: dropped tables [74]`, not for the mark
+/// the first refusal wrote. The mark is not what this run now shows surviving a crash;
+/// what it shows is the quiesce, the restart and a second refusal of the same store,
+/// which is the part of D-044 this seed still reaches. That the marker survives a crash
+/// is shown on the same run by the earlier refusal of the same server at
+/// 16.730362789 s, `the directory carries the RAFT-STORE marker and a CURRENT that
+/// cannot be read`: the marker is there at a later start. Both are asserted, and the
+/// refusal-on-the-mark shape is asserted *absent after the quiesce*, with this reason,
+/// so the day the second open stops finding the loss itself and falls back on the mark
+/// the pin says so and can be upgraded.
+///
+/// The bug's half is still not here, asserted as before. Its own pin, seed 102, has lost
+/// the mechanism too — see D-078, which reports that to the owner.
 #[test]
+// PROPOSED(D-078): a follower compacts its log to its own applied index.
 fn seed_687_which_the_premerge_found_stays_green() {
     use ananke_env::NodeId;
-    let node = Some(NodeId::new(3));
+    let node = Some(NodeId::new(1));
     let lost_state = |report: &raft::Report| -> Vec<(u64, ananke_env::Instant)> {
         report
             .records
@@ -910,10 +990,15 @@ fn seed_687_which_the_premerge_found_stays_green() {
             _ => None,
         })
         .collect();
+    // PROPOSED(D-078): a follower's compaction moved the disk draws, so the recovery
+    // that loses writes here now drops table 74 twice — once at each of the two starts
+    // the seed makes on that store — where it dropped tables 21 and 34 before. What the
+    // pin needs of this is that the recovery really lost tables, which is what quiesces
+    // the engine below; the numbers are asserted so a run that stops losing any says so.
     assert_eq!(
         dropped,
-        vec![21, 34],
-        "seed 687 under the correct server no longer drops tables 21 and 34: {dropped:?}; \
+        vec![74, 74],
+        "seed 687 under the correct server no longer drops table 74 twice: {dropped:?}; \
          re-audit the pin"
     );
     let quiesced = correct
@@ -925,51 +1010,72 @@ fn seed_687_which_the_premerge_found_stays_green() {
             "seed 687 under the correct server no longer quiesces server 3's engine over a \
              recovery that lost writes: re-audit the pin",
         );
-    let on_the_mark = correct
+    // PROPOSED(D-078): the second open finds the loss itself, so it refuses for lost
+    // state rather than on the mark the first refusal wrote. The mark's own survival
+    // across a crash is shown by the earlier refusal of the same store, asserted below.
+    let refused_again = correct
         .records
         .iter()
         .find(|r| {
             r.at > quiesced
-                && matches!(&r.event, TraceEvent::RaftRefused { server: 3, reason }
-                    if reason.contains("the RAFT-STORE marker says this store lost state"))
+                && matches!(&r.event, TraceEvent::RaftRefused { server: 1, reason }
+                    if reason.starts_with(LOST_STATE))
         })
         .map(|r| r.at)
         .expect(
-            "seed 687 under the correct server no longer refuses server 3's store on the \
-             durable mark after the quiesce: re-audit the pin",
+            "seed 687 under the correct server no longer refuses server 1's store again after \
+             the quiesce: re-audit the pin",
         );
+    assert!(
+        !correct.records.iter().any(|r| {
+            r.at > quiesced
+                && matches!(&r.event, TraceEvent::RaftRefused { server: 1, reason }
+                    if reason.contains("the RAFT-STORE marker says this store lost state"))
+        }),
+        "seed 687 under the correct server refuses server 1's store on the durable mark after \
+         the quiesce again: pin that, which is the stronger statement, rather than the second \
+         open finding the loss itself"
+    );
+    // The marker does survive a crash on this run, shown by the earlier refusal of the
+    // same store at a later start: the absence just above is of the mark's *lost state*
+    // clause, not of the marker being read at all.
+    assert!(
+        correct.records.iter().any(|r| {
+            r.at < quiesced
+                && matches!(&r.event, TraceEvent::RaftRefused { server: 1, reason }
+                    if reason.contains(STORE_MARKER))
+        }),
+        "seed 687 under the correct server no longer refuses server 1's store on a marker it \
+         finds at a start, so the absence above says nothing about the marker: re-audit the pin"
+    );
     let restarted = correct.records.iter().any(|r| {
-        r.at > quiesced && r.at < on_the_mark && matches!(r.event, TraceEvent::NodeRestarted { .. })
+        r.at > quiesced
+            && r.at < refused_again
+            && matches!(r.event, TraceEvent::NodeRestarted { .. })
     });
     assert!(
         restarted,
         "seed 687 under the correct server no longer restarts the node between the quiesce at \
-         {quiesced:?} and the refusal on the mark at {on_the_mark:?}, so the mark is not shown \
-         to survive a crash: re-audit the pin"
+         {quiesced:?} and the second refusal at {refused_again:?}, so the refusal is the same \
+         open's: re-audit the pin"
     );
-    let adopted = correct
-        .records
-        .iter()
-        .find(|r| r.at > on_the_mark && matches!(r.event, TraceEvent::RaftAdopted { server: 3 }))
-        .map(|r| r.at)
-        .expect("seed 687 under the correct server never re-seeds server 3: re-audit the pin");
     let worked = correct.records.iter().any(|r| {
         r.at > quiesced
-            && r.at < adopted
+            && r.at < refused_again
             && r.node == node
             && matches!(
                 r.event,
                 TraceEvent::ManifestWritten { .. }
                     | TraceEvent::CurrentSwitched { .. }
                     | TraceEvent::WalSegmentDeleted { .. }
-                    | TraceEvent::RaftRecovered { server: 3, .. }
+                    | TraceEvent::RaftRecovered { server: 1, .. }
             )
     });
     assert!(
         !worked,
         "seed 687 under the correct server writes a manifest, switches CURRENT, deletes a log \
-         segment or opens server 3's store clean between the quiesce at {quiesced:?} and the \
-         install adopted at {adopted:?}: the quiesced engine is doing work (D-044); re-audit \
+         segment or opens server 1's store clean between the quiesce at {quiesced:?} and the \
+         refusal at {refused_again:?}: the quiesced engine is doing work (D-044); re-audit \
          the pin"
     );
 }
@@ -1150,9 +1256,12 @@ fn the_nightlys_eleven_variant_catches_of_the_trace_timestamp_gap_are_not_catche
     const KEPT: [u64; 2] = [5203, 6691];
     // D-060's layout moved the schedules again: one of the eleven now steps a leader
     // down leaving a follower uncounted, the state D-049 recorded on 2509 and 5990.
-    // PROPOSED(D-069) moved them once more, and it is a different one: seed 3087's
-    // run has the step-down and seed 1252's no longer does.
-    const UNCOUNTED_STEP_DOWN: [u64; 1] = [3087];
+    // PROPOSED(D-069) moved them once more, and it was a different one: seed 3087's
+    // run had the step-down and seed 1252's no longer did.
+    // PROPOSED(D-078) moved them once more and **none of the eleven has it now**: the
+    // list is empty and asserted empty, so the day a run of these eleven steps a leader
+    // down leaving a follower uncounted this test says which.
+    const UNCOUNTED_STEP_DOWN: [u64; 0] = [];
     let verdicts = sweep(pairs.len() as u64, |i| {
         let (seed, variant, _, original) = pairs[usize::try_from(i).expect("small")];
         let report = raft::run(seed, variant);
@@ -1366,7 +1475,10 @@ fn the_nightlies_removed_catches_meet_the_sweeps_assertions() {
     // schedule away from its catch; these keep the isolation the catch named.
     // PROPOSED(D-069) moved them once more: seed 5918 keeps its isolation now, where
     // it did not before, and the other five are unchanged.
-    const KEPT: [u64; 6] = [5203, 6691, 5051, 5879, 5918, 2578];
+    // PROPOSED(D-078) moved the schedules again: seed 5918's isolation of server 3 from
+    // 9.532 s is gone and seed 4814's of server 3 from 12.111 s has come back, so six of
+    // the 28 still hold the isolation their catch named, a different six.
+    const KEPT: [u64; 6] = [5203, 6691, 5051, 5879, 4814, 2578];
     let runs = sweep(REMOVED.len() as u64, |i| {
         let (seed, variant, was) = REMOVED[usize::try_from(i).expect("small")];
         let report = raft::run(seed, variant);
@@ -1411,14 +1523,18 @@ fn the_nightlies_removed_catches_meet_the_sweeps_assertions() {
         if *seed == 5153 {
             // The key layout and the format record (D-060) moved this schedule, and the
             // read's move to the server that serves it (D-069) moved it again: the count
-            // below was five stretches before that and is three now. The nightly's own
-            // gap is gone from the replay by durability time, and what that replay finds
-            // instead is three other stretches on a run the timer bound is not asked of
-            // at all: its schedule is not uniform, or its majority is not up, so §2's
-            // carve-out (D-035) withholds the bound and neither reading makes a catch of
-            // them. That is why nothing is removed here.
+            // below was five stretches before that and three after it.
+            // PROPOSED(D-078) moves it once more — a follower writes a snapshot record
+            // and deletes log keys where it wrote and deleted nothing — and the run is
+            // **four** stretches now and the timer bound *is* asked of it, its schedule
+            // being uniform and its majority up, so the first of the four is a catch:
+            // the variant's own rule, caught where the rule is written for it. The
+            // nightly's own gap is still gone from the replay by durability time and
+            // decision time still removes nothing, which is why nothing is removed here;
+            // the catch itself is asserted below, with the other runs caught over their
+            // own bug.
             assert!(
-                durable_gaps > 0 && !names_the_nightlys && !asked && removed.is_empty(),
+                durable_gaps > 0 && !names_the_nightlys && asked && removed.is_empty(),
                 "seed 5153 under {variant:?}: the replay by durability time finds \
                  {durable_gaps} gaps, the nightly's own among them: {names_the_nightlys}; the \
                  timer bound is asked of the run: {asked}; decision time removed {} catches; \
@@ -1426,29 +1542,49 @@ fn the_nightlies_removed_catches_meet_the_sweeps_assertions() {
                 removed.len()
             );
         }
-        // PROPOSED(D-069): three of the 28 are now caught, each by its own variant's
+        // PROPOSED(D-069): three of the 28 were caught, each by its own variant's
         // bug on a schedule the read's move redrew, and none by a check reading a
         // record's time — `checked` above asserts that decision time removes nothing
         // on any of them. Each catch is asserted, so a move either way is seen.
+        // PROPOSED(D-078) moved them once more, and it is four now and a different
+        // set: seed 9557 under `AdoptionAsBuilt` passes outright, seed 5153 under
+        // `ResetTimerOnAnyRpc` and seed 6366 under `ApplyBeforeCommit` are caught over
+        // their own variants' bugs where they were not, and seeds 2305 and 6717 keep
+        // their catch with the numbers the moved schedules give.
         let own_bug: Option<&str> = match (*seed, *variant) {
             // The streamed `CURRENT` written the moment it arrives, and a restart that
             // adopts the store it leaves (RAFT.md §5).
             (2305, Variant::SnapshotWithoutCurrentLast) => Some(
-                "seed 2305: state machine safety: server 3 recovered an applied index of 282 \
-                 in group 2 but its log does not hold index 281",
+                "seed 2305: state machine safety: server 3 recovered an applied index of 327 \
+                 in group 2 but its log does not hold index 322",
+            ),
+            // PROPOSED(D-078): seed 6366's run under `ApplyBeforeCommit` is caught by
+            // state machine safety now, over the variant's own bug: entries handed to
+            // the apply task before any commit index reaches them, applied differently
+            // on two servers.
+            (6366, Variant::ApplyBeforeCommit) => Some(
+                "seed 6366: state machine safety: index 60 of group 2 was applied as term 2 \
+                 payload 0x7eed89c74e606ebf on one server and term 3 payload \
+                 0xaf63bd4c8601b7df on server 1",
+            ),
+            // PROPOSED(D-078): seed 5153's run is caught by the timer check now too,
+            // over a gap of its own rather than the nightly's, which is gone.
+            (5153, Variant::ResetTimerOnAnyRpc) => Some(
+                "seed 5153: timers: server 3's replica of range 2 heard from no leader of its \
+                 term and granted no vote since Instant(2.184906554s) and had not campaigned \
+                 by Instant(2.585015833s)",
             ),
             // The timer variant's own catch, the rule it is written for.
             (6717, Variant::ResetTimerOnAnyRpc) => Some(
                 "seed 6717: timers: server 1's replica of range 2 heard from no leader of its \
-                 term and granted no vote since Instant(1.987649864s) and had not campaigned \
-                 by Instant(2.388765868s)",
+                 term and granted no vote since Instant(1.992451251s) and had not campaigned \
+                 by Instant(2.392781988s)",
             ),
-            // The adoption as built losing the copied store, caught where D-041's own
-            // pin on seed 6325 describes it: a voter restating from index 1.
-            (9557, Variant::AdoptionAsBuilt) => Some(
-                "seed 9557: committed entries stay: server 2 truncated group 2 from index 1 \
-                 with commit index 249",
-            ),
+            // PROPOSED(D-078): seed 9557's run under `AdoptionAsBuilt` is no longer
+            // caught at all — the adoption as built loses no copied store on the moved
+            // schedule — so it falls to the `None` arm with the other 24 and is
+            // asserted to pass outright. The variant's own catch is asserted at its
+            // Phase 2 tier by `a_server_whose_adoption_is_as_built_is_caught`.
             _ => None,
         };
         if let Some(expected) = own_bug {
@@ -1742,6 +1878,16 @@ fn a_term_change_stepped_inside_an_isolation_from_a_message_received_before_it_i
 /// isolation, server 1's from 6.90976 s, straddles too, where it did not before. The
 /// first four are unchanged, instant for instant, and so is the first, which this test
 /// names.
+///
+/// Re-audited again under D-078, which moves every schedule once more — a follower
+/// writes a snapshot record and deletes log keys where it wrote and deleted nothing.
+/// The seed still reaches D-047's shape and not D-050's, so this pin keeps asserting
+/// the same mechanism; what has moved is how many windows reach it. **Seven** of the
+/// run's isolations straddle now, not five, and the first is server 2's from term 1 to
+/// 2, decided 9.447 µs before its isolation at **1.24716 s** and traced 1.297 ms into
+/// it, at the delivery of server 1's **AppendEntries** of term 2 rather than its
+/// RequestVote. The count and the first are both asserted, as before.
+// PROPOSED(D-078): a follower compacts its log to its own applied index.
 #[test]
 fn seed_1_of_the_term_raise_schedule_now_straddles_its_isolations_by_decision_time() {
     let report = raft::run_with(
@@ -1757,15 +1903,15 @@ fn seed_1_of_the_term_raise_schedule_now_straddles_its_isolations_by_decision_ti
     );
     let straddle = assert_rise_straddles_the_isolation(
         &report,
-        5,
+        7,
         (2, 1, 2, "follower"),
-        "pre-vote: server 2 raised its term from 1 to 2 while isolated from Instant(1.21785s) to Instant(1.51785s)",
+        "pre-vote: server 2 raised its term from 1 to 2 while isolated from Instant(1.24716s) to Instant(1.54716s)",
     );
     assert_eq!(
         straddle.causes,
-        [(1, "request-vote", 2)],
-        "seed 1: the rise was not decided at the delivery of server 1's RequestVote of term 2, \
-         so its decision time is not that message's step: {straddle:?}"
+        [(1, "append-entries", 2)],
+        "seed 1: the rise was not decided at the delivery of server 1's AppendEntries of term \
+         2, so its decision time is not that message's step: {straddle:?}"
     );
     report.check().unwrap();
 }
@@ -1788,6 +1934,17 @@ fn seed_1_of_the_term_raise_schedule_now_straddles_its_isolations_by_decision_ti
 /// holding two (server 1's, from terms 3 and 5, at 2.85601 s and 3.67795 s). The shape
 /// is reached on 276 of the first thousand seeds of the schedule. Seed 1's own test
 /// above asserts what it reaches instead.
+///
+/// **Re-audited under D-078**, which moves every schedule once more. Seed 4 still holds
+/// exactly one such change and keeps the pin, but it is a different one: server **2**'s
+/// from term 1 to 2, caused by server 1's RequestVote of term 2, received at
+/// 1.22460251 s, with the isolation beginning 7.49 µs later at 1.22461 s and the step
+/// taking the message 1.017 µs into it. Seed 1 still reaches none; seed 2 now holds
+/// exactly one too, so seed 4 is no longer the *lowest* such seed — the pin stays on 4
+/// because it is the seed the shape has been pinned on, and seed 2's own run is not
+/// pinned anywhere. The numbers below are the new ones and are asserted to the
+/// nanosecond, so the next move says so.
+// PROPOSED(D-078): a follower compacts its log to its own applied index.
 #[test]
 fn seed_4_of_the_term_raise_schedule_steps_a_message_received_before_its_isolation() {
     let report = raft::run_with(
@@ -1804,16 +1961,16 @@ fn seed_4_of_the_term_raise_schedule_steps_a_message_received_before_its_isolati
     };
     assert_eq!(
         (s.server, s.before, s.term, s.role, s.causes.as_slice()),
-        (3, 4, 5, "follower", &[(2, "request-vote", 5)][..]),
+        (2, 1, 2, "follower", &[(1, "request-vote", 2)][..]),
         "seed 4 steps another change: {s:?}"
     );
     assert_eq!(
         (s.received, s.from, s.decided, s.until),
         (
-            ananke_env::Instant::from_nanos(2_853_812_638),
-            ananke_env::Instant::from_nanos(2_853_820_000),
-            ananke_env::Instant::from_nanos(2_853_832_880),
-            ananke_env::Instant::from_nanos(3_153_820_000),
+            ananke_env::Instant::from_nanos(1_224_602_510),
+            ananke_env::Instant::from_nanos(1_224_610_000),
+            ananke_env::Instant::from_nanos(1_225_627_305),
+            ananke_env::Instant::from_nanos(1_524_610_000),
         ),
         "seed 4's receipt, isolation or step moved: {s:?}"
     );
@@ -1821,8 +1978,8 @@ fn seed_4_of_the_term_raise_schedule_steps_a_message_received_before_its_isolati
     assert_eq!(
         report.isolation_keeps_its_term_by(RecordTime::Decided, s.server, s.from, s.until),
         Err(
-            "pre-vote: server 3 raised its term from 4 to 5 while isolated from \
-             Instant(2.85382s) to Instant(3.15382s)"
+            "pre-vote: server 2 raised its term from 1 to 2 while isolated from \
+             Instant(1.22461s) to Instant(1.52461s)"
                 .to_owned()
         )
     );
@@ -2186,6 +2343,125 @@ fn a_server_that_applies_before_commit_is_caught() {
     is_caught(Variant::ApplyBeforeCommit);
 }
 
+/// D-065's own assertion, with the known-buggy variant beside it that the same
+/// fold catches (CLAUDE.md's pair rule).
+///
+/// A follower compacts to its own applied index. On the correct system that
+/// index never passes its commit index, so the prefix it drops holds nothing
+/// uncommitted — and `raft::compaction_stays_committed` says so over the whole
+/// trace, on every seed at every tier, as part of
+/// [`the_correct_server_passes_every_seed`]'s `check()`.
+///
+/// `ApplyBeforeCommit` is the bug that breaks exactly that step: it hands the
+/// `apply` task the entries of a persist as they become durable, before any
+/// commit index reaches them (`node.rs`), so a follower's applied index runs past
+/// its commit index and the record it writes names an index nothing has
+/// committed. The fold is asked of that variant here on its own, rather than
+/// through `check()`, because `check()` returns the first violation and state
+/// machine safety usually sees this variant first: what this test measures is
+/// whether the new fold *by itself* distinguishes the bug from correct code.
+#[test]
+fn a_server_that_applies_before_commit_compacts_past_its_commit_index() {
+    let caught: Vec<String> = sweep(seeds(), |seed| {
+        let report = raft::run(seed, Variant::ApplyBeforeCommit);
+        raft::compaction_stays_committed(&report.records)
+            .err()
+            .map(|violation| format!("seed {seed}: {violation}"))
+    })
+    .into_iter()
+    .flatten()
+    .collect();
+    eprintln!(
+        "ApplyBeforeCommit: the compaction fold caught it on {} of {} seeds, first: {}",
+        caught.len(),
+        seeds(),
+        caught.first().map_or("", String::as_str)
+    );
+    assert!(
+        !caught.is_empty(),
+        "the compaction fold never saw ApplyBeforeCommit compact past a commit index"
+    );
+}
+
+/// The seed the follower-log bound's pair is pinned at. Five seeds of the first
+/// thousand carry a replica's log past [`raft::FOLLOWER_LOG_MULTIPLE`] under
+/// [`Variant::FollowerNeverCompacts`] — 116, 429, 512, 577 and 757 — and this is
+/// the one with the most room: 878 entries against the bound's 768, where seed
+/// 116, the lowest, holds 788. A pin two per cent over a bound would go quiet at
+/// the next schedule move and say nothing about it.
+// PROPOSED(D-078): Stage B's exit measures the largest in-memory log of any
+// follower replica.
+const FOLLOWER_LOG_SEED: u64 = 512;
+
+/// Stage B's exit bound on a follower's log, with the known-buggy variant beside
+/// it that the same check catches (CLAUDE.md's pair rule).
+///
+/// `FOLLOWER_NEVER_COMPACTS` is the server as it was built before D-065: a replica
+/// that is not leading never compacts, so its in-memory log keeps every entry
+/// since the last snapshot a leader gave it or it took itself, and grows with the
+/// run. That is the only thing in the tree that can make
+/// `Report::follower_log_is_bounded` fire, and before this variant existed the
+/// bound was unfalsifiable — widening `FOLLOWER_LOG_MULTIPLE` from 64 to 4 096
+/// changed no test at any tier, which is how the review of this slice found it.
+///
+/// **The rate, measured before it is asserted (D-061).** Over the first thousand
+/// seeds in release, the variant is caught on **5** — 116, 429, 512, 577 and 757 —
+/// and on every one of the five it is this bound that catches it; its largest
+/// follower log is 878 entries, 73 × the threshold, on seed 512. Half a per cent
+/// is far too thin for a sweep at the gate's twenty seeds, so this is pinned at a
+/// seed instead of swept: [`FOLLOWER_LOG_SEED`] asserts the mechanism by name, at
+/// every tier, and the sweep's own `follower_log_multiples` keeps the distribution
+/// in view.
+///
+/// The correct half of the pair is the same seed run correct: it passes, and its
+/// largest follower log is inside the bound with room.
+// PROPOSED(D-078): Stage B's exit measures the largest in-memory log of any
+// follower replica.
+#[test]
+fn a_replica_that_never_compacts_outgrows_the_follower_log_bound() {
+    let bound = raft::FOLLOWER_LOG_MULTIPLE * raft::SNAPSHOT_THRESHOLD;
+
+    let broken = raft::run(FOLLOWER_LOG_SEED, Variant::FollowerNeverCompacts);
+    let (longest, server) = broken.largest_follower_log();
+    let violation = broken.check().expect_err(&format!(
+        "seed {FOLLOWER_LOG_SEED} under FollowerNeverCompacts passed every check; its \
+         largest follower log was {longest} entries against the {bound} of the bound"
+    ));
+    assert!(
+        violation.contains("follower log:"),
+        "seed {FOLLOWER_LOG_SEED} under FollowerNeverCompacts is caught, but by something \
+         else first — the pin asserts this bound's own mechanism: {violation}"
+    );
+    assert!(
+        longest > bound,
+        "the violation names the bound, so the log must be past it: {longest} of {bound} \
+         on server {server}"
+    );
+    eprintln!(
+        "FollowerNeverCompacts: seed {FOLLOWER_LOG_SEED} held {longest} entries on server \
+         {server}, past the {bound} of {} × {}",
+        raft::FOLLOWER_LOG_MULTIPLE,
+        raft::SNAPSHOT_THRESHOLD
+    );
+
+    let correct = raft::run(FOLLOWER_LOG_SEED, Variants::default());
+    let (longest, server) = correct.largest_follower_log();
+    assert!(
+        correct.check().is_ok(),
+        "the correct half of the pair must pass: {:?}",
+        correct.check().err()
+    );
+    assert!(
+        longest <= bound,
+        "the correct server's own log is what the bound is about: {longest} of {bound} \
+         on server {server}"
+    );
+    eprintln!(
+        "Correct: seed {FOLLOWER_LOG_SEED} held {longest} entries on server {server}, \
+         inside the {bound} of the bound"
+    );
+}
+
 #[test]
 fn a_leader_that_commits_an_older_terms_entry_by_count_is_caught() {
     is_caught(Variant::CountOlderTermForCommit);
@@ -2335,171 +2611,97 @@ fn a_server_whose_refusal_is_not_durable_is_caught() {
     }
 }
 
-/// Seed 102, the first seed of the first thousand on which `RefusalNotDurable` is
-/// caught on this tree, pinned in place of seed 158 under the owner's decision of
-/// 2026-09-15 (D-056): the sweep asserts the catch only from the thousand-seed tier, and
-/// this pin keeps the variant's catch, with its mechanism, at every tier, the gate's and
-/// CI's included. The catch is on 7 of the first thousand seeds here, 0.7 % — 102, 293,
-/// 378, 465, 744, 893 and 926; it was 9 before D-069 moved every raft schedule that
-/// serves a read (the read is served at one engine version now, an extra engine read on
-/// the path), 16 with D-056's send queue alone, and the nightly's last measure, before
-/// the queue, was 132 of ten thousand. Seed 158 held this pin on the tree before D-069
-/// and now reaches neither half; its own test below asserts that absence.
+/// Seed 102, which pinned `RefusalNotDurable`'s own mechanism at every tier from
+/// D-069 until D-078 moved every schedule again — a follower writes a snapshot record
+/// and deletes log keys where it wrote and deleted nothing, so every simulated disk draw
+/// from the first compaction on is another draw and the run after it is another run.
+/// The pin was put here under the owner's decision of 2026-09-15 (D-056), in place of
+/// seed 158, because the sweep asserts the catch only from the thousand-seed tier and a
+/// pinned seed keeps it at the gate's twenty and CI's hundred.
 ///
-/// This pin holds the bug's half alone. The fix's own mechanism — the quiesce, the
-/// durable mark and the opens refused on it — is on seed 687, whose schedule reaches it.
+/// **The mechanism has left this seed, and it has left the first thousand.** The search
+/// CLAUDE.md:58-67 asks for at such a move was run over seeds 0..1000 in release on this
+/// tree, for a run of `RefusalNotDurable` whose verdict is a state machine safety
+/// violation *and* that crashes a refused server *and* restarts it after a lost-state
+/// refusal before any install — the three facts this pin asserted: **0 of 1 000**. It
+/// was 7 of 1 000 on the tree this branch is cut from (`ae75bdf`): seeds 102, 293, 378,
+/// 465, 744, 893 and 926.
 ///
-/// As built, read off the trace: server 1's open at 13.556327079 s drops table 6, which
-/// the manifest lists, and the store is refused for lost state at 13.578870962 s.
-/// `Fault::CrashRefused` then crashes the refused server, restarting it at 13.608 s;
-/// that open drops table 6 again and is refused again at 13.67192931 s; and this time
-/// the refused engine, not quiesced, flushes what the recovery replayed — table 9, then
-/// manifest 10 listing tables 5, 7, 8 and 9 with table 6 forgotten, and `CURRENT`
-/// switched to it at 13.690493628 s — so the evidence of the loss is written away. The
-/// crash at 13.759 s and the restart at 13.788 s then find a self-consistent store,
-/// remove `000006.sst` as an orphan at 13.84034698 s and recover clean at
-/// 13.880843335 s with an applied index of 331, no install having been adopted on server
-/// 1 since its refusal. State machine safety reports that restatement, whose log does
-/// not hold the index 1 it claims to have applied. That is seed 687's premerge failure,
-/// the bug D-044 fixed, and decision time (D-047) does not move it. (Seed 158's run of
-/// the same shape deleted log segments too; here the flush covers no whole segment, so
-/// the laundering is the manifest, the switch and the orphan removal alone.)
+/// The variant is still caught, and more often — 58 of 1 000 against 26 — but every one
+/// of the 58 is now the `match starts` oracle rather than state machine safety, where
+/// before the 26 were 19 by the oracle and 7 by state machine safety. The reason is
+/// D-065 itself: a follower's compaction leaves a snapshot record in the store, so the
+/// laundered store that opens fresh has a prefix to account for its applied index with,
+/// and the restatement no longer contradicts its own log. The oracle catches the variant
+/// by the other consequence of the same bug — a store that lost its refusal opens fresh,
+/// takes a new incarnation, and the leader traces a second first rise of its match.
+/// **This goes to the owner**: the variant's Phase 2 standard, the catch from the
+/// hundred-seed tier (§10), still holds at 5.8 %, but the mechanism D-044 names is no
+/// longer reached at this tier by any seed, so no pin can keep it at the gate's twenty.
 ///
-/// Under the correct server the seed reaches nothing of the sort, and the test asserts
-/// that absence with its reason: no table is dropped on any node, so no engine reports
-/// lost state and none is quiesced, and no crash lands on a refused server.
+/// Until the owner says otherwise this test asserts the absence with its reason, in the
+/// shape seed 158's pin below uses, so the day an open drops a table here again it says
+/// so and the pin can assert what each server does with it. The fix's own mechanism —
+/// the quiesce, the durable mark and the opens refused on it — is on seed 687, whose
+/// schedule still reaches it.
+///
+/// Its companion for non-vacuity is the refusal matcher, asserted non-empty on both
+/// runs: what is absent is the lost-state refusal, not every refusal.
 #[test]
+// PROPOSED(D-078): a follower compacts its log to its own applied index.
 fn seed_102_pins_the_refusal_that_is_not_durable_which_a_hundred_seeds_can_miss() {
-    use ananke_env::NodeId;
-    let node = Some(NodeId::new(1));
-    let lost_state = |report: &raft::Report| -> Vec<ananke_env::Instant> {
+    let lost_state = |report: &raft::Report| -> Vec<(u64, ananke_env::Instant)> {
         report
             .records
             .iter()
-            .filter(|r| {
-                matches!(&r.event, TraceEvent::RaftRefused { server: 1, reason }
-                    if reason.starts_with(LOST_STATE))
+            .filter_map(|r| match &r.event {
+                TraceEvent::RaftRefused { server, reason } if reason.starts_with(LOST_STATE) => {
+                    Some((*server, r.at))
+                }
+                _ => None,
             })
-            .map(|r| r.at)
             .collect()
     };
-
     let built = raft::run(102, Variant::RefusalNotDurable);
-    let verdict = built.check();
-    assert_eq!(
-        built.moved_by_decision_time(&verdict),
-        None,
-        "seed 102 as built: decision time moves its verdict; re-audit the pin"
-    );
-    let violation = verdict.err().unwrap_or_default();
-    assert!(
-        violation.starts_with(
-            "seed 102: state machine safety: server 1 recovered an applied index of 331 in \
-             group 2 but its log does not hold index 1"
-        ),
-        "seed 102 as built is no longer caught with the laundered store's restatement: \
-         {violation:?}; re-audit the pin"
-    );
-    let refusals = lost_state(&built);
-    let (Some(&refused), Some(&last_refused)) = (refusals.first(), refusals.last()) else {
-        panic!("seed 102 as built never refuses server 1 for lost state: re-audit the pin");
-    };
-    assert!(
-        crashes_while_refused(&built) > 0,
-        "seed 102 as built: no crash lands on a refused server; re-audit the pin"
-    );
-    let restarts = built.restarts_after_lost_state_refusal();
-    assert!(
-        !restarts.is_empty()
-            && restarts
-                .iter()
-                .all(|&(server, at, _)| server == 1 && at == refused),
-        "seed 102 as built no longer restarts server 1 after its refusal for lost state at \
-         {refused:?} before an install: {restarts:?}; re-audit the pin"
-    );
-    let dropped: BTreeSet<u64> = built
-        .records
-        .iter()
-        .filter(|r| r.node == node && r.at <= refused)
-        .filter_map(|r| match r.event {
-            TraceEvent::SstDropped { number, .. } => Some(number),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(
-        dropped,
-        BTreeSet::from([6]),
-        "seed 102 as built: server 1's refused open no longer drops table 6; re-audit the pin"
-    );
-    let recovered_clean = built
-        .records
-        .iter()
-        .find(|r| {
-            r.at > last_refused
-                && matches!(
-                    r.event,
-                    TraceEvent::RaftRecovered {
-                        server: 1,
-                        applied: 331,
-                        ..
-                    }
-                )
-        })
-        .map(|r| r.at)
-        .expect(
-            "seed 102 as built: server 1 never opens clean after its refusal; re-audit the pin",
-        );
-    assert!(
-        !built.records.iter().any(|r| r.at > refused
-            && r.at < recovered_clean
-            && matches!(r.event, TraceEvent::RaftAdopted { server: 1 })),
-        "seed 102 as built: an install replaced server 1's store before its clean open at \
-         {recovered_clean:?}, so the restatement is not the laundered store's; re-audit the pin"
-    );
-    let between = |r: &&ananke_env::sim::TraceRecord| {
-        r.node == node && r.at > last_refused && r.at < recovered_clean
-    };
-    let laundering_manifest = built.records.iter().filter(between).any(|r| {
-        matches!(&r.event, TraceEvent::ManifestWritten { tables, .. }
-            if !tables.is_empty() && tables.iter().all(|t| !dropped.contains(t)))
-    });
-    let switched = built
-        .records
-        .iter()
-        .filter(between)
-        .any(|r| matches!(r.event, TraceEvent::CurrentSwitched { .. }));
-    let orphaned = built.records.iter().filter(between).any(|r| {
-        matches!(&r.event, TraceEvent::OrphanRemoved { path }
-            if path.to_string_lossy().ends_with("000006.sst"))
-    });
-    assert!(
-        laundering_manifest && switched && orphaned,
-        "seed 102 as built: the refused engine no longer writes a manifest without table \
-         {dropped:?} (manifest {laundering_manifest}, switch {switched}) and the next open no \
-         longer removes the dropped table as an orphan ({orphaned}) before the clean open at \
-         {recovered_clean:?}; re-audit the pin"
-    );
-
-    // The fix's half is not on this seed, asserted with its reason: nothing is dropped,
-    // so no engine reports lost state and none is quiesced. Seed 687 pins the quiesce
-    // and the durable refusal.
     let correct = raft::run(102, Variant::Correct);
+    assert_eq!(
+        built.check().err(),
+        None,
+        "seed 102 as built is caught again: pin the mechanism rather than this absence"
+    );
     assert_eq!(
         correct.check().err(),
         None,
-        "seed 102 under the correct server no longer passes"
+        "seed 102 under the correct server no longer passes: re-audit the pin"
     );
-    assert!(
-        lost_state(&correct).is_empty()
-            && !correct.records.iter().any(|r| matches!(
-                r.event,
-                TraceEvent::SstDropped { .. } | TraceEvent::EngineQuiesced { .. }
-            ))
-            && crashes_while_refused(&correct) == 0,
-        "seed 102 under the correct server drops a table, quiesces an engine or crashes a \
-         refused server again: the quiesce and the durable refusal are reachable here, so pin \
-         them"
-    );
+    for report in [&built, &correct] {
+        assert!(
+            !refusals(report).is_empty(),
+            "seed 102 under {:?} refuses no store at all, so the absence below says nothing: \
+             re-audit the pin and the refusal matcher",
+            report.variants
+        );
+        let lost = lost_state(report);
+        assert!(
+            lost.is_empty(),
+            "seed 102 under {:?} refuses a server for lost state again ({lost:?}): D-044's \
+             mechanism is reachable here once more, so pin it",
+            report.variants
+        );
+        assert_eq!(
+            crashes_while_refused(report),
+            0,
+            "seed 102 under {:?}: a crash lands on a refused server again, so the laundered \
+             store may be reachable: re-audit the pin",
+            report.variants
+        );
+        assert!(
+            report.restarts_after_lost_state_refusal().is_empty(),
+            "seed 102 under {:?} restarts a server after a lost-state refusal again: pin the \
+             mechanism rather than this absence",
+            report.variants
+        );
+    }
 }
 
 /// Seed 158, which held the pin above from the key layout and the store's format record
@@ -2575,26 +2777,31 @@ fn seed_158_which_pinned_the_refusal_that_is_not_durable_before_the_read_moved_l
 }
 
 /// Seed 119, which held the pin above from D-056's send queue until the key layout and
-/// the store's format record (D-059, D-060) moved every raft schedule again (see seed
-/// 164's pin), and what it does now: no store is refused at all on the run, under either
-/// server. `RefusalNotDurable`'s bug is what a *refused* engine goes on doing, so with no
-/// refusal it has nothing to change, and its trace is the correct server's record for
-/// record. The test asserts that absence with its reason, so the day the seed refuses a
-/// store again it says so and the pin can be made to assert what each server does with
-/// it; the mechanism itself is pinned on seed 102 above, the first of the seven seeds of
-/// the first thousand the variant is caught on since the read moved (D-069), seed 158
-/// above having become an asserted absence with it.
+/// the store's format record (D-059, D-060) moved every raft schedule again, and what it
+/// does now, re-audited under D-078, which moves every schedule once more — a follower
+/// writes a snapshot record and deletes log keys where it wrote and deleted nothing.
 ///
-/// This pin has no companion showing its matcher can find a refusal, and cannot have
-/// one: seed 119 refuses nothing under `Correct`, `RefusalNotDurable`,
-/// `IgnoreIncarnation` or `SharedSnapshotDir`, so there is no report here whose
-/// refusals are non-empty, and D-060's rule — every absence assertion in a pin gets a
-/// companion that shows the vector can be non-empty — cannot be applied on this seed.
-/// What stands in for it is the matcher itself: [`refusals`] is shared with seed 132's
-/// pin, where `IgnoreIncarnation` and the correct server do refuse and the companion is
-/// asserted, so a matcher narrowed until it finds nothing fails there before it can
-/// make this absence vacuous.
+/// The seed refuses a store again, where it refused none: server 3's start finds a
+/// `RAFT-STORE` marker it cannot read and refuses on it, under the correct server and
+/// under the variant alike. That is damage the *start* finds in the marker's own bytes,
+/// not the lost-state refusal `RefusalNotDurable` is about: the variant's bug is what a
+/// server does *after* its engine's recovery reports lost state — keep the refusal in
+/// the process instead of writing it into the store — and no recovery on this run
+/// reports lost state, so the variant still has nothing to do here and neither run is
+/// caught. Both facts are asserted: the refusal present, no refusal for lost state, and
+/// no crash landing on a refused server.
+///
+/// The two runs are no longer record for record the same, as they were before D-078, and
+/// that is asserted as a difference rather than left unstated: a run under a variant is
+/// another run once the variant changes any draw, and `Variants` is part of each core's
+/// seed material. What the pin turns on is the absence of the lost-state refusal, which
+/// is asserted directly on both runs, so the identity is no longer needed to carry it.
+///
+/// Its companion for non-vacuity is the refusal matcher, asserted non-empty on both runs
+/// here, which it was not before: what is absent is the lost-state refusal, not every
+/// refusal, so a matcher narrowed until it finds nothing fails on this seed itself.
 #[test]
+// PROPOSED(D-078): a follower compacts its log to its own applied index.
 fn seed_119_which_pinned_the_refusal_that_is_not_durable_before_the_layout_refuses_nothing() {
     let built = raft::run(119, Variant::RefusalNotDurable);
     let correct = raft::run(119, Variant::Correct);
@@ -2609,11 +2816,31 @@ fn seed_119_which_pinned_the_refusal_that_is_not_durable_before_the_layout_refus
         "seed 119 under the correct server no longer passes: re-audit the pin"
     );
     for report in [&built, &correct] {
-        let refusals = refusals(report);
+        // The companion: the seed does refuse, so the absence below is of lost state
+        // and not of the matcher finding anything at all.
+        let found = refusals(report);
         assert!(
-            refusals.is_empty(),
-            "seed 119 under {:?} refuses a store again ({refusals:?}): the variant now has \
-             something to do here, so pin what it does",
+            !found.is_empty(),
+            "seed 119 under {:?} refuses no store at all, so the absence below says nothing: \
+             re-audit the pin and the refusal matcher",
+            report.variants
+        );
+        assert!(
+            found.iter().all(|event| matches!(
+                event,
+                TraceEvent::RaftRefused { reason, .. } if !reason.starts_with(LOST_STATE)
+            )),
+            "seed 119 under {:?} refuses a server for lost state again ({found:?}): the variant \
+             now has something to do here, so pin what it does",
+            report.variants
+        );
+        assert!(
+            !report.records.iter().any(|r| matches!(
+                r.event,
+                TraceEvent::SstDropped { .. } | TraceEvent::EngineQuiesced { .. }
+            )),
+            "seed 119 under {:?} drops a table or quiesces an engine again: a recovery here \
+             lost writes, which is what the variant is about, so pin it",
             report.variants
         );
     }
@@ -2622,10 +2849,10 @@ fn seed_119_which_pinned_the_refusal_that_is_not_durable_before_the_layout_refus
         0,
         "seed 119 as built: a crash lands on a refused server again; re-audit the pin"
     );
-    assert_eq!(
+    assert_ne!(
         built.records, correct.records,
-        "seed 119's two runs are no longer record for record the same, though neither refuses a \
-         store: re-audit the pin"
+        "seed 119's two runs are record for record the same again: say so in the pin, since it \
+         is a stronger statement than the one asserted here"
     );
 }
 
@@ -3052,12 +3279,34 @@ struct Coverage {
     /// silently empty once before, at D-060, and every assertion built on it
     /// passed while it did.
     takes_paired: usize,
+    /// Snapshots a server really installed, and prefixes a restart re-stated:
+    /// one event kind, split because D-065 made the second population large and
+    /// counting them together reported installs that never happened
+    /// ([`raft::Report::snapshots_installed_and_restated`]).
+    // PROPOSED(D-078): a follower compacts its log to its own applied index.
     snapshots_installed: usize,
+    snapshot_prefixes_restated: usize,
     snapshot_resumes: usize,
     snapshot_versions_deleted: usize,
     snapshot_takes_reused: usize,
     snapshot_streams_at_once: usize,
     compactions: usize,
+    /// D-065's own path: the compactions a replica made while it was not leading,
+    /// with the seeds that saw one, and the largest in-memory log any follower
+    /// replica held over the sweep — Stage B's exit measurement (Q39), printed at
+    /// every tier beside the bound `raft::FOLLOWER_LOG_MULTIPLE` asserts per seed.
+    // PROPOSED(D-078): a follower compacts its log to its own applied index.
+    follower_compactions: usize,
+    seeds_with_a_follower_compaction: u64,
+    /// Of those, the ones whose prefix swallowed the configuration entry in
+    /// force, so D-029's revert floor is what the replica reverts to from there.
+    follower_compactions_swallowing_the_config: usize,
+    largest_follower_log: u64,
+    largest_follower_log_seed: u64,
+    /// The distribution of the per-seed largest follower log, in multiples of
+    /// `raft::SNAPSHOT_THRESHOLD`: the bound is set from the whole shape, not
+    /// from the maximum alone.
+    follower_log_multiples: BTreeMap<u64, u64>,
     reseeded: usize,
     reseed_completions: u64,
     progress_resets: usize,
@@ -3280,8 +3529,10 @@ impl Coverage {
         self.snapshots_taken +=
             report.count(|e| matches!(e, TraceEvent::RaftSnapshot { taken: true, .. }));
         self.takes_paired += report.snapshot_takes().len();
-        self.snapshots_installed +=
-            report.count(|e| matches!(e, TraceEvent::RaftSnapshot { taken: false, .. }));
+        // PROPOSED(D-078): a follower compacts its log to its own applied index.
+        let (installed, restated) = report.snapshots_installed_and_restated();
+        self.snapshots_installed += installed;
+        self.snapshot_prefixes_restated += restated;
         self.snapshot_resumes +=
             report.count(|e| matches!(e, TraceEvent::RaftSnapshotResumed { .. }));
         // D-043: versions swept, takes answered by the recorded
@@ -3294,6 +3545,20 @@ impl Coverage {
             |e| matches!(e, TraceEvent::RaftSnapshotStreams { streams, .. } if *streams > 1),
         );
         self.compactions += report.count(|e| matches!(e, TraceEvent::RaftCompacted { .. }));
+        // PROPOSED(D-078): a follower compacts its log to its own applied index.
+        let (follower_compactions, swallowed) = report.follower_compactions();
+        self.follower_compactions += follower_compactions;
+        self.follower_compactions_swallowing_the_config += swallowed;
+        self.seeds_with_a_follower_compaction += u64::from(follower_compactions > 0);
+        let (longest, _) = report.largest_follower_log();
+        if longest > self.largest_follower_log {
+            self.largest_follower_log = longest;
+            self.largest_follower_log_seed = report.seed;
+        }
+        *self
+            .follower_log_multiples
+            .entry(longest / raft::SNAPSHOT_THRESHOLD)
+            .or_default() += 1;
         self.reseeded += report.count(|e| matches!(e, TraceEvent::RaftReseeded { .. }));
         self.reseed_completions += u64::from(reseed_completed(report));
         self.progress_resets += report.count(|e| matches!(e, TraceEvent::RaftProgressReset { .. }));
@@ -3393,6 +3658,10 @@ impl Coverage {
                 self.takes_paired as u64,
             ),
             ("log compactions", self.compactions as u64),
+            (
+                "compactions by a replica that was not leading",
+                self.follower_compactions as u64,
+            ),
             ("crash-mid-install faults", self.install_crash_faults as u64),
             (
                 "crash-mid-adoption faults",
