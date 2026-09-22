@@ -9048,6 +9048,366 @@ printed figure, and row 7 is the range/server confusion `RangeId` exists to make
   schedule moves, and `ananke-shard`'s own tests are 34 unit tests that run in 0.26 s at
   any tier.
 
+## PROPOSED D-073 — The node's tasks: one `raft` task over every core in Q41's round, and one `apply` task over every range
+
+**Context.** Stage B's third build (SHARD.md:2219-2232) is §4's node. D-072 built its
+wire. This entry is the next slice, the **tasks and the round**, and nothing else: "one
+`raft` task stepping every core on one ticker in Q41's round, every output after a
+core's `Persist` executed when that core's own persist resolves and its messages and
+ticks held until then; one `apply` task (Q14)". The snapshot task keyed by range and
+follower, bootstrap ranges and the four ranges per node in the scenarios, Q15's refusal
+and re-seed, and follower compaction are each their own PR. The single-group server in
+`ananke-raft` runs exactly as it did; nothing in `sim/` changes behaviour; the node runs
+one range, `node::SINGLE_GROUP`, until the slice that switches the sweeps to it.
+
+What the tree has. One server is one group: `incarnation` (node.rs:854-1285) owns one
+`Raft`, one ticker and one `Server::execute` (node.rs:2432-2562) that runs a step's
+outputs in order, awaiting `store.persist(..)` before everything after it. That order is
+right for one core and wrong for many: it makes every core on the node wait on every
+other core's disk. Q41 says what replaces it, and §4 sets it out in full
+(SHARD.md:384-425).
+
+**Decision.** `ananke-shard` gains three modules beside the wire.
+
+`round` is the discipline alone — no clock, no socket, no disk — so the order can be
+asserted without a simulation. `Cores` holds every range's core keyed by `RangeId` and
+hands back a `Round`: the outputs that leave **before** the round's sync (those that
+precede a core's `Persist`, and all outputs of a core that persisted nothing), and the
+persists the round submits **together**. Everything a core produced after its `Persist` —
+its sends, `Apply`, `ReadReady`, `ReadDropped`, snapshot actions and its trace events —
+is held for that core and executed when *that core's own* persist resolves, and that
+core steps no further until then. The work handed to a waiting core meanwhile is held in
+arrival order, one entry per missed tick, and replayed in that order when its persist
+resolves, every missed tick stepped and none collapsed; the replay stops at the first
+step that persists again.
+
+`node` is the two tasks. `Node::raft` is one loop over a three-way race of the inbox,
+the ticker and the outstanding persists: a round is a tick's steps, or the messages
+drained since the last round. It never waits on a persist — while a sync is outstanding
+it goes on stepping the cores that persisted nothing, so a later round's persists can be
+submitted behind it (SHARD.md:519-543). `Persists` holds the round's persists side by
+side; the round submits them all and then arms them in one synchronous pass with no
+await between, so a round's records reach the WAL writer together and are never split
+across two of its groups, and the writer syncs them once (wal.rs:16-20, D-018). A round
+submitted while an earlier sync is outstanding joins the group that sync's records did
+not take, which is §4's loaded case (SHARD.md:519-533). `node::apply` is one task per node taking every range's jobs one at a time, in
+the order they were queued, whatever the range: Q14's rule, and D-036's consequence that
+one range's take holds every range's applies. Sends leave through D-072's per-peer
+outbox, one frame per peer per flush.
+
+`variant` is the node's known-buggy variants. They are a set of their own, not more of
+`ananke_raft::Variant`: the core is untouched, they are not Raft bugs, and they are
+outside §10's count. The node is not under the sweeps until the slice that puts it
+there, so each is caught by a deterministic check in the crate. That is what CLAUDE.md's
+pair rule asks — the buggy variant is *seen to fail* the check the correct code passes —
+and D-061's tier rule does not apply, because it is a rule about a *sweep's* assertion
+and there is no rate to measure in a check that is a single deterministic run.
+
+`Host` and `Applier` are what the tasks need of the node's disk, socket and clients. The
+node is the schedule; the host is what it drives. Splitting them is what lets a check
+drive the round with a host that resolves persists in an order it chooses, which is the
+only way to assert Q41's rule that each core's later outputs wait on that core's own
+persist and on no other's.
+
+**What §4 leaves open, settled here, each marked `// PROPOSED(D-073)` in the code.**
+
+1. *The order several ready persists resolve in* (`node.rs`, `Persists`). §4 says each
+   core's outputs follow its own persist and says nothing about ties. A fixed order —
+   range order — would let one range's persists always be seen before another's, which
+   is exactly what the round exists to prevent. The bit comes from the environment's
+   scheduling stream, as `race` draws it, and only where there is a choice: a node with
+   one range draws nothing, so its schedule is the one-group server's and no pinned seed
+   moves.
+2. *Which round a resolution's flush belongs to* (`node.rs`, `Frames`). A round flushes
+   once before its sync and again as each of its persists resolves. The replayed work's
+   own early outputs ride the resolution's flush rather than taking one of their own:
+   both are correct, since the discipline forbids only flushing a core's later outputs
+   *early*, and one flush is the option that puts fewer frames on the wire. The
+   resolution's flush is credited to the round whose persist resolved, which is what
+   makes "frames per peer in a round" a figure with an answer.
+3. *Whether a held message keeps its charge against the node's bound*
+   (`inbox.rs`, `Inbox::hold_at`). §4 says a message for a waiting core "is still taken
+   from the inbox and held for that core, counted against the node's byte bound (Q14)",
+   and D-072's inbox releases a message's bytes when it is popped. The node tells the
+   inbox what it holds, as a whole figure rather than a delta, because the node knows
+   what it holds and a lost increment would leak the bound away. D-072's rule that
+   nothing is refused into an *empty queue* is narrowed to match, which is **PROPOSED
+   D-074**: without that, the rule and this one together make the bound bind nothing,
+   because the `raft` task drains the queue to empty on every wake.
+4. *Where the `net` task's receipt comes from* (`node.rs`, `received`). D-050's stamp is
+   taken by the `net` task in the one-group server and carried on the inbox entry.
+   D-072's `Received` does not carry one, so the node takes the stamp as it hands the
+   message to its core. Taking one reads the time and nothing else (D-047), so it moves
+   no schedule; the conservative reading is that it is a receipt of the wrong moment by
+   however long the message waited in the inbox, and the fix belongs on `Received`, in
+   the slice that next touches the wire.
+5. *The outbox's drops* (`node.rs`, `Node::act`). `TraceEvent` has no kind for a message
+   the outbox dropped over its per-peer bound or refused as oversized (D-072); the node
+   counts both on `Frames` and traces neither. Adding an event kind moves every pinned
+   trace hash, and nothing would emit it until the node is under the sweeps: the event
+   belongs with that slice, where it can also be seen to fire. This is the one place
+   this slice is knowingly short of "every state transition that matters emits a trace
+   event", and it is short of it in the crate's own counters, not silently.
+6. *A persist that fails*. The task fails the node — `Host::failed` and the error
+   returned — as `Server::execute` does today (node.rs:2432-2562). Not open, recorded
+   because a node holding many ranges fails all of them at once, which is Q15's
+   territory and the slice after next's.
+
+**The pair, for each variant (CLAUDE.md:52-67).** Each is built beside the correct round
+and caught by the same check that asserts the correct round's order.
+
+| variant | what it does | the check that catches it |
+|---|---|---|
+| `DeferredFlushedEarly` | a core's outputs after its `Persist` go with the round's early ones | `a_cores_later_outputs_wait_on_its_own_persist_and_on_no_others` (the response leaves before either persist resolved) and `the_applies_reach_the_task_after_their_persists_and_partition_the_log` |
+| `StepWhilePersisting` | a waiting core is stepped anyway | `every_tick_a_core_missed_is_stepped_when_its_persist_resolves` (nothing is held, no tick is replayed) |
+| `CollapseHeldTicks` | the missed ticks become one | the same check (one tick replayed where three fell due), `the_ticks_a_core_missed_reach_its_timer_and_not_only_its_counter` (the follower's election timer is short by the whole sync, so it does not campaign when the sync resolves) and `the_variant_collapses_the_missed_ticks_into_one` |
+| `PersistsOneAtATime` | each persist pays a sync of its own | `a_rounds_persists_are_submitted_together` (the second reaches the writer only after the first resolved) |
+| `HeldNotCounted` | a held message stops counting against the bound | `what_the_node_holds_fills_the_nodes_bound` (the node refuses no arrival against a bound of four messages and holds every one of them) |
+| `PersistsNotArmed` | the round's persists are submitted but left unpolled | `a_rounds_persists_reach_the_writer_before_the_task_takes_anything_else` (on some seeds the round's record reaches the writer only after the task has taken a tick and shipped a later round's frame) |
+| `AppliedNotAdvanced` | the index handed to the `apply` task is not remembered | `the_applies_reach_the_task_after_their_persists_and_partition_the_log` (the jobs are `[1]`, `[1,2]`, `[1,2,3]` where they should partition the log) |
+| `TakeToSnapshotTask` | a take goes to the `snapshot` task, not the `apply` task | `every_output_of_a_step_goes_where_section_four_sends_it` (the take never reaches the apply queue, so D-036's stall stops holding) |
+
+Three of these — `PersistsNotArmed`, `AppliedNotAdvanced`, `TakeToSnapshotTask` — were
+added by the adversarial review's findings 7, 5 and 6: the behaviours were in the code
+and stated in its documentation, and nothing in the crate distinguished them from their
+absence. `PersistsNotArmed` is the one variant whose catch depends on the scheduling
+draw, because what it breaks is which side of the task's three-way race is polled first;
+its directed scenario is a fixed set of 24 seeds, on all of which the correct node
+submits before its next note and on some of which the variant does not (D-061's rule for
+a new variant with no rate to measure).
+
+**Measurements.** Machine: Darwin 25.6.0 arm64, Apple M2, 8 cores, AC Power. Other
+agents were building in parallel on it, so the load averages are recorded beside each
+figure.
+
+*A core step's cost*, release, host time, outside the simulator (SHARD.md §12). The
+adversarial review's finding 8 was that the figures here were not reproducible and this
+entry recorded them as if they were — a *quieter* machine gave a figure 53 % higher. It
+was right, and the harness was changed for it: each shape now runs **five** times and the
+figure reported is the **lowest**, which is the statistic to take on a shared machine
+(every run is the step's cost plus whatever interference it met), with the spread printed
+beside it. The shapes were re-measured on the fixed tree, three times over, and the runs
+are all recorded because the spread between them is the point:
+
+```
+cargo run --release -p ananke-shard --example step-cost
+                  run A            run B            run C
+                  load 29.8        load 28.1        load 25.3 (39.3 by the end)
+idle tick         42 (42..86)      29 (29..59)      73 (73..91)     ns/step
+leader tick       55 (55..183)     27 (27..134)     65 (65..186)
+heartbeat in     107 (107..135)    41 (41..46)     141 (141..251)
+response in      306 (306..345)   119 (119..122)   373 (373..642)
+loaded           561 (561..831)   235 (235..251)   269 (269..313)
+```
+
+Take the lowest of the three, **29 ns an idle step**, and read the rest as a range:
+29–73 ns idle, 27–65 ns a leader tick, 41–141 ns a heartbeat in, 119–373 ns a response
+in, 235–561 ns loaded. The *loaded* shape also changed (finding 9): it used to propose a
+million commands into a log that never compacted — the example printed "1 001 001
+entries" — which measured a growing `Vec` as much as a step, and was the figure that
+moved most. The leader is now compacted every 9 500 commands, which is §4's ~608 KiB log
+at 64 bytes a command, and the example ends with a log of 4 001 entries.
+
+**The pass bound is an idle step below 20 µs**, computed from §4's constants — 500 steps
+in a 10 ms tick at 1 000 ranges (SHARD.md:504, 512-517), not measured. Every run of every
+shape is **two orders of magnitude** under it, the lowest and the highest alike; stating
+the margin as an order of magnitude rather than as "625 times" is finding 8's other half,
+because the ratio is a ratio of one machine's run to a computed constant and it moved by
+a factor of 2.5 between runs of the same tree. **PASS**, and nothing goes to the owner on
+this figure. One `raft` task per node holds 1 000 ranges' idle ticks in 0.1–0.4 % of a
+tick, and 10 000 ranges' in 1.5–3.7 %. The two tick shapes run on a core whose election
+timeout is set long, so that every tick measured is the tick that does not time out — the
+tick almost every one of a node's 300 replicas takes on any given tick of a steady
+cluster. Without that the follower times out after ten ticks and the figure becomes an
+election storm's, which is a different step and not one of §4's 500.
+
+*The frames per peer in a round with persists* (SHARD.md:490-492, which leaves it to this
+stage). A round flushes once before its sync and once as each of its persists resolves,
+so a round with `p` persisting cores costs, per peer, one frame at each flush that has
+sends for it: **up to 1 + p frames per peer per round**. §4 asks how many flushes that
+is, saying it "depends on how the group commit resolves the round's persists": it is one
+per persisting core *even when one group commit resolves them all*, which
+`a_shared_sync_still_costs_one_later_flush_per_persisting_core` measures — two cores
+whose persists resolve at the same instant cost three flushes and two frames to the one
+peer, not one. That check measures the `p`; the `1` is measured by
+`a_round_that_sends_before_its_sync_costs_that_frame_too`, a round in which one core
+answers a pre-vote without persisting and another appends, which costs two flushes and
+two frames to the one peer — the pre-sync flush's and the resolution's. (The review's
+finding 10: the earlier entry claimed the first check measured `1 + p`, and it measured
+`p`, because both its cores persist on their first step and its pre-sync flush ships
+nothing.) An idle tick's round persists nothing and costs the one frame §4 counts
+(SHARD.md:485-492); a round in which 100 of a node's leader replicas persist costs up to
+100 frames to each peer. **This is what the slice asks the owner** — see below.
+
+*The replay burst after a slow persist* (SHARD.md §12): the ticks a core replays once
+its persist resolves, times the cores held, times a step's cost, against the 10 ms tick
+at 1 000 ranges. A core behind a sync of `s` holds one tick per 10 ms of it, every one
+stepped; a node at 1 000 ranges holds 300 replicas (SHARD.md:504). At the lowest and the
+highest idle figures measured, 29 ns and 73 ns:
+
+```
+sync      ticks replayed   burst at 29 ns     burst at 73 ns
+    2 ms          0        0.00 %             0.00 %
+   20 ms          2        0.17 %             0.44 %
+   80 ms          8        0.70 %             1.75 %
+  200 ms         20        1.74 %             4.38 %
+ 1000 ms        100        8.70 %            21.90 %
+```
+
+The burst first fills a whole tick at a sync of **4.6 s** on the slowest of the three
+runs and 11.5 s on the fastest. The sweep's disk operations are 100 µs to 2 ms
+(sim/raft.rs:2807-2808) and the sync §4 calls as bad as a crash is 80 ms, so the burst
+costs **0.7–1.8 % of a tick** at every latency the tree models. It does not break the
+tick budget, and nothing goes to the owner on this figure either. (The earlier entry
+quoted 0.77 % to two decimals off one run; the range is what the figure supports.)
+
+**What it asks of the owner.** One thing, and it is the frames figure, not a bound.
+
+> A round with `p` persisting cores costs up to `1 + p` frames per peer, because §4's
+> rule is read literally: each core's later outputs are flushed *when that core's own
+> persist resolves*, one flush per resolution, even when one group commit resolved the
+> whole round at one instant. At 1 000 ranges a write burst touching 100 of a node's
+> leader replicas therefore costs up to 100 frames toward each peer in that round,
+> against the one frame an idle tick costs. Coalescing the resolutions that are ready in
+> the same poll into one flush would cut that to one frame and would still be correct —
+> every core's outputs would still follow its own persist — but it is a change to when
+> outputs leave, which is a scheduling decision and not this slice's to make. **The
+> recommendation** is to leave it as built through Stage B, which is the conservative
+> option and the one §4's words say, and to decide it before Stage C with the figure
+> measured on the sweeps' real traffic, where the node runs four ranges and the number
+> of cores that persist in one round is a measurement rather than an argument.
+
+**What the adversarial review changed.** One blocker and five majors, all in the tree
+now, with the mutation that proves each fixed. The blocker is its own entry, D-074.
+
+| # | finding | what changed | proved by |
+|---|---|---|---|
+| 1 | the node's byte bound bound nothing: the task drains the queue to empty, so D-072's empty-queue exemption fired at every arrival | **PROPOSED D-074** — the exemption now also asks that the node hold nothing | mutation `F1-revert-empties` (the exemption as it was) is caught by `what_the_node_holds_fills_the_nodes_bound` |
+| 2 | the `HeldNotCounted` check asserted the figure the node had just written, not the bound | the check now runs a 256-byte bound against eleven arrivals and asks the *inbox* which got in | `M1` (`charged()` returns `self.bytes`) — a survivor before, caught now |
+| 3 | "every missed tick stepped" was asserted by a counter; nothing saw the tick reach the core | `the_ticks_a_core_missed_reach_its_timer_and_not_only_its_counter`: the follower's election timeout is four ticks and its sync spans six, so the correct node campaigns at the resolution and a node whose timer stood still does not | `M2` (count the replayed tick, do not step it) — a survivor before, caught now |
+| 4 | a deferred `Apply` read the core *after* the replay had stepped it, and `entries_to_apply` dropped missing indices silently while `applied_sent` advanced past them | the entries are read at the step that named them and carried on the `Act`; a missing index is `Err(index)` and fails the node | `F4-gap-passed-over` (the old `filter_map`) is caught by `the_entries_an_apply_names_are_the_ones_not_handed_out_yet`. The *scenario* in which the gap arises needs a compaction path the node does not have yet — issue #79 |
+| 5 | nothing caught the node re-applying its whole log from index 1 | `Note::Applied` carries the job's indices and the check asserts they partition the committed log; `AppliedNotAdvanced` is the variant | `M7` (`applied` never advances) — a survivor before, caught now |
+| 6 | "a take is the `apply` task's" was stated three times and checked nowhere | `every_output_of_a_step_goes_where_section_four_sends_it` drives `Node::act` over every output kind and asserts where each lands; `TakeToSnapshotTask` is the variant | `M11` (route the take to `snapshot`) and `M18` (drop `Output::Rejected`) — both survivors before, both caught now |
+| 7 | the third commit's `arm().await` had no check that distinguished armed from unarmed | `a_rounds_persists_reach_the_writer_before_the_task_takes_anything_else` over 24 seeds; `PersistsNotArmed` is the variant | `M4` (delete `arm().await`) — a survivor before, caught now |
+| 8, 9 | the step-cost figures were not reproducible, and the *loaded* shape measured a leader's log growing to a million entries | five runs a shape, the minimum reported with its spread, the margin stated as an order of magnitude; the loaded leader compacts every 9 500 commands | the three runs recorded above, which span 29–73 ns for the same tree |
+| 10 | the "1" of `1 + p` frames per peer was never observed | `a_round_that_sends_before_its_sync_costs_that_frame_too` | `M20` (discard the pre-sync flush's frames) — a survivor before, caught now |
+| 11 | stale `ananke-raft` citations in the new code and in this entry | corrected here and in `round.rs`; SHARD.md carries the same two and is shared with the parallel slices — issue #80 |  |
+| 12 | `Round::persists` documented "in range order", which is only a tick's round | documented as the order the round's cores persisted |  |
+| 13 | dead public API | `ApplyWork::Retake` dropped; `Round::sends_early` now feeds `Frames::rounds_sending_before_their_sync`; `Inbox::charged_bytes` is what finding 2's check reads |  |
+| 14 | this entry said the inbox had twelve tests | it has fourteen |  |
+| 15 | a message for a range the node does not hold was dropped in silence | `Meters::messages_for_ranges_not_held`, with a check | `F15-silent-unrouted` is caught |
+| 16 | `Output::Rejected` and the resolution path's `hold_at` were unasserted | the routing check covers the first, the bound check covers the second | `M18` and `M12` — both survivors before, both caught now |
+
+`M6` (`take_ready` always takes index 0) is left a survivor on purpose: it is point 1
+above, the draw that happens only where there is a choice, and a node with one range
+never has one. It is a PROPOSED point, not a defect.
+
+**What moved.** Nothing. No schedule moves and no pinned seed moves: `ananke-raft`,
+`ananke-env`, `ananke-storage` and `sim/` are untouched but for RAFT.md, the new code
+runs in no scenario yet, and the one draw the node makes from the scheduling stream is
+taken only where two or more persists are outstanding, which a one-range node never has.
+`Inbox`'s arithmetic gained a `held` term and D-074's narrowing of the empty-queue
+exemption; the `held` term is zero everywhere D-072's own fourteen tests reach it, so the
+narrowing changes none of them and all fourteen are unchanged and green. So there is no
+re-audit to do, and this entry says so rather than leaving it unsaid.
+
+**What is not done, and why.** The node is not wired to a `RaftStore`, a socket or the
+scenarios: `Host` and `Applier` are the seam, and the slice that switches the sweeps to
+the node implements them over the store, the engine and the `net` task. The `snapshot`
+task, bootstrap ranges, four ranges per node, Q15's whole-node refusal and follower
+compaction are each their own PR, as the plan sets out. The measurements the node's
+entry also owes — the inbox's drops under its byte bound, the apply lag, how long one
+range's take holds the node's other ranges' applies, and the trace records per range per
+virtual second — are all measurements *under the sweep's client load*, which needs the
+node in the scenarios: they belong to the slice that puts it there, and this entry
+records the three that do not. Two of the review's findings are filed rather than fixed
+because fixing them here would widen the slice: **#79**, the directed scenario for the
+applied-stream gap, which needs a compaction path the node has not got until D-065's
+slice; and **#80**, SHARD.md's two stale `ananke-raft` citations, which is a shared file
+the parallel slices are also in.
+
+---
+
+## PROPOSED D-074 — Nothing is refused into an empty queue, *while the node holds nothing*
+
+**Context.** D-072's inbox has one rule over both of its drop policies: **nothing is
+ever refused into an empty queue**. A message larger than the whole bound is admitted
+over it rather than refused for ever — an AppendEntries carrying a 64 KiB command costs
+65 622 bytes against a 16 kB inbox, and refusing it refuses every retransmission of it
+identically, so the range it is about never replicates again. The bound is then exceeded
+only by a queue holding exactly one message, which the next pop empties.
+
+D-073 point 3 added the other half of the node's bound: a message taken from the inbox
+and held for a core whose persist is outstanding is **still counted against the bound**
+(SHARD.md §4, Q14). The node tells the inbox what it holds; the inbox charges the queue
+and the hold together.
+
+The two together bind nothing. `Node::raft` drains the queue to empty on every wake —
+`while let Some(next) = inbox.take()` — and hands everything to `Cores`, which holds what
+it cannot step. So the queue is **empty** at the moment the next frame arrives, every
+time, and the exemption fires at every arrival whatever the hold says. The arithmetic
+that charges the hold is correct and the real path never reaches it. A node behind a
+slow sync accumulates one held message per arrival, without limit, for the whole sync:
+at 10 000 ranges and 2 000 messages a tick (SHARD.md:504) an 80 ms sync — the one §4
+calls as bad as a crash — takes 16 000 messages out of a bounded inbox and refuses none
+of them. This was the adversarial review's finding 1 on the tasks slice, reproduced
+end-to-end: against a 256-byte bound the node held 19 136 bytes, 74 times the bound, and
+refused 0 of 300 arrivals.
+
+**Decision.** The exemption is narrowed to what it is for: a message no *emptying* could
+make room for, at a node that is holding nothing.
+
+```rust
+let empties = inner.held == 0
+    && (inner.items.len() == 0
+        || (room > 0 && inner.items.len() == inner.items.heartbeats()));
+```
+
+Nothing else changes: the two drop policies, the heartbeat victim index, and the
+arithmetic are D-072's. With the term, what the node holds is bounded by the bound —
+each arrival that is held was charged before it was admitted, so the hold cannot pass
+the bound by more than the one message the exemption ever lets through.
+
+**Why this and not a cap on the hold.** The other way to bound it is to stop draining
+into the hold once `Cores::held_bytes()` reaches the bound, leaving later arrivals in the
+queue where D-072's arithmetic already binds them. That is a change to the `raft` task's
+round — the round is *the messages drained since the last round*, and this would make it
+"the messages drained until the hold is full", a scheduling decision. The narrowing is a
+change to an admission test that was already conditional, so it is the smaller and the
+more conservative of the two. It is also the one that keeps the bound a property of the
+inbox, which is where a check can reach it.
+
+**What it costs.** A message larger than the whole bound, arriving while the node is
+holding something, is refused where D-072 would have admitted it. It is not refused for
+ever: what the node holds drains when the sync resolves — a persist resolves or the node
+fails (D-073 point 6) — so the retransmission that finds the node holding nothing is
+admitted under D-072's rule unchanged. The cost is a delay of at most one slow sync on a
+message that only a node already at its bound would meet, against a node that otherwise
+has no bound at all while a sync is outstanding. The conservative reading, and the one
+taken here, is that a bound that binds is worth a retransmission.
+
+**Recommendation.** As built. If the owner prefers the hold to be capped in the `raft`
+task instead, that is a scheduling decision and belongs with the slice that puts the node
+under the sweeps, where the drops under the byte bound are measured rather than argued
+(SHARD.md §12).
+
+**The pair (CLAUDE.md:52-67).** `NodeVariant::HeldNotCounted` is the variant: it takes
+the message and stops counting it. The check is
+`node::what_the_node_holds_fills_the_nodes_bound` — a 256-byte bound, a core behind a
+65 ms sync, and eleven 64-byte arrivals fed one a millisecond. The correct node holds
+four of them, is charged 256 bytes, refuses the rest, and admits again once the sync has
+resolved and released what it held. The variant holds all eleven and refuses none. The
+check fails on the code as it stood before this entry, which is finding 1; the same check
+also kills the review's mutation M1 (`charged()` returns `self.bytes`) and M12 (no
+`hold_at` on the resolution path), which both survived the slice as merged.
+
+**What moved.** Nothing outside `crates/ananke-shard`. D-072's fourteen inbox tests never
+set `held`, so `held == 0` holds throughout them and the added term changes no decision
+any of them makes; all fourteen are unchanged and green. `sim/` does not depend on
+`ananke-shard`, no schedule moves and no pinned seed moves.
+
+---
+
 ## PROPOSED D-078 — Follower compaction as D-065 decided it: a record at the applied index, no checkpoint under it, and the follower log bounded at 64 × `snapshot_threshold`
 
 **What this builds.** D-065's option C, on today's single-group server, independent of

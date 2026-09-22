@@ -40,12 +40,20 @@
 //!   reset by the entries themselves, so refusing heartbeats under pressure cannot
 //!   start the election that refusing entry-carriers would need to repair.
 //!
-//! and one rule over both: **nothing is ever refused into an empty queue.** A message
-//! larger than the whole bound is admitted over it rather than refused for ever — an
-//! AppendEntries carrying a 64 KiB command costs 65 622 bytes against a 16 kB inbox,
-//! and refusing it refuses every retransmission of it identically, so the range it is
-//! about never replicates again. The bound is exceeded only by an inbox holding
-//! exactly one message, which the next pop empties.
+//! and one rule over both: **nothing is ever refused into an empty queue, while the
+//! node holds nothing.** A message larger than the whole bound is admitted over it
+//! rather than refused for ever — an AppendEntries carrying a 64 KiB command costs
+//! 65 622 bytes against a 16 kB inbox, and refusing it refuses every retransmission of
+//! it identically, so the range it is about never replicates again. The bound is
+//! exceeded only by an inbox holding exactly one message, which the next pop empties.
+//!
+//! The second half of that rule is PROPOSED D-074 and is what makes the bound a bound
+//! of *the node*: the node's `raft` task takes a message it cannot step yet and
+//! [holds](Inbox::hold_at) it, draining the queue to empty on every wake, so an
+//! exemption that asked only about the queue would be met at every arrival and a node
+//! behind a slow sync would hold messages without limit. What the node holds drains
+//! when the sync resolves, so the oversized message is admitted on the retransmission
+//! that finds the node holding nothing, and nothing is refused for ever.
 //!
 //! The victim is chosen through the `slots` module's index of heartbeats **by sender
 //! and range**, which SHARD.md §11's raft item 11 names: a map from (sender, range) to
@@ -358,8 +366,20 @@ struct Inner {
     bytes: usize,
     refused: u64,
     dropped: u64,
+    /// The bytes of messages the node has taken from the queue and cannot step yet:
+    /// a message for a core whose persist is outstanding is held for that core and
+    /// still counted against the node's byte bound (SHARD.md §4, Q14).
+    // PROPOSED(D-073): held messages keep their charge against the bound.
+    held: usize,
     waker: Option<Waker>,
     closed: bool,
+}
+
+impl Inner {
+    /// What the bound is measured against: the queue and what the node holds.
+    fn charged(&self) -> usize {
+        self.bytes.saturating_add(self.held)
+    }
 }
 
 /// See the module documentation.
@@ -392,6 +412,7 @@ impl Inbox {
                 bytes: 0,
                 refused: 0,
                 dropped: 0,
+                held: 0,
                 waker: None,
                 closed: false,
             })),
@@ -431,7 +452,7 @@ impl Inbox {
                 inner.refused += 1;
                 return Admission::Refused(message);
             }
-            if inner.bytes.saturating_add(message.bytes) > self.bound {
+            if inner.charged().saturating_add(message.bytes) > self.bound {
                 // The room a message carrying data can make for itself is what the
                 // queued heartbeats hold; whether that is enough is decided here,
                 // before anything is dropped for it.
@@ -443,18 +464,31 @@ impl Inbox {
                 } else {
                     0
                 };
-                let fits_after = (inner.bytes - room).saturating_add(message.bytes) <= self.bound;
+                let fits_after = (inner.charged() - room.min(inner.charged()))
+                    .saturating_add(message.bytes)
+                    <= self.bound;
                 // PROPOSED(D-072): nothing is refused into an empty queue. A message
                 // larger than the whole bound would otherwise be refused for ever,
                 // every retransmission of it alike, and the range it is about would
                 // never replicate again.
-                let empties = inner.items.len() == 0
-                    || (room > 0 && inner.items.len() == inner.items.heartbeats());
+                //
+                // PROPOSED(D-074): *and only while the node holds nothing*. The
+                // exemption is for a message no emptying of the queue could make room
+                // for. A node behind a slow sync drains the queue to empty on every
+                // wake, so without this term the queue is empty at every admission and
+                // the exemption is the whole path: the bound would bind nothing and
+                // the node would hold messages without limit for the whole sync. What
+                // the node holds drains when that sync resolves, so a message larger
+                // than the bound is still admitted rather than refused for ever — on a
+                // retransmission that finds the node holding nothing.
+                let empties = inner.held == 0
+                    && (inner.items.len() == 0
+                        || (room > 0 && inner.items.len() == inner.items.heartbeats()));
                 if !fits_after && !empties {
                     inner.refused += 1;
                     return Admission::Refused(message);
                 }
-                while inner.bytes.saturating_add(message.bytes) > self.bound {
+                while inner.charged().saturating_add(message.bytes) > self.bound {
                     let Some(victim) = inner.items.take_noisiest_heartbeat() else {
                         break;
                     };
@@ -503,6 +537,50 @@ impl Inbox {
     #[must_use]
     pub fn queued_bytes(&self) -> usize {
         self.lock().bytes
+    }
+
+    /// The bytes the node holds for cores whose persists are outstanding.
+    #[must_use]
+    pub fn held_bytes(&self) -> usize {
+        self.lock().held
+    }
+
+    /// What the bound is measured against: the bytes queued and the bytes held.
+    #[must_use]
+    pub fn charged_bytes(&self) -> usize {
+        self.lock().charged()
+    }
+
+    /// Sets the bytes the node holds for cores whose persists are outstanding.
+    ///
+    /// A message for a core whose persist is outstanding is still taken from the
+    /// inbox and held for that core, *counted against the node's byte bound*
+    /// (SHARD.md §4, Q14). The queue cannot know when that happens, so the node tells
+    /// it, with the whole figure rather than a delta: the node knows what it holds
+    /// and a lost increment would leak the bound away.
+    ///
+    /// D-072's rule that nothing is refused into an empty queue reads, with this, as
+    /// *nothing is refused into an empty queue while the node holds nothing*: the
+    /// node's `raft` task drains the queue to empty on every wake, so a node behind a
+    /// slow sync would otherwise meet the exemption at every arrival and hold messages
+    /// without limit for the whole sync. A message larger than the whole bound is
+    /// still never refused for ever — what the node holds drains when the sync
+    /// resolves, and the next retransmission finds the exemption open.
+    // PROPOSED(D-073): held messages keep their charge against the bound.
+    // PROPOSED(D-074): the empty-queue exemption is narrowed to a node holding
+    // nothing, so that what the node holds is bounded too.
+    pub fn hold_at(&self, bytes: usize) {
+        self.lock().held = bytes;
+    }
+
+    /// The next message if one is queued, without waiting: what the `raft` task
+    /// drains a round with (SHARD.md §4, "the messages drained since the last
+    /// round").
+    pub fn take(&self) -> Option<Received> {
+        let mut inner = self.lock();
+        let message = inner.items.pop_front()?;
+        inner.bytes -= message.bytes;
+        Some(message)
     }
 
     /// The messages queued.
