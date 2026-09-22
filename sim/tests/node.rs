@@ -288,15 +288,23 @@ fn every_seed_passes_on_the_correct_node_under_the_raft_sweeps_arms() {
     );
     // §11, env 8's teeth. An arm that resolved "the leader" without its range would
     // cut off whichever range elected last — a perfectly good fault that no check of
-    // the run would report. The floor was measured on the correct node before it was
-    // asserted (D-061) and is in the entry; a harness that ignored the range would sit
-    // near one range in four.
+    // the run would report, which is why this is here rather than left to the run's
+    // other checks.
+    //
+    // Both figures were measured before the floor was written (D-061), by planting the
+    // mutation: the correct node hits **115 of 115** over a hundred seeds, and a
+    // `leader_of_range` that ignores its range argument hits **82 of 115, 71.3 %** —
+    // not one in four, because three nodes hold four ranges and the leader of the
+    // range that elected last is often the leader of the range the arm drew as well.
+    // The floor sits between them with room on both sides. It is a bound the correct
+    // system must not trip, so a tier that comes in under it is a model error to take
+    // to the owner and not a number to widen (D-030, D-039).
     assert!(arms_fired > 0, "no leader-relative arm fired over the tier");
     assert!(
-        aimed_rate >= 60.0,
+        aimed_rate >= 90.0,
         "{arms_hit} of {arms_fired} leader-relative arms hit the leader of the range they drew \
-         ({aimed_rate:.1}%), which is what a harness that resolved a leader without its range \
-         would look like"
+         ({aimed_rate:.1}%), under the 90% floor: a harness that resolved a leader without its \
+         range sits at about 71%"
     );
     // The shape the keyed checks need, on every seed: four ranges on every node,
     // each electing and applying. It is what says the sweep can tell a keyed check
@@ -305,6 +313,30 @@ fn every_seed_passes_on_the_correct_node_under_the_raft_sweeps_arms() {
         assert!(leaders.contains_key(&range), "range {range} never led");
         assert!(applies.contains_key(&range), "range {range} never applied");
     }
+    // And the work is spread over the four, not piled on one. "Every range applied
+    // something" is satisfied by a range that applied only its leader's no-ops, which
+    // is what the node looks like when the scenario's key map sends every client key
+    // to one range: the sweep would then be a one-range sweep wearing four names, and
+    // every check keyed by range would have nothing to be wrong about.
+    //
+    // Measured before it was asserted (D-061), by planting that mutation. Over a
+    // hundred seeds the correct node applies {2: 31 264, 3: 36 021, 4: 32 403,
+    // 5: 33 776} — least over busiest, **0.87** — and a key map that answers one range
+    // gives {2: 95 986, 3: 16 459, 4: 12 886, 5: 14 353}, **0.13**. The floor is half,
+    // between them and far from both.
+    let least = applies.values().copied().min().unwrap_or(0);
+    let busiest = applies.values().copied().max().unwrap_or(0);
+    let spread = least as f64 / busiest.max(1) as f64;
+    println!(
+        "node: the least-applied range took {least} entries against the busiest range's \
+         {busiest}, a spread of {spread:.2}"
+    );
+    assert!(
+        spread >= 0.5,
+        "the least-applied range took {least} entries against the busiest's {busiest} \
+         ({spread:.2}), which is what a sweep whose client work all lands on one range looks \
+         like"
+    );
     // Read off the frames themselves, not off the scenario's parameters: a frame
     // between two nodes carries messages of several ranges, which is what four
     // ranges to a node is the parameter for (SHARD.md §12). The floor was measured
