@@ -10255,6 +10255,25 @@ Membership seed 7205 is not pinned as a seed. The shape it found is pinned in th
 cases above, where the window can be written by hand, which is the bound no sweep tier
 holds on its own.
 
+**The premerge.** `ANANKE_SEEDS=1000 scripts/premerge.sh` on this branch's tip, in the
+words the script printed (D-070):
+
+    premerge: Darwin 25.6.0 arm64, Apple M2, 8 cores
+    premerge: before, load 141.09/112.40/125.85, AC Power, no thermal warning recorded
+    premerge: after, load 126.54/149.22/158.29, AC Power, no thermal warning recorded
+    premerge: green at 1000 seeds in 2263 s
+
+AC throughout and no thermal warning, but the machine was **not quiet**: a load of 141
+before and 126 after, against the 26-to-49 of D-075's run, because several branches were
+building beside it. The 2 263 s is a measurement of that machine at that moment and of
+nothing else; this change touches no code that runs in a simulation, so there is no
+figure of its own to compare it with. What the run is for is the green and the rates,
+and those are exact: `RefusalNotDurable` **58 of 1 000**, every one of them this fold's —
+its first catch on seed 20 now reads in the new message's words —
+`SingleMajorityInJointConsensus` **241 of 1 000**, and the membership sweep's
+`seeds_with_a_match_start` 1 000 of 1 000 over 11 648 match starts and 3 216 accepted
+changes. Every one of those is the figure `main` produces.
+
 ---
 
 _Next entry: D-080. Add one before implementing anything not covered above._
