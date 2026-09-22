@@ -9,7 +9,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use ananke_env::sim::TraceRecord;
-use ananke_env::{ClientOp, DropReason, TraceEvent};
+use ananke_env::{ClientOp, DropReason, Instant, TraceEvent};
 use ananke_raft::core::{Variant, Variants};
 use ananke_raft::invariants::{self, Checker};
 use ananke_raft::store::{LOST_STATE, STORE_MARKER};
@@ -511,6 +511,77 @@ fn seed_5909_passes_under_both_bugs_together_which_is_the_finding() {
             "seed 5909 under {variants:?} no longer leaves exactly {expected_uncounted:?} \
              uncounted after the last heal: re-audit the pin"
         );
+    }
+}
+
+/// The widest set of operation windows open at one instant, on the operations of
+/// one key: how much concurrency the linearizability search must order there. A
+/// pending operation is open to the end of the history.
+// PROPOSED(D-080): the read-only candidates go first, together.
+fn most_open_at_once(ops: &[&ananke_sim::lin::Op]) -> usize {
+    let last = ops.iter().filter_map(|op| op.ret).max();
+    let mut edges: Vec<(Instant, i64)> = Vec::new();
+    for op in ops {
+        edges.push((op.call, 1));
+        edges.push((op.ret.or(last).unwrap_or(op.call), -1));
+    }
+    edges.sort();
+    let (mut open, mut most) = (0i64, 0i64);
+    for (_, step) in edges {
+        open += step;
+        most = most.max(open);
+    }
+    usize::try_from(most).expect("a count of operations")
+}
+
+/// The ten-thousand-seed nightly's seeds 3085 and 4065 (GitHub run 35705563274, on
+/// 7127745): the first correct-server failures that were not violations at all. The
+/// checker reported its own search budget — "332 of 397 operations placed before
+/// the search budget ran out" on 3085's key `"k1"`, 376 of 438 on 4065's `"k0"` —
+/// and both histories are in fact linearizable (issue #82).
+///
+/// The search branched over every candidate. A window of *w* concurrent reads of
+/// one value is then 2^w different sets of linearized operations, all at the same
+/// register value, and the memo cannot collapse them because they are genuinely
+/// different sets. 3085's `"k1"` holds 397 operations, 199 of them gets, 20 windows
+/// open at once at the widest; 4065's `"k0"` holds 438, 244 gets, 22 open. Measured
+/// on 7127745, the search expanded 296 345 and 287 535 states before the 2 000 000
+/// budget ran out; a throwaway copy with the budget raised decided 3085 at
+/// 4 000 000 states and 4065 at 400 000 000. D-080 commits every read-only
+/// candidate outright, keeping no branch point, and the two decide at 383 and 408
+/// states — beside a worst key of 778 over seeds 0..1000.
+///
+/// The pin asserts the mechanism and not the green: each key must still hold the
+/// window of concurrent reads that the reduction is what carries. The day a
+/// schedule moves that window away the assertion says so, and the pin should be
+/// re-audited against a seed that still reaches it rather than quietly kept.
+#[test]
+fn seeds_3085_and_4065_which_the_nightly_found_linearize_inside_the_budget() {
+    for (seed, key, least_ops, least_gets, least_open) in [
+        (3085u64, "k1", 300usize, 150usize, 12usize),
+        (4065, "k0", 300, 150, 12),
+    ] {
+        let report = raft::run(seed, Variant::Correct);
+        let ops: Vec<&ananke_sim::lin::Op> = report
+            .history
+            .ops
+            .iter()
+            .filter(|op| op.op.key().as_ref() == key.as_bytes())
+            .collect();
+        let gets = ops
+            .iter()
+            .filter(|op| matches!(op.op, ClientOp::Get { .. }))
+            .count();
+        let open = most_open_at_once(&ops);
+        assert!(
+            ops.len() >= least_ops && gets >= least_gets && open >= least_open,
+            "seed {seed} no longer reaches the shape D-080's reduction decides: key {key:?} \
+             holds {} operations, {gets} of them gets, {open} open at once, against the \
+             {least_ops}/{least_gets}/{least_open} the pin was taken at; re-audit it against \
+             a seed that does",
+            ops.len()
+        );
+        report.check().unwrap();
     }
 }
 

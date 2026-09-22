@@ -20,6 +20,12 @@
 # (`raft-<hash> <test> --exact`) rather than through cargo, so the figure is the test's own
 # cost and not a build's, at 0.415 user + 0.033 sys = 0.4 cpu s, load 50.28/59.22/56.19.
 # Shard 6 was the lightest at 1242.0 and takes it, to 1242.4.
+# D-080 added one row, the two nightly seeds the linearizability search could not decide.
+# It is pinned at two seeds, not swept, so the tier does not move it: weighed the same way,
+# from the built release test binary rather than through cargo, at 0.32 user + 0.02 sys =
+# 0.3 cpu s, with other agents' slices building on the same laptop (load 168.98/143.58/96.79),
+# so the figure is if anything generous. Shard 6 was the lightest at 1242.4 and takes it,
+# to 1242.7.
 #
 # shard	binary	cpu_s	test
 # shard 1: 1278.5 cpu s
@@ -87,7 +93,7 @@
 5	raft	187.0	a_leader_that_commits_an_older_terms_entry_by_count_is_caught
 5	raft	139.6	the_correct_server_passes_the_membership_scenario_on_every_seed
 5	raft	50.7	a_server_that_applies_before_commit_compacts_past_its_commit_index
-# shard 6: 1242.4 cpu s
+# shard 6: 1242.7 cpu s
 6	echo	0.1	a_busy_looping_task_fails_the_scenario_instead_of_hanging
 6	engine	310.3	an_engine_that_acknowledges_before_the_log_is_caught
 6	engine	204.5	an_engine_that_releases_a_memtable_before_the_manifest_is_caught
@@ -106,5 +112,6 @@
 6	raft	0.2	seed_4_of_the_term_raise_schedule_steps_a_message_received_before_its_isolation
 6	raft	0.2	seed_7381_which_the_first_nightly_found_stays_green
 6	raft	0.4	a_replica_that_never_compacts_outgrows_the_follower_log_bound
+6	raft	0.3	seeds_3085_and_4065_which_the_nightly_found_linearize_inside_the_budget
 6	wal	34.4	a_log_that_skips_sync_dir_on_rotation_is_caught
 6	wal	0.3	same_seed_gives_byte_identical_trace

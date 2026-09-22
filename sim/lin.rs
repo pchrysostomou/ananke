@@ -28,6 +28,20 @@
 //! server must never reach it. A violation names the key, how far the search got,
 //! and the operations it could not place.
 //!
+//! One reduction keeps that search out of the exponential (D-080). A candidate that
+//! only *reads* the register — a get, or a compare-and-set known to have found
+//! something other than what it expected — leaves the value as it found it and has
+//! its result settled by the value alone. Such an operation never needs a branch
+//! point: if any linearization of the rest exists, one exists with that read first.
+//! `reads_only` carries the exchange argument. So every read-only candidate is
+//! committed at once, with no alternative kept, and the search branches only over
+//! the operations that write. Without it a window of *w* concurrent reads of one
+//! value is 2^w states that the memo cannot collapse, because each is a genuinely
+//! different set of linearized operations reaching the same register value; with it
+//! the window is one state. This is Wing and Gong's search under a partial-order
+//! reduction, and it is what makes the checker's cost track the number of writes in
+//! a window rather than the number of operations.
+//!
 //! Each key's search leaves a timeline of (time, value) for the linearization it
 //! found, so a multi-key read can later be checked against every key it covers.
 
@@ -299,6 +313,44 @@ fn apply(
     }
 }
 
+/// Whether `op` is *read-only* at `value`: it applies there, it leaves the value
+/// exactly as it found it, and its result is settled by that value alone.
+///
+/// The search commits such an operation without keeping an alternative (D-080), so
+/// the exchange argument matters. Let `o` be a read-only candidate at a state, and
+/// suppose some linearization `L` of the unlinearized operations exists from there.
+///
+/// * `o` may go first in the real-time order. `o` is a candidate, so `o.call` is at
+///   or before the earliest return among the unlinearized operations; every `x` in
+///   `L` therefore has `o.call <= x.ret`, and real-time order forbids `o` before `x`
+///   only when `x.ret < o.call`.
+/// * `o` may go first in the value order. `o` does not write, so every other
+///   operation of `L` sees exactly the values it saw before, in the same order; and
+///   `o` itself applies at the state's value, which is what this function checked.
+/// * So `L` with `o` moved to the front — or, when `o` is pending and `L` left it
+///   out, `o` prepended to `L` — is a linearization too.
+///
+/// The second point is why the two cases below are the only ones. A put or a delete
+/// writes. A compare-and-set that swapped writes. A compare-and-set with **no**
+/// result (abandoned, closed at its entry's apply) is not read-only either, even
+/// where it happens not to swap at this value: deferred, it may meet a different
+/// value, swap there, and be the write a later read needs — so moving it earlier
+/// changes the value order, and the exchange argument does not hold for it.
+fn reads_only(op: &Op, value: &Option<Bytes>) -> bool {
+    match (&op.op, &op.result) {
+        // A get never writes. With a result it must have seen this value, which
+        // `apply` checks; abandoned, with no result, it matches whatever it meets.
+        (ClientOp::Get { .. }, _) => apply(&op.op, op.result.as_ref(), value).is_some(),
+        // A compare-and-set that is known not to have swapped is a read assertion:
+        // it applies only where the value differs from what it expected, and it
+        // leaves that value alone.
+        (ClientOp::Cas { .. }, Some(ClientResult::Swapped(false))) => {
+            apply(&op.op, op.result.as_ref(), value).is_some()
+        }
+        _ => false,
+    }
+}
+
 fn bit(mask: &[u64], i: usize) -> bool {
     mask[i / 64] & (1 << (i % 64)) != 0
 }
@@ -351,6 +403,9 @@ impl Search<'_> {
         // An operation may go next only if no unlinearized operation returned before
         // it was invoked. Completed operations are tried before pending ones, since
         // a pending one is a candidate at every step.
+        //
+        // PROPOSED(D-080): the read-only candidates go first, together, with no
+        // branch point kept.
         let min_ret = (0..self.ops.len())
             .filter(|&i| !bit(&self.mask, i))
             .filter_map(|i| self.ops[i].ret)
@@ -362,6 +417,29 @@ impl Search<'_> {
         if self.order.len() >= self.deepest {
             self.deepest = self.order.len();
             self.stuck = candidates.clone();
+        }
+        // Every read-only candidate goes now, together, and no alternative is kept
+        // (D-080). Taking one leaves the value alone, so the others are read-only
+        // still; and it only drops an operation from the unlinearized set, which can
+        // only move `min_ret` later, so the others are candidates still.
+        let forced: Vec<usize> = candidates
+            .iter()
+            .copied()
+            .filter(|&i| reads_only(self.ops[i], &self.value))
+            .collect();
+        if !forced.is_empty() {
+            for &i in &forced {
+                set(&mut self.mask, i, true);
+                self.order.push(i);
+            }
+            let found = self.dfs();
+            if found != Some(true) {
+                for &i in forced.iter().rev() {
+                    self.order.pop();
+                    set(&mut self.mask, i, false);
+                }
+            }
+            return found;
         }
         let (completed, pending): (Vec<usize>, Vec<usize>) = candidates
             .into_iter()
@@ -459,6 +537,17 @@ mod tests {
                 key: b("k"),
                 value: b(value),
             },
+            result: ret.map(|_| ClientResult::Done),
+        }
+    }
+
+    fn del(process: u64, call: u64, ret: Option<u64>) -> Op {
+        Op {
+            process,
+            seq: call,
+            call: at(call),
+            ret: ret.map(at),
+            op: ClientOp::Delete { key: b("k") },
             result: ret.map(|_| ClientResult::Done),
         }
     }
@@ -578,6 +667,125 @@ mod tests {
     fn a_value_nobody_wrote_is_a_violation() {
         let h = history(vec![put(1, 0, Some(1), "a"), get(2, 2, 3, Some("z"))]);
         assert!(check(&h).is_err());
+    }
+
+    /// A write that returned and a read wholly after it that did not see it, with
+    /// nothing in between to have overwritten it: the write was lost.
+    #[test]
+    fn a_lost_write_is_a_violation() {
+        let h = history(vec![put(1, 0, Some(1), "a"), get(2, 2, 3, None)]);
+        assert!(check(&h).is_err(), "a lost write was accepted");
+        // The same two with the read concurrent with the write is fine: it may have
+        // taken effect after the read.
+        let concurrent = history(vec![put(1, 0, Some(4), "a"), get(2, 2, 3, None)]);
+        check(&concurrent).unwrap();
+    }
+
+    // The tests below pin D-080's reduction: which candidates the search may commit
+    // without keeping an alternative, and that committing them hides nothing. Each
+    // fails under a different way of getting [`reads_only`] wrong; the entry's
+    // mutation table names which.
+
+    /// A read is committed outright only where it saw *this* value. The same two
+    /// writes with a read that matches are linearizable; with a stale one they are
+    /// not, and the stale read must not be forced past the mismatch.
+    #[test]
+    fn a_read_is_forced_only_where_it_saw_this_value() {
+        let fresh = history(vec![
+            put(1, 0, Some(1), "a"),
+            put(1, 2, Some(3), "b"),
+            get(2, 4, 5, Some("b")),
+        ]);
+        check(&fresh).unwrap();
+        let stale = history(vec![
+            put(1, 0, Some(1), "a"),
+            put(1, 2, Some(3), "b"),
+            get(2, 4, 5, Some("a")),
+        ]);
+        assert!(
+            check(&stale).is_err(),
+            "a stale read was forced past its value"
+        );
+    }
+
+    /// A put writes, so it is never committed as a read and its value is never
+    /// dropped: the read after it sees what it wrote, and the timeline holds it.
+    #[test]
+    fn a_write_is_never_forced_so_its_value_is_never_lost() {
+        let h = history(vec![put(1, 0, Some(1), "a"), get(2, 2, 3, Some("a"))]);
+        let timelines = check(&h).unwrap();
+        assert_eq!(timelines[&b("k")], vec![(at(0), Some(b("a")))]);
+        // A delete writes too.
+        let deleted = history(vec![
+            put(1, 0, Some(1), "a"),
+            del(1, 2, Some(3)),
+            get(2, 4, 5, None),
+        ]);
+        check(&deleted).unwrap();
+    }
+
+    /// A compare-and-set that swapped writes, so it is not read-only: the read
+    /// concurrent with it may go first, but the swap must still take effect for the
+    /// read after it.
+    #[test]
+    fn a_swapping_compare_and_set_is_not_read_only() {
+        let h = history(vec![
+            cas(1, 0, 10, None, "b", true),
+            get(2, 1, 2, None),
+            get(3, 20, 21, Some("b")),
+        ]);
+        check(&h).unwrap();
+    }
+
+    /// A compare-and-set abandoned before its result is not read-only either, even
+    /// where it would not swap at the value in hand: deferred it meets `"b"`, swaps
+    /// there, and is the write the last read needs.
+    #[test]
+    fn an_abandoned_compare_and_set_is_not_read_only() {
+        let mut abandoned = cas(1, 0, 10, Some("b"), "c", true);
+        abandoned.result = None;
+        let h = history(vec![
+            abandoned,
+            put(2, 1, Some(2), "b"),
+            get(3, 20, 21, Some("c")),
+        ]);
+        check(&h).unwrap();
+    }
+
+    /// Committing a window of reads outright hides no violation after it: the three
+    /// concurrent reads of `"a"` all go, and the read of a value nobody wrote is
+    /// still caught.
+    #[test]
+    fn forcing_a_window_of_reads_hides_no_later_violation() {
+        let window = vec![
+            put(1, 0, Some(1), "a"),
+            get(2, 2, 3, Some("a")),
+            get(3, 2, 3, Some("a")),
+            get(4, 2, 3, Some("a")),
+        ];
+        check(&history(window.clone())).unwrap();
+        let mut with_violation = window;
+        with_violation.push(get(5, 4, 5, Some("z")));
+        assert!(
+            check(&history(with_violation)).is_err(),
+            "a window of forced reads swallowed the violation after it"
+        );
+    }
+
+    /// A window wider than the mask's first word, of reads of one value: the shape
+    /// D-080's reduction is for. Every one of the 80 reads is committed in one step,
+    /// and the writes on either side still order.
+    #[test]
+    fn a_wide_window_of_concurrent_reads_is_decided() {
+        let mut ops = vec![put(1, 0, Some(1), "a")];
+        ops.extend((0..80u64).map(|i| get(10 + i, 2, 400, Some("a"))));
+        ops.push(put(1, 3, Some(401), "b"));
+        ops.push(get(999, 402, 403, Some("b")));
+        let timelines = check(&history(ops)).unwrap();
+        assert_eq!(
+            timelines[&b("k")],
+            vec![(at(0), Some(b("a"))), (at(3), Some(b("b")))]
+        );
     }
 
     /// A trace of two ranges, with a write proposed in one of them and never
