@@ -134,11 +134,20 @@ pub enum NodeVariant {
     /// install, never that the staging directory must start over, so the install takes
     /// the abandoned stream's files for the new snapshot's (RAFT.md:203-207).
     CompleteOnRestart,
-    /// A loss in the shared engine refuses only the range whose store failed to open,
-    /// and the node's other ranges carry on over the same engine. A node owns one
-    /// engine (Q2), so a loss in it is every replica's: this is the whole of Q15 got
-    /// wrong, and with four ranges on a node it leaves three replicas serving reads
-    /// and granting votes over state their own disk lost (SHARD.md §11, storage 8).
+    /// A loss in the shared engine treated as one range's: only the range whose store
+    /// open failed is refused — traced as refused, and given a refused mark — and the
+    /// node's other replicas are neither. A node owns one engine (Q2), so a loss in it
+    /// is every replica's: this is the whole of Q15 got wrong (SHARD.md §11, storage 8).
+    ///
+    /// What the three unrefused replicas then do is worth stating exactly, because the
+    /// obvious sentence — that they "carry on over the same engine" — is not available
+    /// to any implementation: the refused directory's marker says lost, so nothing can
+    /// open it at all. They are re-created in the *new* engine instead, and because
+    /// nothing refused them they are created there as a first start would create them:
+    /// quarantine clear, incarnation 1, empty. That is the same harm one range along —
+    /// three replicas voting again on state their node lost (D-035) and three leaders
+    /// keeping a `matched` the rebuilt log cannot honour (D-042) — reached by the
+    /// mistake a reader of §11 would actually make.
     RefuseOneRangeOnly,
     /// The re-seed built in the refused directory instead of a new one beside it,
     /// which opens fresh a directory that held a store (D-041).

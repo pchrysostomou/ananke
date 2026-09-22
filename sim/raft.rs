@@ -6509,6 +6509,76 @@ mod tests {
         );
     }
 
+    /// The other half of the same reading: a replica that comes back is *lifted* out
+    /// of the down set, so its range is asked the checks about time again.
+    ///
+    /// Nothing asserted this half until the review of D-077 planted it. Making the
+    /// `RaftRecovered` arm a no-op — every refused replica down for the rest of its
+    /// run — passes the whole tree, sweeps included, and it has to: a down set that is
+    /// too *large* drops ranges from [`Report::ranges_with_a_majority_up`], and a range
+    /// not in that set is one the checks about time are never asked about. The failure
+    /// direction is green. That is the same silent exemption D-077 exists to close, one
+    /// event along, so the lifting is asserted here rather than left to a sweep that
+    /// cannot fail on it.
+    // PROPOSED(D-077): a refusal marks down the ranges its node held.
+    #[test]
+    fn a_recovered_replica_is_lifted_out_and_its_range_is_asked_again() {
+        let recovered = |server, range| TraceEvent::RaftRecovered {
+            server,
+            range,
+            term: 1,
+            applied: 0,
+            last_index: 0,
+            incarnation: 2,
+        };
+        let with = |lift: Vec<TraceRecord>| {
+            let mut all = vec![
+                record(
+                    ms(0),
+                    ms(0),
+                    Some(1),
+                    term_of(1, SINGLE_GROUP, 1, "follower"),
+                ),
+                record(ms(1), ms(1), Some(1), refused(1)),
+                record(ms(1), ms(1), Some(1), replica_refused(1, SINGLE_GROUP)),
+                record(ms(2), ms(2), Some(2), refused(2)),
+                record(ms(2), ms(2), Some(2), replica_refused(2, SINGLE_GROUP)),
+            ];
+            all.extend(lift);
+            report(all, Vec::new())
+        };
+
+        // Two of the three replicas down: the range is not asked.
+        assert_eq!(
+            with(Vec::new()).ranges_with_a_majority_up(),
+            BTreeSet::new(),
+            "two replicas down leaves the range short of a majority"
+        );
+
+        // One of them re-seeded and restated: one replica down, a majority again.
+        assert_eq!(
+            with(vec![record(
+                ms(3),
+                ms(3),
+                Some(1),
+                recovered(1, SINGLE_GROUP)
+            )])
+            .ranges_with_a_majority_up(),
+            BTreeSet::from([SINGLE_GROUP]),
+            "a recovered replica is no longer down, and its range is asked again"
+        );
+
+        // A recovery of another range on the same server lifts nothing here: the set
+        // is keyed by replica, not by server. That range is one of the run's, and
+        // nothing took it down, so it is up — and this one is still short.
+        assert_eq!(
+            with(vec![record(ms(3), ms(3), Some(1), recovered(1, OTHER))])
+                .ranges_with_a_majority_up(),
+            BTreeSet::from([OTHER]),
+            "a recovery names one replica, and server 1's replica of this range is not it"
+        );
+    }
+
     /// And the carve-out is read where it is *used*, not only where it is
     /// computed: the check about time asks it of the gap's own range. Server 1
     /// holds two ranges; both replicas of the other range are quarantined by a

@@ -10069,7 +10069,17 @@ describes the path in the terms this entry builds it in.
    marker does not say lost** (`newest_not_lost`), which is D-066. The module decides
    over a listing and touches no disk, so it is asserted without a simulation as
    `round` and `snapshot` are; `server::generations` does the listing and the marker
-   reads.
+   reads, and a restart of the re-seeded node in the directed scenario is what asks
+   `server::run` the same question the module answers.
+
+   **What that reading does not do** is step over a generation whose filling a crash
+   caught. An absent marker is not a lost one, so a directory the re-seed created and
+   had not finished filling is openable, and its replicas — no quarantine key, no
+   incarnation key — open clean. That is a hole in D-066 as this slice leaves it, and
+   it is also why `OpenNewestEvenIfLost` catches nothing the node can reach: both are
+   **#99**, which wants a three-valued marker, a "whole" mark written when the filling
+   finishes, and a fault arm that crashes between the two. Changing what "newest" means
+   is changing D-066, so it is its own entry and not a patch to this one.
 3. **A durable per-replica refused mark is written into the new engine before that
    replica serves.** `RaftStore::mark_reseeded` puts the quarantine flag (D-035) and the
    incarnation (D-042) in **one synced batch**, because a crash between them would leave
@@ -10077,7 +10087,15 @@ describes the path in the terms this entry builds it in.
    replica that never lost anything. It is written for every range before any core is
    built, so no replica can answer before its own mark is durable. `RaftReseeded`, which
    §8 already keeps per replica, is traced when the mark is durable and is the event the
-   exit criterion's (c) reads.
+   exit criterion's (c) reads. The marks survive a crash and are read back by the next
+   start, which the restart in the directed scenario asserts.
+
+   The batch holds *one replica's* two keys together, not the whole re-seed's. A node
+   refused holding four ranges writes four batches, and a crash between the first and
+   the fourth leaves one replica marked and three not — the same two holes one replica
+   along. One engine (Q2) makes a single batch across every replica possible, and that
+   is **#100**, to be done with D-067's `ReseedMarkNotSynced`, which is a flag on the
+   sync of the very batch it would merge.
 4. **Incarnation and quarantine are per replica, the incarnation drawn at each creation
    from the node's generator** (`env.rng()`), never below `FIRST_INCARNATION + 1`, as the
    one-group re-seed draws one today (node.rs:2246). It is deliberately *not* drawn from
@@ -10193,16 +10211,141 @@ the node's generator drawn once.
 
 | Variant | What it gets wrong | Caught by | A one-range world? |
 |---|---|---|---|
-| `RefuseOneRangeOnly` | refuses only the range whose store open failed; the node's other three keep serving over an engine that lost state | the directed scenario: `replicas_refused` is not every range | **no** — with one range it is the correct node |
-| `IncarnationPerRangeStream` | draws the replica's incarnation from `n{id}/r{range}/protocol` instead of the node's generator | the directed scenario: the incarnations differ from the correct node's | **no** — one range draws one number either way |
+| `RefuseOneRangeOnly` | refuses and marks only the range whose store open failed; the node's other three are re-created in the new engine as a first start would create them — quarantine clear, incarnation 1 | the directed scenario: `replicas_refused` is exactly the first range and not the four | **no** — with one range it is the correct node |
+| `IncarnationPerRangeStream` | draws the replica's incarnation from `n{id}/r{range}/protocol` instead of the node's generator | the directed scenario: every range still restates an incarnation, and every one of them differs from the node generator's | **no** — one range draws one number either way |
 | `ServeBeforeRefusedMark` | a replica answers before its refused mark is durable | the directed scenario: no mark traced, replicas answer without one, and one keeps incarnation 1 | yes |
-| `ReseedIntoRefusedDir` | re-seeds in the refused directory | the directed scenario: no generation beside it; and `reseed::tests` | yes |
+| `ReseedIntoRefusedDir` | re-seeds in the refused directory | the directed scenario: no generation beside it, and the node stops on "the re-seed's fresh engine", which is it reaching the re-seed and being refused by the marker it wrote; and `reseed::tests` | yes |
 | `ReuseLostGeneration` | takes the lowest generation not in use, handing back a directory a lost store held | `reseed::tests`: a node refused twice reopens generation 0 | **no** — needs a node refused twice, which no check before this slice asked of any node |
-| `OpenNewestEvenIfLost` | opens the newest directory whatever its marker says | `reseed::tests`: a node refused into a directory that crashed before it held anything reopens the refused one | **no** — same |
+| `OpenNewestEvenIfLost` | opens the newest directory whatever its marker says | `reseed::tests` **only, and on a state the node cannot reach** — see below and **#99** | **no** — same |
 
 `reseed::tests` also asserts the property over a whole run rather than over one refusal:
 a node refused three times opens four distinct directories and is never offered one it
 opened before.
+
+**`OpenNewestEvenIfLost` is not, today, a variant the tree knows to be buggy**, and the
+review of this entry is what established it. Under the marker scheme this slice ships,
+every directory the variant would prefer over the correct choice is one marked *lost*,
+and `refuse_lost_store` refuses it at open anyway, so correct and variant re-seed alike:
+in every state the node can reach the two agree. The pair in `reseed::tests` is asserted
+on a listing — generation 2 not lost, generation 3 lost — that the node cannot produce,
+since for generation 3 to exist the node must first have been refused out of generation
+2, which marks 2 lost. The variant becomes a real one the moment a directory can be
+*absent* a marker rather than lost, which is a crash part way through a re-seed's filling
+and is **#99**: the three-valued marker, a "whole" mark written when the filling
+finishes, and a fault arm that crashes between the two. That is a change to what D-066
+means, so it is filed rather than folded in here. The row above says so rather than
+leaving the table claiming six catches when it has five.
+
+### The review of this entry, and what it changed
+
+The slice's first review was lost before it reached the branch, so it was reviewed again
+from the code, adversarially: for every check with more than one range to be wrong about,
+what a wrong key would look like and whether anything fails when it is planted; which
+assertions could pass for a reason other than the one they claim; which tests drive a
+helper rather than the thing under test; which measurement is structural rather than
+observed. Five things moved.
+
+**1. A decision nothing in the simulator asked.** Which directory a *start* opens is
+`server::run`'s, made over the listing before any store opens, and until this review
+nothing exercised it: `newest_not_lost` was called only by `reseed::tests`, directly.
+That is the defect of driving the helper instead of the thing under test, and the cost is
+measurable — a `run` that ignored the listing entirely and opened the configured
+directory every time passed the whole tree. The scenario now crashes and restarts the
+re-seeded node
+(`a_restarted_node_opens_the_directory_its_reseed_built_and_is_not_refused_again`): the
+configured directory is marked lost, so a start that reopens it is refused a second time
+and builds a third generation, and one refusal in the whole run with no `node-g2` beside
+it is the start having found what its re-seed left. Planted, that mutation now fails.
+
+**2. A check that passed for a reason other than the one it claims.** "No replica speaks
+before its refused mark is durable" was green on the correct node because *no replica
+speaks at all*: a re-seeded replica is quarantined and takes part in nothing until its
+install, and this slice builds no install. The scenario now reads the other side of the
+same fold (`answered_after_the_mark`) and asserts it empty, with the reason — the
+situation's absence asserted rather than left silent (CLAUDE.md) — so the day the wiring
+gives a re-seeded replica something to answer, the check says so and can be upgraded to
+the ordering §12's (c) names. The entry's claim that (c) is asserted was corrected above.
+
+**3. Three assertions that asked only for a difference.** `RefuseOneRangeOnly`,
+`IncarnationPerRangeStream` and `ReseedIntoRefusedDir` were each caught by an
+`assert_ne!` against the correct node's reading, or by the absence of a directory name.
+A run that fell over before it reached the re-seed differs from the correct one too, and
+those assertions could not tell the two apart. Each now says what the variant's run did:
+the first range and no other; every range still restating an incarnation, and every one
+of them different; and the node stopping on "the re-seed's fresh engine", which is the
+variant reaching the re-seed and being refused by the marker it had just written.
+
+**4. A known-buggy variant that is not known to be buggy.** `OpenNewestEvenIfLost`, above
+— filed as **#99**, with the per-replica batch it shares a crash window with as **#100**.
+
+**4b. An arm of the reading this slice rewrote that nothing asserted.** The recovery that
+*lifts* a replica out of the down set — see the mutation table below, and the check this
+review added for it.
+
+**5. Two claims in this entry that were not true.** The premerge (corrected above: it is
+owed, and no figure for it is quoted) and the assertion that the simulator could not
+restart a node, which `sim/ranges.rs` has done for `Fault::Crash` since D-076.
+
+**What was in the worktree when the review began.** An uncommitted change to
+`ananke-raft`'s `store.rs` and the `reseed` module: a three-valued `StoreMarker`, a
+`store_marker` reader, a `newest_complete` that opens only a *whole* directory, and a
+split of `mark_reseeded` into a staging call and a read-back. It was reverted, not
+finished. It did not compile — `server.rs`, `lib.rs` and `sim/ranges.rs` still used the
+old names — and, more to the point, neither half was wired to the thing that would make
+it work: nothing in the shard path writes a "whole" marker at all (only
+`ananke_raft::run` does), so a start that asked for one would have found none and fallen
+back to generation 0 for ever, and the staged batch was still written per replica. Its
+subject is real and is now **#99** and **#100**; what was on disk was a sketch of it,
+and shipping a sketch is worse than filing the finding.
+
+**The mutation pass.** Over the code this slice touches, on the tree with the fixes
+above. Each mutation was planted on its own and the smallest test set that could see it
+was run.
+
+| # | Mutation | What fails |
+|---|---|---|
+| 1 | `ranges_with_a_majority_up` keys `down` by range alone, dropping the server | `a_majority_is_asked_of_each_range_and_a_refusal_is_the_whole_nodes` and `a_refusal_marks_down_only_the_ranges_its_node_held` |
+| 2 | the old reading restored: a `RaftRefused` marks its node down for every range in the run | `a_refusal_marks_down_only_the_ranges_its_node_held` — the fix's own case, failing as this entry says it does |
+| 3 | a `RaftRecovered` no longer lifts its replica out of the down set | **nothing, before this review** — the unit tests, the `ranges` sweep and the `raft` sweep were all green on it. `a_recovered_replica_is_lifted_out_and_its_range_is_asked_again`, added here, fails on it; see below |
+| 4 | only the first range is refused (`RefuseOneRangeOnly` forced on) | `a_loss_in_the_shared_engine_…` and `a_restarted_node_…` |
+| 5 | the incarnation floor dropped: no `.max(FIRST_INCARNATION + 1)` | **nothing** — see below |
+| 6 | the re-seeded replica is not restated quarantined | `a_loss_in_the_shared_engine_…`: no `RaftReseeded`, so no mark is traced |
+| 7 | the start ignores the listing and opens the configured directory | `a_restarted_node_…` — the check this review added, and nothing else in the tree |
+| 8 | `newest_not_lost` drops its filter and takes the newest whatever the marker says | `reseed::tests::a_start_opens_the_newest_directory_not_marked_lost` only, which is #99's point |
+| 9 | a re-seed reuses the highest generation instead of stepping past it | three of `reseed::tests` |
+| 10 | `generation_of` accepts a leading zero, so `-g01` is a second name for generation 1 | `reseed::tests::a_generation_name_round_trips_and_nothing_else_is_one` |
+| 11 | the one-group server names the wrong range in its per-replica refusal | the `ranges` sweep and the `raft` sweep stay **green**: the one-group server's only range is `SINGLE_GROUP`, every reader of the event is keyed by it, and a constant would serve. It is not a hole — there is nothing else the event could say on that server — but it is not defended either, and the entry says so rather than counting it |
+| 12 | `RaftReseeded` traced for every replica, quarantined or not | `a_loss_in_the_shared_engine_…`: `ServeBeforeRefusedMark` stops being distinguishable |
+
+**Mutation 5 is a survivor, and it is a guard nothing can trip.** The incarnation is
+`env.rng().next_u64().max(FIRST_INCARNATION + 1)`; a `u64` draw is `1` once in 2^64, so
+the floor is unreachable and removing it changes no test in any tier. It is kept — it
+costs nothing and states the invariant at the point the number is made — but this entry
+records that it is documentation rather than a defended bound, so nobody later reads the
+green as evidence it works.
+
+**Mutation 3 was a survivor too, and that one was a hole.**
+`Report::ranges_with_a_majority_up` has two arms: `RaftReplicaRefused` puts a replica in
+the down set and `RaftRecovered` takes it out. This slice rewrote the first and every
+check in the tree was keyed to it. The second was asserted by nothing, and could not be
+asserted by a sweep, because making it a no-op only makes the down set *larger* — and a
+range with too many impaired replicas is dropped from this set, which means the checks
+about time are never asked about it. The failure direction is green. That is the same
+silent exemption this entry exists to close, one event along, so
+`a_recovered_replica_is_lifted_out_and_its_range_is_asked_again` asserts it directly: two
+replicas down and the range is not asked; one of them recovered and it is; a recovery of
+another range on the same server lifts nothing, because the set is keyed by replica.
+
+**A note on how the mutation pass was run, which is a finding of its own.** Every arm
+above was built with `scripts/gate.sh`'s own flags. It had to be re-run that way after a
+first pass gave three mutations the same three "catches" in the `raft` sweep — which
+turned out to be red on the *unmutated* tree in that build. The cause is **#102**: the
+simulated run of a seed depends on whether rustc compiled incrementally, so `target/`'s
+state, not just the source, decides what a sweep says. The gate that covers the commits
+of this review was run with `CARGO_INCREMENTAL=0`, which is the build a cold CI checkout
+makes and the one this tree is green under; a warm incremental cache turns three `raft`
+tests red on this source and on its merge base alike. Nothing here widens a bound to
+accommodate that: the bound is not the problem, the build is, and it is filed.
 
 ### What moved, and the re-audit
 
@@ -10220,8 +10363,16 @@ in the tree: `seed_119_which_pinned_the_refusal_that_is_not_durable_before_the_l
 golden-hash checks of `echo`, `raft` and `wal`. Each of the refusal-pinned seeds asserts
 its *mechanism* — that the refusal is or is not durable, and what the restart finds — and
 none asserts a record count or a trace hash over a refusal, which is why a record added
-beside the refusal leaves them saying what they said. The premerge at a thousand seeds
-was run on the committed tip and is recorded in the commit that adds it.
+beside the refusal leaves them saying what they said.
+
+**The premerge at a thousand seeds is owed, and no figure for it is quoted anywhere in
+this entry.** `pmset -g batt` said "Now drawing from 'Battery Power'" (92 %, discharging)
+when the code was done, with load average 28.8 from the Stage B slices building in
+parallel, and D-070 forbids a premerge figure taken on battery. An earlier draft of this
+section said the premerge "was run on the committed tip and is recorded in the commit
+that adds it": that sentence was false — no premerge has been run on this branch — and
+the review removed it rather than leaving the entry claiming a measurement nobody took.
+The run is owed on AC, on a quiet machine.
 
 ### What is not built, and why
 
@@ -10244,13 +10395,25 @@ was run on the committed tip and is recorded in the commit that adds it.
   what will exercise the installs above once the wiring exists. `mark_reseeded` is written
   so that variant is a flag on the batch's sync and nothing else.
 - **Exit criterion for the re-seed shape, per seed, is therefore owed in full.** Its (a),
-  (b) and (d) each name an install or a stream; (c) and (e) are what this slice's directed
-  scenario asserts, for one node, on a scenario of its own rather than on the shape.
-- **A second refusal in one run is asserted only in `reseed::tests`**, over the listing,
-  and not in the simulator: the directed scenario refuses its node once, and refusing it a
-  second time needs the node to be restartable inside the scenario, which the sim's task
-  model does not give without stopping a task. The two directory variants are caught on
-  the listing instead, which is where the decision they get wrong is actually made.
+  (b) and (d) each name an install or a stream. Its (c) — the durable mark before the
+  replica's first answer — is owed too, and the review of this entry is what found that
+  out: on the correct node a re-seeded replica is quarantined and takes part in nothing
+  until its install (RAFT.md §3), and this slice builds no install, so the replica never
+  answers *anything* and there is no order to observe. The scenario now asserts that
+  absence with its reason (`Refusal::answered_after_the_mark`, empty), so the day the
+  wiring gives a re-seeded replica something to answer the assertion fails and the pair
+  can be upgraded to the ordering (c) names. What is asserted today is the other half:
+  `ServeBeforeRefusedMark` does answer before its mark, and is caught for it. Only (e) is
+  asserted outright.
+- **A second refusal in one run is asserted only in `reseed::tests`**, over the listing.
+  The directed scenario refuses its node once; refusing it twice needs the node's disk to
+  lose a store a second time, which nothing in the simulator raises.
+  A *restart* after one refusal is asserted in the scenario —
+  `a_restarted_node_opens_the_directory_its_reseed_built_and_is_not_refused_again` — and
+  an earlier draft of this entry said that could not be done, "which the sim's task model
+  does not give without stopping a task". That was wrong: `sim/ranges.rs` already crashes
+  and restarts nodes for `Fault::Crash`, and the same two calls give the directed
+  scenario its restart.
 
 ---
 

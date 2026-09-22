@@ -745,24 +745,15 @@ async fn lose_the_store<E: ananke_env::Environment>(env: &E) -> std::io::Result<
     mark_store_lost(env, dir, "the scenario lost this store").await
 }
 
-/// Q15's whole-node refusal and re-seed, alone: one node of four ranges whose engine
+/// The simulation the three readings below share: one node of four ranges whose engine
 /// directory is marked lost before it starts, as `sim/quorum.rs` refuses a server
-/// (D-049), so its open is refused on the mark.
+/// (D-049), so its open is refused on the mark. Run for `for_` and handed back still
+/// running, so a caller that wants a restart can crash it.
 ///
-/// It is the directed scenario for Q15's path (SHARD.md §11, storage 8). It is directed
-/// and not a sweep because the thing under test happens once, at a start, and because
-/// the re-seed's *installs* need the node's snapshot wiring, which no slice has built
-/// yet: what runs here is the refusal and the rebuild up to the point each replica
-/// waits for its leader's stream. The other two voters are configured and never
-/// started, so nothing arrives to fill them and the state they wait in is the state the
-/// assertions read.
-///
-/// The node is left running afterwards: the point of the re-seed is that the node does
-/// *not* stop, which is what `run` did before this slice and what the trace shows by
-/// carrying records past the refusal.
+/// The other two voters are configured and never started, so nothing arrives to fill
+/// the re-seeded replicas and the state they wait in is the state the assertions read.
 // PROPOSED(D-077): Q15's whole-node refusal, and the re-seed per replica.
-#[must_use]
-pub fn refused_whole(seed: u64, for_: Duration, node_variants: NodeVariants) -> Vec<TraceRecord> {
+fn refused_sim(seed: u64, for_: Duration, node_variants: NodeVariants) -> (Sim, NodeId) {
     let schedule = Schedule {
         warmup: for_,
         faults: Vec::new(),
@@ -782,43 +773,18 @@ pub fn refused_whole(seed: u64, for_: Duration, node_variants: NodeVariants) -> 
                 .await;
     });
     sim.run_for(for_);
-    sim.trace()
+    (sim, at)
 }
 
-/// [`refused_whole`]'s trace together with the node's engine directories as the run
-/// left them: each generation's name and whether its marker says the store there lost
-/// state.
+/// The node's engine directories as the run left them: each generation's name and
+/// whether its marker says the store there lost state.
 ///
 /// The directories are read by a task on the node itself, after the run, because that
 /// is the only handle on the node's filesystem the simulator offers — and because
 /// reading them through the same `Environment` the node wrote them through is what
 /// makes the answer the node's own view rather than the harness's.
 // PROPOSED(D-077): Q15's whole-node refusal, and the re-seed per replica.
-#[must_use]
-pub fn refused_whole_dirs(
-    seed: u64,
-    for_: Duration,
-    node_variants: NodeVariants,
-) -> (Vec<TraceRecord>, BTreeMap<String, bool>) {
-    let schedule = Schedule {
-        warmup: for_,
-        faults: Vec::new(),
-        gaps: Vec::new(),
-        settle: Duration::ZERO,
-    };
-    let mut sim = Sim::new(config(seed, &schedule));
-    let at = sim.add_node();
-    let env = sim.env(at);
-    let inner = env.clone();
-    env.spawn("node", async move {
-        if lose_the_store(&inner).await.is_err() {
-            return;
-        }
-        let _ =
-            ananke_shard::server::run(inner, server_config(1, Variants::default(), node_variants))
-                .await;
-    });
-    sim.run_for(for_);
+fn engine_dirs(sim: &mut Sim, at: NodeId) -> BTreeMap<String, bool> {
     let dirs: Arc<Mutex<BTreeMap<String, bool>>> = Arc::new(Mutex::new(BTreeMap::new()));
     let audited = dirs.clone();
     let auditor = sim.env(at);
@@ -849,8 +815,70 @@ pub fn refused_whole_dirs(
         }
     });
     sim.run_for(Duration::from_millis(50));
-    let read = dirs.lock().expect("the audit").clone();
-    (sim.trace(), read)
+    dirs.lock().expect("the audit").clone()
+}
+
+/// Q15's whole-node refusal and re-seed, alone.
+///
+/// It is the directed scenario for Q15's path (SHARD.md §11, storage 8). It is directed
+/// and not a sweep because the thing under test happens once, at a start, and because
+/// the re-seed's *installs* need the node's snapshot wiring, which no slice has built
+/// yet: what runs here is the refusal and the rebuild up to the point each replica
+/// waits for its leader's stream.
+///
+/// The node is left running afterwards: the point of the re-seed is that the node does
+/// *not* stop, which is what `run` did before this slice and what the trace shows by
+/// carrying records past the refusal.
+// PROPOSED(D-077): Q15's whole-node refusal, and the re-seed per replica.
+#[must_use]
+pub fn refused_whole(seed: u64, for_: Duration, node_variants: NodeVariants) -> Vec<TraceRecord> {
+    refused_sim(seed, for_, node_variants).0.trace()
+}
+
+/// [`refused_whole`]'s trace together with the node's engine directories as the run
+/// left them.
+// PROPOSED(D-077): Q15's whole-node refusal, and the re-seed per replica.
+#[must_use]
+pub fn refused_whole_dirs(
+    seed: u64,
+    for_: Duration,
+    node_variants: NodeVariants,
+) -> (Vec<TraceRecord>, BTreeMap<String, bool>) {
+    let (mut sim, at) = refused_sim(seed, for_, node_variants);
+    let dirs = engine_dirs(&mut sim, at);
+    (sim.trace(), dirs)
+}
+
+/// [`refused_whole`]'s node crashed and restarted once its re-seed is done, and run
+/// again for as long: the trace of both lives and the directories the second one left.
+///
+/// This is what asks the *start* the question D-066 answers. The re-seed's own choice
+/// of directory is made in the run above and read off the names it leaves; which
+/// directory a later start then opens is a second decision, made in `server::run`
+/// before any store opens, and until a node here is restarted nothing in the simulator
+/// asked it — `newest_not_lost` was exercised only by `reseed::tests` calling it
+/// directly, so a `run` that ignored it and opened the configured directory every time
+/// passed the whole tree. A restart is what binds the two: the configured directory is
+/// marked lost, so a node that opens it is refused a second time and re-seeds again,
+/// and both the second refusal and the third generation it would build are visible
+/// here.
+///
+/// The crash is the simulator's (§1.3): every task on the node dies and its disk keeps
+/// only what was synced, which is what the re-seed's marks were.
+// PROPOSED(D-077): Q15's whole-node refusal, and the re-seed per replica.
+#[must_use]
+pub fn refused_whole_restarted(
+    seed: u64,
+    for_: Duration,
+    node_variants: NodeVariants,
+) -> (Vec<TraceRecord>, BTreeMap<String, bool>) {
+    let (mut sim, at) = refused_sim(seed, for_, node_variants);
+    sim.crash(at);
+    sim.restart(at);
+    spawn_node(&sim, at, 1, Variants::default(), node_variants);
+    sim.run_for(for_);
+    let dirs = engine_dirs(&mut sim, at);
+    (sim.trace(), dirs)
 }
 
 /// What [`refused_whole`] is read for: the refusal, the replicas it took down, and the
@@ -878,6 +906,27 @@ pub struct Refusal {
     /// restatement that follows the mark traces the replica's log and term around the
     /// `RaftReseeded`, and none of that is the replica answering anybody.
     pub served_before_the_mark: BTreeSet<u64>,
+    /// The ranges whose replica sent a message *after* its refused mark was durable.
+    ///
+    /// It is here so that an empty [`Refusal::served_before_the_mark`] is read for
+    /// what it is. That set is empty on a node that ordered the mark and the answer
+    /// correctly and equally empty on a node that never answered at all, and the two
+    /// are not the same result: the second is a check with nothing to see. On the
+    /// correct node today it is the second — a re-seeded replica is quarantined and
+    /// takes part in nothing until its install (RAFT.md §3), and this slice builds no
+    /// install — so this set is empty too, and the scenario asserts that absence with
+    /// its reason. The ordering §12's exit criterion (c) names is owed with the
+    /// snapshot wiring, and the day a re-seeded replica has something to answer, the
+    /// assertion on this set fails and says so.
+    pub answered_after_the_mark: BTreeSet<u64>,
+    /// Why the node stopped, from `RaftServerFailed`: empty on the correct node, which
+    /// re-seeds and carries on.
+    ///
+    /// A variant that gets the re-seed's *directory* wrong stops the node here, and
+    /// the reason says where. Reading it is what tells a run that reached the re-seed
+    /// and failed in it from a run that never got that far — the second would leave
+    /// the same directory listing behind and pass a check that only counts names.
+    pub failures: Vec<String>,
 }
 
 /// Reads a [`Refusal`] off [`refused_whole`]'s trace.
@@ -904,6 +953,7 @@ pub fn refusal(records: &[TraceRecord]) -> Refusal {
             } => {
                 read.incarnations.insert(*range, *incarnation);
             }
+            TraceEvent::RaftServerFailed { reason, .. } => read.failures.push(reason.clone()),
             // A message on the wire is the replica answering. Read off the frames
             // themselves, so what counts is what the node actually sent and not what
             // the scenario believes it sent.
@@ -916,7 +966,12 @@ pub fn refusal(records: &[TraceRecord]) -> Refusal {
                 };
                 for tagged in decoded.messages {
                     let range = tagged.range.get();
-                    if read.replicas_refused.contains(&range) && !read.marked.contains(&range) {
+                    if !read.replicas_refused.contains(&range) {
+                        continue;
+                    }
+                    if read.marked.contains(&range) {
+                        read.answered_after_the_mark.insert(range);
+                    } else {
                         read.served_before_the_mark.insert(range);
                     }
                 }
