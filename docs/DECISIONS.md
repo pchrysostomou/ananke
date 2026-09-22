@@ -10114,6 +10114,147 @@ those outputs or from a run made the same way.
   slice's: there is one range here, and C's whole point is that it takes no checkpoint,
   so the figure this slice could produce would be the leader's hold unchanged.
 
+## PROPOSED D-079 — `RaftMatchStarted` is a first rise *per tracking window*: a voter re-added inside one leadership is tracked afresh
+
+**What this fixes (issue #81).** `match_starts_are_first_rises` (D-069, `sim/raft.rs`)
+folded the trace under the key (leader, term, follower, incarnation) and called a second
+record under one key a second "first" rise. Its reasoning was that a leader holds one
+term for one leadership, so the key names one stretch of tracking. It does not. The
+ten-thousand-seed nightly failed membership seed 7205 with it on the correct system:
+
+```
+seed 7205: match starts: leader 3 of term 2 traced a second first rise of 4's
+           match under incarnation 1 (at 161)
+```
+
+**What the correct system did.** Under leader 3 of term 2 the scenario's operator drove
+a grow, a shrink and a grow — `RaftChangeAccepted` of `[1, 2, 3, 4, 5]` at applied 151,
+of `[1, 2, 3]` at 156, of `[1, 2, 3, 4, 5]` at 161 — because its change requests are
+retried and idempotent (D-029) and a retried grow can land after the shrink has taken
+effect. `on_change` treats every target outside the voters in force as a learner and
+*re-inserts* its `Progress` (core.rs:2085-2103) with `incarnation: None` and
+`match_started: false`. The shrink had dropped server 4 from the voters, so the re-grow
+rebuilt the leader's whole picture of it: match index zero, next index at the leader's
+end, no incarnation recorded. Server 4's store never changed — it did not restart and
+was not re-seeded, and its incarnation was 1 throughout — so when its next append
+succeeded, `matched` rose from zero under incarnation 1 for the second time in that
+leadership, and `note_match_started` (core.rs:1874-1890) traced it, correctly.
+
+Nothing of the server's is wrong here, and the event is doing its job: SHARD.md §8 wants
+`RaftMatchStarted` precisely so that the re-add window assertion can see a match set from
+an answer that reached a leader which had begun tracking a replica afresh, and §8 names
+these two places — a leader taking office and a leader re-admitting a server — as the
+two where it makes fresh progress with no incarnation recorded. A check that declares
+that shape impossible would make the assertion §11's raft item 12 asks for unwritable.
+
+**Why the key was incomplete.** The core clears `match_started` at three places
+(core.rs:788-794), and D-069's key covered two of them: a leader taking office
+(core.rs:1704, keyed apart by the term) and a change of the follower's incarnation
+(core.rs:1845, keyed apart by the incarnation — except where a delayed answer carries a
+retired incarnation back, the one-message window D-042 names). The third, the re-insert
+in `on_change`, is keyed apart by nothing.
+
+**The rule now.** At most one `RaftMatchStarted` per (leader, term, follower,
+incarnation) **per tracking window**, a window being one stretch of one leader tracking
+one follower. A window opens at the leader's term, and where the leader begins tracking
+the follower afresh. The second is read in the trace exactly as SHARD.md §8 reads it — a
+`RaftChangeAccepted` of the leader naming the follower among its `voters` while the
+leader's own configuration in force, its latest `RaftConfig`, does not — with two
+conditions that make the reading match `on_change` rather than approximate it:
+
+- **Not while joint.** A change accepted with a joint configuration in force is answered
+  from `on_change`'s `new_voters` branch and never reaches the learners.
+- **One catch-up phase is one window.** While the core holds a change it accepts a
+  repeat of the same request and tracks nothing afresh (D-029), and the scenario's
+  operator repeats it. Consecutive accepts of the same voters with no `RaftConfig` of
+  the leader's between them are therefore one window; only `append_joint`, which traces
+  one, and a new leadership end the phase.
+
+**The third place the core clears the flag is deliberately not a window.** A change of
+the follower's incarnation clears `match_started` too (core.rs:1845), and the first
+build of this fix opened a window there as well, on the reasoning that the core clears
+the flag so the fold should forgive it. That is wrong, and measurably so. The
+incarnation is *in the key*, so a repeat under one key means a retired incarnation came
+back — which the correct system cannot do, a fresh store being incarnation 1 and a
+re-seed drawing `next_u64().max(2)` (node.rs:2327). A repeat is therefore either D-042's
+one-message window, a delayed answer from the store the leader has already moved past,
+which SHARD.md §8 says is the case D-042 names the step to take for and not a bound to
+widen; or a store that lost its state and opened fresh at 1 again — which is
+`RefusalNotDurable`, caught on **58 of a thousand raft seeds, every one of them by this
+fold**. Forgiving a window there took the catch to **0 of a thousand**: the variant
+stopped being caught at all, and the thousand-seed tier's assertion of its catch with
+it. The fix narrows the rule by the one shape issue #81 proved legitimate and by nothing
+else.
+
+**The reading is exact, not conservative, and that was measured.** With the core printing
+every `Progress` it re-inserts in `on_change` and the fold printing every window it
+opens, membership seeds 7000 to 7099 produce **378 re-tracks and 378 windows, the same
+(leader, follower) in the same order on every seed, with no seed differing**. Without
+the two conditions above the fold would open windows the core never opens; they are not
+slack, they are the rule.
+
+**What it still catches.** The counters cannot see any of this — dropping the
+`match_started` clause from the core's guard raises the raft sweep's count from 1 840 to
+63 164 at a hundred seeds with every seed still green (D-069) — and neither can a rule
+with one window per key. Seven mutations, each planted on this tree with the rest of the
+tree clean:
+
+| Mutation | Dies on |
+| --- | --- |
+| M1 the core traces a first rise on *every* rise (D-069's own mutation, `match_started` dropped from the guard) | the fold: both positive controls fail at the gate's twenty seeds — `the_correct_server_passes_every_seed` and `..._the_membership_scenario_on_every_seed` — and nine pinned seeds with them |
+| M2 the core traces no first rise at all | not the fold, which can only see what is there: `raft::CoverageCounters`' `seeds_with_a_match_start` and the membership coverage's, which is why D-069 pairs the fold with a counter per seed |
+| M3 the window opened for every server the change names, not the servers it re-adds | `raft::tests::a_re_add_opens_the_window_of_the_server_re_added_alone` |
+| M4 no window for a re-add at all (D-069's key) | `raft::tests::a_voter_re_added_inside_one_term_starts_its_match_afresh`, and membership seed 7205 |
+| M5 every accepted change opens a window, repeats included | `raft::tests::a_request_repeated_inside_one_catch_up_phase_is_one_window` |
+| M6 a change accepted under a joint configuration opens a window | `raft::tests::a_change_accepted_under_a_joint_configuration_opens_no_window` |
+| M7 a changed incarnation opens a window | `raft::tests::an_incarnation_carried_back_is_a_second_first_rise` at the gate, and `a_server_whose_refusal_is_not_durable_is_caught` from the thousand-seed tier, where the catch goes 58 to 0 |
+
+M3 to M6 are the ones no sweep kills at any tier: each makes the check *weaker*, so the
+correct system passes and only a hand-written window fails. That is what the five cases
+are for, and it is why the fix is not a sweep-only change. M7 is killed twice over, by
+its case at the gate and by the rate from the premerge up; it was the first build of
+this fix, and the rate is how it was found.
+
+**What was rejected.** Issue #81's own proposal was to have `on_change` trace
+`RaftProgressReset` when it replaces a `Progress` it already holds, and have the fold
+forget that follower's keys on one. It is the more direct signal and it would need no
+inference. It was not taken for two reasons. First, SHARD.md §8 reads `RaftProgressReset`
+as *the follower answered with another incarnation*, and its re-add window assertion
+turns on the `incarnation` such a record carries; a record emitted where the leader has
+no incarnation recorded would have to carry a placeholder, and §8 says in as many words
+that the two fresh-progress places trace neither event. Second, it changes code that runs
+in every simulation, which puts every catch rate D-069 and D-071 recorded back in
+question; this change touches no core and no scenario, so the sweeps' numbers stand as
+measured. The direct signal remains available if §8's assertion later wants it, as an
+event of its own rather than as a second meaning for that one.
+
+**Pinned seeds, re-audited.** No pinned seed's mechanism moves. No simulated code runs
+differently — the change is to a fold in the scenario's own checks — so every trace on
+this tree is the trace `main` produces, seed for seed.
+
+The three `RefusalNotDurable` pins — seeds 102, 119 and 158 — are the ones to look at,
+because since D-078 every catch of that variant in the sweep is this fold's. All three
+now assert an *absence* with its reason: seed 102's pin says the variant is no longer
+caught on 102 and names the four facts that would mean D-044's mechanism had come back
+(sim/tests/raft.rs). They still assert exactly that absence, for exactly those reasons,
+and this change cannot touch them: it alters no run.
+
+What does read the fold is the sweep's own assertion at the thousand-seed tier,
+`a_server_whose_refusal_is_not_durable_is_caught`'s `!caught.is_empty()` (D-056). It was
+re-measured rather than reasoned about. Over a thousand raft seeds: **58 caught, all 58
+by this fold, on `main` and on this tree alike**. The reason it cannot move is structural
+as well as measured — the raft scenario proposes no `Command::Change`, so it traces no
+`RaftChangeAccepted`, so no window ever opens in that sweep and the fold there is
+D-069's fold exactly.
+
+The membership sweep's own negative control is untouched for a different reason:
+`SingleMajorityInJointConsensus` is caught on 241 of a thousand seeds and **none of them
+by this fold** — its catch is the joint-majority check's, and always was.
+
+Membership seed 7205 is not pinned as a seed. The shape it found is pinned in the five
+cases above, where the window can be written by hand, which is the bound no sweep tier
+holds on its own.
+
 ---
 
-_Next entry: D-079. Add one before implementing anything not covered above._
+_Next entry: D-080. Add one before implementing anything not covered above._
