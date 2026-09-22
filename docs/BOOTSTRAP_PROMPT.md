@@ -101,6 +101,10 @@ ananke/
 
 _Update this section at the end of every session._
 
+- Merge update (2026-09-22): branch `phase-3-stage-b-compaction` merged `origin/main`
+  to resolve PR conflicts, carrying in PROPOSED D-073 and D-074 from main and keeping
+  this branch's PROPOSED D-078.
+
 - Phase 3, Stage B in progress (2026-09-21). Merged: PR #71 the trace of §8 (D-069),
   PR #75 the checks keyed by range (D-071), PR #76 the node's wire (D-072, crate
   `ananke-shard`: `RangeId`, range-tagged batch frames, the per-peer outbox keyed by
