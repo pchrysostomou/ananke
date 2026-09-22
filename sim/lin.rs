@@ -772,9 +772,16 @@ mod tests {
         );
     }
 
-    /// A window wider than the mask's first word, of reads of one value: the shape
-    /// D-080's reduction is for. Every one of the 80 reads is committed in one step,
-    /// and the writes on either side still order.
+    /// A window wider than the mask's first word, of reads of one value, with the
+    /// writes on either side still ordered and the timeline right.
+    ///
+    /// It is **not** evidence for D-080's reduction, and must not be read as any:
+    /// it passes unchanged with the reduction removed, because a depth-first search
+    /// that tries its candidates in index order walks these 80 reads without ever
+    /// taking a second branch. What it pins is the mask spanning more than one word
+    /// and the timeline of a window that wide. The evidence for the reduction is
+    /// `seeds_3085_and_4065_which_the_nightly_found_linearize_inside_the_budget` in
+    /// `sim/tests/raft.rs`, which is the only test the reduction's removal fails.
     #[test]
     fn a_wide_window_of_concurrent_reads_is_decided() {
         let mut ops = vec![put(1, 0, Some(1), "a")];
@@ -785,6 +792,104 @@ mod tests {
         assert_eq!(
             timelines[&b("k")],
             vec![(at(0), Some(b("a"))), (at(3), Some(b("b")))]
+        );
+    }
+
+    /// A compare-and-set is committed as a read assertion only where its own result
+    /// holds: it must be known not to have swapped **and** meet a value it would not
+    /// have swapped at. The two come apart on one history, and this is it.
+    ///
+    /// The register is absent and the operation expected it to be absent, so it
+    /// would have swapped, and it reported that it did not. Nothing can place it,
+    /// and the search must not commit it outright on the strength of its result
+    /// alone. Without the check on the value this history is called linearizable.
+    #[test]
+    fn a_compare_and_set_that_reported_no_swap_is_not_forced_where_it_would_swap() {
+        let contradicted = history(vec![cas(1, 0, 1, None, "b", false)]);
+        assert!(
+            check(&contradicted).is_err(),
+            "a compare-and-set was committed as a read at a value its own result says \
+             it would have swapped at"
+        );
+        // Where the register holds something else it did not swap, its result holds,
+        // and it is the read assertion the search may commit outright.
+        let consistent = history(vec![
+            put(1, 0, Some(1), "a"),
+            cas(2, 2, 3, None, "b", false),
+        ]);
+        check(&consistent).unwrap();
+    }
+
+    /// The forced commit is undone when the search backtracks past it.
+    ///
+    /// Both writes are concurrent, so either may go first. Taking `"a"` first forces
+    /// `"b"` next — it is the only candidate — and the two reads of `"b"` are then
+    /// committed outright, and the read of `"a"` at the end cannot be placed. The
+    /// search must give those two reads back and find the other order, where `"b"`
+    /// goes first, the same two reads are committed, and `"a"` is written after them.
+    /// The timeline is asserted rather than the verdict alone, because it is what
+    /// pins the order: with the forced commit left in place on the way out, the mask
+    /// and the order carry operations the surviving path never placed.
+    #[test]
+    fn a_forced_window_is_undone_when_the_search_backtracks_past_it() {
+        let h = history(vec![
+            put(1, 0, Some(10), "a"),
+            put(2, 1, Some(10), "b"),
+            get(3, 2, 11, Some("b")),
+            get(4, 2, 11, Some("b")),
+            get(5, 20, 21, Some("a")),
+        ]);
+        let timelines = check(&h).unwrap();
+        assert_eq!(
+            timelines[&b("k")],
+            vec![(at(1), Some(b("b"))), (at(2), Some(b("a")))],
+            "the search did not take the order that places the write of \"a\" last"
+        );
+    }
+
+    /// The order a search returns is the linearization it claims to have found:
+    /// every operation of the key exactly once, and a replay of it from an absent
+    /// register applies at every step.
+    ///
+    /// Nothing outside this module reads it — `check`'s timelines are dropped at
+    /// all three call sites — so a commit that marked an operation linearized
+    /// without putting it in the order would be invisible everywhere else. The
+    /// history mixes forced reads with writes so the forced commit's own
+    /// bookkeeping is what is under test.
+    #[test]
+    fn the_order_a_search_returns_replays_under_the_specification() {
+        let ops = vec![
+            put(1, 0, Some(1), "a"),
+            get(2, 2, 3, Some("a")),
+            get(3, 2, 3, Some("a")),
+            get(4, 2, 3, Some("a")),
+            cas(5, 4, 5, Some("a"), "b", true),
+            get(6, 6, 7, Some("b")),
+            cas(7, 8, 9, Some("a"), "c", false),
+            del(8, 10, Some(11)),
+            get(9, 12, 13, None),
+        ];
+        let refs: Vec<&Op> = ops.iter().collect();
+        let Ok(order) = linearize(&refs) else {
+            panic!("the history is linearizable, but the search did not place it")
+        };
+        assert_eq!(
+            order.len(),
+            ops.len(),
+            "the order does not hold every operation: {order:?}"
+        );
+        let mut placed = vec![false; ops.len()];
+        let mut value: Option<Bytes> = None;
+        for &i in &order {
+            assert!(!placed[i], "operation {i} is in the order twice: {order:?}");
+            placed[i] = true;
+            value = apply(&refs[i].op, refs[i].result.as_ref(), &value).unwrap_or_else(|| {
+                panic!("the order does not replay: operation {i} does not apply at {value:?}")
+            });
+        }
+        assert!(
+            placed.iter().all(|&p| p),
+            "an operation is missing from the order: {order:?}"
         );
     }
 

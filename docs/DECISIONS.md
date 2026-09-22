@@ -10186,31 +10186,47 @@ a read assertion. Nothing else:
   absent, a put of `"b"` beside it, and a read of `"c"` after both.
 
 **The cost, before and after.** All on an 8-core Apple M2, **on AC power**, in release,
-measured by instrumenting the search itself and counting the states it expands. The
-figure per seed is the seed's most expensive key.
+measured by instrumenting the search itself. The figure per seed is the seed's most
+expensive key.
 
-| seeds 0..1000 | p50 | p90 | p99 | worst |
+**Two counters, and which one each figure is.** A *state* is an entry of the `seen`
+memo — a distinct `(set of operations linearized, value)` — and every table below counts
+**distinct states**, which is `seen.len()`. A *visit* is one call of `dfs` that got past
+the `done` and budget checks, and `BUDGET` is charged **per visit, memo hits included**,
+because the decrement precedes the `seen.insert`. The two are not the same number on the
+old search and they are on the new one, so the tables are like-for-like in states but not
+in budget:
+
+| | distinct states | visits (what `BUDGET` charges) | visits per state |
+|---|---|---|---|
+| seed 3085 `"k1"`, as it was | 296 345 | 2 000 000, then exhausted | 6.7 |
+| seed 4065 `"k0"`, as it was | 287 535 | 2 000 000, then exhausted | 7.0 |
+| seed 3085 `"k1"`, as it is | **383** | **383** (0 memo hits) | 1.0 |
+| seed 4065 `"k0"`, as it is | **408** | **408** (0 memo hits) | 1.0 |
+
+So a state figure is not a budget figure. On the old search each state cost more than one
+charge against the cap — 6.7 and 7.0 on the two tail keys, which are the only keys whose
+visit count was recorded — so the headroom a state count suggests is several times what
+the cap actually allows. On the new search the two coincide, because the reduction removes
+the revisits along with the branches. Where a figure below is a state count it is stated
+as one, and no visit figure is quoted that was not measured.
+
+| seeds 0..1000, **distinct states** of the worst key | p50 | p90 | p99 | worst |
 |---|---|---|---|---|
 | the search as it was | 448 | 632 | 916 | 1 395 |
 | the search as it is | 390 | 526 | 634 | **778** |
 
-| seeds 3000..5000, the band the two failures are in | p50 | p90 | p99 | worst | budget exhausted |
+| seeds 3000..5000, **distinct states**, the band the two failures are in | p50 | p90 | p99 | worst | budget exhausted |
 |---|---|---|---|---|---|
 | the search as it was | 437 | 615 | 871 | 296 345 | 2 of 2000: 3085, 4065 |
 | the search as it is | 381 | 514 | 645 | **1 145** | **none** |
 
-| the two histories themselves | states expanded | |
-|---|---|---|
-| | seed 3085 `"k1"`, 397 ops | seed 4065 `"k0"`, 438 ops |
-| the search as it was | 296 345, then the budget | 287 535, then the budget |
-| the search as it is | **383** | **408** |
-
 The typical history barely moves, which is the point: it was never the problem. The two
-tail histories fall by about 750×, from past the budget to under a thousand states, and
-the budget is untouched at 2 000 000 — three orders of magnitude of headroom on every
-seed of both bands. A history's cost now tracks the **writes** in a window rather than
-the operations, which is why the worst of two thousand seeds is now 1 145 and not a
-number four orders of magnitude out.
+tail histories fall by about 750× in states, from past the budget to under a thousand,
+and the budget is untouched at 2 000 000. A history's cost now tracks the **writes** in a
+window rather than the operations, which is why the worst of two thousand seeds is 1 145
+distinct states and not a number four orders of magnitude out — and, since the new
+search's visits and states coincide, 1 145 is also what it charges the cap.
 
 **`BUDGET` is not raised, and that is deliberate.** Raising it to 400 000 000 buys the
 worst seed known today and nothing past it: the distribution is close to bimodal —
@@ -10271,10 +10287,25 @@ reads (`forcing_a_window_of_reads_hides_no_later_violation`).
 | **M-3** | an abandoned compare-and-set counts as read-only where it would not swap | `an_abandoned_compare_and_set_is_not_read_only` |
 | **M-4** | a put or a delete that applies counts as read-only | `a_write_is_never_forced_so_its_value_is_never_lost` and 14 more |
 | **M-5** | nothing is ever forced (the reduction removed) | `seeds_3085_and_4065_which_the_nightly_found_linearize_inside_the_budget` |
+| **M-6** | the compare-and-set arm drops its check on the value | `a_compare_and_set_that_reported_no_swap_is_not_forced_where_it_would_swap` |
+| **M-7** | the forced commit is never undone on the way out | `a_forced_window_is_undone_when_the_search_backtracks_past_it` |
+| **M-8** | the forced operations are marked but never put in the order | `the_order_a_search_returns_replays_under_the_specification`, `a_forced_window_is_undone_when_the_search_backtracks_past_it` |
 
 M-5 is the one that matters in the other direction: it fails **only** the pinned seeds,
 which is the evidence that the pin is a real regression test for this change and that
-none of the small histories needs the reduction to be decided.
+none of the small histories needs the reduction to be decided. Its converse is that
+`a_wide_window_of_concurrent_reads_is_decided` is **not** evidence for the reduction and
+must not be read as any — it passes unchanged under M-5, because a depth-first search
+trying its candidates in index order walks that window without a second branch. Its
+comment says so.
+
+M-6 to M-8 were added by the adversarial review of this change, which found each of them
+standing: the boundary this entry's own prose names — a compare-and-set whose result says
+no swap, met at a value where it would have swapped — had no test of its own, and neither
+the backtrack out of a forced commit nor the order the search returns was asserted
+anywhere. The order in particular was invisible to the whole tree, since `check`'s
+timelines are dropped at all three call sites (`sim/raft.rs`, `sim/membership.rs`,
+`sim/quorum.rs`); that half is its own issue, and the test is here.
 
 **The pinned seeds assert the mechanism, not the green.** `sim/tests/raft.rs` pins 3085
 and 4065 and asserts, before the check, that each key still holds the window of
@@ -10282,7 +10313,13 @@ concurrent reads the reduction is what carries — at least 300 operations, 150 
 gets, 12 open at once, against the 397/199/20 and 438/244/22 the pin was taken at. The
 day a schedule moves that window away the assertion says so and the pin is re-audited
 against a seed that still reaches it, rather than quietly kept as a bare green
-(CLAUDE.md).
+(CLAUDE.md). Those three are **floors, deliberately loose** — about 40 % below what the
+seeds measure — so an ordinary redraw of the schedules does not fail a tree with nothing
+wrong; they catch a window that has gone, not one that has shifted. `most_open_at_once`
+is conservative in the same direction: it sorts `(Instant, i64)`, so a window closing at
+*t* is counted before one opening at *t*, and two windows that merely touch are never
+counted as overlapping. It under-counts, never over-counts, which is the safe way round
+for a floor.
 
 **The premerge**, at a thousand seeds in release on this branch's tip, quoting its own
 machine lines (D-070):
