@@ -73,18 +73,25 @@
 # 80 s of wall on eight cores, which puts it near 455 s against the 374.64 s D-052
 # recorded — inside the quarter of an hour D-040 sets (Q39).
 #
-# **D-086's review round changed two of those four tests materially and these four
-# figures are therefore owed a re-weighing.** `a_leader_that_shares_one_snapshot_directory_is_caught_on_the_node`
-# now runs `high_rate_share()` rather than the tier, and the variant under it wedges the
-# node on 36 % of seeds where before the fix it wedged none — a run that wedges plays out
-# its whole length, so the cost moved in both directions at once;
-# `the_pair_on_the_node_is_the_stream_half_alone_until_the_reseed_lands` and
-# `a_leader_that_ignores_incarnations_has_no_incarnation_to_ignore_on_the_node_yet` moved
-# to the share as well. Re-weighing was attempted and abandoned: the laptop was at load
-# average **177** with other agents' slices building, and a figure taken there is exactly
-# the incomparable kind D-070 exists to stop — which is the same reason D-083 left its own
-# tiering owed. The rows keep the figures measured on this tree before that round, at load
-# 8 to 17, and the re-weigh is owed on a quiet machine before the shards are rebalanced.
+# **D-086's rows are known LOW and a re-weigh on a quiet machine is owed.** The review
+# round changed two of the four tests materially — the shared-directory variant now
+# expresses its bug and wedges 30 % of seeds, where a wedged run plays out its whole
+# length, and three of the four moved to `high_rate_share()` — and the re-review then
+# measured what they actually cost:
+#   a_leader_that_shares_one_snapshot_directory_is_caught_on_the_node  438.2 cpu s
+#                                                        against its row of 265.8 (+65 %)
+#   every_seed_passes_on_the_correct_node_under_the_raft_sweeps_arms  about 244 cpu s
+#                                                        against its row of 163.5 (+49 %)
+# Shard 6 is already the heaviest at 1 567.6, so about +172 puts it near **1 740**, some
+# 19 % over the ideal rather than the 6 % this file's placement note claims above.
+#
+# The rows are **not** re-placed on those figures and the weights below are **not**
+# changed, deliberately. Re-weighing here was attempted and abandoned at load average
+# 177 with several agents' slices building, and a figure taken there is exactly the
+# incomparable kind D-070 exists to stop — the same reason D-083 left its own tiering
+# owed. The owner takes the re-weigh when the machine is quiet, and the shards are
+# rebalanced then. Until that happens, read every D-086 row as a floor and shard 6's
+# header as understated.
 # shard 1: 1432.8 cpu s
 1	engine	625.1	an_install_in_two_switches_is_caught
 1	engine	36.8	an_install_whose_repair_precedes_its_switch_is_caught

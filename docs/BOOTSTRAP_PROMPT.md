@@ -121,15 +121,17 @@ _Update this section at the end of every session._
   slice's own variant translation and the review found it: the node's take did not empty
   its version directory, so `SharedSnapshotDir`'s re-take *failed* instead of rewriting
   and every fold of its symptom read zero. With it fixed the variant's fault fires on every seed and its
-  wedge is caught by the liveness check on 36 of 100 — where one group's is 4 of 10 000
-  — so it is asserted at Phase 2's own tiers and no stronger. With the four fixed the
+  wedge is caught by the liveness check on 30 of 100 — where one group's is 4 of 10 000
+  — so it is asserted at Phase 2's own tiers and no stronger. With the five fixed the
   correct node passes every seed at the gate's twenty and CI's hundred, over 6 250
   snapshot actions. `Cluster::OneGroup` is untouched: seed 42's JSONL still hashes to
   `445f970010f9d493d489d7627543b77cccba863cb5675af4602686f5de182217`.
   **The variant tiers go to the owner**: `SnapshotWithoutCurrentLast` is caught on 0/100
   with its arm firing on 1/100, so its catch is not re-asserted; `SharedSnapshotDir`'s
-  fault fires on every seed, its scramble on 12/100 and its liveness catch on 36/100,
-  asserted at Phase 2's own tiers with only its aimed arm (3/100) moved down; and
+  fault fires on every seed and is asserted at every tier, its liveness catch (30/100)
+  sits at Phase 2's own ten thousand, and two assertions move up on this cluster's
+  measured rates — the scramble (17/100) to a thousand and the aimed arm (1/100, 21 of
+  1 000) to ten thousand; and
   `IgnoreIncarnation` and the pair are blocked on PR #86's whole-node refusal, since a
   live install deliberately keeps a store's incarnation and only a re-seed changes one.
 

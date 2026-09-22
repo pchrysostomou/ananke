@@ -632,19 +632,21 @@ fn a_seed_replays_to_the_same_trace_on_the_node() {
 ///   the range it drew for the switch-without-repair to have been reached at all, and
 ///   that count is 0 when the variant's bit is disconnected;
 /// - `Fault::CrashInstalling` reached the final chunk of the range it drew and crashed
-///   its victim there on **1 of 100 seeds**, against one group, where the arm's whole
-///   scenario is the one range it has. On a node the victim is drawn without regard to
-///   which of its four ranges it is behind on, so the arm must find a victim that is
-///   behind *that* range's compacted prefix, designated for it, and streamed within
-///   `INSTALL_WAIT_BUDGET`;
-/// - the catch is **0 of 100 seeds**, which at an arm firing on 1 % is what a variant
-///   that is never aimed at looks like, not a variant that is aimed at and survives.
+///   its victim there on **0 of 100** seeds and **1 of 1 000**, against one group, where
+///   the arm's whole scenario is the one range it has. On a node the victim is drawn
+///   without regard to which of its four ranges it is behind on, so the arm must find a
+///   victim that is behind *that* range's compacted prefix, designated for it, and
+///   streamed within `INSTALL_WAIT_BUDGET`;
+/// - the catch is **0 of 1 000**, which at an arm firing on a tenth of a per cent is
+///   what a variant that is never aimed at looks like, not one that is aimed at and
+///   survives.
 ///
-/// So the catch is asserted nowhere and the arm's firing from the thousand-seed tier,
-/// which is what D-061 allows at a measured 1 %. The rate is printed at every tier so
-/// the day the arm is aimed better the number is visible, and the variant keeps its
-/// Phase 2 assertion on `Cluster::OneGroup`, which this sweep leaves running exactly as
-/// it is.
+/// So the catch is asserted nowhere, and the arm's firing only from the **nightly's ten
+/// thousand**: at 0.1 % a thousand seeds see none about one run in three. **Below that
+/// tier this test asserts nothing about the variant**, which is said here rather than
+/// left to be discovered. The rate is printed at every tier so the day the arm is aimed
+/// better the number is visible, and the variant keeps its Phase 2 assertion on
+/// `Cluster::OneGroup`, which this sweep leaves running exactly as it is.
 // PROPOSED(D-086): Phase 2's stream variants re-asserted on the node.
 #[test]
 fn a_server_that_installs_without_current_last_is_injected_on_the_node() {
@@ -677,14 +679,20 @@ fn a_server_that_installs_without_current_last_is_injected_on_the_node() {
     // which is the exact shape D-082 found `SendBeforePersist` in and this entry
     // claimed to have fixed.
     //
-    // `aimed_installs` is the discriminator and it moves: **1 of 100** on the correct
-    // wiring against **0 of 100** with the bit disconnected. D-061 puts a figure under
-    // 5 % at `seeds() >= 1000`, so that is where it is asserted; at the gate's twenty
-    // and CI's hundred the rate is printed and nothing is claimed. Aiming the arm at a
-    // range its victim is behind on should put it at 10 to 17 %, which would carry it
-    // at a hundred — that is a change to how the arms are drawn and is the owner's
-    // (PROPOSED D-086).
-    if seeds >= 1000 {
+    // `aimed_installs` is the discriminator, and it is **thin**: the arm reaches the
+    // final chunk of the range it drew on **0 of 100** seeds and **1 of 1 000** — about
+    // a tenth of a per cent. Asserted from a thousand, as this first did, it would see
+    // none about one run in three and fail a tree with nothing wrong, which is the
+    // model error D-030 and D-039 forbid; asserted from ten thousand the sample expects
+    // about ten and sees none about once in 20 000.
+    //
+    // So it is asserted **only at the nightly's tier**, and the consequence is stated
+    // rather than buried: below ten thousand seeds this test asserts nothing about
+    // `SnapshotWithoutCurrentLast` at all. Its catch is 0 of 1 000 and is asserted
+    // nowhere. That is the variant's real state on this node and it goes to the owner;
+    // aiming the arm at a range its victim is behind on is what would change it, and
+    // that is a change to how the arms are drawn (PROPOSED D-086).
+    if seeds >= 10_000 {
         assert!(
             fired > 0,
             "`Fault::CrashInstalling` never crashed its victim at the final chunk of the \
@@ -706,19 +714,25 @@ fn a_server_that_installs_without_current_last_is_injected_on_the_node() {
 /// - **the fault fired**, at every tier as Phase 2 has it: a take at an index that
 ///   server had already taken **of that range**, the re-take the variant rewrites one
 ///   directory for. **100 of 100** seeds — every one;
-/// - **the aimed arm reached its stream**, moved to the thousand-seed tier where Phase
-///   2 has it at every tier. **3 of 100**, under D-061's 5 %: the variant wedges the
-///   run so readily that `RetakeUnderStream`'s own setup often never completes;
-/// - **the wedge's stream half** — that re-take landing under a live stream the
-///   follower never installs at afterwards — from the **thousand-seed** tier, where
-///   Phase 2 has it from a hundred, which its rate here supports: **12 of 100** against
-///   13.5 % of a thousand there;
+/// - **the aimed arm reached its stream**, moved to the **nightly's** tier where Phase 2
+///   has it at every tier. **1 of 100** and 21 of 1 000, about 2 %: the variant wedges
+///   the run so readily that `RetakeUnderStream`'s own setup often never completes, and
+///   a thousand's sample of a hundred would see none about one run in eight;
+/// - **a re-take landing under a live stream the follower never installs at** — from
+///   the **thousand-seed** tier, where Phase 2 has it from a hundred. **17 of 100** and
+///   172 of 1 000, against 13.5 % of a thousand there; at the hundred-seed tier the
+///   sample is twenty and sees none about one run in forty. It is *not* "the wedge's
+///   stream half": it accounts for at most 17 of the 30 catches, and the dominant
+///   observable is the rewrite making a version unfindable — miss, retake, cascade,
+///   wedge;
 /// - **the liveness catch at ten thousand**, Phase 2's own tier and no stronger. On the
-///   node it is **36 of 100** against one group's **4 of 10 000**: four ranges share one
-///   directory name per index and one `snapshot` task, so a re-take under a live stream
-///   is not the coincidence it is on a server. That rate would carry an assertion at a
-///   hundred seeds and it is deliberately not written there — §12 re-asserts a Phase 2
-///   variant to its own standard **and no stronger**.
+///   node it is **30 of 100** and 266 of 1 000, against one group's **4 of 10 000**. The
+///   range stays in the name, so it is not ranges colliding with each other: it is that
+///   a node takes four ranges' snapshots through one `apply` task and one `snapshot`
+///   task, so repeated applied indices — and therefore takes into a directory a stream
+///   already has open — come round far more often than on a server with one range. That
+///   rate would carry an assertion at a hundred seeds and it is deliberately not written
+///   there — §12 re-asserts a Phase 2 variant to its own standard **and no stronger**.
 ///
 /// Every fold behind these is keyed by `(server, range, index)` since PROPOSED D-086.
 /// On one group they were keyed by `(server, index)`, which named a take uniquely
@@ -744,8 +758,18 @@ fn a_leader_that_shares_one_snapshot_directory_is_caught_on_the_node() {
     // scramble) and 36 % (the catch) a share measures each as well as the tier: over a
     // share of 20 the catch is missed with probability 0.64^20, about one run in
     // 10 000. The rate is over the share, as D-061 requires (PROPOSED D-086).
-    let seeds = high_rate_share();
-    let outcomes: Vec<(Option<String>, bool, usize, bool, usize)> = sweep(seeds, |seed| {
+    // **Two numbers, named apart, and every tier gate below reads `tier`.** They were
+    // one until PROPOSED D-086's re-review: `seeds` held the *share* and the gates
+    // compared it against 100, 1 000 and 10 000, so each assertion sat a tier higher
+    // than it claimed and the liveness catch — the whole point of re-asserting this
+    // variant — needed `ANANKE_SEEDS` of 100 000 and never ran at all. At the nightly's
+    // ten thousand the test printed `/1000`, exited 0 and reached none of it. That is
+    // the same defect as the variant that could not express its bug, one level up: a
+    // check that cannot fail, reported as a check that passes.
+    // PROPOSED(D-086): the tier gates read the tier, the counts read the share.
+    let tier = seeds();
+    let share = high_rate_share();
+    let outcomes: Vec<(Option<String>, bool, usize, bool, usize)> = sweep(share, |seed| {
         let report = buggy(seed, Variant::SharedSnapshotDir);
         let scrambled: Vec<_> = report
             .retakes_under_streams()
@@ -786,65 +810,84 @@ fn a_leader_that_shares_one_snapshot_directory_is_caught_on_the_node() {
     let looped: usize = outcomes.iter().map(|(_, _, _, _, l)| l).sum();
     let liveness = caught.iter().filter(|v| v.contains(": liveness: ")).count();
     println!(
-        "node: SharedSnapshotDir caught on {}/{seeds} seeds, {liveness} by the liveness check, \
-         re-took at an index already taken of one range on {fired} seeds, scrambled a live \
-         stream the follower never installed after on {scrambled} seeds ({looped} \
-         duplicate-chunk loops after those), the aimed re-take arm reached its stream on \
-         {aimed} seeds, first: {}",
+        "node: SharedSnapshotDir caught on {}/{share} seeds (tier {tier}), {liveness} by the \
+         liveness check, re-took at an index already taken of one range on {fired} seeds, \
+         scrambled a live stream the follower never installed after on {scrambled} seeds \
+         ({looped} duplicate-chunk loops after those), the aimed re-take arm reached its \
+         stream on {aimed} seeds, first: {}",
         caught.len(),
         caught.first().map_or("", |v| v.as_str())
     );
     // **The fault itself, at every tier**, as Phase 2 asserts it: a take at an index
     // this server had already taken **that range** at, which is the re-take the variant
-    // rewrites one directory for. **100 of 100** seeds — every seed — so the gate's
-    // twenty carry it with nothing to spare.
+    // rewrites one directory for. **100 of 100** seeds — every one. The shared name is
+    // why it is every one and not a fraction: with the take counter pinned, a second
+    // take at a repeated applied index writes the directory the first wrote, so the
+    // re-take is a re-take by construction rather than by coincidence.
     assert!(
         fired > 0,
         "SharedSnapshotDir never re-took at an index it had already taken that range at: the \
-         fault was not injected on any of the {seeds} seeds"
+         fault was not injected on any of the {share} seeds"
     );
-    // **The wedge's stream half, from the hundred-seed tier**, which is Phase 2's own
-    // tier for it: that re-take landing under a live stream the follower never installs
-    // at afterwards. **12 of 100** here against 13.5 % of a thousand on one group — the
-    // same order, and above D-061's 5 %, so the tier is Phase 2's unchanged. At the
-    // gate's twenty a 12 % rate sees none about one run in thirteen, which is why it is
-    // not asserted there.
-    if seeds >= 100 {
+    // **A re-take landing under a live stream the follower never installs at, from the
+    // hundred-seed tier**, which is Phase 2's own tier for it. **17 of 100**, above
+    // D-061's 5 %.
+    //
+    // It is *not* "the wedge's stream half", which is what this comment called it
+    // until the re-review: it accounts for a minority of the catches — at most 17 of
+    // the 30 caught, and 4 of 25 on a per-seed probe. The dominant observable is the
+    // rewrite making the version unfindable: a lookup miss, then a retake, then the
+    // cascade, then the wedge. Under the variant those misses run about 64 000 over a
+    // hundred seeds against about 1 100 on the correct node. Same bug, and this fold
+    // sees one face of it.
+    //
+    // **The tier is the thousand, not Phase 2's hundred, and the reason is the share.**
+    // The share at tier T is T/10, so CI's hundred runs twenty seeds here: at 17 % a
+    // sample of twenty sees none about one run in forty, which is a flake, and a
+    // thousand's sample of a hundred sees none about once in 10^8. This is a weakening
+    // of Phase 2's tier, it is weaker because the sample says so, and it goes to the
+    // owner with the number (PROPOSED D-086).
+    if tier >= 1000 {
         assert!(
             scrambled > 0,
             "SharedSnapshotDir never re-took into a directory a live stream had open and left \
-             unfinished: the wedge's stream half was not built on any of the {seeds} seeds"
+             unfinished over {share} seeds"
         );
     }
-    // **The aimed arm, from the thousand-seed tier**, where Phase 2 asserts it at every
-    // tier. It reaches a stream of the range it drew on **3 of 100** seeds here, under
-    // D-061's 5 %: the variant wedges the run so readily that `RetakeUnderStream`'s own
-    // setup often never completes. This is the one assertion of the four that is weaker
-    // than Phase 2's, it is weaker because the measurement says so, and the number goes
-    // to the owner with it (PROPOSED D-086).
-    if seeds >= 1000 {
+    // **The aimed arm, from the nightly's ten thousand**, where Phase 2 asserts it at
+    // every tier. It reaches a stream of the range it drew on **1 of 100** seeds and 21
+    // of 1 000 — about 2 %, under D-061's 5 % — because the variant wedges the run so
+    // readily that `RetakeUnderStream`'s own setup often never completes. With the
+    // directory half disabled the arm returns to 15 of 100, which is what says the fall
+    // is the variant's effect and not a broken arm. At a thousand the sample is a
+    // hundred and sees none about one run in eight, so the assertion belongs a tier
+    // higher still. This is the largest of the two weakenings here and it is the
+    // owner's to confirm (PROPOSED D-086).
+    if tier >= 10_000 {
         assert!(
             aimed > 0,
             "the aimed re-take arm never reached a stream of the range it drew on the node \
-             over {seeds} seeds"
+             over {share} seeds"
         );
     }
-    // **The liveness catch at the nightly's ten thousand, which is Phase 2's tier for
-    // it and no stronger.** On the node it is **36 of 100** against one group's 4 of
-    // 10 000: the variant wedges a node far more readily than a server, because four
-    // ranges share one directory name per index and one `snapshot` task. The rate would
-    // carry an assertion at a hundred seeds, and it is **not** written there — Phase 2
-    // asserts this catch at ten thousand and this re-assertion is held to that standard
-    // and no stronger (§10, §12's Stage B).
-    if seeds >= 10_000 {
+    // **The liveness catch at the nightly's ten thousand, Phase 2's tier for it and no
+    // stronger.** On the node it is **30 of 100** and 266 of 1 000, against one group's
+    // 4 of 10 000: the variant wedges a node far more readily than a server. The range
+    // stays in the directory name, so this is not two ranges colliding — it is that one
+    // `apply` task takes for four ranges and one `snapshot` task streams for them, so a
+    // repeated applied index, and with it a take into a directory a stream has open,
+    // comes round far more often than on a server with one range. The rate would carry an assertion at a hundred seeds and is
+    // deliberately not written there — §12 re-asserts a Phase 2 variant to its own
+    // standard and no stronger.
+    if tier >= 10_000 {
         assert!(
             liveness > 0,
             "SharedSnapshotDir's wedge was never caught by the liveness check on the node"
         );
     }
     println!(
-        "node: SharedSnapshotDir's liveness catch is {liveness}/{seeds}, asserted at ten \
-         thousand as Phase 2 asserts it and no stronger"
+        "node: SharedSnapshotDir's liveness catch is {liveness}/{share} over a tier of \
+         {tier}, asserted from ten thousand as Phase 2 asserts it and no stronger"
     );
 }
 
