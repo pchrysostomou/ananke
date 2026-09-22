@@ -36,7 +36,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ananke_env::{ApplyEffect, RangeCause};
-use ananke_env::{Clock, Decision, Environment, Network, Rng, Socket, TraceEvent};
+use ananke_env::{Clock, Decision, Environment, FileSystem, Network, Rng, Socket, TraceEvent};
 use ananke_raft::apply::{Command, Outcome, apply_command, user_key};
 use ananke_raft::client::{Reply, Request, Response};
 use ananke_raft::core::{RaftConfig, SnapshotAction, Variant};
@@ -943,6 +943,24 @@ impl<E: Environment> ServerApplier<E> {
             let Some(spans) = self.checkpoint_spans(range) else {
                 return self.take_failed(range);
             };
+            // The version directory is emptied before the checkpoint is written into
+            // it, exactly as the one-group take does (`snapshot::take_numbered`,
+            // snapshot.rs:671-677). `Engine::checkpoint_spans` refuses a directory
+            // that is not empty (`AlreadyExists`), so without this a take into a
+            // directory that already holds files **fails** instead of rewriting it.
+            //
+            // For the correct node this is a no-op: every take goes to
+            // `snap-r<range>-<index>-<take + 1>`, a name no take has used. It is what
+            // Phase 2's `SharedSnapshotDir` needs, and until PROPOSED D-086's review
+            // it was missing: under that variant the name has no take counter, so the
+            // re-take found its own directory full, `take_failed` answered the core,
+            // and no `RaftSnapshot { taken: true }` was traced. The variant then could
+            // not express D-043's bug at all — a directory rewritten under the stream
+            // reading it — and every fold that reads the symptom was structurally
+            // zero. The rates this slice first measured for it were measurements of
+            // that defect and not of the node.
+            // PROPOSED(D-086): a take empties its version directory, as Phase 2's does.
+            self.clear_version(&dir).await;
             let borrowed: Vec<std::ops::Range<&[u8]>> = spans
                 .iter()
                 .map(|span| &span.start[..]..&span.end[..])
@@ -963,6 +981,21 @@ impl<E: Environment> ServerApplier<E> {
                     .map(|_| ())
             };
             if taken.is_err() {
+                return self.take_failed(range);
+            }
+            // The checkpoint's own format record, after the engine's checkpoint, as
+            // `snapshot::take_numbered` writes it for the one-group server (D-060,
+            // snapshot.rs:693). Without it `snapshot::checkpoint_complete` calls every
+            // checkpoint this node takes incomplete, and the stream that looks for a
+            // complete version of the index its core asked for finds none, ever.
+            // A crash between the engine's checkpoint and this record leaves a version
+            // that reads incomplete, which costs a retake and never streams a
+            // half-written checkpoint — which is the property the record is for.
+            // PROPOSED(D-086): a node's checkpoint carries D-060's format record.
+            if ananke_raft::format::write_checkpoint_record(&self.env, &dir)
+                .await
+                .is_err()
+            {
                 return self.take_failed(range);
             }
             self.env.trace_decided(
@@ -988,6 +1021,23 @@ impl<E: Environment> ServerApplier<E> {
             index: state.index,
             term: state.term,
         }));
+    }
+
+    /// Empties a version directory before a take writes into it, as
+    /// `snapshot::take_numbered` does for the one-group server (snapshot.rs:671-677).
+    ///
+    /// A missing directory is nothing to empty and is not an error: the common case is
+    /// a fresh numbered name that has never existed.
+    // PROPOSED(D-086): a take empties its version directory, as Phase 2's does.
+    async fn clear_version(&self, dir: &std::path::Path) {
+        let fs = self.env.fs();
+        let Ok(names) = fs.read_dir(dir).await else {
+            return;
+        };
+        for name in names {
+            let _ = fs.remove_file(&dir.join(name)).await;
+        }
+        let _ = fs.sync_dir(dir).await;
     }
 
     /// A take that could not be made: the core is told, and the next need takes a

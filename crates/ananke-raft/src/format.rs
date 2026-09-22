@@ -584,7 +584,11 @@ pub async fn heal_format<E: Environment>(
 ///
 /// The filesystem's.
 // PROPOSED(D-060)
-pub(crate) async fn write_checkpoint_record<E: Environment>(env: &E, dir: &Path) -> io::Result<()> {
+// PROPOSED(D-086): `pub`, because the node takes checkpoints of its own. A take in
+// `ananke_shard`'s `apply` task writes a checkpoint exactly as this crate's does and
+// must carry the same record, or `checkpoint_complete` calls every one of them
+// incomplete and no stream of a node's own checkpoint ever opens.
+pub async fn write_checkpoint_record<E: Environment>(env: &E, dir: &Path) -> io::Result<()> {
     let fs = env.fs();
     let file = fs
         .open(

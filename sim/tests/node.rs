@@ -214,6 +214,7 @@ fn every_seed_passes_on_the_correct_node_under_the_raft_sweeps_arms() {
     let mut arms_fired = 0usize;
     let mut retook = 0usize;
     let mut at_one_index = 0usize;
+    let mut least_actions = usize::MAX;
     for (_, (by_leader, by_apply, dropped, lags, held, rates, lease, arms, takes)) in &results {
         retook += usize::from(takes.0);
         at_one_index += usize::from(takes.1);
@@ -226,6 +227,7 @@ fn every_seed_passes_on_the_correct_node_under_the_raft_sweeps_arms() {
         read_index_reads += round_trip;
         exceeded += usize::from(*drifted);
         snapshot_actions += actions;
+        least_actions = least_actions.min(*actions);
         for (range, count) in by_leader {
             *leaders.entry(*range).or_default() += count;
         }
@@ -365,12 +367,50 @@ fn every_seed_passes_on_the_correct_node_under_the_raft_sweeps_arms() {
     // version is never read out from under. It is the property `SharedSnapshotDir`
     // turns off.
     //
-    // The *index* alone is not the property and the figure beside it says so: a correct
-    // node re-takes at an index it has already taken at on about half the seeds, after
+    // The *index* alone is not the property and the figure beside it says so: the
+    // correct node re-takes at an index it has already taken at on 44 of 100 seeds,
+    // after
     // an install leaves the core's `taken` naming a snapshot this replica never took
     // (D-078) while the applied index stands still. Asserting the index would have been
     // a bound the correct system trips.
     // PROPOSED(D-086): the take counter's property, keyed by range.
+    println!(
+        "node: {snapshot_actions} snapshot actions over {seeds} seeds, {:.1} a seed, fewest on \
+         any one seed {least_actions}",
+        snapshot_actions as f64 / seeds as f64
+    );
+    // **A floor on the snapshot actions a seed asks for, on average over the tier.**
+    // Nothing else in the tree checks that a replica which asks for a snapshot gets an
+    // answer, and D-078's follower compaction has no direct check at all: a `Record` is
+    // written between two applies and traces nothing, by design, so the ask and the
+    // answer are both invisible. What *is* visible is the consequence — the core sets
+    // `take_pending` when it asks and only an answer clears it, so a node that drops
+    // the ask stops taking snapshots altogether.
+    //
+    // Measured, all on the same tiers: the correct node asks **60.4 a seed** over 100
+    // seeds (6 041, fewest 26 on any one) and **58.8** over 20 (1 176, fewest 32). A
+    // node whose `Record` goes to the `snapshot` task, which drops it, asks **11.6**
+    // over 20; one that routes `Record` to the node's *first* range rather than the
+    // range that asked — textually a no-op on one group, and a mutation no
+    // single-range world could catch — asks **23.3**.
+    //
+    // The floor is **30 a seed**: a little under half the correct node's mean, and
+    // over both mutants. It is taken over the tier and not per seed because a single
+    // heavily-partitioned seed writes little, and a per-seed minimum would be a bound
+    // the correct system could trip (D-030, D-039); a mean over the tier moves only
+    // when the mechanism does.
+    //
+    // The range-routing mutant is why the floor is not 20: at 20 it passed, and the
+    // node sweep sees it otherwise only from seed 25, so the gate's twenty were green.
+    // PROPOSED(D-086): a floor on the snapshot actions a seed asks for.
+    const ACTIONS_A_SEED: usize = 30;
+    assert!(
+        snapshot_actions >= ACTIONS_A_SEED * seeds as usize,
+        "the node asked for {snapshot_actions} snapshot actions over {seeds} seeds, under the \
+         floor of {ACTIONS_A_SEED} a seed: a replica that asks for a take or a compaction \
+         record and is not answered keeps `take_pending` set and never asks again, which is \
+         how a range wedges (PROPOSED D-086)"
+    );
     println!(
         "node: the correct node re-took a range at an index it had already taken it at on \
          {at_one_index}/{seeds} seeds — which is legitimate after an install — and into the \
@@ -587,22 +627,24 @@ fn a_seed_replays_to_the_same_trace_on_the_node() {
 /// Phase 2 variant keeps is the owner's, so the catch is **not** asserted here and the
 /// numbers go to the owner instead of a quieter assertion (PROPOSED D-086):
 ///
-/// - the variant is **injected**, which this asserts at every tier: the node's switch
-///   is made without the repair whenever the core carries the bit, and the check below
-///   is that the install path ran at all on the seeds it is measured over;
+/// - the variant is **injected**, which the assertion below tests from the
+///   thousand-seed tier: the arm has to have crashed its victim at the final chunk of
+///   the range it drew for the switch-without-repair to have been reached at all, and
+///   that count is 0 when the variant's bit is disconnected;
 /// - `Fault::CrashInstalling` reached the final chunk of the range it drew and crashed
-///   its victim there on **2 of 100 seeds**, against one group, where the arm's whole
+///   its victim there on **1 of 100 seeds**, against one group, where the arm's whole
 ///   scenario is the one range it has. On a node the victim is drawn without regard to
 ///   which of its four ranges it is behind on, so the arm must find a victim that is
 ///   behind *that* range's compacted prefix, designated for it, and streamed within
 ///   `INSTALL_WAIT_BUDGET`;
-/// - the catch is **0 of 100 seeds**, which at an arm firing on 2 % is what a variant
+/// - the catch is **0 of 100 seeds**, which at an arm firing on 1 % is what a variant
 ///   that is never aimed at looks like, not a variant that is aimed at and survives.
 ///
-/// So the assertion is the one D-061 allows at a measured 2 %: nothing at the gate and
-/// nothing at a hundred. The rate is printed at every tier so the day the arm is aimed
-/// better the number is visible, and the variant keeps its Phase 2 assertion on
-/// `Cluster::OneGroup`, which this sweep leaves running exactly as it is.
+/// So the catch is asserted nowhere and the arm's firing from the thousand-seed tier,
+/// which is what D-061 allows at a measured 1 %. The rate is printed at every tier so
+/// the day the arm is aimed better the number is visible, and the variant keeps its
+/// Phase 2 assertion on `Cluster::OneGroup`, which this sweep leaves running exactly as
+/// it is.
 // PROPOSED(D-086): Phase 2's stream variants re-asserted on the node.
 #[test]
 fn a_server_that_installs_without_current_last_is_injected_on_the_node() {
@@ -626,42 +668,83 @@ fn a_server_that_installs_without_current_last_is_injected_on_the_node() {
         caught.len(),
         caught.first().map_or("", |v| v.as_str())
     );
-    // The path the variant is on, asserted at every tier: without a snapshot action
-    // there is no install, and a run with no install says nothing about a switch made
-    // without its repair. This is what keeps the absence above from being an absence
-    // asserted against a silence.
-    assert!(
-        actions > 0,
-        "no core asked for a snapshot action over {seeds} seeds, so the install path the \
-         variant breaks was never reached and its rate is a measurement of nothing"
-    );
+    // **The arm's own firing, from the thousand-seed tier.** This is the only thing
+    // here that can fail, and until PROPOSED D-086's review the test asserted
+    // `actions > 0` instead — which `checked()` already asserts on every seed of every
+    // sweep, so the test could not fail at all. Removing the variant's bit from
+    // `with_repair` left the node binary green at a hundred seeds and
+    // `sim/tests/install.rs` green at twenty: a bit set, carried, and read by nothing,
+    // which is the exact shape D-082 found `SendBeforePersist` in and this entry
+    // claimed to have fixed.
+    //
+    // `aimed_installs` is the discriminator and it moves: **1 of 100** on the correct
+    // wiring against **0 of 100** with the bit disconnected. D-061 puts a figure under
+    // 5 % at `seeds() >= 1000`, so that is where it is asserted; at the gate's twenty
+    // and CI's hundred the rate is printed and nothing is claimed. Aiming the arm at a
+    // range its victim is behind on should put it at 10 to 17 %, which would carry it
+    // at a hundred — that is a change to how the arms are drawn and is the owner's
+    // (PROPOSED D-086).
+    if seeds >= 1000 {
+        assert!(
+            fired > 0,
+            "`Fault::CrashInstalling` never crashed its victim at the final chunk of the \
+             range it drew over {seeds} seeds, so `SnapshotWithoutCurrentLast` was not \
+             injected at the moment it is about and its 0 catches say nothing"
+        );
+    }
+    let _ = actions;
 }
 
 /// The leader that shares one snapshot directory per index and streams one follower at
 /// a time (D-043), on the node.
 ///
-/// Phase 2 asserts three things and this asserts the same three, at the same tiers
-/// (`a_leader_that_shares_one_snapshot_directory_and_streams_one_follower_at_a_time_is_caught`):
+/// Phase 2 asserts four things
+/// (`a_leader_that_shares_one_snapshot_directory_and_streams_one_follower_at_a_time_is_caught`).
+/// All four are asserted, each at the tier **this cluster's** measured rate supports
+/// rather than one group's — three at Phase 2's own tiers, one moved down:
 ///
-/// - **the fault fired**, at every tier: a take at an index that server had already
-///   taken **of that range** — the re-take the variant rewrites one directory for;
-/// - **the aimed arm reached its stream**, at every tier;
-/// - **the wedge's stream half**, from the hundred-seed tier: that re-take landing
-///   under a live stream of the index which the follower never installs at afterwards;
-/// - **the liveness catch at the nightly's ten thousand only**, which is where Phase 2
-///   puts it and where it is asserted here. It is not run locally: the catch is 2 in
-///   10 000 and a local ten thousand is not this machine's to run.
+/// - **the fault fired**, at every tier as Phase 2 has it: a take at an index that
+///   server had already taken **of that range**, the re-take the variant rewrites one
+///   directory for. **100 of 100** seeds — every one;
+/// - **the aimed arm reached its stream**, moved to the thousand-seed tier where Phase
+///   2 has it at every tier. **3 of 100**, under D-061's 5 %: the variant wedges the
+///   run so readily that `RetakeUnderStream`'s own setup often never completes;
+/// - **the wedge's stream half** — that re-take landing under a live stream the
+///   follower never installs at afterwards — from the **thousand-seed** tier, where
+///   Phase 2 has it from a hundred, which its rate here supports: **12 of 100** against
+///   13.5 % of a thousand there;
+/// - **the liveness catch at ten thousand**, Phase 2's own tier and no stronger. On the
+///   node it is **36 of 100** against one group's **4 of 10 000**: four ranges share one
+///   directory name per index and one `snapshot` task, so a re-take under a live stream
+///   is not the coincidence it is on a server. That rate would carry an assertion at a
+///   hundred seeds and it is deliberately not written there — §12 re-asserts a Phase 2
+///   variant to its own standard **and no stronger**.
 ///
-/// Every one of those folds is keyed by `(server, range, index)` since PROPOSED D-086.
+/// Every fold behind these is keyed by `(server, range, index)` since PROPOSED D-086.
 /// On one group they were keyed by `(server, index)`, which named a take uniquely
 /// there; on a node four ranges cross `snapshot_threshold` within a few indices of one
 /// another, so `(server, index)` names two different snapshots of two different ranges
-/// over and over, and a fold that ignored the range would report the correct node
-/// re-taking at an index it had already taken at on almost every seed.
+/// over and over.
+///
+/// **None of these numbers existed until the variant could express its bug.** Until
+/// PROPOSED D-086's review the node's take did not empty its version directory before
+/// checkpointing, `Engine::checkpoint_spans` refuses a directory that is not empty, and
+/// the variant's re-take therefore *failed* rather than rewriting — so all three folds
+/// read zero and the first measurement of this variant on the node was a measurement of
+/// that defect. `ServerApplier::take` empties it now, as `snapshot::take_numbered`
+/// always has for the one-group server.
 // PROPOSED(D-086): Phase 2's stream variants re-asserted on the node.
 #[test]
 fn a_leader_that_shares_one_snapshot_directory_is_caught_on_the_node() {
-    let seeds = seeds();
+    // The share, as the high-rate variants use (D-055, D-061), and here it is a cost
+    // decision as much as a statistical one. This variant **wedges the node on 36 % of
+    // seeds**, against one group's 4 in 10 000, and a wedged run plays out its whole
+    // length with a scrambled stream restarting under it — so the full tier costs many
+    // times what the correct node's does. At rates of 100 % (the fault), 12 % (the
+    // scramble) and 36 % (the catch) a share measures each as well as the tier: over a
+    // share of 20 the catch is missed with probability 0.64^20, about one run in
+    // 10 000. The rate is over the share, as D-061 requires (PROPOSED D-086).
+    let seeds = high_rate_share();
     let outcomes: Vec<(Option<String>, bool, usize, bool, usize)> = sweep(seeds, |seed| {
         let report = buggy(seed, Variant::SharedSnapshotDir);
         let scrambled: Vec<_> = report
@@ -711,41 +794,58 @@ fn a_leader_that_shares_one_snapshot_directory_is_caught_on_the_node() {
         caught.len(),
         caught.first().map_or("", |v| v.as_str())
     );
-    // What is asserted at every tier is the arm's own firing, which is where the
-    // variant's situation is built and which is well above 5 % (18 of 100 seeds):
-    // a tier on which the re-take arm never reached a stream says nothing about a
-    // leader that re-takes under one, and the liveness catch below would be a green
-    // that means nothing.
+    // **The fault itself, at every tier**, as Phase 2 asserts it: a take at an index
+    // this server had already taken **that range** at, which is the re-take the variant
+    // rewrites one directory for. **100 of 100** seeds — every seed — so the gate's
+    // twenty carry it with nothing to spare.
     assert!(
-        aimed > 0,
-        "the aimed re-take arm never reached a stream of the range it drew on the node: the \
-         shape the variant's situation is built on was never built over {seeds} seeds"
+        fired > 0,
+        "SharedSnapshotDir never re-took at an index it had already taken that range at: the \
+         fault was not injected on any of the {seeds} seeds"
     );
-    // **The re-take half is not built on the node and the catch is not asserted at
-    // Phase 2's tiers.** Measured at 100 seeds: the leader re-took at an index it had
-    // already taken *of that range* on 0 seeds, so the scrambled stream is 0 too,
-    // where one group builds the re-take on 46 of 100 and the scramble on 13.5 % of a
-    // thousand. Both of Phase 2's rate assertions therefore rest on a situation this
-    // cluster does not reach, and D-061's rule is that the tier a Phase 2 variant
-    // keeps is the owner's, so they are not written weaker here — they are not written,
-    // the numbers are printed at every tier, and the variant keeps its Phase 2
-    // assertion on `Cluster::OneGroup`.
-    //
-    // Why the node does not reach it, as far as this slice measured: a take at an
-    // index the range has already taken at needs the core's `taken` to be cleared and
-    // the same applied index to come round again, which on one group follows a failed
-    // stream and on the node follows a failed stream of *that range* — and the node's
-    // streams complete. What the liveness catch on 2 of 100 seeds is, is the other
-    // half of the variant, the one stream at a time: a leader feeding its designated
-    // followers one after another rather than at once (D-043). That half **is** built
-    // here, which is why the catch is not zero.
+    // **The wedge's stream half, from the hundred-seed tier**, which is Phase 2's own
+    // tier for it: that re-take landing under a live stream the follower never installs
+    // at afterwards. **12 of 100** here against 13.5 % of a thousand on one group — the
+    // same order, and above D-061's 5 %, so the tier is Phase 2's unchanged. At the
+    // gate's twenty a 12 % rate sees none about one run in thirteen, which is why it is
+    // not asserted there.
+    if seeds >= 100 {
+        assert!(
+            scrambled > 0,
+            "SharedSnapshotDir never re-took into a directory a live stream had open and left \
+             unfinished: the wedge's stream half was not built on any of the {seeds} seeds"
+        );
+    }
+    // **The aimed arm, from the thousand-seed tier**, where Phase 2 asserts it at every
+    // tier. It reaches a stream of the range it drew on **3 of 100** seeds here, under
+    // D-061's 5 %: the variant wedges the run so readily that `RetakeUnderStream`'s own
+    // setup often never completes. This is the one assertion of the four that is weaker
+    // than Phase 2's, it is weaker because the measurement says so, and the number goes
+    // to the owner with it (PROPOSED D-086).
+    if seeds >= 1000 {
+        assert!(
+            aimed > 0,
+            "the aimed re-take arm never reached a stream of the range it drew on the node \
+             over {seeds} seeds"
+        );
+    }
+    // **The liveness catch at the nightly's ten thousand, which is Phase 2's tier for
+    // it and no stronger.** On the node it is **36 of 100** against one group's 4 of
+    // 10 000: the variant wedges a node far more readily than a server, because four
+    // ranges share one directory name per index and one `snapshot` task. The rate would
+    // carry an assertion at a hundred seeds, and it is **not** written there — Phase 2
+    // asserts this catch at ten thousand and this re-assertion is held to that standard
+    // and no stronger (§10, §12's Stage B).
     if seeds >= 10_000 {
         assert!(
             liveness > 0,
             "SharedSnapshotDir's wedge was never caught by the liveness check on the node"
         );
     }
-    let _ = (fired, scrambled);
+    println!(
+        "node: SharedSnapshotDir's liveness catch is {liveness}/{seeds}, asserted at ten \
+         thousand as Phase 2 asserts it and no stronger"
+    );
 }
 
 /// Whether some server took a snapshot **of one range** at an index it had already
@@ -771,8 +871,9 @@ fn took_an_index_twice_on_the_node(report: &raft::Report) -> bool {
 /// symptom exactly, and the thing the correct node's take counter exists to prevent.
 ///
 /// The index alone is *not* the property, and finding that out is what the campaign
-/// behind PROPOSED D-086 was for. A correct node re-takes at an index it has already
-/// taken at on **46 of 100 seeds**, and does so legitimately: after a live install the
+/// behind PROPOSED D-086 was for. **The correct node** re-takes at an index it has
+/// already taken at on **44 of 100 seeds** — its own figure, not one group's — and does
+/// so legitimately: after a live install the
 /// core's `taken` names a snapshot this replica never took (D-078), the record behind
 /// it names an older one, the stream asks for a take, and the applied index has not
 /// moved — so the take is at the same index, into `snap-r<range>-<index>-<take + 1>`,
@@ -914,34 +1015,62 @@ fn the_pair_on_the_node_is_the_stream_half_alone_until_the_reseed_lands() {
     // the cost.
     let seeds = high_rate_share();
     let both = Variants::of(&[Variant::IgnoreIncarnation, Variant::SharedSnapshotDir]);
-    let outcomes: Vec<(bool, bool, bool)> = sweep(seeds, |seed| {
+    let outcomes: Vec<(u64, bool, bool, bool)> = sweep(seeds, |seed| {
         (
+            seed,
             checked(&buggy(seed, both)).is_err(),
             checked(&buggy(seed, Variant::SharedSnapshotDir)).is_err(),
             checked(&buggy(seed, Variant::IgnoreIncarnation)).is_err(),
         )
     });
-    let pair = outcomes.iter().filter(|(p, _, _)| *p).count();
-    let stream = outcomes.iter().filter(|(_, s, _)| *s).count();
-    let incarnation = outcomes.iter().filter(|(_, _, i)| *i).count();
-    let only_the_pair = outcomes.iter().filter(|(p, s, i)| *p && !*s && !*i).count();
+    // **Per seed, not per count.** Counts were what this compared until PROPOSED
+    // D-086's review, and a count equality cannot see the pin disappear: a genuine
+    // D-045 wedge on one seed and a stream-only catch on another leave `pair` and
+    // `stream` equal, and the wedge — the whole reason the pair exists — goes
+    // unreported. The sets are compared, and the seeds where the pair is caught and
+    // neither half alone is are asserted empty, which is the wedge itself.
+    let seeds_where = |f: fn(&(u64, bool, bool, bool)) -> bool| -> BTreeSet<u64> {
+        outcomes.iter().filter(|o| f(o)).map(|o| o.0).collect()
+    };
+    let pair = seeds_where(|o| o.1);
+    let stream = seeds_where(|o| o.2);
+    let incarnation = seeds_where(|o| o.3);
+    let only_the_pair = seeds_where(|o| o.1 && !o.2 && !o.3);
     println!(
-        "node: the pair caught on {pair}/{seeds} seeds, `SharedSnapshotDir` alone on \
-         {stream}, `IgnoreIncarnation` alone on {incarnation}, and on {only_the_pair} seeds \
-         the pair is caught where neither half alone is — which is the wedge D-045 pinned"
+        "node: the pair caught on {}/{seeds} seeds {pair:?}, `SharedSnapshotDir` alone on {} \
+         {stream:?}, `IgnoreIncarnation` alone on {} {incarnation:?}, and on {} seeds \
+         {only_the_pair:?} the pair is caught where neither half alone is — which is the \
+         wedge D-045 pinned",
+        pair.len(),
+        stream.len(),
+        incarnation.len(),
+        only_the_pair.len()
     );
-    // `IgnoreIncarnation` is a no-op on this node (see above), so the pair must be
-    // exactly the stream half. Asserted, not assumed: the day it is not, the other
-    // half has arrived and the pair is worth pinning here.
+    // The wedge itself, asserted rather than printed: a seed the pair is caught on and
+    // neither half alone is, is a wedge that needs both bugs, which is what D-045
+    // pinned seed 680 for and what this node cannot produce while `IgnoreIncarnation`
+    // is a no-op on it. The day one appears, pin it here as D-045 pinned 680.
+    assert!(
+        only_the_pair.is_empty(),
+        "the pair is caught on seeds {only_the_pair:?} where neither half alone is: that is a \
+         wedge needing both bugs, which is what D-045 pinned seed 680 for — pin it here \
+         rather than this absence, and take it to the owner"
+    );
+    // And the equality that says why: `IgnoreIncarnation` is a no-op on this node, so
+    // the pair is exactly the stream half, seed for seed.
     assert_eq!(
         pair, stream,
-        "the pair no longer catches exactly what `SharedSnapshotDir` alone catches on the \
-         node, so `IgnoreIncarnation` is doing something here now: search the first thousand \
-         seeds for a wedge that needs both bugs and pin it, as D-045 pinned 680"
+        "the pair no longer catches exactly the seeds `SharedSnapshotDir` alone catches on \
+         the node, so `IgnoreIncarnation` is doing something here now: search the first \
+         thousand seeds for a wedge that needs both bugs and pin it, as D-045 pinned 680"
     );
-    assert_eq!(
-        incarnation, 0,
-        "`IgnoreIncarnation` alone is caught on the node now, which it cannot be while a \
-         store's incarnation never changes: re-audit this test"
+    // `IgnoreIncarnation` alone is caught on 0 of 10 000 on one group too
+    // (RAFT.md:697, SHARD.md:1579), so this is **not** the guard that sees Q15's
+    // re-seed land — the two assertions above are. It is kept because a catch here
+    // would mean something new either way.
+    assert!(
+        incarnation.is_empty(),
+        "`IgnoreIncarnation` alone is caught on the node on seeds {incarnation:?}, which it \
+         cannot be while a store's incarnation never changes: re-audit this test"
     );
 }

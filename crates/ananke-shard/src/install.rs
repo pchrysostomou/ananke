@@ -415,55 +415,62 @@ impl<E: Environment> Task<E> {
             last_index: index,
             last_term: term,
         };
+        // A range this node does not host has no version to stream and no core to
+        // answer; the ask cannot have come from here.
         let Some(store) = self.stores.get(&range).cloned() else {
             return;
         };
-        // The version to stream is the one this range's own snapshot record names, and
-        // a stream pins it for its whole life (D-043). A record that names no complete
-        // take — the store compacted without checkpointing (D-065, D-078), or a crash
-        // landed between the record and the checkpoint — is not a stream to open but a
-        // take to ask for, which `retake` does.
+        // What the record names, if it names a take of its own: the fast path through
+        // `find_version`, which falls back to scanning the engine directory.
+        let recorded = match store.snapshot_record().await {
+            Ok(Some(record)) if record.taken => Some((record.last_index, record.take)),
+            _ => None,
+        };
+        // The version to stream is a **complete version directory of the index the core
+        // asked for**, and a stream pins it for its whole life (D-043). This is the
+        // one-group server's own rule (`start_stream` and `snapshot::find_version`,
+        // crates/ananke-raft/src/node.rs:2182 and snapshot.rs:165-191), keyed by range:
+        // `snap-r<range>-<index>-<take>` names survive later takes, which is exactly
+        // what the take counter is for, so a version of the asked index is still there
+        // after the record has moved on. A range that has no complete version of it —
+        // the store compacted without checkpointing (D-065, D-078), or a crash landed
+        // between the record and the checkpoint — is not a stream to open but a take to
+        // ask for, which `retake` does.
         //
-        // **The record is matched at or past the index the core asked for, not at it.**
-        // The `apply` task takes between two applies and rewrites this record each
-        // time, while the `Install` the core asked for carries the index its `taken`
-        // held when it asked; the two are written and read by different tasks, so a
-        // take that lands between the ask and this read moves the record past the ask.
-        // Matched exactly, that was a `retake` — which clears the core's `taken`, has
-        // it take again, ask again, and lose the race again: a cascade that on
-        // `sim/install.rs`'s seed 7 left one install of eight never completing, however
-        // long the run was given. A newer snapshot is not a worse answer for a follower
-        // behind the compacted prefix; it is a better one, and the stream is opened on
-        // the record's own identity so the receiver's assembly and the chunks agree,
-        // with `Input::SnapshotInstalled` carrying the index actually installed
-        // (`Raft::on_snapshot_installed` takes `matched.max(index)`).
-        //
-        // It stayed hidden while `SnapshotAction::Record` was dropped on the floor,
-        // because a replica that asked for one never asked for another snapshot again
-        // and takes were rare (PROPOSED D-086).
-        // PROPOSED(D-086): a stream opens on the record it finds at or past the ask.
-        let (dir, at) = match store.snapshot_record().await {
-            Ok(Some(record)) if record.taken && record.last_index >= index => (
-                record.dir,
-                Identity {
-                    term: at.term,
-                    last_index: record.last_index,
-                    last_term: record.last_term,
-                },
-            ),
+        // **It is emphatically not the store's snapshot record**, and PROPOSED D-086
+        // tried both of the other readings first. Matching the record's index *exactly*
+        // made a take landing between the core's ask and this read answer `retake`, and
+        // the core then took, asked and lost the race again: `sim/install.rs`'s seed 7,
+        // an install that never completed at any run length. Taking the record's
+        // identity *instead* fixed that and broke something worse — the identity then
+        // moved with every take, so each re-open of one logical install carried a new
+        // one, `is_streaming` never suppressed the duplicate, and each fresh stream
+        // restarted the receiver's assembly under it (RAFT.md:203-207). Three leaders
+        // of one range were opening streams at three identities at once. The index the
+        // core asked for is the only one of the three that is **stable**, which is why
+        // it is the one the version is looked up by.
+        // PROPOSED(D-086): a stream opens on a complete version of the index asked for.
+        let dir = match crate::snapshot::find_version(
+            &self.env,
+            &self.engine_dir,
+            range,
+            index,
+            recorded,
+        )
+        .await
+        {
+            Ok(Some(dir)) => dir,
             _ => return self.retake(range, to),
         };
         if self.plan.is_streaming(range, to, at) {
             return;
         }
-        let (index, term) = (at.last_index, at.last_term);
         let started = self.plan.stream(range, to, at);
         if matches!(started, Started::Waiting) {
             // Only `CapStreamsSent` answers this: Q14 puts no cap on streams sent.
             return self.give_up(range, to);
         }
-        let sender = match Sender::open(&self.env, Path::new(&dir), to, index, term, at.term).await
-        {
+        let sender = match Sender::open(&self.env, &dir, to, index, term, at.term).await {
             Ok(sender) => sender,
             Err(_) => {
                 self.plan.sent(range, to);

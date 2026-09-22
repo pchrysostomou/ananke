@@ -107,7 +107,7 @@ _Update this section at the end of every session._
   from `1 << 30` to the one-group sweep's 12 and `Fault::CrashInstalling` and
   `Fault::RetakeUnderStream` come back to `Schedule::draw_on_the_node`, so
   `sim/tests/node.rs` asserts the snapshot path **reached** on every seed where D-082
-  asserted it absent. Reaching it found **four node bugs, all fixed here and none of
+  asserted it absent. Reaching it found **five node bugs, all fixed here and none of
   them a bound widened**: the applied watermark left at zero at every start
   (`Cores::insert`), a live install leaving the `apply` task's applied state behind and
   the store's own caches stale (`RaftStore::restate_after_install`), and
@@ -117,13 +117,19 @@ _Update this section at the end of every session._
   bound on the correct node** on 3 of the first 100 seeds, and fixing it uncovered a
   fifth: a stream opened only on a snapshot record whose index matched the ask exactly,
   and the `apply` task rewrites that record on every take, so an install could lose the
-  race forever — `sim/install.rs`'s seed 7, at any run length. With the four fixed the
+  race forever — `sim/install.rs`'s seed 7, at any run length. A sixth fault was in this
+  slice's own variant translation and the review found it: the node's take did not empty
+  its version directory, so `SharedSnapshotDir`'s re-take *failed* instead of rewriting
+  and every fold of its symptom read zero. With it fixed the variant's fault fires on every seed and its
+  wedge is caught by the liveness check on 36 of 100 — where one group's is 4 of 10 000
+  — so it is asserted at Phase 2's own tiers and no stronger. With the four fixed the
   correct node passes every seed at the gate's twenty and CI's hundred, over 6 250
   snapshot actions. `Cluster::OneGroup` is untouched: seed 42's JSONL still hashes to
   `445f970010f9d493d489d7627543b77cccba863cb5675af4602686f5de182217`.
-  **Two of the four variants are not re-asserted at their Phase 2 tier and the numbers
-  go to the owner**: `SnapshotWithoutCurrentLast` is caught on 0/100 with its arm firing
-  on 1/100, `SharedSnapshotDir` on 0/100 with its re-take half not built at all, and
+  **The variant tiers go to the owner**: `SnapshotWithoutCurrentLast` is caught on 0/100
+  with its arm firing on 1/100, so its catch is not re-asserted; `SharedSnapshotDir`'s
+  fault fires on every seed, its scramble on 12/100 and its liveness catch on 36/100,
+  asserted at Phase 2's own tiers with only its aimed arm (3/100) moved down; and
   `IgnoreIncarnation` and the pair are blocked on PR #86's whole-node refusal, since a
   live install deliberately keeps a store's incarnation and only a re-seed changes one.
 

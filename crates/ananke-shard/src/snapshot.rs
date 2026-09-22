@@ -48,10 +48,11 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
+use std::io;
 use std::ops::Range as KeyRange;
 use std::path::{Path, PathBuf};
 
-use ananke_env::MAX_FRAME_LEN;
+use ananke_env::{Environment, FileSystem, MAX_FRAME_LEN};
 use ananke_raft::types::{Index, ServerId, Term};
 use bytes::Bytes;
 
@@ -125,7 +126,10 @@ pub fn version_dir(
         // Phase 2's `SharedSnapshotDir` on the node, by its own bit (Q37): one mutable
         // directory **per range and index**, with no take counter, so every take at an
         // index rewrites the directory a stream of that index may have open — the
-        // leader as built before D-043 (`snapshot::checkpoint_dir`, node.rs:1505-1509).
+        // leader as built before D-043 (`ananke_raft::node`'s `Job::Take` arm, which
+        // calls `snapshot::checkpoint_dir` at crates/ananke-raft/src/node.rs:1508 —
+        // named in full because from inside `ananke-shard` a bare `node.rs` reads as
+        // this crate's).
         //
         // The range stays in the name and the take counter goes, which is the node's
         // reading of Phase 2's rule and not a weakening of it. Phase 2's server holds
@@ -136,7 +140,19 @@ pub fn version_dir(
         // about is a re-take at one index scrambling the stream reading it, and that
         // is what the missing take counter does.
         // PROPOSED(D-086): Phase 2's `SharedSnapshotDir` on the node's version names.
-        return engine_dir.join(format!("snap-{range}-{index}"));
+        //
+        // The take counter is pinned at **zero**, not dropped from the name. Dropping
+        // it gave `snap-r<range>-<index>`, which `parse_version` does not parse, so
+        // `find_version` could not see the variant's own directories and every stream
+        // answered `retake` — a cascade that looked like a 38 % liveness catch and was
+        // the lookup failing, not D-043's wedge. Phase 2 has the same shape from the
+        // other side: its `find_version` treats take 0 as `checkpoint_dir`, the one
+        // mutable directory per index (crates/ananke-raft/src/snapshot.rs:181-185).
+        // Pinned at zero the name still parses, every take at an index writes the same
+        // directory and rewrites it under whatever stream is reading it, and the rest
+        // of the machinery goes on working — which is what lets the variant be caught
+        // by its own symptom rather than by the harness tripping over it.
+        return engine_dir.join(version_name(range, index, 0));
     }
     if variants.contains(NodeVariant::VersionDirWithoutRange) {
         // The variant: today's `snap-<index>-<take>` (snapshot.rs:119-121), which two
@@ -144,6 +160,76 @@ pub fn version_dir(
         return engine_dir.join(format!("snap-{index}-{take}"));
     }
     engine_dir.join(version_name(range, index, take))
+}
+
+/// A complete version directory of `range`'s snapshot at `index`, the highest take
+/// first, or `None` where the range has none.
+///
+/// `ananke_raft::snapshot::find_version` keyed by range: the names this layout writes
+/// are `snap-r<range>-<index>-<take>`, so a take at a new index or a fresh take at this
+/// one leaves earlier versions where they are and this still finds the one a stream
+/// asked for. That is what the take counter is for (D-043), and it is why a stream is
+/// opened by the index the **core** asked for and not by whatever the store's snapshot
+/// record names now: the record moves under the `snapshot` task on every take, and the
+/// core's ask does not.
+///
+/// Completeness is `ananke_raft::snapshot::checkpoint_complete`, the checkpoint's own
+/// format record (D-060): a directory a crash left short fails it and the next take is
+/// asked for instead.
+// PROPOSED(D-086): a stream opens on a complete version of the index asked for.
+///
+/// # Errors
+///
+/// The filesystem's, reading the engine directory.
+pub async fn find_version<E: Environment>(
+    env: &E,
+    engine_dir: &Path,
+    range: RangeId,
+    index: Index,
+    recorded: Option<(Index, u64)>,
+) -> io::Result<Option<PathBuf>> {
+    // The record's own version first, when it names this index: the common case by far,
+    // and it costs one `checkpoint_complete` where the scan below costs a `read_dir` of
+    // an engine directory that holds a version per take. Measured before it was added:
+    // without it the gate's node binary went from about fifty seconds to over ten
+    // minutes, because a stream opens often and the directory only grows
+    // (PROPOSED D-086).
+    //
+    // Take **0** is tried beside it, because that is the one name
+    // [`NodeVariant`]-free `SharedSnapshotDir` writes — its counter is pinned there —
+    // and for a correct node take 0 never exists, so the extra probe is one cheap miss.
+    // Without it the variant's own lookups all fell through to the scan, which is where
+    // most of the cost was: the directory holds a version per index under it.
+    let mut first: Vec<u64> = Vec::new();
+    if let Some((at, take)) = recorded
+        && at == index
+    {
+        first.push(take);
+    }
+    first.push(0);
+    for take in first {
+        let dir = engine_dir.join(version_name(range, index, take));
+        if ananke_raft::snapshot::checkpoint_complete(env, &dir).await? {
+            return Ok(Some(dir));
+        }
+    }
+    let mut takes: Vec<u64> = env
+        .fs()
+        .read_dir(engine_dir)
+        .await?
+        .iter()
+        .filter_map(|name| parse_version(name.to_str()?))
+        .filter(|&(of, at, _)| of == range && at == index)
+        .map(|(_, _, take)| take)
+        .collect();
+    takes.sort_unstable_by(|a, b| b.cmp(a));
+    for take in takes {
+        let dir = engine_dir.join(version_name(range, index, take));
+        if ananke_raft::snapshot::checkpoint_complete(env, &dir).await? {
+            return Ok(Some(dir));
+        }
+    }
+    Ok(None)
 }
 
 /// What a chunk names its stream by: the leader's term and the snapshot's last index

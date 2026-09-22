@@ -72,6 +72,19 @@
 # lightest, which is shard 4. On `scripts/premerge.sh` the four add 644.1 cpu s, about
 # 80 s of wall on eight cores, which puts it near 455 s against the 374.64 s D-052
 # recorded — inside the quarter of an hour D-040 sets (Q39).
+#
+# **D-086's review round changed two of those four tests materially and these four
+# figures are therefore owed a re-weighing.** `a_leader_that_shares_one_snapshot_directory_is_caught_on_the_node`
+# now runs `high_rate_share()` rather than the tier, and the variant under it wedges the
+# node on 36 % of seeds where before the fix it wedged none — a run that wedges plays out
+# its whole length, so the cost moved in both directions at once;
+# `the_pair_on_the_node_is_the_stream_half_alone_until_the_reseed_lands` and
+# `a_leader_that_ignores_incarnations_has_no_incarnation_to_ignore_on_the_node_yet` moved
+# to the share as well. Re-weighing was attempted and abandoned: the laptop was at load
+# average **177** with other agents' slices building, and a figure taken there is exactly
+# the incomparable kind D-070 exists to stop — which is the same reason D-083 left its own
+# tiering owed. The rows keep the figures measured on this tree before that round, at load
+# 8 to 17, and the re-weigh is owed on a quiet machine before the shards are rebalanced.
 # shard 1: 1432.8 cpu s
 1	engine	625.1	an_install_in_two_switches_is_caught
 1	engine	36.8	an_install_whose_repair_precedes_its_switch_is_caught
@@ -104,7 +117,7 @@
 2	ranges	0.1	no_batch_frame_of_the_node_parses_as_a_frame_of_the_one_group_server
 2	ranges	0.1	the_ranges_of_one_node_draw_their_own_election_timeouts
 2	node	163.5	every_seed_passes_on_the_correct_node_under_the_raft_sweeps_arms
-# shard 3: 1301.9 cpu s
+# shard 3: 1562.9 cpu s
 3	echo	0.2	trace_hash_matches_the_pinned_golden
 3	engine	417.5	the_range_delete_crash_test_passes_every_seed
 3	engine	235.9	the_seek_crash_test_passes_every_seed
@@ -125,7 +138,7 @@
 3	node	13.2	a_server_without_pre_vote_is_caught_on_the_node
 3	node	4.2	a_server_that_applies_before_commit_is_caught_on_the_node
 3	node	0.5	a_server_that_sends_before_it_persists_is_caught_on_the_node
-# shard 4: 1302.4 cpu s
+# shard 4: 1376.3 cpu s
 4	echo	0.1	same_seed_gives_byte_identical_trace
 4	engine	210.8	the_correct_engine_passes_every_seed
 4	engine	38.6	an_install_that_switches_one_span_at_a_time_is_caught
@@ -142,7 +155,7 @@
 4	node	13.5	a_server_that_resets_its_timer_on_any_message_is_caught_on_the_node
 4	node	8.7	a_leader_that_commits_an_older_terms_entry_by_count_is_caught_on_the_node
 4	node	73.9	the_pair_on_the_node_is_the_stream_half_alone_until_the_reseed_lands
-# shard 5: 1351.7 cpu s
+# shard 5: 1395.1 cpu s
 5	echo	6.0	every_seed_satisfies_the_invariants_and_the_sweep_exercises_the_disk_faults
 5	engine	19.5	a_seek_that_counts_tombstones_is_caught
 5	raft	332.9	a_term_change_stepped_inside_an_isolation_from_a_message_received_before_it_is_excused
@@ -153,7 +166,7 @@
 5	raft	50.7	a_server_that_applies_before_commit_compacts_past_its_commit_index
 5	ranges	59.0	every_seed_passes_on_the_correct_node
 5	node	43.4	a_leader_that_ignores_incarnations_has_no_incarnation_to_ignore_on_the_node_yet
-# shard 6: 1301.8 cpu s
+# shard 6: 1567.6 cpu s
 6	echo	0.1	a_busy_looping_task_fails_the_scenario_instead_of_hanging
 6	engine	310.3	an_engine_that_acknowledges_before_the_log_is_caught
 6	engine	204.5	an_engine_that_releases_a_memtable_before_the_manifest_is_caught

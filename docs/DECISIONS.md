@@ -11487,26 +11487,59 @@ any of them (D-030, D-039; CLAUDE.md).
    compacts and later leads, and every other node scenario holds `snapshot_threshold`
    above what its clients write, so `Record` was never asked for at all.
 
-5. **A stream opened on an exact record match, and the record moves** (`Task::open`,
-   install.rs). This one the fourth fix *uncovered*: with `Record` answered, takes
-   become frequent, and the `apply` task rewrites the range's snapshot record on every
-   one of them while the `Install` the core asked for carries the index its `taken` held
-   when it asked. The two are written and read by different tasks. Matched exactly, a
-   take landing between the ask and the read moved the record past the ask, `open`
-   answered `retake`, the core cleared `taken`, took again, asked again and lost the
-   race again — **a cascade in which the install never completes, however long the run
-   is given**, which is how it was told apart from a slow install: `sim/install.rs`'s
-   seed 7 failed at `AFTER` of 14 s and failed identically at 20 s. The record is
-   matched **at or past** the ask now, and the stream is opened on the record's own
-   identity, so the receiver's assembly and the chunks agree; a newer snapshot is a
-   better answer for a follower behind the prefix, not a worse one, and
-   `Raft::on_snapshot_installed` already takes `matched.max(index)`. D-083's own
-   scenario is green again, unchanged, and no bound of it was widened — raising its run
-   length was tried first and did not help, which is what said this was a wedge.
+5. **A stream opened on the store's snapshot record, and that record moves**
+   (`Task::open`, install.rs). This one the fourth fix *uncovered*: with `Record`
+   answered, takes become frequent, and the `apply` task rewrites the range's snapshot
+   record on every one of them while the `Install` the core asked for carries the index
+   its `taken` held when it asked. Matched exactly, a take landing between the ask and
+   the read moved the record past the ask, `open` answered `retake`, and the core took,
+   asked and lost the race again — **a cascade in which the install never completes,
+   however long the run is given**, which is how it was told apart from a slow install:
+   `sim/install.rs`'s seed 7 failed at `AFTER` of 14 s and failed identically at 20 s.
+
+   The fix took three attempts and the first two are worth recording, because each was
+   plausible and each was wrong. Matching the record **at or past** the ask fixed the
+   cascade and broke something worse: the stream's identity then moved with every take,
+   so each re-open of one logical install carried a new identity, `is_streaming` never
+   suppressed the duplicate, and each fresh stream restarted the receiver's assembly
+   under it (RAFT.md:203-207) — three leaders of one range opening streams at three
+   identities at once, and the install never completing for that reason instead.
+
+   What is correct is the **one-group server's own rule**, which neither attempt
+   consulted: open a **complete version directory of the index the core asked for**
+   (`start_stream` and `snapshot::find_version`, crates/ananke-raft/src/node.rs:2182 and
+   snapshot.rs:165-191). `ananke_shard::snapshot::find_version` is that function keyed
+   by range. The core's ask is the only one of the three candidates that is *stable*,
+   version directories are numbered so an earlier one survives later takes — which is
+   what the take counter is for (D-043) — and the record's motion stops mattering.
+
+   It needed one more thing: **the node's take did not write D-060's checkpoint format
+   record**, which `checkpoint_complete` requires, so every version this node wrote read
+   as incomplete and no stream opened at all. `format::write_checkpoint_record` is `pub`
+   now and the take calls it, as `snapshot::take_numbered` always has. A crash between
+   the engine's checkpoint and that record leaves a version that reads incomplete, costs
+   a retake and never streams a half-written checkpoint, which is the property the
+   record exists for.
 
 With the five fixed, **the correct node passes every seed of the gate's twenty and CI's
-hundred**, over 6 250 snapshot actions at 100 seeds where D-082 asserted zero, and
+hundred**, over **5 916** snapshot actions at 100 seeds where D-082 asserted zero, and
 `sim/install.rs`'s three tests pass unchanged.
+
+**A sixth fault was in this slice's own variant translation, and the review found it.**
+It is not a node bug — the correct node never reuses a version directory — but it made
+this entry's central measurement a measurement of nothing. `ServerApplier::take` did not
+empty the version directory before checkpointing into it, where the one-group take has
+always done so (`snapshot::take_numbered`, snapshot.rs:671-677). `SharedSnapshotDir`
+names its directory `snap-<range>-<index>` with no take counter, so a re-take at one
+index finds that directory full; `Engine::checkpoint_spans` refuses a non-empty
+directory with `AlreadyExists` (engine.rs:1517-1523); and `take_failed` answers the core
+with no `RaftSnapshot { taken: true }` traced. **The variant therefore never rewrote a
+directory a live stream had open — D-043's actual bug — it turned the re-take into a
+failed take.** Every fold that reads the symptom was structurally zero, and this entry's
+first draft reported "the re-take half is not built on the node" on that basis. The take
+empties the directory now, which is a no-op for the correct node (a fresh numbered name
+is empty) and is what lets the variant express itself. The rates below are the
+re-measured ones; the first ones are withdrawn.
 
 ### The one-group cluster did not move, and the evidence is not an argument
 
@@ -11536,11 +11569,16 @@ that needs both bugs.
 **On the node the pair is the stream half alone, and the search cannot be run yet.**
 `IgnoreIncarnation` is a no-op on this node (below), so a seed the pair is "caught on"
 here is a seed `SharedSnapshotDir` alone is caught on — not a wedge that needs both
-bugs, which is what D-045 pinned. Measured at 100 seeds: the pair on 2, the stream half
-alone on the same 2, the incarnation half alone on 0, and **on 0 seeds is the pair
-caught where neither half alone is**. `the_pair_on_the_node_is_the_stream_half_alone_until_the_reseed_lands`
-asserts that equality rather than a green, so the day the incarnation half arrives the
-difference fails the test and the search becomes worth running. **This goes to the
+bugs, which is what D-045 pinned. Measured on the share of 20 seeds: the pair on 9, the
+stream half alone on the same 9, the incarnation half alone on 0, and **on 0 seeds is the pair
+caught where neither half alone is**.
+`the_pair_on_the_node_is_the_stream_half_alone_until_the_reseed_lands` asserts the
+**per-seed sets**, not the counts, and asserts the pair-only set empty. The counts were
+what it compared until the review: a count equality cannot see the pin disappear, since
+a genuine D-045 wedge on one seed and a stream-only catch on another leave the counts
+equal and the wedge — the whole reason the pair exists — unreported. `IgnoreIncarnation`
+alone is caught on 0 of 10 000 on one group too (RAFT.md:697, SHARD.md:1579), so that
+assertion is not the guard either; the two set assertions are. **This goes to the
 owner**: the pair is Phase 2's control for a wedge that needs both bugs, and on the node
 it has only one bug to work with until PR #86 lands.
 
@@ -11552,25 +11590,47 @@ averages **7.96/11.11/16.52**. Every figure below is a **gate-tier (20 seed) or 
 (100 seed)** figure and is labelled as one. **`scripts/premerge.sh` has not run**; it is
 the owner's to schedule.
 
-The four stream variants, on the node, at **100 seeds**:
+The four stream variants, on the node, at **100 seeds**. `SharedSnapshotDir`'s test runs
+`high_rate_share()` rather than the tier — a cost decision set out below — so its
+assertions see a tenth of these seeds; the figures here are the full hundred, which is
+what the tiers were set from, and at rates of 100 %, 12 %, 3 % and 36 % the share sees
+each in proportion (D-061).
 
 | Variant | On the node | Phase 2's standard | Verdict |
 |---|---|---|---|
-| `SnapshotWithoutCurrentLast` | caught **0/100**; `Fault::CrashInstalling` reached the final chunk of the range it drew and crashed there on **1/100** | caught on some seed at every tier | **not met — to the owner** |
-| `SharedSnapshotDir` | caught **0/100**; re-took at an index already taken **of that range into that directory** on **0/100**; scrambled a live stream **0/100**; the aimed re-take arm reached its stream on **16/100** | fault fired and arm reached its stream at every tier; scramble from 100; liveness catch at 10 000 | **arm asserted; re-take half not built — to the owner** |
+| `SnapshotWithoutCurrentLast` | caught **0/100**; `Fault::CrashInstalling` reached the final chunk of the range it drew and crashed there on **1/100** | caught on some seed at every tier | **not met — to the owner**; the arm's firing asserted from 1 000 |
+| `SharedSnapshotDir` | the fault fired (a re-take at an index already taken of that range) **100/100**; the scramble **12/100**, with 31 duplicate-chunk loops; the aimed arm reached its stream **3/100**; **caught 36/100**, every one by the liveness check | fault at every tier; scramble from 100; arm at every tier; liveness catch at 10 000 | **fault at every tier, scramble from 100 and liveness at 10 000, all three Phase 2's own tiers; the arm moved to 1 000 — to the owner** |
 | `IgnoreIncarnation` | the correct node reset a follower's progress **0** times and the variant **0**, over **0** store refusals, on the share of 20 | injection at every tier, reach from 100 | **blocked on PR #86 — see below** |
-| `{IgnoreIncarnation, SharedSnapshotDir}` | pair **0/20** = stream half alone **0/20**; pair-only **0/20** | pinned on a seed of the first thousand | **blocked with its half — to the owner** |
+| `{IgnoreIncarnation, SharedSnapshotDir}` | pair **9/20** = stream half alone **9/20**, seed for seed, on `{0, 1, 4, 5, 8, 9, 12, 16, 17}`; incarnation half **0/20**; pair-only **0/20** | pinned on a seed of the first thousand | **blocked with its half — to the owner** |
 
-`SharedSnapshotDir` read **2/100 by the liveness check** before the fifth fix landed,
-and it is **0/100** after it. Those two catches were the `open` cascade, not D-043's
-wedge: a variant that made takes collide made the race above more likely, and the run
-died of the race rather than of the bug. Recording that is the point of measuring twice.
+**`SharedSnapshotDir` wedges a node far more readily than a server**, which is the
+opposite of what this entry first reported twice over. Its fault fires on **every seed**,
+its scramble on 12 %, and the liveness check — Phase 2's wedge — catches it on **36 of
+100** against one group's **4 of 10 000**. Four ranges share one directory name per index
+and one `snapshot` task, so a re-take under a live stream is not the coincidence it is on
+a server.
+
+That rate would carry an assertion at a hundred seeds and it is deliberately **not**
+written there: Phase 2 asserts this catch at ten thousand, and SHARD.md §12 re-asserts a
+Phase 2 variant "to the standard their Phase 2 tests assert **and no stronger**". Three
+of the four assertions therefore sit at exactly Phase 2's tiers — the fault at every
+tier, the scramble from a hundred, the liveness catch at ten thousand. The fourth, the
+aimed arm's own firing, moves **down** from every tier to a thousand: it reaches a stream
+on 3 of 100 seeds here, under D-061's 5 %, because the variant wedges the run so readily
+that `RetakeUnderStream`'s setup often never completes. That one weakening is the
+owner's to confirm, and it is the only one.
+
+**The pair's test is non-vacuous now**, which it was not when this entry first reported
+it. The pair is caught on 9 of the share's 20 seeds, on exactly the seeds
+`SharedSnapshotDir` alone is caught on, and on none where neither half alone is. The
+equality is asserted **seed for seed** rather than by count, and over nine real catches
+rather than over zero.
 
 The seven D-082 measured are unchanged in kind and moved where the schedules moved, the
 threshold being a disk-work change: `SendBeforePersist` **20/20**, `ApplyBeforeCommit`
 **20/20**, `NoPreVote` **20/20**, `TruncateOnEveryAppend` **20/20**,
-`CountOlderTermForCommit` **8/20** (40 %, was 14/20), `ResetTimerOnAnyRpc` **10/20**
-(50 %, unchanged), `LeaseTrustsTheClock` **0/100**. All are above 5 % but the last,
+`CountOlderTermForCommit` **4/20** (20 %, was 14/20), `ResetTimerOnAnyRpc` **10/20**
+(50 %, unchanged), `LeaseTrustsTheClock` **0/100**, which keeps the thousand-seed tier D-082 set for it. All are above 5 % but the last,
 which keeps its thousand-seed tier as D-082 set it.
 
 **`IgnoreIncarnation` is blocked by Q15's re-seed, not by the wiring**, and the reason is
@@ -11595,27 +11655,36 @@ measured arm-firing of 2 % and a catch of 0, an assertion at any local tier woul
 green that means nothing, and one at the nightly would be a guess. So the assertions are
 **not written weaker — they are not written**, the rates are printed at every tier, both
 variants keep their Phase 2 assertions on `Cluster::OneGroup` unmoved, and the numbers
-are here for the owner to rule on. What *is* asserted at every tier is each variant's
-own non-vacuity: that the install path was reached at all, and that the re-take arm
-reached a stream of the range it drew.
+are here for the owner to rule on. What *is* asserted is each variant's own
+non-vacuity at the tier its rate carries: `SharedSnapshotDir`'s fault firing and its arm
+reaching a stream, at every tier; `SnapshotWithoutCurrentLast`'s arm firing, from a
+thousand. The install variant's test asserted `actions > 0` until the review, which
+`checked()` already asserts on every seed of every sweep — so it could not fail, and
+removing the variant's bit from `with_repair` left the node binary green at a hundred
+seeds. `aimed_installs` is the discriminator, 1/100 against 0/100, and it is asserted
+where 1 % belongs.
 
 **What the two rates say about the arms, which is the owner's decision to make.** On one
 group `Fault::CrashInstalling` has one range to aim at and its victim is behind that
 range by construction. On a node the victim is drawn without regard to which of its four
 ranges it is behind on, so the arm must find a victim behind *that* range's compacted
 prefix, designated for it, and streamed within `INSTALL_WAIT_BUDGET` — and it does, on
-1 seed in 100. The same shape thins `RetakeUnderStream`: it reaches its stream on 16
-seeds in 100, and the re-take that follows needs the core's `taken` cleared and the same
-applied index to come round again on *that* range, which the node's completing streams
-do not produce. Aiming an arm at a range its victim is actually behind on would change
-both numbers, and it is a change to how the arms are drawn — the owner's, not this
-slice's.
+1 seed in 100. `RetakeUnderStream` reaches its stream on 16 seeds in 100 by the same
+shape.
+
+**For `SharedSnapshotDir` the aim is not the blocker**, and saying so is the correction
+this entry owes: with the sixth fault fixed its fault fires on 25 % of seeds and its
+scramble on 2 %, so what it wants is not a better-aimed arm but more seeds, which is
+what moving the scramble to the thousand-seed tier does. For `SnapshotWithoutCurrentLast`
+the aim *is* the blocker: at 1 % nothing local carries its catch. Aiming an arm at a
+range its victim is actually behind on is a change to how the arms are drawn — the
+owner's, not this slice's — and the figure it would have to reach is D-061's 5 %.
 
 ### The mutation table: what a single-range world could not catch
 
 The owner's standing demand on this stage: a check with more than one range to be wrong
-about shows the mutation a single-range world could not catch. Nine are below. Six were
-**planted one at a time**, each run at **100 seeds**, each reverted before the next and
+about shows the mutation a single-range world could not catch. Twelve are below. Eight
+were **planted one at a time**, each reverted before the next and
 each restore followed by an assertion that the next build really recompiled the unit
 (issue #102: a file restored by copy carries an mtime older than the build that compiled
 the mutant, and cargo then calls the unit fresh). Three were not planted at all — they
@@ -11633,30 +11702,72 @@ cache here by ending its run-loop incarnation.
 | **M3** | `install_landing` waits for the final chunk of *any* range | **not caught**, recorded with a number: the install crash's firing rises from **1/100 to 17/100**. A range-blind watch reports the arm working eight times as often while crashing the victim at some other range's install — the arm would look healthy and be aiming at nothing |
 | **M4** | `stream_opened` waits for a stream opening to the victim of *any* range | **not caught**, recorded: the re-take arm "reached its stream" on **18/100** against **16/100**, and the freeze that follows would hold a leader over a stream of a range it did not draw |
 | **M5** | `Report::raft_messages` decodes one-group frames only — which is what it did before this slice | **not caught today, and this is the row to read twice.** On a node `Frame::decode` sees none of a batch frame, so every fold built on it — `retakes_under_streams`, `duplicate_chunk_loop`, the two `SharedSnapshotDir`'s catch is read from — answers **empty on every seed, whatever the node does**. The numbers do not move only because the re-take half is not reached either way. It is fixed here and recorded as not covered: an assertion over a fold that cannot report is green because nothing was read |
-| **M6** | `SharedSnapshotDir`'s shared version directory drops the *range* as well as the take | **not caught**, recorded: the liveness catch falls from **2/100 to 0/100** and the arm from 14 to 12. A variant made strictly more broken catches strictly less, because two ranges' checkpoints colliding is `VersionDirWithoutRange`'s bug (D-075) and not D-043's |
+| **M6** | `SharedSnapshotDir`'s shared version directory drops the *range* as well as the take | **not caught**, recorded: two ranges' checkpoints colliding is `VersionDirWithoutRange`'s bug (D-075) and not D-043's, and the variant made strictly more broken catches no more |
+| **M7a** | `SharedSnapshotDir`'s directory drops the take counter from the name entirely, rather than pinning it at zero | **caught by its own incoherence rather than by a check, and that is the point.** `parse_version` does not parse `snap-r<range>-<index>`, so `find_version` could not see the variant's own directories, every stream answered `retake`, and the run wedged: a 38 % liveness "catch" that was the lookup failing. Recorded because it is the third time in this slice that a number about the node turned out to be a number about the harness |
 | **M7** | `Cores::insert` leaves the applied watermark at zero | **found as a live bug, not planted.** 17 of the gate's 20 seeds: "an apply through 41 names index 1, which the core does not hold", and the node stops |
 | **M8** | a live install moves neither the `apply` task's applied state nor the store's caches | **found as a live bug.** "range 2: apply of 13 after 10", then one layer down "applying 13 after 10", on 12 of 20 seeds |
 | **M9** | `SnapshotAction::Record` is not routed to the `apply` task | **found as a live bug.** The liveness bound, on the **correct** node, on seeds 17, 20 and 64 of the first hundred |
 | **M10** | a stream opens only on a record whose index matches the ask exactly | **found as a live bug**, by fixing M9: `sim/install.rs`'s seed 7, one install of eight never completing at any run length |
+| **M11** | `SnapshotAction::Record` routed to the node's **first** range rather than the range that asked — textually a no-op on one group, which holds one range | **the snapshot-actions floor**, at the gate's twenty: 23.3 actions a seed against the correct node's 58.8 and a floor of 30. The node sweep sees it otherwise only from **seed 25**, so the gate's twenty node seeds were green and only `sim/install.rs`'s seed 1 saw it. This is the reviewer's mutation and it is the reason the floor is 30 rather than 20, where it passed |
+| **M12** | `SnapshotAction::Record` dropped on the floor again, which is M9 as it stood | **the same floor**, at the gate: 11.6 a seed. Before the floor existed, only seed 17 of the gate's twenty caught it, by the liveness bound |
 
-**None of the six planted mutations ends caught by an assertion, four were live bugs,
-and six are recorded and not covered.** That is the honest reading, and it is worse than
-the table this slice expected to write. The one planted mutation that was caught was
-caught by a bound the campaign itself had just invented, and the fifth fix then showed
-that bound to be wrong about the correct system — so the row is withdrawn rather than
-kept. What has teeth here are the checks about the *correct* node's own behaviour: the
-take counter's directory property, the arms hitting the range they drew, and the five
-failures the reach itself produced. The checks about a variant's catch have no teeth
-yet, because the situations behind two of the four variants are not reached on this
-node at all. A campaign whose every row
+**Two of the eight planted mutations are caught by an assertion, four were live bugs,
+and six are recorded and not covered.** The two that are caught, M11 and M12, are both
+caught by a bound the **review** asked for and not by anything this slice wrote on its
+own: nothing here checked that a replica which asks for a snapshot gets an answer, and
+D-078's follower compaction had no direct check at all. The one mutation this slice's
+own campaign caught, M2, was caught by a bound the campaign itself had just invented,
+and the fifth fix then showed that bound wrong about the correct system — so that row is
+withdrawn rather than kept.
+
+What has teeth here are the checks about the *correct* node's own behaviour: the take
+counter's directory property, the arms hitting the range they drew, the snapshot-actions
+floor, and the five failures the reach itself produced. `SharedSnapshotDir`'s catch now
+has teeth too, at the tiers its own rates support. `SnapshotWithoutCurrentLast`'s does
+not, and its arm firing on 1 seed in 100 is why. A campaign whose every row
 is caught has usually been written after the checks rather than against them; this one
 was written against them, and it says where the sweep is thin.
 
+### The cost this slice adds, which is the one thing it does not settle
+
+Making `SharedSnapshotDir` express its bug made the node's sweep **much more
+expensive**, and the figures belong to the owner because Q39 holds
+`scripts/premerge.sh` near a quarter of an hour.
+
+The variant's own churn is most of it and is inherent: it wedges **36 % of seeds**
+against one group's 4 in 10 000, and a wedged run plays out its whole length with a
+stream restarting under it. Its test runs `high_rate_share()` for that reason — a tenth
+of the tier, which at rates of 100 %, 12 % and 36 % measures each as well as the tier
+would.
+
+The correct node is dearer too, and that part is not the variant's: every take now
+writes D-060's checkpoint format record and empties its directory first, and every
+stream open reads a record and probes for a complete version. Takes are frequent — 59 a
+seed — so these are not rare paths.
+
+Measured on this machine, `sim/tests/node.rs` in **debug** at `ANANKE_SEEDS=20`, which is
+the gate's own configuration: **about 48 s of CPU before this slice's review round and
+several minutes after it**, with the worst reading taken before the variant moved to a
+share and before `find_version` got its fast path. The four rows in
+`scripts/nightly-shards.txt` are **weighed on the tree that adds them** and are the
+figures to read; the premerge figure this changes is not measured here, and
+`scripts/premerge.sh` has not run.
+
+**This goes to the owner as a cost question, not a correctness one.** The options, none
+of them taken here: leave it, shrink the variant's share further, or shorten the node
+cluster's runs. What would be wrong is to buy the time back by making the variant
+express less, which is exactly the state the review found this entry in.
+
 ### What is not taken, and what goes to the owner
 
-- **`SnapshotWithoutCurrentLast`'s and `SharedSnapshotDir`'s Phase 2 tiers**, with the
-  measured rates above. Neither is re-asserted on the node at its Phase 2 standard, and
-  neither standard is lowered; both keep their Phase 2 assertions on one group.
+- **`SnapshotWithoutCurrentLast`'s Phase 2 tier**, with the measured rates above: its
+  catch is not re-asserted on the node, its standard is not lowered, and it keeps its
+  Phase 2 assertion on one group. Its arm's firing is asserted from a thousand seeds.
+- **`SharedSnapshotDir`'s two moved assertions**: the scramble from a hundred seeds to a
+  thousand, on a measured 2 %, and the liveness catch not asserted at all until this
+  cluster has a ten-thousand-seed rate. Both are weaker than Phase 2's, which makes them
+  the owner's to confirm. Its fault firing and its arm are asserted at every tier, as
+  Phase 2 has them.
 - **`IgnoreIncarnation` and the pair** are blocked on PR #86's whole-node refusal and
   re-seed. They are re-asserted in the commit that follows #86 into this branch, as
   D-082 says of `RefusalNotDurable`.
@@ -11671,8 +11782,8 @@ was written against them, and it says where the sweep is thin.
 - **The take's hold on the node's other ranges' applies (D-036)**, which D-082 recorded
   as owed by the slice that wires the take: the node takes snapshots now, so the figure
   is measurable for the first time. It is not taken here, and the ordinary-apply hold
-  D-082 measured has moved with the threshold: at 100 seeds the median is **2.39 ms**
-  and the maximum **796.1 ms**, against D-082's 2.07 ms and 572.9 ms and a heartbeat
+  D-082 measured has moved with the threshold: at 100 seeds the median is **2.38 ms**
+  and the maximum **687.8 ms**, against D-082's 2.07 ms and 572.9 ms and a heartbeat
   interval of 20 ms. The maximum goes to the owner again, larger than before.
 - **`AdoptionAsBuilt`'s first rule** still has no crash arm aimed at the live install's
   switch; `Fault::CrashAdopting` and `Fault::CrashRefused` stay out of the node's draw,
