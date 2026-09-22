@@ -11075,6 +11075,399 @@ on its own, and it is put to the owner with the wiring rather than decided here.
   asserted on the node. It stays asserted on `Cluster::OneGroup`, where D-078 measured
   it.
 
+## PROPOSED D-084 — `sim/membership.rs` on the node: the same scenario, four ranges, and the half of #46 the node cannot reach
+
+**The number.** This branch stacks on `phase-3-stage-b-sweeps`, whose entry is
+PROPOSED **D-082** and whose footer reads D-083. Two other branches are open against
+the same file — the quorum sweep, a sibling of this one, and the node's snapshot
+wiring — so a number taken from the footer here would collide with one of them at the
+merge. This entry takes **D-084**, past D-083, and the footer moves to D-085. Every
+code site carries `// PROPOSED(D-084)`. The integrator may renumber it at the merge;
+nothing in the tree depends on the number beyond those markers, this heading and the
+footer.
+
+**Context.** SHARD.md §12's Stage B has, as its **first** exit criterion,
+"`sim/raft.rs`'s arms, `sim/membership.rs` with #46's extension, and `sim/quorum.rs`,
+each run on the node with four ranges on every node, each range placed as today's one
+group is (§10): the correct system passes every seed at every tier"
+(SHARD.md:2272-2280). D-082 moved the first of the three and said in terms what the
+other two have to do:
+
+> **`sim/membership.rs`** drives its own scenario rather than `raft::run_on`: it keeps
+> a `Driver` with a `Sim` of its own and asks `leader_now` of it in four places. Each
+> becomes `leader_of_range(&self.sim, range)` for the range the change is about, and
+> its client becomes `client_on(cluster, …)`. Its changes are `Command::Change`, which
+> `ananke_shard::server` already takes per range (`server.rs:342`), so the membership
+> arm needs no new node code — and #46's extension (a change of a range while another
+> range on the node is changing) is the thing four ranges make possible and one group
+> could not. `SingleMajorityInJointConsensus` is re-asserted there.
+
+This is that slice. **The shape D-082 named is the shape taken, in every particular**,
+and the departures are three, each stated below with its reason.
+
+### The shape taken from D-082
+
+1. **The arms are shared and the node is a second cluster of them.** `Cluster` is
+   D-082's own enum, imported rather than re-declared, and this scenario grows
+   `run_on(cluster, seed, variants)` beside `run`. What differs between the two
+   systems is what D-082 said differs and nothing else: how a server is spawned
+   (`spawn_server`), which ranges it holds, which range a partition reads its leader
+   of, how a request is encoded (`Cluster::encode`, now `pub(crate)` — the only change
+   this branch makes to `sim/raft.rs`), and whether a joining server is fed by
+   snapshot. Which change is asked for when, what the partition cuts, what the driver
+   polls for and what the checks demand is **one body of code** driven against either.
+2. **`leader_now` is gone from this file and `leader_of_range` is in its place**, in
+   all four of the places D-082 counted: the operator's request, the fallback in
+   `await_compacted_leader`, the transfer, and the partition's target.
+3. **The client is `client_on(cluster, …)`**, D-082's, with its per-range leader map.
+4. **The one-group scenario is left running exactly as it is**, and the evidence is
+   not an argument. Seed 7's moirae JSONL — the seed
+   `the_membership_scenario_has_byte_identical_traces_for_one_seed` pins — is
+   **3 429 033 bytes** and hashes to
+   `24358ff2930cb7fbb9a104c049a1e4f2c6cb1acb049e019813ffa218ce5f427a` on
+   `origin/phase-3-stage-b-sweeps` and on this branch, from a run in a worktree of
+   each. The node's extra draws are taken from a stream of their own,
+   `membership-range`, exactly as D-082 took `arm-range`, so `Schedule::draw` draws
+   from the same streams in the same order it drew from before `Cluster` reached this
+   file.
+5. **A leader-relative fault draws its range from its own stream** (§11, env 8).
+   `Schedule::focus` holds two picks, the grow's and the shrink's, and the partition
+   puts *that range's* leader on the minority side. The other three ranges' changes
+   run under the same partition wherever their leaders happen to sit, which is the
+   multi-range situation and not a second scenario.
+6. **The transfer hands over every range the node holds**, not one — D-082's item 5
+   for the lease trial, applied here for the same reason. The transfer exists so that
+   the shrink's leader is outside `C_new` and the step-down is exercised; a node
+   leading one range of four would leave three led from inside `C_new`. One group
+   holds one range, so this is exactly the one transfer it always sent.
+7. **What the node has not got is asserted absent, with its reason, on every seed**
+   (CLAUDE.md:58-67): `snapshot_threshold` is `NODE_SNAPSHOT_THRESHOLD`, the disk does
+   not rot, and `Report::check`'s node clauses fail any seed that traces a snapshot
+   action, reaches the threshold, is refused, or counts a snapshot-fed joiner.
+
+### Where this departs from D-082, and why
+
+- **The changes are driven on *every* range, staggered, and not on one.** D-082 wrote
+  "`leader_of_range(&self.sim, range)` for the range the change is about", which reads
+  as one range per change. Driving one range would have made the node's run a
+  one-group run with three idle ranges beside it, and would have left D-082's own next
+  sentence — "#46's extension … is the thing four ranges make possible" — with nothing
+  to stand on: *two ranges changing at once is the extension*, and one change cannot
+  produce it. So the grow, and later the shrink, is asked of every range, each after
+  its own drawn stagger (`RANGE_STAGGER_MAX_MS`, 25 ms) behind the range before it, and
+  `Report::joint_overlap` is asserted on every seed. `leader_of_range(&self.sim, range)`
+  is still what each request resolves; there are simply four of them.
+- **The scenario's liveness and availability checks became per range**, which D-082 did
+  not ask for. They had to: both were folded over the whole client history, and on a
+  node of four ranges a wedged range hides inside three busy ones. The bounds are new,
+  measured, and stated below.
+- **`sim/membership.rs`'s tests are in `sim/tests/node.rs`** rather than a binary of
+  their own, following the precedent that the one-group membership tests live in
+  `sim/tests/raft.rs` beside the sweep whose client and addresses they share.
+
+### What the node runs, and what one group runs beside it
+
+Five nodes, **four ranges on every one of them** (`crate::ranges`'s four, spans `k0`
+to `k7`), each range placed as today's one group is: servers 1 to 3 its voters, servers
+4 and 5 outside the configuration with empty replicas. An operator asks for
+{1, 2, 3, 4, 5} on **every** range, staggered; a partition drawn from the seed lands
+during the change and puts the leader **of the range that phase drew** on the minority
+side of the old voters; the partition heals; the changes complete; leadership of every
+range is handed to server 4 or 5 on some seeds; and the operator shrinks every range
+back to {1, 2, 3} under another partition.
+
+`ananke_shard::server` takes `Command::Change` per range already (`server.rs:342`), so
+**the node needed no new code**, which is what D-082 predicted. The whole of this
+branch's change to code outside `sim/membership.rs` and `sim/tests/node.rs` is two
+`pub(crate)`s on `Cluster::encode` and `Cluster::decode`.
+
+### The checks that now have more than one range to be wrong about
+
+Six, each written so that the range is part of the question rather than beside it:
+
+1. **`Driver::change_complete(range, voters)`** — a configuration in force on a
+   majority *of that range's* replicas, and `change_complete_everywhere` over all four.
+   Without the range, "the change completed" is true the moment any one range finishes.
+2. **`Report::time_to_write_after_heal_of(range)`** — liveness after the last heal, of
+   each range's keys. A cluster serving three ranges briskly with the fourth wedged
+   satisfies the whole-history clause on its first operation.
+3. **`Report::longest_completion_gap_of(range)`** — SPEC §3's availability criterion,
+   of each range's keys, on its own measured bound.
+4. **`Report::ranges_admitting(joiner)`** — the ranges a joining server became a voter
+   of. The grow admits 4 and 5 to *every* range; "a configuration holding 4 and 5 took
+   effect somewhere" cannot tell that from one range in four.
+5. **`Report::partitions_hit_their_ranges`** — whether each partition cut off the
+   leader of the range it drew, folded forward over the finished trace rather than by
+   the backward windowed search the driver used.
+6. **`Report::joint_overlap`** — two ranges' joint configurations in force **on one
+   node** at one instant, which is issue #46's extension on the node and has no subject
+   at all on one group.
+
+The invariants underneath them were already keyed by range (D-071), and
+`raft::payload_is_well_formed` is now asked of the cluster's ranges rather than of
+`SINGLE_GROUP`.
+
+### The mutation table: what a single-range world could not catch
+
+The owner's standing demand on this stage. Eight mutations were planted **one at a
+time**, each run at **100 seeds** in release, each reverted before the next. Every one
+of them is a no-op on one group: with a single range, `change_complete`'s range
+argument has one value, the key map has one answer, `focus_of` answers the only range,
+`ranges()` is a list of one, and there is no second range to overlap with.
+
+| | Mutation | What it does on one group | Caught by |
+|---|---|---|---|
+| **M1** | `Driver::change_complete` ignores its `range` | nothing: one range | **the joiners clause.** `seed 3: the grow completed, but server 4 became a voter of {2, 3, 5} and not of every range this node holds` — 8 of 100 seeds. The driver stops polling when the *first* range finishes and leaves the others mid-change |
+| **M2** | `Report::longest_completion_gap_of` folds over the whole history | nothing: the whole history is the one range's | **the per-range-against-cluster floor.** Correct: worst range **996.309655 ms** against the cluster's **329.015134 ms**. Mutated: equal, and the floor fails. The bound itself catches nothing — a widened fold only ever passes — which is why the floor and not the bound is the catcher |
+| **M3** | `Report::time_to_write_after_heal_of` folds over the whole history | nothing, likewise | **the same floor for liveness.** Correct: **1.129614604 s** against the cluster's **344.163046 ms**; mutated, equal |
+| **M4** | the partition cuts off `leader_of_the_cluster` instead of the drawn range's leader | nothing: one range, one leader | **the partitions-hit floor.** 200/200 (**100 %**) correct, **130/200 (65.0 %)** mutated, against a 90 % floor. Not one in four, because five nodes hold four ranges and the leaders often coincide — which is why this needed a measured floor and not an intuition |
+| **M5** | `Schedule::focus_of` always answers the first range | nothing: the first range is the only range | **the aimed-ranges set.** `the partitions aimed at {2} and not at every range this node holds`. The hit floor cannot catch this: hits are counted against what was aimed at, so a draw that always aims at one range hits it every time |
+| **M6** | `Report::ranges` answers one range | nothing: it already did | **`payload_is_well_formed`**, on every seed, and `a_node_changes_two_of_its_ranges_at_once` |
+| **M7** | `Report::joint_overlap` keyed by nothing instead of by node | nothing: one node's state is the cluster's | **the per-seed overlap clause**, on seeds 6 and 95. The merge makes the fold *stricter*, not looser — any node leaving a range's joint configuration clears it for all — so the overlap it reports is 98 of 100 |
+| **M8** | `Report::joint_overlap` never clears a range, so any two ranges ever joint on a node count | nothing, likewise | **not caught.** Every check passes and the overlap is 100 of 100 either way. What would catch it is a measurement of how *long* two ranges are jointly configured together, or a ceiling on the count of overlapping instants — and a ceiling on a count that partitions legitimately raise is a bound the correct system would trip (D-030). Recorded, not covered |
+
+**Seven of eight caught, one recorded and not covered.** Three of the seven — M2, M3
+and M5 — are only caught because three floors were added *for* them: the two
+comparisons of a per-range fold against the cluster's, and the set of ranges the
+partitions aimed at. **Without those three floors M2, M3 and M5 pass every tier**, and
+saying so is the honest reading of the table. The bounds could not have caught them:
+a fold widened back to the whole history only ever passes a bound, so what catches a
+widening is a floor that says the narrow fold saw something the wide one could not.
+
+**The machine, for every figure below** (D-070). Darwin 25.6.0 arm64, Apple M2, 8
+cores, **on AC Power**, no thermal warning recorded, with four other agents' slices
+building on it throughout: load averages ran from **59.44/71.60/80.63** to
+**121.29/106.06/90.35** across the runs. **Every figure here is a gate-tier (20 seed),
+CI-tier (100 seed) or thousand-seed figure and is labelled as one, and
+`scripts/premerge.sh` has not run**: the premerge is the owner's to schedule on a quiet
+machine.
+
+One distinction matters for reading the thousand-seed rows: the bounds below are in
+**virtual time**, which the simulator's clock decides and the host's load does not
+touch, so a thousand-seed virtual-time figure is exact whatever the load was. What the
+tier bounds is how much of the schedule space was looked at, not the precision of any
+one number. No figure here is a host-time figure except the nightly weights, which are
+cpu seconds for exactly that reason.
+
+### The rates, every one measured before its assertion was written (D-061)
+
+**`SingleMajorityInJointConsensus` on the node.** Its Phase 2 test asserts it caught on
+some seed, at every tier (`sim/tests/raft.rs`,
+`a_server_that_counts_one_majority_in_joint_consensus_is_caught`), and that is what is
+asserted here — to that standard and no stronger, at the tier it uses today (§10, Q39).
+
+| | On the node | On one group | Tier asserted |
+|---|---|---|---|
+| 100 seeds | **14/100 (14 %)** | **19/100 (19 %)** | every tier |
+| 20 seeds | **2/20**, seeds 3 and 15 | — | every tier |
+
+The rate is **above D-061's five per cent**, so the rule leaves the variant where it
+is and the tier is not moved; the tier a variant keeps is the owner's in any case. The
+node's rate is about three quarters of the one-group server's, which is what four
+ranges' extra elections and extra joint windows do to a fault whose catch is a
+committed entry a later leader does not hold.
+
+One thing worth saying plainly, because a rate of 14 % invites the arithmetic: the
+gate's twenty seeds are **seeds 0 to 19, fixed**, not twenty drawn at random, so the
+catch at the gate is a deterministic fact and not a one-in-twenty coin. Seeds 3 and 15
+catch it, and a green gate here is a gate that injected the fault. What the rate does
+bound is how much room a later change has to move the catch off those two seeds before
+the gate goes quiet, and that is the reason to record it rather than only the verdict.
+The seeds caught over the first hundred are 3, 15, 25, 44, 48, 63, 72, 73, 75, 77, 78,
+86, 93 and 98.
+
+### The correct node, and the shape the keyed checks need
+
+At **100 seeds**, all pass; at **1 000**, 999 pass and one is issue #81, below.
+
+| | 100 seeds | 1 000 seeds |
+|---|---|---|
+| uniformly scheduled | 50 | 500 |
+| grow completed **on every range** | 100/100 | 1000/1000 |
+| shrink completed on every range | 100/100 | 1000/1000 |
+| a node jointly configured on two ranges at once | **100/100** | **1000/1000** |
+| both joiners admitted to **every** range | 100/100 | 1000/1000 |
+| partitions that cut off the drawn range's leader | **200/200** | **2000/2000** |
+| snapshot actions traced | **0** | **0** |
+| highest index any replica reached | **52** | **61** |
+| leaders by range | {2: 295, 3: 284, 4: 299, 5: 295} | {2: 2982, 3: 2930, 4: 2967, 5: 2936} |
+| applies by range | {2: 11 394, 3: 11 436, 4: 11 324, 5: 11 054} | {2: 116 634, 3: 116 052, 4: 117 667, 5: 116 438} |
+
+The four ranges agree with each other to within 4 % on applies at a hundred seeds and
+1.4 % at a thousand, which is what says one range is not being starved by the node's
+one `apply` task — and it is the figure D-082's own M3 showed that
+`applies.contains_key(&range)` cannot see.
+
+### The bounds, measured before they were asserted
+
+| Bound | Worst on the correct node | Set to | Margin |
+|---|---|---|---|
+| a range's gap without a completed operation (`RANGE_AVAILABILITY_TIMEOUTS`) | 996.309655 ms at 100 seeds, **1.331587004 s at 1 000** | 25 timeouts, **5 s** | 3.8× |
+| a range's first write after the last heal (`RANGE_LIVENESS_TIMEOUTS`) | 1.129614604 s at 100 seeds, **1.810368194 s at 1 000** | 30 timeouts, **6 s** | 3.3× |
+
+Neither is the cluster's bound, and the reason is arithmetic before it is anything
+else: the clients draw a key uniformly, so a range of four sees about a quarter of the
+operations and the intervals between *its* completions are about four times the
+cluster's. The one-group scenario's cluster bound has the same shape — 549 ms measured
+at ten thousand seeds against 2 s, a margin of 3.6× — so these are that margin and not
+a looser one. A bound the correct system trips is a model error and never a bound to
+widen (D-030, D-039), which cuts both ways: a per-range check on the cluster's ten
+timeouts would have failed correct runs at the thousand-seed tier, where the worst
+first write is 1.81 s against 2 s.
+
+**The cluster's own two clauses are kept beside the per-range ones, unchanged**, so
+the one-group scenario's standard is exactly what it was and the node gains a check
+rather than trading one.
+
+Six seconds is most of an eight-second run, and that is said rather than hidden: **the
+clause with teeth is the one beside the bound** — that *no* write of that range
+completed after the heal at all — which has nothing to tune and no margin to get
+wrong. The bound is the backstop under it.
+
+### The trace records a run holds per range per virtual second, against `TRACE_CAP`
+
+At **100 seeds**, over **4 376 880 records** and a longest run of **8.195 virtual
+seconds**: at most **2 534.9 records per virtual second per range** by the conservative
+reading — the whole trace, every client operation and every message, divided by the
+four ranges, taken as the worst *seed* rather than the tier's average — and at most
+**154.7** of the busiest range's own records per virtual second, about a sixteenth of
+it. The tier's average by the conservative reading is about **1 335**.
+
+`TRACE_CAP` is **600 000** for this scenario. So four ranges under these changes hold
+about **237 virtual seconds** before the cap on the conservative reading, and a run of
+this scenario is about eight virtual seconds long. **Four ranges fit with room**, by a
+factor of about 29, so Stage B's range count does not go to the owner and is not
+lowered. The number to carry into Stages C to E is the conservative one.
+
+### The pinned seeds, re-audited
+
+SHARD.md's Stage B asks each commit that moves a schedule to re-audit every pinned seed
+in `sim/tests/raft.rs` (SHARD.md:2361-2370). **This commit moves none**, and the audit
+begins with the evidence for that rather than with an assurance.
+
+- **Seed 7 of the membership scenario**, which
+  `the_membership_scenario_has_byte_identical_traces_for_one_seed` pins: its moirae
+  JSONL is **3 429 033 bytes** and hashes to
+  `24358ff2930cb7fbb9a104c049a1e4f2c6cb1acb049e019813ffa218ce5f427a` on
+  `origin/phase-3-stage-b-sweeps` and on this branch, from a run in a worktree of each.
+  This is the pin this branch could have moved and did not: the node's two extra draws
+  come from the `membership-range` stream, so `Schedule::draw` draws from the same
+  streams in the same order, and `Cluster::OneGroup` spawns the same server with the
+  same configuration.
+- **Seed 42 of the raft sweep**, which D-082 used as its own evidence: **12 898 025
+  bytes**, hashing to
+  `445f970010f9d493d489d7627543b77cccba863cb5675af4602686f5de182217` on both trees —
+  the same hash D-082 recorded against `origin/main`. `sim/raft.rs`'s only change on
+  this branch is two `pub(crate)`s, which cannot move a schedule, and this is what
+  says so rather than an argument that it cannot.
+
+So **no pin moved**, and the twenty-three pins D-082 audited stand exactly as it left
+them; this entry does not restate that table. The two membership tests that fix a seed
+are re-audited under CLAUDE.md:58-67 on this tree:
+
+| Pinned | What it pins | Verdict |
+|---|---|---|
+| membership seed 7, `the_membership_scenario_has_byte_identical_traces_for_one_seed` | determinism: two runs' JSONL byte for byte | **mechanism**, unmoved (hash above) |
+| membership seed 0, `a_refusal_that_is_not_for_lost_state_fails_the_run` | the run passes as it runs, then the clause's two verdicts over one appended record, both ways round | **mechanism**, unmoved |
+
+And the node's own new fixed seeds, written to the same rule:
+
+| Pinned | What it pins | Verdict |
+|---|---|---|
+| node membership seed 7, `a_membership_seed_replays_to_the_same_trace_on_the_node` | determinism of the node's run: which range is asked first and which range's leader the partition cuts are functions of the trace and the seed | **mechanism** |
+| node membership seed 1, `a_node_changes_two_of_its_ranges_at_once` | the node and the two ranges of one overlap, named — issue #46's extension read record by record on one seed | **mechanism** |
+
+Neither is a bare green: each asserts what it is for and fails with the thing it
+asserts in the message.
+
+### Issue #46's extension: what is met, what is owed, and what is not pretended
+
+Issue #46 asks for `sim/membership.rs` past the snapshot threshold, "so learners and
+joining voters are snapshot-fed during 3 → 5 → 3", through two pieces of Phase 2 code
+only unit-tested until then: **the configuration key the install's repair writes**, and
+**the floor a truncation of a configuration entry reverts to**. Stage A met the first
+of those and left the second, and this slice keeps that division exactly:
+
+- **Met, and left where it is met.** The snapshot-fed joiner and the configuration key
+  are asserted on **`Cluster::OneGroup`**, on every seed, by
+  `the_correct_server_passes_the_membership_scenario_on_every_seed` — unchanged, on a
+  byte-identical schedule, and unweakened by this branch.
+- **Owed, and said so per seed rather than passed over.** On the node there is no
+  snapshot path at all: `ananke_shard::snapshot` (D-075) is not wired to
+  `ananke_shard::server::ServerHost`, so no leader takes a snapshot, streams one or
+  installs one. The node's `snapshot_threshold` is therefore
+  `raft::NODE_SNAPSHOT_THRESHOLD`, far above what a run writes, and `Report::check`
+  fails any seed on the node that (a) traces a snapshot action, (b) has a replica at or
+  past that threshold — **the condition behind every action a core can ask for**, which
+  is asserted because a `RaftSnapshot` record is not evidence on its own, the node's
+  `Host::snapshot` bumping a counter and tracing nothing — or (c) counts a snapshot-fed
+  joiner. Each names the slice that owns the wiring. **The day it lands the sweep says
+  so instead of passing over it.**
+- **Still deferred, and not pretended done.** The truncation revert floor and the
+  kept-tail repair are issue #46's remainder and are not touched here, on either
+  cluster.
+
+So the half of #46 four ranges make *possible* — a change of a range while another
+range on the same node is changing — is built and asserted on every seed, and the half
+four ranges cannot *reach* is asserted absent with its reason. Neither is claimed as
+the other.
+
+### What this branch found, and what goes to the owner
+
+- **Issue #81 is reached by this scenario at the thousand-seed tier, on seed 449.**
+  Exactly **one** of a thousand seeds fails, and its verdict is
+  `match starts: leader 3 of term 2 of group 4 traced a second first rise of 4's match
+  under incarnation 1 (at 11)`. The trace is #81's mechanism to the letter: under
+  leader 3 of term 2, group 4's shrink to {1, 2, 3} takes effect at index 11, dropping
+  servers 4 and 5 from the voters, and a retried grow lands at index 12 and re-adds
+  them, so `on_change` rebuilds their `Progress` and the next rise of `matched` is
+  traced as a first rise under incarnation 1 again. **Nothing here is wrong with the
+  server and nothing here is this branch's**: it is a fold bug, `match_starts_are_first_rises`
+  folding under (leader, term, follower, incarnation), and **PR #89 (PROPOSED D-079)
+  fixes it**. What this slice adds is the observation that the node reaches it four
+  times as often as one group does, since four ranges give four chances a seed: #81 was
+  found on membership seed 7205 of a ten-thousand-seed nightly, and here it is seed 449
+  of a thousand. The gate's twenty seeds and CI's hundred are green. **Stage B's first
+  exit criterion — "the correct system passes every seed at every tier" — is therefore
+  met at the gate and CI tiers here and is owed at the thousand and ten-thousand tiers
+  until #89 lands.**
+- **A latent fault in `commit_majority`'s initial configuration, filed rather than
+  fixed.** `Checker::note_group` takes the **first** `RangeCreated` traced of a group
+  as that group's birth configuration, on the reasoning that "every replica of it is
+  created with the same voters". In this scenario that is false: servers 4 and 5 are
+  outside the configuration and their replicas are created with **no voters**, and
+  which node's creation lands first is the scheduler's. Measured over 200 seeds,
+  **328 of 800 range-creations** have an empty first creation. It does not fire today,
+  and the reason it does not is worth stating because it is not a reason to rely on:
+  `restate` traces a `RaftConfig` for every replica at its bootstrap, so
+  `configs[(range, server)]` is populated before any `RaftCommit` and the `born_with`
+  fallback is never consulted. The moment a leader's commit is folded before its own
+  configuration record, `majority_of(&[])` is `0 * 2 > 0` and **every commit of that
+  group is reported short of a majority on correct code**. That is a model error
+  waiting rather than a bound to widen, and the fix is one line of intent — a creation
+  with no voters does not state the group's birth configuration — but it is
+  `ananke-raft` production code and a change of its own, so it is **filed as
+  issue #105** and not made here (one change per pull request).
+- **The membership scenario's per-range liveness and availability bounds are new**, and
+  are the only bounds this branch introduces. Both are measured and both are stated
+  above. Nothing existing was widened.
+
+### What is not built here
+
+- **The node's snapshot wiring** is the branch that follows D-082's, designed in full
+  in D-082 §"The node's snapshot wiring". Until it lands, issue #46's snapshot-fed
+  joiner is asserted only on `Cluster::OneGroup`, and the node's every seed says so.
+- **`sim/quorum.rs` on the node** is this slice's sibling and stacks on the re-seed
+  slice (PR #86), as D-082 recorded.
+- **Follower compaction, the install path's variants and Q15's refusal** are not
+  reachable on this node either, for the reasons D-082 gave, and this scenario asserts
+  the same absences with the same words.
+- **A bound on how long two of a node's ranges are jointly configured together.** M8
+  shows the overlap fold can be widened unnoticed, and the measurement that would catch
+  it — the duration of the overlap, or a ceiling on its count — is not built here,
+  because a ceiling on a count that partitions legitimately raise is a bound the
+  correct system would trip. It is recorded in the table and goes to the owner with it.
+
 ---
 
-_Next entry: D-083. Add one before implementing anything not covered above._
+_Next entry: D-085. Add one before implementing anything not covered above._

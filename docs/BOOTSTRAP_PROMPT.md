@@ -101,6 +101,25 @@ ananke/
 
 _Update this section at the end of every session._
 
+- Branch `phase-3-stage-b-membership` (2026-09-22), stacked on
+  `phase-3-stage-b-sweeps` (PR #101, PROPOSED D-082): **`sim/membership.rs` on the
+  node** (PROPOSED D-084), the second of Stage B's first exit criterion's three
+  scenarios. The scenario is one body of code driven against either of D-082's two
+  clusters: five one-group servers as before, byte for byte — seed 7's JSONL hashes to
+  `24358ff2…` on this branch and on the base — or five nodes of **four ranges each**,
+  3 → 5 → 3 on **every** range. The half of issue #46's extension four ranges make
+  possible is built and asserted on every seed: **a change of a range while another
+  range on the same node is changing**. The half they cannot reach — a joining server
+  fed by a snapshot in its learner phase — stays asserted on the one-group server and
+  is asserted *absent with its reason* on the node, whose `snapshot` task is not wired
+  (that slice follows D-082's). `SingleMajorityInJointConsensus` is re-asserted on the
+  node at 14 of 100 seeds against the one-group server's 19, above D-061's five per
+  cent, so its tier does not move. Liveness and availability became **per range** on
+  measured bounds (a range's gap 1.33 s at 1 000 seeds against 5 s; its first write
+  after a heal 1.81 s against 6 s). Eight mutations were planted one at a time and
+  seven caught, three of them only because floors were added for them. **Finding:** at
+  the thousand-seed tier, seed 449 reaches **issue #81** — a voter removed and re-added
+  inside one leader's term — whose fix is PR #89; the gate and CI tiers are green.
 - Merge update (2026-09-22): branch `phase-3-stage-b-compaction` merged `origin/main`
   to resolve PR conflicts, carrying in PROPOSED D-073 and D-074 from main and keeping
   this branch's PROPOSED D-078.

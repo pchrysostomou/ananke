@@ -352,7 +352,10 @@ impl Cluster {
     }
 
     /// The request a client of this cluster puts on the wire for `range`.
-    fn encode(self, range: u64, request: Request) -> Bytes {
+    ///
+    /// Crate-visible rather than private because `crate::membership` drives its own
+    /// operator sockets against either cluster and encodes on them (PROPOSED D-084).
+    pub(crate) fn encode(self, range: u64, request: Request) -> Bytes {
         match self {
             Self::OneGroup => request.encode(),
             Self::Node => RangedRequest {
@@ -364,7 +367,9 @@ impl Cluster {
     }
 
     /// The answer in a packet a client of this cluster received, if it is one.
-    fn decode(self, bytes: Bytes) -> Option<Response> {
+    ///
+    /// Crate-visible for the same reason as [`Cluster::encode`] (PROPOSED D-084).
+    pub(crate) fn decode(self, bytes: Bytes) -> Option<Response> {
         match self {
             Self::OneGroup => Response::decode(bytes).ok(),
             Self::Node => RangedResponse::decode(bytes).ok().map(|r| r.response),
