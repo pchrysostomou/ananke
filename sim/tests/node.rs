@@ -442,9 +442,15 @@ impl Coverage {
     /// of its observation, which is what keeps a tier of twenty from failing a tree
     /// with nothing wrong while still failing a tree where an arm stopped firing.
     /// They are scaled by the tier, since every one of them is a per-seed rate.
+    ///
+    /// **`per_seed` clamps at one**, so a floor whose hundred-seed observation is in the
+    /// single figures stops being a quarter of anything at the gate's twenty and becomes
+    /// "at least one". The thirteen in the array are all far above that; the install
+    /// arm's floor below is not, and is asserted from a hundred seeds for that reason.
+    // PROPOSED(D-089): the stream arms aim their victim at a range it lags.
     fn assert_complete(&self) {
         let per_seed = |floor: f64| (floor * self.seeds as f64 / 100.0).max(1.0) as usize;
-        let floors: [(&str, usize, usize); 14] = [
+        let floors: [(&str, usize, usize); 13] = [
             ("partitions", self.partitions, per_seed(108.0)),
             ("crashes", self.crashes, per_seed(69.0)),
             ("one-way blocks", self.one_way_blocks, per_seed(12.0)),
@@ -470,28 +476,46 @@ impl Coverage {
                 self.redirected as usize,
                 per_seed(1300.0),
             ),
-            // **The install arm reaching the moment it aims at**, which was not a
-            // floor before PROPOSED D-089 because it was not a number: the arm drew
-            // its victim and its range apart and reached the final chunk of the range
-            // it drew on **0 of 100** seeds. Aimed at a range its victim is behind the
-            // compacted prefix of, the correct node's arm reaches it on **9 of 100**
-            // and 2 of the gate's 20, so the floor is a quarter of the observation
-            // like the twelve above it. An aim that stops working — a scan that reads
-            // the wrong range's prefix, a fallback that swallows every candidate —
-            // shows up here as an arm that stopped firing, which is the one failure a
-            // sweep cannot otherwise report.
-            // PROPOSED(D-089): the stream arms aim their victim at a range it lags.
-            (
-                "install arms that reached their range's final chunk",
-                self.installs_fired,
-                per_seed(2.0),
-            ),
         ];
         for (what, saw, floor) in floors {
             assert!(
                 saw >= floor,
                 "the sweep saw {saw} {what} over {} seeds, under the floor of {floor}: an arm \
                  that stops firing is a sweep that passes because it injected nothing",
+                self.seeds
+            );
+        }
+        // **The install arm reaching the moment it aims at**, which was not a floor
+        // before PROPOSED D-089 because it was not a number: the arm drew its victim and
+        // its range apart and reached the final chunk of the range it drew on **0 of
+        // 100** seeds. Aimed at a range its victim is behind the compacted prefix of,
+        // the correct node's arm reaches it on **9 of 100** and **131 of 1 000**. An aim
+        // that stops working — a scan that reads the wrong range's prefix, a fallback
+        // that swallows every candidate, a range resolved before the lag exists — shows
+        // up here as an arm that stopped firing, which is the one failure a sweep cannot
+        // otherwise report.
+        //
+        // **It is asserted from a hundred seeds and not at the gate's twenty**, which is
+        // where the review of this slice found it. The floor above is a per-seed rate
+        // clamped at one, so at twenty it reads "at least one" against an observation of
+        // two — not the quarter of the observation the twelve above it sit at. Twenty
+        // seeds draw about **8** install arms and each reaches its final chunk about a
+        // **quarter** of the time (131 of 517 at a thousand), so all eight missing is
+        // 0.75^8, about **one run in ten**: a worse bound than the one run in twenty
+        // this file refuses for `aimed_installs > 0`, and a bound the correct tree trips
+        // is one to fix and never one to widen (D-030, D-039). At a hundred seeds the
+        // observation is 9 against a floor of 2 and the same arithmetic gives about one
+        // run in a hundred thousand. The count is printed at every tier, and both
+        // mutations this floor catches fail it at a hundred as well as at twenty.
+        // PROPOSED(D-089): the stream arms aim their victim at a range it lags.
+        if self.seeds >= 100 {
+            let floor = per_seed(2.0);
+            assert!(
+                self.installs_fired >= floor,
+                "the sweep saw {} install arms that reached their range's final chunk over {} \
+                 seeds, under the floor of {floor}: an arm that stops firing is a sweep that \
+                 passes because it injected nothing",
+                self.installs_fired,
                 self.seeds
             );
         }
@@ -1050,6 +1074,16 @@ fn the_nodes_arms_aim_at_every_range_and_not_at_one() {
     // from its own stream. What says the draw is spent is the set of ranges the
     // schedules of a run of seeds aim at — one range would mean three of the four
     // never saw a leader isolation, a leader crash or a Figure 8 burst at all.
+    //
+    // This reads `Schedule::range_of`, which is the range each fault **draws**, and for
+    // every arm but two that is also the range it aims at. `Fault::CrashInstalling` and
+    // `Fault::RetakeUnderStream` resolve theirs against the trace at the arm
+    // (`lagging_range`), preferring this draw where it qualifies; what those two aimed
+    // at is `Report::install_aims` and `Report::stream_aims`, asserted on the correct
+    // node's sweep. So what this measures is the **draw**, which is still what §11 asks
+    // about: a range the draw never reaches is one an arm aims at only by the accident
+    // of no other range qualifying.
+    // PROPOSED(D-089): the stream arms aim their victim at a range it lags.
     let mut aimed: BTreeSet<u64> = BTreeSet::new();
     for seed in 0..64 {
         let schedule = raft::Schedule::draw_on_the_node(seed);
@@ -1770,9 +1804,17 @@ fn seeds_272_and_516_go_past_the_timer_bound_while_a_live_install_completes() {
         // The violation `Report::check` reports is this gap and nothing earlier: every
         // safety fold and the liveness bound run before the timer replay, so a seed
         // that fails here has passed all of them.
-        let violation = report
-            .check()
-            .expect_err("seed {seed} trips the timer bound");
+        // `expect_err` takes a message and not a format string, so the seed has to be
+        // interpolated here: this message is read on exactly the day a pinned seed stops
+        // failing, which is the day it has to say which seed.
+        let Err(violation) = report.check() else {
+            panic!(
+                "seed {seed} no longer goes past the timer bound: either the check has gained \
+                 its fourth arm for the node's live install — in which case this pin has done \
+                 its job and goes — or the schedule moved off the situation and the pin has to \
+                 be re-audited against the entry"
+            );
+        };
         assert_eq!(
             violation,
             format!("seed {seed}: {}", gap.violation()),

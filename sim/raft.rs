@@ -1147,13 +1147,21 @@ impl Schedule {
         self.range_picks.get(i).copied().unwrap_or(0)
     }
 
-    /// The range the `i`th fault aims at, on `cluster`.
+    /// The range the `i`th fault **draws**, on `cluster`.
     ///
-    /// One group has one range and every arm aims at it; the node's arms take
-    /// theirs from [`Schedule::range_picks`]. A pick past the cluster's ranges — a
-    /// schedule built by hand — falls back to the first, so the answer is always a
-    /// range the cluster holds.
+    /// One group has one range and every arm draws it; the node's arms take theirs
+    /// from [`Schedule::range_picks`]. A pick past the cluster's ranges — a schedule
+    /// built by hand — falls back to the first, so the answer is always a range the
+    /// cluster holds.
+    ///
+    /// For most arms the draw is also the aim. **It is not for the two stream arms**:
+    /// [`Fault::CrashInstalling`] and [`Fault::RetakeUnderStream`] resolve theirs
+    /// against the trace at the arm, against the ranges their victim actually lags
+    /// (`lagging_range`, PROPOSED D-089), preferring this draw where it qualifies. What
+    /// those two aimed at is recorded per arm in [`Report::install_aims`] and
+    /// [`Report::stream_aims`], and the schedule alone no longer answers it.
     // PROPOSED(D-082): a leader-relative arm resolves its leader per range.
+    // PROPOSED(D-089): the stream arms aim their victim at a range it lags.
     #[must_use]
     pub fn range_of(&self, cluster: Cluster, i: usize) -> u64 {
         let ranges = cluster.ranges();
@@ -6098,11 +6106,45 @@ fn lagging_range(sim: &Sim, cluster: Cluster, victim: u64, pick: u64, drawn: u64
     // server's compacted prefix the victim has to be behind — not any server's. A
     // follower that compacted further than its leader says nothing about what the
     // leader can serve from its log.
+    let leaders: BTreeMap<u64, u64> = ranges
+        .iter()
+        .map(|range| (*range, leader_of_range(sim, *range)))
+        .collect();
+    aim_among_lagging(&ranges, &leaders, &appended, &compacted, pick, drawn)
+}
+
+/// The aim itself, over what the walk above read: which of `ranges` the victim lags,
+/// and which of those the arm's own draw spends itself on.
+///
+/// Split out of [`lagging_range`] so the rule can be stated on inputs built by hand
+/// (`the_aim_is_that_ranges_leaders_prefix_and_prefers_the_draw`, below) rather than
+/// only on the schedules a sweep happens to draw. The review of PROPOSED D-089 found
+/// that of the three load-bearing properties, **"that range's leader's prefix, not any
+/// server's"** had no mutation behind it: a scan that read the highest prefix *anyone*
+/// compacted of that range passed the gate, the install variant's hundred-seed
+/// assertion and the per-range spread alike, firing 12 of 100 against 14. The sweep
+/// cannot separate it, because a rate of 12 % and a rate of 14 % are not a test;
+/// inputs built by hand can, and do, deterministically and at every tier.
+///
+/// `leaders` maps each range to the server leading it. A range with no leader in the
+/// map does not qualify: the arm is about a stream the leader opens, and a range
+/// nobody leads opens none.
+// PROPOSED(D-089): the stream arms aim their victim at a range it lags.
+fn aim_among_lagging(
+    ranges: &[u64],
+    leaders: &BTreeMap<u64, u64>,
+    appended: &BTreeMap<u64, u64>,
+    compacted: &BTreeMap<(u64, u64), u64>,
+    pick: u64,
+    drawn: u64,
+) -> u64 {
     let lagging: Vec<u64> = ranges
         .iter()
         .copied()
         .filter(|range| {
-            let leader = leader_of_range(sim, *range);
+            let Some(leader) = leaders.get(range).copied() else {
+                return false;
+            };
             let prefix = compacted.get(&(leader, *range)).copied().unwrap_or(0);
             prefix > appended.get(range).copied().unwrap_or(0)
         })
@@ -8999,6 +9041,125 @@ mod tests {
                 "liveness: no client write to k0 completed after the last heal at Instant(0ns)"
                     .to_owned()
             )
+        );
+    }
+
+    /// The two stream arms' aim, on inputs built by hand: which range a victim lags,
+    /// and which of those the arm's own draw spends itself on.
+    ///
+    /// [`lagging_range`] resolves the range against the trace and three properties of
+    /// the rule are load-bearing (PROPOSED D-089). Only the **first** — the compacted
+    /// prefix and not the log — has a mutation behind it in the sweeps: that one, and a
+    /// range-blind scan beside it, each take the install arm's firing to 0 of 100 and
+    /// fail two checks. The other two had none, and the review of this slice showed why
+    /// they can have none. It planted **the highest prefix *any* server compacted of
+    /// that range, in place of that range's leader's**, and the whole tree stayed green
+    /// below the nightly: the arm fired 12 of 100 against 14, the correct node's sweep
+    /// was green at every tier, the aims still spread over all four ranges. A two-point
+    /// difference in a rate is not a test. Dropping the drawn range's preference (the
+    /// entry's N4) hides the same way at 13 of 100, and `>=` for `>` at 15 of 100.
+    ///
+    /// So the rule is stated **here**, where a wrong rule is a different answer and not
+    /// a different rate: deterministic, at every tier, and costing a sweep nothing. Each
+    /// assertion names the wrong rule it rejects. Every one of them is a no-op on one
+    /// group, where the drawn range is the only range and [`lagging_range`]
+    /// short-circuits before this is reached at all.
+    // PROPOSED(D-089): the stream arms aim their victim at a range it lags.
+    #[test]
+    fn the_aim_is_that_ranges_leaders_prefix_and_prefers_the_draw() {
+        let ranges = Cluster::Node.ranges();
+        assert_eq!(
+            ranges,
+            [2, 3, 4, 5],
+            "the node's ranges have moved: re-read this test's fixtures against them"
+        );
+        // Each range led by a different server, and the victim has appended through
+        // index 50 of every one of them.
+        let leaders: BTreeMap<u64, u64> = [(2, 1), (3, 2), (4, 3), (5, 4)].into_iter().collect();
+        let appended: BTreeMap<u64, u64> = ranges.iter().map(|range| (*range, 50)).collect();
+        let aim = |compacted: &BTreeMap<(u64, u64), u64>, pick: u64, drawn: u64| {
+            aim_among_lagging(&ranges, &leaders, &appended, compacted, pick, drawn)
+        };
+
+        // **That range's leader's prefix, and not any server's.** Range 2's leader has
+        // compacted nothing; a follower of range 2 has compacted through 100, well past
+        // the victim's 50. The leader can still serve every entry the victim needs out
+        // of its own log, so it is fed entries and no stream ever opens: the range does
+        // not qualify, and with nothing else qualifying the aim is the drawn range.
+        let a_follower_ran_ahead: BTreeMap<(u64, u64), u64> =
+            [((1, 2), 0), ((5, 2), 100)].into_iter().collect();
+        for pick in 0..4u64 {
+            assert_eq!(
+                aim(&a_follower_ran_ahead, pick, 3),
+                3,
+                "a range whose *follower* compacted past the victim was aimed at: the \
+                 prefix the victim has to be behind is that range's leader's, because the \
+                 leader is who designates and who streams"
+            );
+        }
+
+        // **Strictly behind.** The leader of range 2 has compacted through exactly the
+        // victim's own highest append, so the next entry the victim needs is still in
+        // that leader's log and it is fed rather than streamed.
+        let compacted_to_the_same_index: BTreeMap<(u64, u64), u64> =
+            [((1, 2), 50)].into_iter().collect();
+        assert_eq!(
+            aim(&compacted_to_the_same_index, 0, 3),
+            3,
+            "a range whose leader compacted through the victim's own highest append was \
+             aimed at: the victim has to be behind the prefix, not level with it"
+        );
+
+        // Ranges 2 and 3 both qualify now: each one's leader has compacted past 50.
+        let two_and_three_lag: BTreeMap<(u64, u64), u64> =
+            [((1, 2), 100), ((2, 3), 100)].into_iter().collect();
+        // **The drawn range wins where it qualifies**, whatever the pick — the arm's own
+        // range draw stays spent, `Fault::RetakeUnderStream`'s filling puts and its watch
+        // stay on one range, and a seed already aimed right stays aimed the same way.
+        for pick in 0..4u64 {
+            assert_eq!(
+                aim(&two_and_three_lag, pick, 3),
+                3,
+                "the aim left a drawn range the victim lags: the draw is spent there and \
+                 the arm's fill and watch part from the range it aims at"
+            );
+        }
+        // **Where the drawn range does not qualify, the pick chooses among those that
+        // do** — and it is the pick that chooses. An aim that answered the first
+        // candidate every time would fire as often and leave the node's other ranges'
+        // streams never crashed at and never re-taken under.
+        assert_eq!(
+            [0, 1, 2, 3].map(|pick| aim(&two_and_three_lag, pick, 4)),
+            [2u64, 3, 2, 3],
+            "the aim over a drawn range that does not qualify is not the arm's own draw \
+             spread over the ranges that do"
+        );
+        // **Where no range qualifies the drawn range comes back unchanged**, and the arm
+        // reduces to the isolation it already was: this can make an arm fire where it did
+        // not, never the reverse.
+        assert_eq!(
+            aim(&BTreeMap::new(), 1, 5),
+            5,
+            "an arm whose victim lags no range lost the range it drew: the fallback is \
+             that range, so an aim can only add a firing and never remove one"
+        );
+        // A range nobody leads opens no stream, so it cannot be aimed at however far
+        // behind the victim is. `leaders` is built from the cluster's own ranges, so this
+        // is the branch that keeps a gap in it from inventing a candidate.
+        let led_by_nobody: BTreeMap<u64, u64> = [(2, 1), (3, 2), (4, 3)].into_iter().collect();
+        let range_five_is_far_behind: BTreeMap<(u64, u64), u64> =
+            [((4, 5), 100)].into_iter().collect();
+        assert_eq!(
+            aim_among_lagging(
+                &ranges,
+                &led_by_nobody,
+                &appended,
+                &range_five_is_far_behind,
+                0,
+                3
+            ),
+            3,
+            "a range with no leader was aimed at: there is no stream for the arm to reach"
         );
     }
 }

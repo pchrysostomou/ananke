@@ -13540,6 +13540,27 @@ below makes concrete:
   range is returned unchanged and the arm reduces to an isolation exactly as it does
   today: this can make an arm fire where it did not, never the reverse.
 
+**Two of those three had no mutation behind them, and the review of this slice found that.**
+The first has one — a range-blind scan and "behind the log" each take the arm's firing to
+0 of 100. The second and third do not and **cannot**: the review planted *"the highest
+prefix any server compacted of that range"* in place of *"that range's leader's"* and the
+whole tree stayed green below the nightly, the arm firing 12 of 100 against 14 and the aims
+still spread over all four ranges; the entry's own **N4** — drop the drawn range's
+preference and take the first candidate — was already recorded as **not covered** at 13 of
+100. A two-point difference in a rate is not a test, and no floor over a sweep can be one.
+
+So **the rule is now stated on inputs built by hand** rather than only on the schedules a
+sweep happens to draw. The scan's answer is split out of `lagging_range` into
+`aim_among_lagging` (sim/raft.rs), which takes the ranges, each range's leader, the
+victim's appends and everyone's compacted prefixes as maps, and
+`the_aim_is_that_ranges_leaders_prefix_and_prefers_the_draw` (sim/raft.rs, `mod tests`)
+asserts all three properties on inputs written out by hand, where a wrong rule is a
+different **answer** and not a different rate. It is deterministic, runs at every tier
+including the gate's, costs a sweep nothing, and **catches all five rule mutations** —
+including the two the sweeps cannot see. The split is behaviour-neutral and measured so
+below: every figure in the table is unchanged to the digit, and one group is still byte
+for byte the run it was.
+
 **One group short-circuits before the scan** — with one range the answer is that range
 whatever the trace says — so `Cluster::OneGroup`'s runs are the runs they were, byte for
 byte, and no Phase 2 figure moves with this. That is measured below, not asserted.
@@ -13567,13 +13588,18 @@ rows are over `high_rate_share()`, a tenth of the tier, and say so.
 | its catch, all by the liveness check | share of 100 at tier 1 000 | 26 / 100 | **26 / 100** |
 | the correct node's install arm reached its range's final chunk | 20 | — | **2 / 20** |
 | the same | 100 | — | **9 / 100** |
+| the same | 1 000 | — | **131 / 1 000** (of 517 install arms drawn: a **quarter**) |
 | the correct node's install-arm aims, by range | 20 | — | **{2: 3, 3: 2, 4: 1, 5: 2}** |
 | the same | 100 | — | **{2: 11, 3: 15, 4: 11, 5: 12}** |
+| the same | 1 000 | — | **{2: 123, 3: 128, 4: 137, 5: 129}** |
 | the correct node's re-take-arm aims, by range | 20 | — | **{2: 3, 3: 1, 5: 2}** |
 | the same | 100 | — | **{2: 7, 3: 4, 4: 5, 5: 9}** |
-| aims that kept the range the schedule drew | 20 | — | **11 of 14** |
-| the same | 100 | — | **63 of 74** |
+| the same | 1 000 | — | **{2: 64, 3: 57, 4: 69, 5: 56}** |
+| aims that kept the range the schedule drew | 20 | — | **11 of 14** (78.6 %) |
+| the same | 100 | — | **63 of 74** (85.1 %) |
+| the same | 1 000 | — | **616 of 763** (80.7 %) |
 | the correct node's snapshot actions | 100 | 5 873 | **5 812** (58.1 a seed, fewest 27) |
+| the same | 1 000 | — | **58 869** (58.9 a seed, fewest 21) |
 
 **The one assertion this buys, and where it sits.** `aimed_installs > 0` moves from the
 nightly's ten thousand to the **hundred-seed tier**. At 14 % a sample of a hundred sees
@@ -13601,33 +13627,74 @@ is a decision, not a side effect of aiming an arm.
 
 ### What the correct node now asserts, and why it is in the sweep rather than in a test of its own
 
+What can only be seen over a run of seeds — that the arm reaches its moment at all, and
+that its aims spread — is asserted in the sweep. What is a property of the rule and not of
+a schedule is asserted on hand-built inputs instead, in `sim/raft.rs`'s unit tests: it is
+exact there and statistical here, and the sweeps measurably cannot see two of the three
+properties at all (the mutation table below).
+
 Two checks are added to `every_seed_passes_on_the_correct_node_under_the_raft_sweeps_arms`,
 where the correct node already runs, so the tier's cost does not move and
-`scripts/nightly-shards.txt` gains no row:
+`scripts/nightly-shards.txt` gains no row. The oracle is a unit test of the `ananke-sim`
+library and not of `sim/tests/*.rs`, which is what the shard table covers, so it adds no
+row either and runs in microseconds:
 
 - **a floor on the install arm reaching its range's final chunk** — 9 of 100 on the
-  correct node, floored at a quarter of that like the twelve floors beside it. An aim
-  that stops working shows up here as an arm that stopped firing;
+  correct node, floored at a quarter of that, **and asserted from a hundred seeds rather
+  than at the gate's twenty**. An aim that stops working shows up here as an arm that
+  stopped firing;
 - **the aims cover more than one range**, for each of the two arms. Measured at the gate's
   twenty and at a hundred, and asserted at two rather than four because the sweep runs
   seeds `0..tier` and a larger tier only adds.
 
-`aims_kept_the_draw` is **printed and not asserted**, and the mutation table says why: the
-mutant it would catch is separated from the correct aim by 59 against 63 of 74, which no
-floor can tell apart.
+**Why the floor is not at the gate**, which is the review of this slice's finding and is
+the same arithmetic this entry does two paragraphs above for `aimed_installs > 0`. The
+floors beside it scale as a per-seed rate and clamp at one, so at twenty seeds this one
+read *"at least one"* against an observation of **two** — not the quarter of the
+observation the twelve others sit at, and not what the comment beside it claimed. Twenty
+seeds draw about **8** install arms and each reaches its range's final chunk about a
+**quarter** of the time (131 of 517 at a thousand), so all eight missing is 0.75^8, about
+**one run in ten**. That is a worse bound than the one run in twenty this entry refuses for
+`aimed_installs > 0` eleven lines earlier, and a bound the correct tree trips is one to fix
+and never one to widen (D-030, D-039). At a hundred seeds the observation is 9 against a
+floor of 2, about one run in a hundred thousand.
+
+**It costs no coverage, measured and not assumed.** Both mutations this floor is the only
+check for fail it at a hundred as well as at twenty: **N3** goes `installs_fired: 0` and
+fails with *"the sweep saw 0 install arms that reached their range's final chunk over 100
+seeds, under the floor of 2"*, and so does **MR2**. What the move gives up is stated
+plainly: under N3 and under MR2 the correct node's sweep now **passes at the gate's
+twenty** and reports at a hundred. N3 is still caught twice there — this floor and the
+install variant's own assertion — and three times counting the hand-built oracle, which
+catches it at the gate.
+
+`aims_kept_the_draw` is **printed and not asserted**. The earlier reason was that the
+mutant a floor there would catch is separated from the correct aim by 59 against 63 of 74,
+which no floor can tell apart; that is still true, and the review's proposal of a 70 %
+floor from a hundred seeds is declined for the same reason it declines the gate floor
+above — the correct tree reads 85 % at a hundred, 80.7 % at a thousand and 78.6 % at
+twenty, so a 70 % floor sits about two standard deviations off an observation that moves
+with every re-seed. **The property that floor would have been a proxy for is asserted
+exactly instead**, by `the_aim_is_that_ranges_leaders_prefix_and_prefers_the_draw`, which
+separates the same mutant in one comparison and cannot drift.
 
 ### What it costs, which is reported and not claimed
 
 The aim is one forward walk of the trace per arm — at most twice in a schedule, since a
 schedule draws at most one of each — against a run of about 124 000 records a seed on the
-node. It allocates two maps of a few entries and calls `leader_of_range` once per range.
+node. It allocates three maps of a few entries — the victim's appends per range, everyone's
+compacted prefixes, and each range's leader — and calls `leader_of_range` once per range,
+which it did before the rule was split out of the walk.
 
 The correct node's thousand-seed sweep ran **102.7 s** against the base's **96.1 s**, and
 **that pair is not a measurement**: the machine's load average moved from about 55 to
 about 105 between the two runs, which is the incomparable kind D-070 exists to stop, and
-the later run also failed two seeds and so did different work. The figure is here because
-leaving it out would be worse; a cost this slice can be held to is a job for a quiet
-machine, with `scripts/premerge.sh`, and it is the owner's to schedule. No row of
+the later run also failed two seeds and so did different work. The same sweep after the
+review's changes ran **105.0 s** at a load average of about 111, and the review's own pair
+was 93.2 s against the base's 127.4 s under loads moving between 55 and 105 — three pairs
+that between them show no blow-up and **none of which is a measurement**. The figures are
+here because leaving them out would be worse; a cost this slice can be held to is a job for
+a quiet machine, with `scripts/premerge.sh`, and it is the owner's to schedule. No row of
 `scripts/nightly-shards.txt` is re-weighed on it, and the one row this slice adds — the
 two pinned seeds, 0.7 cpu s — is weighed on its own and takes shard 4, the lightest.
 
@@ -13686,25 +13753,46 @@ for, or to exclude two seeds from a sweep, and all three are worse than saying s
 
 ### The mutation table: what a single-range world could not catch
 
-Five mutations, **planted one at a time**, each reverted before the next from a pristine
+Eight mutations, **planted one at a time**, each reverted before the next from a pristine
 copy, and each restore followed by a build asserted to have recompiled the unit (issue
 #102: a file restored by copy carries an mtime older than the build that compiled the
-mutant, and cargo then calls the unit fresh). Every one of the five is a **no-op on one
+mutant, and cargo then calls the unit fresh). Every one of the eight is a **no-op on one
 group**: with a single range the drawn range, the aimed range and the only range are one,
 and the compacted prefix the victim is behind is that range's whichever way it is read.
 
-| | Mutation | Caught by |
-|---|---|---|
-| **N1** | the scan drops the range from both sides: the victim's highest append *anywhere* against the highest prefix *anyone* compacted anywhere | **caught twice.** The arm's firing falls to **0 of 100** and the install variant's hundred-seed assertion fails; the correct node's floor fails at the **gate's twenty** with `installs_fired: 0`. A range-blind scan answers "behind" for ranges it is not behind, so the aim lands where no stream will open |
-| **N2** | a range qualifies where the victim is behind the leader's **log**, not behind what the leader has **compacted** | **caught the same two ways**, firing **0 of 100**. This is the row that says the compacted prefix is the property: a victim behind the log is fed entries, and the arm waits out `INSTALL_WAIT_BUDGET` for a stream that never opens. On one group an isolated victim is behind both, so this mutation is invisible there |
-| **N3** | the aim answers the range the schedule drew, whatever the victim lags — **which is the base branch** | **caught the same two ways**, firing **0 of 100**. It is the strongest row and it is not a plant so much as a measurement of what this slice fixes: the state D-086 shipped, failing the assertion D-089 writes. On one group it is not a mutation at all, because the drawn range is the only range |
-| **N4** | the candidates are found and the aim takes the **first** of them, dropping both the drawn range's preference and the arm's own draw | **not caught**, and recorded with its numbers. The arm still fires (**13 of 100** against 14), the aims still spread over all four ranges, and `aims_kept_the_draw` reads **10 of 14** against 11 at the gate and **59 of 74** against 63 at a hundred — too close for a floor. What it costs is real and small: the aim stops being a function of the seed's own draw, and `RetakeUnderStream`'s fill and watch can part where the drawn range would have qualified. Catching it would mean a check that restates the lookup, which is a tautology and not a test. It is recorded as **not covered** |
-| **N5** | the candidates are found and the aim answers the **cluster's first range** whenever any of them lags: a constant aim | **caught by the per-range spread**, on the re-take arm, at the gate's twenty: *"the re-take arm aimed at 1 range(s)"*. The firing assertion does **not** catch it — the arm still fires on **5 of 100** — which is the row's point: a constant aim keeps three of the node's four ranges' installs never crashed at and never re-taken under, a fault model narrower than it reads, and only a check that can count ranges reports it. On one group the first range is the only range |
+Five of them mutate the **rule** — what `aim_among_lagging` answers for given maps — and
+three mutate what the rule is asked **about**: which trace events the walk reads (N1, N2)
+and when the arm reads them (MR2). The first five are caught by the hand-built oracle at
+every tier, the last three only by the sweeps.
 
-**Three of five are caught, one is the bug this slice fixes, and one is recorded and not
-covered.** The two checks that catch anything are the two this slice adds, and N5 is the
-reason the per-range spread is asserted at all: nothing else in the tree would have said
-the aim had collapsed.
+**The rule, against `the_aim_is_that_ranges_leaders_prefix_and_prefers_the_draw`.** Each
+row below was planted, built (with `Compiling ananke-sim` seen), run and restored, and each
+restore checked byte-identical by `sha256` to the pristine copy the campaign ran against.
+
+| | Mutation of the rule | What the hand-built test says |
+|---|---|---|
+| **MR1** | the highest prefix **any server** compacted of that range, in place of **that range's leader's** | **caught**: *"a range whose follower compacted past the victim was aimed at"*, `left: 2, right: 3`. **The sweeps catch nothing**: the arm fires **12 of 100** against 14, the correct node is green at 20 (`installs_fired` **1** — on the gate floor this slice originally wrote) and at 100 (**6**, floor 2), and the aims still spread over all four ranges ({2: 7, 3: 13, 4: 20, 5: 9} at a hundred). `aims_kept_the_draw` moves 63 → **46** of 74, which is the widest separation any sweep figure offers and still not one a floor can hold. This row is why the oracle exists |
+| **MR3** | `>=` for `>`: a victim level with the leader's prefix counts as behind it | **caught**: *"the victim has to be behind the prefix, not level with it"*. The sweeps catch nothing — a benign relaxation, firing **15 of 100** against 14 with the correct node green (`installs_fired` 7, `aims_kept_the_draw` 59 of 74), and no rate separates 15 from 14 |
+| **N4** | the candidates are found and the aim takes the **first** of them, dropping the drawn range's preference and the arm's own draw | **caught**: *"the aim left a drawn range the victim lags"*. **This row was recorded as not covered** before the oracle: the arm still fires (13 of 100 against 14), the aims still spread, and `aims_kept_the_draw` reads 59 of 74 against 63 — too close for any floor. A hand-built input separates it in one comparison |
+| **N5** | a constant aim: the cluster's first range whenever any of them lags | **caught** by the oracle, and independently by the per-range spread on the re-take arm at the gate's twenty: *"the re-take arm aimed at 1 range(s) over 20 seeds ({2: 6})"*. The firing assertion does **not** catch it — the arm still fires on 5 of 100 — which is why the spread is asserted at all |
+| **N3** | the aim answers the range the schedule drew, whatever the victim lags — **which is the base branch** | **caught** by the oracle (`left: [4, 4, 4, 4], right: [2, 3, 2, 3]`), and by the sweeps: firing **0 of 100** fails the install variant's hundred-seed assertion, and the correct node's floor fails at a hundred with `installs_fired: 0`. Not a plant so much as a measurement of what this slice fixes. On one group it is not a mutation at all |
+
+**All five are caught, and two of the five are caught by nothing else.** The oracle costs a
+sweep nothing and runs at the gate.
+
+**What the rule is asked about, against the sweeps.** These three cannot be reached from
+hand-built maps — they change which records the walk reads, or when — and the oracle passes
+under all three, correctly.
+
+| | Mutation of the walk | Caught by |
+|---|---|---|
+| **N1** | the scan drops the range from both sides: the victim's highest append *anywhere* against the highest prefix *anyone* compacted anywhere | **caught twice.** The arm's firing falls to **0 of 100** and the install variant's hundred-seed assertion fails; the correct node's floor fails at a hundred with `installs_fired: 0`. A range-blind scan answers "behind" for ranges it is not behind, so the aim lands where no stream will open |
+| **N2** | a range qualifies where the victim is behind the leader's **log**, not behind what the leader has **compacted** | **caught the same two ways**, firing **0 of 100**. This is the row that says the compacted prefix is the property: a victim behind the log is fed entries, and the arm waits out `INSTALL_WAIT_BUDGET` for a stream that never opens. On one group an isolated victim is behind both, so this mutation is invisible there |
+| **MR2** | the aim is resolved **before** the isolation and heal rather than after — the trace read at a moment when the lag this arm is about does not exist yet | **caught by this slice's new floor and by nothing else**: `installs_fired` **0** at 20 and at 100, while the install variant still passes at 1 of 100. The floor is the only check in the tree that reports it, which is the best argument for keeping it |
+
+**Eight planted, eight caught.** The `aims_kept_the_draw` figure is still **printed and not
+asserted**, and the reason is now a better one than "no floor can tell N4 apart": the thing
+a floor there would have been a proxy for is asserted exactly, by the oracle.
 
 ### The pinned seeds, re-audited
 
@@ -13736,6 +13824,50 @@ re-run and read.
   set's *emptiness*, not a literal set, so nothing failed; the prose is corrected above;
 - **no pin asserts a bare green as a result of this slice**, and no pin was retired.
 
+### What the adversarial review moved, and what it did not
+
+The review reproduced every load-bearing figure in this entry to the digit on its own
+build — the 14 of 100 and 122 of 1 000 firing, the per-range aim spreads at all three
+tiers, the base's 0 of 100 and its green thousand, both D-086 corrections and the
+byte-identical one-group trace — re-planted N3 and N5 and got the recorded messages
+verbatim, and raised two things beyond the timer bound. Both are taken.
+
+- **The floor on the install arm's firing was written into the gate**, where the correct
+  tree scored 2 against a floor of 1 on an event whose per-arm rate is a quarter. That is
+  about a one-in-ten exposure on the next re-seed — worse than the one in twenty this entry
+  refuses eleven lines earlier — and the comment's *"a quarter of the observation like the
+  twelve above it"* was not what the clamp computed at that tier. **The floor now asserts
+  from a hundred seeds**, and the coverage it would have lost was measured rather than
+  assumed: N3 and MR2, the only two mutations it catches, fail it at a hundred as well;
+- **"that range's leader's prefix, not any server's" had no mutation behind it.** The
+  review's MR1 — read the highest prefix any server compacted of that range — passes the
+  gate, the install variant's hundred-seed assertion and the per-range spread alike, which
+  this entry reproduced (12 of 100 firing, `installs_fired` 1 at 20 and 6 at 100). The
+  review offered either an honest second *not covered* row or a 70 % floor on
+  `aims_kept_the_draw`. **Neither is taken**: a *not covered* row leaves a property this
+  entry calls load-bearing untested, and the floor is the same model error as the one being
+  fixed a paragraph above — 85 % at a hundred seeds, 80.7 % at a thousand, 78.6 % at
+  twenty, against a 70 % bound. Instead the rule is split out of the walk and **stated on
+  hand-built inputs**, which separates MR1 in one comparison, cannot drift with a re-seed,
+  and also closes **N4**, the row this entry had recorded as *not covered*, and **MR3**.
+  Five rule mutations, five caught, at every tier including the gate's.
+
+The three smaller findings are taken as written: `expect_err`'s message was a literal
+string containing `{seed}` and is now a `let ... else` that formats; `Schedule::range_of`'s
+doc claimed to be what the `i`th fault *aims* at, which is no longer true of the two stream
+arms, and now says it is the **draw** and names where the aim is recorded (the same
+sentence is on `the_nodes_arms_aim_at_every_range_and_not_at_one`, which reads it); and the
+thousand-seed rows this entry reported to the owner but left out of its own table are in
+the table above.
+
+**The split is behaviour-neutral, and that is measured, not argued.** Every figure in the
+rates table reproduces to the digit after it — `installs_fired` 2 / 9 / 131 at 20 / 100 /
+1 000, the four aim maps, 63 of 74 and 616 of 763 kept, 5 812 and 58 869 snapshot actions —
+seeds 272 and 516 still go red at the thousand with the same violation string and nothing
+earlier, and `Cluster::OneGroup` is still byte for byte the run it was: seed 42's moirae
+JSONL is 12 898 170 bytes hashing to `05a18a8e…` after the split, with all 47 one-group
+tests passing.
+
 ### Consequences
 
 `Fault::CrashInstalling` and `Fault::RetakeUnderStream` aim at a range their victim lags,
@@ -13744,9 +13876,10 @@ qualify. **The correct node trips the timer bound on seeds 272 and 516 of the fi
 thousand as a result**, on a situation the base branch never reached; both are pinned with
 their mechanism, neither is widened, and the branch is green at the gate and red at the
 thousand until the owner rules (above). `Report` carries each arm as **(the range drawn, the range aimed at)**, the
-correct node's sweep floors the install arm's firing and asserts each arm's aims cover
-more than one range, and `SnapshotWithoutCurrentLast`'s injection is asserted from a
-hundred seeds instead of ten thousand. Its catch on the node is still 0 of 1 000 and still
+correct node's sweep floors the install arm's firing **from a hundred seeds** and asserts
+each arm's aims cover more than one range at every tier, the aim's rule is stated on
+hand-built inputs in `sim/raft.rs`'s unit tests, and `SnapshotWithoutCurrentLast`'s
+injection is asserted from a hundred seeds instead of ten thousand. Its catch on the node is still 0 of 1 000 and still
 asserted nowhere; the arm is no longer the reason, and that is the state this entry takes
 to the owner.
 
