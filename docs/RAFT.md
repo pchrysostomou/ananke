@@ -184,7 +184,7 @@ take rewrites a directory a stream is reading (D-043). On the node that name gai
 range, `snap-r<range>-<index>-<take>`, and the staging directory gains the range and the
 sender, `staging-r<range>-s<sender>`, because a node's ranges apply streams of commands
 of their own and two of them taking at one index is ordinary; a range's sweep then
-proposes only its own versions for deletion (SHARD.md §11 raft 14; D-076, proposed).
+proposes only its own versions for deletion (SHARD.md §11 raft 14; D-075, proposed).
 On the node the take is still the `apply` task's, and it checkpoints the range's own
 key intervals rather than the engine directory (`Engine::checkpoint_spans`): one engine
 holds every range on the node, and a take that copied all of it would stream three other
@@ -219,12 +219,23 @@ cap wait rather than restarting one another. A slot the cap frees is granted to 
 that is asking for it, never reserved for one that asked earlier and may since have been
 replaced as leader; and a chunk that starts an assembly over is answered with that
 restart even when it is its stream's last, since the directory it would be installed from
-has just been started over (Q14; D-076, proposed). On the node a chunk and its
-response are taken off the wire by the `net` task and handed to the `snapshot` task
-before the node's inbox sees them, so they are charged to that task's receive cap and
-not to the inbox's byte bound, and so they arrive at all: the core's arm for them is
-empty because the server is expected to route them away first, which the one-group
-server does and the node did not until D-083 (issue #96, proposed). An
+has just been started over (Q14; D-075, proposed). A chunk naming a range the node
+does not host is refused before it is admitted, so a leader that has not learned the
+range moved and a garbled range id each cost one answer and no slot, while the node's
+own send half fails instead, where the range streamed is the node's claim and not a
+peer's. A last chunk resent because its answer was lost is answered installed and
+installs once: the receiver remembers the identity each assembly completed until the
+node ends that assembly, which it does only once it has answered the sender. The slot
+an admitted assembly holds is given up when that range's own Raft supersedes its
+sender — a chunk of that range from a leader at a higher term takes it — and on a
+leader change the node observes for a range, the node ends the assembly the old leader
+held, since a chunk of one range is no evidence about who leads another (Q14; D-075,
+proposed). On the node a chunk and its response are taken off the wire by the `net`
+task and handed to the `snapshot` task before the node's inbox sees them, so they are
+charged to that task's receive cap and not to the inbox's byte bound, and so they
+arrive at all: the core's arm for them is empty because the server is expected to route
+them away first, which the one-group server does and the node did not until D-083
+(issue #96, proposed). An
 acknowledgement that takes a stream past the furthest point any acknowledgement had
 taken it is that stream's progress, and the task marks the follower for the core, which
 reads the marks before each tick; a duplicate, the answer a resend gets and ground a
@@ -813,7 +824,7 @@ waits in the inbox for the next:
   the running engine, with the range's repair carried in the same manifest switch, and
   no incarnation ends and no engine reopens. `RaftAdopted` on the node records only a
   node taking a fresh directory as its store after a whole-node refusal, and never a
-  replica's install (D-066; D-076, proposed).
+  replica's install (D-066; D-075, proposed).
 
 The `net` and `raft` tasks are separate so that a message arriving while the core is
 awaiting a persist is a queued message, not a lost one, and so that the interleaving
