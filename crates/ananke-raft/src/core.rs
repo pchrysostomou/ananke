@@ -154,7 +154,7 @@ pub enum Variant {
     /// or it took itself, so a replica that trails and is never streamed to grows
     /// its in-memory log with the run. This is the variant
     /// [`crate::core`]'s follower trigger is paired with: the bound Stage B's exit
-    /// asks for (`sim::raft::FOLLOWER_LOG_MULTIPLE`) is a statement about the
+    /// asks for (`sim::raft::FOLLOWER_LOG_BOUND`) is a statement about the
     /// correct server that must be false of a server without the trigger, and
     /// without this variant nothing in the tree could make the assertion fire.
     // PROPOSED(D-078): a follower compacts its log to its own applied index.
