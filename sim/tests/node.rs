@@ -877,6 +877,243 @@ fn a_seed_replays_to_the_same_trace_on_the_node() {
     }
 }
 
+// --- The sharded check-quorum scenario (PROPOSED D-085, D-049, D-077) ---
+
+use ananke_shard::variant::NodeVariant;
+use ananke_sim::quorum::{self, NodeReport};
+
+/// What a sweep of the sharded scenario saw, printed at every tier.
+#[derive(Debug, Default)]
+struct QuorumNodeFigures {
+    seeds: u64,
+    ranges_refused: usize,
+    ranges_reseeded: usize,
+    ranges_on_the_keepers_majority: usize,
+    ranges_on_the_cut_off_leader: usize,
+    commits_through_a_reseeded_replica: usize,
+    step_downs: usize,
+    /// The whole of D-049's rule on the node: rejections stamped incarnation 0.
+    refused_rejections: usize,
+    /// What the node answers instead: rejections carrying the re-seeded store's own
+    /// incarnation, and answers that fitted.
+    store_rejections: usize,
+    fitted: usize,
+    step_downs_naming_anyone_uncounted: usize,
+    streams: usize,
+    seeds_carrying_both_outcomes: u64,
+}
+
+impl QuorumNodeFigures {
+    fn add(&mut self, report: &NodeReport) {
+        self.seeds += 1;
+        self.seeds_carrying_both_outcomes += u64::from(report.both_outcomes);
+        let (Some(cast), Some(holds)) = (report.cast.as_ref(), report.holds()) else {
+            return;
+        };
+        for hold in holds.values() {
+            self.ranges_refused += usize::from(hold.replica_refused);
+            self.ranges_reseeded += usize::from(hold.reseeded);
+            self.refused_rejections += hold.refused_rejections;
+            self.store_rejections += hold.store_rejections;
+            self.fitted += hold.fitted;
+            self.streams += hold.streams;
+            if hold.leader == cast.keeper {
+                self.ranges_on_the_keepers_majority += 1;
+                self.commits_through_a_reseeded_replica +=
+                    usize::from(hold.commit_after_cut.is_some());
+            } else if hold.leader == cast.other {
+                self.ranges_on_the_cut_off_leader += 1;
+            }
+            if let Some((_, uncounted)) = &hold.quorum_lost {
+                self.step_downs += 1;
+                self.step_downs_naming_anyone_uncounted += usize::from(!uncounted.is_empty());
+            }
+        }
+    }
+}
+
+/// The sharded scenario over the tier's seeds under `variants` and `node`: every
+/// seed's violation, if it has one, and the figures.
+fn quorum_node_sweep(
+    variants: impl Into<Variants> + Copy + Send + Sync,
+    node: NodeVariants,
+) -> (Vec<String>, QuorumNodeFigures) {
+    let figures = std::sync::Mutex::new(QuorumNodeFigures::default());
+    let violations: Vec<String> = sweep(seeds(), |seed| {
+        let report = quorum::node_run(seed, variants, node);
+        figures.lock().unwrap().add(&report);
+        report.check().err()
+    })
+    .into_iter()
+    .flatten()
+    .collect();
+    (violations, figures.into_inner().unwrap())
+}
+
+/// The sharded check-quorum scenario's positive control (PROPOSED D-085): **one
+/// fault, four answers**.
+///
+/// One `mark_store_lost` at the victim's restart refuses the node and every replica
+/// it holds (D-077), each re-seeded with a store incarnation of its own; the third
+/// node is then cut off, and check quorum is asked separately of each of the four
+/// ranges' leaders about that one refused node. On every seed the run carries **both**
+/// outcomes at once, which no single-range scenario can: the ranges the keeper leads
+/// keep their leader through the hold and commit past their commit index at the cut,
+/// on a majority of the keeper and the node the refusal re-seeded; the ranges the
+/// cut-off node leads lose theirs within two windows and three ticks and stay
+/// leaderless, because a re-seeded replica neither votes nor campaigns (D-035) and the
+/// keeper alone is no majority.
+///
+/// The figures print the two absences D-049's own halves need and the node does not
+/// have; `d_049s_pair_has_no_site_on_the_node_and_this_says_the_day_it_does` is where
+/// they are asserted.
+// PROPOSED(D-085): sharded is one fault and four answers, not the scenario four times.
+#[test]
+fn the_sharded_quorum_scenario_asks_four_leaders_about_one_refused_node() {
+    let (violations, figures) = quorum_node_sweep(Variants::default(), NodeVariants::correct());
+    eprintln!(
+        "sharded quorum, correct: {} of {} seeds failed, {figures:?}, first: {}",
+        violations.len(),
+        seeds(),
+        violations.first().map_or("", String::as_str)
+    );
+    assert!(violations.is_empty(), "{}", violations[0]);
+    // The shape the checks need, asserted rather than assumed: four replicas refused
+    // and re-seeded a seed, both outcomes reached on every seed, and the answers that
+    // carried the keeper's office actually delivered.
+    let ranges = u64::try_from(ranges().len()).expect("small");
+    assert_eq!(
+        figures.ranges_refused as u64,
+        figures.seeds * ranges,
+        "the one refusal did not fan out to every range on every seed"
+    );
+    assert_eq!(figures.ranges_reseeded as u64, figures.seeds * ranges);
+    assert!(
+        figures.ranges_on_the_keepers_majority > 0 && figures.ranges_on_the_cut_off_leader > 0,
+        "the sweep reached only one of the scenario's two outcomes"
+    );
+    assert!(
+        figures.seeds_carrying_both_outcomes > 0,
+        "no seed carried both outcomes at once, which is the whole of what a sharded \
+         scenario says over a single-range one"
+    );
+    assert!(
+        figures.fitted > 0,
+        "no answer of a re-seeded replica fitted, so no keeper's office was kept on one"
+    );
+}
+
+/// The node's own variant beside the correct node (the pair rule, CLAUDE.md):
+/// `RefuseOneRangeOnly` (D-077) marks down only the range whose store open failed,
+/// where a loss in the shared engine is every replica's.
+///
+/// **This is the catch a single-range world cannot make.** On one group, refusing the
+/// one range *is* refusing the node, so the variant does nothing there and D-077
+/// catches it on its own scenario's shape. Here it is caught from this scenario's
+/// side, by the clause that asks the fan-out per range: three of the four replicas
+/// were never refused, so they were never re-seeded either.
+///
+/// Measured before it was asserted (Q39, D-061): caught on every seed of the gate's
+/// twenty, and the rate is printed at every tier.
+// PROPOSED(D-085): sharded is one fault and four answers, not the scenario four times.
+#[test]
+fn a_node_that_refuses_only_one_range_is_caught_on_the_sharded_quorum_scenario() {
+    let (caught, figures) = quorum_node_sweep(
+        Variants::default(),
+        NodeVariants::of(&[NodeVariant::RefuseOneRangeOnly]),
+    );
+    eprintln!(
+        "sharded quorum, RefuseOneRangeOnly: caught on {} of {} seeds, {figures:?}, first: {}",
+        caught.len(),
+        seeds(),
+        caught.first().map_or("", String::as_str)
+    );
+    assert_eq!(
+        caught.len() as u64,
+        seeds(),
+        "RefuseOneRangeOnly was not caught on every seed: {caught:?}"
+    );
+    assert!(
+        caught
+            .iter()
+            .all(|v| v.contains("but not this range's replica")),
+        "caught by something other than the fan-out: {caught:?}"
+    );
+}
+
+/// D-049's pair, `RefusedCountsForQuorum` and `RefusedNeverCounts`, **has no site on
+/// the node**, asserted per seed with the reason and with what would upgrade it.
+///
+/// This is what replaces D-085's tripwire, and it is narrower and sharper than the
+/// tripwire was. D-085 read the scenario as blocked behind two paths and predicted
+/// that PR #86's whole-node refusal would unblock the first half. **It did not**, and
+/// the measurement is the reason: D-049's rule is keyed on *a rejection stamped
+/// incarnation 0*, which is a server that has **no store** (`Progress::refused_answered`,
+/// core.rs:2760; D-042). The one-group server has one: its re-seed loop answers from
+/// no store at all until a leader's stream installs one. D-077's node has none — it
+/// marks the loss, opens a **fresh engine beside the refused one** and creates every
+/// range's store in it with a store incarnation of its own *before any replica
+/// answers*, so every answer the node ever sends carries a store incarnation and
+/// `refused_answered` is never set. Both variants then compute the same thing as the
+/// correct core and change nothing.
+///
+/// So the two variants are run here and asserted **not caught**, per seed, beside the
+/// counts that make that evidence rather than silence: the refusal landed, the node
+/// answered, and not one of those answers was a store-less refused server's. The rate
+/// is 0 of the tier's seeds and is printed at every tier. **Nothing is lowered**: §10's
+/// standard for this pair — caught on every seed at every tier — is asserted where the
+/// pair has a site, which is `sim/tests/raft.rs`'s four D-049 tests on the one-group
+/// server, and this says why it cannot yet be asserted here.
+///
+/// The day it can, this fails. Two things would do it, and the message says which:
+/// a node that answers from no store, and the snapshot wiring (PR #107) that gives
+/// D-049's open half its stream. **The second alone will not be enough** — a leader
+/// that compacts past a re-seeded replica's log will find that replica answering from
+/// its own store, counted as any follower's, which is the hazard D-049 was written
+/// about, reintroduced on the node. That is the finding this test carries to the
+/// owner, and `NodeReport::check`'s install clause is where it comes due.
+// PROPOSED(D-085): D-049's pair has no site on the node; the absence asserted per seed.
+#[test]
+fn d_049s_pair_has_no_site_on_the_node_and_this_says_the_day_it_does() {
+    for variant in [Variant::RefusedCountsForQuorum, Variant::RefusedNeverCounts] {
+        let (caught, figures) = quorum_node_sweep(variant, NodeVariants::correct());
+        eprintln!(
+            "sharded quorum, {:?}: caught on {} of {} seeds, {figures:?}",
+            Variants::from(variant),
+            caught.len(),
+            seeds()
+        );
+        // The counts that make the absence evidence: the node was refused on every
+        // seed and did answer, and D-049's own key never matched.
+        assert_eq!(
+            figures.ranges_reseeded as u64,
+            figures.seeds * u64::try_from(ranges().len()).expect("small"),
+            "the refusal did not land, so this seed's absence says nothing"
+        );
+        assert!(
+            figures.store_rejections + figures.fitted > 0,
+            "the refused node answered nothing at all, so the absence below says nothing"
+        );
+        assert_eq!(
+            figures.refused_rejections, 0,
+            "the node answered a rejection stamped incarnation 0: D-049's rule has a site \
+             here now and its pair must be re-asserted on the node at §10's standard"
+        );
+        assert_eq!(
+            figures.step_downs_naming_anyone_uncounted, 0,
+            "a step-down left a follower uncounted, which only a refused server's answer can \
+             do (core.rs `heard_this_window`): D-049's rule has a site on the node now"
+        );
+        assert_eq!(
+            caught.len(),
+            0,
+            "{:?} is caught on the node: it has a site here now, so assert the catch at \
+             §10's standard instead of this absence: {caught:?}",
+            Variants::from(variant)
+        );
+    }
+}
+
 /// A Phase 2 variant this node has no path for, run on the node anyway.
 ///
 /// m1 of the review of this slice: until now the four blocked variants were named in
