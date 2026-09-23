@@ -12944,4 +12944,270 @@ test it named.
 
 ---
 
-_Next entry: D-086. Add one before implementing anything not covered above._
+## PROPOSED D-088 — `LeaseTrustsTheClock`'s catch on the node moves to the nightly's ten thousand
+
+**The number.** Four branches are open against their own copies of this file, each taking
+the next number it can see: PR #110 writes D-081, PR #107 D-083, PR #106 D-084 and PR #109
+D-086, while the footer on `main` reads D-086. A number taken from the footer here would
+collide with #109. This entry takes **D-088**, past all four, as the owner's ruling of
+2026-09-23 numbers it, and the footer moves to D-089. Its one code site carries
+`// PROPOSED(D-088)`. The integrator may renumber it at the merge; nothing in the tree
+depends on the number beyond that marker, this heading and the footer.
+
+**Context.** D-082 moved `sim/raft.rs`'s arms onto the node and re-asserted Phase 2's
+variants there, each "at the tier its **measured** rate supports and no stronger than its
+Phase 2 test asserts" (§10, §12, D-061). For `LeaseTrustsTheClock` it copied the tier
+across from the one-group test — `seeds() >= 1000` — and then measured what the node does
+at that tier, which nobody had:
+
+> **`LeaseTrustsTheClock`'s tier is a question for the owner, with a number.** … It is
+> **9 of 1 000, 0.9 %**, against one group's 4.0 %. … So the assertion as it stands is
+> roughly a hundred thousand times likelier to fail a tree with nothing wrong than the
+> one-group assertion it was copied from.
+>
+> *The recommendation, not a decision taken here:* move this one assertion to the
+> nightly's ten thousand, as `SharedSnapshotDir`'s liveness catch already is (§10), and
+> keep printing the rate at every tier. The tier is the owner's to set and this slice has
+> not moved it.
+
+**Decision — the owner's of 2026-09-23.** Move it: *"LeaseTrustsTheClock: move the
+assertion to the nightly, per D-061's rule at 0.9%."* This entry is that move and nothing
+else. One line of `sim/tests/node.rs` changes, `if seeds >= 1000` to `if seeds >= 10_000`,
+with the arithmetic in the code beside it. The rate keeps printing at **every** tier, which
+is D-061's other half. The one-group assertion in `sim/tests/raft.rs` is untouched: its rate
+is 4.0 % and the thousand-seed tier is exactly where D-061 puts 4.0 %.
+
+**CLAUDE.md is not edited, because the rule already allows this.** Its working agreement
+reads "a variant caught on under 5 % of seeds asserts its catch at the premerge tier,
+`seeds() >= 1000` … never at the gate's twenty or CI's hundred" — a **floor**, not a
+ceiling, and D-061's own audit already places one catch above it: `SharedSnapshotDir`'s
+liveness catch, 0.02 %, at `seeds() >= 10_000`. A rate of 0.78 % is between the two and this
+entry is the record of where the owner put it.
+
+### The rate, re-measured on the tree that ships
+
+D-082's 0.9 % was measured on D-082's own branch. Since then PR #86's whole-node refusal
+and re-seed (D-077), D-082's own verification pass, PR #101 and PR #104 have landed, and
+all of them are on the node's path — `ananke_shard::server` is the system under test here.
+So the figure was not carried across on trust. It was re-measured on this tree, at both
+tiers, and **it moved**:
+
+| Tier | Seeds | Caught | Rate | First seed | Cost |
+| --- | --- | --- | --- | --- | --- |
+| the premerge's thousand | 1 000 | **6** | **0.60 %** | 186 | 25.32 s real, 163.0 cpu s |
+| the nightly's ten thousand | 10 000 | **78** | **0.78 %** | 186 | 368.25 s real, 1 572.7 cpu s |
+| *D-082's figure, another tree* | 1 000 | 9 | 0.90 % | — | — |
+
+Both catches are the check the variant is about: `linearizability: key "k1": 28 of 72
+operations placed`, a stale read the guardless leader served from a lease its own clock
+had outlived. The first seed is 186 at both tiers, which is what a sweep of the same
+schedules over a longer prefix should give.
+
+**The move from 0.9 % to 0.78 % is a draw, not a regression.** 78 of 10 000 has a 95 %
+interval of **[0.61 %, 0.95 %]**, and 0.9 % sits inside it; 6 of 1 000 has [0.12 %, 1.08 %]
+and contains both. Nothing here says the node caught less than it did, and nothing here
+would have been decided differently at 0.9 %: every tier's arithmetic below is on the same
+side of the line at 0.6 %, 0.78 % and 0.9 % alike. What it does say is that a rate this
+thin is estimated to ±0.17 % even by ten thousand seeds, which is itself a reason the
+assertion belongs at the tier with the most seeds behind it.
+
+### The arithmetic, at both tiers
+
+D-061 reasons with P(none) = (1 − p)^n, p the measured rate and n the seeds the assertion
+sees at the lowest tier it is asserted at. At the node's two measured rates, and at one
+group's for the comparison:
+
+| n | p = 0.78 % (this tree, 10 000 seeds) | p = 0.60 % (this tree, 1 000 seeds) | p = 4.0 % (one group) |
+| --- | --- | --- | --- |
+| 20, the gate | 0.855 | 0.887 | 0.442 |
+| 100, CI | 0.457 | 0.548 | 0.0169 |
+| **1 000, the premerge — the tier it leaves** | **4.0e-4** | **2.4e-3** | 1.9e-18 |
+| **10 000, the nightly — the tier it takes** | **9.8e-35** | 7.3e-27 | 5.2e-178 |
+
+Read the bold row. At the thousand-seed tier this assertion reddens a clean tree about
+**one run in 2 500** at the better-measured rate and **one run in 410** at the thinner one,
+where the one-group assertion whose tier it was copied from stands at one run in 5×10^17.
+At the nightly's ten thousand it is 1e-34, which is the margin the rest of the sweep's
+assertions are written to. The tier moves because the statistics moved, which is the whole
+of D-061's rule, and it lands where `SharedSnapshotDir`'s liveness catch — 0.02 % — already
+sits (D-061's table; `sim/tests/raft.rs`).
+
+**What the gate, CI and the premerge do instead.** Print. The rate line runs at every tier
+and is unchanged, so a run at any tier says what it saw. That is not a formality: at 0.78 %
+the premerge's thousand seeds expect ~8 catches, so a slice that took the catch to zero
+would show in that line at the premerge even though nothing there asserts it.
+
+### Why the tier moved, and three things it is not
+
+**It is not a narrower window.** The obvious reading of 0.78 % against 4.0 % is that the
+node's lease trial builds less of the shape, and that reading is wrong in the direction
+that matters: the node's trial hands over **every** range the node holds, not one
+(D-082), so a node cut off with the reading client holds **four** stale-able leases where
+the one-group server holds one. The window is wider, not narrower, and the mutation below
+measures how much wider — take the trial down to one range and the catch goes to zero.
+
+*Why a wider window gives a thinner rate is not established here, and this entry does not
+invent a mechanism for it.* The candidates are ordinary — the node draws its client keys
+from a larger space, its four cores share one ticker so a trial's timing is noisier, and
+the checker is keyed by range — and telling them apart is a measurement nobody has taken.
+What the number does establish is that one group's rate says nothing about the node's,
+which is exactly why D-061 asks for the rate on the system the assertion runs on.
+
+**It is not a bound the correct system trips** (D-030, D-039). Nothing here is a bound and
+nothing was widened. The correct node's own assertions — some seed exceeds the drift bound,
+the guard revokes — are in the correct node's sweep, at every tier, and this commit does
+not touch them. This is the tier of one *variant's catch*, which is a draw and not a bound;
+D-061 is the entry that says so.
+
+**It is not the one-group assertion, and §12 forbids moving that one.** §12 asks each
+variant re-asserted on the node "to the standard its Phase 2 test asserts and no stronger",
+and D-082 reads that as forbidding *weaker* too. The one-group test keeps `seeds() >= 1000`
+because 4.0 % supports it; the node's moves because 0.78 % does not. Two clusters, one set
+of arms, two rates, two tiers — which is exactly what D-082's shape was for.
+
+SHARD.md §12's plan (docs/SHARD.md:2352) says this variant's stale read is "caught at
+every tier". D-061 already superseded that sentence for the one-group assertion; this entry
+supersedes it for the node's, as the approved plan's text rather than as a change to it.
+
+### The risk here is the opposite of the usual one, so the assertion was proved to fire
+
+A tier that goes up buys margin by asserting less often, and the failure it invites is an
+assertion that can never fire at all. The stream-variants slice shipped exactly that: tier
+gates computed off the **sampled share** rather than the tier, so a "ten thousand seed"
+assertion needed a hundred thousand seeds before it ran. This test does not sample — it
+sweeps `seeds()` itself, and `high_rate_share()` is not in it — but that was checked rather
+than assumed, and then the gate was run:
+
+**M1 — the tier gate, both ways.** The sweep was stubbed to run **no** seeds, so `caught` is
+empty whatever the node does and each run is instant; then the gate was moved and the tier
+was moved, and the three runs were read against each other. All three are logged.
+
+| run | the gate in the tree | `ANANKE_SEEDS` | what happened |
+| --- | --- | --- | --- |
+| A | the shipping `seeds >= 10_000` | 10 000 | **FAILED.** `panicked at sim/tests/node.rs:855: LeaseTrustsTheClock was never caught on the node over 10000 seeds; at the 0.78 % PROPOSED(D-088) measured…` |
+| B | mutated to `seeds >= 100_000` | 10 000 | passed, silently — **the stream-variants bug reproduced on purpose** |
+| C | the shipping `seeds >= 10_000` | 1 000 | passed — the gate is at ten thousand and not below it |
+
+A is the proof asked for: the assertion executes at the tier it now names, and it fails when
+there is nothing to find. B is the same tree with one digit changed and it is green, which
+is what that class of bug looks like from outside — a test that reports a rate and asserts
+nothing, indefinitely. C fixes the gate's lower edge. Run A also confirms the arithmetic in
+the message is the arithmetic in this entry, since the message is read out of the binary
+that ran.
+
+**M2 — the lease trial hands over one range instead of every range the node holds.** This is
+the mutation a single-range world could not be wrong about, and it is D-082's M6, which that
+slice could only measure at a hundred seeds where the variant catches nothing either way.
+In `sim/raft.rs` the trial's `for (j, &range) in ranges.iter().enumerate()` becomes
+`.take(1)`: the slowest clock is handed **one** range and leads the other three not at all.
+
+*It is invisible to one group, by construction.* `Cluster::OneGroup` has one range, so
+`.take(1)` changes nothing there — and that is measured, not argued: the one-group lease
+test's own line is **byte-for-byte identical** on the clean tree and under the mutant, at
+twenty seeds, down to the seed number of the first stale read.
+
+```
+lease safety: drift beyond 1000 ppm on 11 of 20 seeds; of those, the guard revoked on 11,
+a stale read was caught without the guard on 3, neither on 0; the slowest clock led 29 of
+the trials; 2760 lease reads on the seeds within the bound; first stale: seed 7: …
+```
+
+*On the node it takes the rate apart.* Against the shipping tree's 6 of 1 000 and 78 of
+10 000:
+
+| | shipping | one-range mutant |
+| --- | --- | --- |
+| 1 000 seeds | 6 (0.60 %) | **0** |
+| 10 000 seeds | 78 (0.78 %) | **5 (0.05 %)** |
+| the first catch | seed 186, key `k1` | seed 2016, key `k7` |
+
+A fifteen-fold collapse, and far outside any draw: 5 where 78 was expected is a Poisson
+outcome of order 10^-25.
+
+**And here is the finding, which is not the comfortable one.** The assertion this entry
+moves **does not kill M2, and did not reliably kill it before either.** It asserts a bare
+catch — `!caught.is_empty()` — which §12 requires of it, no stronger than its Phase 2 test.
+Against a mutant whose rate is 0.05 %:
+
+- at the **thousand-seed** tier it leaves, the mutant catches nothing on 61 % of runs, so the
+  old assertion killed M2 about three times in five — by luck, not by design. The single
+  run taken here happened to be one of those: 0 of 1 000, which the old assertion would have
+  failed on.
+- at the **nightly's ten thousand** it takes, the mutant catches 5, so the assertion passes.
+  It kills M2 on 0.7 % of runs.
+
+Neither tier is an instrument for this. **The instrument is the printed rate**, and it works
+at both: 0 against 6 at the premerge, 5 against 78 at the nightly, printed by the same line
+at every tier. That is not a rescue written after the fact — it is the second half of
+D-061's rule, "the catch rate is printed at every tier", and it is the half this change was
+required to keep.
+
+So the honest accounting of the move is: the tier buys a factor of about six thousand
+against reddening a clean tree (4.0e-4 to 9.8e-35 as P(none)), and it costs a 61 %-reliable
+accidental kill of a mutation that quarters the scenario. **Whether that trade should be
+closed with an assertion on the rate rather than on the catch is the owner's**, and it is
+not taken here: an assertion that the node's catch stays above a floor would be *stronger*
+than the Phase 2 test this one is held to, which §12 forbids as plainly as it forbids
+weaker. It is recorded so the choice is on the record and not in an agent's head.
+
+### Consequences
+
+- The gate, CI and the premerge no longer assert this catch on the node. They print it, as
+  they did. The nightly asserts it.
+- **No schedule moves and no pinned seed moves.** The change is one comparison and its
+  comments; every seed of every tier runs exactly the run it ran before, on both clusters.
+  Seed 42's one-group trace is untouched, as are the pinned seeds of `sim/tests/raft.rs`.
+- **The nightly shard table's weight for this row does not change.** The test swept
+  `seeds()` before and sweeps `seeds()` now — the tier gate decides whether to assert, not
+  how many seeds to run — so `scripts/nightly-shards.txt`'s 149.49 cpu s at
+  `ANANKE_SEEDS=1000` stands and no row is re-placed. The table's prose beside that row said
+  the row is large because the catch "is asserted from the thousand-seed tier and which
+  therefore runs every seed"; the clause is corrected to name this entry's tier, since this
+  commit is what falsified it. Nothing else in that file is touched.
+- **A rate this thin is worth re-reading at each nightly.** 0.78 % ± 0.17 % is the estimate
+  ten thousand seeds support. If a later slice moves the node's schedules the way D-056's
+  queue moved the raft ones, the figure to re-measure is this one and the tier to re-check
+  is this entry's.
+- **For the owner, from M2: a bare catch is not an instrument for a rate that collapses.**
+  Quartering the lease trial takes the node's rate from 0.78 % to 0.05 % and the assertion
+  passes — at this tier, and 39 % of the time at the tier it left. What sees it is the
+  printed rate, which is why D-061 asks for it at every tier and why this change keeps it.
+  Whether the node's catch should additionally be held to a **floor** rather than to "not
+  empty" is the owner's: it would be *stronger* than the Phase 2 test §12 holds this one to,
+  so it is not taken here.
+- **`docs/RAFT.md` is not edited, and that is not an oversight.** RAFT.md:887 says
+  "`LeaseTrustsTheClock` from the thousand-seed tier, its stale read being caught on about
+  4 % of seeds (D-061)". That sentence is about `sim/raft.rs`'s sweep on the one-group
+  server, which this entry does not touch, and it stays true. The node's sweep is Stage B's
+  and is documented in SHARD.md and here. `docs/SHARD.md:2352` is the one place that reads
+  across both, and it is superseded rather than edited, as D-061 superseded it before — the
+  plan's approved text stands and the entries record where the tree differs from it.
+
+**The machine, and what every figure is a figure of** (D-070). Darwin 25.6.0 arm64, Apple
+M2, 8 cores, on AC power, no thermal warning, with a dozen other agents' slices building on
+it throughout — which is why the costs above are cpu seconds (user + sys) and not wall time.
+The thousand-seed run: load **9.38/8.45/8.62** before, **14.11/9.69/9.07** after. The
+ten-thousand-seed run: **17.82/11.29/9.69** before and **157.62/100.29/51.03** after. Both
+are one test's own run from the built release binary at `ANANKE_SEEDS=1000` and
+`ANANKE_SEEDS=10000`; **`scripts/premerge.sh` has not run** — the coordinator schedules
+those — so no figure here is a premerge's.
+
+**Issue #102's discipline, and the way it bit anyway.** Both campaigns above mutate a file
+in the tree. Each backed its file up **by copy**, restored by copy with a `touch`, and
+checked the restored file's checksum against the backup's; each run is in its own log with
+its own verdict, so no run can be confused with another's build. That is the rule and it
+worked — and it still lost work, in a way worth writing down because the issue's own wording
+does not cover it. The gate proof's backup of `sim/tests/node.rs` was taken **before** the
+ten-thousand-seed measurement came back, so the restore at the end of the campaign quietly
+reverted the two comment edits that put 0.78 % into the file. Nothing was red; the file
+simply went back to an earlier true thing. What caught it was reading the diff of the tree
+before committing rather than trusting the campaign's own "restore: matches the backup"
+line — which was correct, and about the wrong backup. **The rule that follows: a backup is
+stale the moment the file is edited again, so re-take it after every edit, and diff the tree
+against `git` and not against the backup.** The measured figures are unaffected: the run
+that proved the assertion fires compiled the 0.78 % file, and its panic message in the log
+quotes it.
+
+---
+
+_Next entry: D-089. Add one before implementing anything not covered above._

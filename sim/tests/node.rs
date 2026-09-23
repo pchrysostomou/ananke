@@ -812,13 +812,30 @@ fn a_leader_that_trusts_the_clock_is_caught_on_the_node() {
     // are asserted where the correct node is already run, in the sweep above; here
     // the buggy node runs alone, which is what keeps this test to one run a seed.
     //
-    // The catch is a stale read, found by linearizability, and it is asserted from
-    // the thousand-seed tier: exactly where the one-group test asserts it and no
-    // stronger (§10, §12). On one group the stale read is caught on 4.0 % of the
-    // first thousand seeds, and D-061 puts a catch under 5 % at `seeds() >= 1000` —
-    // at 4 % the gate's twenty catch none with probability 0.44 and a hundred with
-    // 0.017, so an assertion there would fail a tree with nothing wrong the day a
-    // change redraws the schedules. The node's own rate is in the entry.
+    // The catch is a stale read, found by linearizability. On the node it is asserted
+    // from the **nightly's ten thousand**, not from the thousand-seed tier the
+    // one-group test asserts it at, and the reason is the node's own rate: the stale
+    // read is caught on **78 of 10 000 seeds, 0.78 %** here, and 6 of the first 1 000,
+    // 0.6 %, against one group's 4.0 % on the same arms.
+    //
+    // D-061 reasons with P(none) = (1 − p)^n, n the seeds the assertion sees at the
+    // lowest tier it is asserted at. At 0.78 % a **thousand** seeds catch none with
+    // probability 0.9922^1000 = 4.0e-4, about one run in 2 500, and at the 0.6 % the
+    // thousand itself measured, 0.994^1000 = 2.4e-3, one run in 410 — either way a
+    // tier that reddens a tree with nothing wrong, against the 0.96^1000 = 1.9e-18 of
+    // the one-group assertion this was copied from. At the **nightly's ten thousand**
+    // the same arithmetic gives 0.9922^10000 = 9.8e-35, and 7.3e-27 at the thinner
+    // rate. So the tier moves to where the statistics are, as `SharedSnapshotDir`'s
+    // liveness catch already is (D-061; `sim/tests/raft.rs`). The owner ruled it on
+    // 2026-09-23; PROPOSED(D-088) has the measurement and its machine.
+    //
+    // It is **not** a narrower window: the node's lease trial hands over *every* range
+    // the node holds, so the window is wider than the one-group trial's, not
+    // narrower. The rate keeps printing at every tier, which is D-061's other half —
+    // a tier that asserts nothing still has to say what it saw, or the day the rate
+    // collapses nobody learns of it until the nightly. The one-group assertion is
+    // untouched at its own tier, where 4.0 % belongs.
+    // PROPOSED(D-088): the node's stale read asserts at the nightly's ten thousand.
     let seeds = seeds();
     let caught: Vec<String> = sweep(seeds, |seed| {
         checked(&buggy(seed, Variant::LeaseTrustsTheClock)).err()
@@ -832,10 +849,15 @@ fn a_leader_that_trusts_the_clock_is_caught_on_the_node() {
         caught.len(),
         caught.first().map_or("", String::as_str)
     );
-    if seeds >= 1000 {
+    // The tier, not a share of it: this test sweeps `seeds()` itself, so the gate is
+    // reached at exactly the seed count the nightly sets and not a tenth of it.
+    if seeds >= 10_000 {
         assert!(
             !caught.is_empty(),
-            "LeaseTrustsTheClock was never caught on the node"
+            "LeaseTrustsTheClock was never caught on the node over {seeds} seeds; at the \
+             0.78 % PROPOSED(D-088) measured over ten thousand, ten thousand seeds catch \
+             none with probability 9.8e-35, so this is the node having changed and not a \
+             draw"
         );
     }
 }
