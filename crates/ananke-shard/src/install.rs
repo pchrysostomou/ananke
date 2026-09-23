@@ -605,6 +605,32 @@ impl<E: Environment> Task<E> {
                 )
                 .await;
             }
+            Landing::NotHosted => {
+                // `range` is a peer's word, not this node's: a leader that has not
+                // learned the range moved (Q33), or a garbled range id, names a range
+                // the task does not host. It is refused before admission, so it takes
+                // no slot under the cap and disturbs no assembly, and it is refused
+                // rather than fatal — failing on it would let any peer abort the node.
+                // The sender starts over and finds the range where it now lives
+                // (D-075). The reason is its own, so a run refusing unhosted ranges
+                // does not read in the trace as one starved of slots.
+                self.start_over(
+                    range,
+                    from,
+                    StartOver::NotHosted,
+                    store.term(),
+                    (last_index, last_term),
+                )
+                .await;
+            }
+            Landing::Installed { .. } => {
+                // This stream's last chunk again, at the identity this assembly has
+                // already completed: its answer was lost, so the node answers the
+                // resend what it answered the first — installed — and installs
+                // nothing a second time (D-075).
+                let answer = snapshot::installed(store.term(), (last_index, last_term));
+                self.answer(range, from, answer, store.incarnation()).await;
+            }
             Landing::Restarted { dir, .. } => {
                 self.clear(&dir).await;
                 self.receiving.insert((range, from), Inbound::default());
