@@ -9261,6 +9261,36 @@ costs **0.7–1.8 % of a tick** at every latency the tree models. It does not br
 tick budget, and nothing goes to the owner on this figure either. (The earlier entry
 quoted 0.77 % to two decimals off one run; the range is what the figure supports.)
 
+**The tick shapes re-measured (second review, finding 3).** The three runs above were
+taken on a harness whose `steady()` set a literal 1 000 000-tick election timeout against
+a measurement of 10 001 000 ticks — the warm-up plus `RUNS` runs of the default 2 000 000
+steps. The timer fired about ten times inside the measurement and runs 2 to 5 were
+entirely past the first firing, so **both tick shapes measured a pre-candidate**, not a
+follower and not a leader. The harness said the opposite in its own words and asserted
+nothing, so the output could not show it. The timeout is now derived from the measurement
+(`ticks_measured`), and `still()` asserts the role after every shape, so the harness stops
+rather than reporting a figure of a shape it did not measure. Re-measured on the fixed
+tree, Apple M2 / 8 cores / AC Power, **load 203.38/216.77/169.79** — several agents
+building in parallel, so every figure over-estimates:
+
+```
+idle tick         28 ns/step (28..78 over 5 runs)     a real Follower
+leader tick      347 ns/step (347..518)               a real Leader
+heartbeat in     101 ns/step (101..258)
+response in      204 ns/step (204..472)
+loaded           388 ns/step (388..435)
+```
+
+The **idle** figure is unmoved — 28 ns as a follower against 29–73 ns recorded as a
+pre-candidate — so the pass bound's verdict does not change: **PASS**, two orders of
+magnitude under, and nothing goes to the owner. The **leader tick** figure does move, and
+by a lot: 347 ns for a core that is still a leader against 27–65 ns recorded for one that
+had stopped being one, about **five times**. That shape is the one "300 of a node's 500
+steps a tick are ticks" leans on, so it is restated here: at 347 ns a leader tick, 300
+leader replicas cost 0.104 ms, **1.0 % of a 10 ms tick**, on a machine at load 203. The
+replay burst is computed from the idle figure, which did not move; at 28 ns it is 0.67 %
+of a tick at the 80 ms sync and first fills a tick at a sync of 11.9 s.
+
 **What it asks of the owner.** One thing, and it is the frames figure, not a bound.
 
 > A round with `p` persisting cores costs up to `1 + p` frames per peer, because §4's
@@ -9297,6 +9327,33 @@ now, with the mutation that proves each fixed. The blocker is its own entry, D-0
 | 14 | this entry said the inbox had twelve tests | it has fourteen |  |
 | 15 | a message for a range the node does not hold was dropped in silence | `Meters::messages_for_ranges_not_held`, with a check | `F15-silent-unrouted` is caught |
 | 16 | `Output::Rejected` and the resolution path's `hold_at` were unasserted | the routing check covers the first, the bound check covers the second | `M18` and `M12` — both survivors before, both caught now |
+
+Row 4 above is corrected by the second review: the fix it describes is in the tree, but
+what proved it was a test of `entries_to_apply`, the helper, and nothing drove `Node::act`
+with an `Err`. See row 5 of the table below.
+
+**What the second adversarial review changed.** Six majors and four minors, every one in
+the tree, with the mutation that proves each fixed. One of them is a decision correction
+and is written up in D-074 rather than here. Nothing was widened, deleted or relaxed to
+make anything pass, and no bound was tripped by correct code.
+
+| # | finding | what changed | proved by |
+|---|---|---|---|
+| 1 | D-074's narrowing gated *both* admission cases on the hold, which re-creates "refused for ever" for a message larger than the whole bound, and the entry's stated cost was false | **D-074 corrected**: the hold gates the ordinary case only; a message no emptying could hold is admitted whatever the node holds | `inbox::a_message_no_emptying_could_hold_is_admitted_whatever_the_node_holds`, which catches the entry as it stood (0 of 1 000 retransmissions admitted) *and* the entry reverted (a message admitted into a full hold) |
+| 2 | the applied stream could leave a resolution out of index order and nothing would notice: no check fed a resolution that carried both a deferred `Apply` and a replayed one | `a_resolution_hands_the_apply_task_its_deferred_job_before_its_replayed_one` — an append of two entries committing the first, then a held commit-advancing heartbeat | mutation `m11` (the deferred acts appended *after* the replay) — a survivor before; now `left: [[2], [1]], right: [[1], [2]]` |
+| 3 | the step-cost tick shapes measured a **pre-candidate**: `steady()`'s literal timeout fired ten times inside a measurement, and the harness asserted nothing | the timeout is derived from the measurement (`ticks_measured`); `still()` asserts the role after every shape; the tick figures re-recorded above | the harness with the old literal now stops: "the idle tick shape measured a PreCandidate, not a Follower" |
+| 4 | the node's whole trace path was unasserted — deleting every `Output::Trace` arm passed all 58 tests | `a_cores_later_outputs_wait_on_its_own_persist_and_on_no_others` now reads the simulation's trace: the persisting core's `RaftAppend` is recorded only after its sync (D-026) and carries the *step's* decision time (D-047), and a `RaftTerm` carries the receipt the node put there (D-050) | mutations `m26` (the node traces nothing), `m3` (`trace_decided(env.decision(), …)`) and `m4` (drop the `RaftTerm` receipt) — all three survivors before, all three caught now |
+| 5 | the node failing on a gap in the applied stream was proved by a test of the helper; nothing drove `Node::act` with an `Err` | `a_gap_in_the_applied_stream_fails_the_node_and_an_empty_job_is_not_a_job` drives `act` with `Some(Err(2))` and asserts it returns an error, tells the host why, and hands the state machine nothing. `Probe::failed` records rather than panics, and `run_with` asserts no run failed, so every other check is as loud as before | mutation `m1` (the gap arm returns `Ok(())` silently) — a survivor before, caught now |
+| 6 | `Host::stamp` was never observed: deleting the call passed all 58 tests | `Probe::stamp` writes a `local` and an `incarnation` no core produces, and the send-order check asserts every append-response *in the shipped frame* carries them | mutation `m2` (delete `host.stamp`) — a survivor before, caught now |
+| 7 | an unreachable counter branch in `Cores::drive` | the dead arm is gone; `drive` takes the slot with an `expect`, since `hold` is `persisting(range)` and that is false for a range with no slot | the branch is no longer there to survive; `a_message_for_a_range_the_node_does_not_hold_is_counted` still covers the live path in `step` |
+| 8 | `Cores::insert` dropped a replaced slot's held bytes without releasing them, which under D-074 permanently shrinks the node's bound | `insert` subtracts the replaced slot's held bytes and says what happens to its deferred outputs | `a_core_replaced_on_a_running_node_releases_what_it_held`; the mutation (insert as it was) gives `left: 192, right: 0` |
+| 9 | the empty-`Apply` guard in `Node::act` was reached by no test | the guard is asserted as a mechanism, not deleted: an empty job never reaches the one-at-a-time `apply` queue, where every other range waits behind it (D-036) | mutation `m18` (remove the guard) — a survivor before, caught now |
+| 10 | `node.rs` cited §11 raft item 10, "a seed per range", which the slice does not build | the citation drops item 10 and says which slice owns it | — |
+
+The review's `m5` (`take_ready` always index 0) is declared in point 1 below as a
+PROPOSED point and is not a defect. Its finding 11 is evidence, not code: the nightly and
+premerge on record were for a superseded tree, and both are re-run on the fixed tip and
+recorded below.
 
 `M6` (`take_ready` always takes index 0) is left a survivor on purpose: it is point 1
 above, the draw that happens only where there is a choice, and a node with one range
@@ -9355,13 +9412,27 @@ end-to-end: against a 256-byte bound the node held 19 136 bytes, 74 times the bo
 refused 0 of 300 arrivals.
 
 **Decision.** The exemption is narrowed to what it is for: a message no *emptying* could
-make room for, at a node that is holding nothing.
+make room for. The hold gates the ordinary case and **not** that one.
 
 ```rust
-let empties = inner.held == 0
+let never_fits = message.bytes > self.bound;
+let empties = (never_fits || inner.held == 0)
     && (inner.items.len() == 0
         || (room > 0 && inner.items.len() == inner.items.heartbeats()));
 ```
+
+**Corrected on the second adversarial review (finding 1).** This entry first read
+`inner.held == 0 && (…)`, gating *both* cases on the hold, and justified it with "the
+retransmission that finds the node holding nothing is admitted". That is false. `held > 0`
+for as long as any message has arrived for any core whose persist is outstanding, which
+at §4's own target — 300 replicas a node, 200 messages a tick, syncs up to the 80 ms §4
+calls as bad as a crash — is the steady state and not an exception. A node that is
+periodically holding nothing is not a property the node has, so the exemption never
+opened and the message D-072 was written for was refused on every retransmission alike:
+the range never replicates again, and the cost was unbounded rather than "one slow sync".
+Reproduced against the shipped code at bound 16 384 with `hold_at(64)` — the node holding
+64 of 16 384 bytes — and the queue empty at every arrival: **0 of 1 000 retransmissions of
+the 65 622-byte AppendEntries admitted**; with the term above, 1 000 of 1 000.
 
 Nothing else changes: the two drop policies, the heartbeat victim index, and the
 arithmetic are D-072's. With the term, what the node holds is bounded by the bound —
@@ -9377,14 +9448,22 @@ change to an admission test that was already conditional, so it is the smaller a
 more conservative of the two. It is also the one that keeps the bound a property of the
 inbox, which is where a check can reach it.
 
-**What it costs.** A message larger than the whole bound, arriving while the node is
-holding something, is refused where D-072 would have admitted it. It is not refused for
-ever: what the node holds drains when the sync resolves — a persist resolves or the node
-fails (D-073 point 6) — so the retransmission that finds the node holding nothing is
-admitted under D-072's rule unchanged. The cost is a delay of at most one slow sync on a
-message that only a node already at its bound would meet, against a node that otherwise
-has no bound at all while a sync is outstanding. The conservative reading, and the one
-taken here, is that a bound that binds is worth a retransmission.
+**What it costs.** A message *the bound could hold*, arriving while the hold fills the
+bound, is refused where D-072 would have admitted it into an empty queue. It is not
+refused for ever, and the reason is the **queue**, not the hold: `Node::raft` empties the
+queue on every wake, so the ordinary refusal is decided against a queue that is empty
+again at the next arrival and the same message is admitted as soon as the hold is under
+the bound — which the resolution of the outstanding sync makes it (a persist resolves or
+the node fails, D-073 point 6). The cost is a delay of at most one slow sync on a message
+that only a node already at its bound would meet.
+
+A message *larger than the whole bound* costs nothing new at all: it is admitted whatever
+the node holds, exactly as under D-072. The bound is then exceeded by the hold plus a
+queue holding exactly one message — the queue side of D-072's "exceeded only by an inbox
+holding exactly one message" is unchanged, and the hold side is bounded because every
+held message was charged before it was admitted. The conservative reading, and the one
+taken here, is that a bound that binds is worth a retransmission, but never worth a range
+that stops replicating.
 
 **Recommendation.** As built. If the owner prefers the hold to be capped in the `raft`
 task instead, that is a scheduling decision and belongs with the slice that puts the node
@@ -9400,6 +9479,14 @@ resolved and released what it held. The variant holds all eleven and refuses non
 check fails on the code as it stood before this entry, which is finding 1; the same check
 also kills the review's mutation M1 (`charged()` returns `self.bytes`) and M12 (no
 `hold_at` on the resolution path), which both survived the slice as merged.
+
+The correction above has its own check,
+`inbox::a_message_no_emptying_could_hold_is_admitted_whatever_the_node_holds`, and that
+one is the pair for this decision in **both** directions, because an error either way is
+caught there and nowhere else. Gating the never-fits case on the hold — this entry as it
+first stood — admits 0 of 1 000 retransmissions where it asserts 1 000. Dropping the hold
+from the ordinary case — this entry reverted — admits a message into a hold that fills the
+bound where it asserts a refusal. Both mutations were run against it and both fail it.
 
 **What moved.** Nothing outside `crates/ananke-shard`. D-072's fourteen inbox tests never
 set `held`, so `held == 0` holds throughout them and the added term changes no decision
