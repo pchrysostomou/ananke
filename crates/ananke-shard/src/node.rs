@@ -1,4 +1,9 @@
-//! The node's tasks (SHARD.md §4, §13 Q41; §11, raft 1, 2, 10, 11).
+//! The node's tasks (SHARD.md §4, §13 Q41; §11, raft 1, 2, 11).
+//!
+//! Not raft 10, "a seed per range: a core's generator is seeded from the node's
+//! protocol stream at its incarnation's start". [`Cores::insert`] takes a core already
+//! constructed and nothing here touches a seed; that is the slice that *builds* a
+//! node's cores, not this one, which is the schedule over cores it is handed.
 //!
 //! Today's unit is a group: one server is one Raft group with a socket and a set of
 //! tasks of its own. The unit becomes a *node*, and this module is the two tasks that
@@ -1197,11 +1202,30 @@ mod tests {
         log: Arc<Mutex<Vec<Note>>>,
         /// Every message that left the node, by range and kind, in order.
         sent: Arc<Mutex<Vec<(RangeId, &'static str)>>>,
+        /// For every append-response that left the node, whether the frame it left in
+        /// carried this host's stamp: the check reads the *shipped bytes*, so a send
+        /// the node never stamped is distinguishable from one it did.
+        stamped: Arc<Mutex<Vec<(RangeId, bool)>>>,
+        /// Every reason the node gave for failing. Recorded rather than panicked, so
+        /// that a check can assert the node fails and says why; [`run_with`] asserts
+        /// this is empty, so a run that was not meant to fail is still loud.
+        failures: Arc<Mutex<Vec<String>>>,
         delays: BTreeMap<RangeId, Duration>,
         /// How long the socket takes a frame: zero unless a check needs the node's
         /// loop to come back round with something else already due.
         ship: Duration,
     }
+
+    /// What [`Probe::stamp`] writes into a response's `local`: a value no core
+    /// produces, so a frame carrying it was stamped by the host on its way out and a
+    /// frame without it was not (RAFT.md §1, D-042).
+    const STAMPED_LOCAL: u64 = 0x5854_414D_5053;
+
+    /// What [`Probe::stamp`] writes into a response's `incarnation`. The store's, which
+    /// the core cannot know: a leader that sees it change forgets what it knew of this
+    /// follower's log, so a response that left unstamped carries a 0 that means "a
+    /// refused server with no store" (D-042).
+    const STAMPED_INCARNATION: u64 = 9;
 
     impl Probe {
         fn new(env: &SimEnv, delays: &[(RangeId, Duration)]) -> Self {
@@ -1209,6 +1233,8 @@ mod tests {
                 env: env.clone(),
                 log: Arc::new(Mutex::new(Vec::new())),
                 sent: Arc::default(),
+                stamped: Arc::default(),
+                failures: Arc::default(),
                 delays: delays.iter().copied().collect(),
                 ship: Duration::ZERO,
             }
@@ -1286,11 +1312,40 @@ mod tests {
             })
         }
 
-        fn stamp(&self, _range: RangeId, _message: &mut Message) {}
+        fn stamp(&self, _range: RangeId, message: &mut Message) {
+            // What a real host puts here is the follower's clock for the leader's
+            // drift guard and its store incarnation (RAFT.md §1, D-042); what this one
+            // puts here is a pair of values no core produces, so that a check can see
+            // on the wire whether the node stamped at all.
+            if let Message::AppendEntriesResponse {
+                local, incarnation, ..
+            } = message
+            {
+                *local = STAMPED_LOCAL;
+                *incarnation = STAMPED_INCARNATION;
+            }
+        }
 
         fn ship(&self, to: ServerId, frame: Bytes) -> Boxed<'_, ()> {
             let decoded = decode(&frame).expect("the node's own frame decodes");
             let ranges = decoded.messages.iter().map(|tagged| tagged.range).collect();
+            self.stamped
+                .lock()
+                .expect("the stamps")
+                .extend(
+                    decoded
+                        .messages
+                        .iter()
+                        .filter_map(|tagged| match &tagged.frame.message {
+                            Message::AppendEntriesResponse {
+                                local, incarnation, ..
+                            } => Some((
+                                tagged.range,
+                                *local == STAMPED_LOCAL && *incarnation == STAMPED_INCARNATION,
+                            )),
+                            _ => None,
+                        }),
+                );
             self.sent.lock().expect("the sent log").extend(
                 decoded
                     .messages
@@ -1340,7 +1395,7 @@ mod tests {
         }
 
         fn failed(&self, reason: String) {
-            panic!("the node failed: {reason}");
+            self.failures.lock().expect("the failures").push(reason);
         }
     }
 
@@ -1423,6 +1478,12 @@ mod tests {
         terms: BTreeMap<RangeId, Term>,
         /// Every message that left, by range and kind, in order.
         sent: Vec<(RangeId, &'static str)>,
+        /// For every append-response that left, whether its frame carried the host's
+        /// stamp.
+        stamped: Vec<(RangeId, bool)>,
+        /// The simulation's trace: what the node recorded, when the step that produced
+        /// it decided, and when the record was made (D-026, D-047).
+        trace: Vec<ananke_env::sim::TraceRecord>,
         meters: Meters,
         frames: Frames,
         held_bytes_seen: usize,
@@ -1492,6 +1553,8 @@ mod tests {
         probe.ship = setup.ship;
         let log = probe.log.clone();
         let sent = probe.sent.clone();
+        let stamped = probe.stamped.clone();
+        let failures = probe.failures.clone();
         let inbox = Inbox::new(setup.bound);
         let mut cores = Cores::new(variants);
         for (range, core) in (setup.cores)() {
@@ -1560,10 +1623,16 @@ mod tests {
             .expect("the cell")
             .take()
             .expect("the node stopped");
+        // A run that was not meant to fail is loud about it: `Probe::failed` records
+        // rather than panics, so that a check can drive a failure on purpose.
+        let failures = failures.lock().expect("the failures").clone();
+        assert!(failures.is_empty(), "the node failed: {failures:?}");
         Run {
             log: log.lock().expect("the log").clone(),
             terms,
             sent: sent.lock().expect("the sent log").clone(),
+            stamped: stamped.lock().expect("the stamps").clone(),
+            trace: sim.trace(),
             meters,
             frames,
             held_bytes_seen,
@@ -2031,6 +2100,86 @@ mod tests {
                 > position(&correct.log, &Note::Persisted(R1)),
             "the slow core's response left before its persist: {:?}",
             correct.log
+        );
+
+        // Every response that left carried the host's stamp (RAFT.md §1, D-042). The
+        // node cannot make it itself — the incarnation is the store's — and a send
+        // that left unstamped carries a zero incarnation, which a leader reads as a
+        // server with no store, and a zero clock, which is the lease's. Nothing else
+        // in this crate looks at what `Host::stamp` did.
+        assert!(
+            !correct.stamped.is_empty(),
+            "no append-response left the node, so the stamp was never asked"
+        );
+        assert!(
+            correct.stamped.iter().all(|(_, stamped)| *stamped),
+            "a response left the node unstamped: {:?}",
+            correct.stamped
+        );
+
+        // What the node traced, and when (D-026, D-047). The append is recorded when
+        // it is *durable* — after the core's persist resolved — and carries the
+        // decision time of the step that made it, which is before the persist was even
+        // submitted. Nothing else in this crate asserts that the node traces at all.
+        let appends: Vec<(u64, u64, u128, u128)> = correct
+            .trace
+            .iter()
+            .filter_map(|record| match record.event {
+                ananke_env::TraceEvent::RaftAppend { range, index, .. } => Some((
+                    range,
+                    index,
+                    u128::from(record.decided.as_nanos()),
+                    u128::from(record.at.as_nanos()),
+                )),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !appends.is_empty(),
+            "the node traced no append at all: {:?}",
+            correct.trace
+        );
+        for (range, sync) in [(R1, 40u128), (R2, 5)] {
+            let sync = sync * 1_000_000;
+            let (_, _, decided, at) = *appends
+                .iter()
+                .find(|(traced, index, _, _)| *traced == range.get() && *index == 1)
+                .unwrap_or_else(|| panic!("no append traced for {range:?}: {appends:?}"));
+            assert!(
+                at >= sync,
+                "{range:?}'s append was traced at {at} ns, before its {sync} ns sync \
+                 resolved: a `RaftAppend` in the trace before it is durable (D-026)"
+            );
+            assert!(
+                decided < sync,
+                "{range:?}'s append carries a decision time of {decided} ns, at or \
+                 after its {sync} ns sync: the flush's time, not the step's (D-047)"
+            );
+            assert!(
+                decided < at,
+                "{range:?}'s append decided at {decided} ns and was recorded at {at} \
+                 ns: a record made where it was decided cannot have waited for the \
+                 disk"
+            );
+        }
+        // D-050: a term's record carries when the message whose step changed the term
+        // reached the node, which the node puts there and no core can.
+        let terms: Vec<_> = correct
+            .trace
+            .iter()
+            .filter(|record| {
+                matches!(record.event, ananke_env::TraceEvent::RaftTerm { range, .. } if range == R1.get())
+            })
+            .collect();
+        assert!(
+            terms.iter().any(|record| matches!(
+                record.event,
+                ananke_env::TraceEvent::RaftTerm {
+                    received: Some(_),
+                    ..
+                }
+            )),
+            "no term record carries the receipt of the message that caused it: {terms:?}"
         );
 
         let buggy = run(
@@ -2603,6 +2752,119 @@ mod tests {
         );
     }
 
+    /// One resolution, two applies: the deferred one **before** the replayed one.
+    ///
+    /// The check above feeds appends that each land on a core whose previous persist
+    /// has resolved, so each is its own round and no resolution ever carries both a
+    /// deferred `Apply` and a replayed one. This is the case that does, and it is the
+    /// only thing that pins the order of the two inside `Cores::resolved`: the
+    /// deferred outputs are the ones the persisting step produced, so they are older
+    /// than anything the replay steps afterwards, and appending them after the replay
+    /// instead — a one-line move — hands the `apply` task index 2 before index 1.
+    ///
+    /// An applied stream out of index order is not a crash: the state machine is
+    /// handed a later index first, and `applied_sent` has already passed both, so
+    /// nothing downstream ever says so.
+    ///
+    /// The shape: an `AppendEntries{entries: [1, 2], commit: 1}` — the follower
+    /// appends (a `Persist`) and its `Apply{through: 1}` is *deferred* behind it —
+    /// then, while that sync is outstanding, a heartbeat `{entries: [], commit: 2}`,
+    /// which is held. The heartbeat persists nothing, so when the replay steps it its
+    /// `Apply{through: 2}` is one of the resolution round's **early** outputs.
+    #[test]
+    fn a_resolution_hands_the_apply_task_its_deferred_job_before_its_replayed_one() {
+        fn entry(index: Index) -> Entry {
+            Entry {
+                index,
+                term: 1,
+                payload: Payload::Command(Bytes::from_static(b"x")),
+            }
+        }
+        /// Two entries, committing the first: the step persists and defers its apply.
+        fn two_committing_one() -> Received {
+            arrival(
+                R1,
+                Message::AppendEntries {
+                    term: 1,
+                    prev_index: 0,
+                    prev_term: 0,
+                    entries: vec![entry(1), entry(2)],
+                    commit: 1,
+                    sent: 0,
+                },
+            )
+        }
+        /// A heartbeat committing through index 2: it carries no entry, so the step
+        /// persists nothing and its apply is one of its round's early outputs.
+        fn beat_committing_two() -> Received {
+            arrival(
+                R1,
+                Message::AppendEntries {
+                    term: 1,
+                    prev_index: 2,
+                    prev_term: 1,
+                    entries: Vec::new(),
+                    commit: 2,
+                    sent: 0,
+                },
+            )
+        }
+
+        let arrivals = [two_committing_one()];
+        // The heartbeat arrives well inside r1's 20 ms sync, so it is held.
+        let feed = [(Duration::from_millis(5), beat_committing_two())];
+        let delays = [
+            (R1, Duration::from_millis(20)),
+            (R2, Duration::from_millis(1)),
+        ];
+        let run = run_with(Setup {
+            arrivals: &arrivals,
+            feed: &feed,
+            duration: Duration::from_millis(45),
+            ..Setup::new(NodeVariants::correct(), &delays)
+        });
+        assert_eq!(run.fed, vec![true], "the heartbeat was admitted");
+        let jobs: Vec<Vec<Index>> = run
+            .log
+            .iter()
+            .filter_map(|note| match note {
+                Note::Applied(_, Job::Entries(indices)) => Some(indices.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            jobs,
+            vec![vec![1], vec![2]],
+            "the applied stream left the resolution out of index order: {:?}",
+            run.log
+        );
+        // Both jobs are of the one resolution: they follow the persist, and there is
+        // only one persist in the run.
+        let persisted = position(&run.log, &Note::Persisted(R1));
+        let applies: Vec<usize> = run
+            .log
+            .iter()
+            .enumerate()
+            .filter(|(_, note)| matches!(note, Note::Applied(..)))
+            .map(|(at, _)| at)
+            .collect();
+        assert_eq!(applies.len(), 2, "{:?}", run.log);
+        assert!(
+            applies.iter().all(|at| *at > persisted),
+            "an apply of the resolution left before the persist resolved: {:?}",
+            run.log
+        );
+        assert_eq!(
+            run.log
+                .iter()
+                .filter(|note| matches!(note, Note::Submitted(R1)))
+                .count(),
+            1,
+            "the heartbeat was meant to persist nothing: {:?}",
+            run.log
+        );
+    }
+
     /// Where each of a step's outputs goes (SHARD.md §4, RAFT.md §1).
     ///
     /// A [`SnapshotAction::Take`] is the **`apply` task's**, a job between two
@@ -2719,6 +2981,123 @@ mod tests {
             !buggy.contains(&Note::Applied(R1, Job::Take)),
             "the variant is meant to keep the take off the `apply` queue: {buggy:?}"
         );
+    }
+
+    /// The two arms of the `Apply` route that no run reaches, driven at the node.
+    ///
+    /// **A gap fails the node.** `entries_to_apply` answers `Err(index)` for an index
+    /// the core did not hold, and `the_entries_an_apply_names_are_the_ones_not_handed_out_yet`
+    /// asserts that of the *helper*. This asserts it of [`Node::act`]: the node tells
+    /// its host it failed and returns the error. Passing over the gap instead hands the
+    /// state machine nothing while [`Cores::applied_sent`] has already advanced past
+    /// the hole, so the entries in the hole are never applied and nothing anywhere
+    /// later says so — the one shape that cannot show up as a failure afterwards.
+    ///
+    /// **An empty job never reaches the queue.** An `Apply` naming only indices already
+    /// handed out is not a failure, but it must not be handed on: a job on the
+    /// one-at-a-time `apply` queue costs a slot, and every other range's applies wait
+    /// behind it (D-036, Q14).
+    ///
+    /// The outputs are handed to [`Node::act`] for the reason the routing check above
+    /// gives: the scenario in which a gap *arises* needs the node's compaction path,
+    /// which is issue #79's; its reaction to one is testable now.
+    #[test]
+    fn a_gap_in_the_applied_stream_fails_the_node_and_an_empty_job_is_not_a_job() {
+        fn act_on(entries: Option<Result<Vec<Entry>, Index>>) -> (bool, Vec<String>, Vec<Note>) {
+            let mut sim = Sim::new(SimConfig::new(5));
+            let id = sim.add_node();
+            let env = sim.env(id);
+            let probe = Probe::new(&env, &[]);
+            let log = probe.log.clone();
+            let failures = probe.failures.clone();
+            let variants = NodeVariants::correct();
+            let mut cores = Cores::new(variants);
+            cores.insert(R1, core(R1));
+            let mut node = Node::new(
+                env.clone(),
+                NodeConfig {
+                    id: ME,
+                    tick: TICK,
+                    variants,
+                },
+                cores,
+                Outbox::new(),
+                probe,
+            );
+            let stamps = Stamps {
+                decided: env.decision(),
+                received: None,
+            };
+            let failed = Arc::new(Mutex::new(false));
+            env.clone().spawn("act", {
+                let failed = failed.clone();
+                async move {
+                    let outcome = node
+                        .act(Act {
+                            range: R1,
+                            stamps,
+                            output: Output::Apply { through: 2 },
+                            entries,
+                        })
+                        .await;
+                    *failed.lock().expect("the cell") = outcome.is_err();
+                }
+            });
+            sim.run_for(TICK);
+            let failed = *failed.lock().expect("the cell");
+            (
+                failed,
+                failures.lock().expect("the failures").clone(),
+                log.lock().expect("the log").clone(),
+            )
+        }
+
+        // The gap: the core's own `Apply` named index 2, which it does not hold.
+        let (failed, failures, log) = act_on(Some(Err(2)));
+        assert!(
+            failed,
+            "a gap in the applied stream did not fail the node: {log:?}"
+        );
+        assert_eq!(
+            failures.len(),
+            1,
+            "the host was not told the node failed: {failures:?}"
+        );
+        assert!(
+            failures[0].contains("which the core does not hold"),
+            "the failure does not say what it was: {failures:?}"
+        );
+        assert!(
+            !log.iter().any(|note| matches!(note, Note::Applied(..))),
+            "the state machine was handed a job with a hole in it: {log:?}"
+        );
+
+        // The empty job: every index the apply named has been handed out already.
+        let (failed, failures, log) = act_on(Some(Ok(Vec::new())));
+        assert!(!failed, "an empty apply is not a failure: {failures:?}");
+        assert!(failures.is_empty(), "{failures:?}");
+        assert!(
+            !log.iter().any(|note| matches!(note, Note::Applied(..))),
+            "an empty job took a slot on the one-at-a-time `apply` queue, where every \
+             other range's applies wait behind it: {log:?}"
+        );
+
+        // And the ordinary job does reach it, so the two above are refusals of
+        // something this path otherwise does.
+        let (failed, failures, log) = act_on(Some(Ok(vec![
+            Entry {
+                index: 1,
+                term: 1,
+                payload: Payload::Command(Bytes::from_static(b"x")),
+            },
+            Entry {
+                index: 2,
+                term: 1,
+                payload: Payload::Command(Bytes::from_static(b"y")),
+            },
+        ])));
+        assert!(!failed, "{failures:?}");
+        assert_eq!(log, vec![Note::Applied(R1, Job::Entries(vec![1, 2]))]);
     }
 
     /// The round arms its persists: they are polled in one pass **before the task

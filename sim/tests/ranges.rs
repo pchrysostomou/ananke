@@ -432,3 +432,262 @@ fn the_ranges_of_one_node_draw_their_own_election_timeouts() {
         "no seed gave the node's four ranges four election timeouts of their own"
     );
 }
+
+/// Q15's whole-node refusal and its re-seed, on the node that has real range
+/// membership (SHARD.md §11, storage 8; §12's "A loss in the shared engine").
+///
+/// A loss in the shared engine is not one range's: the node owns one engine (Q2), so
+/// the refusal is the node's and every replica on it goes down with it. The node then
+/// rebuilds into a *fresh* engine in a new directory beside the refused one, which
+/// stays marked lost and quiesced (D-041), and each replica's durable refused mark is
+/// written into the new engine before that replica serves anything (D-035, D-042).
+///
+/// Directed and not a sweep because the thing under test happens once, at a start; the
+/// rate rule (D-061) asks a tier of a *sweep's* assertion, and there is no sweep here
+/// to measure one on. What the sweep beside it cannot reach at all is the refusal
+/// itself: the node scenario raises no disk fault that loses a store.
+///
+/// The three variants this catches are each a mutation a single-range world could not
+/// see. With one range on a node, refusing only that range *is* refusing the node, and
+/// a per-range incarnation stream is the node's generator drawn once.
+// PROPOSED(D-077): Q15's whole-node refusal, and the re-seed per replica.
+#[test]
+fn a_loss_in_the_shared_engine_refuses_the_whole_node_and_reseeds_beside_it() {
+    let for_ = std::time::Duration::from_millis(600);
+    let every_range: BTreeSet<u64> = (0..ranges::RANGES)
+        .map(|i| ranges::FIRST_RANGE + i)
+        .collect();
+
+    let (records, dirs) = ranges::refused_whole_dirs(1, for_, NodeVariants::correct());
+    let read = ranges::refusal(&records);
+
+    // The node is refused once, as a node, and every replica it holds is refused with
+    // it — all four, not the one whose store open failed.
+    assert_eq!(read.refusals, 1, "one refusal, the node's");
+    assert_eq!(
+        read.replicas_refused, every_range,
+        "a loss in the shared engine refuses every replica on the node"
+    );
+
+    // Each replica's durable refused mark is in the new engine, and none of them
+    // traced anything of its own before its mark was durable.
+    assert_eq!(
+        read.marked, every_range,
+        "every re-seeded replica's refused mark is durable"
+    );
+    assert_eq!(
+        read.served_before_the_mark,
+        BTreeSet::new(),
+        "no replica speaks before its refused mark is durable"
+    );
+    // What the check above cannot yet say, asserted as an absence with its reason
+    // rather than left as a silent green (CLAUDE.md). §12's exit criterion (c) orders
+    // two things — the mark, then the replica's first answer — and on the correct node
+    // this scenario has only the first: a re-seeded replica is quarantined and takes
+    // part in nothing until its install (RAFT.md §3), and there is no install here to
+    // give it, so it never sends a frame at all. `served_before_the_mark` is therefore
+    // empty on the correct node because there is no answer to be early, not because an
+    // answer was late enough; the variant beside it is what shows the set can fill.
+    // The day the node's snapshot wiring gives a re-seeded replica something to answer,
+    // this assertion fails, and the pair can be upgraded to the ordering (c) names.
+    assert_eq!(
+        read.answered_after_the_mark,
+        BTreeSet::new(),
+        "a re-seeded replica answers nothing at all until its install: {read:?}"
+    );
+    assert!(
+        read.failures.is_empty(),
+        "the re-seeded node carries on rather than stopping: {:?}",
+        read.failures
+    );
+
+    // A re-seeded replica is not a bootstrap: its `RangeCreated` is its install's,
+    // with `cause: snapshot`, and the install is the node's snapshot wiring, which no
+    // slice has built yet.
+    assert_eq!(
+        read.bootstrapped,
+        BTreeSet::new(),
+        "a re-seeded replica is created by its install, not at bootstrap"
+    );
+
+    // The incarnation is per replica, drawn from the node's generator, never the
+    // first incarnation a fresh store opens at (Q26, D-042).
+    assert_eq!(
+        read.incarnations.keys().copied().collect::<BTreeSet<u64>>(),
+        every_range,
+        "every replica restates an incarnation of its own"
+    );
+    assert!(
+        read.incarnations.values().all(|&i| i > 1),
+        "no re-seeded replica keeps a fresh store's incarnation 1: {:?}",
+        read.incarnations
+    );
+    let distinct: BTreeSet<u64> = read.incarnations.values().copied().collect();
+    assert_eq!(
+        distinct.len(),
+        read.incarnations.len(),
+        "the incarnations are drawn per replica, not once for the node: {:?}",
+        read.incarnations
+    );
+
+    // D-041: the refused directory is still there, still marked lost, and the node
+    // rebuilt beside it rather than in it.
+    assert_eq!(
+        dirs.get("node"),
+        Some(&true),
+        "the refused directory stays marked lost: {dirs:?}"
+    );
+    assert_eq!(
+        dirs.get("node-g1"),
+        Some(&false),
+        "the re-seed built the generation beside it: {dirs:?}"
+    );
+
+    // The pair rule, each variant beside the correct node above. Each says what the
+    // variant's run *did*, not merely that it differed from the correct one: a run
+    // that fell over before it reached the re-seed differs from the correct one too,
+    // and a check that only asks for a difference cannot tell the two apart.
+    let one_range = ranges::refusal(&ranges::refused_whole(
+        1,
+        for_,
+        NodeVariants::of(&[NodeVariant::RefuseOneRangeOnly]),
+    ));
+    assert_eq!(
+        one_range.replicas_refused,
+        BTreeSet::from([ranges::FIRST_RANGE]),
+        "RefuseOneRangeOnly refuses the one range whose store open failed and no other, \
+         leaving the node's three other replicas unrefused over an engine that lost state"
+    );
+
+    let (refused_in_place, in_place) = ranges::refused_whole_dirs(
+        1,
+        for_,
+        NodeVariants::of(&[NodeVariant::ReseedIntoRefusedDir]),
+    );
+    let in_place_read = ranges::refusal(&refused_in_place);
+    assert_eq!(
+        in_place.get("node-g1"),
+        None,
+        "ReseedIntoRefusedDir builds no directory beside the refused one: {in_place:?}"
+    );
+    // ...because it built *in* the refused one, whose marker says lost, so the fresh
+    // engine's own open is refused and the node stops there. Without this the check
+    // above would pass on a run that never reached the re-seed at all.
+    assert_eq!(
+        in_place.get("node"),
+        Some(&true),
+        "and the refused directory is the one it tried: {in_place:?}"
+    );
+    assert!(
+        in_place_read
+            .failures
+            .iter()
+            .any(|reason| reason.contains("the re-seed's fresh engine")),
+        "ReseedIntoRefusedDir reaches the re-seed and is refused by its own marker: {:?}",
+        in_place_read.failures
+    );
+
+    let unmarked = ranges::refusal(&ranges::refused_whole(
+        1,
+        for_,
+        NodeVariants::of(&[NodeVariant::ServeBeforeRefusedMark]),
+    ));
+    assert_eq!(
+        unmarked.marked,
+        BTreeSet::new(),
+        "ServeBeforeRefusedMark writes no refused mark at all"
+    );
+    assert_ne!(
+        unmarked.served_before_the_mark,
+        BTreeSet::new(),
+        "and its replicas answer without one: {unmarked:?}"
+    );
+    assert!(
+        unmarked.incarnations.values().any(|&i| i == 1),
+        "a replica that never marked keeps a fresh store's incarnation: {:?}",
+        unmarked.incarnations
+    );
+
+    let per_range = ranges::refusal(&ranges::refused_whole(
+        1,
+        for_,
+        NodeVariants::of(&[NodeVariant::IncarnationPerRangeStream]),
+    ));
+    // Every replica still restates an incarnation — the variant is a different draw,
+    // not a missing one — and every one of them is a different number from the node
+    // generator's. Asserting only that the two maps differ would pass on a run that
+    // traced no incarnation at all.
+    assert_eq!(
+        per_range
+            .incarnations
+            .keys()
+            .copied()
+            .collect::<BTreeSet<u64>>(),
+        every_range,
+        "IncarnationPerRangeStream still gives every replica an incarnation: {:?}",
+        per_range.incarnations
+    );
+    for range in &every_range {
+        assert_ne!(
+            per_range.incarnations.get(range),
+            read.incarnations.get(range),
+            "IncarnationPerRangeStream draws range {range}'s number from its range's \
+             stream and not from the node's: {:?} against {:?}",
+            per_range.incarnations,
+            read.incarnations
+        );
+    }
+}
+
+/// The second question D-066 answers, which the scenario above cannot ask: once a node
+/// has re-seeded, which directory does its *next start* open?
+///
+/// The re-seed's own choice is made in the run above. This one is made in
+/// `server::run`, before any store opens, over the listing beside the node, and until
+/// this test nothing in the simulator asked it — `newest_not_lost` was driven only by
+/// `reseed::tests` calling it directly, so a `run` that ignored it and opened the
+/// directory configuration names every time passed the whole tree. That is the defect
+/// a check that drives the helper instead of the thing under test leaves behind.
+///
+/// The evidence is what a wrong answer would cost: the configured directory is marked
+/// lost, so a node that reopens it is refused a *second* time and re-seeds into a third
+/// generation. One refusal in the whole run, and `node-g2` never built, is the start
+/// having found the directory its re-seed left.
+// PROPOSED(D-077): Q15's whole-node refusal, and the re-seed per replica.
+#[test]
+fn a_restarted_node_opens_the_directory_its_reseed_built_and_is_not_refused_again() {
+    let for_ = std::time::Duration::from_millis(600);
+    let every_range: BTreeSet<u64> = (0..ranges::RANGES)
+        .map(|i| ranges::FIRST_RANGE + i)
+        .collect();
+
+    let (records, dirs) = ranges::refused_whole_restarted(1, for_, NodeVariants::correct());
+    let read = ranges::refusal(&records);
+
+    assert_eq!(
+        read.refusals, 1,
+        "one refusal in the whole run: the restart opened the re-seeded directory and \
+         was not refused on the old one's marker"
+    );
+    assert_eq!(
+        read.replicas_refused, every_range,
+        "and the one refusal is still the whole node's"
+    );
+    assert_eq!(
+        dirs,
+        BTreeMap::from([("node".to_owned(), true), ("node-g1".to_owned(), false)]),
+        "the refused directory stays lost, the re-seed's generation is the live one, \
+         and the restart built no third: {dirs:?}"
+    );
+    // The marks the re-seed made durable are what the restart read back: each replica
+    // is restated quarantined, on the disk's word rather than on the re-seed's.
+    assert_eq!(
+        read.marked, every_range,
+        "every replica's refused mark survives the crash and is restated"
+    );
+    assert!(
+        read.failures.is_empty(),
+        "the restarted node runs: {:?}",
+        read.failures
+    );
+}

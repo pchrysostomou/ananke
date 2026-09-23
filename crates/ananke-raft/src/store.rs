@@ -629,6 +629,24 @@ pub async fn mark_store_lost<E: Environment>(
     write_marker(env, engine_dir, Bytes::from(content)).await
 }
 
+/// Whether `engine_dir`'s marker says the store there lost state.
+///
+/// [`refuse_lost_store`] asks the same question of the directory a server is
+/// about to open and turns a yes into a refusal. A node that keeps several
+/// engine directories needs to ask it of a directory it is *choosing between*,
+/// where a yes is not an error but the reason to look at an older one
+/// (SHARD.md §11, storage 8; D-066's rule that a node opens the newest directory
+/// not marked lost). A directory with no marker at all has never opened as a
+/// store and is not lost.
+///
+/// # Errors
+///
+/// The filesystem's.
+// PROPOSED(D-077): Q15's whole-node refusal, and the re-seed per replica.
+pub async fn is_marked_lost<E: Environment>(env: &E, engine_dir: &Path) -> io::Result<bool> {
+    Ok(matches!(marker(env, engine_dir).await?, Marker::Lost(_)))
+}
+
 /// Writes the marker's content in place, truncating what was there, synced, with
 /// the directory synced after. A crash part way leaves a marker that is neither
 /// form, which reads as a lost store.
@@ -1084,6 +1102,45 @@ impl<E: Environment> RaftStore<E> {
         let mut batch = WriteBatch::new();
         batch.put(self.prefix.snapshot_key(), encode_snapshot_record(record));
         self.engine.write(batch, true).await?;
+        Ok(())
+    }
+
+    /// Marks this replica re-seeded in *this* store, synced: the quarantine flag
+    /// (D-035) and `incarnation` (D-042) in one batch, so both are durable or
+    /// neither is.
+    ///
+    /// This is the durable per-replica refused mark of Q15's whole-node re-seed
+    /// (SHARD.md §11, storage 8). A node whose shared engine lost state is refused
+    /// whole and opens a *fresh* engine beside the refused one; every replica in
+    /// that fresh engine would otherwise open as a first start — quarantine clear
+    /// and incarnation 1 — and a replica that opens clean is a replica that votes
+    /// again on state its node may have lost, which is the hole D-035 closed, and
+    /// one whose leader keeps what it knew of a log the node no longer has, which
+    /// is the hole D-042 closed. So the node writes the mark here, into the new
+    /// engine, before the replica serves anything, and the incarnation it writes
+    /// is drawn at this creation of the replica from the node's own generator
+    /// (Q26) rather than being the fresh store's 1.
+    ///
+    /// The two keys go in one batch because a crash between them would leave a
+    /// replica quarantined at incarnation 1 — indistinguishable, to its leader,
+    /// from the replica that never lost anything.
+    ///
+    /// # Errors
+    ///
+    /// The engine's.
+    // PROPOSED(D-077): Q15's whole-node refusal, and the re-seed per replica.
+    pub async fn mark_reseeded(&mut self, incarnation: u64) -> io::Result<()> {
+        let mut batch = WriteBatch::new();
+        batch.put(self.prefix.quarantine_key(), Bytes::from_static(&[1]));
+        batch.put(
+            self.prefix.incarnation_key(),
+            encode_incarnation(incarnation),
+        );
+        self.engine.write(batch, true).await?;
+        // The store carries its incarnation for its own life (D-042), and from here
+        // that life is the re-seeded replica's: every message this store stamps must
+        // carry the number now on the disk, not the 1 a fresh store opened at.
+        self.incarnation = incarnation;
         Ok(())
     }
 

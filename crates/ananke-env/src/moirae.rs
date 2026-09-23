@@ -34,6 +34,7 @@
 //! | `OrphanRemoved` / `WalSegmentDeleted`    | `log` `ananke.fs.orphan-removed` / `ananke.wal.segment-deleted` |
 //! | `RaftTerm` / `RaftVote` / `RaftLeader` / `RaftAppend` / `RaftTruncate` / `RaftCommit` / `RaftApply` | `log` `ananke.raft.term` / `.vote` / `.leader` / `.append` / `.truncate` / `.commit` / `.apply` |
 //! | `RaftRecovered` / `RaftProposed` / `RaftRefused` / `RaftServerFailed` / `RaftInboxDropped` | `log` `ananke.raft.recovered` / `.proposed` / `.refused` / `.failed` / `.inbox-dropped` |
+//! | `RaftReplicaRefused`                     | `log` `ananke.raft.replica-refused`           |
 //! | `RaftRead` / `RaftLeaseRevoked` / `RaftQuorumLost` / `RaftTransfer` | `log` `ananke.raft.read` / `.lease-revoked` / `.quorum-lost` / `.transfer` |
 //! | `RaftConfig` / `RaftSnapshot`            | `log` `ananke.raft.config` / `.snapshot`      |
 //! | `RaftCompacted` / `RaftReseeded` / `RaftSnapshotResumed` / `RaftAdopted` | `log` `ananke.raft.compacted` / `.reseeded` / `.snapshot-resumed` / `.adopted` |
@@ -1016,6 +1017,14 @@ fn convert(
             Some(Json::obj(vec![
                 ("server", int(*server)),
                 ("reason", Json::str(reason)),
+            ])),
+        ),
+        // PROPOSED(D-077): Q15's whole-node refusal, and the re-seed per replica.
+        TraceEvent::RaftReplicaRefused { server, range } => log(
+            "ananke.raft.replica-refused",
+            Some(Json::obj(vec![
+                ("server", int(*server)),
+                ("range", int(*range)),
             ])),
         ),
         TraceEvent::RaftServerFailed { server, reason } => log(

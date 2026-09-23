@@ -28,28 +28,60 @@
 # rows beside it. Re-weighed after the review's fixes, on an idle machine, the two sweeps came
 # to 60.7 and 51.9 cpu s against the 59.0 and 53.9 recorded here: within the noise of the load
 # they were first measured under, so the rows keep their figures.
-# D-076's rows and D-078's were placed against different tables, on branches open at the same
-# time, and this merge keeps each row in the shard its own branch's longest-first placement gave
-# it rather than re-placing them: the merged shards run 1276.9 to 1351.7 cpu s, a spread of 75
+# D-077 added two rows, both `ranges` and both cheap. The first, the directed re-seed scenario,
+# was weighed on its tree on the same Apple M2, on AC under load average 6.1, at 0.01 cpu s on
+# the built binary (it runs one 600 ms scenario five times and no sweep). The second, the
+# restart its review added, was weighed the same way from the built release binary at
+# ANANKE_SEEDS=1000 ANANKE_DEEP_SEEDS=100: user and sys were each below the timer's 0.01 s
+# resolution on three runs (real 0.41 s, then 0.00 s twice, the first being the binary's
+# page-in), under load average 92.8 from the slices building beside it, which can only make a
+# figure high. Both are rounded up to 0.1 like the cheap rows beside them, and longest-first
+# into the lightest shard put both in shard 2. D-077 also left the shard 2 total reading 1276.9
+# against rows summing to 1277.0.
+# D-076's rows, D-077's and D-078's were placed against three different tables, on branches
+# open at the same time. **This merge combined two independent placements**: it takes the union
+# of both sides' rows and keeps every row in the shard its own side placed it in, re-placing
+# none of them, and every total below is recomputed from the rows that resulted rather than
+# carried over from either side. The merged shards run 1277.1 to 1351.7 cpu s, a spread of 75
 # on about 1 300, so the night is bounded by shard 5 at about 4 % over the ideal. The next row
 # added goes into the lightest, which is shard 2.
 #
-# D-082's eleven rows — the raft sweep's arms on the node, `node` — were weighed on its
-# own tree at ANANKE_SEEDS=1000 in release, from the built binary
-# (`node-<hash> <test> --exact`) rather than through cargo, so each figure is the test's
-# own cost and not a build's. On an Apple M2 of 8 cores, on AC Power, with the other
-# Stage B slices building beside it: the load average ran from 55 at the start to 292 at
-# the end, so the figures are cpu seconds (user + sys) and not wall time for exactly that
-# reason (D-070). They total 360.8 cpu s. Six of the variant rows run
-# `high_rate_share()`, a tenth of the tier, which is why they are tens of cpu seconds and
-# not hundreds; the two large rows are the correct node on every seed and
-# `LeaseTrustsTheClock`, whose catch is asserted from the thousand-seed tier and which
-# therefore runs every seed.
+# D-080 added one row, the pinned pair of seeds whose histories the old search could not
+# decide. It is pinned at two seeds, not swept, so the tier does not move it: weighed from
+# the built release test binary rather than through cargo, at 0.3 cpu s. Shard 6 takes it.
+# D-082's seventeen rows — the raft sweep's arms on the node, `node` — were weighed on
+# its own tree at ANANKE_SEEDS=1000 in release, from the
+# built binary (`node-<hash> <test> --exact`) rather than through cargo, so each figure
+# is the test's own cost and not a build's. On an Apple M2 of 8 cores, on AC Power, no
+# thermal warning, with other agents' slices building beside it: load averages
+# 53.69/47.43/54.61 before and 80.57/65.30/60.65 after, which is why these are cpu
+# seconds (user + sys) and not wall time (D-070). They total 446.31 cpu s.
+# Issue #102's discipline applies to the mutation figures these rows sit beside, and it
+# is not what it first looked like: incremental compilation is not the cause, and five
+# distinct binaries of one tree give byte-identical traces. What bites is a mutation
+# harness that restores a file with an mtime *older* than the build that compiled the
+# mutant — cargo then calls the unit fresh and the tree goes on running the mutant. Back
+# up by copy, touch on restore, and confirm the next build recompiled.
+# Six of the seventeen are the variants the node has no path for yet, one test each so
+# that `cargo test --list` and this table carry the debt rather than a paragraph of
+# prose; each runs its variant over `high_rate_share()` and asserts the path absent.
+# Six more run that share and are tens of cpu seconds for the same reason; the two
+# large rows are the correct node on every seed and `LeaseTrustsTheClock`, whose catch
+# is asserted from the thousand-seed tier and which therefore runs every seed.
 # Placed longest-first into the lightest shard, against the table as this branch found
-# it. The two large rows go to shards 2 and 1, which were the lightest, and take them to
-# 1440.4 and 1432.8 against a mean of 1354.3: about 6 % over the ideal, which is what
-# longest-first gives when two rows are an eighth of a shard each. The night is bounded
-# by shard 2. The next row added goes into the lightest, which is shard 3.
+# it, where the shards then ran 1328.0 to 1442.7 cpu s; the merge note below recomputes
+# every total.
+#
+# **This merge combined two independent placements**: D-080's single row, placed on main
+# against main's table, and D-082's seventeen, placed on this branch against the table as
+# this branch found it. It takes the union of both sides' rows and keeps every row in the
+# shard its own side placed it in, re-placing none of them, and every total below is
+# recomputed from the rows beneath it rather than carried over from either side. That
+# recomputation also corrects three headers this branch carried that its own rows did not
+# support — shards 3, 4 and 6, each out by 0.1 from the two-decimal `node` figures. The
+# merged shards run 1328.1 to 1442.9 cpu s against a mean of 1370.1, so the night is
+# bounded by shard 2 at about 5 % over the ideal. The next row added goes into the
+# lightest, which is shard 4.
 #
 # shard	binary	cpu_s	test
 # D-083's three rows are the node's snapshot wiring, weighed on its own tree in release,
@@ -61,7 +93,17 @@
 # shards of thirteen hundred changes no assignment. They were re-weighed after the
 # review of #107, which raised the binary's seed count from eight to thirty-two and
 # added the state read-back.
-# shard 1: 1432.8 cpu s
+#
+# **This merge combined two independent placements**: D-083's three `install` rows,
+# placed on this branch against the table as it stood before the base moved, and the
+# base's table (`phase-3-stage-b-sweeps`), which by then carried D-077's two `ranges`
+# rows, D-080's one `raft` row and D-082's seventeen `node` rows re-weighed to two
+# decimals by its review. It takes the union of both sides' rows and keeps every row in
+# the shard its own side placed it in, re-placing none of them; the eleven older `node`
+# rows this branch carried are the base's re-weighed seventeen, not rows of its own, so
+# the base's figures and placements stand for them. Every total below is recomputed from
+# the rows beneath it rather than carried over from either side.
+# shard 1: 1428.0 cpu s
 1	engine	625.1	an_install_in_two_switches_is_caught
 1	engine	36.8	an_install_whose_repair_precedes_its_switch_is_caught
 1	engine	0.6	seed_44_never_opens_empty_in_either_mode
@@ -76,8 +118,8 @@
 1	raft	0.2	seed_164_which_a_local_ten_thousand_seed_run_found_stays_green
 1	raft	0.2	seed_5909_which_the_nightly_found_stays_green
 1	wal	29.3	a_log_that_skips_the_checksum_is_caught
-1	node	154.3	a_leader_that_trusts_the_clock_is_caught_on_the_node
-# shard 2: 1440.4 cpu s
+1	node	149.49	a_leader_that_trusts_the_clock_is_caught_on_the_node
+# shard 2: 1442.9 cpu s
 2	echo	0.2	different_seeds_give_different_traces
 2	engine	581.7	the_live_install_crash_test_passes_every_seed
 2	engine	211.2	a_compaction_that_deletes_its_inputs_before_the_manifest_is_caught
@@ -92,8 +134,10 @@
 2	ranges	0.1	every_frame_between_two_nodes_may_carry_several_ranges
 2	ranges	0.1	no_batch_frame_of_the_node_parses_as_a_frame_of_the_one_group_server
 2	ranges	0.1	the_ranges_of_one_node_draw_their_own_election_timeouts
-2	node	163.5	every_seed_passes_on_the_correct_node_under_the_raft_sweeps_arms
-# shard 3: 1301.6 cpu s
+2	ranges	0.1	a_loss_in_the_shared_engine_refuses_the_whole_node_and_reseeds_beside_it
+2	ranges	0.1	a_restarted_node_opens_the_directory_its_reseed_built_and_is_not_refused_again
+2	node	165.78	every_seed_passes_on_the_correct_node_under_the_raft_sweeps_arms
+# shard 3: 1330.7 cpu s
 3	echo	0.2	trace_hash_matches_the_pinned_golden
 3	engine	417.5	the_range_delete_crash_test_passes_every_seed
 3	engine	235.9	the_seek_crash_test_passes_every_seed
@@ -111,10 +155,11 @@
 3	raft	0.2	seed_385_which_a_local_ten_thousand_seed_run_found_stays_green
 3	raft	0.2	the_membership_scenario_has_byte_identical_traces_for_one_seed
 3	wal	21.2	a_log_that_acknowledges_before_syncing_is_caught
-3	node	13.2	a_server_without_pre_vote_is_caught_on_the_node
-3	node	4.2	a_server_that_applies_before_commit_is_caught_on_the_node
-3	node	0.5	a_server_that_sends_before_it_persists_is_caught_on_the_node
-# shard 4: 1302.4 cpu s
+3	node	15.16	a_leader_that_shares_one_snapshot_directory_is_not_re_asserted_on_the_node_yet
+3	node	14.54	the_pair_that_wedged_seed_680_is_not_re_asserted_on_the_node_yet
+3	node	13.25	a_server_without_pre_vote_is_caught_on_the_node
+3	node	4.03	a_server_that_applies_before_commit_is_caught_on_the_node
+# shard 4: 1328.1 cpu s
 4	echo	0.1	same_seed_gives_byte_identical_trace
 4	engine	210.8	the_correct_engine_passes_every_seed
 4	engine	38.6	an_install_that_switches_one_span_at_a_time_is_caught
@@ -128,8 +173,14 @@
 4	raft	0.2	seed_2023_which_the_nightly_failed_on_a_trace_timestamp_no_longer_straddles_an_isolation
 4	wal	36.9	the_correct_log_passes_every_seed
 4	wal	0.2	the_seed_42_trace_is_written_for_the_studio
-4	node	13.5	a_server_that_resets_its_timer_on_any_message_is_caught_on_the_node
-4	node	8.7	a_leader_that_commits_an_older_terms_entry_by_count_is_caught_on_the_node
+4	node	15.39	a_leader_that_ignores_incarnations_is_not_re_asserted_on_the_node_yet
+4	node	14.92	a_server_whose_refusal_is_not_durable_is_not_re_asserted_on_the_node_yet
+4	node	14.32	a_server_that_installs_without_current_last_is_not_re_asserted_on_the_node_yet
+4	node	2.32	a_follower_that_truncates_on_every_append_is_caught_on_the_node
+4	node	0.52	a_server_that_sends_before_it_persists_is_caught_on_the_node
+4	node	0.24	a_seed_replays_to_the_same_trace_on_the_node
+4	node	0.11	a_node_under_the_raft_sweeps_arms_runs_every_range
+4	node	0.1	the_nodes_arms_aim_at_every_range_and_not_at_one
 # shard 5: 1351.7 cpu s
 5	echo	6.0	every_seed_satisfies_the_invariants_and_the_sweep_exercises_the_disk_faults
 5	engine	19.5	a_seek_that_counts_tombstones_is_caught
@@ -140,7 +191,7 @@
 5	raft	139.6	the_correct_server_passes_the_membership_scenario_on_every_seed
 5	raft	50.7	a_server_that_applies_before_commit_compacts_past_its_commit_index
 5	ranges	59.0	every_seed_passes_on_the_correct_node
-# shard 6: 1305.6 cpu s
+# shard 6: 1339.1 cpu s
 6	echo	0.1	a_busy_looping_task_fails_the_scenario_instead_of_hanging
 6	engine	310.3	an_engine_that_acknowledges_before_the_log_is_caught
 6	engine	204.5	an_engine_that_releases_a_memtable_before_the_manifest_is_caught
@@ -156,16 +207,16 @@
 6	raft	0.4	a_replica_that_never_compacts_outgrows_the_follower_log_bound
 6	raft	0.4	seed_158_which_pinned_the_refusal_that_is_not_durable_before_the_read_moved_loses_nothing
 6	raft	0.4	seed_1_of_the_term_raise_schedule_now_straddles_its_isolations_by_decision_time
+6	raft	0.3	seeds_3085_and_4065_which_the_nightly_found_linearize_inside_the_budget
 6	raft	0.2	seed_102_pins_the_refusal_that_is_not_durable_which_a_hundred_seeds_can_miss
 6	raft	0.2	seed_4_of_the_term_raise_schedule_steps_a_message_received_before_its_isolation
 6	raft	0.2	seed_7381_which_the_first_nightly_found_stays_green
 6	ranges	53.9	a_node_that_steps_a_core_while_its_persist_is_outstanding_is_caught
 6	wal	34.4	a_log_that_skips_sync_dir_on_rotation_is_caught
 6	wal	0.3	same_seed_gives_byte_identical_trace
-6	node	2.4	a_follower_that_truncates_on_every_append_is_caught_on_the_node
-6	node	0.3	a_seed_replays_to_the_same_trace_on_the_node
-6	node	0.1	a_node_under_the_raft_sweeps_arms_runs_every_range
-6	node	0.1	the_nodes_arms_aim_at_every_range_and_not_at_one
+6	node	14.65	a_server_whose_adoption_is_as_built_is_not_re_asserted_on_the_node_yet
+6	node	13.12	a_server_that_resets_its_timer_on_any_message_is_caught_on_the_node
+6	node	8.37	a_leader_that_commits_an_older_terms_entry_by_count_is_caught_on_the_node
 3	install	2.4	every_wiring_variant_is_caught
 6	install	6.3	the_correct_node_installs_on_every_seed
 6	install	0.1	a_stream_flows_and_an_install_completes_on_every_range_and_every_follower

@@ -696,6 +696,37 @@ pub enum TraceEvent {
         /// Why.
         reason: String,
     },
+    /// One replica of a node whose shared engine was refused whole (Q15; SHARD.md
+    /// §11, storage 8, §12's "A loss in the shared engine").
+    ///
+    /// A node owns one engine (Q2), so a loss in it is not one range's: every replica
+    /// the node holds is refused with it. `RaftRefused` says the *node* refused and
+    /// stays range-less, as §8 fixes it (SHARD.md:1132-1136); this event names one
+    /// replica the refusal took down, one per range the node holds, traced with it.
+    ///
+    /// It exists because of *when* a refusal is known. `RaftRefused` is traced before
+    /// the store opens — the refusal is what stops it opening — so at that instant the
+    /// node has restated nothing and holds no store to ask. What it does have is its
+    /// configuration: the ranges §2 fixes at bootstrap are in `ServerConfig` before
+    /// anything touches a disk, so the node names them here and a reader of the trace
+    /// need not guess. That is the whole reason this event carries `range` while
+    /// `RaftRefused` does not: a reader that took "the ranges it holds" from the run's
+    /// ranges instead would mark a node down for ranges it never held and for ranges
+    /// created after it was refused, and silently exempt those ranges from the checks
+    /// about time (`Report::ranges_with_a_majority_up`).
+    ///
+    /// The replica is down from here until its own re-seed installs and its
+    /// restatement's `RaftRecovered` says so (RAFT.md §3), per replica and not per
+    /// node. The durable per-replica refused mark the re-seed then writes into the
+    /// node's *new* engine is `RaftReseeded`, which §8 already keeps per replica: this
+    /// event is the refusal, that one is the mark.
+    // PROPOSED(D-077): Q15's whole-node refusal, and the re-seed per replica.
+    RaftReplicaRefused {
+        /// The node.
+        server: u64,
+        /// The range this refused replica holds.
+        range: u64,
+    },
     /// A Raft server stopped on an I/O error after starting. The simulator raises no
     /// I/O error of its own, so under simulation this is an engine bug.
     RaftServerFailed {
