@@ -184,7 +184,7 @@ take rewrites a directory a stream is reading (D-043). On the node that name gai
 range, `snap-r<range>-<index>-<take>`, and the staging directory gains the range and the
 sender, `staging-r<range>-s<sender>`, because a node's ranges apply streams of commands
 of their own and two of them taking at one index is ordinary; a range's sweep then
-proposes only its own versions for deletion (SHARD.md §11 raft 14; D-076, proposed).
+proposes only its own versions for deletion (SHARD.md §11 raft 14; D-075, proposed).
 A take asked for at the index
 the record already names answers with the recorded version when this store took it
 and it is complete; a take asked for because a stream found no usable checkpoint is
@@ -211,7 +211,18 @@ cap wait rather than restarting one another. A slot the cap frees is granted to 
 that is asking for it, never reserved for one that asked earlier and may since have been
 replaced as leader; and a chunk that starts an assembly over is answered with that
 restart even when it is its stream's last, since the directory it would be installed from
-has just been started over (Q14; D-076, proposed). An
+has just been started over (Q14; D-075, proposed). A chunk naming a range the node
+does not host is refused before it is admitted, so a leader that has not learned the
+range moved and a garbled range id each cost one answer and no slot, while the node's
+own send half fails instead, where the range streamed is the node's claim and not a
+peer's. A last chunk resent because its answer was lost is answered installed and
+installs once: the receiver remembers the identity each assembly completed until the
+node ends that assembly, which it does only once it has answered the sender. The slot
+an admitted assembly holds is given up when that range's own Raft supersedes its
+sender — a chunk of that range from a leader at a higher term takes it — and on a
+leader change the node observes for a range, the node ends the assembly the old leader
+held, since a chunk of one range is no evidence about who leads another (Q14; D-075,
+proposed). An
 acknowledgement that takes a stream past the furthest point any acknowledgement had
 taken it is that stream's progress, and the task marks the follower for the core, which
 reads the marks before each tick; a duplicate, the answer a resend gets and ground a
@@ -343,6 +354,7 @@ nodes in the scenario that drives it, and a core's events carry the range its
 | `RaftRecovered` | a server starts on what its store held | `term`, `applied`, `last_index`, `incarnation` |
 | `RaftProposed` | a leader made a client's request an entry | `client`, `seq`, `index`, `term` |
 | `RaftRefused` | a server's store lost state, or its staged install is damaged, and it waits to be re-seeded (§3) | `reason` |
+| `RaftReplicaRefused` | one replica a refusal took down, traced with it, one per range the server held: this server hosts one group and traces one, the node of SHARD.md §4 one per range. It carries `range` where `RaftRefused` does not, because a refusal is traced *before* the store opens and the ranges a server holds are known then only from its configuration (PROPOSED D-077) | `range` |
 | `RaftServerFailed` | a server stopped on an I/O error | `reason` |
 | `RaftInboxDropped` | a full inbox dropped a message | `kind` |
 | `RaftReseeded` | a server starts on a store a re-seed rebuilt (D-035) | — |
@@ -454,7 +466,11 @@ re-seeded by a leader and a re-seeded one never votes, so a range whose impaired
 replicas are not a minority cannot elect a leader if it loses the one it has, which is
 the availability D-035 gives up and not a liveness failure (D-030, D-035), and it is
 also where `IgnoreIncarnation`'s wedge would stall a commit (§5, D-042). A node's
-refusal is its whole store's, so every replica on it counts as refused. After the last
+refusal is its whole store's, so every replica *on it* counts as refused — the replicas
+its `RaftReplicaRefused` events name, and not every range of the run: a refusal that
+marked its node down for ranges it never held would exempt those ranges from both these
+checks, which with four ranges on a node is three ranges exempted by one refusal
+(PROPOSED D-077). After the last
 fault heals, a client write to **every key** of such a range completes within ten
 maximum election timeouts: a single minimum over every write is passed by a wedged
 range beside a live one, so the bound is asked of each key some client wrote to after
@@ -728,7 +744,11 @@ waits in the inbox for the next:
   a client of one range waits behind that range's disk and behind no other's (PROPOSED
   D-076). The node's bound covers what it holds because the task drains its
   queue to empty on every wake, so a bound that asked only about the queue would bind
-  nothing (D-074, proposed).
+  nothing (D-074, proposed). What the hold does *not* bind is a message larger than the
+  whole bound: no emptying could ever make room for one, so it is admitted whatever the
+  node holds, exactly as it is into an empty queue (D-072). Binding that case on the hold
+  refuses every retransmission of it alike — a node behind any outstanding sync is
+  holding something — and the range would never replicate again.
 
   The entries an `Apply` names are read from the core **at the step that named them**,
   not when the node comes to execute it: a deferred `Apply` runs after the replay has
@@ -768,7 +788,7 @@ waits in the inbox for the next:
   the running engine, with the range's repair carried in the same manifest switch, and
   no incarnation ends and no engine reopens. `RaftAdopted` on the node records only a
   node taking a fresh directory as its store after a whole-node refusal, and never a
-  replica's install (D-066; D-076, proposed).
+  replica's install (D-066; D-075, proposed).
 
 The `net` and `raft` tasks are separate so that a message arriving while the core is
 awaiting a persist is a queued message, not a lost one, and so that the interleaving
@@ -901,10 +921,10 @@ no known-buggy variant: its crash test,
 | `AdoptionAsBuilt` | §1: the adoption copies and switches before it deletes, a damaged staging `CURRENT` is refused, and a marked store never opens fresh (D-041); the variant removes the old store first, sweeps a damaged staging `CURRENT` as debris, and neither checks nor writes the marker | committed entries stay: a voter restarts on a fresh store and restates a truncation from index 1 below its commit index | the adoption crash storm, `Fault::CrashAdopting`, on one seed in four: the install crash's setup, then sixteen to thirty-two crashes, each the moment the adoption's first change to the store directory is durable, each a roll of the disk's rot on the staging `CURRENT` (D-041) |
 | `IgnoreIncarnation` | §1: a leader forgets a follower's progress when its store incarnation changes (D-042); the variant records the incarnation and never resets | the liveness check, were the wedge to stall a commit where the bound is asked (the configuration under Needs is not): a re-seeded follower below the match its leader recorded is never counted again while that leader leads. Caught on 4 of 10 000 seeds before D-047 (nightly run 34711427220) and on 0 of 10 000 after it (runs 34731272921 and 34749071877); D-047 moved no schedule, so the drop is itself evidence that the four were timing artefacts of the pre-vote check, as D-047 measured each directly | a follower refused and re-seeded below the match its leader recorded, while the third server is unavailable; after the last heal a server is unavailable only by refusal, and a refused server beside a re-seeded one is where §2 does not ask the liveness bound (D-035) |
 | `SharedSnapshotDir` | §1: every take its own version, a stream pinned to one, and a stream to every designated follower at once (D-043); the variant rewrites one directory per index under whatever stream reads it and streams to one follower at a time | the liveness check: a take lands on the directory a live stream reads, that stream never completes, and a second designated follower waits behind it with no entries, so neither follower counts and nothing commits. Only the liveness check's catches count: a linearizability search that exhausts its budget proves nothing (D-047). The *shape* short of the stall — a re-take into a directory a live stream has open, at an index the follower never installs at afterwards — is reached on 13.5 % of a thousand seeds against the correct server's 0, and is asserted from the hundred-seed tier (D-060) | a take at an index a live stream is reading, which no fault forces; `Fault::RetakeUnderStream`, on one seed in four, builds the shape around it: a designated follower's stream running while the leader's other follower is cut off |
-| `RefusalNotDurable` | §3: a refusal is marked in the store directory before anything else, and a refused engine does no work (D-044); the variant keeps the refusal in the process alone and its engine flushing | state machine safety: a server restarts on a store its refused engine flushed into self-consistency, a `RaftRecovered` after a `RaftRefused` with no install between, whose applied index its log does not hold | `Fault::CrashRefused`, on every seed: three to five rounds, each crashing the victim inside a memtable flush it has begun or, when it already sits refused, sixty to a hundred and sixty milliseconds into the round, and restarting it (D-044) |
+| `RefusalNotDurable` | §3: a refusal is marked in the store directory before anything else, and a refused engine does no work (D-044); the variant keeps the refusal in the process alone and its engine flushing | match starts: a leader traces a second first rise of a follower's match under one incarnation, the refused server having gone on serving as if its store had not changed under it. The state-machine-safety route this row named before — a server restarting on a store its refused engine flushed into self-consistency, a `RaftRecovered` after a `RaftRefused` with no install between, whose applied index its log does not hold — is **no longer reached**: D-065 leaves a compacted follower a snapshot record, so the laundered store has a prefix that accounts for its applied index and the restatement no longer contradicts its log. Measured at a thousand seeds on this tree: 0 of 1 000 by state machine safety, against 7 of 1 000 before the change, with all 58 catches the `match starts` oracle (D-078, finding 1). Seed 102, which pinned the old mechanism, now asserts its absence with that reason | `Fault::CrashRefused`, on every seed: three to five rounds, each crashing the victim inside a memtable flush it has begun or, when it already sits refused, sixty to a hundred and sixty milliseconds into the round, and restarting it (D-044) |
 | `RefusedCountsForQuorum` | §1: a refused follower's rejection counts for check quorum only in a window in which the leader's re-seed stream to it had a chunk acknowledged (D-049); the variant counts it whatever the stream does, the leader as built | the re-seed scenario's blocked half: with the leader's other follower cut off and the stream to the refused one lost to a path-MTU black hole, the leader keeps its office through the whole hold where the correct leader steps down within two windows and three ticks | a follower refused and being re-seeded while the leader's other follower is away, which `sim/quorum.rs` builds on every seed: the refusal made by the store's lost mark at a restart, the other follower cut off the moment the leader opens the stream |
 | `RefusedNeverCounts` | the same rule from the other side: nothing from a refused follower counts, the alternative D-049 rejected | the re-seed scenario's open half: the leader steps down mid-re-seed and, the re-seeded server never voting (D-035) and the other follower away, commits nothing after the install, where the correct leader keeps its office and commits | the same, with the stream open, on a disk that takes no time, since on the sweep's the refused server's silence while it repairs and adopts deposes the leader under any counting |
-| `FollowerNeverCompacts` | §1 above: a replica that is not leading compacts to its own applied index once its log is more than `snapshot_threshold` entries past its prefix (D-065); the variant is the server as it was built before that, whose follower log shrinks only by truncation or install | the follower-log bound, `raft::FOLLOWER_LOG_MULTIPLE` × `SNAPSHOT_THRESHOLD`, asked of every replica on every seed: caught on 5 of the first 1 000 seeds (116, 429, 512, 577, 757), by that bound on all five, with 878 entries — 73 × the threshold — the largest, on seed 512. The rate is half a per cent, far under the gate's twenty seeds, so the pair is pinned at seed 512 rather than swept (D-061): `a_replica_that_never_compacts_outgrows_the_follower_log_bound` | a replica that trails its leader and is never streamed a snapshot, over a run long enough for the lag to pass 64 × the threshold |
+| `FollowerNeverCompacts` | §1 above: a replica that is not leading compacts to its own applied index once its log is more than `snapshot_threshold` entries past its prefix (D-065); the variant is the server as it was built before that, whose follower log shrinks only by truncation or install | the follower-log bound, `raft::FOLLOWER_LOG_BOUND`, 768 entries, asked of every replica on every seed: caught on 5 of the first 1 000 seeds (116, 429, 512, 577, 757), by that bound on all five, with 878 entries — 73 × the threshold — the largest, on seed 512. The rate is half a per cent, far under the gate's twenty seeds, so the pair is pinned at seed 512 rather than swept (D-061): `a_replica_that_never_compacts_outgrows_the_follower_log_bound` | a replica that trails its leader and is never streamed a snapshot, over a run long enough for the lag to pass the bound's 768 entries |
 
 The checks about time in §2 are bounds, not properties: a client write within ten
 maximum election timeouts of the last heal, and an election within two of a server's

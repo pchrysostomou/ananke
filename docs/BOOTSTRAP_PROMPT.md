@@ -101,6 +101,22 @@ ananke/
 
 _Update this section at the end of every session._
 
+- Branch `phase-3-stage-b-quorum` (2026-09-23), PR #104, PROPOSED D-085: `origin/main`
+  merged in (carrying PR #86's whole-node refusal and re-seed, D-077), and the sharded
+  `sim/quorum.rs` built on the node — `quorum::node_run`: three nodes of four ranges, one
+  `mark_store_lost` refusing the node and all four replicas it holds, the third node cut
+  off, and check quorum asked of each range's own leader about that one node. The correct
+  system passes every seed at every tier (0 of 1 000 in release);
+  `NodeVariant::RefuseOneRangeOnly` is caught 1 000 of 1 000. **The finding**: D-049's own
+  pair, `RefusedCountsForQuorum` and `RefusedNeverCounts`, still has **no site** on the
+  node and PR #107 will not give it one. The rule is keyed on a rejection stamped
+  incarnation 0 — a server with *no store* — and D-077's node rebuilds every range's store
+  in a fresh engine before it serves, so it never sends one: 0 such rejections over 1 000
+  seeds, `uncounted` empty in all 1 394 step-downs, both variants caught 0 of 1 000. The
+  hazard D-049 fixed therefore returns on the node the day a leader can compact past a
+  re-seeded replica; that goes to the owner beside issue #103. Stage B's first exit
+  criterion for `sim/quorum.rs` is met for the scenario and still owed for §10's pair.
+
 - Merge update (2026-09-22): branch `phase-3-stage-b-compaction` merged `origin/main`
   to resolve PR conflicts, carrying in PROPOSED D-073 and D-074 from main and keeping
   this branch's PROPOSED D-078.

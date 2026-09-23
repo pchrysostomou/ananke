@@ -22,7 +22,8 @@
 //!   reserved for one, because nothing here has a clock and the waiter whose turn it
 //!   is may be a leader that has since been replaced. The re-seed shape caps two of a
 //!   node's four ranges on purpose, "so that re-seeds toward it wait for one another"
-//!   (SHARD.md §12).
+//!   (SHARD.md:2260-2261, where the phrase wraps the line break a grep for it must
+//!   cross).
 //! - **Paths keyed by range.** [`staging_name`] and [`version_name`] put the range in
 //!   the name, and [`Snapshots::sweep`] is a range's own sweep: it proposes for
 //!   deletion only version directories of the range it is sweeping.
@@ -197,6 +198,38 @@ pub enum Landing {
         /// stream that is asking for it, never held for one that may be gone.
         ahead: usize,
     },
+    /// A chunk for a range this node does not host (RAFT.md:214-218). Nothing was
+    /// written, no slot was
+    /// taken and no assembly was disturbed; the sender is told to start over, as an
+    /// over-cap chunk is, and finds the range where it now lives.
+    ///
+    /// `range` and `from` reach [`on_chunk`](Snapshots::on_chunk) from a *peer's*
+    /// `InstallSnapshot`, so an unhosted range is something the wire can say: a leader
+    /// that has not yet learned the rebalancer moved the range off this node (Q33)
+    /// streams to the old replica, and a garbled range id says it too. The node
+    /// refuses the chunk rather than failing on it — `Builder::push`'s line, that a
+    /// caller's lost message "is its bug and not the wire's" (frame.rs:134-137), cuts
+    /// the same way here: the *send* half still fails where the node lost track of a
+    /// range ([`stream`](Snapshots::stream)), because there the range is the node's
+    /// own claim and not a peer's.
+    // PROPOSED(D-075): a chunk of an unhosted range is refused on arrival, before it
+    // takes a slot, rather than panicking on the stream's last chunk.
+    NotHosted,
+    /// This stream's last chunk again, at the identity this assembly already
+    /// completed: nothing is staged and nothing is installed a second time. A last
+    /// chunk whose answer was lost is resent as a matter of course (RAFT.md:200-202),
+    /// and the node answers the resend what it answered the first: installed.
+    ///
+    /// The assembly remembers it until [`finish`](Snapshots::finish), so the node must
+    /// not finish a completed assembly until it has answered the sender.
+    // PROPOSED(D-075): a duplicate last chunk is answered idempotently rather than
+    // installing again, because nothing here carries an offset and a second install
+    // would switch from a staging directory the first switch may already have
+    // consumed.
+    Installed {
+        /// The identity that was installed, which is this chunk's own.
+        at: Identity,
+    },
     /// The stream's last chunk: what the node installs, and how.
     Complete(Box<Install>),
 }
@@ -221,7 +254,7 @@ pub struct Install {
     pub spans: Vec<KeyRange<Bytes>>,
     /// Whether the range's repair — term, vote, applied index, snapshot record, log
     /// tail, configuration, quarantine and incarnation, with tombstones for the log
-    /// keys the tail does not replace (RAFT.md:225-233) — is carried in the switch.
+    /// keys the tail does not replace (RAFT.md:238-246) — is carried in the switch.
     /// The correct node never switches without it (D-066).
     pub repair_in_switch: bool,
     /// Whether this install ends the node's run-loop incarnation and reopens the
@@ -240,11 +273,14 @@ pub struct Install {
 pub struct Adopted {
     /// The fresh directory, beside the refused one.
     pub dir: PathBuf,
-    /// The ranges that had installed into *this* directory when the event was traced,
-    /// read back from what the task counted, not a constant: none, because the event
-    /// is traced when the fresh engine is opened and before any range installs into
-    /// it. [`Snapshots::adopt_fresh`] refuses to adopt a directory that is not in that
-    /// state, which is how the figure is kept true.
+    /// The ranges that had installed into *this* directory when the event was traced:
+    /// **zero on every path that returns**, and a constant, like [`Streams::abandoned`]
+    /// and named as one here. It is read back from what the task counted per directory
+    /// rather than written down, but `installed` is keyed by engine directory and a
+    /// fresh directory has no entry of its own, so 0 is the only value that reaches
+    /// this field. [`Snapshots::adopt_fresh`]'s assertion is what keeps that true — it
+    /// refuses a directory that has taken an install — so the figure is the
+    /// assertion's, not an observation's.
     pub ranges_installed: usize,
 }
 
@@ -270,6 +306,15 @@ pub struct Streams {
     pub installs: usize,
     /// Assemblies started over for a chunk of another identity of their own sender.
     pub restarts: usize,
+    /// Chunks refused because the node does not host the range they name. Nothing was
+    /// written and no slot was taken for any of them.
+    pub unhosted: usize,
+    /// Assemblies displaced by a chunk of the same range from a sender at a higher
+    /// term: the slot of a leader that range's own Raft has superseded.
+    pub displaced: usize,
+    /// Last chunks that arrived again at the identity their assembly had already
+    /// completed, answered installed and installed no second time.
+    pub duplicates: usize,
     /// `RaftAdopted` events. One per fresh directory, none per install.
     pub adoptions: usize,
 }
@@ -287,6 +332,10 @@ struct Assembly {
     from: Option<ServerId>,
     at: Option<Identity>,
     staged: usize,
+    /// The identity this assembly has already completed an install for, until the
+    /// node [`finish`](Snapshots::finish)es it. A last chunk whose answer was lost is
+    /// resent (RAFT.md:200-202), and the resend must not install a second time.
+    complete: Option<Identity>,
 }
 
 /// One stream being sent to one follower of one range.
@@ -333,13 +382,24 @@ impl Snapshots {
     /// the *sender*, so the send half can only name the directory its followers stage
     /// under if it knows who it is.
     ///
-    /// `cap` is Q14's per-node cap on streams received and assembled. Nothing in the
-    /// design documents fixes a default: the re-seed shape sets it to two, below its
-    /// four ranges, on purpose, and D-066 leaves the quorum scenario's to the owner.
-    /// The recommendation this slice records is that a scenario which is not about the
-    /// cap sets it at or above the node's range count, so no stream waits by accident.
+    /// `cap` is Q14's per-node cap on what is assembled at once. Nothing in the design
+    /// documents fixes a default: the re-seed shape sets it to two, below its four
+    /// ranges, on purpose, and D-066 leaves the quorum scenario's to the owner. The
+    /// recommendation this slice records is that a scenario which is not about the cap
+    /// sets it at or above the node's range count **plus the senders a range may have
+    /// at once** — a leader and the stale leader it replaced are two assemblies of one
+    /// range, by the same decision that keys staging by sender — so no stream waits by
+    /// accident. A cap equal to the range count alone starves a range as soon as any
+    /// range has two senders.
+    ///
+    /// It is one cap, on assemblies. `SHARD.md:2231` and `SHARD.md:3035` say "caps",
+    /// received *and* assembled; nothing here receives a chunk without assembling it,
+    /// so the two are one number in this module, and a separate bound on streams a
+    /// node lets in before it assembles them belongs with the sockets the wiring slice
+    /// holds.
     // PROPOSED(D-075): the receive cap is a node setting with no default; a scenario
-    // not about the cap sets it at or above its range count.
+    // not about the cap sets it at or above its range count plus the concurrent
+    // senders any of its ranges may have. One cap, on assemblies.
     #[must_use]
     pub fn new(
         engine_dir: impl Into<PathBuf>,
@@ -367,10 +427,18 @@ impl Snapshots {
     /// # Panics
     ///
     /// If the spans are not sorted and disjoint, which `Engine::install_spans` refuses
-    /// (`SpansOverlap`, D-068). A caller that hands over overlapping spans has lost
-    /// track of what the range holds, which is a bug here and not a refusal to
-    /// discover at the switch.
+    /// (`SpansOverlap`, D-068), or if there are no spans at all, which it refuses the
+    /// same way: `EmptySpan` is "the set is empty **or** any span in it holds no key"
+    /// (engine.rs:1799; D-068), and only the second half of that was asserted here. A
+    /// caller that hands over overlapping spans, or none, has lost track of what the
+    /// range holds, which is a bug here and not a refusal to discover at the switch —
+    /// and a range registered with no spans is refused at *every* switch, which is the
+    /// permanent refusal this panic exists to prevent.
     pub fn host(&mut self, range: RangeId, spans: Vec<KeyRange<Bytes>>) {
+        assert!(
+            !spans.is_empty(),
+            "{range} is hosted with no spans: every install of it would be refused"
+        );
         assert!(
             spans.windows(2).all(|w| w[0].end <= w[1].start),
             "{range}'s spans are not sorted and disjoint"
@@ -458,7 +526,19 @@ impl Snapshots {
     /// follower of a range at once (Q14, D-043); a stream already running to that
     /// (range, follower) at another identity is replaced, which is the leader having
     /// moved on.
+    ///
+    /// # Panics
+    ///
+    /// If the range is not one this node hosts. A leader of a range is a replica of
+    /// it, so the range being streamed is the node's own claim and not a peer's: the
+    /// node fails here, where it lost track of the range. The *receive* half answers
+    /// the same mistake with [`Landing::NotHosted`], because there the range is a
+    /// peer's word.
     pub fn stream(&mut self, range: RangeId, to: ServerId, at: Identity) -> Started {
+        assert!(
+            self.hosted.contains_key(&range),
+            "{range} is streamed to {to} but is not hosted here"
+        );
         if self.variants.contains(NodeVariant::CapStreamsSent)
             && self.sending.len() >= BUGGY_SEND_CAP
             && !self.sending.contains_key(&(range, to))
@@ -552,12 +632,20 @@ impl Snapshots {
     /// a stream whose earlier bytes it never saw. That stream is restarted from its
     /// first byte (RAFT.md:203-207) and completes on the next pass.
     ///
+    /// A chunk naming a range this node does not host is answered
+    /// [`NotHosted`](Landing::NotHosted) before anything is admitted: it takes no slot
+    /// and disturbs no assembly. A chunk resending the last chunk of a stream this
+    /// assembly already completed is answered [`Installed`](Landing::Installed) and
+    /// installs nothing a second time.
+    ///
     /// # Panics
     ///
-    /// If `range` completes a stream but was never [`host`](Self::host)ed. The install
+    /// If `range` completes a stream but was never [`host`](Self::host)ed, which the
+    /// refusal above makes unreachable on the correct node and which
+    /// [`NodeVariant::AdmitsAnUnhostedRange`] is the way to reach. The install
     /// switches exactly the range's spans, and a node that cannot say what a range
-    /// holds has lost track of it: it fails here, where it lost track, and not at the
-    /// switch with an empty span set (`EmptySpan`, D-068).
+    /// holds has lost track of it: it fails here rather than switching an empty span
+    /// set the engine refuses (`EmptySpan`, D-068).
     pub fn on_chunk(
         &mut self,
         range: RangeId,
@@ -566,19 +654,41 @@ impl Snapshots {
         bytes: usize,
         done: bool,
     ) -> Landing {
+        if !self.hosted.contains_key(&range)
+            && !self.variants.contains(NodeVariant::AdmitsAnUnhostedRange)
+        {
+            // Refused before anything is admitted, so a range this node does not host
+            // takes no slot from one it does: `range` is a peer's word, and a peer
+            // that has not learned the range moved (Q33) would otherwise starve every
+            // hosted range on the node under the cap.
+            self.meters.unhosted += 1;
+            return Landing::NotHosted;
+        }
         let key = self.key(range, from);
-        if !self.receiving.contains_key(&key) && !self.admit(key) {
+        if !self.receiving.contains_key(&key) && !self.admit(key, at) {
             let ahead = self
                 .waiting
                 .iter()
                 .position(|w| *w == key)
-                .unwrap_or(self.waiting.len());
+                .expect("admit queues every key it refuses");
             return Landing::Waiting { ahead };
         }
         let dir = self.staging(key.0, key.1);
+        // The variant: the resent last chunk of a stream already installed installs
+        // again, from a staging directory the first switch may have consumed.
+        let installs_duplicates = self
+            .variants
+            .contains(NodeVariant::InstallsADuplicateLastChunk);
         let assembly = self.receiving.get_mut(&key).expect("admitted");
         let fresh = assembly.at.is_none();
         let restarted = !fresh && (assembly.from != Some(from) || assembly.at != Some(at));
+        if !restarted && assembly.complete == Some(at) && !installs_duplicates {
+            // This stream's last chunk again, resent because its answer was lost
+            // (RAFT.md:200-202). Nothing is staged and nothing is installed twice;
+            // the node answers what it answered the first time.
+            self.meters.duplicates += 1;
+            return Landing::Installed { at };
+        }
         // An assembly abandoned for a chunk that is not its sender's: the count the
         // check reads. On the correct node it never happens, because the key the
         // assembly is under already carries the sender.
@@ -603,6 +713,11 @@ impl Snapshots {
             };
             assembly.from = Some(from);
             assembly.at = Some(at);
+            if done {
+                // Remembered until the node finishes this assembly, so the resend of
+                // a last chunk whose answer was lost is answered, not installed.
+                assembly.complete = Some(at);
+            }
         }
         let staged = assembly.staged;
         if abandoned {
@@ -615,9 +730,17 @@ impl Snapshots {
             }
         }
         if done {
-            let spans = self.hosted.get(&range).cloned().unwrap_or_else(|| {
+            let mut spans = self.hosted.get(&range).cloned().unwrap_or_else(|| {
                 panic!("{range} completed a stream from {from} but is not hosted here")
             });
+            if self.variants.contains(NodeVariant::InstallWrongRangesSpans) {
+                // The variant: the install carries the node's first hosted range's
+                // spans instead of the completed range's, which on a node whose ranges
+                // are a `BTreeMap` is its lowest range id. `Engine::install_spans`
+                // removes every key of the spans it is given (D-068), so a re-seed of
+                // r4 would delete r1's Raft state and user keys while r1 is running.
+                spans = self.hosted.values().next().cloned().expect("hosted");
+            }
             self.meters.installs += 1;
             *self.installed.entry(self.engine_dir.clone()).or_default() += 1;
             return Landing::Complete(Box::new(Install {
@@ -640,6 +763,11 @@ impl Snapshots {
 
     /// Ends the assembly for this (range, sender) — its install switched, or its
     /// stream gave up — and frees its slot under the receive cap.
+    ///
+    /// It also forgets the identity this (range, sender) last completed, so the node
+    /// must not finish a completed assembly until it has answered the sender: a last
+    /// chunk resent before the answer is [`Landing::Installed`], one resent after the
+    /// assembly is finished is a stream of its own again (RAFT.md:200-202, 218-220).
     ///
     /// Returns the (range, sender) at the head of the queue, as a hint for the node's
     /// trace: the slot is *not* reserved for it. A waiter is admitted when its own
@@ -724,16 +852,56 @@ impl Snapshots {
     /// the order the waiters asked in, which is what `ahead` reports and what
     /// [`finish`](Self::finish) hints at, but it is an order among streams that are
     /// still asking, not a reservation.
-    fn admit(&mut self, key: (RangeId, ServerId)) -> bool {
+    fn admit(&mut self, key: (RangeId, ServerId), at: Identity) -> bool {
         if self.receiving.len() < self.cap {
             self.waiting.retain(|w| *w != key);
             self.receiving.insert(key, Assembly::default());
+            return true;
+        }
+        // The one supersession this module can prove on its own: a chunk of *this*
+        // range at a term above the one an assembly of this range holds is that
+        // range's own Raft saying the assembly's sender no longer leads it, and a
+        // stream from a superseded leader can never be installed — the receiver's raft
+        // refuses an `InstallSnapshot` below its term. The stale assembly gives up its
+        // slot rather than holding it until a `finish` that may never come.
+        // A sender superseded on *another* range is not something a chunk proves, and
+        // the node ends that assembly itself when it learns of the leader change
+        // (RAFT.md:222-225).
+        // PROPOSED(D-075): a full cap displaces an assembly of the same range at a
+        // lower term, and nothing else.
+        let stale = if self
+            .variants
+            .contains(NodeVariant::AssemblyHeldForDepartedSender)
+        {
+            None
+        } else {
+            self.superseded(key, at)
+        };
+        if let Some(stale) = stale {
+            self.receiving.remove(&stale);
+            self.waiting.retain(|w| *w != key);
+            self.receiving.insert(key, Assembly::default());
+            self.meters.displaced += 1;
             return true;
         }
         if !self.waiting.contains(&key) {
             self.waiting.push_back(key);
         }
         false
+    }
+
+    /// The assembly of `key`'s range whose identity a chunk at `at` supersedes: one
+    /// held by another sender at a strictly lower term. `None` when there is no such
+    /// assembly, which is every case where the cap is doing its job.
+    fn superseded(&self, key: (RangeId, ServerId), at: Identity) -> Option<(RangeId, ServerId)> {
+        self.receiving
+            .iter()
+            .find(|((range, from), assembly)| {
+                *range == key.0
+                    && *from != key.1
+                    && assembly.at.is_some_and(|held| held.term < at.term)
+            })
+            .map(|(held, _)| *held)
     }
 }
 
@@ -833,23 +1001,35 @@ mod tests {
 
     #[test]
     fn a_ranges_sweep_leaves_every_other_ranges_versions() {
+        // Two takes at index 11, which D-043 makes two directories: the record pins
+        // take 1, and a stream that opened take 0 has ended. The take is half the pin —
+        // a sweep that read the index alone would delete the take a stream is reading.
         let names: Vec<String> = [
             version_name(R1, 9, 0),  // R1's, unpinned: debris R1 sweeps
-            version_name(R1, 11, 0), // R1's, pinned: kept
+            version_name(R1, 11, 0), // R1's other take at the pinned index: debris too
+            version_name(R1, 11, 1), // R1's, pinned: kept
             version_name(R2, 9, 0),  // R2's, and R2's record is not R1's
-            version_name(R2, 11, 0),
+            version_name(R2, 11, 1),
             "staging-r2-s1".to_owned(),
         ]
         .into_iter()
         .collect();
-        let keep: BTreeSet<(Index, u64)> = [(11, 0)].into_iter().collect();
+        let keep: BTreeSet<(Index, u64)> = [(11, 1)].into_iter().collect();
 
         let swept = correct().sweep(&names, R1, &keep);
-        assert_eq!(swept, vec![version_name(R1, 9, 0)]);
+        assert_eq!(
+            swept,
+            vec![version_name(R1, 9, 0), version_name(R1, 11, 0)],
+            "the take the record does not name is debris at the pinned index too"
+        );
+        assert!(
+            !swept.contains(&version_name(R1, 11, 1)),
+            "the pinned take is kept: {swept:?}"
+        );
 
         let swept = buggy(NodeVariant::SweepAcrossRanges).sweep(&names, R1, &keep);
         assert!(
-            swept.contains(&version_name(R2, 11, 0)),
+            swept.contains(&version_name(R2, 11, 1)),
             "the variant is meant to sweep other ranges' versions: {swept:?}"
         );
     }
@@ -1020,6 +1200,22 @@ mod tests {
             Landing::Waiting { ahead: 0 }
         );
         assert_eq!(task.meters().waiting, 2, "a resend queues nothing new");
+        // A waiter the node gives up on leaves the queue. `finish` on a (range, sender)
+        // holding no assembly frees no slot and hints at nothing, but the queue falls
+        // with it — otherwise a stream that stopped inflates `ahead` for every waiter
+        // behind it, for ever.
+        assert_eq!(
+            task.finish(RangeId(4), S1),
+            None,
+            "a waiter holds no slot to free"
+        );
+        assert_eq!(task.meters().waiting, 1);
+        assert_eq!(
+            task.on_chunk(RangeId(4), S1, AT, 16, false),
+            Landing::Waiting { ahead: 1 },
+            "and when it asks again it queues behind the one still asking"
+        );
+        assert_eq!(task.meters().waiting, 2);
         // Nothing the waiters sent disturbed the two that were admitted.
         assert!(matches!(
             task.on_chunk(RangeId(1), S1, AT, 16, false),
@@ -1065,8 +1261,12 @@ mod tests {
             task.on_chunk(range, S1, AT, 16, false);
         }
         assert_eq!(task.meters().waiting, 2);
-        // S1 is replaced. Its two assemblies end — the node knows those streams stopped
-        // — and its two waiters never send again.
+        // S1 is replaced as the leader of r1 and r2. The node ends the assemblies it
+        // held: that is the node's rule for a leader change it observes
+        // (RAFT.md:222-225), and not something this check may assume — what the module
+        // can prove for itself, a higher term on the *same* range, is
+        // `an_assembly_whose_leader_its_range_superseded_gives_up_its_slot`. Its two
+        // waiters never send again.
         task.finish(RangeId(1), S1);
         task.finish(RangeId(2), S1);
         assert_eq!(task.meters().receiving, 0);
@@ -1195,6 +1395,14 @@ mod tests {
         assert_eq!(refused.range, R1);
         assert_eq!(refused.to, S2);
         assert_eq!(refused.len, MAX_FRAME_LEN);
+        // And the first byte over the limit, not only a chunk far over it: the guard is
+        // `encoded_len(chunk) > MAX_FRAME_LEN`, and one that forgot `HEADER_LEN` would
+        // hand this chunk to `Builder::push`, whose own `fits` assertion panics on it.
+        let over = MAX_FRAME_LEN - encoded_len(0) + 1;
+        let refused = task
+            .route(R1, S2, &vec![7u8; over])
+            .expect_err("one byte over what fits a frame");
+        assert_eq!(refused.len, over);
         assert_eq!(task.meters().frames, 0);
         assert_eq!(task.meters().chunks, 0, "a refused chunk is not counted");
     }
@@ -1277,6 +1485,40 @@ mod tests {
         assert!(!install.adopted, "an install is never a RaftAdopted");
         assert_eq!(task.meters().adoptions, 0);
 
+        // A *second* range's install carries that range's spans. `hosted` is a
+        // `BTreeMap`, so "the first hosted range" is R1 here: an install of R2 that
+        // carried R1's spans would have `Engine::install_spans` remove every key of R1
+        // — its Raft state under tenant 0 and its user keys under tenant 2 — and put
+        // R2's staged tables there, in one switch, while R1 is running (D-068).
+        receive(&mut task, R2, S2, AT);
+        let landing = task.on_chunk(R2, S2, AT, 16, true);
+        let Landing::Complete(second) = landing else {
+            panic!("R2's stream completes: {landing:?}");
+        };
+        assert_eq!(second.range, R2);
+        assert_eq!(second.spans, spans(R2), "the completed range's spans");
+        assert_ne!(
+            second.spans,
+            spans(R1),
+            "not the node's first hosted range's"
+        );
+        assert_eq!(second.source, task.staging(R2, S2));
+
+        let mut wrong = buggy(NodeVariant::InstallWrongRangesSpans);
+        receive(&mut wrong, R2, S2, AT);
+        let Landing::Complete(install) = wrong.on_chunk(R2, S2, AT, 16, true) else {
+            panic!("the stream completes");
+        };
+        assert_eq!(
+            install.range, R2,
+            "the variant names the range that completed"
+        );
+        assert_eq!(
+            install.spans,
+            spans(R1),
+            "the variant is meant to carry the first hosted range's spans"
+        );
+
         let mut buggy = buggy(NodeVariant::InstallWithoutRepair);
         receive(&mut buggy, R1, S2, AT);
         let Landing::Complete(install) = buggy.on_chunk(R1, S2, AT, 16, true) else {
@@ -1290,7 +1532,13 @@ mod tests {
 
     #[test]
     fn only_a_fresh_directory_after_a_refusal_is_adopted() {
-        let mut task = correct();
+        // A cap of one, so the queue is not empty when the adoption drops it: a waiter
+        // names a directory under the refused store exactly as an assembly does, and an
+        // adoption asserted on an empty queue asserts nothing about it.
+        let mut task = Snapshots::new("/n1", ME, 1, NodeVariants::correct());
+        for range in [R1, R2] {
+            task.host(range, spans(range));
+        }
         // Every range's install on the node traces no adoption.
         for range in [R1, R2] {
             receive(&mut task, range, S2, AT);
@@ -1306,10 +1554,22 @@ mod tests {
             2,
             "two ranges installed, not adopted"
         );
-        // An assembly is open and a stream is being sent: both name directories under
-        // the refused store, and the adoption drops them.
+        // An assembly is open, a stream is waiting for its slot and a stream is being
+        // sent: all three name directories under the refused store, and the adoption
+        // drops them.
         receive(&mut task, R1, S3, AT);
+        assert_eq!(
+            task.on_chunk(R2, S3, AT, 16, false),
+            Landing::Waiting { ahead: 0 },
+            "the cap of one puts R2's stream in the queue"
+        );
         task.stream(R2, S1, AT);
+        let meters = task.meters();
+        assert_eq!(
+            (meters.receiving, meters.waiting, meters.sending),
+            (1, 1, 1),
+            "one of each before the adoption"
+        );
         // The one thing that traces an adoption: the node taking a fresh directory
         // (Q15). Nothing has installed into *that* directory, which is what the figure
         // says and what the assertion checks.
@@ -1377,7 +1637,12 @@ mod tests {
             matches!(landing, Landing::Staged { staged: 1_032, .. }),
             "S1's stream counts its own bytes: {landing:?}"
         );
-        assert_eq!(correct.meters().receiving, 2);
+        assert_eq!(
+            correct.meters().receiving,
+            2,
+            "two senders of one range are two assemblies, and so two slots under the \
+             cap: the arithmetic open choice 2's recommendation rests on"
+        );
         assert_eq!(correct.meters().abandoned, 0);
 
         let mut buggy = buggy(NodeVariant::StagingByRangeAlone);
@@ -1395,15 +1660,217 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "but is not hosted here")]
-    fn a_range_the_task_does_not_host_never_completes_a_stream() {
-        // A replica the rebalancer has just placed here, whose spans the task has not
-        // been told: the install would switch an empty set of spans, which
-        // `Engine::install_spans` refuses at the switch (`EmptySpan`, D-068). The node
-        // fails where it lost track of the range instead (D-075, proposed 5).
-        let mut task = correct();
+    fn a_chunk_of_a_range_the_node_does_not_host_is_refused_and_takes_no_slot() {
+        // `range` and `from` come off a peer's `InstallSnapshot`. A leader that has not
+        // learned the rebalancer moved the range off this node (Q33) streams to the old
+        // replica, and a garbled range id says the same thing: the node refuses the
+        // chunk, as it refuses one over the cap. It does not fail on a peer's word
+        // (frame.rs:134-137), and it does not let that word hold a slot.
+        let mut task = Snapshots::new("/n1", ME, 2, NodeVariants::correct());
+        task.host(R1, spans(R1));
         let unhosted = RangeId(7);
-        task.on_chunk(unhosted, S2, AT, 16, true);
+        assert_eq!(
+            task.on_chunk(unhosted, S2, AT, 16, false),
+            Landing::NotHosted
+        );
+        // Its last chunk is refused the same way: the node cannot say what spans the
+        // switch would take, so there is nothing to install.
+        assert_eq!(
+            task.on_chunk(unhosted, S2, AT, 16, true),
+            Landing::NotHosted
+        );
+        let meters = task.meters();
+        assert_eq!(
+            (meters.receiving, meters.waiting, meters.installs),
+            (0, 0, 0),
+            "nothing admitted, nothing queued, nothing installed"
+        );
+        assert_eq!(meters.unhosted, 2);
+        // The range the node does host is admitted, both slots still free to it.
+        assert!(matches!(
+            task.on_chunk(R1, S2, AT, 16, false),
+            Landing::Staged { .. }
+        ));
+
+        // The variant: the unhosted ranges are taken in, and with the cap at two they
+        // starve the one range this node actually hosts.
+        let mut buggy = Snapshots::new(
+            "/n1",
+            ME,
+            2,
+            NodeVariants::correct().with(NodeVariant::AdmitsAnUnhostedRange),
+        );
+        buggy.host(R1, spans(R1));
+        for range in [RangeId(7), RangeId(8)] {
+            assert!(
+                matches!(
+                    buggy.on_chunk(range, S2, AT, 16, false),
+                    Landing::Staged { .. }
+                ),
+                "the variant is meant to admit a range the node does not host"
+            );
+        }
+        assert_eq!(
+            buggy.on_chunk(R1, S2, AT, 16, false),
+            Landing::Waiting { ahead: 0 },
+            "the variant is meant to starve the node's own range"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "but is not hosted here")]
+    fn a_range_the_task_does_not_host_is_never_streamed() {
+        // The send half. The range a leader streams is the node's own claim, not a
+        // peer's: a node streaming a range it cannot say the spans of has lost track of
+        // it, and fails where it lost track.
+        let mut task = correct();
+        task.stream(RangeId(7), S2, AT);
+    }
+
+    #[test]
+    #[should_panic(expected = "completed a stream from")]
+    fn an_admitted_unhosted_range_still_installs_nothing() {
+        // The invariant behind the refusal: even with the refusal removed, an install
+        // is never made for a range whose spans the node cannot name. This is the
+        // variant's own end, and the reason the assertion stays.
+        let mut buggy = Snapshots::new(
+            "/n1",
+            ME,
+            2,
+            NodeVariants::correct().with(NodeVariant::AdmitsAnUnhostedRange),
+        );
+        buggy.host(R1, spans(R1));
+        buggy.on_chunk(RangeId(7), S2, AT, 16, true);
+    }
+
+    #[test]
+    fn an_assembly_whose_leader_its_range_superseded_gives_up_its_slot() {
+        // §12's shape again: four ranges, two slots, S1 holding both assemblies. S1 is
+        // replaced as r1's leader, and r1's new leader's chunk names a higher term —
+        // r1's own Raft saying S1 no longer leads it, which is the one supersession a
+        // chunk proves. The stale assembly can never be installed by anyone, so it
+        // gives up its slot rather than holding it until a `finish` that never comes.
+        let mut task = Snapshots::new("/n1", ME, 2, NodeVariants::correct());
+        for range in [RangeId(1), RangeId(2), RangeId(3), RangeId(4)] {
+            task.host(range, spans(range));
+        }
+        for range in [RangeId(1), RangeId(2)] {
+            task.on_chunk(range, S1, AT, 16, false);
+        }
+        assert_eq!(task.meters().receiving, 2);
+        let landing = task.on_chunk(RangeId(1), S2, LATER, 16, false);
+        assert!(
+            matches!(landing, Landing::Staged { staged: 16, .. }),
+            "r1's new leader takes the slot its superseded leader held: {landing:?}"
+        );
+        let meters = task.meters();
+        assert_eq!(
+            (meters.receiving, meters.waiting, meters.displaced),
+            (2, 0, 1),
+            "one assembly displaced, none queued, the cap still two"
+        );
+        // Only that range's. A chunk of r1 is no evidence about who leads r2, whose
+        // Raft is its own: r2's assembly keeps its slot and its bytes, and the node
+        // ends it itself when it learns r2's leader changed (RAFT.md:222-225).
+        assert!(matches!(
+            task.on_chunk(RangeId(2), S1, AT, 16, false),
+            Landing::Staged { staged: 32, .. }
+        ));
+        // The superseded sender's own next chunk asks for a slot like anyone else's:
+        // it waits, and does not displace its way back in.
+        assert_eq!(
+            task.on_chunk(RangeId(1), S1, AT, 16, false),
+            Landing::Waiting { ahead: 0 }
+        );
+        // A range with no assembly of its own displaces nothing, whatever its term.
+        assert_eq!(
+            task.on_chunk(RangeId(3), S2, LATER, 16, false),
+            Landing::Waiting { ahead: 1 }
+        );
+        assert_eq!(task.meters().displaced, 1);
+
+        // The variant: the stale assembly is held until it finishes, which a leader
+        // that has been replaced never does, and r1's new leader waits for ever.
+        let mut buggy = Snapshots::new(
+            "/n1",
+            ME,
+            2,
+            NodeVariants::correct().with(NodeVariant::AssemblyHeldForDepartedSender),
+        );
+        for range in [RangeId(1), RangeId(2), RangeId(3), RangeId(4)] {
+            buggy.host(range, spans(range));
+        }
+        for range in [RangeId(1), RangeId(2)] {
+            buggy.on_chunk(range, S1, AT, 16, false);
+        }
+        assert!(
+            matches!(
+                buggy.on_chunk(RangeId(1), S2, LATER, 16, false),
+                Landing::Waiting { .. }
+            ),
+            "the variant is meant to hold the superseded assembly's slot"
+        );
+        assert_eq!(buggy.meters().displaced, 0);
+    }
+
+    #[test]
+    fn a_resent_last_chunk_installs_once() {
+        // A chunk unanswered for half a minimum election timeout is resent
+        // (RAFT.md:200-202), and a last chunk's answer is exactly what can be lost. The
+        // resend is answered installed: no second switch, from a staging directory the
+        // first switch may already have consumed.
+        let mut task = correct();
+        receive(&mut task, R1, S2, AT);
+        let Landing::Complete(install) = task.on_chunk(R1, S2, AT, 16, true) else {
+            panic!("the stream completes");
+        };
+        assert_eq!(install.at, AT);
+        for _ in 0..2 {
+            assert_eq!(
+                task.on_chunk(R1, S2, AT, 16, true),
+                Landing::Installed { at: AT },
+                "the resend is answered what the first answer said"
+            );
+        }
+        // And a chunk of the installed stream that is not its last one stages nothing
+        // either: that stream is over.
+        assert_eq!(
+            task.on_chunk(R1, S2, AT, 16, false),
+            Landing::Installed { at: AT }
+        );
+        let meters = task.meters();
+        assert_eq!((meters.installs, meters.duplicates), (1, 3));
+        // The sender's *next* snapshot is a stream of its own: a new identity starts
+        // the directory over and installs when it completes.
+        let landing = task.on_chunk(R1, S2, LATER, 16, false);
+        assert!(
+            matches!(landing, Landing::Restarted { staged: 0, .. }),
+            "a new identity starts over: {landing:?}"
+        );
+        let Landing::Complete(next) = task.on_chunk(R1, S2, LATER, 16, true) else {
+            panic!("the new stream completes");
+        };
+        assert_eq!(next.at, LATER);
+        assert_eq!(task.meters().installs, 2);
+        // The memory is the assembly's, so it ends with `finish`: which is why the node
+        // finishes a completed assembly only once it has answered the sender.
+        task.finish(R1, S2);
+        assert!(matches!(
+            task.on_chunk(R1, S2, LATER, 16, true),
+            Landing::Complete(_)
+        ));
+        assert_eq!(task.meters().installs, 3);
+
+        // The variant: the resend installs again.
+        let mut buggy = buggy(NodeVariant::InstallsADuplicateLastChunk);
+        receive(&mut buggy, R1, S2, AT);
+        let _ = buggy.on_chunk(R1, S2, AT, 16, true);
+        assert!(
+            matches!(buggy.on_chunk(R1, S2, AT, 16, true), Landing::Complete(_)),
+            "the variant is meant to install the resend a second time"
+        );
+        assert_eq!(buggy.meters().installs, 2);
+        assert_eq!(buggy.meters().duplicates, 0);
     }
 
     #[test]
@@ -1412,6 +1879,17 @@ mod tests {
         let raft = |g: u64| Bytes::copy_from_slice(&[0u64.to_be_bytes(), g.to_be_bytes()].concat());
         let mut task = correct();
         task.host(RangeId(7), vec![raft(0)..raft(4), raft(2)..raft(6)]);
+    }
+
+    #[test]
+    #[should_panic(expected = "is hosted with no spans")]
+    fn a_range_hosted_with_no_spans_is_refused_where_it_is_hosted() {
+        // `EmptySpan` is "the set is empty or any span in it holds no key"
+        // (engine.rs:1799; D-068). A range registered before its intervals are known
+        // would install nothing and be refused at every switch for ever — the
+        // permanent refusal, not a transient one.
+        let mut task = correct();
+        task.host(RangeId(7), Vec::new());
     }
 
     #[test]
@@ -1471,6 +1949,22 @@ mod tests {
             (
                 NodeVariant::CompleteOnRestart,
                 "a_restarted_stream_is_never_installed",
+            ),
+            (
+                NodeVariant::InstallWrongRangesSpans,
+                "an_install_is_a_live_install_of_the_ranges_spans_with_its_repair",
+            ),
+            (
+                NodeVariant::AdmitsAnUnhostedRange,
+                "a_chunk_of_a_range_the_node_does_not_host_is_refused_and_takes_no_slot",
+            ),
+            (
+                NodeVariant::AssemblyHeldForDepartedSender,
+                "an_assembly_whose_leader_its_range_superseded_gives_up_its_slot",
+            ),
+            (
+                NodeVariant::InstallsADuplicateLastChunk,
+                "a_resent_last_chunk_installs_once",
             ),
         ];
         for (variant, _) in caught {
