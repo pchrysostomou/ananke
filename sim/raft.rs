@@ -2266,8 +2266,6 @@ pub fn messages_of(payload: &Bytes) -> Vec<(u64, Message)> {
 /// came last for all four, and one leader's four first rises under one follower
 /// collapse into one key. The node scenario's sweep fails on every seed under that
 /// key and no one-range sweep can tell the two apart (D-076).
-// PROPOSED(D-076): the fold is keyed by `(range, leader, term, follower,
-// incarnation)`.
 ///
 /// A window is one stretch of one replica's leader tracking one follower. It opens
 /// at the leader's term, and where the leader *begins tracking the follower
@@ -2321,6 +2319,8 @@ pub fn messages_of(payload: &Bytes) -> Vec<(u64, Message)> {
 ///
 /// The first repeat, naming the leader, the term, the follower and the incarnation.
 // PROPOSED(D-069): `RaftMatchStarted` is the first rise, and this is what says so.
+// PROPOSED(D-076): the fold is keyed by `(range, leader, term, follower,
+// incarnation)`.
 // PROPOSED(D-079): per tracking window, so that a re-added voter's fresh progress
 // is a fresh first rise (issue #81).
 pub fn match_starts_are_first_rises(records: &[TraceRecord]) -> Result<(), String> {
@@ -2751,11 +2751,26 @@ impl Report {
             .min()
     }
 
-    /// Per key some client wrote to after the last heal, how long the quickest of
+    /// Per key some client wrote to after the last heal, how long the **slowest** of
     /// those writes took **from its own call** — `ret − max(call, last_heal)`, and
     /// every write folded here was called at or after the heal — with `None` for a
     /// key whose post-heal writes all stayed pending. The write bound is asked of
     /// each of these (SHARD.md §8).
+    ///
+    /// The slowest and not the quickest, which is the whole point of reading a write
+    /// from its own call: under the old reading (`ret − last_heal`) the earliest
+    /// completion was also the smallest number, so a minimum meant "the key's first
+    /// completion after the heal" and a key served late failed the bound. Measured
+    /// from each write's own call that stops being true — a minimum then means "the
+    /// fastest write to this key", which a single quick write hides every slow one
+    /// behind. D-076's review planted exactly that: a key called 10 ms after the heal
+    /// and served at 2.9 s, with a second write to it served in 10 ms, passed a
+    /// bound of 2 s. The maximum is what asks the bound of every post-heal write
+    /// there is, which is what SHARD.md §8 says. It widens nothing: the bound is the
+    /// same bound, and the correct system's slowest post-heal write over a thousand
+    /// seeds of the node scenario is **101.93275 ms** against it, measured on this
+    /// tree (75.622274 ms over a hundred; no key of any seed passes the bound under
+    /// either reading).
     ///
     /// The interval is the write's own and not the time since the heal, because the
     /// time since the heal is not the cluster's alone: with eight keys, two clients
@@ -2796,9 +2811,13 @@ impl Report {
             let took = op
                 .ret
                 .map(|ret| ret.duration_since(op.call.max(self.last_heal)));
-            let first = by_key.entry(op.op.key().clone()).or_default();
-            *first = match (*first, took) {
-                (Some(one), Some(another)) => Some(one.min(another)),
+            let worst = by_key.entry(op.op.key().clone()).or_default();
+            // The slowest of the key's post-heal writes, so that no quick write
+            // hides a slow one; `None` still means "none of them completed", which
+            // is the wedge, and a write still in flight when the run ended is not
+            // one (D-076's review).
+            *worst = match (*worst, took) {
+                (Some(one), Some(another)) => Some(one.max(another)),
                 (one, another) => one.or(another),
             };
         }
@@ -2935,8 +2954,9 @@ impl Report {
     /// unimpaired replicas form a majority completes within [`LIVENESS_TIMEOUTS`]
     /// maximum election timeouts of the last heal (SHARD.md §8).
     ///
-    /// The bound is asked of each key some client wrote to after the heal
-    /// ([`Report::writes_after_heal_by_key`]), and of no other: a key no client
+    /// The bound is asked of every write to each key some client wrote to after the
+    /// heal — the slowest of them is what is read
+    /// ([`Report::writes_after_heal_by_key`]) — and of no other: a key no client
     /// wrote to in the window is no evidence of anything, and the two clients draw
     /// their keys at random. A key whose post-heal writes all stayed pending is the
     /// wedge this check is here to see. With no range left with a majority nothing
@@ -2965,7 +2985,7 @@ impl Report {
                 Some(took) if took <= bound => {}
                 Some(took) => {
                     return Err(format!(
-                        "liveness: the first client write to {key} after the last heal took {took:?} from its own call, over {bound:?}"
+                        "liveness: the slowest client write to {key} after the last heal took {took:?} from its own call, over {bound:?}"
                     ));
                 }
                 None => {
@@ -8664,6 +8684,89 @@ mod tests {
                 "liveness: range {SINGLE_GROUP} took 2.505s after the last heal to \
                  complete a client write, over 2s"
             ))
+        );
+    }
+
+    /// The bound is asked of the *slowest* post-heal write to a key, not the
+    /// quickest (D-076's review). Reading each write from its own call made the
+    /// per-key fold's minimum mean "the fastest write to this key", which one quick
+    /// write hides every slow one behind; the maximum is what asks the bound of
+    /// every post-heal write there is.
+    ///
+    /// The pair (CLAUDE.md:52-57) is the history the review planted: a key asked
+    /// for 10 ms after the heal and served at 2.9 s, with a second write to it
+    /// served in 10 ms, beside a key of the same range served throughout. The
+    /// quickest reading passes it at 10 ms and the per-range reading passes it at
+    /// 30 ms — the live key's own completion — so the per-key maximum is the only
+    /// thing in the tree that fails it, and this asserts both halves.
+    // PROPOSED(D-076): the write bound is asked of every post-heal write.
+    #[test]
+    fn the_write_bound_is_asked_of_the_slowest_write_to_a_key_not_the_quickest() {
+        let write = |key: &str, call: u64, ret: Option<u64>| lin::Op {
+            process: 1,
+            seq: 0,
+            call: ms(call),
+            ret: ret.map(ms),
+            op: ClientOp::Put {
+                key: Bytes::from(key.to_owned()),
+                value: Bytes::from_static(b"v"),
+            },
+            result: ret.map(|_| ananke_env::ClientResult::Done),
+        };
+        let live = vec![record(
+            ms(0),
+            ms(0),
+            Some(1),
+            term_of(1, SINGLE_GROUP, 1, "follower"),
+        )];
+        let hidden = Report {
+            history: History {
+                ops: vec![
+                    write("k1", 5, Some(30)),
+                    write("k0", 10, Some(2900)),
+                    write("k0", 2950, Some(2960)),
+                ],
+                ..History::default()
+            },
+            ..report(live, Vec::new())
+        };
+        let bound = election_max() * LIVENESS_TIMEOUTS;
+        assert_eq!(
+            bound,
+            Duration::from_secs(2),
+            "the bound this case is about"
+        );
+        // The buggy half, written out: the quickest post-heal write to k0 is the
+        // second one, 10 ms, and nothing about it is evidence of the first.
+        let quickest = hidden
+            .history
+            .ops
+            .iter()
+            .filter(|op| op.op.key() == &Bytes::from_static(b"k0"))
+            .filter_map(|op| {
+                op.ret
+                    .map(|ret| ret.duration_since(op.call.max(hidden.last_heal)))
+            })
+            .min();
+        assert_eq!(quickest, Some(Duration::from_millis(10)));
+        // What the check reads, and what it says.
+        assert_eq!(
+            hidden.writes_after_heal_by_key()[&Bytes::from_static(b"k0")],
+            Some(Duration::from_millis(2890))
+        );
+        assert_eq!(
+            hidden.liveness(),
+            Err(
+                "liveness: the slowest client write to k0 after the last heal took 2.89s \
+                 from its own call, over 2s"
+                    .to_owned()
+            )
+        );
+        // And the range's own reading passes it: the range completed a write 30 ms
+        // after the heal, so this one is the per-key check's to catch or nobody's.
+        assert_eq!(
+            hidden.writes_after_heal_by_range()[&SINGLE_GROUP],
+            Some(Duration::from_millis(30))
         );
     }
 
