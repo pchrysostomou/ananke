@@ -38,6 +38,15 @@ Deferred ideas are GitHub issues labelled by phase; [docs/BACKLOG.md](docs/BACKL
   made unless `scripts/gate.sh` has exited 0 on the exact tree being committed, run as
   that single command, never as separate shell lines whose failures can be missed. CI
   runs the same checks as parallel jobs.
+- **Never leave a killed gate's children running.** `scripts/gate.sh` spawns `cargo`,
+  which spawns test binaries that bind ports and hold the build lock; killing the script
+  leaves them, and the next run in that worktree blocks on the lock or fails on a bound
+  port in another worktree. Kill the process group
+  (`kill -- -$(ps -o pgid= -p PID | tr -d ' ')`), and before killing anything check its
+  working directory (`lsof -a -p PID -d cwd`) — several worktrees share this repository
+  and most long-running `cargo` processes are not yours. A killed gate also prints no
+  verdict, so a watcher on its log waits for a line that never arrives: read the log
+  itself rather than trusting the wait.
 - **Every commit is the author's.** Commits are authored and committed as
   `pchrysostomou <prodromosch@hotmail.co.uk>`, never with a `Co-Authored-By` or any
   other AI trailer. Before any push, `git log --format='%an %cn' main..HEAD | sort -u`
