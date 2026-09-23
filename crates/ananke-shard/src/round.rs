@@ -412,6 +412,25 @@ impl Cores {
             self.meters.messages_for_ranges_not_held += 1;
             return;
         };
+        // Phase 2's `SendBeforePersist` on the node (SHARD.md §10, §12). §10 calls it
+        // the variant that matters most against Q41's round: a send that follows a
+        // core's `Persist` leaves when that persist resolves, and the variant sends it
+        // first. It is the *core's* variant, read off the core's own configuration, so
+        // a node whose cores carry it is a node whose cores' sends leave early and
+        // nothing else about the node changes.
+        //
+        // It is not [`NodeVariant::DeferredFlushedEarly`], and the difference is the
+        // one D-026 turns on: this sends early and still executes the `Apply`, the
+        // reads and the step's trace events when the persist resolves, "so the trace
+        // says what is durable"; `DeferredFlushedEarly` hands out all of them early and
+        // is caught by checks about the trace rather than by commit-by-majority. Both
+        // are here because they are different bugs.
+        // PROPOSED(D-082): Phase 2's `SendBeforePersist` re-asserted on the node.
+        let sends_early = slot
+            .core
+            .config()
+            .variants
+            .contains(ananke_raft::core::Variant::SendBeforePersist);
         let outputs = slot.core.step(input);
         let mut persisted = false;
         for output in outputs {
@@ -450,7 +469,8 @@ impl Cores {
                         output,
                         entries,
                     };
-                    if persisted && !early {
+                    let sent_early = sends_early && matches!(act.output, Output::Send { .. });
+                    if persisted && !early && !sent_early {
                         slot.deferred.push(act);
                     } else {
                         round.early.push(act);

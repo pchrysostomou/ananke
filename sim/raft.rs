@@ -91,6 +91,10 @@ use ananke_raft::message::{self, Frame, Message};
 use ananke_raft::node::SINGLE_GROUP;
 use ananke_raft::store::LOST_STATE;
 use ananke_raft::{NodeConfig, ServerId, invariants, run as run_server};
+use ananke_shard::client::{RangedRequest, RangedResponse};
+use ananke_shard::range::RangeId;
+use ananke_shard::server::ServerConfig;
+use ananke_shard::variant::NodeVariants;
 use ananke_storage::EngineConfig;
 use bytes::Bytes;
 use moirae_sched::Policy;
@@ -234,6 +238,177 @@ pub fn server_of(addr: SocketAddr) -> Option<u64> {
 /// A node id (1-based, like the trace) for server `id`: servers are added first.
 fn node_of_server(id: u64) -> NodeId {
     NodeId::new(u32::try_from(id).expect("small"))
+}
+
+/// The system this scenario's arms are driven against (SHARD.md §12, Stage B's
+/// first exit criterion).
+///
+/// Every arm below — the isolations, the one-way blocks, the crashes, the lease
+/// trials, the Figure 8 driver, the crashes aimed at an install, an adoption and a
+/// refusal — is written once and driven against whichever of these the run names.
+/// What varies between them is small and is all here: how a server is spawned,
+/// which ranges it holds, which range an arm aims at, who leads that range, and how
+/// a client addresses it. Everything else — when an arm fires, what it waits for,
+/// what it heals — is the same code, so the two clusters cannot drift apart
+/// (PROPOSED D-082).
+///
+/// [`Cluster::OneGroup`] keeps Phase 2's unit and Phase 2's draws: a schedule drawn
+/// for it draws from exactly the streams it drew from before this enum existed, in
+/// exactly the order, so every seed pinned in `sim/tests/raft.rs` runs the run it
+/// was pinned on. [`Cluster::Node`] is §4's node, and its schedule takes the range
+/// each leader-relative arm aims at from a stream of its own (§11, env 8; D-031).
+// PROPOSED(D-082): the arms are shared and the node is a second cluster of them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cluster {
+    /// One server, one Raft group: [`ananke_raft::run`], the unit Phase 2 built
+    /// and the one every pinned seed of this sweep was pinned against.
+    OneGroup,
+    /// The node of SHARD.md §4: [`ananke_shard::server::run`], four ranges on every
+    /// node over one socket, one engine, one inbox and one ticker.
+    Node,
+}
+
+/// The node cluster's `snapshot_threshold`, far above what a run writes.
+///
+/// Every snapshot action a core can ask for is behind this number. A leader asks for
+/// a take when its log has outgrown its compacted prefix by the threshold
+/// (`core.rs`), a follower asks for a record on the same condition (D-078), and a
+/// leader asks for an install only for a follower whose `next` has fallen at or below
+/// the compacted prefix — which with nothing compacted is index 0, and no follower's
+/// `next` is ever that. So a run whose highest index stays below this asked for
+/// nothing, and that is what [`Report::highest_index`] lets a sweep assert rather
+/// than assume.
+// PROPOSED(D-082): what the node cluster does not reach yet, asserted absent.
+pub const NODE_SNAPSHOT_THRESHOLD: u64 = 1 << 30;
+
+/// The keys the node cluster's clients draw from: two per range, as the node
+/// scenario's are ([`crate::ranges::KEYS`]), so a range's liveness is about a key
+/// some client wrote and not about the one key the cluster has.
+// PROPOSED(D-082): the arms are shared and the node is a second cluster of them.
+pub const NODE_KEYS: u64 = 2 * crate::ranges::RANGES;
+
+impl Cluster {
+    /// The ranges every server of this cluster holds, in id order.
+    #[must_use]
+    pub fn ranges(self) -> Vec<u64> {
+        match self {
+            Self::OneGroup => vec![SINGLE_GROUP],
+            Self::Node => (crate::ranges::FIRST_RANGE
+                ..crate::ranges::FIRST_RANGE + crate::ranges::RANGES)
+                .collect(),
+        }
+    }
+
+    /// How many keys a client draws from.
+    #[must_use]
+    pub fn keys(self) -> u64 {
+        match self {
+            Self::OneGroup => KEYS,
+            Self::Node => NODE_KEYS,
+        }
+    }
+
+    /// The map from a key to the range that serves it, which the write bound and
+    /// the liveness check read per key (D-071).
+    #[must_use]
+    pub fn key_range(self) -> fn(&Bytes) -> u64 {
+        match self {
+            Self::OneGroup => range_of_key,
+            Self::Node => node_range_of_key,
+        }
+    }
+
+    /// How likely a block is to rot on this cluster's disk.
+    ///
+    /// The one-group server's disk rots, and its engine's checksums turn a rotted
+    /// table into a refusal the server survives by re-seeding. The node's does not,
+    /// and the reason is the absence this cluster asserts rather than hides: a
+    /// refusal on the node stops the node, because Q15's whole-node refusal and its
+    /// re-seed are another slice's (PR #86, D-077) and are not in this tree. A node
+    /// that stopped would take its four ranges with it for the rest of the run and
+    /// the liveness checks would be measuring a scenario nobody wrote. The sweep
+    /// asserts that no store was refused and says why, so the day the path arrives
+    /// the sweep says so instead of passing over it.
+    // PROPOSED(D-082): what the node cluster does not reach yet, asserted absent.
+    #[must_use]
+    pub fn bitrot(self) -> f64 {
+        match self {
+            Self::OneGroup => 0.02,
+            Self::Node => 0.0,
+        }
+    }
+
+    /// Spawns server `id` on its node, as a start or as a restart.
+    fn spawn(self, sim: &Sim, id: u64, variants: Variants, node: NodeVariants) {
+        let env = sim.env(node_of_server(id));
+        let inner = env.clone();
+        match self {
+            Self::OneGroup => {
+                env.spawn("raft", async move {
+                    let _ = run_server(inner, node_config(id, variants)).await;
+                });
+            }
+            Self::Node => {
+                env.spawn("node", async move {
+                    let _ =
+                        ananke_shard::server::run(inner, node_server_config(id, variants, node))
+                            .await;
+                });
+            }
+        }
+    }
+
+    /// The request a client of this cluster puts on the wire for `range`.
+    fn encode(self, range: u64, request: Request) -> Bytes {
+        match self {
+            Self::OneGroup => request.encode(),
+            Self::Node => RangedRequest {
+                range: RangeId(range),
+                request,
+            }
+            .encode(),
+        }
+    }
+
+    /// The answer in a packet a client of this cluster received, if it is one.
+    fn decode(self, bytes: Bytes) -> Option<Response> {
+        match self {
+            Self::OneGroup => Response::decode(bytes).ok(),
+            Self::Node => RangedResponse::decode(bytes).ok().map(|r| r.response),
+        }
+    }
+}
+
+/// The node cluster's map from a key to its range: the scenario's fixed map
+/// (SHARD.md, Stage B), which every client, driver and check reads.
+///
+/// A key is `k`, the number of the first key of its range's span, and whatever the
+/// writer wants after it: the clients write `k0` to `k7`, two to a range, and the
+/// Figure 8 driver's burst and the re-take driver's fill write keys of their arm's
+/// own range — `k4b`, `k4f2.7` — which sort inside that range's span, so the map
+/// and the spans `RangeCreated` names agree. A key the map does not know is the
+/// first range's, so the map is total, as a routing table must be.
+// PROPOSED(D-082): the arms are shared and the node is a second cluster of them.
+#[must_use]
+pub fn node_range_of_key(key: &Bytes) -> u64 {
+    let digits = std::str::from_utf8(key)
+        .ok()
+        .and_then(|key| key.strip_prefix('k'))
+        .map(|rest| {
+            rest.split(|c: char| !c.is_ascii_digit())
+                .next()
+                .unwrap_or("")
+        })
+        .filter(|digits| !digits.is_empty())
+        .and_then(|digits| digits.parse::<u64>().ok())
+        .unwrap_or(0);
+    crate::ranges::FIRST_RANGE + (digits / 2).min(crate::ranges::RANGES - 1)
+}
+
+/// The first key of range index `pick`'s span: what a driver aimed at that range
+/// prefixes its keys with, so that they sort inside the span (`node_range_of_key`).
+fn node_key_prefix(pick: u64) -> String {
+    format!("k{}", pick * 2)
 }
 
 /// One fault of a schedule. Every fault heals before the next starts.
@@ -590,6 +765,31 @@ pub const ADOPTION_WAIT_BUDGET: Duration = Duration::from_millis(100);
 /// (D-041).
 const EMPTY_STORE_DELAY: Duration = Duration::from_millis(3);
 
+impl Fault {
+    /// Whether this arm aims at a path [`Cluster::Node`] has not got: the snapshot
+    /// install, the adoption of a staged store, or the refusal of a store that lost
+    /// state.
+    ///
+    /// Each of the four is an arm whose whole aim is one of those paths — a crash
+    /// timed at an install's last chunk, at an adoption's first durable change, at
+    /// the window a refusal can be laundered in, or at a leader re-taking under a
+    /// live stream. On a node that takes no snapshot and cannot be refused, each
+    /// would wait out its budget and fire as an ordinary isolation or crash, which
+    /// [`Schedule::draw`] draws anyway. [`Schedule::draw_on_the_node`] leaves them
+    /// out and says why.
+    // PROPOSED(D-082): the arms are shared and the node is a second cluster of them.
+    #[must_use]
+    pub fn needs_a_path_the_node_has_not_got(&self) -> bool {
+        matches!(
+            self,
+            Self::CrashInstalling { .. }
+                | Self::CrashAdopting { .. }
+                | Self::CrashRefused { .. }
+                | Self::RetakeUnderStream { .. }
+        )
+    }
+}
+
 /// One lease trial; two open every schedule, see the module documentation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Trial {
@@ -643,6 +843,21 @@ pub struct Schedule {
     pub drifts: Vec<i64>,
     /// Each server's clock offset in nanoseconds, by server index.
     pub skews: Vec<i64>,
+    /// Which of the cluster's ranges each leader-relative fault aims at, as an
+    /// index into [`Cluster::ranges`], one per entry of `faults`.
+    ///
+    /// Empty on a schedule drawn for [`Cluster::OneGroup`], where the cluster has
+    /// one range and there is nothing to aim: [`Schedule::range_of`] answers the
+    /// only range there is, and no draw is spent, so a one-group schedule is drawn
+    /// from exactly the streams it was drawn from before this field existed and
+    /// every pinned seed of this sweep keeps its run.
+    ///
+    /// On the node it is drawn from a stream of its own, `arm-range`, as §11's env
+    /// item 8 asks: which range an arm aims at is the arm's own draw, so changing
+    /// it moves no other arm's dice (D-031).
+    // PROPOSED(D-082): a leader-relative arm on a node of many ranges draws its
+    // range from its own stream.
+    pub range_picks: Vec<u64>,
 }
 
 impl Schedule {
@@ -664,6 +879,7 @@ impl Schedule {
             settle: Duration::ZERO,
             drifts: vec![0; SERVERS as usize],
             skews: vec![0; SERVERS as usize],
+            range_picks: Vec::new(),
         }
     }
 
@@ -849,7 +1065,82 @@ impl Schedule {
             settle: election_max() * LIVENESS_TIMEOUTS + Duration::from_millis(200),
             drifts,
             skews,
+            range_picks: Vec::new(),
         }
+    }
+
+    /// A schedule for [`Cluster::Node`] drawn from `seed`: [`Schedule::draw`]'s
+    /// own draw, with the arms aimed at paths the node has not got taken out, and
+    /// with the range each leader-relative arm aims at drawn from a stream of its
+    /// own (SHARD.md §11, env 8).
+    ///
+    /// **What it keeps** is everything Q41's round and the batched wire are about:
+    /// the two lease trials, the isolations, the leader isolation, the one-way
+    /// blocks, the crashes, the leader crash, [`Fault::StaleSender`]'s rule-5 shape
+    /// and the Figure 8 driver. Seven of Phase 2's eight `sim/raft.rs` variants are
+    /// caught on these (§10), and on the node each is caught with four ranges'
+    /// persists sharing one group commit and four ranges' messages sharing one
+    /// frame.
+    ///
+    /// **What it takes out** is the third of the arms that aim at the install, the
+    /// adoption and the refusal — [`Fault::CrashInstalling`],
+    /// [`Fault::CrashAdopting`], [`Fault::CrashRefused`] and
+    /// [`Fault::RetakeUnderStream`] — because this node has none of those paths:
+    /// `ananke_shard::snapshot` is not wired to `ananke_shard::server::ServerHost`,
+    /// and Q15's whole-node refusal and re-seed are not in this tree either. D-076
+    /// said so in as many words when it added the node beside the server. An arm
+    /// kept here would fire, wait out its budget and reduce to an isolation or an
+    /// ordinary crash, which the schedule already draws: it would cost the tier its
+    /// time and assert nothing. They come back with the slice that wires the path,
+    /// and until then the variants they carry keep their Phase 2 assertions on
+    /// [`Cluster::OneGroup`], which this sweep leaves running exactly as it is
+    /// (PROPOSED D-082).
+    ///
+    /// Each taken-out arm's absence is asserted on every seed by [`Report::check`]'s
+    /// node clauses — no snapshot action asked for, no store refused — so the day a
+    /// path arrives the sweep says so rather than passing over it (CLAUDE.md).
+    // PROPOSED(D-082): the arms are shared and the node is a second cluster of them.
+    #[must_use]
+    pub fn draw_on_the_node(seed: u64) -> Self {
+        let drawn = Self::draw(seed);
+        let mut faults = Vec::new();
+        let mut gaps = Vec::new();
+        for (fault, gap) in drawn.faults.iter().zip(drawn.gaps.iter()) {
+            if fault.needs_a_path_the_node_has_not_got() {
+                continue;
+            }
+            faults.push(fault.clone());
+            gaps.push(*gap);
+        }
+        let mut rng = moirae_sched::stream(seed, "arm-range");
+        let range_picks = faults
+            .iter()
+            .map(|_| rng.below(crate::ranges::RANGES))
+            .collect();
+        Self {
+            faults,
+            gaps,
+            range_picks,
+            ..drawn
+        }
+    }
+
+    /// The range the `i`th fault aims at, on `cluster`.
+    ///
+    /// One group has one range and every arm aims at it; the node's arms take
+    /// theirs from [`Schedule::range_picks`]. A pick past the cluster's ranges — a
+    /// schedule built by hand — falls back to the first, so the answer is always a
+    /// range the cluster holds.
+    // PROPOSED(D-082): a leader-relative arm resolves its leader per range.
+    #[must_use]
+    pub fn range_of(&self, cluster: Cluster, i: usize) -> u64 {
+        let ranges = cluster.ranges();
+        let pick = usize::try_from(self.range_picks.get(i).copied().unwrap_or(0)).expect("small");
+        ranges
+            .get(pick)
+            .or_else(|| ranges.first())
+            .copied()
+            .unwrap_or(SINGLE_GROUP)
     }
 
     /// The directed schedule for issue #32's shape (D-050): after the warmup,
@@ -872,6 +1163,7 @@ impl Schedule {
             settle: election_max() * LIVENESS_TIMEOUTS + Duration::from_millis(200),
             drifts: vec![0; SERVERS as usize],
             skews: vec![0; SERVERS as usize],
+            range_picks: Vec::new(),
         }
     }
 
@@ -1043,6 +1335,20 @@ pub struct Report {
     /// the cluster-wide reading at all (D-071, item 6).
     // PROPOSED(D-076): the scenario's key-to-range map is the run's, not a constant.
     pub key_range: fn(&Bytes) -> u64,
+    /// Which system the run was driven against.
+    // PROPOSED(D-082): the arms are shared and the node is a second cluster of them.
+    pub cluster: Cluster,
+    /// Every leader-relative arm that fired, as (the range it drew, the leader of
+    /// that range it resolved, when it resolved it).
+    ///
+    /// What [`Report::arms_hit_their_ranges`] reads. All four of the arms that
+    /// resolve a leader per range are here — [`Fault::IsolateLeader`] and
+    /// [`Fault::CrashLeader`], which aim at the leader itself, and
+    /// [`Fault::StaleSender`] and [`Fault::FigureEight`], which choose a victim
+    /// *relative* to it and would pick the wrong follower just as silently. Empty for
+    /// a run another scenario drove.
+    // PROPOSED(D-082): a leader-relative arm resolves its leader per range.
+    pub aimed: Vec<(u64, u64, Instant)>,
 }
 
 /// What another scenario's run hands [`Report::over_a_run`].
@@ -1319,6 +1625,27 @@ impl Report {
             clients,
             ranges,
             key_range,
+            // A run another scenario drove is `sim/ranges.rs`'s, and this says
+            // `OneGroup` so that the follower-log bound is still asked of it.
+            //
+            // That is deliberate and it is *not* the same judgement as the one this
+            // scenario's node cluster gets. `ranges::Report::check` calls
+            // `self.checked.check()` and adds its own clauses; it does not opt out of
+            // this one, so naming the cluster here is the whole of the decision.
+            // Asking the bound there is safe and worth keeping: that scenario's node
+            // has no follower compaction either, but it also has no client load worth
+            // the name against this one: the review of this slice measured its largest
+            // follower log at **66 entries over a hundred seeds and 74 over a
+            // thousand** against the bound's 768 — a margin over ten times the figure,
+            // barely growing with the tier, where this scenario's node reaches 610. A bound with that much room is a
+            // tripwire rather than a claim about a mechanism, and a tripwire on a
+            // scenario that should never approach it is worth having. The day it
+            // tightens, the judgement moves to `ranges::Report::check` where the
+            // scenario can make it for itself.
+            // PROPOSED(D-082): the follower-log bound is the one-group server's, and
+            // the node scenario's run is named `OneGroup` here so it keeps it.
+            cluster: Cluster::OneGroup,
+            aimed: Vec::new(),
         }
     }
 
@@ -1375,6 +1702,380 @@ impl Report {
             |e| matches!(e, TraceEvent::ClientInvoke { client, .. } if client >> 32 == BURST >> 32),
         )
     }
+
+    /// The span the run's records cover: the last record's time less the first's.
+    ///
+    /// It is what a rate is divided by, in place of the schedule's planned total —
+    /// they agree on a run that finished, and a run stopped as a runaway is exactly
+    /// the case where they would not.
+    // PROPOSED(D-082): the measurements SHARD.md §12 asks of the sweeps.
+    #[must_use]
+    pub fn observed(&self) -> Duration {
+        match (self.records.first(), self.records.last()) {
+            (Some(first), Some(last)) => last.at.duration_since(first.at),
+            _ => Duration::ZERO,
+        }
+    }
+
+    /// Trace records per virtual second divided by the run's range count: the
+    /// figure Stage B measures against [`TRACE_CAP`], which sizes the scenarios of
+    /// Stages C to E.
+    ///
+    /// The numerator is the **whole** trace — every client operation, every
+    /// `MessageSent` and `MessageDelivered`, the engine's records — and only a part
+    /// of it is about a range at all, so this is an upper bound on any range's own
+    /// rate and not that rate ([`Report::busiest_range_records_per_second`] is the
+    /// observed one). A cap sized from this figure is sized conservatively, which
+    /// is the direction to be wrong in.
+    // PROPOSED(D-082): the measurements SHARD.md §12 asks of the sweeps.
+    #[must_use]
+    pub fn records_per_second_per_range(&self) -> f64 {
+        let seconds = self.observed().as_secs_f64().max(f64::EPSILON);
+        self.records.len() as f64 / self.ranges.len().max(1) as f64 / seconds
+    }
+
+    /// The records that name a range, counted for the busiest range, per observed
+    /// virtual second: the rate a range's own records actually reach.
+    // PROPOSED(D-082): the measurements SHARD.md §12 asks of the sweeps.
+    #[must_use]
+    pub fn busiest_range_records_per_second(&self) -> f64 {
+        let seconds = self.observed().as_secs_f64().max(f64::EPSILON);
+        let mut by_range: BTreeMap<u64, usize> = BTreeMap::new();
+        for record in &self.records {
+            if let Some(range) = range_of(&record.event) {
+                *by_range.entry(range).or_default() += 1;
+            }
+        }
+        by_range.into_values().max().unwrap_or(0) as f64 / seconds
+    }
+
+    /// The messages the node's inbox dropped under its byte bound, by the kind it
+    /// dropped and the range it was of: the coverage SHARD.md §12 asks each
+    /// scenario to print.
+    ///
+    /// A drop costs a follower its timer reset and a leader a promise (§4), which
+    /// is why the policy drops the noisiest pair's oldest heartbeat and never a
+    /// message carrying entries or snapshot data (D-072). The count is printed, not
+    /// asserted at zero: a bounded inbox that never dropped anything would say the
+    /// bound was never reached, and what the bound is for is the tick at 1 000
+    /// ranges where it is.
+    // PROPOSED(D-082): the inbox's drops under its byte bound, printed.
+    #[must_use]
+    pub fn inbox_drops(&self) -> BTreeMap<(&'static str, u64), usize> {
+        let mut by: BTreeMap<(&'static str, u64), usize> = BTreeMap::new();
+        for record in &self.records {
+            if let TraceEvent::RaftInboxDropped { range, kind, .. } = &record.event {
+                *by.entry((kind, *range)).or_default() += 1;
+            }
+        }
+        by
+    }
+
+    /// Every apply's lag, in virtual time: from the `RaftCommit` that made a range's
+    /// index committed on a node to that node's `RaftApply` of it, by range.
+    ///
+    /// SHARD.md §12's measurement, and §4's threshold is on the **median**: Q14's
+    /// grouped applies are built if it exceeds one heartbeat interval, 20 ms. The
+    /// sweep's disk latencies drive it — an apply is a synced batch — and on the
+    /// node one `apply` task carries every range, so a range's lag is its own work
+    /// plus whatever the task was doing for the others
+    /// ([`Report::cross_range_apply_holds`]).
+    ///
+    /// A commit index advancing to `index` makes every index above the last one
+    /// committed, so each of them is stamped with that record's time; a later
+    /// commit over the same index — a restart resets the commit index, which is not
+    /// persisted — restamps it, and the apply is measured from the stamp in force
+    /// when it happened. An index applied with no commit of it in the trace before
+    /// it contributes nothing rather than a guess.
+    // PROPOSED(D-082): the apply lag per range, under the sweep's client load.
+    #[must_use]
+    pub fn apply_lags(&self) -> BTreeMap<u64, Vec<Duration>> {
+        let mut committed: BTreeMap<(u64, u64), (u64, BTreeMap<u64, Instant>)> = BTreeMap::new();
+        let mut lags: BTreeMap<u64, Vec<Duration>> = BTreeMap::new();
+        for record in &self.records {
+            match &record.event {
+                TraceEvent::RaftCommit {
+                    server,
+                    range,
+                    index,
+                    ..
+                } => {
+                    let (highest, at) = committed.entry((*server, *range)).or_default();
+                    for i in (*highest + 1)..=*index {
+                        at.insert(i, record.at);
+                    }
+                    *highest = (*highest).max(*index);
+                }
+                TraceEvent::RaftApply {
+                    server,
+                    range,
+                    index,
+                    ..
+                } => {
+                    if let Some((_, at)) = committed.get(&(*server, *range))
+                        && let Some(committed_at) = at.get(index)
+                        && record.at >= *committed_at
+                    {
+                        lags.entry(*range)
+                            .or_default()
+                            .push(record.at.duration_since(*committed_at));
+                    }
+                }
+                _ => {}
+            }
+        }
+        lags
+    }
+
+    /// The median apply lag over every range of the run, and the median per range.
+    ///
+    /// `None` when nothing was both committed and applied, which is a run that put
+    /// no work through any range.
+    // PROPOSED(D-082): the apply lag per range, under the sweep's client load.
+    #[must_use]
+    pub fn median_apply_lag(&self) -> (Option<Duration>, BTreeMap<u64, Duration>) {
+        let lags = self.apply_lags();
+        let mut all: Vec<Duration> = Vec::new();
+        let mut per_range = BTreeMap::new();
+        for (range, mut of_range) in lags {
+            all.extend(of_range.iter().copied());
+            of_range.sort_unstable();
+            if let Some(median) = median(&of_range) {
+                per_range.insert(range, median);
+            }
+        }
+        all.sort_unstable();
+        (median(&all), per_range)
+    }
+
+    /// How long a range's ready apply waited through **another** range's apply job
+    /// on the same node, in virtual time, over windows in which that node was up
+    /// throughout.
+    ///
+    /// D-036's figure as far as this node can produce it. One `apply` task per node
+    /// takes every range's jobs one at a time (Q14), so "one range's take holds the
+    /// node's other ranges' applies" is the extreme case of a hold that exists
+    /// whatever the job is. **This node takes no snapshot** — the `snapshot` task is
+    /// not wired to its host — so the take's own hold cannot be measured here at all,
+    /// and the slice that wires it owes that figure. What is measured is the hold by
+    /// an ordinary apply.
+    ///
+    /// The fold, over one node's applies in time order. For three consecutive applies
+    /// at `t0 < t1 < t2` where the one at `t2` is of a different range than the one at
+    /// `t1`, and `t2`'s entry became committed at `r <= t1`: the hold is
+    /// `t1 - max(r, t0)` — the part of the job that ran from `t0` to `t1`, another
+    /// range's, that the range applied at `t2` spent waiting with its own entry
+    /// already committed.
+    ///
+    /// **A window in which the node crashed is not a hold, and is dropped.** Clamping
+    /// to `t0` was once thought to rule a crash out, and it does not: a node that
+    /// crashes just after `t0` and restarts before `t1` leaves two applies far apart
+    /// with no work between them, and the gap is the node being dead, not one range
+    /// holding another. The review of this slice found the maximum this fold reported
+    /// was exactly that — seed 71, server 1, window 8.067849144 s to 8.640712611 s,
+    /// with `NodeCrashed` at 8.068 s and `NodeRestarted` at 8.413 s inside it, 345 ms
+    /// of the 573 spent down — and the next three maxima were the same shape. So a
+    /// hold whose window holds a `NodeCrashed` or a `NodeRestarted` of that server is
+    /// not counted, and the count of what was dropped is returned beside the holds,
+    /// because a fold that quietly drops its input is a fold that says nothing.
+    ///
+    /// What is left is still an **upper bound on one job's hold and a lower bound on
+    /// the wait's total**, because an apply's completion is all the trace carries.
+    // PROPOSED(D-082): how long one range's applies hold the node's others.
+    #[must_use]
+    pub fn cross_range_apply_holds(&self) -> Vec<Duration> {
+        self.cross_range_apply_holds_counted().0
+    }
+
+    /// The holds, and how many windows were dropped for holding a crash or a restart
+    /// of their node.
+    // PROPOSED(D-082): a window in which the node crashed is not a hold.
+    #[must_use]
+    pub fn cross_range_apply_holds_counted(&self) -> (Vec<Duration>, usize) {
+        // Every crash and restart, by the node that suffered it, in time order.
+        let mut downs: BTreeMap<u64, Vec<Instant>> = BTreeMap::new();
+        for record in &self.records {
+            let node = match &record.event {
+                TraceEvent::NodeCrashed { node } | TraceEvent::NodeRestarted { node } => {
+                    u64::from(node.get())
+                }
+                _ => continue,
+            };
+            downs.entry(node).or_default().push(record.at);
+        }
+        let mut committed: BTreeMap<(u64, u64), (u64, BTreeMap<u64, Instant>)> = BTreeMap::new();
+        // The two most recent applies on each node: (t0, t1) with t1's range.
+        let mut last: BTreeMap<u64, (Option<Instant>, Instant, u64)> = BTreeMap::new();
+        let mut holds = Vec::new();
+        let mut dropped = 0usize;
+        for record in &self.records {
+            match &record.event {
+                TraceEvent::RaftCommit {
+                    server,
+                    range,
+                    index,
+                    ..
+                } => {
+                    let (highest, at) = committed.entry((*server, *range)).or_default();
+                    for i in (*highest + 1)..=*index {
+                        at.insert(i, record.at);
+                    }
+                    *highest = (*highest).max(*index);
+                }
+                TraceEvent::RaftApply {
+                    server,
+                    range,
+                    index,
+                    ..
+                } => {
+                    if let Some(&(t0, t1, of)) = last.get(server)
+                        && of != *range
+                        && let Some((_, at)) = committed.get(&(*server, *range))
+                        && let Some(&ready) = at.get(index)
+                        && ready <= t1
+                    {
+                        let from = match t0 {
+                            Some(t0) if t0 > ready => t0,
+                            _ => ready,
+                        };
+                        // A node's own server id is its node id in these scenarios
+                        // (`node_of_server`), so the crash records are looked up by it.
+                        let crashed = downs
+                            .get(server)
+                            .is_some_and(|at| at.iter().any(|&a| a >= from && a <= t1));
+                        if crashed {
+                            dropped += 1;
+                        } else {
+                            holds.push(t1.duration_since(from));
+                        }
+                    }
+                    let t0 = last.get(server).map(|&(_, t1, _)| t1);
+                    last.insert(*server, (t0, record.at, *range));
+                }
+                _ => {}
+            }
+        }
+        (holds, dropped)
+    }
+
+    /// Every peer frame this run's nodes sent, decoded: how many messages it
+    /// carried and how many distinct ranges those messages were of.
+    ///
+    /// What says a frame between two nodes carries several ranges — the parameter
+    /// four is fixed for (SHARD.md §12) — read off the frames themselves. A frame
+    /// of the one-group codec counts as one message of one range, which is what it
+    /// is.
+    // PROPOSED(D-082): the batching claim is read off this sweep's own frames.
+    #[must_use]
+    pub fn frames_carried(&self) -> (BTreeMap<usize, usize>, BTreeMap<usize, usize>) {
+        let mut messages: BTreeMap<usize, usize> = BTreeMap::new();
+        let mut ranges: BTreeMap<usize, usize> = BTreeMap::new();
+        for record in &self.records {
+            let TraceEvent::MessageSent { payload, .. } = &record.event else {
+                continue;
+            };
+            if ananke_shard::is_ranged(payload) {
+                continue;
+            }
+            let carried = messages_of(payload);
+            if carried.is_empty() {
+                continue;
+            }
+            *messages.entry(carried.len()).or_default() += 1;
+            let of: BTreeSet<u64> = carried.iter().map(|(range, _)| *range).collect();
+            *ranges.entry(of.len()).or_default() += 1;
+        }
+        (messages, ranges)
+    }
+
+    /// How many of this run's peer frames carried messages of more than one range.
+    // PROPOSED(D-082): the batching claim is read off this sweep's own frames.
+    #[must_use]
+    pub fn frames_of_several_ranges(&self) -> usize {
+        let (_, ranges) = self.frames_carried();
+        ranges
+            .iter()
+            .filter(|(carried, _)| **carried > 1)
+            .map(|(_, frames)| *frames)
+            .sum()
+    }
+
+    /// Snapshot actions traced on this run.
+    // PROPOSED(D-082): what the node cluster does not reach yet, asserted absent.
+    #[must_use]
+    pub fn snapshot_actions(&self) -> usize {
+        self.count(|e| matches!(e, TraceEvent::RaftSnapshot { .. }))
+    }
+
+    /// How many of this run's leader-relative arms hit the leader of the range they
+    /// drew, and how many fired: the teeth of §11's env item 8.
+    ///
+    /// An arm on a node of four ranges draws a range and cuts off *that range's*
+    /// leader. An arm that resolved "the leader" without the range would cut off
+    /// whichever range elected last, which is a perfectly good fault and which no
+    /// check of the run would report — so this is what reports it. The fold is a
+    /// forward walk of the finished trace keeping the latest `RaftLeader` per range,
+    /// which is not the backward windowed search the arm itself used.
+    ///
+    /// It is not asserted at one: a leadership change between the arm's read and its
+    /// partition is ordinary, and on one group every arm aims at the only range there
+    /// is. What the sweep asserts is a floor measured on the correct system.
+    // PROPOSED(D-082): a leader-relative arm resolves its leader per range.
+    #[must_use]
+    pub fn arms_hit_their_ranges(&self) -> (usize, usize) {
+        let mut hit = 0;
+        for (range, server, at) in &self.aimed {
+            let mut leader = None;
+            for record in &self.records {
+                if record.at > *at {
+                    break;
+                }
+                if let TraceEvent::RaftLeader {
+                    server: who,
+                    range: of,
+                    ..
+                } = &record.event
+                    && of == range
+                {
+                    leader = Some(*who);
+                }
+            }
+            hit += usize::from(leader == Some(*server));
+        }
+        (hit, self.aimed.len())
+    }
+
+    /// The highest index any replica of this run appended, committed or applied.
+    ///
+    /// What says a core could not have asked for a snapshot action at all. Counting
+    /// `RaftSnapshot` records alone would not: the node's `Host::snapshot` bumps a
+    /// counter and traces nothing (`ananke_shard::server::Gaps`), so a take the node
+    /// dropped on the floor would leave no record for a check to find and the
+    /// absence would be asserted against a silence. The condition behind every
+    /// action is the log's length against `snapshot_threshold`, and that the trace
+    /// does carry.
+    // PROPOSED(D-082): what the node cluster does not reach yet, asserted absent.
+    #[must_use]
+    pub fn highest_index(&self) -> u64 {
+        self.records
+            .iter()
+            .filter_map(|record| match &record.event {
+                TraceEvent::RaftAppend { index, .. }
+                | TraceEvent::RaftCommit { index, .. }
+                | TraceEvent::RaftApply { index, .. } => Some(*index),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0)
+    }
+}
+
+/// The middle value of a sorted slice, the lower of the two when it is even.
+fn median(sorted: &[Duration]) -> Option<Duration> {
+    if sorted.is_empty() {
+        return None;
+    }
+    Some(sorted[(sorted.len() - 1) / 2])
 }
 
 /// The range a record about a replica names, and `None` for a record about
@@ -2180,7 +2881,21 @@ impl Report {
         if let Err(violation) = compaction_stays_committed(&self.records) {
             return fail(violation);
         }
-        if let Err(violation) = self.follower_log_is_bounded() {
+        // Asked of the one-group server alone, and the reason is the node's, not a
+        // convenience. D-078's follower compaction is the core asking its `apply` task
+        // for a `SnapshotAction::Record`, and the node's host counts that action and
+        // drops it: no record is written, no prefix is dropped, and a follower replica
+        // on the node has nothing bounding its in-memory log but the run's length. The
+        // bound is a bound on a mechanism this node does not run, so asking it here
+        // would be asserting a property nobody built — measured at 372 entries over a
+        // hundred seeds against the bound's 768, and growing with the tier, which is a
+        // nightly waiting to turn red on a claim the entry itself denies. The node's
+        // sweep prints the distribution instead, and the slice that wires the
+        // `snapshot` task owes the node its own bound.
+        // PROPOSED(D-082): the follower-log bound is the one-group server's.
+        if self.cluster == Cluster::OneGroup
+            && let Err(violation) = self.follower_log_is_bounded()
+        {
             return fail(violation);
         }
         // Both are asked only of a range whose unimpaired replicas form a majority
@@ -5018,6 +5733,19 @@ pub fn config(seed: u64, schedule: &Schedule) -> SimConfig {
     config
 }
 
+/// The simulator's configuration for `cluster`'s run of `seed`.
+///
+/// The raft sweep's drops, duplicates, delays, clock skew and disk latencies
+/// whichever cluster runs; what differs is the bit rot, and [`Cluster::bitrot`]
+/// says why.
+// PROPOSED(D-082): the arms are shared and the node is a second cluster of them.
+#[must_use]
+pub fn config_on(cluster: Cluster, seed: u64, schedule: &Schedule) -> SimConfig {
+    let mut config = config(seed, schedule);
+    config.fs.p_bitrot = cluster.bitrot();
+    config
+}
+
 /// The server configuration for `id` under `variants`: the set of known bugs
 /// this server carries, which a single [`Variant`](ananke_raft::core::Variant)
 /// converts into (D-045).
@@ -5065,12 +5793,54 @@ pub fn node_config(id: u64, variants: impl Into<Variants>) -> NodeConfig {
     }
 }
 
-fn spawn_server(sim: &Sim, id: u64, variants: Variants) {
-    let env = sim.env(node_of_server(id));
-    let inner = env.clone();
-    env.spawn("raft", async move {
-        let _ = run_server(inner, node_config(id, variants)).await;
-    });
+/// One node of the node cluster, configured as this scenario needs it: the raft
+/// sweep's tick, drift bound and clocks over [`crate::ranges`]'s four ranges.
+///
+/// Two parameters are **not** the raft sweep's, and each is an absence this
+/// scenario asserts rather than leaves to be found (CLAUDE.md):
+///
+/// - `snapshot_threshold` is far above what a run writes, where the one-group
+///   server's is 12. The node's host counts a snapshot action a core asks for in
+///   [`ananke_shard::server::Gaps`] and does nothing with it, because the `snapshot`
+///   task is not wired to the host in this tree: a small threshold would produce a
+///   stream of takes nobody serves and followers behind a prefix nobody streams. The
+///   sweep asserts that no snapshot action was asked for.
+/// - the disk does not rot ([`Cluster::bitrot`]), because a refusal stops the node.
+///
+/// Both are the same fact in two places: the node's install and refusal paths are
+/// other slices' and are not here. The variants that break them keep their Phase 2
+/// assertions on [`Cluster::OneGroup`] and are re-asserted on the node by the slice
+/// that builds the path (PROPOSED D-082).
+// PROPOSED(D-082): the arms are shared and the node is a second cluster of them.
+#[must_use]
+pub fn node_server_config(
+    id: u64,
+    variants: impl Into<Variants>,
+    node: NodeVariants,
+) -> ServerConfig {
+    let mut engine = EngineConfig::new(PathBuf::from(DIR));
+    engine.memtable_bytes = 16 * 1024;
+    engine.segment_bytes = 16 * 1024;
+    engine.background_compaction = true;
+    ServerConfig {
+        id: ServerId(id),
+        listen: server_addr(id),
+        servers: (1..=SERVERS)
+            .map(|s| (ServerId(s), server_addr(s)))
+            .collect(),
+        ranges: crate::ranges::ranges(),
+        initial_voters: (1..=SERVERS).map(ServerId).collect(),
+        raft: RaftConfig {
+            variants: variants.into(),
+            tick_nanos: u64::try_from(TICK.as_nanos()).expect("small"),
+            drift_bound_ppm: DRIFT_BOUND_PPM,
+            snapshot_threshold: NODE_SNAPSHOT_THRESHOLD,
+            ..RaftConfig::default()
+        },
+        engine,
+        inbox_bytes: crate::ranges::INBOX_BYTES,
+        node,
+    }
 }
 
 /// The leader in force: the server of the latest `RaftLeader` event, or server 1.
@@ -5081,6 +5851,36 @@ fn spawn_server(sim: &Sim, id: u64, variants: Variants) {
 /// holds no `RaftLeader` doubles until the trace is exhausted, so the answer is the
 /// whole trace's either way.
 pub(crate) fn leader_now(sim: &Sim) -> u64 {
+    leader_of_range(sim, SINGLE_GROUP)
+}
+
+/// The server leading the most of `cluster`'s ranges, ties to the lowest id.
+///
+/// What an arm means by "the leader" when it is about a *node* and not a range:
+/// the lease trial cuts one node off and wants the one whose leases are worth
+/// cutting off. On one group the cluster has one range and this is exactly
+/// [`leader_now`].
+// PROPOSED(D-082): "the leader" of a node of four ranges is the one leading most.
+pub(crate) fn leader_of_the_cluster(sim: &Sim, cluster: Cluster) -> u64 {
+    let mut leading: BTreeMap<u64, usize> = BTreeMap::new();
+    for range in cluster.ranges() {
+        *leading.entry(leader_of_range(sim, range)).or_default() += 1;
+    }
+    leading
+        .into_iter()
+        .max_by_key(|&(server, count)| (count, std::cmp::Reverse(server)))
+        .map_or(1, |(server, _)| server)
+}
+
+/// The leader of `range` in force, read the same way.
+///
+/// On a node of four ranges "the leader" is a question about a range and not about
+/// a cluster: node `a` leads one range while node `b` leads the one beside it, and
+/// an arm that cut off "the leader" without saying of what would cut off whichever
+/// range elected last. Which range each leader-relative arm aims at is its own
+/// draw (§11, env 8), and this is where the draw is spent.
+// PROPOSED(D-082): a leader-relative arm resolves its leader per range.
+pub(crate) fn leader_of_range(sim: &Sim, range: u64) -> u64 {
     let len = sim.trace_len();
     let mut window = 256;
     loop {
@@ -5090,7 +5890,9 @@ pub(crate) fn leader_now(sim: &Sim) -> u64 {
             .iter()
             .rev()
             .find_map(|r| match r.event {
-                TraceEvent::RaftLeader { server, .. } => Some(server),
+                TraceEvent::RaftLeader {
+                    server, range: of, ..
+                } if of == range => Some(server),
                 _ => None,
             });
         if let Some(server) = found {
@@ -5134,18 +5936,40 @@ fn to_result(outcome: Outcome) -> ClientResult {
 /// `servers` is how many server nodes it may try: the membership scenario runs
 /// five, this sweep three.
 pub(crate) async fn client<E: Environment>(env: E, n: u64, servers: u64, stats: SharedStats) {
+    client_on(Cluster::OneGroup, env, n, servers, stats).await;
+}
+
+/// The same client against `cluster`: the same draws, the same deadlines and the
+/// same rules about what may be retried, with its key's range on every message and
+/// the leader it last heard of kept **per range**.
+///
+/// One leader for the cluster would be wrong on a node: node `a` leads one range
+/// while node `b` leads the one beside it, and a client that remembered one would
+/// take a `NotLeader` on three ranges in four. On one group the map holds one key
+/// and every draw falls exactly where it fell before (PROPOSED D-082).
+// PROPOSED(D-082): the arms are shared and the node is a second cluster of them.
+pub(crate) async fn client_on<E: Environment>(
+    cluster: Cluster,
+    env: E,
+    n: u64,
+    servers: u64,
+    stats: SharedStats,
+) {
     let Ok(sock) = env.net().bind(client_addr(n)).await else {
         return;
     };
+    let key_range = cluster.key_range();
     let mut incarnation = 0u64;
     let mut process = n << 32 | incarnation;
     let mut seq = 0u64;
-    let mut leader: Option<u64> = None;
+    // The leader it last heard of, per range.
+    let mut leaders: BTreeMap<u64, u64> = BTreeMap::new();
     // The server the last abandoned operation went to: not the first to try next.
     let mut avoid: Option<u64> = None;
     let mut known: BTreeMap<Bytes, Option<Bytes>> = BTreeMap::new();
     loop {
-        let key = Bytes::from(format!("k{}", env.rng().below(KEYS)));
+        let key = Bytes::from(format!("k{}", env.rng().below(cluster.keys())));
+        let range = key_range(&key);
         let value = Bytes::from(format!("{n}.{incarnation}.{seq}"));
         let draw = env.rng().below(10);
         let op = match (n, draw) {
@@ -5173,7 +5997,7 @@ pub(crate) async fn client<E: Environment>(env: E, n: u64, servers: u64, stats: 
             } else {
                 OP_TIMEOUT
             };
-        let mut target = leader.unwrap_or_else(|| {
+        let mut target = leaders.get(&range).copied().unwrap_or_else(|| {
             let pick = 1 + env.rng().below(servers);
             if avoid == Some(pick) {
                 pick % servers + 1
@@ -5189,7 +6013,7 @@ pub(crate) async fn client<E: Environment>(env: E, n: u64, servers: u64, stats: 
                 command: command.clone(),
             };
             if sock
-                .send(server_addr(target), request.encode())
+                .send(server_addr(target), cluster.encode(range, request))
                 .await
                 .is_err()
             {
@@ -5206,7 +6030,7 @@ pub(crate) async fn client<E: Environment>(env: E, n: u64, servers: u64, stats: 
                 let timer = pin!(env.clock().sleep_until(try_deadline));
                 match race(&env, recv, timer).await {
                     Either::Left(Ok((_, bytes))) => {
-                        if let Ok(response) = Response::decode(bytes)
+                        if let Some(response) = cluster.decode(bytes)
                             && response.client == process
                             && response.seq == seq
                         {
@@ -5249,7 +6073,7 @@ pub(crate) async fn client<E: Environment>(env: E, n: u64, servers: u64, stats: 
         }
         match outcome {
             Some(result) => {
-                leader = Some(target);
+                leaders.insert(range, target);
                 match (&op, &result) {
                     (ClientOp::Put { value, .. }, Outcome::Done) => {
                         known.insert(key, Some(value.clone()));
@@ -5274,7 +6098,7 @@ pub(crate) async fn client<E: Environment>(env: E, n: u64, servers: u64, stats: 
             }
             None => {
                 stats.lock().unwrap().abandoned += 1;
-                leader = None;
+                leaders.remove(&range);
                 avoid = Some(target);
                 incarnation += 1;
                 process = n << 32 | incarnation;
@@ -5293,13 +6117,34 @@ pub(crate) async fn client<E: Environment>(env: E, n: u64, servers: u64, stats: 
 /// (RAFT.md §4). The ones the doomed leader appends are the backlog the driver
 /// needs; a reply, had anyone read one, would arrive only after the entry
 /// applied, so never for the entries the crash cuts off.
-async fn burst<E: Environment>(env: E, n: u64, target: u64, count: u64) {
+async fn burst<E: Environment>(
+    cluster: Cluster,
+    env: E,
+    n: u64,
+    target: u64,
+    range: u64,
+    count: u64,
+) {
     let Ok(sock) = env.net().bind(burst_addr(n)).await else {
         return;
     };
     let process = BURST | n;
+    // One group's burst writes [`BURST_KEY`], as it always has. The node's writes a
+    // key of the range its arm aims at, prefixed with that range's first key so
+    // that the fixed map routes it there and it sorts inside the span
+    // `RangeCreated` names (`node_range_of_key`). The backlog the driver needs is a
+    // backlog of *that range's* log, and a burst on the wrong range would leave the
+    // isolated follower's own range with nothing to catch up on.
+    // PROPOSED(D-082): a driver aimed at a range writes a key of that range.
+    let key = match cluster {
+        Cluster::OneGroup => Bytes::from_static(BURST_KEY),
+        Cluster::Node => Bytes::from(format!(
+            "{}b",
+            node_key_prefix(range - crate::ranges::FIRST_RANGE)
+        )),
+    };
     for seq in 0..count {
-        let key = Bytes::from_static(BURST_KEY);
+        let key = key.clone();
         let value = Bytes::from(format!("b{n}.{seq}"));
         env.trace(TraceEvent::ClientInvoke {
             client: process,
@@ -5315,7 +6160,7 @@ async fn burst<E: Environment>(env: E, n: u64, target: u64, count: u64) {
             command: Command::Put { key, value },
         };
         if sock
-            .send(server_addr(target), request.encode())
+            .send(server_addr(target), cluster.encode(range, request))
             .await
             .is_err()
         {
@@ -5333,12 +6178,29 @@ async fn burst<E: Environment>(env: E, n: u64, target: u64, count: u64) {
 /// that short. Each key is written once and never read, so the checker's
 /// per-key search sees one put that always applies, as [`burst`]'s do.
 pub(crate) async fn spread<E: Environment>(env: E, n: u64, target: u64, count: u64) {
+    spread_on(Cluster::OneGroup, env, n, target, SINGLE_GROUP, count).await;
+}
+
+/// The same filling puts against `cluster`, on keys of `range`.
+// PROPOSED(D-082): a driver aimed at a range writes a key of that range.
+pub(crate) async fn spread_on<E: Environment>(
+    cluster: Cluster,
+    env: E,
+    n: u64,
+    target: u64,
+    range: u64,
+    count: u64,
+) {
     let Ok(sock) = env.net().bind(spread_addr(n)).await else {
         return;
     };
     let process = SPREAD | n;
+    let prefix = match cluster {
+        Cluster::OneGroup => String::new(),
+        Cluster::Node => node_key_prefix(range - crate::ranges::FIRST_RANGE),
+    };
     for seq in 0..count {
-        let key = Bytes::from(format!("f{n}.{seq}"));
+        let key = Bytes::from(format!("{prefix}f{n}.{seq}"));
         let value = Bytes::from(vec![b'f'; SPREAD_VALUE_BYTES]);
         env.trace(TraceEvent::ClientInvoke {
             client: process,
@@ -5354,7 +6216,7 @@ pub(crate) async fn spread<E: Environment>(env: E, n: u64, target: u64, count: u
             command: Command::Put { key, value },
         };
         if sock
-            .send(server_addr(target), request.encode())
+            .send(server_addr(target), cluster.encode(range, request))
             .await
             .is_err()
         {
@@ -5377,8 +6239,45 @@ pub fn run(seed: u64, variants: impl Into<Variants>) -> Report {
 // D-045: a variant is a set.
 #[must_use]
 pub fn run_with(seed: u64, schedule: Schedule, variants: impl Into<Variants>) -> Report {
+    run_on(
+        Cluster::OneGroup,
+        seed,
+        schedule,
+        variants,
+        NodeVariants::correct(),
+    )
+}
+
+/// Runs the scenario for `seed` on the node of SHARD.md §4, with four ranges on
+/// every node, under the arms [`Schedule::draw_on_the_node`] keeps.
+// PROPOSED(D-082): the arms are shared and the node is a second cluster of them.
+#[must_use]
+pub fn run_on_the_node(seed: u64, variants: impl Into<Variants>, node: NodeVariants) -> Report {
+    run_on(
+        Cluster::Node,
+        seed,
+        Schedule::draw_on_the_node(seed),
+        variants,
+        node,
+    )
+}
+
+/// Runs `schedule`'s arms against `cluster`.
+///
+/// One body, two clusters: which arm fires when, what it waits for and what it
+/// heals is the same code whichever system is underneath, so the node's sweep and
+/// the one-group sweep cannot drift apart (PROPOSED D-082).
+// PROPOSED(D-082): the arms are shared and the node is a second cluster of them.
+#[must_use]
+pub fn run_on(
+    cluster: Cluster,
+    seed: u64,
+    schedule: Schedule,
+    variants: impl Into<Variants>,
+    node_variants: NodeVariants,
+) -> Report {
     let variants = variants.into();
-    let mut sim = Sim::new(config(seed, &schedule));
+    let mut sim = Sim::new(config_on(cluster, seed, &schedule));
     let servers: Vec<NodeId> = (0..SERVERS as usize)
         .map(|i| sim.add_node_with_clock(schedule.skews[i], schedule.drifts[i]))
         .collect();
@@ -5386,13 +6285,16 @@ pub fn run_with(seed: u64, schedule: Schedule, variants: impl Into<Variants>) ->
     let admin = sim.add_node();
     let stats: Vec<SharedStats> = (0..CLIENTS).map(|_| SharedStats::default()).collect();
     for id in 1..=SERVERS {
-        spawn_server(&sim, id, variants);
+        cluster.spawn(&sim, id, variants, node_variants);
     }
     for (i, &node) in clients.iter().enumerate() {
         let env = sim.env(node);
         let inner = env.clone();
         let stats = stats[i].clone();
-        env.spawn("client", client(inner, i as u64 + 1, SERVERS, stats));
+        env.spawn(
+            "client",
+            client_on(cluster, inner, i as u64 + 1, SERVERS, stats),
+        );
     }
     let all_but = |server: u64, client: u64| -> (Vec<NodeId>, Vec<NodeId>) {
         let side: Vec<NodeId> = vec![servers[server as usize - 1], clients[client as usize - 1]];
@@ -5406,29 +6308,51 @@ pub fn run_with(seed: u64, schedule: Schedule, variants: impl Into<Variants>) ->
         (side, rest)
     };
     let mut isolations = Vec::new();
+    // Every leader-relative arm that fired, with the range it drew: what says the
+    // draw reached the arm and not just the schedule (§11, env 8).
+    // PROPOSED(D-082): a leader-relative arm resolves its leader per range.
+    let mut aimed: Vec<(u64, u64, Instant)> = Vec::new();
     let mut watch = Watch::default();
     advance(&mut sim, schedule.warmup, &mut watch);
     let restart = |sim: &mut Sim, server: u64| {
         sim.restart(node_of_server(server));
-        spawn_server(sim, server, variants);
+        cluster.spawn(sim, server, variants, node_variants);
     };
     // The lease trials: the operator hands leadership to the slowest clock, which
     // leads for a while and is then cut off with client 1; twice, so the variant's
     // catch rate is not one window's noise.
     let slowest = schedule.slowest();
+    let ranges = cluster.ranges();
     let mut trials_led_by_slowest = 0;
     let mut last_heal = sim.now();
     for (n, trial) in schedule.trials.iter().enumerate() {
         if watch.stopped.is_some() {
             break;
         }
-        let leader = leader_now(&sim);
-        if leader != slowest {
+        // The operator's sequence numbers and sockets run on from trial to trial,
+        // whether or not a transfer was needed: one group asks for at most one a
+        // trial and keeps the numbers it always had, 0 and 1 on sockets 1 and 2,
+        // with [`TERM_RAISE_ADMIN`] still past them.
+        let base = n * ranges.len();
+        // Every range the cluster has is handed to the slowest clock, not one of
+        // them: the trial is about a lease the slow server holds while it is cut
+        // off, and a node that led one range of four would leave the reading
+        // client asking the other three of whoever leads them. One group has one
+        // range, so this is exactly the one transfer it always sent.
+        // PROPOSED(D-082): the lease trial hands over every range the node holds.
+        let mut asked = false;
+        for (j, &range) in ranges.iter().enumerate() {
+            let leader = leader_of_range(&sim, range);
+            if leader == slowest {
+                continue;
+            }
+            asked = true;
             let env = sim.env(admin);
             let inner = env.clone();
-            let seq = n as u64;
+            let seq = u64::try_from(base + j).expect("small");
+            let socket = seq + 1;
             env.spawn("admin", async move {
-                let Ok(sock) = inner.net().bind(admin_addr(seq + 1)).await else {
+                let Ok(sock) = inner.net().bind(admin_addr(socket)).await else {
                     return;
                 };
                 let request = Request {
@@ -5436,12 +6360,16 @@ pub fn run_with(seed: u64, schedule: Schedule, variants: impl Into<Variants>) ->
                     seq,
                     command: Command::Transfer { to: slowest },
                 };
-                let _ = sock.send(server_addr(leader), request.encode()).await;
+                let _ = sock
+                    .send(server_addr(leader), cluster.encode(range, request))
+                    .await;
             });
+        }
+        if asked {
             advance(&mut sim, TRANSFER_WAIT, &mut watch);
         }
         advance(&mut sim, trial.settle, &mut watch);
-        let leader = leader_now(&sim);
+        let leader = leader_of_the_cluster(&sim, cluster);
         trials_led_by_slowest += usize::from(leader == slowest);
         let (side, rest) = all_but(leader, 1);
         let from = sim.now();
@@ -5455,10 +6383,16 @@ pub fn run_with(seed: u64, schedule: Schedule, variants: impl Into<Variants>) ->
     let mut bursts = 0u64;
     let mut fills = 0u64;
     let mut aimed_streams = 0usize;
-    for (fault, gap) in schedule.faults.iter().zip(schedule.gaps.iter()) {
+    for (i, (fault, gap)) in schedule.faults.iter().zip(schedule.gaps.iter()).enumerate() {
         if watch.stopped.is_some() {
             break;
         }
+        // Which range this arm aims at (§11, env 8): its own draw on the node, and
+        // the only range there is on one group. Every `leader` below is the leader
+        // *of this range*, so an arm that cuts off "the leader" cuts off the one it
+        // drew and not whichever range elected last.
+        let aimed_range = schedule.range_of(cluster, i);
+        let leader_now = |sim: &Sim| leader_of_range(sim, aimed_range);
         match fault {
             Fault::Isolate {
                 server,
@@ -5476,6 +6410,7 @@ pub fn run_with(seed: u64, schedule: Schedule, variants: impl Into<Variants>) ->
                 let leader = leader_now(&sim);
                 let (side, rest) = all_but(leader, 1);
                 let from = sim.now();
+                aimed.push((aimed_range, leader, from));
                 sim.partition(&side, &rest);
                 advance(&mut sim, *for_, &mut watch);
                 sim.heal();
@@ -5493,6 +6428,7 @@ pub fn run_with(seed: u64, schedule: Schedule, variants: impl Into<Variants>) ->
             }
             Fault::CrashLeader { down } => {
                 let leader = leader_now(&sim);
+                aimed.push((aimed_range, leader, sim.now()));
                 sim.crash(node_of_server(leader));
                 advance(&mut sim, *down, &mut watch);
                 restart(&mut sim, leader);
@@ -5623,7 +6559,7 @@ pub fn run_with(seed: u64, schedule: Schedule, variants: impl Into<Variants>) ->
                     let inner = env.clone();
                     let (n, target, puts) = (fills, leader, *fill);
                     env.spawn("spread", async move {
-                        spread(inner, n, target, puts).await;
+                        spread_on(cluster, inner, n, target, aimed_range, puts).await;
                     });
                 }
                 advance(&mut sim, *settle, &mut watch);
@@ -5675,6 +6611,7 @@ pub fn run_with(seed: u64, schedule: Schedule, variants: impl Into<Variants>) ->
                 down,
             } => {
                 let leader = leader_now(&sim);
+                aimed.push((aimed_range, leader, sim.now()));
                 let stale = if *server == leader {
                     server % SERVERS + 1
                 } else {
@@ -5709,6 +6646,7 @@ pub fn run_with(seed: u64, schedule: Schedule, variants: impl Into<Variants>) ->
                 steer,
             } => {
                 let leader = leader_now(&sim);
+                aimed.push((aimed_range, leader, sim.now()));
                 let behind = if *follower == leader {
                     follower % SERVERS + 1
                 } else {
@@ -5729,7 +6667,7 @@ pub fn run_with(seed: u64, schedule: Schedule, variants: impl Into<Variants>) ->
                 let inner = env.clone();
                 let (n, target, puts) = (bursts, leader, *count);
                 env.spawn("burst", async move {
-                    burst(inner, n, target, puts).await;
+                    burst(cluster, inner, n, target, aimed_range, puts).await;
                 });
                 advance(&mut sim, *crash_after, &mut watch);
                 sim.crash(node_of_server(leader));
@@ -5776,7 +6714,9 @@ pub fn run_with(seed: u64, schedule: Schedule, variants: impl Into<Variants>) ->
                                 seq,
                                 command: Command::Transfer { to: target },
                             };
-                            let _ = sock.send(server_addr(leader), request.encode()).await;
+                            let _ = sock
+                                .send(server_addr(leader), cluster.encode(aimed_range, request))
+                                .await;
                         });
                     }
                     if term_raise_delivered(&mut sim, &mut watch, third) {
@@ -5835,8 +6775,10 @@ pub fn run_with(seed: u64, schedule: Schedule, variants: impl Into<Variants>) ->
         stopped: watch.stopped,
         history,
         clients: clients_total,
-        ranges: vec![SINGLE_GROUP],
-        key_range: range_of_key,
+        ranges: cluster.ranges(),
+        key_range: cluster.key_range(),
+        cluster,
+        aimed,
     }
 }
 
@@ -6303,6 +7245,108 @@ mod tests {
 
     /// A report around `records` and `isolations`, three servers whose clocks run
     /// true, so each server's timer bound is 400 ms.
+    /// The cross-range hold fold, on records built by hand: it counts a wait across
+    /// ranges, it counts nothing across a crash, and it counts nothing at all within
+    /// one range.
+    ///
+    /// Both clauses were mutated and only one was caught by the sweeps. Dropping the
+    /// crash windows moved the maximum this fold reports from 572.9 ms to 178.6 ms —
+    /// the figure §12 sends to the owner — and dropping `of != range` moved the count
+    /// from 5 317 waits to 54 808 and the median from 2.07 ms to 2.50 ms **with every
+    /// test still green**, because both figures are printed and neither is asserted.
+    /// A number that goes to the owner needs an oracle of its own, and a sweep cannot
+    /// be it: this is that oracle.
+    // PROPOSED(D-082): how long one range's applies hold the node's others.
+    #[test]
+    fn the_hold_fold_counts_a_wait_across_ranges_and_nothing_across_a_crash() {
+        let commit = |server, range, index| TraceEvent::RaftCommit {
+            server,
+            range,
+            term: 1,
+            index,
+        };
+        let apply = |server, range, index| TraceEvent::RaftApply {
+            server,
+            range,
+            index,
+            entry_term: 1,
+            hash: 0,
+            key: None,
+            effect: ApplyEffect::None,
+        };
+        let held = |records: Vec<TraceRecord>| {
+            let (holds, dropped) = report(records, Vec::new()).cross_range_apply_holds_counted();
+            (holds, dropped)
+        };
+
+        // Range 3's index 1 is committed at 10 ms; range 2 applies at 20 ms and again
+        // at 40 ms; range 3 applies at 60 ms. Its wait ran through the job that ended
+        // at 40 ms, so the hold is 40 − 20 = 20 ms.
+        let across = vec![
+            record(ms(10), ms(10), Some(1), commit(1, 3, 1)),
+            record(ms(20), ms(20), Some(1), apply(1, 2, 1)),
+            record(ms(40), ms(40), Some(1), apply(1, 2, 2)),
+            record(ms(60), ms(60), Some(1), apply(1, 3, 1)),
+        ];
+        let (holds, dropped) = held(across.clone());
+        assert_eq!(
+            (holds.as_slice(), dropped),
+            (&[Duration::from_millis(20)][..], 0),
+            "a wait across ranges is one hold of the job it waited through"
+        );
+
+        // The same trace with the node crashing inside the window: not a hold at all,
+        // and counted as dropped rather than passed over.
+        let mut crashed = across.clone();
+        crashed.insert(
+            2,
+            record(
+                ms(25),
+                ms(25),
+                Some(1),
+                TraceEvent::NodeCrashed {
+                    node: NodeId::new(1),
+                },
+            ),
+        );
+        let (holds, dropped) = held(crashed);
+        assert_eq!(
+            (holds.as_slice(), dropped),
+            (&[][..], 1),
+            "a window the node spent crashed in is not one range holding another"
+        );
+
+        // One range applying three times in a row holds nothing: there is no other
+        // range's job in the window, and a fold that counted this would report a
+        // range's own apply latency as a cross-range hold.
+        let alone = vec![
+            record(ms(10), ms(10), Some(1), commit(1, 2, 3)),
+            record(ms(20), ms(20), Some(1), apply(1, 2, 1)),
+            record(ms(40), ms(40), Some(1), apply(1, 2, 2)),
+            record(ms(60), ms(60), Some(1), apply(1, 2, 3)),
+        ];
+        let (holds, dropped) = held(alone);
+        assert_eq!(
+            (holds.as_slice(), dropped),
+            (&[][..], 0),
+            "one range's own applies are not a hold by another range"
+        );
+
+        // And a wait on another *node* is not this node's: the fold is per node.
+        let elsewhere = vec![
+            record(ms(10), ms(10), Some(2), commit(2, 3, 1)),
+            record(ms(20), ms(20), Some(1), apply(1, 2, 1)),
+            record(ms(40), ms(40), Some(1), apply(1, 2, 2)),
+            record(ms(60), ms(60), Some(2), apply(2, 3, 1)),
+        ];
+        let (holds, dropped) = held(elsewhere);
+        assert_eq!(
+            (holds.as_slice(), dropped),
+            (&[][..], 0),
+            "a hold is one node's apply task holding its own ranges"
+        );
+    }
+
     fn report(records: Vec<TraceRecord>, isolations: Vec<(u64, Instant, Instant)>) -> Report {
         let sim = Sim::new(SimConfig::new(0));
         Report {
@@ -6322,6 +7366,8 @@ mod tests {
             clients: ClientStats::default(),
             ranges: (SINGLE_GROUP..SINGLE_GROUP + 4).collect(),
             key_range: range_of_key,
+            cluster: Cluster::OneGroup,
+            aimed: Vec::new(),
         }
     }
 
