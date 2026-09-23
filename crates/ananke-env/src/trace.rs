@@ -1403,6 +1403,14 @@ pub enum StartOver {
     /// The node is assembling as many streams as its per-node cap allows and this is
     /// not one of them. Nothing was written and no other assembly was disturbed; the
     /// stream takes a slot by asking again once one is free (Q14, D-075).
+    ///
+    /// This one is answered `SnapshotStatus::Waiting` rather than `Restart`, and is
+    /// **not** counted against RAFT.md:210-212's restart bound: a stream waiting its
+    /// turn has covered no ground it must cover again, and a node's receive cap sits
+    /// below its range count on purpose, so counting these would declare a usable
+    /// checkpoint unusable as a matter of routine (D-087). The event is still this
+    /// event — a reason on it is how a check tells a cap-wait from an identity change.
+    // PROPOSED(D-087): a cap-wait is answered as a wait, not as a start-over.
     Cap,
     /// The staged bytes could not be used: the directory was short, the engine refused
     /// the source, or the stream carried no snapshot record for this range.

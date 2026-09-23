@@ -170,7 +170,26 @@ pub enum SnapshotStatus {
     /// The receiver cannot use the stream, because the identity changed under it
     /// or the assembled store failed its checks: start over from the first file,
     /// or take a fresh snapshot.
+    ///
+    /// This is the answer RAFT.md:210-212's bound counts: twice the stream is
+    /// restarted from its first byte, and at the third such ask the sender counts the
+    /// checkpoint unusable.
     Restart,
+    /// The receiver is assembling as many streams as its per-node cap allows and this
+    /// is not one of them (RAFT.md:214-218). Nothing was staged, nothing was disturbed
+    /// and no slot was taken; the stream takes one on the first chunk it sends while a
+    /// slot is free.
+    ///
+    /// It is a status of its own rather than a second use of
+    /// [`Restart`](SnapshotStatus::Restart) because the two say opposite things to a
+    /// sender: a restart says the ground this stream covered is gone, and a wait says
+    /// the receiver is busy and nothing has changed. No single bound is right for
+    /// both — a node whose receive cap is below its range count makes cap-waits
+    /// ordinary, and counting them against RAFT.md's restart bound declares a perfectly
+    /// usable checkpoint unusable after two asks and forces a pointless retake (D-087).
+    // PROPOSED(D-087): a cap-wait is its own status, so the restart bound counts a
+    // start-over and nothing else.
+    Waiting,
 }
 
 impl SnapshotStatus {
@@ -179,6 +198,7 @@ impl SnapshotStatus {
             SnapshotStatus::More => 0,
             SnapshotStatus::Installed => 1,
             SnapshotStatus::Restart => 2,
+            SnapshotStatus::Waiting => 3,
         }
     }
 
@@ -187,6 +207,7 @@ impl SnapshotStatus {
             0 => SnapshotStatus::More,
             1 => SnapshotStatus::Installed,
             2 => SnapshotStatus::Restart,
+            3 => SnapshotStatus::Waiting,
             _ => return Err(bad("snapshot status malformed")),
         })
     }
@@ -198,6 +219,7 @@ impl SnapshotStatus {
             SnapshotStatus::More => "more",
             SnapshotStatus::Installed => "installed",
             SnapshotStatus::Restart => "restart",
+            SnapshotStatus::Waiting => "waiting",
         }
     }
 }

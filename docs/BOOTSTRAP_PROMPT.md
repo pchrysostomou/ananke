@@ -101,6 +101,26 @@ ananke/
 
 _Update this section at the end of every session._
 
+- Branch `phase-3-stream-restarts-cap-wait` (2026-09-23), PROPOSED D-087, stacked on
+  PR #107: the node gets RAFT.md:210-212's restart bound — `Outbound::restarts`,
+  `STREAM_RESTARTS = 2`, the third ask counting the checkpoint unusable — and the answer
+  that keeps it from counting the wrong thing, `SnapshotStatus::Waiting` for a cap-wait.
+  **Two bounds were measured and one of them is a finding, not a fix.** `CHUNK_RESENDS`
+  was going to be corrected 4 to 8, the number RAFT.md:210 states and the node's own
+  comment claimed — and the correct node trips it at *both* numbers, 3 781 give-ups at 4
+  and 2 112 at 8 over 32 seeds, because the receiver answers nothing while an install
+  decision is pending and the sender counts that silence as a lost chunk. Left at 4 and
+  filed as **issue #120** rather than widened (D-030, D-039). And on the cap-wait's own
+  bound: bounding a cap-wait by `CHUNK_RESENDS` ran to ten consecutive waits on one
+  stream with four ranges over a cap of two, so a cap-wait is now counted against no
+  give-up bound at all — a slot is granted to a stream *that is asking* (RAFT.md:218-220),
+  so a bound on the asking is a bound on the mechanism. Measured at 100 seeds in release
+  with the cap at two over four ranges: 800 cap-waits on the correct node against 2 151 as
+  it stood, and a worst single stream of six asks in a row against forty-four; 800 of 800
+  installs and 100 of 100 green in all three configurations. The pair
+  is deterministic in `ananke_shard::install` — `CapWaitIsAStartOver`, which a node of one
+  range cannot be wrong about, and `RestartsNotCounted`.
+
 - Branch `phase-3-stage-b-quorum` (2026-09-23), PR #104, PROPOSED D-085: `origin/main`
   merged in (carrying PR #86's whole-node refusal and re-seed, D-077), and the sharded
   `sim/quorum.rs` built on the node — `quorum::node_run`: three nodes of four ranges, one

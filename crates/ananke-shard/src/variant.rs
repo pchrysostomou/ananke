@@ -295,6 +295,37 @@ pub enum NodeVariant {
     /// against a write in flight — which is the one thing the hold exists to prevent.
     // PROPOSED(D-083): a live install holds one range and replaces its replica.
     AsksTheHostBeforeTheHold,
+    /// A cap-wait answered with the same `Restart` a changed identity gets, which is
+    /// the one answer the node had for both before D-087.
+    ///
+    /// The sender cannot tell the two apart, so RAFT.md:210-212's restart bound counts
+    /// a stream that is merely waiting its turn: at the third ask its leader declares
+    /// unusable a checkpoint nothing was ever wrong with, throws the stream away and
+    /// asks for a fresh take. A node's receive cap sits below its range count on
+    /// purpose (D-075; §12's re-seed shape), so this is not an edge — it is what every
+    /// range over the cap gets.
+    ///
+    /// **It needs more than one range to be wrong about.** A cap-wait between ranges is
+    /// the situation, and a node of one range never reaches it: the only sender its cap
+    /// could be contended by is a stale leader of that same range, whose chunk a
+    /// higher-term assembly displaces ([`Snapshots::superseded`]) and whose term the
+    /// receiving store refuses outright. With one range and one slot the correct answer
+    /// and this one are the same answer, because neither is ever sent.
+    ///
+    /// [`Snapshots::superseded`]: crate::snapshot::Snapshots
+    // PROPOSED(D-087): a cap-wait is answered as a wait, not as a start-over.
+    CapWaitIsAStartOver,
+    /// A stream's restarts not counted: the node as it stood, with RAFT.md:210-212's
+    /// bound absent.
+    ///
+    /// Neither bound is then reachable for a stream that keeps being told to start
+    /// over — the restart bound because nothing counts, and the resend bound because
+    /// every restart resets it — so a receiver that answers `Restart` forever is
+    /// answered forever. That is the unbounded loop D-083 recorded: a run that told
+    /// senders to start over 669 times and one that told them none differed in nothing
+    /// a check could read.
+    // PROPOSED(D-087): the node honours RAFT.md's restart bound.
+    RestartsNotCounted,
 }
 
 impl NodeVariant {
@@ -340,6 +371,8 @@ impl NodeVariant {
         NodeVariant::TakeSkipsTheUserKeys,
         NodeVariant::TakeStreamsTheLogToo,
         NodeVariant::AsksTheHostBeforeTheHold,
+        NodeVariant::CapWaitIsAStartOver,
+        NodeVariant::RestartsNotCounted,
     ];
 
     /// Q15's whole-node refusal and re-seed, in order: the six ways to get a node's
@@ -415,6 +448,22 @@ impl NodeVariant {
         NodeVariant::AsksTheHostBeforeTheHold,
     ];
 
+    /// RAFT.md:209-212's bounds on a stream, and the answer that keeps the restart bound
+    /// from counting the wrong thing: the two ways to get D-087 wrong.
+    ///
+    /// They are neither the `snapshot` task's discipline ([`SNAPSHOT`](Self::SNAPSHOT))
+    /// nor its running inside the node ([`WIRING`](Self::WIRING)) but the *sender's*
+    /// bookkeeping over a stream's answers, which had no bound at all until D-087.
+    /// [`CapWaitIsAStartOver`](Self::CapWaitIsAStartOver) is one a node of a single range
+    /// could not be wrong about; [`RestartsNotCounted`](Self::RestartsNotCounted) is
+    /// wrong with one range too.
+    // PROPOSED(D-087): the node honours RAFT.md's restart bound, and a cap-wait is not
+    // one of the asks it counts.
+    pub const BOUNDS: &'static [NodeVariant] = &[
+        NodeVariant::CapWaitIsAStartOver,
+        NodeVariant::RestartsNotCounted,
+    ];
+
     /// The bit this variant takes in a [`NodeVariants`].
     const fn bit(self) -> u64 {
         match self {
@@ -464,6 +513,10 @@ impl NodeVariant {
             NodeVariant::TakeSkipsTheUserKeys => 1 << 37,
             NodeVariant::TakeStreamsTheLogToo => 1 << 38,
             NodeVariant::AsksTheHostBeforeTheHold => 1 << 39,
+            // D-087's two: the restart bound RAFT.md states and the cap-wait it must
+            // not count. Twenty-two bits are left.
+            NodeVariant::CapWaitIsAStartOver => 1 << 40,
+            NodeVariant::RestartsNotCounted => 1 << 41,
         }
     }
 
@@ -511,6 +564,8 @@ impl NodeVariant {
             NodeVariant::TakeSkipsTheUserKeys => "TakeSkipsTheUserKeys",
             NodeVariant::TakeStreamsTheLogToo => "TakeStreamsTheLogToo",
             NodeVariant::AsksTheHostBeforeTheHold => "AsksTheHostBeforeTheHold",
+            NodeVariant::CapWaitIsAStartOver => "CapWaitIsAStartOver",
+            NodeVariant::RestartsNotCounted => "RestartsNotCounted",
         }
     }
 }
@@ -595,13 +650,14 @@ mod tests {
             seen |= variant.bit();
         }
         // Twenty of the round's and the snapshot task's, the snapshot review's four,
-        // D-077's six for Q15's whole-node refusal and re-seed, and D-083's ten for the
-        // snapshot wiring.
-        assert_eq!(NodeVariant::BUGS.len(), 40);
+        // D-077's six for Q15's whole-node refusal and re-seed, D-083's ten for the
+        // snapshot wiring, and D-087's two for a stream's bounds.
+        assert_eq!(NodeVariant::BUGS.len(), 42);
         for variant in NodeVariant::SNAPSHOT
             .iter()
             .chain(NodeVariant::WIRING)
             .chain(NodeVariant::RESEED)
+            .chain(NodeVariant::BOUNDS)
         {
             assert!(
                 NodeVariant::BUGS.contains(variant),
@@ -611,6 +667,7 @@ mod tests {
         assert_eq!(NodeVariant::SNAPSHOT.len(), 15);
         assert_eq!(NodeVariant::WIRING.len(), 10);
         assert_eq!(NodeVariant::RESEED.len(), 6);
+        assert_eq!(NodeVariant::BOUNDS.len(), 2);
         // The discipline, the wiring and the re-seed are pairwise disjoint: a variant is
         // a way to get the `snapshot` task's keys, caps and frames wrong, a way to get
         // its running inside the node wrong, or a way to get Q15's whole-node refusal
@@ -628,6 +685,16 @@ mod tests {
         for variant in NodeVariant::RESEED {
             assert!(
                 !NodeVariant::SNAPSHOT.contains(variant),
+                "{variant} is in two sets"
+            );
+        }
+        // D-087's two are a fourth kind: the sender's bookkeeping over a stream's
+        // answers, which is none of the three above.
+        for variant in NodeVariant::BOUNDS {
+            assert!(
+                !NodeVariant::SNAPSHOT.contains(variant)
+                    && !NodeVariant::WIRING.contains(variant)
+                    && !NodeVariant::RESEED.contains(variant),
                 "{variant} is in two sets"
             );
         }

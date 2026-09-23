@@ -64,6 +64,13 @@ fn a_stream_flows_and_an_install_completes_on_every_range_and_every_follower() {
         "the client committed nothing before the late nodes joined, so every range's \
          log was empty and nothing above is evidence of anything"
     );
+
+    // The refusals, by reason: what RAFT.md:209-212's bounds count and what they must
+    // not (D-087). Printed rather than asserted — the figure is evidence about this
+    // tree, and the bounds themselves are checked where they are decided, in
+    // `ananke_shard::install`.
+    // PROPOSED(D-087): the restart and cap-wait counts are readable from a run.
+    println!("install: start-overs by reason: {:?}", report.start_overs());
 }
 
 /// How many seeds this binary runs, at every tier.

@@ -219,7 +219,31 @@ impl SnapAnswer {
 
 /// How many times one chunk is resent before its stream is given up, as the
 /// one-group task counts them (RAFT.md §1).
+///
+/// **The correct node trips this bound, and it is left alone on purpose.** It reads 4
+/// while RAFT.md:210 says eight and the one-group task counts to eight, so correcting
+/// it looked like part of D-087's sentence — until it was measured. `sim/install.rs`,
+/// 32 seeds in release, correct node: **2 112 streams given up on this bound**, with
+/// runs of up to **nine** consecutive resends of one chunk, so raising 4 to 8 would not
+/// have stopped it either. The cause is not the number: the receiver answers *nothing*
+/// while an install decision is pending (`Inbound::pending`, "the sender retries once
+/// the switch settles"), and the sender counts that silence as a lost chunk. A bound
+/// the correct system trips is a model error to fix and never a bound to widen (D-030,
+/// D-039), the model error is in the wiring this branch stacks on rather than in this
+/// slice, and it is reported rather than papered over: **issue #120**, and D-087's
+/// consequences.
+// PROPOSED(D-087): measured, tripped by the correct node, and deliberately not widened.
 const CHUNK_RESENDS: u32 = 4;
+
+/// How many times a stream is restarted from its first byte before the sender counts
+/// the checkpoint unusable and asks for a fresh take: RAFT.md:210-212, "restarted from
+/// its first byte, twice, and at the third such ask the leader counts the checkpoint
+/// as unusable", and `STREAM_RESTARTS` in the one-group task.
+///
+/// It counts a [`SnapshotStatus::Restart`] and nothing else. A cap-wait is a different
+/// answer with a different bound — see [`Step::Wait`].
+// PROPOSED(D-087): the node honours RAFT.md's restart bound.
+const STREAM_RESTARTS: u32 = 2;
 
 /// One stream being sent to one follower of one range: the sender's bookkeeping, and
 /// when the chunk outstanding on it falls due for a resend.
@@ -227,10 +251,93 @@ struct Outbound {
     sender: Sender,
     deadline: ananke_env::Instant,
     resends: u32,
+    /// How many times this stream has been restarted from its first byte at a
+    /// receiver's ask, which [`STREAM_RESTARTS`] bounds. Cap-waits are not counted
+    /// here: a stream waiting its turn has covered no ground it must cover again.
+    // PROPOSED(D-087): the node honours RAFT.md's restart bound.
+    restarts: u32,
     /// The furthest point the stream reached, as (file position, offset): an
     /// acknowledgement past it is progress, and progress is what check quorum counts
     /// for a refused follower (D-049).
     furthest: (usize, u64),
+}
+
+/// What one arriving answer asks of the stream it answers (RAFT.md:209-212).
+///
+/// A free function over the status and the restarts already counted, so that the bound
+/// is a thing a check can drive directly rather than a branch buried in an async
+/// receive loop.
+// PROPOSED(D-087): the node honours RAFT.md's restart bound, and a cap-wait has one of
+// its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Step {
+    /// Send on from where the answer points.
+    Resume,
+    /// The stream is installed and ends here.
+    Done,
+    /// Start the stream again from its first byte, and count the restart.
+    Restart,
+    /// Wait for a slot under the receiver's cap: nothing is restarted, because nothing
+    /// was staged and this stream stands exactly where it stood. The chunk outstanding
+    /// falls due on the ordinary resend timer and is asked again.
+    ///
+    /// **It is counted against no give-up bound at all**, and the measurement is what
+    /// says so. Bounding it by [`CHUNK_RESENDS`], on the reading that a cap-wait is an
+    /// unanswered chunk from the sender's side, was tried first: with four ranges over
+    /// a cap of two, the *correct* node ran to ten consecutive waits on one stream and
+    /// tripped it twice in thirty-two seeds. A bound the correct system trips is a
+    /// model error and not a bound to widen (D-030, D-039), and the model error is
+    /// plain in RAFT.md:218-220 — "a slot the cap frees is granted to a stream that is
+    /// asking for it, never reserved for one that asked earlier". A stream that has
+    /// stopped asking cannot be granted the slot it is waiting for, so a bound on the
+    /// asking is a bound on the mechanism.
+    ///
+    /// What bounds it instead is already there, and is two things. A receiver that
+    /// answers is alive and is queueing this stream, which is why the answer resets
+    /// the resend counter; a receiver that goes *silent* leaves the chunk unanswered
+    /// and `CHUNK_RESENDS` bounds it exactly as it bounds any other. And the stream is
+    /// ended from above when its range's Raft supersedes it — a leader change, a new
+    /// term, a follower that caught up — which is where a stream that should stop
+    /// waiting is stopped.
+    Wait,
+    /// The restart bound is spent: count the checkpoint unusable and ask for a fresh
+    /// take (RAFT.md:210-212).
+    Unusable,
+}
+
+/// The step one answer takes, given how many restarts this stream has already been
+/// through.
+///
+/// `restarts` is the count *before* this answer, so the third `Restart` of a stream —
+/// arriving with two already counted — is the one that spends the bound, which is what
+/// RAFT.md:210-212 says in words.
+// PROPOSED(D-087): the node honours RAFT.md's restart bound.
+fn step_for(status: SnapshotStatus, restarts: u32, variants: NodeVariants) -> Step {
+    // The variant: the node as it stood before this bound, where a restart reset the
+    // resend counter and nothing counted the restarts, so a stream told to start over
+    // restarted for as long as it was told to and neither bound was ever reached.
+    let bounded = !variants.contains(NodeVariant::RestartsNotCounted);
+    match status {
+        SnapshotStatus::More => Step::Resume,
+        SnapshotStatus::Installed => Step::Done,
+        SnapshotStatus::Waiting => Step::Wait,
+        SnapshotStatus::Restart if bounded && restarts >= STREAM_RESTARTS => Step::Unusable,
+        SnapshotStatus::Restart => Step::Restart,
+    }
+}
+
+/// The status a receiver answers a cap-wait with: a wait of its own, or — under the
+/// variant — the start-over the node answered it with before this bound existed.
+// PROPOSED(D-087): a cap-wait is answered as a wait, not as a start-over.
+fn cap_status(variants: NodeVariants) -> SnapshotStatus {
+    if variants.contains(NodeVariant::CapWaitIsAStartOver) {
+        // The variant: the conflation as it stood. The sender cannot tell a receiver
+        // that is busy from one whose checkpoint identity moved, so a stream merely
+        // waiting its turn spends the restart bound and its leader retakes a
+        // checkpoint that was never unusable.
+        return SnapshotStatus::Restart;
+    }
+    SnapshotStatus::Waiting
 }
 
 /// One stream being assembled from one sender of one range: where its bytes are going
@@ -492,6 +599,7 @@ impl<E: Environment> Task<E> {
                 sender,
                 deadline: self.env.clock().now(),
                 resends: 0,
+                restarts: 0,
                 furthest: (0, 0),
             },
         );
@@ -594,11 +702,21 @@ impl<E: Environment> Task<E> {
             Landing::Waiting { .. } => {
                 // The node is assembling as many streams as its cap allows and this is
                 // not one of them: nothing was written and no other assembly was
-                // disturbed. The sender restarts, and takes a slot the next time it
-                // asks while one is free (D-075).
-                self.start_over(
+                // disturbed. The sender waits, and takes a slot the next time it asks
+                // while one is free (D-075).
+                //
+                // It is told to *wait* and not to start over, because the two are
+                // different things to a sender and only one of them is what
+                // RAFT.md:210-212's restart bound counts. A node's cap is routinely
+                // below its range count — §12's re-seed shape sets it there on
+                // purpose — so cap-waits are ordinary here in a way they never are on
+                // the one-group server, which has no cap at all.
+                // PROPOSED(D-087): a cap-wait is answered as a wait, not as a
+                // start-over.
+                self.refuse(
                     range,
                     from,
+                    cap_status(self.variants),
                     StartOver::Cap,
                     store.term(),
                     (last_index, last_term),
@@ -705,6 +823,7 @@ impl<E: Environment> Task<E> {
         else {
             return;
         };
+        let variants = self.variants;
         let Some(out) = self.sending.get_mut(&(range, from)) else {
             return;
         };
@@ -712,8 +831,8 @@ impl<E: Environment> Task<E> {
             // An answer to a stream this node is no longer sending: stale.
             return;
         }
-        match status {
-            SnapshotStatus::More => {
+        match step_for(status, out.restarts, variants) {
+            Step::Resume => {
                 out.sender.on_more(&file, offset);
                 out.resends = 0;
                 let now = out.sender.acknowledged();
@@ -735,7 +854,7 @@ impl<E: Environment> Task<E> {
                 }
                 self.send_chunk(range, from).await;
             }
-            SnapshotStatus::Installed => {
+            Step::Done => {
                 self.sending.remove(&(range, from));
                 self.plan.sent(range, from);
                 self.local
@@ -746,10 +865,42 @@ impl<E: Environment> Task<E> {
                         incarnation,
                     }));
             }
-            SnapshotStatus::Restart => {
+            Step::Restart => {
+                // RAFT.md:210-212: restarted from its first byte, and counted. The
+                // count is what makes the give-up below reachable at all — without it
+                // the reset of `resends` on this line puts a stream that keeps being
+                // told to start over into a loop with no bound on either counter,
+                // which is the hole D-083 found and this closes.
+                // PROPOSED(D-087): the node honours RAFT.md's restart bound.
+                out.restarts += 1;
                 out.sender.restart();
                 out.resends = 0;
                 self.send_chunk(range, from).await;
+            }
+            Step::Unusable => {
+                // The third such ask: the leader counts the checkpoint unusable and
+                // asks for a fresh take (RAFT.md:210-212), which is what the one-group
+                // task does with `StreamFailed { retake: true }`.
+                // PROPOSED(D-087): the node honours RAFT.md's restart bound.
+                self.sending.remove(&(range, from));
+                self.plan.sent(range, from);
+                self.retake(range, from);
+            }
+            Step::Wait => {
+                // A slot, not a start-over: nothing was staged, so this stream stands
+                // exactly where it stood and there is nothing to cover again. The
+                // chunk outstanding is left to fall due on the ordinary resend timer,
+                // which paces the next ask — and the ask is what takes the slot, since
+                // a freed slot is granted to a stream that is asking for it
+                // (RAFT.md:218-220). The resend counter is reset because this chunk was
+                // answered: a receiver saying "wait" is alive and queueing this stream,
+                // and it is a receiver gone *silent* that `CHUNK_RESENDS` is for.
+                // PROPOSED(D-087): a cap-wait is counted against no give-up bound.
+                let deadline = self.env.clock().now() + self.chunk_timeout();
+                if let Some(out) = self.sending.get_mut(&(range, from)) {
+                    out.resends = 0;
+                    out.deadline = deadline;
+                }
             }
         }
     }
@@ -1060,18 +1211,42 @@ impl<E: Environment> Task<E> {
     }
 
     /// Tells a sender to start its stream over, and traces **why** (RAFT.md:203-212).
-    ///
-    /// The node says this for conditions that mean different things — a changed
-    /// identity, no slot under the receive cap, staged bytes it could not use — and
-    /// the message carries only `SnapshotStatus::Restart`, which cannot tell them
-    /// apart. The trace can, and now does. Until it did, a run whose streams restarted
-    /// six hundred times and one whose streams restarted none produced the same trace,
-    /// which is how a livelock sat under a green check (D-083).
     // PROPOSED(D-083): the node's start-over is traced, with its reason.
     async fn start_over(
         &self,
         range: RangeId,
         from: ServerId,
+        reason: StartOver,
+        term: Term,
+        at: (Index, Term),
+    ) {
+        self.refuse(range, from, SnapshotStatus::Restart, reason, term, at)
+            .await;
+    }
+
+    /// Refuses one chunk: the answer that says so, and the trace that says **why**
+    /// (RAFT.md:203-218).
+    ///
+    /// The node refuses a chunk for conditions that mean different things — a changed
+    /// identity, staged bytes it could not use, a range it does not host, and no slot
+    /// under its receive cap — and until D-083 the message carried only
+    /// `SnapshotStatus::Restart` for every one of them. The trace tells them apart, and
+    /// has since D-083: until it did, a run whose streams restarted six hundred times
+    /// and one whose streams restarted none produced the same trace, which is how a
+    /// livelock sat under a green check.
+    ///
+    /// The *answer* now tells the last of them apart too, because the sender has to act
+    /// differently on it: three of these say the ground this stream covered is gone and
+    /// are counted against RAFT.md:210-212's restart bound, and a cap-wait says the
+    /// receiver is busy, changes nothing, and is bounded as an unanswered chunk is
+    /// ([`Step::Wait`]). The event stays one event with a reason on it, because a check
+    /// that wants to tell a cap-wait from an identity change reads the reason (D-087).
+    // PROPOSED(D-087): the answer says which refusal it is, not only the trace.
+    async fn refuse(
+        &self,
+        range: RangeId,
+        from: ServerId,
+        status: SnapshotStatus,
         reason: StartOver,
         term: Term,
         at: (Index, Term),
@@ -1086,8 +1261,11 @@ impl<E: Environment> Task<E> {
             .stores
             .get(&range)
             .map_or(0, |store| store.incarnation());
-        self.answer(range, from, snapshot::start_over(term, at), incarnation)
-            .await;
+        let message = match status {
+            SnapshotStatus::Waiting => snapshot::waiting(term, at),
+            _ => snapshot::start_over(term, at),
+        };
+        self.answer(range, from, message, incarnation).await;
     }
 
     /// Answers a sender, stamped with this store's incarnation (D-042).
@@ -1390,6 +1568,282 @@ mod tests {
             ),
             "with one range the fan-out is the correct route, which is why this \
              mutation needs a node of several"
+        );
+    }
+
+    // ---- RAFT.md:209-212's bounds on the node, and the cap-wait they must not count.
+
+    /// The four ranges of the check below, and the two slots they share.
+    const FOUR: [RangeId; 4] = [RangeId(1), R2, RangeId(3), RangeId(4)];
+    /// The receive cap: below the range count, which is where D-075 puts it and where
+    /// §12's re-seed shape puts it on purpose.
+    const SLOTS: usize = 2;
+    /// The leader streaming to this node, one per range.
+    const LEADER: ServerId = ServerId(7);
+    /// How many chunks one stream carries here. Long enough that the two ranges that
+    /// hold slots are still streaming while the two that wait spend a bound — either
+    /// bound — so the check reads which bound was spent and not who finished first.
+    const CHUNKS: usize = 4;
+
+    /// Where one stream of the check below ended.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Ended {
+        /// Installed: the stream got its slot and ran to its last chunk.
+        Installed,
+        /// Given up, and whether its leader was told to take a fresh checkpoint.
+        GaveUp {
+            /// `true` is RAFT.md:210-212's "counts the checkpoint as unusable".
+            retake: bool,
+        },
+    }
+
+    /// One (range, sender) stream as its sender sees it.
+    struct Stream {
+        range: RangeId,
+        restarts: u32,
+        waits: u32,
+        chunks: usize,
+        ended: Option<Ended>,
+    }
+
+    /// A range's two key intervals: its Raft state under tenant 0, its user keys under
+    /// tenant 2 (D-066).
+    fn spans(range: RangeId) -> Vec<KeyRange<Bytes>> {
+        let at = |tenant: u64, g: u64| {
+            Bytes::copy_from_slice(&[tenant.to_be_bytes(), g.to_be_bytes()].concat())
+        };
+        let g = range.get();
+        vec![at(0, g)..at(0, g + 1), at(2, g)..at(2, g + 1)]
+    }
+
+    /// Runs `ranges` streams into one node of `cap` slots, each stream sending one chunk
+    /// per round, and says where each ended and how often it was made to wait.
+    ///
+    /// The receiver is the real planner — the cap, the queue and the slot granting are
+    /// `Snapshots`' own — and the two halves this entry adds are the real functions:
+    /// [`cap_status`] for the answer a cap-wait gets and [`step_for`] for what the
+    /// sender does with an answer. What the harness stands in for is the I/O between
+    /// them and the clock that paces a resend.
+    fn run(
+        ranges: &[RangeId],
+        cap: usize,
+        variants: NodeVariants,
+    ) -> BTreeMap<RangeId, (Ended, u32)> {
+        let mut plan = Snapshots::new("/n1", ServerId(9), cap, variants);
+        for range in ranges {
+            plan.host(*range, spans(*range));
+        }
+        let at = Identity {
+            term: 4,
+            last_index: 40,
+            last_term: 4,
+        };
+        let mut streams: Vec<Stream> = ranges
+            .iter()
+            .map(|range| Stream {
+                range: *range,
+                restarts: 0,
+                waits: 0,
+                chunks: 0,
+                ended: None,
+            })
+            .collect();
+        // A bound on the harness itself, so a stream that neither lands nor gives up
+        // fails this check rather than hanging it. Nothing correct comes near it.
+        for _ in 0..1_000 {
+            if streams.iter().all(|s| s.ended.is_some()) {
+                break;
+            }
+            for stream in &mut streams {
+                if stream.ended.is_some() {
+                    continue;
+                }
+                let last = stream.chunks + 1 == CHUNKS;
+                let landing = plan.on_chunk(stream.range, LEADER, at, 16, last);
+                let status = match landing {
+                    Landing::Staged { .. } => SnapshotStatus::More,
+                    Landing::Waiting { .. } => cap_status(variants),
+                    Landing::Restarted { .. } => SnapshotStatus::Restart,
+                    Landing::Complete(_) => {
+                        // The install's switch is made and the slot given back, which
+                        // is `finish`'s job on the running node too.
+                        plan.finish(stream.range, LEADER);
+                        SnapshotStatus::Installed
+                    }
+                    Landing::Installed { .. } | Landing::NotHosted => {
+                        panic!(
+                            "{} landed {landing:?}, which this check does not build",
+                            stream.range
+                        )
+                    }
+                };
+                match step_for(status, stream.restarts, variants) {
+                    Step::Resume => stream.chunks += 1,
+                    Step::Done => stream.ended = Some(Ended::Installed),
+                    Step::Restart => {
+                        stream.restarts += 1;
+                        stream.chunks = 0;
+                    }
+                    Step::Unusable => stream.ended = Some(Ended::GaveUp { retake: true }),
+                    Step::Wait => {
+                        // The chunk falls due on the resend timer and is asked again,
+                        // and the ask is what takes the slot. Nothing is given up for
+                        // waiting: the answer resets the resend counter, because a
+                        // receiver that answers is not a receiver gone silent.
+                        stream.waits += 1;
+                    }
+                }
+            }
+        }
+        streams
+            .iter()
+            .map(|s| {
+                let ended = s.ended.unwrap_or_else(|| {
+                    panic!(
+                        "{} neither installed nor gave up in a thousand rounds",
+                        s.range
+                    )
+                });
+                (s.range, (ended, s.waits))
+            })
+            .collect()
+    }
+
+    /// A stream waiting for a slot is not a stream whose checkpoint is unusable.
+    ///
+    /// Four ranges share two slots. Under the correct node the two that wait are told
+    /// to *wait*, keep their place and install when a slot frees. Under the variant
+    /// they are told to start over, which is what the node said before this entry, and
+    /// RAFT.md:210-212's bound spends itself on them: at the third ask their leader
+    /// throws away a checkpoint nothing was ever wrong with and takes a fresh one. On
+    /// the running node that is not a permanent failure — the leader retakes and opens
+    /// the stream again — which is worse than it reads here, because the cycle repeats
+    /// for as long as the cap is contended, and the cap is contended by design.
+    ///
+    /// **A single-range world cannot catch it.** With one range there is no cap-wait to
+    /// answer at all: the only sender that could contend the slot is a stale leader of
+    /// that same range, and a chunk at a higher term displaces the assembly
+    /// (`Snapshots::superseded`) rather than queueing behind it. The last clause below
+    /// is that statement as a check — one range, one slot, and the two answers
+    /// identical.
+    // PROPOSED(D-087): a cap-wait is answered as a wait, not as a start-over.
+    #[test]
+    fn a_stream_waiting_for_a_slot_is_not_a_checkpoint_counted_unusable() {
+        let correct = run(&FOUR, SLOTS, NodeVariants::correct());
+        assert!(
+            correct.values().all(|(end, _)| *end == Ended::Installed),
+            "every range should install once a slot frees: {correct:?}"
+        );
+        // And the situation was reached: two ranges over two slots did wait, so the
+        // clause above is not a green against a cap that was never contended.
+        let waited = correct.values().filter(|(_, waits)| *waits > 0).count();
+        assert_eq!(
+            waited,
+            FOUR.len() - SLOTS,
+            "two of four ranges should have waited for a slot: {correct:?}"
+        );
+
+        // The pair: the conflation as it stood. The two ranges over the cap are given
+        // up with a retake asked for, which is RAFT.md's answer to an unusable
+        // checkpoint and the wrong answer to a busy receiver.
+        let conflated = run(
+            &FOUR,
+            SLOTS,
+            NodeVariants::of(&[NodeVariant::CapWaitIsAStartOver]),
+        );
+        let retaken = conflated
+            .values()
+            .filter(|(end, _)| *end == Ended::GaveUp { retake: true })
+            .count();
+        assert_eq!(
+            retaken,
+            FOUR.len() - SLOTS,
+            "the variant is meant to count a cap-wait against the restart bound: \
+             {conflated:?}"
+        );
+
+        // And the property this rests on, at its tightest: one range on a node of
+        // **one** slot — the smallest cap there is — never waits either, because the
+        // range's own stream takes the slot and the only sender that could contend it
+        // is a stale leader the assembly displaces or the store's term refuses. The
+        // variant and the correct node are the same node there, which is why four
+        // ranges sharing one cap is what this mutation needs.
+        let one = [R2];
+        let waited = run(&one, 1, NodeVariants::correct());
+        assert!(
+            waited
+                .values()
+                .all(|(end, waits)| *end == Ended::Installed && *waits == 0),
+            "one range on one slot should install without ever waiting: {waited:?}"
+        );
+        assert_eq!(
+            waited,
+            run(
+                &one,
+                1,
+                NodeVariants::of(&[NodeVariant::CapWaitIsAStartOver])
+            ),
+            "with one range no chunk ever waits, so neither answer is ever sent"
+        );
+    }
+
+    /// RAFT.md:210-212's restart bound, which the node did not have: a stream is
+    /// restarted from its first byte twice, and the third such ask counts the
+    /// checkpoint unusable.
+    ///
+    /// The variant is the node as it stood — nothing counted the restarts and every
+    /// restart reset the resend counter, so neither bound was reachable for a stream
+    /// that kept being told to start over. That is the shape of the livelock D-083
+    /// found: 669 start-overs in a run, and no bound between it and forever.
+    // PROPOSED(D-087): the node honours RAFT.md's restart bound.
+    #[test]
+    fn a_stream_restarted_twice_has_its_checkpoint_counted_unusable_at_the_third_ask() {
+        let correct = NodeVariants::correct();
+        assert_eq!(step_for(SnapshotStatus::Restart, 0, correct), Step::Restart);
+        assert_eq!(step_for(SnapshotStatus::Restart, 1, correct), Step::Restart);
+        assert_eq!(
+            step_for(SnapshotStatus::Restart, 2, correct),
+            Step::Unusable,
+            "the third ask is the one RAFT.md:210-212 gives up on"
+        );
+
+        // The pair: unbounded. A receiver that answers `Restart` forever is answered
+        // forever, which is the loop this bound exists to cut.
+        let unbounded = NodeVariants::of(&[NodeVariant::RestartsNotCounted]);
+        for restarts in [0, 1, 2, 3, 100, 669] {
+            assert_eq!(
+                step_for(SnapshotStatus::Restart, restarts, unbounded),
+                Step::Restart,
+                "the variant is meant to restart however many times it is asked"
+            );
+        }
+    }
+
+    /// A cap-wait is a wait however many restarts a stream has behind it: the two
+    /// bounds do not share a counter.
+    ///
+    /// This is the half of the ruling that keeps the re-seed shape working. §12 sets
+    /// the cap below the range count deliberately, so a stream that has restarted twice
+    /// for an honest reason — its leader retook while it streamed — and then finds the
+    /// cap full must still be told to wait, not counted out.
+    // PROPOSED(D-087): a cap-wait is not counted against the restart bound.
+    #[test]
+    fn a_cap_wait_is_a_wait_whatever_the_stream_has_restarted() {
+        let correct = NodeVariants::correct();
+        for restarts in [0, 1, 2, 3, 100] {
+            assert_eq!(
+                step_for(SnapshotStatus::Waiting, restarts, correct),
+                Step::Wait,
+                "a stream with {restarts} restarts behind it is still only waiting"
+            );
+        }
+        // And the answer the node sends for one, which is what makes the sender able to
+        // tell the two apart at all.
+        assert_eq!(cap_status(correct), SnapshotStatus::Waiting);
+        assert_eq!(
+            cap_status(NodeVariants::of(&[NodeVariant::CapWaitIsAStartOver])),
+            SnapshotStatus::Restart,
+            "the variant is meant to be the one answer the node had for both"
         );
     }
 }
