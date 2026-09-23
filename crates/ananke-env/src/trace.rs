@@ -1457,6 +1457,10 @@ pub enum StartOver {
     /// The staged bytes could not be used: the directory was short, the engine refused
     /// the source, or the stream carried no snapshot record for this range.
     Unusable,
+    /// The chunk named a range this node does not host, so it was refused before
+    /// anything was admitted: it took no slot under the cap and disturbed no assembly.
+    /// The sender starts over and finds the range where it now lives (D-075).
+    NotHosted,
 }
 
 impl StartOver {
@@ -1467,6 +1471,7 @@ impl StartOver {
             StartOver::Identity => "identity",
             StartOver::Cap => "cap",
             StartOver::Unusable => "unusable",
+            StartOver::NotHosted => "not-hosted",
         }
     }
 }
