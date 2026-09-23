@@ -149,6 +149,16 @@ pub enum Variant {
     // D-049: a refused follower counts for check quorum only while its re-seed
     // stream progresses.
     RefusedNeverCounts,
+    /// A replica that is not leading never compacts: the server as built before
+    /// D-065. Its log keeps every entry since the last snapshot a leader gave it
+    /// or it took itself, so a replica that trails and is never streamed to grows
+    /// its in-memory log with the run. This is the variant
+    /// [`crate::core`]'s follower trigger is paired with: the bound Stage B's exit
+    /// asks for (`sim::raft::FOLLOWER_LOG_BOUND`) is a statement about the
+    /// correct server that must be false of a server without the trigger, and
+    /// without this variant nothing in the tree could make the assertion fire.
+    // PROPOSED(D-078): a follower compacts its log to its own applied index.
+    FollowerNeverCompacts,
 }
 
 impl Variant {
@@ -173,6 +183,7 @@ impl Variant {
         Variant::RefusalNotDurable,
         Variant::RefusedCountsForQuorum,
         Variant::RefusedNeverCounts,
+        Variant::FollowerNeverCompacts,
     ];
 
     /// This variant's bit in a [`Variants`] set. [`Variant::Correct`] owns no
@@ -198,6 +209,7 @@ impl Variant {
             Variant::RefusalNotDurable => 1 << 13,
             Variant::RefusedCountsForQuorum => 1 << 14,
             Variant::RefusedNeverCounts => 1 << 15,
+            Variant::FollowerNeverCompacts => 1 << 16,
         }
     }
 }
@@ -583,6 +595,17 @@ pub enum SnapshotAction {
     /// metadata written before the checkpoint's `CURRENT`, and answer with
     /// [`Input::SnapshotTaken`].
     Take,
+    /// Write a snapshot record at the applied index with *no checkpoint under
+    /// it*, and answer with [`Input::SnapshotTaken`]: a follower's compaction
+    /// point (D-065). The record is written in the `apply` task between applies,
+    /// as a take's is, so its last term and configuration are exact (D-036).
+    /// A record with no local checkpoint is a shape the store already holds —
+    /// an install's repair writes one, and a crash between a take's record and
+    /// its checkpoint leaves one — and a leader that finds no complete version
+    /// to stream already asks for a take, so this needs no new state and no new
+    /// message.
+    // PROPOSED(D-078): a follower compacts its log to its own applied index.
+    Record,
     /// Stream the snapshot at (`index`, `term`) to `to`, and answer with
     /// [`Input::SnapshotInstalled`] or [`Input::SnapshotFailed`].
     Install {
@@ -806,10 +829,22 @@ pub struct Raft {
     /// itself (RAFT.md §1, D-029). None while nothing is compacted, when the
     /// initial configuration serves.
     snap_config: Option<Configuration>,
-    /// The last checkpoint taken or installed here, streamable to a follower;
-    /// `snap_index` never passes it. None until one is taken.
+    /// The last snapshot this server holds a record of, taken or installed here;
+    /// `snap_index` never passes it. None until one is recorded.
+    ///
+    /// A record does not promise a local checkpoint: an install's repair writes
+    /// one with none, a crash between a take's record and its checkpoint leaves
+    /// one, and a follower's compaction writes one deliberately (D-065). The
+    /// server finds that out when it tries to stream — no complete version, so
+    /// [`Input::SnapshotFailed`] with `retake`, which clears this and lets the
+    /// next tick ask for a take.
+    // PROPOSED(D-078): a follower compacts its log to its own applied index.
     taken: Option<(Index, Term)>,
-    /// A [`SnapshotAction::Take`] is with the snapshot task.
+    /// A [`SnapshotAction::Take`] or [`SnapshotAction::Record`] is with the
+    /// `apply` task. One flag for both: they are jobs of the same task, and a
+    /// server that changes role with one in flight must not queue the other
+    /// behind it.
+    // PROPOSED(D-078): a follower compacts its log to its own applied index.
     take_pending: bool,
     /// This server runs on a re-seeded store (RAFT.md §3): the state it lost may
     /// have included a vote, so it grants no vote and no pre-vote, never
@@ -1506,6 +1541,32 @@ impl Raft {
                 }
             }
             Role::Follower | Role::PreCandidate | Role::Candidate => {
+                // A follower compacts its log to its own applied index once the
+                // log has outgrown the prefix by `snapshot_threshold` (D-065).
+                // It asks for a record, not a take: a checkpoint is paid for
+                // only when one must actually be streamed, which is what the
+                // leader's path after an install already does. There is no
+                // hold-off, because there is nothing to hold off from — a record
+                // is one synced batch in the `apply` task, not a checkpoint that
+                // stalls every range's applies for its duration (D-036).
+                //
+                // The baseline is `snap_index`, the prefix the log really starts
+                // past, not `taken`: on a follower the two are equal after every
+                // compaction, and after an install `taken` may name a snapshot
+                // this server never took.
+                // PROPOSED(D-078): a follower compacts its log to its own applied
+                // index.
+                if !self
+                    .config
+                    .variants
+                    .contains(Variant::FollowerNeverCompacts)
+                    && !self.take_pending
+                    && self.applied > self.snap_index
+                    && self.last_index() - self.snap_index > self.config.snapshot_threshold
+                {
+                    self.take_pending = true;
+                    self.outputs.push(Output::Snapshot(SnapshotAction::Record));
+                }
                 if self.election_elapsed >= self.election_timeout {
                     // A quarantined server never campaigns: leading takes a vote
                     // for itself, and it grants none (RAFT.md §3).
@@ -1894,24 +1955,41 @@ impl Raft {
         }
     }
 
-    /// Compacts the log to the last checkpoint once every follower's match is past
-    /// it or the follower is designated snapshot-fed (RAFT.md §1): the prefix at or
-    /// below it is deleted, the snapshot standing in for it.
+    /// Compacts the log to the last snapshot recorded: the prefix at or below it
+    /// is deleted, the snapshot standing in for it.
+    ///
+    /// A leader waits until every follower's match is past the snapshot or the
+    /// follower is designated snapshot-fed (RAFT.md §1, D-037), since the entries
+    /// it drops are the ones it would otherwise send. A follower has no follower
+    /// to wait for and compacts at once, to the record it just wrote at its own
+    /// applied index (D-065).
+    // PROPOSED(D-078): a follower compacts its log to its own applied index.
     fn maybe_compact(&mut self) {
-        if self.role != Role::Leader {
-            return;
-        }
         let Some((index, term)) = self.taken else {
             return;
         };
         if index <= self.snap_index {
             return;
         }
-        let blocked = self
-            .progress
-            .values()
-            .any(|p| p.matched < index && !p.needs_snapshot && !p.installing);
-        if blocked {
+        if self.role == Role::Leader {
+            let blocked = self
+                .progress
+                .values()
+                .any(|p| p.matched < index && !p.needs_snapshot && !p.installing);
+            if blocked {
+                return;
+            }
+        } else if index > self.last_index() {
+            // Unreachable on the correct system: a follower's record is written
+            // at its applied index, its applied index never passes its commit
+            // index, and a committed entry is never truncated — so the entry the
+            // record names is still in the log. `ApplyBeforeCommit` breaks the
+            // middle step, and this keeps the broken server compacting nothing
+            // rather than panicking in `drain`, so the sweep catches the variant
+            // with the violation it is there to catch it with, not with a crash.
+            // What the correct system must hold is asserted over the trace:
+            // every `RaftCompacted` is at or below that server's commit index
+            // (`sim/raft.rs`, `compaction_stays_committed`).
             return;
         }
         // The prefix may swallow the configuration entry in force: keep the

@@ -33,6 +33,13 @@
 //! - *loaded*: the sweep's client load, a leader proposing 64-byte commands with its
 //!   followers acknowledging, which is what `sim/raft.rs`'s clients drive.
 //!
+//! "Long" is [`ticks_measured`], not a literal: a measurement is the warm-up plus
+//! [`RUNS`] runs of `steps`, so a timeout of 1 000 000 against the default 2 000 000
+//! steps a run fired about ten times inside the measurement and four of the five runs
+//! were entirely past the first one. The figure reported is the lowest of the runs, so
+//! nothing in the output showed it. [`still`] now asserts the role after every shape,
+//! and the harness stops rather than reporting a figure of a shape it did not measure.
+//!
 //! From the idle figure it then computes the replay burst after a slow persist
 //! (SHARD.md §12): the ticks a core replays once its persist resolves, times the
 //! cores held, times a step's cost, against the 10 ms tick at 1 000 ranges.
@@ -45,7 +52,7 @@ use std::collections::VecDeque;
 use std::hint::black_box;
 
 use ananke_env::{Clock, Environment, Instant, RealEnv};
-use ananke_raft::core::{Raft, RaftConfig, Variants};
+use ananke_raft::core::{Raft, RaftConfig, Role, Variants};
 use ananke_raft::message::Message;
 use ananke_raft::types::{Configuration, Entry, Index, Payload, ServerId};
 use ananke_raft::{Input, Output};
@@ -80,11 +87,28 @@ fn config() -> RaftConfig {
     }
 }
 
-/// A core whose timers do not fire inside a measurement: see the module
-/// documentation.
-fn steady() -> RaftConfig {
+/// How many ticks a measurement of `steps` steps puts through one core: the warm-up
+/// and then [`RUNS`] runs of `steps`.
+///
+/// A timeout has to be above **this**, not above `steps`: the figure reported is the
+/// lowest of `RUNS` runs, and a timeout that fires inside run 1 has fired in every run
+/// after it, so the shape measured is whatever the core became, on every run that
+/// counts.
+fn ticks_measured(steps: u64) -> u64 {
+    steps
+        .min(WARM_UP)
+        .saturating_add(steps.saturating_mul(RUNS as u64))
+}
+
+/// A core whose timers cannot fire inside a measurement of `steps` steps: see the
+/// module documentation.
+///
+/// A leader's check quorum falls due at twice `election_ticks.0` (core.rs:1488), so a
+/// timeout above the whole measurement puts both timers past its end.
+fn steady(steps: u64) -> RaftConfig {
+    let ticks = ticks_measured(steps);
     RaftConfig {
-        election_ticks: (1_000_000, 1_000_001),
+        election_ticks: (ticks + 1, ticks + 2),
         ..config()
     }
 }
@@ -96,19 +120,19 @@ fn follower(config: RaftConfig) -> Raft {
 /// A leader of the three: campaign, win both peers' pre-votes and votes, and be at
 /// the head of its term.
 fn leader(config: RaftConfig) -> Raft {
+    // A follower campaigns at its election timeout, which the steady shapes set above
+    // the whole measurement: the campaign loop's bound moves with it, or the core
+    // never reaches office and the shape is a follower's.
+    let campaign = config.election_ticks.1.saturating_mul(2).saturating_add(8);
     let mut core = Raft::new(ME, Configuration::of(&[ME, PEER, THIRD]), config, 1);
-    for _ in 0..2_000_002 {
-        if core.role() == ananke_raft::Role::Leader {
+    for _ in 0..campaign {
+        if core.role() == Role::Leader {
             break;
         }
         let outputs = core.step(Input::Tick);
         answer(&mut core, outputs);
     }
-    assert_eq!(
-        core.role(),
-        ananke_raft::Role::Leader,
-        "the core takes office"
-    );
+    assert_eq!(core.role(), Role::Leader, "the core takes office");
     core
 }
 
@@ -176,13 +200,18 @@ fn response(term: u64, prev: Index, matched: Index) -> Message {
 /// more than it knows.
 const RUNS: usize = 5;
 
+/// Steps run before the clock starts, so the figure is not the first allocation's.
+const WARM_UP: u64 = 1_000;
+
 /// A shape's cost in nanoseconds a step: the lowest and the highest of [`RUNS`] runs.
 fn measure<F>(env: &RealEnv, steps: u64, mut next: F) -> (u128, u128)
 where
     F: FnMut(u64),
 {
-    // A warm-up run, so the figure is not the first allocation's.
-    for i in 0..steps.min(1_000) {
+    // A warm-up run, so the figure is not the first allocation's. `ticks_measured`
+    // counts it, because a core that timed out in the warm-up is the wrong shape for
+    // every run after it.
+    for i in 0..steps.min(WARM_UP) {
         next(i);
     }
     let mut low = u128::MAX;
@@ -204,6 +233,24 @@ fn nanos(at: Instant) -> u128 {
     u128::from(at.as_nanos())
 }
 
+/// The shape a measurement was of, asserted after it.
+///
+/// Without this the harness drifts in silence, and it did: `steady`'s timeout was a
+/// literal 1 000 000 ticks against a default measurement of 10 001 000, so the timer
+/// fired about ten times inside it, four of the five runs were entirely past the first
+/// timeout, and the two tick shapes measured a **pre-candidate**. The figure reported
+/// is the lowest of the runs, so nothing in the output said so. A shape is now what it
+/// is called or the harness stops.
+fn still(core: &Raft, role: Role, shape: &str) {
+    assert_eq!(
+        core.role(),
+        role,
+        "the {shape} shape measured a {:?}, not a {role:?}: its timer fired inside the \
+         measurement, so the figure is not the step this shape is about",
+        core.role(),
+    );
+}
+
 fn report(name: &str, (low, high): (u128, u128)) {
     let tick = low * STEPS_PER_TICK_AT_1000;
     println!(
@@ -223,7 +270,7 @@ fn main() {
         println!("a core step's cost, {steps} steps a shape, release, host time\n");
 
         // Idle: a follower with a live leader, ticking.
-        let mut core = follower(steady());
+        let mut core = follower(steady(steps));
         core.step(Input::Message {
             from: PEER,
             message: heartbeat(1, 0, 0),
@@ -232,12 +279,14 @@ fn main() {
         let idle = measure(&env, steps, |_| {
             black_box(core.step(Input::Tick));
         });
+        still(&core, Role::Follower, "idle tick");
 
         // A leader's tick, which is a heartbeat on one phase of two.
-        let mut lead = leader(steady());
+        let mut lead = leader(steady(steps));
         let leader_tick = measure(&env, steps, |_| {
             black_box(lead.step(Input::Tick));
         });
+        still(&lead, Role::Leader, "leader tick");
 
         // A heartbeat arriving at a follower, which re-arms its timer at every one:
         // the default election timeout is right here.
@@ -254,6 +303,7 @@ fn main() {
                 now: i,
             }));
         });
+        still(&core, Role::Follower, "heartbeat in");
 
         // A response arriving at a leader. No tick falls due inside the loop, so the
         // default configuration's check quorum never runs and the core stays leader.
@@ -266,6 +316,7 @@ fn main() {
                 now: i,
             }));
         });
+        still(&lead, Role::Leader, "response in");
 
         // The sweep's client load: a leader proposing 64-byte commands, its followers
         // acknowledging each. Three steps a command, reported per step.
@@ -299,6 +350,7 @@ fn main() {
             });
             (low / 3, high / 3)
         };
+        still(&lead, Role::Leader, "loaded");
 
         // The log the proposals left, which the cap holds near the steady state.
         let entries = lead.log().len();

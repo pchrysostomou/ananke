@@ -187,6 +187,15 @@ pub struct Meters {
     /// at all. The trace event for it goes with the outbox's drops, in the slice that
     /// puts the node under the sweeps (PROPOSED D-073); the counter is here now.
     pub messages_for_ranges_not_held: u64,
+    /// Node-local inputs — a client's request, an index the `apply` task made
+    /// durable — held for a core whose persist was outstanding (SHARD.md §4).
+    ///
+    /// It says the holding path was *reached*, which nothing else does: a held input
+    /// is stepped a moment later and leaves no other mark, so a node that threw every
+    /// one of them away would look like this one to any check downstream of it.
+    // PROPOSED(D-076): a node-local input is held for a persisting core as a message
+    // of its range is.
+    pub locals_held: u64,
 }
 
 /// Every core on the node, keyed by range, and the order they are stepped in
@@ -223,8 +232,23 @@ impl Cores {
     }
 
     /// Puts `core` on the node as `range`'s, replacing whatever was there.
+    ///
+    /// A replaced slot's held work goes with it, and **its bytes are released**: what
+    /// the node holds is charged against the inbox's bound (D-074), and `held_bytes`
+    /// is only ever decreased by a resolution, so a slot dropped with work still held
+    /// would shrink the node's bound by those bytes for the rest of the node's life —
+    /// and under D-074 a bound the node can never re-open. The replaced slot's
+    /// deferred outputs go too: they belong to a core that is no longer on the node,
+    /// and a persist for it can no longer resolve.
+    ///
+    /// Today the only caller is the node's construction, where there is nothing to
+    /// release. Adoption and rebalancing are the next slices, and this is the
+    /// bookkeeping they need to be able to rely on.
     pub fn insert(&mut self, range: RangeId, core: Raft) {
-        self.slots.insert(range, Slot::new(core));
+        if let Some(replaced) = self.slots.insert(range, Slot::new(core)) {
+            let held: usize = replaced.held.iter().map(|held| held.bytes).sum();
+            self.held_bytes = self.held_bytes.saturating_sub(held);
+        }
     }
 
     /// The ranges on the node, in order.
@@ -267,6 +291,20 @@ impl Cores {
     #[must_use]
     pub fn held_bytes(&self) -> usize {
         self.held_bytes
+    }
+
+    /// Counts a node-local input — a client's request, an applied index — for a
+    /// range this node does not hold. The node's own inputs are counted where its
+    /// peers' messages are, so neither is ever silently lost.
+    // PROPOSED(D-076): a local input for a range not held is counted, never silent.
+    pub fn count_input_for_a_range_not_held(&mut self) {
+        self.meters.messages_for_ranges_not_held += 1;
+    }
+
+    /// Counts a node-local input held for a core whose persist is outstanding: the
+    /// only mark that path leaves ([`Meters::locals_held`]).
+    pub fn count_local_held(&mut self) {
+        self.meters.locals_held += 1;
     }
 
     /// What the node measured about its rounds.
@@ -327,11 +365,13 @@ impl Cores {
         }
         let collapse =
             variants.contains(NodeVariant::CollapseHeldTicks) && matches!(input, Input::Tick);
-        let Some(slot) = self.slots.get_mut(&range) else {
-            // A message for a range this node does not hold: counted, never silent.
-            self.meters.messages_for_ranges_not_held += 1;
-            return;
-        };
+        // `hold` is `self.persisting(range)`, which is false for a range with no slot,
+        // so the slot is here. A message for a range the node does not hold takes the
+        // other arm and is counted in `step`, which is the one path that can meet one.
+        let slot = self
+            .slots
+            .get_mut(&range)
+            .expect("a range is held while its persist is outstanding");
         if collapse
             && slot
                 .held
@@ -847,5 +887,42 @@ mod tests {
         cores.messages(&env, [(R1, append(2, 1), None, 64)]);
         assert_eq!(cores.meters().messages_for_ranges_not_held, 1);
         assert_eq!(cores.meters().held_most, 1);
+    }
+
+    /// A core replaced on a running node releases what it held.
+    ///
+    /// `held_bytes` is what the node charges against its inbox's bound (D-074), and it
+    /// is otherwise only ever decreased by a resolution. A slot dropped with work still
+    /// held would take those bytes out of the node's bound for good — and under D-074's
+    /// admission rule a byte the node can never re-open is a byte of the bound gone.
+    /// Today `insert` is only called at construction; adoption and rebalancing are the
+    /// next slices, and this is what they rely on.
+    #[test]
+    fn a_core_replaced_on_a_running_node_releases_what_it_held() {
+        let env = env();
+        let mut cores = cores(NodeVariants::correct());
+        // r1 persists, then two more arrivals for r1 are held behind its sync.
+        cores.messages(&env, [(R1, append(1, 1), None, 64)]);
+        cores.messages(&env, [(R1, append(2, 1), None, 64)]);
+        cores.messages(&env, [(R1, append(3, 1), None, 128)]);
+        assert_eq!(
+            cores.held_bytes(),
+            192,
+            "both arrivals are held and charged"
+        );
+
+        cores.insert(R1, core(R1));
+        assert_eq!(
+            cores.held_bytes(),
+            0,
+            "the replaced core's held bytes were never released: the node's bound is \
+             short of them for the rest of its life"
+        );
+        // And the fresh core is a fresh core: it is not waiting on the persist the
+        // one it replaced asked for, and it holds none of its work.
+        assert!(!cores.persisting(R1));
+        let round = cores.messages(&env, [(R1, append(1, 1), None, 64)]);
+        assert_eq!(round.persists.len(), 1, "the fresh core steps: {round:?}");
+        assert_eq!(cores.held_bytes(), 0);
     }
 }

@@ -101,6 +101,10 @@ ananke/
 
 _Update this section at the end of every session._
 
+- Merge update (2026-09-22): branch `phase-3-stage-b-compaction` merged `origin/main`
+  to resolve PR conflicts, carrying in PROPOSED D-073 and D-074 from main and keeping
+  this branch's PROPOSED D-078.
+
 - Phase 3, Stage B in progress (2026-09-21). Merged: PR #71 the trace of §8 (D-069),
   PR #75 the checks keyed by range (D-071), PR #76 the node's wire (D-072, crate
   `ananke-shard`: `RangeId`, range-tagged batch frames, the per-peer outbox keyed by
@@ -114,9 +118,23 @@ _Update this section at the end of every session._
   holds 1 000 ranges' idle ticks in 0.2 % of a 10 ms tick; the replay burst after a slow
   persist is under 1 % of a tick at every disk latency the tree models and first fills a
   tick at a sync of about 10.4 s; a round with `p` persisting cores costs up to `1 + p`
-  frames per peer, which is the one figure D-073 puts to the owner. The node runs one
-  range and is in no scenario yet; the single-group server in `ananke-raft` is
-  untouched.
+  frames per peer, which is the one figure D-073 puts to the owner.
+  Branch `phase-3-stage-b-ranges`, stacked on the snapshot slice: **four ranges on every
+  node** (PROPOSED D-076). `ananke_shard::server::run` is the node as a running server —
+  one engine, one socket, one inbox, one `raft` task on one ticker, one `apply` task, and
+  a Raft store and a core per range, with the ranges fixed at bootstrap from
+  configuration and each traced `RangeCreated { cause: bootstrap }`, each core seeded
+  from `n{id}/r{range}/protocol` (D-057's first caller), and a range on every client
+  message. `sim/ranges.rs` runs three nodes of four ranges under crashes and isolations
+  whose range each arm draws from its own stream, and its trace is put through the checks
+  D-071 keyed: the first trace in the tree with more than one range to be wrong about.
+  Two checks were wrong and are fixed here, both caught by that sweep on its first run:
+  `match_starts_are_first_rises` was keyed by the node, and the timer check's replay read
+  a delivered frame as one group's rather than as the batch frame a node sends. The
+  single-group server in `ananke-raft` is untouched and `sim/raft.rs`'s arms,
+  `sim/membership.rs` and `sim/quorum.rs` still run on it: moving them onto the node
+  needs the snapshot, re-seed and compaction paths the other Stage B slices build, so
+  Stage B's first exit criterion is owed.
 - Phase: 2 CODE-COMPLETE, not tagged. Overnight (2026-09-09), branch
   `phase-2-overnight`, merged to main as PR #24: stages D and E of RAFT.md's order
   and issue #22 landed (D-029, D-030, D-031), every commit gated, the correct server
