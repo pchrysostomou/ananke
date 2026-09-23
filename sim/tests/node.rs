@@ -31,6 +31,30 @@
 //! twenty-millisecond threshold, how long one range's applies hold the node's
 //! others, and the trace records a run holds per range per virtual second against
 //! `TRACE_CAP`.
+//!
+//! # The membership scenario on the node
+//!
+//! The second half of this binary is `sim/membership.rs` on the same node (PROPOSED
+//! D-084, following D-082): five nodes, **four ranges on every one of them**, 3 → 5 → 3
+//! on every range under the partitions the seed draws, each range placed as today's one
+//! group is. It is here rather than in a binary of its own for the reason the one-group
+//! membership tests sit in `sim/tests/raft.rs`: the scenario shares the sweep's client,
+//! its addresses and its schedule's clocks, and a second binary would be a second build
+//! of all of it.
+//!
+//! What it adds to the list above:
+//!
+//! - the other half of issue #46's extension, the half four ranges make possible and
+//!   one group could not have: **a change of a range while another range on the same
+//!   node is changing**, asserted on every seed and named on one;
+//! - liveness and availability asked of **each range** and not of the cluster, on
+//!   bounds measured on the correct node before they were written;
+//! - `SingleMajorityInJointConsensus` re-asserted on the node to the standard its
+//!   Phase 2 test asserts and no stronger, at the tier it uses today;
+//! - the half of issue #46 the node **cannot** reach — a joining server fed by a
+//!   snapshot in its learner phase — asserted absent on every seed with its reason and
+//!   the slice that owns the wiring, and left asserted where the path is, on
+//!   `Cluster::OneGroup`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
@@ -1215,5 +1239,646 @@ fn the_pair_that_wedged_seed_680_is_not_re_asserted_on_the_node_yet() {
         "{IgnoreIncarnation, SharedSnapshotDir}",
         Variants::of(&[Variant::IgnoreIncarnation, Variant::SharedSnapshotDir]),
         "PR #86's re-seed and the node's snapshot wiring",
+    );
+}
+
+// --- The membership scenario on the node (SHARD.md §12's Stage B, issue #46) ---
+
+use ananke_sim::membership;
+
+/// The correct node's membership run for `seed`: five nodes, four ranges on each,
+/// 3 → 5 → 3 on **every** range under the partitions the seed draws.
+fn membership_node(seed: u64, variants: impl Into<Variants>) -> membership::Report {
+    membership::run_on(Cluster::Node, seed, variants)
+}
+
+/// The run's verdict on the node: the scenario's own checks — which are now each
+/// range's, not the cluster's — and then the shape four ranges are *for*, asserted on
+/// every seed rather than printed.
+///
+/// The two clauses here are the ones a single-range world could not have made, and
+/// each is stated per seed because a floor over a tier cannot see a seed that reached
+/// nothing (CLAUDE.md): a run where the four changes never overlapped, or where the
+/// joiners were admitted to one range and not four, has not run the scenario this
+/// binary claims to run, and must say so rather than pass.
+// PROPOSED(D-084): the membership scenario on the node, four ranges on every node.
+fn membership_checked(report: &membership::Report) -> Result<(), String> {
+    let seed = report.seed;
+    report.check()?;
+    // Issue #46's extension the node makes possible: a change of a range while
+    // another range **on the same node** is changing. One group has one range and no
+    // overlap to have, which is why this could not be asserted before.
+    //
+    // Asked as `witnessed_joint_overlap` and not as `joint_overlap`, because the
+    // forward fold that produces the answer can be widened into always answering —
+    // drop the line that clears a range when its joint configuration ends — and no
+    // floor, count or bound could see it, since a fold that always answers passes
+    // everything. The witness reads the same trace backwards at the record the fold
+    // stopped on and asks whether both ranges really were joint there. It cannot be
+    // satisfied by construction and it is not a bound, so the correct node cannot trip
+    // it: 100 of 100 witnessed, against 87 of 100 for the never-clearing fold.
+    // PROPOSED(D-084): the answer is witnessed, which is what guards the fold.
+    if let Err(why) = report.witnessed_joint_overlap() {
+        return Err(format!("seed {seed}: {why}"));
+    }
+    // The grow admits servers 4 and 5 to **every** range. A run that admitted them to
+    // one range and left three unchanged completes "a change" and is not this
+    // scenario; the whole-cluster reading cannot tell the two apart. Asked only where
+    // the grow completed, which `Report::check` asserts of every uniformly scheduled
+    // seed and liveness cannot be asked of the others (D-016).
+    if report.grow_completed {
+        let held: BTreeSet<u64> = report.ranges().into_iter().collect();
+        for joiner in membership::INITIAL_VOTERS + 1..=membership::SERVERS {
+            let admitted = report.ranges_admitting(joiner);
+            if admitted != held {
+                return Err(format!(
+                    "seed {seed}: the grow completed, but server {joiner} became a voter of \
+                     {admitted:?} and not of every range this node holds, {held:?}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// What the correct node's membership runs saw, over a tier.
+#[derive(Debug, Default)]
+struct NodeMembershipCoverage {
+    seeds: u64,
+    uniform_seeds: u64,
+    grows_completed: u64,
+    shrinks_completed: u64,
+    /// Seeds on which a node held two ranges' joint configurations at once, **and the
+    /// trace read backwards witnessed it** ([`membership::Report::witnessed_joint_overlap`]).
+    overlapped: u64,
+    /// Seeds on which both joiners became voters of every range.
+    joiners_on_every_range: u64,
+    /// Partitions that cut off the leader of the range they drew, and partitions made.
+    partitions_hit: usize,
+    partitions_made: usize,
+    /// Snapshot actions traced, and the highest index any replica reached: the two
+    /// halves of the absence this cluster asserts (`Report::check`).
+    snapshot_actions: usize,
+    highest_index: u64,
+    /// Ranges that elected a leader and ranges that applied something, over the tier.
+    leaders: BTreeMap<u64, usize>,
+    applies: BTreeMap<u64, usize>,
+    /// The worst gap any one range went without a completed operation, and the worst
+    /// first write after a heal, against their bounds.
+    worst_range_gap: Duration,
+    worst_write_after_heal: Duration,
+    /// The same two folded over the **cluster** instead, which is what the one-group
+    /// scenario has always asked. They are here to be compared with the two above:
+    /// a per-range fold that saw no more than the cluster's fold is not a per-range
+    /// fold, and the comparison is the only thing that says so (see
+    /// `assert_complete`).
+    worst_cluster_gap: Duration,
+    worst_cluster_write_after_heal: Duration,
+    /// The ranges the run's partitions aimed at, over the tier.
+    aimed_ranges: BTreeSet<u64>,
+    /// The ranges a leadership transfer was asked for, over the tier, and how many of
+    /// those transfers were followed by the asked-for server leading that range.
+    // PROPOSED(D-084): the transfer hands over every range the node holds.
+    transfer_ranges: BTreeSet<u64>,
+    transfers_landed: usize,
+    transfers_made: usize,
+    /// The states the one-group scenario's own coverage asserts, folded here over the
+    /// node's trace so that this positive control demands what that one does. Each is
+    /// reachable on the node and none needs a snapshot path; the ones the node cannot
+    /// reach are named in `assert_complete` with the reason, not left out.
+    // PROPOSED(D-084): the node's positive control asks what the one-group one asks.
+    joint_configs_taken: usize,
+    new_configs_taken: usize,
+    learners_promoted: usize,
+    learner_rounds_caught_up: usize,
+    config_reverts: usize,
+    elections_while_joint: usize,
+    step_downs_outside_new: usize,
+    changes_accepted: usize,
+    match_starts: usize,
+    learner_rounds: usize,
+    seeds_with_a_match_start: u64,
+    seeds_with_a_learner_round: u64,
+    seeds_with_a_change_accepted: u64,
+    partitions: usize,
+    completed: u64,
+    /// Trace records, and the longest run in virtual seconds, for the density figure.
+    records: usize,
+    longest_run: f64,
+}
+
+impl NodeMembershipCoverage {
+    fn add(&mut self, report: &membership::Report) {
+        self.seeds += 1;
+        self.uniform_seeds += u64::from(report.uniform());
+        self.grows_completed += u64::from(report.grow_completed);
+        self.shrinks_completed += u64::from(report.shrink_completed);
+        self.overlapped += u64::from(report.witnessed_joint_overlap().is_ok());
+        let held: BTreeSet<u64> = report.ranges().into_iter().collect();
+        let every = (membership::INITIAL_VOTERS + 1..=membership::SERVERS)
+            .all(|joiner| report.ranges_admitting(joiner) == held);
+        self.joiners_on_every_range += u64::from(every);
+        let (hit, made) = report.partitions_hit_their_ranges();
+        self.partitions_hit += hit;
+        self.partitions_made += made;
+        self.snapshot_actions += report.snapshot_actions();
+        self.highest_index = self.highest_index.max(report.highest_index());
+        for range in report.ranges() {
+            if let Some(gap) = report.longest_completion_gap_of(range) {
+                self.worst_range_gap = self.worst_range_gap.max(gap);
+            }
+            if let Some(took) = report.time_to_write_after_heal_of(range) {
+                self.worst_write_after_heal = self.worst_write_after_heal.max(took);
+            }
+        }
+        if let Some(gap) = report.longest_completion_gap() {
+            self.worst_cluster_gap = self.worst_cluster_gap.max(gap);
+        }
+        if let Some(took) = report.time_to_write_after_heal() {
+            self.worst_cluster_write_after_heal = self.worst_cluster_write_after_heal.max(took);
+        }
+        self.aimed_ranges
+            .extend(report.aimed.iter().map(|aimed| aimed.range));
+        self.transfer_ranges.extend(report.transfer_ranges());
+        let (landed, made) = report.transfers_landed();
+        self.transfers_landed += landed;
+        self.transfers_made += made;
+        self.partitions += report.partitions.len();
+        self.completed += report.clients.completed;
+        self.fold_the_one_group_states(report);
+        for record in &report.records {
+            match &record.event {
+                ananke_env::TraceEvent::RaftLeader { range, .. } => {
+                    *self.leaders.entry(*range).or_default() += 1;
+                }
+                ananke_env::TraceEvent::RaftApply { range, .. } => {
+                    *self.applies.entry(*range).or_default() += 1;
+                }
+                _ => {}
+            }
+        }
+        self.records += report.records.len();
+        let end = report.records.last().map_or(0, |r| r.at.as_nanos());
+        self.longest_run = self.longest_run.max(end as f64 / 1e9);
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.seeds += other.seeds;
+        self.uniform_seeds += other.uniform_seeds;
+        self.grows_completed += other.grows_completed;
+        self.shrinks_completed += other.shrinks_completed;
+        self.overlapped += other.overlapped;
+        self.joiners_on_every_range += other.joiners_on_every_range;
+        self.partitions_hit += other.partitions_hit;
+        self.partitions_made += other.partitions_made;
+        self.snapshot_actions += other.snapshot_actions;
+        self.highest_index = self.highest_index.max(other.highest_index);
+        self.worst_range_gap = self.worst_range_gap.max(other.worst_range_gap);
+        self.worst_write_after_heal = self
+            .worst_write_after_heal
+            .max(other.worst_write_after_heal);
+        self.worst_cluster_gap = self.worst_cluster_gap.max(other.worst_cluster_gap);
+        self.worst_cluster_write_after_heal = self
+            .worst_cluster_write_after_heal
+            .max(other.worst_cluster_write_after_heal);
+        for (range, count) in other.leaders {
+            *self.leaders.entry(range).or_default() += count;
+        }
+        for (range, count) in other.applies {
+            *self.applies.entry(range).or_default() += count;
+        }
+        self.records += other.records;
+        self.longest_run = self.longest_run.max(other.longest_run);
+        self.aimed_ranges.extend(other.aimed_ranges);
+        self.transfer_ranges.extend(other.transfer_ranges);
+        self.transfers_landed += other.transfers_landed;
+        self.transfers_made += other.transfers_made;
+        self.joint_configs_taken += other.joint_configs_taken;
+        self.new_configs_taken += other.new_configs_taken;
+        self.learners_promoted += other.learners_promoted;
+        self.learner_rounds_caught_up += other.learner_rounds_caught_up;
+        self.config_reverts += other.config_reverts;
+        self.elections_while_joint += other.elections_while_joint;
+        self.step_downs_outside_new += other.step_downs_outside_new;
+        self.changes_accepted += other.changes_accepted;
+        self.match_starts += other.match_starts;
+        self.learner_rounds += other.learner_rounds;
+        self.seeds_with_a_match_start += other.seeds_with_a_match_start;
+        self.seeds_with_a_learner_round += other.seeds_with_a_learner_round;
+        self.seeds_with_a_change_accepted += other.seeds_with_a_change_accepted;
+        self.partitions += other.partitions;
+        self.completed += other.completed;
+    }
+
+    /// The states `MembershipCoverage` counts on the one-group server, folded over the
+    /// node's trace with the same rules — a configuration's own `RaftConfig` per
+    /// (server, range), a promotion per (index, joiner), a step-down of a leader the
+    /// new configuration leaves out, a revert to a lower index, an election while
+    /// joint — so that what this control demands and what that one demands can be
+    /// compared line for line (PROPOSED D-084).
+    // PROPOSED(D-084): the node's positive control asks what the one-group one asks.
+    fn fold_the_one_group_states(&mut self, report: &membership::Report) {
+        let match_starts =
+            report.count(|e| matches!(e, ananke_env::TraceEvent::RaftMatchStarted { .. }));
+        let learner_rounds =
+            report.count(|e| matches!(e, ananke_env::TraceEvent::RaftLearnerRound { .. }));
+        let changes =
+            report.count(|e| matches!(e, ananke_env::TraceEvent::RaftChangeAccepted { .. }));
+        self.match_starts += match_starts;
+        self.learner_rounds += learner_rounds;
+        self.changes_accepted += changes;
+        self.seeds_with_a_match_start += u64::from(match_starts > 0);
+        self.seeds_with_a_learner_round += u64::from(learner_rounds > 0);
+        self.seeds_with_a_change_accepted += u64::from(changes > 0);
+        self.learner_rounds_caught_up += report.count(|e| {
+            matches!(
+                e,
+                ananke_env::TraceEvent::RaftLearnerRound {
+                    caught_up: true,
+                    ..
+                }
+            )
+        });
+        // Keyed by (server, range) and not by server: a node holds four replicas and
+        // one entry would read one range's configuration as another's, which is the
+        // mistake this whole slice exists to make visible.
+        let mut in_force: BTreeMap<(u64, u64), (u64, bool)> = BTreeMap::new();
+        let mut leading: BTreeSet<(u64, u64)> = BTreeSet::new();
+        let mut promoted: BTreeSet<(u64, u64, u64)> = BTreeSet::new();
+        for record in &report.records {
+            match &record.event {
+                ananke_env::TraceEvent::RaftConfig {
+                    server,
+                    range,
+                    index,
+                    old,
+                    new,
+                    joint,
+                    ..
+                } => {
+                    if *joint {
+                        self.joint_configs_taken += 1;
+                        for id in new {
+                            if !old.contains(id) {
+                                promoted.insert((*range, *index, *id));
+                            }
+                        }
+                    } else if *index > 0 {
+                        self.new_configs_taken += 1;
+                        if leading.contains(&(*range, *server)) && !old.contains(server) {
+                            self.step_downs_outside_new += 1;
+                        }
+                    }
+                    if let Some(&(previous, _)) = in_force.get(&(*range, *server))
+                        && *index < previous
+                    {
+                        self.config_reverts += 1;
+                    }
+                    in_force.insert((*range, *server), (*index, *joint));
+                }
+                ananke_env::TraceEvent::RaftTerm {
+                    server,
+                    range,
+                    role,
+                    ..
+                } => {
+                    if &**role == "leader" {
+                        leading.insert((*range, *server));
+                    } else {
+                        leading.remove(&(*range, *server));
+                    }
+                }
+                ananke_env::TraceEvent::RaftLeader { server, range, .. } => {
+                    leading.insert((*range, *server));
+                    if in_force
+                        .get(&(*range, *server))
+                        .is_some_and(|&(_, joint)| joint)
+                    {
+                        self.elections_while_joint += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.learners_promoted += promoted.len();
+    }
+
+    /// The floors, each measured on the correct node before it was written (D-061).
+    ///
+    /// The per-range counts are the ones that mean anything here: a scenario that
+    /// elected and applied on one range while three sat idle would satisfy every
+    /// whole-cluster count there is, which is the mistake `applies.contains_key` made
+    /// in D-082's own campaign.
+    fn assert_complete(&self) {
+        assert_eq!(self.seeds, seeds(), "every seed of the tier is counted");
+        assert_eq!(
+            self.overlapped, self.seeds,
+            "some seed's four changes never overlapped on one node: {self:?}"
+        );
+        assert_eq!(
+            self.joiners_on_every_range, self.seeds,
+            "some seed admitted the joiners to fewer than every range: {self:?}"
+        );
+        assert_eq!(
+            self.grows_completed, self.seeds,
+            "some seed's grow did not complete on every range: {self:?}"
+        );
+        assert_eq!(
+            self.shrinks_completed, self.seeds,
+            "some seed's shrink did not complete on every range: {self:?}"
+        );
+        // The absence this cluster asserts, over the tier as well as per seed.
+        assert_eq!(
+            self.snapshot_actions, 0,
+            "the node traced a snapshot action, a path it does not have: {self:?}"
+        );
+        assert!(
+            self.highest_index < raft::NODE_SNAPSHOT_THRESHOLD,
+            "a replica reached the snapshot threshold: {self:?}"
+        );
+        for range in Cluster::Node.ranges() {
+            assert!(
+                self.leaders.get(&range).copied().unwrap_or(0) > 0,
+                "range {range} never elected a leader over the tier: {self:?}"
+            );
+            assert!(
+                self.applies.get(&range).copied().unwrap_or(0) > 0,
+                "range {range} applied nothing over the tier: {self:?}"
+            );
+        }
+        // Every partition aimed at a range cut off *that range's* leader. Measured at
+        // 200/200 over a hundred seeds on the correct node; the floor is 90 %, as
+        // D-082 set the raft sweep's, because a leadership change between the
+        // driver's read and the partition is ordinary and is not a fault.
+        assert!(
+            self.partitions_made > 0,
+            "no partition was made at all: {self:?}"
+        );
+        let hit = self.partitions_hit as f64 / self.partitions_made as f64;
+        assert!(
+            hit >= 0.9,
+            "only {hit:.3} of the partitions cut off the leader of the range they drew, under \
+             the floor of 0.900: {self:?}"
+        );
+        // The applies are spread over the ranges rather than piled on one. The floor
+        // is the least range's share of the busiest, measured **on this scenario** at
+        // **0.976** at a hundred seeds ({2: 11 396, 3: 11 438, 4: 11 161, 5: 11 229})
+        // and 0.920 at the gate's twenty; D-082 set the same floor at 0.5 against its
+        // own sweep's 0.87, for the same reason, that `contains_key` passes a range
+        // which applied only its leader's no-ops.
+        // Every range was aimed at by some partition over the tier. Without this a
+        // schedule whose draw answered the first range every time would leave three
+        // ranges' leaders never cut off, and every other floor here would be met:
+        // `partitions_hit` counts hits against what was *aimed at*, so a draw that
+        // always aims at one range hits it every time.
+        assert_eq!(
+            self.aimed_ranges,
+            Cluster::Node.ranges().into_iter().collect::<BTreeSet<_>>(),
+            "the partitions aimed at {:?} and not at every range this node holds: {self:?}",
+            self.aimed_ranges
+        );
+        // A per-range fold that saw no more than the cluster's fold is not a per-range
+        // fold. Both quantities below are per-range maxima over folds whose inputs are
+        // *subsets* of the cluster fold's, so each is at least the cluster's by
+        // construction and the only question is whether it is ever strictly more. Over
+        // a tier it is, comfortably — at a hundred seeds the worst range went 996 ms
+        // without a completed operation against the cluster's 329 ms, and a range's
+        // first write after a heal took 1.130 s against the cluster's first — and this
+        // is what fails if either fold is quietly widened back to the whole history,
+        // which no bound below could see, since a widened fold only ever passes.
+        assert!(
+            self.worst_range_gap > self.worst_cluster_gap,
+            "the worst gap of any one range, {:?}, is no worse than the cluster's {:?}: the \
+             per-range availability fold is reading the whole history: {self:?}",
+            self.worst_range_gap,
+            self.worst_cluster_gap
+        );
+        assert!(
+            self.worst_write_after_heal > self.worst_cluster_write_after_heal,
+            "the worst first write after a heal of any one range, {:?}, is no worse than the \
+             cluster's {:?}: the per-range liveness fold is reading the whole history: \
+             {self:?}",
+            self.worst_write_after_heal,
+            self.worst_cluster_write_after_heal
+        );
+        // Every range a leadership transfer was asked for. D-084's item 6 says the
+        // transfer hands over **every** range the node holds, so that the shrink's
+        // leader is outside `C_new` on each of them; nothing else records that claim.
+        // A transfer that reached one range of four leaves every other floor here met
+        // — the elections it costs the other three are lost among the ones the
+        // partitions cause anyway — so this is what says the claim was kept.
+        // PROPOSED(D-084): the transfer hands over every range the node holds.
+        assert!(
+            self.transfers_made > 0,
+            "no leadership transfer was asked for at all: {self:?}"
+        );
+        assert_eq!(
+            self.transfer_ranges,
+            Cluster::Node.ranges().into_iter().collect::<BTreeSet<_>>(),
+            "leadership was handed over for {:?} and not for every range this node holds: \
+             {self:?}",
+            self.transfer_ranges
+        );
+        // And the transfers were followed by the server they named leading that range,
+        // which is what sets the step-down up. Not at one — a transfer is one shot and
+        // best effort, as the sweep's lease trial is — but at a floor measured on the
+        // correct node: 140 of 192 (72.9 %) at a hundred seeds and 23 of 32 (71.9 %) at
+        // the gate's twenty.
+        let landed = self.transfers_landed as f64 / self.transfers_made as f64;
+        assert!(
+            landed >= 0.5,
+            "only {landed:.3} of the leadership transfers were followed by the server they \
+             named leading that range, under the floor of 0.500: {self:?}"
+        );
+        // What the one-group scenario's own coverage asserts of this scenario
+        // (`MembershipCoverage::assert_complete`), asked here with the same tiering, so
+        // that the node's positive control demands what the one-group one demands.
+        // Every one of these is reachable on the node and none needs a snapshot path;
+        // the ones the node cannot reach are named below with their reason rather than
+        // left out.
+        // PROPOSED(D-084): the node's positive control asks what the one-group one asks.
+        for (what, seen) in [
+            (
+                "joint configurations taken",
+                self.joint_configs_taken as u64,
+            ),
+            ("new configurations taken", self.new_configs_taken as u64),
+            ("learners promoted", self.learners_promoted as u64),
+            (
+                "learner rounds that caught up",
+                self.learner_rounds_caught_up as u64,
+            ),
+            ("partitions", self.partitions as u64),
+            ("completed operations", self.completed),
+            ("uniformly scheduled seeds", self.uniform_seeds),
+        ] {
+            assert!(
+                seen > 0,
+                "the node's membership runs never saw {what}: {self:?}"
+            );
+        }
+        // SHARD.md §8's three events, each on *every* seed, as the one-group control
+        // asserts them: the driver grows the configuration of every range on every
+        // seed, so a change is accepted, a learner is tracked and caught up, and every
+        // leader's first answer from a follower raises `matched` under the incarnation
+        // it carried. 100 of 100 and 20 of 20 for all three here. A total above zero is
+        // what an emission rule gone wrong passes; these say the rule fires where it
+        // must.
+        for (what, seen) in [
+            (
+                "a leader's match rise under a follower's incarnation",
+                self.seeds_with_a_match_start,
+            ),
+            (
+                "a learner's catch-up round",
+                self.seeds_with_a_learner_round,
+            ),
+            ("an accepted change", self.seeds_with_a_change_accepted),
+        ] {
+            assert_eq!(
+                seen, self.seeds,
+                "a node membership run saw no {what}: {self:?}"
+            );
+        }
+        // The one-group control's tiering for the two states that need the partition to
+        // land inside a narrow phase of a change. On the node they are commoner —
+        // 212 step-downs and 47 reverts at a hundred seeds, 41 and 0 at the gate's
+        // twenty — because four ranges give four changes a seed; the tier is kept the
+        // one-group one rather than tightened, since nothing here measured the rate a
+        // tighter tier would rest on.
+        if self.seeds >= 100 {
+            for (what, seen) in [
+                (
+                    "step-downs of a leader outside C_new",
+                    self.step_downs_outside_new as u64,
+                ),
+                ("configuration reverts", self.config_reverts as u64),
+            ] {
+                assert!(
+                    seen > 0,
+                    "the node's membership runs never saw {what}: {self:?}"
+                );
+            }
+        }
+        // An election while joint needs the partition to cut a leader off inside the
+        // joint phase itself, and the one-group control asserts it from the
+        // thousand-seed tier under D-061 (3.4 % of its seeds). On the node it is 13
+        // elections over a hundred seeds and 2 over the gate's twenty, so the same
+        // tier is kept.
+        if self.seeds >= 1000 {
+            assert!(
+                self.elections_while_joint > 0,
+                "the node's membership runs never saw elections while joint: {self:?}"
+            );
+        }
+        let least = self.applies.values().copied().min().unwrap_or(0) as f64;
+        let busiest = self.applies.values().copied().max().unwrap_or(1).max(1) as f64;
+        assert!(
+            least / busiest >= 0.5,
+            "the least busy range applied {:.2} of the busiest range's entries, under the floor \
+             of 0.50: {self:?}",
+            least / busiest
+        );
+    }
+}
+
+/// The positive control: the correct node passes 3 → 5 → 3 on every one of its four
+/// ranges, on every seed, with the changes overlapping on a node and both joiners
+/// admitted to every range.
+///
+/// Every figure SHARD.md §12 asks of a sweep on the node is printed beside the
+/// verdict: the trace records a run holds per range per virtual second against
+/// `TRACE_CAP`, the worst gap and first write after a heal any range showed against
+/// their bounds, and the two halves of the snapshot path's absence.
+// PROPOSED(D-084): the membership scenario on the node, four ranges on every node.
+#[test]
+fn every_seed_passes_the_membership_scenario_on_the_correct_node() {
+    let coverage = std::sync::Mutex::new(NodeMembershipCoverage::default());
+    let verdicts = sweep(seeds(), |seed| {
+        let report = membership_node(seed, Variants::default());
+        let mut mine = NodeMembershipCoverage::default();
+        mine.add(&report);
+        coverage.lock().unwrap().merge(mine);
+        membership_checked(&report)
+            .inspect_err(|_| write_trace(&format!("node-membership-{seed}"), &report.jsonl()))
+    });
+    let coverage = coverage.into_inner().unwrap();
+    let per_range_per_second =
+        coverage.records as f64 / 4.0 / coverage.longest_run.max(1e-9) / coverage.seeds as f64;
+    eprintln!(
+        "node membership: {coverage:?}; about {per_range_per_second:.0} records per range per \
+         virtual second against a TRACE_CAP of {}",
+        membership::TRACE_CAP
+    );
+    if let Err(violation) = verdict(&verdicts) {
+        panic!("{violation}");
+    }
+    coverage.assert_complete();
+}
+
+/// The negative control on the node: a server that counts one merged majority while
+/// joint (thesis §4.3) is caught by the scenario's checks on some seed.
+///
+/// Its Phase 2 test asserts exactly this and no more — caught on some seed, at every
+/// tier — and that is what is asserted here (§10, Q39). Its **measured** rate on the
+/// node is 14 of 100 seeds against the one-group server's 19 of 100, above D-061's
+/// five per cent, so the tier it keeps is the tier it has. At the gate's twenty seeds
+/// the catch is deterministic and not a coin: seeds 3 and 15 of the first twenty catch
+/// it, so a green gate here is a gate that injected the fault.
+// PROPOSED(D-084): Phase 2's variant re-asserted on the node, at the tier it uses today.
+#[test]
+fn a_server_that_counts_one_majority_in_joint_consensus_is_caught_on_the_node() {
+    let outcomes: Vec<(Option<String>, bool)> = sweep(seeds(), |seed| {
+        let report = membership_node(seed, Variant::SingleMajorityInJointConsensus);
+        (report.check().err(), report.joint_overlap().is_some())
+    });
+    let overlapped = outcomes.iter().filter(|(_, o)| *o).count();
+    let caught: Vec<String> = outcomes.into_iter().filter_map(|(v, _)| v).collect();
+    eprintln!(
+        "SingleMajorityInJointConsensus on the node: caught on {} of {} seeds, the changes \
+         overlapped on {overlapped}, first: {}",
+        caught.len(),
+        seeds(),
+        caught.first().map_or("", String::as_str)
+    );
+    assert!(
+        !caught.is_empty(),
+        "SingleMajorityInJointConsensus was never caught on the node"
+    );
+}
+
+/// The node's membership scenario replays: two runs of one seed give byte-identical
+/// traces, so the driver's decisions — which range it asks first, which range's leader
+/// the partition cuts off — are functions of the trace and the seed alone.
+// PROPOSED(D-084): the membership scenario on the node, four ranges on every node.
+#[test]
+fn a_membership_seed_replays_to_the_same_trace_on_the_node() {
+    let first = membership_node(7, Variants::default());
+    let second = membership_node(7, Variants::default());
+    assert_eq!(first.jsonl().as_bytes(), second.jsonl().as_bytes());
+}
+
+/// One seed's run, read record by record: the two ranges a node changed at once, and
+/// the node that held them.
+///
+/// The sweep asserts the overlap on every seed and this names it, so a reader can see
+/// what issue #46's extension looks like on the node without running a tier.
+// PROPOSED(D-084): #46's extension the node makes possible — one node, two ranges
+// changing at once.
+#[test]
+fn a_node_changes_two_of_its_ranges_at_once() {
+    let report = membership_node(1, Variants::default());
+    membership_checked(&report).expect("the correct node passes membership seed 1");
+    let (node, first, second, at) = report
+        .joint_overlap()
+        .expect("a node held two ranges' joint configurations at once");
+    println!(
+        "node membership: node {node} was jointly configured on ranges {first} and {second} at \
+         {at:?}"
+    );
+    assert_ne!(first, second, "two ranges, not one");
+    assert!(
+        report.ranges().contains(&first) && report.ranges().contains(&second),
+        "both are ranges this node holds"
     );
 }

@@ -93,6 +93,8 @@
 # high (D-070). They are 70.0, 39.6 and 34.6 cpu s, placed longest-first into the lightest
 # shard: 70.0 to shard 4 (1328.1 -> 1398.1), 39.6 to shard 3 (1328.3 -> 1367.9) and 34.6 to
 # shard 6 (1332.7 -> 1367.3).
+# D-084's rows join the shards their own branch placed them in; this merge took main's
+# table otherwise, including the rows and weights D-085 brought in through PR #104.
 # shard	binary	cpu_s	test
 # shard 1: 1428.0 cpu s
 1	engine	625.1	an_install_in_two_switches_is_caught
@@ -128,7 +130,7 @@
 2	ranges	0.1	every_frame_between_two_nodes_may_carry_several_ranges
 2	ranges	0.1	no_batch_frame_of_the_node_parses_as_a_frame_of_the_one_group_server
 2	ranges	0.1	the_ranges_of_one_node_draw_their_own_election_timeouts
-# shard 3: 1367.9 cpu s
+# shard 3: 1461.2 cpu s
 3	echo	0.2	trace_hash_matches_the_pinned_golden
 3	engine	417.5	the_range_delete_crash_test_passes_every_seed
 3	engine	235.9	the_seek_crash_test_passes_every_seed
@@ -136,11 +138,12 @@
 3	engine	52.4	a_span_checkpoint_without_syncs_is_caught
 3	engine	39.8	an_install_whose_repair_follows_its_switch_is_caught
 3	engine	0.3	seed_3123_which_the_nightly_found_supersedes_a_resurrected_segment
+3	node	93.3	every_seed_passes_the_membership_scenario_on_the_correct_node
+3	node	39.6	a_node_that_refuses_only_one_range_is_caught_on_the_sharded_quorum_scenario
 3	node	15.16	a_leader_that_shares_one_snapshot_directory_is_not_re_asserted_on_the_node_yet
 3	node	14.54	the_pair_that_wedged_seed_680_is_not_re_asserted_on_the_node_yet
 3	node	13.25	a_server_without_pre_vote_is_caught_on_the_node
 3	node	4.03	a_server_that_applies_before_commit_is_caught_on_the_node
-3	node	39.6	a_node_that_refuses_only_one_range_is_caught_on_the_sharded_quorum_scenario
 3	raft	281.7	a_server_whose_refusal_is_not_durable_is_caught
 3	raft	158.5	a_leader_that_counts_a_refused_followers_rejections_whatever_its_stream_does_is_caught
 3	raft	12.8	the_incremental_checker_agrees_with_the_fold_over_the_whole_trace
@@ -151,11 +154,11 @@
 3	raft	0.2	seed_385_which_a_local_ten_thousand_seed_run_found_stays_green
 3	raft	0.2	the_membership_scenario_has_byte_identical_traces_for_one_seed
 3	wal	21.2	a_log_that_acknowledges_before_syncing_is_caught
-# shard 4: 1398.1 cpu s
+# shard 4: 1398.3 cpu s
 4	echo	0.1	same_seed_gives_byte_identical_trace
-4	node	70.0	d_049s_pair_has_no_site_on_the_node_and_this_says_the_day_it_does
 4	engine	210.8	the_correct_engine_passes_every_seed
 4	engine	38.6	an_install_that_switches_one_span_at_a_time_is_caught
+4	node	70.0	d_049s_pair_has_no_site_on_the_node_and_this_says_the_day_it_does
 4	node	15.39	a_leader_that_ignores_incarnations_is_not_re_asserted_on_the_node_yet
 4	node	14.92	a_server_whose_refusal_is_not_durable_is_not_re_asserted_on_the_node_yet
 4	node	14.32	a_server_that_installs_without_current_last_is_not_re_asserted_on_the_node_yet
@@ -163,6 +166,8 @@
 4	node	0.52	a_server_that_sends_before_it_persists_is_caught_on_the_node
 4	node	0.24	a_seed_replays_to_the_same_trace_on_the_node
 4	node	0.11	a_node_under_the_raft_sweeps_arms_runs_every_range
+4	node	0.1	a_membership_seed_replays_to_the_same_trace_on_the_node
+4	node	0.1	a_node_changes_two_of_its_ranges_at_once
 4	node	0.1	the_nodes_arms_aim_at_every_range_and_not_at_one
 4	parallel	6.4	a_seed_inside_the_driver_gives_the_sequential_trace
 4	raft	355.6	a_leader_that_trusts_the_clock_is_caught_and_the_guard_revokes
@@ -184,13 +189,14 @@
 5	raft	139.6	the_correct_server_passes_the_membership_scenario_on_every_seed
 5	raft	50.7	a_server_that_applies_before_commit_compacts_past_its_commit_index
 5	ranges	59.0	every_seed_passes_on_the_correct_node
-# shard 6: 1367.3 cpu s
+# shard 6: 1435.5 cpu s
 6	echo	0.1	a_busy_looping_task_fails_the_scenario_instead_of_hanging
-6	node	34.6	the_sharded_quorum_scenario_asks_four_leaders_about_one_refused_node
 6	engine	310.3	an_engine_that_acknowledges_before_the_log_is_caught
 6	engine	204.5	an_engine_that_releases_a_memtable_before_the_manifest_is_caught
 6	engine	39.2	a_range_delete_that_skips_the_memtables_is_caught
 6	engine	0.3	the_seed_42_trace_is_written_for_the_studio
+6	node	68.2	a_server_that_counts_one_majority_in_joint_consensus_is_caught_on_the_node
+6	node	34.6	the_sharded_quorum_scenario_asks_four_leaders_about_one_refused_node
 6	node	14.65	a_server_whose_adoption_is_as_built_is_not_re_asserted_on_the_node_yet
 6	node	13.12	a_server_that_resets_its_timer_on_any_message_is_caught_on_the_node
 6	node	8.37	a_leader_that_commits_an_older_terms_entry_by_count_is_caught_on_the_node
