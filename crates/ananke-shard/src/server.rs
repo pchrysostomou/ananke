@@ -31,17 +31,20 @@
 use std::collections::BTreeMap;
 use std::io;
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use ananke_env::{ApplyEffect, RangeCause};
+use ananke_env::{ApplyEffect, FileSystem, RangeCause};
 use ananke_env::{Clock, Decision, Environment, Network, Rng, Socket, TraceEvent};
 use ananke_raft::apply::{Command, Outcome, apply_command, user_key};
 use ananke_raft::client::{Reply, Request, Response};
-use ananke_raft::core::{RaftConfig, SnapshotAction, Variant};
+use ananke_raft::core::{RaftConfig, SnapshotAction, Variant, Variants};
 use ananke_raft::node::{Start, StartOrder, start_store};
 use ananke_raft::queue::Queue;
-use ananke_raft::store::{KeyPrefix, RaftStore, mark_store_lost};
+use ananke_raft::store::{
+    FIRST_INCARNATION, KeyPrefix, RaftStore, Recovered, is_marked_lost, mark_store_lost,
+};
 use ananke_raft::types::{Configuration, Entry, Index, Payload, ServerId, Term};
 use ananke_raft::{Input, Message, Persist, Raft};
 use ananke_storage::EngineConfig;
@@ -55,8 +58,9 @@ use crate::node::{
 };
 use crate::outbox::Outbox;
 use crate::range::RangeId;
+use crate::reseed::{Candidate, generation_of, newest_not_lost, reseed_dir};
 use crate::round::Cores;
-use crate::variant::NodeVariants;
+use crate::variant::{NodeVariant, NodeVariants};
 
 /// One range as configuration fixes it at bootstrap (SHARD.md §2).
 ///
@@ -770,6 +774,17 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
     });
 
     // The start: one engine, and a store per range under its own prefix (§2, §4).
+    //
+    // D-066: the node opens the newest directory not marked lost. Before its first
+    // refusal that is the directory configuration named; after one it is the directory
+    // the re-seed built, and the refused one is stepped over for the rest of the run.
+    let base_dir = engine.dir.clone();
+    let present = generations(&env, &base_dir).await?;
+    let engine = EngineConfig {
+        dir: newest_not_lost(&present, node_variants)
+            .map_or_else(|| base_dir.clone(), |candidate| candidate.path.clone()),
+        ..engine
+    };
     let first = ranges
         .first()
         .ok_or_else(|| io::Error::other("a node hosts at least one range"))?;
@@ -782,7 +797,7 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
         StartOrder::Correct,
     )
     .await;
-    let (first_store, first_recovered) = match started {
+    let opened: Vec<(Range, Arc<RaftStore<E>>, Recovered)> = match started {
         Start::Failed(error) => {
             env.trace(TraceEvent::RaftServerFailed {
                 server,
@@ -791,28 +806,38 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
             return Err(error);
         }
         Start::Refused(error) => {
-            // D-044: the loss is marked in the store directory before anything
-            // else. Q15's whole-node re-seed is its own slice's; this node stops.
-            let reason = error.to_string();
-            mark_store_lost(&env, &engine.dir, &reason).await?;
-            env.trace(TraceEvent::RaftRefused { server, reason });
-            return Err(error);
+            // Q15: a loss in the *shared* engine refuses the whole node. The node
+            // re-seeds into a fresh engine in a new directory beside the refused one,
+            // which stays marked lost and quiesced (§11, storage 8; D-041).
+            reseed(
+                &env,
+                server,
+                &base_dir,
+                &engine,
+                &present,
+                &ranges,
+                variants,
+                node_variants,
+                &error,
+            )
+            .await?
         }
         Start::Opened {
             store, recovered, ..
-        } => (store, recovered),
+        } => {
+            let mut opened = vec![(first.clone(), Arc::new(store), recovered)];
+            for range in ranges.iter().skip(1) {
+                let (store, recovered) = opened[0]
+                    .1
+                    .open_sibling(KeyPrefix::group(range.id.get()))
+                    .await?;
+                opened.push((range.clone(), Arc::new(store), recovered));
+            }
+            opened
+        }
     };
 
     let mut stores: BTreeMap<RangeId, Arc<RaftStore<E>>> = BTreeMap::new();
-    let mut opened = vec![(first.clone(), Arc::new(first_store), first_recovered)];
-    for range in ranges.iter().skip(1) {
-        let (store, recovered) = opened[0]
-            .1
-            .open_sibling(KeyPrefix::group(range.id.get()))
-            .await?;
-        opened.push((range.clone(), Arc::new(store), recovered));
-    }
-
     let mut cores = Cores::new(node_variants);
     let mut replicas: BTreeMap<RangeId, Arc<Mutex<Replica>>> = BTreeMap::new();
     let mut applied_at: BTreeMap<RangeId, Index> = BTreeMap::new();
@@ -827,12 +852,15 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
         let (snap_index, snap_term) = snapshot_record
             .as_ref()
             .map_or((0, 0), |record| (record.last_index, record.last_term));
+        let recovered_quarantined = recovered.quarantined;
+        // A re-seeded replica is not fresh: its `RangeCreated` is the install's, with
+        // `cause: snapshot`, and not a bootstrap's (§8; Q15).
         let fresh = recovered.log.is_empty()
             && snapshot_record.is_none()
             && store.applied() == 0
             && store.term() == 0
             && store.vote().is_none()
-            && !recovered.quarantined;
+            && !recovered_quarantined;
         // Every trace event a core emits carries the range it replicates (D-069),
         // which is this replica's and not the one group's default.
         let core_config = RaftConfig {
@@ -872,7 +900,15 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
                 incarnation: store.incarnation(),
             });
         }
-        restate(&env, server, id_of, &core, &store, snap_index, snap_term);
+        restate(
+            &env,
+            server,
+            id_of,
+            &core,
+            &store,
+            (snap_index, snap_term),
+            recovered_quarantined,
+        );
         cores.insert(id_of, core);
     }
 
@@ -932,6 +968,190 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
     ran
 }
 
+/// Every engine directory of this node beside `base`, with its marker read (D-066).
+///
+/// The parent is listed rather than the node remembering what it opened, because the
+/// node that has to find the directory may be a *restart* — it remembers nothing — and
+/// because that is the only reading that survives a crash between a re-seed creating a
+/// directory and anything in it becoming durable.
+///
+/// A parent with no listing at all is a node starting on an empty disk: no candidates,
+/// and the caller opens the directory configuration named.
+// PROPOSED(D-077): Q15's whole-node refusal, and the re-seed per replica.
+async fn generations<E: Environment>(env: &E, base: &Path) -> io::Result<Vec<Candidate>> {
+    let Some(parent) = base.parent() else {
+        return Ok(Vec::new());
+    };
+    let listed = match env.fs().read_dir(parent).await {
+        Ok(listed) => listed,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let mut candidates = Vec::new();
+    for entry in listed {
+        // A listing hands back names, not paths: the parent is put back on, or the
+        // marker below would be read from wherever a relative name happened to land.
+        let Some(name) = entry
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+        else {
+            continue;
+        };
+        let Some(generation) = generation_of(base, &name) else {
+            continue;
+        };
+        let path = parent.join(&name);
+        candidates.push(Candidate {
+            lost: is_marked_lost(env, &path).await?,
+            generation,
+            path,
+        });
+    }
+    candidates.sort_by_key(|candidate| candidate.generation);
+    Ok(candidates)
+}
+
+/// Q15's whole-node re-seed: the refusal of every replica the node holds, and the fresh
+/// engine it rebuilds them in (SHARD.md §11, storage 8; §12's "A loss in the shared
+/// engine").
+///
+/// The order is the whole of it, and each step is here because a crash between two of
+/// them must leave something a restart can read:
+///
+/// 1. **The refused directory is marked lost, synced, before anything else** (D-044).
+///    A crash before this leaves a directory whose store lost state and whose marker
+///    does not say so, which the next start would open as a store.
+/// 2. **`RaftRefused` for the node, then one `RaftReplicaRefused` for each range it
+///    holds.** The node is refused whole: one engine (Q2), so the loss is every
+///    replica's, and the per-replica events are what a reader takes "the ranges this
+///    node held" from. They are traced *here*, before the new engine exists, because
+///    that is the only moment at which the answer is known from configuration alone —
+///    the store that could have been asked is the one that just refused.
+/// 3. **The fresh engine is opened at once, in a new directory beside the refused
+///    one**, whose generation steps over every generation present (D-041): the refused
+///    directory stays marked lost and quiesced for the rest of the run, and no range's
+///    re-seed can install into it.
+/// 4. **Each range's store is created in the new engine, and its durable refused mark
+///    is written before that replica serves anything.** A store created in a fresh
+///    engine opens as a first start — quarantine clear, incarnation 1 — and a replica
+///    that serves in that state votes again on state its node lost (D-035) and lets
+///    its leader keep a `matched` the rebuilt log cannot honour (D-042). The mark is
+///    the two keys in one synced batch (`RaftStore::mark_reseeded`), and `RaftReseeded`
+///    is traced when it is durable, per replica and carrying its range (§8).
+///
+/// The incarnation is drawn per replica from the **node's** generator and is never the
+/// first incarnation. It is not drawn from the range's protocol stream: `SimEnv` derives
+/// a named stream from the seed and the name alone, so a replica created again for the
+/// same (range, node) would draw its predecessor's number and a leader comparing
+/// incarnations for inequality only (D-042) would never reset (Q26,
+/// SHARD.md:1372-1379). [`NodeVariant::IncarnationPerRangeStream`] is that mistake.
+///
+/// What the replicas are when this returns is empty and quarantined: each waits for its
+/// leader's stream, and the install that fills it is the node's snapshot *wiring*, which
+/// this slice does not build (see the entry). The state they wait in is the state the
+/// install expects, and it is durable before any of them answers anything.
+// PROPOSED(D-077): Q15's whole-node refusal, and the re-seed per replica.
+// The arguments are the node's start in full — its configuration, its variants, the
+// directory it refused and what stands beside it — and bundling them into a struct
+// used at one call site would hide what the re-seed reads, not clarify it.
+#[allow(clippy::too_many_arguments)]
+async fn reseed<E: Environment>(
+    env: &E,
+    server: u64,
+    base_dir: &Path,
+    refused: &EngineConfig,
+    present: &[Candidate],
+    ranges: &[Range],
+    variants: Variants,
+    node_variants: NodeVariants,
+    error: &io::Error,
+) -> io::Result<Vec<(Range, Arc<RaftStore<E>>, Recovered)>> {
+    // 1. D-044: the loss is marked in the store directory before anything else.
+    let reason = error.to_string();
+    mark_store_lost(env, &refused.dir, &reason).await?;
+    env.trace(TraceEvent::RaftRefused { server, reason });
+
+    // 2. Every replica the node holds is refused with it (Q2, Q15). Under
+    //    `RefuseOneRangeOnly` only the range whose store failed to open is, which is
+    //    the whole of Q15 got wrong: the node's other replicas keep serving over an
+    //    engine that lost state.
+    let refused_ranges: Vec<&Range> = if node_variants.contains(NodeVariant::RefuseOneRangeOnly) {
+        ranges.first().into_iter().collect()
+    } else {
+        ranges.iter().collect()
+    };
+    for range in &refused_ranges {
+        env.trace(TraceEvent::RaftReplicaRefused {
+            server,
+            range: range.id.get(),
+        });
+    }
+
+    // 3. A fresh engine in a NEW directory beside the refused one, opened at once.
+    let fresh_dir = reseed_dir(base_dir, &refused.dir, present, node_variants);
+    let fresh = EngineConfig {
+        dir: fresh_dir,
+        ..refused.clone()
+    };
+    let first = ranges
+        .first()
+        .ok_or_else(|| io::Error::other("a node hosts at least one range"))?;
+    let started = start_store(
+        env,
+        server,
+        &fresh,
+        variants,
+        &KeyPrefix::group(first.id.get()),
+        StartOrder::Correct,
+    )
+    .await;
+    let (first_store, first_recovered) = match started {
+        Start::Opened {
+            store, recovered, ..
+        } => (store, recovered),
+        // A fresh directory that refuses or fails is not something a second re-seed
+        // can mend: the node stops, and says which of the two it was.
+        Start::Refused(error) | Start::Failed(error) => {
+            env.trace(TraceEvent::RaftServerFailed {
+                server,
+                reason: format!("the re-seed's fresh engine: {error}"),
+            });
+            return Err(error);
+        }
+    };
+
+    // 4. Each range's store, its durable refused mark written before it serves.
+    let mut opened: Vec<(Range, Arc<RaftStore<E>>, Recovered)> = Vec::with_capacity(ranges.len());
+    let mut first_opened = Some((first_store, first_recovered));
+    for range in ranges {
+        // The first range's store is the one the fresh engine was opened with; every
+        // other is a sibling prefix in that same engine (§2, §4).
+        let (mut store, mut recovered) = match first_opened.take() {
+            Some(opened) => opened,
+            None => {
+                opened[0]
+                    .1
+                    .open_sibling(KeyPrefix::group(range.id.get()))
+                    .await?
+            }
+        };
+        if refused_ranges.iter().any(|refused| refused.id == range.id) {
+            let incarnation = if node_variants.contains(NodeVariant::IncarnationPerRangeStream) {
+                env.range_rng(range.id.get()).next_u64()
+            } else {
+                env.rng().next_u64()
+            }
+            .max(FIRST_INCARNATION + 1);
+            if !node_variants.contains(NodeVariant::ServeBeforeRefusedMark) {
+                store.mark_reseeded(incarnation).await?;
+                recovered.quarantined = true;
+            }
+        }
+        opened.push((range.clone(), Arc::new(store), recovered));
+    }
+    Ok(opened)
+}
+
 /// The restatement of one replica at the node's start (RAFT.md §2): the log as the
 /// disk holds it, the snapshot it records, the configuration in force and the term,
 /// each naming the range (§8).
@@ -941,9 +1161,10 @@ fn restate<E: Environment>(
     range: RangeId,
     core: &Raft,
     store: &RaftStore<E>,
-    snap_index: Index,
-    snap_term: Term,
+    snapshot: (Index, Term),
+    quarantined: bool,
 ) {
+    let (snap_index, snap_term) = snapshot;
     env.trace(TraceEvent::RaftTruncate {
         server,
         range: range.get(),
@@ -956,6 +1177,18 @@ fn restate<E: Environment>(
             last_index: snap_index,
             last_term: snap_term,
             taken: false,
+        });
+    }
+    // The durable per-replica refused mark, restated per replica and carrying its range
+    // (§8). It is traced here on a restart, where the quarantine flag is what the disk
+    // held; at the re-seed itself this same restatement is the replica's first, and the
+    // mark was made durable before it (`reseed`). One-group `run` traces it in exactly
+    // this position (node.rs:963-968), so the two restatements stay comparable.
+    // PROPOSED(D-077): Q15's whole-node refusal, and the re-seed per replica.
+    if quarantined {
+        env.trace(TraceEvent::RaftReseeded {
+            server,
+            range: range.get(),
         });
     }
     for entry in core.log() {

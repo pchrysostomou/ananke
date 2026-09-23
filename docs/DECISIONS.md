@@ -10029,6 +10029,398 @@ directed check, which asserts the figure.
 
 ---
 
+## PROPOSED D-077 — Q15's whole-node refusal: every replica refused with its node, the re-seed in a new directory beside the refused one, and a refusal that marks down only the ranges its node held
+
+**The number.** SHARD.md's Stage B plan and the work order for this slice name this entry
+D-076. The branch this one is stacked on (the four-ranges slice) had already taken D-076
+on the same file, for the same reason its own entry records, so this is D-077 and the
+footer moves to D-078. Every code site of it carries `// PROPOSED(D-077)`. Nothing of
+D-076's is renumbered. The integrator may renumber this entry when the branches merge;
+nothing in the tree depends on the number beyond those markers and this heading.
+
+The merge of `main` into this branch settled it: `main` had meanwhile taken **D-078** for
+follower compaction, the entry below, so D-077 is this one's for good, nothing was
+renumbered, and the footer is D-079 — `main`'s, the later of the two.
+
+**Context.** A node owns one engine (Q2), so a loss in it is not one range's. SHARD.md
+§12 asks for "a loss in the shared engine (Q15; §11, storage 8): the whole node refused;
+its re-seed into a fresh engine in a new directory beside the refused one, which stays
+marked lost and quiesced, opened at once, each range installed live as its stream
+completes, and a durable per-replica refused mark written into the new engine before it
+serves. Incarnation and quarantine are per replica (Q26), the incarnation drawn at each
+creation of a replica from the node's generator, and `RaftRecovered`, `RaftReseeded` and
+`RaftProgressReset` per replica (§8)" (SHARD.md:2249-2257). Before this slice the node's
+refusal path marked the store lost, traced `RaftRefused` and **stopped the node**
+(server.rs, "Q15's whole-node re-seed is its own slice's; this node stops"). D-067 has
+already decided the variant this path will be caught by, `ReseedMarkNotSynced`, and
+describes the path in the terms this entry builds it in.
+
+### What is built
+
+1. **A loss in the shared engine refuses the whole node.** `server::run`'s refusal arm is
+   now `server::reseed`. It marks the refused directory lost and synced before anything
+   else (D-044), traces `RaftRefused` for the node, and then traces one
+   `RaftReplicaRefused { server, range }` for **each range the node holds** — not for the
+   one range whose store open happened to fail. The refused directory is never reopened,
+   never deleted, and nothing installs into it.
+2. **The re-seed opens a fresh engine in a new directory beside the refused one, at
+   once.** `crate::reseed` is the naming the two rules that meet there fix. A node's
+   configured directory is generation 0 and later ones are siblings, `base-g1`,
+   `base-g2`. A re-seed takes the generation **one past the highest present, lost or
+   not** (`next_generation`), so a generation a lost store held is never handed back —
+   D-041's rule that a directory that held a store never opens fresh, applied to the
+   whole run rather than to one refusal. A start takes the **highest generation whose
+   marker does not say lost** (`newest_not_lost`), which is D-066. The module decides
+   over a listing and touches no disk, so it is asserted without a simulation as
+   `round` and `snapshot` are; `server::generations` does the listing and the marker
+   reads, and a restart of the re-seeded node in the directed scenario is what asks
+   `server::run` the same question the module answers.
+
+   **What that reading does not do** is step over a generation whose filling a crash
+   caught. An absent marker is not a lost one, so a directory the re-seed created and
+   had not finished filling is openable, and its replicas — no quarantine key, no
+   incarnation key — open clean. That is a hole in D-066 as this slice leaves it, and
+   it is also why `OpenNewestEvenIfLost` catches nothing the node can reach: both are
+   **#99**, which wants a three-valued marker, a "whole" mark written when the filling
+   finishes, and a fault arm that crashes between the two. Changing what "newest" means
+   is changing D-066, so it is its own entry and not a patch to this one.
+3. **A durable per-replica refused mark is written into the new engine before that
+   replica serves.** `RaftStore::mark_reseeded` puts the quarantine flag (D-035) and the
+   incarnation (D-042) in **one synced batch**, because a crash between them would leave
+   a replica quarantined at incarnation 1 — indistinguishable, to its leader, from the
+   replica that never lost anything. It is written for every range before any core is
+   built, so no replica can answer before its own mark is durable. `RaftReseeded`, which
+   §8 already keeps per replica, is traced when the mark is durable and is the event the
+   exit criterion's (c) reads. The marks survive a crash and are read back by the next
+   start, which the restart in the directed scenario asserts.
+
+   The batch holds *one replica's* two keys together, not the whole re-seed's. A node
+   refused holding four ranges writes four batches, and a crash between the first and
+   the fourth leaves one replica marked and three not — the same two holes one replica
+   along. One engine (Q2) makes a single batch across every replica possible, and that
+   is **#100**, to be done with D-067's `ReseedMarkNotSynced`, which is a flag on the
+   sync of the very batch it would merge.
+4. **Incarnation and quarantine are per replica, the incarnation drawn at each creation
+   from the node's generator** (`env.rng()`), never below `FIRST_INCARNATION + 1`, as the
+   one-group re-seed draws one today (node.rs:2246). It is deliberately *not* drawn from
+   `n{id}/r{range}/protocol`: `SimEnv` derives a named stream from the seed and the name
+   alone, so a replica created again for the same (range, node) would draw its
+   predecessor's number and a leader comparing incarnations for inequality only (D-042)
+   would never reset (Q26, SHARD.md:1372-1379).
+5. **`RaftRecovered`, `RaftReseeded` and `RaftProgressReset` are per replica and carry
+   their range.** The first two are traced by the node's restatement, which the ranges
+   slice already keyed by range; `RaftProgressReset` is the core's and carries
+   `self.config.range`, which D-069 gave it. A re-seeded replica traces **no**
+   `RangeCreated { cause: bootstrap }`: its `RangeCreated` is its install's, with
+   `cause: snapshot`.
+6. **At start a node opens the newest directory not marked lost** (D-066), before the
+   first store opens, so a node that was refused finds the directory its re-seed built
+   and never the refused one.
+
+### The fix the owner asked for by name
+
+`Report::ranges_with_a_majority_up` read "every replica on the node counts as refused"
+as **every range in the run**. With one group per server the two are the same sentence.
+With four ranges on a node they are not: a refusal marked its node down for ranges it
+never held and for ranges created after it was refused, and since a range whose impaired
+replicas reach half is dropped from the live set, each of those ranges was **silently
+exempted** from the checks about time — the write bound, the recovery margin, every
+tooth §8 has. One refusal on a four-range node exempted the three ranges the refusal did
+not touch, and the direction is the dangerous one: the checks pass because they are not
+asked.
+
+**Where "the ranges it holds" comes from.** The obvious version — ask the node's store —
+cannot work, and this is the whole reason a new event exists. `RaftRefused` is traced
+*before the store opens*: the refusal is what stops it opening, so at that instant the
+node has restated nothing and has no store to ask. What it does have is its
+**configuration**: the ranges §2 fixes at bootstrap are in `ServerConfig` before anything
+touches a disk. So the node names them itself, at the refusal, in
+`RaftReplicaRefused { server, range }`, and the reader takes the ranges down from those
+events and from nothing else.
+
+`ananke_raft::run`, the one-group server, traces one too, for `SINGLE_GROUP`, with the
+refusal's own decision stamp. That keeps every existing scenario reading exactly as
+before — its only range is the one it names — while the node's reading becomes correct.
+A `RaftRefused` with no per-replica event beside it now takes nothing down; no code path
+in the tree emits one.
+
+**The case that fails without it** is
+`raft::tests::a_refusal_marks_down_only_the_ranges_its_node_held`: two nodes refused
+holding one range each, beside a range they never held and a range created after they
+were refused. On the fixed reading the live set is `{3, 4}`; on the old reading, run
+against the same test, it is `{}` — both untouched ranges dropped, and every check about
+time in the run skipped. The failure was reproduced by reverting the single match arm and
+is recorded here rather than left as a claim.
+
+### What the design documents left open, settled here
+
+Each is the most conservative option, and each is marked `// PROPOSED(D-077)` in the code.
+
+1. **How a re-seed directory is named, and what "newest" means.** §12 says "a fresh engine
+   in a new directory beside the refused one" and D-066 says "the newest directory not
+   marked lost"; neither fixes a name or an order. Settled: generation 0 is the configured
+   directory, generation *n* is the sibling `base-g{n}`, and newest is the **generation in
+   the name**, not a timestamp — the simulator has no wall clock a listing could be
+   ordered by, and a generation is what the node itself chose. Conservative because a
+   generation is written by the node and read back from the name, so nothing depends on
+   the filesystem's ordering or on the node remembering anything across a restart.
+2. **Which generation a re-seed takes.** Settled: one past the **highest present, lost or
+   not**, never the lowest free one. The conservative reading of D-041: a generation a
+   lost store held is spent for the run, even though nothing live is using it. The cheaper
+   rule is a mutation, `ReuseLostGeneration`.
+3. **Where a node looks for its directories.** Settled: it **lists the parent** rather
+   than remembering what it opened, because the node that has to find the directory may be
+   a restart, which remembers nothing, and because that is the only reading that survives a
+   crash between a re-seed creating a directory and anything in it becoming durable.
+4. **What "before that replica serves" is measured against.** §12's exit criterion (c)
+   says "before that replica's first answer other than its re-seed stream". Settled: an
+   **answer is a message on the wire**, read off the frames themselves, and not a record
+   of the replica's own — the restatement traces the replica's log and term around its
+   `RaftReseeded`, and none of that is the replica answering anybody. The code is stricter
+   than the reading needs: the mark is written for every range before any core exists.
+5. **Whether a whole-node refusal is one event or many.** §8 fixes `RaftRefused` as per
+   node, carrying no range. Settled: it stays exactly that, and the per-replica facts go
+   in a **new** event rather than by adding a field to it, so no existing reader of
+   `RaftRefused` changes meaning.
+6. **What a second refusal of an already re-seeded node does.** Settled: it refuses again
+   and steps to the next generation. A fresh directory that itself refuses or fails is
+   **not** re-seeded a second time — the node traces `RaftServerFailed` and stops, since a
+   directory created moments ago that cannot open is not something another new directory
+   would mend.
+
+### The measurements
+
+Machine: Apple M2, 8 cores, on AC Power (`pmset -g batt`: "Now drawing from 'AC Power'").
+Other Stage B slices were building beside this one, so load averages are recorded with
+each figure.
+
+- **The new test's weight for the shards file** (D-064): 0.01 cpu s, measured on the
+  built release binary, `ANANKE_SEEDS=1000 ANANKE_DEEP_SEEDS=100`, run alone, at load
+  average 6.12. It runs one 600 ms scenario five times and no sweep. Rounded up to 0.1
+  like the cheap rows beside it; longest-first into the lightest shard put it in shard 2.
+
+This slice adds **no** rate to assert. Every check it adds is deterministic — the
+directed scenario and the pure module — so D-061's tier rule, which asks a tier of a
+*sweep's* assertion, has nothing to price here. The node scenario raises no disk fault
+that loses a store, so no sweep in the tree can reach a refusal at all; that is why the
+scenario is directed, and it is stated here rather than left as a silent absence.
+
+### The mutation standard
+
+Six known-buggy variants, each built beside the correct code and each caught by the same
+check that asserts the correct code (`NodeVariant::RESEED`). **Four of the six are
+mutations a single-range world could not catch at all**: with one range on a node,
+refusing only that range *is* refusing the node, and a per-range incarnation stream is
+the node's generator drawn once.
+
+| Variant | What it gets wrong | Caught by | A one-range world? |
+|---|---|---|---|
+| `RefuseOneRangeOnly` | refuses and marks only the range whose store open failed; the node's other three are re-created in the new engine as a first start would create them — quarantine clear, incarnation 1 | the directed scenario: `replicas_refused` is exactly the first range and not the four | **no** — with one range it is the correct node |
+| `IncarnationPerRangeStream` | draws the replica's incarnation from `n{id}/r{range}/protocol` instead of the node's generator | the directed scenario: every range still restates an incarnation, and every one of them differs from the node generator's | **no** — one range draws one number either way |
+| `ServeBeforeRefusedMark` | a replica answers before its refused mark is durable | the directed scenario: no mark traced, replicas answer without one, and one keeps incarnation 1 | yes |
+| `ReseedIntoRefusedDir` | re-seeds in the refused directory | the directed scenario: no generation beside it, and the node stops on "the re-seed's fresh engine", which is it reaching the re-seed and being refused by the marker it wrote; and `reseed::tests` | yes |
+| `ReuseLostGeneration` | takes the lowest generation not in use, handing back a directory a lost store held | `reseed::tests`: a node refused twice reopens generation 0 | **no** — needs a node refused twice, which no check before this slice asked of any node |
+| `OpenNewestEvenIfLost` | opens the newest directory whatever its marker says | `reseed::tests` **only, and on a state the node cannot reach** — see below and **#99** | **no** — same |
+
+`reseed::tests` also asserts the property over a whole run rather than over one refusal:
+a node refused three times opens four distinct directories and is never offered one it
+opened before.
+
+**`OpenNewestEvenIfLost` is not, today, a variant the tree knows to be buggy**, and the
+review of this entry is what established it. Under the marker scheme this slice ships,
+every directory the variant would prefer over the correct choice is one marked *lost*,
+and `refuse_lost_store` refuses it at open anyway, so correct and variant re-seed alike:
+in every state the node can reach the two agree. The pair in `reseed::tests` is asserted
+on a listing — generation 2 not lost, generation 3 lost — that the node cannot produce,
+since for generation 3 to exist the node must first have been refused out of generation
+2, which marks 2 lost. The variant becomes a real one the moment a directory can be
+*absent* a marker rather than lost, which is a crash part way through a re-seed's filling
+and is **#99**: the three-valued marker, a "whole" mark written when the filling
+finishes, and a fault arm that crashes between the two. That is a change to what D-066
+means, so it is filed rather than folded in here. The row above says so rather than
+leaving the table claiming six catches when it has five.
+
+### The review of this entry, and what it changed
+
+The slice's first review was lost before it reached the branch, so it was reviewed again
+from the code, adversarially: for every check with more than one range to be wrong about,
+what a wrong key would look like and whether anything fails when it is planted; which
+assertions could pass for a reason other than the one they claim; which tests drive a
+helper rather than the thing under test; which measurement is structural rather than
+observed. Five things moved.
+
+**1. A decision nothing in the simulator asked.** Which directory a *start* opens is
+`server::run`'s, made over the listing before any store opens, and until this review
+nothing exercised it: `newest_not_lost` was called only by `reseed::tests`, directly.
+That is the defect of driving the helper instead of the thing under test, and the cost is
+measurable — a `run` that ignored the listing entirely and opened the configured
+directory every time passed the whole tree. The scenario now crashes and restarts the
+re-seeded node
+(`a_restarted_node_opens_the_directory_its_reseed_built_and_is_not_refused_again`): the
+configured directory is marked lost, so a start that reopens it is refused a second time
+and builds a third generation, and one refusal in the whole run with no `node-g2` beside
+it is the start having found what its re-seed left. Planted, that mutation now fails.
+
+**2. A check that passed for a reason other than the one it claims.** "No replica speaks
+before its refused mark is durable" was green on the correct node because *no replica
+speaks at all*: a re-seeded replica is quarantined and takes part in nothing until its
+install, and this slice builds no install. The scenario now reads the other side of the
+same fold (`answered_after_the_mark`) and asserts it empty, with the reason — the
+situation's absence asserted rather than left silent (CLAUDE.md) — so the day the wiring
+gives a re-seeded replica something to answer, the check says so and can be upgraded to
+the ordering §12's (c) names. The entry's claim that (c) is asserted was corrected above.
+
+**3. Three assertions that asked only for a difference.** `RefuseOneRangeOnly`,
+`IncarnationPerRangeStream` and `ReseedIntoRefusedDir` were each caught by an
+`assert_ne!` against the correct node's reading, or by the absence of a directory name.
+A run that fell over before it reached the re-seed differs from the correct one too, and
+those assertions could not tell the two apart. Each now says what the variant's run did:
+the first range and no other; every range still restating an incarnation, and every one
+of them different; and the node stopping on "the re-seed's fresh engine", which is the
+variant reaching the re-seed and being refused by the marker it had just written.
+
+**4. A known-buggy variant that is not known to be buggy.** `OpenNewestEvenIfLost`, above
+— filed as **#99**, with the per-replica batch it shares a crash window with as **#100**.
+
+**4b. An arm of the reading this slice rewrote that nothing asserted.** The recovery that
+*lifts* a replica out of the down set — see the mutation table below, and the check this
+review added for it.
+
+**5. Two claims in this entry that were not true.** The premerge (corrected above: it is
+owed, and no figure for it is quoted) and the assertion that the simulator could not
+restart a node, which `sim/ranges.rs` has done for `Fault::Crash` since D-076.
+
+**What was in the worktree when the review began.** An uncommitted change to
+`ananke-raft`'s `store.rs` and the `reseed` module: a three-valued `StoreMarker`, a
+`store_marker` reader, a `newest_complete` that opens only a *whole* directory, and a
+split of `mark_reseeded` into a staging call and a read-back. It was reverted, not
+finished. It did not compile — `server.rs`, `lib.rs` and `sim/ranges.rs` still used the
+old names — and, more to the point, neither half was wired to the thing that would make
+it work: nothing in the shard path writes a "whole" marker at all (only
+`ananke_raft::run` does), so a start that asked for one would have found none and fallen
+back to generation 0 for ever, and the staged batch was still written per replica. Its
+subject is real and is now **#99** and **#100**; what was on disk was a sketch of it,
+and shipping a sketch is worse than filing the finding.
+
+**The mutation pass.** Over the code this slice touches, on the tree with the fixes
+above. Each mutation was planted on its own and the smallest test set that could see it
+was run.
+
+| # | Mutation | What fails |
+|---|---|---|
+| 1 | `ranges_with_a_majority_up` keys `down` by range alone, dropping the server | `a_majority_is_asked_of_each_range_and_a_refusal_is_the_whole_nodes` and `a_refusal_marks_down_only_the_ranges_its_node_held` |
+| 2 | the old reading restored: a `RaftRefused` marks its node down for every range in the run | `a_refusal_marks_down_only_the_ranges_its_node_held` — the fix's own case, failing as this entry says it does |
+| 3 | a `RaftRecovered` no longer lifts its replica out of the down set | **nothing, before this review** — the unit tests, the `ranges` sweep and the `raft` sweep were all green on it. `a_recovered_replica_is_lifted_out_and_its_range_is_asked_again`, added here, fails on it; see below |
+| 4 | only the first range is refused (`RefuseOneRangeOnly` forced on) | `a_loss_in_the_shared_engine_…` and `a_restarted_node_…` |
+| 5 | the incarnation floor dropped: no `.max(FIRST_INCARNATION + 1)` | **nothing** — see below |
+| 6 | the re-seeded replica is not restated quarantined | `a_loss_in_the_shared_engine_…`: no `RaftReseeded`, so no mark is traced |
+| 7 | the start ignores the listing and opens the configured directory | `a_restarted_node_…` — the check this review added, and nothing else in the tree |
+| 8 | `newest_not_lost` drops its filter and takes the newest whatever the marker says | `reseed::tests::a_start_opens_the_newest_directory_not_marked_lost` only, which is #99's point |
+| 9 | a re-seed reuses the highest generation instead of stepping past it | three of `reseed::tests` |
+| 10 | `generation_of` accepts a leading zero, so `-g01` is a second name for generation 1 | `reseed::tests::a_generation_name_round_trips_and_nothing_else_is_one` |
+| 11 | the one-group server names the wrong range in its per-replica refusal | the `ranges` sweep and the `raft` sweep stay **green**: the one-group server's only range is `SINGLE_GROUP`, every reader of the event is keyed by it, and a constant would serve. It is not a hole — there is nothing else the event could say on that server — but it is not defended either, and the entry says so rather than counting it |
+| 12 | `RaftReseeded` traced for every replica, quarantined or not | `a_loss_in_the_shared_engine_…`: `ServeBeforeRefusedMark` stops being distinguishable |
+
+**Mutation 5 is a survivor, and it is a guard nothing can trip.** The incarnation is
+`env.rng().next_u64().max(FIRST_INCARNATION + 1)`; a `u64` draw is `1` once in 2^64, so
+the floor is unreachable and removing it changes no test in any tier. It is kept — it
+costs nothing and states the invariant at the point the number is made — but this entry
+records that it is documentation rather than a defended bound, so nobody later reads the
+green as evidence it works.
+
+**Mutation 3 was a survivor too, and that one was a hole.**
+`Report::ranges_with_a_majority_up` has two arms: `RaftReplicaRefused` puts a replica in
+the down set and `RaftRecovered` takes it out. This slice rewrote the first and every
+check in the tree was keyed to it. The second was asserted by nothing, and could not be
+asserted by a sweep, because making it a no-op only makes the down set *larger* — and a
+range with too many impaired replicas is dropped from this set, which means the checks
+about time are never asked about it. The failure direction is green. That is the same
+silent exemption this entry exists to close, one event along, so
+`a_recovered_replica_is_lifted_out_and_its_range_is_asked_again` asserts it directly: two
+replicas down and the range is not asked; one of them recovered and it is; a recovery of
+another range on the same server lifts nothing, because the set is keyed by replica.
+
+**A note on how the mutation pass was run, which is a finding of its own.** Every arm
+above was built with `scripts/gate.sh`'s own flags. It had to be re-run that way after a
+first pass gave three mutations the same three "catches" in the `raft` sweep — which
+turned out to be red on the *unmutated* tree in that build. The cause is **#102**: the
+simulated run of a seed depends on whether rustc compiled incrementally, so `target/`'s
+state, not just the source, decides what a sweep says. The gate that covers the commits
+of this review was run with `CARGO_INCREMENTAL=0`, which is the build a cold CI checkout
+makes and the one this tree is green under; a warm incremental cache turns three `raft`
+tests red on this source and on its merge base alike. Nothing here widens a bound to
+accommodate that: the bound is not the problem, the build is, and it is filed.
+
+### What moved, and the re-audit
+
+**One thing moved: every refusal in the tree now traces a second record.**
+`ananke_raft::run` traces `RaftReplicaRefused` beside its `RaftRefused`, with the
+refusal's own decision stamp (`trace_decided(refused, ..)`), so it draws nothing from any
+generator and advances no clock. No schedule moves: the simulator's scheduling bits are
+drawn by `race` and by task polls, not by tracing.
+
+The gate was run on the exact tree committed and is green, which covers every pinned seed
+in the tree: `seed_119_which_pinned_the_refusal_that_is_not_durable_before_the_layout_refuses_nothing`,
+`seed_102_pins_the_refusal_that_is_not_durable_which_a_hundred_seeds_can_miss`,
+`seed_158_which_pinned_the_refusal_that_is_not_durable_before_the_read_moved_loses_nothing`,
+`seed_687`, `seed_8` of the per-range majority rule, and the byte-identical-trace and
+golden-hash checks of `echo`, `raft` and `wal`. Each of the refusal-pinned seeds asserts
+its *mechanism* — that the refusal is or is not durable, and what the restart finds — and
+none asserts a record count or a trace hash over a refusal, which is why a record added
+beside the refusal leaves them saying what they said.
+
+**The premerge at a thousand seeds is owed, and no figure for it is quoted anywhere in
+this entry.** `pmset -g batt` said "Now drawing from 'Battery Power'" (92 %, discharging)
+when the code was done, with load average 28.8 from the Stage B slices building in
+parallel, and D-070 forbids a premerge figure taken on battery. An earlier draft of this
+section said the premerge "was run on the committed tip and is recorded in the commit
+that adds it": that sentence was false — no premerge has been run on this branch — and
+the review removed it rather than leaving the entry claiming a measurement nobody took.
+The run is owed on AC, on a quiet machine.
+
+### What is not built, and why
+
+- **The installs the re-seed waits for.** §12 asks that "each range is installed live as
+  its stream completes". The node **cannot** do this yet and this slice does not pretend
+  to: `ananke_shard::server` runs no `snapshot` task. The task exists as a module — its
+  streams keyed by (range, sender), its caps, its `Install`, its `adopt_fresh` — and
+  `snapshot.rs` says in so many words that "the streams' bytes are the node's wiring,
+  which Stage B's scenarios slice puts under the sweeps". So no snapshot stream reaches
+  the node, from a leader or from anywhere, and no install can complete on it.
+  What this slice builds is everything up to that point: the refusal, the fresh engine in
+  its new directory opened at once, every range's store created in it, and every
+  replica's refused mark durable before it serves. The state the replicas then wait in —
+  empty, quarantined, at an incarnation of their own — **is** the state an install
+  expects, and it is durable before any of them answers anything. This is a boundary, not
+  a weaker version of the item: nothing here stands in for an install, and no check
+  asserts one happened.
+- **The re-seed shape, and `ReseedMarkNotSynced`.** SHARD.md's directed re-seed shape
+  (SHARD.md:2258-2268) and the variant D-067 decided are the next slice's, and they are
+  what will exercise the installs above once the wiring exists. `mark_reseeded` is written
+  so that variant is a flag on the batch's sync and nothing else.
+- **Exit criterion for the re-seed shape, per seed, is therefore owed in full.** Its (a),
+  (b) and (d) each name an install or a stream. Its (c) — the durable mark before the
+  replica's first answer — is owed too, and the review of this entry is what found that
+  out: on the correct node a re-seeded replica is quarantined and takes part in nothing
+  until its install (RAFT.md §3), and this slice builds no install, so the replica never
+  answers *anything* and there is no order to observe. The scenario now asserts that
+  absence with its reason (`Refusal::answered_after_the_mark`, empty), so the day the
+  wiring gives a re-seeded replica something to answer the assertion fails and the pair
+  can be upgraded to the ordering (c) names. What is asserted today is the other half:
+  `ServeBeforeRefusedMark` does answer before its mark, and is caught for it. Only (e) is
+  asserted outright.
+- **A second refusal in one run is asserted only in `reseed::tests`**, over the listing.
+  The directed scenario refuses its node once; refusing it twice needs the node's disk to
+  lose a store a second time, which nothing in the simulator raises.
+  A *restart* after one refusal is asserted in the scenario —
+  `a_restarted_node_opens_the_directory_its_reseed_built_and_is_not_refused_again` — and
+  an earlier draft of this entry said that could not be done, "which the sim's task model
+  does not give without stopping a task". That was wrong: `sim/ranges.rs` already crashes
+  and restarts nodes for `Fault::Crash`, and the same two calls give the directed
+  scenario its restart.
+
+---
+
 ## PROPOSED D-078 — Follower compaction as D-065 decided it: a record at the applied index, no checkpoint under it, and the follower log bounded at 64 × `snapshot_threshold`
 
 **What this builds.** D-065's option C, on today's single-group server, independent of
@@ -10748,4 +11140,267 @@ same numbers as the fold before it. The two tips differ by this file alone.
 
 ---
 
+phase-3-fix-81-match-starts
 _Next entry: D-080. Add one before implementing anything not covered above._
+=======
+## PROPOSED D-080 — The linearizability search commits its read-only candidates outright
+
+**The failure this answers.** The ten-thousand-seed nightly of 2026-09-22 (GitHub run
+35705563274, on 7127745) failed `the_correct_server_passes_every_seed` on two seeds of
+ten thousand, and on neither was there anything wrong with the server:
+
+```
+seed 3085: linearizability: key "k1": 332 of 397 operations placed before the
+           search budget ran out; could not place [...]
+seed 4065: linearizability: key "k0": 376 of 438 operations placed before the
+           search budget ran out; could not place [...]
+```
+
+The checker reported **its own search**, not a violation. Both histories are
+linearizable: a throwaway copy with `lin::BUDGET` raised decides 3085 at 4 000 000
+states and 4065 at 400 000 000, against the 2 000 000 in the tree (issue #82).
+
+**The search as it was.** `Search::dfs` is a depth-first walk over states
+`(the set of operations linearized so far, the register's value)`, with a `seen` set
+so a state is expanded once. At each state it takes `min_ret`, the earliest return
+among the operations not yet linearized, and the candidates are every unlinearized
+operation invoked at or before it — Wing and Gong's search under Lowe's real-time
+rule, in porcupine's shape. It then **branches over every one of them**, completed
+operations before pending ones, and recurses.
+
+That last step is where the cost is. Branching over every candidate means a window of
+*w* concurrent operations is explored as up to 2^w sets, and the memo cannot collapse
+them: `{g₁}` and `{g₂}` are genuinely different sets of linearized operations, so they
+are different states, even when both reach the same register value because both `g₁`
+and `g₂` are reads. The failing histories are exactly that shape. On 7127745, seed
+3085's key `"k1"` holds 397 operations — 199 of them gets, 149 distinct values written,
+20 windows open at once at the widest — and seed 4065's `"k0"` holds 438, 244 of them
+gets, 22 open at once. Both stall about sixty operations from the end.
+
+**The search as it is.** A candidate that only *reads* the register never needs a
+branch point. Let `o` be such an operation at some state, and suppose a linearization
+`L` of the rest exists from there. Then `L` with `o` moved to its front is one too:
+
+- **Real-time.** `o` is a candidate, so `o.call` is at or before the earliest return
+  among the unlinearized operations; every `x` in `L` therefore has `o.call <= x.ret`,
+  and the order forbids `o` before `x` only where `x.ret < o.call`.
+- **Values.** `o` does not write, so every other operation of `L` meets exactly the
+  values it met before, in the same order; and `o` itself applies at this state's
+  value, which is what made it read-only.
+- **Pending.** Where `o` never returned and `L` left it out, `o` prepended to `L` is a
+  linearization, by the same two points.
+
+So the search commits **every** read-only candidate at once, keeping no alternative,
+and branches only over the operations that write. Taking one read leaves the value
+alone, so the others are read-only still; and dropping one from the unlinearized set
+can only move `min_ret` later, so the others are candidates still — which is why they
+go together rather than one per level. `lin::reads_only` carries the argument in its
+documentation, beside the code.
+
+**Which operations are read-only, and which are deliberately not.** A get, with a
+result or without one — it never writes, and with a result it must have met this value,
+which `apply` checks. A compare-and-set **known not to have swapped**: it applies only
+where the value differs from what it expected, and it leaves that value alone, so it is
+a read assertion. Nothing else:
+
+- A put or a delete writes.
+- A compare-and-set that swapped writes.
+- A compare-and-set **with no result** — abandoned, closed at its entry's apply — is
+  not read-only even where it happens not to swap at the value in hand. Deferred, it
+  may meet a different value, swap *there*, and be the write some later read needs. The
+  exchange argument's second point fails for it, and `an_abandoned_compare_and_set_is_not_read_only`
+  is the history that shows it: a compare-and-set expecting `"b"` where the value is
+  absent, a put of `"b"` beside it, and a read of `"c"` after both.
+
+**The cost, before and after.** All on an 8-core Apple M2, **on AC power**, in release,
+measured by instrumenting the search itself. The figure per seed is the seed's most
+expensive key.
+
+**Two counters, and which one each figure is.** A *state* is an entry of the `seen`
+memo — a distinct `(set of operations linearized, value)` — and every table below counts
+**distinct states**, which is `seen.len()`. A *visit* is one call of `dfs` that got past
+the `done` and budget checks, and `BUDGET` is charged **per visit, memo hits included**,
+because the decrement precedes the `seen.insert`. The two are not the same number on the
+old search and they are on the new one, so the tables are like-for-like in states but not
+in budget:
+
+| | distinct states | visits (what `BUDGET` charges) | visits per state |
+|---|---|---|---|
+| seed 3085 `"k1"`, as it was | 296 345 | 2 000 000, then exhausted | 6.7 |
+| seed 4065 `"k0"`, as it was | 287 535 | 2 000 000, then exhausted | 7.0 |
+| seed 3085 `"k1"`, as it is | **383** | **383** (0 memo hits) | 1.0 |
+| seed 4065 `"k0"`, as it is | **408** | **408** (0 memo hits) | 1.0 |
+
+So a state figure is not a budget figure. On the old search each state cost more than one
+charge against the cap — 6.7 and 7.0 on the two tail keys, which are the only keys whose
+visit count was recorded — so the headroom a state count suggests is several times what
+the cap actually allows. On the new search the two coincide, because the reduction removes
+the revisits along with the branches. Where a figure below is a state count it is stated
+as one, and no visit figure is quoted that was not measured.
+
+| seeds 0..1000, **distinct states** of the worst key | p50 | p90 | p99 | worst |
+|---|---|---|---|---|
+| the search as it was | 448 | 632 | 916 | 1 395 |
+| the search as it is | 390 | 526 | 634 | **778** |
+
+| seeds 3000..5000, **distinct states**, the band the two failures are in | p50 | p90 | p99 | worst | budget exhausted |
+|---|---|---|---|---|---|
+| the search as it was | 437 | 615 | 871 | 296 345 | 2 of 2000: 3085, 4065 |
+| the search as it is | 381 | 514 | 645 | **1 145** | **none** |
+
+The typical history barely moves, which is the point: it was never the problem. The two
+tail histories fall by about 750× in states, from past the budget to under a thousand,
+and the budget is untouched at 2 000 000. A history's cost now tracks the **writes** in a
+window rather than the operations, which is why the worst of two thousand seeds is 1 145
+distinct states and not a number four orders of magnitude out — and, since the new
+search's visits and states coincide, 1 145 is also what it charges the cap.
+
+**`BUDGET` is not raised, and that is deliberate.** Raising it to 400 000 000 buys the
+worst seed known today and nothing past it: the distribution is close to bimodal —
+almost every history is free and a very small minority explodes — so no finite number
+separates the two, and a larger one only makes the next tail history a slower failure
+instead of a faster one. It would also cost the memory: the `seen` set is one entry per
+expanded state, and at 300 000 states it is already tens of megabytes per key, with
+eight seeds sweeping at once. D-030 and D-039 say a bound the correct system trips is
+never widened to make a run green, and this is that rule applied to the checker's own
+bound. The question was what made the search hard, and the answer was the search.
+
+**The oracle is no weaker, and that is the part that had to be proved.** A pruning rule
+that is subtly wrong reports "linearizable" for a history that is not, which would
+silently disarm the strongest oracle in the project.
+
+*Every buggy variant still trips it, on the same seeds.* All sixteen variants, the
+correct server among them, were run over seeds 0..300 — 4 800 runs — and **both**
+searches were run on the same history, key by key, in one process, so the comparison is
+over identical inputs rather than over two runs. The tree's real `lin::check` was run
+beside the copy of the old search on every one of the 4 800 and agreed with it on every
+seed, so the copy is known faithful. Two variants trip linearizability at all, and both
+trip it on exactly the same seeds before and after:
+
+| variant | keys the old search proved bad | the new one | same seeds | exhausted, old → new |
+|---|---|---|---|---|
+| `ApplyBeforeCommit` | 107 of 300 | 107 | yes | 0 → 0 |
+| `LeaseTrustsTheClock` | 19 of 300 | 19 | yes | **1 → 0** (seed 18) |
+| the other 13, and `Correct` | 0 | 0 | yes | 0 → 0 |
+
+A key the old search proves bad and the new one calls good — the blind case — appeared
+nowhere, on any variant, on any seed.
+
+*And one catch the old search was making was false.* `LeaseTrustsTheClock` seed 18 is the
+last row's `1 → 0`. `is_caught` and the lease sweep's `stale` counter both read a catch as
+"`check()` returned an error mentioning linearizability", and the old search's **budget
+exhaustion says exactly that** — so a history the checker could not decide was counted as
+a stale read the variant had been caught by. D-080 decides that history, and it is
+linearizable: the catch was the checker giving up, not the bug. The count for that variant
+therefore falls by one seed in three hundred, which is the number getting more honest and
+not less. It is well inside D-061's margin: the stale read is caught on about 4 % of
+seeds and the assertion that carries it runs from the thousand-seed tier.
+
+That this was possible at all is wider than this change and is **issue #92**:
+`Violation::exhausted` is set, and no reader outside `lin` looks at it, so every counter
+that scores a catch by matching the violation's text scores an undecided search as one —
+six of them do. D-080 removes the two seeds that were tripping it and leaves the defect
+standing; the lease sweep's 42 against 41 over the same thousand seeds is its
+demonstration, and it is recorded here as the measurement of a bug, not as a result of
+this one.
+
+*The hand-built histories are still rejected*, as unit tests in `sim/lin.rs`: a stale
+read after a committed write (`a_read_is_forced_only_where_it_saw_this_value`, which
+asserts the matching read is accepted in the same breath), a lost write
+(`a_lost_write_is_a_violation`, with the concurrent version accepted beside it), a read
+of a value nobody wrote (`a_value_nobody_wrote_is_a_violation`), a double apply
+(`a_double_apply_shows_as_a_wrong_swap`), and a violation *after* a window of forced
+reads (`forcing_a_window_of_reads_hides_no_later_violation`).
+
+*Five mutations of the new code, and what each breaks.* Each is a single edit to
+`reads_only` or to the commit itself; every one is caught, and none is left standing.
+
+| | the mutation | what fails |
+|---|---|---|
+| **M-1** | a get is forced without checking it met this value | `a_read_is_forced_only_where_it_saw_this_value`, `a_stale_read_is_a_violation_with_the_shortest_prefix`, `a_value_nobody_wrote_is_a_violation`, `a_lost_write_is_a_violation`, `forcing_a_window_of_reads_hides_no_later_violation` and 5 more |
+| **M-2** | any compare-and-set that applies counts as read-only | `a_swapping_compare_and_set_is_not_read_only`, `a_double_apply_shows_as_a_wrong_swap`, `a_sequential_history_is_linearizable_and_leaves_a_timeline` |
+| **M-3** | an abandoned compare-and-set counts as read-only where it would not swap | `an_abandoned_compare_and_set_is_not_read_only` |
+| **M-4** | a put or a delete that applies counts as read-only | `a_write_is_never_forced_so_its_value_is_never_lost` and 14 more |
+| **M-5** | nothing is ever forced (the reduction removed) | `seeds_3085_and_4065_which_the_nightly_found_linearize_inside_the_budget` |
+| **M-6** | the compare-and-set arm drops its check on the value | `a_compare_and_set_that_reported_no_swap_is_not_forced_where_it_would_swap` |
+| **M-7** | the forced commit is never undone on the way out | `a_forced_window_is_undone_when_the_search_backtracks_past_it` |
+| **M-8** | the forced operations are marked but never put in the order | `the_order_a_search_returns_replays_under_the_specification`, `a_forced_window_is_undone_when_the_search_backtracks_past_it` |
+
+M-5 is the one that matters in the other direction: it fails **only** the pinned seeds,
+which is the evidence that the pin is a real regression test for this change and that
+none of the small histories needs the reduction to be decided. Its converse is that
+`a_wide_window_of_concurrent_reads_is_decided` is **not** evidence for the reduction and
+must not be read as any — it passes unchanged under M-5, because a depth-first search
+trying its candidates in index order walks that window without a second branch. Its
+comment says so.
+
+M-6 to M-8 were added by the adversarial review of this change, which found each of them
+standing: the boundary this entry's own prose names — a compare-and-set whose result says
+no swap, met at a value where it would have swapped — had no test of its own, and neither
+the backtrack out of a forced commit nor the order the search returns was asserted
+anywhere. The order in particular was invisible to the whole tree, since `check`'s
+timelines are dropped at all three call sites (`sim/raft.rs`, `sim/membership.rs`,
+`sim/quorum.rs`) — that half is **issue #93**, and the test that closes the gap for
+D-080's own bookkeeping is here.
+
+**What the mutations do not bound: the reduction refusing too much.** Every one of M-1 to
+M-8 is a `reads_only` that forces something it should not, or a commit that loses track of
+what it forced, and each is caught because it changes a *verdict*. The opposite mistake —
+a `reads_only` too strict, refusing to commit an operation that is in fact read-only — no
+test in the tree can see. Planting one that calls no compare-and-set read-only leaves all
+forty tests green, and it would: over-strictness costs states and can never cost
+soundness, since the search then simply branches where it could have committed. The cost
+is real but unmeasured, because `lin` exposes no state counter and the figures in this
+entry came from an instrumented throwaway copy. A reduction that quietly stopped firing
+would show as the tail coming back at the nightly, which is the same signal that found
+this, rather than as a failing test.
+
+**The pinned seeds assert the mechanism, not the green.** `sim/tests/raft.rs` pins 3085
+and 4065 and asserts, before the check, that each key still holds the window of
+concurrent reads the reduction is what carries — at least 300 operations, 150 of them
+gets, 12 open at once, against the 397/199/20 and 438/244/22 the pin was taken at. The
+day a schedule moves that window away the assertion says so and the pin is re-audited
+against a seed that still reaches it, rather than quietly kept as a bare green
+(CLAUDE.md). Those three are **floors, deliberately loose** — about 40 % below what the
+seeds measure — so an ordinary redraw of the schedules does not fail a tree with nothing
+wrong; they catch a window that has gone, not one that has shifted. `most_open_at_once`
+is conservative in the same direction: it sorts `(Instant, i64)`, so a window closing at
+*t* is counted before one opening at *t*, and two windows that merely touch are never
+counted as overlapping. It under-counts, never over-counts, which is the safe way round
+for a floor.
+
+**The premerge**, at a thousand seeds in release on this branch's tip, quoting its own
+machine lines (D-070):
+`premerge: Darwin 25.6.0 arm64, Apple M2, 8 cores`;
+`premerge: before, load 118.95/193.10/164.07, AC Power, no thermal warning recorded`;
+`premerge: after, load 168.58/167.98/160.16, AC Power, no thermal warning recorded`;
+`premerge: green at 1000 seeds in 1899 s`. **On AC power** throughout, with five or six
+other agents' slices sweeping and building on the same laptop the whole time — the load
+average never fell below 118 — so the figure is not comparable with D-071's 625 s on an
+idle machine or with D-078's 1 279 s, and it says nothing about whether this change made
+the checker faster. It could not say much either way: the checker is a few milliseconds
+of a run that takes a second and a half, and the saving is on two seeds in ten thousand.
+The case for this change is the tail it removes, not a premerge clock.
+
+**One reported rate moves by one seed, and it moves the right way.** The lease sweep's
+`a_leader_that_trusts_the_clock_is_caught_and_the_guard_revokes` counts a catch as
+"`check()` returned an error mentioning linearizability", which the old search's budget
+exhaustion also does. The same thousand seeds on the same tree give 42 stale reads with
+the search as it was and **41** with the search as it is; the one dropped is seed 18,
+where the old search proved nothing and merely gave up, and whose history D-080 decides
+as linearizable. `is_caught` reads a catch the same way, so the same applies to every
+variant — though on seeds 0..300 no other variant had an exhaustion to lose. The comment
+in that test carries both numbers and the reason. D-061's margin is unaffected: 4.2 % and
+4.1 % both sit at the 4 % the assertion's arithmetic is written for, and it runs from the
+thousand-seed tier.
+
+**What is not settled.** The reduction is a partial-order reduction over *reads*; a
+history whose concurrency is all in its writes would still branch as before, and this
+change does not bound that. No such history has been seen: over seeds 0..1000 the worst
+key expands 778 states, and the two tail histories were read windows. If one appears,
+the next step is the pending operations, not the budget.
+
+---
+
+_Next entry: D-081. Add one before implementing anything not covered above._
+main
