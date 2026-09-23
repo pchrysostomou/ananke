@@ -194,14 +194,21 @@ impl Replica {
     /// `Some` is a client to answer `NotLeader` at once. `None` is a read — whose
     /// registration is taken back here, because the core that refused it will never
     /// name its id again — or a step with nothing in flight.
+    ///
+    /// `leave_the_read` is [`NodeVariant::RefusedReadLeft`], the node as it was: the
+    /// registration is left in `reads` and nothing ever takes it out again. The
+    /// buggy half runs the same path the node runs, and not a copy of it written in
+    /// a test (D-076's review).
     // PROPOSED(D-076): a refused read's registration is taken back at the step.
-    fn refuse(&mut self) -> Option<(SocketAddr, u64, u64)> {
+    fn refuse(&mut self, leave_the_read: bool) -> Option<(SocketAddr, u64, u64)> {
         match self.in_flight.take()? {
             InFlight::Propose { from, client, seq } | InFlight::Change { from, client, seq } => {
                 Some((from, client, seq))
             }
             InFlight::Read { id } => {
-                self.reads.remove(&id);
+                if !leave_the_read {
+                    self.reads.remove(&id);
+                }
                 None
             }
         }
@@ -210,6 +217,22 @@ impl Replica {
 
 /// How many proposals a replica remembers against duplicates (the server's figure).
 const PROPOSED_REMEMBERED: usize = 4096;
+
+/// How many reads one replica may have registered and not yet answered or refused.
+///
+/// A registration lives from the step that hands the read to the core until that
+/// core answers it (`read_ready`, `read_dropped`) or refuses it at the step, so what
+/// stands here at any moment is the reads the clients of this range have in flight
+/// with this replica — a small number, and one that does not grow with the run's
+/// length. Measured before it was asserted (D-061): over the node scenario's 1000
+/// seeds and 180 222 registrations the most any replica held at once was **4**, and
+/// over 100 seeds 3. The bound is twice that worst, and what passing it means is not
+/// a slow node but a registration nobody will ever take back — which is exactly the
+/// standing failure D-076 fixed and D-076's review found nothing asserting
+/// (CLAUDE.md:58-67).
+// PROPOSED(D-076): a replica's outstanding read registrations are bounded, and the
+// node fails when they are not.
+const READS_OUTSTANDING: usize = 8;
 
 /// What the node's tasks hand the `raft` task besides its peers' messages.
 pub enum Local {
@@ -250,6 +273,8 @@ pub struct ServerHost<E: Environment> {
     // node's `answers` task.
     answers: Queue<(SocketAddr, Bytes)>,
     variants: ananke_raft::core::Variants,
+    /// The node's own variants, for the paths a core knows nothing about.
+    node: NodeVariants,
     gaps: Mutex<Gaps>,
 }
 
@@ -270,6 +295,24 @@ impl<E: Environment> ServerHost<E> {
 
     fn replica(&self, range: RangeId) -> Option<&Arc<Mutex<Replica>>> {
         self.replicas.get(&range)
+    }
+
+    /// Fails the node when a replica holds more registered reads than its clients
+    /// can have in flight with it ([`READS_OUTSTANDING`]).
+    ///
+    /// Every scenario that runs this node runs this, on every seed: a registration
+    /// nothing will ever take back is a leak whatever answers it was waiting for,
+    /// and counting it where nobody reads the counter is the same as not seeing it
+    /// (D-076's review).
+    // PROPOSED(D-076): a replica's outstanding read registrations are bounded.
+    fn reads_are_bounded(&self, range: RangeId, outstanding: usize) {
+        if outstanding > READS_OUTSTANDING {
+            self.failed(format!(
+                "range {} holds {outstanding} registered reads, over the {READS_OUTSTANDING} \
+                 its clients can have in flight with it: a read's registration was left behind",
+                range.get()
+            ));
+        }
     }
 
     /// Queues one answer for the node's `answers` task.
@@ -323,7 +366,17 @@ impl<E: Environment> Host for ServerHost<E> {
             } => (range, from, request),
         };
         let Some(replica) = self.replica(range) else {
+            // The same absence, traced for the same reason: this node hosts the
+            // ranges its configuration names and nothing routes, so a request for
+            // another range is a client the run has no answer for. Routing and the
+            // answer that redirects it are Stage C's.
+            // PROPOSED(D-076): the request this node drops is traced, not only counted.
             lock(&self.gaps).requests_for_ranges_not_held += 1;
+            self.failed(format!(
+                "a client asked this node for range {}, which it does not host: nothing \
+                 routes yet, and the redirect is Stage C's",
+                range.get()
+            ));
             return None;
         };
         let mut state = lock(replica);
@@ -360,6 +413,9 @@ impl<E: Environment> Host for ServerHost<E> {
                 // to the step as the work in flight — where the registration is
                 // taken back rather than left behind (D-076).
                 let id = state.register_read(from, request);
+                // Where the map is at its largest, so where a registration left
+                // behind by an earlier refusal shows.
+                self.reads_are_bounded(range, state.reads.len());
                 Some(Input::Read {
                     id,
                     now: now_nanos(&self.env),
@@ -557,7 +613,13 @@ impl<E: Environment> Host for ServerHost<E> {
         // schedule of the scenario this slice measured. That answer is the next
         // slice's first job (D-076); what is fixed here is the entry left behind,
         // which is a standing failure and not a latency wart.
-        let Some((from, client, seq)) = lock(replica).refuse() else {
+        let (taken, outstanding) = {
+            let mut state = lock(replica);
+            let taken = state.refuse(self.node.contains(NodeVariant::RefusedReadLeft));
+            (taken, state.reads.len())
+        };
+        self.reads_are_bounded(range, outstanding);
+        let Some((from, client, seq)) = taken else {
             return;
         };
         self.answer_later(range, from, client, seq, Reply::NotLeader { leader });
@@ -567,11 +629,22 @@ impl<E: Environment> Host for ServerHost<E> {
         self.jobs.push(job);
     }
 
-    fn snapshot(&self, _range: RangeId, _action: SnapshotAction) {
+    fn snapshot(&self, range: RangeId, action: SnapshotAction) {
         // The `snapshot` task keyed by range and follower is its own slice's; this
-        // node has none wired. Counted, never silent, and asserted at zero by the
-        // scenarios that run it.
+        // node has none wired. Counted, never silent, and traced as a failure of the
+        // node so that the scenarios running it fail where they say they do
+        // (CLAUDE.md:58-67). Counting alone was silent in practice: `Gaps` is
+        // reachable only through `ServerHost::gaps()`, `server::run` owns the host
+        // inside a task and hands it to nobody, and D-076's review planted a
+        // snapshot threshold this run's cores do cross and found every check green
+        // over the dropped actions.
+        // PROPOSED(D-076): the action this node drops is traced, not only counted.
         lock(&self.gaps).snapshot_actions += 1;
+        self.failed(format!(
+            "range {} asked for the snapshot action {action:?}, which this node drops: the \
+             `snapshot` task keyed by range and follower is its own slice's",
+            range.get()
+        ));
     }
 
     fn failed(&self, reason: String) {
@@ -846,8 +919,17 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
         stores.insert(id_of, store.clone());
         replicas.insert(id_of, Arc::new(Mutex::new(Replica::new())));
         // Q13, D-057: each core seeded from `n{id}/r{range}/protocol`, so two ranges
-        // on one node draw different election timeouts.
-        let seed = env.range_rng(id_of.get()).next_u64();
+        // on one node draw different election timeouts — and so that range r's
+        // stream is r's alone, which is what makes a range's schedule independent of
+        // which other ranges the node holds. `OneSeedForEveryCore` is the plausible
+        // bug beside it: four draws off the node's own stream, which are four
+        // different seeds and so pass any check that only asks that the timeouts
+        // differ (D-076's review).
+        let seed = if node_variants.contains(NodeVariant::OneSeedForEveryCore) {
+            env.rng().next_u64()
+        } else {
+            env.range_rng(id_of.get()).next_u64()
+        };
         let snapshot_record = recovered.snapshot.clone();
         let (snap_index, snap_term) = snapshot_record
             .as_ref()
@@ -922,6 +1004,7 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
         jobs: Queue::new(),
         answers: Queue::new(),
         variants,
+        node: node_variants,
         gaps: Mutex::new(Gaps::default()),
     };
     let answers = host.answers.clone();
@@ -1265,8 +1348,11 @@ mod tests {
     /// the life of the node.
     ///
     /// The pair (CLAUDE.md:52-57) is the second half: the replica as it was, which
-    /// registered the read and held nothing in flight, leaves an entry behind for
-    /// every read it refuses — and this same check sees it.
+    /// leaves an entry behind for every read it refuses — and this same check sees
+    /// it. Since D-076's review that half is [`NodeVariant::RefusedReadLeft`] and
+    /// runs the node's own `refuse`, not a copy of it written here; the node
+    /// scenario's own oracle for it is `READS_OUTSTANDING`, which this unit case
+    /// cannot stand in for.
     #[test]
     fn a_read_a_replica_refuses_leaves_nothing_behind() {
         let mut replica = Replica::new();
@@ -1278,7 +1364,7 @@ mod tests {
                 "a read is registered while the core has it"
             );
             assert!(
-                replica.refuse().is_none(),
+                replica.refuse(false).is_none(),
                 "a refused read has no client to answer at the step"
             );
             assert!(
@@ -1293,17 +1379,15 @@ mod tests {
             client: 1,
             seq: 9,
         });
-        assert_eq!(replica.refuse(), Some((client_addr(), 1, 9)));
+        assert_eq!(replica.refuse(false), Some((client_addr(), 1, 9)));
         assert!(replica.in_flight.is_none());
-        // The known-buggy replica, beside it: the read registered with nothing in
-        // flight, which is what this node did until the review of D-076.
+        // The known-buggy replica, beside it: `RefusedReadLeft`, the node's own
+        // refusal with the registration left behind, which is what this node did
+        // until D-076.
         let mut buggy = Replica::new();
         for seq in 0..8 {
-            let id = buggy.next_read;
-            buggy.next_read += 1;
-            buggy.reads.insert(id, (client_addr(), read(seq)));
-            buggy.in_flight = None;
-            assert!(buggy.refuse().is_none());
+            buggy.register_read(client_addr(), read(seq));
+            assert!(buggy.refuse(true).is_none());
         }
         assert_eq!(
             buggy.reads.len(),

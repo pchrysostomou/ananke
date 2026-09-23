@@ -130,6 +130,22 @@ pub enum NodeVariant {
     /// to reclaim it, so the node's slots fill with reservations for departed senders
     /// and it re-seeds nothing more (SHARD.md §12; Q14).
     SlotReservedForWaiter,
+    /// Every core of the node seeded from the node's own stream, `env.rng()`, rather
+    /// than from `n{id}/r{range}/protocol` (D-057, `Environment::range_rng`). The
+    /// four cores still draw four different seeds, so nothing about *one* run tells
+    /// the two apart — what the keying buys is that range r's stream is range r's
+    /// alone, so a range added to or removed from the configuration moves no other
+    /// range's schedule, and under this variant it moves all of them (SHARD.md §2,
+    /// Q13).
+    OneSeedForEveryCore,
+    /// A read a replica refuses leaves its registration behind: the step's refusal
+    /// takes the work in flight and the `reads` map keeps its `(SocketAddr,
+    /// Request)` for the life of the node. This is the node exactly as it was before
+    /// D-076's review — a follower refusing reads for a living grows an unbounded
+    /// map — and it is here rather than in a scratch file so that the bug has a half
+    /// beside the correct code that the node scenario runs on every seed
+    /// (CLAUDE.md:52-57; SHARD.md §4).
+    RefusedReadLeft,
     /// A stream completed on the very chunk that restarted it: the node is told to
     /// install, never that the staging directory must start over, so the install takes
     /// the abandoned stream's files for the new snapshot's (RAFT.md:203-207).
@@ -231,6 +247,8 @@ impl NodeVariant {
         NodeVariant::OpenNewestEvenIfLost,
         NodeVariant::ServeBeforeRefusedMark,
         NodeVariant::IncarnationPerRangeStream,
+        NodeVariant::RefusedReadLeft,
+        NodeVariant::OneSeedForEveryCore,
     ];
 
     /// Q15's whole-node refusal and re-seed, in order: the six ways to get a node's
@@ -307,14 +325,18 @@ impl NodeVariant {
             NodeVariant::IncarnationPerRangeStream => 1 << 25,
             // Bits 20 to 25 are D-077's six, which `main` took while this slice was
             // open; before that merge the snapshot review's four held 20 to 23. They
-            // take the next free bits instead, so no two variants share one. Thirty
-            // variants now take bits 0 to 29 and two are left: the next slice to add
-            // more than two must widen `NodeVariants` to a `u64`, as `ananke_raft`'s
-            // set was widened for the same reason.
+            // take the next free bits instead, so no two variants share one.
             NodeVariant::InstallWrongRangesSpans => 1 << 26,
             NodeVariant::AdmitsAnUnhostedRange => 1 << 27,
             NodeVariant::AssemblyHeldForDepartedSender => 1 << 28,
             NodeVariant::InstallsADuplicateLastChunk => 1 << 29,
+            // D-076's review adds the last two. Thirty-two variants take bits 0 to
+            // 31 and the `u32` is full: the next slice to add one must widen
+            // `NodeVariants` to a `u64`, as `ananke_raft`'s set was widened for the
+            // same reason, rather than reusing a bit. `variants_have_distinct_bits`
+            // is what says so the day one is reused.
+            NodeVariant::RefusedReadLeft => 1 << 30,
+            NodeVariant::OneSeedForEveryCore => 1 << 31,
         }
     }
 
@@ -352,6 +374,8 @@ impl NodeVariant {
             NodeVariant::AdmitsAnUnhostedRange => "AdmitsAnUnhostedRange",
             NodeVariant::AssemblyHeldForDepartedSender => "AssemblyHeldForDepartedSender",
             NodeVariant::InstallsADuplicateLastChunk => "InstallsADuplicateLastChunk",
+            NodeVariant::RefusedReadLeft => "RefusedReadLeft",
+            NodeVariant::OneSeedForEveryCore => "OneSeedForEveryCore",
         }
     }
 }
@@ -436,8 +460,9 @@ mod tests {
             seen |= variant.bit();
         }
         // Twenty of the round's and the snapshot task's, the snapshot review's four,
-        // and D-077's six for Q15's whole-node refusal and re-seed.
-        assert_eq!(NodeVariant::BUGS.len(), 30);
+        // D-077's six for Q15's whole-node refusal and re-seed, and D-076's review's
+        // two. Thirty-two is every bit of the `u32` (see `NodeVariant::bit`).
+        assert_eq!(NodeVariant::BUGS.len(), 32);
         for variant in NodeVariant::SNAPSHOT {
             assert!(
                 NodeVariant::BUGS.contains(variant),

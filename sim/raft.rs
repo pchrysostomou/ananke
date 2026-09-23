@@ -2902,12 +2902,14 @@ impl Report {
         }
         // Asked of the one-group server alone, and the reason is the node's, not a
         // convenience. D-078's follower compaction is the core asking its `apply` task
-        // for a `SnapshotAction::Record`, and the node's host counts that action and
-        // drops it: no record is written, no prefix is dropped, and a follower replica
-        // on the node has nothing bounding its in-memory log but the run's length. The
-        // bound is a bound on a mechanism this node does not run, so asking it here
-        // would be asserting a property nobody built — measured at 372 entries over a
-        // hundred seeds against the bound's 768, and growing with the tier, which is a
+        // for a `SnapshotAction::Record`, and the node's host has nowhere to send that
+        // action — it fails the run on one now (D-076's review), and the node scenario
+        // keeps every core below the threshold that would ask: no record is written, no
+        // prefix is dropped, and a follower replica on the node has nothing bounding
+        // its in-memory log but the run's length. The bound is a bound on a mechanism
+        // this node does not run, so asking it here would be asserting a property
+        // nobody built — measured at 372 entries over a hundred seeds against the
+        // bound's 768, and growing with the tier, which is a
         // nightly waiting to turn red on a claim the entry itself denies. The node's
         // sweep prints the distribution instead, and the slice that wires the
         // `snapshot` task owes the node its own bound.

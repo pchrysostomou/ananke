@@ -93,6 +93,22 @@
 # high (D-070). They are 70.0, 39.6 and 34.6 cpu s, placed longest-first into the lightest
 # shard: 70.0 to shard 4 (1328.1 -> 1398.1), 39.6 to shard 3 (1328.3 -> 1367.9) and 34.6 to
 # shard 6 (1332.7 -> 1367.3).
+#
+# D-076's adversarial review added three `ranges` rows, salvaged onto `main` here and weighed
+# on the tree that ships, on an Apple M2 of 8 cores on AC Power with the other slices sweeping
+# beside it -- load averages 118.90/138.84/124.86 before and 88.10/120.13/119.30 after, so every
+# figure is if anything high (D-070). The sweep -- the node that leaves a refused read's
+# registration behind -- is 81.19 user + 5.07 sys = 86.3 cpu s at ANANKE_SEEDS=1000 in release;
+# the review weighed the same sweep at 58.5 on an idler machine and its own tree, and the higher
+# figure is the one kept because over-weighting a shard is the safe direction. The two directed
+# rows are pinned at their own seeds and the tier does not move them, so both were weighed from
+# the built release binary (`ranges-<hash> <test> --exact`) rather than through cargo: 0.14 and
+# 0.01 cpu s, rounded to 0.2 and 0.1 like the cheap rows beside them. Placed longest-first into
+# the lightest shard, against the table as this branch found it (1428.0, 1442.9, 1367.9, 1398.1,
+# 1351.7, 1367.3): 86.3 to shard 5 (1351.7 -> 1438.0), then 0.2 to shard 6 (1367.3 -> 1367.5)
+# and 0.1 to shard 6 again (1367.5 -> 1367.6). The shards now run 1367.6 to 1442.9 against a
+# mean of 1407.1, so the night is bounded by shard 2 at about 2.5 % over the ideal. The next row
+# added goes into the lightest, which is shard 6.
 # shard	binary	cpu_s	test
 # shard 1: 1428.0 cpu s
 1	engine	625.1	an_install_in_two_switches_is_caught
@@ -174,7 +190,8 @@
 4	raft	0.2	seed_2023_which_the_nightly_failed_on_a_trace_timestamp_no_longer_straddles_an_isolation
 4	wal	36.9	the_correct_log_passes_every_seed
 4	wal	0.2	the_seed_42_trace_is_written_for_the_studio
-# shard 5: 1351.7 cpu s
+# shard 5: 1438.0 cpu s
+5	ranges	86.3	a_node_that_leaves_a_refused_reads_registration_behind_is_caught
 5	echo	6.0	every_seed_satisfies_the_invariants_and_the_sweep_exercises_the_disk_faults
 5	engine	19.5	a_seek_that_counts_tombstones_is_caught
 5	raft	332.9	a_term_change_stepped_inside_an_isolation_from_a_message_received_before_it_is_excused
@@ -184,7 +201,9 @@
 5	raft	139.6	the_correct_server_passes_the_membership_scenario_on_every_seed
 5	raft	50.7	a_server_that_applies_before_commit_compacts_past_its_commit_index
 5	ranges	59.0	every_seed_passes_on_the_correct_node
-# shard 6: 1367.3 cpu s
+# shard 6: 1367.6 cpu s
+6	ranges	0.2	a_core_that_asks_for_a_snapshot_action_fails_the_run
+6	ranges	0.1	each_range_draws_its_election_timer_from_its_own_stream
 6	echo	0.1	a_busy_looping_task_fails_the_scenario_instead_of_hanging
 6	node	34.6	the_sharded_quorum_scenario_asks_four_leaders_about_one_refused_node
 6	engine	310.3	an_engine_that_acknowledges_before_the_log_is_caught

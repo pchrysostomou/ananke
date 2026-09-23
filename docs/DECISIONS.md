@@ -9990,6 +9990,25 @@ Each is marked `// PROPOSED(D-076)` in the code.
    _and_the_range_from_the_heal`, whose second history is the pair — a range that takes
    2.5 s after the heal to complete any write while every write that completes is quick
    passes the per-key reading and is caught by the per-range one.
+
+   **The fold beside the reading, corrected under this entry's adversarial review.**
+   The per-key fold kept the *minimum* over a key's post-heal writes. Under the old
+   reading that minimum was the key's first completion after the heal, which is a
+   liveness quantity; measured from each write's own call it becomes the *fastest*
+   write to that key, which one quick write hides every slow one behind. The review
+   planted the history that shows it — `k0` asked for 10 ms after the heal and served
+   at 2.9 s, with a second write to it served in 10 ms — and `liveness` passed it on
+   both readings. The fold keeps the **maximum** now, which is what §8 says: the bound
+   is asked of every post-heal write there is. Nothing is widened (D-030, D-039): the
+   bound is the same `election_max() * 10`, the wedge arm is untouched, and the correct
+   node's slowest post-heal write is **101.93275 ms** of it at a thousand seeds on the
+   tree that ships (75.622274 ms over a hundred). The case is
+   `the_write_bound_is_asked_of_the_slowest_write
+   _to_a_key_not_the_quickest`, whose history the per-range reading passes at 30 ms and
+   the quickest reading at 10 ms, so the per-key maximum is the only thing in the tree
+   that fails it. **Every figure this entry reports for the per-key reading is taken
+   under the corrected fold**; the ones it first reported were the worst *fastest*
+   write and were the margin of nothing.
 10. *A read a replica refuses gives its registration back at the step.* `local_input`
    registers every read it hands a core, because a core that leads answers it later by
    id. A core that does **not** lead answers `Output::Rejected` and never names the id
@@ -10003,12 +10022,68 @@ Each is marked `// PROPOSED(D-076)` in the code.
    still waits for its own timeout: answering there queues a packet inside the round and
    moves every schedule this entry measures. That answer stays the next slice's first
    job.
+
+   **The oracle for it, added under the review.** This entry claimed the fix was caught
+   by `a_read_a_replica_refuses_leaves_nothing_behind`, which never runs the node: it
+   builds a bare `Replica`, calls `register_read` and `refuse`, and wrote its buggy half
+   by inserting into the map inside the test body. The review put the leak back in
+   `ServerHost::rejected`, left `Replica::refuse` byte-identical, and every test in the
+   tree stayed green. Two things are true now. The buggy half is
+   [`NodeVariant::RefusedReadLeft`], so it runs the node's own `refuse` rather than a
+   copy of it, and it is caught by the node sweep on **535 of 1 000 seeds (53.5 %)** on
+   the tree that ships, every one of them by name. What catches it is
+   `READS_OUTSTANDING` — see point 12.
 11. *The paths this node does not have are asserted absent rather than left to be found.*
    It has no `snapshot` task, no install, no re-seed and no follower compaction — each is
    another Stage B slice's. So the scenario keeps `snapshot_threshold` far above what its
    clients write and rots no bit, and `Report::check` fails on every seed that traces a
    snapshot or a refusal, naming the slice that owns it. The day a schedule reaches one,
    the sweep says so instead of passing over it (CLAUDE.md:58-67).
+
+   **Half of that was not true, and the review found it.** The refusal half was: a
+   refused store traces `RaftRefused` and the check reads it. The snapshot half was not.
+   `ServerHost::snapshot` incremented `Gaps::snapshot_actions` and traced nothing, `Gaps`
+   is reachable only through `ServerHost::gaps()`, and `server::run` owns the host inside
+   a spawned task and hands it to nobody — so the counter was unreadable by construction.
+   The check looked instead for a `TraceEvent::RaftSnapshot`, which this node emits only
+   when it *restates* a snapshot record already on disk: a record it can never write. The
+   review set this scenario's threshold to twelve, so that every core crossed it and asked
+   for actions the host dropped on the floor, and all three test targets stayed green.
+   The action is traced as a failure of the node now (point 13), and the run that reaches
+   it is `ranges::asking_for_snapshots`, the directed case beside the absence.
+
+The review of this entry settled three more points, taken the same way — the most
+conservative option, marked `// PROPOSED(D-076)` in the code.
+
+12. *A replica's registered reads are bounded, and the node fails when they are not.*
+   `READS_OUTSTANDING` is 8. A registration lives from the step that hands a read to a
+   core until that core answers it or the step refuses it, so what stands at any moment
+   is the reads this range's clients have in flight with this replica: a small number
+   that does not grow with the run's length. Measured before it was asserted (D-061):
+   over the node scenario's thousand seeds and **180 222 registrations the most any
+   replica held at once was 4**, and 3 over a hundred (17 955 registrations) — measured
+   on the tree that ships, with the count traced at both call sites and the
+   instrumentation taken out again. The bound is twice that
+   worst, it is checked where the map is at its largest (right after a registration)
+   and again at every refusal, and what passing it means is not a slow node but a
+   registration nobody will ever take back. The alternative — a counter in `Meters` for
+   the sim to read — was not taken because nothing outside the node can read the node's
+   meters today, which is exactly how the first version of this came to be unwatched.
+13. *What this node cannot serve fails it, rather than being counted and dropped.* A
+   snapshot action a core asks for, and a client request for a range this node does not
+   host, are each traced `RaftServerFailed` with the slice that owes the path named in
+   the reason. Counting them in `Gaps` was the first version and it was silent by
+   construction. Failing the run is the conservative option: the day a threshold moves,
+   a core's compaction rule changes or a later slice wires a core that asks for a take,
+   the sweep says so where it says it does instead of passing over it
+   (CLAUDE.md:58-67). The cost is stated plainly — when the `snapshot` task, routing or
+   a redirect answer arrives, the slice that adds it removes the trace it replaces, and
+   `ranges::asking_for_snapshots` is the run that will fail first and say so.
+14. *The scenario's snapshot threshold is a parameter of the run, not a constant of the
+   configuration.* `ranges::SNAPSHOT_THRESHOLD` is what every sweep uses and
+   `run_with_of` takes another, which is what lets the directed case for point 13 exist
+   at all. Nothing else reads it, and no sweep's schedule moves: the sweeps pass
+   `SNAPSHOT_THRESHOLD` and are byte-identical runs to the ones this entry measured.
 
 ### The measurements
 
@@ -10019,31 +10094,57 @@ beside it: the load averages are recorded with each figure and are high for that
 | What | Command | Figure |
 |---|---|---|
 | The correct node at a thousand seeds | `ANANKE_SEEDS=1000 cargo test --release -p ananke-sim --test ranges every_seed_passes_on_the_correct_node` | green; 12 000 bootstrap creations, leaders by range {2: 2707, 3: 2684, 4: 2658, 5: 2701}, applies by range {2: 125 605, 3: 125 474, 4: 125 297, 5: 125 884}, 37 469 381 records; load 149 |
-| Trace records per virtual second, divided by the range count | the same run | at most **1 905**, against `TRACE_CAP` of 400 000: a run of this scenario holds four ranges for some 52 virtual seconds before the cap, and its own runs are under 3 s. The name is what the figure is: the numerator is the *whole* trace — client operations, every `MessageSent`/`MessageDelivered`, the engine's records — of which only a small part names a range at all, so it is an upper bound on any range's own rate and not that rate |
-| The busiest range's own records per virtual second | the same run | **131**, about a fifteenth of the figure above (`busiest_range_records_per_second`, folding `raft::range_of` over the records). A cap sized from the row above is sized conservatively, which is the direction to be wrong in; both figures are here so that neither is read as the other |
+| Trace records per virtual second, divided by the range count | the same run | at most **1 905** at a thousand seeds, and **1 957** at ten thousand on the branch this entry was written on (run 35722937750; the salvage's re-measurement on `main` is the table below), against `TRACE_CAP` of 400 000: a run of this scenario holds four ranges for some 52 virtual seconds before the cap, and its own runs are under 3 s. The name is what the figure is: the numerator is the *whole* trace — client operations, every `MessageSent`/`MessageDelivered`, the engine's records — of which only a small part names a range at all, so it is an upper bound on any range's own rate and not that rate |
+| The busiest range's own records per virtual second | the same run | **131** at a thousand seeds and **142** at ten thousand on that same branch, about a fifteenth of the figure above (`busiest_range_records_per_second`, folding `raft::range_of` over the records). A cap sized from the row above is sized conservatively, which is the direction to be wrong in; both figures are here so that neither is read as the other |
 | Peer frames carrying messages of more than one range | the same run | **1 121 821** over a thousand seeds, about 1 122 a seed; on seed 3 alone, messages per frame {1: 2 554, 2: 877, 3: 64, 4: 4} and ranges per frame {1: 2 625, 2: 811, 3: 59, 4: 4}. The sweep asserts a hundred a seed, measured before it was asserted (D-061). This is the claim four ranges to a node is the parameter for (SHARD.md §12), and it is read off the frames: counting the ranges a *run* names would restate the scenario's own shape and pass a node whose every frame carried one message |
-| `StepWhilePersisting` (the node's pair) | the same command, `a_node_that_steps_a_core_while_its_persist_is_outstanding_is_caught` | caught on **639 of 1 000 seeds (63.9 %)**, which is why it is asserted at every tier (D-061) |
+| `StepWhilePersisting` (the node's pair) | the same command, `a_node_that_steps_a_core_while_its_persist_is_outstanding_is_caught` | caught on **639 of 1 000 seeds (63.9 %)** on this entry's branch, and on **596 of 1 000 (59.6 %)** on the tree the salvage ships (below) — either way far above 5 %, which is why it is asserted at every tier (D-061) |
 | The write bound's margin, four ranges | `ANANKE_SEEDS=1000` over the node sweep | see below |
 | The recovery time's margin, per range | `ANANKE_SEEDS=1000` over the node sweep | see below |
 | The premerge on this branch's tip | `scripts/premerge.sh` | first tip: **green at a thousand seeds in 1 252 s** (`before, load 41.40/56.73/59.91, AC Power, no thermal warning recorded`; `after, load 43.04/48.76/50.33, AC Power`). Fixed tip, after the review: **green at a thousand seeds in 673 s** — `premerge: Darwin 25.6.0 arm64, Apple M2, 8 cores`; `premerge: before, load 10.70/10.18/7.46, AC Power, no thermal warning recorded`; `premerge: after, load 19.29/15.63/11.89, AC Power, no thermal warning recorded` |
 
 **The write bound's margin is the figure for the owner**, and the reading it is taken
 under changed under the review of this entry (settled point 9 above): a post-heal write
-is measured from its own call, and the recovery time proper is asked per range. The
-figures below are all under the new reading, at `ANANKE_SEEDS=1000` in release on an
-Apple M2 of 8 cores on AC Power, load average 3.7 (an idle machine this time):
+is measured from its own call, the fold over a key's post-heal writes keeps the
+**slowest**, and the recovery time proper is asked per range.
+
+**Every figure in this section is the salvage's, taken on the tree that ships.** The
+review's fixes were written on `phase-3-stage-b-ranges` and its agent was killed before
+they were pushed; they are carried onto `main` here (`phase-3-ranges-write-bound`), and
+`main` has moved a long way under them — the node's tasks, the snapshot task, follower
+compaction, the raft-arms sweep, the Q15 re-seed and the linearizability search fix all
+touch `crates/ananke-shard/src/server.rs` and `sim/raft.rs`. So the node scenario's
+schedules are not the ones the review measured, and **every figure it reported has been
+taken again here rather than restated**. At `ANANKE_SEEDS=1000` in release on an Apple
+M2 of 8 cores on AC Power, load average 118 (the other slices sweeping beside it; the
+figures below are virtual time and a simulation's own counts, so the load moves none of
+them — only the cpu seconds in `scripts/nightly-shards.txt`):
 
 | Reading | Worst, of the 2 s bound | Margin |
 |---|---|---|
-| The first post-heal write to a key of a live range, **from its own call**, on a run the bound is asked of | **30.554792 ms** | **1.969445208 s** |
-| The same on any run, asked of or not (D-016 withholds every claim about time on a non-uniform schedule) | **31.858991 ms** | — |
-| **A live range's recovery**: the first write to any of its keys completed after the heal, from the heal | **1.163172939 s** | **836.827061 ms** |
+| The **slowest** post-heal write to a key of a live range, **from its own call**, on a run the bound is asked of | **101.93275 ms** | **1.89806725 s** |
+| The same on any run, asked of or not (D-016 withholds every claim about time on a non-uniform schedule) | **101.93275 ms** | — |
+| **A live range's recovery**: the first write to any of its keys completed after the heal, from the heal | **1.101135983 s** | **898.864017 ms** |
 
-Nothing else in the run moved: 12 000 bootstrap creations, leaders by range {2: 2707,
-3: 2684, 4: 2658, 5: 2701}, applies {2: 125 605, 3: 125 474, 4: 125 297, 5: 125 884} and
-37 469 381 records are the figures this entry reported before the fix, to the record.
-That is the point of taking the measurement rather than the schedule: this reading moves
-nothing, so every other figure here and the whole mutation table below stand.
+The first two rows are the **corrected fold** (settled point 9): this entry first
+reported 30.554792 ms and 31.858991 ms, which were the worst *fastest* post-heal write
+to a key and the margin of nothing. The correction makes the figure between three and
+four times larger and the check strictly stronger, **and the correct node trips it on
+no seed of a thousand** — 101.9 ms of a 2 s bound. On the review's own tree the same
+two rows read 85.918737 ms and 90.748171 ms; the difference is `main`'s, not the fold's.
+
+**What moved with `main` under it, and what did not.** The same run at a thousand seeds
+gives 12 000 bootstrap creations (unmoved: it is `NODES * RANGES` asserted on every
+seed), leaders by range {2: 2 690, 3: 2 708, 4: 2 680, 5: 2 770}, applies
+{2: 125 434, 3: 125 738, 4: 126 493, 5: 125 342}, 37 581 290 records, at most 1 854
+trace records per virtual second per range and 138 of the busiest range's own, and
+**1 103 898 peer frames carrying messages of more than one range** (107 934 over a
+hundred seeds). Against the figures this entry reported from its own branch — {2 707,
+2 684, 2 658, 2 701}, {125 605, 125 474, 125 297, 125 884}, 37 469 381, 1 905, 131 and
+1 121 821 — every one has moved by well under a percent, which is what a schedule
+redrawn by work elsewhere in the node looks like and not a change in what the scenario
+does. No cap, floor or bound in the tree is crossed by any of them: the sweep's floor is
+a hundred multi-range frames a seed against 1 104, and `TRACE_CAP` is 400 000 against
+1 854.
 
 **What the old figures were, and why they are not comparable.** This entry first reported
 1.8404 s of the 2 s bound with four ranges (a margin of 159.6 ms) and 504.6 ms with one,
@@ -10055,23 +10156,57 @@ at up to 2.4348 s — seeds 2400, 4976, 5193, 6508, 6605 and 9204, run 356456883
 is the model error, and the 159.6 ms margin they showed was never the margin of anything
 the cluster does.
 
-**What the narrowing that is left is.** The recovery margin, 836.8 ms at a thousand
-seeds, is the one to watch: four ranges elect, replicate and apply through one `raft`
-task, one `apply` task and one engine on each node, so a range's recovery after a heal
-waits behind the other three ranges' work as well as its own. The one-range scenarios
-read under the same two readings, on the premerge of this branch's fixed tip at a
-thousand seeds, are the comparison:
+**What the narrowing that is left is.** The recovery margin — **898.864017 ms at a
+thousand seeds on the tree that ships** — is the one to watch: four ranges elect,
+replicate and apply through one `raft` task, one `apply` task and one engine on each
+node, so a range's recovery after a heal waits behind the other three ranges' work as
+well as its own. The one-range scenarios read under the same two readings, on this
+entry's own branch at a thousand seeds, are the comparison:
 
 | Reading | One range | Four ranges to a node |
 |---|---|---|
-| A post-heal write from its own call | **44.623736 ms** (`sim/raft.rs`'s sweep, `Coverage::slowest_write_after_heal`) | 30.554792 ms |
-| A range's recovery from the heal | **664.94607 ms** (`sim/membership.rs`'s sweep, whose figure is `Report::time_to_write_after_heal`) | 1.163172939 s |
+| A post-heal write from its own call | **44.623736 ms** (`sim/raft.rs`'s sweep, `Coverage::slowest_write_after_heal`) | 101.93275 ms |
+| A range's recovery from the heal | **664.94607 ms** (`sim/membership.rs`'s sweep, whose figure is `Report::time_to_write_after_heal`) | 1.101135983 s |
 
-So a range on the node recovers in about 1.75 times what one group takes, and an
-individual write is no slower. **The bound is not widened** (D-030, D-039). If the nightly at ten thousand seeds finds a seed past it, that is a
-recovery genuinely over ten election timeouts and a finding for the owner, not a bound to
-move: the recommendation would be to look at the node's round and its engine, not at the
-number.
+So a range on the node recovers in about 1.65 times what one group takes, and an
+individual write is about twice as slow but three orders inside the bound. **The bound
+is not widened** (D-030, D-039).
+
+**What a thousand seeds cannot say, and who says it.** At ten thousand the margin was
+40 % narrower than at a thousand on this entry's own branch — 596.605754 ms against
+836.8 ms — so the recovery margin is the figure that shrinks with the tier, and the
+thousand-seed figure above is an upper bound on it and not the figure to plan by. That
+ten-thousand-seed figure is *this entry's branch's*, taken under the old fold and on a
+`main` that has moved since, so it is not carried into the table above. The nightly
+dispatched on the salvage's branch is what gives it again; its run id is in the pull
+request. If it finds a seed past the bound, that is a recovery genuinely over ten
+election timeouts and a finding for the owner, not a bound to move: the recommendation
+would be to look at the node's round and its engine, not at the number.
+
+**The nightly on this entry's own branch, at ten thousand seeds.** Run **35722937750**
+on `phase-3-stage-b-ranges`. The node sweep passed **every one of ten thousand seeds**
+and printed: 120 000 bootstrap creations, leaders by range {2: 27 213, 3: 27 271,
+4: 27 228, 5: 27 263}, applies {2: 1 256 420, 3: 1 257 798, 4: 1 261 486, 5: 1 259 074},
+376 233 678 records, at most 1 957 trace records per virtual second per range and 142 of
+the busiest range's own, **11 112 004 peer frames carrying messages of more than one
+range**, and the recovery margin of 596.605754 ms quoted above.
+`StepWhilePersisting` was caught on 6 267 of 10 000 seeds (62.7 %), beside 63.9 % at a
+thousand. **Every figure in this paragraph is that branch's, under the old fold and on
+the `main` of the day**, and is kept for the record rather than carried forward: the
+salvage's own nightly, dispatched on `phase-3-ranges-write-bound`, is what gives them
+again under the corrected fold and on the tree that ships.
+
+Two shards of that run failed, and neither failure was this slice's: shard 5 on
+`the_correct_server_passes_the_membership_scenario_on_every_seed` at seed 7205 (issue
+**#81**, PR #89) and shard 6 on `the_correct_server_passes_every_seed` at seeds 3085
+and 4065, the linearizability search budget (issue **#82**, PR #87). Both are one-group
+scenarios on `ananke_raft::run`; both were verified in the job logs, by this entry and
+again by its review, **and both PRs are merged into the `main` the salvage is branched
+off**, so neither is outstanding against the run dispatched here. The earlier run
+**35645688334** is the one that found the write bound's model error, and this entry
+recorded it without recording the run that came after it — a reader of this entry saw a
+failing nightly and a thousand-seed margin and nothing else, which the review was right
+to call out.
 
 ### The mutation standard: what the sweeps can now be wrong about
 
@@ -10150,7 +10285,7 @@ scenario at twenty seeds and then two hundred, and against `cargo test -p ananke
 | M1 a local input for a persisting core dropped instead of held | `node.rs` | **survived** 200 seeds of the sweep and the lib tests | **caught** by `a_local_input_for_a_persisting_core_is_held_and_stepped_in_order`, the check the new `HeldLocalDropped` variant is the pair of |
 | M7 held locals replayed last-in-first-out (`pop_back`) | `node.rs` | **survived** 200 seeds | **caught** by the order half of the same check |
 | M4 one seed drawn once for every core on the node | `server.rs` | **survived** 200 seeds | **caught** by `the_ranges_of_one_node_draw_their_own_election_timeouts`: the node's four ranges campaign at one instant instead of four |
-| M8 a refused read's registration left behind (the node as it was) | `server.rs` | no check at all | **caught** by `a_read_a_replica_refuses_leaves_nothing_behind` |
+| M8 a refused read's registration left behind (the node as it was) | `server.rs` | no check at all | **caught** by `a_read_a_replica_refuses_leaves_nothing_behind` — *which this entry's review found was not true of the node: that case builds a bare `Replica` and the mutation planted in `ServerHost::rejected` survived it. The node's own oracle is `READS_OUTSTANDING` and the buggy half is `NodeVariant::RefusedReadLeft` (finding 2 below)* |
 | M2 the `apply` task never feeds `Local::Applied` back | `server.rs` | caught at 20 seeds | unchanged |
 | M3 cores built without their range (every range traces range 2) | `server.rs` | caught at 20 seeds | unchanged |
 | M6 every sibling store opened under the first range's prefix | `server.rs` | caught at 20 seeds | unchanged |
@@ -10163,6 +10298,118 @@ as the node's variants did before this slice put one of them under a sweep, and
 `Meters::locals_held` is what says the path is reached at all — 8 to 12 deferrals against
 700 to 870 local inputs in a run of the node scenario (about 1.4 %), and exactly 3 in the
 directed check, which asserts the figure.
+
+### The adversarial review of this entry, and the nine survivors it found
+
+The review planted twelve mutations in a throwaway copy of this tree, one at a time,
+each run at twenty seeds against `--test ranges`, `-p ananke-sim --lib` and
+`-p ananke-shard --lib`. **Nine survived, eight of them on assertions this entry
+claimed to hold.** They were all of one shape, and it is the shape to watch for: a
+check that tests its own helper rather than the thing under test, and a figure named
+after a quantity it does not measure. Every one is fixed here. The re-plantings are
+`scratchpad stage-b/ranges-fix/mutations-review-fixes.log`, run against the fixed tree
+with a target directory of its own.
+
+| # | What survived, and where | The smallest fix | The mutation, re-planted against the fix |
+|---|---|---|---|
+| 1 | The per-key write bound folded the **minimum**, so one quick write hid every slow one (`sim/raft.rs`, `writes_after_heal_by_key`) — and with it the entry's headline margin, the two error strings and `Coverage`'s comment in the raft sweep | the fold keeps the maximum (settled point 9); the strings and the comment say "the slowest" | the fold put back to the minimum fails `the_write_bound_is_asked_of_the_slowest_write_to_a_key_not_the_quickest`, the unit case whose history the per-range reading and the quickest reading both pass |
+| 2 | `ServerHost::rejected` leaving a refused read's registration behind — **the node exactly as it was** — passed every test in the tree, because the pair tested `Replica::refuse` and not the node (`crates/ananke-shard/src/server.rs`) | `READS_OUTSTANDING`, a bound on a replica's registered reads checked on the node's own path (point 12), and `NodeVariant::RefusedReadLeft` for the buggy half | the variant is in the tree now: caught on **535 of 1 000 seeds (53.5 %)** on the tree that ships, every one of them by the bound, in `a_node_that_leaves_a_refused_reads_registration_behind_is_caught` |
+| 3 | `snapshot_threshold` at 12 — every core asking for actions the host dropped — passed all three targets, because the absence was asserted through an event this node cannot emit and the real counter is unreadable (`sim/ranges.rs`, `server.rs`) | the dropped action is traced `RaftServerFailed`, naming the slice that owes it (point 13); the same for a request for a range this node does not host | that same threshold is now a scenario: `a_core_that_asks_for_a_snapshot_action_fails_the_run` fails seed 1 with "range 3 asked for the snapshot action Record, which this node drops" |
+| 4 | Check 7's first step was pinned on one of its four claims: the `cause` clause, the "created twice" clause and the generation and voters in the descriptor could each be deleted with nothing failing (`sim/ranges.rs`, `creations_agree`) | three more forgeries on the same run in `a_ranges_replicas_are_created_with_one_descriptor_and_created_once` — a second creation for one (range, node), one by `Split`, one with another generation and voters | each of the three deletions fails that test at twenty seeds |
+| 5 | The entry told the owner to watch a recovery margin of 836.8 ms and recorded no ten-thousand-seed run at all, though one existed and the margin there is **40 % narrower** | the nightly paragraph above: run 35722937750, its figures, its two pre-existing failures with their issue numbers, and the ten-thousand-seed caps of 1 957 and 142 recorded beside the thousand-seed ones | — (a documentation correction) |
+| 6 | The directed scenario for D-057 asserted that the four timeouts *differ*, which four draws off one stream also satisfy; the keying itself was unpinned (`server.rs`, `sim/ranges.rs`) | `NodeVariant::OneSeedForEveryCore` beside the correct seeding, and `each_range_draws_its_election_timer_from_its_own_stream`: the node asked for three of its four ranges keeps every gap between the survivors' election timers | the variant moves them on **every one of seeds 1 to 4**; the correct node keeps them on all four (on seed 4 the whole node starts a fraction of a tick earlier without the fourth range and every campaign moves one tick together, which is why the gaps and not the ticks are compared) |
+| 7 | "Ranges per frame" folded as "messages per frame" passed the batching claim's own oracle (`sim/ranges.rs`, `frames_carried`) | one line: the two histograms must differ (`assert_ne!`) in `every_frame_between_two_nodes_may_carry_several_ranges` | re-planted, that test fails at twenty seeds |
+| 8 | Half the codec direction was unpinned: deleting the batch-decode clause of `frames_are_this_nodes` passed everything | a second forged payload — neither codec's — in `no_batch_frame_of_the_node_parses_as_a_frame_of_the_one_group_server`, asserting the violation names "no batch frame" | re-planted, that test fails at twenty seeds |
+| 9 | Stale prose: a frame count from a version of the run that no longer exists, and a `// PROPOSED(D-076)` line comment inside a doc block, between two `///` paragraphs | the count is the measured one (1 103 898 over a thousand seeds and 107 934 over a hundred, on the tree that ships); the marker moved below the doc block, where every other marker sits | — |
+
+**Nothing was weakened to make any of this pass** (D-030, D-039). Finding 1 is the only
+one that changes what a check asserts, and it makes it strictly stronger: the correct
+node's slowest post-heal write is 101.93275 ms of a 2 s bound at a thousand seeds on the
+tree that ships and no key of any seed passes it under either reading. The review's own scope note — that the
+fold is `sim/raft.rs`'s, so the correction reaches the one-group `raft`, `membership`
+and `quorum` sweeps too — is answered twice. The premerge runs every one of those
+sweeps at a thousand seeds under the corrected fold, and it is the coordinator's to run
+on this branch before a merge, not this slice's. And the one catch rate the review
+named, the `liveness > 0` that `SharedSnapshotDir`'s wedge asserts
+(`sim/tests/raft.rs`), is asked only at ten thousand seeds and can only go up: the
+maximum over a key's post-heal writes is never below the minimum and the `None` arm the
+wedge lands on is untouched, so a run the old fold caught by liveness the new one
+catches by liveness. The nightly dispatched on this branch is what confirms it.
+
+**No finding was disagreed with and none was filed as an issue**: every one was a defect
+in this slice's own code, tests or entry, and small enough to fix here. The one item
+that would widen this slice's scope is the one this entry already owes and already
+names — Stage B's first exit criterion, below.
+
+### The salvage: the review's fixes carried onto `main`, and re-planted there
+
+The review's fixes were written on `phase-3-stage-b-ranges` and its agent was killed
+before they were pushed. They are carried onto `main` on
+`phase-3-ranges-write-bound`, and **no figure is restated**: every one above was taken
+again on the tree that ships, and the mutations below were planted again on it, because
+`main` moved a long way under the work. The node's tasks, the `snapshot` task, follower
+compaction, four ranges, the raft-arms sweep (`Cluster::{OneGroup, Node}`), the Q15
+re-seed and the linearizability search fix all landed between, and all of them touch
+`crates/ananke-shard/src/server.rs`, `sim/raft.rs` or `sim/ranges.rs`.
+
+Three things had to be resolved rather than applied.
+
+- **The `// PROPOSED(D-076)` marker of `match_starts_are_first_rises`** (finding 9) had
+  moved again under D-079, which added a marker of its own below the doc block. All
+  three markers sit there now, in entry order.
+- **`NodeVariants` is a `u32` and `main` had taken bits 0 to 29.** PR #95 moved four
+  snapshot variants to 26-29 to resolve a real collision, and left a note that the next
+  slice to add more than two must widen the set to a `u64`. This adds exactly two —
+  [`NodeVariant::RefusedReadLeft`] and [`NodeVariant::OneSeedForEveryCore`], which the
+  review wrote at bits 20 and 21 where D-077's re-seed variants now sit. They take bits
+  **30 and 31**, the last two the `u32` has, and no widening is needed. `BUGS.len()` is
+  **32** and the `u32` is now full: the note in `NodeVariant::bit` says so, and
+  `variants_have_distinct_bits` is what fails the day a bit is reused instead of the
+  set widened.
+- **D-078's follower compaction reaches `ServerHost::snapshot`** on the one-group
+  server, and `sim/raft.rs`'s own comment said the node's host "counts that action and
+  drops it". It fails the run on one now (settled point 13), so that comment is
+  corrected; the node scenario keeps every core below `SNAPSHOT_THRESHOLD`, which is
+  why the correct node reaches it on no seed and `asking_for_snapshots` is the run that
+  does.
+
+**The mutations, planted again on the tree that ships**, one at a time, each against
+`-p ananke-sim --lib`, `-p ananke-shard --lib` and `--test ranges` at twenty seeds:
+
+| # | Mutation | `--lib` (sim) | `--lib` (shard) | `--test ranges` |
+|---|---|---|---|---|
+| W2 | the per-key fold put back to the **minimum** | **caught**: `the_write_bound_is_asked_of_the_slowest_write_to_a_key_not_the_quickest` | green | green |
+| S1 | `ServerHost::snapshot` back to counting the action in `Gaps` and dropping it | green | green | **caught**: `a_core_that_asks_for_a_snapshot_action_fails_the_run` |
+| R1 | `reads_are_bounded` made a no-op | green | green | **caught**: `a_node_that_leaves_a_refused_reads_registration_behind_is_caught` |
+| R2 | the bound checked at the refusal only, not at the registration | green | green | **survived** |
+| D3 | every core seeded from the node's own stream (D-057's keying abandoned) | green | green | **caught**: `each_range_draws_its_election_timer_from_its_own_stream` |
+
+**W2 is the shape the review found**: the four-range sweep passes it at twenty seeds and
+so does everything else in the tree — the unit case is the only thing that fails it,
+which is what the review said and what makes that case load-bearing rather than
+decorative. **R1 confirms the other half of finding 2**: with the bound gone the node's
+own `refuse` leaks exactly as it did before D-076 and `-p ananke-shard --lib` stays
+green, because the unit case builds a bare `Replica` and cannot see the node.
+
+**R2 survived, and it is recorded rather than fixed.** The two call sites bound the same
+map at two moments, and `RefusedReadLeft` grows it at both, so either one alone catches
+the variant. They are kept because they fail on different runs and not on this one: the
+registration site is the only one a run with no refusals at all reaches, and it is where
+the map is largest on a node that is *not* leaking — a genuine burst of client reads —
+while the refusal site is where a leak first appears. Neither is a check that cannot
+fail; what R2 says is that the sweep does not need both to catch this variant.
+
+**The mutation a single-range world could not catch is D3**, and it is the reason
+`each_range_draws_its_election_timer_from_its_own_stream` exists. With one range on a
+node, `env.rng()` and `env.range_rng(r)` each hand that range's core one seed and
+nothing in any trace tells them apart; with four, D-057's keying is what makes range r's
+stream r's alone, so a range added to or taken out of the configuration moves no other
+range's timer relative to its fellows. Under D3 the node's surviving three ranges draw
+the node's *first* three seeds where they drew its last three, every gap between their
+campaign ticks moves, and that test fails on seed 1. **`the_ranges_of_one_node_draw_
+their_own_election_timeouts` — the check a one-range world's version of this claim would
+be, that the timeouts differ — passes D3 on every seed**, which is the review's finding 6
+re-planted and confirmed here: four draws off one stream differ too.
 
 ### What is not built, and why
 

@@ -130,8 +130,8 @@ fn every_seed_passes_on_the_correct_node() {
          applies by range {applies:?}, {records} records in all, at most \
          {per_range_per_second:.0} trace records per virtual second per range and \
          {busiest_range_per_second:.0} of the busiest range's own; {multi_range_frames} peer \
-         frames carried messages of more than one range; the worst first write to a key of a \
-         live range after the heal took {worst:?} from its own call of the {bound:?} bound on a \
+         frames carried messages of more than one range; the slowest post-heal write to a key \
+         of a live range took {worst:?} from its own call of the {bound:?} bound on a \
          run the bound is asked of, a margin of {:?}, and {worst_anywhere:?} on any run; the \
          worst live range took {worst_recovery:?} after the heal to complete a write, a margin \
          of {:?}",
@@ -152,8 +152,9 @@ fn every_seed_passes_on_the_correct_node() {
     // The other half of that shape, read off the frames themselves: a frame between
     // two nodes carries messages of several ranges, which is what four ranges to a
     // node is the parameter for (SHARD.md §12). The figure was measured before it
-    // was asserted (D-061): 3 898 + 1 194 + 31 = 5 123 such frames on seeds 1 to 5,
-    // about a thousand a seed, against a floor of a hundred a seed here.
+    // was asserted (D-061): 1 103 898 such frames over a thousand seeds, about
+    // 1 104 a seed, and 107 934 over a hundred — against a floor of a hundred a
+    // seed here.
     assert!(
         multi_range_frames >= 100 * seeds as usize,
         "{multi_range_frames} frames of several ranges over {seeds} seeds is too few to say a \
@@ -222,6 +223,18 @@ fn every_frame_between_two_nodes_may_carry_several_ranges() {
         messages.keys().any(|carried| *carried > 1),
         "no frame carried more than one message: {messages:?}"
     );
+    // And the two histograms are of two different things, which is the whole claim:
+    // every assertion above is satisfied by a node that batched four messages of
+    // *one* range, if "ranges per frame" is really the message count under another
+    // name. D-076's review folded the ranges per frame as `decoded.messages.len()`
+    // and watched nothing fail. On this seed the two differ in every bucket —
+    // messages {1: 2604, 2: 928, 3: 23} against ranges {1: 2681, 2: 852, 3: 22} —
+    // because a frame carrying two messages of one range counts once in each
+    // histogram and in different places.
+    assert_ne!(
+        messages, ranges_per,
+        "the ranges a frame carried are counted as the messages it carried: {messages:?}"
+    );
 }
 
 #[test]
@@ -281,8 +294,52 @@ fn no_batch_frame_of_the_node_parses_as_a_frame_of_the_one_group_server() {
         payloads > 100,
         "{payloads} payloads is too few to say anything"
     );
-    // The pair (CLAUDE.md:52-57): a payload that is a one-group frame is caught by
-    // the check on the run's own frames, whichever seed it runs.
+    // The pair (CLAUDE.md:52-57), both ways round, because the check has two
+    // clauses and D-076's review deleted the second one and watched every test in
+    // the tree stay green: a payload that *is* a one-group frame is caught, and a
+    // payload that is neither codec's is caught too.
+    let seed = report.seed;
+    let variants = report.variants;
+    let node_variants = report.node_variants;
+    let schedule = report.schedule.clone();
+    let policy = report.checked.policy;
+    let header = report.checked.run.clone();
+    let last_heal = report.checked.last_heal;
+    let isolations = report.checked.isolations.clone();
+    let of_run = report.checked.ranges.clone();
+    let with_payload = |payload: bytes::Bytes| {
+        let mut records = report.records().to_vec();
+        let put = records
+            .iter_mut()
+            .find_map(|record| match &mut record.event {
+                TraceEvent::MessageSent { payload: sent, .. } if !ananke_shard::is_ranged(sent) => {
+                    *sent = payload.clone();
+                    Some(())
+                }
+                _ => None,
+            });
+        assert!(put.is_some(), "the run sent a peer frame to forge");
+        ranges::Report {
+            seed,
+            variants,
+            node_variants,
+            schedule: schedule.clone(),
+            checked: ananke_sim::raft::Report::over_a_run(ananke_sim::raft::Run {
+                seed,
+                variants,
+                policy,
+                header: header.clone(),
+                records,
+                last_heal,
+                isolations: isolations.clone(),
+                history: Default::default(),
+                clients: Default::default(),
+                ranges: of_run.clone(),
+                key_range: ranges::range_of_key,
+                stopped: None,
+            }),
+        }
+    };
     let prevote = ananke_raft::message::Frame {
         from: ananke_raft::ServerId(1),
         message: ananke_raft::message::Message::PreVote {
@@ -296,39 +353,30 @@ fn no_batch_frame_of_the_node_parses_as_a_frame_of_the_one_group_server() {
         ananke_raft::message::Frame::decode(prevote.clone()).is_ok(),
         "the forged payload is a one-group frame"
     );
-    let mut records = report.records().to_vec();
-    let put = records
-        .iter_mut()
-        .find_map(|record| match &mut record.event {
-            TraceEvent::MessageSent { payload, .. } if !ananke_shard::is_ranged(payload) => {
-                *payload = prevote.clone();
-                Some(())
-            }
-            _ => None,
-        });
-    assert!(put.is_some(), "the run sent a peer frame to forge");
-    let forged = ranges::Report {
-        checked: ananke_sim::raft::Report::over_a_run(ananke_sim::raft::Run {
-            seed: report.seed,
-            variants: Variants::default(),
-            policy: report.checked.policy,
-            header: report.checked.run.clone(),
-            records,
-            last_heal: report.checked.last_heal,
-            isolations: report.checked.isolations.clone(),
-            history: Default::default(),
-            clients: Default::default(),
-            ranges: report.checked.ranges.clone(),
-            key_range: ranges::range_of_key,
-            stopped: None,
-        }),
-        ..report
-    };
-    let violation = forged
+    let violation = with_payload(prevote)
         .frames_are_this_nodes()
         .expect_err("a one-group frame among the node's own is not caught");
     assert!(
         violation.contains("parses as a frame of the one-group server"),
+        "the violation names what it found: {violation}"
+    );
+    // The other clause: a payload of neither codec — a batch frame's version byte
+    // with nothing behind it — which is what a node sending something this scenario
+    // cannot read would look like.
+    let garbled = bytes::Bytes::from_static(b"\x01\x00\x00");
+    assert!(
+        !ananke_shard::is_ranged(&garbled),
+        "the forged payload is no client packet"
+    );
+    assert!(
+        ananke_raft::message::Frame::decode(garbled.clone()).is_err(),
+        "the forged payload is no one-group frame either"
+    );
+    let violation = with_payload(garbled)
+        .frames_are_this_nodes()
+        .expect_err("a payload of neither codec is not caught");
+    assert!(
+        violation.contains("is no batch frame"),
         "the violation names what it found: {violation}"
     );
 }
@@ -337,13 +385,48 @@ fn no_batch_frame_of_the_node_parses_as_a_frame_of_the_one_group_server() {
 fn a_ranges_replicas_are_created_with_one_descriptor_and_created_once() {
     // Check 7's first step, which D-071 (item 11) said the stage emitting
     // `RangeCreated` owes: checks 2 and 4 take a creation's floor on sight, so
-    // something must hold the creations themselves to account. Here is the pair:
-    // the correct node's creations agree, and a trace where one node's differ is
-    // caught.
+    // something must hold the creations themselves to account. Here is the pair: the
+    // correct node's creations agree, and a trace forged against each of the four
+    // things the check claims is caught, naming it.
+    //
+    // Four, because D-076's review deleted three of them one at a time — the
+    // `cause` clause, the "created twice" clause, and the generation and voters out
+    // of the descriptor compared — and the sweep and this test stayed green on all
+    // three: one forged floor pinned the floor comparison and nothing else.
     let report = correct(5);
     report
         .creations_agree()
         .expect("the correct node's creations agree");
+    let seed = report.seed;
+    let variants = report.variants;
+    let node_variants = report.node_variants;
+    let schedule = report.schedule.clone();
+    let policy = report.checked.policy;
+    let header = report.checked.run.clone();
+    let last_heal = report.checked.last_heal;
+    let isolations = report.checked.isolations.clone();
+    let of_run = report.checked.ranges.clone();
+    let over = |records: Vec<ananke_env::sim::TraceRecord>| ranges::Report {
+        seed,
+        variants,
+        node_variants,
+        schedule: schedule.clone(),
+        checked: ananke_sim::raft::Report::over_a_run(ananke_sim::raft::Run {
+            seed,
+            variants,
+            policy,
+            header: header.clone(),
+            records,
+            last_heal,
+            isolations: isolations.clone(),
+            history: Default::default(),
+            clients: Default::default(),
+            ranges: of_run.clone(),
+            key_range: ranges::range_of_key,
+            stopped: None,
+        }),
+    };
+    // A creation whose floor disagrees with the replicas beside it.
     let mut records = report.records().to_vec();
     let forged = records
         .iter_mut()
@@ -355,29 +438,74 @@ fn a_ranges_replicas_are_created_with_one_descriptor_and_created_once() {
             _ => None,
         });
     assert!(forged.is_some(), "the run traced no creation to forge");
-    let forged = ranges::Report {
-        checked: ananke_sim::raft::Report::over_a_run(ananke_sim::raft::Run {
-            seed: report.seed,
-            variants: Variants::default(),
-            policy: report.checked.policy,
-            header: report.checked.run.clone(),
-            records,
-            last_heal: report.checked.last_heal,
-            isolations: report.checked.isolations.clone(),
-            history: Default::default(),
-            clients: Default::default(),
-            ranges: report.checked.ranges.clone(),
-            key_range: ranges::range_of_key,
-            stopped: None,
-        }),
-        ..report
-    };
-    let violation = forged
+    let violation = over(records)
         .creations_agree()
         .expect_err("a forged floor disagrees with the replicas beside it");
     assert!(
         violation.contains("was created with"),
         "the violation names the descriptors: {violation}"
+    );
+    // A creation whose generation and voters disagree: the rest of the descriptor
+    // check 7 compares, which a check that compared the span and the floor alone
+    // would pass.
+    let mut records = report.records().to_vec();
+    let forged = records
+        .iter_mut()
+        .find_map(|record| match &mut record.event {
+            TraceEvent::RangeCreated {
+                generation, voters, ..
+            } => {
+                *generation += 1;
+                voters.push(99);
+                Some(())
+            }
+            _ => None,
+        });
+    assert!(forged.is_some(), "the run traced no creation to forge");
+    let violation = over(records)
+        .creations_agree()
+        .expect_err("a forged generation and voters disagree with the replicas beside it");
+    assert!(
+        violation.contains("was created with"),
+        "the violation names the descriptors: {violation}"
+    );
+    // A creation by something other than the bootstrap this scenario runs: a split's
+    // or an install's, which this node has no path to and which check 7's later
+    // steps — the ones the stage producing them owes — are what would hold to
+    // account.
+    let mut records = report.records().to_vec();
+    let forged = records
+        .iter_mut()
+        .find_map(|record| match &mut record.event {
+            TraceEvent::RangeCreated { cause, .. } => {
+                *cause = ananke_env::RangeCause::Split;
+                Some(())
+            }
+            _ => None,
+        });
+    assert!(forged.is_some(), "the run traced no creation to forge");
+    let violation = over(records)
+        .creations_agree()
+        .expect_err("a creation this scenario has no path to is caught");
+    assert!(
+        violation.contains("was created by Split"),
+        "the violation names the cause: {violation}"
+    );
+    // One replica created twice: a node that re-bootstrapped a range it already
+    // held, instead of restating it from its store.
+    let mut records = report.records().to_vec();
+    let again = records
+        .iter()
+        .find(|record| matches!(record.event, TraceEvent::RangeCreated { .. }))
+        .cloned()
+        .expect("the run traced a creation to repeat");
+    records.push(again);
+    let violation = over(records)
+        .creations_agree()
+        .expect_err("a replica created twice is caught");
+    assert!(
+        violation.contains("twice"),
+        "the violation says which replica was created twice: {violation}"
     );
 }
 
@@ -639,6 +767,99 @@ fn a_loss_in_the_shared_engine_refuses_the_whole_node_and_reseeds_beside_it() {
     }
 }
 
+/// The survivors' campaign ticks as offsets from the lowest one's, in range order.
+///
+/// Dropping a range takes a store open and a bootstrap creation out of the node's
+/// start, which moves the whole node a fraction of a tick and can carry every one of
+/// its campaigns over a tick boundary together (seed 4 below: all three survivors one
+/// tick earlier, every gap between them the same). The offsets are what the seeds
+/// themselves decide, and the shift is what the start decides.
+fn offsets(ticks: &BTreeMap<u64, u64>) -> Vec<i64> {
+    let base = ticks.values().next().copied().unwrap_or(0);
+    ticks
+        .values()
+        .map(|tick| i64::try_from(*tick).expect("small") - i64::try_from(base).expect("small"))
+        .collect()
+}
+
+#[test]
+fn each_range_draws_its_election_timer_from_its_own_stream() {
+    // What `Environment::range_rng` buys is not that the four timeouts differ — four
+    // draws off one stream differ too, which is why
+    // `the_ranges_of_one_node_draw_their_own_election_timeouts` cannot see the
+    // difference and D-076's review planted exactly that mutation and watched it
+    // live. What it buys is that range r's stream is r's alone: the seed a core is
+    // given is a function of (node, range) and of nothing else, so a range added to
+    // or taken out of the configuration moves no other range's timer relative to its
+    // fellows (D-057, Q13).
+    //
+    // So this asks the node for three of its four ranges and compares the survivors'
+    // election timers with the ones they drew beside the fourth. The range dropped is
+    // the *first*, because four draws off one stream would give the survivors the
+    // node's first three draws where they had its last three; dropping the last would
+    // leave a shared stream looking right.
+    //
+    // The pair (CLAUDE.md:52-57) is `OneSeedForEveryCore` beside it, the node with
+    // D-057's keying abandoned: the same two runs, and its survivors' timers move
+    // against each other. Measured before asserted (D-061): on each of seeds 1 to 4
+    // the correct node's survivors keep every gap exactly, and the variant's move on
+    // every one of the four.
+    let for_ = std::time::Duration::from_millis(600);
+    let four = ranges::ranges();
+    let three: Vec<_> = four.iter().skip(1).cloned().collect();
+    let one_seed = NodeVariants::of(&[NodeVariant::OneSeedForEveryCore]);
+    let survivors: Vec<u64> = three.iter().map(|range| range.id.get()).collect();
+    let of = |ticks: &BTreeMap<u64, u64>| {
+        let kept: BTreeMap<u64, u64> = ticks
+            .iter()
+            .filter(|(range, _)| survivors.contains(range))
+            .map(|(range, tick)| (*range, *tick))
+            .collect();
+        offsets(&kept)
+    };
+    for seed in 1..=4 {
+        let with_four = ranges::first_campaign_ticks(&ranges::alone(seed, for_));
+        let with_three = ranges::first_campaign_ticks(&ranges::alone_of(
+            seed,
+            for_,
+            three.clone(),
+            NodeVariants::correct(),
+        ));
+        println!(
+            "ranges: seed {seed} campaign ticks with four ranges {with_four:?}, with three \
+             {with_three:?}"
+        );
+        assert_eq!(
+            with_three.len(),
+            three.len(),
+            "seed {seed}: the node of three ranges campaigned with {with_three:?}"
+        );
+        assert_eq!(
+            of(&with_three),
+            of(&with_four),
+            "seed {seed}: the node's three ranges drew {with_three:?} without range \
+             {} and {with_four:?} with it, so a range's timer is not its own",
+            four[0].id.get()
+        );
+        // The pair: the same two runs on the node that seeds every core off one
+        // stream, where taking a range out shifts every other range's draw.
+        let buggy_four =
+            ranges::first_campaign_ticks(&ranges::alone_of(seed, for_, four.clone(), one_seed));
+        let buggy_three =
+            ranges::first_campaign_ticks(&ranges::alone_of(seed, for_, three.clone(), one_seed));
+        println!(
+            "ranges: seed {seed} under OneSeedForEveryCore {buggy_four:?} then {buggy_three:?}"
+        );
+        assert_ne!(
+            of(&buggy_three),
+            of(&buggy_four),
+            "seed {seed}: a node that seeds every core off one stream kept its survivors' \
+             timers ({buggy_four:?} then {buggy_three:?}), so this check does not say what \
+             it is for"
+        );
+    }
+}
+
 /// The second question D-066 answers, which the scenario above cannot ask: once a node
 /// has re-seeded, which directory does its *next start* open?
 ///
@@ -689,5 +910,89 @@ fn a_restarted_node_opens_the_directory_its_reseed_built_and_is_not_refused_agai
         read.failures.is_empty(),
         "the restarted node runs: {:?}",
         read.failures
+    );
+}
+
+/// The pair rule again, for the path this node does **not** have: a core that asks
+/// for a snapshot action fails the run, naming the slice that owes it.
+///
+/// `Report::check` said this absence was asserted and it was not: the node counted
+/// the dropped action in `Gaps`, which nothing outside the node can read, and the
+/// check looked for a `RaftSnapshot` record this node only emits when it restates a
+/// snapshot already on disk — a record it can never write. D-076's review set the
+/// scenario's threshold to twelve, so that every core crossed it and asked for takes
+/// the host dropped, and all three test targets stayed green. Here is that run, with
+/// the action traced.
+#[test]
+fn a_core_that_asks_for_a_snapshot_action_fails_the_run() {
+    // The correct scenario keeps its cores below the threshold, and passes.
+    correct(1)
+        .check()
+        .expect("the scenario's own threshold is never reached");
+    // Twelve entries is under any range's share of one run's writes, so every core
+    // asks — and the node has nowhere to send the request.
+    let report = ranges::asking_for_snapshots(1, 12);
+    let violation = report
+        .check()
+        .expect_err("a snapshot action this node drops is not caught");
+    println!("ranges: a core asking for a snapshot action gives: {violation}");
+    assert!(
+        violation.contains("asked for the snapshot action"),
+        "the violation names the action dropped: {violation}"
+    );
+    assert!(
+        violation.contains("snapshot` task keyed by range and follower is its own slice's"),
+        "the violation names the slice that owes the path: {violation}"
+    );
+}
+
+/// The pair rule for the registration a refused read leaves behind
+/// (`NodeVariant::RefusedReadLeft`): the node exactly as it was before D-076, whose
+/// `reads` map grows for the life of the run.
+///
+/// D-076 fixed that leak and pinned `Replica::refuse` in a unit case, which is not
+/// the node: D-076's review planted the leak back in `ServerHost::rejected`, left
+/// `refuse` untouched, and every test in the tree stayed green. What sees it now is
+/// `READS_OUTSTANDING` — a replica's registrations bounded on the node's own path —
+/// and this is the run that says so.
+#[test]
+fn a_node_that_leaves_a_refused_reads_registration_behind_is_caught() {
+    let seeds = seeds();
+    let mut caught = 0usize;
+    let results = sweep(seeds, |seed| {
+        let report = ranges::run(
+            seed,
+            Variants::default(),
+            NodeVariants::of(&[NodeVariant::RefusedReadLeft]),
+        );
+        let verdict = report.check();
+        let named = verdict
+            .as_ref()
+            .err()
+            .is_some_and(|violation| violation.contains("registered reads"));
+        (verdict.is_err(), named)
+    });
+    let mut named = 0usize;
+    for (failed, by_the_bound) in &results {
+        caught += usize::from(*failed);
+        named += usize::from(*by_the_bound);
+    }
+    let rate = caught as f64 * 100.0 / seeds as f64;
+    println!(
+        "ranges: RefusedReadLeft caught on {caught}/{seeds} seeds ({rate:.1}%), {named} of them \
+         by the outstanding-reads bound"
+    );
+    // D-061: the rate is measured before it is asserted, and the assertion is made
+    // at the tier the rate supports. The figures are in D-076's entry.
+    assert!(
+        caught > 0,
+        "the node that keeps every read it refuses passed every one of {seeds} seeds"
+    );
+    assert_eq!(
+        named,
+        caught,
+        "{} of the {caught} seeds caught were caught by something other than the \
+         outstanding-reads bound, which is not what this pair is for",
+        caught - named
     );
 }
