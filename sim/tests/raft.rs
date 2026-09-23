@@ -2666,14 +2666,21 @@ fn a_server_whose_refusal_is_not_durable_is_caught() {
     // tier above, and the rate printed at every tier. On the tree with the send
     // queue alone the catch was 16 of the first thousand seeds, none of them below seed
     // 100 (the first at 119); with the key layout and the store's format record
-    // (D-059, D-060) it was 9, the first at seed 158. On this tree, with D-069 having
-    // moved every raft schedule that serves a read, it is 7 of the first thousand,
-    // 0.7 % — seeds 102, 293, 378, 465, 744, 893 and 926 — and the first catch is at
-    // seed 102. At 0.7 % a hundred seeds catch none about half the time
-    // (0.993^100 = 0.49) and the gate's twenty six times in seven, so the assertion
-    // there would fail a tree with nothing wrong on the draw alone; a thousand miss
-    // about once in a thousand (0.993^1000 = 9e-4). Seed 102, the first catch of
-    // the thousand, is pinned with its mechanism at every tier:
+    // (D-059, D-060) it was 9, the first at seed 158. Since D-078 moved every
+    // schedule again it is **58 of the first thousand, 5.8 %**, the first at seed 20,
+    // and every one of the 58 is the `match starts` oracle's rather than state
+    // machine safety's — D-078's own entry says so and D-079 re-measured it, on that
+    // branch and on `main` alike. The 0.7 % this comment argued from, and the seven
+    // seeds it named, are the figures of the tree before D-078.
+    //
+    // At 5.8 % a hundred seeds catch none about once in four hundred
+    // (0.942^100 = 2.5e-3) and the gate's twenty about three times in ten
+    // (0.942^20 = 0.30). So the hundred-seed tier is now comfortably above D-061's
+    // 5 % rule rather than the coin-flip it was, and only the gate's twenty still
+    // needs the pin. **Where the assertion sits is the owner's** (D-056): it stays at
+    // the thousand-seed tier until the owner moves it, and this note records that the
+    // reason for putting it there has gone rather than moving it. Seed 102 is pinned
+    // with its mechanism at every tier:
     // `seed_102_pins_the_refusal_that_is_not_durable_which_a_hundred_seeds_can_miss`.
     // Seeds 119 and 158, which held that pin before and which the moved schedules took
     // the situation off, are kept beside it as asserted absences.

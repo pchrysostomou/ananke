@@ -1509,11 +1509,11 @@ pub fn messages_of(payload: &Bytes) -> Vec<(u64, Message)> {
     }
 }
 
-/// A leader traces one [`TraceEvent::RaftMatchStarted`] per (leader, term,
-/// follower, incarnation): the rule the event's own definition states — the *first*
-/// rise of `matched` under the store incarnation the follower's answer carried
-/// (SHARD.md §8) — folded per run, so that a leader emitting one on every rise is
-/// seen.
+/// A leader traces one [`TraceEvent::RaftMatchStarted`] per (range, leader, term,
+/// follower, incarnation) *per tracking window*: the rule the event's own
+/// definition states — the *first* rise of `matched` under the store incarnation
+/// the follower's answer carried (SHARD.md §8) — folded per run, so that a leader
+/// emitting one on every rise is seen.
 ///
 /// The rule is a *replica's*, and so is every map here: the leader is the record's
 /// node **and the range the record names**, and its term is the latest term record
@@ -1525,23 +1525,73 @@ pub fn messages_of(payload: &Bytes) -> Vec<(u64, Message)> {
 // PROPOSED(D-076): the fold is keyed by `(range, leader, term, follower,
 // incarnation)`.
 ///
-/// The counters cannot see that: dropping the `match_started` clause from the
-/// core's guard raises this sweep's count from 1 840 to 63 164 at a hundred seeds,
-/// on every one of which a match start is still seen, with every seed still green.
-/// Measured on this tree, the mutation planted and this fold silenced. The leader is
-/// the record's node and its term is the latest term record of that node — the core
-/// traces one at every role it takes and the node one at every restatement — and a
-/// leader holds one term for one leadership, so a second record under one key is a
-/// second "first" rise.
+/// A window is one stretch of one replica's leader tracking one follower. It opens
+/// at the leader's term, and where the leader *begins tracking the follower
+/// afresh*: `on_change` re-inserts a `Progress` with `incarnation: None` and
+/// `match_started: false` for every target server outside the voters in force
+/// (core.rs:2074-2103). That is a voter removed and re-added inside one
+/// leadership, which the correct system does and which issue #81 caught on
+/// membership seed 7205 — leader 3 of term 2 grew to {1, 2, 3, 4, 5}, shrank to
+/// {1, 2, 3} and grew again, and server 4's match rose from zero a second time
+/// under the incarnation it had never left.
+///
+/// A change of the follower's incarnation clears the flag too (core.rs:1845), and
+/// that is deliberately *not* a window: it changes the key's own incarnation, so a
+/// repeat under one key means a retired incarnation came back. In the correct
+/// system it cannot — a fresh store is incarnation 1 and a re-seed draws
+/// `next_u64().max(2)` (node.rs:2327) — so a repeat is either D-042's window, a
+/// delayed answer from the store the leader has moved past, which SHARD.md §8 says
+/// is the case D-042 names the step to take for and not a bound to widen, or a
+/// store that lost its state and opened fresh at 1 again. The second is how
+/// `RefusalNotDurable` is caught on 58 of a thousand raft seeds, every one of them
+/// by this fold, which is what `a_server_whose_refusal_is_not_durable_is_caught`
+/// asserts from the thousand-seed tier (D-056).
+///
+/// A fresh tracking is read in the trace by *refining* what SHARD.md §8 recognises
+/// (SHARD.md:1358-1364): §8 takes a `RaftChangeAccepted` of the leader whose
+/// `voters` include `n` as a re-admission on its own, and attaches "while its
+/// configuration in force includes `n`" to its `RaftLeader` alternative instead.
+/// Three conditions narrow that to exactly the accepts at which `on_change`
+/// re-inserts a `Progress`, each one a branch it returns from first:
+///
+/// - The follower is outside the leader's own configuration in force, its latest
+///   `RaftConfig` of that range: `on_change` takes as learners the targets outside
+///   `membership.voters` and no others (core.rs:2074-2077).
+/// - That configuration is not joint: a change accepted with `new_voters` in force
+///   is answered from that branch and never reaches the learners (core.rs:2067).
+/// - The accept is not a repeat of the change already in flight, which the core
+///   holds through its catch-up phase and accepts again without re-tracking
+///   anything (core.rs:2065, D-029) — the scenario's operator repeats it. Two
+///   accepts of one target are one window while no `RaftConfig` of the leader's
+///   and no term record of its own falls between them: `append_joint` traces the
+///   first and ends the phase, and `become_leader` and `become_follower` clear the
+///   change without tracing a configuration at all (core.rs:1410, core.rs:1680),
+///   which the leader's own `RaftTerm` is what shows.
+///
+/// The counters cannot see any of this: dropping the `match_started` clause from
+/// the core's guard raises this sweep's count from 1 840 to 63 164 at a hundred
+/// seeds, on every one of which a match start is still seen, with every seed still
+/// green. Measured on this tree, the mutation planted and this fold silenced.
 ///
 /// # Errors
 ///
 /// The first repeat, naming the leader, the term, the follower and the incarnation.
 // PROPOSED(D-069): `RaftMatchStarted` is the first rise, and this is what says so.
+// PROPOSED(D-079): per tracking window, so that a re-added voter's fresh progress
+// is a fresh first rise (issue #81).
 pub fn match_starts_are_first_rises(records: &[TraceRecord]) -> Result<(), String> {
     let mut terms: BTreeMap<(u64, u64), u64> = BTreeMap::new();
-    let mut started: BTreeSet<(u64, u64, u64, u64, u64)> = BTreeSet::new();
+    // Each replica's configuration as its own `RaftConfig` states it: the voters
+    // in force, and whether it is joint.
+    let mut in_force: BTreeMap<(u64, u64), (BTreeSet<u64>, bool)> = BTreeMap::new();
+    // The voters of the change a leader last accepted with no configuration and no
+    // term record of its own traced since.
+    let mut last_accepted: BTreeMap<(u64, u64), Vec<u64>> = BTreeMap::new();
+    // How many times a leader has begun tracking a follower afresh.
+    let mut windows: BTreeMap<(u64, u64, u64), u64> = BTreeMap::new();
+    let mut started: BTreeSet<(u64, u64, u64, u64, u64, u64)> = BTreeSet::new();
     for record in records {
+        let node = record.node.map_or(0, |node| u64::from(node.get()));
         match &record.event {
             TraceEvent::RaftTerm {
                 server,
@@ -1556,6 +1606,31 @@ pub fn match_starts_are_first_rises(records: &[TraceRecord]) -> Result<(), Strin
                 ..
             } => {
                 terms.insert((*range, *server), *term);
+                // Taking office and stepping down both clear the core's change
+                // (core.rs:1410, core.rs:1680) without tracing a configuration, so
+                // the catch-up phase a repeat would fall in ends here too.
+                last_accepted.remove(&(*range, *server));
+            }
+            TraceEvent::RaftConfig {
+                server,
+                range,
+                old,
+                joint,
+                ..
+            } => {
+                in_force.insert((*range, *server), (old.iter().copied().collect(), *joint));
+                last_accepted.remove(&(*range, *server));
+            }
+            TraceEvent::RaftChangeAccepted { range, voters, .. } => {
+                if let Some((voters_in_force, joint)) = in_force.get(&(*range, node))
+                    && !joint
+                    && last_accepted.get(&(*range, node)) != Some(voters)
+                {
+                    for follower in voters.iter().filter(|s| !voters_in_force.contains(s)) {
+                        *windows.entry((*range, node, *follower)).or_default() += 1;
+                    }
+                }
+                last_accepted.insert((*range, node), voters.clone());
             }
             TraceEvent::RaftMatchStarted {
                 range,
@@ -1564,13 +1639,17 @@ pub fn match_starts_are_first_rises(records: &[TraceRecord]) -> Result<(), Strin
                 matched,
                 ..
             } => {
-                let leader = record.node.map_or(0, |node| u64::from(node.get()));
-                let term = terms.get(&(*range, leader)).copied().unwrap_or_default();
-                if !started.insert((*range, leader, term, *follower, *incarnation)) {
+                let term = terms.get(&(*range, node)).copied().unwrap_or_default();
+                let window = windows
+                    .get(&(*range, node, *follower))
+                    .copied()
+                    .unwrap_or_default();
+                if !started.insert((*range, node, term, *follower, *incarnation, window)) {
                     return Err(format!(
-                        "match starts: leader {leader} of term {term} of group {range} traced a \
+                        "match starts: leader {node} of term {term} of group {range} traced a \
                          second first rise of {follower}'s match under incarnation \
-                         {incarnation} (at {matched})"
+                         {incarnation} (at {matched}), with nothing between them that began \
+                         the tracking afresh"
                     ));
                 }
             }
@@ -7096,6 +7175,302 @@ mod tests {
                 "liveness: no client write to k1 completed after the last heal at Instant(0ns)"
                     .to_owned()
             )
+        );
+    }
+
+    /// Records of leader 3 in term 2, one event a millisecond in the order given.
+    fn led_by_three(events: Vec<TraceEvent>) -> Vec<TraceRecord> {
+        traced_by(events.into_iter().map(|event| (3, event)).collect())
+    }
+
+    /// The same, with the node that traced each record named: the maps this fold
+    /// keeps are a *replica's*, so a second server's records are what tells them
+    /// from one map held for the cluster.
+    fn traced_by(events: Vec<(u64, TraceEvent)>) -> Vec<TraceRecord> {
+        let start = record(ms(0), ms(0), Some(3), term_of(3, SINGLE_GROUP, 2, "leader"));
+        std::iter::once(start)
+            .chain(events.into_iter().enumerate().map(|(i, (node, event))| {
+                let at = ms(u64::try_from(i).expect("few") + 1);
+                record(at, at, Some(node), event)
+            }))
+            .collect()
+    }
+
+    /// A server's record of the configuration in force: joint where `new` is given.
+    fn config_of(server: u64, old: &[u64], new: &[u64]) -> TraceEvent {
+        config_in(SINGLE_GROUP, server, old, new)
+    }
+
+    fn config_in(range: u64, server: u64, old: &[u64], new: &[u64]) -> TraceEvent {
+        TraceEvent::RaftConfig {
+            server,
+            range,
+            index: 0,
+            old: old.to_vec(),
+            new: new.to_vec(),
+            joint: !new.is_empty(),
+            learners: Vec::new(),
+        }
+    }
+
+    fn change_accepted(voters: &[u64]) -> TraceEvent {
+        change_accepted_in(SINGLE_GROUP, voters)
+    }
+
+    fn change_accepted_in(range: u64, voters: &[u64]) -> TraceEvent {
+        TraceEvent::RaftChangeAccepted {
+            range,
+            voters: voters.to_vec(),
+            applied: 0,
+            term: 2,
+        }
+    }
+
+    fn match_started(follower: u64, incarnation: u64, matched: u64) -> TraceEvent {
+        match_started_in(SINGLE_GROUP, follower, incarnation, matched)
+    }
+
+    fn match_started_in(range: u64, follower: u64, incarnation: u64, matched: u64) -> TraceEvent {
+        TraceEvent::RaftMatchStarted {
+            range,
+            follower,
+            incarnation,
+            matched,
+        }
+    }
+
+    fn progress_reset(server: u64, follower: u64, incarnation: u64) -> TraceEvent {
+        TraceEvent::RaftProgressReset {
+            server,
+            range: SINGLE_GROUP,
+            follower,
+            incarnation,
+        }
+    }
+
+    /// The violation names the leader, its term, the follower and the incarnation.
+    fn a_second_first_rise(records: &[TraceRecord], of: &str) -> bool {
+        match_starts_are_first_rises(records).is_err_and(|violation| {
+            violation.contains("leader 3 of term 2") && violation.contains(of)
+        })
+    }
+
+    /// Issue #81: a voter removed and re-added inside one leadership is tracked
+    /// afresh — `on_change` re-inserts its `Progress` with `match_started: false`
+    /// — so its match rises from zero again under the incarnation it never left,
+    /// and that rise is a first rise. Two rises inside one window are not, which
+    /// is what the check is for: this is the pair, and the membership scenario's
+    /// seed 7205 is the run that made the first half of it.
+    // PROPOSED(D-079): a first rise per tracking window.
+    #[test]
+    fn a_voter_re_added_inside_one_term_starts_its_match_afresh() {
+        let re_added = led_by_three(vec![
+            config_of(3, &[1, 2, 3], &[]),
+            change_accepted(&[1, 2, 3, 4]),
+            match_started(4, 1, 10),
+            config_of(3, &[1, 2, 3, 4], &[]),
+            // The shrink drops 4; the grow after it tracks 4 from nothing again.
+            change_accepted(&[1, 2, 3]),
+            config_of(3, &[1, 2, 3], &[]),
+            change_accepted(&[1, 2, 3, 4]),
+            match_started(4, 1, 20),
+        ]);
+        assert_eq!(match_starts_are_first_rises(&re_added), Ok(()));
+
+        let continuous = led_by_three(vec![
+            config_of(3, &[1, 2, 3, 4], &[]),
+            match_started(4, 1, 10),
+            match_started(4, 1, 20),
+        ]);
+        assert!(
+            a_second_first_rise(&continuous, "4's match under incarnation 1"),
+            "one continuous rise traced as two first rises must fail the check"
+        );
+    }
+
+    /// A re-add opens the window of the server re-added and of no other: 5
+    /// rejoining excuses nothing of 4's, which the leader never stopped tracking.
+    // PROPOSED(D-079): a first rise per tracking window.
+    #[test]
+    fn a_re_add_opens_the_window_of_the_server_re_added_alone() {
+        let records = led_by_three(vec![
+            config_of(3, &[1, 2, 3, 4], &[]),
+            match_started(4, 1, 10),
+            change_accepted(&[1, 2, 3, 4, 5]),
+            match_started(5, 1, 15),
+            match_started(4, 1, 20),
+        ]);
+        assert!(
+            a_second_first_rise(&records, "4's match under incarnation 1"),
+            "5's re-add must not excuse a second first rise of 4's match"
+        );
+    }
+
+    /// One catch-up phase is one window. The operator repeats its request while
+    /// the change is in flight and the leader accepts it again (D-029), holding
+    /// the change it already has and tracking nothing afresh: only a
+    /// configuration of the leader's own ends the phase.
+    // PROPOSED(D-079): a first rise per tracking window.
+    #[test]
+    fn a_request_repeated_inside_one_catch_up_phase_is_one_window() {
+        let records = led_by_three(vec![
+            config_of(3, &[1, 2, 3], &[]),
+            change_accepted(&[1, 2, 3, 4]),
+            match_started(4, 1, 10),
+            change_accepted(&[1, 2, 3, 4]),
+            match_started(4, 1, 20),
+        ]);
+        assert!(
+            a_second_first_rise(&records, "4's match under incarnation 1"),
+            "a repeat of the change in flight tracks nothing afresh"
+        );
+    }
+
+    /// A change accepted while a joint configuration is in force tracks nothing
+    /// afresh either: `on_change` answers from its `new_voters` branch and
+    /// returns before it reaches the learners.
+    // PROPOSED(D-079): a first rise per tracking window.
+    #[test]
+    fn a_change_accepted_under_a_joint_configuration_opens_no_window() {
+        let records = led_by_three(vec![
+            config_of(3, &[1, 2, 3], &[1, 2, 3, 4]),
+            match_started(4, 1, 10),
+            change_accepted(&[1, 2, 3, 4]),
+            match_started(4, 1, 20),
+        ]);
+        assert!(
+            a_second_first_rise(&records, "4's match under incarnation 1"),
+            "a change accepted under the joint configuration tracks nothing afresh"
+        );
+    }
+
+    /// An incarnation carried back is a second first rise and stays one, reset or
+    /// no reset. A leader forgets a follower's progress at every change of its
+    /// incarnation (D-042), so the core does trace a first rise after one; but the
+    /// incarnation is in the key, and the correct system never returns to a number
+    /// it has retired — a fresh store is 1 and a re-seed draws above it. A repeat
+    /// under one incarnation is therefore either D-042's one-message window, which
+    /// SHARD.md §8 asks to be shown rather than allowed, or a store that lost its
+    /// state and opened fresh at 1 again, which is `RefusalNotDurable`.
+    // PROPOSED(D-079): a first rise per tracking window.
+    #[test]
+    fn an_incarnation_carried_back_is_a_second_first_rise() {
+        let there_and_back = led_by_three(vec![
+            config_of(3, &[1, 2, 3, 4], &[]),
+            match_started(4, 1, 10),
+            progress_reset(3, 4, 2),
+            match_started(4, 2, 20),
+            progress_reset(3, 4, 1),
+            match_started(4, 1, 30),
+        ]);
+        assert!(
+            a_second_first_rise(&there_and_back, "4's match under incarnation 1"),
+            "an incarnation the leader had already retired came back: D-042's case, not a window"
+        );
+    }
+
+    /// A term record of the leader's own ends the catch-up phase, as a
+    /// configuration of its own does. `become_leader` and `become_follower` clear
+    /// the core's change (core.rs:1680, core.rs:1410) and trace a role, not a
+    /// configuration, so a leader that accepts a grow, loses the lead and takes it
+    /// again re-tracks the same followers with no `RaftConfig` of its own between
+    /// the two accepts. Reading only the configuration made the fold open one
+    /// window where the core made two, on **2 of 11 220** re-tracks over seeds 0 to
+    /// 3 000 (seeds 659 and 7123).
+    ///
+    /// That staleness was in the strict direction — fewer windows are more
+    /// collisions — and the real shape carries a term rise with it, so the key's
+    /// own term already told the two rises apart and no verdict was ever wrong.
+    /// The case therefore holds the term still, with a restatement rather than an
+    /// election, so that the clearing is asserted at all rather than masked by the
+    /// term in the key.
+    // PROPOSED(D-079): a first rise per tracking window.
+    #[test]
+    fn a_term_record_of_the_leaders_own_ends_the_catch_up_phase() {
+        let restated = led_by_three(vec![
+            config_of(3, &[1, 2, 3], &[]),
+            change_accepted(&[1, 2, 3, 4]),
+            match_started(4, 1, 10),
+            // The core this leader runs on is rebuilt and restates its term: its
+            // change went with it, so the accept that follows tracks 4 afresh.
+            TraceEvent::RaftRecovered {
+                server: 3,
+                range: SINGLE_GROUP,
+                term: 2,
+                applied: 0,
+                last_index: 0,
+                incarnation: 1,
+            },
+            change_accepted(&[1, 2, 3, 4]),
+            match_started(4, 1, 20),
+        ]);
+        assert_eq!(match_starts_are_first_rises(&restated), Ok(()));
+    }
+
+    /// The configuration a window is read against is the *leader's own*. A
+    /// follower restating a configuration the leader has left behind must not open
+    /// the leader's window: 4 is a voter of leader 3's configuration throughout, so
+    /// the accept that names it tracks nothing afresh and the second rise is a
+    /// second first rise.
+    // PROPOSED(D-079): a first rise per tracking window.
+    #[test]
+    fn a_followers_configuration_opens_no_window_of_the_leaders() {
+        let records = traced_by(vec![
+            (3, config_of(3, &[1, 2, 3, 4], &[])),
+            (3, match_started(4, 1, 10)),
+            // Server 1 is behind and still says {1, 2, 3}. It is not the leader.
+            (1, config_of(1, &[1, 2, 3], &[])),
+            (3, change_accepted(&[1, 2, 3, 4])),
+            (3, match_started(4, 1, 20)),
+        ]);
+        assert!(
+            a_second_first_rise(&records, "4's match under incarnation 1"),
+            "a follower's stale configuration must not open the leader's window"
+        );
+    }
+
+    /// The catch-up phase a repeat falls in is the *leader's own* too: another
+    /// server's configuration is not the end of it, so the leader's repeat of the
+    /// change it already holds still tracks nothing afresh.
+    // PROPOSED(D-079): a first rise per tracking window.
+    #[test]
+    fn a_followers_configuration_does_not_end_the_leaders_catch_up_phase() {
+        let records = traced_by(vec![
+            (3, config_of(3, &[1, 2, 3], &[])),
+            (3, change_accepted(&[1, 2, 3, 4])),
+            (3, match_started(4, 1, 10)),
+            // Server 1 takes the joint entry and traces its own configuration.
+            (1, config_of(1, &[1, 2, 3], &[1, 2, 3, 4])),
+            (3, change_accepted(&[1, 2, 3, 4])),
+            (3, match_started(4, 1, 20)),
+        ]);
+        assert!(
+            a_second_first_rise(&records, "4's match under incarnation 1"),
+            "another server's configuration must not end the leader's catch-up phase"
+        );
+    }
+
+    /// Every map here is a replica's, the windows included: a change accepted in
+    /// one range tracks nothing afresh in another, and must not forgive a repeat
+    /// there. D-069's key was range-blind in the *strict* direction — one node's
+    /// four ranges collapsed into one key — and D-076 fixed that; window state
+    /// keyed by the node alone would be range-blind in the *lax* direction, which
+    /// is the one that lets a repeat through.
+    // PROPOSED(D-079): a first rise per tracking window.
+    #[test]
+    fn a_change_accepted_in_one_range_opens_no_window_in_another() {
+        let records = led_by_three(vec![
+            config_of(3, &[1, 2, 3, 4], &[]),
+            config_in(OTHER, 3, &[1, 2, 3], &[]),
+            match_started(4, 1, 10),
+            // A genuine re-add of 4, in the other range and in that range alone.
+            change_accepted_in(OTHER, &[1, 2, 3, 4]),
+            match_started_in(OTHER, 4, 1, 15),
+            match_started(4, 1, 20),
+        ]);
+        assert!(
+            a_second_first_rise(&records, &format!("of group {SINGLE_GROUP} traced")),
+            "a window opened in one range must not forgive a repeat in another"
         );
     }
 
