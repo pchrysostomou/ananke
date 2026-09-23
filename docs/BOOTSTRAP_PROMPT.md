@@ -121,21 +121,42 @@ _Update this section at the end of every session._
   slice's own variant translation and the review found it: the node's take did not empty
   its version directory, so `SharedSnapshotDir`'s re-take *failed* instead of rewriting
   and every fold of its symptom read zero. With it fixed the variant's fault fires on every seed and its
-  wedge is caught by the liveness check on 30 of 100 — where one group's is 4 of 10 000
+  wedge is caught by the liveness check on 30 of 100 — 26 of 100 after the merge below,
+  where one group's is 4 of 10 000
   — so it is asserted at Phase 2's own tiers and no stronger. With the five fixed the
   correct node passes every seed at the gate's twenty and CI's hundred, over 5 912
-  snapshot actions at a hundred seeds (59.1 a seed, fewest on any one seed 30). `Cluster::OneGroup` is untouched: seed 42's JSONL still hashes to
+  snapshot actions at a hundred seeds (59.1 a seed, fewest on any one seed 30; 5 849,
+  58.5 and 27 after the merge below). `Cluster::OneGroup` is untouched: seed 42's JSONL still hashes to
   `445f970010f9d493d489d7627543b77cccba863cb5675af4602686f5de182217`.
   **The variant tiers go to the owner**: `SnapshotWithoutCurrentLast` is caught on 0/100
   and 0/1 000 with its arm firing on 0/100 and 1/1 000, so its catch is not re-asserted
   and its one arm assertion moves to ten thousand — **nothing below the nightly asserts
   that variant**; `SharedSnapshotDir`'s
-  fault fires on every seed and is asserted at every tier, its liveness catch (30/100)
-  sits at Phase 2's own ten thousand, and two assertions move up on this cluster's
-  measured rates — the scramble (17/100) to a thousand and the aimed arm (1/100, 21 of
-  1 000) to ten thousand; and
+  fault fires on every seed and is asserted at every tier, its liveness catch (30/100,
+  26/100 after the merge below) sits at Phase 2's own ten thousand, and two assertions
+  move up on this cluster's measured rates — the scramble (17/100, 29/100 after the
+  merge, at which Phase 2's hundred-seed tier would hold: to the owner) to a thousand
+  and the aimed arm (1/100, 21 of 1 000) to ten thousand; and
   `IgnoreIncarnation` and the pair are blocked on PR #86's whole-node refusal, since a
   live install deliberately keeps a store's incarnation and only a re-seed changes one.
+
+- Merge update (2026-09-23): branch `phase-3-stage-b-stream-variants` merged its base
+  `phase-3-stage-b-wiring` to resolve PR #109's conflicts, carrying in D-077's
+  whole-node re-seed, D-080's linearizability change, D-082's verification pass and
+  D-083's adversarial-review fixes. The one code conflict is `Task::open`: the base made
+  it require a **complete** checkpoint and made the node's take write D-060's checkpoint
+  record; this branch rewrote the same lookup as `ananke_shard::snapshot::find_version`,
+  keyed by range and by the index the core asked for. The merged code keeps
+  `find_version` and D-083's completeness holds inside it — it is checked on every
+  candidate, not on the record's directory alone — so an incomplete version is skipped
+  for a complete take of the same index and answered with `retake` when there is none.
+  Four of D-082's six `*_is_not_re_asserted_on_the_node_yet` tests are superseded by
+  this branch's four real assertions, as D-082 said they should be, and their shard rows
+  go with them; `AdoptionAsBuilt` and `RefusalNotDurable` keep theirs. The four
+  `SharedSnapshotDir` rates were re-run on the merged tree at the share of 100: fault
+  100/100 and arm 1/100 unmoved, scramble 17 → 29/100, catch 30 → 26/100. The correct
+  node's own asks moved with them — 5 849 over 100 seeds against 5 912, 58.5 a seed
+  against 59.1 — and the take-counter property it stands on is unmoved at 0 of 100.
 
 - Merge update (2026-09-22): branch `phase-3-stage-b-compaction` merged `origin/main`
   to resolve PR conflicts, carrying in PROPOSED D-073 and D-074 from main and keeping

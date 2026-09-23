@@ -55,23 +55,26 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::net::SocketAddr;
+use std::ops::Range as KeyRange;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use ananke_env::{
     Clock, Either, Environment, File, FileSystem, MAX_FRAME_LEN, Network, OpenOptions, Socket,
-    TraceEvent, race,
+    StartOver, TraceEvent, race,
 };
+use ananke_raft::apply::user_key;
 use ananke_raft::core::{RaftConfig, SnapshotAction};
 use ananke_raft::message::{Frame, Message, SnapshotStatus};
 use ananke_raft::queue::Queue;
 use ananke_raft::snapshot::{self, Repair, Sender};
-use ananke_raft::store::RaftStore;
+use ananke_raft::store::{PURPOSE_LOG, RaftStore};
 use ananke_raft::types::{Configuration, Index, ServerId, Term};
 use bytes::Bytes;
 
 use crate::range::RangeId;
+use crate::server::Range;
 use crate::snapshot::{Identity, Install, Landing, Route, Snapshots, Started};
 use crate::variant::{NodeVariant, NodeVariants};
 
@@ -259,6 +262,11 @@ pub struct Task<E: Environment> {
     config: RaftConfig,
     variants: NodeVariants,
     engine_dir: PathBuf,
+    ranges: Vec<Range>,
+    /// Shared with the `apply` task: a live install moves a range's applied index,
+    /// term and configuration without an apply, and both tasks read this.
+    // PROPOSED(D-083): a live install moves the apply task's state with it.
+    applied: Arc<std::sync::Mutex<BTreeMap<RangeId, crate::server::Applied>>>,
     plan: Snapshots,
     local: Queue<crate::server::Local>,
     snaps: Queue<SnapJob>,
@@ -283,6 +291,8 @@ impl<E: Environment> Task<E> {
         config: RaftConfig,
         variants: NodeVariants,
         engine_dir: PathBuf,
+        ranges: Vec<Range>,
+        applied: Arc<std::sync::Mutex<BTreeMap<RangeId, crate::server::Applied>>>,
         plan: Snapshots,
         local: Queue<crate::server::Local>,
         snaps: Queue<SnapJob>,
@@ -296,6 +306,8 @@ impl<E: Environment> Task<E> {
             config,
             variants,
             engine_dir,
+            ranges,
+            applied,
             plan,
             local,
             snaps,
@@ -436,6 +448,24 @@ impl<E: Environment> Task<E> {
         // the store compacted without checkpointing (D-065, D-078), or a crash landed
         // between the record and the checkpoint — is not a stream to open but a take to
         // ask for, which `retake` does.
+        //
+        // **Complete is D-083's requirement and `find_version` is where it is now
+        // enforced**, on every candidate it considers rather than on the record's
+        // directory alone. The record is written *before* the checkpoint under it
+        // (RAFT.md §1, D-036), so a record naming a version is not a promise the
+        // version is there yet, and opening a half-written one is not a slow start but
+        // a permanent one: `Sender::open` lists the directory once and keeps that list
+        // for the stream's life, so a stream opened on a directory holding one table
+        // streams that table, says `done`, and hands the receiver a staged directory
+        // with no `CURRENT` that `open_span_source` refuses — for ever, because the
+        // identity never changes and the sender is never re-opened. Eleven seeds in two
+        // hundred and fifty lost an install to exactly that (D-083). `find_version`
+        // calls `ananke_raft::snapshot::checkpoint_complete` on each candidate and
+        // returns only one that passes, so the incomplete directory is skipped for a
+        // complete take of the same index where there is one and answered with `retake`
+        // where there is not — which is D-083's answer, reached by a lookup that can
+        // also see past the record.
+        // PROPOSED(D-083): a stream opens only a complete version.
         //
         // **It is emphatically not the store's snapshot record**, and PROPOSED D-086
         // tried both of the other readings first. Matching the record's index *exactly*
@@ -594,19 +624,38 @@ impl<E: Environment> Task<E> {
                 // not one of them: nothing was written and no other assembly was
                 // disturbed. The sender restarts, and takes a slot the next time it
                 // asks while one is free (D-075).
-                let answer = snapshot::start_over(store.term(), (last_index, last_term));
-                self.answer(range, from, answer, store.incarnation()).await;
+                self.start_over(
+                    range,
+                    from,
+                    StartOver::Cap,
+                    store.term(),
+                    (last_index, last_term),
+                )
+                .await;
             }
             Landing::Restarted { dir, .. } => {
                 self.clear(&dir).await;
                 self.receiving.insert((range, from), Inbound::default());
-                let answer = snapshot::start_over(store.term(), (last_index, last_term));
-                self.answer(range, from, answer, store.incarnation()).await;
+                self.start_over(
+                    range,
+                    from,
+                    StartOver::Identity,
+                    store.term(),
+                    (last_index, last_term),
+                )
+                .await;
             }
             Landing::Staged { dir, .. } => {
                 if self.stage(&dir, &file, offset, &data).await.is_err() {
-                    let answer = snapshot::start_over(store.term(), (last_index, last_term));
-                    return self.answer(range, from, answer, store.incarnation()).await;
+                    return self
+                        .start_over(
+                            range,
+                            from,
+                            StartOver::Unusable,
+                            store.term(),
+                            (last_index, last_term),
+                        )
+                        .await;
                 }
                 let inbound = self.receiving.entry((range, from)).or_default();
                 advance(inbound, &file, offset, total, data.len());
@@ -620,8 +669,15 @@ impl<E: Environment> Task<E> {
                     .await
                     .is_err()
                 {
-                    let answer = snapshot::start_over(store.term(), (last_index, last_term));
-                    return self.answer(range, from, answer, store.incarnation()).await;
+                    return self
+                        .start_over(
+                            range,
+                            from,
+                            StartOver::Unusable,
+                            store.term(),
+                            (last_index, last_term),
+                        )
+                        .await;
                 }
                 self.receiving.entry((range, from)).or_default().pending = Some(install);
                 // The `raft` task holds the range and builds the repair from its core;
@@ -713,6 +769,24 @@ impl<E: Environment> Task<E> {
         let Some(store) = self.stores.get(&range).cloned() else {
             return self.abandon(range, from).await;
         };
+        // The store may have caught up while the repair was being built: the one-group
+        // server cannot have this window, because it quiesces its `apply` task before
+        // it decides (node.rs, `install_decision`), and the node's hold stops the
+        // *core* rather than the `apply` task, so a job queued before the hold can
+        // still land. Its rule applies here unchanged — "the store already holds
+        // everything the snapshot carries: answer installed without switching" — and
+        // applied at the switch rather than only at the chunk, which is where the
+        // window actually is. Switching anyway would take the store backwards.
+        // PROPOSED(D-083): the switch re-checks what the chunk path checks.
+        if store.applied() >= install.at.last_index {
+            self.clear(&install.source).await;
+            self.plan.finish(range, from);
+            self.receiving.remove(&(range, from));
+            let answer =
+                snapshot::installed(repair.term, (install.at.last_index, install.at.last_term));
+            self.answer(range, from, answer, store.incarnation()).await;
+            return self.release(range);
+        }
         // D-047: the install is decided when the task takes the repair; it is traced
         // once the manifest switch that carries it is durable.
         let installing = self.env.decision();
@@ -786,9 +860,34 @@ impl<E: Environment> Task<E> {
         if switched.is_err() {
             return self.restart(range, from, &install, &store).await;
         }
+        // The switch moved this range's applied index, its term and the configuration
+        // in force, without an apply: the store's cached index and the `apply` task's
+        // own state are both the replaced replica's until they are told. The first
+        // showed up as an install reporting `applied 0` at snapshot 48; the second
+        // would have had the next take of this range write a record with the old
+        // replica's term and configuration in it.
+        // PROPOSED(D-083): a live install moves the applied state with it.
+        store.installed_at(install.at.last_index);
+        if let Ok(mut applied) = self.applied.lock() {
+            applied.insert(
+                range,
+                crate::server::Applied {
+                    index: install.at.last_index,
+                    term: install.at.last_term,
+                    config: config.clone(),
+                },
+            );
+        }
         self.clear_staging(&install.source).await;
         self.plan.finish(range, from);
         self.receiving.remove(&(range, from));
+        // What actually landed, read back from the engine before this range is let go
+        // again, so a check can compare it with what the take that fed it put in.
+        // Counting events says a stream flowed; it says nothing about what is in the
+        // store, and a take that dropped the range's user keys produces exactly the
+        // same events as a correct one (D-083).
+        // PROPOSED(D-083): what an install installed is read back and traced.
+        self.state_of(range, install.at, &store).await;
         self.env.trace_decided(
             installing,
             TraceEvent::RaftSnapshot {
@@ -829,9 +928,22 @@ impl<E: Environment> Task<E> {
         self.clear(&install.source).await;
         self.plan.finish(range, from);
         self.receiving.remove(&(range, from));
-        let answer =
-            snapshot::start_over(store.term(), (install.at.last_index, install.at.last_term));
-        self.answer(range, from, answer, store.incarnation()).await;
+        self.start_over(
+            range,
+            from,
+            StartOver::Unusable,
+            store.term(),
+            (install.at.last_index, install.at.last_term),
+        )
+        .await;
+        self.local
+            .push(crate::server::Local::Snapshot(SnapAnswer::Abandoned {
+                range,
+            }));
+    }
+
+    /// Lets a held range go without a switch.
+    fn release(&self, range: RangeId) {
         self.local
             .push(crate::server::Local::Snapshot(SnapAnswer::Abandoned {
                 range,
@@ -916,6 +1028,88 @@ impl<E: Environment> Task<E> {
         for name in swept_on_install(source, &names, self.variants) {
             self.clear(&self.engine_dir.join(name)).await;
         }
+    }
+
+    /// Reads a range's replica back out of the engine and traces what it holds.
+    ///
+    /// Called at the two points where a range's state is claimed to be a snapshot's:
+    /// the take that writes one, and the live install that lands one. Pairing the two
+    /// by `(range, last_index, last_term)` is what lets a check say the bytes that
+    /// landed are the bytes that were taken — which no count of events can say.
+    // PROPOSED(D-083): what an install installed is read back and traced.
+    async fn state_of(&self, range: RangeId, at: Identity, store: &RaftStore<E>) {
+        let Some(spans) = self.user_span(range) else {
+            return;
+        };
+        let version = store.engine().snapshot();
+        let Ok(user) = store
+            .engine()
+            .scan(&spans.start[..]..&spans.end[..], &version)
+            .await
+        else {
+            return;
+        };
+        let log_span = store.prefix().purpose_span(PURPOSE_LOG);
+        let log = store
+            .engine()
+            .scan(&log_span.start[..]..&log_span.end[..], &version)
+            .await
+            .unwrap_or_default();
+        drop(version);
+        // Order-independent so the digest does not depend on how the scan happened to
+        // walk, and so two replicas of one range agree when they hold the same keys.
+        let digest = user.iter().fold(0u64, |acc, (key, value)| {
+            acc.wrapping_add(fnv(key).rotate_left(1) ^ fnv(value))
+        });
+        self.env.trace(TraceEvent::RaftSnapshotState {
+            server: self.id.0,
+            range: range.get(),
+            last_index: at.last_index,
+            last_term: at.last_term,
+            applied: store.applied(),
+            user_keys: user.len() as u64,
+            user_digest: digest,
+            log_keys: log.len() as u64,
+        });
+    }
+
+    /// The range's user-key interval, from the ranges configuration.
+    fn user_span(&self, range: RangeId) -> Option<KeyRange<Bytes>> {
+        self.ranges
+            .iter()
+            .find(|one| one.id == range)
+            .map(|one| user_key(&one.start)..user_key(&one.end))
+    }
+
+    /// Tells a sender to start its stream over, and traces **why** (RAFT.md:203-212).
+    ///
+    /// The node says this for conditions that mean different things — a changed
+    /// identity, no slot under the receive cap, staged bytes it could not use — and
+    /// the message carries only `SnapshotStatus::Restart`, which cannot tell them
+    /// apart. The trace can, and now does. Until it did, a run whose streams restarted
+    /// six hundred times and one whose streams restarted none produced the same trace,
+    /// which is how a livelock sat under a green check (D-083).
+    // PROPOSED(D-083): the node's start-over is traced, with its reason.
+    async fn start_over(
+        &self,
+        range: RangeId,
+        from: ServerId,
+        reason: StartOver,
+        term: Term,
+        at: (Index, Term),
+    ) {
+        self.env.trace(TraceEvent::RaftSnapshotStartOver {
+            server: self.id.0,
+            range: range.get(),
+            from: from.0,
+            reason,
+        });
+        let incarnation = self
+            .stores
+            .get(&range)
+            .map_or(0, |store| store.incarnation());
+        self.answer(range, from, snapshot::start_over(term, at), incarnation)
+            .await;
     }
 
     /// Answers a sender, stamped with this store's incarnation (D-042).
@@ -1099,6 +1293,16 @@ pub fn job_of(range: RangeId, action: SnapshotAction) -> Option<SnapJob> {
         }),
         SnapshotAction::Take | SnapshotAction::Record => None,
     }
+}
+
+/// A small order-free hash for the state digest: FNV-1a over the bytes.
+///
+/// It is not a cryptographic hash and does not need to be. It exists so two replicas
+/// of one range can be compared in a trace without the trace carrying every value.
+pub(crate) fn fnv(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x1000_0000_01b3)
+    })
 }
 
 #[cfg(test)]

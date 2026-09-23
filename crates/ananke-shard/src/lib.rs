@@ -50,6 +50,12 @@
 //!   (issue #96), and D-066's live install of the range's two spans in one manifest
 //!   switch, with the range held across it and its replica replaced by the one the
 //!   switch built.
+//! - [`mod@reseed`], Q15's whole-node refusal: a loss in the shared engine refuses
+//!   every replica the node holds, and the node re-seeds into a fresh engine in a new
+//!   directory beside the refused one, which stays marked lost and quiesced. This
+//!   module is the naming the two rules that meet there fix — D-041's directory that
+//!   held a store never opening fresh, and D-066's start opening the newest directory
+//!   not marked lost — decided over a listing rather than over a disk.
 //! - [`mod@variant`], the node's known-buggy variants, each a plausible way to get
 //!   the round or the snapshot task wrong, built beside the correct code (CLAUDE.md's
 //!   pair rule).
@@ -63,6 +69,7 @@ pub mod install;
 pub mod node;
 pub mod outbox;
 pub mod range;
+pub mod reseed;
 pub mod round;
 pub mod server;
 pub mod snapshot;
@@ -77,6 +84,9 @@ pub use node::{
 };
 pub use outbox::{Dropped, Outbox, Oversized};
 pub use range::RangeId;
+pub use reseed::{
+    Candidate, generation_dir, generation_of, newest_not_lost, next_generation, reseed_dir,
+};
 pub use round::{Act, Cores, Meters, Round, Stamps};
 pub use server::{Gaps, Local, Range, ServerConfig, ServerHost, run};
 pub use snapshot::{

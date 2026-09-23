@@ -9,7 +9,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use ananke_env::sim::TraceRecord;
-use ananke_env::{ClientOp, DropReason, TraceEvent};
+use ananke_env::{ClientOp, DropReason, Instant, TraceEvent};
 use ananke_raft::core::{Variant, Variants};
 use ananke_raft::invariants::{self, Checker};
 use ananke_raft::store::{LOST_STATE, STORE_MARKER};
@@ -511,6 +511,77 @@ fn seed_5909_passes_under_both_bugs_together_which_is_the_finding() {
             "seed 5909 under {variants:?} no longer leaves exactly {expected_uncounted:?} \
              uncounted after the last heal: re-audit the pin"
         );
+    }
+}
+
+/// The widest set of operation windows open at one instant, on the operations of
+/// one key: how much concurrency the linearizability search must order there. A
+/// pending operation is open to the end of the history.
+// PROPOSED(D-080): the read-only candidates go first, together.
+fn most_open_at_once(ops: &[&ananke_sim::lin::Op]) -> usize {
+    let last = ops.iter().filter_map(|op| op.ret).max();
+    let mut edges: Vec<(Instant, i64)> = Vec::new();
+    for op in ops {
+        edges.push((op.call, 1));
+        edges.push((op.ret.or(last).unwrap_or(op.call), -1));
+    }
+    edges.sort();
+    let (mut open, mut most) = (0i64, 0i64);
+    for (_, step) in edges {
+        open += step;
+        most = most.max(open);
+    }
+    usize::try_from(most).expect("a count of operations")
+}
+
+/// The ten-thousand-seed nightly's seeds 3085 and 4065 (GitHub run 35705563274, on
+/// 7127745): the first correct-server failures that were not violations at all. The
+/// checker reported its own search budget — "332 of 397 operations placed before
+/// the search budget ran out" on 3085's key `"k1"`, 376 of 438 on 4065's `"k0"` —
+/// and both histories are in fact linearizable (issue #82).
+///
+/// The search branched over every candidate. A window of *w* concurrent reads of
+/// one value is then 2^w different sets of linearized operations, all at the same
+/// register value, and the memo cannot collapse them because they are genuinely
+/// different sets. 3085's `"k1"` holds 397 operations, 199 of them gets, 20 windows
+/// open at once at the widest; 4065's `"k0"` holds 438, 244 gets, 22 open. Measured
+/// on 7127745, the search expanded 296 345 and 287 535 states before the 2 000 000
+/// budget ran out; a throwaway copy with the budget raised decided 3085 at
+/// 4 000 000 states and 4065 at 400 000 000. D-080 commits every read-only
+/// candidate outright, keeping no branch point, and the two decide at 383 and 408
+/// states — beside a worst key of 778 over seeds 0..1000.
+///
+/// The pin asserts the mechanism and not the green: each key must still hold the
+/// window of concurrent reads that the reduction is what carries. The day a
+/// schedule moves that window away the assertion says so, and the pin should be
+/// re-audited against a seed that still reaches it rather than quietly kept.
+#[test]
+fn seeds_3085_and_4065_which_the_nightly_found_linearize_inside_the_budget() {
+    for (seed, key, least_ops, least_gets, least_open) in [
+        (3085u64, "k1", 300usize, 150usize, 12usize),
+        (4065, "k0", 300, 150, 12),
+    ] {
+        let report = raft::run(seed, Variant::Correct);
+        let ops: Vec<&ananke_sim::lin::Op> = report
+            .history
+            .ops
+            .iter()
+            .filter(|op| op.op.key().as_ref() == key.as_bytes())
+            .collect();
+        let gets = ops
+            .iter()
+            .filter(|op| matches!(op.op, ClientOp::Get { .. }))
+            .count();
+        let open = most_open_at_once(&ops);
+        assert!(
+            ops.len() >= least_ops && gets >= least_gets && open >= least_open,
+            "seed {seed} no longer reaches the shape D-080's reduction decides: key {key:?} \
+             holds {} operations, {gets} of them gets, {open} open at once, against the \
+             {least_ops}/{least_gets}/{least_open} the pin was taken at; re-audit it against \
+             a seed that does",
+            ops.len()
+        );
+        report.check().unwrap();
     }
 }
 
@@ -2384,7 +2455,7 @@ fn a_server_that_applies_before_commit_compacts_past_its_commit_index() {
 }
 
 /// The seed the follower-log bound's pair is pinned at. Five seeds of the first
-/// thousand carry a replica's log past [`raft::FOLLOWER_LOG_MULTIPLE`] under
+/// thousand carry a replica's log past [`raft::FOLLOWER_LOG_BOUND`] under
 /// [`Variant::FollowerNeverCompacts`] — 116, 429, 512, 577 and 757 — and this is
 /// the one with the most room: 878 entries against the bound's 768, where seed
 /// 116, the lowest, holds 788. A pin two per cent over a bound would go quiet at
@@ -2401,8 +2472,8 @@ const FOLLOWER_LOG_SEED: u64 = 512;
 /// since the last snapshot a leader gave it or it took itself, and grows with the
 /// run. That is the only thing in the tree that can make
 /// `Report::follower_log_is_bounded` fire, and before this variant existed the
-/// bound was unfalsifiable — widening `FOLLOWER_LOG_MULTIPLE` from 64 to 4 096
-/// changed no test at any tier, which is how the review of this slice found it.
+/// bound was unfalsifiable — widening it from 768 entries to 49 152 changed no
+/// test at any tier, which is how the review of this slice found it.
 ///
 /// **The rate, measured before it is asserted (D-061).** Over the first thousand
 /// seeds in release, the variant is caught on **5** — 116, 429, 512, 577 and 757 —
@@ -2419,7 +2490,7 @@ const FOLLOWER_LOG_SEED: u64 = 512;
 // follower replica.
 #[test]
 fn a_replica_that_never_compacts_outgrows_the_follower_log_bound() {
-    let bound = raft::FOLLOWER_LOG_MULTIPLE * raft::SNAPSHOT_THRESHOLD;
+    let bound = raft::FOLLOWER_LOG_BOUND;
 
     let broken = raft::run(FOLLOWER_LOG_SEED, Variant::FollowerNeverCompacts);
     let (longest, server) = broken.largest_follower_log();
@@ -2439,9 +2510,7 @@ fn a_replica_that_never_compacts_outgrows_the_follower_log_bound() {
     );
     eprintln!(
         "FollowerNeverCompacts: seed {FOLLOWER_LOG_SEED} held {longest} entries on server \
-         {server}, past the {bound} of {} × {}",
-        raft::FOLLOWER_LOG_MULTIPLE,
-        raft::SNAPSHOT_THRESHOLD
+         {server}, past the bound's {bound}"
     );
 
     let correct = raft::run(FOLLOWER_LOG_SEED, Variants::default());
@@ -2595,14 +2664,21 @@ fn a_server_whose_refusal_is_not_durable_is_caught() {
     // tier above, and the rate printed at every tier. On the tree with the send
     // queue alone the catch was 16 of the first thousand seeds, none of them below seed
     // 100 (the first at 119); with the key layout and the store's format record
-    // (D-059, D-060) it was 9, the first at seed 158. On this tree, with D-069 having
-    // moved every raft schedule that serves a read, it is 7 of the first thousand,
-    // 0.7 % — seeds 102, 293, 378, 465, 744, 893 and 926 — and the first catch is at
-    // seed 102. At 0.7 % a hundred seeds catch none about half the time
-    // (0.993^100 = 0.49) and the gate's twenty six times in seven, so the assertion
-    // there would fail a tree with nothing wrong on the draw alone; a thousand miss
-    // about once in a thousand (0.993^1000 = 9e-4). Seed 102, the first catch of
-    // the thousand, is pinned with its mechanism at every tier:
+    // (D-059, D-060) it was 9, the first at seed 158. Since D-078 moved every
+    // schedule again it is **58 of the first thousand, 5.8 %**, the first at seed 20,
+    // and every one of the 58 is the `match starts` oracle's rather than state
+    // machine safety's — D-078's own entry says so and D-079 re-measured it, on that
+    // branch and on `main` alike. The 0.7 % this comment argued from, and the seven
+    // seeds it named, are the figures of the tree before D-078.
+    //
+    // At 5.8 % a hundred seeds catch none about once in four hundred
+    // (0.942^100 = 2.5e-3) and the gate's twenty about three times in ten
+    // (0.942^20 = 0.30). So the hundred-seed tier is now comfortably above D-061's
+    // 5 % rule rather than the coin-flip it was, and only the gate's twenty still
+    // needs the pin. **Where the assertion sits is the owner's** (D-056): it stays at
+    // the thousand-seed tier until the owner moves it, and this note records that the
+    // reason for putting it there has gone rather than moving it. Seed 102 is pinned
+    // with its mechanism at every tier:
     // `seed_102_pins_the_refusal_that_is_not_durable_which_a_hundred_seeds_can_miss`.
     // Seeds 119 and 158, which held that pin before and which the moved schedules took
     // the situation off, are kept beside it as asserted absences.
@@ -3223,11 +3299,21 @@ fn a_leader_that_trusts_the_clock_is_caught_and_the_guard_revokes() {
     // D-061, the owner's rule of 2026-09-15: a variant caught on under 5 % of seeds
     // asserts its catch from the thousand-seed tier (the premerge and the nightly), its
     // firing at every tier above, and its rate printed at every tier. The stale read is
-    // caught on 40 of the first thousand seeds on this tree, 4.0 % (37, 3.7 %, before
-    // the read moved to the server it is served on, D-069; 41, 4.1 %, on the tree with
-    // D-056's send queue alone, before the key layout redrew them), and was on 472 of
-    // the ten thousand of the nightlies before the queue, 4.72 %; the drift exceeds the
-    // bound on 503 of the thousand seeds and the guard revokes on every one of them.
+    // caught on 41 of the first thousand seeds on this tree, 4.1 % (40, 4.0 %, on the
+    // tree D-069 left; 37, 3.7 %, before the read moved to the server it is served on;
+    // 41, 4.1 %, on the tree with D-056's send queue alone, before the key layout redrew
+    // them), and was on 472 of the ten thousand of the nightlies before the queue,
+    // 4.72 %; the drift exceeds the bound on 503 of the thousand seeds and the guard
+    // revokes on every one of them.
+    //
+    // The count on this tree is one lower than the same thousand seeds give with the
+    // search D-080 replaced, which reported 42. The one it drops is seed 18, where the
+    // old search ran out of its budget rather than proving anything: an undecided search
+    // returns an error that says "linearizability", which this counter and `is_caught`
+    // both read as a catch. D-080 decides that history, and it is linearizable, so the
+    // catch was never the variant's. The rate is the honest one, and the margin below is
+    // computed at 4 %, which both figures round to.
+    // PROPOSED(D-080): the read-only candidates go first, together.
     // The rate that carries the assertion is over the tier's seeds, as every row of
     // D-061's table is: at 4.0 % the gate's twenty catch none with probability
     // 0.96^20 = 0.44 and a hundred with 0.96^100 = 0.017, so the assertion there would
@@ -3299,7 +3385,7 @@ struct Coverage {
     /// D-065's own path: the compactions a replica made while it was not leading,
     /// with the seeds that saw one, and the largest in-memory log any follower
     /// replica held over the sweep — Stage B's exit measurement (Q39), printed at
-    /// every tier beside the bound `raft::FOLLOWER_LOG_MULTIPLE` asserts per seed.
+    /// every tier beside the bound `raft::FOLLOWER_LOG_BOUND` asserts per seed.
     // PROPOSED(D-078): a follower compacts its log to its own applied index.
     follower_compactions: usize,
     seeds_with_a_follower_compaction: u64,
@@ -3690,6 +3776,19 @@ impl Coverage {
         ] {
             assert!(seen > 0, "the sweep never saw {what}: {self:?}");
         }
+        // PROPOSED(D-078): an absence with its reason. This scenario proposes one
+        // configuration — the initial one, which is no log entry — and never changes
+        // it, so no prefix a compaction drops can contain a configuration entry and
+        // D-029's revert floor is unreachable here by construction. The measure is
+        // kept in this sweep all the same, because a count above zero would mean it
+        // is reading something other than what it names; where the floor *is*
+        // reachable is the membership scenario, and that is where it is asserted
+        // positive (`MembershipCoverage::assert_complete`).
+        assert_eq!(
+            self.follower_compactions_swallowing_the_config, 0,
+            "the raft scenario changes no configuration, so nothing here can swallow \
+             one: {self:?}"
+        );
         // PROPOSED(D-069): `RaftMatchStarted` is on every seed of this sweep, not
         // merely somewhere in it: every leader's first answer from a follower raises
         // `matched` under the incarnation it carried, so the count is 1 000 of 1 000
@@ -3718,6 +3817,19 @@ impl Coverage {
             assert!(
                 self.snapshots_installed > 0,
                 "the sweep never saw a snapshot installed: {self:?}"
+            );
+            // PROPOSED(D-078): both halves of the split, not the sum. The split is
+            // read off a record's position in the trace, and a rule that put the
+            // whole population on one side would satisfy an assertion on that side
+            // alone — which is how this counter, called "installed" when it held
+            // both, reported installs that never happened. Asserting each half
+            // says the rule divides something. (`Restating`'s own unit tests are
+            // where the rule itself is held; this is the sweep's non-vacuity.)
+            assert!(
+                self.snapshot_prefixes_restated > 0,
+                "the sweep never saw a restart re-state a compacted or installed \
+                 prefix, so the install/re-statement split is putting everything \
+                 on one side: {self:?}"
             );
             assert!(
                 self.snapshot_resumes > 0,
@@ -3914,6 +4026,21 @@ struct MembershipCoverage {
     truncation_reverts_to_a_prefix: usize,
     installs_keeping_a_tail: usize,
     installs_whose_tail_carries_a_configuration: usize,
+    /// D-065's own path in the scenario that has configuration entries to
+    /// swallow: the compactions a replica made while not leading, and of those
+    /// the ones whose prefix swallowed the configuration entry in force, so that
+    /// D-029's revert floor is what the replica would revert to from there.
+    ///
+    /// This lives here and not only in the raft sweep because the raft scenario
+    /// appends no configuration entry after the first, so its `swallowed` is
+    /// **zero by construction** — a measure that can only read zero evidences
+    /// nothing. The review of this slice found the corrected measure calculated
+    /// nowhere that ships and asserted nowhere at all; it is asserted below, at
+    /// every tier, on the rate this scenario really has.
+    // PROPOSED(D-078): a follower compacts its log to its own applied index.
+    follower_compactions: usize,
+    follower_compactions_swallowing_the_config: usize,
+    seeds_with_a_swallowed_config: u64,
 }
 
 impl MembershipCoverage {
@@ -3923,6 +4050,11 @@ impl MembershipCoverage {
         self.snapshot_fed_joiners += joiners.len();
         self.seeds_with_a_snapshot_fed_joiner += u64::from(!joiners.is_empty());
         self.compactions += report.count(|e| matches!(e, TraceEvent::RaftCompacted { .. }));
+        // PROPOSED(D-078): a follower compacts its log to its own applied index.
+        let (follower_compactions, swallowed) = raft::follower_compactions(&report.records);
+        self.follower_compactions += follower_compactions;
+        self.follower_compactions_swallowing_the_config += swallowed;
+        self.seeds_with_a_swallowed_config += u64::from(swallowed > 0);
         // PROPOSED(D-069): the three events emitted from this stage, each with the
         // seeds that saw one: D-061 measures a counter's rate over those.
         let match_starts = report.count(|e| matches!(e, TraceEvent::RaftMatchStarted { .. }));
@@ -4133,6 +4265,30 @@ impl MembershipCoverage {
         ] {
             assert_eq!(seen, seeds, "a membership run saw no {what}: {self:?}");
         }
+        // PROPOSED(D-078): D-029's revert floor on a follower, which is what D-065
+        // said this change would make routine, observed on this scenario rather than
+        // argued. A follower compacts to its own applied index; when the
+        // configuration entry in force sits inside the prefix that compaction drops,
+        // the floor — the configuration held at the new prefix's end — is what that
+        // replica reverts to. Before this change the floor was reached on 3 of 10 000
+        // seeds (issue #56); here it is reached on every seed of the scenario.
+        //
+        // The rate, measured before it is asserted (D-061): D-078 records the sweep.
+        // At 100 % of seeds the gate's twenty support it, so it is asked at every
+        // tier and not merely as a sweep total — a total above zero is what a measure
+        // gone structural passes, and a measure that reads the whole population is
+        // exactly the failure the review of this slice found in the first build of
+        // this counter.
+        assert_eq!(
+            self.seeds_with_a_swallowed_config, seeds,
+            "a membership run saw no follower compaction swallow the configuration in \
+             force, which is D-029's revert floor on a follower: {self:?}"
+        );
+        assert!(
+            self.follower_compactions_swallowing_the_config < self.follower_compactions,
+            "every follower compaction swallowed a configuration entry, which is the \
+             shape of a measure that is structural rather than observed (D-039): {self:?}"
+        );
         // PROPOSED(D-058): every seed adopts installs, and none is refused for anything
         // but lost state, which each run's check also fails.
         assert!(self.adoptions > 0, "no install was adopted: {self:?}");

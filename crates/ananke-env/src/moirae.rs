@@ -34,11 +34,13 @@
 //! | `OrphanRemoved` / `WalSegmentDeleted`    | `log` `ananke.fs.orphan-removed` / `ananke.wal.segment-deleted` |
 //! | `RaftTerm` / `RaftVote` / `RaftLeader` / `RaftAppend` / `RaftTruncate` / `RaftCommit` / `RaftApply` | `log` `ananke.raft.term` / `.vote` / `.leader` / `.append` / `.truncate` / `.commit` / `.apply` |
 //! | `RaftRecovered` / `RaftProposed` / `RaftRefused` / `RaftServerFailed` / `RaftInboxDropped` | `log` `ananke.raft.recovered` / `.proposed` / `.refused` / `.failed` / `.inbox-dropped` |
+//! | `RaftReplicaRefused`                     | `log` `ananke.raft.replica-refused`           |
 //! | `RaftRead` / `RaftLeaseRevoked` / `RaftQuorumLost` / `RaftTransfer` | `log` `ananke.raft.read` / `.lease-revoked` / `.quorum-lost` / `.transfer` |
 //! | `RaftConfig` / `RaftSnapshot`            | `log` `ananke.raft.config` / `.snapshot`      |
 //! | `RaftCompacted` / `RaftReseeded` / `RaftSnapshotResumed` / `RaftAdopted` | `log` `ananke.raft.compacted` / `.reseeded` / `.snapshot-resumed` / `.adopted` |
 //! | `RaftProgressReset`                      | `log` `ananke.raft.progress-reset`            |
 //! | `RaftSnapshotDeleted` / `RaftSnapshotReused` / `RaftSnapshotStreams` | `log` `ananke.raft.snapshot-deleted` / `.snapshot-reused` / `.snapshot-streams` |
+//! | `RaftSnapshotStartOver` / `RaftSnapshotState` | `log` `ananke.raft.snapshot-start-over` / `.snapshot-state` |
 //! | `RaftMatchStarted` / `RaftLearnerRound` / `RaftChangeAccepted` | `log` `ananke.raft.match-started` / `.learner-round` / `.change-accepted` |
 //! | `RangeCreated` / `RangeDescriptor` / `RangesRestated` / `RangeReplicaCreated` | `log` `ananke.range.created` / `.descriptor` / `.restated` / `.replica-created` |
 //! | `RangeSplit` / `RangeSubsumed` / `RangeMerged`           | `log` `ananke.range.split` / `.subsumed` / `.merged` |
@@ -1017,6 +1019,14 @@ fn convert(
                 ("reason", Json::str(reason)),
             ])),
         ),
+        // PROPOSED(D-077): Q15's whole-node refusal, and the re-seed per replica.
+        TraceEvent::RaftReplicaRefused { server, range } => log(
+            "ananke.raft.replica-refused",
+            Some(Json::obj(vec![
+                ("server", int(*server)),
+                ("range", int(*range)),
+            ])),
+        ),
         TraceEvent::RaftServerFailed { server, reason } => log(
             "ananke.raft.failed",
             Some(Json::obj(vec![
@@ -1116,6 +1126,42 @@ fn convert(
                 ("range", int(*range)),
                 ("lastIndex", int(*last_index)),
                 ("take", int(*take)),
+            ])),
+        ),
+        TraceEvent::RaftSnapshotStartOver {
+            server,
+            range,
+            from,
+            reason,
+        } => log(
+            "ananke.raft.snapshot-start-over",
+            Some(Json::obj(vec![
+                ("server", int(*server)),
+                ("range", int(*range)),
+                ("from", int(*from)),
+                ("reason", Json::str(reason.as_str())),
+            ])),
+        ),
+        TraceEvent::RaftSnapshotState {
+            server,
+            range,
+            last_index,
+            last_term,
+            applied,
+            user_keys,
+            user_digest,
+            log_keys,
+        } => log(
+            "ananke.raft.snapshot-state",
+            Some(Json::obj(vec![
+                ("server", int(*server)),
+                ("range", int(*range)),
+                ("last_index", int(*last_index)),
+                ("last_term", int(*last_term)),
+                ("applied", int(*applied)),
+                ("user_keys", int(*user_keys)),
+                ("user_digest", int(*user_digest)),
+                ("log_keys", int(*log_keys)),
             ])),
         ),
         TraceEvent::RaftSnapshotStreams {
