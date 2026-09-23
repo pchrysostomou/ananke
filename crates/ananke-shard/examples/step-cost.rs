@@ -187,6 +187,7 @@ fn response(term: u64, prev: Index, matched: Index) -> Message {
         echo: 0,
         local: 0,
         incarnation: 1,
+        refused: false,
     }
 }
 

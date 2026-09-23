@@ -892,10 +892,22 @@ struct QuorumNodeFigures {
     ranges_on_the_cut_off_leader: usize,
     commits_through_a_reseeded_replica: usize,
     step_downs: usize,
-    /// The whole of D-049's rule on the node: rejections stamped incarnation 0.
+    /// The answers D-049's rule is about: rejections **carrying the refused mark**
+    /// (PROPOSED D-087). Under the key this figure was written for — a rejection
+    /// stamped incarnation 0 — it was 0 on every seed at every tier, because the
+    /// node has no store-less state. It is not 0 now.
     refused_rejections: usize,
-    /// What the node answers instead: rejections carrying the re-seeded store's own
-    /// incarnation, and answers that fitted.
+    /// Answers from **no store at all**, stamped incarnation 0. D-077's node has
+    /// none, which is the half of PROPOSED D-085's finding that D-087 leaves
+    /// standing, and `NodeReport::check` fails the seed if it ever does.
+    store_less_answers: usize,
+    /// Marked rejections the victim **sent** after it had sent an answer of the same
+    /// range that fitted (send order, since delays reorder deliveries): the figure a
+    /// mark read per node rather than per replica moves, and `NodeReport::check`
+    /// fails the seed on it.
+    marked_after_fitted: usize,
+    /// The node's other answers: rejections a caught-up re-seeded replica sends,
+    /// carrying its store's own incarnation and no mark, and answers that fitted.
     store_rejections: usize,
     fitted: usize,
     step_downs_naming_anyone_uncounted: usize,
@@ -914,6 +926,8 @@ impl QuorumNodeFigures {
             self.ranges_refused += usize::from(hold.replica_refused);
             self.ranges_reseeded += usize::from(hold.reseeded);
             self.refused_rejections += hold.refused_rejections;
+            self.store_less_answers += hold.store_less_answers;
+            self.marked_after_fitted += hold.marked_after_fitted;
             self.store_rejections += hold.store_rejections;
             self.fitted += hold.fitted;
             self.streams += hold.streams;
@@ -1041,40 +1055,55 @@ fn a_node_that_refuses_only_one_range_is_caught_on_the_sharded_quorum_scenario()
     );
 }
 
-/// D-049's pair, `RefusedCountsForQuorum` and `RefusedNeverCounts`, **has no site on
-/// the node**, asserted per seed with the reason and with what would upgrade it.
+/// D-049's rule **has a site on the node now**, and its pair is measured there:
+/// what the mark buys, and the one thing the pair still waits for.
 ///
-/// This is what replaces D-085's tripwire, and it is narrower and sharper than the
-/// tripwire was. D-085 read the scenario as blocked behind two paths and predicted
-/// that PR #86's whole-node refusal would unblock the first half. **It did not**, and
-/// the measurement is the reason: D-049's rule is keyed on *a rejection stamped
-/// incarnation 0*, which is a server that has **no store** (`Progress::refused_answered`,
-/// core.rs:2760; D-042). The one-group server has one: its re-seed loop answers from
-/// no store at all until a leader's stream installs one. D-077's node has none — it
-/// marks the loss, opens a **fresh engine beside the refused one** and creates every
-/// range's store in it with a store incarnation of its own *before any replica
-/// answers*, so every answer the node ever sends carries a store incarnation and
-/// `refused_answered` is never set. Both variants then compute the same thing as the
-/// correct core and change nothing.
+/// This replaces the absence PROPOSED D-085 asserted here. D-085 measured that
+/// D-049's rule was keyed on *a rejection stamped incarnation 0* — a server with no
+/// store — that the one-group server's re-seed loop is such a server and D-077's
+/// node never is, and that `Progress::refused_answered` was therefore never set on
+/// the node, on any seed, for any range. PROPOSED D-087 changed the key: the answer
+/// carries a refused mark ([`ananke_raft::Raft::refused`]), which the node's
+/// re-seeded replicas send on a store of their own, and the leader reads the mark
+/// instead of inferring the absence of a store from a stamp. What this test asserts
+/// now, per variant, over the tier's seeds:
 ///
-/// So the two variants are run here and asserted **not caught**, per seed, beside the
-/// counts that make that evidence rather than silence: the refusal landed, the node
-/// answered, and not one of those answers was a store-less refused server's. The rate
-/// is 0 of the tier's seeds and is printed at every tier. **Nothing is lowered**: §10's
-/// standard for this pair — caught on every seed at every tier — is asserted where the
-/// pair has a site, which is `sim/tests/raft.rs`'s four D-049 tests on the one-group
-/// server, and this says why it cannot yet be asserted here.
+/// 1. **The refusal landed** — four replicas a seed, as before, or nothing below is
+///    evidence.
+/// 2. **The node sends the mark**: `refused_rejections` is no longer 0. This is the
+///    assertion that would fail if the key were reverted, if the mark stopped being
+///    set where a re-seed builds the store, or if it stopped surviving the wire, and
+///    it is the whole of what D-087 buys on this cluster.
+/// 3. **And the node still answers from no store nowhere**: `store_less_answers` is
+///    0. That half of D-085's finding stands, and `NodeReport::check` fails the seed
+///    that breaks it. The mark is a replacement for the stamp, not a re-creation of
+///    the store-less state D-077 decided against — which is the owner's ruling, in
+///    the one figure that can tell the two shapes apart.
+/// 4. **The pair is still caught on 0 seeds, for a narrower reason than before, and
+///    the rate is printed at every tier.** The rule has its site; what it does not
+///    yet have is a *window the site decides*. On this tree nothing compacts — a
+///    core's snapshot action is counted and dropped — so a leader always feeds a
+///    re-seeded replica from index 1, the replica answers a refused rejection and
+///    then a success **inside the same check-quorum window**, and `active` settles
+///    the window whichever way the variant counts the rejection. Measured, and the
+///    figures say it: over a hundred seeds the node delivered 33 refused rejections
+///    and 25 010 answers that fitted, and **0** step-downs left anyone `uncounted`.
 ///
-/// The day it can, this fails. Two things would do it, and the message says which:
-/// a node that answers from no store, and the snapshot wiring (PR #107) that gives
-/// D-049's open half its stream. **The second alone will not be enough** — a leader
-/// that compacts past a re-seeded replica's log will find that replica answering from
-/// its own store, counted as any follower's, which is the hazard D-049 was written
-/// about, reintroduced on the node. That is the finding this test carries to the
-/// owner, and `NodeReport::check`'s install clause is where it comes due.
-// PROPOSED(D-085): D-049's pair has no site on the node; the absence asserted per seed.
+/// **Nothing is lowered.** §10's standard for this pair — caught on every seed at
+/// every tier — is asserted where the pair is caught, `sim/tests/raft.rs`'s four
+/// D-049 tests on the one-group server, whose every figure D-087 left unmoved. What
+/// this says is why it is not yet caught here, and the reason is now one thing and
+/// not two: **PR #107's wiring**. A leader that can compact past a re-seeded replica
+/// can no longer feed it from its log, its refused rejections become the only answer
+/// in the window, and the rule decides. The bare core already does decide it —
+/// `crates/ananke-raft/tests/paper.rs` steps a leader down naming a follower that
+/// answers a refused rejection on a store of its own, which is the node's shape and
+/// which under the old key kept its office. This test fails the day the node reaches
+/// it, and says so.
+// PROPOSED(D-087): D-049's rule keyed on a refused mark the answer carries.
 #[test]
-fn d_049s_pair_has_no_site_on_the_node_and_this_says_the_day_it_does() {
+fn d_049s_rule_has_a_site_on_the_node_now_and_its_pair_waits_only_on_the_wiring() {
+    let ranges = u64::try_from(ranges().len()).expect("small");
     for variant in [Variant::RefusedCountsForQuorum, Variant::RefusedNeverCounts] {
         let (caught, figures) = quorum_node_sweep(variant, NodeVariants::correct());
         eprintln!(
@@ -1083,32 +1112,34 @@ fn d_049s_pair_has_no_site_on_the_node_and_this_says_the_day_it_does() {
             caught.len(),
             seeds()
         );
-        // The counts that make the absence evidence: the node was refused on every
-        // seed and did answer, and D-049's own key never matched.
         assert_eq!(
             figures.ranges_reseeded as u64,
-            figures.seeds * u64::try_from(ranges().len()).expect("small"),
-            "the refusal did not land, so this seed's absence says nothing"
+            figures.seeds * ranges,
+            "the refusal did not land, so nothing below is evidence"
         );
         assert!(
             figures.store_rejections + figures.fitted > 0,
-            "the refused node answered nothing at all, so the absence below says nothing"
+            "the refused node answered nothing at all, so nothing below is evidence"
         );
-        assert_eq!(
-            figures.refused_rejections, 0,
-            "the node answered a rejection stamped incarnation 0: D-049's rule has a site \
-             here now and its pair must be re-asserted on the node at §10's standard"
+        // The site: the node's re-seeded replicas say they hold nothing of the log.
+        assert!(
+            figures.refused_rejections > 0,
+            "no answer of the node carried the refused mark, so D-049's rule has no \
+             site here after all: PROPOSED D-087's key is not reaching the leader, and \
+             the entry's claim that it does is wrong"
         );
+        // And they say it on a store of their own, which is D-077's shape unchanged.
         assert_eq!(
-            figures.step_downs_naming_anyone_uncounted, 0,
-            "a step-down left a follower uncounted, which only a refused server's answer can \
-             do (core.rs `heard_this_window`): D-049's rule has a site on the node now"
+            figures.store_less_answers, 0,
+            "the node answered from no store, where D-077 rebuilds every range's store \
+             before any replica serves: the re-seed changed shape, which is the shape \
+             the owner ruled against changing"
         );
         assert_eq!(
             caught.len(),
             0,
-            "{:?} is caught on the node: it has a site here now, so assert the catch at \
-             §10's standard instead of this absence: {caught:?}",
+            "{:?} is caught on the node: the rule's site now decides a window here, so \
+             assert the catch at §10's standard instead of this: {caught:?}",
             Variants::from(variant)
         );
     }

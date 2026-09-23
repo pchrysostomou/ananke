@@ -354,6 +354,7 @@ mod tests {
                 echo: 123_456_789,
                 local: 987_654_321,
                 incarnation: 1,
+                refused: false,
             },
         }
     }

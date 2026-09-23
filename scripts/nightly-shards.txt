@@ -153,7 +153,7 @@
 3	wal	21.2	a_log_that_acknowledges_before_syncing_is_caught
 # shard 4: 1398.1 cpu s
 4	echo	0.1	same_seed_gives_byte_identical_trace
-4	node	70.0	d_049s_pair_has_no_site_on_the_node_and_this_says_the_day_it_does
+4	node	70.0	d_049s_rule_has_a_site_on_the_node_now_and_its_pair_waits_only_on_the_wiring
 4	engine	210.8	the_correct_engine_passes_every_seed
 4	engine	38.6	an_install_that_switches_one_span_at_a_time_is_caught
 4	node	15.39	a_leader_that_ignores_incarnations_is_not_re_asserted_on_the_node_yet
