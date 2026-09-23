@@ -351,15 +351,22 @@ impl NodeVariant {
         NodeVariant::CompleteOnRestart,
     ];
 
-    /// The node's snapshot *wiring*: the six ways to get the running of
+    /// The node's snapshot *wiring*: the ten ways to get the running of
     /// [`mod@crate::snapshot`] inside the node's server wrong, as against the eleven
     /// ways to get its discipline wrong ([`SNAPSHOT`](Self::SNAPSHOT)). Three of the
-    /// six — [`TakeCheckpointsTheWholeNode`](Self::TakeCheckpointsTheWholeNode),
-    /// [`InstallHoldsEveryRange`](Self::InstallHoldsEveryRange) and
-    /// [`InstallSweepsEveryStaging`](Self::InstallSweepsEveryStaging) — and
-    /// [`SnapshotAckToEveryCore`](Self::SnapshotAckToEveryCore), issue #103's, are the
+    /// ten — [`InstallHoldsEveryRange`](Self::InstallHoldsEveryRange),
+    /// [`InstallSweepsEveryStaging`](Self::InstallSweepsEveryStaging) and
+    /// [`SnapshotAckToEveryCore`](Self::SnapshotAckToEveryCore), issue #103's — are the
     /// correct wiring exactly on a node of one range, and can only be caught where a
     /// node hosts several.
+    ///
+    /// [`TakeCheckpointsTheWholeNode`](Self::TakeCheckpointsTheWholeNode) needs more
+    /// than one range as well, but on narrower ground: it is *not* the correct take on
+    /// a node of one range, because `checkpoint_spans` leaves the log purpose out and a
+    /// whole-engine checkpoint takes it in, so the two differ by the whole log however
+    /// many ranges there are. What one range cannot do is tell it from
+    /// [`TakeStreamsTheLogToo`](Self::TakeStreamsTheLogToo), whose check reads the log
+    /// keys this one's does not (D-083's review, correction 5).
     // PROPOSED(D-083): the node's snapshot wiring.
     pub const WIRING: &'static [NodeVariant] = &[
         NodeVariant::StepWhileInstalling,
