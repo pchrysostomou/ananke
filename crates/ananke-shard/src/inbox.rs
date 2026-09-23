@@ -472,16 +472,23 @@ impl Inbox {
                 // every retransmission of it alike, and the range it is about would
                 // never replicate again.
                 //
-                // PROPOSED(D-074): *and only while the node holds nothing*. The
-                // exemption is for a message no emptying of the queue could make room
-                // for. A node behind a slow sync drains the queue to empty on every
-                // wake, so without this term the queue is empty at every admission and
-                // the exemption is the whole path: the bound would bind nothing and
-                // the node would hold messages without limit for the whole sync. What
-                // the node holds drains when that sync resolves, so a message larger
-                // than the bound is still admitted rather than refused for ever — on a
-                // retransmission that finds the node holding nothing.
-                let empties = inner.held == 0
+                // PROPOSED(D-074): *and, for a message the bound could hold, only
+                // while the node holds nothing*. A node behind a slow sync drains the
+                // queue to empty on every wake, so without that term the queue is
+                // empty at every admission and the exemption is the whole path: the
+                // bound would bind nothing and the node would hold messages without
+                // limit for the whole sync.
+                //
+                // The hold does **not** gate the other case. A message larger than the
+                // whole bound is one that no emptying could ever make room for, and
+                // that is a property of the message, not of the hold: gating it on the
+                // hold re-creates "refused for ever", because `held > 0` for as long as
+                // any message has arrived for any core whose persist is outstanding,
+                // which at §4's own load is the steady state and not an exception. The
+                // queue, by contrast, *is* emptied by every wake, so a message the
+                // bound could hold is only ever delayed.
+                let never_fits = message.bytes > self.bound;
+                let empties = (never_fits || inner.held == 0)
                     && (inner.items.len() == 0
                         || (room > 0 && inner.items.len() == inner.items.heartbeats()));
                 if !fits_after && !empties {
@@ -829,6 +836,95 @@ mod tests {
         // carrying nothing is admitted into an empty queue too.
         let inbox = Inbox::new(100);
         assert!(inbox.admit(message(2, 1, 4096)).is_admitted());
+        assert_eq!(inbox.len(), 1);
+    }
+
+    /// D-074's narrowing binds the hold **without** re-creating "refused for ever".
+    ///
+    /// The two halves are one decision and this check asserts both, because an error
+    /// either way is caught here and nowhere else:
+    ///
+    /// - A message larger than the whole bound is admitted *whatever the node holds*.
+    ///   No emptying could ever make room for it, and that is a property of the
+    ///   message. `held > 0` for as long as any message has arrived for any core whose
+    ///   persist is outstanding — at §4's own load the steady state — so gating this
+    ///   case on the hold refuses every retransmission alike and the range never
+    ///   replicates again. Gating it (D-074 as it first stood) fails the first half.
+    /// - A message the bound *could* hold is still refused when the hold fills the
+    ///   bound. Dropping the hold from the ordinary case (D-074 reverted) fails the
+    ///   second half: it is what made the bound bind nothing.
+    ///
+    /// The scenario is the adversarial review's: a 16 kB bound, the node holding 64
+    /// bytes of it, the queue empty at every arrival, and the 65 622-byte
+    /// AppendEntries of the check above retransmitted a thousand times.
+    #[test]
+    fn a_message_no_emptying_could_hold_is_admitted_whatever_the_node_holds() {
+        let bound = 16 * 1024;
+        let frame = Frame {
+            from: ServerId(1),
+            message: Message::AppendEntries {
+                term: 3,
+                prev_index: 7,
+                prev_term: 2,
+                entries: vec![Entry {
+                    term: 3,
+                    index: 8,
+                    payload: Payload::Command(Bytes::from(vec![7u8; 64 * 1024])),
+                }],
+                commit: 6,
+                sent: 123_456_789,
+            },
+        };
+        let cost = HEADER_LEN + TAG_LEN + frame.encode().len();
+        assert!(cost > bound, "{cost} is over the whole bound of {bound}");
+        let big = || Received {
+            range: RangeId(9),
+            from: ServerId(1),
+            message: frame.message.clone(),
+            bytes: cost,
+        };
+
+        // The node holds 64 bytes of 16 384 — far under the bound, but not nothing,
+        // which is what a node behind any outstanding sync looks like.
+        let inbox = Inbox::new(bound);
+        inbox.hold_at(64);
+        let mut admitted = 0;
+        for _ in 0..1000 {
+            if inbox.admit(big()).is_admitted() {
+                admitted += 1;
+            }
+            drain(&inbox);
+        }
+        assert_eq!(
+            admitted, 1000,
+            "a message no emptying could hold was refused because the node held 64 \
+             bytes: that is refused for ever, since the hold is the steady state"
+        );
+        assert_eq!(inbox.refused(), 0, "and none of them refused");
+
+        // The narrowing still binds. A message the bound *can* hold is refused while
+        // the hold fills the bound, which is the blocker D-074 was written for.
+        let inbox = Inbox::new(bound);
+        inbox.hold_at(bound);
+        assert!(
+            !inbox.admit(message(9, 1, 64)).is_admitted(),
+            "a message the bound could hold was admitted into a full hold: the bound \
+             binds nothing again"
+        );
+        assert_eq!(inbox.refused(), 1);
+        // And it is admitted once the hold releases, under D-072's rule unchanged.
+        inbox.hold_at(0);
+        assert!(inbox.admit(message(9, 1, 64)).is_admitted());
+
+        // The bound is still exceeded by an inbox holding exactly one message: the
+        // exemption admits one and the queue is no longer empty for a second.
+        let inbox = Inbox::new(bound);
+        inbox.hold_at(64);
+        assert!(inbox.admit(big()).is_admitted());
+        assert!(
+            !inbox.admit(big()).is_admitted(),
+            "the exemption is for an empty queue, one message at a time"
+        );
         assert_eq!(inbox.len(), 1);
     }
 

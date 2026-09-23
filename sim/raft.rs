@@ -147,8 +147,19 @@ pub const TRACE_CAP: usize = 400_000;
 // PROPOSED(D-078): the follower log bound is stated as a multiple of this.
 pub const SNAPSHOT_THRESHOLD: u64 = 12;
 
-/// The bound on the largest in-memory log of any follower replica, in entries,
-/// as a multiple of [`SNAPSHOT_THRESHOLD`] (Stage B's exit; Q39).
+/// The bound on the largest in-memory log of any follower replica, **in entries**
+/// (Stage B's exit; Q39).
+///
+/// It is a number of entries and not a multiple of [`SNAPSHOT_THRESHOLD`], though
+/// 768 is 64 × this scenario's threshold of 12 and that is how it was chosen. What
+/// the bound measures is a follower's *apply lag* in entries, and the threshold
+/// does not scale that lag: written as a product, raising the threshold for some
+/// unrelated reason would silently double the bound while the measured maximum
+/// barely moved. A threshold change has to be re-measured against this number
+/// instead — which is the point (D-039). At the server's own 4 096 the same lag
+/// would be a fraction of one threshold, so read as a production figure the
+/// multiple is very conservative; SHARD.md's exit asks for it stated there, and
+/// 64 × 4 096 is 262 144 entries, a bound nothing could trip.
 ///
 /// Measured before it was asserted, on the correct system under this scenario's
 /// client writes; D-078 records the sweep, the command and the machine. At a
@@ -174,12 +185,8 @@ pub const SNAPSHOT_THRESHOLD: u64 = 12;
 /// against it. A bound the correct system trips is a model error to take to the
 /// owner, never a number to widen (D-030, D-039).
 ///
-/// The multiple is this scenario's, at its threshold of 12. What the bound really
-/// measures is the follower's apply lag in entries, which the threshold does not
-/// scale: at the server's own 4 096 the same lag would be a fraction of one
-/// threshold, so 64 × is conservative read as a production figure.
 // PROPOSED(D-078): a follower compacts its log to its own applied index.
-pub const FOLLOWER_LOG_MULTIPLE: u64 = 64;
+pub const FOLLOWER_LOG_BOUND: u64 = 768;
 
 /// The maximum election timeout.
 #[must_use]
@@ -1333,11 +1340,18 @@ pub struct Report {
     /// the cluster-wide reading at all (D-071, item 6).
     // PROPOSED(D-076): the scenario's key-to-range map is the run's, not a constant.
     pub key_range: fn(&Bytes) -> u64,
-    /// Every leader-relative arm that fired, as (the range it drew, the server it
-    /// hit, when it hit it).
+    /// Which system the run was driven against.
+    // PROPOSED(D-082): the arms are shared and the node is a second cluster of them.
+    pub cluster: Cluster,
+    /// Every leader-relative arm that fired, as (the range it drew, the leader of
+    /// that range it resolved, when it resolved it).
     ///
-    /// What [`Report::arms_hit_their_ranges`] reads. Empty for a run another
-    /// scenario drove.
+    /// What [`Report::arms_hit_their_ranges`] reads. All four of the arms that
+    /// resolve a leader per range are here — [`Fault::IsolateLeader`] and
+    /// [`Fault::CrashLeader`], which aim at the leader itself, and
+    /// [`Fault::StaleSender`] and [`Fault::FigureEight`], which choose a victim
+    /// *relative* to it and would pick the wrong follower just as silently. Empty for
+    /// a run another scenario drove.
     // PROPOSED(D-082): a leader-relative arm resolves its leader per range.
     pub aimed: Vec<(u64, u64, Instant)>,
 }
@@ -1373,6 +1387,15 @@ pub struct Run {
 
 /// Which replica a per-replica record is about, for the folds that follow one
 /// server's records in order.
+///
+/// Every variant of [`TraceEvent`] that carries a `server` is here. It is a list,
+/// and a list left behind is how [`Restating`]'s positional rule would go wrong
+/// quietly — the review of this slice found seven kinds missing from it — so
+/// [`Restating::saw`] does not trust the list alone: it clears the record's
+/// emitting node as well, which covers a kind this function has never heard of
+/// (`RaftMatchStarted`, which is about a leader and its follower and carries no
+/// `server` at all, is one such). The two together are why adding the seven
+/// changed no count.
 // PROPOSED(D-078): a follower compacts its log to its own applied index.
 fn replica_of(event: &TraceEvent) -> Option<u64> {
     match event {
@@ -1386,7 +1409,22 @@ fn replica_of(event: &TraceEvent) -> Option<u64> {
         | TraceEvent::RaftRecovered { server, .. }
         | TraceEvent::RaftReseeded { server, .. }
         | TraceEvent::RaftTerm { server, .. }
-        | TraceEvent::RaftLeader { server, .. } => Some(*server),
+        | TraceEvent::RaftLeader { server, .. }
+        | TraceEvent::RaftVote { server, .. }
+        | TraceEvent::RaftRead { server, .. }
+        | TraceEvent::RaftLeaseRevoked { server, .. }
+        | TraceEvent::RaftTransfer { server, .. }
+        | TraceEvent::RaftQuorumLost { server, .. }
+        | TraceEvent::RaftProposed { server, .. }
+        | TraceEvent::RaftRefused { server, .. }
+        | TraceEvent::RaftServerFailed { server, .. }
+        | TraceEvent::RaftInboxDropped { server, .. }
+        | TraceEvent::RaftSnapshotResumed { server, .. }
+        | TraceEvent::RaftAdopted { server, .. }
+        | TraceEvent::RaftProgressReset { server, .. }
+        | TraceEvent::RaftSnapshotDeleted { server, .. }
+        | TraceEvent::RaftSnapshotReused { server, .. }
+        | TraceEvent::RaftSnapshotStreams { server, .. } => Some(*server),
         _ => None,
     }
 }
@@ -1420,9 +1458,18 @@ struct Restating {
 
 impl Restating {
     /// Folds one record in. Call it once per record, before asking anything.
-    fn saw(&mut self, event: &TraceEvent) {
+    ///
+    /// "Nothing of that server's in between" is read two ways at once, because
+    /// either alone is a list that can fall behind the trace: the record's event
+    /// names a server ([`replica_of`]), and the record's own node emitted it. The
+    /// restatement's two traces are back to back with no await between them
+    /// (`node.rs`), so on the correct path nothing of either kind can land
+    /// between, and the second reading costs nothing; what it buys is that a new
+    /// event kind, or one missing from `replica_of`, cannot silently turn an
+    /// install into a re-statement.
+    fn saw(&mut self, record: &TraceRecord) {
         self.restated = false;
-        match event {
+        match &record.event {
             TraceEvent::RaftTruncate { server, .. } => {
                 self.after_truncate.insert(*server);
             }
@@ -1432,6 +1479,9 @@ impl Restating {
             other => {
                 if let Some(server) = replica_of(other) {
                     self.after_truncate.remove(&server);
+                }
+                if let Some(node) = record.node {
+                    self.after_truncate.remove(&u64::from(node.get()));
                 }
             }
         }
@@ -1485,7 +1535,7 @@ pub fn follower_compactions(records: &[TraceRecord]) -> (usize, usize) {
     let mut restating = Restating::default();
     let (mut count, mut swallowed) = (0usize, 0usize);
     for record in records {
-        restating.saw(&record.event);
+        restating.saw(record);
         match &record.event {
             TraceEvent::RaftRecovered { server, .. } => {
                 leading.insert(*server, false);
@@ -1580,6 +1630,26 @@ impl Report {
             clients,
             ranges,
             key_range,
+            // A run another scenario drove is `sim/ranges.rs`'s, and this says
+            // `OneGroup` so that the follower-log bound is still asked of it.
+            //
+            // That is deliberate and it is *not* the same judgement as the one this
+            // scenario's node cluster gets. `ranges::Report::check` calls
+            // `self.checked.check()` and adds its own clauses; it does not opt out of
+            // this one, so naming the cluster here is the whole of the decision.
+            // Asking the bound there is safe and worth keeping: that scenario's node
+            // has no follower compaction either, but it also has no client load worth
+            // the name against this one: the review of this slice measured its largest
+            // follower log at **66 entries over a hundred seeds and 74 over a
+            // thousand** against the bound's 768 — a margin over ten times the figure,
+            // barely growing with the tier, where this scenario's node reaches 610. A bound with that much room is a
+            // tripwire rather than a claim about a mechanism, and a tripwire on a
+            // scenario that should never approach it is worth having. The day it
+            // tightens, the judgement moves to `ranges::Report::check` where the
+            // scenario can make it for itself.
+            // PROPOSED(D-082): the follower-log bound is the one-group server's, and
+            // the node scenario's run is named `OneGroup` here so it keeps it.
+            cluster: Cluster::OneGroup,
             aimed: Vec::new(),
         }
     }
@@ -1784,7 +1854,8 @@ impl Report {
     }
 
     /// How long a range's ready apply waited through **another** range's apply job
-    /// on the same node, in virtual time.
+    /// on the same node, in virtual time, over windows in which that node was up
+    /// throughout.
     ///
     /// D-036's figure as far as this node can produce it. One `apply` task per node
     /// takes every range's jobs one at a time (Q14), so "one range's take holds the
@@ -1797,21 +1868,51 @@ impl Report {
     /// The fold, over one node's applies in time order. For three consecutive applies
     /// at `t0 < t1 < t2` where the one at `t2` is of a different range than the one at
     /// `t1`, and `t2`'s entry became committed at `r <= t1`: the hold is
-    /// `t1 - max(r, t0)`. That is the part of the job that ran from `t0` to `t1` —
-    /// another range's — that the range applied at `t2` spent waiting with its own
-    /// entry already committed.
+    /// `t1 - max(r, t0)` — the part of the job that ran from `t0` to `t1`, another
+    /// range's, that the range applied at `t2` spent waiting with its own entry
+    /// already committed.
     ///
-    /// `max(r, t0)` is what keeps the figure about the apply task. An entry that
-    /// became committed and then sat through a crash, an isolation or an election
-    /// waited on its own account and not on the task's, and clamping to `t0` bounds
-    /// every hold by one job's own span, which is the thing D-036 is about.
+    /// **A window in which the node crashed is not a hold, and is dropped.** Clamping
+    /// to `t0` was once thought to rule a crash out, and it does not: a node that
+    /// crashes just after `t0` and restarts before `t1` leaves two applies far apart
+    /// with no work between them, and the gap is the node being dead, not one range
+    /// holding another. The review of this slice found the maximum this fold reported
+    /// was exactly that — seed 71, server 1, window 8.067849144 s to 8.640712611 s,
+    /// with `NodeCrashed` at 8.068 s and `NodeRestarted` at 8.413 s inside it, 345 ms
+    /// of the 573 spent down — and the next three maxima were the same shape. So a
+    /// hold whose window holds a `NodeCrashed` or a `NodeRestarted` of that server is
+    /// not counted, and the count of what was dropped is returned beside the holds,
+    /// because a fold that quietly drops its input is a fold that says nothing.
+    ///
+    /// What is left is still an **upper bound on one job's hold and a lower bound on
+    /// the wait's total**, because an apply's completion is all the trace carries.
     // PROPOSED(D-082): how long one range's applies hold the node's others.
     #[must_use]
     pub fn cross_range_apply_holds(&self) -> Vec<Duration> {
+        self.cross_range_apply_holds_counted().0
+    }
+
+    /// The holds, and how many windows were dropped for holding a crash or a restart
+    /// of their node.
+    // PROPOSED(D-082): a window in which the node crashed is not a hold.
+    #[must_use]
+    pub fn cross_range_apply_holds_counted(&self) -> (Vec<Duration>, usize) {
+        // Every crash and restart, by the node that suffered it, in time order.
+        let mut downs: BTreeMap<u64, Vec<Instant>> = BTreeMap::new();
+        for record in &self.records {
+            let node = match &record.event {
+                TraceEvent::NodeCrashed { node } | TraceEvent::NodeRestarted { node } => {
+                    u64::from(node.get())
+                }
+                _ => continue,
+            };
+            downs.entry(node).or_default().push(record.at);
+        }
         let mut committed: BTreeMap<(u64, u64), (u64, BTreeMap<u64, Instant>)> = BTreeMap::new();
         // The two most recent applies on each node: (t0, t1) with t1's range.
         let mut last: BTreeMap<u64, (Option<Instant>, Instant, u64)> = BTreeMap::new();
         let mut holds = Vec::new();
+        let mut dropped = 0usize;
         for record in &self.records {
             match &record.event {
                 TraceEvent::RaftCommit {
@@ -1842,7 +1943,16 @@ impl Report {
                             Some(t0) if t0 > ready => t0,
                             _ => ready,
                         };
-                        holds.push(t1.duration_since(from));
+                        // A node's own server id is its node id in these scenarios
+                        // (`node_of_server`), so the crash records are looked up by it.
+                        let crashed = downs
+                            .get(server)
+                            .is_some_and(|at| at.iter().any(|&a| a >= from && a <= t1));
+                        if crashed {
+                            dropped += 1;
+                        } else {
+                            holds.push(t1.duration_since(from));
+                        }
                     }
                     let t0 = last.get(server).map(|&(_, t1, _)| t1);
                     last.insert(*server, (t0, record.at, *range));
@@ -1850,7 +1960,7 @@ impl Report {
                 _ => {}
             }
         }
-        holds
+        (holds, dropped)
     }
 
     /// Every peer frame this run's nodes sent, decoded: how many messages it
@@ -2148,11 +2258,11 @@ pub fn messages_of(payload: &Bytes) -> Vec<(u64, Message)> {
     }
 }
 
-/// A leader traces one [`TraceEvent::RaftMatchStarted`] per (leader, term,
-/// follower, incarnation): the rule the event's own definition states — the *first*
-/// rise of `matched` under the store incarnation the follower's answer carried
-/// (SHARD.md §8) — folded per run, so that a leader emitting one on every rise is
-/// seen.
+/// A leader traces one [`TraceEvent::RaftMatchStarted`] per (range, leader, term,
+/// follower, incarnation) *per tracking window*: the rule the event's own
+/// definition states — the *first* rise of `matched` under the store incarnation
+/// the follower's answer carried (SHARD.md §8) — folded per run, so that a leader
+/// emitting one on every rise is seen.
 ///
 /// The rule is a *replica's*, and so is every map here: the leader is the record's
 /// node **and the range the record names**, and its term is the latest term record
@@ -2164,23 +2274,73 @@ pub fn messages_of(payload: &Bytes) -> Vec<(u64, Message)> {
 // PROPOSED(D-076): the fold is keyed by `(range, leader, term, follower,
 // incarnation)`.
 ///
-/// The counters cannot see that: dropping the `match_started` clause from the
-/// core's guard raises this sweep's count from 1 840 to 63 164 at a hundred seeds,
-/// on every one of which a match start is still seen, with every seed still green.
-/// Measured on this tree, the mutation planted and this fold silenced. The leader is
-/// the record's node and its term is the latest term record of that node — the core
-/// traces one at every role it takes and the node one at every restatement — and a
-/// leader holds one term for one leadership, so a second record under one key is a
-/// second "first" rise.
+/// A window is one stretch of one replica's leader tracking one follower. It opens
+/// at the leader's term, and where the leader *begins tracking the follower
+/// afresh*: `on_change` re-inserts a `Progress` with `incarnation: None` and
+/// `match_started: false` for every target server outside the voters in force
+/// (core.rs:2074-2103). That is a voter removed and re-added inside one
+/// leadership, which the correct system does and which issue #81 caught on
+/// membership seed 7205 — leader 3 of term 2 grew to {1, 2, 3, 4, 5}, shrank to
+/// {1, 2, 3} and grew again, and server 4's match rose from zero a second time
+/// under the incarnation it had never left.
+///
+/// A change of the follower's incarnation clears the flag too (core.rs:1845), and
+/// that is deliberately *not* a window: it changes the key's own incarnation, so a
+/// repeat under one key means a retired incarnation came back. In the correct
+/// system it cannot — a fresh store is incarnation 1 and a re-seed draws
+/// `next_u64().max(2)` (node.rs:2327) — so a repeat is either D-042's window, a
+/// delayed answer from the store the leader has moved past, which SHARD.md §8 says
+/// is the case D-042 names the step to take for and not a bound to widen, or a
+/// store that lost its state and opened fresh at 1 again. The second is how
+/// `RefusalNotDurable` is caught on 58 of a thousand raft seeds, every one of them
+/// by this fold, which is what `a_server_whose_refusal_is_not_durable_is_caught`
+/// asserts from the thousand-seed tier (D-056).
+///
+/// A fresh tracking is read in the trace by *refining* what SHARD.md §8 recognises
+/// (SHARD.md:1358-1364): §8 takes a `RaftChangeAccepted` of the leader whose
+/// `voters` include `n` as a re-admission on its own, and attaches "while its
+/// configuration in force includes `n`" to its `RaftLeader` alternative instead.
+/// Three conditions narrow that to exactly the accepts at which `on_change`
+/// re-inserts a `Progress`, each one a branch it returns from first:
+///
+/// - The follower is outside the leader's own configuration in force, its latest
+///   `RaftConfig` of that range: `on_change` takes as learners the targets outside
+///   `membership.voters` and no others (core.rs:2074-2077).
+/// - That configuration is not joint: a change accepted with `new_voters` in force
+///   is answered from that branch and never reaches the learners (core.rs:2067).
+/// - The accept is not a repeat of the change already in flight, which the core
+///   holds through its catch-up phase and accepts again without re-tracking
+///   anything (core.rs:2065, D-029) — the scenario's operator repeats it. Two
+///   accepts of one target are one window while no `RaftConfig` of the leader's
+///   and no term record of its own falls between them: `append_joint` traces the
+///   first and ends the phase, and `become_leader` and `become_follower` clear the
+///   change without tracing a configuration at all (core.rs:1410, core.rs:1680),
+///   which the leader's own `RaftTerm` is what shows.
+///
+/// The counters cannot see any of this: dropping the `match_started` clause from
+/// the core's guard raises this sweep's count from 1 840 to 63 164 at a hundred
+/// seeds, on every one of which a match start is still seen, with every seed still
+/// green. Measured on this tree, the mutation planted and this fold silenced.
 ///
 /// # Errors
 ///
 /// The first repeat, naming the leader, the term, the follower and the incarnation.
 // PROPOSED(D-069): `RaftMatchStarted` is the first rise, and this is what says so.
+// PROPOSED(D-079): per tracking window, so that a re-added voter's fresh progress
+// is a fresh first rise (issue #81).
 pub fn match_starts_are_first_rises(records: &[TraceRecord]) -> Result<(), String> {
     let mut terms: BTreeMap<(u64, u64), u64> = BTreeMap::new();
-    let mut started: BTreeSet<(u64, u64, u64, u64, u64)> = BTreeSet::new();
+    // Each replica's configuration as its own `RaftConfig` states it: the voters
+    // in force, and whether it is joint.
+    let mut in_force: BTreeMap<(u64, u64), (BTreeSet<u64>, bool)> = BTreeMap::new();
+    // The voters of the change a leader last accepted with no configuration and no
+    // term record of its own traced since.
+    let mut last_accepted: BTreeMap<(u64, u64), Vec<u64>> = BTreeMap::new();
+    // How many times a leader has begun tracking a follower afresh.
+    let mut windows: BTreeMap<(u64, u64, u64), u64> = BTreeMap::new();
+    let mut started: BTreeSet<(u64, u64, u64, u64, u64, u64)> = BTreeSet::new();
     for record in records {
+        let node = record.node.map_or(0, |node| u64::from(node.get()));
         match &record.event {
             TraceEvent::RaftTerm {
                 server,
@@ -2195,6 +2355,31 @@ pub fn match_starts_are_first_rises(records: &[TraceRecord]) -> Result<(), Strin
                 ..
             } => {
                 terms.insert((*range, *server), *term);
+                // Taking office and stepping down both clear the core's change
+                // (core.rs:1410, core.rs:1680) without tracing a configuration, so
+                // the catch-up phase a repeat would fall in ends here too.
+                last_accepted.remove(&(*range, *server));
+            }
+            TraceEvent::RaftConfig {
+                server,
+                range,
+                old,
+                joint,
+                ..
+            } => {
+                in_force.insert((*range, *server), (old.iter().copied().collect(), *joint));
+                last_accepted.remove(&(*range, *server));
+            }
+            TraceEvent::RaftChangeAccepted { range, voters, .. } => {
+                if let Some((voters_in_force, joint)) = in_force.get(&(*range, node))
+                    && !joint
+                    && last_accepted.get(&(*range, node)) != Some(voters)
+                {
+                    for follower in voters.iter().filter(|s| !voters_in_force.contains(s)) {
+                        *windows.entry((*range, node, *follower)).or_default() += 1;
+                    }
+                }
+                last_accepted.insert((*range, node), voters.clone());
             }
             TraceEvent::RaftMatchStarted {
                 range,
@@ -2203,13 +2388,17 @@ pub fn match_starts_are_first_rises(records: &[TraceRecord]) -> Result<(), Strin
                 matched,
                 ..
             } => {
-                let leader = record.node.map_or(0, |node| u64::from(node.get()));
-                let term = terms.get(&(*range, leader)).copied().unwrap_or_default();
-                if !started.insert((*range, leader, term, *follower, *incarnation)) {
+                let term = terms.get(&(*range, node)).copied().unwrap_or_default();
+                let window = windows
+                    .get(&(*range, node, *follower))
+                    .copied()
+                    .unwrap_or_default();
+                if !started.insert((*range, node, term, *follower, *incarnation, window)) {
                     return Err(format!(
-                        "match starts: leader {leader} of term {term} of group {range} traced a \
+                        "match starts: leader {node} of term {term} of group {range} traced a \
                          second first rise of {follower}'s match under incarnation \
-                         {incarnation} (at {matched})"
+                         {incarnation} (at {matched}), with nothing between them that began \
+                         the tracking afresh"
                     ));
                 }
             }
@@ -2265,7 +2454,7 @@ fn fold_logs(
     let mut shapes: BTreeMap<u64, LogShape> = BTreeMap::new();
     let mut restating = Restating::default();
     for record in records {
-        restating.saw(&record.event);
+        restating.saw(record);
         let server = match &record.event {
             TraceEvent::RaftAppend { server, .. }
             | TraceEvent::RaftTruncate { server, .. }
@@ -2332,8 +2521,27 @@ pub fn compaction_stays_committed(records: &[TraceRecord]) -> Result<(), String>
                 let seen = committed.entry(*server).or_default();
                 *seen = (*seen).max(*index);
             }
+            // An install's prefix, and a re-statement standing in for one, is
+            // committed by construction: a leader streams only what it had
+            // committed, and the receiver traced no commit of its own for those
+            // indices, so without this arm the check would fail on the correct
+            // system. A **take** is a different matter, and is excluded: its
+            // `last_index` is the taker's *applied* index, the very quantity
+            // `ApplyBeforeCommit` corrupts, so a take raising this floor would
+            // hand the oracle its bound from the bug it watches for. Raising the
+            // floor a compaction is compared against is the only way a check of
+            // this shape can hide anything — the reasoning D-078 first recorded
+            // here had that backwards, and the review of this slice caught it.
+            //
+            // Measured, not assumed: with the arm narrowed, `ApplyBeforeCommit`
+            // is still caught on 999 of 1 000 seeds, first seed 0 with the same
+            // message, and the correct system still passes every seed. Nothing
+            // was masked; the weakening was latent.
             TraceEvent::RaftSnapshot {
-                server, last_index, ..
+                server,
+                last_index,
+                taken: false,
+                ..
             } => {
                 let seen = committed.entry(*server).or_default();
                 *seen = (*seen).max(*last_index);
@@ -2409,7 +2617,7 @@ impl Report {
         let mut restating = Restating::default();
         let (mut installed, mut restated) = (0usize, 0usize);
         for record in &self.records {
-            restating.saw(&record.event);
+            restating.saw(record);
             if let TraceEvent::RaftSnapshot { taken: false, .. } = &record.event {
                 if restating.restated() {
                     restated += 1;
@@ -2469,9 +2677,35 @@ impl Report {
     /// every schedule has been redrawn since, and seed 60 of this tree has its
     /// range live.)
     ///
-    /// A node's refusal is its whole store's, so every replica on it counts as
+    /// A node's refusal is its whole store's, so every replica *on it* counts as
     /// refused (SHARD.md §8); its re-seed and its quarantine are per replica.
+    ///
+    /// "On it" is the load-bearing word, and until D-077 this read it as *every range
+    /// in the run*. With one group on a server the two are the same sentence. With four
+    /// ranges on a node they are not: a refusal marked its node down for ranges it never
+    /// held and for ranges created after it was refused, and since a range whose
+    /// impaired replicas reach half is dropped from this set, each of those ranges was
+    /// silently exempted from the checks about time — the bound, the recovery margin,
+    /// every tooth §8 has. One refusal on a four-range node exempted the three ranges
+    /// the refusal did not touch. The direction is the dangerous one: the checks pass
+    /// because they are not asked.
+    ///
+    /// The ranges a refusal takes down are now the ones the node says it held, from the
+    /// `RaftReplicaRefused` its refusal traces per replica. They cannot come from the
+    /// node's *store*, and this is why the event exists: `RaftRefused` is traced before
+    /// the store opens — the refusal is what stops it opening — so at that instant there
+    /// is nothing to ask. What the node does have is the ranges §2 fixed at bootstrap,
+    /// in its configuration before it touches a disk, and those are what it names.
+    ///
+    /// A `RaftRefused` with no `RaftReplicaRefused` beside it therefore takes nothing
+    /// down. That is not a gap but the one-group server, which hosts a group rather than
+    /// holding ranges and whose refusal `sim/quorum.rs` and the `raft` arms still raise:
+    /// its range is `SINGLE_GROUP`, the only range of those runs, and it is marked down
+    /// by its own per-replica event once the node traces one. Until a scenario runs the
+    /// node, the sole reader of this is the node's own sweep.
     // PROPOSED(D-071): the checks about time are asked per range.
+    // PROPOSED(D-077): a refusal marks down the ranges its node held, which its
+    // per-replica refusal events name, and not every range in the run.
     #[must_use]
     pub fn ranges_with_a_majority_up(&self) -> BTreeSet<u64> {
         let ranges = self.ranges();
@@ -2479,8 +2713,8 @@ impl Report {
         let mut quarantined: BTreeSet<(u64, u64)> = BTreeSet::new();
         for record in &self.records {
             match &record.event {
-                TraceEvent::RaftRefused { server, .. } => {
-                    down.extend(ranges.iter().map(|range| (*range, *server)));
+                TraceEvent::RaftReplicaRefused { server, range } => {
+                    down.insert((*range, *server));
                 }
                 TraceEvent::RaftRecovered { server, range, .. } => {
                     down.remove(&(*range, *server));
@@ -2652,7 +2886,21 @@ impl Report {
         if let Err(violation) = compaction_stays_committed(&self.records) {
             return fail(violation);
         }
-        if let Err(violation) = self.follower_log_is_bounded() {
+        // Asked of the one-group server alone, and the reason is the node's, not a
+        // convenience. D-078's follower compaction is the core asking its `apply` task
+        // for a `SnapshotAction::Record`, and the node's host counts that action and
+        // drops it: no record is written, no prefix is dropped, and a follower replica
+        // on the node has nothing bounding its in-memory log but the run's length. The
+        // bound is a bound on a mechanism this node does not run, so asking it here
+        // would be asserting a property nobody built — measured at 372 entries over a
+        // hundred seeds against the bound's 768, and growing with the tier, which is a
+        // nightly waiting to turn red on a claim the entry itself denies. The node's
+        // sweep prints the distribution instead, and the slice that wires the
+        // `snapshot` task owes the node its own bound.
+        // PROPOSED(D-082): the follower-log bound is the one-group server's.
+        if self.cluster == Cluster::OneGroup
+            && let Err(violation) = self.follower_log_is_bounded()
+        {
             return fail(violation);
         }
         // Both are asked only of a range whose unimpaired replicas form a majority
@@ -2668,9 +2916,8 @@ impl Report {
         Ok(())
     }
 
-    /// The largest in-memory log of any follower replica, against the bound
-    /// [`FOLLOWER_LOG_MULTIPLE`] states as a multiple of
-    /// [`SNAPSHOT_THRESHOLD`] (Stage B's exit; Q39).
+    /// The largest in-memory log of any follower replica, against the entry bound
+    /// [`FOLLOWER_LOG_BOUND`] (Stage B's exit; Q39).
     ///
     /// A follower compacts one tick after its log passes the threshold, and the
     /// entries of that tick's round, of the persist the compaction waits behind
@@ -2679,13 +2926,11 @@ impl Report {
     /// itself.
     // PROPOSED(D-078): a follower compacts its log to its own applied index.
     fn follower_log_is_bounded(&self) -> Result<(), String> {
-        let bound = FOLLOWER_LOG_MULTIPLE * SNAPSHOT_THRESHOLD;
         let (longest, server) = self.largest_follower_log();
-        if longest > bound {
+        if longest > FOLLOWER_LOG_BOUND {
             return Err(format!(
                 "follower log: server {server} held {longest} entries in memory while not \
-                 leading, over the {bound} entries of {FOLLOWER_LOG_MULTIPLE} × \
-                 {SNAPSHOT_THRESHOLD}"
+                 leading, over the bound of {FOLLOWER_LOG_BOUND} entries"
             ));
         }
         Ok(())
@@ -6371,6 +6616,7 @@ pub fn run_on(
                 down,
             } => {
                 let leader = leader_now(&sim);
+                aimed.push((aimed_range, leader, sim.now()));
                 let stale = if *server == leader {
                     server % SERVERS + 1
                 } else {
@@ -6405,6 +6651,7 @@ pub fn run_on(
                 steer,
             } => {
                 let leader = leader_now(&sim);
+                aimed.push((aimed_range, leader, sim.now()));
                 let behind = if *follower == leader {
                     follower % SERVERS + 1
                 } else {
@@ -6535,6 +6782,7 @@ pub fn run_on(
         clients: clients_total,
         ranges: cluster.ranges(),
         key_range: cluster.key_range(),
+        cluster,
         aimed,
     }
 }
@@ -7002,6 +7250,108 @@ mod tests {
 
     /// A report around `records` and `isolations`, three servers whose clocks run
     /// true, so each server's timer bound is 400 ms.
+    /// The cross-range hold fold, on records built by hand: it counts a wait across
+    /// ranges, it counts nothing across a crash, and it counts nothing at all within
+    /// one range.
+    ///
+    /// Both clauses were mutated and only one was caught by the sweeps. Dropping the
+    /// crash windows moved the maximum this fold reports from 572.9 ms to 178.6 ms —
+    /// the figure §12 sends to the owner — and dropping `of != range` moved the count
+    /// from 5 317 waits to 54 808 and the median from 2.07 ms to 2.50 ms **with every
+    /// test still green**, because both figures are printed and neither is asserted.
+    /// A number that goes to the owner needs an oracle of its own, and a sweep cannot
+    /// be it: this is that oracle.
+    // PROPOSED(D-082): how long one range's applies hold the node's others.
+    #[test]
+    fn the_hold_fold_counts_a_wait_across_ranges_and_nothing_across_a_crash() {
+        let commit = |server, range, index| TraceEvent::RaftCommit {
+            server,
+            range,
+            term: 1,
+            index,
+        };
+        let apply = |server, range, index| TraceEvent::RaftApply {
+            server,
+            range,
+            index,
+            entry_term: 1,
+            hash: 0,
+            key: None,
+            effect: ApplyEffect::None,
+        };
+        let held = |records: Vec<TraceRecord>| {
+            let (holds, dropped) = report(records, Vec::new()).cross_range_apply_holds_counted();
+            (holds, dropped)
+        };
+
+        // Range 3's index 1 is committed at 10 ms; range 2 applies at 20 ms and again
+        // at 40 ms; range 3 applies at 60 ms. Its wait ran through the job that ended
+        // at 40 ms, so the hold is 40 − 20 = 20 ms.
+        let across = vec![
+            record(ms(10), ms(10), Some(1), commit(1, 3, 1)),
+            record(ms(20), ms(20), Some(1), apply(1, 2, 1)),
+            record(ms(40), ms(40), Some(1), apply(1, 2, 2)),
+            record(ms(60), ms(60), Some(1), apply(1, 3, 1)),
+        ];
+        let (holds, dropped) = held(across.clone());
+        assert_eq!(
+            (holds.as_slice(), dropped),
+            (&[Duration::from_millis(20)][..], 0),
+            "a wait across ranges is one hold of the job it waited through"
+        );
+
+        // The same trace with the node crashing inside the window: not a hold at all,
+        // and counted as dropped rather than passed over.
+        let mut crashed = across.clone();
+        crashed.insert(
+            2,
+            record(
+                ms(25),
+                ms(25),
+                Some(1),
+                TraceEvent::NodeCrashed {
+                    node: NodeId::new(1),
+                },
+            ),
+        );
+        let (holds, dropped) = held(crashed);
+        assert_eq!(
+            (holds.as_slice(), dropped),
+            (&[][..], 1),
+            "a window the node spent crashed in is not one range holding another"
+        );
+
+        // One range applying three times in a row holds nothing: there is no other
+        // range's job in the window, and a fold that counted this would report a
+        // range's own apply latency as a cross-range hold.
+        let alone = vec![
+            record(ms(10), ms(10), Some(1), commit(1, 2, 3)),
+            record(ms(20), ms(20), Some(1), apply(1, 2, 1)),
+            record(ms(40), ms(40), Some(1), apply(1, 2, 2)),
+            record(ms(60), ms(60), Some(1), apply(1, 2, 3)),
+        ];
+        let (holds, dropped) = held(alone);
+        assert_eq!(
+            (holds.as_slice(), dropped),
+            (&[][..], 0),
+            "one range's own applies are not a hold by another range"
+        );
+
+        // And a wait on another *node* is not this node's: the fold is per node.
+        let elsewhere = vec![
+            record(ms(10), ms(10), Some(2), commit(2, 3, 1)),
+            record(ms(20), ms(20), Some(1), apply(1, 2, 1)),
+            record(ms(40), ms(40), Some(1), apply(1, 2, 2)),
+            record(ms(60), ms(60), Some(2), apply(2, 3, 1)),
+        ];
+        let (holds, dropped) = held(elsewhere);
+        assert_eq!(
+            (holds.as_slice(), dropped),
+            (&[][..], 0),
+            "a hold is one node's apply task holding its own ranges"
+        );
+    }
+
     fn report(records: Vec<TraceRecord>, isolations: Vec<(u64, Instant, Instant)>) -> Report {
         let sim = Sim::new(SimConfig::new(0));
         Report {
@@ -7021,8 +7371,20 @@ mod tests {
             clients: ClientStats::default(),
             ranges: (SINGLE_GROUP..SINGLE_GROUP + 4).collect(),
             key_range: range_of_key,
+            cluster: Cluster::OneGroup,
             aimed: Vec::new(),
         }
+    }
+
+    fn refused(server: u64) -> TraceEvent {
+        TraceEvent::RaftRefused {
+            server,
+            reason: "a table the manifest names is gone".to_owned(),
+        }
+    }
+
+    fn replica_refused(server: u64, range: u64) -> TraceEvent {
+        TraceEvent::RaftReplicaRefused { server, range }
     }
 
     fn vote(server: u64) -> TraceEvent {
@@ -7666,7 +8028,8 @@ mod tests {
     /// form a majority (SHARD.md §8), where RAFT.md §2 asked it of the cluster: two
     /// of one range's three replicas quarantined by a re-seed leave that range with
     /// no majority, and say nothing about the range beside it. A node's refusal is
-    /// its whole store's and impairs every range on it.
+    /// its whole store's and impairs every range **on it**, which its per-replica
+    /// refusals name (D-077).
     #[test]
     fn a_majority_is_asked_of_each_range_and_a_refusal_is_the_whole_nodes() {
         let quarantined = |server, range| TraceEvent::RaftReseeded { server, range };
@@ -7689,10 +8052,9 @@ mod tests {
             BTreeSet::from([OTHER]),
             "one range short of a majority, the other not"
         );
-        let refused = |server| TraceEvent::RaftRefused {
-            server,
-            reason: "a table the manifest names is gone".to_owned(),
-        };
+        // A node refused while holding both ranges takes both of its replicas down,
+        // and two such nodes leave neither range a majority. The refusal says the
+        // node; the per-replica events say which replicas went with it.
         let whole_node = report(
             vec![
                 record(
@@ -7703,11 +8065,130 @@ mod tests {
                 ),
                 record(ms(0), ms(0), Some(1), term_of(1, OTHER, 1, "follower")),
                 record(ms(1), ms(1), Some(1), refused(1)),
+                record(ms(1), ms(1), Some(1), replica_refused(1, SINGLE_GROUP)),
+                record(ms(1), ms(1), Some(1), replica_refused(1, OTHER)),
                 record(ms(2), ms(2), Some(2), refused(2)),
+                record(ms(2), ms(2), Some(2), replica_refused(2, SINGLE_GROUP)),
+                record(ms(2), ms(2), Some(2), replica_refused(2, OTHER)),
             ],
             Vec::new(),
         );
         assert_eq!(whole_node.ranges_with_a_majority_up(), BTreeSet::new());
+    }
+
+    /// The case the old reading got wrong, and the reason D-077 changed it.
+    ///
+    /// Before D-077 a `RaftRefused` marked its node down for *every range in the run*.
+    /// At one group per server that was the same sentence; with four ranges on a node
+    /// it is not. Here two nodes are refused holding one range each, and the ranges
+    /// they never held — one that existed all along, one created after they were
+    /// refused — are untouched by the refusal and must still be asked the checks about
+    /// time. Under the old reading every one of them was marked down on both servers,
+    /// dropped from this set, and so exempted from the bound, the recovery margin and
+    /// every other tooth §8 has: the checks passed because they were never asked.
+    ///
+    /// The assertion below is the fix's evidence in both directions: the range the
+    /// nodes *did* hold is short of a majority and correctly dropped, and the two they
+    /// did not are kept. On the old code the expected set was empty.
+    // PROPOSED(D-077): a refusal marks down the ranges its node held.
+    #[test]
+    fn a_refusal_marks_down_only_the_ranges_its_node_held() {
+        const LATER: u64 = SINGLE_GROUP + 2;
+        let report = report(
+            vec![
+                record(
+                    ms(0),
+                    ms(0),
+                    Some(1),
+                    term_of(1, SINGLE_GROUP, 1, "follower"),
+                ),
+                // A range that existed all along on other nodes, never on 1 or 2.
+                record(ms(0), ms(0), Some(3), term_of(3, OTHER, 1, "follower")),
+                // Both nodes hold SINGLE_GROUP alone, and are refused holding it.
+                record(ms(1), ms(1), Some(1), refused(1)),
+                record(ms(1), ms(1), Some(1), replica_refused(1, SINGLE_GROUP)),
+                record(ms(2), ms(2), Some(2), refused(2)),
+                record(ms(2), ms(2), Some(2), replica_refused(2, SINGLE_GROUP)),
+                // A range created after both refusals, on a node that was not refused.
+                record(ms(3), ms(3), Some(3), term_of(3, LATER, 1, "follower")),
+            ],
+            Vec::new(),
+        );
+        assert_eq!(
+            report.ranges_with_a_majority_up(),
+            BTreeSet::from([OTHER, LATER]),
+            "a refusal takes down the ranges its node held, and no others"
+        );
+    }
+
+    /// The other half of the same reading: a replica that comes back is *lifted* out
+    /// of the down set, so its range is asked the checks about time again.
+    ///
+    /// Nothing asserted this half until the review of D-077 planted it. Making the
+    /// `RaftRecovered` arm a no-op — every refused replica down for the rest of its
+    /// run — passes the whole tree, sweeps included, and it has to: a down set that is
+    /// too *large* drops ranges from [`Report::ranges_with_a_majority_up`], and a range
+    /// not in that set is one the checks about time are never asked about. The failure
+    /// direction is green. That is the same silent exemption D-077 exists to close, one
+    /// event along, so the lifting is asserted here rather than left to a sweep that
+    /// cannot fail on it.
+    // PROPOSED(D-077): a refusal marks down the ranges its node held.
+    #[test]
+    fn a_recovered_replica_is_lifted_out_and_its_range_is_asked_again() {
+        let recovered = |server, range| TraceEvent::RaftRecovered {
+            server,
+            range,
+            term: 1,
+            applied: 0,
+            last_index: 0,
+            incarnation: 2,
+        };
+        let with = |lift: Vec<TraceRecord>| {
+            let mut all = vec![
+                record(
+                    ms(0),
+                    ms(0),
+                    Some(1),
+                    term_of(1, SINGLE_GROUP, 1, "follower"),
+                ),
+                record(ms(1), ms(1), Some(1), refused(1)),
+                record(ms(1), ms(1), Some(1), replica_refused(1, SINGLE_GROUP)),
+                record(ms(2), ms(2), Some(2), refused(2)),
+                record(ms(2), ms(2), Some(2), replica_refused(2, SINGLE_GROUP)),
+            ];
+            all.extend(lift);
+            report(all, Vec::new())
+        };
+
+        // Two of the three replicas down: the range is not asked.
+        assert_eq!(
+            with(Vec::new()).ranges_with_a_majority_up(),
+            BTreeSet::new(),
+            "two replicas down leaves the range short of a majority"
+        );
+
+        // One of them re-seeded and restated: one replica down, a majority again.
+        assert_eq!(
+            with(vec![record(
+                ms(3),
+                ms(3),
+                Some(1),
+                recovered(1, SINGLE_GROUP)
+            )])
+            .ranges_with_a_majority_up(),
+            BTreeSet::from([SINGLE_GROUP]),
+            "a recovered replica is no longer down, and its range is asked again"
+        );
+
+        // A recovery of another range on the same server lifts nothing here: the set
+        // is keyed by replica, not by server. That range is one of the run's, and
+        // nothing took it down, so it is up — and this one is still short.
+        assert_eq!(
+            with(vec![record(ms(3), ms(3), Some(1), recovered(1, OTHER))])
+                .ranges_with_a_majority_up(),
+            BTreeSet::from([OTHER]),
+            "a recovery names one replica, and server 1's replica of this range is not it"
+        );
     }
 
     /// And the carve-out is read where it is *used*, not only where it is
@@ -7804,6 +8285,302 @@ mod tests {
                 "liveness: no client write to k1 completed after the last heal at Instant(0ns)"
                     .to_owned()
             )
+        );
+    }
+
+    /// Records of leader 3 in term 2, one event a millisecond in the order given.
+    fn led_by_three(events: Vec<TraceEvent>) -> Vec<TraceRecord> {
+        traced_by(events.into_iter().map(|event| (3, event)).collect())
+    }
+
+    /// The same, with the node that traced each record named: the maps this fold
+    /// keeps are a *replica's*, so a second server's records are what tells them
+    /// from one map held for the cluster.
+    fn traced_by(events: Vec<(u64, TraceEvent)>) -> Vec<TraceRecord> {
+        let start = record(ms(0), ms(0), Some(3), term_of(3, SINGLE_GROUP, 2, "leader"));
+        std::iter::once(start)
+            .chain(events.into_iter().enumerate().map(|(i, (node, event))| {
+                let at = ms(u64::try_from(i).expect("few") + 1);
+                record(at, at, Some(node), event)
+            }))
+            .collect()
+    }
+
+    /// A server's record of the configuration in force: joint where `new` is given.
+    fn config_of(server: u64, old: &[u64], new: &[u64]) -> TraceEvent {
+        config_in(SINGLE_GROUP, server, old, new)
+    }
+
+    fn config_in(range: u64, server: u64, old: &[u64], new: &[u64]) -> TraceEvent {
+        TraceEvent::RaftConfig {
+            server,
+            range,
+            index: 0,
+            old: old.to_vec(),
+            new: new.to_vec(),
+            joint: !new.is_empty(),
+            learners: Vec::new(),
+        }
+    }
+
+    fn change_accepted(voters: &[u64]) -> TraceEvent {
+        change_accepted_in(SINGLE_GROUP, voters)
+    }
+
+    fn change_accepted_in(range: u64, voters: &[u64]) -> TraceEvent {
+        TraceEvent::RaftChangeAccepted {
+            range,
+            voters: voters.to_vec(),
+            applied: 0,
+            term: 2,
+        }
+    }
+
+    fn match_started(follower: u64, incarnation: u64, matched: u64) -> TraceEvent {
+        match_started_in(SINGLE_GROUP, follower, incarnation, matched)
+    }
+
+    fn match_started_in(range: u64, follower: u64, incarnation: u64, matched: u64) -> TraceEvent {
+        TraceEvent::RaftMatchStarted {
+            range,
+            follower,
+            incarnation,
+            matched,
+        }
+    }
+
+    fn progress_reset(server: u64, follower: u64, incarnation: u64) -> TraceEvent {
+        TraceEvent::RaftProgressReset {
+            server,
+            range: SINGLE_GROUP,
+            follower,
+            incarnation,
+        }
+    }
+
+    /// The violation names the leader, its term, the follower and the incarnation.
+    fn a_second_first_rise(records: &[TraceRecord], of: &str) -> bool {
+        match_starts_are_first_rises(records).is_err_and(|violation| {
+            violation.contains("leader 3 of term 2") && violation.contains(of)
+        })
+    }
+
+    /// Issue #81: a voter removed and re-added inside one leadership is tracked
+    /// afresh — `on_change` re-inserts its `Progress` with `match_started: false`
+    /// — so its match rises from zero again under the incarnation it never left,
+    /// and that rise is a first rise. Two rises inside one window are not, which
+    /// is what the check is for: this is the pair, and the membership scenario's
+    /// seed 7205 is the run that made the first half of it.
+    // PROPOSED(D-079): a first rise per tracking window.
+    #[test]
+    fn a_voter_re_added_inside_one_term_starts_its_match_afresh() {
+        let re_added = led_by_three(vec![
+            config_of(3, &[1, 2, 3], &[]),
+            change_accepted(&[1, 2, 3, 4]),
+            match_started(4, 1, 10),
+            config_of(3, &[1, 2, 3, 4], &[]),
+            // The shrink drops 4; the grow after it tracks 4 from nothing again.
+            change_accepted(&[1, 2, 3]),
+            config_of(3, &[1, 2, 3], &[]),
+            change_accepted(&[1, 2, 3, 4]),
+            match_started(4, 1, 20),
+        ]);
+        assert_eq!(match_starts_are_first_rises(&re_added), Ok(()));
+
+        let continuous = led_by_three(vec![
+            config_of(3, &[1, 2, 3, 4], &[]),
+            match_started(4, 1, 10),
+            match_started(4, 1, 20),
+        ]);
+        assert!(
+            a_second_first_rise(&continuous, "4's match under incarnation 1"),
+            "one continuous rise traced as two first rises must fail the check"
+        );
+    }
+
+    /// A re-add opens the window of the server re-added and of no other: 5
+    /// rejoining excuses nothing of 4's, which the leader never stopped tracking.
+    // PROPOSED(D-079): a first rise per tracking window.
+    #[test]
+    fn a_re_add_opens_the_window_of_the_server_re_added_alone() {
+        let records = led_by_three(vec![
+            config_of(3, &[1, 2, 3, 4], &[]),
+            match_started(4, 1, 10),
+            change_accepted(&[1, 2, 3, 4, 5]),
+            match_started(5, 1, 15),
+            match_started(4, 1, 20),
+        ]);
+        assert!(
+            a_second_first_rise(&records, "4's match under incarnation 1"),
+            "5's re-add must not excuse a second first rise of 4's match"
+        );
+    }
+
+    /// One catch-up phase is one window. The operator repeats its request while
+    /// the change is in flight and the leader accepts it again (D-029), holding
+    /// the change it already has and tracking nothing afresh: only a
+    /// configuration of the leader's own ends the phase.
+    // PROPOSED(D-079): a first rise per tracking window.
+    #[test]
+    fn a_request_repeated_inside_one_catch_up_phase_is_one_window() {
+        let records = led_by_three(vec![
+            config_of(3, &[1, 2, 3], &[]),
+            change_accepted(&[1, 2, 3, 4]),
+            match_started(4, 1, 10),
+            change_accepted(&[1, 2, 3, 4]),
+            match_started(4, 1, 20),
+        ]);
+        assert!(
+            a_second_first_rise(&records, "4's match under incarnation 1"),
+            "a repeat of the change in flight tracks nothing afresh"
+        );
+    }
+
+    /// A change accepted while a joint configuration is in force tracks nothing
+    /// afresh either: `on_change` answers from its `new_voters` branch and
+    /// returns before it reaches the learners.
+    // PROPOSED(D-079): a first rise per tracking window.
+    #[test]
+    fn a_change_accepted_under_a_joint_configuration_opens_no_window() {
+        let records = led_by_three(vec![
+            config_of(3, &[1, 2, 3], &[1, 2, 3, 4]),
+            match_started(4, 1, 10),
+            change_accepted(&[1, 2, 3, 4]),
+            match_started(4, 1, 20),
+        ]);
+        assert!(
+            a_second_first_rise(&records, "4's match under incarnation 1"),
+            "a change accepted under the joint configuration tracks nothing afresh"
+        );
+    }
+
+    /// An incarnation carried back is a second first rise and stays one, reset or
+    /// no reset. A leader forgets a follower's progress at every change of its
+    /// incarnation (D-042), so the core does trace a first rise after one; but the
+    /// incarnation is in the key, and the correct system never returns to a number
+    /// it has retired — a fresh store is 1 and a re-seed draws above it. A repeat
+    /// under one incarnation is therefore either D-042's one-message window, which
+    /// SHARD.md §8 asks to be shown rather than allowed, or a store that lost its
+    /// state and opened fresh at 1 again, which is `RefusalNotDurable`.
+    // PROPOSED(D-079): a first rise per tracking window.
+    #[test]
+    fn an_incarnation_carried_back_is_a_second_first_rise() {
+        let there_and_back = led_by_three(vec![
+            config_of(3, &[1, 2, 3, 4], &[]),
+            match_started(4, 1, 10),
+            progress_reset(3, 4, 2),
+            match_started(4, 2, 20),
+            progress_reset(3, 4, 1),
+            match_started(4, 1, 30),
+        ]);
+        assert!(
+            a_second_first_rise(&there_and_back, "4's match under incarnation 1"),
+            "an incarnation the leader had already retired came back: D-042's case, not a window"
+        );
+    }
+
+    /// A term record of the leader's own ends the catch-up phase, as a
+    /// configuration of its own does. `become_leader` and `become_follower` clear
+    /// the core's change (core.rs:1680, core.rs:1410) and trace a role, not a
+    /// configuration, so a leader that accepts a grow, loses the lead and takes it
+    /// again re-tracks the same followers with no `RaftConfig` of its own between
+    /// the two accepts. Reading only the configuration made the fold open one
+    /// window where the core made two, on **2 of 11 220** re-tracks over seeds 0 to
+    /// 3 000 (seeds 659 and 7123).
+    ///
+    /// That staleness was in the strict direction — fewer windows are more
+    /// collisions — and the real shape carries a term rise with it, so the key's
+    /// own term already told the two rises apart and no verdict was ever wrong.
+    /// The case therefore holds the term still, with a restatement rather than an
+    /// election, so that the clearing is asserted at all rather than masked by the
+    /// term in the key.
+    // PROPOSED(D-079): a first rise per tracking window.
+    #[test]
+    fn a_term_record_of_the_leaders_own_ends_the_catch_up_phase() {
+        let restated = led_by_three(vec![
+            config_of(3, &[1, 2, 3], &[]),
+            change_accepted(&[1, 2, 3, 4]),
+            match_started(4, 1, 10),
+            // The core this leader runs on is rebuilt and restates its term: its
+            // change went with it, so the accept that follows tracks 4 afresh.
+            TraceEvent::RaftRecovered {
+                server: 3,
+                range: SINGLE_GROUP,
+                term: 2,
+                applied: 0,
+                last_index: 0,
+                incarnation: 1,
+            },
+            change_accepted(&[1, 2, 3, 4]),
+            match_started(4, 1, 20),
+        ]);
+        assert_eq!(match_starts_are_first_rises(&restated), Ok(()));
+    }
+
+    /// The configuration a window is read against is the *leader's own*. A
+    /// follower restating a configuration the leader has left behind must not open
+    /// the leader's window: 4 is a voter of leader 3's configuration throughout, so
+    /// the accept that names it tracks nothing afresh and the second rise is a
+    /// second first rise.
+    // PROPOSED(D-079): a first rise per tracking window.
+    #[test]
+    fn a_followers_configuration_opens_no_window_of_the_leaders() {
+        let records = traced_by(vec![
+            (3, config_of(3, &[1, 2, 3, 4], &[])),
+            (3, match_started(4, 1, 10)),
+            // Server 1 is behind and still says {1, 2, 3}. It is not the leader.
+            (1, config_of(1, &[1, 2, 3], &[])),
+            (3, change_accepted(&[1, 2, 3, 4])),
+            (3, match_started(4, 1, 20)),
+        ]);
+        assert!(
+            a_second_first_rise(&records, "4's match under incarnation 1"),
+            "a follower's stale configuration must not open the leader's window"
+        );
+    }
+
+    /// The catch-up phase a repeat falls in is the *leader's own* too: another
+    /// server's configuration is not the end of it, so the leader's repeat of the
+    /// change it already holds still tracks nothing afresh.
+    // PROPOSED(D-079): a first rise per tracking window.
+    #[test]
+    fn a_followers_configuration_does_not_end_the_leaders_catch_up_phase() {
+        let records = traced_by(vec![
+            (3, config_of(3, &[1, 2, 3], &[])),
+            (3, change_accepted(&[1, 2, 3, 4])),
+            (3, match_started(4, 1, 10)),
+            // Server 1 takes the joint entry and traces its own configuration.
+            (1, config_of(1, &[1, 2, 3], &[1, 2, 3, 4])),
+            (3, change_accepted(&[1, 2, 3, 4])),
+            (3, match_started(4, 1, 20)),
+        ]);
+        assert!(
+            a_second_first_rise(&records, "4's match under incarnation 1"),
+            "another server's configuration must not end the leader's catch-up phase"
+        );
+    }
+
+    /// Every map here is a replica's, the windows included: a change accepted in
+    /// one range tracks nothing afresh in another, and must not forgive a repeat
+    /// there. D-069's key was range-blind in the *strict* direction — one node's
+    /// four ranges collapsed into one key — and D-076 fixed that; window state
+    /// keyed by the node alone would be range-blind in the *lax* direction, which
+    /// is the one that lets a repeat through.
+    // PROPOSED(D-079): a first rise per tracking window.
+    #[test]
+    fn a_change_accepted_in_one_range_opens_no_window_in_another() {
+        let records = led_by_three(vec![
+            config_of(3, &[1, 2, 3, 4], &[]),
+            config_in(OTHER, 3, &[1, 2, 3], &[]),
+            match_started(4, 1, 10),
+            // A genuine re-add of 4, in the other range and in that range alone.
+            change_accepted_in(OTHER, &[1, 2, 3, 4]),
+            match_started_in(OTHER, 4, 1, 15),
+            match_started(4, 1, 20),
+        ]);
+        assert!(
+            a_second_first_rise(&records, &format!("of group {SINGLE_GROUP} traced")),
+            "a window opened in one range must not forgive a repeat in another"
         );
     }
 
@@ -7967,5 +8744,282 @@ mod tests {
                     .to_owned()
             )
         );
+    }
+}
+
+/// The two folds D-065 added, on records written by hand.
+///
+/// Both read a trace positionally, and both were found by the review of this
+/// slice to be defensible by nothing: a sweep cannot see a fold that under-reads,
+/// because the bound is never near-tripped on the correct system, and it cannot
+/// see a measure that counts the wrong thing, because nothing asserts the count.
+/// These tests are that defence, and each names the wrong shape it rejects.
+// PROPOSED(D-078): a follower compacts its log to its own applied index.
+#[cfg(test)]
+mod compaction_folds {
+    use super::*;
+    use ananke_raft::node::SINGLE_GROUP;
+
+    fn at(n: u64) -> Instant {
+        Instant::from_nanos(n * 1_000_000)
+    }
+
+    /// A record of `server`'s, emitted by the node of the same number — which is
+    /// how the simulator numbers them, and what [`Restating`] reads as the second
+    /// half of "nothing of that server's in between".
+    fn of(n: u64, server: u64, event: TraceEvent) -> TraceRecord {
+        TraceRecord {
+            at: at(n),
+            decided: at(n),
+            node: Some(NodeId::new(u32::try_from(server).expect("small"))),
+            event,
+        }
+    }
+
+    fn append(server: u64, index: u64) -> TraceEvent {
+        TraceEvent::RaftAppend {
+            server,
+            range: SINGLE_GROUP,
+            index,
+            entry_term: 1,
+            hash: 0,
+        }
+    }
+
+    fn truncate(server: u64, from_index: u64) -> TraceEvent {
+        TraceEvent::RaftTruncate {
+            server,
+            range: SINGLE_GROUP,
+            from_index,
+        }
+    }
+
+    fn snapshot(server: u64, last_index: u64, taken: bool) -> TraceEvent {
+        TraceEvent::RaftSnapshot {
+            server,
+            range: SINGLE_GROUP,
+            last_index,
+            last_term: 1,
+            taken,
+        }
+    }
+
+    fn compacted(server: u64, through: u64) -> TraceEvent {
+        TraceEvent::RaftCompacted {
+            server,
+            range: SINGLE_GROUP,
+            through,
+        }
+    }
+
+    fn config(server: u64, index: u64) -> TraceEvent {
+        TraceEvent::RaftConfig {
+            server,
+            range: SINGLE_GROUP,
+            index,
+            old: vec![1, 2, 3],
+            new: Vec::new(),
+            joint: false,
+            learners: Vec::new(),
+        }
+    }
+
+    fn following(server: u64) -> TraceEvent {
+        TraceEvent::RaftTerm {
+            server,
+            range: SINGLE_GROUP,
+            term: 1,
+            role: "follower",
+            received: None,
+        }
+    }
+
+    /// The largest follower log, over a trace whose every shape is known.
+    fn longest(records: &[TraceRecord]) -> u64 {
+        let mut worst = 0;
+        fold_logs(records, |_, shape| {
+            worst = worst.max(if shape.leading { 0 } else { shape.len() });
+            Ok(())
+        })
+        .expect("the fold decides nothing");
+        worst
+    }
+
+    /// The log the fold holds after the last record of the trace.
+    fn ends_at(records: &[TraceRecord]) -> u64 {
+        let mut last = 0;
+        fold_logs(records, |_, shape| {
+            last = shape.len();
+            Ok(())
+        })
+        .expect("the fold decides nothing");
+        last
+    }
+
+    /// A **live take** leaves the log where it was; an install and a re-statement
+    /// stand in for a prefix that is gone. The whole Stage B exit measurement
+    /// rests on this one distinction, and reading a take as moving the prefix
+    /// under-reads every follower log that has a take outstanding — the wrong
+    /// direction for a bound, and invisible to any sweep, since a bound that is
+    /// never near-tripped cannot fail on a log read too short.
+    ///
+    /// The shape rejected: `TraceEvent::RaftSnapshot { .. } => true` in
+    /// [`Restating::moves_the_prefix`], which is what this fold did before the
+    /// first review of this slice. It reads the log below as 10 entries, not 30.
+    #[test]
+    fn a_live_take_does_not_move_the_folds_prefix_and_an_install_does() {
+        let mut records: Vec<TraceRecord> = vec![of(0, 1, following(1))];
+        for index in 1..=30 {
+            records.push(of(index, 1, append(1, index)));
+        }
+        assert_eq!(ends_at(&records), 30, "thirty entries, no prefix");
+
+        // A take at 20, with no compaction under it yet: the core still holds
+        // every entry from 1, so the log is *still* 30 entries. This is the
+        // assertion the mutation fails, and it has to be read after the take
+        // rather than as a maximum over the run — the maximum was already 30
+        // before the take, so a maximum cannot see the take shorten it.
+        records.push(of(31, 1, snapshot(1, 20, true)));
+        assert_eq!(
+            ends_at(&records),
+            30,
+            "a take writes a checkpoint and leaves the log alone"
+        );
+        assert_eq!(longest(&records), 30);
+
+        // The compaction is what drops the prefix.
+        records.push(of(32, 1, compacted(1, 20)));
+        assert_eq!(longest(&records), 30, "the maximum stands at 30");
+        assert_eq!(
+            ends_at(&records),
+            10,
+            "after the compaction the log is the 10 entries past the prefix"
+        );
+
+        // A restart: the durable log re-stated as a truncation to one past its
+        // end and then the prefix's snapshot — a *re-stated take*, which does
+        // move the prefix, because the prefix it names is already gone.
+        let mut restarted = records.clone();
+        restarted.push(of(33, 1, truncate(1, 31)));
+        restarted.push(of(34, 1, snapshot(1, 20, true)));
+        assert_eq!(
+            longest(&restarted),
+            30,
+            "a re-statement restores the shape the compaction left, no more"
+        );
+
+        // An install replaces the log under the snapshot at once, take or no take.
+        let mut installed = records.clone();
+        installed.push(of(33, 1, snapshot(1, 28, false)));
+        assert_eq!(
+            ends_at(&installed),
+            2,
+            "an install's prefix leaves 29 and 30"
+        );
+    }
+
+    /// The positional rule is "nothing of that server's between its truncation and
+    /// the snapshot". [`replica_of`] is a list of event kinds, and a list is what
+    /// falls behind: seven kinds that carry a server were missing from it, and any
+    /// one of them landing in that window would have turned a real install into a
+    /// re-statement — which moves the asserted follower-log bound, since a
+    /// re-stated take moves the prefix where a live take does not.
+    ///
+    /// The shape rejected: `RaftRefused` (one of the seven) not clearing the
+    /// window. With it missing, the take below is read as a re-statement.
+    #[test]
+    fn any_record_of_a_server_closes_its_restatement_window() {
+        let take = |between: Option<TraceEvent>| {
+            let mut records = vec![of(0, 1, following(1)), of(1, 1, append(1, 1))];
+            records.push(of(2, 1, truncate(1, 2)));
+            if let Some(event) = between {
+                records.push(of(3, 1, event));
+            }
+            records.push(of(4, 1, snapshot(1, 1, true)));
+            let mut restating = Restating::default();
+            let mut moved = false;
+            for record in &records {
+                restating.saw(record);
+                if matches!(record.event, TraceEvent::RaftSnapshot { .. }) {
+                    moved = restating.moves_the_prefix(&record.event);
+                }
+            }
+            moved
+        };
+        assert!(
+            take(None),
+            "a take's snapshot straight after that server's truncation is the \
+             restatement's, and it moves the prefix"
+        );
+        for between in [
+            TraceEvent::RaftRefused {
+                server: 1,
+                reason: "lost state".to_owned(),
+            },
+            append(1, 2),
+            compacted(1, 1),
+        ] {
+            assert!(
+                !take(Some(between.clone())),
+                "a record of server 1's closes the window, so what follows is a \
+                 live take, not a re-statement: {between:?}"
+            );
+        }
+    }
+
+    /// D-029's revert floor, observed rather than inferred: a follower's
+    /// compaction swallowed the configuration entry in force only when that entry
+    /// sits *strictly inside* the step the prefix took.
+    ///
+    /// The shape rejected: asking whether the server's last configuration index is
+    /// at or below `through`, which holds for every compaction by construction and
+    /// so counts the total under another name. It reads the trace below as 2 of 2;
+    /// the truth is 1 of 2.
+    #[test]
+    fn a_swallowed_configuration_is_the_one_inside_the_step() {
+        let mut records = vec![of(0, 1, following(1)), of(1, 1, config(1, 5))];
+        for index in 1..=12 {
+            records.push(of(1 + index, 1, append(1, index)));
+        }
+        records.push(of(20, 1, compacted(1, 8)));
+        records.push(of(21, 1, compacted(1, 12)));
+        assert_eq!(
+            follower_compactions(&records),
+            (2, 1),
+            "two compactions by a replica that is not leading; the configuration at \
+             5 is inside the first step and behind the second"
+        );
+
+        // Index 0 is the initial configuration, which is no entry: it can be
+        // swallowed by nothing.
+        let initial = vec![
+            of(0, 2, following(2)),
+            of(1, 2, config(2, 0)),
+            of(2, 2, append(2, 1)),
+            of(3, 2, compacted(2, 1)),
+        ];
+        assert_eq!(
+            follower_compactions(&initial),
+            (1, 0),
+            "the initial configuration is no log entry"
+        );
+
+        // A leader's compaction is not a follower's.
+        let leading = vec![
+            of(
+                0,
+                3,
+                TraceEvent::RaftLeader {
+                    server: 3,
+                    range: SINGLE_GROUP,
+                    term: 1,
+                    last_index: 0,
+                },
+            ),
+            of(1, 3, config(3, 5)),
+            of(2, 3, append(3, 8)),
+            of(3, 3, compacted(3, 8)),
+        ];
+        assert_eq!(follower_compactions(&leading), (0, 0));
     }
 }
