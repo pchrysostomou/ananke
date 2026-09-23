@@ -119,7 +119,12 @@ _Update this section at the end of every session._
   now for one reason and not two: nothing on the node compacts, so a re-seeded replica
   answers a marked rejection and then a success inside the same window. §10's exit
   criterion for the pair on a sharded `sim/quorum.rs` is still owed, and its one remaining
-  blocker is PR #107's wiring.
+  blocker is PR #107's wiring. **After review**, two mutations this slice had not
+  anticipated are closed: the mark computed once per node and stamped on its other three
+  replicas — caught 20 of 20 and 1 000 of 1 000 by a new per-range clause, the dual of the
+  one that was already there — and `Raft::refused()` with its `quarantined` conjunct
+  dropped, caught by a new gate-tier test that reads the predicate itself, which no test in
+  the tree did.
 
 - Branch `phase-3-stage-b-quorum` (2026-09-23), PR #104, PROPOSED D-085: `origin/main`
   merged in (carrying PR #86's whole-node refusal and re-seed, D-077), and the sharded

@@ -903,9 +903,18 @@ struct QuorumNodeFigures {
     store_less_answers: usize,
     /// Marked rejections the victim **sent** after it had sent an answer of the same
     /// range that fitted (send order, since delays reorder deliveries): the figure a
-    /// mark read per node rather than per replica moves, and `NodeReport::check`
-    /// fails the seed on it.
+    /// mark read per node rather than per replica moves when it is set too **widely**,
+    /// and `NodeReport::check` fails the seed on it.
     marked_after_fitted: usize,
+    /// Its dual: **unmarked** rejections the victim sent after that range's replica
+    /// was re-seeded and before it had sent anything of that range that fitted — what
+    /// the same per-node mark does when it is set too **narrowly**, which is what a
+    /// mark read off one replica and stamped on the other three looks like.
+    /// `refused_rejections` above is a sweep-wide total and sees only the mark's
+    /// complete disappearance; this sees three quarters of it go. Also 0, and
+    /// `NodeReport::check` fails the seed on it, naming the range.
+    // m1 of the review of this slice.
+    unmarked_before_fitted: usize,
     /// The node's other answers: rejections a caught-up re-seeded replica sends,
     /// carrying its store's own incarnation and no mark, and answers that fitted.
     store_rejections: usize,
@@ -928,6 +937,7 @@ impl QuorumNodeFigures {
             self.refused_rejections += hold.refused_rejections;
             self.store_less_answers += hold.store_less_answers;
             self.marked_after_fitted += hold.marked_after_fitted;
+            self.unmarked_before_fitted += hold.unmarked_before_fitted;
             self.store_rejections += hold.store_rejections;
             self.fitted += hold.fitted;
             self.streams += hold.streams;
@@ -1073,7 +1083,15 @@ fn a_node_that_refuses_only_one_range_is_caught_on_the_sharded_quorum_scenario()
 /// 2. **The node sends the mark**: `refused_rejections` is no longer 0. This is the
 ///    assertion that would fail if the key were reverted, if the mark stopped being
 ///    set where a re-seed builds the store, or if it stopped surviving the wire, and
-///    it is the whole of what D-087 buys on this cluster.
+///    it is the whole of what D-087 buys on this cluster. It is a **sweep-wide
+///    total**, so on its own it sees the mark disappearing and nothing short of
+///    that: a mark read once per node and stamped on its other three replicas only
+///    takes it from 282 to 72 at a thousand seeds. What sees *that* is
+///    `NodeReport::check`'s pair of per-range clauses — no marked rejection sent
+///    after that range's replica answered something that fitted, and no **unmarked**
+///    one sent after its re-seed and before it did — which fail the seed naming the
+///    range, and which the figures `marked_after_fitted` and
+///    `unmarked_before_fitted` print at every tier. Both are 0 here.
 /// 3. **And the node still answers from no store nowhere**: `store_less_answers` is
 ///    0. That half of D-085's finding stands, and `NodeReport::check` fails the seed
 ///    that breaks it. The mark is a replacement for the stamp, not a re-creation of

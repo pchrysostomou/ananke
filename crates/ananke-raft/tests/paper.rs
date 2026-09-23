@@ -1429,6 +1429,131 @@ fn a_refused_followers_rejections_count_for_check_quorum_only_beside_reseed_prog
     }
 }
 
+/// What the mark on the answer **is** (PROPOSED D-087): a quarantined server with
+/// nothing of this log in it — and neither conjunct alone.
+///
+/// The test above steps the mark in by hand, as a parameter of the harness, so it
+/// asserts what a *leader* does with an answer that carries it and nothing about
+/// where such an answer comes from. [`Raft::refused`] is the other half, and it is
+/// the half the node's re-seeded replicas actually run. Its entry claims both
+/// conjuncts are necessary and neither sufficient; this is that claim, asserted.
+///
+/// - **The quarantine alone is not enough.** It is permanent (D-035, and durable),
+///   and D-049 says in as many words that a re-seeded follower that has since been
+///   caught up "counts as any follower does". So a quarantined server that has
+///   landed something is not refused, whether it landed by an append or by an
+///   install — the two ways the window closes, and the two last cases here.
+/// - **The empty log alone is not enough.** A server with an empty log that was
+///   never re-seeded is a fresh member, or one its leader has not yet reached: a
+///   re-seed *ask* (RAFT.md §3), not a refusal. Marking its rejections would tell
+///   every leader adding a member that the member holds nothing to commit with,
+///   which is true and is not what the mark means.
+/// - **And the mark is what the answer carries**, so the last part steps a
+///   quarantined core with an empty log and reads the bit off its rejections: set
+///   while it holds nothing, clear on the next rejection once one entry has landed.
+///   That is [`Raft::refused`] reaching the wire, which the harness above cannot
+///   see because it writes the bit itself.
+///
+/// Gate tier and no seeds: the predicate is a function of two fields, so a sweep
+/// would add nothing to reading them.
+// PROPOSED(D-087): D-049's rule keyed on a refused mark the answer carries.
+#[test]
+fn a_refused_server_is_a_quarantined_one_with_nothing_of_this_log_in_it() {
+    let members = Configuration::of(&[s(1), s(2), s(3)]);
+    let restored = |snap: (Index, Term), log: Vec<Entry>, quarantined: bool| {
+        Raft::restore_compacted(
+            s(2),
+            members.clone(),
+            config(Variant::Correct),
+            3,
+            7,
+            None,
+            snap.0,
+            snap.1,
+            None,
+            log,
+            quarantined,
+        )
+    };
+
+    let fresh = Raft::new(s(2), members.clone(), config(Variant::Correct), 3);
+    assert!(!fresh.quarantined());
+    assert!(
+        !fresh.refused(),
+        "an empty log alone is a fresh server, not a refused one"
+    );
+
+    let lost_it_all = restored((0, 0), Vec::new(), true);
+    assert!(
+        lost_it_all.refused(),
+        "a re-seeded store with nothing of this log in it is what the mark means"
+    );
+
+    let appended_to = restored((0, 0), log_of(&[7]), true);
+    assert!(appended_to.quarantined());
+    assert!(
+        !appended_to.refused(),
+        "one entry landed: the quarantine outlives the refusal, and D-049 counts \
+         this follower as any follower"
+    );
+
+    let installed_into = restored((5, 7), Vec::new(), true);
+    assert!(installed_into.quarantined());
+    assert!(
+        !installed_into.refused(),
+        "an install landed: the window closes the same way, with an empty log"
+    );
+
+    // The bit on the wire, off the same core: a rejection while it holds nothing
+    // carries the mark, and the next rejection after an entry lands does not.
+    let mut core = restored((0, 0), Vec::new(), true);
+    let answer = |core: &mut Raft, prev_index: Index, entries: Vec<Entry>| {
+        core.step(Input::Message {
+            now: 0,
+            from: s(1),
+            message: Message::AppendEntries {
+                term: 7,
+                prev_index,
+                // The consistency check reads the entry before `entries`, and an
+                // empty log's is (0, 0).
+                prev_term: if prev_index == 0 { 0 } else { 7 },
+                entries,
+                commit: 0,
+                sent: 0,
+            },
+        })
+        .iter()
+        .find_map(|o| match o {
+            Output::Send {
+                message:
+                    Message::AppendEntriesResponse {
+                        success, refused, ..
+                    },
+                ..
+            } => Some((*success, *refused)),
+            _ => None,
+        })
+        .expect("a follower answers every AppendEntries")
+    };
+    assert_eq!(
+        answer(&mut core, 3, Vec::new()),
+        (false, true),
+        "the rejection of a server holding nothing of the log carries the mark"
+    );
+    assert_eq!(
+        answer(&mut core, 0, log_of(&[7])),
+        (true, false),
+        "and the entry the leader reached back to fits"
+    );
+    assert!(!core.refused(), "which closes the window");
+    assert_eq!(
+        answer(&mut core, 3, Vec::new()),
+        (false, false),
+        "so the next rejection carries no mark, though the quarantine stands"
+    );
+    assert!(core.quarantined());
+}
+
 /// The vote rule behind the lease (RAFT.md §1, thesis §6.4.1): a follower that has
 /// heard from its leader within the minimum election timeout ignores a vote
 /// request, term and all; once it has not, it grants one.
