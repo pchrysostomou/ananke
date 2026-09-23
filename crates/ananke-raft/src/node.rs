@@ -2136,11 +2136,11 @@ async fn snapshot_task<E: Environment>(
                         // this server is not talking to today: the one-group receiver
                         // holds one stream and has no cap (RAFT.md:214-218), so
                         // nothing on this path answers a wait. The rule is the node's
-                        // (D-087) and is written here so that hearing one is a wait
+                        // (D-090) and is written here so that hearing one is a wait
                         // rather than a mystery: nothing is restarted, nothing is
                         // reset, and the chunk outstanding falls due on the ordinary
                         // resend timer, which is what bounds it.
-                        // PROPOSED(D-087): a cap-wait is not a start-over.
+                        // PROPOSED(D-090): a cap-wait is not a start-over.
                         out.deadline = env.clock().now() + chunk_timeout;
                     }
                     SnapshotStatus::More => {

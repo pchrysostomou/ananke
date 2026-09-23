@@ -1408,9 +1408,9 @@ pub enum StartOver {
     /// **not** counted against RAFT.md:210-212's restart bound: a stream waiting its
     /// turn has covered no ground it must cover again, and a node's receive cap sits
     /// below its range count on purpose, so counting these would declare a usable
-    /// checkpoint unusable as a matter of routine (D-087). The event is still this
+    /// checkpoint unusable as a matter of routine (D-090). The event is still this
     /// event — a reason on it is how a check tells a cap-wait from an identity change.
-    // PROPOSED(D-087): a cap-wait is answered as a wait, not as a start-over.
+    // PROPOSED(D-090): a cap-wait is answered as a wait, not as a start-over.
     Cap,
     /// The staged bytes could not be used: the directory was short, the engine refused
     /// the source, or the stream carried no snapshot record for this range.

@@ -296,7 +296,7 @@ pub enum NodeVariant {
     // PROPOSED(D-083): a live install holds one range and replaces its replica.
     AsksTheHostBeforeTheHold,
     /// A cap-wait answered with the same `Restart` a changed identity gets, which is
-    /// the one answer the node had for both before D-087.
+    /// the one answer the node had for both before D-090.
     ///
     /// The sender cannot tell the two apart, so RAFT.md:210-212's restart bound counts
     /// a stream that is merely waiting its turn: at the third ask its leader declares
@@ -313,7 +313,7 @@ pub enum NodeVariant {
     /// and this one are the same answer, because neither is ever sent.
     ///
     /// [`Snapshots::superseded`]: crate::snapshot::Snapshots
-    // PROPOSED(D-087): a cap-wait is answered as a wait, not as a start-over.
+    // PROPOSED(D-090): a cap-wait is answered as a wait, not as a start-over.
     CapWaitIsAStartOver,
     /// A stream's restarts not counted: the node as it stood, with RAFT.md:210-212's
     /// bound absent.
@@ -324,7 +324,7 @@ pub enum NodeVariant {
     /// answered forever. That is the unbounded loop D-083 recorded: a run that told
     /// senders to start over 669 times and one that told them none differed in nothing
     /// a check could read.
-    // PROPOSED(D-087): the node honours RAFT.md's restart bound.
+    // PROPOSED(D-090): the node honours RAFT.md's restart bound.
     RestartsNotCounted,
 }
 
@@ -449,15 +449,15 @@ impl NodeVariant {
     ];
 
     /// RAFT.md:209-212's bounds on a stream, and the answer that keeps the restart bound
-    /// from counting the wrong thing: the two ways to get D-087 wrong.
+    /// from counting the wrong thing: the two ways to get D-090 wrong.
     ///
     /// They are neither the `snapshot` task's discipline ([`SNAPSHOT`](Self::SNAPSHOT))
     /// nor its running inside the node ([`WIRING`](Self::WIRING)) but the *sender's*
-    /// bookkeeping over a stream's answers, which had no bound at all until D-087.
+    /// bookkeeping over a stream's answers, which had no bound at all until D-090.
     /// [`CapWaitIsAStartOver`](Self::CapWaitIsAStartOver) is one a node of a single range
     /// could not be wrong about; [`RestartsNotCounted`](Self::RestartsNotCounted) is
     /// wrong with one range too.
-    // PROPOSED(D-087): the node honours RAFT.md's restart bound, and a cap-wait is not
+    // PROPOSED(D-090): the node honours RAFT.md's restart bound, and a cap-wait is not
     // one of the asks it counts.
     pub const BOUNDS: &'static [NodeVariant] = &[
         NodeVariant::CapWaitIsAStartOver,
@@ -513,7 +513,7 @@ impl NodeVariant {
             NodeVariant::TakeSkipsTheUserKeys => 1 << 37,
             NodeVariant::TakeStreamsTheLogToo => 1 << 38,
             NodeVariant::AsksTheHostBeforeTheHold => 1 << 39,
-            // D-087's two: the restart bound RAFT.md states and the cap-wait it must
+            // D-090's two: the restart bound RAFT.md states and the cap-wait it must
             // not count. Twenty-two bits are left.
             NodeVariant::CapWaitIsAStartOver => 1 << 40,
             NodeVariant::RestartsNotCounted => 1 << 41,
@@ -651,7 +651,7 @@ mod tests {
         }
         // Twenty of the round's and the snapshot task's, the snapshot review's four,
         // D-077's six for Q15's whole-node refusal and re-seed, D-083's ten for the
-        // snapshot wiring, and D-087's two for a stream's bounds.
+        // snapshot wiring, and D-090's two for a stream's bounds.
         assert_eq!(NodeVariant::BUGS.len(), 42);
         for variant in NodeVariant::SNAPSHOT
             .iter()
@@ -688,7 +688,7 @@ mod tests {
                 "{variant} is in two sets"
             );
         }
-        // D-087's two are a fourth kind: the sender's bookkeeping over a stream's
+        // D-090's two are a fourth kind: the sender's bookkeeping over a stream's
         // answers, which is none of the three above.
         for variant in NodeVariant::BOUNDS {
             assert!(

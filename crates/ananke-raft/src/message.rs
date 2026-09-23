@@ -186,8 +186,8 @@ pub enum SnapshotStatus {
     /// the receiver is busy and nothing has changed. No single bound is right for
     /// both — a node whose receive cap is below its range count makes cap-waits
     /// ordinary, and counting them against RAFT.md's restart bound declares a perfectly
-    /// usable checkpoint unusable after two asks and forces a pointless retake (D-087).
-    // PROPOSED(D-087): a cap-wait is its own status, so the restart bound counts a
+    /// usable checkpoint unusable after two asks and forces a pointless retake (D-090).
+    // PROPOSED(D-090): a cap-wait is its own status, so the restart bound counts a
     // start-over and nothing else.
     Waiting,
 }
@@ -865,7 +865,53 @@ mod tests {
                 status: SnapshotStatus::More,
                 incarnation: 4,
             },
+            // The cap-wait's answer, which only a node ever sends: last in this list on
+            // purpose, so the `find`s below still take the `More` response above.
+            // PROPOSED(D-090): a cap-wait is its own status, so it is its own tag.
+            Message::InstallSnapshotResponse {
+                term: 3,
+                last_index: 40,
+                last_term: 2,
+                file: Bytes::new(),
+                offset: 0,
+                status: SnapshotStatus::Waiting,
+                incarnation: 4,
+            },
         ]
+    }
+
+    /// Every status survives the wire, and an unknown tag is refused.
+    ///
+    /// `Waiting` is tag 3 and was added by D-090; until this existed nothing in the
+    /// tree encoded or decoded it, because the one-group receiver never sends it and
+    /// the node's own scenario does not reach its cap. A status that does not round
+    /// trip is a sender told to start over when it was told to wait.
+    // PROPOSED(D-090): a cap-wait is its own status, so it is its own tag.
+    #[test]
+    fn every_snapshot_status_round_trips_through_its_tag() {
+        let every = [
+            SnapshotStatus::More,
+            SnapshotStatus::Installed,
+            SnapshotStatus::Restart,
+            SnapshotStatus::Waiting,
+        ];
+        for status in every {
+            assert_eq!(
+                SnapshotStatus::of(status.tag()).expect("a known tag"),
+                status,
+                "{} did not survive its own tag",
+                status.name()
+            );
+        }
+        // The tags are distinct, so no two statuses are the same byte on the wire.
+        let mut tags: Vec<u8> = every.iter().map(|status| status.tag()).collect();
+        tags.sort_unstable();
+        tags.dedup();
+        assert_eq!(tags.len(), every.len(), "two statuses share a tag");
+        assert!(
+            SnapshotStatus::of(every.len() as u8).is_err(),
+            "an unknown status tag is refused rather than guessed"
+        );
     }
 
     #[test]

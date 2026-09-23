@@ -1524,8 +1524,8 @@ pub fn start_over(term: Term, staged: (Index, Term)) -> Message {
 ///
 /// The one-group receiver has no cap and never sends this; a node does (D-075), and
 /// the answer is separate from [`start_over`] so that RAFT.md:210-212's restart bound
-/// counts a start-over and not a stream waiting its turn (D-087).
-// PROPOSED(D-087): a cap-wait is answered as a wait, not as a start-over.
+/// counts a start-over and not a stream waiting its turn (D-090).
+// PROPOSED(D-090): a cap-wait is answered as a wait, not as a start-over.
 #[must_use]
 pub fn waiting(term: Term, staged: (Index, Term)) -> Message {
     Message::InstallSnapshotResponse {

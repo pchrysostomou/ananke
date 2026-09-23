@@ -13453,13 +13453,20 @@ test it named.
    nothing — so nothing is red; only the reasons are stale. Left for the owner to place
    rather than widened into this slice.
 
-## PROPOSED D-087 — A cap-wait is not a start-over: the node gets RAFT.md's restart bound, and the answer that keeps it from counting the wrong thing
+## PROPOSED D-090 — A cap-wait is not a start-over: the node gets RAFT.md's restart bound, and the answer that keeps it from counting the wrong thing
 
-**The number.** This entry takes **D-087** and the footer moves to D-088. D-086 is the
-stream-variants slice (PR #109), in flight against the same file on a branch of its own,
-and this entry does not renumber it; D-085 sits in this tree already. Every code site
-carries `// PROPOSED(D-087)`. The integrator may renumber at the merge; nothing depends
-on the number beyond those markers, this heading and the footer.
+**The number.** This entry takes **D-090** and the footer moves to D-091. It took D-087
+first, and that was a collision this branch's review found: four entries are in flight
+against this one file at once, and naming only one of them was not enough. **D-086** is
+the stream-variants slice (PR #109); **D-087** is D-049's rule keyed on a refused mark
+(PR #121, opened fifty-three seconds before this branch's PR, so its claim on the number
+is the older one); **D-088** is `LeaseTrustsTheClock`'s move to the nightly (PR #119);
+**D-089** is the stream arms' aim (PR #123). D-085 sits in this tree already. This entry
+renumbers none of them and takes the first number none of them holds. Every code site
+carries `// PROPOSED(D-090)`. The integrator may renumber again at the merge; nothing
+depends on the number beyond those markers, this heading and the footer — and the footer
+conflicts between all five branches whatever they are numbered, which is a merge to
+resolve by hand and not a thing one branch can fix for the others.
 
 **What this stacks on.** PR #107, the snapshot wiring (PROPOSED D-083), whose review
 found this and put it to the owner. The finding is D-083's review point 4, and it is the
@@ -13498,17 +13505,22 @@ over four ranges on purpose), so that is not an edge case: it is the ordinary pa
    meaning for the three refusals that *are* start-overs — a changed identity, staged
    bytes the node could not use, and a range it does not host — and RAFT.md's bound
    counts those three and nothing else.
-2. **`Outbound::restarts`, and `STREAM_RESTARTS = 2`** on the node, matching the
-   one-group server: two restarts, and the third ask gives the stream up with
-   `retake: true`, which is "counts the checkpoint as unusable" in this wiring's words.
+2. **`Counted { resends, restarts }` on `Outbound`, and `STREAM_RESTARTS = 2`** on the
+   node, matching the one-group server: two restarts, and the third ask gives the stream
+   up with `retake: true`, which is "counts the checkpoint as unusable" in this wiring's
+   words. The two counters are one value because they are what both bounds are made of.
 3. **`CHUNK_RESENDS` is left at 4, and that is a finding rather than a decision.** It was
    corrected to 8 first — the constant's own doc claimed to count "as the one-group task
    counts them", which counts to eight, and RAFT.md:210 says eight in the same breath as
    the restart bound this entry implements — and then it was measured. See "The second
    bound the correct system trips" below. It is reverted, and the finding is **issue
    #120**.
-4. **`step_for(status, restarts, variants)`**, a free function, so the bound is a thing a
-   check drives directly rather than a branch inside an async receive loop.
+4. **Three free functions, so every part of the bound is a thing a check drives directly
+   rather than a branch inside an async receive loop**: `step_for(status, restarts,
+   variants)` for what an answer *means*, `booked(step, counted)` for what the sender then
+   *records*, and `refusal(status, term, at)` for the message a refusal *sends*. The
+   second and third were added by this branch's review, which showed that `step_for`
+   alone left both of the others deletable with the whole suite green.
 5. **The trace event stays one event.** D-083 added `RaftSnapshotStartOver` with a
    `reason` — `Identity`, `Cap`, `Unusable`, `NotHosted` — and that is exactly how a
    check tells a cap-wait from an identity change, so no second event is added. Its doc
@@ -13524,13 +13536,14 @@ covered — so the resend bound is the honest one, and a stream that runs out gi
 *without* a retake, because the checkpoint was never the problem. It needed no new
 constant and reused a bound RAFT.md already states.
 
-**Measured, the correct system tripped it.** With four ranges over a cap of two, the
-correct node ran to **ten consecutive cap-waits on one stream** and two streams in
-thirty-two seeds were given up for waiting — measured with the resend bound at 8. On the
-tree as it ships, with it at 4, the worst run of cap-waits on the correct node is **6 at
-a hundred seeds**: above either number, so the bound was tripped at any value it could
-sensibly have held. D-030 and D-039 say a bound the correct system trips is a model error
-to fix and never a bound to widen, so the number was not raised to fit it.
+**Measured, the correct system tripped it.** With four ranges over a cap of two and the
+resend bound at 8, the correct node ran to **ten consecutive cap-waits on one stream**,
+and two streams in thirty-two seeds were **observed given up for waiting** — not inferred
+from a run length, but counted at the give-up itself. On the tree as it ships, with the
+bound at 4, the correct node's worst run of consecutive `Step::Wait`s on one stream over a
+hundred seeds is **5**, which is over 4 as well. So the bound was tripped at either value
+it could sensibly have held. D-030 and D-039 say a bound the correct system trips is a
+model error to fix and never a bound to widen, so the number was not raised to fit it.
 
 **The model error, and it is in RAFT.md in so many words.** RAFT.md:218-220: *"A slot the
 cap frees is granted to a stream that is asking for it, never reserved for one that asked
@@ -13561,10 +13574,16 @@ the measurement stopped it. Instrumenting the give-up branch of `Task::due` and 
 | 4, as it stands | 3 781 | 5 (it gives up at 5) |
 | 8, RAFT.md's number | 2 112 | 9 |
 
-19 251 resends are traced over those 32 seeds in the first place, about 75 per stream
+**16 463** resends are traced over those 32 seeds in the first place, about 64 per stream
 against 8 streams a seed. **The correct node trips this bound on essentially every
 install, at either number**, so 4 → 8 would have been a bound widened to fit a trip —
 exactly what D-030 and D-039 forbid — and it would not even have stopped the trip.
+
+_(This figure and the identity-restart count below were published first as 19 251 and 2.
+Those are the `CHUNK_RESENDS = 8` tree's values, taken while that correction was still in
+the working tree and not re-taken when it was reverted; the review of this branch caught
+it and both are corrected here. The 4-versus-8 table above, which is what the decision
+rests on, was taken correctly and reproduces to the unit at both values.)_
 
 The cause is not the number. The receiver answers *nothing* while an install decision is
 pending (`Inbound::pending`, "the sender retries once the switch settles"), the sender
@@ -13585,15 +13604,18 @@ Two configurations, because the scenario in this tree and the situation this ent
 about are not the same node.
 
 **On `sim/install.rs` as committed** (`SNAPSHOT_CAP` = the range count, so no stream ever
-waits), 32 seeds, release, node correct and node-as-it-stood: **0 cap-waits and 2 identity
-restarts on both**, 256 of 256 installs, 32 of 32 green. The committed scenario does not
+waits), 32 seeds, release, node correct and node-as-it-stood: **0 cap-waits and 1 identity
+restart on both**, 256 of 256 installs, 32 of 32 green. The committed scenario does not
 reach the cap path at all, which is the honest reading of "measured before and after" here
 and the reason the catch below is deterministic rather than a sweep's.
 
 **On the same scenario with the cap set to two over four ranges** — §12's re-seed shape's
-configuration, measured locally and *not* committed — at 100 seeds in release:
+configuration, measured locally and *not* committed — at 100 seeds in release. **The runs
+counted are the receiver's**: consecutive `Cap` refusals of one (range, sender), which is
+the quantity that is comparable across all three columns, because under both variants the
+sender takes no `Step::Wait` at all and its own run is zero by construction.
 
-| node | cap-waits | identity restarts | worst run of cap-waits on one stream | installs | green |
+| node | cap-waits | identity restarts | worst run of cap-waits on one stream, receiver-side | installs | green |
 | --- | --- | --- | --- | --- | --- |
 | correct (this entry) | 800 | 4 | 6 | 800/800 | 100/100 |
 | the bound with the conflation kept | 1 758 | 12 | 11 | 800/800 | 100/100 |
@@ -13602,6 +13624,11 @@ configuration, measured locally and *not* committed — at 100 seeds in release:
 The correct node needs **2.7× fewer cap-wait round trips** than the node as it stood,
 because a cap-wait no longer throws the sender's position away — and the worst single
 stream goes from forty-four asks in a row to six.
+
+Counted on the *sender's* side instead — consecutive `Step::Wait`s on one stream, which is
+the quantity the resend bound would apply to — the correct node's worst run over the same
+hundred seeds is **5**. The two differ because an answer can be lost in flight: a refusal
+the receiver traced is a wait the sender never took.
 
 **Every one of these three configurations is green at 100 seeds.** The scenario cannot
 see the difference, and saying so is the point: the harm is wasted round trips and a
@@ -13619,9 +13646,53 @@ Two variants, one per half of the change, both caught deterministically in
   two slots; under the correct node the two that wait install once a slot frees, and
   under the variant RAFT.md's bound spends itself on them and their leaders are told the
   checkpoint is unusable. The check drives the real planner (`Snapshots`, its cap, its
-  queue, its slot granting) and the two real functions this entry adds.
+  queue, its slot granting) and the real functions this entry adds.
 - **`NodeVariant::RestartsNotCounted`** — the node as it stood, with the restart bound
   absent: a receiver answering `Restart` forever is answered forever.
+
+**What the review of this branch found, and what was added for it.** Both variants above
+are injected *inside* the pure functions the checks drive, so they proved what the node
+**decides** about an answer and nothing about what it then **records** or **sends**. Three
+one-line mutations at the sites the node actually runs survived the entire workspace suite
+in release:
+
+| mutation | what it reinstates |
+| --- | --- |
+| the refusal always sends `snapshot::start_over` | `CapWaitIsAStartOver`, on the wire |
+| a `Step::Wait` does not clear the resend counter | the correct node giving streams up for *waiting* |
+| a `Step::Restart` does not count itself | `RestartsNotCounted`, at the site |
+
+All three need more than one range to be wrong about, since all three need a contended
+cap. Three things close them, and the shape is the one this file already uses — hoist the
+arithmetic out of the async arm and drive the real function:
+
+1. **`booked(step, counted)`** — everything one answer does to the two counters, in one
+   place, with `Counted` (`resends`, `restarts`) as its value.
+   `a_wait_clears_the_resend_counter_and_a_restart_is_the_only_step_that_counts_one`
+   drives it directly, including a stream answered `Waiting` four hundred times over that
+   never reaches either bound.
+2. **The four-ranges-over-two-slots harness now counts a resend per round** and gives a
+   stream up on `CHUNK_RESENDS` exactly as `Task::due` does, so the second mutation shows
+   up there as the correct node giving two of four streams up with `retake: false` — the
+   outcome the section above spends itself rejecting, now asserted rather than argued.
+   **Its `CHUNKS` had to move, and that is worth recording.** At 4 a waiting stream was
+   made to wait four rounds, one *under* the resend bound, so the harness watched the
+   mutation and did not trip: the first attempt at this check passed. `CHUNKS` is now
+   written as `CHUNK_RESENDS + 2` rather than as a number, so the situation the comment
+   has always claimed — "the two that wait spend a bound, either bound" — is one the
+   constant actually produces, and stays one if either number moves.
+3. **`refusal(status, term, at)`** — the status-to-message match, hoisted out of an async
+   method that also traces, stamps an incarnation, frames and sends.
+   `a_cap_wait_is_refused_with_a_waiting_answer_and_every_other_refusal_with_a_start_over`
+   asserts the message a cap-wait carries, and `every_snapshot_status_round_trips_through_its_tag`
+   in `ananke-raft` asserts tag 3 survives the wire. Before these, `snapshot::waiting` had
+   exactly one caller in the whole tree and was constructed by no test at all.
+
+**What is still not asserted, stated rather than hidden.** The one statement in
+`Task::response` that calls `booked`, the one in `refuse` that calls `refusal`, and the
+async loop around both. Driving those wants a simulated environment behind the task, which
+is the same gap `swept_on_install` and `acked_for` have in this file and is not this
+slice's to close.
 
 **The single-range mutation.** `CapWaitIsAStartOver` is invisible on a node of one range,
 and the check asserts it: with one range the cap is never contended, so neither answer is
@@ -13631,7 +13702,7 @@ a higher term *displaces* the assembly (`Snapshots::superseded`) rather than que
 behind it, while a chunk at a lower term is refused on the store's term. Four ranges
 sharing one receive cap is the whole situation, and it is the situation §12 builds.
 
-### RAFT.md is not edited, and does not need to be
+### RAFT.md: no section reopened, and one sentence corrected
 
 Both halves of this change are things RAFT.md already says. The bound is RAFT.md:210-212,
 quoted above. The cap-wait is RAFT.md:217-220: *"the streams over the cap wait rather than
@@ -13641,12 +13712,19 @@ sentence excludes — and it did not count what the other sentence counts. **The
 wrong and the spec was right**, which is the happiest shape a finding can have and is why
 no spec section is reopened here.
 
-A clause naming the distinct answer would be a readability gain and was written, measured
-against its cost, and dropped: adding it inserts nine lines at RAFT.md:218 and silently
-staled **58 line references** in `docs/SHARD.md` and in code comments, every one of which
-would also conflict with each branch in flight against those files. That is a coordinated
-pass over the whole tree, not a clause in a slice, and it is left to the owner in the
-report.
+**One sentence is corrected, and the review was right that it had to be.** RAFT.md:819,
+in the `snapshot` task's description, said *"a (range, sender) over the cap is told to
+restart and takes the first slot that frees"* — which contradicted RAFT.md:218 before this
+entry and contradicts the code after it. It now reads *"told to wait"*. That is a two-word
+replacement on one line: same line count, no reference churn, and none of the cost the
+paragraph below weighs.
+
+A *new clause* naming the distinct answer is a different matter, and it was written,
+measured against its cost, and dropped: adding it inserts nine lines at RAFT.md:218 and
+silently stales **58 line references** in `docs/SHARD.md` and in code comments, every one
+of which would also conflict with each branch in flight against those files. That is a
+coordinated pass over the whole tree, not a clause in a slice, and it is left to the owner
+in the report.
 
 ### Consequences
 
@@ -13676,4 +13754,4 @@ report.
 
 ---
 
-_Next entry: D-088. Add one before implementing anything not covered above._
+_Next entry: D-091. Add one before implementing anything not covered above._
