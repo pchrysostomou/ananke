@@ -1472,19 +1472,25 @@ fn spawn_apply<E: Environment>(
                         inbox.push(Event::TakeFailed);
                         continue;
                     }
-                    let take = match store.snapshot_record().await {
-                        Ok(record) => record.map_or(0, |record| record.take),
+                    let previous = match store.snapshot_record().await {
+                        Ok(record) => record,
                         Err(_) => {
                             inbox.push(Event::TakeFailed);
                             continue;
                         }
                     };
+                    // The record the store holds goes in whole, not a field of it:
+                    // what the new record keeps from the old — today the take
+                    // counter — is then a decision inside `compaction_record`,
+                    // where it is tested, instead of a bare number chosen here,
+                    // where nothing could see it. The review of this slice planted
+                    // a `0` in its place and no test at any tier noticed.
                     let recorded = store
                         .record_snapshot(&compaction_record(
                             applied,
                             applied_term,
                             config.clone(),
-                            take,
+                            previous.as_ref(),
                         ))
                         .await;
                     match recorded {
@@ -2683,13 +2689,15 @@ impl<E: Environment> Server<E> {
 /// * `take` is the store's counter carried forward, never reset, so a later take
 ///   still numbers its version directory past every one this store has made
 ///   (D-043). An install's repair writes 0 there because an install's versions
-///   start over; a compaction's do not.
+///   start over; a compaction's do not. It is read from `previous` — the record
+///   the store holds — rather than passed in as a number, so that dropping it is
+///   a change to this function and not an invisible one at the call site.
 // PROPOSED(D-078): a follower compacts its log to its own applied index.
 fn compaction_record(
     applied: Index,
     applied_term: Term,
     config: Configuration,
-    take: u64,
+    previous: Option<&SnapshotRecord>,
 ) -> SnapshotRecord {
     SnapshotRecord {
         last_index: applied,
@@ -2697,13 +2705,14 @@ fn compaction_record(
         config,
         dir: String::new(),
         taken: false,
-        take,
+        take: previous.map_or(0, |record| record.take),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::compaction_record;
+    use crate::store::SnapshotRecord;
     use crate::types::{Configuration, ServerId};
 
     /// The pair for D-078's settled points 2 and 4, which nothing else in the tree
@@ -2714,7 +2723,18 @@ mod tests {
     #[test]
     fn a_compactions_record_is_not_a_take_and_carries_the_counter_forward() {
         let config = Configuration::of(&[ServerId(1), ServerId(2), ServerId(3)]);
-        let record = compaction_record(41, 7, config.clone(), 5);
+        // The record a store that has taken five checkpoints holds, exactly as
+        // `snapshot_record` returns it: the counter, the directory of the newest
+        // version and `taken`. What the compaction keeps of it is the counter.
+        let previous = SnapshotRecord {
+            last_index: 30,
+            last_term: 6,
+            config: config.clone(),
+            dir: "/s/snap-30-5".to_owned(),
+            taken: true,
+            take: 5,
+        };
+        let record = compaction_record(41, 7, config.clone(), Some(&previous));
         assert_eq!(record.last_index, 41);
         assert_eq!(record.last_term, 7);
         assert_eq!(record.config, config);
@@ -2738,7 +2758,7 @@ mod tests {
     // PROPOSED(D-078): a follower compacts its log to its own applied index.
     #[test]
     fn a_compactions_record_invents_no_version() {
-        let record = compaction_record(1, 1, Configuration::of(&[ServerId(1)]), 0);
+        let record = compaction_record(1, 1, Configuration::of(&[ServerId(1)]), None);
         assert_eq!(record.take, 0);
         assert!(record.dir.is_empty());
         assert!(!record.taken);

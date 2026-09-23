@@ -10641,9 +10641,11 @@ direction for a bound — so a take no longer moves the fold's prefix.
   **878 entries, 73 ×**, on seed 512, and would have gone on growing with a longer run: a
   follower's log had nothing to bound it (SHARD.md:339-340 — 337-338 are the sentence
   about *how* a follower's log shrinks, not the one about its growth).
-- The bound asserted is **64 ×**, `raft::FOLLOWER_LOG_MULTIPLE`, on every seed at every
-  tier. 64 × is 768 entries: 2.25 × over the measured maximum and below the 878 the same
-  sweep reaches with the compaction off, so it is not a vacuous bound.
+- The bound asserted is **768 entries**, `raft::FOLLOWER_LOG_BOUND`, on every seed at every
+  tier: 2.25 × over the measured maximum and below the 878 the same sweep reaches with the
+  compaction off, so it is not a vacuous bound. It is stated in entries and not as
+  `multiple × threshold` because the threshold does not scale what is bounded — see the
+  second review's findings below, where the product was replaced.
 - **The tail is not geometric, and this entry's first risk model was wrong.** It said ten
   thousand seeds should reach about 38 × and pass 48 × about one run in ten, putting the
   nightly's chance of reaching 64 × near one in 470. The nightly it cited says otherwise:
@@ -10667,9 +10669,8 @@ direction for a bound — so a take no longer moves the fold's prefix.
   of the five with the most room — 878 entries against 768, where seed 116, the lowest of
   the five, holds 788 — because a pin two per cent over a bound would go quiet at the
   next schedule move and say nothing about it. Before this
-  variant existed the bound was unfalsifiable inside the tree: the review widened
-  `FOLLOWER_LOG_MULTIPLE` from 64 to 4 096 and the whole raft suite passed at 20 seeds
-  and at 200.
+  variant existed the bound was unfalsifiable inside the tree: the review widened it
+  from 768 entries to 49 152 and the whole raft suite passed at 20 seeds and at 200.
 
 *The three D-065 names to re-measure, before and after, at a thousand seeds.*
 
@@ -10896,9 +10897,9 @@ that proves it:
 - The D-029 measure, structural rather than observed (above). Now observational; the
   raft figure is 0 and the claim is restated where it is true, in the membership
   scenario.
-- `FOLLOWER_LOG_MULTIPLE` had no pair: `Variant::FollowerNeverCompacts` is the server as
+- The follower-log bound had no pair: `Variant::FollowerNeverCompacts` is the server as
   it was before D-065, and seed 512 is pinned against it (above). The review's M11 —
-  widening the bound from 64 to 4 096 — now fails that test.
+  widening the bound sixty-four-fold — now fails that test.
 - `snapshots_installed` no longer counted installs (settled point 2 above), and
   RAFT.md's `RaftSnapshot` row said the compaction emits the event, which it does not.
   Both corrected; the row and this entry now say the same thing.
@@ -10928,16 +10929,17 @@ The other three survivors on this slice's code are killed by the tests above.
   state, and reaching it needs a test over the loop, which this tree has no shape for.
   It is stated here as an untested decision.
 - The review's M12 — dropping the `RaftSnapshot` arm from `compaction_stays_committed` —
-  still survives the whole raft suite (46 tests, 20 seeds), re-measured on the tree that
-  ships. It is left standing deliberately, because the mutation makes the oracle
-  *stricter*, not weaker: the arm only ever raises the floor a compaction is compared
-  against, so dropping it can produce a false failure and can hide nothing. That it
-  survives says the arm is not load-bearing on the correct system at that tier — a
-  compaction's index is always covered by a `RaftCommit` the same server traced — and
-  the arm is kept for the install case, where a prefix is committed by construction and
-  no `RaftCommit` of that server need name it. A pair for it would have to be a variant
-  that compacts past an installed prefix, which is `ApplyBeforeCommit`'s ground and
-  already covered.
+  survives the whole raft suite (46 tests, 20 seeds), which says the arm is not
+  load-bearing on the correct system at that tier: a compaction's index is generally
+  covered by a `RaftCommit` the same server traced. The arm is kept for the install case,
+  where a prefix is committed by construction and no `RaftCommit` of that server need
+  name it. **The reasoning recorded here for leaving the arm as it stood was wrong**, and
+  the second review caught it: "the arm only ever raises the floor a compaction is
+  compared against, so dropping it can hide nothing" has it exactly backwards — raising
+  the floor a compaction is compared against is the only way an oracle of this shape
+  *can* hide something. The arm is now narrowed to `taken: false`, since a take's index
+  is the taker's applied index and that is the quantity `ApplyBeforeCommit` corrupts;
+  see the second review's findings below for the re-measurement.
 
 **RAFT.md.** Updated where it describes what changed (D-053): the paragraph after "A
 leader compacts the Raft log to its last checkpoint…" now says what a follower does,
@@ -10960,6 +10962,145 @@ the stage's other slices were sweeping, not because anything here got cheaper. N
 figure is comparable with D-071's 625 s on an otherwise idle machine, and both are
 recorded with their loads for that reason (D-070). Every rate quoted above is from one of
 those outputs or from a run made the same way.
+
+**The second review, and what it changed.** A second adversarial review read the tip
+`b66fd7f` — four commits, not the two the builder's report described — and found four
+mutation survivors and ten findings. Every one that is a defect in this slice's own code,
+tests or entry is fixed below, each with the mutation or the run that proves it. The one
+part of a finding that would widen this slice is filed as **issue #88**; the blocker's two
+causes were already **#81** and **#82**. Nothing is disagreed with: every finding stood.
+
+- **The branch's gate is unmet and `main` is red, and this slice cannot mend that from
+  here.** PR #78 was merged at 2026-09-22T00:05:58Z as `0b29932`, against this entry's own
+  statement that the branch was not mergeable. `main`'s ten-thousand-seed nightly went
+  from green (`dd65aee`, run 35638970526) to **red** (`7127745`, run 35705563274, shards 5
+  and 6), on the two correct-system tests this slice moved a schedule onto — issues **#81**
+  and **#82**, both open and both diagnosed above as model errors in checks D-065 did not
+  write. Mending it means either the owner ruling on #81 and #82 or reverting `0b29932` on
+  `main`, and this slice may do neither: it never pushes `main` and never merges. It is
+  recorded here so that nothing downstream mistakes this red for a new regression. The
+  fixes below are on `phase-3-stage-b-compaction`, which is now ahead of what was merged.
+
+- **The corrected D-029 measure was dead code, and nothing asserted it** — the finding
+  that matters most, because D-078's central D-065 claim rested on it. `follower_compactions`
+  was called from the *raft* sweep alone, where its `swallowed` half is **zero by
+  construction** (that scenario changes no configuration), and the membership sweep — the
+  one whose figure this entry quotes — never called it at all; the counter was accumulated,
+  never asserted and never printed outside a `{self:?}`. The review's **M11**, reverting the
+  measure to the structural form (`set.iter().max().is_some_and(|index| index <= through)`),
+  survived the whole suite at 20 seeds. Now: `MembershipCoverage` folds
+  `raft::follower_compactions(&report.records)`, and two assertions run **at every tier** —
+  every seed of the scenario sees a follower compaction swallow the configuration in force,
+  and *not every* follower compaction swallows one. The second is what a structural measure
+  cannot pass. The raft sweep keeps the counter and now asserts its zero **with the reason**,
+  so a count above zero there says the measure has started reading something other than what
+  it names. The rule itself is held directly by a new unit test,
+  `a_swallowed_configuration_is_the_one_inside_the_step`: M11 fails it, reading a
+  hand-written trace as 2 of 2 where the truth is 1 of 2.
+
+- **The `LogShape` correction, which the whole Stage B exit rests on, had no test.** The fold
+  reads a *live take* as not moving the prefix (`self.restated || !taken`); the review's
+  **M7** put the bug back and survived at 20 and at 200 seeds, because nothing compares the
+  fold to the core and a bound never near-tripped cannot fail on a log read too *short*. Now
+  `a_live_take_does_not_move_the_folds_prefix_and_an_install_does` folds a trace whose every
+  shape is known and asserts the log **after** each record rather than the maximum over the
+  run — the maximum was already 30 entries before the take, which is why a maximum cannot see
+  a take shorten it, and why the first draft of this test passed under the mutation. M7 now
+  fails it, and fails the window test below as well.
+
+- **The install/re-statement split was a positional inference with an incomplete list.**
+  `replica_of` named 11 event kinds; 14 more carry a `server` and did not clear the window, so
+  any one of them landing between a server's truncation and a later install would have
+  reclassified that install as a re-statement — which moves the asserted follower-log bound,
+  since a re-stated take moves the prefix where a live take does not. The list is now complete,
+  and `Restating::saw` no longer trusts a list at all: it clears the record's **emitting node**
+  as well, which covers a kind the list has never heard of (`RaftMatchStarted` carries no
+  `server` and is one). On the correct path the two traces are back to back with no await
+  between them, so this changes no classification and the counts confirm it. Held by
+  `any_record_of_a_server_closes_its_restatement_window`, which rejects `RaftRefused` — one of
+  the fourteen — in that window. The sweep also asserts **both halves** of the split non-zero
+  from a hundred seeds, not the sum: a rule that put the whole population on one side satisfied
+  the old single assertion, and that is exactly how this counter once reported installs that
+  never happened.
+
+- **The record's shape is tested on the helper, not on the record the real path writes.** The
+  review's **M1** — the call site passing `0` for the take counter instead of carrying it
+  forward — survived the whole suite at 20 and at 200 seeds, and **M10** (`taken: true`) was
+  caught by the two helper unit tests alone. `compaction_record` now takes the
+  `Option<&SnapshotRecord>` the store returned rather than a bare `u64`, so what the new record
+  keeps of the old is a decision *inside* the tested function; its test feeds it the record a
+  store that has taken five checkpoints really holds. M1 in the review's form no longer
+  compiles. **What is not fixed**: nothing reads the record back off the store after a real
+  follower compaction, so a mutation passing `None` at the call site remains invisible to every
+  sweep — and it must, because settled point 2 is that the record traces nothing of its own.
+  Making that observable needs a directed node-level scenario (a server that takes while
+  leading, loses leadership, then compacts as a follower), which is a scope this slice does not
+  own. **Filed as issue #88**, named here.
+
+- **`compaction_stays_committed` let a live take raise the floor it checks against.** The arm
+  matched every `RaftSnapshot`; for an install or a re-statement the prefix is committed by
+  construction, but a take's `last_index` is the taker's *applied* index — the very quantity
+  `ApplyBeforeCommit` corrupts — so the oracle could be handed its floor by the bug it watches
+  for. This entry's earlier justification for leaving it, that "the arm only ever raises the
+  floor … so dropping it can produce a false failure and can hide nothing", **had the reasoning
+  inverted**: raising the floor is the only way a check of this shape can hide anything. The arm
+  is narrowed to `taken: false`. Measured, not argued: `ApplyBeforeCommit` is still caught on
+  999 of 1 000 seeds, first seed 0 with the identical message ("server 2 compacted through 13, past the 12 it knew committed"), and the correct system still passes every seed — nothing
+  was masked, the weakening was latent.
+
+- **The bound scaled with a knob the bounded quantity does not.** `FOLLOWER_LOG_MULTIPLE × 
+  SNAPSHOT_THRESHOLD` would have doubled to 1 536 entries had the scenario's threshold been
+  raised to 24 for an unrelated reason, while the measured maximum barely moved. The constant is
+  now `raft::FOLLOWER_LOG_BOUND = 768`, **in entries**; that it is 64 × this scenario's threshold
+  is prose in its doc comment, where SHARD.md's reading at the production 4 096 also lives. A
+  threshold change must now be re-measured against a number rather than absorbed by one.
+
+- **The install-count claim had no "before" figure.** This entry said the rise in `taken: false`
+  records "is exactly this change putting a prefix under replicas that had none, not the
+  schedules", and measured the split on the new tree alone. Now measured on both, with the same
+  fold and the same tier: the correct tree gives **9 342 installs / 10 788 re-statements**
+  over a thousand raft seeds; with `Variant::FollowerNeverCompacts` — the server as it was before
+  D-065 — the same sweep gives **9 324 / 10 491**. **Real installs did not rise** — 9 342 against 9 324, a fifth of a per cent apart. What rose is the re-statement half, and only modestly: 10 788 against 10 491. So the cost D-065's option C might have incurred — a follower elected with a prefix it holds no checkpoint for, having to be streamed a snapshot where a checkpoint-taking follower would have served one — does not show at this tier, and the claim this entry made about the population is weaker than it read: the split mattered for honest naming, not because D-065 made either half large. The caveat is that `FollowerNeverCompacts` is a variant run and not `ae75bdf` itself: the code path is the one that differs, the schedules are not the same ones. As a further check that nothing here is an artefact of the fold's own change, the correct tree's figures over the same thousand seeds are identical to the record before the review's fixes — 9 342 / 10 788 installs and re-statements, 58 228 follower compactions, 0 swallowed configurations, and a largest follower log of 342 entries on seed 514.
+
+- **RAFT.md's `RefusalNotDurable` row contradicted this entry (D-053).** The row still named
+  state machine safety as what catches the variant; finding 1 above measures that mechanism at 0
+  of 1 000 on this tree against 7 of 1 000 on `ae75bdf`, with all 58 catches the `match starts`
+  oracle. The row now says so, with the reason — a compacted follower leaves a snapshot record,
+  so the laundered store has a prefix that accounts for its applied index — and points at this
+  entry.
+
+- **Disagreed with: nothing.** Every finding stood.
+
+- **One process point the review made, recorded because it cost it a pass:** the report handed
+  to the review described `85412c6` while the tip was `b66fd7f`, so several figures it was asked
+  to check had already been struck by this entry. A review brief is written against the tip.
+
+**The second review's premerge**, on the tip that carries its fixes, quoting the
+script's own machine lines:
+`premerge: Darwin 25.6.0 arm64, Apple M2, 8 cores`;
+`premerge: before, load 171.02/173.15/164.43, AC Power, no thermal warning recorded`;
+`premerge: after, load 137.36/116.70/128.83, AC Power, no thermal warning recorded`;
+`premerge: green at 1000 seeds in 1610 s`. **On AC power** throughout. It is the slowest
+of this slice's three premerges — 1 279 s, then 1 610 s — and the loads say why: this run
+began at a load of 171 and never fell below 88, where the previous one began at 10. None
+of the three is comparable with D-071's 625 s on an idle machine (D-070).
+
+Its own output re-states every figure the second review's fixes touch, on the tree that
+ships:
+
+- The raft sweep: `follower_compactions: 58228, seeds_with_a_follower_compaction: 1000,
+  follower_compactions_swallowing_the_config: 0, largest_follower_log: 342,
+  largest_follower_log_seed: 514`, and `snapshots_installed: 9342,
+  snapshot_prefixes_restated: 10788` — every one identical to the figures recorded above,
+  which is the check that completing `replica_of` and reading the emitting node
+  reclassified nothing.
+- The membership sweep: `follower_compactions: 33270,
+  follower_compactions_swallowing_the_config: 5437, seeds_with_a_swallowed_config: 1000`.
+  D-029's revert floor on a follower, 16.3 % of compactions and **every seed**, now
+  asserted at every tier from the scenario where it is reachable.
+- `ApplyBeforeCommit: the compaction fold caught it on 999 of 1000 seeds, first: seed 0:
+  compaction: server 2 compacted through 13, past the 12 it knew committed` — the
+  narrowed oracle, word for word what the un-narrowed one printed.
 
 **What is not done.**
 

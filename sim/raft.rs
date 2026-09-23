@@ -143,8 +143,19 @@ pub const TRACE_CAP: usize = 400_000;
 // PROPOSED(D-078): the follower log bound is stated as a multiple of this.
 pub const SNAPSHOT_THRESHOLD: u64 = 12;
 
-/// The bound on the largest in-memory log of any follower replica, in entries,
-/// as a multiple of [`SNAPSHOT_THRESHOLD`] (Stage B's exit; Q39).
+/// The bound on the largest in-memory log of any follower replica, **in entries**
+/// (Stage B's exit; Q39).
+///
+/// It is a number of entries and not a multiple of [`SNAPSHOT_THRESHOLD`], though
+/// 768 is 64 × this scenario's threshold of 12 and that is how it was chosen. What
+/// the bound measures is a follower's *apply lag* in entries, and the threshold
+/// does not scale that lag: written as a product, raising the threshold for some
+/// unrelated reason would silently double the bound while the measured maximum
+/// barely moved. A threshold change has to be re-measured against this number
+/// instead — which is the point (D-039). At the server's own 4 096 the same lag
+/// would be a fraction of one threshold, so read as a production figure the
+/// multiple is very conservative; SHARD.md's exit asks for it stated there, and
+/// 64 × 4 096 is 262 144 entries, a bound nothing could trip.
 ///
 /// Measured before it was asserted, on the correct system under this scenario's
 /// client writes; D-078 records the sweep, the command and the machine. At a
@@ -170,12 +181,8 @@ pub const SNAPSHOT_THRESHOLD: u64 = 12;
 /// against it. A bound the correct system trips is a model error to take to the
 /// owner, never a number to widen (D-030, D-039).
 ///
-/// The multiple is this scenario's, at its threshold of 12. What the bound really
-/// measures is the follower's apply lag in entries, which the threshold does not
-/// scale: at the server's own 4 096 the same lag would be a fraction of one
-/// threshold, so 64 × is conservative read as a production figure.
 // PROPOSED(D-078): a follower compacts its log to its own applied index.
-pub const FOLLOWER_LOG_MULTIPLE: u64 = 64;
+pub const FOLLOWER_LOG_BOUND: u64 = 768;
 
 /// The maximum election timeout.
 #[must_use]
@@ -1069,6 +1076,15 @@ pub struct Run {
 
 /// Which replica a per-replica record is about, for the folds that follow one
 /// server's records in order.
+///
+/// Every variant of [`TraceEvent`] that carries a `server` is here. It is a list,
+/// and a list left behind is how [`Restating`]'s positional rule would go wrong
+/// quietly — the review of this slice found seven kinds missing from it — so
+/// [`Restating::saw`] does not trust the list alone: it clears the record's
+/// emitting node as well, which covers a kind this function has never heard of
+/// (`RaftMatchStarted`, which is about a leader and its follower and carries no
+/// `server` at all, is one such). The two together are why adding the seven
+/// changed no count.
 // PROPOSED(D-078): a follower compacts its log to its own applied index.
 fn replica_of(event: &TraceEvent) -> Option<u64> {
     match event {
@@ -1082,7 +1098,22 @@ fn replica_of(event: &TraceEvent) -> Option<u64> {
         | TraceEvent::RaftRecovered { server, .. }
         | TraceEvent::RaftReseeded { server, .. }
         | TraceEvent::RaftTerm { server, .. }
-        | TraceEvent::RaftLeader { server, .. } => Some(*server),
+        | TraceEvent::RaftLeader { server, .. }
+        | TraceEvent::RaftVote { server, .. }
+        | TraceEvent::RaftRead { server, .. }
+        | TraceEvent::RaftLeaseRevoked { server, .. }
+        | TraceEvent::RaftTransfer { server, .. }
+        | TraceEvent::RaftQuorumLost { server, .. }
+        | TraceEvent::RaftProposed { server, .. }
+        | TraceEvent::RaftRefused { server, .. }
+        | TraceEvent::RaftServerFailed { server, .. }
+        | TraceEvent::RaftInboxDropped { server, .. }
+        | TraceEvent::RaftSnapshotResumed { server, .. }
+        | TraceEvent::RaftAdopted { server, .. }
+        | TraceEvent::RaftProgressReset { server, .. }
+        | TraceEvent::RaftSnapshotDeleted { server, .. }
+        | TraceEvent::RaftSnapshotReused { server, .. }
+        | TraceEvent::RaftSnapshotStreams { server, .. } => Some(*server),
         _ => None,
     }
 }
@@ -1116,9 +1147,18 @@ struct Restating {
 
 impl Restating {
     /// Folds one record in. Call it once per record, before asking anything.
-    fn saw(&mut self, event: &TraceEvent) {
+    ///
+    /// "Nothing of that server's in between" is read two ways at once, because
+    /// either alone is a list that can fall behind the trace: the record's event
+    /// names a server ([`replica_of`]), and the record's own node emitted it. The
+    /// restatement's two traces are back to back with no await between them
+    /// (`node.rs`), so on the correct path nothing of either kind can land
+    /// between, and the second reading costs nothing; what it buys is that a new
+    /// event kind, or one missing from `replica_of`, cannot silently turn an
+    /// install into a re-statement.
+    fn saw(&mut self, record: &TraceRecord) {
         self.restated = false;
-        match event {
+        match &record.event {
             TraceEvent::RaftTruncate { server, .. } => {
                 self.after_truncate.insert(*server);
             }
@@ -1128,6 +1168,9 @@ impl Restating {
             other => {
                 if let Some(server) = replica_of(other) {
                     self.after_truncate.remove(&server);
+                }
+                if let Some(node) = record.node {
+                    self.after_truncate.remove(&u64::from(node.get()));
                 }
             }
         }
@@ -1181,7 +1224,7 @@ pub fn follower_compactions(records: &[TraceRecord]) -> (usize, usize) {
     let mut restating = Restating::default();
     let (mut count, mut swallowed) = (0usize, 0usize);
     for record in records {
-        restating.saw(&record.event);
+        restating.saw(record);
         match &record.event {
             TraceEvent::RaftRecovered { server, .. } => {
                 leading.insert(*server, false);
@@ -1705,7 +1748,7 @@ fn fold_logs(
     let mut shapes: BTreeMap<u64, LogShape> = BTreeMap::new();
     let mut restating = Restating::default();
     for record in records {
-        restating.saw(&record.event);
+        restating.saw(record);
         let server = match &record.event {
             TraceEvent::RaftAppend { server, .. }
             | TraceEvent::RaftTruncate { server, .. }
@@ -1772,8 +1815,27 @@ pub fn compaction_stays_committed(records: &[TraceRecord]) -> Result<(), String>
                 let seen = committed.entry(*server).or_default();
                 *seen = (*seen).max(*index);
             }
+            // An install's prefix, and a re-statement standing in for one, is
+            // committed by construction: a leader streams only what it had
+            // committed, and the receiver traced no commit of its own for those
+            // indices, so without this arm the check would fail on the correct
+            // system. A **take** is a different matter, and is excluded: its
+            // `last_index` is the taker's *applied* index, the very quantity
+            // `ApplyBeforeCommit` corrupts, so a take raising this floor would
+            // hand the oracle its bound from the bug it watches for. Raising the
+            // floor a compaction is compared against is the only way a check of
+            // this shape can hide anything — the reasoning D-078 first recorded
+            // here had that backwards, and the review of this slice caught it.
+            //
+            // Measured, not assumed: with the arm narrowed, `ApplyBeforeCommit`
+            // is still caught on 999 of 1 000 seeds, first seed 0 with the same
+            // message, and the correct system still passes every seed. Nothing
+            // was masked; the weakening was latent.
             TraceEvent::RaftSnapshot {
-                server, last_index, ..
+                server,
+                last_index,
+                taken: false,
+                ..
             } => {
                 let seen = committed.entry(*server).or_default();
                 *seen = (*seen).max(*last_index);
@@ -1849,7 +1911,7 @@ impl Report {
         let mut restating = Restating::default();
         let (mut installed, mut restated) = (0usize, 0usize);
         for record in &self.records {
-            restating.saw(&record.event);
+            restating.saw(record);
             if let TraceEvent::RaftSnapshot { taken: false, .. } = &record.event {
                 if restating.restated() {
                     restated += 1;
@@ -2134,9 +2196,8 @@ impl Report {
         Ok(())
     }
 
-    /// The largest in-memory log of any follower replica, against the bound
-    /// [`FOLLOWER_LOG_MULTIPLE`] states as a multiple of
-    /// [`SNAPSHOT_THRESHOLD`] (Stage B's exit; Q39).
+    /// The largest in-memory log of any follower replica, against the entry bound
+    /// [`FOLLOWER_LOG_BOUND`] (Stage B's exit; Q39).
     ///
     /// A follower compacts one tick after its log passes the threshold, and the
     /// entries of that tick's round, of the persist the compaction waits behind
@@ -2145,13 +2206,11 @@ impl Report {
     /// itself.
     // PROPOSED(D-078): a follower compacts its log to its own applied index.
     fn follower_log_is_bounded(&self) -> Result<(), String> {
-        let bound = FOLLOWER_LOG_MULTIPLE * SNAPSHOT_THRESHOLD;
         let (longest, server) = self.largest_follower_log();
-        if longest > bound {
+        if longest > FOLLOWER_LOG_BOUND {
             return Err(format!(
                 "follower log: server {server} held {longest} entries in memory while not \
-                 leading, over the {bound} entries of {FOLLOWER_LOG_MULTIPLE} × \
-                 {SNAPSHOT_THRESHOLD}"
+                 leading, over the bound of {FOLLOWER_LOG_BOUND} entries"
             ));
         }
         Ok(())
@@ -7634,5 +7693,282 @@ mod tests {
                     .to_owned()
             )
         );
+    }
+}
+
+/// The two folds D-065 added, on records written by hand.
+///
+/// Both read a trace positionally, and both were found by the review of this
+/// slice to be defensible by nothing: a sweep cannot see a fold that under-reads,
+/// because the bound is never near-tripped on the correct system, and it cannot
+/// see a measure that counts the wrong thing, because nothing asserts the count.
+/// These tests are that defence, and each names the wrong shape it rejects.
+// PROPOSED(D-078): a follower compacts its log to its own applied index.
+#[cfg(test)]
+mod compaction_folds {
+    use super::*;
+    use ananke_raft::node::SINGLE_GROUP;
+
+    fn at(n: u64) -> Instant {
+        Instant::from_nanos(n * 1_000_000)
+    }
+
+    /// A record of `server`'s, emitted by the node of the same number — which is
+    /// how the simulator numbers them, and what [`Restating`] reads as the second
+    /// half of "nothing of that server's in between".
+    fn of(n: u64, server: u64, event: TraceEvent) -> TraceRecord {
+        TraceRecord {
+            at: at(n),
+            decided: at(n),
+            node: Some(NodeId::new(u32::try_from(server).expect("small"))),
+            event,
+        }
+    }
+
+    fn append(server: u64, index: u64) -> TraceEvent {
+        TraceEvent::RaftAppend {
+            server,
+            range: SINGLE_GROUP,
+            index,
+            entry_term: 1,
+            hash: 0,
+        }
+    }
+
+    fn truncate(server: u64, from_index: u64) -> TraceEvent {
+        TraceEvent::RaftTruncate {
+            server,
+            range: SINGLE_GROUP,
+            from_index,
+        }
+    }
+
+    fn snapshot(server: u64, last_index: u64, taken: bool) -> TraceEvent {
+        TraceEvent::RaftSnapshot {
+            server,
+            range: SINGLE_GROUP,
+            last_index,
+            last_term: 1,
+            taken,
+        }
+    }
+
+    fn compacted(server: u64, through: u64) -> TraceEvent {
+        TraceEvent::RaftCompacted {
+            server,
+            range: SINGLE_GROUP,
+            through,
+        }
+    }
+
+    fn config(server: u64, index: u64) -> TraceEvent {
+        TraceEvent::RaftConfig {
+            server,
+            range: SINGLE_GROUP,
+            index,
+            old: vec![1, 2, 3],
+            new: Vec::new(),
+            joint: false,
+            learners: Vec::new(),
+        }
+    }
+
+    fn following(server: u64) -> TraceEvent {
+        TraceEvent::RaftTerm {
+            server,
+            range: SINGLE_GROUP,
+            term: 1,
+            role: "follower",
+            received: None,
+        }
+    }
+
+    /// The largest follower log, over a trace whose every shape is known.
+    fn longest(records: &[TraceRecord]) -> u64 {
+        let mut worst = 0;
+        fold_logs(records, |_, shape| {
+            worst = worst.max(if shape.leading { 0 } else { shape.len() });
+            Ok(())
+        })
+        .expect("the fold decides nothing");
+        worst
+    }
+
+    /// The log the fold holds after the last record of the trace.
+    fn ends_at(records: &[TraceRecord]) -> u64 {
+        let mut last = 0;
+        fold_logs(records, |_, shape| {
+            last = shape.len();
+            Ok(())
+        })
+        .expect("the fold decides nothing");
+        last
+    }
+
+    /// A **live take** leaves the log where it was; an install and a re-statement
+    /// stand in for a prefix that is gone. The whole Stage B exit measurement
+    /// rests on this one distinction, and reading a take as moving the prefix
+    /// under-reads every follower log that has a take outstanding — the wrong
+    /// direction for a bound, and invisible to any sweep, since a bound that is
+    /// never near-tripped cannot fail on a log read too short.
+    ///
+    /// The shape rejected: `TraceEvent::RaftSnapshot { .. } => true` in
+    /// [`Restating::moves_the_prefix`], which is what this fold did before the
+    /// first review of this slice. It reads the log below as 10 entries, not 30.
+    #[test]
+    fn a_live_take_does_not_move_the_folds_prefix_and_an_install_does() {
+        let mut records: Vec<TraceRecord> = vec![of(0, 1, following(1))];
+        for index in 1..=30 {
+            records.push(of(index, 1, append(1, index)));
+        }
+        assert_eq!(ends_at(&records), 30, "thirty entries, no prefix");
+
+        // A take at 20, with no compaction under it yet: the core still holds
+        // every entry from 1, so the log is *still* 30 entries. This is the
+        // assertion the mutation fails, and it has to be read after the take
+        // rather than as a maximum over the run — the maximum was already 30
+        // before the take, so a maximum cannot see the take shorten it.
+        records.push(of(31, 1, snapshot(1, 20, true)));
+        assert_eq!(
+            ends_at(&records),
+            30,
+            "a take writes a checkpoint and leaves the log alone"
+        );
+        assert_eq!(longest(&records), 30);
+
+        // The compaction is what drops the prefix.
+        records.push(of(32, 1, compacted(1, 20)));
+        assert_eq!(longest(&records), 30, "the maximum stands at 30");
+        assert_eq!(
+            ends_at(&records),
+            10,
+            "after the compaction the log is the 10 entries past the prefix"
+        );
+
+        // A restart: the durable log re-stated as a truncation to one past its
+        // end and then the prefix's snapshot — a *re-stated take*, which does
+        // move the prefix, because the prefix it names is already gone.
+        let mut restarted = records.clone();
+        restarted.push(of(33, 1, truncate(1, 31)));
+        restarted.push(of(34, 1, snapshot(1, 20, true)));
+        assert_eq!(
+            longest(&restarted),
+            30,
+            "a re-statement restores the shape the compaction left, no more"
+        );
+
+        // An install replaces the log under the snapshot at once, take or no take.
+        let mut installed = records.clone();
+        installed.push(of(33, 1, snapshot(1, 28, false)));
+        assert_eq!(
+            ends_at(&installed),
+            2,
+            "an install's prefix leaves 29 and 30"
+        );
+    }
+
+    /// The positional rule is "nothing of that server's between its truncation and
+    /// the snapshot". [`replica_of`] is a list of event kinds, and a list is what
+    /// falls behind: seven kinds that carry a server were missing from it, and any
+    /// one of them landing in that window would have turned a real install into a
+    /// re-statement — which moves the asserted follower-log bound, since a
+    /// re-stated take moves the prefix where a live take does not.
+    ///
+    /// The shape rejected: `RaftRefused` (one of the seven) not clearing the
+    /// window. With it missing, the take below is read as a re-statement.
+    #[test]
+    fn any_record_of_a_server_closes_its_restatement_window() {
+        let take = |between: Option<TraceEvent>| {
+            let mut records = vec![of(0, 1, following(1)), of(1, 1, append(1, 1))];
+            records.push(of(2, 1, truncate(1, 2)));
+            if let Some(event) = between {
+                records.push(of(3, 1, event));
+            }
+            records.push(of(4, 1, snapshot(1, 1, true)));
+            let mut restating = Restating::default();
+            let mut moved = false;
+            for record in &records {
+                restating.saw(record);
+                if matches!(record.event, TraceEvent::RaftSnapshot { .. }) {
+                    moved = restating.moves_the_prefix(&record.event);
+                }
+            }
+            moved
+        };
+        assert!(
+            take(None),
+            "a take's snapshot straight after that server's truncation is the \
+             restatement's, and it moves the prefix"
+        );
+        for between in [
+            TraceEvent::RaftRefused {
+                server: 1,
+                reason: "lost state".to_owned(),
+            },
+            append(1, 2),
+            compacted(1, 1),
+        ] {
+            assert!(
+                !take(Some(between.clone())),
+                "a record of server 1's closes the window, so what follows is a \
+                 live take, not a re-statement: {between:?}"
+            );
+        }
+    }
+
+    /// D-029's revert floor, observed rather than inferred: a follower's
+    /// compaction swallowed the configuration entry in force only when that entry
+    /// sits *strictly inside* the step the prefix took.
+    ///
+    /// The shape rejected: asking whether the server's last configuration index is
+    /// at or below `through`, which holds for every compaction by construction and
+    /// so counts the total under another name. It reads the trace below as 2 of 2;
+    /// the truth is 1 of 2.
+    #[test]
+    fn a_swallowed_configuration_is_the_one_inside_the_step() {
+        let mut records = vec![of(0, 1, following(1)), of(1, 1, config(1, 5))];
+        for index in 1..=12 {
+            records.push(of(1 + index, 1, append(1, index)));
+        }
+        records.push(of(20, 1, compacted(1, 8)));
+        records.push(of(21, 1, compacted(1, 12)));
+        assert_eq!(
+            follower_compactions(&records),
+            (2, 1),
+            "two compactions by a replica that is not leading; the configuration at \
+             5 is inside the first step and behind the second"
+        );
+
+        // Index 0 is the initial configuration, which is no entry: it can be
+        // swallowed by nothing.
+        let initial = vec![
+            of(0, 2, following(2)),
+            of(1, 2, config(2, 0)),
+            of(2, 2, append(2, 1)),
+            of(3, 2, compacted(2, 1)),
+        ];
+        assert_eq!(
+            follower_compactions(&initial),
+            (1, 0),
+            "the initial configuration is no log entry"
+        );
+
+        // A leader's compaction is not a follower's.
+        let leading = vec![
+            of(
+                0,
+                3,
+                TraceEvent::RaftLeader {
+                    server: 3,
+                    range: SINGLE_GROUP,
+                    term: 1,
+                    last_index: 0,
+                },
+            ),
+            of(1, 3, config(3, 5)),
+            of(2, 3, append(3, 8)),
+            of(3, 3, compacted(3, 8)),
+        ];
+        assert_eq!(follower_compactions(&leading), (0, 0));
     }
 }

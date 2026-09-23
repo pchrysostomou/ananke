@@ -2455,7 +2455,7 @@ fn a_server_that_applies_before_commit_compacts_past_its_commit_index() {
 }
 
 /// The seed the follower-log bound's pair is pinned at. Five seeds of the first
-/// thousand carry a replica's log past [`raft::FOLLOWER_LOG_MULTIPLE`] under
+/// thousand carry a replica's log past [`raft::FOLLOWER_LOG_BOUND`] under
 /// [`Variant::FollowerNeverCompacts`] — 116, 429, 512, 577 and 757 — and this is
 /// the one with the most room: 878 entries against the bound's 768, where seed
 /// 116, the lowest, holds 788. A pin two per cent over a bound would go quiet at
@@ -2472,8 +2472,8 @@ const FOLLOWER_LOG_SEED: u64 = 512;
 /// since the last snapshot a leader gave it or it took itself, and grows with the
 /// run. That is the only thing in the tree that can make
 /// `Report::follower_log_is_bounded` fire, and before this variant existed the
-/// bound was unfalsifiable — widening `FOLLOWER_LOG_MULTIPLE` from 64 to 4 096
-/// changed no test at any tier, which is how the review of this slice found it.
+/// bound was unfalsifiable — widening it from 768 entries to 49 152 changed no
+/// test at any tier, which is how the review of this slice found it.
 ///
 /// **The rate, measured before it is asserted (D-061).** Over the first thousand
 /// seeds in release, the variant is caught on **5** — 116, 429, 512, 577 and 757 —
@@ -2490,7 +2490,7 @@ const FOLLOWER_LOG_SEED: u64 = 512;
 // follower replica.
 #[test]
 fn a_replica_that_never_compacts_outgrows_the_follower_log_bound() {
-    let bound = raft::FOLLOWER_LOG_MULTIPLE * raft::SNAPSHOT_THRESHOLD;
+    let bound = raft::FOLLOWER_LOG_BOUND;
 
     let broken = raft::run(FOLLOWER_LOG_SEED, Variant::FollowerNeverCompacts);
     let (longest, server) = broken.largest_follower_log();
@@ -2510,9 +2510,7 @@ fn a_replica_that_never_compacts_outgrows_the_follower_log_bound() {
     );
     eprintln!(
         "FollowerNeverCompacts: seed {FOLLOWER_LOG_SEED} held {longest} entries on server \
-         {server}, past the {bound} of {} × {}",
-        raft::FOLLOWER_LOG_MULTIPLE,
-        raft::SNAPSHOT_THRESHOLD
+         {server}, past the bound's {bound}"
     );
 
     let correct = raft::run(FOLLOWER_LOG_SEED, Variants::default());
@@ -3382,7 +3380,7 @@ struct Coverage {
     /// D-065's own path: the compactions a replica made while it was not leading,
     /// with the seeds that saw one, and the largest in-memory log any follower
     /// replica held over the sweep — Stage B's exit measurement (Q39), printed at
-    /// every tier beside the bound `raft::FOLLOWER_LOG_MULTIPLE` asserts per seed.
+    /// every tier beside the bound `raft::FOLLOWER_LOG_BOUND` asserts per seed.
     // PROPOSED(D-078): a follower compacts its log to its own applied index.
     follower_compactions: usize,
     seeds_with_a_follower_compaction: u64,
@@ -3773,6 +3771,19 @@ impl Coverage {
         ] {
             assert!(seen > 0, "the sweep never saw {what}: {self:?}");
         }
+        // PROPOSED(D-078): an absence with its reason. This scenario proposes one
+        // configuration — the initial one, which is no log entry — and never changes
+        // it, so no prefix a compaction drops can contain a configuration entry and
+        // D-029's revert floor is unreachable here by construction. The measure is
+        // kept in this sweep all the same, because a count above zero would mean it
+        // is reading something other than what it names; where the floor *is*
+        // reachable is the membership scenario, and that is where it is asserted
+        // positive (`MembershipCoverage::assert_complete`).
+        assert_eq!(
+            self.follower_compactions_swallowing_the_config, 0,
+            "the raft scenario changes no configuration, so nothing here can swallow \
+             one: {self:?}"
+        );
         // PROPOSED(D-069): `RaftMatchStarted` is on every seed of this sweep, not
         // merely somewhere in it: every leader's first answer from a follower raises
         // `matched` under the incarnation it carried, so the count is 1 000 of 1 000
@@ -3801,6 +3812,19 @@ impl Coverage {
             assert!(
                 self.snapshots_installed > 0,
                 "the sweep never saw a snapshot installed: {self:?}"
+            );
+            // PROPOSED(D-078): both halves of the split, not the sum. The split is
+            // read off a record's position in the trace, and a rule that put the
+            // whole population on one side would satisfy an assertion on that side
+            // alone — which is how this counter, called "installed" when it held
+            // both, reported installs that never happened. Asserting each half
+            // says the rule divides something. (`Restating`'s own unit tests are
+            // where the rule itself is held; this is the sweep's non-vacuity.)
+            assert!(
+                self.snapshot_prefixes_restated > 0,
+                "the sweep never saw a restart re-state a compacted or installed \
+                 prefix, so the install/re-statement split is putting everything \
+                 on one side: {self:?}"
             );
             assert!(
                 self.snapshot_resumes > 0,
@@ -3997,6 +4021,21 @@ struct MembershipCoverage {
     truncation_reverts_to_a_prefix: usize,
     installs_keeping_a_tail: usize,
     installs_whose_tail_carries_a_configuration: usize,
+    /// D-065's own path in the scenario that has configuration entries to
+    /// swallow: the compactions a replica made while not leading, and of those
+    /// the ones whose prefix swallowed the configuration entry in force, so that
+    /// D-029's revert floor is what the replica would revert to from there.
+    ///
+    /// This lives here and not only in the raft sweep because the raft scenario
+    /// appends no configuration entry after the first, so its `swallowed` is
+    /// **zero by construction** — a measure that can only read zero evidences
+    /// nothing. The review of this slice found the corrected measure calculated
+    /// nowhere that ships and asserted nowhere at all; it is asserted below, at
+    /// every tier, on the rate this scenario really has.
+    // PROPOSED(D-078): a follower compacts its log to its own applied index.
+    follower_compactions: usize,
+    follower_compactions_swallowing_the_config: usize,
+    seeds_with_a_swallowed_config: u64,
 }
 
 impl MembershipCoverage {
@@ -4006,6 +4045,11 @@ impl MembershipCoverage {
         self.snapshot_fed_joiners += joiners.len();
         self.seeds_with_a_snapshot_fed_joiner += u64::from(!joiners.is_empty());
         self.compactions += report.count(|e| matches!(e, TraceEvent::RaftCompacted { .. }));
+        // PROPOSED(D-078): a follower compacts its log to its own applied index.
+        let (follower_compactions, swallowed) = raft::follower_compactions(&report.records);
+        self.follower_compactions += follower_compactions;
+        self.follower_compactions_swallowing_the_config += swallowed;
+        self.seeds_with_a_swallowed_config += u64::from(swallowed > 0);
         // PROPOSED(D-069): the three events emitted from this stage, each with the
         // seeds that saw one: D-061 measures a counter's rate over those.
         let match_starts = report.count(|e| matches!(e, TraceEvent::RaftMatchStarted { .. }));
@@ -4216,6 +4260,30 @@ impl MembershipCoverage {
         ] {
             assert_eq!(seen, seeds, "a membership run saw no {what}: {self:?}");
         }
+        // PROPOSED(D-078): D-029's revert floor on a follower, which is what D-065
+        // said this change would make routine, observed on this scenario rather than
+        // argued. A follower compacts to its own applied index; when the
+        // configuration entry in force sits inside the prefix that compaction drops,
+        // the floor — the configuration held at the new prefix's end — is what that
+        // replica reverts to. Before this change the floor was reached on 3 of 10 000
+        // seeds (issue #56); here it is reached on every seed of the scenario.
+        //
+        // The rate, measured before it is asserted (D-061): D-078 records the sweep.
+        // At 100 % of seeds the gate's twenty support it, so it is asked at every
+        // tier and not merely as a sweep total — a total above zero is what a measure
+        // gone structural passes, and a measure that reads the whole population is
+        // exactly the failure the review of this slice found in the first build of
+        // this counter.
+        assert_eq!(
+            self.seeds_with_a_swallowed_config, seeds,
+            "a membership run saw no follower compaction swallow the configuration in \
+             force, which is D-029's revert floor on a follower: {self:?}"
+        );
+        assert!(
+            self.follower_compactions_swallowing_the_config < self.follower_compactions,
+            "every follower compaction swallowed a configuration entry, which is the \
+             shape of a measure that is structural rather than observed (D-039): {self:?}"
+        );
         // PROPOSED(D-058): every seed adopts installs, and none is refused for anything
         // but lost state, which each run's check also fails.
         assert!(self.adoptions > 0, "no install was adopted: {self:?}");
