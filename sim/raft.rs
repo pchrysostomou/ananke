@@ -1137,6 +1137,16 @@ impl Schedule {
         }
     }
 
+    /// The raw draw the `i`th fault spends on its range, before any cluster's ranges
+    /// are consulted: what [`Schedule::range_of`] resolves and what the stream arms'
+    /// aim spends among the ranges their victim actually lags (PROPOSED D-089). Zero
+    /// for a schedule built by hand, which has no picks.
+    // PROPOSED(D-089): the stream arms aim their victim at a range it lags.
+    #[must_use]
+    pub fn range_pick(&self, i: usize) -> u64 {
+        self.range_picks.get(i).copied().unwrap_or(0)
+    }
+
     /// The range the `i`th fault aims at, on `cluster`.
     ///
     /// One group has one range and every arm aims at it; the node's arms take
@@ -1327,9 +1337,29 @@ pub struct Report {
     /// stream to re-take under. What the sweep asserts fired. (D-043).
     pub aimed_streams: usize,
     /// How many [`Fault::CrashInstalling`] arms reached the final chunk of the range
-    /// they drew and crashed their victim there: the arm's firing
-    /// (PROPOSED D-086).
+    /// they aimed at and crashed their victim there: the arm's firing
+    /// (PROPOSED D-086; the range is the aimed one since PROPOSED D-089).
     pub aimed_installs: usize,
+    /// Each [`Fault::CrashInstalling`] arm of this run as **(the range the schedule
+    /// drew, the range it aimed at)**: the two are equal where the victim was behind
+    /// the drawn range's compacted prefix, and the aim is a range it was behind
+    /// otherwise (PROPOSED D-089).
+    ///
+    /// Both halves are kept because the two failures they report are different ones.
+    /// The aimed range says the aim is a **per-range** one and not a constant: an aim
+    /// that answered one range every time would fire as often as this one and leave
+    /// three of the four ranges' installs never crashed at. The pair says the aim
+    /// **spends the arm's own draw**: an aim that ignored it would still fire, still
+    /// spread — the candidates differ from arm to arm — and would quietly stop being a
+    /// function of the seed's schedule, which is what makes one seed's arm
+    /// reproducible from its draw. Neither is something a single-range world can be
+    /// wrong about: there the drawn range, the aimed range and the only range are one.
+    // PROPOSED(D-089): the stream arms aim their victim at a range it lags.
+    pub install_aims: Vec<(u64, u64)>,
+    /// Each [`Fault::RetakeUnderStream`] arm of this run, read the same way
+    /// (PROPOSED D-089).
+    // PROPOSED(D-089): the stream arms aim their victim at a range it lags.
+    pub stream_aims: Vec<(u64, u64)>,
     /// Servers refused at a restart, with the reason.
     pub refused: Vec<(u64, String)>,
     /// Why the run stopped early, if it did: a safety violation the folds saw at a
@@ -1636,6 +1666,8 @@ impl Report {
             trials_led_by_slowest: 0,
             aimed_streams: 0,
             aimed_installs: 0,
+            install_aims: Vec::new(),
+            stream_aims: Vec::new(),
             refused,
             stopped,
             history,
@@ -5994,6 +6026,94 @@ pub(crate) fn leader_of_range(sim: &Sim, range: u64) -> u64 {
     }
 }
 
+/// The range of `cluster` the two stream arms aim `victim` at: one the victim is
+/// **actually behind the leader's compacted prefix of**, preferring the range the
+/// schedule drew when the victim is behind that one.
+///
+/// This is what PROPOSED D-086 left to the owner and PROPOSED D-089 takes.
+/// [`Fault::CrashInstalling`] and [`Fault::RetakeUnderStream`] draw their victim
+/// from one stream and their range from another, so on a node the arm reached its
+/// situation only where the two draws happened to agree — where the victim it drew
+/// was, by coincidence, behind the compacted prefix of the range it drew. It was:
+/// the install crash reached the final chunk of the range it drew on **0 of 100**
+/// seeds and 1 of 1 000, which is why `SnapshotWithoutCurrentLast` had no assertion
+/// below the nightly at all. On one group there is nothing to coincide: the arm has
+/// one range, and an isolated victim is behind it by construction.
+///
+/// So the victim is drawn as before and the *range* is resolved here, against the
+/// trace, at the moment the arm has cut the victim off and healed it — the moment
+/// the lag it is about exists. A range qualifies when the victim's own highest
+/// appended index of that range is below the index that range's leader has compacted
+/// through: the entries it needs are gone from the leader's log, so a designation and
+/// a stream are the only way it catches up, which is precisely the situation both
+/// arms are about.
+///
+/// **The drawn range wins where it qualifies**, which keeps the draw meaningful, keeps
+/// [`Fault::RetakeUnderStream`]'s filling puts and its watch on one range, and leaves
+/// a seed that was already aimed right aimed the same way. Where it does not, the
+/// draw chooses among the ranges that do, so the aim still spreads over the node's
+/// ranges rather than collapsing onto the busiest one. Where **no** range qualifies
+/// the drawn range is returned unchanged and the arm reduces to an isolation exactly
+/// as it does today: this can make an arm fire where it did not, never the reverse.
+///
+/// One group short-circuits before the scan: with one range the answer is that range
+/// whatever the trace says, so [`Cluster::OneGroup`]'s runs are the runs they were,
+/// byte for byte, and no figure of Phase 2's moves with this.
+// PROPOSED(D-089): the stream arms aim their victim at a range it lags.
+fn lagging_range(sim: &Sim, cluster: Cluster, victim: u64, pick: u64, drawn: u64) -> u64 {
+    let ranges = cluster.ranges();
+    if ranges.len() <= 1 {
+        return drawn;
+    }
+    // The victim's own highest append per range, and the highest index each server
+    // has compacted through per range. One forward walk of the trace: the arm runs
+    // at most twice in a schedule and the answer is about the whole run, not its
+    // tail, so the windowed backward search `leader_of_range` uses does not fit —
+    // a range whose leader never compacted has no record to find in any window.
+    let mut appended: BTreeMap<u64, u64> = BTreeMap::new();
+    let mut compacted: BTreeMap<(u64, u64), u64> = BTreeMap::new();
+    for record in sim.trace() {
+        match &record.event {
+            TraceEvent::RaftAppend {
+                server,
+                range,
+                index,
+                ..
+            } if *server == victim => {
+                let at = appended.entry(*range).or_default();
+                *at = (*at).max(*index);
+            }
+            TraceEvent::RaftCompacted {
+                server,
+                range,
+                through,
+            } => {
+                let at = compacted.entry((*server, *range)).or_default();
+                *at = (*at).max(*through);
+            }
+            _ => {}
+        }
+    }
+    // The leader of each range is who designates and who streams, so it is that
+    // server's compacted prefix the victim has to be behind — not any server's. A
+    // follower that compacted further than its leader says nothing about what the
+    // leader can serve from its log.
+    let lagging: Vec<u64> = ranges
+        .iter()
+        .copied()
+        .filter(|range| {
+            let leader = leader_of_range(sim, *range);
+            let prefix = compacted.get(&(leader, *range)).copied().unwrap_or(0);
+            prefix > appended.get(range).copied().unwrap_or(0)
+        })
+        .collect();
+    if lagging.contains(&drawn) || lagging.is_empty() {
+        return drawn;
+    }
+    let at = usize::try_from(pick).expect("small") % lagging.len();
+    lagging[at]
+}
+
 fn to_command(op: &ClientOp) -> Command {
     match op {
         ClientOp::Put { key, value } => Command::Put {
@@ -6473,10 +6593,17 @@ pub fn run_on(
     let mut fills = 0u64;
     let mut aimed_streams = 0usize;
     // How many `Fault::CrashInstalling` arms got as far as the final chunk of the
-    // range they drew and crashed their victim there: the arm's firing, which
-    // `SnapshotWithoutCurrentLast`'s test asserts at every tier so that a sweep which
-    // passes is known to have injected the fault (PROPOSED D-086).
+    // range they **aimed at** and crashed their victim there: the arm's firing, which
+    // `SnapshotWithoutCurrentLast`'s test asserts so that a sweep which passes is
+    // known to have injected the fault (PROPOSED D-086). The range was the one the
+    // schedule drew beside the victim until PROPOSED D-089 aimed it at one the victim
+    // lags, which is what took this from 0 of 100 seeds to a rate that carries an
+    // assertion.
     let mut aimed_installs = 0usize;
+    // The range each of the two stream arms aimed at, resolved against the lag its
+    // victim actually has rather than drawn beside it (PROPOSED D-089).
+    let mut install_aims: Vec<(u64, u64)> = Vec::new();
+    let mut stream_aims: Vec<(u64, u64)> = Vec::new();
     for (i, (fault, gap)) in schedule.faults.iter().zip(schedule.gaps.iter()).enumerate() {
         if watch.stopped.is_some() {
             break;
@@ -6554,6 +6681,16 @@ pub fn run_on(
                 advance(&mut sim, *isolate, &mut watch);
                 sim.heal();
                 isolations.push((victim, from, sim.now()));
+                // The aim, now the lag exists (PROPOSED D-089): a range this victim
+                // is behind the leader's compacted prefix of, the drawn one where it
+                // is behind that. Aiming at a range it is merely *behind* on would
+                // not do — the leader feeds that follower entries and no stream ever
+                // opens — and aiming at the drawn range regardless is what left this
+                // arm reaching its situation on 0 of 100 seeds.
+                let drawn_range = aimed_range;
+                let aimed_range =
+                    lagging_range(&sim, cluster, victim, schedule.range_pick(i), aimed_range);
+                install_aims.push((drawn_range, aimed_range));
                 if install_landing(&mut sim, &mut watch, victim, aimed_range) {
                     aimed_installs += 1;
                     advance(&mut sim, *grace, &mut watch);
@@ -6681,6 +6818,17 @@ pub fn run_on(
                 advance(&mut sim, *isolate, &mut watch);
                 sim.heal();
                 isolations.push((fed, from, sim.now()));
+                // The same aim as the install crash's (PROPOSED D-089). The filling
+                // puts above went to the drawn range, and that range wins wherever
+                // the fed follower is behind its compacted prefix — which the fill
+                // and the isolation together usually make true, and which is the
+                // whole arm when it is. Where they did not, the arm's alternative is
+                // not a smaller checkpoint but *no stream at all*, so it re-aims at
+                // a range the follower does lag rather than waiting out its budget.
+                let drawn_range = aimed_range;
+                let aimed_range =
+                    lagging_range(&sim, cluster, fed, schedule.range_pick(i), aimed_range);
+                stream_aims.push((drawn_range, aimed_range));
                 if stream_opened(&mut sim, &mut watch, fed, aimed_range) {
                     aimed_streams += 1;
                     // The leader's other follower away: the fed one keeps the
@@ -6867,6 +7015,8 @@ pub fn run_on(
         trials_led_by_slowest,
         aimed_streams,
         aimed_installs,
+        install_aims,
+        stream_aims,
         refused,
         stopped: watch.stopped,
         history,
@@ -7469,6 +7619,8 @@ mod tests {
             trials_led_by_slowest: 0,
             aimed_streams: 0,
             aimed_installs: 0,
+            install_aims: Vec::new(),
+            stream_aims: Vec::new(),
             refused: Vec::new(),
             stopped: None,
             history: History::default(),

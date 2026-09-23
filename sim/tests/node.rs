@@ -211,6 +211,24 @@ struct Coverage {
     multi_range_frames: usize,
     arms_hit: usize,
     arms_fired: usize,
+    /// The range each stream arm **aimed** at, counted per range, and how many install
+    /// arms reached the final chunk there (PROPOSED D-089).
+    ///
+    /// The two stream arms draw their victim from one stream and their range from
+    /// another, so until this slice an arm reached its situation only where the two
+    /// coincided — on 0 of 100 seeds for the install crash. The aim is resolved
+    /// against the trace now, at the moment the victim has been cut off and healed,
+    /// and lands on a range that victim is behind the leader's compacted prefix of.
+    /// These three say what the aim did: which ranges it chose, and how often the
+    /// choice carried the arm to the moment it is about.
+    install_aims_by_range: BTreeMap<u64, usize>,
+    stream_aims_by_range: BTreeMap<u64, usize>,
+    installs_fired: usize,
+    /// Of all the stream arms' aims, how many kept the range the schedule drew — the
+    /// aim does, wherever the victim is behind that range's compacted prefix — and how
+    /// many there were (PROPOSED D-089).
+    aims_kept_the_draw: usize,
+    aims: usize,
     lags_by_range: BTreeMap<u64, Vec<Duration>>,
     holds: Vec<Duration>,
     holds_dropped_for_a_crash: usize,
@@ -281,6 +299,11 @@ impl std::fmt::Debug for Coverage {
             .field("multi_range_frames", &self.multi_range_frames)
             .field("arms_hit", &self.arms_hit)
             .field("arms_fired", &self.arms_fired)
+            .field("install_aims_by_range", &self.install_aims_by_range)
+            .field("stream_aims_by_range", &self.stream_aims_by_range)
+            .field("installs_fired", &self.installs_fired)
+            .field("aims_kept_the_draw", &self.aims_kept_the_draw)
+            .field("aims", &self.aims)
             .field("apply_lag_samples", &lag_samples)
             .field("apply_lag_median", &median_lag)
             .field("apply_lag_median_per_range", &per_range)
@@ -379,6 +402,18 @@ impl Coverage {
         let (hit, fired) = report.arms_hit_their_ranges();
         self.arms_hit += hit;
         self.arms_fired += fired;
+        // PROPOSED(D-089): the stream arms aim their victim at a range it lags.
+        for (drawn, aimed) in &report.install_aims {
+            *self.install_aims_by_range.entry(*aimed).or_default() += 1;
+            self.aims_kept_the_draw += usize::from(drawn == aimed);
+            self.aims += 1;
+        }
+        for (drawn, aimed) in &report.stream_aims {
+            *self.stream_aims_by_range.entry(*aimed).or_default() += 1;
+            self.aims_kept_the_draw += usize::from(drawn == aimed);
+            self.aims += 1;
+        }
+        self.installs_fired += report.aimed_installs;
         for (range, lags) in report.apply_lags() {
             self.lags_by_range.entry(range).or_default().extend(lags);
         }
@@ -409,7 +444,7 @@ impl Coverage {
     /// They are scaled by the tier, since every one of them is a per-seed rate.
     fn assert_complete(&self) {
         let per_seed = |floor: f64| (floor * self.seeds as f64 / 100.0).max(1.0) as usize;
-        let floors: [(&str, usize, usize); 13] = [
+        let floors: [(&str, usize, usize); 14] = [
             ("partitions", self.partitions, per_seed(108.0)),
             ("crashes", self.crashes, per_seed(69.0)),
             ("one-way blocks", self.one_way_blocks, per_seed(12.0)),
@@ -435,12 +470,54 @@ impl Coverage {
                 self.redirected as usize,
                 per_seed(1300.0),
             ),
+            // **The install arm reaching the moment it aims at**, which was not a
+            // floor before PROPOSED D-089 because it was not a number: the arm drew
+            // its victim and its range apart and reached the final chunk of the range
+            // it drew on **0 of 100** seeds. Aimed at a range its victim is behind the
+            // compacted prefix of, the correct node's arm reaches it on **9 of 100**
+            // and 2 of the gate's 20, so the floor is a quarter of the observation
+            // like the twelve above it. An aim that stops working — a scan that reads
+            // the wrong range's prefix, a fallback that swallows every candidate —
+            // shows up here as an arm that stopped firing, which is the one failure a
+            // sweep cannot otherwise report.
+            // PROPOSED(D-089): the stream arms aim their victim at a range it lags.
+            (
+                "install arms that reached their range's final chunk",
+                self.installs_fired,
+                per_seed(2.0),
+            ),
         ];
         for (what, saw, floor) in floors {
             assert!(
                 saw >= floor,
                 "the sweep saw {saw} {what} over {} seeds, under the floor of {floor}: an arm \
                  that stops firing is a sweep that passes because it injected nothing",
+                self.seeds
+            );
+        }
+        // **The aim is a per-range one and not a constant** (PROPOSED D-089). The two
+        // stream arms resolve their range against the trace now, and an aim that
+        // answered one range every time would fire as often as this one, pass every
+        // check above, and leave three of the node's four ranges' installs never
+        // crashed at and never re-taken under — a fault model narrower than it reads.
+        // **A single-range world cannot be wrong about this**: with one range every
+        // aim is that range and this assertion is about nothing, which is why it is
+        // here and not in `sim/tests/raft.rs`. Measured on the correct node: the
+        // install arm's aims land on all four ranges at the gate's twenty
+        // (`{2: 3, 3: 2, 4: 1, 5: 2}`) and at a hundred
+        // (`{2: 11, 3: 15, 4: 11, 5: 12}`), the re-take arm's on three at twenty and
+        // four at a hundred. The sweep runs seeds `0..tier`, so a larger tier holds
+        // the gate's seeds and these only grow: the assertion is two, not four.
+        for (what, aims) in [
+            ("install", &self.install_aims_by_range),
+            ("re-take", &self.stream_aims_by_range),
+        ] {
+            assert!(
+                aims.len() > 1,
+                "the {what} arm aimed at {} range(s) over {} seeds ({aims:?}): an aim that \
+                 answers one range leaves the node's others' streams unreached, which every \
+                 check of a single-range world would pass",
+                aims.len(),
                 self.seeds
             );
         }
@@ -1022,31 +1099,37 @@ fn a_seed_replays_to_the_same_trace_on_the_node() {
 ///
 /// Phase 2's standard is `is_caught`: caught on some seed at every tier
 /// (`a_server_that_installs_without_current_last_is_caught`, sim/tests/raft.rs). On the
-/// node the measured rate does not support it, and D-061's rule is that the tier a
-/// Phase 2 variant keeps is the owner's, so the catch is **not** asserted here and the
-/// numbers go to the owner instead of a quieter assertion (PROPOSED D-086):
+/// node the measured **catch** rate still does not support it, and D-061's rule is that
+/// the tier a Phase 2 variant keeps is the owner's, so the catch is **not** asserted
+/// here and the numbers go to the owner instead of a quieter assertion. What *is*
+/// asserted, and from the hundred-seed tier since PROPOSED D-089, is that the variant
+/// was **injected at the moment it is about**:
 ///
-/// - the variant is **injected**, which the assertion below tests from the
-///   thousand-seed tier: the arm has to have crashed its victim at the final chunk of
-///   the range it drew for the switch-without-repair to have been reached at all, and
-///   that count is 0 when the variant's bit is disconnected;
-/// - `Fault::CrashInstalling` reached the final chunk of the range it drew and crashed
-///   its victim there on **0 of 100** seeds and **1 of 1 000**, against one group, where
-///   the arm's whole scenario is the one range it has. On a node the victim is drawn
-///   without regard to which of its four ranges it is behind on, so the arm must find a
-///   victim that is behind *that* range's compacted prefix, designated for it, and
+/// - `Fault::CrashInstalling` reaches the final chunk of the range it aims at and
+///   crashes its victim there on **14 of 100** seeds and **122 of 1 000**. Until
+///   PROPOSED D-089 the arm drew its victim and its range from two streams and reached
+///   that moment on **0 of 100** and 1 of 1 000: on a node the victim was drawn without
+///   regard to which of its four ranges it was behind on, so the arm reached its
+///   situation only where the two draws happened to coincide. The range is resolved
+///   against the trace now, after the isolation and the heal, and lands on one the
+///   victim is behind the leader's compacted prefix of — designated for it, and
 ///   streamed within `INSTALL_WAIT_BUDGET`;
-/// - the catch is **0 of 1 000**, which at an arm firing on a tenth of a per cent is
-///   what a variant that is never aimed at looks like, not one that is aimed at and
-///   survives.
+/// - the catch is still **0 of 100 and 0 of 1 000**, now over 122 firings rather than
+///   one. That is the finding the aim turns up and it goes to the owner: the arm is no
+///   longer the reason. A variant injected at its own moment on a tenth of the seeds
+///   and caught on none of a thousand is either a bug this node's checks cannot see or
+///   one its install path repairs, and which of those it is belongs to the slice that
+///   owns the path, not to this one (PROPOSED D-089).
 ///
-/// So the catch is asserted nowhere, and the arm's firing only from the **nightly's ten
-/// thousand**: at 0.1 % a thousand seeds see none about one run in three. **Below that
-/// tier this test asserts nothing about the variant**, which is said here rather than
-/// left to be discovered. The rate is printed at every tier so the day the arm is aimed
-/// better the number is visible, and the variant keeps its Phase 2 assertion on
-/// `Cluster::OneGroup`, which this sweep leaves running exactly as it is.
+/// So the catch is asserted nowhere and the **arm's firing is asserted from a hundred
+/// seeds**, where at 14 % a sample of a hundred sees none about three times in ten
+/// million. It is deliberately not asserted at the gate's twenty: 0.86^20 is about one
+/// run in twenty, which is a flake, and a bound the correct system trips is one to fix
+/// rather than to widen (D-030, D-039). The rate is printed at every tier, and the
+/// variant keeps its Phase 2 assertion on `Cluster::OneGroup`, which this sweep leaves
+/// running exactly as it is.
 // PROPOSED(D-086): Phase 2's stream variants re-asserted on the node.
+// PROPOSED(D-089): the stream arms aim their victim at a range it lags.
 #[test]
 fn a_server_that_installs_without_current_last_is_injected_on_the_node() {
     let seeds = seeds();
@@ -1064,8 +1147,8 @@ fn a_server_that_installs_without_current_last_is_injected_on_the_node() {
     let rate = caught.len() as f64 * 100.0 / seeds as f64;
     println!(
         "node: SnapshotWithoutCurrentLast caught on {}/{seeds} seeds ({rate:.1}%), the install \
-         crash reached the final chunk of the range it drew and crashed there on {fired}/{seeds} \
-         seeds, {actions} snapshot actions asked for, first: {}",
+         crash reached the final chunk of the range it aimed at and crashed there on \
+         {fired}/{seeds} seeds, {actions} snapshot actions asked for, first: {}",
         caught.len(),
         caught.first().map_or("", |v| v.as_str())
     );
@@ -1078,24 +1161,26 @@ fn a_server_that_installs_without_current_last_is_injected_on_the_node() {
     // which is the exact shape D-082 found `SendBeforePersist` in and this entry
     // claimed to have fixed.
     //
-    // `aimed_installs` is the discriminator, and it is **thin**: the arm reaches the
-    // final chunk of the range it drew on **0 of 100** seeds and **1 of 1 000** — about
-    // a tenth of a per cent. Asserted from a thousand, as this first did, it would see
-    // none about one run in three and fail a tree with nothing wrong, which is the
-    // model error D-030 and D-039 forbid; asserted from ten thousand the sample expects
-    // about ten and sees none about once in 20 000.
+    // `aimed_installs` is the discriminator, and it was **thin**: aimed at the range
+    // the schedule drew beside the victim it reached that moment on 0 of 100 seeds and
+    // 1 of 1 000, so this assertion sat at the nightly's ten thousand and below that
+    // tier the test asserted nothing about the variant at all.
     //
-    // So it is asserted **only at the nightly's tier**, and the consequence is stated
-    // rather than buried: below ten thousand seeds this test asserts nothing about
-    // `SnapshotWithoutCurrentLast` at all. Its catch is 0 of 1 000 and is asserted
-    // nowhere. That is the variant's real state on this node and it goes to the owner;
-    // aiming the arm at a range its victim is behind on is what would change it, and
-    // that is a change to how the arms are drawn (PROPOSED D-086).
-    if seeds >= 10_000 {
+    // Aimed at a range the victim actually lags it reaches it on **14 of 100** and
+    // **122 of 1 000** (PROPOSED D-089), measured before this line was moved (Q39,
+    // D-061). At 14 % a hundred seeds see none about three times in ten million, so
+    // the assertion sits at the hundred-seed tier; the gate's twenty would see none
+    // about one run in twenty, which is a bound the correct tree trips and D-030 and
+    // D-039 forbid writing it there and widening it later.
+    //
+    // **The catch is still 0 of 1 000**, now over 122 firings rather than one, and it
+    // is asserted nowhere. The arm is no longer the reason and that is the finding to
+    // take to the owner, not to paper over with a quieter assertion.
+    if seeds >= 100 {
         assert!(
             fired > 0,
             "`Fault::CrashInstalling` never crashed its victim at the final chunk of the \
-             range it drew over {seeds} seeds, so `SnapshotWithoutCurrentLast` was not \
+             range it aimed at over {seeds} seeds, so `SnapshotWithoutCurrentLast` was not \
              injected at the moment it is about and its 0 catches say nothing"
         );
     }
@@ -1118,8 +1203,9 @@ fn a_server_that_installs_without_current_last_is_injected_on_the_node() {
 ///   the run so readily that `RetakeUnderStream`'s own setup often never completes, and
 ///   a thousand's sample of a hundred would see none about one run in eight;
 /// - **a re-take landing under a live stream the follower never installs at** — from
-///   the **thousand-seed** tier, where Phase 2 has it from a hundred. **29 of 100**
-///   (17 of 100 and 172 of 1 000 before the merge with `phase-3-stage-b-wiring`),
+///   the **thousand-seed** tier, where Phase 2 has it from a hundred. **30 of 100**
+///   (29 before PROPOSED D-089's aim, 17 of 100 and 172 of 1 000 before the merge with
+///   `phase-3-stage-b-wiring`),
 ///   against 13.5 % of a thousand there. The tier was argued from 17 %, at which the
 ///   hundred-seed tier's sample of twenty sees none about one run in forty; at 29 % that
 ///   tier would hold, so the assertion is left where it is and the number goes to the
@@ -1137,6 +1223,15 @@ fn a_server_that_installs_without_current_last_is_injected_on_the_node() {
 ///   already has open — come round far more often than on a server with one range. That
 ///   rate would carry an assertion at a hundred seeds and it is deliberately not written
 ///   there — §12 re-asserts a Phase 2 variant to its own standard **and no stronger**.
+///
+/// **PROPOSED D-089 aimed both stream arms at a range their victim lags, and three of
+/// these four did not move.** The aim resolves the range after the isolation and the
+/// heal and keeps the drawn range wherever the victim is behind *its* compacted prefix,
+/// which for this arm the filling puts and the isolation together already make true:
+/// the fault stays **100 of 100**, the arm **1 of 100**, the catch **26 of 100** and its
+/// 26 liveness catches, and the scramble moves 29 to **30 of 100** with the same 55
+/// duplicate-chunk loops. Nothing asserted changes hands and no tier moves with it. The
+/// figures below are the re-measured ones, at the tier each is labelled with.
 ///
 /// Every fold behind these is keyed by `(server, range, index)` since PROPOSED D-086.
 /// On one group they were keyed by `(server, index)`, which named a take uniquely
@@ -1165,6 +1260,9 @@ fn a_leader_that_shares_one_snapshot_directory_is_caught_on_the_node() {
     // The four were re-measured on the merge with `phase-3-stage-b-wiring`, whose
     // re-seed, verification pass and snapshot fixes move every schedule: the fault and
     // the arm did not move, the scramble went 17 % to 29 % and the catch 30 % to 26 %.
+    // Re-measured again on PROPOSED D-089's aim, which moves what both stream arms
+    // watch and so moves every schedule that draws one: the fault stays 100/100, the
+    // arm 1/100 and the catch 26/100, and the scramble goes 29 to 30 of 100.
     // **Two numbers, named apart, and every tier gate below reads `tier`.** They were
     // one until PROPOSED D-086's re-review: `seeds` held the *share* and the gates
     // compared it against 100, 1 000 and 10 000, so each assertion sat a tier higher
@@ -1237,8 +1335,8 @@ fn a_leader_that_shares_one_snapshot_directory_is_caught_on_the_node() {
          fault was not injected on any of the {share} seeds"
     );
     // **A re-take landing under a live stream the follower never installs at, from the
-    // hundred-seed tier**, which is Phase 2's own tier for it. **29 of 100** on the
-    // merged tree, 17 of 100 before it, both above D-061's 5 %.
+    // hundred-seed tier**, which is Phase 2's own tier for it. **30 of 100** on the
+    // aimed tree, 29 on the merged tree and 17 of 100 before it, all above D-061's 5 %.
     //
     // It is *not* "the wedge's stream half", which is what this comment called it
     // until the re-review: pre-merge it accounted for a minority of the catches — at
@@ -1255,10 +1353,11 @@ fn a_leader_that_shares_one_snapshot_directory_is_caught_on_the_node() {
     // thousand's sample of a hundred sees none about once in 10^8. This is a weakening
     // of Phase 2's tier, it is weaker because the sample says so, and it goes to the
     // owner with the number (PROPOSED D-086).
-    // **The merge with `phase-3-stage-b-wiring` took this rate to 29 %**, at which a
-    // sample of twenty sees none about one run in nine hundred and Phase 2's own
-    // hundred-seed tier would hold. The assertion is left here deliberately: putting it
-    // back is a decision about a tier and belongs to the owner, not to a merge.
+    // **The merge with `phase-3-stage-b-wiring` took this rate to 29 %**, and PROPOSED
+    // D-089's aim to **30 %**, at which a sample of twenty sees none about one run in a
+    // thousand and Phase 2's own hundred-seed tier would hold. The assertion is left
+    // here deliberately: putting it back is a decision about a tier and belongs to the
+    // owner, not to a merge and not to a slice that moved the rate by one seed.
     if tier >= 1000 {
         assert!(
             scrambled > 0,
@@ -1602,4 +1701,117 @@ fn a_server_whose_refusal_is_not_durable_is_not_re_asserted_on_the_node_yet() {
         Variant::RefusalNotDurable,
         "PR #86's whole-node refusal and re-seed",
     );
+}
+
+/// Seeds 272 and 516, which PROPOSED D-089's aim reaches and nothing before it did: a
+/// replica being fed a snapshot of one range goes past the timer bound without
+/// campaigning, while the **live** install of that range completes on it.
+///
+/// **This is a bound the correct node trips, and it is pinned rather than widened**
+/// (D-030, D-039; CLAUDE.md). Neither seed fails any safety fold: the four log
+/// invariants, the commit majority, linearizability, the payload oracle, the match
+/// starts, the isolation's term and D-065's two all pass, and the run's liveness bound
+/// passes — `Report::check` reaches the timer replay, which is the last of them, and
+/// reports there.
+///
+/// **The mechanism, identical on both seeds.** The flagged replica's clock is last reset
+/// by an `AppendEntries` of its term. Its leader then stops appending to it and starts
+/// streaming it a snapshot of that range, re-opening the stream at offset 0 five times
+/// across the window (`RaftSnapshotResumed`), and the replica completes an install of
+/// that range inside it (`RaftSnapshot { taken: false }`) — seed 272 at 21.647 s, 290 ms
+/// into a window that runs 21.357 s to 21.758 s, on server 2's replica of range 4 under
+/// leader 3; seed 516 at 17.188 s, 267 ms into 16.921 s to 17.322 s, on server 2's
+/// replica of range 5 under leader 1. **No `InstallSnapshot` chunk of that range is
+/// delivered to it inside the window**, so D-030's reset arm has nothing to fire on, and
+/// the replica neither hears a leader of its term nor campaigns.
+///
+/// **Why none of the timer check's three arms covers it, which is the open question.**
+/// `TimerResets` has an arm for an install chunk delivered (D-030, seed 164), one for an
+/// install's restatement (D-039, seed 385) and one for the adoption of a completed
+/// install (PROPOSED D-063, seed 2605). The third is the one this looks like, and it was
+/// written for a server whose **run-loop incarnation ends at the completion and starts
+/// again at its restatement**, so there is no election timer in between. A node does not
+/// do that: "an install into a live store keeps its incarnation" (D-042, D-066), the
+/// range's replica is replaced in place, and there is no restatement to put it back. So
+/// the arm never fires here and the replay measures a stretch that, on a one-group
+/// server, would not have been one.
+///
+/// **What this test does not do is decide that.** Whether the check gains a fourth arm
+/// for the node's live install, or the node should campaign here and does not, is the
+/// owner's ruling and a decision of its own; PROPOSED D-089 takes it to them with these
+/// two seeds. What the test asserts is the **situation and its shape**, so that the day
+/// either changes it says so: the gap is there, it is the only one, it is on the
+/// (server, range) recorded, the install completes inside its window, and no chunk of
+/// that range lands inside it. A fourth arm removes the gap and fails this test, which
+/// is how it should be found.
+///
+/// The base branch reaches none of this: its install crash reached the final chunk of
+/// the range it drew on 0 of 100 seeds, so the aim is what makes the situation
+/// reachable at all, and 1 000 seeds of the correct node were green before it.
+// PROPOSED(D-089): the stream arms aim their victim at a range it lags.
+#[test]
+fn seeds_272_and_516_go_past_the_timer_bound_while_a_live_install_completes() {
+    for (seed, server, range) in [(272u64, 2u64, 4u64), (516, 2, 5)] {
+        let report = correct(seed);
+        let gaps = report.timer_gaps(raft::TimerResets::ALL);
+        assert_eq!(
+            gaps.len(),
+            1,
+            "seed {seed}: the timer replay reports {} gaps, not the one this pins: {gaps:?}",
+            gaps.len()
+        );
+        let gap = gaps[0];
+        assert_eq!(
+            (gap.server, gap.range),
+            (server, range),
+            "seed {seed}: the gap moved off server {server}'s replica of range {range}, so the \
+             schedule this pins is not the schedule it runs: re-audit it against the entry"
+        );
+        // The violation `Report::check` reports is this gap and nothing earlier: every
+        // safety fold and the liveness bound run before the timer replay, so a seed
+        // that fails here has passed all of them.
+        let violation = report
+            .check()
+            .expect_err("seed {seed} trips the timer bound");
+        assert_eq!(
+            violation,
+            format!("seed {seed}: {}", gap.violation()),
+            "seed {seed}: the run now fails something other than the timer gap this pins"
+        );
+        // The mechanism: the live install of that range completes inside the window,
+        // and no chunk of that range is delivered inside it.
+        let completed = report.records.iter().any(|record| {
+            record.decided > gap.since
+                && record.decided <= gap.at
+                && matches!(
+                    &record.event,
+                    ananke_env::TraceEvent::RaftSnapshot {
+                        server: who,
+                        range: of,
+                        taken: false,
+                        ..
+                    } if *who == server && *of == range
+                )
+        });
+        assert!(
+            completed,
+            "seed {seed}: no install of range {range} completed on server {server} inside the \
+             window, so this is no longer the live install's shape that PROPOSED D-089 pins"
+        );
+        let resumed = report.records.iter().any(|record| {
+            record.decided > gap.since
+                && record.decided <= gap.at
+                && matches!(
+                    &record.event,
+                    ananke_env::TraceEvent::RaftSnapshotResumed { to, range: of, .. }
+                        if *to == server && *of == range
+                )
+        });
+        assert!(
+            resumed,
+            "seed {seed}: the leader re-opened no stream of range {range} to server {server} \
+             inside the window: the replica was not being fed a snapshot and the gap is \
+             another shape"
+        );
+    }
 }

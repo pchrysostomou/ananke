@@ -101,6 +101,37 @@ ananke/
 
 _Update this section at the end of every session._
 
+- Branch `phase-3-stream-arms-aimed`, stacked on `phase-3-stage-b-stream-variants`
+  (2026-09-23): **the two stream arms aim their victim at a range it lags**
+  (PROPOSED D-089), which is the owner's ruling on what D-086 took to them.
+  `Fault::CrashInstalling` and `Fault::RetakeUnderStream` drew a victim from one stream
+  and a range from another, so on a node the arm reached its situation only where the
+  two draws coincided: the install crash reached the final chunk of the range it drew on
+  **0 of 100** seeds. The range is resolved against the trace now, after the isolation
+  and the heal, and lands on one the victim is behind that range's leader's compacted
+  prefix of, preferring the drawn range wherever it qualifies. The arm fires on **14 of
+  100** and **122 of 1 000**, so `SnapshotWithoutCurrentLast`'s injection is asserted
+  from a **hundred seeds** instead of the nightly's ten thousand — the hole the ruling
+  was about. Its **catch is still 0 of 1 000**, now over 122 firings rather than one,
+  and is still asserted nowhere: the arm is no longer the reason, and that goes to the
+  owner. `SharedSnapshotDir`'s four rates were re-measured and three did not move (the
+  fault 100/100, the arm 1/100, the catch 26/100; the scramble 29 → 30 of 100), and no
+  tier moves with this. The correct node's sweep floors the install arm's firing and
+  asserts each arm's aims cover more than one range, which is what a constant aim is
+  caught by. `Cluster::OneGroup` is byte-identical to the base — seed 42's JSONL hashes
+  to `05a18a8e6f57159a703bdc0c8b37a9e52f9d083f154760abd24a53bfa6f5ea86` on both, which
+  is **not** the hash D-086 records: the merge with `phase-3-stage-b-wiring` moved it by
+  145 bytes before this slice, and D-086 is corrected rather than rewritten.
+  **The aim reaches a situation nothing before it did, and the correct node trips the
+  timer bound in it on 2 of the first 1 000 seeds** — 272 and 516, where the base is green
+  on all thousand. A replica being fed a snapshot of one range completes a **live**
+  install inside the window with no chunk of that range delivered in it, and none of the
+  timer check's three reset arms covers a node whose install keeps its incarnation
+  (D-042, D-066), so it neither hears a leader nor campaigns. No safety fold fails on
+  either seed. Nothing is widened: both are pinned with their mechanism
+  (`seeds_272_and_516_go_past_the_timer_bound_while_a_live_install_completes`), and
+  whether the check owes a fourth arm is the owner's ruling. **The gate is green and the
+  thousand-seed tier is red on those two seeds until it is made.**
 - Branch `phase-3-stage-b-stream-variants`, stacked on the snapshot wiring
   (2026-09-22): **the node reaches the stream path**, and Phase 2's four stream
   variants are measured on it (PROPOSED D-086). The node's `snapshot_threshold` drops

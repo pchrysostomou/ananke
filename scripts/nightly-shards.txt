@@ -102,6 +102,15 @@
 # rows this branch carried are the base's re-weighed seventeen, not rows of its own, so
 # the base's figures and placements stand for them. Every total below is recomputed from
 # the rows beneath it rather than carried over from either side.
+# PROPOSED D-089 adds one row: the two seeds the aimed stream arms reach that go past the
+# timer bound while a live install completes. It is pinned at two seeds, not swept, so the
+# tier does not move it: weighed on its own tree from the built binary
+# (`node-<hash> <test> --exact`) rather than through cargo, so the figure is the test's own
+# cost and not a build's, at 0.65 user + 0.03 sys = 0.7 cpu s, load average 55.53/85.71/105.47
+# on an Apple M2 of 8 cores on AC. Shard 4 was the lightest at 1372.3 and takes it, to 1373.0.
+# Nothing else in the table moves: this slice adds no sweep and renames no test, and the two
+# `node` sweeps whose figures it changes — the correct node's and the install variant's —
+# keep their rows, their rates having moved and not their shapes.
 # D-086's four rows are Phase 2's four stream variants on the node, weighed on its own
 # tree at ANANKE_SEEDS=1000 in release, from the built binary (`node-<hash> <test>
 # --exact`) rather than through cargo, so each figure is the test's own cost and not a
@@ -223,7 +232,7 @@
 3	node	4.03	a_server_that_applies_before_commit_is_caught_on_the_node
 3	install	2.4	every_wiring_variant_is_caught
 3	node	261.0	a_server_that_installs_without_current_last_is_injected_on_the_node
-# shard 4: 1372.3 cpu s
+# shard 4: 1373.0 cpu s
 4	echo	0.1	same_seed_gives_byte_identical_trace
 4	engine	210.8	the_correct_engine_passes_every_seed
 4	engine	38.6	an_install_that_switches_one_span_at_a_time_is_caught
@@ -244,6 +253,7 @@
 4	node	0.11	a_node_under_the_raft_sweeps_arms_runs_every_range
 4	node	0.1	the_nodes_arms_aim_at_every_range_and_not_at_one
 4	node	73.9	the_pair_on_the_node_is_the_stream_half_alone_until_the_reseed_lands
+4	node	0.7	seeds_272_and_516_go_past_the_timer_bound_while_a_live_install_completes
 # shard 5: 1395.1 cpu s
 5	echo	6.0	every_seed_satisfies_the_invariants_and_the_sweep_exercises_the_disk_faults
 5	engine	19.5	a_seek_that_counts_tombstones_is_caught
