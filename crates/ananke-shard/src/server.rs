@@ -1791,7 +1791,13 @@ fn restate<E: Environment>(
     // the rest of its life on that store. It is traced here on a restart, where the
     // quarantine flag is what the disk held; at the re-seed itself this same
     // restatement is the replica's first, and the mark was made durable before it
-    // (`reseed`).
+    // (`reseed`). One-group `run` traces it in exactly this position, so the two
+    // restatements stay comparable.
+    //
+    // D-083 reached the same restatement from the other side — the node emitted this
+    // event for no replica at all, as the one-group server does (node.rs:975-980) — and
+    // both now rest on this line. The flag here is `recovered.quarantined`, which is
+    // also what the core was restored with, so `core.quarantined()` would read the same.
     // PROPOSED(D-077): Q15's whole-node refusal, and the re-seed per replica.
     // PROPOSED(D-083): the node states a quarantined replica as a server does.
     if quarantined {

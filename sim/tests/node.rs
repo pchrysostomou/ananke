@@ -141,157 +141,411 @@ fn a_node_under_the_raft_sweeps_arms_runs_every_range() {
     }
 }
 
-#[test]
-fn every_seed_passes_on_the_correct_node_under_the_raft_sweeps_arms() {
-    let seeds = seeds();
-    let mut leaders: BTreeMap<u64, usize> = BTreeMap::new();
-    let mut applies: BTreeMap<u64, usize> = BTreeMap::new();
-    let mut drops: BTreeMap<(String, u64), usize> = BTreeMap::new();
-    let mut lags_by_range: BTreeMap<u64, Vec<Duration>> = BTreeMap::new();
-    let mut holds: Vec<Duration> = Vec::new();
-    let mut per_range_per_second = 0.0f64;
-    let mut busiest_range_per_second = 0.0f64;
-    let mut multi_range_frames = 0usize;
-    let mut records = 0usize;
-    let results = sweep(seeds, |seed| {
-        let report = correct(seed);
-        let outcome = checked(&report);
-        if outcome.is_err() {
-            write_trace(&format!("node-{seed}"), &report.jsonl());
+/// What the correct node's sweep saw, and what it must have seen.
+///
+/// `sim/tests/raft.rs` has had a `Coverage` since Phase 2 for a reason this slice
+/// then proved again: a sweep that passes may not have injected anything.
+/// `SendBeforePersist` was caught on 0 of 20 seeds here not because the node was
+/// right but because nothing on the node read the variant. The counters below are
+/// the same idea one level out — not "was the bug caught" but "did the arm fire at
+/// all" — and two of them exist because *drawn* is not *reached*: `StaleSender` and
+/// `FigureEight` each spend a budget waiting for a shape that may not come, and the
+/// Figure 8 driver's burst is the one whose silence would be invisible. The review of
+/// this slice aimed the burst at the wrong range entirely; `CountOlderTermForCommit`
+/// fell from 14/20 to 11/20 and every test stayed green.
+///
+/// It carries the node's arms, which are `sim/raft.rs`'s less the four
+/// `Schedule::draw_on_the_node` removes.
+// PROPOSED(D-082): the node's sweep has a coverage of its own.
+#[derive(Default)]
+struct Coverage {
+    seeds: u64,
+    uniform_seeds: u64,
+    partitions: usize,
+    one_way_blocks: usize,
+    crashes: usize,
+    isolate_leader_faults: usize,
+    leader_crashes: usize,
+    stale_sender_faults: usize,
+    figure_eight_faults: usize,
+    burst_puts: usize,
+    drift_exceeded_seeds: u64,
+    lease_reads: usize,
+    read_index_reads: usize,
+    lease_revokes: usize,
+    quorum_losses: usize,
+    duplicates: usize,
+    drops: usize,
+    leaders: usize,
+    terms_above_one: u64,
+    truncations: usize,
+    commits: usize,
+    applies: usize,
+    inbox_drops: BTreeMap<(String, u64), usize>,
+    /// The two paths this node has not got, counted so the absence is a number and
+    /// not a hope.
+    snapshot_actions: usize,
+    refusals: usize,
+    highest_index: u64,
+    puts: u64,
+    gets: u64,
+    deletes: u64,
+    cas: u64,
+    completed: u64,
+    abandoned: u64,
+    redirected: u64,
+    leaders_by_range: BTreeMap<u64, usize>,
+    applies_by_range: BTreeMap<u64, usize>,
+    multi_range_frames: usize,
+    arms_hit: usize,
+    arms_fired: usize,
+    lags_by_range: BTreeMap<u64, Vec<Duration>>,
+    holds: Vec<Duration>,
+    holds_dropped_for_a_crash: usize,
+    records: usize,
+    per_range_per_second: f64,
+    busiest_range_per_second: f64,
+    /// The largest in-memory log any follower replica held, and the distribution in
+    /// multiples of the one-group scenario's `snapshot_threshold`: printed, never
+    /// asserted, because this node has no follower compaction to bound it.
+    largest_follower_log: u64,
+    follower_log_multiples: BTreeMap<u64, u64>,
+}
+
+/// Everything but the two sample vectors, which are summarised.
+///
+/// `lags_by_range` holds one duration per apply: 133 464 of them at a hundred seeds
+/// and **1 327 475 at a thousand**, and `holds` tens of thousands beside it. Deriving
+/// `Debug` and printing the struct put all of them in the sweep's output and so into
+/// every nightly log — some three hundred kilobytes of durations that no reader was
+/// ever going to read. The summary is what the coverage is for: how many samples, and
+/// what they came to.
+// PROPOSED(D-082): the coverage prints its samples' shape, not its samples.
+impl std::fmt::Debug for Coverage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let lag_samples: usize = self.lags_by_range.values().map(Vec::len).sum();
+        let (median_lag, per_range) = medians(&self.lags_by_range);
+        let mut holds = self.holds.clone();
+        holds.sort_unstable();
+        f.debug_struct("Coverage")
+            .field("seeds", &self.seeds)
+            .field("uniform_seeds", &self.uniform_seeds)
+            .field("partitions", &self.partitions)
+            .field("one_way_blocks", &self.one_way_blocks)
+            .field("crashes", &self.crashes)
+            .field("isolate_leader_faults", &self.isolate_leader_faults)
+            .field("leader_crashes", &self.leader_crashes)
+            .field("stale_sender_faults", &self.stale_sender_faults)
+            .field("figure_eight_faults", &self.figure_eight_faults)
+            .field("burst_puts", &self.burst_puts)
+            .field("drift_exceeded_seeds", &self.drift_exceeded_seeds)
+            .field("lease_reads", &self.lease_reads)
+            .field("read_index_reads", &self.read_index_reads)
+            .field("lease_revokes", &self.lease_revokes)
+            .field("quorum_losses", &self.quorum_losses)
+            .field("duplicates", &self.duplicates)
+            .field("drops", &self.drops)
+            .field("leaders", &self.leaders)
+            .field("terms_above_one", &self.terms_above_one)
+            .field("truncations", &self.truncations)
+            .field("commits", &self.commits)
+            .field("applies", &self.applies)
+            .field("inbox_drops", &self.inbox_drops)
+            .field("snapshot_actions", &self.snapshot_actions)
+            .field("refusals", &self.refusals)
+            .field("highest_index", &self.highest_index)
+            .field("puts", &self.puts)
+            .field("gets", &self.gets)
+            .field("deletes", &self.deletes)
+            .field("cas", &self.cas)
+            .field("completed", &self.completed)
+            .field("abandoned", &self.abandoned)
+            .field("redirected", &self.redirected)
+            .field("leaders_by_range", &self.leaders_by_range)
+            .field("applies_by_range", &self.applies_by_range)
+            .field("multi_range_frames", &self.multi_range_frames)
+            .field("arms_hit", &self.arms_hit)
+            .field("arms_fired", &self.arms_fired)
+            .field("apply_lag_samples", &lag_samples)
+            .field("apply_lag_median", &median_lag)
+            .field("apply_lag_median_per_range", &per_range)
+            .field("holds", &holds.len())
+            .field("hold_median", &median_of(&holds))
+            .field("hold_max", &holds.last())
+            .field("holds_dropped_for_a_crash", &self.holds_dropped_for_a_crash)
+            .field("records", &self.records)
+            .field("per_range_per_second", &self.per_range_per_second)
+            .field("busiest_range_per_second", &self.busiest_range_per_second)
+            .field("largest_follower_log", &self.largest_follower_log)
+            .field("follower_log_multiples", &self.follower_log_multiples)
+            .finish()
+    }
+}
+
+impl Coverage {
+    fn add(&mut self, report: &raft::Report) {
+        use ananke_env::{ClientOp, DropReason, TraceEvent};
+        self.seeds += 1;
+        self.uniform_seeds += u64::from(report.uniform());
+        self.partitions += report.count(|e| matches!(e, TraceEvent::PartitionStarted { .. }));
+        self.crashes += report.count(|e| matches!(e, TraceEvent::NodeCrashed { .. }));
+        for fault in &report.schedule.faults {
+            match fault {
+                raft::Fault::OneWay { .. } => self.one_way_blocks += 1,
+                raft::Fault::IsolateLeader { .. } => self.isolate_leader_faults += 1,
+                raft::Fault::CrashLeader { .. } => self.leader_crashes += 1,
+                raft::Fault::StaleSender { .. } => self.stale_sender_faults += 1,
+                raft::Fault::FigureEight { .. } => self.figure_eight_faults += 1,
+                _ => {}
+            }
         }
-        let mut leaders: BTreeMap<u64, usize> = BTreeMap::new();
-        let mut applies: BTreeMap<u64, usize> = BTreeMap::new();
+        self.burst_puts += report.burst_puts();
+        self.drift_exceeded_seeds += u64::from(report.drift_exceeded());
+        self.lease_reads += report.lease_reads();
+        self.read_index_reads += report.read_index_reads();
+        self.lease_revokes += report.lease_revokes();
+        self.quorum_losses += report.quorum_losses();
+        self.duplicates +=
+            report.count(|e| matches!(e, TraceEvent::MessageDelivered { dup: true, .. }));
+        self.drops += report.count(|e| {
+            matches!(
+                e,
+                TraceEvent::MessageDropped {
+                    reason: DropReason::Injected,
+                    ..
+                }
+            )
+        });
+        self.leaders += report.count(|e| matches!(e, TraceEvent::RaftLeader { .. }));
+        self.terms_above_one += u64::from(
+            report.has(|e| matches!(e, TraceEvent::RaftLeader { term, .. } if *term > 1)),
+        );
+        self.truncations += report.count(|e| matches!(e, TraceEvent::RaftTruncate { .. }));
+        self.commits += report.count(|e| matches!(e, TraceEvent::RaftCommit { .. }));
+        self.applies += report.count(|e| matches!(e, TraceEvent::RaftApply { .. }));
+        for ((kind, range), count) in report.inbox_drops() {
+            *self
+                .inbox_drops
+                .entry((kind.to_owned(), range))
+                .or_default() += count;
+        }
+        self.snapshot_actions += report.snapshot_actions();
+        self.refusals += report.refused.len();
+        self.highest_index = self.highest_index.max(report.highest_index());
         for record in &report.records {
             match &record.event {
-                ananke_env::TraceEvent::RaftLeader { range, .. } => {
-                    *leaders.entry(*range).or_default() += 1;
+                TraceEvent::ClientInvoke { op, .. } => match op {
+                    ClientOp::Put { .. } => self.puts += 1,
+                    ClientOp::Get { .. } => self.gets += 1,
+                    ClientOp::Delete { .. } => self.deletes += 1,
+                    ClientOp::Cas { .. } => self.cas += 1,
+                },
+                TraceEvent::RaftLeader { range, .. } => {
+                    *self.leaders_by_range.entry(*range).or_default() += 1;
                 }
-                ananke_env::TraceEvent::RaftApply { range, .. } => {
-                    *applies.entry(*range).or_default() += 1;
+                TraceEvent::RaftApply { range, .. } => {
+                    *self.applies_by_range.entry(*range).or_default() += 1;
                 }
                 _ => {}
             }
         }
-        let drops: BTreeMap<(String, u64), usize> = report
-            .inbox_drops()
-            .into_iter()
-            .map(|((kind, range), count)| ((kind.to_owned(), range), count))
-            .collect();
-        (
-            outcome,
-            (
-                leaders,
-                applies,
-                drops,
-                report.apply_lags(),
-                report.cross_range_apply_holds(),
-                (
-                    report.records_per_second_per_range(),
-                    report.busiest_range_records_per_second(),
-                    report.frames_of_several_ranges(),
-                    report.records.len(),
-                ),
-                (
-                    report.lease_revokes(),
-                    report.lease_reads(),
-                    report.read_index_reads(),
-                    report.drift_exceeded(),
-                    report.snapshot_actions(),
-                ),
-                report.arms_hit_their_ranges(),
-            ),
-        )
-    });
-    let mut revoked = 0usize;
-    let mut lease_reads = 0usize;
-    let mut read_index_reads = 0usize;
-    let mut exceeded = 0usize;
-    let mut snapshot_actions = 0usize;
-    let mut arms_hit = 0usize;
-    let mut arms_fired = 0usize;
-    for (_, (by_leader, by_apply, dropped, lags, held, rates, lease, arms)) in &results {
-        let (rate, busiest, several, len) = rates;
-        let (revokes, leased, round_trip, drifted, actions) = lease;
-        arms_hit += arms.0;
-        arms_fired += arms.1;
-        revoked += usize::from(*revokes > 0);
-        lease_reads += leased;
-        read_index_reads += round_trip;
-        exceeded += usize::from(*drifted);
-        snapshot_actions += actions;
-        for (range, count) in by_leader {
-            *leaders.entry(*range).or_default() += count;
+        self.completed += report.clients.completed;
+        self.abandoned += report.clients.abandoned;
+        self.redirected += report.clients.redirected;
+        self.multi_range_frames += report.frames_of_several_ranges();
+        let (hit, fired) = report.arms_hit_their_ranges();
+        self.arms_hit += hit;
+        self.arms_fired += fired;
+        for (range, lags) in report.apply_lags() {
+            self.lags_by_range.entry(range).or_default().extend(lags);
         }
-        for (range, count) in by_apply {
-            *applies.entry(*range).or_default() += count;
-        }
-        for (key, count) in dropped {
-            *drops.entry(key.clone()).or_default() += count;
-        }
-        for (range, of_range) in lags {
-            lags_by_range
-                .entry(*range)
-                .or_default()
-                .extend(of_range.iter().copied());
-        }
-        holds.extend(held.iter().copied());
-        per_range_per_second = per_range_per_second.max(*rate);
-        busiest_range_per_second = busiest_range_per_second.max(*busiest);
-        multi_range_frames += several;
-        records += len;
+        let (holds, dropped) = report.cross_range_apply_holds_counted();
+        self.holds.extend(holds);
+        self.holds_dropped_for_a_crash += dropped;
+        self.records += report.records.len();
+        self.per_range_per_second = self
+            .per_range_per_second
+            .max(report.records_per_second_per_range());
+        self.busiest_range_per_second = self
+            .busiest_range_per_second
+            .max(report.busiest_range_records_per_second());
+        let (longest, _) = report.largest_follower_log();
+        self.largest_follower_log = self.largest_follower_log.max(longest);
+        *self
+            .follower_log_multiples
+            .entry(longest / raft::SNAPSHOT_THRESHOLD)
+            .or_default() += 1;
     }
-    let (median_lag, per_range_median) = medians(&lags_by_range);
+
+    /// Everything the sweep must have seen, at every tier.
+    ///
+    /// The floors were measured on the correct node at 100 seeds before they were
+    /// written (D-061) and are recorded in the entry; each is set at about a quarter
+    /// of its observation, which is what keeps a tier of twenty from failing a tree
+    /// with nothing wrong while still failing a tree where an arm stopped firing.
+    /// They are scaled by the tier, since every one of them is a per-seed rate.
+    fn assert_complete(&self) {
+        let per_seed = |floor: f64| (floor * self.seeds as f64 / 100.0).max(1.0) as usize;
+        let floors: [(&str, usize, usize); 13] = [
+            ("partitions", self.partitions, per_seed(108.0)),
+            ("crashes", self.crashes, per_seed(69.0)),
+            ("one-way blocks", self.one_way_blocks, per_seed(12.0)),
+            (
+                "leader isolations",
+                self.isolate_leader_faults,
+                per_seed(14.0),
+            ),
+            ("leader crashes", self.leader_crashes, per_seed(14.0)),
+            (
+                "stale-sender arms",
+                self.stale_sender_faults,
+                per_seed(11.0),
+            ),
+            ("figure-8 arms", self.figure_eight_faults, per_seed(29.0)),
+            ("burst puts", self.burst_puts, per_seed(4200.0)),
+            ("truncations", self.truncations, per_seed(620.0)),
+            ("quorum losses", self.quorum_losses, per_seed(280.0)),
+            ("lease reads", self.lease_reads, per_seed(2000.0)),
+            ("read-index reads", self.read_index_reads, per_seed(5400.0)),
+            (
+                "client redirects",
+                self.redirected as usize,
+                per_seed(1300.0),
+            ),
+        ];
+        for (what, saw, floor) in floors {
+            assert!(
+                saw >= floor,
+                "the sweep saw {saw} {what} over {} seeds, under the floor of {floor}: an arm \
+                 that stops firing is a sweep that passes because it injected nothing",
+                self.seeds
+            );
+        }
+        // Every client operation kind, and both outcomes: a history with no
+        // abandoned operation is a history the checker never had to leave pending.
+        for (what, saw) in [
+            ("puts", self.puts),
+            ("gets", self.gets),
+            ("deletes", self.deletes),
+            ("compare-and-swaps", self.cas),
+            ("completed operations", self.completed),
+            ("abandoned operations", self.abandoned),
+        ] {
+            assert!(saw > 0, "the sweep invoked no {what}");
+        }
+        assert!(
+            self.duplicates > 0 && self.drops > 0,
+            "the network delivered no duplicate or dropped nothing: {self:?}"
+        );
+        assert!(
+            self.terms_above_one > 0 && self.leaders > 0 && self.commits > 0,
+            "the sweep elected nobody past term 1, or committed nothing"
+        );
+        // The two absences, asserted as numbers. `highest_index` is the one that
+        // means something: the node's `Host::snapshot` traces nothing, so a take it
+        // dropped would leave `snapshot_actions` at zero either way.
+        assert_eq!(
+            self.snapshot_actions, 0,
+            "a snapshot action was traced on a node whose `snapshot` task is not wired"
+        );
+        assert_eq!(
+            self.refusals, 0,
+            "a store was refused on a node whose whole-node refusal is PR #86's"
+        );
+        assert!(
+            self.highest_index < raft::NODE_SNAPSHOT_THRESHOLD,
+            "a replica reached index {}, at or past this cluster's `snapshot_threshold`",
+            self.highest_index
+        );
+    }
+}
+
+#[test]
+fn every_seed_passes_on_the_correct_node_under_the_raft_sweeps_arms() {
+    let seeds = seeds();
+    let coverage = std::sync::Mutex::new(Coverage::default());
+    let verdicts = sweep(seeds, |seed| {
+        let report = correct(seed);
+        let outcome = checked(&report);
+        coverage.lock().expect("the coverage").add(&report);
+        if outcome.is_err() {
+            write_trace(&format!("node-{seed}"), &report.jsonl());
+        }
+        outcome
+    });
+    let coverage = coverage.into_inner().expect("the coverage");
+    let (median_lag, per_range_median) = medians(&coverage.lags_by_range);
+    let worst_range_lag = per_range_median.values().copied().max();
+    let mut holds = coverage.holds.clone();
     holds.sort_unstable();
     println!(
-        "node: {seeds} seeds, leaders by range {leaders:?}, applies by range {applies:?}, \
-         {records} records in all; at most {per_range_per_second:.0} trace records per virtual \
-         second per range and {busiest_range_per_second:.0} of the busiest range's own, against \
-         TRACE_CAP of {}; {multi_range_frames} peer frames carried messages of more than one \
-         range",
-        raft::TRACE_CAP
+        "node: {seeds} seeds, leaders by range {:?}, applies by range {:?}, {} records in all; \
+         at most {:.0} trace records per virtual second per range and {:.0} of the busiest \
+         range's own, against TRACE_CAP of {}; {} peer frames carried messages of more than \
+         one range",
+        coverage.leaders_by_range,
+        coverage.applies_by_range,
+        coverage.records,
+        coverage.per_range_per_second,
+        coverage.busiest_range_per_second,
+        raft::TRACE_CAP,
+        coverage.multi_range_frames
     );
-    println!("node: the inbox dropped {drops:?} under its byte bound");
+    println!("node: coverage {coverage:?}");
     println!(
-        "node: apply lag, median over every range {median_lag:?}, per range {per_range_median:?}, \
-         against SHARD.md §4's threshold of {HEARTBEAT:?}; {} applies measured",
-        lags_by_range.values().map(Vec::len).sum::<usize>()
+        "node: the inbox dropped {:?} under its byte bound",
+        coverage.inbox_drops
+    );
+    println!(
+        "node: apply lag, median over every range {median_lag:?}, per range \
+         {per_range_median:?}, worst range {worst_range_lag:?}, against SHARD.md §4's threshold \
+         of {HEARTBEAT:?}; {} applies measured",
+        coverage.lags_by_range.values().map(Vec::len).sum::<usize>()
     );
     println!(
         "node: one range's applies held another's for a median of {:?} and at most {:?}, over {} \
-         waits that crossed a range",
+         waits that crossed a range, with {} windows dropped for holding a crash or a restart \
+         of their node",
         median_of(&holds),
         holds.last(),
-        holds.len()
+        holds.len(),
+        coverage.holds_dropped_for_a_crash
     );
     println!(
-        "node: the drift bound was exceeded on {exceeded}/{seeds} seeds and the correct node's          guard revoked on {revoked}/{seeds}; {lease_reads} reads were served by a lease and          {read_index_reads} after a heartbeat round; {snapshot_actions} snapshot actions were          asked for"
+        "node: the largest follower log was {} entries, distribution by multiple of {} {:?} — \
+         printed, not asserted: this node has no follower compaction to bound it",
+        coverage.largest_follower_log,
+        raft::SNAPSHOT_THRESHOLD,
+        coverage.follower_log_multiples
     );
-    // The lease trial's firing, at every tier (§10, D-061): a tier whose clocks never
-    // exceed the bound, or whose correct node never revokes, says nothing about the
-    // guard, and `LeaseTrustsTheClock`'s catch below would be a green that means
-    // nothing. This is where the correct node is run, so the variant's own test runs
-    // the buggy node alone.
-    assert!(
-        exceeded > 0,
-        "no seed of this tier exceeded the drift bound, so the guard was never asked"
-    );
-    assert!(
-        revoked > 0,
-        "the correct node never revoked a promise, so the guard's path was not reached"
-    );
-    assert!(
-        lease_reads > 0,
-        "no read was served by a lease, so there is no stale read for the variant to serve"
-    );
-    let aimed_rate = if arms_fired == 0 {
+    let aimed_rate = if coverage.arms_fired == 0 {
         0.0
     } else {
-        arms_hit as f64 * 100.0 / arms_fired as f64
+        coverage.arms_hit as f64 * 100.0 / coverage.arms_fired as f64
     };
     println!(
-        "node: {arms_hit}/{arms_fired} leader-relative arms ({aimed_rate:.1}%) hit the leader of \
-         the range they drew"
+        "node: {}/{} leader-relative arms ({aimed_rate:.1}%) hit the leader of the range they \
+         drew",
+        coverage.arms_hit, coverage.arms_fired
     );
+
+    coverage.assert_complete();
+
+    // §4's threshold is on the median apply lag, and it is asked **per range**. The
+    // pooled median hides a breach: with the scenario's key map answering one range,
+    // three of the four ranges' medians go past 20 ms while the pooled figure still
+    // reads 3 ms, because the one busy range carries 85 % of the applies and so 85 %
+    // of the samples. Measured at 100 seeds: per range 2.86 / 3.27 / 2.96 / 3.12 ms
+    // correct, and 27.6 / 26.8 / 26.0 ms on the three starved ranges mutated.
+    // PROPOSED(D-082): the apply lag's threshold is asked per range.
+    for (range, median) in &per_range_median {
+        assert!(
+            *median <= HEARTBEAT,
+            "range {range}'s median apply lag is {median:?}, past SHARD.md §4's threshold of \
+             {HEARTBEAT:?}: Q14's grouped applies go to the owner"
+        );
+    }
+
     // §11, env 8's teeth. An arm that resolved "the leader" without its range would
     // cut off whichever range elected last — a perfectly good fault that no check of
     // the run would report, which is why this is here rather than left to the run's
@@ -305,19 +559,28 @@ fn every_seed_passes_on_the_correct_node_under_the_raft_sweeps_arms() {
     // The floor sits between them with room on both sides. It is a bound the correct
     // system must not trip, so a tier that comes in under it is a model error to take
     // to the owner and not a number to widen (D-030, D-039).
-    assert!(arms_fired > 0, "no leader-relative arm fired over the tier");
+    assert!(coverage.arms_fired > 0, "no leader-relative arm fired");
     assert!(
         aimed_rate >= 90.0,
-        "{arms_hit} of {arms_fired} leader-relative arms hit the leader of the range they drew \
-         ({aimed_rate:.1}%), under the 90% floor: a harness that resolved a leader without its \
-         range sits at about 71%"
+        "{}/{} leader-relative arms hit the leader of the range they drew ({aimed_rate:.1}%), \
+         under the 90% floor: a harness that resolved a leader without its range sits at \
+         about 71%",
+        coverage.arms_hit,
+        coverage.arms_fired
     );
+
     // The shape the keyed checks need, on every seed: four ranges on every node,
     // each electing and applying. It is what says the sweep can tell a keyed check
     // from a wrongly keyed one at all, so it is asserted at every tier.
     for range in ranges() {
-        assert!(leaders.contains_key(&range), "range {range} never led");
-        assert!(applies.contains_key(&range), "range {range} never applied");
+        assert!(
+            coverage.leaders_by_range.contains_key(&range),
+            "range {range} never led"
+        );
+        assert!(
+            coverage.applies_by_range.contains_key(&range),
+            "range {range} never applied"
+        );
     }
     // And the work is spread over the four, not piled on one. "Every range applied
     // something" is satisfied by a range that applied only its leader's no-ops, which
@@ -330,8 +593,18 @@ fn every_seed_passes_on_the_correct_node_under_the_raft_sweeps_arms() {
     // 5: 33 776} — least over busiest, **0.87** — and a key map that answers one range
     // gives {2: 95 986, 3: 16 459, 4: 12 886, 5: 14 353}, **0.13**. The floor is half,
     // between them and far from both.
-    let least = applies.values().copied().min().unwrap_or(0);
-    let busiest = applies.values().copied().max().unwrap_or(0);
+    let least = coverage
+        .applies_by_range
+        .values()
+        .copied()
+        .min()
+        .unwrap_or(0);
+    let busiest = coverage
+        .applies_by_range
+        .values()
+        .copied()
+        .max()
+        .unwrap_or(0);
     let spread = least as f64 / busiest.max(1) as f64;
     println!(
         "node: the least-applied range took {least} entries against the busiest range's \
@@ -345,15 +618,17 @@ fn every_seed_passes_on_the_correct_node_under_the_raft_sweeps_arms() {
     );
     // Read off the frames themselves, not off the scenario's parameters: a frame
     // between two nodes carries messages of several ranges, which is what four
-    // ranges to a node is the parameter for (SHARD.md §12). The floor was measured
-    // before it was asserted (D-061) and is recorded in the entry.
+    // ranges to a node is the parameter for (SHARD.md §12). A one-range world can
+    // never produce one, so this is the owner's class of check, and the floor has a
+    // mutant behind it as well as an observation: the correct node sends about 2 707
+    // such frames a seed, and an outbox that cuts one frame per (peer, range) instead
+    // of one per peer sends **0**. The floor is a hundred a seed.
     assert!(
-        multi_range_frames >= 100 * seeds as usize,
-        "{multi_range_frames} frames of several ranges over {seeds} seeds is too few to say a \
-         frame between two nodes carries several ranges"
+        coverage.multi_range_frames >= 100 * seeds as usize,
+        "{} frames of several ranges over {seeds} seeds is too few to say a frame between two \
+         nodes carries several ranges",
+        coverage.multi_range_frames
     );
-    let verdicts: Vec<Result<(), String>> =
-        results.into_iter().map(|(verdict, _)| verdict).collect();
     verdict(&verdicts).expect("the correct node passes every seed");
 }
 
@@ -393,14 +668,61 @@ fn high_rate_share() -> u64 {
     (seeds() / 10).max(seeds().min(20))
 }
 
-/// How often `variants` is caught over the share, printed.
-fn caught_on(name: &str, variants: impl Into<Variants> + Copy + Send + Sync) -> (usize, u64) {
+/// The violations `variants` was caught by over the share, with the rate and the
+/// mechanisms printed.
+///
+/// It returns the violations and not a count, because a count cannot tell a catch by
+/// the check the variant is about from a catch by something else that happened to go
+/// wrong first. §12 asks each variant to be re-asserted "to the standard its Phase 2
+/// test asserts and no stronger", and two of Phase 2's tests assert the mechanism by
+/// name rather than a bare catch.
+// PROPOSED(D-082): a catch on the node is attributed, not counted.
+fn caught_on(name: &str, variants: impl Into<Variants> + Copy + Send + Sync) -> Vec<String> {
     let seeds = high_rate_share();
-    let results = sweep(seeds, |seed| (checked(&buggy(seed, variants)).is_err(), ()));
-    let caught = results.iter().filter(|(failed, ())| *failed).count();
-    let rate = caught as f64 * 100.0 / seeds as f64;
-    println!("node: {name} caught on {caught}/{seeds} seeds ({rate:.1}%)");
-    (caught, seeds)
+    let caught: Vec<String> = sweep(seeds, |seed| checked(&buggy(seed, variants)).err())
+        .into_iter()
+        .flatten()
+        .collect();
+    let rate = caught.len() as f64 * 100.0 / seeds as f64;
+    let mut by_check: BTreeMap<&str, usize> = BTreeMap::new();
+    for violation in &caught {
+        *by_check.entry(mechanism(violation)).or_default() += 1;
+    }
+    println!(
+        "node: {name} caught on {}/{seeds} seeds ({rate:.1}%), by {by_check:?}, first: {}",
+        caught.len(),
+        caught.first().map_or("", String::as_str)
+    );
+    caught
+}
+
+/// Which check a violation came from, for the attribution `caught_on` prints.
+///
+/// The names are the checks' own words. `server failed` is not a check at all: it is
+/// the node telling the scenario its own apply stream had a hole, which is a real
+/// catch of a real bug and a different statement from a safety fold's.
+// PROPOSED(D-082): a catch on the node is attributed, not counted.
+fn mechanism(violation: &str) -> &'static str {
+    for (needle, name) in [
+        ("pre-vote:", "pre-vote"),
+        ("timers:", "timers"),
+        ("state machine safety", "state machine safety"),
+        ("committed entries", "committed entries stay"),
+        ("commit majority:", "commit by majority"),
+        ("commit by current term", "commit by current term"),
+        ("log matching", "log matching"),
+        ("election safety", "election safety"),
+        ("leader completeness", "leader completeness"),
+        ("linearizability", "linearizability"),
+        ("liveness", "liveness"),
+        ("follower log:", "the follower-log bound"),
+        ("failed:", "the node failed"),
+    ] {
+        if violation.contains(needle) {
+            return name;
+        }
+    }
+    "something else"
 }
 
 // Phase 2's variants on `sim/raft.rs`'s arms, re-asserted on the node (§10, §12).
@@ -415,20 +737,47 @@ fn a_server_that_sends_before_it_persists_is_caught_on_the_node() {
     // persist leaves when that persist resolves, and the variant sends it first
     // (§10). On the node the round submits four ranges' persists together, so the
     // send the variant lets out early races a sync that carries other ranges' work.
-    let (caught, _) = caught_on("SendBeforePersist", Variant::SendBeforePersist);
-    assert!(caught > 0, "SendBeforePersist was never caught on the node");
+    let caught = caught_on("SendBeforePersist", Variant::SendBeforePersist);
+    assert!(
+        !caught.is_empty(),
+        "SendBeforePersist was never caught on the node"
+    );
 }
 
 #[test]
 fn a_server_that_applies_before_commit_is_caught_on_the_node() {
-    let (caught, _) = caught_on("ApplyBeforeCommit", Variant::ApplyBeforeCommit);
-    assert!(caught > 0, "ApplyBeforeCommit was never caught on the node");
+    // Its Phase 2 test asserts a bare catch, so this does too (§12, "no stronger").
+    // The attribution is printed rather than asserted, and it is worth reading: on
+    // this tier three of the twenty catches are the **node failing**, not a safety
+    // fold — `server 1 failed: range 2: apply of 189 after 186`, the node's own apply
+    // task refusing a hole in its applied stream. That is a real catch of the real
+    // bug by the node's own oracle, and it is a different statement from state
+    // machine safety's, which is why the entry says so rather than leaving it in the
+    // count.
+    let caught = caught_on("ApplyBeforeCommit", Variant::ApplyBeforeCommit);
+    assert!(
+        !caught.is_empty(),
+        "ApplyBeforeCommit was never caught on the node"
+    );
 }
 
 #[test]
 fn a_server_without_pre_vote_is_caught_on_the_node() {
-    let (caught, _) = caught_on("NoPreVote", Variant::NoPreVote);
-    assert!(caught > 0, "NoPreVote was never caught on the node");
+    // Its Phase 2 test asserts the **mechanism**, not a bare catch: `by_pre_vote > 0`
+    // (`sim/tests/raft.rs`). §12 asks for that standard and no stronger, so a bare
+    // catch here would be weaker than Phase 2's and this asserts the same thing — the
+    // catch is pre-vote's own property, a server raising its term while cut off.
+    // PROPOSED(D-082): a catch on the node is attributed, not counted.
+    let caught = caught_on("NoPreVote", Variant::NoPreVote);
+    let by_pre_vote = caught
+        .iter()
+        .filter(|violation| violation.contains("pre-vote:"))
+        .count();
+    assert!(
+        by_pre_vote > 0,
+        "NoPreVote was never caught on the node by pre-vote's own property, which is what \
+         its Phase 2 test asserts: {caught:?}"
+    );
 }
 
 #[test]
@@ -436,27 +785,27 @@ fn a_leader_that_commits_an_older_terms_entry_by_count_is_caught_on_the_node() {
     // The Figure 8 driver's window (D-031), on the node: the burst writes a key of
     // the range the arm drew, so the backlog the restarted leader re-sends is that
     // range's.
-    let (caught, _) = caught_on("CountOlderTermForCommit", Variant::CountOlderTermForCommit);
+    let caught = caught_on("CountOlderTermForCommit", Variant::CountOlderTermForCommit);
     assert!(
-        caught > 0,
+        !caught.is_empty(),
         "CountOlderTermForCommit was never caught on the node"
     );
 }
 
 #[test]
 fn a_follower_that_truncates_on_every_append_is_caught_on_the_node() {
-    let (caught, _) = caught_on("TruncateOnEveryAppend", Variant::TruncateOnEveryAppend);
+    let caught = caught_on("TruncateOnEveryAppend", Variant::TruncateOnEveryAppend);
     assert!(
-        caught > 0,
+        !caught.is_empty(),
         "TruncateOnEveryAppend was never caught on the node"
     );
 }
 
 #[test]
 fn a_server_that_resets_its_timer_on_any_message_is_caught_on_the_node() {
-    let (caught, _) = caught_on("ResetTimerOnAnyRpc", Variant::ResetTimerOnAnyRpc);
+    let caught = caught_on("ResetTimerOnAnyRpc", Variant::ResetTimerOnAnyRpc);
     assert!(
-        caught > 0,
+        !caught.is_empty(),
         "ResetTimerOnAnyRpc was never caught on the node"
     );
 }
@@ -532,4 +881,108 @@ fn a_seed_replays_to_the_same_trace_on_the_node() {
         assert_eq!(a.at, b.at);
         assert_eq!(a.event, b.event);
     }
+}
+
+/// A Phase 2 variant this node has no path for, run on the node anyway.
+///
+/// m1 of the review of this slice: until now the four blocked variants were named in
+/// prose and by nothing executable, so `cargo test --list` and the nightly's shard
+/// table carried none of the debt. Each of these runs its variant over the share and
+/// asserts two things: the correct-system checks still pass (the variant injects
+/// nothing, because the path it breaks is not here), and the path itself is still
+/// unreached. Both are absences with a reason, and both have an upgrade trigger: the
+/// day the wiring lands, either the variant starts being caught — and this test fails,
+/// asking to be turned into the assertion — or the path counters move and it fails
+/// saying so.
+// PROPOSED(D-082): each blocked variant is named by a test, not by prose.
+fn blocked_on_the_node(
+    name: &str,
+    variants: impl Into<Variants> + Copy + Send + Sync,
+    waits_on: &str,
+) {
+    let seeds = high_rate_share();
+    let caught: Vec<String> = sweep(seeds, |seed| checked(&buggy(seed, variants)).err())
+        .into_iter()
+        .flatten()
+        .collect();
+    println!(
+        "node: {name} is not re-asserted here; over {seeds} seeds it was caught {} times, and \
+         it waits on {waits_on}",
+        caught.len()
+    );
+    assert!(
+        caught.is_empty(),
+        "{name} is caught on the node, so the path it breaks is reachable after all: turn this \
+         absence into the assertion §10 asks for. {caught:?}"
+    );
+}
+
+#[test]
+fn a_server_that_installs_without_current_last_is_not_re_asserted_on_the_node_yet() {
+    // §12 translates this one to the node as the live install's manifest switch made
+    // only with the range's repair durable or carried in it, which is
+    // `NodeVariant::InstallWithoutRepair` (D-075) — and there is no install on this
+    // node to make a switch at all.
+    blocked_on_the_node(
+        "SnapshotWithoutCurrentLast",
+        Variant::SnapshotWithoutCurrentLast,
+        "the node's snapshot wiring (PROPOSED D-082)",
+    );
+}
+
+#[test]
+fn a_server_whose_adoption_is_as_built_is_not_re_asserted_on_the_node_yet() {
+    // The owner ruled on 2026-09-20 that this is re-asserted on the two rules that
+    // remain rather than §10 amended. The two are the live install's single switch and
+    // Q15's refused directory; neither path is in this tree. The third rule, a damaged
+    // staging `CURRENT` refused, has no subject on a node that adopts no staged store.
+    blocked_on_the_node(
+        "AdoptionAsBuilt",
+        Variant::AdoptionAsBuilt,
+        "the node's snapshot wiring and PR #86's refused directory",
+    );
+}
+
+#[test]
+fn a_leader_that_ignores_incarnations_is_not_re_asserted_on_the_node_yet() {
+    // A core variant, so the node carries it — but an incarnation only ever changes
+    // when a store is re-seeded, and nothing re-seeds here.
+    blocked_on_the_node(
+        "IgnoreIncarnation",
+        Variant::IgnoreIncarnation,
+        "PR #86's re-seed and the node's snapshot wiring",
+    );
+}
+
+#[test]
+fn a_leader_that_shares_one_snapshot_directory_is_not_re_asserted_on_the_node_yet() {
+    blocked_on_the_node(
+        "SharedSnapshotDir",
+        Variant::SharedSnapshotDir,
+        "the node's snapshot wiring (PROPOSED D-082)",
+    );
+}
+
+#[test]
+fn a_server_whose_refusal_is_not_durable_is_not_re_asserted_on_the_node_yet() {
+    // The node *does* read this one (`quiesce_on_loss` in `server::run`), and it still
+    // has nothing to do: the disk does not rot on this cluster, because a refusal
+    // stops the node until Q15's whole-node re-seed lands.
+    blocked_on_the_node(
+        "RefusalNotDurable",
+        Variant::RefusalNotDurable,
+        "PR #86's whole-node refusal and re-seed",
+    );
+}
+
+#[test]
+fn the_pair_that_wedged_seed_680_is_not_re_asserted_on_the_node_yet() {
+    // D-045's control for a wedge that needs both bugs. SHARD.md expects the node's
+    // schedule move to retire its pin on seed 680; under this slice's shape nothing
+    // moved it, so the pin stands where it is and the pair waits with the rest.
+    blocked_on_the_node(
+        "{IgnoreIncarnation, SharedSnapshotDir}",
+        Variants::of(&[Variant::IgnoreIncarnation, Variant::SharedSnapshotDir]),
+        "PR #86's re-seed and the node's snapshot wiring",
+    );
 }
