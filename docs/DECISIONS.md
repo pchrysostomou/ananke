@@ -9521,7 +9521,7 @@ slice that puts the node under the sweeps carries.
   (Q14, D-043). A per-node cap bounds the assemblies; a (range, sender) over it is answered
   with a restart, writes nothing and disturbs no admitted assembly, and takes a slot by
   asking for it again once one is free. This is the re-seed shape's "wait for one another"
-  (SHARD.md:2257-2259). The send half names the directory its followers stage under from
+  (SHARD.md:2260-2261, where the phrase wraps the line break a grep for it must cross). The send half names the directory its followers stage under from
   the node's *own* id, because that is the sender the receiver keys the name by.
 - *Paths keyed by range.* `version_name` is `snap-r<range>-<index>-<take>` and `staging_name`
   is `staging-r<range>-s<sender>`. `Snapshots::sweep` is one range's sweep: it proposes for
@@ -9554,7 +9554,13 @@ slice that puts the node under the sweeps carries.
    purpose. *Taken:* no default at all — `Snapshots::new` takes the cap — with the
    recommendation that a scenario which is not about the cap sets it at or above the node's
    range count, so no stream waits by accident. A wrong default would be invisible; a cap
-   that must be named is not.
+   that must be named is not. *Amended after the second review:* that recommendation
+   contradicted open choice 1, which argues that two senders of one range each hold an
+   assembly — a cap equal to the range count then starves a range as soon as any range has
+   two senders (four ranges, cap 4, `(r1,S1)` and `(r1,S2)` admitted: r4 waits). The
+   recommendation is now **the node's range count plus the senders a range may have at
+   once**. Q14's plural, "caps on streams received *and* assembled" (SHARD.md:2231,
+   SHARD.md:3035), is one number here and is recorded as open choice 11 below.
 3. *What a stream over the cap is told, and who gets the slot when one frees.* Nothing
    settles whether an over-cap stream is refused, queued or admitted by evicting another.
    *Taken:* refused with a restart, nothing evicted. Eviction would make the node the thing
@@ -9575,7 +9581,12 @@ slice that puts the node under the sweeps carries.
 5. *When overlapping spans are refused.* `Engine::install_spans` refuses them at the switch
    (`SpansOverlap`, D-068). *Taken:* `Snapshots::host` asserts sorted, disjoint, non-empty
    spans when the range is registered, so a node that has lost track of what a range holds
-   fails where it lost track, not at the switch of an install.
+   fails where it lost track, not at the switch of an install. *Amended after the second
+   review:* "non-empty" was asserted of each span and not of the set, and both assertions
+   are vacuously true on `vec![]` — while `EmptySpan` is "the set is empty **or** any span
+   in it holds no key" (engine.rs:1799; D-068). A range registered with no spans was
+   accepted and refused at *every* switch afterwards, which is the permanent refusal this
+   choice exists to prevent. The empty set is asserted now, with a check of its own.
 6. *D-066's open question about `sim/quorum.rs`'s cap* — "set at or above its ranges, or
    D-049's rule counts a queued stream as progress" — is not this slice's to close, since
    that scenario is Q15's slice. *Recommendation:* set the cap at or above its ranges.
@@ -9598,8 +9609,43 @@ slice that puts the node under the sweeps carries.
    *Taken:* they do not. Every one of them names a directory under the store the node just
    refused, so `adopt_fresh` drops them and the streams come again against the fresh one.
 
-**The pair (CLAUDE.md:52-67), and the mutation standard.** Eleven variants, each built
-beside the correct code and each failing a check here. Seven of the eleven are mutations
+9. *What a chunk naming a range the node does not host is answered.* `on_chunk`'s `range`
+   and `from` are a *peer's* word, off its `InstallSnapshot`: a leader that has not learned
+   the rebalancer moved the range (Q33), or a garbled range id, names a range this node does
+   not host. Nothing settles what the node does with it. *Taken:* the chunk is refused on
+   arrival, before admission — `Landing::NotHosted`, which the node turns into a restart as
+   it does an over-cap chunk — so it takes no slot under the cap and disturbs no assembly.
+   Failing on it would let any peer abort the node (the discipline this crate draws
+   elsewhere: a caller's lost message "is its bug and not the wire's", frame.rs:134-137),
+   and admitting it would let a peer starve every range the node does host. The *send* half
+   keeps the panic: there the range is the node's own claim. The assertion on the install
+   path stays behind the refusal as the invariant it always was, and
+   `AdmitsAnUnhostedRange` is the variant that reaches it.
+10. *What a resent last chunk does.* A chunk unanswered for half a minimum election timeout
+   is resent (RAFT.md:200-202), so the last chunk of a stream whose answer was lost arrives
+   again as a matter of course; nothing here carries an offset, so the module cannot tell it
+   from a new stream at the same identity. *Taken:* the assembly remembers the identity it
+   completed until the node finishes it, and a chunk at that identity is answered
+   `Landing::Installed` — no second `Install`, from a staging directory the first switch may
+   already have consumed. The rule this puts on the node is that it finishes a completed
+   assembly only once it has answered the sender (RAFT.md:218-220).
+11. *One cap or two, and whose slot a superseded leader holds.* SHARD.md:2231 and
+   SHARD.md:3035 both say "caps", on streams received **and** assembled. *Taken:* one cap,
+   on assemblies — nothing here receives a chunk without assembling it, and a separate bound
+   on what a node lets in before it assembles belongs with the sockets the wiring slice
+   holds. *Recommendation:* leave it one number unless the wiring finds a reason for two.
+   On the slot itself: an admitted assembly whose sender is gone holds its slot exactly as a
+   reservation did (open choice 3), and the module has no clock. *Taken:* a chunk of the
+   **same range** at a strictly higher term displaces it, because that is the one
+   supersession a chunk proves — the range's own Raft has a leader above the assembly's, and
+   a stream from below the receiver's term can never be installed. Nothing else displaces
+   anything. A sender superseded on *another* range is not something a chunk proves, so the
+   node ends that assembly itself on a leader change it observes (RAFT.md:222-225); that
+   rule is now written in RAFT.md instead of being assumed by a check.
+   `AssemblyHeldForDepartedSender` keeps the wedge beside the correct code.
+
+**The pair (CLAUDE.md:52-67), and the mutation standard.** Fifteen variants, each built
+beside the correct code and each failing a check here. Nine of the fifteen are mutations
 that a single-range, single-follower world could not catch at all — with one range and one
 stream they are indistinguishable from the correct node:
 
@@ -9616,15 +9662,24 @@ stream they are indistinguishable from the correct node:
 | `StagingByRangeAlone` | the staging directory keyed by range and not also by sender | `two_senders_of_one_range_assemble_into_directories_of_their_own` |
 | `SlotReservedForWaiter` | a freed slot reserved for the waiter at the head of the queue | `a_freed_slot_goes_to_a_stream_still_asking_for_it` |
 | `CompleteOnRestart` | a stream completed on the very chunk that restarted it | `a_restarted_stream_is_never_installed` |
+| `InstallWrongRangesSpans` | the install carries the node's first hosted range's spans | `an_install_is_a_live_install_of_the_ranges_spans_with_its_repair` |
+| `AdmitsAnUnhostedRange` | a chunk of a range the node does not host is given an assembly | `a_chunk_of_a_range_the_node_does_not_host_is_refused_and_takes_no_slot` |
+| `AssemblyHeldForDepartedSender` | an admitted assembly keeps its slot after its range superseded its sender | `an_assembly_whose_leader_its_range_superseded_gives_up_its_slot` |
+| `InstallsADuplicateLastChunk` | a resent last chunk installs a second time | `a_resent_last_chunk_installs_once` |
 
-Seven need more than one range, more than one sender or more than one follower to be wrong
+Nine need more than one range, more than one sender or more than one follower to be wrong
 about, and that is the mutation standard applied to this slice: `SharedStagingDir`,
 `StagingByRangeAlone`, `OneAssemblyPerNode`, `VersionDirWithoutRange`, `SweepAcrossRanges`,
-`CapStreamsSent` and `SlotReservedForWaiter` — the last needs three keys and a cap below
-them, which is §12's shape exactly, and the first two are the same mistake one level apart.
-The other four — `ChunksInBatchFrames`, `InstallWithoutRepair`, `AdoptedOnRangeInstall` and
-`CompleteOnRestart` — are wrong with one range and one follower too, and are here because
-Q41, D-066 and RAFT.md:203-207 name them. (This entry first claimed "six of the eight" and
+`CapStreamsSent`, `SlotReservedForWaiter`, `InstallWrongRangesSpans` and
+`AssemblyHeldForDepartedSender` — `SlotReservedForWaiter` needs three keys and a cap below
+them, which is §12's shape exactly; the first two are the same mistake one level apart;
+`InstallWrongRangesSpans` is invisible until a *second* range completes a stream, since
+with one range "the first hosted range's spans" are that range's; and
+`AssemblyHeldForDepartedSender` needs a range whose leader changes while the cap is full.
+The other six — `ChunksInBatchFrames`, `InstallWithoutRepair`, `AdoptedOnRangeInstall`,
+`CompleteOnRestart`, `AdmitsAnUnhostedRange` and `InstallsADuplicateLastChunk` — are wrong
+with one range and one follower too, and are here because Q41, D-066, Q33 and
+RAFT.md:200-207 name them. (This entry first claimed "six of the eight" and
 then contradicted itself in the next sentence; the count above is against the standard, not
 against the table's row order, and it is the corrected one.)
 
@@ -9638,7 +9693,7 @@ run one at a time against the fixed tree, reverted between runs.
 | --- | --- | --- |
 | A chunk that restarted an assembly *and* said it was its stream's last was installed: `Install` pointed at a directory holding two streams' files, labelled as one | the restart wins; the stream is restarted from its first byte and completes on the next pass (open choice 7 above) | completing on a restart → `a_restarted_stream_is_never_installed` fails; kept as `CompleteOnRestart` |
 | `finish` reserved the freed slot for the head of the queue, so a waiter whose leader had changed held a slot for ever and the node wedged under §12's own shape | the slot is freed, not reserved, and granted to whichever stream asks (open choice 3, amended) | reserving on `finish` → `a_freed_slot_goes_to_a_stream_still_asking_for_it` and the cap check fail; kept as `SlotReservedForWaiter` |
-| A range the task was never told it hosts completed with `spans: []`, which `Engine::install_spans` refuses at every switch (`EmptySpan`, D-068) — a permanent refusal for a newly placed replica | `on_chunk` panics where the range is unknown, as `host` does | `unwrap_or_default()` → `a_range_the_task_does_not_host_never_completes_a_stream` fails |
+| A range the task was never told it hosts completed with `spans: []`, which `Engine::install_spans` refuses at every switch (`EmptySpan`, D-068) — a permanent refusal for a newly placed replica | `on_chunk` panics where the range is unknown, as `host` does. *Superseded by the second review (finding 2):* a panic on a peer's word is a remotely triggerable abort; the chunk is refused on arrival now (open choice 9), the panic stays behind it as the install path's invariant, and the *send* half panics where the range is the node's own claim | `unwrap_or_default()` → the checks of open choice 9 fail |
 | The send half recorded the staging name of the *follower*, a path that exists on no node, and `is_streaming` compared it with itself | `Snapshots::new` takes the node's own id and the name is built from it; the tautology is gone | naming it by the follower → `the_name_a_leader_records_is_the_name_its_followers_stage_under` fails |
 | `adopt_fresh` asserted "no assembly is open" while its doc said "no range has installed", and `ranges_installed` was the literal `0` | installs are counted per engine directory; the assertion and the figure both read that count, and the adoption drops what the refused store was carrying (open choice 8) | dropping the assertion → `a_directory_a_range_installed_into_is_not_adopted_as_fresh` fails |
 | The slice's most-argued decision — staging keyed by (range, sender) — had no variant, and was held up only by a path literal in a check about adoption | `StagingByRangeAlone`, and a check about two senders of one range | keying by range alone → `two_senders_of_one_range_assemble_into_directories_of_their_own` fails |
@@ -9650,6 +9705,35 @@ need more than one range is corrected in the paragraph above. Its observation th
 the four measurements were constants rather than observations is why the Measurements table
 now says which is which, and the frames figure is now read at three chunk sizes instead of
 one.
+
+**What the second adversarial review changed.** It ran seven probes against the *correct*
+node and thirty-odd mutations, and found six survivors and two safety defects the checks
+could not have seen. Each fix below is the smallest one that makes the code do what this
+entry claims, and each is proved by the mutation or probe that undoes it being caught. The
+mutations were run one at a time against the fixed tree, reverted between runs.
+
+| Finding | The fix | The proof |
+| --- | --- | --- |
+| **An install could carry another range's spans and no check would notice.** `install.spans` was asserted only where the node completed a stream for its *first* hosted range, so on a `BTreeMap` of ranges the mutation "carry `hosted.values().next()`" was invisible. `Engine::install_spans` removes every key of the spans it is given (D-068), so a re-seed of r4 would have deleted r1's Raft state and user keys, live, in one switch | a second range's stream completes in that check, and `install.range`, `install.spans` and `install.source` are asserted to be R2's and *not* R1's; `InstallWrongRangesSpans` is the variant | the mutation with the not-hosted panic kept → `an_install_is_a_live_install_of_the_ranges_spans_with_its_repair` fails (it passed before) |
+| **A peer's chunk for a range the node does not host aborted the node**, and before its last chunk it was admitted and held a slot, so a peer could starve every hosted range under the cap | open choice 9: refused on arrival with `Landing::NotHosted`, no slot, no assembly touched; the panic moves to the send half and stays behind the refusal as the install path's invariant | removing the refusal → `a_chunk_of_a_range_the_node_does_not_host_is_refused_and_takes_no_slot` fails; `AdmitsAnUnhostedRange` fills the cap with ranges the node does not host; the two `#[should_panic]` checks keep the send half's panic and the invariant |
+| **`host` accepted an empty span *set***, so the permanent refusal open choice 5 claims to close was still open | `assert!(!spans.is_empty(), ..)`, with a third `#[should_panic]` check | dropping the assertion → `a_range_hosted_with_no_spans_is_refused_where_it_is_hosted` fails |
+| **The standing wedge was still there one level up**: an *admitted* assembly whose sender departed held its slot exactly as a reservation did, and the check that claimed the ground handed itself the escape by calling `finish` under a premise nothing stated | open choice 11: a chunk of the same range at a higher term displaces the stale assembly, which is the one supersession a chunk proves; the cross-range case is the node's rule and is now written in RAFT.md:222-225 instead of assumed, and the old check cites it | removing the displacement → `an_assembly_whose_leader_its_range_superseded_gives_up_its_slot` fails; `AssemblyHeldForDepartedSender` keeps the wedge beside it |
+| **A duplicated last chunk installed a second time** — and a last chunk's answer is exactly what a resend replaces (RAFT.md:200-202) | open choice 10: the assembly remembers the identity it completed until `finish`, and a chunk at that identity is answered `Landing::Installed` | dropping the memory → `a_resent_last_chunk_installs_once` fails; `InstallsADuplicateLastChunk` installs twice |
+| The cap recommendation starved a range under this entry's own open choice 1 | open choice 2, amended: range count **plus** the senders a range may have at once | the arithmetic is in the amended text; the received-vs-assembled plural is recorded as open choice 11 |
+| `Adopted::ranges_installed` was called an observation and is a constant | named a constant, here and in its doc, as `abandoned` already was | the Measurements table above |
+| The sweep's pin was never checked against the *take*; the oversize guard's boundary was untested over a five-byte window; `adopt_fresh` dropping the waiters was asserted on a state the check never built; `finish` on a queued waiter was never exercised; `ahead` had an unreachable `unwrap_or` | each check now builds the state it asserts: two takes at one index with the later one pinned, `MAX_FRAME_LEN - encoded_len(0) + 1` refused, an adoption with the queue non-empty, a waiter finished and the queue asserted to fall; the dead branch is an `expect` naming the invariant | the four mutations the review listed as survivors (pin by index alone, guard off by `HEADER_LEN`, `waiting.clear()` dropped, the waiter's `retain` dropped) are each caught now |
+
+One finding is **disagreed with, not changed**: the review called the quotation "so that
+re-seeds toward it wait for one another" fabricated, on a `grep -rn` that returned only the
+module and this entry. The phrase is `docs/SHARD.md:2260-2261` verbatim — "the node's cap on
+streams received set to two, below its four ranges, so that re-seeds toward it wait for /
+one another" — and the grep missed it because it wraps the line break. The citations on both
+sides are now the exact lines rather than "§12", so the next reader's grep crosses it.
+
+One finding is **filed rather than fixed**: this slice's own RAFT.md insertion moved every
+citation of a RAFT.md line below 207 by 13, in other entries and other documents whose
+slices are being edited in parallel. The slice's own citations are corrected here;
+issue **#94** carries the rest, with the old→new mapping verified line by line.
 
 **Tiers and rates (D-061).** Nothing here is asserted at a tier, because nothing here is a
 sweep: each check is deterministic and fails under its variant on every run. D-061 asks a
@@ -9667,8 +9751,11 @@ none was widened or lowered.
 | assemblies abandoned for a chunk that is not their own | 0 on the correct node, over four interleaved (range, sender) streams | a **constant**: with the key carrying the sender, the abandon path is unreachable by construction. The figure cannot distinguish a correct-side mutation, and is here as the variant's contrast, not as a count | `a_chunk_of_another_stream_never_abandons_an_assembly` |
 | assemblies open under a cap of two with four ranges arriving | 2 open, 2 waiting; a freed slot stays free until a waiter asks, and a resend queues nothing new | observation | `the_receive_cap_holds_and_a_freed_slot_admits_the_first_waiter` |
 | slots recovered when the waiters' leader is replaced | 2 of 2 — both freed slots go to the new leader's streams | observation, and the figure the review's wedge turned into a check | `a_freed_slot_goes_to_a_stream_still_asking_for_it` |
-| `RaftAdopted` events per replica install | 0; one per fresh directory, and `ranges_installed` is read from the installs counted for that directory | observation | `only_a_fresh_directory_after_a_refusal_is_adopted` |
+| `RaftAdopted` events per replica install | 0; one per fresh directory | observation for the events; `ranges_installed` is a **constant**: it is read back from the installs counted for that directory, but `installed` is keyed by engine directory and a fresh directory has no entry, so 0 is the only value that reaches the field, and the assertion is what keeps it true. The second review named this; the entry had called it an observation, which moved the tautology rather than removing it | `only_a_fresh_directory_after_a_refusal_is_adopted` |
 | streams installed from a directory that had just been started over | 0 | observation | `a_restarted_stream_is_never_installed` |
+| slots a chunk of an unhosted range takes | 0 of 2, over two chunks including a last one; the node's own range is admitted after them, and under `AdmitsAnUnhostedRange` two unhosted ranges fill the cap and the hosted one waits | observation | `a_chunk_of_a_range_the_node_does_not_host_is_refused_and_takes_no_slot` |
+| assemblies displaced when a range's leader is superseded, cap 2 and four ranges | 1 of 1 — that range's stale assembly, and no other range's; the superseded sender then waits like any other, and a range with no assembly of its own displaces nothing | observation | `an_assembly_whose_leader_its_range_superseded_gives_up_its_slot` |
+| installs from one stream's last chunk sent four times | 1 install, 3 answered installed; the sender's next identity installs once more | observation | `a_resent_last_chunk_installs_once` |
 
 Stage B's timed measurements — the step cost, the frames per peer in a round, the replay
 burst, the inbox's drops, the apply lag, the take's hold — belong to the tasks slice and the
@@ -9705,9 +9792,27 @@ which add a dozen checks that run in a millisecond and touch no sweep: the relea
 cold for this tree and the other slices' sweeps had the cores for most of it. Both are
 greens, and neither is a timing.
 
+And once more on the tip the second review's fixes land with, which is the figure this
+entry now carries:
+
+```
+premerge: Darwin 25.6.0 arm64, Apple M2, 8 cores
+premerge: before, load 19.32/24.72/34.53, AC Power, no thermal warning recorded
+premerge: after, load 25.17/30.59/32.86, AC Power, no thermal warning recorded
+premerge: green at 1000 seeds in 820 s
+```
+
+AC throughout, no thermal warning, on the quietest machine of the three — load 19 rising to
+25, against the first run's 140 — and with a warm release build. 820 s beside 1 308 s and
+2 558 s on one laptop is the spread D-070 exists to make legible; all three are greens, none
+is a timing, and the fixes add no sweep. The eleven checks this pass adds and the five it
+strengthens are deterministic and run in milliseconds.
+
 **What moved.** Nothing outside `crates/ananke-shard` and the two documents. `sim/` does not
 depend on `ananke-shard`, so no schedule moves, no pinned trace hash moves and no pinned seed
-is re-audited: `crates/ananke-shard/src/variant.rs` gained eleven variants at bits 8 to 18,
+is re-audited — which holds for the review's fixes too, since they move nothing outside this
+crate and the two documents. `crates/ananke-shard/src/variant.rs` gained eleven variants at
+bits 8 to 18, and four more at bits 20 to 23 (19 is `HeldLocalDropped`, D-074's),
 which no existing code reads, and the crate's other files are unchanged but for `lib.rs`'s
 description of this module. `Snapshots::new` takes the node's own `ServerId`, which only
 this module's own checks call. The one-group
@@ -11627,6 +11732,7 @@ the next step is the pending operations, not the budget.
 
 ---
 
+ phase-3-stage-b-sweeps
 ## PROPOSED D-082 — `sim/raft.rs`'s arms on the node: one set of arms, two clusters
 
 **The number.** SHARD.md's Stage B plan does not number this entry, and the footer on
