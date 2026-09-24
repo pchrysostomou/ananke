@@ -822,6 +822,34 @@ impl<E: Environment, H: Host> Node<E, H> {
                     });
                 }
             }
+            // A follower's compaction record is the `apply` task's too, and for the
+            // same reason: it is written between two applies, so the index, the term
+            // and the configuration it carries are exactly the state a snapshot at
+            // that index would capture (D-065, D-078; D-036).
+            //
+            // The node dropped it. `Host::snapshot` counts the action and
+            // `install::job_of` answers `None` for a record, so the core that asked
+            // for one set `take_pending` and was never told it was done — and a core
+            // with `take_pending` stuck asks for nothing again for the rest of its
+            // life on that node. It never compacts, so its log grows without bound
+            // (the whole of D-065), and when it later takes office it never takes a
+            // snapshot either, so it cannot stream one: a re-seeded replica of a range
+            // whose new leader had been a follower waits forever. The directed
+            // re-seed shape found it that way, one or two of its four ranges never
+            // installed on every seed.
+            // PROPOSED(D-081): a follower's compaction record reaches the `apply`
+            // task.
+            Output::Snapshot(SnapshotAction::Record)
+                if !self
+                    .config
+                    .variants
+                    .contains(NodeVariant::RecordNeverQueued) =>
+            {
+                self.host.apply(ApplyJob {
+                    range,
+                    work: ApplyWork::Record,
+                });
+            }
             Output::Snapshot(action) => self.host.snapshot(range, action),
             // D-047: decided at the step, traced now, which is when it is durable for
             // every event that followed a persist.

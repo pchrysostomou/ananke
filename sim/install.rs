@@ -266,6 +266,21 @@ impl Report {
         owed
     }
 
+    /// Every `RaftServerFailed` of the run, with the server that traced it.
+    // PROPOSED(D-081): a scenario that counts events asks whether the node stopped.
+    #[must_use]
+    pub fn failures(&self) -> Vec<String> {
+        self.records
+            .iter()
+            .filter_map(|record| match &record.event {
+                TraceEvent::RaftServerFailed { server, reason } => {
+                    Some(format!("server {server}: {reason}"))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Whether the run reached the situation at all, which is the first thing to
     /// assert of a scenario built to reach one.
     ///
@@ -306,6 +321,21 @@ impl Report {
     pub fn check(&self) -> Result<(), String> {
         let seed = self.seed;
         self.reached()?;
+
+        // Before anything else: no node stopped. This scenario counts streams,
+        // installs and creations, and a node that has stopped answering still has all
+        // three in its trace — so for a while it traced twelve hundred
+        // `RaftServerFailed` a seed and passed, because nothing asked. A fold that
+        // costs one pass over the records is what `sim/ranges.rs` and `sim/reseed.rs`
+        // both keep, and this is the same fold.
+        // PROPOSED(D-081): a scenario that counts events asks whether the node stopped.
+        if let Some(reason) = self.failures().first() {
+            return Err(format!(
+                "seed {seed}: a node stopped during the run: {reason}. Streams, \
+                 installs and creations are all still in the trace of a node that has \
+                 stopped, so they are not asked about until this is"
+            ));
+        }
         let owed = Self::owed();
 
         let streams = self.streams();
