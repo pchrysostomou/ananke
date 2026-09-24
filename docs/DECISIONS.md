@@ -11732,7 +11732,183 @@ the next step is the pending operations, not the budget.
 
 ---
 
- phase-3-stage-b-sweeps
+## PROPOSED D-081 — The directed re-seed shape: four ranges installed live into the directory a refusal built
+
+**Context.** Stage B's exit criterion for Q15's path (SHARD.md §12; §11, storage 8). Two
+open slices meet here and neither reaches the situation alone. D-077 (PR #86) refuses a
+node whose shared engine lost state and rebuilds its four replicas in a fresh engine
+beside the refused directory, where each waits, empty and marked, for a stream that
+nothing in that tree could send; its entry records (a), (b) and (d) as owed with the
+wiring, and leaves (c) asserted as an *absence*, with its reason, because a re-seeded
+replica there answered nothing at all. D-083 (PR #107) makes streams flow and installs
+complete on a node that was never refused. This slice is the two together, and it is
+where (c) stops being vacuous.
+
+**The number.** D-081 is the one gap in the sequence, left when this slice was blocked:
+D-079 and D-080 are taken by PRs #89 and #87, D-082 and D-083 by the branches below this
+one. Taking it closes the gap, and the footer does not move.
+
+**The branch.** This branch merges `phase-3-stage-b-reseed` (#86) into
+`phase-3-stage-b-wiring` (#107) and builds on the union, because the criterion is about
+both at once. The merge decides two things and nothing else: `NodeVariants` carries 64
+bits, because the node's variants outgrew a `u32` when the wiring's ten and Q15's six met
+on one tree; and where this slice and the wiring had each written the same fix, the
+wiring's is kept (below).
+
+**Decided — the shape** (`sim/reseed.rs`, `sim/tests/reseed.rs`). Three servers of four
+ranges each; the node refused by its store's lost mark at a restart, as `sim/quorum.rs`
+refuses a server (D-049), so what is refused is a directory that really held a store and
+really lost it; its cap on streams *received* set to two, below its four ranges, so the
+re-seeds share two slots (Q14, D-075); and a crash arm on a stream of its own,
+`reseed-crash` (D-031), that crashes the node on the trace event of one replica's refused
+mark and restarts it. The arm draws nothing, so it lengthens no schedule stream. Where no
+mark arrives inside its budget the arm crashes at the budget's end anyway, as
+`Fault::CrashRefused` crashes a victim that never flushes (D-044) — which is also what
+gives (c) a plant.
+
+Per seed, on the correct system, `Report::check` asserts, in this order:
+
+- **the node is still running.** A node that stopped answers nothing further, and every
+  criterion below would be asserted about a run that ended early.
+- **(c), first half.** No replica sent anything other than its own re-seed stream before
+  its refused mark was durable. It is asked *first* because it is an ordering: a replica
+  that answered early answered early whatever else went right. `ServeBeforeRefusedMark` —
+  a node that writes no mark at all — is this clause's plant and is caught by it on 100 of
+  100 seeds; while (a) was asked first, that variant was caught by (a) instead, which is
+  a clause testing the wrong sentence.
+- **(a)** each of the four ranges traces its `RangeCreated { cause: snapshot }`; exactly
+  one start of the node lies between the refusal and the last install, the arm's; and no
+  `RaftAdopted` is traced at all, which is what "live" means on a node (D-066).
+- **(b)** every one of the four streams completes into an install, and the four were owed
+  *at once*, every mark preceding the first install. **The cap holding a stream back is a
+  rate, not an every-seed property**, and that is measured rather than preferred: over 200
+  seeds the node answers `StartOver { reason: Cap }` — D-083's own event — on **199**,
+  with a median of 9 held-back chunks and quartiles of 7 and 13, and the seed it does not,
+  113, is a legitimate run in which the four re-seeds arrive spread out enough that each
+  slot is free again before the next chunk comes. Asserted per seed it failed exactly
+  there, on the nightly, which is a model error in the assertion and not a bound to widen
+  (D-030, D-039). So §10's *rate* standard applies: `sim/tests/reseed.rs` prints the rate
+  at every tier, asserts it against a floor of 80 % measured against that 99.5 %, and pins
+  the mechanism on seed 1, where the node holds seven chunks back across two ranges. Raise
+  `RECEIVE_CAP` to the range count and the rate is 0 % and the floor fails. Two levers
+  were measured first and changed nothing: a chunk size of 4 KiB and of 512 B, which take
+  each stream from one chunk to sixty or eighty, leave the rate at 199 of 200 — what
+  decides it is how far apart the four leaders open their streams, which the scenario does
+  not control.
+- **(c), second half.** Every replica sent something other than its re-seed stream
+  **after its own install completed**. Keyed on the *mark* instead, this set is a
+  constant — an empty replica answers AppendEntries with rejections whether or not its
+  re-seed ever happened — and a test here shows it: on a run with one of four ranges
+  installed, the mark-keyed set is all four and the install-keyed set is the one.
+- **(d)** the replica whose mark drew the crash restates **as refused** after it, every
+  other replica restates refused or quarantined and never neither, and that replica's
+  install lands after the restart. This is what D-067 asked the trace for.
+- **(e)** the refused directory's marker still says lost and not one byte of it changed
+  between the arm's crash and the end of the run.
+
+*What (e) does not cover, and why.* The baseline is read with the node down at the arm's
+crash, not at `RaftRefused`. An audit reads a file at a time and each read pays the
+simulated disk, so an audit *at the refusal* advances the run by tens of milliseconds —
+inside which the re-seed opens its remaining stores and syncs them. That is not free:
+D-067 requires the arm's crash to land on the mark's own trace event, before anything
+else syncs the new engine's log, and measured both ways `ReseedMarkNotSynced`'s catch is
+48 % with the crash on the mark and **1 %** with an audit in front of it. The crash timing
+wins, and the window (e) leaves uncovered is the few milliseconds between the refusal and
+the crash, in which the node is opening the *new* directory and the refused engine is
+already marked and quiesced (D-044 does both before `RaftRefused` is traced).
+
+**Decided — `RaftRecovered` says how a replica restated.** D-067 asks for it by name. The
+three are `RecoveredAs::{Refused, Quarantined, Neither}`, computed from the disk — the
+quarantine flag the store carries and whether a snapshot record sits under it — not from
+what the re-seed believes it wrote. On the node they are one flag and two moments: Q15's
+mark *is* D-035's quarantine flag with a fresh incarnation (D-077), so a marked replica
+no install has filled is `Refused`, and a marked replica holding a snapshot is
+`Quarantined`. The one-group server traces `Quarantined` or `Neither` and never
+`Refused`: it adopts its staged store at its start, so it never waits in that state. No
+pinned trace hash moves — the only pinned hash in the tree is `echo`'s, which carries no
+Raft event — and no schedule moves, because a field on a record draws nothing.
+
+**Decided — D-067's variant.** `RaftStore::mark_reseeded` takes the batch's durability as
+a parameter, and `false` is the node's `ReseedMarkNotSynced` path and nothing else: the
+parameter rather than a second method because the only difference between the correct
+mark and the variant's *is* that flag.
+
+**Measured before asserted** (D-039, D-061), at a hundred seeds in release on this tree:
+
+| variant | caught | asserted from | why the *catch* needs more than one range |
+| --- | --- | --- | --- |
+| `ReseedMarkNotSynced` (D-067) | 48 % | every tier | the crash lands on *one* replica's mark and the evidence is what the other three restate beside it; with one range there is nothing to compare against |
+| `RecordNeverQueued` | 77 % | every tier | the core that stops compacting is a *follower* of one range that later leads it; with one range on the node the same core never changes rôle mid-run |
+| `ServeBeforeRefusedMark` (D-077) | 100 %, by (c) | every tier | no — one range would serve early too |
+| `RestartAppliesFromZero` | unit pair | every tier | no — it is a restart over a compacted replica, which one range reaches as well |
+
+Two variants run on a fixed share of twenty seeds; at 48 % and 77 % a share of twenty
+misses with probability 4e-7 and 5e-13. **The standing demand — a mutation a single-range
+world could not catch — is met by two of these four and is not claimed of the others.**
+D-077's own six keep their own account in that entry.
+
+**Proposed, not taken — this binary's tiers.** The correct system's sweep costs 0.40 CPU
+seconds a seed in release (200 seeds: 76.76 user + 4.07 sys) and peaks at 1.13 GiB
+resident for the parallel sweep, which is the figure that actually constrains it. At the
+nightly's ten thousand that is some 4 000 CPU seconds, about three times what a whole
+nightly shard carries (D-064). The binary therefore caps its sweeps at two hundred seeds
+and **prints, in every test, the tier it was asked for and the number it ran**, so a
+capped run never reads as a full one. The cap is put to the owner rather than taken:
+SHARD.md §12 excepts `sim/balance.rs` by name for exactly this reason, and D-083 recorded
+`sim/install.rs`'s tiers as owed. The gate's twenty and CI's hundred run in full. The six
+rows in `scripts/nightly-shards.txt` total 109.5 CPU s and are placed longest-first.
+
+**What the shape found.** Three holes, each reachable only with both slices on one tree.
+
+1. **A follower's compaction record went nowhere.** `Output::Snapshot(Record)` reached
+   `Host::snapshot`, which counted it, and `install::job_of` answered `None`: the core set
+   `take_pending` and was never told, so it never asked again, never compacted — the whole
+   of D-065 undone and D-078's bound with it — and, once it took office over a range it
+   had been following, never took a snapshot and so could not stream one. A re-seed toward
+   such a range waited for ever. Fixed here, `RecordNeverQueued` beside it.
+2. **The applied watermark at a node's start.** `Cores::insert` left it at zero, so the
+   first `Apply` after a restart named every index from 1: where the log still held them
+   the state machine did its whole life's work again, and where it had been compacted past
+   them — every replica a snapshot has filled — the node failed that range and stopped.
+   Fixed here, `RestartAppliesFromZero` beside it, paired in `ananke_shard::round` where
+   the situation is one line of state rather than an interleaving to search for. A second
+   restart at the end of the shape, after the installs have landed, reaches the situation
+   on every seed and would make that a sweep catch of 100 %; it is **not** shipped,
+   because it also fails the correct system on one seed in a hundred with an apply naming
+   an index below its replica's compacted prefix — a third moment of this same family,
+   filed as issue #113 with the recipe, and a criterion that fails on the correct system
+   is a model error to fix, not a bound to widen (D-030, D-039).
+3. **A scenario that counted events and never asked whether the node had stopped.**
+   `sim/install.rs::check` counts streams, installs and creations, all of which a stopped
+   node still has in its trace. On the tree where this branch first merged #86 into #107 it
+   traced 1 173 to 1 314 `RaftServerFailed` a seed and passed — the applied index an
+   install made durable reaching neither the store nor the `apply` task, which is the
+   wiring's own D-083 fix and is **not** a fault of #107's tip, where the count is zero.
+   What is a fault of it is that nothing asked: `sim/install.rs` now folds its failures, as
+   `sim/ranges.rs` and this shape do, and fails on a non-empty one.
+
+**What the merge settled the other way.** Two things this slice had built were built
+upstream at `4a94b01` and are kept in the wiring's form, not this one's: the applied index
+an install makes durable reaching the store *and* the `apply` task (D-083 does both, so
+this slice's `ApplyWork::Installed` and its variant are dropped), and the liveness bug
+this slice first diagnosed as slot starvation. That diagnosis was **wrong**: the stranded
+re-seed of seeds 56, 162 and 175 was a stream opened on a checkpoint still being written,
+which `4a94b01` fixes by opening only a complete one. On the merged base the correct system
+passes **200 of 200 seeds**, those three included. A variant this branch carried for the
+starvation reading (`DueOnlyWhenIdle`, a resend starved by a busy queue) is caught on 0 of
+100 seeds here and is dropped with the change it paired: the situation it modelled is not
+reachable once a stream no longer restarts for ever, and a variant a scenario cannot catch
+proves nothing (issue #114 keeps the latent reading with its pre-merge evidence).
+
+**Consequences.** `ananke-raft` gains a durability parameter on `mark_reseeded`.
+`ananke-shard` gains three variants and routes a follower's compaction record to the
+`apply` task; `NodeVariants` is 64 bits wide. `ananke-env` gains `RecoveredAs` and one
+field on `RaftRecovered`. `sim/` gains one scenario and one test binary, and
+`sim/install.rs` gains a failures fold. The premerge is owed: it is the owner's to
+schedule on a quiet machine (D-070).
+
+---
+
 ## PROPOSED D-082 — `sim/raft.rs`'s arms on the node: one set of arms, two clusters
 
 **The number.** SHARD.md's Stage B plan does not number this entry, and the footer on
@@ -12448,6 +12624,517 @@ on its own, and it is put to the owner with the wiring rather than decided here.
 
 ---
 
+## PROPOSED D-083 — The node runs its `snapshot` task: a take of the range's own spans, a stream per (range, follower), and D-066's live install with the range held across its switch
+
+**Context.** SHARD.md §12's Stage B lists "installs on the node" (§11, storage 5) and no
+branch has built it. `ananke_shard::snapshot` is the discipline — keys, caps, frames,
+switches — merged as PR #83 under PROPOSED D-075, and `ananke_shard::server::run` never
+ran it; PR #86 states the same thing from the other side, that what a re-seeded replica
+waits for "is the node's snapshot *wiring*, which this slice does not build". D-082
+designed that wiring in full and, for a reason about review rather than scope, left it
+to the branch after it. This is that branch. Four Phase 2 variants, the directed re-seed
+shape and the quorum sweep on the node are all behind it.
+
+D-082's design is followed where it holds. Four places it is departed from are set out
+below, each with what was found and what was done instead; one of them is a hole in the
+design rather than a preference, and one is an issue filed against it after it was
+written (#103).
+
+### What is built
+
+`crates/ananke-shard/src/install.rs`, the fourth task, beside `net`, `answers` and
+`apply`, on a fourth handle of the one socket — not a second bind, which would give it
+a different address and make it a different peer. It owns the node's `Snapshots` (D-075)
+as its planner and keeps the I/O the planner deliberately has none of.
+
+1. **`Host::snapshot` is a push**, onto a `Queue<SnapJob>` the host owns beside `jobs`
+   and `answers`, closed after `Node::raft` returns as those are. `server.rs:566-571`,
+   where a core asking for a snapshot action bumped `Gaps::snapshot_actions` and nothing
+   else happened, is that push now. The counter is kept: a scenario that asserts the
+   path's absence keeps its figure, and it is no longer the *only* thing that happens.
+2. **A take is the `apply` task's**, between two applies, as RAFT.md §1 has it and D-036
+   requires for exact metadata. `ApplyWork::Take` was already routed there and dropped;
+   the arm is filled and `Record` (D-078's follower compaction) added beside it.
+   `ServerApplier` now carries per range what the one-group `apply` task carries for its
+   one group — the applied index, the applied **term**, and the configuration at that
+   index, followed entry by entry — because a record whose term or configuration is off
+   by one apply is a record D-029's revert floor reads wrong.
+3. **A stream out** is a `raft::snapshot::Sender` per (range, follower), opened on the
+   version directory that range's *own* snapshot record names and pinned to it for the
+   stream's life (D-043), with `Snapshots::route` cutting each chunk into a frame of its
+   own for `sock.send` (Q41). There is no per-node cap on streams sent, so a leader
+   feeds every designated follower of a range at once.
+4. **A stream in** is an assembly per (range, sender) staging under
+   `Snapshots::staging(range, from)`, with `Snapshots::on_chunk` deciding between
+   staging, restarting, waiting under the node's receive cap, and completing. The
+   file-level bookkeeping an acknowledgement needs — which file, which offset — is the
+   task's, since no chunk carries it and the planner counts bytes rather than files.
+5. **A completed stream is D-066's live install**: `Engine::open_span_source` on the
+   staged directory, then `Engine::install_spans(spans, source, repair)` — the range's
+   two key intervals and the receiver's repair in **one** manifest switch, the engine
+   left open, the node's other ranges untouched. The staged directory is a checkpoint,
+   so the engine's own checks are what say it is whole: one left short by a crash fails
+   at `open_span_source` and the stream restarts, which is the property
+   `Fault::CrashInstalling` aims at.
+6. **The answers go back through the node's `Queue<Local>`**, which `Node::raft` already
+   races, turning into `Input::SnapshotTaken`, `SnapshotInstalled`, `SnapshotFailed` and
+   `SnapshotAcked`. `Local` grows one variant carrying a `SnapAnswer`, and every one of
+   them names its range.
+7. **The `net` task diverts `InstallSnapshot` and `InstallSnapshotResponse`** to the
+   snapshot queue *before* `Inbox::admit`. **This closes issue #96**, and the entry says
+   so because the hole stops being latent the moment this lands: the inbox deliberately
+   admits a chunk by dropping heartbeats to make room (`Inbox::carries_data`), and
+   `Raft::on_message`'s arm for it is empty, because "the server routes these to it
+   before the core sees them" — which the one-group server's `net` loop does and the
+   node's did not. A chunk that reached the node would have cost a heartbeat its place
+   under the byte bound and then vanished. Nothing reached the node before this wiring,
+   so nothing was lost; this wiring is what makes chunks arrive, and the divert is what
+   catches them. It also moves where those bytes are counted — a chunk is charged to the
+   snapshot task's receive cap (D-075) and not to the inbox's bound, which is what the
+   inbox's drops are measured against. `NodeVariant::ChunksToTheInbox` keeps the hole
+   beside the fix, and it is caught on every seed of the directed scenario.
+
+### Where this departs from D-082, and why
+
+**1. The stream carries no log key, and the repair therefore tombstones none.**
+
+D-082's item 6 has the repair carry "tombstones for the log keys the tail does not
+replace", which is what `Assembler::finish` does on the one-group path: it walks the
+staged tables, collects every log index they hold, and tombstones the ones the receiver's
+kept tail does not overwrite. Built here, the take checkpoints the range's Raft state
+**except its log purpose**, and its user keys. The install's spans are still the range's
+two whole intervals, so the switch removes the receiver's own log along with everything
+else in them, and the repair's kept tail is all that goes back.
+
+The end state is the same and the reasons to prefer it are three. It is fewer bytes on
+the wire — a leader's whole log, streamed and then deleted. It removes a standing
+obligation on the receiver to enumerate what the sender sent, which is a second place
+for the two ends to disagree. And the enumeration is not reachable from this crate
+anyway without widening `ananke-raft`'s surface: `SpanSource` exposes no key walk, and
+every SST and key helper the one-group walk uses is `pub(crate)` there, which is Q40's
+line and not an accident. The cost is that the two install paths no longer build their
+repair from the same set of log keys; what keeps them from drifting is that they build
+it from the same *function* — see below.
+
+**2. One builder for the repair's writes, in `ananke-raft`.**
+
+D-082 did not say where the repair is built. It could not be built in `ananke-shard` at
+all: every key constructor (`hard_key`, `applied_key`, `log_key`, `config_key`,
+`snapshot_key`, `quarantine_key`, `incarnation_key`) and every encoder
+(`encode_hard`, `encode_applied`, `encode_snapshot_record`, `encode_config`,
+`encode_incarnation`, `encode_entry`) is `pub(crate)` in `ananke-raft`, which owns what a
+Raft key is. Rather than widen that, `ananke_raft::snapshot::repair_writes` is added:
+`pub`, returning a `WriteBatch` in key order, with `replaced_log` as a parameter so a
+caller whose source carries no log keys passes an empty set and gets no tombstones —
+which is not the same thing as forgetting them. `Assembler::finish` was rewritten to use
+it and is behaviour-preserving; the one-group tests pass unchanged. There is now one
+statement of what a repair *is*, used by two switches of very different shapes.
+
+**3. `ananke_raft::snapshot::staged_record`: the configuration, out of the streamed bytes.**
+
+Neither D-082 nor D-075 says where the receiver gets the configuration in force at the
+snapshot's last index. It needs it twice — the repair writes it into the snapshot record,
+and `Raft::restore_compacted` takes it as the floor a revert cannot go below (D-029) —
+and no message carries it. It cannot use the configuration *it* believes is in force: a
+replica being fed a snapshot is behind by definition, and a membership change inside the
+compacted prefix is exactly what it has not seen. The one-group path reads it while it
+verifies the staged store; a live install verifies nothing of its own, because the engine
+does that at `open_span_source`. So a reader is added beside the repair builder, in the
+crate that owns the layout: one key, read from the staged directory's own tables, nothing
+written.
+
+**4. The design's hole: a live install needs the range *held*, and its replica *replaced*.**
+
+D-082's item 7 ends "Nothing about the round changes". That is not true of the receive
+side, and the gap is not small.
+
+A server ends its whole run-loop incarnation across an install and comes back on the
+store the switch built: that is how its core learns it installed, and how nothing steps
+that core across the switch. A node cannot do either, because reopening the engine "would
+restart every range on it" (SHARD.md §11, storage 5) — which is the whole reason the
+install is live. So two things had to be built that D-082's four `Local` variants do not
+describe:
+
+- **The hold.** Between the install's decision and its manifest switch, the range's core
+  must step nothing. The replica being replaced is behind its leader by definition, so a
+  step of it in that window appends entries at indices the switch is about to compact
+  past, and the store comes back with a log below its own snapshot record. The node
+  already has exactly this primitive — a core whose persist is outstanding queues its
+  messages and its node-local inputs — so the install reuses it: `Slot::installing`
+  beside `Slot::persisting`, and the same queue. The hold is **one range's**; every other
+  range on the node goes on stepping, which is the cost a live install exists to avoid.
+  A hold asked for while that range's persist is outstanding waits behind it like any
+  other local input, so the install never switches under a write still in flight.
+- **The replacement.** When the switch is durable the range's core is rebuilt on the
+  state the repair wrote — term, vote, snapshot index and term, the configuration in
+  force at it, the kept tail, the quarantine — and takes the place of the one it
+  replaced, with the work held meanwhile stepped into it in the order it arrived.
+
+Both are asked for through one new `Host` method, `local_core`, answering a `CoreWork` of
+`Step`, `Hold`, `Restore` or `Release`. It is deliberately not an `Input`: neither of
+these is a step of a core, and expressing them as steps would put an install's
+bookkeeping inside a Raft core that knows nothing about a node's engine. `Step` is the
+default, so a host with no install path answers it for every input and nothing about the
+round changes for it — which is the sentence D-082 wanted, true of every host but this
+one.
+
+**And an ordering the hold depends on.** `Host::local_core` is not a pure question: the
+install's repair is built in its `Ready` arm, from the held core, and handed to the
+`snapshot` task there. So the node has to know whether an input is *held* before it asks
+what the input wants — asked the other way round, a `Ready` that arrived while its own
+range's persist was still outstanding would build a repair and let the switch carrying it
+proceed, against a write in flight, which is the one thing the hold exists to prevent.
+The check therefore comes first, and `Host::local_releases` — pure, and default
+`false` — is what lets the two answers that *end* a hold through it rather than queueing
+them behind the hold they end.
+
+**A bug this found, and it is the reason the hold and the replacement are not enough on
+their own.** The first run of the directed scenario stopped a node with
+
+```
+range RangeId(5): an apply through 81 names index 1, which the core does not hold
+```
+
+`Cores` keeps the highest index handed to the `apply` task per range, beside the cores,
+because the entries an `Apply` names are read at the step that named them. A switch that
+replaced the replica and left that watermark where the *replaced* core stood had the next
+`Apply` name an index below the installed snapshot, the node failed that range, and
+`Node::raft` returned — so the node stopped, and the installs that had not happened yet
+never did. Five of eight installs completed, and the three that did not looked like a
+timing problem. The watermark moves with the replica now. It is recorded here because
+nothing about the hold or the replacement suggests it, and only a scenario that installs
+on several ranges of one node reaches it: with one range, the node stops after its only
+install and the run has nothing left to get wrong.
+
+### Issue #103: which core a stream's answer is stepped into
+
+Filed against this design while it was being built. `Input::SnapshotAcked { to }` names
+the follower and not the range — complete information for a server with one core,
+incomplete for a node with four. A wiring that took the follower's identity as the
+address would set `stream_acked` on every range's progress for that follower, and D-049's
+rule (core.rs:1607-1613) — a *refused* follower counts for check quorum only while its
+re-seed stream progresses — would hold on one range and be void on the other three, with
+no event, no counter and every check green.
+
+**Decided: the address is the range, and it travels on the `Local`, not in the `Input`.**
+Every node-local input already carries its range and is routed by `Host::local_range` to
+exactly one core (D-073, D-076); the snapshot answers carry theirs the same way. The
+range was *not* added to `Input::SnapshotAcked`, and the reason is that it would be the
+weaker fix, not the cheaper one: all four snapshot inputs have this shape, the field
+would be read by nothing — a core knows its own range — and one of the four carrying it
+would make the other three look addressed when they are not. What the wiring gains
+instead is a variant and a check: `NodeVariant::SnapshotAckToEveryCore` fans the answer
+to every core on the node, and `acked_for` is the decision it mutates, asserted
+deterministically. The check also asserts the thing the issue is really about — that with
+one range on the node the fan-out and the correct route are the same route, so no
+single-range scenario could catch it even in principle.
+
+### The directed evidence: a stream flows and an install completes
+
+`sim/install.rs` and `sim/tests/install.rs`. Five voters and four ranges; three nodes
+start, **two start late**, after the running three have written past `snapshot_threshold`
+and their leaders have compacted. The two are then behind every range's compacted prefix,
+so each range's leader streams to both at once: four ranges times two followers.
+
+Two late nodes rather than one is deliberate. With a single follower behind the prefix, a
+leader that fed its followers one at a time would be indistinguishable from one that fed
+them all at once, and `CapStreamsSent` — D-043's rule, one of the seven D-075 says a
+single-stream world cannot catch — would have no situation here at all.
+
+The writer round-robins over the *ranges* rather than drawing a key at random. With a
+random draw, some seeds left a range short of its threshold, that range's late replica
+caught up by AppendEntries and needed no install, and the check reported correct
+behaviour as a missing install. Every range crosses its threshold by construction now.
+
+On seed 1, and on every seed the binary runs:
+
+| What | Figure |
+| --- | --- |
+| streams opened, as (leader, range, follower) | 8 of 8 owed |
+| installs completed on the node, as (server, range) | 8 of 8 owed |
+| replicas created by their install (`RangeCreated { cause: snapshot }`) | 8 of 8 owed |
+| the most streams one leader had running at once | 6 |
+
+`Report::reached` fails any seed that does not reach the situation — no take at all, or
+fewer than four ranges taking — before any of the rest is asserted, because a scenario
+built to exercise a path is worth nothing if a seed quietly fails to reach it. That is
+the same rule `sim/tests/node.rs` keeps from the other side, and it is why the two do not
+contradict each other: that binary holds `snapshot_threshold` at `1 << 30` and asserts
+the path is *not* reached; this one is built to reach it and fails if it does not.
+
+**`RangeCreated { cause: snapshot }` on this node.** §8 defines the cause as an install
+onto a node that held no initialised replica of the range. It is traced when the replica
+the install replaces held nothing — no applied index, no log, no snapshot — so the
+install is what gave that range state. A node restarted on a store it kept does not reach
+it; a replica that bootstrapped empty and was filled by a stream does, which is this
+scenario, and Q15's re-seed into a fresh engine is the case the cause exists for.
+
+### The mutation table: what a single-range world could not catch
+
+The owner's standing demand on this stage. Seven mutations, each built beside the correct
+code and each seen to fail a check the correct code passes. **Four of the seven are the
+correct wiring exactly on a node of one range or one follower**, and are marked.
+
+| Variant | The mutation | Caught by | Needs more than one range or follower |
+| --- | --- | --- | --- |
+| `TakeCheckpointsTheWholeNode` | the take checkpoints the whole engine directory, as the one-group take does, instead of the range's own key intervals | `a_stream_flows_…`, 3/3 seeds: 8 of 8 installs refused at the switch | **yes** — see the correction below |
+| `InstallHoldsEveryRange` | the hold is taken on every range the node hosts, which is the node reaching for the incarnation a server ends | `a_live_install_holds_its_range_alone_…`: another range's work waits on this one's switch, and `ranges_held_for_install` is 2 rather than 1 | **yes** — with one range, holding "every" range is holding this range |
+| `InstallSweepsEveryStaging` | a completed install clears every staging directory, destroying a neighbour's half-assembled stream without telling its sender | `a_completed_install_clears_its_own_assemblys_directory_alone` | **yes** — with one range and one sender there is only ever one directory to clear |
+| `SnapshotAckToEveryCore` | the follower's identity taken as the address, so one range's chunks answer every range's core (issue #103) | `a_streams_acknowledgement_answers_its_own_ranges_core_alone` | **yes** — with one core the fan-out is the correct route |
+| `StepWhileInstalling` | the range is stepped inside its own install's window, so the replica being replaced appends at indices the switch is about to compact past | `a_live_install_holds_its_range_alone_…` | no |
+| `InstallKeepsTheOldCore` | the switch is made and the replica is not replaced: the store holds the snapshot and the core goes on from the log it had | `a_live_install_holds_its_range_alone_…`: the node runs at the old core's term | no |
+| `ChunksToTheInbox` | `InstallSnapshot` admitted to the byte-bounded inbox instead of diverted, which is issue #96 as it stood | `a_stream_flows_…`, 3/3 seeds: 8 of 8 installs never complete | no |
+
+`CapStreamsSent` is D-075's variant rather than this slice's, and it is listed because
+this scenario is the first thing in the tree to reach its situation: it is caught on 3/3
+seeds, and it needs more than one follower behind the prefix. Two more of D-075's —
+`VersionDirWithoutRange` and `SweepAcrossRanges` — are not asserted here. **The reason
+first given for that was wrong and is corrected below.** `InstallWithoutRepair` is left
+out for a nearer reason: the install still *completes* under it — the switch is made,
+the event is traced — and what it breaks is state machine safety after a crash, which
+this scenario has no crash arm to reach. That crash arm is not distant work:
+SHARD.md:1792-1805 makes the crash test of this live install **Phase 3's entry criterion
+(Q2)** — "written and green before any split code" — so it is due before Stage C, and
+this entry records it as due rather than deferred.
+
+
+### What the adversarial review of #107 changed
+
+The review verified a great deal and then broke the central claim in two places. Every
+change below is the smallest one that makes the code do what this entry already said,
+and each is proved by a mutation that undoes it being caught.
+
+**1. The evidence did not survive its own seed count, and the cause was a product bug.**
+
+`sim/tests/install.rs` ran eight seeds and said "every seed". At 250, four failed —
+101, 140, 206, 241 — with one or two installs never landing. Tripling the run's window
+changed nothing, and `takes = 4`, `streams = 8` on all four, so the situation was
+genuinely reached and the stream simply never landed. Measured across six seeds, passing
+and failing alike: a stream re-opened up to **21 times**, 118–159 stream opens against 8
+owed, and — the figure that settles it — **not one resumption from a non-zero offset on
+any seed**. No stream ever kept a byte of progress.
+
+The cause is a bug in this wiring, and it is not subtle once seen. A range's snapshot
+record is written **before** the checkpoint under it (RAFT.md §1, D-036), so a record
+that names a version is not a promise the version exists yet. `Task::open` read the
+record and opened `record.dir` without asking whether the checkpoint was complete.
+`Sender::open` lists the directory **once** and keeps that list for the stream's life,
+so a stream opened on a half-written checkpoint streams the one table that was there,
+reports `done`, and hands the receiver a staging directory with no `CURRENT` — which
+`Engine::open_span_source` refuses, for ever, because the stream's identity never
+changes and the sender is never re-opened. The instrumented failure was exactly that:
+`staged directory has no CURRENT`, `dir = ["000001.sst"]`, 652 times on one range.
+
+*The fix is conformance, not a new decision.* D-043 already says a stream opens the
+newest **complete** version, "complete meaning the checkpoint's own `CURRENT` is there,
+since the record precedes the checkpoint (D-036) and may name a take still in flight",
+and `snapshot::checkpoint_complete` is the existing predicate. `Task::open` now calls it
+and answers `SnapshotFailed { retake: true }` when the version is not whole — which also
+recovers a crash between the record and the checkpoint, where a silent wait would strand
+the follower.
+
+*And one thing this slice had skipped and should not have.* `checkpoint_complete`
+requires the checkpoint's own format record as well as its `CURRENT` (D-060): a
+checkpoint without one is incomplete, so no stream carries a store whose version nothing
+says. The node's take wrote no such record, so with the completeness check in place *no
+stream opened at all*. The take writes it now, as `take_numbered` does.
+
+**2. Nothing checked what an install actually installed.**
+
+`Report::check` counted events and never read a key, a value, an applied index or a
+span. The review wrote two mutations in `checkpoint_spans` that produce this entry's
+exact headline figures — 8 streams, 8 installs, 8 created, 6 at once — and passed:
+`TakeSkipsTheUserKeys`, which drops D-066's user-key interval so the switch removes the
+receiver's user keys and puts nothing back, and `TakeStreamsTheLogToo`, which carries the
+whole Raft interval so the leader's log lands in the receiver's store with nothing to
+tombstone it, the two halves of this entry's first departure disagreeing. The first is
+total, silent state-machine loss on every installed range.
+
+Both are caught now, by reading the state back rather than counting the events:
+`TraceEvent::RaftSnapshotState` is emitted at the two points where a range's state is
+claimed to be a snapshot's — the take that writes one and the live install that lands
+one — carrying the applied index, the range's user-key count and an order-free digest of
+those keys and values, and its log-key count. The check pairs them by
+`(range, last_index, last_term)` and requires the bytes that landed to be the bytes that
+were taken. `TakeSkipsTheUserKeys` is caught 3/3 ("holds 0 user keys where the take held
+1"); `TakeStreamsTheLogToo` 2/3 ("holds 13 log keys after installing at 84, more than the
+2 its kept tail can account for").
+
+Writing that check immediately found two more bugs of the same family, both fixed:
+`RaftStore`'s cached applied index is an atomic written only by `apply`, so after a live
+install — which writes the applied key inside its own manifest switch — it still read the
+*replaced* replica's value (an install at 48 reported `applied 0`); and the `apply`
+task's per-range index, term and configuration were stale the same way, which would have
+had the next take of that range write a record with the old replica's term and
+configuration in it. `RaftStore::installed_at` moves the first, and the `apply` task's
+state is now shared with the `snapshot` task and moved with the replica.
+
+**3. The start-over was invisible, and now is not.**
+
+A run that told senders to start over 669 times and one that told them none produced the
+same trace, which is how a livelock sat under a green check. `TraceEvent::RaftSnapshotStartOver`
+carries the receiver, the range, the sender and — the part that matters — **why**:
+`StartOver::Identity`, `Cap`, `Unusable` or `NotHosted`. It is what diagnosed (1) in a
+single run, and it is a §8 gap closed on its own account, independent of the ruling asked
+for below.
+
+`NotHosted` is this merge's addition, not the original slice's. D-075 gained
+`Landing::NotHosted` on `main` while this branch was open (its open choice 9), and this
+wiring is the first caller that has to answer one. It is a reason of its own rather than a
+second use of `Cap` because the two say opposite things about the node — one range the
+node does not host, against every hosted range starved of slots — and this section exists
+because a start-over that could not say which it was hid a livelock.
+
+**4. A gap the fixes exposed, and the question the owner is asked.**
+
+RAFT.md:210-212 specifies that a receiver's ask to start over restarts the stream "twice,
+and at the third such ask the leader counts the checkpoint as unusable", and the
+one-group server honours it (`STREAM_RESTARTS = 2`, `crates/ananke-raft/src/node.rs:1674`).
+This wiring's `Outbound` (`install.rs:223-231`) has **no `restarts` field**, and
+`install.rs:661-665` resets `resends = 0` on every restart, so the restart bound is absent
+*and* `CHUNK_RESENDS` is unreachable for a stream that keeps restarting. That is what
+turned the bug in (1) from a transient into an unbounded loop.
+
+**The honest statement of the state, after (1) was fixed:** the measured start-over count
+on the previously failing seeds is now **zero**, and 250 of 250 pass. So the missing bound
+is not the active cause of anything observed today; it is the defence that was not there
+when something did go wrong, and would not be there for the next cause.
+
+It is *not* fixed here, because the node cannot adopt the one-group's bound unchanged. The
+node answers `start_over` for two conditions that mean different things and the message
+cannot tell them apart: `install.rs:558-563` for a cap-wait — "I am assembling as many
+streams as my cap allows and you are not one of them", which D-075 decided deliberately —
+and `:566` for a changed identity. A single bound counts a stream merely *waiting for a
+slot* as an unusable checkpoint after two asks, which is precisely the path §12's re-seed
+shape drives into by setting the cap below the node's range count. The one-group server
+has no cap, so `Restart` there has one meaning and one bound is right.
+
+The options, with their costs:
+
+- **(i) A distinct `SnapshotStatus` for a cap-wait.** Keeps D-075's "refused with a
+  restart, nothing evicted" exactly, and lets the restart bound apply only where
+  RAFT.md means it to. Costs a message-format variant and a decode arm.
+- **(ii) Do not answer at all while waiting**, and let `CHUNK_RESENDS` bound it. No
+  format change; costs the sender a round trip per cap-wait and keeps the cap invisible
+  to it.
+- **(iii) Keep one status and count cap-waits against a second, larger bound.** No format
+  change; keeps the conflation and adds a magic number to paper over it.
+
+**Recommended by the reviewer — recorded as a recommendation, not as settled: (i).** The
+two conditions mean different things to the sender, so any single bound is wrong for one
+of them. The owner's ruling is asked for before this is built.
+
+**5. Corrections to this entry's own reasons.** Three of them, each a reason that was
+wrong rather than a conclusion that was.
+
+- *`TakeCheckpointsTheWholeNode` needing more than one range* was justified by "with one
+  range the whole engine *is* that range's spans". **False by construction:**
+  `checkpoint_spans` deliberately excludes `PURPOSE_LOG` — that is this entry's first
+  departure, argued at length — while a whole-engine checkpoint includes it, so the two
+  takes differ by the entire log even on a node of one range. The true claim is about
+  what the *check* can see: on one range the difference is log keys alone, which
+  `TakeStreamsTheLogToo`'s check reads and this variant's does not, so the two variants
+  would be indistinguishable from one another rather than from correct code. It stays in
+  the multi-range column on that narrower ground.
+- *`VersionDirWithoutRange` and `SweepAcrossRanges` "have situations this scenario does
+  not produce"* — wrong. Measured take indices on seed 101 are `[12, 24, 26, 27, 39, …]`
+  for range 2 and `[12, 24, 25, 26, 27, …]` for range 3: two ranges taking at one index
+  happens routinely here. The true reason is that the *check* cannot see it — nothing
+  reads a version directory's name — and they keep D-075's deterministic checks, which
+  build the situation on purpose.
+- *Two of the five things `sim/install.rs` said it asserted were never written.* Nothing
+  in `Report` read an applied index, so "the install of one range changed no other
+  range's applied index" was unimplemented; and `streams_at_once` counts streams on the
+  *sender*, so "the four ranges' installs interleaved" was unimplemented too — the second
+  being the bullet that claimed SHARD.md §11 storage 5, the item this slice exists to
+  satisfy. The applied index is now read and checked; the interleaving claim is **deleted
+  from the file and stated here instead**: it rests on `InstallHoldsEveryRange`'s
+  deterministic check in `ananke_shard::node`, where the hold's scope is asserted
+  directly, and on nothing measurable in the scenario.
+
+**6. The ordering argued for in this entry had no check.** This entry argues at length
+that `local_core` must be consulted after the held check because it builds the repair as
+a side effect. Reverting exactly that ordering left the scenario green with byte-identical
+figures, while instrumentation showed a stream's `Ready` arriving for a range whose
+persist was outstanding **six times across eight seeds** — the path exercised and
+unguarded. `NodeVariant::AsksTheHostBeforeTheHold` and
+`the_host_is_asked_what_an_input_wants_only_after_the_hold_is_checked` are the pair. The
+other bug this entry reported finding, the applied watermark, was already guarded:
+deleting `round.rs`'s watermark line fails 2 of 3 seeds.
+
+**7. A window the node has and a server does not.** The one-group server quiesces its
+`apply` task before it decides an install (`install_decision`), so no apply lands between
+the decision and the switch. The node's hold stops the range's *core*, not the `apply`
+task, so a job queued before the hold can still land and take the store past the
+snapshot. The chunk path's existing rule — "the store already holds everything the
+snapshot carries: answer installed without switching" — is applied at the switch too,
+where the window actually is. Switching anyway would take the store backwards.
+
+**The re-measurement, and which change moved it.** At 250 seeds in release, on the tree
+these fixes land with: **250 of 250 green**. And separately, with this scenario's writer
+left running — the 1(a) tweak reverted, so streams race retakes exactly as they did when
+the review found the four failures — **also 250 of 250 green**. So the product fix in (1)
+is what moved it, and the scenario's determinism is a separate improvement that cuts the
+binary from 33 s to 8 s and stops the scenario being the only thing between a livelock and
+a green run. The committed `SEEDS` is 32, which is the gate's budget; 250 is what the
+claim was measured at.
+
+### What is unblocked, and what is not taken
+
+Now reachable on the node, and not before: a snapshot stream, an install that completes,
+and every counter and event a scenario needs to assert their situations — `RaftSnapshot`
+with `taken` true for a take and false for an install, `RaftSnapshotStreams` per (range,
+follower), `RaftSnapshotResumed`, and `RangeCreated { cause: snapshot }`. The quorum
+sweep's runs recorded 0 `RaftSnapshotStreams` and 0 installs on the node; both are
+non-zero now.
+
+**`RaftReseeded` was emitted by the node for no replica at all**, which is a gap this
+slice found beside its own and closes: the one-group server states it at every
+restatement of a quarantined replica (node.rs:975-980), and the node's restatement did
+not, so the event would have been *missing* for the slice that refuses a node's store
+rather than merely zero. It is emitted now in both places the node states a replica —
+its start, and the restoration a live install builds, which keeps the quarantine across
+the install (D-035). It stays at zero until a store is refused, because nothing on this
+node is quarantined yet and Q15's refusal is PR #86's; what has changed is that the
+zero is now an observation rather than a silence.
+
+Not taken here, and each owed to the slice that owns it:
+
+- **The four Phase 2 variants on the node** — `SnapshotWithoutCurrentLast`,
+  `IgnoreIncarnation`, `SharedSnapshotDir` and the pair
+  `{IgnoreIncarnation, SharedSnapshotDir}` — are the sweeps slice's to re-assert, and
+  are not re-asserted here.
+- **The directed re-seed shape** (D-067's `ReseedMarkNotSynced`, and exit points (a), (b)
+  and (d) PR #86 records as owed) is buildable now and is a later slice's.
+- **This scenario under the four tiers**, with the weight D-064's shard table wants. It
+  runs a fixed eight seeds at every tier today, and deliberately does not read
+  `ANANKE_SEEDS`: its situation is reached by construction on every seed rather than
+  searched for, so at the nightly's tier it would be ten thousand runs of five nodes for
+  twenty simulated seconds — about a whole shard's CPU — bought against a catch that does
+  not vary. Tiering it is owed, and the figure has to be measured on a quiet machine:
+  taken on this laptop, with several Stage B slices building on it, it would be exactly
+  the incomparable kind D-070 exists to stop.
+- **Issue #72** is now live rather than latent: from the first live install on a node's
+  engine, a read served from a pinned version can straddle the switch on its own span,
+  since a read below the install's number sees the replaced span as empty (D-069, D-054).
+  D-082 put it to the owner with the wiring; this entry does not settle it either, and
+  records that the wiring is what makes it reachable.
+- **`AdoptionAsBuilt`'s first rule** — copy and switch before delete — has its path now,
+  `Engine::install_spans`, and D-082 already carries the owner's ruling on how the
+  variant is re-asserted. Doing it is the slice that owns the crash arm.
+
+### Consequences
+
+`ananke_shard::snapshot` is no longer a module the node does not run. `ananke-raft` gains
+two public functions and keeps its layout private. The one-group server is unchanged in
+behaviour: `Assembler::finish` builds its repair from the shared builder and its tests
+pass as they stood. `sim/` gains one scenario and one test binary, and the three
+scenarios that ran before this are unchanged but for `ServerConfig::snapshot_cap`, which
+every one of them sets at its range count as D-075 recommends for a scenario that is not
+about the cap.
+
+---
+
 ## PROPOSED D-084 — `sim/membership.rs` on the node: the same scenario, four ranges, and the half of #46 the node cannot reach
 
 **The number.** This branch stacks on `phase-3-stage-b-sweeps`, whose entry is
@@ -13032,7 +13719,6 @@ the other.
   the same absences with the same words.
 
 ---
-
 
 ## PROPOSED D-085 — A sharded `sim/quorum.rs`: one fault and four answers on the node, and why D-049's own pair still has no site there
 
@@ -13892,4 +14578,270 @@ and it is the whole of the risk the owner's chosen shape carried on this cluster
 
 ---
 
-_Next entry: D-088. Add one before implementing anything not covered above._
+## PROPOSED D-088 — `LeaseTrustsTheClock`'s catch on the node moves to the nightly's ten thousand
+
+**The number.** Four branches are open against their own copies of this file, each taking
+the next number it can see: PR #110 writes D-081, PR #107 D-083, PR #106 D-084 and PR #109
+D-086, while the footer on `main` reads D-086. A number taken from the footer here would
+collide with #109. This entry takes **D-088**, past all four, as the owner's ruling of
+2026-09-23 numbers it, and the footer moves to D-089. Its one code site carries
+`// PROPOSED(D-088)`. The integrator may renumber it at the merge; nothing in the tree
+depends on the number beyond that marker, this heading and the footer.
+
+**Context.** D-082 moved `sim/raft.rs`'s arms onto the node and re-asserted Phase 2's
+variants there, each "at the tier its **measured** rate supports and no stronger than its
+Phase 2 test asserts" (§10, §12, D-061). For `LeaseTrustsTheClock` it copied the tier
+across from the one-group test — `seeds() >= 1000` — and then measured what the node does
+at that tier, which nobody had:
+
+> **`LeaseTrustsTheClock`'s tier is a question for the owner, with a number.** … It is
+> **9 of 1 000, 0.9 %**, against one group's 4.0 %. … So the assertion as it stands is
+> roughly a hundred thousand times likelier to fail a tree with nothing wrong than the
+> one-group assertion it was copied from.
+>
+> *The recommendation, not a decision taken here:* move this one assertion to the
+> nightly's ten thousand, as `SharedSnapshotDir`'s liveness catch already is (§10), and
+> keep printing the rate at every tier. The tier is the owner's to set and this slice has
+> not moved it.
+
+**Decision — the owner's of 2026-09-23.** Move it: *"LeaseTrustsTheClock: move the
+assertion to the nightly, per D-061's rule at 0.9%."* This entry is that move and nothing
+else. One line of `sim/tests/node.rs` changes, `if seeds >= 1000` to `if seeds >= 10_000`,
+with the arithmetic in the code beside it. The rate keeps printing at **every** tier, which
+is D-061's other half. The one-group assertion in `sim/tests/raft.rs` is untouched: its rate
+is 4.0 % and the thousand-seed tier is exactly where D-061 puts 4.0 %.
+
+**CLAUDE.md is not edited, because the rule already allows this.** Its working agreement
+reads "a variant caught on under 5 % of seeds asserts its catch at the premerge tier,
+`seeds() >= 1000` … never at the gate's twenty or CI's hundred" — a **floor**, not a
+ceiling, and D-061's own audit already places one catch above it: `SharedSnapshotDir`'s
+liveness catch, 0.02 %, at `seeds() >= 10_000`. A rate of 0.78 % is between the two and this
+entry is the record of where the owner put it.
+
+### The rate, re-measured on the tree that ships
+
+D-082's 0.9 % was measured on D-082's own branch. Since then PR #86's whole-node refusal
+and re-seed (D-077), D-082's own verification pass, PR #101 and PR #104 have landed, and
+all of them are on the node's path — `ananke_shard::server` is the system under test here.
+So the figure was not carried across on trust. It was re-measured on this tree, at both
+tiers, and **it moved**:
+
+| Tier | Seeds | Caught | Rate | First seed | Cost |
+| --- | --- | --- | --- | --- | --- |
+| the premerge's thousand | 1 000 | **6** | **0.60 %** | 186 | 25.32 s real, 163.0 cpu s |
+| the nightly's ten thousand | 10 000 | **78** | **0.78 %** | 186 | 368.25 s real, 1 572.7 cpu s |
+| *D-082's figure, another tree* | 1 000 | 9 | 0.90 % | — | — |
+
+Both catches are the check the variant is about: `linearizability: key "k1": 28 of 72
+operations placed`, a stale read the guardless leader served from a lease its own clock
+had outlived. The first seed is 186 at both tiers, which is what a sweep of the same
+schedules over a longer prefix should give.
+
+**The move from 0.9 % to 0.78 % is a draw, not a regression.** 78 of 10 000 has a 95 %
+interval of **[0.61 %, 0.95 %]**, and 0.9 % sits inside it; 6 of 1 000 has [0.12 %, 1.08 %]
+and contains both. Nothing here says the node caught less than it did, and nothing here
+would have been decided differently at 0.9 %: every tier's arithmetic below is on the same
+side of the line at 0.6 %, 0.78 % and 0.9 % alike. What it does say is that a rate this
+thin is estimated to ±0.17 % even by ten thousand seeds, which is itself a reason the
+assertion belongs at the tier with the most seeds behind it.
+
+### The arithmetic, at both tiers
+
+D-061 reasons with P(none) = (1 − p)^n, p the measured rate and n the seeds the assertion
+sees at the lowest tier it is asserted at. At the node's two measured rates, and at one
+group's for the comparison:
+
+| n | p = 0.78 % (this tree, 10 000 seeds) | p = 0.60 % (this tree, 1 000 seeds) | p = 4.0 % (one group) |
+| --- | --- | --- | --- |
+| 20, the gate | 0.855 | 0.887 | 0.442 |
+| 100, CI | 0.457 | 0.548 | 0.0169 |
+| **1 000, the premerge — the tier it leaves** | **4.0e-4** | **2.4e-3** | 1.9e-18 |
+| **10 000, the nightly — the tier it takes** | **9.8e-35** | 7.3e-27 | 5.2e-178 |
+
+Read the bold row. At the thousand-seed tier this assertion reddens a clean tree about
+**one run in 2 500** at the better-measured rate and **one run in 410** at the thinner one,
+where the one-group assertion whose tier it was copied from stands at one run in 5×10^17.
+At the nightly's ten thousand it is 1e-34, which is the margin the rest of the sweep's
+assertions are written to. The tier moves because the statistics moved, which is the whole
+of D-061's rule, and it lands where `SharedSnapshotDir`'s liveness catch — 0.02 % — already
+sits (D-061's table; `sim/tests/raft.rs`).
+
+**What the gate, CI and the premerge do instead.** Print. The rate line runs at every tier
+and is unchanged, so a run at any tier says what it saw. That is not a formality: at 0.78 %
+the premerge's thousand seeds expect ~8 catches, so a slice that took the catch to zero
+would show in that line at the premerge even though nothing there asserts it.
+
+### Why the tier moved, and three things it is not
+
+**It is not a narrower window.** The obvious reading of 0.78 % against 4.0 % is that the
+node's lease trial builds less of the shape, and that reading is wrong in the direction
+that matters: the node's trial hands over **every** range the node holds, not one
+(D-082), so a node cut off with the reading client holds **four** stale-able leases where
+the one-group server holds one. The window is wider, not narrower, and the mutation below
+measures how much wider — take the trial down to one range and the catch goes to zero.
+
+*Why a wider window gives a thinner rate is not established here, and this entry does not
+invent a mechanism for it.* The candidates are ordinary — the node draws its client keys
+from a larger space, its four cores share one ticker so a trial's timing is noisier, and
+the checker is keyed by range — and telling them apart is a measurement nobody has taken.
+What the number does establish is that one group's rate says nothing about the node's,
+which is exactly why D-061 asks for the rate on the system the assertion runs on.
+
+**It is not a bound the correct system trips** (D-030, D-039). Nothing here is a bound and
+nothing was widened. The correct node's own assertions — some seed exceeds the drift bound,
+the guard revokes — are in the correct node's sweep, at every tier, and this commit does
+not touch them. This is the tier of one *variant's catch*, which is a draw and not a bound;
+D-061 is the entry that says so.
+
+**It is not the one-group assertion, and §12 forbids moving that one.** §12 asks each
+variant re-asserted on the node "to the standard its Phase 2 test asserts and no stronger",
+and D-082 reads that as forbidding *weaker* too. The one-group test keeps `seeds() >= 1000`
+because 4.0 % supports it; the node's moves because 0.78 % does not. Two clusters, one set
+of arms, two rates, two tiers — which is exactly what D-082's shape was for.
+
+SHARD.md §12's plan (docs/SHARD.md:2352) says this variant's stale read is "caught at
+every tier". D-061 already superseded that sentence for the one-group assertion; this entry
+supersedes it for the node's, as the approved plan's text rather than as a change to it.
+
+### The risk here is the opposite of the usual one, so the assertion was proved to fire
+
+A tier that goes up buys margin by asserting less often, and the failure it invites is an
+assertion that can never fire at all. The stream-variants slice shipped exactly that: tier
+gates computed off the **sampled share** rather than the tier, so a "ten thousand seed"
+assertion needed a hundred thousand seeds before it ran. This test does not sample — it
+sweeps `seeds()` itself, and `high_rate_share()` is not in it — but that was checked rather
+than assumed, and then the gate was run:
+
+**M1 — the tier gate, both ways.** The sweep was stubbed to run **no** seeds, so `caught` is
+empty whatever the node does and each run is instant; then the gate was moved and the tier
+was moved, and the three runs were read against each other. All three are logged.
+
+| run | the gate in the tree | `ANANKE_SEEDS` | what happened |
+| --- | --- | --- | --- |
+| A | the shipping `seeds >= 10_000` | 10 000 | **FAILED.** `panicked at sim/tests/node.rs:855: LeaseTrustsTheClock was never caught on the node over 10000 seeds; at the 0.78 % PROPOSED(D-088) measured…` |
+| B | mutated to `seeds >= 100_000` | 10 000 | passed, silently — **the stream-variants bug reproduced on purpose** |
+| C | the shipping `seeds >= 10_000` | 1 000 | passed — the gate is at ten thousand and not below it |
+
+A is the proof asked for: the assertion executes at the tier it now names, and it fails when
+there is nothing to find. B is the same tree with one digit changed and it is green, which
+is what that class of bug looks like from outside — a test that reports a rate and asserts
+nothing, indefinitely. C fixes the gate's lower edge. Run A also confirms the arithmetic in
+the message is the arithmetic in this entry, since the message is read out of the binary
+that ran.
+
+**M2 — the lease trial hands over one range instead of every range the node holds.** This is
+the mutation a single-range world could not be wrong about, and it is D-082's M6, which that
+slice could only measure at a hundred seeds where the variant catches nothing either way.
+In `sim/raft.rs` the trial's `for (j, &range) in ranges.iter().enumerate()` becomes
+`.take(1)`: the slowest clock is handed **one** range and leads the other three not at all.
+
+*It is invisible to one group, by construction.* `Cluster::OneGroup` has one range, so
+`.take(1)` changes nothing there — and that is measured, not argued: the one-group lease
+test's own line is **byte-for-byte identical** on the clean tree and under the mutant, at
+twenty seeds, down to the seed number of the first stale read.
+
+```
+lease safety: drift beyond 1000 ppm on 11 of 20 seeds; of those, the guard revoked on 11,
+a stale read was caught without the guard on 3, neither on 0; the slowest clock led 29 of
+the trials; 2760 lease reads on the seeds within the bound; first stale: seed 7: …
+```
+
+*On the node it takes the rate apart.* Against the shipping tree's 6 of 1 000 and 78 of
+10 000:
+
+| | shipping | one-range mutant |
+| --- | --- | --- |
+| 1 000 seeds | 6 (0.60 %) | **0** |
+| 10 000 seeds | 78 (0.78 %) | **5 (0.05 %)** |
+| the first catch | seed 186, key `k1` | seed 2016, key `k7` |
+
+A fifteen-fold collapse, and far outside any draw: 5 where 78 was expected is a Poisson
+outcome of order 10^-25.
+
+**And here is the finding, which is not the comfortable one.** The assertion this entry
+moves **does not kill M2, and did not reliably kill it before either.** It asserts a bare
+catch — `!caught.is_empty()` — which §12 requires of it, no stronger than its Phase 2 test.
+Against a mutant whose rate is 0.05 %:
+
+- at the **thousand-seed** tier it leaves, the mutant catches nothing on 61 % of runs, so the
+  old assertion killed M2 about three times in five — by luck, not by design. The single
+  run taken here happened to be one of those: 0 of 1 000, which the old assertion would have
+  failed on.
+- at the **nightly's ten thousand** it takes, the mutant catches 5, so the assertion passes.
+  It kills M2 on 0.7 % of runs.
+
+Neither tier is an instrument for this. **The instrument is the printed rate**, and it works
+at both: 0 against 6 at the premerge, 5 against 78 at the nightly, printed by the same line
+at every tier. That is not a rescue written after the fact — it is the second half of
+D-061's rule, "the catch rate is printed at every tier", and it is the half this change was
+required to keep.
+
+So the honest accounting of the move is: the tier buys a factor of about six thousand
+against reddening a clean tree (4.0e-4 to 9.8e-35 as P(none)), and it costs a 61 %-reliable
+accidental kill of a mutation that quarters the scenario. **Whether that trade should be
+closed with an assertion on the rate rather than on the catch is the owner's**, and it is
+not taken here: an assertion that the node's catch stays above a floor would be *stronger*
+than the Phase 2 test this one is held to, which §12 forbids as plainly as it forbids
+weaker. It is recorded so the choice is on the record and not in an agent's head.
+
+### Consequences
+
+- The gate, CI and the premerge no longer assert this catch on the node. They print it, as
+  they did. The nightly asserts it.
+- **No schedule moves and no pinned seed moves.** The change is one comparison and its
+  comments; every seed of every tier runs exactly the run it ran before, on both clusters.
+  Seed 42's one-group trace is untouched, as are the pinned seeds of `sim/tests/raft.rs`.
+- **The nightly shard table's weight for this row does not change.** The test swept
+  `seeds()` before and sweeps `seeds()` now — the tier gate decides whether to assert, not
+  how many seeds to run — so `scripts/nightly-shards.txt`'s 149.49 cpu s at
+  `ANANKE_SEEDS=1000` stands and no row is re-placed. The table's prose beside that row said
+  the row is large because the catch "is asserted from the thousand-seed tier and which
+  therefore runs every seed"; the clause is corrected to name this entry's tier, since this
+  commit is what falsified it. Nothing else in that file is touched.
+- **A rate this thin is worth re-reading at each nightly.** 0.78 % ± 0.17 % is the estimate
+  ten thousand seeds support. If a later slice moves the node's schedules the way D-056's
+  queue moved the raft ones, the figure to re-measure is this one and the tier to re-check
+  is this entry's.
+- **For the owner, from M2: a bare catch is not an instrument for a rate that collapses.**
+  Quartering the lease trial takes the node's rate from 0.78 % to 0.05 % and the assertion
+  passes — at this tier, and 39 % of the time at the tier it left. What sees it is the
+  printed rate, which is why D-061 asks for it at every tier and why this change keeps it.
+  Whether the node's catch should additionally be held to a **floor** rather than to "not
+  empty" is the owner's: it would be *stronger* than the Phase 2 test §12 holds this one to,
+  so it is not taken here.
+- **`docs/RAFT.md` is not edited, and that is not an oversight.** RAFT.md:887 says
+  "`LeaseTrustsTheClock` from the thousand-seed tier, its stale read being caught on about
+  4 % of seeds (D-061)". That sentence is about `sim/raft.rs`'s sweep on the one-group
+  server, which this entry does not touch, and it stays true. The node's sweep is Stage B's
+  and is documented in SHARD.md and here. `docs/SHARD.md:2352` is the one place that reads
+  across both, and it is superseded rather than edited, as D-061 superseded it before — the
+  plan's approved text stands and the entries record where the tree differs from it.
+
+**The machine, and what every figure is a figure of** (D-070). Darwin 25.6.0 arm64, Apple
+M2, 8 cores, on AC power, no thermal warning, with a dozen other agents' slices building on
+it throughout — which is why the costs above are cpu seconds (user + sys) and not wall time.
+The thousand-seed run: load **9.38/8.45/8.62** before, **14.11/9.69/9.07** after. The
+ten-thousand-seed run: **17.82/11.29/9.69** before and **157.62/100.29/51.03** after. Both
+are one test's own run from the built release binary at `ANANKE_SEEDS=1000` and
+`ANANKE_SEEDS=10000`; **`scripts/premerge.sh` has not run** — the coordinator schedules
+those — so no figure here is a premerge's.
+
+**Issue #102's discipline, and the way it bit anyway.** Both campaigns above mutate a file
+in the tree. Each backed its file up **by copy**, restored by copy with a `touch`, and
+checked the restored file's checksum against the backup's; each run is in its own log with
+its own verdict, so no run can be confused with another's build. That is the rule and it
+worked — and it still lost work, in a way worth writing down because the issue's own wording
+does not cover it. The gate proof's backup of `sim/tests/node.rs` was taken **before** the
+ten-thousand-seed measurement came back, so the restore at the end of the campaign quietly
+reverted the two comment edits that put 0.78 % into the file. Nothing was red; the file
+simply went back to an earlier true thing. What caught it was reading the diff of the tree
+before committing rather than trusting the campaign's own "restore: matches the backup"
+line — which was correct, and about the wrong backup. **The rule that follows: a backup is
+stale the moment the file is edited again, so re-take it after every edit, and diff the tree
+against `git` and not against the backup.** The measured figures are unaffected: the run
+that proved the assertion fires compiled the 0.78 % file, and its panic message in the log
+quotes it.
+
+---
+
+_Next entry: D-89. Add one before implementing anything not covered above._

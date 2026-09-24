@@ -146,6 +146,19 @@ struct Slot {
     core: Raft,
     /// A persist of this core is outstanding: it steps nothing until it resolves.
     persisting: bool,
+    /// A live install of this range is between its decision and its manifest switch:
+    /// it steps nothing until the switch is durable and the replica is replaced
+    /// ([`Cores::hold_for_install`]).
+    ///
+    /// A server ends its whole run-loop incarnation across an install and comes back
+    /// on the store the switch built (RAFT.md §1); a node cannot, because that would
+    /// restart every range on it (SHARD.md §11, storage 5). This flag is the node's
+    /// answer: the hold is one range's, and it is the *same* hold a persisting core
+    /// takes, so the messages and node-local inputs of that range queue where they
+    /// already queue and every other range on the node goes on stepping.
+    // PROPOSED(D-083): a range is held across its live install as it is held across a
+    // persist, so no step of the replaced core writes above the installed state.
+    installing: bool,
     /// The outputs that follow this core's `Persist`, in order, to be executed when
     /// that persist resolves.
     deferred: Vec<Act>,
@@ -159,6 +172,7 @@ impl Slot {
         Self {
             core,
             persisting: false,
+            installing: false,
             deferred: Vec::new(),
             held: VecDeque::new(),
         }
@@ -196,6 +210,16 @@ pub struct Meters {
     // PROPOSED(D-076): a node-local input is held for a persisting core as a message
     // of its range is.
     pub locals_held: u64,
+    /// Ranges held across a live install of their own ([`Cores::hold_for_install`]).
+    ///
+    /// It says the hold was *taken*, which nothing downstream of it does: an install
+    /// that skipped the hold and got away with it — no message of that range arrived
+    /// in its window — leaves a trace identical to a held one's. The figure is what
+    /// [`NodeVariant::InstallHoldsEveryRange`] is caught by — it reads 4 where the
+    /// correct node reads 1 — and what would catch a node that took no hold at all if
+    /// the window it skipped happened to be empty.
+    // PROPOSED(D-083): a range is held across its live install.
+    pub ranges_held_for_install: u64,
 }
 
 /// Every core on the node, keyed by range, and the order they are stepped in
@@ -233,6 +257,25 @@ impl Cores {
 
     /// Puts `core` on the node as `range`'s, replacing whatever was there.
     ///
+    /// The highest index handed to the `apply` task starts where the replica does,
+    /// for the same reason it moves with the replica a switch builds
+    /// ([`Cores::installed`]): the watermark is the node's, the applied index is the
+    /// store's, and a node that started its watermark at zero would have the first
+    /// `Apply` after a restart name every index from 1. Where the log still holds
+    /// them that re-applies the whole log — the state machine's work done twice,
+    /// which is what [`NodeVariant::AppliedNotAdvanced`] does one job at a time — and
+    /// where the log was compacted past them, which is every replica a snapshot has
+    /// filled, the entries are not there to name and the node fails that range and
+    /// stops.
+    ///
+    /// The directed re-seed shape is what found it: the node is crashed on a
+    /// replica's refused mark and restarted, and the replica its install had already
+    /// filled came back at applied 61 against a log starting at 62, so the first
+    /// commit after the restart reported "an apply through 67 names index 1, which
+    /// the core does not hold". Nothing before that scenario restarted a node holding
+    /// a compacted replica. [`NodeVariant::RestartAppliesFromZero`] is the hole kept
+    /// beside the fix.
+    ///
     /// A replaced slot's held work goes with it, and **its bytes are released**: what
     /// the node holds is charged against the inbox's bound (D-074), and `held_bytes`
     /// is only ever decreased by a resolution, so a slot dropped with work still held
@@ -244,7 +287,11 @@ impl Cores {
     /// Today the only caller is the node's construction, where there is nothing to
     /// release. Adoption and rebalancing are the next slices, and this is the
     /// bookkeeping they need to be able to rely on.
+    // PROPOSED(D-081): the applied watermark starts where the replica does.
     pub fn insert(&mut self, range: RangeId, core: Raft) {
+        if !self.variants.contains(NodeVariant::RestartAppliesFromZero) {
+            self.applied.insert(range, core.applied());
+        }
         if let Some(replaced) = self.slots.insert(range, Slot::new(core)) {
             let held: usize = replaced.held.iter().map(|held| held.bytes).sum();
             self.held_bytes = self.held_bytes.saturating_sub(held);
@@ -279,6 +326,116 @@ impl Cores {
     #[must_use]
     pub fn persisting(&self, range: RangeId) -> bool {
         self.slots.get(&range).is_some_and(|slot| slot.persisting)
+    }
+
+    /// Whether `range` is held across a live install of its own (D-066): between the
+    /// stream's completion and the replica the switch builds.
+    #[must_use]
+    pub fn installing(&self, range: RangeId) -> bool {
+        self.slots.get(&range).is_some_and(|slot| slot.installing)
+    }
+
+    /// Whether `range`'s core steps nothing now: its persist is outstanding, or its
+    /// live install is between its decision and its switch. Both hold the same way
+    /// and queue the same work.
+    #[must_use]
+    pub fn held(&self, range: RangeId) -> bool {
+        self.slots
+            .get(&range)
+            .is_some_and(|slot| slot.persisting || slot.installing)
+    }
+
+    /// Holds `range` across a live install: from here its messages and its node-local
+    /// inputs queue as a persisting core's do, and nothing steps that core until
+    /// [`installed`](Self::installed) replaces it.
+    ///
+    /// The hold is what keeps the window between the install's decision and its
+    /// manifest switch from being a hole: the replica being replaced is behind its
+    /// leader by definition, so a step of it in that window appends entries at
+    /// indices the switch has just compacted past, and the store comes back with a
+    /// log below its own snapshot. Every *other* range on the node keeps stepping,
+    /// which is the whole reason a node does not end an incarnation for this
+    /// (SHARD.md §11, storage 5).
+    // PROPOSED(D-083): a range is held across its live install.
+    pub fn hold_for_install(&mut self, range: RangeId) {
+        let Some(slot) = self.slots.get_mut(&range) else {
+            self.meters.messages_for_ranges_not_held += 1;
+            return;
+        };
+        slot.installing = true;
+        self.meters.ranges_held_for_install += 1;
+    }
+
+    /// Lets `range` go without replacing its core: the hold was taken on a range that
+    /// was not the one installing, which is [`NodeVariant::InstallHoldsEveryRange`]
+    /// alone. The work held meanwhile is stepped into the core that was there all
+    /// along, so the variant costs that range the install's length and nothing else.
+    // PROPOSED(D-083): the hold is one range's.
+    pub fn release_install<E: Environment>(&mut self, env: &E, range: RangeId) -> Round {
+        let mut round = Round::default();
+        let Some(slot) = self.slots.get_mut(&range) else {
+            return round;
+        };
+        slot.installing = false;
+        while let Some(slot) = self.slots.get_mut(&range) {
+            if slot.persisting || slot.installing {
+                break;
+            }
+            let Some(held) = slot.held.pop_front() else {
+                break;
+            };
+            self.held_bytes = self.held_bytes.saturating_sub(held.bytes);
+            self.step(env, range, held.input, held.received, &mut round);
+        }
+        self.remember();
+        round
+    }
+
+    /// `range`'s live install switched: `core` is the replica the switch built, and
+    /// the work held while it ran is stepped into it, in the order it arrived.
+    ///
+    /// The held work is *not* thrown away. A message of this range that arrived
+    /// during the install is an ordinary message to the installed replica — an
+    /// AppendEntries the new core answers from its new log, a vote request it answers
+    /// from its new term — and dropping them would make an install look like a
+    /// partition to every peer that spoke during it.
+    // PROPOSED(D-083): the replica a switch builds takes the range's held work.
+    pub fn installed<E: Environment>(&mut self, env: &E, range: RangeId, core: Raft) -> Round {
+        let mut round = Round::default();
+        let Some(slot) = self.slots.get_mut(&range) else {
+            self.meters.messages_for_ranges_not_held += 1;
+            return round;
+        };
+        // The highest index handed to the `apply` task moves with the replica. It is
+        // kept here, beside the cores, because the entries an `Apply` names are read
+        // at the step that named them (`applied_sent`) — and a switch that left it
+        // where the *replaced* core stood would have the next `Apply` name an index
+        // below the installed snapshot, which the new core does not hold. The node
+        // then fails that range and stops, which is how this was found: the directed
+        // scenario's second install on a node reported "an apply through 81 names
+        // index 1, which the core does not hold".
+        // PROPOSED(D-083): the applied watermark moves with the replica a switch
+        // builds.
+        self.applied.insert(range, core.applied());
+        slot.core = core;
+        slot.installing = false;
+        // The outputs of the replaced core's last persist are not the new core's:
+        // that core is gone, and what it was waiting to do with a log the switch has
+        // replaced cannot be executed against the replica that replaced it.
+        slot.deferred.clear();
+        slot.persisting = false;
+        while let Some(slot) = self.slots.get_mut(&range) {
+            if slot.persisting || slot.installing {
+                break;
+            }
+            let Some(held) = slot.held.pop_front() else {
+                break;
+            };
+            self.held_bytes = self.held_bytes.saturating_sub(held.bytes);
+            self.step(env, range, held.input, held.received, &mut round);
+        }
+        self.remember();
+        round
     }
 
     /// How many cores are waiting on a persist.
@@ -358,7 +515,8 @@ impl Cores {
         round: &mut Round,
     ) {
         let variants = self.variants;
-        let hold = self.persisting(range) && !variants.contains(NodeVariant::StepWhilePersisting);
+        let hold = (self.persisting(range) && !variants.contains(NodeVariant::StepWhilePersisting))
+            || (self.installing(range) && !variants.contains(NodeVariant::StepWhileInstalling));
         if !hold {
             self.step(env, range, input, received, round);
             return;
@@ -629,6 +787,72 @@ mod tests {
         cores.insert(R1, core(R1));
         cores.insert(R2, core(R2));
         cores
+    }
+
+    /// A replica put on the node at its start brings its own applied index with it,
+    /// and the watermark starts there rather than at zero.
+    ///
+    /// The pair for [`NodeVariant::RestartAppliesFromZero`], and the unit the directed
+    /// re-seed shape found the hole with: a node restarted holding a replica an
+    /// install had filled came back with a log starting above its applied index, named
+    /// every index from 1 in its first `Apply`, and failed that range on the first one
+    /// the core no longer held. It is asserted here rather than in the shape's sweep
+    /// because the situation is a *restart over a compacted replica*, which is one
+    /// line of state, not an interleaving to search for: the shape reaches it only
+    /// when an install happens to land before its crash.
+    // PROPOSED(D-081): the applied watermark starts where the replica does.
+    #[test]
+    fn a_replica_put_on_the_node_brings_its_applied_index_with_it() {
+        // A replica restored on a snapshot at index 40: its log starts at 41 and it
+        // has applied everything the snapshot covers (RAFT.md §1).
+        let compacted = |range: RangeId| {
+            Raft::restore_compacted(
+                ME,
+                Configuration::of(&[ME, LEADER, ServerId(3)]),
+                RaftConfig {
+                    range: range.get(),
+                    ..RaftConfig::default()
+                },
+                7,
+                2,
+                None,
+                40,
+                2,
+                None,
+                Vec::new(),
+                false,
+            )
+        };
+        let mut correct = Cores::new(NodeVariants::correct());
+        correct.insert(R1, compacted(R1));
+        assert_eq!(
+            correct.applied_sent(R1),
+            40,
+            "the watermark starts where the replica does, so the next job the `apply` \
+             task is handed is the entry after the snapshot"
+        );
+
+        let mut buggy =
+            Cores::new(NodeVariants::correct().with(NodeVariant::RestartAppliesFromZero));
+        buggy.insert(R1, compacted(R1));
+        assert_eq!(
+            buggy.applied_sent(R1),
+            0,
+            "RestartAppliesFromZero leaves it at zero"
+        );
+        // And that is not a difference of bookkeeping: the entries an `Apply` names
+        // from zero are indices this core does not hold, which the node fails on.
+        let core = buggy.core(R1).expect("r1");
+        assert_eq!(
+            entries_to_apply(core, buggy.applied_sent(R1), 41),
+            Err(1),
+            "from zero the job names index 1, which the compacted core does not hold"
+        );
+        let core = correct.core(R1).expect("r1");
+        assert!(
+            entries_to_apply(core, correct.applied_sent(R1), 40).is_ok(),
+            "from the replica's own index there is nothing owed and no gap"
+        );
     }
 
     /// A step's `Persist` is the first of its outputs (`finish`, core.rs:1277-1300),

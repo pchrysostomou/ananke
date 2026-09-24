@@ -101,6 +101,19 @@ ananke/
 
 _Update this section at the end of every session._
 
+- Branch `phase-3-lease-tier-nightly` (2026-09-23), PROPOSED D-088, off `origin/main` at
+  `03e1829`: the owner's ruling on `LeaseTrustsTheClock`'s tier on the node. Its catch —
+  a stale read found by linearizability — asserts from the **nightly's ten thousand**
+  instead of the thousand-seed tier, because the node's own rate is **78 of 10 000
+  (0.78 %)** and **6 of 1 000 (0.60 %)**, re-measured on this tree, against the one-group
+  server's 4.0 %. At 0.78 % a thousand seeds catch none with probability 4.0e-4 and ten
+  thousand with 9.8e-35, where the one-group assertion this tier was copied from sits at
+  1.9e-18. One comparison changes, `if seeds >= 1000` to `if seeds >= 10_000`; the rate
+  keeps printing at every tier and the one-group assertion is untouched. The assertion was
+  *proved to fire*: with the sweep stubbed to no seeds it fails at 10 000 and passes at
+  1 000, and the same stub with the gate at 100 000 passes at 10 000 — the stream-variants
+  slice's bug, reproduced deliberately so this slice could be shown not to have it.
+
 - Branch `phase-3-d049-refused-mark-key` (2026-09-23), PROPOSED D-087, on the owner's
   ruling on issue **#116**: D-049's rule is keyed on **a refused mark the answer carries**
   rather than on a rejection stamped incarnation 0. The incarnation says *which* store
@@ -433,10 +446,21 @@ _Update this section at the end of every session._
   the queue. Ten planted bugs, ten caught, no survivors (the table is in D-072). Nothing
   in `sim/` changes and the single-group server is untouched. The premerge is still owed
   on AC power: the laptop was on battery throughout (D-070).
-- Next concrete task: Phase 3 Stage B's second slice, the node's tasks — the `raft` task
-  over many cores on one ticker in Q41's round, the `apply` task, the snapshot task, and
-  the scenarios' four ranges a node — on top of the wire above. Issue #72 is open on the
-  first live install (D-069). Issue #37: a refused server's silence while it verifies,
+- The node's snapshot wiring is built (PROPOSED D-083): `ananke_shard::server::run`
+  runs the `snapshot` task keyed by range and follower beside `net`, `answers` and
+  `apply`. A take is the `apply` task's and checkpoints the range's own key intervals;
+  a stream is a `Sender` per (range, follower) in frames of its own; a completed stream
+  is D-066's live install of the range's two spans with its repair in one manifest
+  switch, with the range held across the switch and its replica replaced by the one the
+  switch built. `net` diverts `InstallSnapshot` before the inbox, which closes issue
+  #96. `sim/tests/install.rs` is the directed evidence: five voters, four ranges, two
+  late followers, eight streams and eight installs on every seed it runs.
+- Next concrete task: re-asserting the four Phase 2 variants on the node
+  (`SnapshotWithoutCurrentLast`, `IgnoreIncarnation`, `SharedSnapshotDir` and the pair),
+  which the wiring above unblocks, and the directed re-seed shape (D-067). Issue #72 is
+  now live rather than latent — the first live install on a node's engine makes the
+  straddling read reachable (D-069, D-054) — and issue #103, which the wiring answers by
+  routing a stream's answers by range, is recorded in D-083. Issue #37: a refused server's silence while it verifies,
   repairs and adopts its re-seed deposes the leader when the third server is away.
   Open follow-ups: issue #32 (the pre-vote check: a message delivered before an
   isolation but stepped inside it) and issue #33

@@ -196,6 +196,145 @@ pub enum NodeVariant {
     /// number its predecessor drew, and a leader that compares incarnations for
     /// inequality only (D-042) never resets (Q26; SHARD.md:1372-1379).
     IncarnationPerRangeStream,
+    /// A range whose live install is between its decision and its manifest switch is
+    /// stepped anyway, rather than held. The replica being replaced is behind its
+    /// leader by definition, so a step of it in that window appends entries at indices
+    /// the switch is about to compact past, and the store comes back with a log below
+    /// its own snapshot record (RAFT.md §1; D-066).
+    ///
+    /// A server ends its whole run-loop incarnation across an install and so has no
+    /// such window; a node holds one range instead (SHARD.md §11, storage 5). This is
+    /// that hold removed.
+    // PROPOSED(D-083): a range is held across its live install.
+    StepWhileInstalling,
+    /// The install's manifest switch is made and the range's replica is *not* replaced:
+    /// the store holds the snapshot and the old core goes on from the log it had. A
+    /// server gets the replacement for free by reopening its store; a node has to do it
+    /// for the one range, and this is that left undone (D-066).
+    // PROPOSED(D-083): the replica a switch builds replaces the one it replaced.
+    InstallKeepsTheOldCore,
+    /// `InstallSnapshot` and its response admitted to the node's byte-bounded inbox
+    /// instead of diverted to the `snapshot` task: the chunk costs a heartbeat its
+    /// place under the bound ([`carries_data`]) and then vanishes, because
+    /// `Raft::on_message`'s arm for it is empty — the core is told the server routed it
+    /// away, which the one-group server's `net` loop does and the node's did not. The
+    /// node as it stood, and the hole filed as **issue #96**.
+    ///
+    /// [`carries_data`]: crate::inbox::carries_data
+    // PROPOSED(D-083): the `net` task diverts snapshot chunks before the inbox.
+    ChunksToTheInbox,
+    /// A take checkpoints the whole engine directory rather than the range's own key
+    /// intervals, as the one-group take does (`Engine::checkpoint`, snapshot.rs:688).
+    /// Every range's take then carries every *other* range's keys, and installing one
+    /// on a follower writes three ranges' state it was never sent (D-066, D-068).
+    ///
+    /// With one range on the node the whole engine *is* that range's spans, so this
+    /// variant and the correct take produce the same bytes: it is a mutation only a
+    /// node of several ranges can be wrong about.
+    // PROPOSED(D-083): a take checkpoints the range's spans, not the node's store.
+    TakeCheckpointsTheWholeNode,
+    /// The hold across a live install is taken on every range the node hosts rather
+    /// than on the one installing, which is the node reaching for the incarnation a
+    /// server ends. One range's install then stops every other range on the node for
+    /// the length of a stream's switch — the exact cost SHARD.md §11, storage 5 says a
+    /// live install exists to avoid.
+    ///
+    /// With one range it is the correct hold exactly, and nothing can tell them apart.
+    // PROPOSED(D-083): the hold is one range's.
+    InstallHoldsEveryRange,
+    /// A completed install clears every staging directory under the engine directory
+    /// rather than the one its own (range, sender) assembled in. Another range's
+    /// half-assembled stream is destroyed by a neighbour's install, and its sender is
+    /// never told, so it streams the rest of a snapshot into a directory that no longer
+    /// holds its first bytes (D-075's keys, undone at the moment they matter).
+    ///
+    /// With one range and one sender there is only ever one staging directory, and
+    /// clearing "every" one is clearing the right one.
+    // PROPOSED(D-083): an install clears its own assembly's directory and no other.
+    InstallSweepsEveryStaging,
+    /// A stream's acknowledgement stepped into **every** core on the node rather than
+    /// into the one range's.
+    ///
+    /// `Input::SnapshotAcked { to }` names the follower and not the range, which is
+    /// complete information for a server with one core and incomplete for a node with
+    /// four. Under this variant one range's chunks set `stream_acked` on every range's
+    /// progress for that follower, so a *refused* follower keeps counting for check
+    /// quorum on ranges whose stream was never opened, and D-049's rule — a refused
+    /// follower counts only while its re-seed stream progresses (core.rs:1607-1613) —
+    /// is silently void while every test stays green. **Issue #103.**
+    ///
+    /// With one range on the node, every core *is* the range's core, and the fan-out
+    /// and the correct route are the same route.
+    // PROPOSED(D-083): a stream's answers are stepped into the stream's range alone.
+    SnapshotAckToEveryCore,
+    /// A take copies the range's Raft state and **drops its user keys**, so the
+    /// install's switch removes the receiver's user keys and puts nothing in their
+    /// place: total, silent state-machine loss on every range installed from it.
+    ///
+    /// A range lives in two key intervals (D-066) and the take has to carry both. This
+    /// carries one. Every event a correct install emits, it emits — the stream flows,
+    /// the switch is made, the replica is created — which is why a check that counts
+    /// events cannot see it and one that reads the installed state can.
+    // PROPOSED(D-083): what an install installed is read back and traced.
+    TakeSkipsTheUserKeys,
+    /// A take copies the **whole** Raft interval, the log purpose included, as the
+    /// one-group take does. The live install then puts the *leader's* log keys into
+    /// the receiver's store, and nothing tombstones them back out: the node's repair
+    /// carries no log tombstones precisely because the take carries no log keys
+    /// (D-083's first departure from D-082). The two halves of that argument have to
+    /// agree, and this is what catches them disagreeing.
+    // PROPOSED(D-083): the stream carries no log key, so the repair tombstones none.
+    TakeStreamsTheLogToo,
+    /// The host is asked what a local input wants of its core **before** the node has
+    /// checked whether that range is held.
+    ///
+    /// `Host::local_core` is not a pure question: a live install's repair is built in
+    /// its `Ready` arm and handed to the `snapshot` task there. Asked first and held
+    /// afterwards, a stream whose `Ready` arrives while its own range's persist is
+    /// still outstanding builds a repair and lets the switch carrying it proceed
+    /// against a write in flight — which is the one thing the hold exists to prevent.
+    // PROPOSED(D-083): a live install holds one range and replaces its replica.
+    AsksTheHostBeforeTheHold,
+    /// Each replica's durable refused mark written in a batch that is **not synced**
+    /// (D-067). Everything else is the correct node's: the same two keys, the same
+    /// `RaftReseeded` when the write returns, and the same silence until the install.
+    ///
+    /// What a crash keeps of an unsynced write is the disk's draw, so the mark is
+    /// there on some seeds and gone on others; where it is gone the replica opens
+    /// fresh — term 0, no vote, incarnation 1 — and votes from then on, which is
+    /// D-035's hole reopened. Its standard is therefore *rate* and not every seed,
+    /// as `RemovalNotDurable`'s is (§10, a variant of a later stage), and the re-seed
+    /// shape's arm crashes on the mark's own trace event so that nothing else has
+    /// synced the new engine's log by then.
+    // PROPOSED(D-081): the re-seed shape's variant, approved as D-067.
+    ReseedMarkNotSynced,
+    /// The highest index handed to the `apply` task left at zero when a core is put
+    /// on the node at its start, rather than started where the replica's own applied
+    /// index stands (`Cores::insert`).
+    ///
+    /// It is D-083's watermark bug one moment earlier: that one left the watermark
+    /// where the *replaced* replica stood across a live install, this one never sets
+    /// it at all. A node whose replica's log was compacted past its applied index —
+    /// every replica a snapshot has filled — then names, in its first `Apply` after a
+    /// restart, indices the core no longer holds, and the node fails that range and
+    /// stops. Where the log does still hold them the state machine simply does its
+    /// whole life's work again.
+    // PROPOSED(D-081): the applied watermark starts where the replica does.
+    RestartAppliesFromZero,
+    /// A follower's compaction record ([`SnapshotAction::Record`]) asked for by a core
+    /// and queued nowhere: the node as it stood, where `Host::snapshot` counted the
+    /// action and `install::job_of` answered `None` for it.
+    ///
+    /// The core sets `take_pending` when it asks and clears it when it is told the
+    /// record was written, so a record that goes nowhere leaves that core asking for
+    /// nothing ever again. It never compacts, which is the whole of D-065 undone and
+    /// the follower-log bound with it; and a replica that has never taken a snapshot
+    /// cannot stream one when it takes office, so a re-seed toward a range whose new
+    /// leader had been a follower waits forever.
+    ///
+    /// [`SnapshotAction::Record`]: ananke_raft::core::SnapshotAction::Record
+    // PROPOSED(D-081): a follower's compaction record reaches the `apply` task.
+    RecordNeverQueued,
 }
 
 impl NodeVariant {
@@ -231,6 +370,19 @@ impl NodeVariant {
         NodeVariant::OpenNewestEvenIfLost,
         NodeVariant::ServeBeforeRefusedMark,
         NodeVariant::IncarnationPerRangeStream,
+        NodeVariant::StepWhileInstalling,
+        NodeVariant::InstallKeepsTheOldCore,
+        NodeVariant::ChunksToTheInbox,
+        NodeVariant::TakeCheckpointsTheWholeNode,
+        NodeVariant::InstallHoldsEveryRange,
+        NodeVariant::InstallSweepsEveryStaging,
+        NodeVariant::SnapshotAckToEveryCore,
+        NodeVariant::TakeSkipsTheUserKeys,
+        NodeVariant::TakeStreamsTheLogToo,
+        NodeVariant::AsksTheHostBeforeTheHold,
+        NodeVariant::ReseedMarkNotSynced,
+        NodeVariant::RestartAppliesFromZero,
+        NodeVariant::RecordNeverQueued,
     ];
 
     /// Q15's whole-node refusal and re-seed, in order: the six ways to get a node's
@@ -276,8 +428,58 @@ impl NodeVariant {
         NodeVariant::InstallsADuplicateLastChunk,
     ];
 
+    /// The node's snapshot *wiring*: the ten ways to get the running of
+    /// [`mod@crate::snapshot`] inside the node's server wrong, as against the fifteen
+    /// ways to get its discipline wrong ([`SNAPSHOT`](Self::SNAPSHOT)). Three of the
+    /// ten — [`InstallHoldsEveryRange`](Self::InstallHoldsEveryRange),
+    /// [`InstallSweepsEveryStaging`](Self::InstallSweepsEveryStaging) and
+    /// [`SnapshotAckToEveryCore`](Self::SnapshotAckToEveryCore), issue #103's — are the
+    /// correct wiring exactly on a node of one range, and can only be caught where a
+    /// node hosts several.
+    ///
+    /// [`TakeCheckpointsTheWholeNode`](Self::TakeCheckpointsTheWholeNode) needs more
+    /// than one range as well, but on narrower ground: it is *not* the correct take on
+    /// a node of one range, because `checkpoint_spans` leaves the log purpose out and a
+    /// whole-engine checkpoint takes it in, so the two differ by the whole log however
+    /// many ranges there are. What one range cannot do is tell it from
+    /// [`TakeStreamsTheLogToo`](Self::TakeStreamsTheLogToo), whose check reads the log
+    /// keys this one's does not (D-083's review, correction 5).
+    // PROPOSED(D-083): the node's snapshot wiring.
+    pub const WIRING: &'static [NodeVariant] = &[
+        NodeVariant::StepWhileInstalling,
+        NodeVariant::InstallKeepsTheOldCore,
+        NodeVariant::ChunksToTheInbox,
+        NodeVariant::TakeCheckpointsTheWholeNode,
+        NodeVariant::InstallHoldsEveryRange,
+        NodeVariant::InstallSweepsEveryStaging,
+        NodeVariant::SnapshotAckToEveryCore,
+        NodeVariant::TakeSkipsTheUserKeys,
+        NodeVariant::TakeStreamsTheLogToo,
+        NodeVariant::AsksTheHostBeforeTheHold,
+    ];
+
+    /// The directed re-seed shape's own, outside §10's count of range-layer variants:
+    /// D-067's [`ReseedMarkNotSynced`](Self::ReseedMarkNotSynced), the one way to get
+    /// Q15's *durability* wrong as against the six ways to get the refusal itself wrong
+    /// ([`RESEED`](Self::RESEED)), and the four holes the shape found in the node when
+    /// a refusal and the wiring first met on one tree — the applied index an install
+    /// makes durable — no, that one is D-083's — the watermark a start begins at, a
+    /// follower's compaction record, and the watermark a start begins at (D-081).
+    ///
+    /// `ReseedMarkNotSynced` is a mutation a single-range world could not catch
+    /// either, for a reason of its own: the shape crashes the node on one replica's
+    /// mark, and what the *other three* replicas restate afterwards is the evidence.
+    /// With one range there is one mark, the crash is on the only replica there is,
+    /// and a node that lost it has nothing left to compare it against.
+    // PROPOSED(D-081): the re-seed shape's variant, approved as D-067.
+    pub const SHAPE: &'static [NodeVariant] = &[
+        NodeVariant::ReseedMarkNotSynced,
+        NodeVariant::RestartAppliesFromZero,
+        NodeVariant::RecordNeverQueued,
+    ];
+
     /// The bit this variant takes in a [`NodeVariants`].
-    const fn bit(self) -> u32 {
+    const fn bit(self) -> u64 {
         match self {
             NodeVariant::DeferredFlushedEarly => 1,
             NodeVariant::StepWhilePersisting => 1 << 1,
@@ -305,16 +507,30 @@ impl NodeVariant {
             NodeVariant::OpenNewestEvenIfLost => 1 << 23,
             NodeVariant::ServeBeforeRefusedMark => 1 << 24,
             NodeVariant::IncarnationPerRangeStream => 1 << 25,
-            // Bits 20 to 25 are D-077's six, which `main` took while this slice was
-            // open; before that merge the snapshot review's four held 20 to 23. They
-            // take the next free bits instead, so no two variants share one. Thirty
-            // variants now take bits 0 to 29 and two are left: the next slice to add
-            // more than two must widen `NodeVariants` to a `u64`, as `ananke_raft`'s
-            // set was widened for the same reason.
+            // Bits 20 to 25 are D-077's six, which `main` took while the snapshot
+            // review's slice was open; before that merge the review's four held 20 to
+            // 23. They take 26 to 29 instead, and D-083's ten follow at 30 to 39, so no
+            // two variants share a bit. D-081's three for the directed re-seed shape
+            // follow at 40 to 42. Forty-three variants no longer fit a `u32`, which is
+            // why [`NodeVariants`] is a `u64`, as `ananke_raft`'s set was widened for
+            // the same reason; twenty-one bits are left.
             NodeVariant::InstallWrongRangesSpans => 1 << 26,
             NodeVariant::AdmitsAnUnhostedRange => 1 << 27,
             NodeVariant::AssemblyHeldForDepartedSender => 1 << 28,
             NodeVariant::InstallsADuplicateLastChunk => 1 << 29,
+            NodeVariant::StepWhileInstalling => 1 << 30,
+            NodeVariant::InstallKeepsTheOldCore => 1 << 31,
+            NodeVariant::ChunksToTheInbox => 1 << 32,
+            NodeVariant::TakeCheckpointsTheWholeNode => 1 << 33,
+            NodeVariant::InstallHoldsEveryRange => 1 << 34,
+            NodeVariant::InstallSweepsEveryStaging => 1 << 35,
+            NodeVariant::SnapshotAckToEveryCore => 1 << 36,
+            NodeVariant::TakeSkipsTheUserKeys => 1 << 37,
+            NodeVariant::TakeStreamsTheLogToo => 1 << 38,
+            NodeVariant::AsksTheHostBeforeTheHold => 1 << 39,
+            NodeVariant::ReseedMarkNotSynced => 1 << 40,
+            NodeVariant::RestartAppliesFromZero => 1 << 41,
+            NodeVariant::RecordNeverQueued => 1 << 42,
         }
     }
 
@@ -352,6 +568,19 @@ impl NodeVariant {
             NodeVariant::AdmitsAnUnhostedRange => "AdmitsAnUnhostedRange",
             NodeVariant::AssemblyHeldForDepartedSender => "AssemblyHeldForDepartedSender",
             NodeVariant::InstallsADuplicateLastChunk => "InstallsADuplicateLastChunk",
+            NodeVariant::StepWhileInstalling => "StepWhileInstalling",
+            NodeVariant::InstallKeepsTheOldCore => "InstallKeepsTheOldCore",
+            NodeVariant::ChunksToTheInbox => "ChunksToTheInbox",
+            NodeVariant::TakeCheckpointsTheWholeNode => "TakeCheckpointsTheWholeNode",
+            NodeVariant::InstallHoldsEveryRange => "InstallHoldsEveryRange",
+            NodeVariant::InstallSweepsEveryStaging => "InstallSweepsEveryStaging",
+            NodeVariant::SnapshotAckToEveryCore => "SnapshotAckToEveryCore",
+            NodeVariant::TakeSkipsTheUserKeys => "TakeSkipsTheUserKeys",
+            NodeVariant::TakeStreamsTheLogToo => "TakeStreamsTheLogToo",
+            NodeVariant::AsksTheHostBeforeTheHold => "AsksTheHostBeforeTheHold",
+            NodeVariant::ReseedMarkNotSynced => "ReseedMarkNotSynced",
+            NodeVariant::RestartAppliesFromZero => "RestartAppliesFromZero",
+            NodeVariant::RecordNeverQueued => "RecordNeverQueued",
         }
     }
 }
@@ -363,9 +592,12 @@ impl fmt::Display for NodeVariant {
 }
 
 /// A set of [`NodeVariant`]s, shaped like [`ananke_raft::core::Variants`] so the two
-/// read alike where a scenario configures both.
+/// read alike where a scenario configures both. The word is 64 bits and Raft's is 32:
+/// the node's variants outgrew a `u32` when the snapshot wiring's ten, Q15's six and
+/// the re-seed shape's three met on one tree, and nothing but this module reads the
+/// bits.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct NodeVariants(u32);
+pub struct NodeVariants(u64);
 
 impl NodeVariants {
     /// The correct node: no variant.
@@ -430,32 +662,50 @@ mod tests {
 
     #[test]
     fn every_variant_takes_a_bit_of_its_own() {
-        let mut seen = 0u32;
+        let mut seen = 0u64;
         for variant in NodeVariant::BUGS {
             assert_eq!(seen & variant.bit(), 0, "{variant} shares a bit");
             seen |= variant.bit();
         }
         // Twenty of the round's and the snapshot task's, the snapshot review's four,
-        // and D-077's six for Q15's whole-node refusal and re-seed.
-        assert_eq!(NodeVariant::BUGS.len(), 30);
-        for variant in NodeVariant::SNAPSHOT {
+        // D-077's six for Q15's whole-node refusal and re-seed, D-083's ten for the
+        // snapshot wiring, and D-081's three for the directed re-seed shape.
+        assert_eq!(NodeVariant::BUGS.len(), 43);
+        for variant in NodeVariant::SNAPSHOT
+            .iter()
+            .chain(NodeVariant::WIRING)
+            .chain(NodeVariant::RESEED)
+            .chain(NodeVariant::SHAPE)
+        {
             assert!(
                 NodeVariant::BUGS.contains(variant),
                 "{variant} is not in BUGS"
             );
         }
         assert_eq!(NodeVariant::SNAPSHOT.len(), 15);
-        for variant in NodeVariant::RESEED {
-            assert!(
-                NodeVariant::BUGS.contains(variant),
-                "{variant} is not in BUGS"
-            );
-            assert!(
-                !NodeVariant::SNAPSHOT.contains(variant),
-                "{variant} is in two sets"
-            );
-        }
+        assert_eq!(NodeVariant::WIRING.len(), 10);
         assert_eq!(NodeVariant::RESEED.len(), 6);
+        assert_eq!(NodeVariant::SHAPE.len(), 3);
+        // The discipline, the wiring, the re-seed and the shape are pairwise disjoint: a
+        // variant is a way to get the `snapshot` task's keys, caps and frames wrong, a
+        // way to get its running inside the node wrong, a way to get Q15's whole-node
+        // refusal wrong, or one of the shape's own, and never two of them.
+        let sets = [
+            ("SNAPSHOT", NodeVariant::SNAPSHOT),
+            ("WIRING", NodeVariant::WIRING),
+            ("RESEED", NodeVariant::RESEED),
+            ("SHAPE", NodeVariant::SHAPE),
+        ];
+        for (i, (left, one)) in sets.iter().enumerate() {
+            for (right, other) in &sets[i + 1..] {
+                for variant in *one {
+                    assert!(
+                        !other.contains(variant),
+                        "{variant} is in both {left} and {right}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

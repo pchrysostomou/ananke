@@ -106,8 +106,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ananke_env::{
-    ApplyEffect, Clock, Decision, Either, Environment, Instant, Network, Rng, Socket, TraceEvent,
-    race,
+    ApplyEffect, Clock, Decision, Either, Environment, Instant, Network, RecoveredAs, Rng, Socket,
+    TraceEvent, race,
 };
 use ananke_storage::{Engine, EngineConfig};
 
@@ -1029,6 +1029,16 @@ async fn incarnation<E: Environment>(
         applied,
         last_index: core.last_index(),
         incarnation: store.incarnation(),
+        // A one-group server that was re-seeded adopts its staged store at this start
+        // (RAFT.md §1), so a quarantined replica here already holds the state the
+        // install gave it: `Refused`, the state a replica waits for its stream in, is
+        // the node's and has no path on a server that adopts (Q15, D-077).
+        // PROPOSED(D-081): a restatement says how the replica restated (D-067).
+        state: if core.quarantined() {
+            RecoveredAs::Quarantined
+        } else {
+            RecoveredAs::Neither
+        },
     });
     env.trace(TraceEvent::RaftTerm {
         server,
