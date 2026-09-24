@@ -97,12 +97,26 @@ pub enum Message {
         local: u64,
         /// The responder's store incarnation (RAFT.md §3): 1 for a store started
         /// fresh, a fresh value for every store a re-seed rebuilt, 0 from a
-        /// refused server that has no store. A leader that sees it change
-        /// forgets what it knew of the follower's log, since a re-seeded store
-        /// may have lost entries the follower once acknowledged. The server
+        /// one-group refused server that has no store at all. A leader that sees
+        /// it change forgets what it knew of the follower's log, since a re-seeded
+        /// store may have lost entries the follower once acknowledged. The server
         /// stamps it on the way out, like `local`.
+        ///
+        /// It says *which* store answered, and nothing about whether there is one
+        /// to commit with: that is `refused`.
         // D-042: store incarnations.
         incarnation: u64,
+        /// Whether this is a **refused** server's rejection: the answerer lost its
+        /// state, holds nothing of this log, and can commit nothing for the leader
+        /// until its re-seed puts something in it (RAFT.md §3). Check quorum counts
+        /// such a rejection only beside re-seed progress in the same window
+        /// (D-049), so the mark has to reach the leader that counts the answer, and
+        /// it therefore rides on the wire rather than being inferred there.
+        ///
+        /// Never set on a success. It is carried in the same byte as `success`, so
+        /// a response frame is the length it always was.
+        // PROPOSED(D-087): D-049's rule keyed on a refused mark the answer carries.
+        refused: bool,
     },
     /// The leader asks the receiver to start an election at once, without a
     /// pre-vote (thesis §3.10, leadership transfer).
@@ -429,9 +443,10 @@ impl Frame {
                 echo,
                 local,
                 incarnation,
+                refused,
                 ..
             } => {
-                out.put_u8(u8::from(*success));
+                out.put_u8(answer_byte(*success, *refused));
                 out.put_u64_le(*prev_index);
                 out.put_u64_le(*match_index);
                 out.put_u64_le(*hint);
@@ -570,11 +585,7 @@ impl Frame {
                 if bytes.is_empty() {
                     return Err(bad("frame torn"));
                 }
-                let success = match bytes.get_u8() {
-                    0 => false,
-                    1 => true,
-                    _ => return Err(bad("frame malformed")),
-                };
+                let (success, refused) = answer_of(bytes.get_u8())?;
                 let prev_index = u64_field(&mut bytes)?;
                 let match_index = u64_field(&mut bytes)?;
                 let hint = u64_field(&mut bytes)?;
@@ -590,6 +601,7 @@ impl Frame {
                     echo,
                     local,
                     incarnation,
+                    refused,
                 }
             }
             8 => {
@@ -649,6 +661,30 @@ impl Frame {
 
 fn int(v: u64) -> Json {
     i64::try_from(v).map_or_else(|_| Json::Str(v.to_string()), Json::Int)
+}
+
+/// The one byte an [`Message::AppendEntriesResponse`] spends on what kind of answer
+/// it is: bit 0 is `success`, bit 1 the refused mark (D-049). One byte and not two,
+/// so that adding the mark leaves every response frame exactly the length it was —
+/// the simulator drains a link at a modelled rate and bounds an outbox in bytes
+/// (D-056, D-072), so a frame that grew by one byte would move schedules on seeds
+/// that have nothing to do with this rule.
+// PROPOSED(D-087): D-049's rule keyed on a refused mark the answer carries.
+fn answer_byte(success: bool, refused: bool) -> u8 {
+    u8::from(success) | (u8::from(refused) << 1)
+}
+
+/// The inverse of [`answer_byte`]. A byte claiming both success and the refused mark
+/// is malformed: a refused server holds nothing of the log, so nothing ever fits in
+/// it, and a frame saying otherwise is not one this codec produced.
+// PROPOSED(D-087): D-049's rule keyed on a refused mark the answer carries.
+fn answer_of(byte: u8) -> io::Result<(bool, bool)> {
+    match byte {
+        0 => Ok((false, false)),
+        1 => Ok((true, false)),
+        2 => Ok((false, true)),
+        _ => Err(bad("frame malformed")),
+    }
 }
 
 /// The studio's view of a frame: an object whose `type` is `raft.<kind>`, with the
@@ -714,6 +750,7 @@ pub fn studio(payload: &[u8]) -> Json {
             match_index,
             hint,
             incarnation,
+            refused,
             ..
         } => {
             fields.push(("success", Json::Bool(*success)));
@@ -721,6 +758,12 @@ pub fn studio(payload: &[u8]) -> Json {
             fields.push(("matchIndex", int(*match_index)));
             fields.push(("hint", int(*hint)));
             fields.push(("incarnation", int(*incarnation)));
+            // Carried only when set, as `RaftQuorumLost`'s `uncounted` is (D-049):
+            // an ordinary answer's studio line is the line it always was.
+            // PROPOSED(D-087): D-049's rule keyed on a refused mark the answer carries.
+            if *refused {
+                fields.push(("refused", Json::Bool(true)));
+            }
         }
         Message::InstallSnapshot {
             last_index,
@@ -823,6 +866,22 @@ mod tests {
                 echo: 123_456_789,
                 local: 987_654_321,
                 incarnation: 4,
+                refused: false,
+            },
+            // The refused server's rejection, the answer D-049's rule is about: the
+            // same shape with the mark set, so the round trip covers both values of
+            // the byte they share.
+            // PROPOSED(D-087): D-049's rule keyed on a refused mark the answer carries.
+            Message::AppendEntriesResponse {
+                term: 3,
+                success: false,
+                prev_index: 9,
+                match_index: 0,
+                hint: 1,
+                echo: 0,
+                local: 987_654_321,
+                incarnation: 4,
+                refused: true,
             },
             Message::InstallSnapshot {
                 term: 3,

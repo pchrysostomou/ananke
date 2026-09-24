@@ -14214,6 +14214,368 @@ test it named.
    nothing — so nothing is red; only the reasons are stale. Left for the owner to place
    rather than widened into this slice.
 
+## PROPOSED D-087 — D-049's rule keyed on a refused mark the answer carries, not on the absence of a store
+
+**The number.** `main`'s footer says D-086 and the work order named D-086, but PR #109
+(`phase-3-stage-b-stream-variants`, stacked on PR #107) already holds **PROPOSED D-086**
+on a pushed branch. This entry takes **D-087**, past it, and the footer moves to D-088.
+Every code site carries `// PROPOSED(D-087)`. The integrator may renumber at the merge;
+nothing in the tree depends on the number beyond those markers, this heading and the
+footer.
+
+**Context.** Issue **#116**, and the owner's ruling on it. D-049's rule — a refused
+follower's rejections do not count toward a quorum unless the leader's re-seed stream to
+it progressed in the same window, and a leader whose majority needed it steps down —
+was keyed on **a rejection stamped incarnation 0** (`core.rs`, `on_append_entries_response`):
+an answer from *no store*. The one-group server has that state, because
+`ananke_raft::node::reseed` is a loop that answers from no store at all until an install
+completes. **D-077's node never has it.** On a refusal it marks the loss, opens a fresh
+engine beside the refused directory and creates **every range's store, each with an
+incarnation of its own, before any replica answers** (`ananke_shard::server::reseed`,
+steps 3-4); `ServerHost::stamp` then stamps `store.incarnation()`, which is never 0.
+
+PROPOSED D-085 measured the consequence over a thousand seeds on the node: 4 000 replicas
+refused and re-seeded, 248 574 answers fitted, 6 679 rejections carrying a re-seeded
+store's own incarnation, **0 stamped incarnation 0**, and **0 of 1 394 step-downs naming
+anyone `uncounted`**. The rule had no enforcement site on the node, and PR #107's snapshot
+wiring would not have created one: it is quiet today only because nothing on the node
+compacts past a re-seeded replica, and the day one can, that replica answers rejections
+stamped with a store incarnation of its own — counted as any follower's — over a stream
+that may never have been opened. That is D-049's opening sentence, reintroduced.
+
+**The owner's ruling, verbatim.** *"Take the second shape: key the core's rule on a
+refused mark the answer carries, and re-measure every D-049 assertion on both the node and
+the one-group server. The first shape changes what D-077's re-seed does, and its exit
+criteria were written against the current shape — I would rather re-measure assertions
+than redefine a slice that is already green at ten thousand seeds."*
+
+So: **the key changes, the re-seed does not.** This entry is that change and the
+re-measurement it costs.
+
+### What the key was, and what it is
+
+| | |
+|---|---|
+| **was** | `if !success && incarnation == 0 { progress.refused_answered = true }` |
+| **is** | `if !success && refused { progress.refused_answered = true }` |
+
+`incarnation` (D-042) says **which store answered**, so that a leader forgets a match it
+recorded against a store that no longer exists. Whether that store **holds anything of
+this log** is a different question, and the old key answered it by a coincidence: on the
+one-group server a server with nothing to answer from has no store, so "no store" and
+"nothing of the log" are the same sentence. On the node they are not. **One field was
+doing two jobs, and the node separated them.**
+
+`AppendEntriesResponse` therefore carries a `refused` mark of its own, and the leader reads
+the mark. The mark is set by the answerer in two places, and they mean the same thing:
+
+- **the one-group re-seed loop** sets it literally — that server has no store at all, and
+  now says so outright instead of leaving it to be inferred from the stamp;
+- **the core** sets it on every rejection it builds, from `Raft::refused()`:
+
+  > `self.quarantined && self.last_index() == 0` — *running on what a re-seed put in
+  > place of the state it lost, with nothing of this log in it yet.*
+
+**Both conjuncts are necessary and neither is sufficient.** `quarantined` alone is
+permanent and durable (D-035): a re-seeded replica that was caught up an hour ago is still
+quarantined, and D-049 says in as many words that such a follower "counts as any follower
+does". An empty log alone is a server that never had anything, which is a re-seed *ask*
+(RAFT.md §3) and not a refusal. Together they are exactly the window the one-group server
+spends answering from no store, and exactly the window a node's re-seeded replica spends
+holding a store with nothing in it. The window closes the moment anything lands — an
+install, or, where the leader has not compacted past this replica, an ordinary append —
+and both of those are the leader getting somewhere with it, which is what D-049's rule
+asks about. It is derived rather than stored, so it cannot drift from the state it
+describes and it survives a restart with no fourth durable key: the quarantine mark is on
+the disk and so is the log.
+
+### What was rejected
+
+1. **Giving the node a store-less refused state** — issue #116's first shape. The owner
+   ruled against it: it changes what D-077's re-seed does and D-077's exit criteria were
+   written against the current shape. Not revisited here.
+2. **Overloading a field that is already there.** A sentinel incarnation; or `match_index`,
+   which is 0 on every rejection and therefore a free `u64`; or `hint == 1`, which the
+   re-seed loop sends. Each was rejected for the reason this entry exists: one field doing
+   two jobs is the defect. (`hint == 1` is also wrong on its own terms — any follower with
+   an empty log hints 1, refused or not.)
+3. **Keying on `quarantined` alone**, with no second conjunct. It is one durable bit
+   already on the wire's far side in spirit, and it would have been cheap. It is also
+   wrong: D-049's rule is explicitly *not* about a quarantined follower. Run as a
+   mutation below (M3) rather than argued.
+4. **A new byte on the wire.** The mark rides in the **same byte as `success`** — three
+   legal values, and `success && refused` is decoded as malformed, since nothing ever fits
+   in a server that holds nothing. A response frame is therefore exactly the length it was.
+   That is not tidiness: the simulator drains a link at a modelled rate and bounds an
+   outbox in bytes (D-056, D-072), so a frame one byte longer would move schedules on seeds
+   that have nothing to do with this rule, and every pinned seed in the tree would have had
+   to be re-audited against a change that was not the change.
+
+### Where the mark had to reach
+
+The ruling asked where the mark must be carried. It has to reach **the core that counts the
+answer**, which is the leader's, and on the node that core is on another machine — so the
+mark is on the wire and nowhere else would do. It is *not* on `InstallSnapshotResponse`:
+that answer is the snapshot task's and reaches the core only as `SnapshotAcked` /
+`SnapshotInstalled`, which is the *other* half of D-049's rule (`stream_acked`) and already
+carries what it needs.
+
+### Every D-049 assertion, re-measured on both clusters
+
+This is the price the owner accepted, and it is the substance of this slice. Every rate
+below was taken on the tree this entry is committed on, printed by the test that names it,
+at every tier the test runs at. **No rate moved on the one-group server**, and the node's
+two zeroes have a narrower reason than they had.
+
+#### 1. The bare core — `crates/ananke-raft/tests/paper.rs`
+
+`a_refused_followers_rejections_count_for_check_quorum_only_beside_reseed_progress`. Seven
+clusters became nine. The seven that were there assert what they asserted, and the
+harness's `incarnation` parameter became `(incarnation, refused)`, which is the whole
+change restated as a signature. The two new ones are the node's shape, which this file
+could not previously express:
+
+| Clause | What it answers with | Before | After |
+|---|---|---|---|
+| progress every window | `(0, refused)` | Leader | **Leader** |
+| no progress | `(0, refused)` | Follower, `uncounted: [2]` | **Follower, `uncounted: [2]`** |
+| progress in the first window only | `(0, refused)` | Follower, `uncounted: [2]` | **Follower, `uncounted: [2]`** |
+| progress, no answer | — | Follower, `uncounted: []` | **Follower, `uncounted: []`** |
+| a quarantined follower | `(5, not refused)` | Leader | **Leader** |
+| **a refused replica on a store of its own, no progress** | `(5, refused)` | *not expressible; the same answer as the quarantined one, which kept the office* | **Follower, `uncounted: [2]`** |
+| **the same, with progress every window** | `(5, refused)` | *as above* | **Leader** |
+| `RefusedCountsForQuorum` | `(0, refused)` | Leader | **Leader** |
+| `RefusedNeverCounts` | `(0, refused)` | Follower, `uncounted: [2]` | **Follower, `uncounted: [2]`** |
+
+Tier: **every run of the gate**, a bare-core test with no seeds. Those two new rows are the
+node's answer — a store of its own, and nothing of the log in it — and under the old key
+they were the quarantined row: counted, office kept. That is the hole, stated against the
+step function rather than against a cluster.
+
+**And what the mark *is*, asserted where it is computed.** The test above steps the mark in
+as a harness parameter, so it asserts what a *leader* does with an answer that carries one
+and nothing about where such an answer comes from: `Raft::refused()` itself was called by
+no test in the tree. The review of this slice planted the obvious mutation — drop the
+`quarantined` conjunct, so any follower with an empty log marks its rejections — and **the
+whole gate-tier suite passed**, with the node's D-049 figures byte-identical to the control.
+The claim two paragraphs above, that both conjuncts are necessary, was argued and not
+measured. A new gate-tier test,
+`a_refused_server_is_a_quarantined_one_with_nothing_of_this_log_in_it`, now reads the
+predicate directly:
+
+| The server | `refused()` | Why it must be that |
+|---|---|---|
+| fresh, never re-seeded, empty log | **false** | an empty log alone is a new member, or one its leader has not reached yet: a re-seed *ask* (RAFT.md §3), not a refusal |
+| quarantined, empty log, no snapshot | **true** | what a re-seed leaves behind, on both clusters |
+| quarantined, one entry landed | **false** | the quarantine outlives the refusal (D-035), and D-049 counts this follower as any follower |
+| quarantined, an install landed — snapshot at 5, empty tail | **false** | the other way the window closes |
+
+and then steps that same core: its rejection while it holds nothing carries the mark, the
+entry its leader reaches back to fits, and the next rejection carries **no** mark though the
+quarantine stands. That last part is `Raft::refused()` reaching the wire, which the harness
+above cannot see because it writes the bit itself. It also takes **N2** — the core never
+setting the mark — away from being the node's to catch alone. Tier: the gate, no seeds —
+the predicate is a function of two fields, so a sweep would add nothing to reading them.
+
+#### 2. The one-group server — `sim/tests/raft.rs`, the four D-049 tests
+
+Run on the tree before this change and on the tree after it, same seeds, same tiers, from
+the built release binary. **Every figure is identical, figure for figure.** This is the
+risk the owner's chosen shape carries — "the key changes for the one-group server too" —
+and it is the one claim in this entry that had to be measured on both trees rather than
+reasoned about:
+
+| | before (`origin/main`, 03e1829) | after |
+|---|---|---|
+| correct, blocked half | 0 of 1 000 failed; **1 000** step-downs, all naming the refused follower; slowest **2.1553416655748445** windows after the cut; 1 099 chunk acks; 12 301 refused rejections; 9 116 frames lost as oversized | **identical** |
+| correct, open half | 0 of 1 000; 1 000 re-seeded, slowest **7.609777755890815** windows; 1 000 commits after the install, slowest **13.943520230092423**; 1 075 537 chunk acks; 34 159 refused rejections | **identical** |
+| `RefusedCountsForQuorum`, blocked | caught **1 000 of 1 000**; 4 403 chunk acks; 101 284 refused rejections; 29 466 oversized | **identical** |
+| `RefusedNeverCounts`, open | caught **1 000 of 1 000**; slowest step-down **1.9978146258333316** windows | **identical** |
+| the sweep's-disk control, `RefusedCountsForQuorum` | failed 900 of 1 000: 895 by a silent step-down, **0** naming the refused follower, 5 with none `[60, 567, 582, 866, 921]` | **identical, seed list included** |
+| the sweep's-disk control, correct | failed 900 of 1 000: 883 silent, **15** naming the refused follower, 2 with none `[60, 567]` | **identical, seed list included** |
+
+At 100 seeds and at the gate's 20 the same holds, figure for figure: the correct leader
+steps down at most 2.1553416655748445 windows after the cut at a hundred and
+2.04995530991062 at twenty, sees the refused follower re-seeded at most 6.420948284396022
+and 6.242846963954052 and commits through it at most 12.206212715591969 and
+10.496410438222945; both variants are caught on every seed at both.
+
+**Why identical, and why it had to be measured anyway.** On the one-group server a
+refused server has no store, so the mark and incarnation 0 select exactly the same
+answers; and the mark rides in the byte `success` already occupied, so no frame changed
+length and no schedule could move. Both of those are arguments, and the owner's ruling
+put the one-group server's behaviour at risk explicitly. The seed lists above are what
+settles it: the sweep's-disk control fails on the same 900 seeds and names the same
+stragglers, which a moved schedule could not do.
+
+Tiers, unchanged: **every seed at every tier** for all four tests, 20 / 100 / 1 000 /
+10 000.
+
+#### 3. The node — `sim/tests/node.rs`, the sharded scenario
+
+The node's three tests, the same seeds as PROPOSED D-085 measured them on, beside D-085's
+own figures. **Nothing about the node's outcomes moved; what moved is that the rule now
+has something to read.**
+
+| Over 1 000 seeds, correct system | D-085 (the old key) | after |
+|---|---|---|
+| replicas refused and re-seeded | 4 000 | **4 000** |
+| answers that fitted | 248 574 | **248 574** |
+| rejections carrying a re-seeded store's own incarnation | 6 679 | **6 679** — now split **6 397** without the mark and **282** with it |
+| rejections stamped incarnation 0 (`store_less_answers`) | 0 | **0** |
+| rejections carrying the refused mark | **0** — there was no mark | **282** |
+| step-downs naming anyone `uncounted` | **0** of 1 394 | **1** of 1 394 |
+| ranges keeping the keeper's office, and committing through the re-seeded replica | 2 606 / 2 606 | **2 606 / 2 606** |
+| seeds carrying both outcomes | 955 | **955** |
+| snapshot streams toward the victim | 0 | **0** |
+| marked rejections **sent** after a fitting answer of the same range | n/a | **0** |
+| **un**marked rejections sent after that range's re-seed, before a fitting answer of it | n/a | **0** |
+
+The 6 679 splitting exactly into 6 397 and 282 is the load-bearing line of this table: no
+answer appeared, none disappeared, and the ones the rule is about are now distinguishable
+from the ones it is not.
+
+**The mark is asserted in both directions, per range.** `marked_after_fitted` is one-sided
+by construction: it catches a mark set too *widely* and cannot see one set too *narrowly*,
+and the only other thing asserting the mark's presence on the node was a sweep-wide
+`refused_rejections > 0`, which sees a total disappearance and nothing short of it. The
+review of this slice planted the mutation that lives in the gap — the mark computed once per
+**node**, off its first replica, and stamped on the other three (`ServerHost::stamp`) — and
+it passed **every test in the tree, gate included**: three quarters of the node silently
+stopped saying they held nothing of their own logs, and the only figure that moved was
+`refused_rejections`, 282 → 72 at a thousand seeds and 8 → 5 at twenty, which nothing
+asserted. That is the same "read per node where it is per (range, node)" defect this entry
+exists to close, in the direction the entry had left open. `NodeReport::check` now asserts
+the dual clause too, per range and in send order: **no rejection of a range was sent to that
+range's leader after that range's replica was re-seeded and before it had sent anything of
+that range that fitted, carrying no mark.** In that window the replica is quarantined on a
+store the re-seed built with nothing of this log in it, which is the whole of
+`Raft::refused`, so every rejection in it carries the mark. Measured **0 at 20, 100 and
+1 000 seeds** on correct code, under both variants and under `RefuseOneRangeOnly`; the
+mutation is caught **20 of 20** and **1 000 of 1 000**, each failure naming the range, and
+`refused_rejections` falls 282 → 72 while it does, which is the figure that was carrying the
+claim alone. The clause takes the only thing that lands to be an append, which holds while
+nothing streams a snapshot at the victim; `streams == 0` is asserted by a clause that runs
+**before** it, so the day PR #107's wiring lands the seed fails there, saying so, and the two
+are re-read together.
+
+Two things the same review found in the clause as first written, both fixed here. The
+send-order walk was gated on the hold, so a replica that re-seeded and caught up *before*
+the hold began started with `sent_fitted` false and hid both counters; it now reads from the
+**refusal** on, which is where the window the mark describes begins, and `sent_fitted` is
+reset at the re-seed rather than assumed false. And the delivery classifier's
+`incarnation: 0` arm sat first and shadowed the mark arms, which would have read the stamp
+and the mark as one field again — the very thing this entry undoes — the day the node has a
+store-less answer to send; `store_less_answers` is now counted *beside* the mark and not
+instead of it. Neither changed a figure on correct code (both were dormant: the gate bought
+nothing, and `store_less_answers` is 0 on every seed at every tier), which is why they are
+recorded here rather than in the tables above.
+
+**The pair's rate on the node, at every tier: caught 0 of 20, 0 of 100, 0 of 1 000** — the
+same zero D-085 reported, and **a different zero**. D-085's was "the rule has no site
+here": `Progress::refused_answered` was never set, on any seed, for any range, and both
+variants computed what the correct core computed, figure for figure. This one is "the site
+is here and no window has yet turned on it": `refused_answered` is set 282 times over a
+thousand seeds, and the variants no longer compute the same thing — the correct system
+leaves a follower `uncounted` on one step-down in 1 394 where `RefusedCountsForQuorum`
+leaves none. What is still missing is a window the rule *decides*: on this tree nothing
+compacts — `ServerHost` counts a core's snapshot action and drops it — so a leader always
+feeds a re-seeded replica from index 1, and the replica answers a marked rejection and then
+a success inside the same check-quorum window, where `active` settles it whichever way the
+variant counts the rejection.
+
+**That is one blocker and not two, and it is named: PR #107.** A leader that can compact
+past a re-seeded replica cannot feed it from its log; its marked rejections become the only
+answer in the window; and the rule decides, as the bare core already decides it in
+`paper.rs`. `sim/tests/node.rs`'s test fails the day that happens and says so, and
+`NodeReport::check` still fails any seed that opens a stream toward the victim.
+
+**Nothing was lowered.** §10's standard for the pair — caught on every seed at every tier —
+is asserted where the pair is caught, the four D-049 tests on the one-group server, whose
+every figure is above and unmoved. `RefuseOneRangeOnly`, the node's own pair, is still
+caught 20 of 20, 100 of 100 and **1 000 of 1 000**, in the fan-out clause's own words.
+
+### The mutation table
+
+Each mutation applied to the tree, swept, and reverted by restoring a copy taken before it
+(CLAUDE.md; the restore's rebuild was confirmed by a run, issue #102). Every row says what
+caught it **and what did not**, because a mutation that only one check catches is telling
+you which check is carrying the claim.
+
+| | Mutation | Caught by | Not caught by | One-group-blind |
+|---|---|---|---|---|
+| **N1** | the old key restored: `if !success && incarnation == 0` in `on_append_entries_response` | `paper.rs`'s D-049 test, at the new clause: "a refused follower is refused whatever store it answers from" — Leader where Follower was asked | **nothing else**: neither cluster's sweep moved a figure. The one-group sweeps cannot see it (there the two keys select the same answers) and the node's cannot (no window turns on the rule yet) | no — a bare-core test of one range |
+| **N2** | the core never sets the mark (`Raft::refused()` → `false`) | two, since the review: `sim/tests/node.rs`'s assertion — "no answer of the node carried the refused mark, so D-049's rule has no site here after all" — and the new predicate test, at its "a re-seeded store with nothing of this log in it is what the mark means" clause | every one-group test: its re-seed loop sets the mark literally, with no core | **it was**, while `paper.rs` only stepped the mark in as a parameter; the predicate test takes that away, and the node is still the only place the mark is asked to travel |
+| **N3** | the mark is the quarantine alone: `Raft::refused()` → `self.quarantined`, dropping the second conjunct. This is the *cheap per-node reading* — D-077 writes the quarantine mark per replica **from the node's refusal**, so keying on it alone says "this node was refused", which is right for the replicas still behind and wrong for every one that has caught up | two, since the review: `NodeReport::check`'s per-range clause, **20 of 20 seeds**, each naming the range — "node 2 sent leader 3 2 rejections carrying the refused mark **after** it had sent an answer of this range that fitted" — and now the predicate test's "one entry landed" clause in `paper.rs`, at the gate with no seeds | **the one-group server**, on all four D-049 tests at 20 seeds: its single replica catches up too, so the reading is equally wrong there, and no check in that tree compares a mark with that replica's own progress | **yes as the tree stands** — the clause is per range, and the situation it reads is four replicas of one refusal at four different places at one instant, which one group has no second replica to exhibit |
+| **N4** | the mark is dropped at the encoder (`answer_byte(*success, false)`) | three, independently: the codec's round trip; the one-group correct blocked half and `RefusedNeverCounts`; and the node's new assertion | `paper.rs`, which never encodes | no — but it is the row that says the mark genuinely has to survive the wire, which is what the ruling asked to be worked out |
+| **R1** | *the review's, and the one this slice did not anticipate:* the mark computed once per **node**, off its first replica, and stamped on every range (`ServerHost::stamp`) | `NodeReport::check`'s dual clause, **20 of 20** and **1 000 of 1 000**, each naming the range, and through it both node sweeps | **everything else in the tree, gate included**: `paper.rs`, the codec round trip, all four one-group D-049 tests, `RefuseOneRangeOnly`, and the node's own `refused_rejections > 0`, which merely falls 282 → 72 at a thousand seeds and 8 → 5 at twenty | **yes** — three of four replicas can lose the mark while the fourth keeps it, and one group has no second replica to lose it from |
+| **R2** | *the review's:* the quarantine conjunct dropped, `Raft::refused()` → `self.last_index() == 0`, so any follower with an empty log marks its rejections | the new `a_refused_server_is_a_quarantined_one_with_nothing_of_this_log_in_it`, at its first clause | **everything else**: the node's D-049 figures are byte-identical to the control (8 marked, 131 unmarked, 4 661 fitted, 0, 0 at twenty seeds) and every other binary is green at the gate tier | no — a bare-core predicate, and the hazard it guards (a fresh or newly added follower with an empty log marked refused) is reached by no scenario in the tree |
+
+**N3 is the row the standing demand asks for.** It is also the row that would have been
+easiest to ship by accident: `quarantined` is one durable bit, it is already there, and on
+every test in the tree before this branch it would have looked right.
+
+### The pinned seeds, re-audited
+
+CLAUDE.md asks that every pinned seed whose schedule or mechanism this change moves be
+re-audited to assert its mechanism, or the situation's absence with the reason.
+
+- **No schedule moved, and this is measured rather than asserted.** The mark rides in the
+  byte `success` already occupied, so every `AppendEntriesResponse` frame is the length it
+  was; the simulator drains links at a modelled rate and bounds an outbox in bytes (D-056,
+  D-072), and equal bytes is what keeps those two from moving. The evidence is the one-group
+  table above: the sweep's-disk control fails on the same 900 of 1 000 seeds before and
+  after and names the same stragglers, `[60, 567, 582, 866, 921]` and `[60, 567]`, which a
+  moved schedule could not reproduce.
+- **`sim/tests/raft.rs`'s four D-049 tests** are the pins nearest this change. Each asserts
+  a mechanism — a step-down within a measured bound naming the uncounted follower, an office
+  kept through a blocked stream, a step-down mid-re-seed, and a silence that deposes the
+  leader under either count — and each asserts it on the same figures, at 20, 100 and 1 000.
+  None moved.
+- **The twenty-three pinned seeds of `sim/tests/raft.rs`** audited by PROPOSED D-082, and
+  D-085's own audit, stand unchanged: nothing here changes a draw, a tick, a persist or a
+  frame's length.
+- **The pinned trace hash** (`sim/tests/echo.rs`, `fcbe82ee7a0ba672`) is the echo scenario's
+  and carries no Raft frame. The studio decoder gains a `refused` field on an
+  `AppendEntriesResponse`, emitted **only when set**, as `RaftQuorumLost`'s `uncounted` is
+  (D-049), so an ordinary answer's studio line is the line it was.
+
+### What this costs the one-group server
+
+Nothing measured, which is the claim above and not a hope; and one thing that is not a
+figure. Its re-seed loop now states the refused mark outright instead of leaving a leader to
+infer it from a stamp that happens to be 0. That is a line of code and a sentence of RAFT.md,
+and it is the whole of the risk the owner's chosen shape carried on this cluster.
+
+### What goes to the owner
+
+1. **The number.** This entry wanted D-086; PR #109 holds it. It takes **D-087** and the
+   footer moves to D-088. If #109 lands first this needs nothing; if the integrator would
+   rather renumber, every site is marked.
+2. **The pair is still caught 0 of 1 000 on the node**, and this entry does not assert a
+   catch there. That is measured, its cause is named, and its trigger is PR #107 — but it
+   means Stage B's §10 exit criterion for `RefusedCountsForQuorum` and `RefusedNeverCounts`
+   on a sharded `sim/quorum.rs` is **still owed**, now for one reason instead of two. The
+   owner decides whether that is the wiring slice's to close or this one's to reopen after it.
+3. **`crates/ananke-raft/tests/paper.rs` is the only thing that catches a reverted key**
+   (N1). It is a gate-tier bare-core test, so the claim is asserted on every run — but if
+   the owner wants the key asserted on a *cluster*, that is the compaction the wiring brings,
+   not something this slice can build without widening into #107.
+4. **`scripts/premerge.sh` has not run.** The thousand-seed figures are these tests alone
+   from the built release binary, and nothing here may be read as a premerge result. The
+   machine: Darwin 25.6.0 arm64, Apple M2, 8 cores, on AC power, load averages between
+   **49.05 and 235.83** across the campaign — a dozen worktrees building at once — so the
+   cpu seconds in the nightly row are high and the counts, which is what this entry rests
+   on, are unaffected.
+5. **The nightly shard row was renamed, not re-weighed.**
+   `d_049s_pair_has_no_site_on_the_node_and_this_says_the_day_it_does` becomes
+   `d_049s_rule_has_a_site_on_the_node_now_and_its_pair_waits_only_on_the_wiring` in
+   `scripts/nightly-shards.txt`, shard 4, and keeps D-085's **70.0** cpu s. The test does
+   the same work — the same two variants over the tier's seeds, with three assertions
+   instead of four — so the figure is D-085's and is carried rather than re-measured;
+   re-weighing it under load averages near a hundred would have replaced a good number
+   with a worse one. If the owner wants it re-weighed, it wants a quiet machine.
+
 ---
 
 ## PROPOSED D-088 — `LeaseTrustsTheClock`'s catch on the node moves to the nightly's ten thousand
@@ -14482,4 +14844,4 @@ quotes it.
 
 ---
 
-_Next entry: D-089. Add one before implementing anything not covered above._
+_Next entry: D-89. Add one before implementing anything not covered above._

@@ -2305,6 +2305,14 @@ async fn reseed<E: Environment>(
                 // promise is ever measured from this server (RAFT.md §3), and
                 // incarnation 0, no store, so a leader that matched entries on
                 // the lost one forgets them (D-042).
+                //
+                // The refused mark is the same statement said outright, and it is
+                // the one check quorum reads (D-049, PROPOSED D-087): this server
+                // holds nothing of the log and can commit nothing for the leader
+                // until its re-seed does. Here the two coincide, which is why the
+                // old key worked on this server and on nothing else; a core
+                // answering from a store a re-seed built says it with the mark
+                // alone.
                 let message = Message::AppendEntriesResponse {
                     term,
                     success: false,
@@ -2314,6 +2322,7 @@ async fn reseed<E: Environment>(
                     echo: 0,
                     local: 0,
                     incarnation: 0,
+                    refused: true,
                 };
                 send_message(env, sock, addrs, id, from, message, 0).await;
             }

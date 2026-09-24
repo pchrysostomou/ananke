@@ -5183,7 +5183,7 @@ impl Report {
             let Message::AppendEntriesResponse {
                 term: answered,
                 success,
-                incarnation,
+                refused,
                 ..
             } = message
             else {
@@ -5192,7 +5192,11 @@ impl Report {
             if *answered != term {
                 continue;
             }
-            if !*success && *incarnation == 0 {
+            // The refused mark, not incarnation 0: the same set of answers on this
+            // one-group sweep, where a refused server has no store, and the reading
+            // that carries to a node whose re-seed builds one.
+            // PROPOSED(D-087): D-049's rule keyed on a refused mark the answer carries.
+            if !*success && *refused {
                 open.entry((to, from))
                     .or_insert(Open {
                         leader: to,
