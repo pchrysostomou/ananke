@@ -101,6 +101,19 @@ ananke/
 
 _Update this section at the end of every session._
 
+- Branch `phase-3-lease-tier-nightly` (2026-09-23), PROPOSED D-088, off `origin/main` at
+  `03e1829`: the owner's ruling on `LeaseTrustsTheClock`'s tier on the node. Its catch —
+  a stale read found by linearizability — asserts from the **nightly's ten thousand**
+  instead of the thousand-seed tier, because the node's own rate is **78 of 10 000
+  (0.78 %)** and **6 of 1 000 (0.60 %)**, re-measured on this tree, against the one-group
+  server's 4.0 %. At 0.78 % a thousand seeds catch none with probability 4.0e-4 and ten
+  thousand with 9.8e-35, where the one-group assertion this tier was copied from sits at
+  1.9e-18. One comparison changes, `if seeds >= 1000` to `if seeds >= 10_000`; the rate
+  keeps printing at every tier and the one-group assertion is untouched. The assertion was
+  *proved to fire*: with the sweep stubbed to no seeds it fails at 10 000 and passes at
+  1 000, and the same stub with the gate at 100 000 passes at 10 000 — the stream-variants
+  slice's bug, reproduced deliberately so this slice could be shown not to have it.
+
 - Branch `phase-3-stage-b-membership` (2026-09-22), stacked on
   `phase-3-stage-b-sweeps` (PR #101, PROPOSED D-082): **`sim/membership.rs` on the
   node** (PROPOSED D-084), the second of Stage B's first exit criterion's three

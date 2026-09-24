@@ -66,8 +66,11 @@
 # that `cargo test --list` and this table carry the debt rather than a paragraph of
 # prose; each runs its variant over `high_rate_share()` and asserts the path absent.
 # Six more run that share and are tens of cpu seconds for the same reason; the two
-# large rows are the correct node on every seed and `LeaseTrustsTheClock`, whose catch
-# is asserted from the thousand-seed tier and which therefore runs every seed.
+# large rows are the correct node on every seed and `LeaseTrustsTheClock`, which sweeps
+# every seed of its tier rather than a share of it. PROPOSED D-088 moved that catch's
+# assertion from the thousand-seed tier to the nightly's ten thousand; the row's weight
+# is unchanged, because the tier gate decides whether to assert and not how many seeds
+# are swept.
 # Placed longest-first into the lightest shard, against the table as this branch found
 # it, where the shards then ran 1328.0 to 1442.7 cpu s; the merge note below recomputes
 # every total.
