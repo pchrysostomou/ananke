@@ -792,13 +792,18 @@ waits in the inbox for the next:
   and none collapsed. The node's own inputs for that core — a client's request, an index
   the `apply` task made durable — are held the same way and in the order they arrived, so
   a client of one range waits behind that range's disk and behind no other's (PROPOSED
-  D-076). The node's bound covers what it holds because the task drains its
-  queue to empty on every wake, so a bound that asked only about the queue would bind
-  nothing (D-074, proposed). What the hold does *not* bind is a message larger than the
-  whole bound: no emptying could ever make room for one, so it is admitted whatever the
-  node holds, exactly as it is into an empty queue (D-072). Binding that case on the hold
-  refuses every retransmission of it alike — a node behind any outstanding sync is
-  holding something — and the range would never replicate again.
+  D-076). What the node cannot serve fails it rather than being counted and dropped: a
+  snapshot action a core asks for while the `snapshot` task keyed by range and follower
+  is another slice's, and a client request for a range this node does not host, are each
+  traced as a failure of the server, and a replica's registered reads are bounded, so a
+  read the step refuses cannot leave its client's address behind
+  (`READS_OUTSTANDING`; PROPOSED D-076). The node's bound covers what it holds because
+  the task drains its queue to empty on every wake, so a bound that asked only about
+  the queue would bind nothing (D-074, proposed). What the hold does *not* bind is a
+  message larger than the whole bound: no emptying could ever make room for one, so it
+  is admitted whatever the node holds, exactly as it is into an empty queue (D-072).
+  Binding that case on the hold refuses every retransmission of it alike — a node behind
+  any outstanding sync is holding something — and the range would never replicate again.
 
   The entries an `Apply` names are read from the core **at the step that named them**,
   not when the node comes to execute it: a deferred `Apply` runs after the replay has

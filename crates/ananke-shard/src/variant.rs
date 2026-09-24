@@ -130,6 +130,22 @@ pub enum NodeVariant {
     /// to reclaim it, so the node's slots fill with reservations for departed senders
     /// and it re-seeds nothing more (SHARD.md §12; Q14).
     SlotReservedForWaiter,
+    /// Every core of the node seeded from the node's own stream, `env.rng()`, rather
+    /// than from `n{id}/r{range}/protocol` (D-057, `Environment::range_rng`). The
+    /// four cores still draw four different seeds, so nothing about *one* run tells
+    /// the two apart — what the keying buys is that range r's stream is range r's
+    /// alone, so a range added to or removed from the configuration moves no other
+    /// range's schedule, and under this variant it moves all of them (SHARD.md §2,
+    /// Q13).
+    OneSeedForEveryCore,
+    /// A read a replica refuses leaves its registration behind: the step's refusal
+    /// takes the work in flight and the `reads` map keeps its `(SocketAddr,
+    /// Request)` for the life of the node. This is the node exactly as it was before
+    /// D-076's review — a follower refusing reads for a living grows an unbounded
+    /// map — and it is here rather than in a scratch file so that the bug has a half
+    /// beside the correct code that the node scenario runs on every seed
+    /// (CLAUDE.md:52-57; SHARD.md §4).
+    RefusedReadLeft,
     /// A stream completed on the very chunk that restarted it: the node is told to
     /// install, never that the staging directory must start over, so the install takes
     /// the abandoned stream's files for the new snapshot's (RAFT.md:203-207).
@@ -416,6 +432,8 @@ impl NodeVariant {
         NodeVariant::RecordNeverQueued,
         NodeVariant::CapWaitIsAStartOver,
         NodeVariant::RestartsNotCounted,
+        NodeVariant::RefusedReadLeft,
+        NodeVariant::OneSeedForEveryCore,
     ];
 
     /// Q15's whole-node refusal and re-seed, in order: the six ways to get a node's
@@ -562,7 +580,8 @@ impl NodeVariant {
             // two variants share a bit. D-081's three for the directed re-seed shape
             // follow at 40 to 42. Forty-three variants no longer fit a `u32`, which is
             // why [`NodeVariants`] is a `u64`, as `ananke_raft`'s set was widened for
-            // the same reason; twenty-one bits are left.
+            // the same reason; D-090's two at 43 and 44 and D-076's review's two at 45 and 46;
+            // seventeen bits are left.
             NodeVariant::InstallWrongRangesSpans => 1 << 26,
             NodeVariant::AdmitsAnUnhostedRange => 1 << 27,
             NodeVariant::AssemblyHeldForDepartedSender => 1 << 28,
@@ -584,6 +603,10 @@ impl NodeVariant {
             // not count. Nineteen bits are left.
             NodeVariant::CapWaitIsAStartOver => 1 << 43,
             NodeVariant::RestartsNotCounted => 1 << 44,
+            // D-076's review's two: a refused read's registration left behind, and one
+            // seed for every core. Seventeen bits are left.
+            NodeVariant::RefusedReadLeft => 1 << 45,
+            NodeVariant::OneSeedForEveryCore => 1 << 46,
         }
     }
 
@@ -636,6 +659,8 @@ impl NodeVariant {
             NodeVariant::RecordNeverQueued => "RecordNeverQueued",
             NodeVariant::CapWaitIsAStartOver => "CapWaitIsAStartOver",
             NodeVariant::RestartsNotCounted => "RestartsNotCounted",
+            NodeVariant::RefusedReadLeft => "RefusedReadLeft",
+            NodeVariant::OneSeedForEveryCore => "OneSeedForEveryCore",
         }
     }
 }
@@ -725,8 +750,8 @@ mod tests {
         // Twenty of the round's and the snapshot task's, the snapshot review's four,
         // D-077's six for Q15's whole-node refusal and re-seed, D-083's ten for the
         // snapshot wiring, D-081's three for the directed re-seed shape, and D-090's two for a
-        // stream's bounds.
-        assert_eq!(NodeVariant::BUGS.len(), 45);
+        // stream's bounds, and D-076's review's two.
+        assert_eq!(NodeVariant::BUGS.len(), 47);
         for variant in NodeVariant::SNAPSHOT
             .iter()
             .chain(NodeVariant::WIRING)
