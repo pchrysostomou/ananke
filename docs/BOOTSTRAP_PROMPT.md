@@ -101,6 +101,74 @@ ananke/
 
 _Update this section at the end of every session._
 
+- Branch `phase-3-stream-arms-aimed`, the owner's second ruling applied
+  (2026-09-24): **the timer check gains a fourth arm for the node's live install**
+  (PROPOSED D-091), and **a catch on the node is attributed to the variant's own
+  violation**. PROPOSED D-089's per-range aim reached a situation nothing before it did
+  and the correct node tripped the timer bound in it on seeds 272 and 516; the owner
+  ruled for the arm rather than a widening. An install into a live store keeps its
+  incarnation (D-042, D-066), so D-063's arm — written for a run-loop incarnation that
+  ends at the completion — does not apply. What stops the node's core is the **hold**:
+  the node holds the one range it is installing, from the repair's capture to the
+  manifest switch, and a held core takes no tick and has no timer to fire (D-066, which
+  said this re-keying would be owed). The arm is fenced at both ends by named events —
+  it **opens** on the install's decision, carried by the completion record and read at
+  its decision time, so the exemption is never wider than the hold, and **closes** on
+  the restored replica's restatement, with a crash's `RaftTerm` and a `RangeRemoved` as
+  the two closes every stretch already has. It does not exempt the stretch before the
+  hold, the node's other ranges, a take, a completed install with no read-back (D-063's
+  staged one), or anything after the restatement; each is asserted on hand-built records
+  in `sim/raft.rs`. **The correct node is green on all thousand seeds** and the two are
+  pinned with their mechanism both ways
+  (`seeds_272_and_516_are_a_live_installs_hold_and_the_fourth_arm_answers_for_them`).
+  The second half of the ruling: every `caught`-style assertion in `sim/tests/node.rs`
+  now names the check it expects (RAFT.md §5's `What catches it`), so a catch by an
+  unrelated violation **fails rather than passes**, and an absence test reports a run
+  that failed some other check as the node's own failure and not as the variant's catch
+  — which is what one timer gap in the correct node's run was being read as, on three
+  different variants. The three rates the ruling names were re-measured over the share of a
+  thousand seeds their assertions use, before and after: `IgnoreIncarnation` **2 → 0**,
+  `RefusalNotDurable` **2 → 0** and `AdoptionAsBuilt` **1 → 0** violations, and **none of
+  the five was ever by a check the variant breaks** — the before column was three false
+  catches of one bound. The arm takes nothing from the check: over the correct node's
+  thousand it adds no gap and removes exactly those two, and `ResetTimerOnAnyRpc` — the
+  variant the timer check is written for — is still caught on **50 of 100**, all fifty by
+  the timer check, with no gap added or removed. Every one of 11 949 holds the arm opened
+  over that thousand closed, 11 946 on the restatement at its own switch. Five mutations
+  planted, five caught. Nothing is widened: `TIMER_TIMEOUTS`, the bound and
+  every trace and schedule are untouched.
+- Branch `phase-3-stream-arms-aimed`, stacked on `phase-3-stage-b-stream-variants`
+  (2026-09-23): **the two stream arms aim their victim at a range it lags**
+  (PROPOSED D-089), which is the owner's ruling on what D-086 took to them.
+  `Fault::CrashInstalling` and `Fault::RetakeUnderStream` drew a victim from one stream
+  and a range from another, so on a node the arm reached its situation only where the
+  two draws coincided: the install crash reached the final chunk of the range it drew on
+  **0 of 100** seeds. The range is resolved against the trace now, after the isolation
+  and the heal, and lands on one the victim is behind that range's leader's compacted
+  prefix of, preferring the drawn range wherever it qualifies. The arm fires on **14 of
+  100** and **122 of 1 000**, so `SnapshotWithoutCurrentLast`'s injection is asserted
+  from a **hundred seeds** instead of the nightly's ten thousand — the hole the ruling
+  was about. Its **catch is still 0 of 1 000**, now over 122 firings rather than one,
+  and is still asserted nowhere: the arm is no longer the reason, and that goes to the
+  owner. `SharedSnapshotDir`'s four rates were re-measured and three did not move (the
+  fault 100/100, the arm 1/100, the catch 26/100; the scramble 29 → 30 of 100), and no
+  tier moves with this. The correct node's sweep floors the install arm's firing and
+  asserts each arm's aims cover more than one range, which is what a constant aim is
+  caught by. `Cluster::OneGroup` is byte-identical to the base — seed 42's JSONL hashes
+  to `05a18a8e6f57159a703bdc0c8b37a9e52f9d083f154760abd24a53bfa6f5ea86` on both, which
+  is **not** the hash D-086 records: the merge with `phase-3-stage-b-wiring` moved it by
+  145 bytes before this slice, and D-086 is corrected rather than rewritten.
+  **The aim reaches a situation nothing before it did, and the correct node trips the
+  timer bound in it on 2 of the first 1 000 seeds** — 272 and 516, where the base is green
+  on all thousand. A replica being fed a snapshot of one range completes a **live**
+  install inside the window with no chunk of that range delivered in it, and none of the
+  timer check's three reset arms covers a node whose install keeps its incarnation
+  (D-042, D-066), so it neither hears a leader nor campaigns. No safety fold fails on
+  either seed. Nothing is widened: both are pinned with their mechanism, and
+  whether the check owes a fourth arm is the owner's ruling. **The gate is green and the
+  thousand-seed tier is red on those two seeds until it is made.** *The owner made it,
+  and the bullet above is the answer: PROPOSED D-091 on this branch, whose pin replaces
+  this one's — the two seeds are green for the reason the ruling gives.*
 - Branch `phase-3-stage-b-stream-variants`, stacked on the snapshot wiring
   (2026-09-22): **the node reaches the stream path**, and Phase 2's four stream
   variants are measured on it (PROPOSED D-086). The node's `snapshot_threshold` drops

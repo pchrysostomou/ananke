@@ -211,6 +211,24 @@ struct Coverage {
     multi_range_frames: usize,
     arms_hit: usize,
     arms_fired: usize,
+    /// The range each stream arm **aimed** at, counted per range, and how many install
+    /// arms reached the final chunk there (PROPOSED D-089).
+    ///
+    /// The two stream arms draw their victim from one stream and their range from
+    /// another, so until this slice an arm reached its situation only where the two
+    /// coincided — on 0 of 100 seeds for the install crash. The aim is resolved
+    /// against the trace now, at the moment the victim has been cut off and healed,
+    /// and lands on a range that victim is behind the leader's compacted prefix of.
+    /// These three say what the aim did: which ranges it chose, and how often the
+    /// choice carried the arm to the moment it is about.
+    install_aims_by_range: BTreeMap<u64, usize>,
+    stream_aims_by_range: BTreeMap<u64, usize>,
+    installs_fired: usize,
+    /// Of all the stream arms' aims, how many kept the range the schedule drew — the
+    /// aim does, wherever the victim is behind that range's compacted prefix — and how
+    /// many there were (PROPOSED D-089).
+    aims_kept_the_draw: usize,
+    aims: usize,
     lags_by_range: BTreeMap<u64, Vec<Duration>>,
     holds: Vec<Duration>,
     holds_dropped_for_a_crash: usize,
@@ -281,6 +299,11 @@ impl std::fmt::Debug for Coverage {
             .field("multi_range_frames", &self.multi_range_frames)
             .field("arms_hit", &self.arms_hit)
             .field("arms_fired", &self.arms_fired)
+            .field("install_aims_by_range", &self.install_aims_by_range)
+            .field("stream_aims_by_range", &self.stream_aims_by_range)
+            .field("installs_fired", &self.installs_fired)
+            .field("aims_kept_the_draw", &self.aims_kept_the_draw)
+            .field("aims", &self.aims)
             .field("apply_lag_samples", &lag_samples)
             .field("apply_lag_median", &median_lag)
             .field("apply_lag_median_per_range", &per_range)
@@ -379,6 +402,18 @@ impl Coverage {
         let (hit, fired) = report.arms_hit_their_ranges();
         self.arms_hit += hit;
         self.arms_fired += fired;
+        // PROPOSED(D-089): the stream arms aim their victim at a range it lags.
+        for (drawn, aimed) in &report.install_aims {
+            *self.install_aims_by_range.entry(*aimed).or_default() += 1;
+            self.aims_kept_the_draw += usize::from(drawn == aimed);
+            self.aims += 1;
+        }
+        for (drawn, aimed) in &report.stream_aims {
+            *self.stream_aims_by_range.entry(*aimed).or_default() += 1;
+            self.aims_kept_the_draw += usize::from(drawn == aimed);
+            self.aims += 1;
+        }
+        self.installs_fired += report.aimed_installs;
         for (range, lags) in report.apply_lags() {
             self.lags_by_range.entry(range).or_default().extend(lags);
         }
@@ -407,6 +442,12 @@ impl Coverage {
     /// of its observation, which is what keeps a tier of twenty from failing a tree
     /// with nothing wrong while still failing a tree where an arm stopped firing.
     /// They are scaled by the tier, since every one of them is a per-seed rate.
+    ///
+    /// **`per_seed` clamps at one**, so a floor whose hundred-seed observation is in the
+    /// single figures stops being a quarter of anything at the gate's twenty and becomes
+    /// "at least one". The thirteen in the array are all far above that; the install
+    /// arm's floor below is not, and is asserted from a hundred seeds for that reason.
+    // PROPOSED(D-089): the stream arms aim their victim at a range it lags.
     fn assert_complete(&self) {
         let per_seed = |floor: f64| (floor * self.seeds as f64 / 100.0).max(1.0) as usize;
         let floors: [(&str, usize, usize); 13] = [
@@ -441,6 +482,66 @@ impl Coverage {
                 saw >= floor,
                 "the sweep saw {saw} {what} over {} seeds, under the floor of {floor}: an arm \
                  that stops firing is a sweep that passes because it injected nothing",
+                self.seeds
+            );
+        }
+        // **The install arm reaching the moment it aims at**, which was not a floor
+        // before PROPOSED D-089 because it was not a number: the arm drew its victim and
+        // its range apart and reached the final chunk of the range it drew on **0 of
+        // 100** seeds. Aimed at a range its victim is behind the compacted prefix of,
+        // the correct node's arm reaches it on **9 of 100** and **131 of 1 000**. An aim
+        // that stops working — a scan that reads the wrong range's prefix, a fallback
+        // that swallows every candidate, a range resolved before the lag exists — shows
+        // up here as an arm that stopped firing, which is the one failure a sweep cannot
+        // otherwise report.
+        //
+        // **It is asserted from a hundred seeds and not at the gate's twenty**, which is
+        // where the review of this slice found it. The floor above is a per-seed rate
+        // clamped at one, so at twenty it reads "at least one" against an observation of
+        // two — not the quarter of the observation the twelve above it sit at. Twenty
+        // seeds draw about **8** install arms and each reaches its final chunk about a
+        // **quarter** of the time (131 of 517 at a thousand), so all eight missing is
+        // 0.75^8, about **one run in ten**: a worse bound than the one run in twenty
+        // this file refuses for `aimed_installs > 0`, and a bound the correct tree trips
+        // is one to fix and never one to widen (D-030, D-039). At a hundred seeds the
+        // observation is 9 against a floor of 2 and the same arithmetic gives about one
+        // run in a hundred thousand. The count is printed at every tier, and both
+        // mutations this floor catches fail it at a hundred as well as at twenty.
+        // PROPOSED(D-089): the stream arms aim their victim at a range it lags.
+        if self.seeds >= 100 {
+            let floor = per_seed(2.0);
+            assert!(
+                self.installs_fired >= floor,
+                "the sweep saw {} install arms that reached their range's final chunk over {} \
+                 seeds, under the floor of {floor}: an arm that stops firing is a sweep that \
+                 passes because it injected nothing",
+                self.installs_fired,
+                self.seeds
+            );
+        }
+        // **The aim is a per-range one and not a constant** (PROPOSED D-089). The two
+        // stream arms resolve their range against the trace now, and an aim that
+        // answered one range every time would fire as often as this one, pass every
+        // check above, and leave three of the node's four ranges' installs never
+        // crashed at and never re-taken under — a fault model narrower than it reads.
+        // **A single-range world cannot be wrong about this**: with one range every
+        // aim is that range and this assertion is about nothing, which is why it is
+        // here and not in `sim/tests/raft.rs`. Measured on the correct node: the
+        // install arm's aims land on all four ranges at the gate's twenty
+        // (`{2: 3, 3: 2, 4: 1, 5: 2}`) and at a hundred
+        // (`{2: 11, 3: 15, 4: 11, 5: 12}`), the re-take arm's on three at twenty and
+        // four at a hundred. The sweep runs seeds `0..tier`, so a larger tier holds
+        // the gate's seeds and these only grow: the assertion is two, not four.
+        for (what, aims) in [
+            ("install", &self.install_aims_by_range),
+            ("re-take", &self.stream_aims_by_range),
+        ] {
+            assert!(
+                aims.len() > 1,
+                "the {what} arm aimed at {} range(s) over {} seeds ({aims:?}): an aim that \
+                 answers one range leaves the node's others' streams unreached, which every \
+                 check of a single-range world would pass",
+                aims.len(),
                 self.seeds
             );
         }
@@ -789,39 +890,92 @@ fn high_rate_share() -> u64 {
     (seeds() / 10).max(seeds().min(20))
 }
 
-/// The violations `variants` was caught by over the share, with the rate and the
+/// The violations a sweep found, split by the check that reported each: the ones
+/// the variant is **about**, and the ones some other check made.
+///
+/// **A catch is the variant's only when the check that reported it is a check the
+/// variant breaks** (RAFT.md §5's table, the `What catches it` column). Until
+/// PROPOSED D-091 every test here read `checked(...).err()` and counted whatever came
+/// back, so a violation by an unrelated check propped up a positive assertion —
+/// "caught" — and, in the absence tests, was reported as the variant being caught at
+/// all. One gap in the **correct** node's own run did exactly that: the timer bound
+/// PROPOSED D-089's per-range aim reached was reported on three different variants,
+/// on seeds where each of the three injects nothing, and the quoted violations were
+/// the timer strings word for word. Attribution is what tells those apart, and it is
+/// the shape `sim/tests/raft.rs` already uses for `NoPreVote`, whose catch is counted
+/// by the pre-vote check and not by whichever check a run failed first.
+// PROPOSED(D-082): a catch on the node is attributed, not counted.
+// PROPOSED(D-091): a catch is attributed to the variant's own violation, and a catch
+// by an unrelated violation fails rather than passes.
+#[derive(Debug, Default)]
+struct Caught {
+    /// Violations by one of the checks named for this variant: its catch.
+    own: Vec<String>,
+    /// Violations by any other check. These are real failures and they are reported
+    /// as themselves — never as this variant's catch.
+    other: Vec<String>,
+}
+
+impl Caught {
+    /// Splits `violations` by whether the check that made each is one of `checks`,
+    /// named as [`mechanism`] names them.
+    // PROPOSED(D-091): a catch is attributed to the variant's own violation.
+    fn split(violations: Vec<String>, checks: &[&str]) -> Self {
+        let mut caught = Self::default();
+        for violation in violations {
+            if checks.contains(&mechanism(&violation)) {
+                caught.own.push(violation);
+            } else {
+                caught.other.push(violation);
+            }
+        }
+        caught
+    }
+}
+
+/// The violations `variants` was caught by over the share, split by [`Caught`]
+/// against the `checks` this variant's catch is attributed to, with the rate and the
 /// mechanisms printed.
 ///
-/// It returns the violations and not a count, because a count cannot tell a catch by
-/// the check the variant is about from a catch by something else that happened to go
-/// wrong first. §12 asks each variant to be re-asserted "to the standard its Phase 2
-/// test asserts and no stronger", and two of Phase 2's tests assert the mechanism by
-/// name rather than a bare catch.
+/// §12 asks each variant to be re-asserted "to the standard its Phase 2 test asserts
+/// and no stronger", and `checks` is that standard: RAFT.md §5's `What catches it`
+/// for the variant, which is what its Phase 2 test asserts against.
 // PROPOSED(D-082): a catch on the node is attributed, not counted.
-fn caught_on(name: &str, variants: impl Into<Variants> + Copy + Send + Sync) -> Vec<String> {
+// PROPOSED(D-091): a catch is attributed to the variant's own violation.
+fn caught_on(
+    name: &str,
+    variants: impl Into<Variants> + Copy + Send + Sync,
+    checks: &[&str],
+) -> Caught {
     let seeds = high_rate_share();
-    let caught: Vec<String> = sweep(seeds, |seed| checked(&buggy(seed, variants)).err())
+    let violations: Vec<String> = sweep(seeds, |seed| checked(&buggy(seed, variants)).err())
         .into_iter()
         .flatten()
         .collect();
-    let rate = caught.len() as f64 * 100.0 / seeds as f64;
     let mut by_check: BTreeMap<&str, usize> = BTreeMap::new();
-    for violation in &caught {
+    for violation in &violations {
         *by_check.entry(mechanism(violation)).or_default() += 1;
     }
+    let caught = Caught::split(violations, checks);
+    let rate = caught.own.len() as f64 * 100.0 / seeds as f64;
     println!(
-        "node: {name} caught on {}/{seeds} seeds ({rate:.1}%), by {by_check:?}, first: {}",
-        caught.len(),
-        caught.first().map_or("", String::as_str)
+        "node: {name} caught on {}/{seeds} seeds ({rate:.1}%) by {checks:?}, its own checks; \
+         {} more violations came from other checks and are not its catch; every violation by \
+         {by_check:?}, first of its own: {}",
+        caught.own.len(),
+        caught.other.len(),
+        caught.own.first().map_or("", String::as_str)
     );
     caught
 }
 
-/// Which check a violation came from, for the attribution `caught_on` prints.
+/// Which check a violation came from, for the attribution [`Caught`] rests on.
 ///
-/// The names are the checks' own words. `server failed` is not a check at all: it is
-/// the node telling the scenario its own apply stream had a hole, which is a real
-/// catch of a real bug and a different statement from a safety fold's.
+/// The names are the checks' own words. `the node failed` is not a check at all: it
+/// is the node telling the scenario its own apply stream had a hole, which is a real
+/// catch of a real bug and a different statement from a safety fold's. The last two
+/// are `checked`'s own, not `Report::check`'s: what a run must reach for the stream
+/// variants to assert anything, and the one path this node has not got.
 // PROPOSED(D-082): a catch on the node is attributed, not counted.
 fn mechanism(violation: &str) -> &'static str {
     for (needle, name) in [
@@ -831,6 +985,7 @@ fn mechanism(violation: &str) -> &'static str {
         ("committed entries", "committed entries stay"),
         ("commit majority:", "commit by majority"),
         ("commit by current term", "commit by current term"),
+        ("match starts:", "match starts"),
         ("log matching", "log matching"),
         ("election safety", "election safety"),
         ("leader completeness", "leader completeness"),
@@ -838,6 +993,11 @@ fn mechanism(violation: &str) -> &'static str {
         ("liveness", "liveness"),
         ("follower log:", "the follower-log bound"),
         ("failed:", "the node failed"),
+        // PROPOSED(D-091): `checked`'s own two, which were "something else" before
+        // and are named now that a name decides where a violation is counted.
+        ("refused its store", "a store refused"),
+        ("this seed's evidence is vacuous", "no snapshot action"),
+        ("nothing was checkpointed for a stream", "no take completed"),
     ] {
         if violation.contains(needle) {
             return name;
@@ -858,10 +1018,18 @@ fn a_server_that_sends_before_it_persists_is_caught_on_the_node() {
     // persist leaves when that persist resolves, and the variant sends it first
     // (§10). On the node the round submits four ranges' persists together, so the
     // send the variant lets out early races a sync that carries other ranges' work.
-    let caught = caught_on("SendBeforePersist", Variant::SendBeforePersist);
+    // Attributed to the checks RAFT.md §5 names for it: commit by majority, and
+    // leader completeness where a crash falls between the send and the persist.
+    // PROPOSED(D-091): a catch is attributed to the variant's own violation.
+    let caught = caught_on(
+        "SendBeforePersist",
+        Variant::SendBeforePersist,
+        &["commit by majority", "leader completeness"],
+    );
     assert!(
-        !caught.is_empty(),
-        "SendBeforePersist was never caught on the node"
+        !caught.own.is_empty(),
+        "SendBeforePersist was never caught on the node by a check it breaks, which is what \
+         RAFT.md §5 names for it: {caught:?}"
     );
 }
 
@@ -875,10 +1043,17 @@ fn a_server_that_applies_before_commit_is_caught_on_the_node() {
     // bug by the node's own oracle, and it is a different statement from state
     // machine safety's, which is why the entry says so rather than leaving it in the
     // count.
-    let caught = caught_on("ApplyBeforeCommit", Variant::ApplyBeforeCommit);
+    // PROPOSED(D-091): a catch is attributed to the variant's own violation. The
+    // node's own oracle is named beside RAFT.md §5's two, for the reason above: a
+    // hole in the applied stream is this bug and nothing else's.
+    let caught = caught_on(
+        "ApplyBeforeCommit",
+        Variant::ApplyBeforeCommit,
+        &["state machine safety", "linearizability", "the node failed"],
+    );
     assert!(
-        !caught.is_empty(),
-        "ApplyBeforeCommit was never caught on the node"
+        !caught.own.is_empty(),
+        "ApplyBeforeCommit was never caught on the node by a check it breaks: {caught:?}"
     );
 }
 
@@ -889,13 +1064,9 @@ fn a_server_without_pre_vote_is_caught_on_the_node() {
     // catch here would be weaker than Phase 2's and this asserts the same thing — the
     // catch is pre-vote's own property, a server raising its term while cut off.
     // PROPOSED(D-082): a catch on the node is attributed, not counted.
-    let caught = caught_on("NoPreVote", Variant::NoPreVote);
-    let by_pre_vote = caught
-        .iter()
-        .filter(|violation| violation.contains("pre-vote:"))
-        .count();
+    let caught = caught_on("NoPreVote", Variant::NoPreVote, &["pre-vote"]);
     assert!(
-        by_pre_vote > 0,
+        !caught.own.is_empty(),
         "NoPreVote was never caught on the node by pre-vote's own property, which is what \
          its Phase 2 test asserts: {caught:?}"
     );
@@ -906,28 +1077,50 @@ fn a_leader_that_commits_an_older_terms_entry_by_count_is_caught_on_the_node() {
     // The Figure 8 driver's window (D-031), on the node: the burst writes a key of
     // the range the arm drew, so the backlog the restarted leader re-sends is that
     // range's.
-    let caught = caught_on("CountOlderTermForCommit", Variant::CountOlderTermForCommit);
+    // PROPOSED(D-091): a catch is attributed to the variant's own violation.
+    let caught = caught_on(
+        "CountOlderTermForCommit",
+        Variant::CountOlderTermForCommit,
+        &["commit by current term", "leader completeness"],
+    );
     assert!(
-        !caught.is_empty(),
-        "CountOlderTermForCommit was never caught on the node"
+        !caught.own.is_empty(),
+        "CountOlderTermForCommit was never caught on the node by a check it breaks: {caught:?}"
     );
 }
 
 #[test]
 fn a_follower_that_truncates_on_every_append_is_caught_on_the_node() {
-    let caught = caught_on("TruncateOnEveryAppend", Variant::TruncateOnEveryAppend);
+    // PROPOSED(D-091): a catch is attributed to the variant's own violation.
+    let caught = caught_on(
+        "TruncateOnEveryAppend",
+        Variant::TruncateOnEveryAppend,
+        &["committed entries stay"],
+    );
     assert!(
-        !caught.is_empty(),
-        "TruncateOnEveryAppend was never caught on the node"
+        !caught.own.is_empty(),
+        "TruncateOnEveryAppend was never caught on the node by committed entries staying, \
+         which is what RAFT.md §5 names for it: {caught:?}"
     );
 }
 
 #[test]
 fn a_server_that_resets_its_timer_on_any_message_is_caught_on_the_node() {
-    let caught = caught_on("ResetTimerOnAnyRpc", Variant::ResetTimerOnAnyRpc);
+    // PROPOSED(D-091): a catch is attributed to the variant's own violation — the
+    // timer check, which is the one this variant is written for. That matters more
+    // here than anywhere else on this binary: PROPOSED D-091's fourth arm narrows
+    // the timer check, and a variant whose catch *is* the timer check is where a
+    // narrowing would show up as a loss. It does not: the rate is in the entry,
+    // measured before and after.
+    let caught = caught_on(
+        "ResetTimerOnAnyRpc",
+        Variant::ResetTimerOnAnyRpc,
+        &["timers"],
+    );
     assert!(
-        !caught.is_empty(),
-        "ResetTimerOnAnyRpc was never caught on the node"
+        !caught.own.is_empty(),
+        "ResetTimerOnAnyRpc was never caught on the node by the timer check, which is the \
+         check it is written for: {caught:?}"
     );
 }
 
@@ -946,23 +1139,32 @@ fn a_leader_that_trusts_the_clock_is_caught_on_the_node() {
     // at 4 % the gate's twenty catch none with probability 0.44 and a hundred with
     // 0.017, so an assertion there would fail a tree with nothing wrong the day a
     // change redraws the schedules. The node's own rate is in the entry.
+    //
+    // The catch is counted by the check that makes it — the linearizability search,
+    // which is where a stale lease read is reported — and not by whichever check a
+    // run failed first (PROPOSED D-091).
     let seeds = seeds();
-    let caught: Vec<String> = sweep(seeds, |seed| {
+    let violations: Vec<String> = sweep(seeds, |seed| {
         checked(&buggy(seed, Variant::LeaseTrustsTheClock)).err()
     })
     .into_iter()
     .flatten()
     .collect();
-    let rate = caught.len() as f64 * 100.0 / seeds as f64;
+    let caught = Caught::split(violations, &["linearizability"]);
+    let rate = caught.own.len() as f64 * 100.0 / seeds as f64;
     println!(
-        "node: LeaseTrustsTheClock caught on {}/{seeds} seeds ({rate:.1}%), first: {}",
-        caught.len(),
-        caught.first().map_or("", String::as_str)
+        "node: LeaseTrustsTheClock caught on {}/{seeds} seeds ({rate:.1}%) by the \
+         linearizability search, its own check; {} more violations came from other checks \
+         and are not its catch, first of its own: {}",
+        caught.own.len(),
+        caught.other.len(),
+        caught.own.first().map_or("", String::as_str)
     );
     if seeds >= 1000 {
         assert!(
-            !caught.is_empty(),
-            "LeaseTrustsTheClock was never caught on the node"
+            !caught.own.is_empty(),
+            "LeaseTrustsTheClock's stale read was never caught on the node by the \
+             linearizability search, which is the check RAFT.md §5 names for it: {caught:?}"
         );
     }
 }
@@ -973,6 +1175,16 @@ fn the_nodes_arms_aim_at_every_range_and_not_at_one() {
     // from its own stream. What says the draw is spent is the set of ranges the
     // schedules of a run of seeds aim at — one range would mean three of the four
     // never saw a leader isolation, a leader crash or a Figure 8 burst at all.
+    //
+    // This reads `Schedule::range_of`, which is the range each fault **draws**, and for
+    // every arm but two that is also the range it aims at. `Fault::CrashInstalling` and
+    // `Fault::RetakeUnderStream` resolve theirs against the trace at the arm
+    // (`lagging_range`), preferring this draw where it qualifies; what those two aimed
+    // at is `Report::install_aims` and `Report::stream_aims`, asserted on the correct
+    // node's sweep. So what this measures is the **draw**, which is still what §11 asks
+    // about: a range the draw never reaches is one an arm aims at only by the accident
+    // of no other range qualifying.
+    // PROPOSED(D-089): the stream arms aim their victim at a range it lags.
     let mut aimed: BTreeSet<u64> = BTreeSet::new();
     for seed in 0..64 {
         let schedule = raft::Schedule::draw_on_the_node(seed);
@@ -1022,31 +1234,37 @@ fn a_seed_replays_to_the_same_trace_on_the_node() {
 ///
 /// Phase 2's standard is `is_caught`: caught on some seed at every tier
 /// (`a_server_that_installs_without_current_last_is_caught`, sim/tests/raft.rs). On the
-/// node the measured rate does not support it, and D-061's rule is that the tier a
-/// Phase 2 variant keeps is the owner's, so the catch is **not** asserted here and the
-/// numbers go to the owner instead of a quieter assertion (PROPOSED D-086):
+/// node the measured **catch** rate still does not support it, and D-061's rule is that
+/// the tier a Phase 2 variant keeps is the owner's, so the catch is **not** asserted
+/// here and the numbers go to the owner instead of a quieter assertion. What *is*
+/// asserted, and from the hundred-seed tier since PROPOSED D-089, is that the variant
+/// was **injected at the moment it is about**:
 ///
-/// - the variant is **injected**, which the assertion below tests from the
-///   thousand-seed tier: the arm has to have crashed its victim at the final chunk of
-///   the range it drew for the switch-without-repair to have been reached at all, and
-///   that count is 0 when the variant's bit is disconnected;
-/// - `Fault::CrashInstalling` reached the final chunk of the range it drew and crashed
-///   its victim there on **0 of 100** seeds and **1 of 1 000**, against one group, where
-///   the arm's whole scenario is the one range it has. On a node the victim is drawn
-///   without regard to which of its four ranges it is behind on, so the arm must find a
-///   victim that is behind *that* range's compacted prefix, designated for it, and
+/// - `Fault::CrashInstalling` reaches the final chunk of the range it aims at and
+///   crashes its victim there on **14 of 100** seeds and **122 of 1 000**. Until
+///   PROPOSED D-089 the arm drew its victim and its range from two streams and reached
+///   that moment on **0 of 100** and 1 of 1 000: on a node the victim was drawn without
+///   regard to which of its four ranges it was behind on, so the arm reached its
+///   situation only where the two draws happened to coincide. The range is resolved
+///   against the trace now, after the isolation and the heal, and lands on one the
+///   victim is behind the leader's compacted prefix of — designated for it, and
 ///   streamed within `INSTALL_WAIT_BUDGET`;
-/// - the catch is **0 of 1 000**, which at an arm firing on a tenth of a per cent is
-///   what a variant that is never aimed at looks like, not one that is aimed at and
-///   survives.
+/// - the catch is still **0 of 100 and 0 of 1 000**, now over 122 firings rather than
+///   one. That is the finding the aim turns up and it goes to the owner: the arm is no
+///   longer the reason. A variant injected at its own moment on a tenth of the seeds
+///   and caught on none of a thousand is either a bug this node's checks cannot see or
+///   one its install path repairs, and which of those it is belongs to the slice that
+///   owns the path, not to this one (PROPOSED D-089).
 ///
-/// So the catch is asserted nowhere, and the arm's firing only from the **nightly's ten
-/// thousand**: at 0.1 % a thousand seeds see none about one run in three. **Below that
-/// tier this test asserts nothing about the variant**, which is said here rather than
-/// left to be discovered. The rate is printed at every tier so the day the arm is aimed
-/// better the number is visible, and the variant keeps its Phase 2 assertion on
-/// `Cluster::OneGroup`, which this sweep leaves running exactly as it is.
+/// So the catch is asserted nowhere and the **arm's firing is asserted from a hundred
+/// seeds**, where at 14 % a sample of a hundred sees none about three times in ten
+/// million. It is deliberately not asserted at the gate's twenty: 0.86^20 is about one
+/// run in twenty, which is a flake, and a bound the correct system trips is one to fix
+/// rather than to widen (D-030, D-039). The rate is printed at every tier, and the
+/// variant keeps its Phase 2 assertion on `Cluster::OneGroup`, which this sweep leaves
+/// running exactly as it is.
 // PROPOSED(D-086): Phase 2's stream variants re-asserted on the node.
+// PROPOSED(D-089): the stream arms aim their victim at a range it lags.
 #[test]
 fn a_server_that_installs_without_current_last_is_injected_on_the_node() {
     let seeds = seeds();
@@ -1064,8 +1282,8 @@ fn a_server_that_installs_without_current_last_is_injected_on_the_node() {
     let rate = caught.len() as f64 * 100.0 / seeds as f64;
     println!(
         "node: SnapshotWithoutCurrentLast caught on {}/{seeds} seeds ({rate:.1}%), the install \
-         crash reached the final chunk of the range it drew and crashed there on {fired}/{seeds} \
-         seeds, {actions} snapshot actions asked for, first: {}",
+         crash reached the final chunk of the range it aimed at and crashed there on \
+         {fired}/{seeds} seeds, {actions} snapshot actions asked for, first: {}",
         caught.len(),
         caught.first().map_or("", |v| v.as_str())
     );
@@ -1078,24 +1296,26 @@ fn a_server_that_installs_without_current_last_is_injected_on_the_node() {
     // which is the exact shape D-082 found `SendBeforePersist` in and this entry
     // claimed to have fixed.
     //
-    // `aimed_installs` is the discriminator, and it is **thin**: the arm reaches the
-    // final chunk of the range it drew on **0 of 100** seeds and **1 of 1 000** — about
-    // a tenth of a per cent. Asserted from a thousand, as this first did, it would see
-    // none about one run in three and fail a tree with nothing wrong, which is the
-    // model error D-030 and D-039 forbid; asserted from ten thousand the sample expects
-    // about ten and sees none about once in 20 000.
+    // `aimed_installs` is the discriminator, and it was **thin**: aimed at the range
+    // the schedule drew beside the victim it reached that moment on 0 of 100 seeds and
+    // 1 of 1 000, so this assertion sat at the nightly's ten thousand and below that
+    // tier the test asserted nothing about the variant at all.
     //
-    // So it is asserted **only at the nightly's tier**, and the consequence is stated
-    // rather than buried: below ten thousand seeds this test asserts nothing about
-    // `SnapshotWithoutCurrentLast` at all. Its catch is 0 of 1 000 and is asserted
-    // nowhere. That is the variant's real state on this node and it goes to the owner;
-    // aiming the arm at a range its victim is behind on is what would change it, and
-    // that is a change to how the arms are drawn (PROPOSED D-086).
-    if seeds >= 10_000 {
+    // Aimed at a range the victim actually lags it reaches it on **14 of 100** and
+    // **122 of 1 000** (PROPOSED D-089), measured before this line was moved (Q39,
+    // D-061). At 14 % a hundred seeds see none about three times in ten million, so
+    // the assertion sits at the hundred-seed tier; the gate's twenty would see none
+    // about one run in twenty, which is a bound the correct tree trips and D-030 and
+    // D-039 forbid writing it there and widening it later.
+    //
+    // **The catch is still 0 of 1 000**, now over 122 firings rather than one, and it
+    // is asserted nowhere. The arm is no longer the reason and that is the finding to
+    // take to the owner, not to paper over with a quieter assertion.
+    if seeds >= 100 {
         assert!(
             fired > 0,
             "`Fault::CrashInstalling` never crashed its victim at the final chunk of the \
-             range it drew over {seeds} seeds, so `SnapshotWithoutCurrentLast` was not \
+             range it aimed at over {seeds} seeds, so `SnapshotWithoutCurrentLast` was not \
              injected at the moment it is about and its 0 catches say nothing"
         );
     }
@@ -1118,8 +1338,9 @@ fn a_server_that_installs_without_current_last_is_injected_on_the_node() {
 ///   the run so readily that `RetakeUnderStream`'s own setup often never completes, and
 ///   a thousand's sample of a hundred would see none about one run in eight;
 /// - **a re-take landing under a live stream the follower never installs at** — from
-///   the **thousand-seed** tier, where Phase 2 has it from a hundred. **29 of 100**
-///   (17 of 100 and 172 of 1 000 before the merge with `phase-3-stage-b-wiring`),
+///   the **thousand-seed** tier, where Phase 2 has it from a hundred. **30 of 100**
+///   (29 before PROPOSED D-089's aim, 17 of 100 and 172 of 1 000 before the merge with
+///   `phase-3-stage-b-wiring`),
 ///   against 13.5 % of a thousand there. The tier was argued from 17 %, at which the
 ///   hundred-seed tier's sample of twenty sees none about one run in forty; at 29 % that
 ///   tier would hold, so the assertion is left where it is and the number goes to the
@@ -1137,6 +1358,15 @@ fn a_server_that_installs_without_current_last_is_injected_on_the_node() {
 ///   already has open — come round far more often than on a server with one range. That
 ///   rate would carry an assertion at a hundred seeds and it is deliberately not written
 ///   there — §12 re-asserts a Phase 2 variant to its own standard **and no stronger**.
+///
+/// **PROPOSED D-089 aimed both stream arms at a range their victim lags, and three of
+/// these four did not move.** The aim resolves the range after the isolation and the
+/// heal and keeps the drawn range wherever the victim is behind *its* compacted prefix,
+/// which for this arm the filling puts and the isolation together already make true:
+/// the fault stays **100 of 100**, the arm **1 of 100**, the catch **26 of 100** and its
+/// 26 liveness catches, and the scramble moves 29 to **30 of 100** with the same 55
+/// duplicate-chunk loops. Nothing asserted changes hands and no tier moves with it. The
+/// figures below are the re-measured ones, at the tier each is labelled with.
 ///
 /// Every fold behind these is keyed by `(server, range, index)` since PROPOSED D-086.
 /// On one group they were keyed by `(server, index)`, which named a take uniquely
@@ -1165,6 +1395,9 @@ fn a_leader_that_shares_one_snapshot_directory_is_caught_on_the_node() {
     // The four were re-measured on the merge with `phase-3-stage-b-wiring`, whose
     // re-seed, verification pass and snapshot fixes move every schedule: the fault and
     // the arm did not move, the scramble went 17 % to 29 % and the catch 30 % to 26 %.
+    // Re-measured again on PROPOSED D-089's aim, which moves what both stream arms
+    // watch and so moves every schedule that draws one: the fault stays 100/100, the
+    // arm 1/100 and the catch 26/100, and the scramble goes 29 to 30 of 100.
     // **Two numbers, named apart, and every tier gate below reads `tier`.** They were
     // one until PROPOSED D-086's re-review: `seeds` held the *share* and the gates
     // compared it against 100, 1 000 and 10 000, so each assertion sat a tier higher
@@ -1237,8 +1470,8 @@ fn a_leader_that_shares_one_snapshot_directory_is_caught_on_the_node() {
          fault was not injected on any of the {share} seeds"
     );
     // **A re-take landing under a live stream the follower never installs at, from the
-    // hundred-seed tier**, which is Phase 2's own tier for it. **29 of 100** on the
-    // merged tree, 17 of 100 before it, both above D-061's 5 %.
+    // hundred-seed tier**, which is Phase 2's own tier for it. **30 of 100** on the
+    // aimed tree, 29 on the merged tree and 17 of 100 before it, all above D-061's 5 %.
     //
     // It is *not* "the wedge's stream half", which is what this comment called it
     // until the re-review: pre-merge it accounted for a minority of the catches — at
@@ -1255,10 +1488,11 @@ fn a_leader_that_shares_one_snapshot_directory_is_caught_on_the_node() {
     // thousand's sample of a hundred sees none about once in 10^8. This is a weakening
     // of Phase 2's tier, it is weaker because the sample says so, and it goes to the
     // owner with the number (PROPOSED D-086).
-    // **The merge with `phase-3-stage-b-wiring` took this rate to 29 %**, at which a
-    // sample of twenty sees none about one run in nine hundred and Phase 2's own
-    // hundred-seed tier would hold. The assertion is left here deliberately: putting it
-    // back is a decision about a tier and belongs to the owner, not to a merge.
+    // **The merge with `phase-3-stage-b-wiring` took this rate to 29 %**, and PROPOSED
+    // D-089's aim to **30 %**, at which a sample of twenty sees none about one run in a
+    // thousand and Phase 2's own hundred-seed tier would hold. The assertion is left
+    // here deliberately: putting it back is a decision about a tier and belongs to the
+    // owner, not to a merge and not to a slice that moved the rate by one seed.
     if tier >= 1000 {
         assert!(
             scrambled > 0,
@@ -1464,35 +1698,78 @@ fn a_leader_that_ignores_incarnations_has_no_incarnation_to_ignore_on_the_node_y
 /// entry records, and this test pins what the node *does* do, so that the day the other
 /// half arrives the difference is visible.
 // PROPOSED(D-086): the pair on the node is the stream half alone until Q15's re-seed.
+// PROPOSED(D-091): a catch is attributed to the variant's own violation.
+#[derive(Debug)]
+struct Outcome {
+    /// The seed.
+    seed: u64,
+    /// The pair was caught by the liveness check on it.
+    pair: bool,
+    /// `SharedSnapshotDir` alone was.
+    stream: bool,
+    /// `IgnoreIncarnation` alone was.
+    incarnation: bool,
+    /// Violations by any other check, under any of the three: the node failing, not a
+    /// variant being caught.
+    otherwise: Vec<String>,
+}
+
 #[test]
 fn the_pair_on_the_node_is_the_stream_half_alone_until_the_reseed_lands() {
     // The share (D-055, D-061): this runs three variants on every seed it takes, and
     // what it asserts is the *equality* of two of them — a structural claim about one
     // half being a no-op, which a share settles as well as a tier and at a tenth of
     // the cost.
+    //
+    // **Caught, not failed** (PROPOSED D-091). Both halves are caught by the liveness
+    // check and by nothing else — `IgnoreIncarnation`'s wedge stalls a commit where
+    // the bound is asked, and `SharedSnapshotDir`'s stream never completes so neither
+    // designated follower counts (RAFT.md §5, which says of the second in so many
+    // words that "only the liveness check's catches count"). So a seed is counted for
+    // a variant only where the liveness check reported it. A violation by any other
+    // check is the node failing under a variant that injects nothing of that check's
+    // subject, and it is asserted separately, in its own words: the timer bound
+    // PROPOSED D-089's aim reached was reported here as `IgnoreIncarnation` being
+    // caught alone on seeds 272 and 516, which it cannot be while a store's
+    // incarnation never changes — the test said so and was read as a catch anyway.
     let seeds = high_rate_share();
     let both = Variants::of(&[Variant::IgnoreIncarnation, Variant::SharedSnapshotDir]);
-    let outcomes: Vec<(u64, bool, bool, bool)> = sweep(seeds, |seed| {
-        (
+    let by_liveness = |report: &raft::Report| -> (bool, Option<String>) {
+        match checked(report) {
+            Ok(()) => (false, None),
+            Err(violation) if mechanism(&violation) == "liveness" => (true, None),
+            Err(violation) => (false, Some(violation)),
+        }
+    };
+    let outcomes: Vec<Outcome> = sweep(seeds, |seed| {
+        let (pair, a) = by_liveness(&buggy(seed, both));
+        let (stream, b) = by_liveness(&buggy(seed, Variant::SharedSnapshotDir));
+        let (incarnation, c) = by_liveness(&buggy(seed, Variant::IgnoreIncarnation));
+        Outcome {
             seed,
-            checked(&buggy(seed, both)).is_err(),
-            checked(&buggy(seed, Variant::SharedSnapshotDir)).is_err(),
-            checked(&buggy(seed, Variant::IgnoreIncarnation)).is_err(),
-        )
+            pair,
+            stream,
+            incarnation,
+            otherwise: [a, b, c].into_iter().flatten().collect(),
+        }
     });
+    let otherwise: Vec<String> = outcomes
+        .iter()
+        .flat_map(|o| o.otherwise.iter().cloned())
+        .collect();
     // **Per seed, not per count.** Counts were what this compared until PROPOSED
     // D-086's review, and a count equality cannot see the pin disappear: a genuine
     // D-045 wedge on one seed and a stream-only catch on another leave `pair` and
     // `stream` equal, and the wedge — the whole reason the pair exists — goes
     // unreported. The sets are compared, and the seeds where the pair is caught and
     // neither half alone is are asserted empty, which is the wedge itself.
-    let seeds_where = |f: fn(&(u64, bool, bool, bool)) -> bool| -> BTreeSet<u64> {
-        outcomes.iter().filter(|o| f(o)).map(|o| o.0).collect()
+    let seeds_where = |f: fn(&Outcome) -> bool| -> BTreeSet<u64> {
+        outcomes.iter().filter(|o| f(o)).map(|o| o.seed).collect()
     };
-    let pair = seeds_where(|o| o.1);
-    let stream = seeds_where(|o| o.2);
-    let incarnation = seeds_where(|o| o.3);
-    let only_the_pair = seeds_where(|o| o.1 && !o.2 && !o.3);
+    let pair = seeds_where(|o| o.pair);
+    let stream = seeds_where(|o| o.stream);
+    let incarnation = seeds_where(|o| o.incarnation);
+    let only_the_pair = seeds_where(|o| o.pair && !o.stream && !o.incarnation);
     println!(
         "node: the pair caught on {}/{seeds} seeds {pair:?}, `SharedSnapshotDir` alone on {} \
          {stream:?}, `IgnoreIncarnation` alone on {} {incarnation:?}, and on {} seeds \
@@ -1527,8 +1804,18 @@ fn the_pair_on_the_node_is_the_stream_half_alone_until_the_reseed_lands() {
     // would mean something new either way.
     assert!(
         incarnation.is_empty(),
-        "`IgnoreIncarnation` alone is caught on the node on seeds {incarnation:?}, which it \
-         cannot be while a store's incarnation never changes: re-audit this test"
+        "`IgnoreIncarnation` alone is caught on the node by the liveness check on seeds \
+         {incarnation:?}, which it cannot be while a store's incarnation never changes: \
+         re-audit this test"
+    );
+    // And what none of the three is about: a run that failed some other check. That
+    // is the node failing, not a variant being caught, and it is reported as itself.
+    // PROPOSED(D-091): a catch is attributed to the variant's own violation.
+    assert!(
+        otherwise.is_empty(),
+        "a run under one of these variants failed a check none of them breaks, so the node \
+         itself failed and no variant was caught: read these as the correct node's and fix \
+         them there. {otherwise:?}"
     );
 }
 
@@ -1557,25 +1844,51 @@ fn the_pair_on_the_node_is_the_stream_half_alone_until_the_reseed_lands() {
 /// one it replaces, not a weaker one.
 // PROPOSED(D-082): each blocked variant is named by a test, not by prose.
 // PROPOSED(D-086): the four the stream path reaches are re-asserted above, not blocked.
+/// **The absence is of the variant's own catch, and of nothing else** (PROPOSED
+/// D-091). `checks` names the checks RAFT.md §5 says catch this variant; a violation
+/// by one of them is the path arriving and this test asking to be turned into §10's
+/// assertion. A violation by any *other* check is the correct node failing under a
+/// variant that injects nothing on it — a real failure, and this test's job is to say
+/// so in those words rather than to report it as the variant being caught.
+///
+/// That distinction is not hypothetical. The timer bound PROPOSED D-089's per-range
+/// aim reached made this function claim `AdoptionAsBuilt` was caught on seed 440 and
+/// `RefusalNotDurable` on seeds 272 and 516, quoting the timer strings as the
+/// variants' catches — three false catches of one gap in a run neither variant
+/// touched.
+// PROPOSED(D-091): a catch is attributed to the variant's own violation.
 fn blocked_on_the_node(
     name: &str,
     variants: impl Into<Variants> + Copy + Send + Sync,
+    checks: &[&str],
     waits_on: &str,
 ) {
     let seeds = high_rate_share();
-    let caught: Vec<String> = sweep(seeds, |seed| checked(&buggy(seed, variants)).err())
+    let violations: Vec<String> = sweep(seeds, |seed| checked(&buggy(seed, variants)).err())
         .into_iter()
         .flatten()
         .collect();
+    let caught = Caught::split(violations, checks);
     println!(
-        "node: {name} is not re-asserted here; over {seeds} seeds it was caught {} times, and \
-         it waits on {waits_on}",
-        caught.len()
+        "node: {name} is not re-asserted here; over {seeds} seeds it was caught {} times by \
+         {checks:?}, its own checks, and {} runs failed some other check; it waits on \
+         {waits_on}",
+        caught.own.len(),
+        caught.other.len()
     );
     assert!(
-        caught.is_empty(),
-        "{name} is caught on the node, so the path it breaks is reachable after all: turn this \
-         absence into the assertion §10 asks for. {caught:?}"
+        caught.own.is_empty(),
+        "{name} is caught on the node by {checks:?}, the checks RAFT.md §5 names for it, so \
+         the path it breaks is reachable after all: turn this absence into the assertion §10 \
+         asks for. {:?}",
+        caught.own
+    );
+    assert!(
+        caught.other.is_empty(),
+        "the node failed under {name} by a check {name} does not break, and {name} injects \
+         nothing on this node — so this is the **correct node's** failure and not a catch of \
+         {name}. Read it as the correct node's and fix it there. {:?}",
+        caught.other
     );
 }
 
@@ -1585,9 +1898,13 @@ fn a_server_whose_adoption_is_as_built_is_not_re_asserted_on_the_node_yet() {
     // remain rather than §10 amended. The two are the live install's single switch and
     // Q15's refused directory; neither path is in this tree. The third rule, a damaged
     // staging `CURRENT` refused, has no subject on a node that adopts no staged store.
+    // Its catch is `committed entries stay`: a voter restarts on a fresh store and
+    // restates a truncation from index 1 below its commit index (RAFT.md §5).
+    // PROPOSED(D-091): a catch is attributed to the variant's own violation.
     blocked_on_the_node(
         "AdoptionAsBuilt",
         Variant::AdoptionAsBuilt,
+        &["committed entries stay"],
         "the node's snapshot wiring and PR #86's refused directory",
     );
 }
@@ -1597,9 +1914,180 @@ fn a_server_whose_refusal_is_not_durable_is_not_re_asserted_on_the_node_yet() {
     // The node *does* read this one (`quiesce_on_loss` in `server::run`), and it still
     // has nothing to do: the disk does not rot on this cluster, because a refusal
     // stops the node until Q15's whole-node re-seed lands.
+    // Its catch is the `match starts` oracle — a leader tracing a second first rise
+    // of a follower's match under one incarnation — with `state machine safety` the
+    // route D-078 measured out of reach and `a store refused` the path itself
+    // arriving (RAFT.md §5). All three are named, so any of them turns this absence
+    // into §10's assertion.
+    // PROPOSED(D-091): a catch is attributed to the variant's own violation.
     blocked_on_the_node(
         "RefusalNotDurable",
         Variant::RefusalNotDurable,
+        &["match starts", "state machine safety", "a store refused"],
         "PR #86's whole-node refusal and re-seed",
     );
+}
+
+/// Seeds 272 and 516, which PROPOSED D-089's aim reaches and nothing before it did,
+/// and which PROPOSED D-091's fourth arm answers for: a replica being fed a snapshot
+/// of one range goes past the timer bound without campaigning, while the node holds
+/// its core for the **live** install of that range.
+///
+/// **The mechanism is asserted both ways, not a bare green** (CLAUDE.md), which is
+/// the shape D-063's own pin has for seed 2605.
+/// `Report::timer_gaps_held_by_a_live_install` is the replay with every arm but this
+/// one — `TimerResets::WITHOUT_LIVE_INSTALL`, the check exactly as it stood on
+/// 1d17dcc — and on each seed it is that check's one gap, its violation word for
+/// word, on the (server, range) recorded, with the live install's hold in it; while
+/// `check()` is green. It also asserts that that replay finds nothing else on the
+/// seed, so the arm is seen to be exempting the hold and not more.
+///
+/// **The shape, identical on both seeds.** The flagged replica's clock is last reset
+/// by an `AppendEntries` of its term. Its leader then stops appending to it and
+/// starts streaming it a snapshot of that range, re-opening the stream at offset 0
+/// five times across the window (`RaftSnapshotResumed`), and **no `InstallSnapshot`
+/// chunk of that range is delivered to it inside the window**, so D-030's reset arm
+/// has nothing to fire on. The install of that range is then decided on it — the
+/// moment the `raft` task hands the repair over and holds the range (D-066; PROPOSED
+/// D-083's `CoreWork::Hold`) — and from there to the manifest switch the replica's
+/// core takes no input and no tick, so it has no election timer to fire. The switch
+/// restores the replica, which traces its restatement and starts counting again.
+///
+/// Seed 272: server 2's replica of range 4 under leader 3, the window running
+/// 21.356963658 s to 21.757937867 s; the install decided at 21.647374004 s and its
+/// switch durable, with the restatement on it, at 21.789195738 s — so the flag fell
+/// 110.6 ms into the hold and 31.3 ms before the restatement. Seed 516: server 2's
+/// replica of range 5 under leader 1, the window 16.920911437 s to 17.321568677 s,
+/// the install decided at 17.188140918 s and switched at 17.328088046 s — 133.4 ms
+/// into the hold, 6.5 ms before the restatement.
+///
+/// **Why none of the check's other three arms covers it.** `TimerResets` has an arm
+/// for an install chunk delivered (D-030, seed 164), one for an install's
+/// restatement (D-039, seed 385) and one for the adoption of a completed install
+/// (PROPOSED D-063, seed 2605). The third is the one this looks like, and it was
+/// written for a server whose **run-loop incarnation ends at the completion and
+/// begins again at its restatement**. A node does not do that: "an install into a
+/// live store keeps its incarnation" (D-042, D-066), the range's replica is replaced
+/// in place, and the completion's own restatement lands at the same instant — which
+/// is what D-063's `restates` predicate reads as a start's re-trace, so that arm does
+/// not fire here and would be the wrong one if it did. PROPOSED D-091 is the fourth
+/// arm the owner ruled on, keyed to the hold rather than to an incarnation ending, as
+/// D-066 said it would have to be.
+///
+/// **The day the first assertion fails, the seed's schedule has moved off the
+/// situation and this pin is re-audited, not deleted** — as D-063's pin says of 2605.
+// PROPOSED(D-089): the stream arms aim their victim at a range it lags.
+// PROPOSED(D-091): the node's live install holds one range, and the replay does not
+// measure a replica whose core is held.
+#[test]
+fn seeds_272_and_516_are_a_live_installs_hold_and_the_fourth_arm_answers_for_them() {
+    for (seed, server, range, decided, switched) in [
+        (272u64, 2u64, 4u64, 21_647_374_004u64, 21_789_195_738u64),
+        (516, 2, 5, 17_188_140_918, 17_328_088_046),
+    ] {
+        let report = correct(seed);
+        // Green, and green because the replica was held: `check()` passes and the
+        // replay under every arm finds nothing.
+        report
+            .check()
+            .unwrap_or_else(|violation| panic!("seed {seed} no longer passes: {violation}"));
+        let gaps = report.timer_gaps(raft::TimerResets::ALL);
+        assert!(
+            gaps.is_empty(),
+            "seed {seed}: the timer replay reports {gaps:?}, so this seed is no longer the \
+             hold this pins"
+        );
+        // The other way: the check as it stood on 1d17dcc flags exactly one stretch,
+        // on the replica recorded, and the hold is in it.
+        let rescued = report.timer_gaps_held_by_a_live_install();
+        assert_eq!(
+            rescued.len(),
+            1,
+            "seed {seed}: the check without the fourth arm finds {} stretches held by a live \
+             install, not the one this pins: {rescued:?}",
+            rescued.len()
+        );
+        let gap = rescued[0];
+        assert_eq!(
+            (gap.server, gap.range, gap.live_installs),
+            (server, range, 1),
+            "seed {seed}: the stretch moved off server {server}'s replica of range {range}, or \
+             holds more than the one live install: re-audit this pin against the entry"
+        );
+        // And it is the *only* thing that check finds on the seed, so the arm is seen
+        // to be exempting the hold and not more.
+        assert_eq!(
+            report.timer_gaps(raft::TimerResets::WITHOUT_LIVE_INSTALL),
+            rescued,
+            "seed {seed}: the check without the fourth arm finds a stretch this arm does not \
+             answer for, so the arm is exempting more than the live install's hold"
+        );
+        // The mechanism, off the trace: the install of that range was decided inside
+        // the window and its switch — where the replica is restored and restates —
+        // landed after the flag. That is the hold, and the flag fell inside it.
+        let decided = ananke_env::Instant::from_nanos(decided);
+        let switched = ananke_env::Instant::from_nanos(switched);
+        assert!(
+            gap.since < decided && decided < gap.at && gap.at < switched,
+            "seed {seed}: the install was decided at {decided:?} and switched at {switched:?}, \
+             which no longer brackets the flag at {:?} inside the window since {:?}: the \
+             schedule moved and this pin is re-audited",
+            gap.at,
+            gap.since
+        );
+        let held = report.records.iter().any(|record| {
+            record.decided == decided
+                && record.at == switched
+                && matches!(
+                    &record.event,
+                    ananke_env::TraceEvent::RaftSnapshot {
+                        server: who,
+                        range: of,
+                        taken: false,
+                        ..
+                    } if *who == server && *of == range
+                )
+        });
+        assert!(
+            held,
+            "seed {seed}: no live install of range {range} on server {server} was decided at \
+             {decided:?} and switched at {switched:?}, so this is no longer the shape PROPOSED \
+             D-091's arm is written for"
+        );
+        // The restatement the hold closes on, at the switch: without it the replica
+        // would be out of the running set for the rest of the run.
+        let restated = report.records.iter().any(|record| {
+            record.at == switched
+                && matches!(
+                    &record.event,
+                    ananke_env::TraceEvent::RaftRecovered {
+                        server: who,
+                        range: of,
+                        ..
+                    } if *who == server && *of == range
+                )
+        });
+        assert!(
+            restated,
+            "seed {seed}: the restored replica of range {range} traced no restatement at the \
+             switch, so the hold has no close fence on this seed"
+        );
+        // And the leader was streaming it, which is why it heard nothing: the shape
+        // PROPOSED D-089's aim reaches.
+        let resumed = report.records.iter().any(|record| {
+            record.decided > gap.since
+                && record.decided <= gap.at
+                && matches!(
+                    &record.event,
+                    ananke_env::TraceEvent::RaftSnapshotResumed { to, range: of, .. }
+                        if *to == server && *of == range
+                )
+        });
+        assert!(
+            resumed,
+            "seed {seed}: the leader re-opened no stream of range {range} to server {server} \
+             inside the window: the replica was not being fed a snapshot and the gap is \
+             another shape"
+        );
+    }
 }
