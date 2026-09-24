@@ -106,8 +106,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ananke_env::{
-    ApplyEffect, Clock, Decision, Either, Environment, Instant, Network, Rng, Socket, TraceEvent,
-    race,
+    ApplyEffect, Clock, Decision, Either, Environment, Instant, Network, RecoveredAs, Rng, Socket,
+    TraceEvent, race,
 };
 use ananke_storage::{Engine, EngineConfig};
 
@@ -1029,6 +1029,16 @@ async fn incarnation<E: Environment>(
         applied,
         last_index: core.last_index(),
         incarnation: store.incarnation(),
+        // A one-group server that was re-seeded adopts its staged store at this start
+        // (RAFT.md §1), so a quarantined replica here already holds the state the
+        // install gave it: `Refused`, the state a replica waits for its stream in, is
+        // the node's and has no path on a server that adopts (Q15, D-077).
+        // PROPOSED(D-081): a restatement says how the replica restated (D-067).
+        state: if core.quarantined() {
+            RecoveredAs::Quarantined
+        } else {
+            RecoveredAs::Neither
+        },
     });
     env.trace(TraceEvent::RaftTerm {
         server,
@@ -2307,6 +2317,14 @@ async fn reseed<E: Environment>(
                 // promise is ever measured from this server (RAFT.md §3), and
                 // incarnation 0, no store, so a leader that matched entries on
                 // the lost one forgets them (D-042).
+                //
+                // The refused mark is the same statement said outright, and it is
+                // the one check quorum reads (D-049, PROPOSED D-087): this server
+                // holds nothing of the log and can commit nothing for the leader
+                // until its re-seed does. Here the two coincide, which is why the
+                // old key worked on this server and on nothing else; a core
+                // answering from a store a re-seed built says it with the mark
+                // alone.
                 let message = Message::AppendEntriesResponse {
                     term,
                     success: false,
@@ -2316,6 +2334,7 @@ async fn reseed<E: Environment>(
                     echo: 0,
                     local: 0,
                     incarnation: 0,
+                    refused: true,
                 };
                 send_message(env, sock, addrs, id, from, message, 0).await;
             }

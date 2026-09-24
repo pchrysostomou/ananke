@@ -125,6 +125,44 @@ _Update this section at the end of every session._
   the resend counter a cap-wait must clear and the restart counter a start-over must
   increment were both deletable with the whole suite green, and are not now.
 
+- Branch `phase-3-lease-tier-nightly` (2026-09-23), PROPOSED D-088, off `origin/main` at
+  `03e1829`: the owner's ruling on `LeaseTrustsTheClock`'s tier on the node. Its catch —
+  a stale read found by linearizability — asserts from the **nightly's ten thousand**
+  instead of the thousand-seed tier, because the node's own rate is **78 of 10 000
+  (0.78 %)** and **6 of 1 000 (0.60 %)**, re-measured on this tree, against the one-group
+  server's 4.0 %. At 0.78 % a thousand seeds catch none with probability 4.0e-4 and ten
+  thousand with 9.8e-35, where the one-group assertion this tier was copied from sits at
+  1.9e-18. One comparison changes, `if seeds >= 1000` to `if seeds >= 10_000`; the rate
+  keeps printing at every tier and the one-group assertion is untouched. The assertion was
+  *proved to fire*: with the sweep stubbed to no seeds it fails at 10 000 and passes at
+  1 000, and the same stub with the gate at 100 000 passes at 10 000 — the stream-variants
+  slice's bug, reproduced deliberately so this slice could be shown not to have it.
+
+- Branch `phase-3-d049-refused-mark-key` (2026-09-23), PROPOSED D-087, on the owner's
+  ruling on issue **#116**: D-049's rule is keyed on **a refused mark the answer carries**
+  rather than on a rejection stamped incarnation 0. The incarnation says *which* store
+  answered (D-042); whether that store holds anything of the log is a different question,
+  and the old key answered it by a coincidence the one-group server has and D-077's node
+  does not. `AppendEntriesResponse` gains a `refused` bit, carried in the byte `success`
+  already occupied so no frame changed length and no schedule could move; the one-group
+  re-seed loop sets it literally and the core sets it from `Raft::refused()`, *quarantined
+  and holding nothing of this log yet*. **The one-group server did not move**: all four
+  D-049 tests are figure for figure identical at 20, 100 and 1 000 seeds, including the
+  sweep's-disk control's failing-seed lists. **The node has the rule's site now**: 282
+  marked rejections over 1 000 seeds where the old key saw 0, the 6 679 D-085 counted
+  splitting exactly into 6 397 unmarked and 282 marked, 0 answers from no store, and a
+  step-down naming a follower `uncounted` where D-085 measured none in 1 394. The pair,
+  `RefusedCountsForQuorum` and `RefusedNeverCounts`, is **still caught 0 of 1 000 there**,
+  now for one reason and not two: nothing on the node compacts, so a re-seeded replica
+  answers a marked rejection and then a success inside the same window. §10's exit
+  criterion for the pair on a sharded `sim/quorum.rs` is still owed, and its one remaining
+  blocker is PR #107's wiring. **After review**, two mutations this slice had not
+  anticipated are closed: the mark computed once per node and stamped on its other three
+  replicas — caught 20 of 20 and 1 000 of 1 000 by a new per-range clause, the dual of the
+  one that was already there — and `Raft::refused()` with its `quarantined` conjunct
+  dropped, caught by a new gate-tier test that reads the predicate itself, which no test in
+  the tree did.
+
 - Branch `phase-3-stage-b-membership` (2026-09-22), stacked on
   `phase-3-stage-b-sweeps` (PR #101, PROPOSED D-082): **`sim/membership.rs` on the
   node** (PROPOSED D-084), the second of Stage B's first exit criterion's three
@@ -172,6 +210,8 @@ _Update this section at the end of every session._
   hazard D-049 fixed therefore returns on the node the day a leader can compact past a
   re-seeded replica; that goes to the owner beside issue #103. Stage B's first exit
   criterion for `sim/quorum.rs` is met for the scenario and still owed for §10's pair.
+  (Issue #116 was filed on this finding and the owner ruled: the key changed rather than
+  the re-seed. PROPOSED D-087, above, is that change and its re-measurement.)
 
 - Merge update (2026-09-22): branch `phase-3-stage-b-compaction` merged `origin/main`
   to resolve PR conflicts, carrying in PROPOSED D-073 and D-074 from main and keeping

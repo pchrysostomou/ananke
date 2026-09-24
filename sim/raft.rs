@@ -5183,7 +5183,7 @@ impl Report {
             let Message::AppendEntriesResponse {
                 term: answered,
                 success,
-                incarnation,
+                refused,
                 ..
             } = message
             else {
@@ -5192,7 +5192,11 @@ impl Report {
             if *answered != term {
                 continue;
             }
-            if !*success && *incarnation == 0 {
+            // The refused mark, not incarnation 0: the same set of answers on this
+            // one-group sweep, where a refused server has no store, and the reading
+            // that carries to a node whose re-seed builds one.
+            // PROPOSED(D-087): D-049's rule keyed on a refused mark the answer carries.
+            if !*success && *refused {
                 open.entry((to, from))
                     .or_insert(Open {
                         leader: to,
@@ -7621,6 +7625,7 @@ mod tests {
                     applied: 374,
                     last_index: 374,
                     incarnation: 1,
+                    state: ananke_env::RecoveredAs::Neither,
                 },
             ),
             record(at, at, Some(server), term(server, 1, "follower", None)),
@@ -8149,6 +8154,9 @@ mod tests {
             applied: 0,
             last_index: 0,
             incarnation: 2,
+            // The replica this test lifts is one a re-seed marked and no install has
+            // filled: the state a restatement after Q15's refusal says (D-067).
+            state: ananke_env::RecoveredAs::Refused,
         };
         let with = |lift: Vec<TraceRecord>| {
             let mut all = vec![
@@ -8517,6 +8525,9 @@ mod tests {
                 applied: 0,
                 last_index: 0,
                 incarnation: 1,
+                // Nothing refused this replica: the rebuild is of the core alone, so
+                // its store carries no mark (D-081's `state` on a restatement).
+                state: ananke_env::RecoveredAs::Neither,
             },
             change_accepted(&[1, 2, 3, 4]),
             match_started(4, 1, 20),

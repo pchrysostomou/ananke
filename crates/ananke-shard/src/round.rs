@@ -257,6 +257,25 @@ impl Cores {
 
     /// Puts `core` on the node as `range`'s, replacing whatever was there.
     ///
+    /// The highest index handed to the `apply` task starts where the replica does,
+    /// for the same reason it moves with the replica a switch builds
+    /// ([`Cores::installed`]): the watermark is the node's, the applied index is the
+    /// store's, and a node that started its watermark at zero would have the first
+    /// `Apply` after a restart name every index from 1. Where the log still holds
+    /// them that re-applies the whole log — the state machine's work done twice,
+    /// which is what [`NodeVariant::AppliedNotAdvanced`] does one job at a time — and
+    /// where the log was compacted past them, which is every replica a snapshot has
+    /// filled, the entries are not there to name and the node fails that range and
+    /// stops.
+    ///
+    /// The directed re-seed shape is what found it: the node is crashed on a
+    /// replica's refused mark and restarted, and the replica its install had already
+    /// filled came back at applied 61 against a log starting at 62, so the first
+    /// commit after the restart reported "an apply through 67 names index 1, which
+    /// the core does not hold". Nothing before that scenario restarted a node holding
+    /// a compacted replica. [`NodeVariant::RestartAppliesFromZero`] is the hole kept
+    /// beside the fix.
+    ///
     /// A replaced slot's held work goes with it, and **its bytes are released**: what
     /// the node holds is charged against the inbox's bound (D-074), and `held_bytes`
     /// is only ever decreased by a resolution, so a slot dropped with work still held
@@ -268,7 +287,11 @@ impl Cores {
     /// Today the only caller is the node's construction, where there is nothing to
     /// release. Adoption and rebalancing are the next slices, and this is the
     /// bookkeeping they need to be able to rely on.
+    // PROPOSED(D-081): the applied watermark starts where the replica does.
     pub fn insert(&mut self, range: RangeId, core: Raft) {
+        if !self.variants.contains(NodeVariant::RestartAppliesFromZero) {
+            self.applied.insert(range, core.applied());
+        }
         if let Some(replaced) = self.slots.insert(range, Slot::new(core)) {
             let held: usize = replaced.held.iter().map(|held| held.bytes).sum();
             self.held_bytes = self.held_bytes.saturating_sub(held);
@@ -764,6 +787,72 @@ mod tests {
         cores.insert(R1, core(R1));
         cores.insert(R2, core(R2));
         cores
+    }
+
+    /// A replica put on the node at its start brings its own applied index with it,
+    /// and the watermark starts there rather than at zero.
+    ///
+    /// The pair for [`NodeVariant::RestartAppliesFromZero`], and the unit the directed
+    /// re-seed shape found the hole with: a node restarted holding a replica an
+    /// install had filled came back with a log starting above its applied index, named
+    /// every index from 1 in its first `Apply`, and failed that range on the first one
+    /// the core no longer held. It is asserted here rather than in the shape's sweep
+    /// because the situation is a *restart over a compacted replica*, which is one
+    /// line of state, not an interleaving to search for: the shape reaches it only
+    /// when an install happens to land before its crash.
+    // PROPOSED(D-081): the applied watermark starts where the replica does.
+    #[test]
+    fn a_replica_put_on_the_node_brings_its_applied_index_with_it() {
+        // A replica restored on a snapshot at index 40: its log starts at 41 and it
+        // has applied everything the snapshot covers (RAFT.md §1).
+        let compacted = |range: RangeId| {
+            Raft::restore_compacted(
+                ME,
+                Configuration::of(&[ME, LEADER, ServerId(3)]),
+                RaftConfig {
+                    range: range.get(),
+                    ..RaftConfig::default()
+                },
+                7,
+                2,
+                None,
+                40,
+                2,
+                None,
+                Vec::new(),
+                false,
+            )
+        };
+        let mut correct = Cores::new(NodeVariants::correct());
+        correct.insert(R1, compacted(R1));
+        assert_eq!(
+            correct.applied_sent(R1),
+            40,
+            "the watermark starts where the replica does, so the next job the `apply` \
+             task is handed is the entry after the snapshot"
+        );
+
+        let mut buggy =
+            Cores::new(NodeVariants::correct().with(NodeVariant::RestartAppliesFromZero));
+        buggy.insert(R1, compacted(R1));
+        assert_eq!(
+            buggy.applied_sent(R1),
+            0,
+            "RestartAppliesFromZero leaves it at zero"
+        );
+        // And that is not a difference of bookkeeping: the entries an `Apply` names
+        // from zero are indices this core does not hold, which the node fails on.
+        let core = buggy.core(R1).expect("r1");
+        assert_eq!(
+            entries_to_apply(core, buggy.applied_sent(R1), 41),
+            Err(1),
+            "from zero the job names index 1, which the compacted core does not hold"
+        );
+        let core = correct.core(R1).expect("r1");
+        assert!(
+            entries_to_apply(core, correct.applied_sent(R1), 40).is_ok(),
+            "from the replica's own index there is nothing owed and no gap"
+        );
     }
 
     /// A step's `Persist` is the first of its outputs (`finish`, core.rs:1277-1300),

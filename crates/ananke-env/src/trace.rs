@@ -667,6 +667,17 @@ pub enum TraceEvent {
         // D-042: store incarnations, so a leader forgets what a
         // re-seeded follower forgot.
         incarnation: u64,
+        /// What the disk said this replica is: marked refused and waiting for its
+        /// re-seed, re-seeded and quarantined for the rest of its life on that
+        /// store, or neither ([`RecoveredAs`]).
+        ///
+        /// A refusal is the node's and is traced once ([`TraceEvent::RaftRefused`]);
+        /// what a *replica* carries out of it is per replica, and a restart is where
+        /// it can be read. Without this field a replica that lost its refused mark
+        /// in a crash restates exactly like one that never had anything to lose.
+        // PROPOSED(D-081): a restatement says whether the replica is refused,
+        // quarantined or neither (D-067).
+        state: RecoveredAs,
     },
     /// A Raft leader proposed a client's request as a log entry (RAFT.md §4): the
     /// link from an operation of the history to the entry that carries it, so an
@@ -1361,6 +1372,45 @@ impl ApplyEffect {
             ApplyEffect::Aborted => "aborted",
             ApplyEffect::Refused => "refused",
             ApplyEffect::None => "none",
+        }
+    }
+}
+
+/// How a replica restated at its node's start: the `state` of
+/// [`TraceEvent::RaftRecovered`].
+///
+/// The three are what the store can tell apart, and the order they happen in. A
+/// replica of a node whose shared engine lost state is marked refused before it
+/// serves (Q15, D-077): the quarantine flag and a fresh incarnation in one synced
+/// batch. It waits in that state for its leader's stream, and once the stream's
+/// install fills it the flag stays for the rest of its life on that store (D-035),
+/// which is [`RecoveredAs::Quarantined`]. [`RecoveredAs::Neither`] is every replica
+/// that never lost anything — and, on a node that wrote its mark unsynced, the
+/// replica that lost the mark in a crash, which is the whole of what
+/// `ReseedMarkNotSynced` does (D-067).
+// PROPOSED(D-081): a restatement says whether the replica is refused, quarantined
+// or neither (D-067).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
+pub enum RecoveredAs {
+    /// Marked refused, with no state of its own yet: the mark a re-seed wrote is on
+    /// the disk and no install has filled the replica.
+    Refused,
+    /// Quarantined on state an install gave it: the mark is on the disk and the
+    /// replica holds a snapshot the install left (D-035).
+    Quarantined,
+    /// Neither: a replica whose store carries no mark.
+    Neither,
+}
+
+impl RecoveredAs {
+    /// The name the moirae bridge writes.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RecoveredAs::Refused => "refused",
+            RecoveredAs::Quarantined => "quarantined",
+            RecoveredAs::Neither => "neither",
         }
     }
 }

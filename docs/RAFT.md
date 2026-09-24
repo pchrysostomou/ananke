@@ -70,7 +70,10 @@ leader's `match_index` is monotone for one store, not for one follower (D-042). 
 store carries a store incarnation, 1 for a store started fresh, carried across an
 install into a live store, and drawn afresh, never 1, for a store a re-seed rebuilt;
 `AppendEntriesResponse` and `InstallSnapshotResponse` carry the responder's, 0 from a
-refused server, which has no store. A leader records the number each follower's
+one-group refused server, which has no store at all. The incarnation says *which*
+store answered and nothing about whether it holds anything: whether the answerer is a
+refused server is a mark of its own on `AppendEntriesResponse`, in the same byte as
+`success` (PROPOSED D-087). A leader records the number each follower's
 `AppendEntriesResponse` carries, and the one an `Installed` answer carries; chunk
 acknowledgements go to the snapshot task, which does not read the number and tells the
 core only that a stream progressed (D-049). The first
@@ -346,7 +349,8 @@ nothing compares timestamps from two nodes except the lease guard above, which i
 built to. Check quorum runs on the leader's ticks: every minimum election timeout it
 asks whether a majority answered since the last time, and steps down
 (`RaftQuorumLost`) if not, so a leader on the wrong side of a partition stops serving
-within two of them. A follower that answered from a store counts. A refused server's
+within two of them. A follower that answered without the refused
+mark counts. A refused server's marked
 rejection (§3) counts only in a window in which a chunk of the leader's re-seed stream
 to it was acknowledged, the `Installed` answer included: a refused server answers every
 AppendEntries whatever becomes of its re-seed, so its rejections say it is alive, not
@@ -709,10 +713,20 @@ it neither votes nor serves until a snapshot rebuilds it. A refused server trace
 is before it adopts an install or opens its store, and it answers every AppendEntries,
 whatever its term and entries, with a rejection carrying the request's term and
 previous index, a hint of 1, an echo of zero, so no lease promise or read confirmation
-is measured from it, and store incarnation 0, since it has no store (D-042). That
+is measured from it, store incarnation 0, since it has no store (D-042), and **the
+refused mark** (PROPOSED D-087). That
 rejection is how a leader learns the server needs a re-seed. It is a sign of life and
-not of a store: check quorum counts it only in a window in which a chunk of the
-leader's stream to the server was acknowledged (§1, D-049). A leader that recorded
+not of a log: check quorum counts it only in a window in which a chunk of the
+leader's stream to the server was acknowledged (§1, D-049).
+
+A refused *replica of a node* is the same server in a different shape (SHARD.md §11):
+its node rebuilds every range's store before any replica serves, so it answers from a
+store, with a store incarnation of its own, and holds nothing of the log all the same.
+It carries the refused mark and is counted exactly as the store-less one is; the mark
+is what makes the two the same rule, and keying the rule on the store-less stamp left
+it with no site on the node at all (PROPOSED D-087). A server carries the mark while
+it is quarantined and its last index is 0 — nothing of this log in it, by an install
+or by an append — and drops it the moment either lands. A leader that recorded
 another incarnation for it forgets its progress (§1, D-042), and the hint moves the
 leader's next index for it back to 1: a leader whose log is compacted then feeds it the
 snapshot (§1), and one whose log is not sends an AppendEntries whose previous index is

@@ -661,6 +661,9 @@ struct Ack {
     local: u64,
     /// The responder's store incarnation (D-042).
     incarnation: u64,
+    /// The refused mark the answer carried (D-049, PROPOSED D-087): the answerer
+    /// holds nothing of this log and can commit nothing until its re-seed does.
+    refused: bool,
     now: u64,
 }
 
@@ -753,14 +756,19 @@ struct Progress {
     /// The latest `sent` the follower acknowledged: its promise not to vote runs
     /// from there (RAFT.md §1).
     promise: Option<u64>,
-    /// Whether the follower answered since the last quorum check from a store: any
-    /// AppendEntries response but a refused server's rejection.
+    /// Whether the follower answered since the last quorum check with something of
+    /// this log behind it: any AppendEntries response but a refused server's
+    /// rejection.
     active: bool,
     /// Whether the follower answered since the last quorum check as a refused
-    /// server does, with a rejection stamped store incarnation 0 (RAFT.md §3). That
-    /// answer counts for check quorum only beside `stream_acked`.
+    /// server does, with a rejection carrying the refused mark (RAFT.md §3,
+    /// [`Raft::refused`]). That answer counts for check quorum only beside
+    /// `stream_acked`. The mark replaced "stamped store incarnation 0" in
+    /// PROPOSED D-087, which is the same set of answers on the one-group server and
+    /// a set the node had none of.
     // D-049: a refused follower counts for check quorum only while its re-seed
     // stream progresses.
+    // PROPOSED(D-087): D-049's rule keyed on a refused mark the answer carries.
     refused_answered: bool,
     /// Whether the snapshot stream to the follower had a chunk acknowledged since
     /// the last quorum check ([`Input::SnapshotAcked`], or the install's answer).
@@ -1061,6 +1069,34 @@ impl Raft {
     #[must_use]
     pub fn quarantined(&self) -> bool {
         self.quarantined
+    }
+
+    /// Whether this server is a **refused** one: it lost its state, it is running on
+    /// what a re-seed put in its place, and **nothing of this log is in it yet** —
+    /// no entry, no snapshot. Its rejections are the ones D-049's rule is about, and
+    /// every rejection it sends carries the mark (`AppendEntriesResponse::refused`).
+    ///
+    /// The two conjuncts are each necessary and neither is sufficient.
+    /// `quarantined` alone is **permanent** (D-035, and durable): a re-seeded
+    /// replica that has long since been caught up is still quarantined, and D-049
+    /// says in as many words that such a follower "counts as any follower does".
+    /// An empty log alone is a server that never had anything, which is a re-seed
+    /// ask (RAFT.md §3) and not a refusal. Together they are exactly the window the
+    /// one-group server spends answering from no store at all, and exactly the
+    /// window a node's re-seeded replica spends holding a store with nothing in it.
+    ///
+    /// It is derived rather than stored so that it cannot drift from the state it
+    /// describes, and so that it survives a restart without a fourth durable key:
+    /// the quarantine mark is on the disk and so is the log.
+    ///
+    /// The window closes when something lands — an install (`snap_index` rises) or,
+    /// where the leader has not compacted past this replica, an ordinary append.
+    /// Both are the leader getting somewhere with it, which is what D-049's rule
+    /// asks about.
+    // PROPOSED(D-087): D-049's rule keyed on a refused mark the answer carries.
+    #[must_use]
+    pub fn refused(&self) -> bool {
+        self.quarantined && self.last_index() == 0
     }
 
     /// The first index the log holds: one past the snapshot.
@@ -1588,13 +1624,13 @@ impl Raft {
 
     /// The followers check quorum counts for the window since the last check, and
     /// the refused followers it did not count (RAFT.md §1). A follower that
-    /// answered from a store counts. A refused follower's rejection counts only
-    /// when the leader's re-seed stream to it had a chunk acknowledged in the same
-    /// window: a refused server answers every AppendEntries whatever becomes of
-    /// its re-seed, so its rejections alone say it is alive, not that the leader
-    /// is getting anywhere with it, and a leader kept in office by them while its
-    /// other followers are away could hold the office for as long as the stream
-    /// stays stalled with no commit possible and no election either.
+    /// answered without the refused mark counts. A refused follower's rejection
+    /// counts only when the leader's re-seed stream to it had a chunk acknowledged
+    /// in the same window: a refused server answers every AppendEntries whatever
+    /// becomes of its re-seed, so its rejections alone say it is alive, not that
+    /// the leader is getting anywhere with it, and a leader kept in office by them
+    /// while its other followers are away could hold the office for as long as the
+    /// stream stays stalled with no commit possible and no election either.
     /// [`Variant::RefusedCountsForQuorum`] counts every rejection, the leader as
     /// built; [`Variant::RefusedNeverCounts`] counts none, the alternative D-049
     /// rejected.
@@ -2420,6 +2456,7 @@ impl Raft {
                                     echo,
                                     local: 0,
                                     incarnation: 0,
+                                    refused: self.refused(),
                                 },
                             );
                         }
@@ -2463,6 +2500,7 @@ impl Raft {
                 echo,
                 local,
                 incarnation,
+                refused,
                 ..
             } => self.on_append_entries_response(
                 from,
@@ -2474,6 +2512,7 @@ impl Raft {
                     echo,
                     local,
                     incarnation,
+                    refused,
                     now,
                 },
             ),
@@ -2618,6 +2657,7 @@ impl Raft {
                         echo,
                         local: 0,
                         incarnation: 0,
+                        refused: false,
                     },
                 );
                 return;
@@ -2661,6 +2701,7 @@ impl Raft {
                     echo,
                     local: 0,
                     incarnation: 0,
+                    refused: self.refused(),
                 },
             );
             return;
@@ -2716,6 +2757,7 @@ impl Raft {
                 echo,
                 local: 0,
                 incarnation: 0,
+                refused: false,
             },
         );
     }
@@ -2737,6 +2779,7 @@ impl Raft {
             echo,
             local,
             incarnation,
+            refused,
             now,
         } = ack;
         // An answer from a store other than the one recorded: what was known of
@@ -2753,13 +2796,23 @@ impl Raft {
         // timer on the request either way (moirae rule 5). An echo of zero is a
         // quarantined follower's (RAFT.md §3): a sign of life, never a promise and
         // never a read's confirmation, since it grants votes to nobody and a vote
-        // majority need not cross it. A rejection stamped incarnation 0 is a
-        // refused server's, which has no store: a sign of life that check quorum
-        // counts only beside re-seed progress in the same window. A quarantined
-        // follower answers from its store, with its own incarnation, and counts.
+        // majority need not cross it. A rejection *carrying the refused mark* is a
+        // refused server's, one that holds nothing of this log: a sign of life that
+        // check quorum counts only beside re-seed progress in the same window. A
+        // quarantined follower that holds the log answers without the mark and
+        // counts as any follower does.
+        //
+        // The key was `incarnation == 0` — "answered from no store" — until
+        // PROPOSED D-087. That is true of the one-group server's store-less re-seed
+        // loop and of nothing on the node, which rebuilds every range's store, each
+        // with an incarnation of its own, before any replica answers: the rule had
+        // no site there. `incarnation` says *which* store answered (D-042) and the
+        // mark says whether there is anything in it to commit with; they were one
+        // field doing two jobs, and the node separated them.
         // D-049: a refused follower counts for check quorum only while its re-seed
         // stream progresses.
-        if !success && incarnation == 0 {
+        // PROPOSED(D-087): D-049's rule keyed on a refused mark the answer carries.
+        if !success && refused {
             progress.refused_answered = true;
         } else {
             progress.active = true;

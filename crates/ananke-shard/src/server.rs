@@ -35,7 +35,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use ananke_env::{ApplyEffect, FileSystem, RangeCause};
+use ananke_env::{ApplyEffect, FileSystem, RangeCause, RecoveredAs};
 use ananke_env::{Clock, Decision, Environment, Network, Rng, Socket, TraceEvent};
 use ananke_raft::apply::{Command, Outcome, apply_command, user_key};
 use ananke_raft::client::{Reply, Request, Response};
@@ -455,6 +455,15 @@ impl<E: Environment> ServerHost<E> {
                 .stores
                 .get(&range)
                 .map_or(FIRST_INCARNATION, |store| store.incarnation()),
+            // The install has filled it: a quarantined replica here is one the
+            // re-seed marked and the stream then gave state to, which is
+            // `Quarantined` and no longer `Refused` (D-035).
+            // PROPOSED(D-081): a restatement says how the replica restated (D-067).
+            state: if restored.quarantined() {
+                RecoveredAs::Quarantined
+            } else {
+                RecoveredAs::Neither
+            },
         });
         Some(restored)
     }
@@ -1733,7 +1742,13 @@ async fn reseed<E: Environment>(
             }
             .max(FIRST_INCARNATION + 1);
             if !node_variants.contains(NodeVariant::ServeBeforeRefusedMark) {
-                store.mark_reseeded(incarnation).await?;
+                // D-067: `ReseedMarkNotSynced` writes the same two keys, traces the
+                // same event and answers as the correct node would; the batch is
+                // simply not synced, so a crash before anything else syncs this
+                // engine's log may leave the replica with no mark at all.
+                // PROPOSED(D-081): the re-seed shape's variant.
+                let synced = !node_variants.contains(NodeVariant::ReseedMarkNotSynced);
+                store.mark_reseeded(incarnation, synced).await?;
                 recovered.quarantined = true;
             }
         }
@@ -1770,10 +1785,14 @@ fn restate<E: Environment>(
         });
     }
     // The durable per-replica refused mark, restated per replica and carrying its range
-    // (§8). It is traced here on a restart, where the quarantine flag is what the disk
-    // held; at the re-seed itself this same restatement is the replica's first, and the
-    // mark was made durable before it (`reseed`). One-group `run` traces it in exactly
-    // this position (node.rs:963-968), so the two restatements stay comparable.
+    // (§8). A replica running on a store a re-seed rebuilt says so at every restatement,
+    // as the one-group server does (node.rs:963-968): it replicates, applies and counts
+    // for commit majorities, and grants no vote, no pre-vote and no lease promise for
+    // the rest of its life on that store. It is traced here on a restart, where the
+    // quarantine flag is what the disk held; at the re-seed itself this same
+    // restatement is the replica's first, and the mark was made durable before it
+    // (`reseed`). One-group `run` traces it in exactly this position, so the two
+    // restatements stay comparable.
     //
     // D-083 reached the same restatement from the other side — the node emitted this
     // event for no replica at all, as the one-group server does (node.rs:975-980) — and
@@ -1821,6 +1840,19 @@ fn restate<E: Environment>(
         applied: store.applied(),
         last_index: core.last_index(),
         incarnation: store.incarnation(),
+        // What the disk said this replica is (D-067). The mark Q15 writes is the
+        // quarantine flag and a fresh incarnation (D-077), so a marked replica with
+        // nothing installed yet is one waiting for its re-seed — `Refused` — and a
+        // marked replica that holds a snapshot has had its stream — `Quarantined`.
+        // The two are one flag and two moments, and (d) is about the first of them.
+        // PROPOSED(D-081): a restatement says how the replica restated (D-067).
+        state: if !quarantined {
+            RecoveredAs::Neither
+        } else if snap_index > 0 {
+            RecoveredAs::Quarantined
+        } else {
+            RecoveredAs::Refused
+        },
     });
     env.trace(TraceEvent::RaftTerm {
         server,
