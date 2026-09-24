@@ -31,10 +31,35 @@
 //! twenty-millisecond threshold, how long one range's applies hold the node's
 //! others, and the trace records a run holds per range per virtual second against
 //! `TRACE_CAP`.
+//!
+//! # The membership scenario on the node
+//!
+//! The second half of this binary is `sim/membership.rs` on the same node (PROPOSED
+//! D-084, following D-082): five nodes, **four ranges on every one of them**, 3 → 5 → 3
+//! on every range under the partitions the seed draws, each range placed as today's one
+//! group is. It is here rather than in a binary of its own for the reason the one-group
+//! membership tests sit in `sim/tests/raft.rs`: the scenario shares the sweep's client,
+//! its addresses and its schedule's clocks, and a second binary would be a second build
+//! of all of it.
+//!
+//! What it adds to the list above:
+//!
+//! - the other half of issue #46's extension, the half four ranges make possible and
+//!   one group could not have: **a change of a range while another range on the same
+//!   node is changing**, asserted on every seed and named on one;
+//! - liveness and availability asked of **each range** and not of the cluster, on
+//!   bounds measured on the correct node before they were written;
+//! - `SingleMajorityInJointConsensus` re-asserted on the node to the standard its
+//!   Phase 2 test asserts and no stronger, at the tier it uses today;
+//! - the half of issue #46 the node **cannot** reach — a joining server fed by a
+//!   snapshot in its learner phase — asserted absent on every seed with its reason and
+//!   the slice that owns the wiring, and left asserted where the path is, on
+//!   `Cluster::OneGroup`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
+use ananke_env::TraceEvent;
 use ananke_raft::core::{Variant, Variants};
 use ananke_shard::variant::NodeVariants;
 use ananke_sim::raft::{self, Cluster};
@@ -56,8 +81,8 @@ fn ranges() -> Vec<u64> {
 }
 
 /// The run's verdict: every check the one-group sweep makes, then the snapshot path
-/// asserted **reached on every seed**, and then the one path this node still has not
-/// got, asserted **absent with its reason**.
+/// asserted **reached on every seed**, and then D-077's fan-out asserted of every
+/// refusal the run reached.
 ///
 /// Both halves are the same rule, which is why they sit together. A variant whose
 /// situation the run cannot reach is a test that passes because nothing was injected,
@@ -69,10 +94,16 @@ fn ranges() -> Vec<u64> {
 /// snapshot fails here, because `SnapshotWithoutCurrentLast` and `SharedSnapshotDir`
 /// assert nothing on a run with no take and no stream in it.
 ///
-/// What stays an absence is the refusal, which is Q15's and PR #86's. It is asserted
-/// exactly as it was, so the day that path arrives the sweep says so rather than
-/// passing over it.
+/// The refusal is no longer an absence either. Q15's whole-node refusal and re-seed
+/// are in the tree (D-077), and a crash can leave this node an engine its restart
+/// cannot open even though its disk does not rot (`Cluster::bitrot`): #123's nightly
+/// reached one on 1 of 10 000 seeds (run 35949696476, on 677cad3) and the absence
+/// this asserted tripped. So a refusal is counted — its seed, server and reason are
+/// printed by the coverage at every tier — and what is asserted of it is what D-077
+/// promises: every replica the node held is refused with it, and none of them serves
+/// again before its own re-seed is durable (`whole_node_reseed`).
 // PROPOSED(D-086): the snapshot path is reached, and the absence becomes a reach.
+// PROPOSED(D-086): a refusal is counted, and D-077's fan-out is asserted of it.
 fn checked(report: &raft::Report) -> Result<(), String> {
     let seed = report.seed;
     report.check()?;
@@ -99,15 +130,85 @@ fn checked(report: &raft::Report) -> Result<(), String> {
              re-take and `SnapshotWithoutCurrentLast`'s install both assert nothing here"
         ));
     }
-    if let Some((server, reason)) = report.refused.first() {
-        return Err(format!(
-            "seed {seed}: server {server} refused its store ({reason}), a path this node does \
-             not have: Q15's whole-node refusal and re-seed are PR #86's. \
-             `RefusalNotDurable` is not re-asserted here, and a run that reaches this must \
-             say so rather than pass"
-        ));
+    whole_node_reseed(report)
+}
+
+/// D-077's promise, asked of every refusal a run reached: the node is refused whole —
+/// one `RaftReplicaRefused` for each of the ranges it holds, and no other — and no
+/// replica of it serves again before its own `RaftReseeded`.
+///
+/// The second half is the one a crash at the run's end cannot fake: a re-seed the run
+/// ended inside leaves a replica that never served again, which passes, where a
+/// replica that answered anything on a store its node had lost fails naming the
+/// range. The violations say `refused its store`, so `mechanism` files them under
+/// `a store refused`.
+// PROPOSED(D-086): a refusal is counted, and D-077's fan-out is asserted of it.
+fn whole_node_reseed(report: &raft::Report) -> Result<(), String> {
+    let seed = report.seed;
+    let ranges: BTreeSet<u64> = ranges().into_iter().collect();
+    let refusals: Vec<(usize, u64, String)> = report
+        .records
+        .iter()
+        .enumerate()
+        .filter_map(|(at, record)| match &record.event {
+            TraceEvent::RaftRefused { server, reason } => Some((at, *server, reason.clone())),
+            _ => None,
+        })
+        .collect();
+    for (at, server, reason) in refusals {
+        let after = &report.records[at + 1..];
+        let refused: BTreeSet<u64> = after
+            .iter()
+            .filter_map(|record| match &record.event {
+                TraceEvent::RaftReplicaRefused { server: s, range } if *s == server => Some(*range),
+                _ => None,
+            })
+            .collect();
+        if refused != ranges {
+            return Err(format!(
+                "seed {seed}: server {server} refused its store ({reason}) and the whole-node \
+                 re-seed refused its replicas of ranges {refused:?}, not of every range the \
+                 node holds, {ranges:?}: D-077 refuses the node whole"
+            ));
+        }
+        for range in &ranges {
+            let reseeded = after.iter().position(|record| {
+                matches!(
+                    &record.event,
+                    TraceEvent::RaftReseeded { server: s, range: r } if *s == server && r == range
+                )
+            });
+            let served = after
+                .iter()
+                .position(|record| served_by(&record.event) == Some((server, *range)));
+            if let Some(served) = served
+                && reseeded.is_none_or(|reseeded| reseeded > served)
+            {
+                return Err(format!(
+                    "seed {seed}: server {server} refused its store ({reason}) and its replica \
+                     of range {range} served again before its re-seed was durable, where D-077 \
+                     writes the refused mark before any replica of a re-seeded node serves: \
+                     {:?}",
+                    after[served].event
+                ));
+            }
+        }
     }
     Ok(())
+}
+
+/// The replica an event says served, for [`whole_node_reseed`]: a restatement, a
+/// term, an election, an append, a commit or an apply of (server, range).
+fn served_by(event: &TraceEvent) -> Option<(u64, u64)> {
+    match event {
+        TraceEvent::RaftRecovered { server, range, .. }
+        | TraceEvent::RaftTerm { server, range, .. }
+        | TraceEvent::RaftLeader { server, range, .. }
+        | TraceEvent::RaftAppend { server, range, .. }
+        | TraceEvent::RaftCommit { server, range, .. }
+        | TraceEvent::RaftApply { server, range, .. } => Some((*server, *range)),
+        _ => None,
+    }
 }
 
 #[test]
@@ -197,7 +298,17 @@ struct Coverage {
     /// (PROPOSED D-086).
     took_an_index_twice: usize,
     retook_into_one_directory: usize,
+    /// Store refusals over the tier, and each one's seed, server and reason. Counted
+    /// and printed, not asserted absent: the whole-node re-seed is in the tree (D-077)
+    /// and a crash reaches it here about once in ten thousand seeds; what D-077
+    /// promises of each is asserted per seed by `whole_node_reseed` (PROPOSED D-086).
     refusals: usize,
+    refused: Vec<(u64, u64, String)>,
+    /// The most registered reads any one replica held at once over the tier, with its
+    /// seed, server and range: the number `READS_OUTSTANDING` is held to, read from
+    /// `RaftReadsOutstanding` so the tier has a figure and not a failure string
+    /// (PROPOSED D-076, D-086).
+    reads_outstanding_worst: Option<(u64, u64, u64, u64)>,
     highest_index: u64,
     puts: u64,
     gets: u64,
@@ -286,6 +397,8 @@ impl std::fmt::Debug for Coverage {
             .field("took_an_index_twice", &self.took_an_index_twice)
             .field("retook_into_one_directory", &self.retook_into_one_directory)
             .field("refusals", &self.refusals)
+            .field("refused", &self.refused)
+            .field("reads_outstanding_worst", &self.reads_outstanding_worst)
             .field("highest_index", &self.highest_index)
             .field("puts", &self.puts)
             .field("gets", &self.gets)
@@ -377,6 +490,16 @@ impl Coverage {
         self.took_an_index_twice += usize::from(took_an_index_twice_on_the_node(report));
         self.retook_into_one_directory += usize::from(retook_into_one_directory(report));
         self.refusals += report.refused.len();
+        for (server, reason) in &report.refused {
+            self.refused.push((report.seed, *server, reason.clone()));
+        }
+        if let Some((server, range, outstanding)) = report.reads_outstanding_worst()
+            && self
+                .reads_outstanding_worst
+                .is_none_or(|(_, _, _, worst)| outstanding > worst)
+        {
+            self.reads_outstanding_worst = Some((report.seed, server, range, outstanding));
+        }
         self.highest_index = self.highest_index.max(report.highest_index());
         for record in &report.records {
             match &record.event {
@@ -606,11 +729,26 @@ impl Coverage {
             raft::NODE_SNAPSHOT_THRESHOLD,
             self.seeds
         );
-        // What stays an absence is Q15's whole-node refusal, which is PR #86's. It is
-        // asserted exactly as it was, so the day that path arrives the sweep says so.
-        assert_eq!(
-            self.refusals, 0,
-            "a store was refused on a node whose whole-node refusal is PR #86's"
+        // The refusal is counted, not asserted absent (PROPOSED D-086, on the merge
+        // with `main`). Q15's whole-node refusal and re-seed are in the tree (D-077),
+        // and a crash can leave this node an engine its restart cannot open although
+        // its disk does not rot: #123's nightly reached one on 1 of 10 000 seeds (run
+        // 35949696476, on 677cad3), where this line asserted none. What D-077 promises
+        // of each is asserted per seed in `whole_node_reseed`; here every one is
+        // printed with its seed, server and reason at every tier, so a rate that moves
+        // is seen. It is not asserted above zero: at about one seed in ten thousand
+        // no tier supports a floor (D-061).
+        println!(
+            "node: {} store refusals over {} seeds, each re-seeded whole (D-077): {:?}",
+            self.refusals, self.seeds, self.refused
+        );
+        // The bound's own figure at this tier (D-076's `READS_OUTSTANDING`), printed
+        // and not asserted here: the node fails itself the moment a replica holds more,
+        // and `checked` reports that as the node's failure.
+        println!(
+            "node: the most registered reads one replica held at once over {} seeds was \
+             {:?} as (seed, server, range, reads)",
+            self.seeds, self.reads_outstanding_worst
         );
     }
 }
@@ -993,8 +1131,10 @@ fn mechanism(violation: &str) -> &'static str {
         ("liveness", "liveness"),
         ("follower log:", "the follower-log bound"),
         ("failed:", "the node failed"),
-        // PROPOSED(D-091): `checked`'s own two, which were "something else" before
-        // and are named now that a name decides where a violation is counted.
+        // PROPOSED(D-091): `checked`'s own, which were "something else" before and
+        // are named now that a name decides where a violation is counted. Since the
+        // merge with `main` the first is `whole_node_reseed`'s: D-077's fan-out
+        // broken, which is a refusal not made durable after the next crash.
         ("refused its store", "a store refused"),
         ("this seed's evidence is vacuous", "no snapshot action"),
         ("nothing was checkpointed for a stream", "no take completed"),
@@ -1004,6 +1144,54 @@ fn mechanism(violation: &str) -> &'static str {
         }
     }
     "something else"
+}
+
+/// Whether the run's ranges wedged by the liveness check's own reading: the fold,
+/// asked as `check()` asks it, of uniform schedules only (D-016).
+fn wedged(report: &raft::Report) -> bool {
+    report.uniform() && report.liveness().is_err()
+}
+
+/// Whether a violation is the read bound's (`READS_OUTSTANDING`, D-076 point 12).
+fn by_the_read_bound(violation: &str) -> bool {
+    mechanism(violation) == "the node failed" && violation.contains("registered reads")
+}
+
+/// Whether a read-bound trip on this run is the **wedge's second reporter**: the
+/// liveness fold, asked of the run regardless of its schedule, reports that a range's
+/// clients stopped completing writes after the heal.
+///
+/// The difference matters since the merge with `main`. A wedged range's clients retry
+/// their reads, each retry is registered again (issue #125), and `READS_OUTSTANDING` —
+/// sized on the correct node, which never wedges — fails the node before `check()`
+/// reaches its liveness clause, or on a schedule `check()` never asks liveness of
+/// (D-016 asks it of uniform schedules only). Either way a run the wedge caught would
+/// read as the node's own failure, which is how `main`'s nightly on c178682 read one
+/// read-bound trip as five catches. The fold's reading is used here only to attribute
+/// a trip the bound has already reported; it asserts nothing on its own, so D-016's
+/// rule that liveness is a claim about uniform schedules is untouched.
+// PROPOSED(D-086): a read-bound trip downstream of a wedge is attributed to the wedge.
+fn read_bound_reports_a_wedge(report: &raft::Report, violation: &str) -> bool {
+    by_the_read_bound(violation) && report.liveness().is_err()
+}
+
+/// Whether a read-bound trip with **no** wedge the fold reports is the **variant's
+/// load** and not the node's failure: the correct node, run on the same seed, passes.
+///
+/// `SharedSnapshotDir`'s stream never completes, and on a run whose writes still
+/// complete within the liveness bound its leader's reads can still wait past the
+/// clients' retries, each retry registered again (issue #125), until the replica
+/// holds more than `READS_OUTSTANDING` — a bound sized on the correct node, which
+/// holds at most 16 over a thousand seeds of these arms. That is the variant's doing
+/// through a check RAFT.md §5 does not name for it, so it is neither its catch nor
+/// the node's failure; it is counted and printed as what it is. A seed the correct
+/// node trips the bound on too is the node's, and stays a failure.
+// PROPOSED(D-086): a read-bound trip with no wedge is the variant's load only where the
+// correct node passes the seed.
+fn read_bound_is_the_variants_load(report: &raft::Report, violation: &str) -> bool {
+    by_the_read_bound(violation)
+        && report.liveness().is_ok()
+        && correct(report.seed).check().is_ok()
 }
 
 // Phase 2's variants on `sim/raft.rs`'s arms, re-asserted on the node (§10, §12).
@@ -1132,13 +1320,30 @@ fn a_leader_that_trusts_the_clock_is_caught_on_the_node() {
     // are asserted where the correct node is already run, in the sweep above; here
     // the buggy node runs alone, which is what keeps this test to one run a seed.
     //
-    // The catch is a stale read, found by linearizability, and it is asserted from
-    // the thousand-seed tier: exactly where the one-group test asserts it and no
-    // stronger (§10, §12). On one group the stale read is caught on 4.0 % of the
-    // first thousand seeds, and D-061 puts a catch under 5 % at `seeds() >= 1000` —
-    // at 4 % the gate's twenty catch none with probability 0.44 and a hundred with
-    // 0.017, so an assertion there would fail a tree with nothing wrong the day a
-    // change redraws the schedules. The node's own rate is in the entry.
+    // The catch is a stale read, found by linearizability. On the node it is asserted
+    // from the **nightly's ten thousand**, not from the thousand-seed tier the
+    // one-group test asserts it at, and the reason is the node's own rate: the stale
+    // read is caught on **78 of 10 000 seeds, 0.78 %** here, and 6 of the first 1 000,
+    // 0.6 %, against one group's 4.0 % on the same arms.
+    //
+    // D-061 reasons with P(none) = (1 − p)^n, n the seeds the assertion sees at the
+    // lowest tier it is asserted at. At 0.78 % a **thousand** seeds catch none with
+    // probability 0.9922^1000 = 4.0e-4, about one run in 2 500, and at the 0.6 % the
+    // thousand itself measured, 0.994^1000 = 2.4e-3, one run in 410 — either way a
+    // tier that reddens a tree with nothing wrong, against the 0.96^1000 = 1.9e-18 of
+    // the one-group assertion this was copied from. At the **nightly's ten thousand**
+    // the same arithmetic gives 0.9922^10000 = 9.8e-35, and 7.3e-27 at the thinner
+    // rate. So the tier moves to where the statistics are, as `SharedSnapshotDir`'s
+    // liveness catch already is (D-061; `sim/tests/raft.rs`). The owner ruled it on
+    // 2026-09-23; PROPOSED(D-088) has the measurement and its machine.
+    //
+    // It is **not** a narrower window: the node's lease trial hands over *every* range
+    // the node holds, so the window is wider than the one-group trial's, not
+    // narrower. The rate keeps printing at every tier, which is D-061's other half —
+    // a tier that asserts nothing still has to say what it saw, or the day the rate
+    // collapses nobody learns of it until the nightly. The one-group assertion is
+    // untouched at its own tier, where 4.0 % belongs.
+    // PROPOSED(D-088): the node's stale read asserts at the nightly's ten thousand.
     //
     // The catch is counted by the check that makes it — the linearizability search,
     // which is where a stale lease read is reported — and not by whichever check a
@@ -1160,13 +1365,98 @@ fn a_leader_that_trusts_the_clock_is_caught_on_the_node() {
         caught.other.len(),
         caught.own.first().map_or("", String::as_str)
     );
-    if seeds >= 1000 {
+    // The tier, not a share of it: this test sweeps `seeds()` itself, so the gate is
+    // reached at exactly the seed count the nightly sets and not a tenth of it.
+    if seeds >= 10_000 {
         assert!(
             !caught.own.is_empty(),
-            "LeaseTrustsTheClock's stale read was never caught on the node by the \
-             linearizability search, which is the check RAFT.md §5 names for it: {caught:?}"
+            "LeaseTrustsTheClock was never caught on the node over {seeds} seeds by the \
+             linearizability search, which is the check RAFT.md §5 names for it; at the \
+             0.78 % PROPOSED(D-088) measured over ten thousand, ten thousand seeds catch \
+             none with probability 9.8e-35, so this is the node having changed and not a \
+             draw: {caught:?}"
         );
     }
+}
+
+/// The pair rule for the registration a refused read leaves behind
+/// (`NodeVariant::RefusedReadLeft`, D-076), **under the raft arms**: the node exactly
+/// as it was before D-076, whose `reads` map grows by one on every read a replica
+/// refuses and never shrinks.
+///
+/// D-076 caught it on `sim/ranges.rs` at a bound of 8, on 535 of 1 000 seeds. The
+/// bound is 38 since PR #109's merge with `main` re-measured it by D-076's own rule
+/// (point 12), and at 38 `sim/ranges.rs`'s runs are too short for the leak to reach
+/// it — **0 of 1 000** there, in release — so the catch is asserted here, where a run
+/// holds four ranges' leaders through crashes, isolations and streams for long enough
+/// that the refused reads pile up past the bound; `sim/ranges.rs`'s pair keeps the
+/// fault's firing and prints its rate. The bound is the only oracle for this leak
+/// (D-076's review, R2), so the catch and the firing are one measurement here: the
+/// most reads the leaking node held is printed beside the rate at every tier.
+///
+/// Measured before it was asserted (D-061), on the merged tree in release: caught on
+/// **108 of 1 000 seeds (10.8 %)**, 8 of 100 and 2 of 20, every one by the bound, the
+/// leaking replica holding up to **61** reads at once against the correct node's 16.
+/// At 10.8 % the gate's twenty see none about one run in ten (0.892^20 = 0.10), which
+/// is a flake, and a hundred see none about once in ninety thousand (1.1e-5), so the
+/// catch is asserted **from the hundred-seed tier** and printed at every tier — the
+/// tier D-089 put `SnapshotWithoutCurrentLast`'s injection at, for the same arithmetic.
+// PROPOSED(D-086): the read leak's catch moves to the arms, where the bound of 38 sees it.
+#[test]
+fn a_node_that_leaves_a_refused_reads_registration_behind_is_caught_on_the_node() {
+    /// One seed under the leaking node: whether it failed, whether the bound named
+    /// it, and the most reads one replica held at once.
+    struct Leak {
+        failed: bool,
+        named: bool,
+        worst: Option<u64>,
+    }
+    let seeds = seeds();
+    let outcomes: Vec<Leak> = sweep(seeds, |seed| {
+        let report = raft::run_on_the_node(
+            seed,
+            Variants::default(),
+            NodeVariants::of(&[NodeVariant::RefusedReadLeft]),
+        );
+        let verdict = report.check();
+        let named = verdict
+            .as_ref()
+            .err()
+            .is_some_and(|violation| violation.contains("registered reads"));
+        Leak {
+            failed: verdict.is_err(),
+            named,
+            worst: report
+                .reads_outstanding_worst()
+                .map(|(_, _, outstanding)| outstanding),
+        }
+    });
+    let caught = outcomes.iter().filter(|leak| leak.failed).count();
+    let named = outcomes.iter().filter(|leak| leak.named).count();
+    let worst = outcomes.iter().filter_map(|leak| leak.worst).max();
+    let rate = caught as f64 * 100.0 / seeds as f64;
+    println!(
+        "node: RefusedReadLeft caught on {caught}/{seeds} seeds ({rate:.1}%), {named} of them \
+         by the outstanding-reads bound; the most reads a leaking replica held at once was \
+         {worst:?}"
+    );
+    // The tier, not a share of it: this sweeps `seeds()` itself.
+    if seeds >= 100 {
+        assert!(
+            caught > 0,
+            "the node that keeps every read it refuses passed every one of {seeds} seeds under \
+             the raft arms; at the 10.8 % measured over a thousand, a hundred seeds catch none \
+             with probability 1.1e-5, so this is the node or the bound having changed and not \
+             a draw"
+        );
+    }
+    assert_eq!(
+        named,
+        caught,
+        "{} of the {caught} seeds caught were caught by something other than the \
+         outstanding-reads bound, which is not what this pair is for",
+        caught - named
+    );
 }
 
 #[test]
@@ -1213,6 +1503,295 @@ fn a_seed_replays_to_the_same_trace_on_the_node() {
     for (a, b) in first.records.iter().zip(&second.records) {
         assert_eq!(a.at, b.at);
         assert_eq!(a.event, b.event);
+    }
+}
+
+// --- The sharded check-quorum scenario (PROPOSED D-085, D-049, D-077) ---
+
+use ananke_shard::variant::NodeVariant;
+use ananke_sim::quorum::{self, NodeReport};
+
+/// What a sweep of the sharded scenario saw, printed at every tier.
+#[derive(Debug, Default)]
+struct QuorumNodeFigures {
+    seeds: u64,
+    ranges_refused: usize,
+    ranges_reseeded: usize,
+    ranges_on_the_keepers_majority: usize,
+    ranges_on_the_cut_off_leader: usize,
+    commits_through_a_reseeded_replica: usize,
+    step_downs: usize,
+    /// The answers D-049's rule is about: rejections **carrying the refused mark**
+    /// (PROPOSED D-087). Under the key this figure was written for — a rejection
+    /// stamped incarnation 0 — it was 0 on every seed at every tier, because the
+    /// node has no store-less state. It is not 0 now.
+    refused_rejections: usize,
+    /// Answers from **no store at all**, stamped incarnation 0. D-077's node has
+    /// none, which is the half of PROPOSED D-085's finding that D-087 leaves
+    /// standing, and `NodeReport::check` fails the seed if it ever does.
+    store_less_answers: usize,
+    /// Marked rejections the victim **sent** after it had sent an answer of the same
+    /// range that fitted (send order, since delays reorder deliveries): the figure a
+    /// mark read per node rather than per replica moves when it is set too **widely**,
+    /// and `NodeReport::check` fails the seed on it.
+    marked_after_fitted: usize,
+    /// Its dual: **unmarked** rejections the victim sent after that range's replica
+    /// was re-seeded and before it had sent anything of that range that fitted — what
+    /// the same per-node mark does when it is set too **narrowly**, which is what a
+    /// mark read off one replica and stamped on the other three looks like.
+    /// `refused_rejections` above is a sweep-wide total and sees only the mark's
+    /// complete disappearance; this sees three quarters of it go. Also 0, and
+    /// `NodeReport::check` fails the seed on it, naming the range.
+    // m1 of the review of this slice.
+    unmarked_before_fitted: usize,
+    /// The node's other answers: rejections a caught-up re-seeded replica sends,
+    /// carrying its store's own incarnation and no mark, and answers that fitted.
+    store_rejections: usize,
+    fitted: usize,
+    step_downs_naming_anyone_uncounted: usize,
+    streams: usize,
+    seeds_carrying_both_outcomes: u64,
+}
+
+impl QuorumNodeFigures {
+    fn add(&mut self, report: &NodeReport) {
+        self.seeds += 1;
+        self.seeds_carrying_both_outcomes += u64::from(report.both_outcomes);
+        let (Some(cast), Some(holds)) = (report.cast.as_ref(), report.holds()) else {
+            return;
+        };
+        for hold in holds.values() {
+            self.ranges_refused += usize::from(hold.replica_refused);
+            self.ranges_reseeded += usize::from(hold.reseeded);
+            self.refused_rejections += hold.refused_rejections;
+            self.store_less_answers += hold.store_less_answers;
+            self.marked_after_fitted += hold.marked_after_fitted;
+            self.unmarked_before_fitted += hold.unmarked_before_fitted;
+            self.store_rejections += hold.store_rejections;
+            self.fitted += hold.fitted;
+            self.streams += hold.streams;
+            if hold.leader == cast.keeper {
+                self.ranges_on_the_keepers_majority += 1;
+                self.commits_through_a_reseeded_replica +=
+                    usize::from(hold.commit_after_cut.is_some());
+            } else if hold.leader == cast.other {
+                self.ranges_on_the_cut_off_leader += 1;
+            }
+            if let Some((_, uncounted)) = &hold.quorum_lost {
+                self.step_downs += 1;
+                self.step_downs_naming_anyone_uncounted += usize::from(!uncounted.is_empty());
+            }
+        }
+    }
+}
+
+/// The sharded scenario over the tier's seeds under `variants` and `node`: every
+/// seed's violation, if it has one, and the figures.
+fn quorum_node_sweep(
+    variants: impl Into<Variants> + Copy + Send + Sync,
+    node: NodeVariants,
+) -> (Vec<String>, QuorumNodeFigures) {
+    let figures = std::sync::Mutex::new(QuorumNodeFigures::default());
+    let violations: Vec<String> = sweep(seeds(), |seed| {
+        let report = quorum::node_run(seed, variants, node);
+        figures.lock().unwrap().add(&report);
+        report.check().err()
+    })
+    .into_iter()
+    .flatten()
+    .collect();
+    (violations, figures.into_inner().unwrap())
+}
+
+/// The sharded check-quorum scenario's positive control (PROPOSED D-085): **one
+/// fault, four answers**.
+///
+/// One `mark_store_lost` at the victim's restart refuses the node and every replica
+/// it holds (D-077), each re-seeded with a store incarnation of its own; the third
+/// node is then cut off, and check quorum is asked separately of each of the four
+/// ranges' leaders about that one refused node. On every seed the run carries **both**
+/// outcomes at once, which no single-range scenario can: the ranges the keeper leads
+/// keep their leader through the hold and commit past their commit index at the cut,
+/// on a majority of the keeper and the node the refusal re-seeded; the ranges the
+/// cut-off node leads lose theirs within two windows and three ticks and stay
+/// leaderless, because a re-seeded replica neither votes nor campaigns (D-035) and the
+/// keeper alone is no majority.
+///
+/// The figures print what D-049's own halves need of the node;
+/// `d_049s_rule_has_a_site_on_the_node_now_and_its_pair_waits_on_the_scenarios_own_threshold` is
+/// where they are asserted.
+// PROPOSED(D-085): sharded is one fault and four answers, not the scenario four times.
+#[test]
+fn the_sharded_quorum_scenario_asks_four_leaders_about_one_refused_node() {
+    let (violations, figures) = quorum_node_sweep(Variants::default(), NodeVariants::correct());
+    eprintln!(
+        "sharded quorum, correct: {} of {} seeds failed, {figures:?}, first: {}",
+        violations.len(),
+        seeds(),
+        violations.first().map_or("", String::as_str)
+    );
+    assert!(violations.is_empty(), "{}", violations[0]);
+    // The shape the checks need, asserted rather than assumed: four replicas refused
+    // and re-seeded a seed, both outcomes reached on every seed, and the answers that
+    // carried the keeper's office actually delivered.
+    let ranges = u64::try_from(ranges().len()).expect("small");
+    assert_eq!(
+        figures.ranges_refused as u64,
+        figures.seeds * ranges,
+        "the one refusal did not fan out to every range on every seed"
+    );
+    assert_eq!(figures.ranges_reseeded as u64, figures.seeds * ranges);
+    assert!(
+        figures.ranges_on_the_keepers_majority > 0 && figures.ranges_on_the_cut_off_leader > 0,
+        "the sweep reached only one of the scenario's two outcomes"
+    );
+    assert!(
+        figures.seeds_carrying_both_outcomes > 0,
+        "no seed carried both outcomes at once, which is the whole of what a sharded \
+         scenario says over a single-range one"
+    );
+    assert!(
+        figures.fitted > 0,
+        "no answer of a re-seeded replica fitted, so no keeper's office was kept on one"
+    );
+}
+
+/// The node's own variant beside the correct node (the pair rule, CLAUDE.md):
+/// `RefuseOneRangeOnly` (D-077) marks down only the range whose store open failed,
+/// where a loss in the shared engine is every replica's.
+///
+/// **This is the catch a single-range world cannot make.** On one group, refusing the
+/// one range *is* refusing the node, so the variant does nothing there and D-077
+/// catches it on its own scenario's shape. Here it is caught from this scenario's
+/// side, by the clause that asks the fan-out per range: three of the four replicas
+/// were never refused, so they were never re-seeded either.
+///
+/// Measured before it was asserted (Q39, D-061): caught on every seed of the gate's
+/// twenty, and the rate is printed at every tier.
+// PROPOSED(D-085): sharded is one fault and four answers, not the scenario four times.
+#[test]
+fn a_node_that_refuses_only_one_range_is_caught_on_the_sharded_quorum_scenario() {
+    let (caught, figures) = quorum_node_sweep(
+        Variants::default(),
+        NodeVariants::of(&[NodeVariant::RefuseOneRangeOnly]),
+    );
+    eprintln!(
+        "sharded quorum, RefuseOneRangeOnly: caught on {} of {} seeds, {figures:?}, first: {}",
+        caught.len(),
+        seeds(),
+        caught.first().map_or("", String::as_str)
+    );
+    assert_eq!(
+        caught.len() as u64,
+        seeds(),
+        "RefuseOneRangeOnly was not caught on every seed: {caught:?}"
+    );
+    assert!(
+        caught
+            .iter()
+            .all(|v| v.contains("but not this range's replica")),
+        "caught by something other than the fan-out: {caught:?}"
+    );
+}
+
+/// D-049's rule **has a site on the node now**, and its pair is measured there:
+/// what the mark buys, and the one thing the pair still waits for.
+///
+/// This replaces the absence PROPOSED D-085 asserted here. D-085 measured that
+/// D-049's rule was keyed on *a rejection stamped incarnation 0* — a server with no
+/// store — that the one-group server's re-seed loop is such a server and D-077's
+/// node never is, and that `Progress::refused_answered` was therefore never set on
+/// the node, on any seed, for any range. PROPOSED D-087 changed the key: the answer
+/// carries a refused mark ([`ananke_raft::Raft::refused`]), which the node's
+/// re-seeded replicas send on a store of their own, and the leader reads the mark
+/// instead of inferring the absence of a store from a stamp. What this test asserts
+/// now, per variant, over the tier's seeds:
+///
+/// 1. **The refusal landed** — four replicas a seed, as before, or nothing below is
+///    evidence.
+/// 2. **The node sends the mark**: `refused_rejections` is no longer 0. This is the
+///    assertion that would fail if the key were reverted, if the mark stopped being
+///    set where a re-seed builds the store, or if it stopped surviving the wire, and
+///    it is the whole of what D-087 buys on this cluster. It is a **sweep-wide
+///    total**, so on its own it sees the mark disappearing and nothing short of
+///    that: a mark read once per node and stamped on its other three replicas only
+///    takes it from 282 to 72 at a thousand seeds. What sees *that* is
+///    `NodeReport::check`'s pair of per-range clauses — no marked rejection sent
+///    after that range's replica answered something that fitted, and no **unmarked**
+///    one sent after its re-seed and before it did — which fail the seed naming the
+///    range, and which the figures `marked_after_fitted` and
+///    `unmarked_before_fitted` print at every tier. Both are 0 here.
+/// 3. **And the node still answers from no store nowhere**: `store_less_answers` is
+///    0. That half of D-085's finding stands, and `NodeReport::check` fails the seed
+///    that breaks it. The mark is a replacement for the stamp, not a re-creation of
+///    the store-less state D-077 decided against — which is the owner's ruling, in
+///    the one figure that can tell the two shapes apart.
+/// 4. **The pair is still caught on 0 seeds, for a narrower reason than before, and
+///    the rate is printed at every tier.** The rule has its site; what it does not
+///    yet have is a *window the site decides*. Under this scenario's own threshold
+///    nothing compacts — no core asks for a take — so a leader always feeds a
+///    re-seeded replica from index 1, the replica answers a refused rejection and
+///    then a success **inside the same check-quorum window**, and `active` settles
+///    the window whichever way the variant counts the rejection. Measured, and the
+///    figures say it: over a hundred seeds the node delivered 33 refused rejections
+///    and 25 010 answers that fitted, and **0** step-downs left anyone `uncounted`.
+///
+/// **Nothing is lowered.** §10's standard for this pair — caught on every seed at
+/// every tier — is asserted where the pair is caught, `sim/tests/raft.rs`'s four
+/// D-049 tests on the one-group server, whose every figure D-087 left unmoved. What
+/// this says is why it is not yet caught here, and the reason is now one thing and
+/// not two: **a compaction past the re-seeded replica, which this scenario's own
+/// `snapshot_threshold` keeps from happening** (`quorum::NODE_SNAPSHOT_THRESHOLD`,
+/// `1 << 30`; the wiring itself is in the tree, PR #107, and the raft-arms sweep
+/// runs its node at 12). A leader that can compact past a re-seeded replica
+/// can no longer feed it from its log, its refused rejections become the only answer
+/// in the window, and the rule decides. The bare core already does decide it —
+/// `crates/ananke-raft/tests/paper.rs` steps a leader down naming a follower that
+/// answers a refused rejection on a store of its own, which is the node's shape and
+/// which under the old key kept its office. This test fails the day the threshold is
+/// lowered and the node reaches it, and says so.
+// PROPOSED(D-087): D-049's rule keyed on a refused mark the answer carries.
+#[test]
+fn d_049s_rule_has_a_site_on_the_node_now_and_its_pair_waits_on_the_scenarios_own_threshold() {
+    let ranges = u64::try_from(ranges().len()).expect("small");
+    for variant in [Variant::RefusedCountsForQuorum, Variant::RefusedNeverCounts] {
+        let (caught, figures) = quorum_node_sweep(variant, NodeVariants::correct());
+        eprintln!(
+            "sharded quorum, {:?}: caught on {} of {} seeds, {figures:?}",
+            Variants::from(variant),
+            caught.len(),
+            seeds()
+        );
+        assert_eq!(
+            figures.ranges_reseeded as u64,
+            figures.seeds * ranges,
+            "the refusal did not land, so nothing below is evidence"
+        );
+        assert!(
+            figures.store_rejections + figures.fitted > 0,
+            "the refused node answered nothing at all, so nothing below is evidence"
+        );
+        // The site: the node's re-seeded replicas say they hold nothing of the log.
+        assert!(
+            figures.refused_rejections > 0,
+            "no answer of the node carried the refused mark, so D-049's rule has no \
+             site here after all: PROPOSED D-087's key is not reaching the leader, and \
+             the entry's claim that it does is wrong"
+        );
+        // And they say it on a store of their own, which is D-077's shape unchanged.
+        assert_eq!(
+            figures.store_less_answers, 0,
+            "the node answered from no store, where D-077 rebuilds every range's store \
+             before any replica serves: the re-seed changed shape, which is the shape \
+             the owner ruled against changing"
+        );
+        assert_eq!(
+            caught.len(),
+            0,
+            "{:?} is caught on the node: the rule's site now decides a window here, so \
+             assert the catch at §10's standard instead of this: {caught:?}",
+            Variants::from(variant)
+        );
     }
 }
 
@@ -1279,12 +1858,22 @@ fn a_server_that_installs_without_current_last_is_injected_on_the_node() {
     let caught: Vec<&String> = outcomes.iter().filter_map(|(v, _, _)| v.as_ref()).collect();
     let fired = outcomes.iter().filter(|(_, aimed, _)| *aimed > 0).count();
     let actions: usize = outcomes.iter().map(|(_, _, a)| a).sum();
-    let rate = caught.len() as f64 * 100.0 / seeds as f64;
+    // Attributed (PROPOSED D-091): a run the node failed on its own — the read bound, an
+    // apply hole — is the node's failure and not this variant's catch, which is how
+    // `main`'s nightly on c178682 came to report one read-bound trip as five catches.
+    let mut by_check: BTreeMap<&str, usize> = BTreeMap::new();
+    for violation in &caught {
+        *by_check.entry(mechanism(violation.as_str())).or_default() += 1;
+    }
+    let by_the_node = by_check.get("the node failed").copied().unwrap_or(0);
+    let rate = (caught.len() - by_the_node) as f64 * 100.0 / seeds as f64;
     println!(
-        "node: SnapshotWithoutCurrentLast caught on {}/{seeds} seeds ({rate:.1}%), the install \
-         crash reached the final chunk of the range it aimed at and crashed there on \
-         {fired}/{seeds} seeds, {actions} snapshot actions asked for, first: {}",
-        caught.len(),
+        "node: SnapshotWithoutCurrentLast caught on {}/{seeds} seeds ({rate:.1}%) by a check \
+         (every violation by {by_check:?}; {by_the_node} runs the node failed on its own, \
+         which are not its catch), the install crash reached the final chunk of the range \
+         it aimed at and crashed there on {fired}/{seeds} seeds, {actions} snapshot actions \
+         asked for, first: {}",
+        caught.len() - by_the_node,
         caught.first().map_or("", |v| v.as_str())
     );
     // **The arm's own firing, from the thousand-seed tier.** This is the only thing
@@ -1409,7 +1998,23 @@ fn a_leader_that_shares_one_snapshot_directory_is_caught_on_the_node() {
     // PROPOSED(D-086): the tier gates read the tier, the counts read the share.
     let tier = seeds();
     let share = high_rate_share();
-    let outcomes: Vec<(Option<String>, bool, usize, bool, usize)> = sweep(share, |seed| {
+    /// One seed under the variant: `checked`'s violation, the re-take at a taken index,
+    /// the arm's aimed streams, a scramble, the duplicate-chunk loops, and the wedge.
+    struct Shared {
+        violation: Option<String>,
+        fired: bool,
+        aimed: usize,
+        scrambled: bool,
+        looped: usize,
+        /// The liveness check's own catch (uniform schedules, D-016).
+        wedged: bool,
+        /// The read bound fired downstream of a wedge the fold reports.
+        read_bound_on_wedge: bool,
+        /// The read bound fired with no wedge, where the correct node passes the seed:
+        /// the variant's load on a bound that counts retries (issue #125).
+        load: bool,
+    }
+    let outcomes: Vec<Shared> = sweep(share, |seed| {
         let report = buggy(seed, Variant::SharedSnapshotDir);
         let scrambled: Vec<_> = report
             .retakes_under_streams()
@@ -1429,29 +2034,57 @@ fn a_leader_that_shares_one_snapshot_directory_is_caught_on_the_node() {
                 )
             })
             .sum();
-        (
-            checked(&report).err(),
-            took_an_index_twice_on_the_node(&report),
-            report.aimed_streams,
-            !scrambled.is_empty(),
+        let violation = checked(&report).err();
+        let read_bound_on_wedge = violation
+            .as_ref()
+            .is_some_and(|v| read_bound_reports_a_wedge(&report, v));
+        let load = violation
+            .as_ref()
+            .is_some_and(|v| read_bound_is_the_variants_load(&report, v));
+        Shared {
+            violation,
+            fired: took_an_index_twice_on_the_node(&report),
+            aimed: report.aimed_streams,
+            scrambled: !scrambled.is_empty(),
             looped,
-        )
+            wedged: wedged(&report),
+            read_bound_on_wedge,
+            load,
+        }
     });
     let caught: Vec<&String> = outcomes
         .iter()
-        .filter_map(|(v, _, _, _, _)| v.as_ref())
+        .filter_map(|o| o.violation.as_ref())
         .collect();
-    let fired = outcomes.iter().filter(|(_, fired, _, _, _)| *fired).count();
-    let aimed = outcomes
+    let fired = outcomes.iter().filter(|o| o.fired).count();
+    let aimed = outcomes.iter().filter(|o| o.aimed > 0).count();
+    let scrambled = outcomes.iter().filter(|o| o.scrambled).count();
+    let looped: usize = outcomes.iter().map(|o| o.looped).sum();
+    // Attributed (PROPOSED D-091): the liveness check is this variant's catch (RAFT.md §5)
+    // and is what the assertions below read — from the fold itself (`wedged`), because
+    // since the merge with `main` a wedged range's clients retry their reads into the
+    // read bound and `check()` reports the node's failure first (D-076 point 12, issue
+    // #125). The rest are named so a run the node failed on its own is not read as a
+    // catch, as `main`'s nightly on c178682 read a read-bound trip.
+    let liveness = outcomes.iter().filter(|o| o.wedged).count();
+    let read_bound_on_wedge = outcomes.iter().filter(|o| o.read_bound_on_wedge).count();
+    let read_bound_on_wedge_unasked = outcomes
         .iter()
-        .filter(|(_, _, aimed, _, _)| *aimed > 0)
+        .filter(|o| o.read_bound_on_wedge && !o.wedged)
         .count();
-    let scrambled = outcomes.iter().filter(|(_, _, _, s, _)| *s).count();
-    let looped: usize = outcomes.iter().map(|(_, _, _, _, l)| l).sum();
-    let liveness = caught.iter().filter(|v| v.contains(": liveness: ")).count();
+    let load = outcomes.iter().filter(|o| o.load).count();
+    let mut by_check: BTreeMap<&str, usize> = BTreeMap::new();
+    for violation in &caught {
+        *by_check.entry(mechanism(violation.as_str())).or_default() += 1;
+    }
     println!(
-        "node: SharedSnapshotDir caught on {}/{share} seeds (tier {tier}), {liveness} by the \
-         liveness check, re-took at an index already taken of one range on {fired} seeds, \
+        "node: SharedSnapshotDir failed a check on {}/{share} seeds (tier {tier}) and wedged \
+         {liveness} of them by the liveness check's own reading, which is its catch; the \
+         read bound fired downstream of a wedge the fold reports on {read_bound_on_wedge} \
+         runs, {read_bound_on_wedge_unasked} of them on schedules the check does not ask \
+         liveness of, and with no wedge on {load} runs the correct node passes — the \
+         variant's load, not a catch (every violation by {by_check:?}), \
+         re-took at an index already taken of one range on {fired} seeds, \
          scrambled a live stream the follower never installed after on {scrambled} seeds \
          ({looped} duplicate-chunk loops after those), the aimed re-take arm reached its \
          stream on {aimed} seeds, first: {}",
@@ -1584,9 +2217,10 @@ fn retook_into_one_directory(report: &raft::Report) -> bool {
     })
 }
 
-/// `IgnoreIncarnation` on the node (D-042), and **why it is still blocked** — not by
-/// the snapshot wiring, which this slice puts under these arms, but by Q15's whole-node
-/// refusal and re-seed, which is PR #86's.
+/// `IgnoreIncarnation` on the node (D-042), and **why it is still not re-asserted**:
+/// not the snapshot wiring, which this slice puts under these arms, and no longer
+/// Q15's whole-node refusal and re-seed, which are in the tree (D-077) — but their
+/// **rate** under these arms.
 ///
 /// Phase 2 asserts two things
 /// (`a_leader_that_ignores_incarnations_never_forgets`, sim/tests/raft.rs):
@@ -1604,48 +2238,69 @@ fn retook_into_one_directory(report: &raft::Report) -> bool {
 /// (store.rs:28). The node's live install deliberately **keeps** the incarnation — "an
 /// install into a live store keeps its incarnation: the kept tail is everything
 /// acknowledged past the snapshot, so nothing a leader matched is lost"
-/// (server.rs, `ServerHost::repair`, D-042) — so on this node no replica's incarnation
-/// ever changes, the correct leader never resets a progress either, and asserting that
-/// the variant's leader traces no reset would pass on a node where nothing was
-/// injected. That is the one failure mode a sweep cannot report on its own.
+/// (server.rs, `ServerHost::repair`, D-042) — so on this node an incarnation changes
+/// only where a store is refused and re-seeded, and this cluster's disk does not rot
+/// (`Cluster::bitrot`), so a refusal is a crash's doing: #123's nightly reached one on
+/// **1 of 10 000** seeds (run 35949696476, on 677cad3), and the merged tree's own
+/// figure is printed below at every tier. Phase 2's reach is asserted from a hundred
+/// seeds, which a rate near one in ten thousand does not support (D-061), and its
+/// catch is 0 of 10 000 on one group too; asserting that the variant's leader traces
+/// no reset would pass on the seeds where nothing was injected, which is the one
+/// failure mode a sweep cannot report on its own.
 ///
-/// What this test does instead is assert the **absence with its reason and its
-/// non-vacuity** (CLAUDE.md): the correct node traces no `RaftProgressReset` and no
-/// refusal, over a run that is asserted to reach the install path. The day Q15's
-/// re-seed lands, a reset appears here and this test fails, which is when the variant
-/// can be re-asserted rather than a day later.
+/// What this test asserts instead, over a run that is asserted to reach the install
+/// path: **the injection** on every seed — the variant's leader resets nothing — and
+/// **the absence with its reason** — the correct leader resets nothing on a seed where
+/// no store was refused. A reset on a seed that did refuse a store is the re-seed
+/// doing what D-077 says; it is counted and printed, not failed, and the day the rate
+/// supports it the reach is asserted here as Phase 2 asserts it.
 // PROPOSED(D-086): `IgnoreIncarnation` is blocked on Q15's re-seed, not on the wiring.
+// PROPOSED(D-086): on the merge with `main`, the re-seed is in the tree and rare
+// here; a reset is asserted absent only where no store was refused.
 #[test]
-fn a_leader_that_ignores_incarnations_has_no_incarnation_to_ignore_on_the_node_yet() {
+fn a_leader_that_ignores_incarnations_has_an_incarnation_to_ignore_only_where_a_store_is_refused() {
     // The share, as the high-rate variants use (D-055, D-061): this runs the correct
     // node *and* the variant on every seed it takes, so the full tier would cost twice
     // the correct sweep beside it, and what it asserts is an absence of a mechanism
     // that is absent by construction — a store incarnation that never changes — rather
     // than a rate that more seeds would sharpen.
     let seeds = high_rate_share();
-    let outcomes: Vec<(usize, usize, usize, usize)> = sweep(seeds, |seed| {
+    let outcomes: Vec<(u64, usize, usize, usize, usize)> = sweep(seeds, |seed| {
         let correct = correct(seed);
         let buggy = buggy(seed, Variant::IgnoreIncarnation);
         let resets = |report: &raft::Report| {
             report.count(|e| matches!(e, ananke_env::TraceEvent::RaftProgressReset { .. }))
         };
         (
+            seed,
             resets(&correct),
             resets(&buggy),
             correct.refused.len(),
             correct.snapshot_actions(),
         )
     });
-    let correct_resets: usize = outcomes.iter().map(|(c, _, _, _)| c).sum();
-    let buggy_resets: usize = outcomes.iter().map(|(_, b, _, _)| b).sum();
-    let refusals: usize = outcomes.iter().map(|(_, _, r, _)| r).sum();
-    let actions: usize = outcomes.iter().map(|(_, _, _, a)| a).sum();
+    let correct_resets: usize = outcomes.iter().map(|(_, c, _, _, _)| c).sum();
+    let buggy_resets: usize = outcomes.iter().map(|(_, _, b, _, _)| b).sum();
+    let refusals: usize = outcomes.iter().map(|(_, _, _, r, _)| r).sum();
+    let actions: usize = outcomes.iter().map(|(_, _, _, _, a)| a).sum();
+    let refused_seeds: Vec<(u64, usize)> = outcomes
+        .iter()
+        .filter(|(_, _, _, r, _)| *r > 0)
+        .map(|(seed, c, _, _, _)| (*seed, *c))
+        .collect();
+    let reset_without_a_refusal: Vec<(u64, usize)> = outcomes
+        .iter()
+        .filter(|(_, c, _, r, _)| *c > 0 && *r == 0)
+        .map(|(seed, c, _, _, _)| (*seed, *c))
+        .collect();
     println!(
         "node: IgnoreIncarnation over {seeds} seeds — the correct node reset a follower's \
          progress {correct_resets} times and the variant {buggy_resets}, over {refusals} store \
-         refusals and {actions} snapshot actions. A leader resets on a *change* of store \
-         incarnation, and only a re-seed rebuilds a store with a fresh one (Q15, PR #86); a \
-         live install keeps it (D-042). So neither leader has anything to forget yet"
+         refusals (seeds and the correct node's resets on them: {refused_seeds:?}) and \
+         {actions} snapshot actions. A leader resets on a *change* of store incarnation, \
+         and only a re-seed rebuilds a store with a fresh one (D-077); a live install \
+         keeps it (D-042). So the leader has something to forget only where a store was \
+         refused"
     );
     // Non-vacuity: the install path is reached on these seeds, so this is an absence of
     // incarnation changes and not an absence of runs.
@@ -1653,23 +2308,21 @@ fn a_leader_that_ignores_incarnations_has_no_incarnation_to_ignore_on_the_node_y
         actions > 0,
         "no core asked for a snapshot action over {seeds} seeds, so this says nothing"
     );
-    // The absence, with its reason. Both halves are asserted so a move either way is
-    // seen: the day a store's incarnation changes on this node, the correct leader
-    // resets and this fails, and the variant can be re-asserted at its Phase 2 tier.
-    assert_eq!(
-        correct_resets, 0,
-        "the correct node reset a follower's progress, so a store incarnation changed on it: \
-         Q15's re-seed has landed and `IgnoreIncarnation` can be re-asserted here now — \
-         re-audit this test rather than this absence"
+    // The absence, with its reason: an incarnation changes only where a store was
+    // refused and re-seeded, so a reset on a seed with no refusal is a change nothing
+    // explains. A reset on a seed that did refuse a store is D-077's re-seed doing what
+    // it says, and it is in the print above, not in this assertion.
+    assert!(
+        reset_without_a_refusal.is_empty(),
+        "the correct node reset a follower's progress on seeds where no store was refused \
+         (seed, resets: {reset_without_a_refusal:?}), so a store incarnation changed on this \
+         node without a re-seed: re-audit this test"
     );
+    // The injection, on every seed: the variant's leader forgets nothing, refusal or no.
     assert_eq!(
         buggy_resets, 0,
         "the leader that ignores incarnations reset a follower's progress, which is the fix \
          the variant turns off"
-    );
-    assert_eq!(
-        refusals, 0,
-        "a store was refused on the node, which is Q15's path (PR #86): re-audit this test"
     );
 }
 
@@ -1690,14 +2343,17 @@ fn a_leader_that_ignores_incarnations_has_no_incarnation_to_ignore_on_the_node_y
 /// run it was pinned on and keeps saying exactly what it says, and this slice does not
 /// touch it.
 ///
-/// **On the node the pair is the stream half alone**, because the incarnation half has
-/// nothing to ignore until Q15's re-seed lands (see the test above). So the search
-/// SHARD.md asks for cannot be run against the node yet: a seed the pair is "caught on"
-/// here would be a seed `SharedSnapshotDir` alone is caught on, which is not a wedge
-/// that needs both bugs and so is not what D-045 pinned. That goes to the owner as the
-/// entry records, and this test pins what the node *does* do, so that the day the other
-/// half arrives the difference is visible.
+/// **On the node the pair is the stream half alone wherever no store is refused**,
+/// because the incarnation half has nothing to ignore without a re-seed, and a re-seed
+/// here is a crash's doing on a disk that does not rot — about one seed in ten thousand
+/// (see the test above). So the search SHARD.md asks for cannot be run against the node
+/// at any tier that would settle it: a seed the pair is "caught on" here would be a
+/// seed `SharedSnapshotDir` alone is caught on, which is not a wedge that needs both
+/// bugs and so is not what D-045 pinned. That goes to the owner as the entry records,
+/// and this test pins what the node *does* do, so that a seed where the incarnation
+/// half does something is seen: the equality below fails on it and says to pin it.
 // PROPOSED(D-086): the pair on the node is the stream half alone until Q15's re-seed.
+// PROPOSED(D-086): on the merge with `main`, the re-seed is in the tree and rare here.
 // PROPOSED(D-091): a catch is attributed to the variant's own violation.
 #[derive(Debug)]
 struct Outcome {
@@ -1712,10 +2368,19 @@ struct Outcome {
     /// Violations by any other check, under any of the three: the node failing, not a
     /// variant being caught.
     otherwise: Vec<String>,
+    /// Store refusals across the three runs: where the incarnation half has something
+    /// to ignore.
+    refused: usize,
+    /// Runs of the three on which the read bound fired downstream of the wedge and
+    /// `check()` reported it first: the wedge's second reporter, not the node's failure.
+    read_bound_on_wedge: usize,
+    /// Runs on which the read bound fired with no wedge and the correct node passes
+    /// the seed: the variant's load on a bound that counts retries (issue #125).
+    load: usize,
 }
 
 #[test]
-fn the_pair_on_the_node_is_the_stream_half_alone_until_the_reseed_lands() {
+fn the_pair_on_the_node_is_the_stream_half_alone_where_no_store_is_refused() {
     // The share (D-055, D-061): this runs three variants on every seed it takes, and
     // what it asserts is the *equality* of two of them — a structural claim about one
     // half being a no-op, which a share settles as well as a tier and at a tenth of
@@ -1734,23 +2399,63 @@ fn the_pair_on_the_node_is_the_stream_half_alone_until_the_reseed_lands() {
     // incarnation never changes — the test said so and was read as a catch anyway.
     let seeds = high_rate_share();
     let both = Variants::of(&[Variant::IgnoreIncarnation, Variant::SharedSnapshotDir]);
-    let by_liveness = |report: &raft::Report| -> (bool, Option<String>) {
+    // The catch is the wedge, read from the liveness fold itself (`wedged`): under
+    // these variants a wedged range's clients retry their reads into the read bound,
+    // and `check()` reports that before it reaches liveness. A read-bound trip on a
+    // wedged seed is the wedge's second reporter and is counted as such; any other
+    // violation, or a read-bound trip on a seed that did not wedge, is the node's own.
+    // PROPOSED(D-086): a wedge is read from the fold.
+    /// One run's reading: the wedge (the catch), the read bound firing downstream of
+    /// it, the variant's load on the bound with no wedge, or something else.
+    enum Read {
+        Green,
+        Wedge { by_the_bound: bool },
+        Load,
+        Other(String),
+    }
+    let by_liveness = |report: &raft::Report| -> Read {
         match checked(report) {
-            Ok(()) => (false, None),
-            Err(violation) if mechanism(&violation) == "liveness" => (true, None),
-            Err(violation) => (false, Some(violation)),
+            Ok(()) => Read::Green,
+            Err(violation) if mechanism(&violation) == "liveness" => Read::Wedge {
+                by_the_bound: false,
+            },
+            Err(violation) if read_bound_reports_a_wedge(report, &violation) => {
+                Read::Wedge { by_the_bound: true }
+            }
+            Err(violation) if read_bound_is_the_variants_load(report, &violation) => Read::Load,
+            Err(violation) => Read::Other(format!(
+                "{violation} [uniform: {}, the liveness fold: {:?}]",
+                report.uniform(),
+                report.liveness().err()
+            )),
+        }
+    };
+    let split = |read: Read| -> (bool, bool, bool, Option<String>) {
+        match read {
+            Read::Green => (false, false, false, None),
+            Read::Wedge { by_the_bound } => (true, by_the_bound, false, None),
+            Read::Load => (false, false, true, None),
+            Read::Other(violation) => (false, false, false, Some(violation)),
         }
     };
     let outcomes: Vec<Outcome> = sweep(seeds, |seed| {
-        let (pair, a) = by_liveness(&buggy(seed, both));
-        let (stream, b) = by_liveness(&buggy(seed, Variant::SharedSnapshotDir));
-        let (incarnation, c) = by_liveness(&buggy(seed, Variant::IgnoreIncarnation));
+        let under_both = buggy(seed, both);
+        let under_stream = buggy(seed, Variant::SharedSnapshotDir);
+        let under_incarnation = buggy(seed, Variant::IgnoreIncarnation);
+        let (pair, a_bound, a_load, a) = split(by_liveness(&under_both));
+        let (stream, b_bound, b_load, b) = split(by_liveness(&under_stream));
+        let (incarnation, c_bound, c_load, c) = split(by_liveness(&under_incarnation));
         Outcome {
             seed,
             pair,
             stream,
             incarnation,
             otherwise: [a, b, c].into_iter().flatten().collect(),
+            refused: under_both.refused.len()
+                + under_stream.refused.len()
+                + under_incarnation.refused.len(),
+            read_bound_on_wedge: usize::from(a_bound) + usize::from(b_bound) + usize::from(c_bound),
+            load: usize::from(a_load) + usize::from(b_load) + usize::from(c_load),
         }
     });
     let otherwise: Vec<String> = outcomes
@@ -1770,15 +2475,25 @@ fn the_pair_on_the_node_is_the_stream_half_alone_until_the_reseed_lands() {
     let stream = seeds_where(|o| o.stream);
     let incarnation = seeds_where(|o| o.incarnation);
     let only_the_pair = seeds_where(|o| o.pair && !o.stream && !o.incarnation);
+    let refused = seeds_where(|o| o.refused > 0);
+    let read_bound_on_wedge: usize = outcomes.iter().map(|o| o.read_bound_on_wedge).sum();
+    let load = seeds_where(|o| o.load > 0);
     println!(
         "node: the pair caught on {}/{seeds} seeds {pair:?}, `SharedSnapshotDir` alone on {} \
          {stream:?}, `IgnoreIncarnation` alone on {} {incarnation:?}, and on {} seeds \
          {only_the_pair:?} the pair is caught where neither half alone is — which is the \
-         wedge D-045 pinned",
+         wedge D-045 pinned; the wedge is read from the liveness fold, and on \
+         {read_bound_on_wedge} runs the read bound fired downstream of it first; on {} seeds \
+         {load:?} the read bound fired under a variant with no wedge, where the correct node \
+         passes — the variant's load on a bound that counts retries, not a catch and not \
+         the node's failure; a store was refused on {} seeds {refused:?}, the only ones the \
+         incarnation half has anything to ignore on",
         pair.len(),
         stream.len(),
         incarnation.len(),
-        only_the_pair.len()
+        only_the_pair.len(),
+        load.len(),
+        refused.len()
     );
     // The wedge itself, asserted rather than printed: a seed the pair is caught on and
     // neither half alone is, is a wedge that needs both bugs, which is what D-045
@@ -1825,16 +2540,22 @@ fn the_pair_on_the_node_is_the_stream_half_alone_until_the_reseed_lands() {
 /// prose and by nothing executable, so `cargo test --list` and the nightly's shard
 /// table carried none of the debt. Each of these runs its variant over the share and
 /// asserts that the correct-system checks still pass — the variant injects nothing,
-/// because the path it breaks is not here. It is an absence with a reason, and its
-/// upgrade trigger is the day the path it waits on lands: the variant starts being
-/// caught, this test fails, and it asks to be turned into the assertion §10 wants.
+/// because the path it breaks is not reached here. It is an absence with a reason, and
+/// its upgrade trigger is the day the path is reached at a rate a tier supports: the
+/// variant starts being caught, this test fails, and it asks to be turned into the
+/// assertion §10 wants.
 ///
 /// **Four of the six that used to be here have made that crossing and are gone.**
 /// PROPOSED D-086 reaches the stream path and re-asserts `SnapshotWithoutCurrentLast`,
 /// `SharedSnapshotDir`, `IgnoreIncarnation` and D-045's pair as tests of their own,
-/// above — each with the rate it was measured at. What is left waits on something this
-/// branch does not build: `AdoptionAsBuilt` on Q15's refused directory, and
-/// `RefusalNotDurable` on the whole-node refusal and re-seed, both PR #86's.
+/// above — each with the rate it was measured at. What is left waits on a **rate**,
+/// not on a slice: Q15's whole-node refusal and re-seed are in the tree (D-077), and
+/// on this cluster a refusal is a crash's doing on a disk that does not rot
+/// (`Cluster::bitrot`), about one seed in ten thousand. `AdoptionAsBuilt` waits on the
+/// refused directory being reached at a rate that supports its catch, and on a
+/// translation of its rules onto the node's install and re-seed — the node reads that
+/// variant nowhere today; `RefusalNotDurable` is read by the node (`quiesce_on_loss`)
+/// and waits on the refusal's rate alone, or on the rot, which is the owner's.
 ///
 /// The second half of what this asserted is gone with them, and deliberately. It used
 /// to check that the snapshot path was still *unreached*, through `checked`; `checked`
@@ -1896,8 +2617,11 @@ fn blocked_on_the_node(
 fn a_server_whose_adoption_is_as_built_is_not_re_asserted_on_the_node_yet() {
     // The owner ruled on 2026-09-20 that this is re-asserted on the two rules that
     // remain rather than §10 amended. The two are the live install's single switch and
-    // Q15's refused directory; neither path is in this tree. The third rule, a damaged
-    // staging `CURRENT` refused, has no subject on a node that adopts no staged store.
+    // Q15's refused directory; both paths are in the tree now (PROPOSED D-083, D-077),
+    // the node reads this variant on neither — the translation is owed with the
+    // re-assertion — and the refused directory is reached on about one seed in ten
+    // thousand here. The third rule, a damaged staging `CURRENT` refused, has no
+    // subject on a node that adopts no staged store.
     // Its catch is `committed entries stay`: a voter restarts on a fresh store and
     // restates a truncation from index 1 below its commit index (RAFT.md §5).
     // PROPOSED(D-091): a catch is attributed to the variant's own violation.
@@ -1905,26 +2629,31 @@ fn a_server_whose_adoption_is_as_built_is_not_re_asserted_on_the_node_yet() {
         "AdoptionAsBuilt",
         Variant::AdoptionAsBuilt,
         &["committed entries stay"],
-        "the node's snapshot wiring and PR #86's refused directory",
+        "a translation of its rules onto the node's live install (PROPOSED D-083) and \
+         re-seed (D-077), and a refusal rate a tier supports",
     );
 }
 
 #[test]
 fn a_server_whose_refusal_is_not_durable_is_not_re_asserted_on_the_node_yet() {
-    // The node *does* read this one (`quiesce_on_loss` in `server::run`), and it still
-    // has nothing to do: the disk does not rot on this cluster, because a refusal
-    // stops the node until Q15's whole-node re-seed lands.
+    // The node *does* read this one (`quiesce_on_loss` in `server::run`), and it has
+    // almost nothing to do: the disk does not rot on this cluster (`Cluster::bitrot`,
+    // the owner's to turn on), so a store is refused only where a crash leaves an
+    // engine a restart cannot open — about one seed in ten thousand — and the
+    // whole-node re-seed that follows (D-077) is what a refusal not made durable
+    // would launder after the next crash.
     // Its catch is the `match starts` oracle — a leader tracing a second first rise
     // of a follower's match under one incarnation — with `state machine safety` the
-    // route D-078 measured out of reach and `a store refused` the path itself
-    // arriving (RAFT.md §5). All three are named, so any of them turns this absence
+    // route D-078 measured out of reach and `a store refused` D-077's fan-out broken,
+    // a replica serving again before its re-seed is durable (RAFT.md §5;
+    // `whole_node_reseed`). All three are named, so any of them turns this absence
     // into §10's assertion.
     // PROPOSED(D-091): a catch is attributed to the variant's own violation.
     blocked_on_the_node(
         "RefusalNotDurable",
         Variant::RefusalNotDurable,
         &["match starts", "state machine safety", "a store refused"],
-        "PR #86's whole-node refusal and re-seed",
+        "a refusal rate a tier supports, or the rot (`Cluster::bitrot`), which is the owner's",
     );
 }
 
@@ -2090,4 +2819,648 @@ fn seeds_272_and_516_are_a_live_installs_hold_and_the_fourth_arm_answers_for_the
              another shape"
         );
     }
+}
+
+// --- The membership scenario on the node (SHARD.md §12's Stage B, issue #46) ---
+
+use ananke_sim::membership;
+
+/// The correct node's membership run for `seed`: five nodes, four ranges on each,
+/// 3 → 5 → 3 on **every** range under the partitions the seed draws.
+fn membership_node(seed: u64, variants: impl Into<Variants>) -> membership::Report {
+    membership::run_on(Cluster::Node, seed, variants)
+}
+
+/// The run's verdict on the node: the scenario's own checks — which are now each
+/// range's, not the cluster's — and then the shape four ranges are *for*, asserted on
+/// every seed rather than printed.
+///
+/// The two clauses here are the ones a single-range world could not have made, and
+/// each is stated per seed because a floor over a tier cannot see a seed that reached
+/// nothing (CLAUDE.md): a run where the four changes never overlapped, or where the
+/// joiners were admitted to one range and not four, has not run the scenario this
+/// binary claims to run, and must say so rather than pass.
+// PROPOSED(D-084): the membership scenario on the node, four ranges on every node.
+fn membership_checked(report: &membership::Report) -> Result<(), String> {
+    let seed = report.seed;
+    report.check()?;
+    // Issue #46's extension the node makes possible: a change of a range while
+    // another range **on the same node** is changing. One group has one range and no
+    // overlap to have, which is why this could not be asserted before.
+    //
+    // Asked as `witnessed_joint_overlap` and not as `joint_overlap`, because the
+    // forward fold that produces the answer can be widened into always answering —
+    // drop the line that clears a range when its joint configuration ends — and no
+    // floor, count or bound could see it, since a fold that always answers passes
+    // everything. The witness reads the same trace backwards at the record the fold
+    // stopped on and asks whether both ranges really were joint there. It cannot be
+    // satisfied by construction and it is not a bound, so the correct node cannot trip
+    // it: 100 of 100 witnessed, against 87 of 100 for the never-clearing fold.
+    // PROPOSED(D-084): the answer is witnessed, which is what guards the fold.
+    if let Err(why) = report.witnessed_joint_overlap() {
+        return Err(format!("seed {seed}: {why}"));
+    }
+    // The grow admits servers 4 and 5 to **every** range. A run that admitted them to
+    // one range and left three unchanged completes "a change" and is not this
+    // scenario; the whole-cluster reading cannot tell the two apart. Asked only where
+    // the grow completed, which `Report::check` asserts of every uniformly scheduled
+    // seed and liveness cannot be asked of the others (D-016).
+    if report.grow_completed {
+        let held: BTreeSet<u64> = report.ranges().into_iter().collect();
+        for joiner in membership::INITIAL_VOTERS + 1..=membership::SERVERS {
+            let admitted = report.ranges_admitting(joiner);
+            if admitted != held {
+                return Err(format!(
+                    "seed {seed}: the grow completed, but server {joiner} became a voter of \
+                     {admitted:?} and not of every range this node holds, {held:?}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// What the correct node's membership runs saw, over a tier.
+#[derive(Debug, Default)]
+struct NodeMembershipCoverage {
+    seeds: u64,
+    uniform_seeds: u64,
+    grows_completed: u64,
+    shrinks_completed: u64,
+    /// Seeds on which a node held two ranges' joint configurations at once, **and the
+    /// trace read backwards witnessed it** ([`membership::Report::witnessed_joint_overlap`]).
+    overlapped: u64,
+    /// Seeds on which both joiners became voters of every range.
+    joiners_on_every_range: u64,
+    /// Partitions that cut off the leader of the range they drew, and partitions made.
+    partitions_hit: usize,
+    partitions_made: usize,
+    /// Snapshot actions traced, and the highest index any replica reached: the two
+    /// halves of the absence this cluster asserts (`Report::check`).
+    snapshot_actions: usize,
+    highest_index: u64,
+    /// Ranges that elected a leader and ranges that applied something, over the tier.
+    leaders: BTreeMap<u64, usize>,
+    applies: BTreeMap<u64, usize>,
+    /// The worst gap any one range went without a completed operation, and the worst
+    /// first write after a heal, against their bounds.
+    worst_range_gap: Duration,
+    worst_write_after_heal: Duration,
+    /// The same two folded over the **cluster** instead, which is what the one-group
+    /// scenario has always asked. They are here to be compared with the two above:
+    /// a per-range fold that saw no more than the cluster's fold is not a per-range
+    /// fold, and the comparison is the only thing that says so (see
+    /// `assert_complete`).
+    worst_cluster_gap: Duration,
+    worst_cluster_write_after_heal: Duration,
+    /// The ranges the run's partitions aimed at, over the tier.
+    aimed_ranges: BTreeSet<u64>,
+    /// The ranges a leadership transfer was asked for, over the tier, and how many of
+    /// those transfers were followed by the asked-for server leading that range.
+    // PROPOSED(D-084): the transfer hands over every range the node holds.
+    transfer_ranges: BTreeSet<u64>,
+    transfers_landed: usize,
+    transfers_made: usize,
+    /// The states the one-group scenario's own coverage asserts, folded here over the
+    /// node's trace so that this positive control demands what that one does. Each is
+    /// reachable on the node and none needs a snapshot path; the ones the node cannot
+    /// reach are named in `assert_complete` with the reason, not left out.
+    // PROPOSED(D-084): the node's positive control asks what the one-group one asks.
+    joint_configs_taken: usize,
+    new_configs_taken: usize,
+    learners_promoted: usize,
+    learner_rounds_caught_up: usize,
+    config_reverts: usize,
+    elections_while_joint: usize,
+    step_downs_outside_new: usize,
+    changes_accepted: usize,
+    match_starts: usize,
+    learner_rounds: usize,
+    seeds_with_a_match_start: u64,
+    seeds_with_a_learner_round: u64,
+    seeds_with_a_change_accepted: u64,
+    partitions: usize,
+    completed: u64,
+    /// Trace records, and the longest run in virtual seconds, for the density figure.
+    records: usize,
+    longest_run: f64,
+}
+
+impl NodeMembershipCoverage {
+    fn add(&mut self, report: &membership::Report) {
+        self.seeds += 1;
+        self.uniform_seeds += u64::from(report.uniform());
+        self.grows_completed += u64::from(report.grow_completed);
+        self.shrinks_completed += u64::from(report.shrink_completed);
+        self.overlapped += u64::from(report.witnessed_joint_overlap().is_ok());
+        let held: BTreeSet<u64> = report.ranges().into_iter().collect();
+        let every = (membership::INITIAL_VOTERS + 1..=membership::SERVERS)
+            .all(|joiner| report.ranges_admitting(joiner) == held);
+        self.joiners_on_every_range += u64::from(every);
+        let (hit, made) = report.partitions_hit_their_ranges();
+        self.partitions_hit += hit;
+        self.partitions_made += made;
+        self.snapshot_actions += report.snapshot_actions();
+        self.highest_index = self.highest_index.max(report.highest_index());
+        for range in report.ranges() {
+            if let Some(gap) = report.longest_completion_gap_of(range) {
+                self.worst_range_gap = self.worst_range_gap.max(gap);
+            }
+            if let Some(took) = report.time_to_write_after_heal_of(range) {
+                self.worst_write_after_heal = self.worst_write_after_heal.max(took);
+            }
+        }
+        if let Some(gap) = report.longest_completion_gap() {
+            self.worst_cluster_gap = self.worst_cluster_gap.max(gap);
+        }
+        if let Some(took) = report.time_to_write_after_heal() {
+            self.worst_cluster_write_after_heal = self.worst_cluster_write_after_heal.max(took);
+        }
+        self.aimed_ranges
+            .extend(report.aimed.iter().map(|aimed| aimed.range));
+        self.transfer_ranges.extend(report.transfer_ranges());
+        let (landed, made) = report.transfers_landed();
+        self.transfers_landed += landed;
+        self.transfers_made += made;
+        self.partitions += report.partitions.len();
+        self.completed += report.clients.completed;
+        self.fold_the_one_group_states(report);
+        for record in &report.records {
+            match &record.event {
+                ananke_env::TraceEvent::RaftLeader { range, .. } => {
+                    *self.leaders.entry(*range).or_default() += 1;
+                }
+                ananke_env::TraceEvent::RaftApply { range, .. } => {
+                    *self.applies.entry(*range).or_default() += 1;
+                }
+                _ => {}
+            }
+        }
+        self.records += report.records.len();
+        let end = report.records.last().map_or(0, |r| r.at.as_nanos());
+        self.longest_run = self.longest_run.max(end as f64 / 1e9);
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.seeds += other.seeds;
+        self.uniform_seeds += other.uniform_seeds;
+        self.grows_completed += other.grows_completed;
+        self.shrinks_completed += other.shrinks_completed;
+        self.overlapped += other.overlapped;
+        self.joiners_on_every_range += other.joiners_on_every_range;
+        self.partitions_hit += other.partitions_hit;
+        self.partitions_made += other.partitions_made;
+        self.snapshot_actions += other.snapshot_actions;
+        self.highest_index = self.highest_index.max(other.highest_index);
+        self.worst_range_gap = self.worst_range_gap.max(other.worst_range_gap);
+        self.worst_write_after_heal = self
+            .worst_write_after_heal
+            .max(other.worst_write_after_heal);
+        self.worst_cluster_gap = self.worst_cluster_gap.max(other.worst_cluster_gap);
+        self.worst_cluster_write_after_heal = self
+            .worst_cluster_write_after_heal
+            .max(other.worst_cluster_write_after_heal);
+        for (range, count) in other.leaders {
+            *self.leaders.entry(range).or_default() += count;
+        }
+        for (range, count) in other.applies {
+            *self.applies.entry(range).or_default() += count;
+        }
+        self.records += other.records;
+        self.longest_run = self.longest_run.max(other.longest_run);
+        self.aimed_ranges.extend(other.aimed_ranges);
+        self.transfer_ranges.extend(other.transfer_ranges);
+        self.transfers_landed += other.transfers_landed;
+        self.transfers_made += other.transfers_made;
+        self.joint_configs_taken += other.joint_configs_taken;
+        self.new_configs_taken += other.new_configs_taken;
+        self.learners_promoted += other.learners_promoted;
+        self.learner_rounds_caught_up += other.learner_rounds_caught_up;
+        self.config_reverts += other.config_reverts;
+        self.elections_while_joint += other.elections_while_joint;
+        self.step_downs_outside_new += other.step_downs_outside_new;
+        self.changes_accepted += other.changes_accepted;
+        self.match_starts += other.match_starts;
+        self.learner_rounds += other.learner_rounds;
+        self.seeds_with_a_match_start += other.seeds_with_a_match_start;
+        self.seeds_with_a_learner_round += other.seeds_with_a_learner_round;
+        self.seeds_with_a_change_accepted += other.seeds_with_a_change_accepted;
+        self.partitions += other.partitions;
+        self.completed += other.completed;
+    }
+
+    /// The states `MembershipCoverage` counts on the one-group server, folded over the
+    /// node's trace with the same rules — a configuration's own `RaftConfig` per
+    /// (server, range), a promotion per (index, joiner), a step-down of a leader the
+    /// new configuration leaves out, a revert to a lower index, an election while
+    /// joint — so that what this control demands and what that one demands can be
+    /// compared line for line (PROPOSED D-084).
+    // PROPOSED(D-084): the node's positive control asks what the one-group one asks.
+    fn fold_the_one_group_states(&mut self, report: &membership::Report) {
+        let match_starts =
+            report.count(|e| matches!(e, ananke_env::TraceEvent::RaftMatchStarted { .. }));
+        let learner_rounds =
+            report.count(|e| matches!(e, ananke_env::TraceEvent::RaftLearnerRound { .. }));
+        let changes =
+            report.count(|e| matches!(e, ananke_env::TraceEvent::RaftChangeAccepted { .. }));
+        self.match_starts += match_starts;
+        self.learner_rounds += learner_rounds;
+        self.changes_accepted += changes;
+        self.seeds_with_a_match_start += u64::from(match_starts > 0);
+        self.seeds_with_a_learner_round += u64::from(learner_rounds > 0);
+        self.seeds_with_a_change_accepted += u64::from(changes > 0);
+        self.learner_rounds_caught_up += report.count(|e| {
+            matches!(
+                e,
+                ananke_env::TraceEvent::RaftLearnerRound {
+                    caught_up: true,
+                    ..
+                }
+            )
+        });
+        // Keyed by (server, range) and not by server: a node holds four replicas and
+        // one entry would read one range's configuration as another's, which is the
+        // mistake this whole slice exists to make visible.
+        let mut in_force: BTreeMap<(u64, u64), (u64, bool)> = BTreeMap::new();
+        let mut leading: BTreeSet<(u64, u64)> = BTreeSet::new();
+        let mut promoted: BTreeSet<(u64, u64, u64)> = BTreeSet::new();
+        for record in &report.records {
+            match &record.event {
+                ananke_env::TraceEvent::RaftConfig {
+                    server,
+                    range,
+                    index,
+                    old,
+                    new,
+                    joint,
+                    ..
+                } => {
+                    if *joint {
+                        self.joint_configs_taken += 1;
+                        for id in new {
+                            if !old.contains(id) {
+                                promoted.insert((*range, *index, *id));
+                            }
+                        }
+                    } else if *index > 0 {
+                        self.new_configs_taken += 1;
+                        if leading.contains(&(*range, *server)) && !old.contains(server) {
+                            self.step_downs_outside_new += 1;
+                        }
+                    }
+                    if let Some(&(previous, _)) = in_force.get(&(*range, *server))
+                        && *index < previous
+                    {
+                        self.config_reverts += 1;
+                    }
+                    in_force.insert((*range, *server), (*index, *joint));
+                }
+                ananke_env::TraceEvent::RaftTerm {
+                    server,
+                    range,
+                    role,
+                    ..
+                } => {
+                    if &**role == "leader" {
+                        leading.insert((*range, *server));
+                    } else {
+                        leading.remove(&(*range, *server));
+                    }
+                }
+                ananke_env::TraceEvent::RaftLeader { server, range, .. } => {
+                    leading.insert((*range, *server));
+                    if in_force
+                        .get(&(*range, *server))
+                        .is_some_and(|&(_, joint)| joint)
+                    {
+                        self.elections_while_joint += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.learners_promoted += promoted.len();
+    }
+
+    /// The floors, each measured on the correct node before it was written (D-061).
+    ///
+    /// The per-range counts are the ones that mean anything here: a scenario that
+    /// elected and applied on one range while three sat idle would satisfy every
+    /// whole-cluster count there is, which is the mistake `applies.contains_key` made
+    /// in D-082's own campaign.
+    fn assert_complete(&self) {
+        assert_eq!(self.seeds, seeds(), "every seed of the tier is counted");
+        assert_eq!(
+            self.overlapped, self.seeds,
+            "some seed's four changes never overlapped on one node: {self:?}"
+        );
+        assert_eq!(
+            self.joiners_on_every_range, self.seeds,
+            "some seed admitted the joiners to fewer than every range: {self:?}"
+        );
+        assert_eq!(
+            self.grows_completed, self.seeds,
+            "some seed's grow did not complete on every range: {self:?}"
+        );
+        assert_eq!(
+            self.shrinks_completed, self.seeds,
+            "some seed's shrink did not complete on every range: {self:?}"
+        );
+        // The absence this scenario's own threshold produces, over the tier as well as
+        // per seed (`membership::NODE_SNAPSHOT_THRESHOLD`; PROPOSED D-086 says why it
+        // stays at `1 << 30` where the raft-arms sweep runs its node at 12).
+        assert_eq!(
+            self.snapshot_actions, 0,
+            "the node traced a snapshot action, which this scenario's threshold keeps \
+             unreached: {self:?}"
+        );
+        assert!(
+            self.highest_index < ananke_sim::membership::NODE_SNAPSHOT_THRESHOLD,
+            "a replica reached this scenario's snapshot threshold: {self:?}"
+        );
+        for range in Cluster::Node.ranges() {
+            assert!(
+                self.leaders.get(&range).copied().unwrap_or(0) > 0,
+                "range {range} never elected a leader over the tier: {self:?}"
+            );
+            assert!(
+                self.applies.get(&range).copied().unwrap_or(0) > 0,
+                "range {range} applied nothing over the tier: {self:?}"
+            );
+        }
+        // Every partition aimed at a range cut off *that range's* leader. Measured at
+        // 200/200 over a hundred seeds on the correct node; the floor is 90 %, as
+        // D-082 set the raft sweep's, because a leadership change between the
+        // driver's read and the partition is ordinary and is not a fault.
+        assert!(
+            self.partitions_made > 0,
+            "no partition was made at all: {self:?}"
+        );
+        let hit = self.partitions_hit as f64 / self.partitions_made as f64;
+        assert!(
+            hit >= 0.9,
+            "only {hit:.3} of the partitions cut off the leader of the range they drew, under \
+             the floor of 0.900: {self:?}"
+        );
+        // The applies are spread over the ranges rather than piled on one. The floor
+        // is the least range's share of the busiest, measured **on this scenario** at
+        // **0.976** at a hundred seeds ({2: 11 396, 3: 11 438, 4: 11 161, 5: 11 229})
+        // and 0.920 at the gate's twenty; D-082 set the same floor at 0.5 against its
+        // own sweep's 0.87, for the same reason, that `contains_key` passes a range
+        // which applied only its leader's no-ops.
+        // Every range was aimed at by some partition over the tier. Without this a
+        // schedule whose draw answered the first range every time would leave three
+        // ranges' leaders never cut off, and every other floor here would be met:
+        // `partitions_hit` counts hits against what was *aimed at*, so a draw that
+        // always aims at one range hits it every time.
+        assert_eq!(
+            self.aimed_ranges,
+            Cluster::Node.ranges().into_iter().collect::<BTreeSet<_>>(),
+            "the partitions aimed at {:?} and not at every range this node holds: {self:?}",
+            self.aimed_ranges
+        );
+        // A per-range fold that saw no more than the cluster's fold is not a per-range
+        // fold. Both quantities below are per-range maxima over folds whose inputs are
+        // *subsets* of the cluster fold's, so each is at least the cluster's by
+        // construction and the only question is whether it is ever strictly more. Over
+        // a tier it is, comfortably — at a hundred seeds the worst range went 996 ms
+        // without a completed operation against the cluster's 329 ms, and a range's
+        // first write after a heal took 1.130 s against the cluster's first — and this
+        // is what fails if either fold is quietly widened back to the whole history,
+        // which no bound below could see, since a widened fold only ever passes.
+        assert!(
+            self.worst_range_gap > self.worst_cluster_gap,
+            "the worst gap of any one range, {:?}, is no worse than the cluster's {:?}: the \
+             per-range availability fold is reading the whole history: {self:?}",
+            self.worst_range_gap,
+            self.worst_cluster_gap
+        );
+        assert!(
+            self.worst_write_after_heal > self.worst_cluster_write_after_heal,
+            "the worst first write after a heal of any one range, {:?}, is no worse than the \
+             cluster's {:?}: the per-range liveness fold is reading the whole history: \
+             {self:?}",
+            self.worst_write_after_heal,
+            self.worst_cluster_write_after_heal
+        );
+        // Every range a leadership transfer was asked for. D-084's item 6 says the
+        // transfer hands over **every** range the node holds, so that the shrink's
+        // leader is outside `C_new` on each of them; nothing else records that claim.
+        // A transfer that reached one range of four leaves every other floor here met
+        // — the elections it costs the other three are lost among the ones the
+        // partitions cause anyway — so this is what says the claim was kept.
+        // PROPOSED(D-084): the transfer hands over every range the node holds.
+        assert!(
+            self.transfers_made > 0,
+            "no leadership transfer was asked for at all: {self:?}"
+        );
+        assert_eq!(
+            self.transfer_ranges,
+            Cluster::Node.ranges().into_iter().collect::<BTreeSet<_>>(),
+            "leadership was handed over for {:?} and not for every range this node holds: \
+             {self:?}",
+            self.transfer_ranges
+        );
+        // And the transfers were followed by the server they named leading that range,
+        // which is what sets the step-down up. Not at one — a transfer is one shot and
+        // best effort, as the sweep's lease trial is — but at a floor measured on the
+        // correct node: 140 of 192 (72.9 %) at a hundred seeds and 23 of 32 (71.9 %) at
+        // the gate's twenty.
+        let landed = self.transfers_landed as f64 / self.transfers_made as f64;
+        assert!(
+            landed >= 0.5,
+            "only {landed:.3} of the leadership transfers were followed by the server they \
+             named leading that range, under the floor of 0.500: {self:?}"
+        );
+        // What the one-group scenario's own coverage asserts of this scenario
+        // (`MembershipCoverage::assert_complete`), asked here with the same tiering, so
+        // that the node's positive control demands what the one-group one demands.
+        // Every one of these is reachable on the node and none needs a snapshot path;
+        // the ones the node cannot reach are named below with their reason rather than
+        // left out.
+        // PROPOSED(D-084): the node's positive control asks what the one-group one asks.
+        for (what, seen) in [
+            (
+                "joint configurations taken",
+                self.joint_configs_taken as u64,
+            ),
+            ("new configurations taken", self.new_configs_taken as u64),
+            ("learners promoted", self.learners_promoted as u64),
+            (
+                "learner rounds that caught up",
+                self.learner_rounds_caught_up as u64,
+            ),
+            ("partitions", self.partitions as u64),
+            ("completed operations", self.completed),
+            ("uniformly scheduled seeds", self.uniform_seeds),
+        ] {
+            assert!(
+                seen > 0,
+                "the node's membership runs never saw {what}: {self:?}"
+            );
+        }
+        // SHARD.md §8's three events, each on *every* seed, as the one-group control
+        // asserts them: the driver grows the configuration of every range on every
+        // seed, so a change is accepted, a learner is tracked and caught up, and every
+        // leader's first answer from a follower raises `matched` under the incarnation
+        // it carried. 100 of 100 and 20 of 20 for all three here. A total above zero is
+        // what an emission rule gone wrong passes; these say the rule fires where it
+        // must.
+        for (what, seen) in [
+            (
+                "a leader's match rise under a follower's incarnation",
+                self.seeds_with_a_match_start,
+            ),
+            (
+                "a learner's catch-up round",
+                self.seeds_with_a_learner_round,
+            ),
+            ("an accepted change", self.seeds_with_a_change_accepted),
+        ] {
+            assert_eq!(
+                seen, self.seeds,
+                "a node membership run saw no {what}: {self:?}"
+            );
+        }
+        // The one-group control's tiering for the two states that need the partition to
+        // land inside a narrow phase of a change. On the node they are commoner —
+        // 212 step-downs and 47 reverts at a hundred seeds, 41 and 0 at the gate's
+        // twenty — because four ranges give four changes a seed; the tier is kept the
+        // one-group one rather than tightened, since nothing here measured the rate a
+        // tighter tier would rest on.
+        if self.seeds >= 100 {
+            for (what, seen) in [
+                (
+                    "step-downs of a leader outside C_new",
+                    self.step_downs_outside_new as u64,
+                ),
+                ("configuration reverts", self.config_reverts as u64),
+            ] {
+                assert!(
+                    seen > 0,
+                    "the node's membership runs never saw {what}: {self:?}"
+                );
+            }
+        }
+        // An election while joint needs the partition to cut a leader off inside the
+        // joint phase itself, and the one-group control asserts it from the
+        // thousand-seed tier under D-061 (3.4 % of its seeds). On the node it is 13
+        // elections over a hundred seeds and 2 over the gate's twenty, so the same
+        // tier is kept.
+        if self.seeds >= 1000 {
+            assert!(
+                self.elections_while_joint > 0,
+                "the node's membership runs never saw elections while joint: {self:?}"
+            );
+        }
+        let least = self.applies.values().copied().min().unwrap_or(0) as f64;
+        let busiest = self.applies.values().copied().max().unwrap_or(1).max(1) as f64;
+        assert!(
+            least / busiest >= 0.5,
+            "the least busy range applied {:.2} of the busiest range's entries, under the floor \
+             of 0.50: {self:?}",
+            least / busiest
+        );
+    }
+}
+
+/// The positive control: the correct node passes 3 → 5 → 3 on every one of its four
+/// ranges, on every seed, with the changes overlapping on a node and both joiners
+/// admitted to every range.
+///
+/// Every figure SHARD.md §12 asks of a sweep on the node is printed beside the
+/// verdict: the trace records a run holds per range per virtual second against
+/// `TRACE_CAP`, the worst gap and first write after a heal any range showed against
+/// their bounds, and the two halves of the snapshot path's absence.
+// PROPOSED(D-084): the membership scenario on the node, four ranges on every node.
+#[test]
+fn every_seed_passes_the_membership_scenario_on_the_correct_node() {
+    let coverage = std::sync::Mutex::new(NodeMembershipCoverage::default());
+    let verdicts = sweep(seeds(), |seed| {
+        let report = membership_node(seed, Variants::default());
+        let mut mine = NodeMembershipCoverage::default();
+        mine.add(&report);
+        coverage.lock().unwrap().merge(mine);
+        membership_checked(&report)
+            .inspect_err(|_| write_trace(&format!("node-membership-{seed}"), &report.jsonl()))
+    });
+    let coverage = coverage.into_inner().unwrap();
+    let per_range_per_second =
+        coverage.records as f64 / 4.0 / coverage.longest_run.max(1e-9) / coverage.seeds as f64;
+    eprintln!(
+        "node membership: {coverage:?}; about {per_range_per_second:.0} records per range per \
+         virtual second against a TRACE_CAP of {}",
+        membership::TRACE_CAP
+    );
+    if let Err(violation) = verdict(&verdicts) {
+        panic!("{violation}");
+    }
+    coverage.assert_complete();
+}
+
+/// The negative control on the node: a server that counts one merged majority while
+/// joint (thesis §4.3) is caught by the scenario's checks on some seed.
+///
+/// Its Phase 2 test asserts exactly this and no more — caught on some seed, at every
+/// tier — and that is what is asserted here (§10, Q39). Its **measured** rate on the
+/// node is 14 of 100 seeds against the one-group server's 19 of 100, above D-061's
+/// five per cent, so the tier it keeps is the tier it has. At the gate's twenty seeds
+/// the catch is deterministic and not a coin: seeds 3 and 15 of the first twenty catch
+/// it, so a green gate here is a gate that injected the fault.
+// PROPOSED(D-084): Phase 2's variant re-asserted on the node, at the tier it uses today.
+#[test]
+fn a_server_that_counts_one_majority_in_joint_consensus_is_caught_on_the_node() {
+    let outcomes: Vec<(Option<String>, bool)> = sweep(seeds(), |seed| {
+        let report = membership_node(seed, Variant::SingleMajorityInJointConsensus);
+        (report.check().err(), report.joint_overlap().is_some())
+    });
+    let overlapped = outcomes.iter().filter(|(_, o)| *o).count();
+    let caught: Vec<String> = outcomes.into_iter().filter_map(|(v, _)| v).collect();
+    eprintln!(
+        "SingleMajorityInJointConsensus on the node: caught on {} of {} seeds, the changes \
+         overlapped on {overlapped}, first: {}",
+        caught.len(),
+        seeds(),
+        caught.first().map_or("", String::as_str)
+    );
+    assert!(
+        !caught.is_empty(),
+        "SingleMajorityInJointConsensus was never caught on the node"
+    );
+}
+
+/// The node's membership scenario replays: two runs of one seed give byte-identical
+/// traces, so the driver's decisions — which range it asks first, which range's leader
+/// the partition cuts off — are functions of the trace and the seed alone.
+// PROPOSED(D-084): the membership scenario on the node, four ranges on every node.
+#[test]
+fn a_membership_seed_replays_to_the_same_trace_on_the_node() {
+    let first = membership_node(7, Variants::default());
+    let second = membership_node(7, Variants::default());
+    assert_eq!(first.jsonl().as_bytes(), second.jsonl().as_bytes());
+}
+
+/// One seed's run, read record by record: the two ranges a node changed at once, and
+/// the node that held them.
+///
+/// The sweep asserts the overlap on every seed and this names it, so a reader can see
+/// what issue #46's extension looks like on the node without running a tier.
+// PROPOSED(D-084): #46's extension the node makes possible — one node, two ranges
+// changing at once.
+#[test]
+fn a_node_changes_two_of_its_ranges_at_once() {
+    let report = membership_node(1, Variants::default());
+    membership_checked(&report).expect("the correct node passes membership seed 1");
+    let (node, first, second, at) = report
+        .joint_overlap()
+        .expect("a node held two ranges' joint configurations at once");
+    println!(
+        "node membership: node {node} was jointly configured on ranges {first} and {second} at \
+         {at:?}"
+    );
+    assert_ne!(first, second, "two ranges, not one");
+    assert!(
+        report.ranges().contains(&first) && report.ranges().contains(&second),
+        "both are ranges this node holds"
+    );
 }

@@ -130,6 +130,22 @@ pub enum NodeVariant {
     /// to reclaim it, so the node's slots fill with reservations for departed senders
     /// and it re-seeds nothing more (SHARD.md §12; Q14).
     SlotReservedForWaiter,
+    /// Every core of the node seeded from the node's own stream, `env.rng()`, rather
+    /// than from `n{id}/r{range}/protocol` (D-057, `Environment::range_rng`). The
+    /// four cores still draw four different seeds, so nothing about *one* run tells
+    /// the two apart — what the keying buys is that range r's stream is range r's
+    /// alone, so a range added to or removed from the configuration moves no other
+    /// range's schedule, and under this variant it moves all of them (SHARD.md §2,
+    /// Q13).
+    OneSeedForEveryCore,
+    /// A read a replica refuses leaves its registration behind: the step's refusal
+    /// takes the work in flight and the `reads` map keeps its `(SocketAddr,
+    /// Request)` for the life of the node. This is the node exactly as it was before
+    /// D-076's review — a follower refusing reads for a living grows an unbounded
+    /// map — and it is here rather than in a scratch file so that the bug has a half
+    /// beside the correct code that the node scenario runs on every seed
+    /// (CLAUDE.md:52-57; SHARD.md §4).
+    RefusedReadLeft,
     /// A stream completed on the very chunk that restarted it: the node is told to
     /// install, never that the staging directory must start over, so the install takes
     /// the abandoned stream's files for the new snapshot's (RAFT.md:203-207).
@@ -295,6 +311,77 @@ pub enum NodeVariant {
     /// against a write in flight — which is the one thing the hold exists to prevent.
     // PROPOSED(D-083): a live install holds one range and replaces its replica.
     AsksTheHostBeforeTheHold,
+    /// Each replica's durable refused mark written in a batch that is **not synced**
+    /// (D-067). Everything else is the correct node's: the same two keys, the same
+    /// `RaftReseeded` when the write returns, and the same silence until the install.
+    ///
+    /// What a crash keeps of an unsynced write is the disk's draw, so the mark is
+    /// there on some seeds and gone on others; where it is gone the replica opens
+    /// fresh — term 0, no vote, incarnation 1 — and votes from then on, which is
+    /// D-035's hole reopened. Its standard is therefore *rate* and not every seed,
+    /// as `RemovalNotDurable`'s is (§10, a variant of a later stage), and the re-seed
+    /// shape's arm crashes on the mark's own trace event so that nothing else has
+    /// synced the new engine's log by then.
+    // PROPOSED(D-081): the re-seed shape's variant, approved as D-067.
+    ReseedMarkNotSynced,
+    /// The highest index handed to the `apply` task left at zero when a core is put
+    /// on the node at its start, rather than started where the replica's own applied
+    /// index stands (`Cores::insert`).
+    ///
+    /// It is D-083's watermark bug one moment earlier: that one left the watermark
+    /// where the *replaced* replica stood across a live install, this one never sets
+    /// it at all. A node whose replica's log was compacted past its applied index —
+    /// every replica a snapshot has filled — then names, in its first `Apply` after a
+    /// restart, indices the core no longer holds, and the node fails that range and
+    /// stops. Where the log does still hold them the state machine simply does its
+    /// whole life's work again.
+    // PROPOSED(D-081): the applied watermark starts where the replica does.
+    RestartAppliesFromZero,
+    /// A follower's compaction record ([`SnapshotAction::Record`]) asked for by a core
+    /// and queued nowhere: the node as it stood, where `Host::snapshot` counted the
+    /// action and `install::job_of` answered `None` for it.
+    ///
+    /// The core sets `take_pending` when it asks and clears it when it is told the
+    /// record was written, so a record that goes nowhere leaves that core asking for
+    /// nothing ever again. It never compacts, which is the whole of D-065 undone and
+    /// the follower-log bound with it; and a replica that has never taken a snapshot
+    /// cannot stream one when it takes office, so a re-seed toward a range whose new
+    /// leader had been a follower waits forever.
+    ///
+    /// [`SnapshotAction::Record`]: ananke_raft::core::SnapshotAction::Record
+    // PROPOSED(D-081): a follower's compaction record reaches the `apply` task.
+    RecordNeverQueued,
+    /// A cap-wait answered with the same `Restart` a changed identity gets, which is
+    /// the one answer the node had for both before D-090.
+    ///
+    /// The sender cannot tell the two apart, so RAFT.md:210-212's restart bound counts
+    /// a stream that is merely waiting its turn: at the third ask its leader declares
+    /// unusable a checkpoint nothing was ever wrong with, throws the stream away and
+    /// asks for a fresh take. A node's receive cap sits below its range count on
+    /// purpose (D-075; §12's re-seed shape), so this is not an edge — it is what every
+    /// range over the cap gets.
+    ///
+    /// **It needs more than one range to be wrong about.** A cap-wait between ranges is
+    /// the situation, and a node of one range never reaches it: the only sender its cap
+    /// could be contended by is a stale leader of that same range, whose chunk a
+    /// higher-term assembly displaces ([`Snapshots::superseded`]) and whose term the
+    /// receiving store refuses outright. With one range and one slot the correct answer
+    /// and this one are the same answer, because neither is ever sent.
+    ///
+    /// [`Snapshots::superseded`]: crate::snapshot::Snapshots
+    // PROPOSED(D-090): a cap-wait is answered as a wait, not as a start-over.
+    CapWaitIsAStartOver,
+    /// A stream's restarts not counted: the node as it stood, with RAFT.md:210-212's
+    /// bound absent.
+    ///
+    /// Neither bound is then reachable for a stream that keeps being told to start
+    /// over — the restart bound because nothing counts, and the resend bound because
+    /// every restart resets it — so a receiver that answers `Restart` forever is
+    /// answered forever. That is the unbounded loop D-083 recorded: a run that told
+    /// senders to start over 669 times and one that told them none differed in nothing
+    /// a check could read.
+    // PROPOSED(D-090): the node honours RAFT.md's restart bound.
+    RestartsNotCounted,
 }
 
 impl NodeVariant {
@@ -340,6 +427,13 @@ impl NodeVariant {
         NodeVariant::TakeSkipsTheUserKeys,
         NodeVariant::TakeStreamsTheLogToo,
         NodeVariant::AsksTheHostBeforeTheHold,
+        NodeVariant::ReseedMarkNotSynced,
+        NodeVariant::RestartAppliesFromZero,
+        NodeVariant::RecordNeverQueued,
+        NodeVariant::CapWaitIsAStartOver,
+        NodeVariant::RestartsNotCounted,
+        NodeVariant::RefusedReadLeft,
+        NodeVariant::OneSeedForEveryCore,
     ];
 
     /// Q15's whole-node refusal and re-seed, in order: the six ways to get a node's
@@ -415,6 +509,42 @@ impl NodeVariant {
         NodeVariant::AsksTheHostBeforeTheHold,
     ];
 
+    /// The directed re-seed shape's own, outside §10's count of range-layer variants:
+    /// D-067's [`ReseedMarkNotSynced`](Self::ReseedMarkNotSynced), the one way to get
+    /// Q15's *durability* wrong as against the six ways to get the refusal itself wrong
+    /// ([`RESEED`](Self::RESEED)), and the four holes the shape found in the node when
+    /// a refusal and the wiring first met on one tree — the applied index an install
+    /// makes durable — no, that one is D-083's — the watermark a start begins at, a
+    /// follower's compaction record, and the watermark a start begins at (D-081).
+    ///
+    /// `ReseedMarkNotSynced` is a mutation a single-range world could not catch
+    /// either, for a reason of its own: the shape crashes the node on one replica's
+    /// mark, and what the *other three* replicas restate afterwards is the evidence.
+    /// With one range there is one mark, the crash is on the only replica there is,
+    /// and a node that lost it has nothing left to compare it against.
+    // PROPOSED(D-081): the re-seed shape's variant, approved as D-067.
+    pub const SHAPE: &'static [NodeVariant] = &[
+        NodeVariant::ReseedMarkNotSynced,
+        NodeVariant::RestartAppliesFromZero,
+        NodeVariant::RecordNeverQueued,
+    ];
+
+    /// RAFT.md:209-212's bounds on a stream, and the answer that keeps the restart bound
+    /// from counting the wrong thing: the two ways to get D-090 wrong.
+    ///
+    /// They are neither the `snapshot` task's discipline ([`SNAPSHOT`](Self::SNAPSHOT))
+    /// nor its running inside the node ([`WIRING`](Self::WIRING)) but the *sender's*
+    /// bookkeeping over a stream's answers, which had no bound at all until D-090.
+    /// [`CapWaitIsAStartOver`](Self::CapWaitIsAStartOver) is one a node of a single range
+    /// could not be wrong about; [`RestartsNotCounted`](Self::RestartsNotCounted) is
+    /// wrong with one range too.
+    // PROPOSED(D-090): the node honours RAFT.md's restart bound, and a cap-wait is not
+    // one of the asks it counts.
+    pub const BOUNDS: &'static [NodeVariant] = &[
+        NodeVariant::CapWaitIsAStartOver,
+        NodeVariant::RestartsNotCounted,
+    ];
+
     /// The bit this variant takes in a [`NodeVariants`].
     const fn bit(self) -> u64 {
         match self {
@@ -447,9 +577,11 @@ impl NodeVariant {
             // Bits 20 to 25 are D-077's six, which `main` took while the snapshot
             // review's slice was open; before that merge the review's four held 20 to
             // 23. They take 26 to 29 instead, and D-083's ten follow at 30 to 39, so no
-            // two variants share a bit. Forty variants no longer fit a `u32`, which is
+            // two variants share a bit. D-081's three for the directed re-seed shape
+            // follow at 40 to 42. Forty-three variants no longer fit a `u32`, which is
             // why [`NodeVariants`] is a `u64`, as `ananke_raft`'s set was widened for
-            // the same reason; twenty-four bits are left.
+            // the same reason; D-090's two at 43 and 44 and D-076's review's two at 45 and 46;
+            // seventeen bits are left.
             NodeVariant::InstallWrongRangesSpans => 1 << 26,
             NodeVariant::AdmitsAnUnhostedRange => 1 << 27,
             NodeVariant::AssemblyHeldForDepartedSender => 1 << 28,
@@ -464,6 +596,17 @@ impl NodeVariant {
             NodeVariant::TakeSkipsTheUserKeys => 1 << 37,
             NodeVariant::TakeStreamsTheLogToo => 1 << 38,
             NodeVariant::AsksTheHostBeforeTheHold => 1 << 39,
+            NodeVariant::ReseedMarkNotSynced => 1 << 40,
+            NodeVariant::RestartAppliesFromZero => 1 << 41,
+            NodeVariant::RecordNeverQueued => 1 << 42,
+            // D-090's two: the restart bound RAFT.md states and the cap-wait it must
+            // not count. Nineteen bits are left.
+            NodeVariant::CapWaitIsAStartOver => 1 << 43,
+            NodeVariant::RestartsNotCounted => 1 << 44,
+            // D-076's review's two: a refused read's registration left behind, and one
+            // seed for every core. Seventeen bits are left.
+            NodeVariant::RefusedReadLeft => 1 << 45,
+            NodeVariant::OneSeedForEveryCore => 1 << 46,
         }
     }
 
@@ -511,6 +654,13 @@ impl NodeVariant {
             NodeVariant::TakeSkipsTheUserKeys => "TakeSkipsTheUserKeys",
             NodeVariant::TakeStreamsTheLogToo => "TakeStreamsTheLogToo",
             NodeVariant::AsksTheHostBeforeTheHold => "AsksTheHostBeforeTheHold",
+            NodeVariant::ReseedMarkNotSynced => "ReseedMarkNotSynced",
+            NodeVariant::RestartAppliesFromZero => "RestartAppliesFromZero",
+            NodeVariant::RecordNeverQueued => "RecordNeverQueued",
+            NodeVariant::CapWaitIsAStartOver => "CapWaitIsAStartOver",
+            NodeVariant::RestartsNotCounted => "RestartsNotCounted",
+            NodeVariant::RefusedReadLeft => "RefusedReadLeft",
+            NodeVariant::OneSeedForEveryCore => "OneSeedForEveryCore",
         }
     }
 }
@@ -522,7 +672,10 @@ impl fmt::Display for NodeVariant {
 }
 
 /// A set of [`NodeVariant`]s, shaped like [`ananke_raft::core::Variants`] so the two
-/// read alike where a scenario configures both.
+/// read alike where a scenario configures both. The word is 64 bits and Raft's is 32:
+/// the node's variants outgrew a `u32` when the snapshot wiring's ten, Q15's six and
+/// the re-seed shape's three met on one tree, and nothing but this module reads the
+/// bits.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct NodeVariants(u64);
 
@@ -595,13 +748,16 @@ mod tests {
             seen |= variant.bit();
         }
         // Twenty of the round's and the snapshot task's, the snapshot review's four,
-        // D-077's six for Q15's whole-node refusal and re-seed, and D-083's ten for the
-        // snapshot wiring.
-        assert_eq!(NodeVariant::BUGS.len(), 40);
+        // D-077's six for Q15's whole-node refusal and re-seed, D-083's ten for the
+        // snapshot wiring, D-081's three for the directed re-seed shape, and D-090's two for a
+        // stream's bounds, and D-076's review's two.
+        assert_eq!(NodeVariant::BUGS.len(), 47);
         for variant in NodeVariant::SNAPSHOT
             .iter()
             .chain(NodeVariant::WIRING)
             .chain(NodeVariant::RESEED)
+            .chain(NodeVariant::SHAPE)
+            .chain(NodeVariant::BOUNDS)
         {
             assert!(
                 NodeVariant::BUGS.contains(variant),
@@ -611,23 +767,38 @@ mod tests {
         assert_eq!(NodeVariant::SNAPSHOT.len(), 15);
         assert_eq!(NodeVariant::WIRING.len(), 10);
         assert_eq!(NodeVariant::RESEED.len(), 6);
-        // The discipline, the wiring and the re-seed are pairwise disjoint: a variant is
-        // a way to get the `snapshot` task's keys, caps and frames wrong, a way to get
-        // its running inside the node wrong, or a way to get Q15's whole-node refusal
-        // wrong, and never two of them.
-        for variant in NodeVariant::WIRING {
-            assert!(
-                !NodeVariant::SNAPSHOT.contains(variant),
-                "{variant} is in both sets"
-            );
-            assert!(
-                !NodeVariant::RESEED.contains(variant),
-                "{variant} is in both sets"
-            );
+        assert_eq!(NodeVariant::SHAPE.len(), 3);
+        assert_eq!(NodeVariant::BOUNDS.len(), 2);
+        // The discipline, the wiring, the re-seed, the shape and the bounds are pairwise
+        // disjoint: a
+        // variant is a way to get the `snapshot` task's keys, caps and frames wrong, a
+        // way to get its running inside the node wrong, a way to get Q15's whole-node
+        // refusal wrong, one of the shape's own, or a way to get a stream's bounds wrong,
+        // and never two of them.
+        let sets = [
+            ("SNAPSHOT", NodeVariant::SNAPSHOT),
+            ("WIRING", NodeVariant::WIRING),
+            ("RESEED", NodeVariant::RESEED),
+            ("SHAPE", NodeVariant::SHAPE),
+            ("BOUNDS", NodeVariant::BOUNDS),
+        ];
+        for (i, (left, one)) in sets.iter().enumerate() {
+            for (right, other) in &sets[i + 1..] {
+                for variant in *one {
+                    assert!(
+                        !other.contains(variant),
+                        "{variant} is in both {left} and {right}"
+                    );
+                }
+            }
         }
-        for variant in NodeVariant::RESEED {
+        // D-090's two are a fourth kind: the sender's bookkeeping over a stream's
+        // answers, which is none of the three above.
+        for variant in NodeVariant::BOUNDS {
             assert!(
-                !NodeVariant::SNAPSHOT.contains(variant),
+                !NodeVariant::SNAPSHOT.contains(variant)
+                    && !NodeVariant::WIRING.contains(variant)
+                    && !NodeVariant::RESEED.contains(variant),
                 "{variant} is in two sets"
             );
         }

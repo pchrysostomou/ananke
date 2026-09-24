@@ -66,8 +66,11 @@
 # that `cargo test --list` and this table carry the debt rather than a paragraph of
 # prose; each runs its variant over `high_rate_share()` and asserts the path absent.
 # Six more run that share and are tens of cpu seconds for the same reason; the two
-# large rows are the correct node on every seed and `LeaseTrustsTheClock`, whose catch
-# is asserted from the thousand-seed tier and which therefore runs every seed.
+# large rows are the correct node on every seed and `LeaseTrustsTheClock`, which sweeps
+# every seed of its tier rather than a share of it. PROPOSED D-088 moved that catch's
+# assertion from the thousand-seed tier to the nightly's ten thousand; the row's weight
+# is unchanged, because the tier gate decides whether to assert and not how many seeds
+# are swept.
 # Placed longest-first into the lightest shard, against the table as this branch found
 # it, where the shards then ran 1328.0 to 1442.7 cpu s; the merge note below recomputes
 # every total.
@@ -83,6 +86,64 @@
 # bounded by shard 2 at about 5 % over the ideal. The next row added goes into the
 # lightest, which is shard 4.
 #
+# This merge combined two more independent placements, D-077's table and D-083's, the
+# same way the earlier one did: it takes the union of both sides' rows, keeps every row
+# in the shard its own side placed it in, re-places none of them, and recomputes every
+# total below from the rows that resulted. The merged shards run 1301.8 to 1440.6 cpu s.
+# The next row added goes into the lightest, which is shard 6.
+#
+# D-081's seven rows are the directed re-seed shape, `reseed`, weighed on its own tree in
+# release from the built binary (`reseed-<hash> <test> --exact`) at ANANKE_SEEDS=1000
+# ANANKE_DEEP_SEEDS=100, as user+sys, and totalling 110.5 cpu s over seven rows. That binary caps its
+# sweeps at 200 seeds (`TIER_CAP`), a cap the entry proposes rather than takes: the
+# correct system's sweep costs 0.41 cpu s a seed (200 seeds: 73.79 user + 8.68 sys) and
+# peaks at 1.13 GiB resident, so the nightly's ten thousand would be some 4 000 cpu s,
+# about three times a whole shard, and the memory is what really constrains it. On an
+# Apple M2 of 8 cores on AC, with this session's own builds beside them, which for
+# figures of this size changes no assignment. Longest-first into the lightest shard.
+#
+# D-085's one row, the quorum scenario's absence tripwire, joined shard 3 where its own branch
+# placed it; this merge took main's table otherwise, including its re-measured node rows.
+# That row is gone: PR #86 landed, the tripwire fired, and the sharded scenario it was waiting
+# for replaced it. D-085's three rows are weighed the same way, from the built release binary
+# (`node-<hash> <test> --exact`) rather than through cargo so the figure is the test's own cost
+# and not a build's, at ANANKE_SEEDS=1000 ANANKE_DEEP_SEEDS=100, on an Apple M2 of 8 cores on
+# AC power with load averages 19.81/11.48/14.07 -- not idle, so the figures are if anything
+# high (D-070). They are 70.0, 39.6 and 34.6 cpu s, placed longest-first into the lightest
+# shard: 70.0 to shard 4 (1328.1 -> 1398.1), 39.6 to shard 3 (1328.3 -> 1367.9) and 34.6 to
+# shard 6 (1332.7 -> 1367.3).
+#
+# D-084's rows join the shards their own branch placed them in; this merge took main's
+# table otherwise, including the rows and weights D-085 brought in through PR #104.
+#
+# D-076's adversarial review added three `ranges` rows, salvaged onto `main` here and weighed
+# on the tree that ships, on an Apple M2 of 8 cores on AC Power with the other slices sweeping
+# beside it -- load averages 118.90/138.84/124.86 before and 88.10/120.13/119.30 after, so every
+# figure is if anything high (D-070). The sweep -- the node that leaves a refused read's
+# registration behind -- is 81.19 user + 5.07 sys = 86.3 cpu s at ANANKE_SEEDS=1000 in release;
+# the review weighed the same sweep at 58.5 on an idler machine and its own tree, and the higher
+# figure is the one kept because over-weighting a shard is the safe direction. The two directed
+# rows are pinned at their own seeds and the tier does not move them, so both were weighed from
+# the built release binary (`ranges-<hash> <test> --exact`) rather than through cargo: 0.14 and
+# 0.01 cpu s, rounded to 0.2 and 0.1 like the cheap rows beside them. Placed longest-first into
+# the lightest shard, against the table as this branch found it (1428.0, 1442.9, 1367.9, 1398.1,
+# 1351.7, 1367.3): 86.3 to shard 5 (1351.7 -> 1438.0), then 0.2 to shard 6 (1367.3 -> 1367.5)
+# and 0.1 to shard 6 again (1367.5 -> 1367.6). The shards now run 1367.6 to 1442.9 against a
+# mean of 1407.1, so the night is bounded by shard 2 at about 2.5 % over the ideal. The next row
+# added goes into the lightest, which is shard 6.
+#
+# **This merge (PR #118) is a plain union.** Main had gained D-084's four `node` rows; this
+# branch had added D-076's review's three `ranges` rows. No row is on both sides: the 111 rows
+# the two share are byte-identical in shard and weight, so no weight had to be chosen between a
+# newer and an older measurement, and nothing was re-placed -- each of the seven new rows keeps
+# the shard its own side put it in. 111 + 3 + 4 = 118 rows, checked as a set of (binary, test)
+# in both directions against each parent. Every total above is recomputed from the rows beneath
+# it rather than carried from either side; only shard 6 moved (1367.6 and 1435.5 on the two
+# sides, 1435.8 from the merged rows), the other five already matched their rows. The shards now
+# run 1398.3 to 1461.2 against a mean of 1434.0, so the night is bounded by shard 3 at about
+# 1.9 % over the ideal. The next row added goes into the lightest, which is shard 4 -- this
+# supersedes the two paragraphs above, which each named a lightest shard against their own side's
+# table.
 # D-083's three rows are the node's snapshot wiring, weighed on its own tree in release,
 # run alone, as user+sys of the test binary. They are small and they stay small: that
 # binary does not read ANANKE_SEEDS, because its situation is reached by construction on
@@ -181,13 +242,95 @@
 # a one-minute load of about 20. Shard 4's header is recomputed from its rows with it,
 # 1373.0 to 1373.4, and it stays the lightest, so the next row added still goes there.
 #
+# **This merge combined two independent placements**: D-081's seven `reseed` rows, placed
+# on this branch (`phase-3-stage-b-shape`) against the table as it stood before the base
+# moved, and the base's table (`phase-3-stage-b-wiring`) as it now stands, which carries
+# D-082's seventeen `node` rows re-weighed to two decimals and re-placed by its review,
+# D-083's three `install` rows and D-080's one `raft` row. It takes the union of both
+# sides' rows and keeps every row in the shard its own side placed it in, re-placing none
+# of them. The `node` rows this branch carried at one decimal are that same re-weighing
+# seen at an older point, not rows of its own, so the base's figures and placements stand
+# for them -- three of them moved shard in that review (`sends_before_it_persists` to 4,
+# `resets_its_timer` and `commits_an_older_terms_entry` to 6), and it is the base's
+# placement that is kept, not this branch's older one. Only the seven `reseed` rows are
+# this branch's own, and they stay in shards 3, 4 and 6 where it put them. Every total
+# below is recomputed from the rows beneath it rather than carried over from either side.
+# The merged shards run 1346.9 to 1442.9 cpu s against a mean of 1388.5, so the night is
+# bounded by shard 2 at about 4 % over the ideal. The next row added goes into the
+# lightest, which is shard 4.
+# **This merge combined two independent placements**: D-083's three `install` rows, placed
+# on this branch, and D-084's four `node` rows, placed on main by the membership slice
+# (PR #106). No (binary, test) appears on both sides, so no weight had to be chosen
+# between two measurements; each row keeps the shard its own side placed it in and none is
+# re-placed. Every total below is recomputed from the 118 rows beneath it rather than
+# carried over from either side; the two the conflict fell in, shards 3 and 6, come to
+# 1463.6 and 1441.9. The merged shards run 1351.7 to 1463.6 cpu s against a mean of
+# 1421.1, so the night is bounded by shard 3 at about 3 % over the ideal. The next row
+# added goes into the lightest, which is shard 5.
+#
+# **This merge combined two independent placements**: D-081's seven `reseed` rows, placed
+# on this branch, and the seven `node` rows the base (`phase-3-stage-b-wiring`) brought in
+# from main with D-084's membership slice and D-085's sharded quorum scenario. The two
+# sides agree on all 111 rows they share, shard and figure alike, so no weight had to be
+# chosen between two measurements; the union is 125 rows and each keeps the shard its own
+# side placed it in. Fifteen of the shared rows reached this merge from both directions at
+# once -- the base's copy and this branch's older copy of the same re-weighed `node` rows,
+# byte for byte the same row -- and are carried once, not twice; `check-nightly-shards.sh`
+# would have failed had one slipped through twice. Every total below is recomputed from
+# the 125 rows beneath it rather than carried over from either side: shards 3, 4 and 6
+# come to 1546.1, 1417.1 and 1451.1. The merged shards run 1351.7 to 1546.1 cpu s against
+# a mean of 1439.5, so the night is bounded by shard 3 at about 7 % over the ideal, which
+# is worse than either side alone and is the re-seed shape's 110.5 cpu s landing on
+# shards 3 and 4. The next row added goes into the lightest, which is shard 5.
+#
+# **This merge (PR #109 onto `main` at c178682) is a plain union, checked in both directions.**
+# `main` had gained seventeen rows since the two sides parted -- D-084's four `node` rows and
+# D-085's three, D-087's one, D-076's review's three `ranges` rows and D-081's seven `reseed`
+# rows; this branch had added five `node` rows (D-086's four and D-089/D-091's pin) and removed
+# the four `*_is_not_re_asserted_on_the_node_yet` rows those four supersede. No row is on both
+# sides with different figures: the 111 rows the two share are byte-identical in shard and
+# weight, so no weight had to be chosen between a newer and an older measurement, and nothing
+# was re-placed -- each new row keeps the shard its own side put it in, and the four rows that
+# go are exactly the four whose tests this branch deleted (the table is checked against the
+# tests that exist). 128 + 5 - 4 = 129 rows, checked as a set of (binary, test) against each
+# parent: every row of this branch is here, and every row of `main` but those four. Every
+# header below is recomputed from the rows beneath it. The shards now run 1428.0 to 1777.4
+# cpu s against a mean of 1551.5, so the night is bounded by shard 3 at about 15 % over the
+# ideal -- worse than either side alone, because D-086's 261.0 and D-081's 82.5 both landed on
+# shard 3 from their own sides' tables. That is a re-placement question and it is not taken in
+# a merge, as none of the merges above took one; it goes with the re-weigh D-086's note says
+# the owner takes on a quiet machine. The next row added goes into the lightest, which is
+# **shard 1** -- this supersedes every earlier "next row" note above.
+#
+# PROPOSED D-086, on this merge: three tests of this table were renamed rather than kept
+# under a name that had stopped being true. `a_leader_that_ignores_incarnations_has_no_incarnation_to_ignore_on_the_node_yet`
+# and `the_pair_on_the_node_is_the_stream_half_alone_until_the_reseed_lands` waited on Q15's
+# re-seed, which is in this tree (D-077), and D-087's
+# `d_049s_rule_has_a_site_on_the_node_now_and_its_pair_waits_only_on_the_wiring` waited on
+# PR #107's wiring, which is too. Each keeps its row's weight and shard; only the name moved.
+#
+# PROPOSED D-086, on the merge with `main`: `READS_OUTSTANDING` re-measured to 38 moved the
+# read leak's catch off `sim/ranges.rs` (0 of 1 000 at 38) and onto the raft arms, so one row
+# is added and one re-weighed, both from the built release binary (`<binary>-<hash> <test>
+# --exact`) at ANANKE_SEEDS=1000 ANANKE_DEEP_SEEDS=100, as user+sys, on an Apple M2 of 8 cores
+# on AC with load averages about 10 from this session's own builds beside it, so both are if
+# anything high (D-070). `a_node_that_leaves_a_refused_reads_registration_behind_is_caught_on_the_node`
+# is 269.90 + 13.59 = 283.5 cpu s: it runs the leaking node over the whole tier (the catch is
+# a rate, asserted from a hundred), and goes longest-first into the lightest shard, which the
+# note above names as shard 1 (1428.0 -> 1711.5). `ranges`'s pair now runs the correct node
+# beside the leaking one on every seed, to assert the leak's firing where the bound no longer
+# sees it: 101.23 + 6.05 = 107.3 cpu s against its row of 86.3, and it keeps its shard (5,
+# 1481.4 -> 1502.4). Every header below is recomputed from the rows. The shards now run
+# 1442.9 to 1777.4 cpu s; the next row added goes into the lightest, which is shard 2.
 # shard	binary	cpu_s	test
-# shard 1: 1428.0 cpu s
+# shard 1: 1711.5 cpu s
 1	engine	625.1	an_install_in_two_switches_is_caught
 1	engine	36.8	an_install_whose_repair_precedes_its_switch_is_caught
 1	engine	0.6	seed_44_never_opens_empty_in_either_mode
 1	engine	0.4	same_seed_gives_byte_identical_trace
 1	engine	0.3	seed_420_which_the_first_nightly_found_stays_green
+1	node	283.5	a_node_that_leaves_a_refused_reads_registration_behind_is_caught_on_the_node
+1	node	149.49	a_leader_that_trusts_the_clock_is_caught_on_the_node
 1	raft	258.5	a_leader_that_ignores_incarnations_never_forgets
 1	raft	208.6	a_server_that_installs_without_current_last_is_caught
 1	raft	103.3	on_the_sweeps_disk_the_install_silence_deposes_the_leader_under_either_count
@@ -197,26 +340,25 @@
 1	raft	0.2	seed_164_which_a_local_ten_thousand_seed_run_found_stays_green
 1	raft	0.2	seed_5909_which_the_nightly_found_stays_green
 1	wal	29.3	a_log_that_skips_the_checksum_is_caught
-1	node	149.49	a_leader_that_trusts_the_clock_is_caught_on_the_node
 # shard 2: 1442.9 cpu s
 2	echo	0.2	different_seeds_give_different_traces
 2	engine	581.7	the_live_install_crash_test_passes_every_seed
 2	engine	211.2	a_compaction_that_deletes_its_inputs_before_the_manifest_is_caught
 2	engine	34.6	a_checkpoint_that_copies_each_span_at_its_own_version_is_caught
 2	engine	16.6	the_correct_engine_passes_every_seed_with_deep_levels
+2	node	165.78	every_seed_passes_on_the_correct_node_under_the_raft_sweeps_arms
 2	raft	276.0	a_leader_that_shares_one_snapshot_directory_and_streams_one_follower_at_a_time_is_caught
 2	raft	151.5	a_leader_that_counts_nothing_from_a_refused_follower_is_caught
 2	raft	4.4	a_server_that_sends_before_it_persists_is_caught
 2	ranges	0.2	a_ranges_replicas_are_created_with_one_descriptor_and_created_once
+2	ranges	0.1	a_loss_in_the_shared_engine_refuses_the_whole_node_and_reseeds_beside_it
 2	ranges	0.1	a_node_holds_four_ranges_from_its_configuration_and_every_one_of_them_runs
+2	ranges	0.1	a_restarted_node_opens_the_directory_its_reseed_built_and_is_not_refused_again
 2	ranges	0.1	a_seed_replays_to_the_same_trace
 2	ranges	0.1	every_frame_between_two_nodes_may_carry_several_ranges
 2	ranges	0.1	no_batch_frame_of_the_node_parses_as_a_frame_of_the_one_group_server
 2	ranges	0.1	the_ranges_of_one_node_draw_their_own_election_timeouts
-2	ranges	0.1	a_loss_in_the_shared_engine_refuses_the_whole_node_and_reseeds_beside_it
-2	ranges	0.1	a_restarted_node_opens_the_directory_its_reseed_built_and_is_not_refused_again
-2	node	165.78	every_seed_passes_on_the_correct_node_under_the_raft_sweeps_arms
-# shard 3: 1562.0 cpu s
+# shard 3: 1777.4 cpu s
 3	echo	0.2	trace_hash_matches_the_pinned_golden
 3	engine	417.5	the_range_delete_crash_test_passes_every_seed
 3	engine	235.9	the_seek_crash_test_passes_every_seed
@@ -224,6 +366,12 @@
 3	engine	52.4	a_span_checkpoint_without_syncs_is_caught
 3	engine	39.8	an_install_whose_repair_follows_its_switch_is_caught
 3	engine	0.3	seed_3123_which_the_nightly_found_supersedes_a_resurrected_segment
+3	install	2.4	every_wiring_variant_is_caught
+3	node	261.0	a_server_that_installs_without_current_last_is_injected_on_the_node
+3	node	93.3	every_seed_passes_the_membership_scenario_on_the_correct_node
+3	node	39.6	a_node_that_refuses_only_one_range_is_caught_on_the_sharded_quorum_scenario
+3	node	13.25	a_server_without_pre_vote_is_caught_on_the_node
+3	node	4.03	a_server_that_applies_before_commit_is_caught_on_the_node
 3	raft	281.7	a_server_whose_refusal_is_not_durable_is_caught
 3	raft	158.5	a_leader_that_counts_a_refused_followers_rejections_whatever_its_stream_does_is_caught
 3	raft	12.8	the_incremental_checker_agrees_with_the_fold_over_the_whole_trace
@@ -233,15 +381,23 @@
 3	raft	0.3	seed_687_which_the_premerge_found_stays_green
 3	raft	0.2	seed_385_which_a_local_ten_thousand_seed_run_found_stays_green
 3	raft	0.2	the_membership_scenario_has_byte_identical_traces_for_one_seed
+3	reseed	82.5	the_reseed_shape_holds_on_every_seed
 3	wal	21.2	a_log_that_acknowledges_before_syncing_is_caught
-3	node	13.25	a_server_without_pre_vote_is_caught_on_the_node
-3	node	4.03	a_server_that_applies_before_commit_is_caught_on_the_node
-3	install	2.4	every_wiring_variant_is_caught
-3	node	261.0	a_server_that_installs_without_current_last_is_injected_on_the_node
-# shard 4: 1373.4 cpu s
+# shard 4: 1462.4 cpu s
 4	echo	0.1	same_seed_gives_byte_identical_trace
 4	engine	210.8	the_correct_engine_passes_every_seed
 4	engine	38.6	an_install_that_switches_one_span_at_a_time_is_caught
+4	node	73.9	the_pair_on_the_node_is_the_stream_half_alone_where_no_store_is_refused
+4	node	70.0	d_049s_rule_has_a_site_on_the_node_now_and_its_pair_waits_on_the_scenarios_own_threshold
+4	node	14.92	a_server_whose_refusal_is_not_durable_is_not_re_asserted_on_the_node_yet
+4	node	2.32	a_follower_that_truncates_on_every_append_is_caught_on_the_node
+4	node	1.1	seeds_272_and_516_are_a_live_installs_hold_and_the_fourth_arm_answers_for_them
+4	node	0.52	a_server_that_sends_before_it_persists_is_caught_on_the_node
+4	node	0.24	a_seed_replays_to_the_same_trace_on_the_node
+4	node	0.11	a_node_under_the_raft_sweeps_arms_runs_every_range
+4	node	0.1	a_membership_seed_replays_to_the_same_trace_on_the_node
+4	node	0.1	a_node_changes_two_of_its_ranges_at_once
+4	node	0.1	the_nodes_arms_aim_at_every_range_and_not_at_one
 4	parallel	6.4	a_seed_inside_the_driver_gives_the_sequential_trace
 4	raft	355.6	a_leader_that_trusts_the_clock_is_caught_and_the_guard_revokes
 4	raft	282.6	a_server_without_pre_vote_is_caught_on_the_term_raise_schedule
@@ -250,33 +406,36 @@
 4	raft	3.7	the_nightlys_eleven_variant_catches_of_the_trace_timestamp_gap_are_not_catches
 4	raft	0.3	seed_119_which_pinned_the_refusal_that_is_not_durable_before_the_layout_refuses_nothing
 4	raft	0.2	seed_2023_which_the_nightly_failed_on_a_trace_timestamp_no_longer_straddles_an_isolation
+4	reseed	11.0	a_node_that_serves_before_its_refused_mark_is_caught_by_the_order
+4	reseed	7.8	a_node_that_queues_no_compaction_record_is_caught
 4	wal	36.9	the_correct_log_passes_every_seed
 4	wal	0.2	the_seed_42_trace_is_written_for_the_studio
-4	node	14.92	a_server_whose_refusal_is_not_durable_is_not_re_asserted_on_the_node_yet
-4	node	2.32	a_follower_that_truncates_on_every_append_is_caught_on_the_node
-4	node	0.52	a_server_that_sends_before_it_persists_is_caught_on_the_node
-4	node	0.24	a_seed_replays_to_the_same_trace_on_the_node
-4	node	0.11	a_node_under_the_raft_sweeps_arms_runs_every_range
-4	node	0.1	the_nodes_arms_aim_at_every_range_and_not_at_one
-4	node	73.9	the_pair_on_the_node_is_the_stream_half_alone_until_the_reseed_lands
-4	node	1.1	seeds_272_and_516_are_a_live_installs_hold_and_the_fourth_arm_answers_for_them
-# shard 5: 1395.1 cpu s
+# shard 5: 1502.4 cpu s
 5	echo	6.0	every_seed_satisfies_the_invariants_and_the_sweep_exercises_the_disk_faults
 5	engine	19.5	a_seek_that_counts_tombstones_is_caught
+5	node	43.4	a_leader_that_ignores_incarnations_has_an_incarnation_to_ignore_only_where_a_store_is_refused
 5	raft	332.9	a_term_change_stepped_inside_an_isolation_from_a_message_received_before_it_is_excused
 5	raft	304.8	the_correct_leader_steps_down_on_a_blocked_reseed_and_commits_through_an_open_one
 5	raft	252.2	a_server_without_pre_vote_is_caught
 5	raft	187.0	a_leader_that_commits_an_older_terms_entry_by_count_is_caught
 5	raft	139.6	the_correct_server_passes_the_membership_scenario_on_every_seed
 5	raft	50.7	a_server_that_applies_before_commit_compacts_past_its_commit_index
+5	ranges	107.3	a_node_that_leaves_a_refused_reads_registration_behind_is_caught
 5	ranges	59.0	every_seed_passes_on_the_correct_node
-5	node	43.4	a_leader_that_ignores_incarnations_has_no_incarnation_to_ignore_on_the_node_yet
-# shard 6: 1604.9 cpu s
+# shard 6: 1717.2 cpu s
 6	echo	0.1	a_busy_looping_task_fails_the_scenario_instead_of_hanging
 6	engine	310.3	an_engine_that_acknowledges_before_the_log_is_caught
 6	engine	204.5	an_engine_that_releases_a_memtable_before_the_manifest_is_caught
 6	engine	39.2	a_range_delete_that_skips_the_memtables_is_caught
 6	engine	0.3	the_seed_42_trace_is_written_for_the_studio
+6	install	6.3	the_correct_node_installs_on_every_seed
+6	install	0.1	a_stream_flows_and_an_install_completes_on_every_range_and_every_follower
+6	node	265.8	a_leader_that_shares_one_snapshot_directory_is_caught_on_the_node
+6	node	68.2	a_server_that_counts_one_majority_in_joint_consensus_is_caught_on_the_node
+6	node	34.6	the_sharded_quorum_scenario_asks_four_leaders_about_one_refused_node
+6	node	14.65	a_server_whose_adoption_is_as_built_is_not_re_asserted_on_the_node_yet
+6	node	13.12	a_server_that_resets_its_timer_on_any_message_is_caught_on_the_node
+6	node	8.37	a_leader_that_commits_an_older_terms_entry_by_count_is_caught_on_the_node
 6	raft	311.9	the_correct_server_passes_every_seed
 6	raft	266.4	a_server_whose_adoption_is_as_built_is_caught
 6	raft	62.5	a_server_that_applies_before_commit_is_caught
@@ -292,11 +451,11 @@
 6	raft	0.2	seed_4_of_the_term_raise_schedule_steps_a_message_received_before_its_isolation
 6	raft	0.2	seed_7381_which_the_first_nightly_found_stays_green
 6	ranges	53.9	a_node_that_steps_a_core_while_its_persist_is_outstanding_is_caught
+6	ranges	0.2	a_core_that_asks_for_a_snapshot_action_fails_the_run
+6	ranges	0.1	each_range_draws_its_election_timer_from_its_own_stream
+6	reseed	8.6	a_refused_mark_written_unsynced_is_caught
+6	reseed	0.3	seed_1_pins_the_cap_holding_a_re_seed_back
+6	reseed	0.2	the_shape_reaches_its_situation_and_says_what_it_saw
+6	reseed	0.1	an_answer_that_is_evidence_of_the_install_is_not_the_same_as_any_answer
 6	wal	34.4	a_log_that_skips_sync_dir_on_rotation_is_caught
 6	wal	0.3	same_seed_gives_byte_identical_trace
-6	node	14.65	a_server_whose_adoption_is_as_built_is_not_re_asserted_on_the_node_yet
-6	node	13.12	a_server_that_resets_its_timer_on_any_message_is_caught_on_the_node
-6	node	8.37	a_leader_that_commits_an_older_terms_entry_by_count_is_caught_on_the_node
-6	install	6.3	the_correct_node_installs_on_every_seed
-6	install	0.1	a_stream_flows_and_an_install_completes_on_every_range_and_every_follower
-6	node	265.8	a_leader_that_shares_one_snapshot_directory_is_caught_on_the_node

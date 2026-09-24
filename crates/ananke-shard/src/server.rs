@@ -35,7 +35,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use ananke_env::{ApplyEffect, FileSystem, RangeCause};
+use ananke_env::{ApplyEffect, FileSystem, RangeCause, RecoveredAs};
 use ananke_env::{Clock, Decision, Environment, Network, Rng, Socket, TraceEvent};
 use ananke_raft::apply::{Command, Outcome, apply_command, user_key};
 use ananke_raft::client::{Reply, Request, Response};
@@ -118,15 +118,20 @@ pub struct ServerConfig {
     pub node: NodeVariants,
 }
 
-/// What this slice's node was asked for and does not do: each counted, none silent.
+/// What the node was asked for, counted so a scenario can say whether a path was
+/// reached: each counted, none silent.
 ///
-/// A scenario asserts each of these at zero and says why, so the day a schedule
-/// reaches one of these paths the scenario says so instead of passing.
+/// The first is served now and the second is not; a scenario asserts each at the
+/// figure its own configuration produces and says why, so the day a schedule reaches
+/// a path the scenario did not expect it says so instead of passing.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Gaps {
-    /// Snapshot actions a core asked for: a take, or a stream to a follower behind
-    /// the compacted prefix. The `snapshot` task keyed by range and follower is its
-    /// own slice's, and is not wired to this host.
+    /// Snapshot actions a core asked for: a take, a follower's compaction record, or
+    /// a stream to a follower behind the compacted prefix. Counted whether or not the
+    /// `snapshot` task served it — it does since PROPOSED D-083 (`install::job_of`) —
+    /// so a scenario reads one number either way: the sweep that reaches the path
+    /// asserts it above zero on every seed (PROPOSED D-086), and a scenario whose
+    /// threshold keeps the path unreached asserts it zero, with that reason.
     pub snapshot_actions: u64,
     /// Client requests for a range this node does not host.
     pub requests_for_ranges_not_held: u64,
@@ -178,6 +183,10 @@ struct Replica {
     /// Reads waiting on the core, by the id handed to it.
     reads: BTreeMap<u64, (SocketAddr, Request)>,
     next_read: u64,
+    /// The most reads this replica has held registered at once, so a rise is traced
+    /// (`RaftReadsOutstanding`) and a tier reads its worst rather than the bound's
+    /// failure string (PROPOSED D-086, on D-076's bound).
+    reads_high_water: usize,
     /// The client work whose step is being driven now.
     in_flight: Option<InFlight>,
 }
@@ -189,7 +198,22 @@ impl Replica {
             proposed: BTreeMap::new(),
             reads: BTreeMap::new(),
             next_read: 0,
+            reads_high_water: 0,
             in_flight: None,
+        }
+    }
+
+    /// The registered reads this replica holds now and, when that is more than it
+    /// has ever held, the new high-water mark to trace: read at both moments the
+    /// bound is checked, so the trace carries the number the bound is held to.
+    // PROPOSED(D-086): a replica's registered reads' high-water mark is traced.
+    fn reads_held(&mut self) -> (usize, Option<usize>) {
+        let held = self.reads.len();
+        if held > self.reads_high_water {
+            self.reads_high_water = held;
+            (held, Some(held))
+        } else {
+            (held, None)
         }
     }
 
@@ -208,14 +232,21 @@ impl Replica {
     /// `Some` is a client to answer `NotLeader` at once. `None` is a read — whose
     /// registration is taken back here, because the core that refused it will never
     /// name its id again — or a step with nothing in flight.
+    ///
+    /// `leave_the_read` is [`NodeVariant::RefusedReadLeft`], the node as it was: the
+    /// registration is left in `reads` and nothing ever takes it out again. The
+    /// buggy half runs the same path the node runs, and not a copy of it written in
+    /// a test (D-076's review).
     // PROPOSED(D-076): a refused read's registration is taken back at the step.
-    fn refuse(&mut self) -> Option<(SocketAddr, u64, u64)> {
+    fn refuse(&mut self, leave_the_read: bool) -> Option<(SocketAddr, u64, u64)> {
         match self.in_flight.take()? {
             InFlight::Propose { from, client, seq } | InFlight::Change { from, client, seq } => {
                 Some((from, client, seq))
             }
             InFlight::Read { id } => {
-                self.reads.remove(&id);
+                if !leave_the_read {
+                    self.reads.remove(&id);
+                }
                 None
             }
         }
@@ -224,6 +255,37 @@ impl Replica {
 
 /// How many proposals a replica remembers against duplicates (the server's figure).
 const PROPOSED_REMEMBERED: usize = 4096;
+
+/// How many reads one replica may have registered and not yet answered or refused.
+///
+/// A registration lives from the step that hands the read to the core until that
+/// core answers it (`read_ready`, `read_dropped`) or refuses it at the step, so what
+/// stands here at any moment is the reads the clients of this range have in flight
+/// with this replica — and, since a client's retry is registered again beside its
+/// first registration (issue #125), as many of them as its clients retried while the
+/// core held the read. It does not grow with the run's length. Measured before it was
+/// asserted, and the bound is twice the measured worst (D-061, D-076 point 12):
+///
+/// - as first written, over `sim/ranges.rs`'s 1000 seeds and 180 222 registrations
+///   the most any replica held at once was **4**, on a node that never ran
+///   `Fault::RetakeUnderStream`, so the bound was 8;
+/// - re-measured on PR #109's merge with `main` (2026-09-24), which brought that arm
+///   onto the node, over 1000 seeds of every sweep that runs the node, in release:
+///   `sim/ranges.rs` 4, `sim/membership.rs` 4, `sim/raft.rs`'s arms on the node
+///   **16** (seed 644), the sharded `sim/quorum.rs` **19** — so the bound is **38**.
+///
+/// The bound was never wrong for the tree it was measured on, at the tier it was
+/// measured at: `main`'s own nightly on c178682 (run 36008940158, seed 297) reached
+/// 9 against the 8 with no such arm on the node, so a thousand seeds do not size this
+/// bound's tail and the nightly is the measurement that holds it. What passing it
+/// means is not a slow node but a registration nobody will ever take back — which is
+/// exactly the standing failure D-076 fixed and D-076's review found nothing
+/// asserting (CLAUDE.md:58-67). The high-water mark is traced
+/// (`TraceEvent::RaftReadsOutstanding`) so a tier reads its worst.
+// PROPOSED(D-076): a replica's outstanding read registrations are bounded, and the
+// node fails when they are not.
+// PROPOSED(D-086): re-measured with the stream arms on the node, by D-076's rule.
+const READS_OUTSTANDING: usize = 38;
 
 /// What the node's tasks hand the `raft` task besides its peers' messages.
 pub enum Local {
@@ -282,6 +344,8 @@ pub struct ServerHost<E: Environment> {
     initial_voters: Vec<ServerId>,
     raft: RaftConfig,
     variants: ananke_raft::core::Variants,
+    /// The node's own variants, for the paths a core knows nothing about.
+    node: NodeVariants,
     gaps: Mutex<Gaps>,
     /// What the `apply` task has applied per range, shared with that task.
     ///
@@ -318,6 +382,32 @@ impl<E: Environment> ServerHost<E> {
 
     fn replica(&self, range: RangeId) -> Option<&Arc<Mutex<Replica>>> {
         self.replicas.get(&range)
+    }
+
+    /// Fails the node when a replica holds more registered reads than its clients
+    /// can have in flight with it ([`READS_OUTSTANDING`]).
+    ///
+    /// Every scenario that runs this node runs this, on every seed: a registration
+    /// nothing will ever take back is a leak whatever answers it was waiting for,
+    /// and counting it where nobody reads the counter is the same as not seeing it
+    /// (D-076's review).
+    // PROPOSED(D-076): a replica's outstanding read registrations are bounded.
+    // PROPOSED(D-086): the high-water mark is traced, so a tier reads its worst.
+    fn reads_are_bounded(&self, range: RangeId, outstanding: usize, high_water: Option<usize>) {
+        if let Some(high_water) = high_water {
+            self.env.trace(TraceEvent::RaftReadsOutstanding {
+                server: self.id.0,
+                range: range.get(),
+                outstanding: high_water as u64,
+            });
+        }
+        if outstanding > READS_OUTSTANDING {
+            self.failed(format!(
+                "range {} holds {outstanding} registered reads, over the {READS_OUTSTANDING} \
+                 its clients can have in flight with it: a read's registration was left behind",
+                range.get()
+            ));
+        }
     }
 
     /// Queues one answer for the node's `answers` task.
@@ -500,6 +590,15 @@ impl<E: Environment> ServerHost<E> {
                 .stores
                 .get(&range)
                 .map_or(FIRST_INCARNATION, |store| store.incarnation()),
+            // The install has filled it: a quarantined replica here is one the
+            // re-seed marked and the stream then gave state to, which is
+            // `Quarantined` and no longer `Refused` (D-035).
+            // PROPOSED(D-081): a restatement says how the replica restated (D-067).
+            state: if restored.quarantined() {
+                RecoveredAs::Quarantined
+            } else {
+                RecoveredAs::Neither
+            },
         });
         Some(restored)
     }
@@ -553,7 +652,17 @@ impl<E: Environment> Host for ServerHost<E> {
             } => (range, from, request),
         };
         let Some(replica) = self.replica(range) else {
+            // The same absence, traced for the same reason: this node hosts the
+            // ranges its configuration names and nothing routes, so a request for
+            // another range is a client the run has no answer for. Routing and the
+            // answer that redirects it are Stage C's.
+            // PROPOSED(D-076): the request this node drops is traced, not only counted.
             lock(&self.gaps).requests_for_ranges_not_held += 1;
+            self.failed(format!(
+                "a client asked this node for range {}, which it does not host: nothing \
+                 routes yet, and the redirect is Stage C's",
+                range.get()
+            ));
             return None;
         };
         let mut state = lock(replica);
@@ -590,6 +699,10 @@ impl<E: Environment> Host for ServerHost<E> {
                 // to the step as the work in flight — where the registration is
                 // taken back rather than left behind (D-076).
                 let id = state.register_read(from, request);
+                // Where the map is at its largest, so where a registration left
+                // behind by an earlier refusal shows.
+                let (outstanding, high_water) = state.reads_held();
+                self.reads_are_bounded(range, outstanding, high_water);
                 Some(Input::Read {
                     id,
                     now: now_nanos(&self.env),
@@ -825,7 +938,14 @@ impl<E: Environment> Host for ServerHost<E> {
         // schedule of the scenario this slice measured. That answer is the next
         // slice's first job (D-076); what is fixed here is the entry left behind,
         // which is a standing failure and not a latency wart.
-        let Some((from, client, seq)) = lock(replica).refuse() else {
+        let (taken, outstanding, high_water) = {
+            let mut state = lock(replica);
+            let taken = state.refuse(self.node.contains(NodeVariant::RefusedReadLeft));
+            let (outstanding, high_water) = state.reads_held();
+            (taken, outstanding, high_water)
+        };
+        self.reads_are_bounded(range, outstanding, high_water);
+        let Some((from, client, seq)) = taken else {
             return;
         };
         self.answer_later(range, from, client, seq, Reply::NotLeader { leader });
@@ -1286,8 +1406,9 @@ fn now_nanos<E: Environment>(env: &E) -> u64 {
 /// # Errors
 ///
 /// The bind, the start, or an I/O error while running; each is traced before it is
-/// returned. A store refused for lost state marks the loss (D-044) and stops this
-/// node: the whole-node refusal and its re-seed are their own slice's (Q15).
+/// returned. A store refused for lost state marks the loss (D-044), refuses every
+/// replica the node holds with it and re-seeds each in a fresh engine beside the
+/// refused directory before any of them serves (D-077, `reseed`).
 pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()> {
     let ServerConfig {
         id,
@@ -1477,8 +1598,17 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
         stores.insert(id_of, store.clone());
         replicas.insert(id_of, Arc::new(Mutex::new(Replica::new())));
         // Q13, D-057: each core seeded from `n{id}/r{range}/protocol`, so two ranges
-        // on one node draw different election timeouts.
-        let seed = env.range_rng(id_of.get()).next_u64();
+        // on one node draw different election timeouts — and so that range r's
+        // stream is r's alone, which is what makes a range's schedule independent of
+        // which other ranges the node holds. `OneSeedForEveryCore` is the plausible
+        // bug beside it: four draws off the node's own stream, which are four
+        // different seeds and so pass any check that only asks that the timeouts
+        // differ (D-076's review).
+        let seed = if node_variants.contains(NodeVariant::OneSeedForEveryCore) {
+            env.rng().next_u64()
+        } else {
+            env.range_rng(id_of.get()).next_u64()
+        };
         let snapshot_record = recovered.snapshot.clone();
         let (snap_index, snap_term) = snapshot_record
             .as_ref()
@@ -1564,6 +1694,7 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
         initial_voters: initial_voters.clone(),
         raft: raft.clone(),
         variants,
+        node: node_variants,
         gaps: Mutex::new(Gaps::default()),
         applied: applied_at.clone(),
     };
@@ -1833,7 +1964,13 @@ async fn reseed<E: Environment>(
             }
             .max(FIRST_INCARNATION + 1);
             if !node_variants.contains(NodeVariant::ServeBeforeRefusedMark) {
-                store.mark_reseeded(incarnation).await?;
+                // D-067: `ReseedMarkNotSynced` writes the same two keys, traces the
+                // same event and answers as the correct node would; the batch is
+                // simply not synced, so a crash before anything else syncs this
+                // engine's log may leave the replica with no mark at all.
+                // PROPOSED(D-081): the re-seed shape's variant.
+                let synced = !node_variants.contains(NodeVariant::ReseedMarkNotSynced);
+                store.mark_reseeded(incarnation, synced).await?;
                 recovered.quarantined = true;
             }
         }
@@ -1870,10 +2007,14 @@ fn restate<E: Environment>(
         });
     }
     // The durable per-replica refused mark, restated per replica and carrying its range
-    // (§8). It is traced here on a restart, where the quarantine flag is what the disk
-    // held; at the re-seed itself this same restatement is the replica's first, and the
-    // mark was made durable before it (`reseed`). One-group `run` traces it in exactly
-    // this position (node.rs:963-968), so the two restatements stay comparable.
+    // (§8). A replica running on a store a re-seed rebuilt says so at every restatement,
+    // as the one-group server does (node.rs:963-968): it replicates, applies and counts
+    // for commit majorities, and grants no vote, no pre-vote and no lease promise for
+    // the rest of its life on that store. It is traced here on a restart, where the
+    // quarantine flag is what the disk held; at the re-seed itself this same
+    // restatement is the replica's first, and the mark was made durable before it
+    // (`reseed`). One-group `run` traces it in exactly this position, so the two
+    // restatements stay comparable.
     //
     // D-083 reached the same restatement from the other side — the node emitted this
     // event for no replica at all, as the one-group server does (node.rs:975-980) — and
@@ -1921,6 +2062,19 @@ fn restate<E: Environment>(
         applied: store.applied(),
         last_index: core.last_index(),
         incarnation: store.incarnation(),
+        // What the disk said this replica is (D-067). The mark Q15 writes is the
+        // quarantine flag and a fresh incarnation (D-077), so a marked replica with
+        // nothing installed yet is one waiting for its re-seed — `Refused` — and a
+        // marked replica that holds a snapshot has had its stream — `Quarantined`.
+        // The two are one flag and two moments, and (d) is about the first of them.
+        // PROPOSED(D-081): a restatement says how the replica restated (D-067).
+        state: if !quarantined {
+            RecoveredAs::Neither
+        } else if snap_index > 0 {
+            RecoveredAs::Quarantined
+        } else {
+            RecoveredAs::Refused
+        },
     });
     env.trace(TraceEvent::RaftTerm {
         server,
@@ -1961,8 +2115,11 @@ mod tests {
     /// the life of the node.
     ///
     /// The pair (CLAUDE.md:52-57) is the second half: the replica as it was, which
-    /// registered the read and held nothing in flight, leaves an entry behind for
-    /// every read it refuses — and this same check sees it.
+    /// leaves an entry behind for every read it refuses — and this same check sees
+    /// it. Since D-076's review that half is [`NodeVariant::RefusedReadLeft`] and
+    /// runs the node's own `refuse`, not a copy of it written here; the node
+    /// scenario's own oracle for it is `READS_OUTSTANDING`, which this unit case
+    /// cannot stand in for.
     #[test]
     fn a_read_a_replica_refuses_leaves_nothing_behind() {
         let mut replica = Replica::new();
@@ -1974,7 +2131,7 @@ mod tests {
                 "a read is registered while the core has it"
             );
             assert!(
-                replica.refuse().is_none(),
+                replica.refuse(false).is_none(),
                 "a refused read has no client to answer at the step"
             );
             assert!(
@@ -1989,17 +2146,15 @@ mod tests {
             client: 1,
             seq: 9,
         });
-        assert_eq!(replica.refuse(), Some((client_addr(), 1, 9)));
+        assert_eq!(replica.refuse(false), Some((client_addr(), 1, 9)));
         assert!(replica.in_flight.is_none());
-        // The known-buggy replica, beside it: the read registered with nothing in
-        // flight, which is what this node did until the review of D-076.
+        // The known-buggy replica, beside it: `RefusedReadLeft`, the node's own
+        // refusal with the registration left behind, which is what this node did
+        // until D-076.
         let mut buggy = Replica::new();
         for seq in 0..8 {
-            let id = buggy.next_read;
-            buggy.next_read += 1;
-            buggy.reads.insert(id, (client_addr(), read(seq)));
-            buggy.in_flight = None;
-            assert!(buggy.refuse().is_none());
+            buggy.register_read(client_addr(), read(seq));
+            assert!(buggy.refuse(true).is_none());
         }
         assert_eq!(
             buggy.reads.len(),

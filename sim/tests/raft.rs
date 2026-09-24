@@ -3714,8 +3714,10 @@ impl Coverage {
         self.abandoned += report.clients.abandoned;
         self.redirected += report.clients.redirected;
         // The write bound is asked of every key some client wrote to after the heal
-        // (SHARD.md §8), so the figure is the worst of those keys' first
-        // completions and not the best of them.
+        // (SHARD.md §8), and of the slowest post-heal write to each of those keys
+        // (D-076's review), so the figure is the worst of those — not the best of
+        // them, and not a first completion, which is what the per-range reading is
+        // for.
         for took in report.writes_after_heal_by_key().into_values().flatten() {
             self.slowest_write_after_heal = self.slowest_write_after_heal.max(took);
         }

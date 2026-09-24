@@ -326,15 +326,23 @@ impl Cluster {
     /// How likely a block is to rot on this cluster's disk.
     ///
     /// The one-group server's disk rots, and its engine's checksums turn a rotted
-    /// table into a refusal the server survives by re-seeding. The node's does not,
-    /// and the reason is the absence this cluster asserts rather than hides: a
-    /// refusal on the node stops the node, because Q15's whole-node refusal and its
-    /// re-seed are another slice's (PR #86, D-077) and are not in this tree. A node
-    /// that stopped would take its four ranges with it for the rest of the run and
-    /// the liveness checks would be measuring a scenario nobody wrote. The sweep
-    /// asserts that no store was refused and says why, so the day the path arrives
-    /// the sweep says so instead of passing over it.
+    /// table into a refusal the server survives by re-seeding. The node's does not.
+    /// PROPOSED D-082 set that while Q15's whole-node refusal and re-seed were another
+    /// slice's (PR #86), when a refusal stopped the node and took its four ranges with
+    /// it; that slice is in the tree now (D-077), and a node whose store is refused
+    /// re-seeds every replica it holds beside the refused directory and goes on. The
+    /// rot stays off all the same, because turning it on redraws every schedule of
+    /// this cluster — the file system's draws are the seed's — and with them every
+    /// rate PROPOSED D-086, D-089 and D-091 measured; that is the owner's to take,
+    /// with those rates re-measured. What this cluster sees instead is the refusal a
+    /// crash can produce on its own, an engine a restart cannot open: #123's nightly
+    /// reached one on 1 of 10 000 seeds (run 35949696476, on 677cad3) where the sweep
+    /// asserted none. The sweep counts every one, prints its seed and its reason, and
+    /// asserts of it what D-077 promises (`sim/tests/node.rs`), rather than asserting
+    /// there are none.
     // PROPOSED(D-082): what the node cluster does not reach yet, asserted absent.
+    // PROPOSED(D-086): the re-seed is in the tree; a refusal is counted and D-077's
+    // fan-out asserted of it, and the rot stays off for the schedules' sake.
     #[must_use]
     pub fn bitrot(self) -> f64 {
         match self {
@@ -355,16 +363,21 @@ impl Cluster {
             }
             Self::Node => {
                 env.spawn("node", async move {
-                    let _ =
-                        ananke_shard::server::run(inner, node_server_config(id, variants, node))
-                            .await;
+                    let _ = ananke_shard::server::run(
+                        inner,
+                        node_server_config(id, variants, node, NODE_SNAPSHOT_THRESHOLD),
+                    )
+                    .await;
                 });
             }
         }
     }
 
     /// The request a client of this cluster puts on the wire for `range`.
-    fn encode(self, range: u64, request: Request) -> Bytes {
+    ///
+    /// Crate-visible rather than private because `crate::membership` drives its own
+    /// operator sockets against either cluster and encodes on them (PROPOSED D-084).
+    pub(crate) fn encode(self, range: u64, request: Request) -> Bytes {
         match self {
             Self::OneGroup => request.encode(),
             Self::Node => RangedRequest {
@@ -376,7 +389,9 @@ impl Cluster {
     }
 
     /// The answer in a packet a client of this cluster received, if it is one.
-    fn decode(self, bytes: Bytes) -> Option<Response> {
+    ///
+    /// Crate-visible for the same reason as [`Cluster::encode`] (PROPOSED D-084).
+    pub(crate) fn decode(self, bytes: Bytes) -> Option<Response> {
         match self {
             Self::OneGroup => Response::decode(bytes).ok(),
             Self::Node => RangedResponse::decode(bytes).ok().map(|r| r.response),
@@ -792,8 +807,11 @@ impl Fault {
     /// moment the adoption's first change to the store directory is durable", and a
     /// node adopts no staged store at its start — the rule has no subject here, which
     /// D-082 recorded with the owner's ruling that `AdoptionAsBuilt` is re-asserted on
-    /// the two rules that remain. [`Fault::CrashRefused`] aims at a refused store, and
-    /// Q15's whole-node refusal is PR #86's.
+    /// the two rules that remain. [`Fault::CrashRefused`] aims at a refused store; the
+    /// whole-node refusal and re-seed are in the tree (D-077), but this cluster's disk
+    /// does not rot ([`Cluster::bitrot`]), so a refusal here is a crash's doing and
+    /// about one seed in ten thousand has one — an arm timed at a refusal would wait
+    /// out its budget on the rest. It comes back with the rot, which is the owner's.
     // PROPOSED(D-086): the two stream arms come back; the adoption and refusal arms
     // keep waiting for the slices that own their paths.
     #[must_use]
@@ -1094,24 +1112,23 @@ impl Schedule {
     /// persists sharing one group commit and four ranges' messages sharing one
     /// frame.
     ///
-    /// **What it takes out** is the third of the arms that aim at the install, the
-    /// adoption and the refusal — [`Fault::CrashInstalling`],
-    /// [`Fault::CrashAdopting`], [`Fault::CrashRefused`] and
-    /// [`Fault::RetakeUnderStream`] — because this node has none of those paths:
-    /// `ananke_shard::snapshot` is not wired to `ananke_shard::server::ServerHost`,
-    /// and Q15's whole-node refusal and re-seed are not in this tree either. D-076
-    /// said so in as many words when it added the node beside the server. An arm
-    /// kept here would fire, wait out its budget and reduce to an isolation or an
-    /// ordinary crash, which the schedule already draws: it would cost the tier its
-    /// time and assert nothing. They come back with the slice that wires the path,
-    /// and until then the variants they carry keep their Phase 2 assertions on
-    /// [`Cluster::OneGroup`], which this sweep leaves running exactly as it is
-    /// (PROPOSED D-082).
+    /// **What it takes out** is the two arms that aim at paths this node has no
+    /// subject for — [`Fault::CrashAdopting`] and [`Fault::CrashRefused`] — with the
+    /// reason for each in [`Fault::needs_a_path_the_node_has_not_got`]. The other two
+    /// arms of that kind, [`Fault::CrashInstalling`] and [`Fault::RetakeUnderStream`],
+    /// were taken out with them by PROPOSED D-082, when `ananke_shard::snapshot` was
+    /// not yet wired to the host; PROPOSED D-083 wired it and PROPOSED D-086 draws
+    /// them again, so the install's last chunk and a re-take under a live stream are
+    /// reached here and §10's stream variants are measured on them. An arm kept
+    /// without its path would fire, wait out its budget and reduce to an isolation or
+    /// an ordinary crash, which the schedule already draws: it would cost the tier its
+    /// time and assert nothing.
     ///
-    /// Each taken-out arm's absence is asserted on every seed by [`Report::check`]'s
-    /// node clauses — no snapshot action asked for, no store refused — so the day a
-    /// path arrives the sweep says so rather than passing over it (CLAUDE.md).
+    /// The snapshot path is asserted **reached** on every seed by `sim/tests/node.rs`
+    /// (PROPOSED D-086); a store refused — a crash's doing on a disk that does not
+    /// rot, [`Cluster::bitrot`] — is counted there and D-077's fan-out asserted of it.
     // PROPOSED(D-082): the arms are shared and the node is a second cluster of them.
+    // PROPOSED(D-086): the two stream arms are drawn on the node again.
     #[must_use]
     pub fn draw_on_the_node(seed: u64) -> Self {
         let drawn = Self::draw(seed);
@@ -1912,10 +1929,11 @@ impl Report {
     /// D-036's figure as far as this node can produce it. One `apply` task per node
     /// takes every range's jobs one at a time (Q14), so "one range's take holds the
     /// node's other ranges' applies" is the extreme case of a hold that exists
-    /// whatever the job is. **This node takes no snapshot** — the `snapshot` task is
-    /// not wired to its host — so the take's own hold cannot be measured here at all,
-    /// and the slice that wires it owes that figure. What is measured is the hold by
-    /// an ordinary apply.
+    /// whatever the job is. Until PROPOSED D-086 this node took no snapshot — the
+    /// `snapshot` task was not wired to its host — so the take's own hold could not be
+    /// measured here at all; it takes them now, D-086 records how the ordinary hold
+    /// moved with the threshold, and the take's own hold goes to the owner with it.
+    /// What is measured is the hold by an ordinary apply.
     ///
     /// The fold, over one node's applies in time order. For three consecutive applies
     /// at `t0 < t1 < t2` where the one at `t2` is of a different range than the one at
@@ -2323,8 +2341,6 @@ pub fn messages_of(payload: &Bytes) -> Vec<(u64, Message)> {
 /// came last for all four, and one leader's four first rises under one follower
 /// collapse into one key. The node scenario's sweep fails on every seed under that
 /// key and no one-range sweep can tell the two apart (D-076).
-// PROPOSED(D-076): the fold is keyed by `(range, leader, term, follower,
-// incarnation)`.
 ///
 /// A window is one stretch of one replica's leader tracking one follower. It opens
 /// at the leader's term, and where the leader *begins tracking the follower
@@ -2378,6 +2394,8 @@ pub fn messages_of(payload: &Bytes) -> Vec<(u64, Message)> {
 ///
 /// The first repeat, naming the leader, the term, the follower and the incarnation.
 // PROPOSED(D-069): `RaftMatchStarted` is the first rise, and this is what says so.
+// PROPOSED(D-076): the fold is keyed by `(range, leader, term, follower,
+// incarnation)`.
 // PROPOSED(D-079): per tracking window, so that a re-added voter's fresh progress
 // is a fresh first rise (issue #81).
 pub fn match_starts_are_first_rises(records: &[TraceRecord]) -> Result<(), String> {
@@ -2808,11 +2826,26 @@ impl Report {
             .min()
     }
 
-    /// Per key some client wrote to after the last heal, how long the quickest of
+    /// Per key some client wrote to after the last heal, how long the **slowest** of
     /// those writes took **from its own call** — `ret − max(call, last_heal)`, and
     /// every write folded here was called at or after the heal — with `None` for a
     /// key whose post-heal writes all stayed pending. The write bound is asked of
     /// each of these (SHARD.md §8).
+    ///
+    /// The slowest and not the quickest, which is the whole point of reading a write
+    /// from its own call: under the old reading (`ret − last_heal`) the earliest
+    /// completion was also the smallest number, so a minimum meant "the key's first
+    /// completion after the heal" and a key served late failed the bound. Measured
+    /// from each write's own call that stops being true — a minimum then means "the
+    /// fastest write to this key", which a single quick write hides every slow one
+    /// behind. D-076's review planted exactly that: a key called 10 ms after the heal
+    /// and served at 2.9 s, with a second write to it served in 10 ms, passed a
+    /// bound of 2 s. The maximum is what asks the bound of every post-heal write
+    /// there is, which is what SHARD.md §8 says. It widens nothing: the bound is the
+    /// same bound, and the correct system's slowest post-heal write over a thousand
+    /// seeds of the node scenario is **101.93275 ms** against it, measured on this
+    /// tree (75.622274 ms over a hundred; no key of any seed passes the bound under
+    /// either reading).
     ///
     /// The interval is the write's own and not the time since the heal, because the
     /// time since the heal is not the cluster's alone: with eight keys, two clients
@@ -2853,9 +2886,13 @@ impl Report {
             let took = op
                 .ret
                 .map(|ret| ret.duration_since(op.call.max(self.last_heal)));
-            let first = by_key.entry(op.op.key().clone()).or_default();
-            *first = match (*first, took) {
-                (Some(one), Some(another)) => Some(one.min(another)),
+            let worst = by_key.entry(op.op.key().clone()).or_default();
+            // The slowest of the key's post-heal writes, so that no quick write
+            // hides a slow one; `None` still means "none of them completed", which
+            // is the wedge, and a write still in flight when the run ended is not
+            // one (D-076's review).
+            *worst = match (*worst, took) {
+                (Some(one), Some(another)) => Some(one.max(another)),
                 (one, another) => one.or(another),
             };
         }
@@ -2940,12 +2977,14 @@ impl Report {
         }
         // Asked of the one-group server alone, and the reason is the node's, not a
         // convenience. D-078's follower compaction is the core asking its `apply` task
-        // for a `SnapshotAction::Record`, and the node's host counts that action and
-        // drops it: no record is written, no prefix is dropped, and a follower replica
-        // on the node has nothing bounding its in-memory log but the run's length. The
-        // bound is a bound on a mechanism this node does not run, so asking it here
-        // would be asserting a property nobody built — measured at 372 entries over a
-        // hundred seeds against the bound's 768, and growing with the tier, which is a
+        // for a `SnapshotAction::Record`, and the node's host has nowhere to send that
+        // action — it fails the run on one now (D-076's review), and the node scenario
+        // keeps every core below the threshold that would ask: no record is written, no
+        // prefix is dropped, and a follower replica on the node has nothing bounding
+        // its in-memory log but the run's length. The bound is a bound on a mechanism
+        // this node does not run, so asking it here would be asserting a property
+        // nobody built — measured at 372 entries over a hundred seeds against the
+        // bound's 768, and growing with the tier, which is a
         // nightly waiting to turn red on a claim the entry itself denies. The node's
         // sweep prints the distribution instead, and the slice that wires the
         // `snapshot` task owes the node its own bound.
@@ -2992,8 +3031,9 @@ impl Report {
     /// unimpaired replicas form a majority completes within [`LIVENESS_TIMEOUTS`]
     /// maximum election timeouts of the last heal (SHARD.md §8).
     ///
-    /// The bound is asked of each key some client wrote to after the heal
-    /// ([`Report::writes_after_heal_by_key`]), and of no other: a key no client
+    /// The bound is asked of every write to each key some client wrote to after the
+    /// heal — the slowest of them is what is read
+    /// ([`Report::writes_after_heal_by_key`]) — and of no other: a key no client
     /// wrote to in the window is no evidence of anything, and the two clients draw
     /// their keys at random. A key whose post-heal writes all stayed pending is the
     /// wedge this check is here to see. With no range left with a majority nothing
@@ -3005,7 +3045,18 @@ impl Report {
     /// write from its own call and so cannot carry that; the per-range one waits on
     /// no client's choice of key and so is not the client's idleness read as the
     /// cluster's (D-076).
-    fn liveness(&self) -> Result<(), String> {
+    ///
+    /// Public since PROPOSED D-086's merge with `main`: `sim/tests/node.rs` reads it
+    /// directly to attribute a wedge under a variant, because [`Report::check`]
+    /// reports a node's own failure first and a wedged range's clients retry their
+    /// reads into `READS_OUTSTANDING` (issue #125) before the liveness clause is
+    /// reached. Ask it as `check` does, of uniform schedules only (D-016).
+    ///
+    /// # Errors
+    ///
+    /// The violation, naming the key or the range and the bound.
+    // PROPOSED(D-086): the fold is readable on its own, so a wedge is attributed.
+    pub fn liveness(&self) -> Result<(), String> {
         let live = self.ranges_with_a_majority_up();
         if live.is_empty() {
             return Ok(());
@@ -3022,7 +3073,7 @@ impl Report {
                 Some(took) if took <= bound => {}
                 Some(took) => {
                     return Err(format!(
-                        "liveness: the first client write to {key} after the last heal took {took:?} from its own call, over {bound:?}"
+                        "liveness: the slowest client write to {key} after the last heal took {took:?} from its own call, over {bound:?}"
                     ));
                 }
                 None => {
@@ -5080,6 +5131,27 @@ impl Report {
         takes
     }
 
+    /// The most registered reads any one replica held at once in this run, with the
+    /// replica: the high-water mark `RaftReadsOutstanding` traces, which is the count
+    /// `READS_OUTSTANDING` is held to (PROPOSED D-076). `None` on a run that
+    /// registered no read.
+    // PROPOSED(D-086): a replica's registered reads' high-water mark is traced.
+    #[must_use]
+    pub fn reads_outstanding_worst(&self) -> Option<(u64, u64, u64)> {
+        self.records
+            .iter()
+            .filter_map(|record| match &record.event {
+                TraceEvent::RaftReadsOutstanding {
+                    server,
+                    range,
+                    outstanding,
+                } => Some((*outstanding, *server, *range)),
+                _ => None,
+            })
+            .max()
+            .map(|(outstanding, server, range)| (server, range, outstanding))
+    }
+
     /// Every take at an index its server had already taken at, that landed under a
     /// live stream of a snapshot at that index to some follower. Live means the
     /// stream showed itself on both sides of the take: before it, the stream's
@@ -5478,7 +5550,7 @@ impl Report {
             let Message::AppendEntriesResponse {
                 term: answered,
                 success,
-                incarnation,
+                refused,
                 ..
             } = message
             else {
@@ -5487,7 +5559,11 @@ impl Report {
             if *answered != term {
                 continue;
             }
-            if !*success && *incarnation == 0 {
+            // The refused mark, not incarnation 0: the same set of answers on this
+            // one-group sweep, where a refused server has no store, and the reading
+            // that carries to a node whose re-seed builds one.
+            // PROPOSED(D-087): D-049's rule keyed on a refused mark the answer carries.
+            if !*success && *refused {
                 open.entry((to, from))
                     .or_insert(Open {
                         leader: to,
@@ -5955,6 +6031,12 @@ impl StreamProgress {
                 }
                 false
             }
+            // A cap-wait, which the one-group receiver never sends: it has no cap
+            // (RAFT.md:214-218). If one arrived it would be the opposite of progress —
+            // nothing was staged and the stream stands exactly where it stood — and it
+            // is not a restart either, so it is neither counted nor credited.
+            // PROPOSED(D-090): a cap-wait is not progress and is not a start-over.
+            message::SnapshotStatus::Waiting => false,
             message::SnapshotStatus::More => {
                 let done = self
                     .sizes
@@ -6126,27 +6208,30 @@ pub fn node_config(id: u64, variants: impl Into<Variants>) -> NodeConfig {
 /// One node of the node cluster, configured as this scenario needs it: the raft
 /// sweep's tick, drift bound and clocks over [`crate::ranges`]'s four ranges.
 ///
-/// Two parameters are **not** the raft sweep's, and each is an absence this
-/// scenario asserts rather than leaves to be found (CLAUDE.md):
+/// `snapshot_threshold` is the caller's, because two scenarios run this node and
+/// stand on opposite sides of the snapshot path. The raft-arms sweep passes
+/// [`NODE_SNAPSHOT_THRESHOLD`], the one-group sweep's 12, so that every seed reaches
+/// the path — the takes, the records and the streams §10's four stream variants are
+/// measured on (PROPOSED D-086). `sim/quorum.rs` passes its own
+/// [`crate::quorum::NODE_SNAPSHOT_THRESHOLD`], `1 << 30`, which keeps the path
+/// unreached under that scenario's configuration: not because the `snapshot` task is
+/// not wired — it is, since PROPOSED D-083 — but because PROPOSED D-085's four answers
+/// and D-087's figures were measured with no stream toward the victim, and a threshold
+/// that opened one would move every one of their rates and tiers. That scenario
+/// asserts the absence its own threshold produces, with this reason, and the stream
+/// path is this sweep's to measure (D-082, D-086).
 ///
-/// - `snapshot_threshold` is far above what a run writes, where the one-group
-///   server's is 12. The node's host counts a snapshot action a core asks for in
-///   [`ananke_shard::server::Gaps`] and does nothing with it, because the `snapshot`
-///   task is not wired to the host in this tree: a small threshold would produce a
-///   stream of takes nobody serves and followers behind a prefix nobody streams. The
-///   sweep asserts that no snapshot action was asked for.
-/// - the disk does not rot ([`Cluster::bitrot`]), because a refusal stops the node.
-///
-/// Both are the same fact in two places: the node's install and refusal paths are
-/// other slices' and are not here. The variants that break them keep their Phase 2
-/// assertions on [`Cluster::OneGroup`] and are re-asserted on the node by the slice
-/// that builds the path (PROPOSED D-082).
+/// The disk does not rot on this cluster ([`Cluster::bitrot`]), which is the other
+/// parameter that is not the raft sweep's; its reason is with the figure.
 // PROPOSED(D-082): the arms are shared and the node is a second cluster of them.
+// PROPOSED(D-086): the threshold is the scenario's own — the sweep that reaches the
+// path passes 12, and a scenario whose rates were measured without it keeps `1 << 30`.
 #[must_use]
 pub fn node_server_config(
     id: u64,
     variants: impl Into<Variants>,
     node: NodeVariants,
+    snapshot_threshold: u64,
 ) -> ServerConfig {
     let mut engine = EngineConfig::new(PathBuf::from(DIR));
     engine.memtable_bytes = 16 * 1024;
@@ -6164,7 +6249,7 @@ pub fn node_server_config(
             variants: variants.into(),
             tick_nanos: u64::try_from(TICK.as_nanos()).expect("small"),
             drift_bound_ppm: DRIFT_BOUND_PPM,
-            snapshot_threshold: NODE_SNAPSHOT_THRESHOLD,
+            snapshot_threshold,
             ..RaftConfig::default()
         },
         engine,
@@ -8114,6 +8199,7 @@ mod tests {
                     applied: 374,
                     last_index: 374,
                     incarnation: 1,
+                    state: ananke_env::RecoveredAs::Neither,
                 },
             ),
             record(at, at, Some(server), term(server, 1, "follower", None)),
@@ -8318,6 +8404,7 @@ mod tests {
                     applied: 377,
                     last_index: 377,
                     incarnation: 1,
+                    state: ananke_env::RecoveredAs::Neither,
                 },
             ),
         ]
@@ -8892,6 +8979,9 @@ mod tests {
             applied: 0,
             last_index: 0,
             incarnation: 2,
+            // The replica this test lifts is one a re-seed marked and no install has
+            // filled: the state a restatement after Q15's refusal says (D-067).
+            state: ananke_env::RecoveredAs::Refused,
         };
         let with = |lift: Vec<TraceRecord>| {
             let mut all = vec![
@@ -9260,6 +9350,9 @@ mod tests {
                 applied: 0,
                 last_index: 0,
                 incarnation: 1,
+                // Nothing refused this replica: the rebuild is of the core alone, so
+                // its store carries no mark (D-081's `state` on a restatement).
+                state: ananke_env::RecoveredAs::Neither,
             },
             change_accepted(&[1, 2, 3, 4]),
             match_started(4, 1, 20),
@@ -9419,6 +9512,89 @@ mod tests {
                 "liveness: range {SINGLE_GROUP} took 2.505s after the last heal to \
                  complete a client write, over 2s"
             ))
+        );
+    }
+
+    /// The bound is asked of the *slowest* post-heal write to a key, not the
+    /// quickest (D-076's review). Reading each write from its own call made the
+    /// per-key fold's minimum mean "the fastest write to this key", which one quick
+    /// write hides every slow one behind; the maximum is what asks the bound of
+    /// every post-heal write there is.
+    ///
+    /// The pair (CLAUDE.md:52-57) is the history the review planted: a key asked
+    /// for 10 ms after the heal and served at 2.9 s, with a second write to it
+    /// served in 10 ms, beside a key of the same range served throughout. The
+    /// quickest reading passes it at 10 ms and the per-range reading passes it at
+    /// 30 ms — the live key's own completion — so the per-key maximum is the only
+    /// thing in the tree that fails it, and this asserts both halves.
+    // PROPOSED(D-076): the write bound is asked of every post-heal write.
+    #[test]
+    fn the_write_bound_is_asked_of_the_slowest_write_to_a_key_not_the_quickest() {
+        let write = |key: &str, call: u64, ret: Option<u64>| lin::Op {
+            process: 1,
+            seq: 0,
+            call: ms(call),
+            ret: ret.map(ms),
+            op: ClientOp::Put {
+                key: Bytes::from(key.to_owned()),
+                value: Bytes::from_static(b"v"),
+            },
+            result: ret.map(|_| ananke_env::ClientResult::Done),
+        };
+        let live = vec![record(
+            ms(0),
+            ms(0),
+            Some(1),
+            term_of(1, SINGLE_GROUP, 1, "follower"),
+        )];
+        let hidden = Report {
+            history: History {
+                ops: vec![
+                    write("k1", 5, Some(30)),
+                    write("k0", 10, Some(2900)),
+                    write("k0", 2950, Some(2960)),
+                ],
+                ..History::default()
+            },
+            ..report(live, Vec::new())
+        };
+        let bound = election_max() * LIVENESS_TIMEOUTS;
+        assert_eq!(
+            bound,
+            Duration::from_secs(2),
+            "the bound this case is about"
+        );
+        // The buggy half, written out: the quickest post-heal write to k0 is the
+        // second one, 10 ms, and nothing about it is evidence of the first.
+        let quickest = hidden
+            .history
+            .ops
+            .iter()
+            .filter(|op| op.op.key() == &Bytes::from_static(b"k0"))
+            .filter_map(|op| {
+                op.ret
+                    .map(|ret| ret.duration_since(op.call.max(hidden.last_heal)))
+            })
+            .min();
+        assert_eq!(quickest, Some(Duration::from_millis(10)));
+        // What the check reads, and what it says.
+        assert_eq!(
+            hidden.writes_after_heal_by_key()[&Bytes::from_static(b"k0")],
+            Some(Duration::from_millis(2890))
+        );
+        assert_eq!(
+            hidden.liveness(),
+            Err(
+                "liveness: the slowest client write to k0 after the last heal took 2.89s \
+                 from its own call, over 2s"
+                    .to_owned()
+            )
+        );
+        // And the range's own reading passes it: the range completed a write 30 ms
+        // after the heal, so this one is the per-key check's to catch or nobody's.
+        assert_eq!(
+            hidden.writes_after_heal_by_range()[&SINGLE_GROUP],
+            Some(Duration::from_millis(30))
         );
     }
 

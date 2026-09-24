@@ -93,6 +93,15 @@ const OP_GAP: Duration = Duration::from_millis(5);
 /// The liveness window, in maximum election timeouts (`raft::LIVENESS_TIMEOUTS`).
 const LIVENESS_TIMEOUTS: u32 = 10;
 
+/// The cores' snapshot threshold: this scenario's own, far above what this run's
+/// clients write, so that no core asks for a take, a record or an install. The node
+/// has had its `snapshot` task since D-083; this scenario asserts that path *absent*
+/// (SHARD.md §4), and the absence is honest only while this threshold keeps the path
+/// unreached (the owner's ruling, 2026-09-24: the threshold is each scenario's own).
+// PROPOSED(D-076): the snapshot threshold is the scenario's, and a run that reaches
+// it fails.
+pub const SNAPSHOT_THRESHOLD: u64 = 1 << 30;
+
 /// The ranges configuration fixes, with the span each holds: four contiguous spans
 /// over the keys `k0..k7`, two keys each.
 ///
@@ -313,9 +322,14 @@ impl Report {
         by_range
     }
 
-    /// The longest a client's first write to any key of a live range took after the
-    /// last heal, and the bound it ran under: the write bound's margin, per key and
-    /// per range (SHARD.md §8; D-071 measured it with one range).
+    /// The longest any client write to a key of a live range took after the last
+    /// heal, and the bound it ran under: the write bound's margin, per key and per
+    /// range (SHARD.md §8; D-071 measured it with one range).
+    ///
+    /// The slowest such write and not the key's first one: measured from its own
+    /// call, a key's *first* post-heal completion is not its smallest interval, so
+    /// the fold this reads is the maximum over a key's post-heal writes
+    /// ([`raft::Report::writes_after_heal_by_key`], D-076's review).
     ///
     /// `asked` restricts it to the runs the bound is *asked* of: a uniform schedule
     /// (D-016 asks time only of those) with a range whose unimpaired replicas form a
@@ -594,11 +608,10 @@ impl Report {
             .map_err(|violation| format!("seed {seed}: {violation}"))?;
         self.frames_are_this_nodes()
             .map_err(|violation| format!("seed {seed}: {violation}"))?;
-        // The paths this slice's node does not have, asserted absent with the
-        // reason (CLAUDE.md:58-67): the `snapshot` task keyed by range and follower,
-        // Q15's refusal and re-seed, and follower compaction are the other Stage B
-        // slices'. The scenario keeps the cores below their snapshot threshold and
-        // rots no bit, so neither is reached; the day a schedule reaches one, this
+        // The paths this scenario asserts absent, with the reason (CLAUDE.md:58-67):
+        // the snapshot path and Q15's refusal and re-seed are other scenarios' subjects
+        // on the node. The scenario keeps the cores below its own snapshot threshold
+        // and rots no bit, so neither is reached; the day a schedule reaches one, this
         // says so instead of passing over it.
         if let Some(action) = self
             .records()
@@ -609,9 +622,8 @@ impl Report {
             })
         {
             return Err(format!(
-                "seed {seed}: server {} took or restated a snapshot of range {}, a path this \
-                 scenario's node does not have: the `snapshot` task keyed by range and follower \
-                 is another slice's",
+                "seed {seed}: server {} took or restated a snapshot of range {}: this scenario \
+                 asserts that path absent, and its own `snapshot_threshold` is what keeps it so",
                 action.0, action.1
             ));
         }
@@ -660,6 +672,19 @@ pub fn config(seed: u64, schedule: &Schedule) -> SimConfig {
 /// One node's configuration: its ranges, and the voters each starts with.
 #[must_use]
 pub fn server_config(id: u64, variants: impl Into<Variants>, node: NodeVariants) -> ServerConfig {
+    server_config_of(id, variants, node, ranges(), SNAPSHOT_THRESHOLD)
+}
+
+/// The same, with the ranges named: what the directed scenario for D-057's keying
+/// runs, where a node holds three of the four (SHARD.md §2).
+#[must_use]
+pub fn server_config_of(
+    id: u64,
+    variants: impl Into<Variants>,
+    node: NodeVariants,
+    ranges: Vec<Range>,
+    snapshot_threshold: u64,
+) -> ServerConfig {
     let mut engine = EngineConfig::new(PathBuf::from(DIR));
     engine.memtable_bytes = 16 * 1024;
     engine.segment_bytes = 16 * 1024;
@@ -668,15 +693,16 @@ pub fn server_config(id: u64, variants: impl Into<Variants>, node: NodeVariants)
         id: ServerId(id),
         listen: server_addr(id),
         servers: (1..=NODES).map(|s| (ServerId(s), server_addr(s))).collect(),
-        ranges: ranges(),
+        ranges,
         initial_voters: (1..=NODES).map(ServerId).collect(),
         raft: RaftConfig {
             variants: variants.into(),
             tick_nanos: u64::try_from(TICK.as_nanos()).expect("small"),
-            // Far above what this run's clients write: no core reaches its
-            // threshold, so no take is asked for and the `snapshot` task this node
-            // has not got is never wanted. `Report::check` asserts that absence.
-            snapshot_threshold: 1 << 30,
+            // [`SNAPSHOT_THRESHOLD`] is far above what this run's clients write: no
+            // core reaches it, so no take is asked for. `Report::check` asserts that
+            // absence, and `asking_for_snapshots` is the directed run that reaches
+            // it and fails.
+            snapshot_threshold,
             ..RaftConfig::default()
         },
         engine,
@@ -687,10 +713,23 @@ pub fn server_config(id: u64, variants: impl Into<Variants>, node: NodeVariants)
 }
 
 fn spawn_node(sim: &Sim, at: NodeId, id: u64, variants: Variants, node: NodeVariants) {
+    spawn_node_of(sim, at, id, variants, node, ranges(), SNAPSHOT_THRESHOLD);
+}
+
+fn spawn_node_of(
+    sim: &Sim,
+    at: NodeId,
+    id: u64,
+    variants: Variants,
+    node: NodeVariants,
+    ranges: Vec<Range>,
+    snapshot_threshold: u64,
+) {
     let env = sim.env(at);
     let inner = env.clone();
     env.spawn("node", async move {
-        let _ = ananke_shard::server::run(inner, server_config(id, variants, node)).await;
+        let config = server_config_of(id, variants, node, ranges, snapshot_threshold);
+        let _ = ananke_shard::server::run(inner, config).await;
     });
 }
 
@@ -708,6 +747,26 @@ fn spawn_node(sim: &Sim, at: NodeId, id: u64, variants: Variants, node: NodeVari
 // PROPOSED(D-076): each core seeded per range, and the scenario that says so.
 #[must_use]
 pub fn alone(seed: u64, for_: Duration) -> Vec<TraceRecord> {
+    alone_of(seed, for_, ranges(), NodeVariants::correct())
+}
+
+/// The same node alone, holding the ranges named and running the variants given.
+///
+/// Holding *three* of the four is what says the cores are seeded per range and not
+/// off one stream (D-076's review): under D-057's keying the three ranges draw the
+/// same seeds they drew beside the fourth, and under
+/// [`NodeVariant::OneSeedForEveryCore`] they draw the node's first three instead of
+/// its last three and every one of their timers moves.
+///
+/// [`NodeVariant::OneSeedForEveryCore`]: ananke_shard::variant::NodeVariant::OneSeedForEveryCore
+// PROPOSED(D-076): each core seeded per range, and the scenario that says so.
+#[must_use]
+pub fn alone_of(
+    seed: u64,
+    for_: Duration,
+    ranges: Vec<Range>,
+    node: NodeVariants,
+) -> Vec<TraceRecord> {
     let schedule = Schedule {
         warmup: for_,
         faults: Vec::new(),
@@ -715,8 +774,16 @@ pub fn alone(seed: u64, for_: Duration) -> Vec<TraceRecord> {
         settle: Duration::ZERO,
     };
     let mut sim = Sim::new(config(seed, &schedule));
-    let node = sim.add_node();
-    spawn_node(&sim, node, 1, Variants::default(), NodeVariants::correct());
+    let at = sim.add_node();
+    spawn_node_of(
+        &sim,
+        at,
+        1,
+        Variants::default(),
+        node,
+        ranges,
+        SNAPSHOT_THRESHOLD,
+    );
     sim.run_for(for_);
     sim.trace()
 }
@@ -991,6 +1058,28 @@ pub fn refusal(records: &[TraceRecord]) -> Refusal {
     read
 }
 
+/// The scenario run with a snapshot threshold this run's cores do cross: the
+/// directed case for the absence [`Report::check`] asserts on every seed of every
+/// tier.
+///
+/// D-076's review set this threshold to twelve and found every check in the tree
+/// green over the actions the then-unwired node dropped; the node has served them
+/// since D-083. What this run proves is the *scenario's* assertion: at twelve every
+/// core takes a snapshot, the trace carries the `RaftSnapshot` records, and
+/// [`Report::check`] fails naming the absence it asserts (CLAUDE.md:58-67).
+// PROPOSED(D-076): the snapshot threshold is the scenario's, and a run that reaches
+// it fails.
+#[must_use]
+pub fn asking_for_snapshots(seed: u64, snapshot_threshold: u64) -> Report {
+    run_with_of(
+        seed,
+        Schedule::draw(seed),
+        Variants::default(),
+        NodeVariants::correct(),
+        snapshot_threshold,
+    )
+}
+
 /// When each range first campaigned: the time of the first pre-vote its replica
 /// sent, read off the frames themselves.
 #[must_use]
@@ -1016,6 +1105,24 @@ pub fn first_campaigns(records: &[TraceRecord]) -> BTreeMap<u64, Instant> {
         }
     }
     first
+}
+
+/// The whole tick each range first campaigned on: its first pre-vote's instant
+/// divided by the node's tick.
+///
+/// An election timeout is a whole number of ticks and the node's ticker is the only
+/// thing that moves one in [`alone`], so this is the timeout the range's core drew,
+/// read off the trace and rounded to the tick that carried it — which is what two
+/// runs of one seed can be compared on without comparing the nanoseconds of a round
+/// whose work differs between them.
+// PROPOSED(D-076): each core seeded per range, and the scenario that says so.
+#[must_use]
+pub fn first_campaign_ticks(records: &[TraceRecord]) -> BTreeMap<u64, u64> {
+    let tick = u64::try_from(TICK.as_nanos()).expect("a tick fits");
+    first_campaigns(records)
+        .into_iter()
+        .map(|(range, at)| (range, at.as_nanos() / tick))
+        .collect()
 }
 
 /// The leader of `range` now: the server of the latest `RaftLeader` of that range,
@@ -1197,13 +1304,36 @@ pub fn run_with(
     variants: impl Into<Variants>,
     node_variants: NodeVariants,
 ) -> Report {
+    run_with_of(seed, schedule, variants, node_variants, SNAPSHOT_THRESHOLD)
+}
+
+/// The scenario for `seed` with the cores' snapshot threshold named: what the
+/// directed run for the snapshot absence sets (see [`asking_for_snapshots`]).
+// PROPOSED(D-076): the snapshot threshold is the scenario's, and a run that reaches
+// it fails.
+#[must_use]
+pub fn run_with_of(
+    seed: u64,
+    schedule: Schedule,
+    variants: impl Into<Variants>,
+    node_variants: NodeVariants,
+    snapshot_threshold: u64,
+) -> Report {
     let variants = variants.into();
     let mut sim = Sim::new(config(seed, &schedule));
     let nodes: Vec<NodeId> = (0..NODES as usize).map(|_| sim.add_node()).collect();
     let clients: Vec<NodeId> = (0..CLIENTS).map(|_| sim.add_node()).collect();
     let stats: Vec<Arc<Mutex<ClientStats>>> = (0..CLIENTS).map(|_| Arc::default()).collect();
     for id in 1..=NODES {
-        spawn_node(&sim, nodes[id as usize - 1], id, variants, node_variants);
+        spawn_node_of(
+            &sim,
+            nodes[id as usize - 1],
+            id,
+            variants,
+            node_variants,
+            ranges(),
+            snapshot_threshold,
+        );
     }
     for (i, &node) in clients.iter().enumerate() {
         let env = sim.env(node);

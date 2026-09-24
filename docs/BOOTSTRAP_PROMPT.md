@@ -101,6 +101,55 @@ ananke/
 
 _Update this section at the end of every session._
 
+- Merge update (2026-09-24): PR #109 (`phase-3-stage-b-stream-variants`, PROPOSED
+  D-086, carrying #123's D-089 and D-091) merged `origin/main` at c178682 under the
+  owner's ruling, to be gated, nightly-run and merged by the same session. Six files
+  conflicted and were resolved the house way: `docs/DECISIONS.md` as the ordered union
+  D-084 to D-091 with one footer at D-092 (no number collided); the shard table as a
+  checked union of 129 rows, each in its own side's shard, every header recomputed (the
+  night is now bounded by shard 3 at about 15 % over the ideal, which is the re-placement
+  question D-086's re-weigh note already leaves with the owner); both sides' status
+  bullets; and `node.rs`/`round.rs`, where both sides had fixed the same two bugs — taken
+  as D-081's versions, which carry a variant each, with D-086's provenance beside them.
+  **Three absence checks the merge made stale were re-read, not deleted** (D-086, "On the
+  merge with `main`"): the node's snapshot threshold is each scenario's own — 12 for the
+  raft-arms sweep that measures the path, `1 << 30` for `sim/membership.rs` and the
+  sharded `sim/quorum.rs`, whose rates were measured with it unreached (extending D-084
+  and D-085 to the path is the owner's); a store refused on the node is **counted and
+  D-077's fan-out asserted of it**, after #123's nightly reached one on 1 of 10 000 seeds
+  against a tripwire that said #86 was not in the tree (0 on the merged tree's thousand);
+  and every "the day PR #NNN lands" clause naming a landed PR was re-read, with three
+  tests renamed to what is true. **`READS_OUTSTANDING` re-measured by D-076's own rule
+  on the merged tree**: the worst a replica held over a thousand seeds in release was 16
+  under the raft arms on the node (seed 644), 19 on the sharded quorum scenario, 4 on
+  `ranges` and membership, so the bound is **38**, and the high-water mark is now traced
+  (`RaftReadsOutstanding`) and printed at every tier. The owner's provenance is in point
+  12 — the original 4 was measured on a node that never ran `RetakeUnderStream`, #109
+  brought that arm onto the node, and the bound was never wrong for the tree it was
+  measured on, *at the tier it was measured at*: `main`'s own nightly on c178682 (run
+  36008940158, seed 297) found 9 against 8 with no such arm, and the same trip was
+  reported there as five variants caught, which D-091's attribution on this branch is
+  shown to close. The alternative the owner declined — not counting a client's
+  superseded retries — is issue #125, due in Phase 4. `RefusedReadLeft`'s pair, re-measured
+  with the new bound: **0 of 1 000** on `sim/ranges.rs` at 38, whose runs are too short
+  for the leak to reach it, so the catch is asserted under the raft arms on the node —
+  **108 of 1 000 (10.8 %)**, 8 of 100, 2 of 20, every one by the bound — from the
+  hundred-seed tier, and `ranges` keeps the leak's firing at every tier (D-076 point
+  12). **The read bound turned out to be a wedge's second reporter**: under
+  `SharedSnapshotDir` a wedged range's clients retry into the bound before `check()`
+  reaches liveness, and on non-uniform schedules the bound is the wedge's only reporter,
+  so the two wedge tests read the wedge from the liveness fold itself and tell a trip
+  with no wedge apart by running the correct node on the seed (the node's failure, or
+  the variant's load — seeds 41 and 74 at the thousand tier); 20 of 100 wedged by the
+  check's own reading, the pair the stream half alone on 28 of 100 seed for seed, no
+  assertion moved (D-086). And D-081's re-seed shape, run for the first time on a tree
+  with this branch's stream fixes, has its `ServeBeforeRefusedMark` plant run past the
+  runaway cap on seed 7 (401 151 records against 350 130 on `main`, the re-seeded node
+  now serving), which hid clause (c)'s evidence behind the cap: (c) is asked before the
+  cap, by D-081's own reasoning for asking it before (a); the correct shape is green on
+  all 200 of its cap (D-086). The nightly is dispatched on this tip and the merge
+  follows its verdict.
+
 - Branch `phase-3-stream-arms-aimed`, the owner's second ruling applied
   (2026-09-24): **the timer check gains a fourth arm for the node's live install**
   (PROPOSED D-091), and **a catch on the node is attributed to the variant's own
@@ -137,6 +186,7 @@ _Update this section at the end of every session._
   over that thousand closed, 11 946 on the restatement at its own switch. Five mutations
   planted, five caught. Nothing is widened: `TIMER_TIMEOUTS`, the bound and
   every trace and schedule are untouched.
+
 - Branch `phase-3-stream-arms-aimed`, stacked on `phase-3-stage-b-stream-variants`
   (2026-09-23): **the two stream arms aim their victim at a range it lags**
   (PROPOSED D-089), which is the owner's ruling on what D-086 took to them.
@@ -169,6 +219,87 @@ _Update this section at the end of every session._
   thousand-seed tier is red on those two seeds until it is made.** *The owner made it,
   and the bullet above is the answer: PROPOSED D-091 on this branch, whose pin replaces
   this one's — the two seeds are green for the reason the ruling gives.*
+
+- Branch `phase-3-stream-restarts-cap-wait` (2026-09-23), PROPOSED D-090, stacked on
+  PR #107: the node gets RAFT.md:210-212's restart bound — `Outbound`'s `Counted`
+  carrying the two counters both bounds are made of, `STREAM_RESTARTS = 2`, the third ask
+  counting the checkpoint unusable — and the answer that keeps it from counting the wrong
+  thing, `SnapshotStatus::Waiting` for a cap-wait.
+  **Two bounds were measured and one of them is a finding, not a fix.** `CHUNK_RESENDS`
+  was going to be corrected 4 to 8, the number RAFT.md:210 states and the node's own
+  comment claimed — and the correct node trips it at *both* numbers, 3 781 give-ups at 4
+  and 2 112 at 8 over 32 seeds, because the receiver answers nothing while an install
+  decision is pending and the sender counts that silence as a lost chunk. Left at 4 and
+  filed as **issue #120** rather than widened (D-030, D-039). And on the cap-wait's own
+  bound: bounding a cap-wait by `CHUNK_RESENDS` ran to ten consecutive waits on one
+  stream with four ranges over a cap of two, so a cap-wait is now counted against no
+  give-up bound at all — a slot is granted to a stream *that is asking* (RAFT.md:218-220),
+  so a bound on the asking is a bound on the mechanism. Measured at 100 seeds in release
+  with the cap at two over four ranges: 800 cap-waits on the correct node against 2 151 as
+  it stood, and a worst single stream, receiver-side, of six asks in a row against
+  forty-four; 800 of 800 installs and 100 of 100 green in all three configurations. The
+  pair is deterministic in `ananke_shard::install` — `CapWaitIsAStartOver`, which a node of
+  one range cannot be wrong about, and `RestartsNotCounted` — and the review of this branch
+  added a third check beside them, for what the node *records* rather than what it decides:
+  the resend counter a cap-wait must clear and the restart counter a start-over must
+  increment were both deletable with the whole suite green, and are not now.
+
+- Branch `phase-3-lease-tier-nightly` (2026-09-23), PROPOSED D-088, off `origin/main` at
+  `03e1829`: the owner's ruling on `LeaseTrustsTheClock`'s tier on the node. Its catch —
+  a stale read found by linearizability — asserts from the **nightly's ten thousand**
+  instead of the thousand-seed tier, because the node's own rate is **78 of 10 000
+  (0.78 %)** and **6 of 1 000 (0.60 %)**, re-measured on this tree, against the one-group
+  server's 4.0 %. At 0.78 % a thousand seeds catch none with probability 4.0e-4 and ten
+  thousand with 9.8e-35, where the one-group assertion this tier was copied from sits at
+  1.9e-18. One comparison changes, `if seeds >= 1000` to `if seeds >= 10_000`; the rate
+  keeps printing at every tier and the one-group assertion is untouched. The assertion was
+  *proved to fire*: with the sweep stubbed to no seeds it fails at 10 000 and passes at
+  1 000, and the same stub with the gate at 100 000 passes at 10 000 — the stream-variants
+  slice's bug, reproduced deliberately so this slice could be shown not to have it.
+
+- Branch `phase-3-d049-refused-mark-key` (2026-09-23), PROPOSED D-087, on the owner's
+  ruling on issue **#116**: D-049's rule is keyed on **a refused mark the answer carries**
+  rather than on a rejection stamped incarnation 0. The incarnation says *which* store
+  answered (D-042); whether that store holds anything of the log is a different question,
+  and the old key answered it by a coincidence the one-group server has and D-077's node
+  does not. `AppendEntriesResponse` gains a `refused` bit, carried in the byte `success`
+  already occupied so no frame changed length and no schedule could move; the one-group
+  re-seed loop sets it literally and the core sets it from `Raft::refused()`, *quarantined
+  and holding nothing of this log yet*. **The one-group server did not move**: all four
+  D-049 tests are figure for figure identical at 20, 100 and 1 000 seeds, including the
+  sweep's-disk control's failing-seed lists. **The node has the rule's site now**: 282
+  marked rejections over 1 000 seeds where the old key saw 0, the 6 679 D-085 counted
+  splitting exactly into 6 397 unmarked and 282 marked, 0 answers from no store, and a
+  step-down naming a follower `uncounted` where D-085 measured none in 1 394. The pair,
+  `RefusedCountsForQuorum` and `RefusedNeverCounts`, is **still caught 0 of 1 000 there**,
+  now for one reason and not two: nothing on the node compacts, so a re-seeded replica
+  answers a marked rejection and then a success inside the same window. §10's exit
+  criterion for the pair on a sharded `sim/quorum.rs` is still owed, and its one remaining
+  blocker is PR #107's wiring. **After review**, two mutations this slice had not
+  anticipated are closed: the mark computed once per node and stamped on its other three
+  replicas — caught 20 of 20 and 1 000 of 1 000 by a new per-range clause, the dual of the
+  one that was already there — and `Raft::refused()` with its `quarantined` conjunct
+  dropped, caught by a new gate-tier test that reads the predicate itself, which no test in
+  the tree did.
+
+- Branch `phase-3-stage-b-quorum` (2026-09-23), PR #104, PROPOSED D-085: `origin/main`
+  merged in (carrying PR #86's whole-node refusal and re-seed, D-077), and the sharded
+  `sim/quorum.rs` built on the node — `quorum::node_run`: three nodes of four ranges, one
+  `mark_store_lost` refusing the node and all four replicas it holds, the third node cut
+  off, and check quorum asked of each range's own leader about that one node. The correct
+  system passes every seed at every tier (0 of 1 000 in release);
+  `NodeVariant::RefuseOneRangeOnly` is caught 1 000 of 1 000. **The finding**: D-049's own
+  pair, `RefusedCountsForQuorum` and `RefusedNeverCounts`, still has **no site** on the
+  node and PR #107 will not give it one. The rule is keyed on a rejection stamped
+  incarnation 0 — a server with *no store* — and D-077's node rebuilds every range's store
+  in a fresh engine before it serves, so it never sends one: 0 such rejections over 1 000
+  seeds, `uncounted` empty in all 1 394 step-downs, both variants caught 0 of 1 000. The
+  hazard D-049 fixed therefore returns on the node the day a leader can compact past a
+  re-seeded replica; that goes to the owner beside issue #103. Stage B's first exit
+  criterion for `sim/quorum.rs` is met for the scenario and still owed for §10's pair.
+  (Issue #116 was filed on this finding and the owner ruled: the key changed rather than
+  the re-seed. PROPOSED D-087, above, is that change and its re-measurement.)
+
 - Branch `phase-3-stage-b-stream-variants`, stacked on the snapshot wiring
   (2026-09-22): **the node reaches the stream path**, and Phase 2's four stream
   variants are measured on it (PROPOSED D-086). The node's `snapshot_threshold` drops
@@ -225,6 +356,39 @@ _Update this section at the end of every session._
   100/100 and arm 1/100 unmoved, scramble 17 → 29/100, catch 30 → 26/100. The correct
   node's own asks moved with them — 5 849 over 100 seeds against 5 912, 58.5 a seed
   against 59.1 — and the take-counter property it stands on is unmoved at 0 of 100.
+
+- Branch `phase-3-stage-b-membership` (2026-09-22), stacked on
+  `phase-3-stage-b-sweeps` (PR #101, PROPOSED D-082): **`sim/membership.rs` on the
+  node** (PROPOSED D-084), the second of Stage B's first exit criterion's three
+  scenarios. The scenario is one body of code driven against either of D-082's two
+  clusters: five one-group servers as before, byte for byte — seed 7's JSONL hashes to
+  `24358ff2…` on this branch and on the base — or five nodes of **four ranges each**,
+  3 → 5 → 3 on **every** range. The half of issue #46's extension four ranges make
+  possible is built and asserted on every seed: **a change of a range while another
+  range on the same node is changing**. The half they cannot reach — a joining server
+  fed by a snapshot in its learner phase — stays asserted on the one-group server and
+  is asserted *absent with its reason* on the node, whose `snapshot` task is not wired
+  (that slice follows D-082's). `SingleMajorityInJointConsensus` is re-asserted on the
+  node at 14 of 100 seeds against the one-group server's 19, above D-061's five per
+  cent, so its tier does not move. Liveness and availability became **per range** on
+  measured bounds (a range's gap 1.33 s at 1 000 seeds against 5 s; its first write
+  after a heal 1.81 s against 6 s). Eleven mutations were planted one at a time and ten
+  caught, six of them only because a guard was added for them; the review's round found
+  three checks asserting less than their names claimed, and the fixes are a **witness**
+  on the overlap fold (the answer checked against the trace read backwards — 0 of 100
+  unwitnessed correct, 38 of 100 for a fold that never clears its state), the side the
+  partition actually cut, and the ranges the transfer was asked for. **Two findings**,
+  both from the nightly's shard 3, red on 33 of 10 000 seeds, each seed re-run and
+  classified: 30 are **issue #81** — a voter removed and re-added inside one leader's
+  term, whose fix is PR #89 — and **3, seeds 6097, 7759 and 7887, were this slice's own
+  per-seed overlap clause**, tripped by **the scenario's own parameter and not by the
+  node**. `RANGE_STAGGER_MAX_MS` was 25 ms, the top of the range its own doc comment
+  names as the one that serialises the four changes. **The parameter was fixed, not the
+  clause** (D-030, D-039), and the value chosen on a ten-candidate measurement at 1 000
+  seeds: 2 ms, one of only two caps leaving no seed one step from failure, against
+  16.6 % of seeds at 25 ms. At 2 ms the overlap is witnessed on 1 000 of 1 000 and the
+  gate and CI are green; the ten-thousand tier is re-run on the fixed tip.
+
 
 - Merge update (2026-09-22): branch `phase-3-stage-b-compaction` merged `origin/main`
   to resolve PR conflicts, carrying in PROPOSED D-073 and D-074 from main and keeping

@@ -667,6 +667,17 @@ pub enum TraceEvent {
         // D-042: store incarnations, so a leader forgets what a
         // re-seeded follower forgot.
         incarnation: u64,
+        /// What the disk said this replica is: marked refused and waiting for its
+        /// re-seed, re-seeded and quarantined for the rest of its life on that
+        /// store, or neither ([`RecoveredAs`]).
+        ///
+        /// A refusal is the node's and is traced once ([`TraceEvent::RaftRefused`]);
+        /// what a *replica* carries out of it is per replica, and a restart is where
+        /// it can be read. Without this field a replica that lost its refused mark
+        /// in a crash restates exactly like one that never had anything to lose.
+        // PROPOSED(D-081): a restatement says whether the replica is refused,
+        // quarantined or neither (D-067).
+        state: RecoveredAs,
     },
     /// A Raft leader proposed a client's request as a log entry (RAFT.md §4): the
     /// link from an operation of the history to the entry that carries it, so an
@@ -695,6 +706,22 @@ pub enum TraceEvent {
         server: u64,
         /// Why.
         reason: String,
+    },
+    /// The most reads a replica has held registered at once so far, traced each time
+    /// that high-water mark rises: at the registration, where the map is at its
+    /// largest, and at a refusal, where a registration left behind first shows. A
+    /// handful of records a run, and the number `READS_OUTSTANDING` is checked
+    /// against, so a tier reads its worst instead of learning it from the failure
+    /// string of the first seed over the bound (PROPOSED D-076; the node's bound was
+    /// sized at a thousand seeds and main's nightly found nine against eight).
+    // PROPOSED(D-086): a replica's registered reads' high-water mark is traced.
+    RaftReadsOutstanding {
+        /// The server.
+        server: u64,
+        /// The range the replica is of.
+        range: u64,
+        /// The reads it holds registered now, more than it ever held before.
+        outstanding: u64,
     },
     /// One replica of a node whose shared engine was refused whole (Q15; SHARD.md
     /// §11, storage 8, §12's "A loss in the shared engine").
@@ -1365,6 +1392,45 @@ impl ApplyEffect {
     }
 }
 
+/// How a replica restated at its node's start: the `state` of
+/// [`TraceEvent::RaftRecovered`].
+///
+/// The three are what the store can tell apart, and the order they happen in. A
+/// replica of a node whose shared engine lost state is marked refused before it
+/// serves (Q15, D-077): the quarantine flag and a fresh incarnation in one synced
+/// batch. It waits in that state for its leader's stream, and once the stream's
+/// install fills it the flag stays for the rest of its life on that store (D-035),
+/// which is [`RecoveredAs::Quarantined`]. [`RecoveredAs::Neither`] is every replica
+/// that never lost anything — and, on a node that wrote its mark unsynced, the
+/// replica that lost the mark in a crash, which is the whole of what
+/// `ReseedMarkNotSynced` does (D-067).
+// PROPOSED(D-081): a restatement says whether the replica is refused, quarantined
+// or neither (D-067).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
+pub enum RecoveredAs {
+    /// Marked refused, with no state of its own yet: the mark a re-seed wrote is on
+    /// the disk and no install has filled the replica.
+    Refused,
+    /// Quarantined on state an install gave it: the mark is on the disk and the
+    /// replica holds a snapshot the install left (D-035).
+    Quarantined,
+    /// Neither: a replica whose store carries no mark.
+    Neither,
+}
+
+impl RecoveredAs {
+    /// The name the moirae bridge writes.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RecoveredAs::Refused => "refused",
+            RecoveredAs::Quarantined => "quarantined",
+            RecoveredAs::Neither => "neither",
+        }
+    }
+}
+
 /// Why a replica was created (SHARD.md §8): the `cause` of
 /// [`TraceEvent::RangeCreated`].
 // PROPOSED(D-069): defined here; emitted by the stage that builds what it reports.
@@ -1403,6 +1469,14 @@ pub enum StartOver {
     /// The node is assembling as many streams as its per-node cap allows and this is
     /// not one of them. Nothing was written and no other assembly was disturbed; the
     /// stream takes a slot by asking again once one is free (Q14, D-075).
+    ///
+    /// This one is answered `SnapshotStatus::Waiting` rather than `Restart`, and is
+    /// **not** counted against RAFT.md:210-212's restart bound: a stream waiting its
+    /// turn has covered no ground it must cover again, and a node's receive cap sits
+    /// below its range count on purpose, so counting these would declare a usable
+    /// checkpoint unusable as a matter of routine (D-090). The event is still this
+    /// event — a reason on it is how a check tells a cap-wait from an identity change.
+    // PROPOSED(D-090): a cap-wait is answered as a wait, not as a start-over.
     Cap,
     /// The staged bytes could not be used: the directory was short, the engine refused
     /// the source, or the stream carried no snapshot record for this range.
