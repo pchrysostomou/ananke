@@ -147,8 +147,18 @@ _Update this section at the end of every session._
   runaway cap on seed 7 (401 151 records against 350 130 on `main`, the re-seeded node
   now serving), which hid clause (c)'s evidence behind the cap: (c) is asked before the
   cap, by D-081's own reasoning for asking it before (a); the correct shape is green on
-  all 200 of its cap (D-086). The nightly is dispatched on this tip and the merge
-  follows its verdict.
+  all 200 of its cap (D-086). **The first nightly on the merged tip (run 36049438254)
+  was red on one seed of ten thousand, 3164, on both shards that run it** — and the
+  mechanism is the per-key liveness reading, not the node: the key's only post-heal
+  write was a CAS issued 47 ms before the run's end and proposed by a live leader, which
+  `writes_after_heal_by_key` read as "none completed"; `677cad3` fails it identically,
+  masked there by the tripwire that panicked first. The reading now leaves out a write
+  pending at the run's end inside the bound, as its own comment claimed (D-086); every
+  figure re-measured, `SharedSnapshotDir` 20 → 17 of 100 and the pair 28 → 25. The
+  same run held the read bound at ten thousand — worst 19 against 38, the tier's own
+  measurement — and counted the one refusal (seed 6695, a torn record) with D-077's
+  fan-out holding. The nightly is re-dispatched on the fixed tip and the merge follows
+  its verdict.
 
 - Branch `phase-3-stream-arms-aimed`, the owner's second ruling applied
   (2026-09-24): **the timer check gains a fourth arm for the node's live install**

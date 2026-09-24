@@ -2826,6 +2826,43 @@ impl Report {
             .min()
     }
 
+    /// The run's end: the schedule's whole duration from the origin, which is where
+    /// the simulation stops — not the last record, which a run's quiet tail leaves
+    /// behind and which a hand-built trace has nowhere near the run's length.
+    fn end(&self) -> Instant {
+        Instant::default() + self.schedule.total()
+    }
+
+    /// The post-heal writes the two liveness readings are asked of: every client
+    /// write called at or after the last heal, **except one still pending at the
+    /// run's end with the bound not yet run out since its call**. That write is no
+    /// evidence either way — the run ended before the bound could say whether it
+    /// would complete — which is what D-076's review said of a write in flight at
+    /// the end and how a write no leader proposed is already treated (`lin.rs`). A
+    /// pending write the bound *has* run out on stays what it is: the wedge.
+    ///
+    /// Found by the merged tree's first nightly (PROPOSED D-086, run 36049438254):
+    /// seed 3164's only post-heal write to `k6` was a CAS issued 47 ms before the
+    /// trace's end and proposed 7 ms later by a live leader, and the per-key
+    /// reading turned it into "no client write to k6 completed after the last
+    /// heal" — on a range that had committed six other writes since the heal and
+    /// served the key twelve times. It was the branch's before the merge too,
+    /// masked on #123's nightly by a tier-level tripwire that panicked first.
+    // PROPOSED(D-086): a write pending at the run's end inside the bound is no
+    // evidence, as the reading's own doc said.
+    fn post_heal_writes(&self) -> impl Iterator<Item = &crate::lin::Op> {
+        let bound = election_max() * LIVENESS_TIMEOUTS;
+        let end = self.end();
+        self.history.ops.iter().filter(move |op| {
+            let since = op.call.max(self.last_heal);
+            let pending_inside_the_bound = op.ret.is_none()
+                && end
+                    .checked_duration_since(since)
+                    .is_some_and(|elapsed| elapsed <= bound);
+            op.op.is_write() && op.call >= self.last_heal && !pending_inside_the_bound
+        })
+    }
+
     /// Per key some client wrote to after the last heal, how long the **slowest** of
     /// those writes took **from its own call** — `ret − max(call, last_heal)`, and
     /// every write folded here was called at or after the heal — with `None` for a
@@ -2877,12 +2914,7 @@ impl Report {
     #[must_use]
     pub fn writes_after_heal_by_key(&self) -> BTreeMap<Bytes, Option<Duration>> {
         let mut by_key: BTreeMap<Bytes, Option<Duration>> = BTreeMap::new();
-        for op in self
-            .history
-            .ops
-            .iter()
-            .filter(|op| op.op.is_write() && op.call >= self.last_heal)
-        {
+        for op in self.post_heal_writes() {
             let took = op
                 .ret
                 .map(|ret| ret.duration_since(op.call.max(self.last_heal)));
@@ -2914,12 +2946,7 @@ impl Report {
     #[must_use]
     pub fn writes_after_heal_by_range(&self) -> BTreeMap<u64, Option<Duration>> {
         let mut by_range: BTreeMap<u64, Option<Duration>> = BTreeMap::new();
-        for op in self
-            .history
-            .ops
-            .iter()
-            .filter(|op| op.op.is_write() && op.call >= self.last_heal)
-        {
+        for op in self.post_heal_writes() {
             let took = op.ret.map(|ret| ret.duration_since(self.last_heal));
             let first = by_range.entry((self.key_range)(op.op.key())).or_default();
             *first = match (*first, took) {

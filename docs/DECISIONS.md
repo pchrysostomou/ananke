@@ -10115,7 +10115,13 @@ conservative option, marked `// PROPOSED(D-076)` in the code.
    size this bound's tail, and this entry does not present the figures above as if
    they did: the nightly on the merged tree is the measurement that holds the 38, and
    a seed over it there is the tail saying a thousand seeds do not size this bound — to
-   be reported with its seed and mechanism, not a number to bump (D-030, D-039). **Not
+   be reported with its seed and mechanism, not a number to bump (D-030, D-039).
+   **The tier's own measurement, from the first nightly with the count instrumented**
+   (run 36049438254 on 2d5cd4d, the merged tree): over ten thousand seeds of the
+   raft-arms sweep on the node the most any replica held at once was **19** (seed
+   9293, server 1, range 2) — the thousand-seed worst of the sharded quorum scenario,
+   reached by this sweep at ten thousand — against the 38. The bound held at the
+   nightly's tier, and the rule sized it. **Not
    taken**: a bound that does not count a client's *superseded retries* as distinct
    outstanding reads. The owner ruled it a product change not to take unasked; it is
    **issue #125**, and it comes due when clients get sessions in Phase 4.
@@ -15122,7 +15128,11 @@ it on sight.
    of it served again before its own `RaftReseeded`; over the tier the coverage prints
    every refusal with its seed, server and reason. It is asserted above zero nowhere: at
    about one seed in ten thousand no tier supports a floor (D-061), and the merged tree's
-   thousand seeds saw **0** (release). **Not taken, the owner's:** turning the rot on for
+   thousand seeds saw **0** (release); its first nightly (run 36049438254, on 2d5cd4d)
+   saw **1 of 10 000** — seed 6695, server 1, *"the log is damaged: a record at segment
+   5 offset 0 (torn-record) was skipped and the rest of the segment with it"* — a crash's
+   torn write on a disk that does not rot, which is the mechanism named above, and
+   D-077's fan-out held on it. **Not taken, the owner's:** turning the rot on for
    the node cluster, which would make refusals ordinary here as they are on one group; it
    redraws every schedule of this cluster and with them every rate this entry, D-089 and
    D-091 measured. `IgnoreIncarnation`'s absence test and the pair's were re-read with it:
@@ -15211,7 +15221,47 @@ pair is the stream half alone on **28 of 100** seeds, seed for seed, with the re
 first on all 28, and seeds **41 and 74** are the variant's load. At the gate's twenty and
 CI's hundred: 6 of 20 wedged, 7 of 20 the pair, 0 load. No assertion moved; what moved
 is what a read-bound trip under a wedging variant is read as, and every category is
-printed at every tier.
+printed at every tier. (Re-measured once more after the end-of-run reading below: 17 of
+100 wedged, 13 read-bound trips downstream of a wedge, 3 the variant's load; the pair
+the stream half alone on 25 of 100, seed for seed — seeds 1, 24 and 32 were that
+reading's artefact, on the variant as on the correct node.)
+
+**The merged tree's first nightly, and the reading it found wrong** (run 36049438254 on
+2d5cd4d; CI green on the same commit). Shards 3, 4, 5, 6 and `rest` green. Shard 2 red on
+**seed 3164** of the correct node's sweep — *"liveness: no client write to k6 completed
+after the last heal at 17.698 s"* — and shard 1 red on the same seed under the leaking
+node, where the new pair test refused a catch by anything but the bound (the leaking
+replica held 28, under 38). One seed of ten thousand, one mechanism, and it is not the
+node's: reproduced locally in release and read off the trace and the history, k6 is
+range 5's, range 5 is live after the heal — its leader proposes and commits indexes 95 to
+100 for the range's other keys from 18.19 s, its per-range recovery reads 520 ms, and k6
+is read twelve times after the heal in 16 to 140 ms each — and the **only client write to
+k6 after the heal** is a CAS issued at 20.373 s, proposed by that leader 7 ms later
+(index 101, term 9), **47 ms before the trace ends at 20.42 s**, with the client's own
+60 ms write timeout still running. `lin.rs::from_trace` keeps it with `ret: None`, and
+`Report::writes_after_heal_by_key` turned the key's one pending write into "none
+completed" — a wedge. The reading's own comment says "a write still in flight when the
+run ended is not one (D-076's review)", and nothing implemented it. It is not new to the
+merge either: **`677cad3` fails seed 3164 the same way**, with the same CAS at the same
+instant (the k6 draw is the seed's and no merged change moved it); #123's nightly never
+showed it because the tier-level refusal tripwire panicked first, and the high-water event
+is not a suspect — `SimEnv::trace` records under the lock with no draw, and the seed
+fails identically with the event silenced. Not #120, not D-090's cap-wait: no stream
+toward any replica of range 5 is involved. **Taken: the smallest correct fix, and no
+bound widened.** `Report::post_heal_writes` feeds both readings, and leaves out a write
+still pending at the run's end — the schedule's whole duration, where the simulation
+stops — with less than the bound elapsed since its call: no evidence either way, as a
+write no leader proposed already is, while a pending write the bound has run out on
+stays the wedge (`sim/raft.rs`, PROPOSED(D-086)). D-076's own hand-built case of the
+carve-out still catches its pending write, which has the whole of its schedule's 3.9 s
+to complete in and does not. Re-measured on
+the fixed tree at a thousand seeds in release: the correct node green with its figures
+unmoved (worst reads 16 on seed 644, 0 refusals), `ranges` green, both pair tests
+unmoved (108 of 1 000 by the bound; 0 of 1 000 on `ranges` with the firing on 1 000 of
+1 000), `SharedSnapshotDir` 20 → **17** of 100 wedged and the pair 28 → **25**, the
+one-group binary green at the gate; seed 3164 green under both nodes. The reading is
+D-076's review's and the change is its stated intent made true; the owner can overturn
+it on sight, and the nightly is re-dispatched on the fixed tip.
 
 ### Consequences
 
