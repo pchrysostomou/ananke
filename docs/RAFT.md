@@ -70,7 +70,10 @@ leader's `match_index` is monotone for one store, not for one follower (D-042). 
 store carries a store incarnation, 1 for a store started fresh, carried across an
 install into a live store, and drawn afresh, never 1, for a store a re-seed rebuilt;
 `AppendEntriesResponse` and `InstallSnapshotResponse` carry the responder's, 0 from a
-refused server, which has no store. A leader records the number each follower's
+one-group refused server, which has no store at all. The incarnation says *which*
+store answered and nothing about whether it holds anything: whether the answerer is a
+refused server is a mark of its own on `AppendEntriesResponse`, in the same byte as
+`success` (PROPOSED D-087). A leader records the number each follower's
 `AppendEntriesResponse` carries, and the one an `Installed` answer carries; chunk
 acknowledgements go to the snapshot task, which does not read the number and tells the
 core only that a stream progressed (D-049). The first
@@ -185,6 +188,14 @@ range, `snap-r<range>-<index>-<take>`, and the staging directory gains the range
 sender, `staging-r<range>-s<sender>`, because a node's ranges apply streams of commands
 of their own and two of them taking at one index is ordinary; a range's sweep then
 proposes only its own versions for deletion (SHARD.md §11 raft 14; D-075, proposed).
+On the node the take is still the `apply` task's, and it checkpoints the range's own
+key intervals rather than the engine directory (`Engine::checkpoint_spans`): one engine
+holds every range on the node, and a take that copied all of it would stream three other
+ranges' state to a follower of this one. It copies the range's Raft state **except its
+log** and the range's user keys; the leader's log is not part of what a snapshot
+describes, and the install's switch removes the receiver's own log with the rest of the
+span, so the repair's kept tail is all that goes back and nothing is streamed to be
+tombstoned again (D-083, proposed).
 A take asked for at the index
 the record already names answers with the recorded version when this store took it
 and it is complete; a take asked for because a stream found no usable checkpoint is
@@ -222,7 +233,12 @@ an admitted assembly holds is given up when that range's own Raft supersedes its
 sender — a chunk of that range from a leader at a higher term takes it — and on a
 leader change the node observes for a range, the node ends the assembly the old leader
 held, since a chunk of one range is no evidence about who leads another (Q14; D-075,
-proposed). An
+proposed). On the node a chunk and its response are taken off the wire by the `net`
+task and handed to the `snapshot` task before the node's inbox sees them, so they are
+charged to that task's receive cap and not to the inbox's byte bound, and so they
+arrive at all: the core's arm for them is empty because the server is expected to route
+them away first, which the one-group server does and the node did not until D-083
+(issue #96, proposed). An
 acknowledgement that takes a stream past the furthest point any acknowledgement had
 taken it is that stream's progress, and the task marks the follower for the core, which
 reads the marks before each tick; a duplicate, the answer a resend gets and ground a
@@ -270,6 +286,29 @@ staging. Until the switch is durable the old `CURRENT` names the old store whole
 crash anywhere before the staging `CURRENT` is gone re-runs the adoption on the same
 staged bytes.
 
+**On the node, none of the two paragraphs above happens.** An install there is Stage A's
+live install into the running engine (D-066), because ending an incarnation and
+reopening the engine would restart every range on it: the completed stream's staged
+directory is opened as a span source — which is also the check that it is whole, so one
+left short by a crash is refused there and the stream restarts — and the range's two key
+intervals and its repair go into the engine in **one** manifest switch, with the engine
+left open and the node's other ranges untouched. The repair is the same list, built by
+the same function, with no log tombstones because no log key was streamed. The node
+adopts no staged store at its start, so a staging `CURRENT` is never found damaged
+there and `RaftAdopted` on the node records only a node taking a fresh directory after a
+whole-node refusal.
+
+Two things a server gets for free from ending its incarnation, the node has to do for
+the one range. It **holds** that range from the install's decision to its switch — its
+messages and its node-local inputs queue exactly where a persisting core's already
+queue, and every other range on the node goes on stepping — because the replica being
+replaced is behind its leader by definition, and a step of it in that window would
+append at indices the switch is about to compact past. And it **replaces** that range's
+replica with one restored on the state the repair wrote, which takes the held work in
+the order it arrived, and carries with it the highest index handed to the `apply` task,
+since an `Apply` naming an index below the installed snapshot is one the new replica
+cannot serve (D-083, proposed).
+
 A leader compacts the Raft log to its last checkpoint once every follower has matched
 it, is being streamed the snapshot, or is designated snapshot-fed (D-037). A follower is
 designated when it is more than `snapshot_threshold` entries behind and has answered
@@ -310,7 +349,8 @@ nothing compares timestamps from two nodes except the lease guard above, which i
 built to. Check quorum runs on the leader's ticks: every minimum election timeout it
 asks whether a majority answered since the last time, and steps down
 (`RaftQuorumLost`) if not, so a leader on the wrong side of a partition stops serving
-within two of them. A follower that answered from a store counts. A refused server's
+within two of them. A follower that answered without the refused
+mark counts. A refused server's marked
 rejection (§3) counts only in a window in which a chunk of the leader's re-seed stream
 to it was acknowledged, the `Installed` answer included: a refused server answers every
 AppendEntries whatever becomes of its re-seed, so its rejections say it is alive, not
@@ -673,10 +713,20 @@ it neither votes nor serves until a snapshot rebuilds it. A refused server trace
 is before it adopts an install or opens its store, and it answers every AppendEntries,
 whatever its term and entries, with a rejection carrying the request's term and
 previous index, a hint of 1, an echo of zero, so no lease promise or read confirmation
-is measured from it, and store incarnation 0, since it has no store (D-042). That
+is measured from it, store incarnation 0, since it has no store (D-042), and **the
+refused mark** (PROPOSED D-087). That
 rejection is how a leader learns the server needs a re-seed. It is a sign of life and
-not of a store: check quorum counts it only in a window in which a chunk of the
-leader's stream to the server was acknowledged (§1, D-049). A leader that recorded
+not of a log: check quorum counts it only in a window in which a chunk of the
+leader's stream to the server was acknowledged (§1, D-049).
+
+A refused *replica of a node* is the same server in a different shape (SHARD.md §11):
+its node rebuilds every range's store before any replica serves, so it answers from a
+store, with a store incarnation of its own, and holds nothing of the log all the same.
+It carries the refused mark and is counted exactly as the store-less one is; the mark
+is what makes the two the same rule, and keying the rule on the store-less stamp left
+it with no site on the node at all (PROPOSED D-087). A server carries the mark while
+it is quarantined and its last index is 0 — nothing of this log in it, by an install
+or by an append — and drops it the moment either lands. A leader that recorded
 another incarnation for it forgets its progress (§1, D-042), and the hint moves the
 leader's next index for it back to 1: a leader whose log is compacted then feeds it the
 snapshot (§1), and one whose log is not sends an AppendEntries whose previous index is
@@ -785,7 +835,7 @@ waits in the inbox for the next:
   On the node (SHARD.md §4; Q14, Q41) it is one task keyed by (range, follower) on the
   way out and (range, sender) on the way in. Nothing caps the streams it sends, so a
   leader feeds every designated follower of a range at once (D-043); a per-node cap
-  bounds what it assembles, and a (range, sender) over the cap is told to restart and
+  bounds what it assembles, and a (range, sender) over the cap is told to wait and
   takes the first slot that frees. Its chunks go in frames of their own on a socket
   handle of its own, never through the per-peer outbox, so a 256 KiB chunk never spends
   the frame a round's heartbeats needed (Q41). Its install is not the adoption of §1:

@@ -913,16 +913,15 @@ fn a_restarted_node_opens_the_directory_its_reseed_built_and_is_not_refused_agai
     );
 }
 
-/// The pair rule again, for the path this node does **not** have: a core that asks
-/// for a snapshot action fails the run, naming the slice that owes it.
+/// The pair rule again, for the path this scenario asserts **absent**: a core that
+/// reaches the snapshot threshold fails the run, and the check says why.
 ///
-/// `Report::check` said this absence was asserted and it was not: the node counted
-/// the dropped action in `Gaps`, which nothing outside the node can read, and the
-/// check looked for a `RaftSnapshot` record this node only emits when it restates a
-/// snapshot already on disk — a record it can never write. D-076's review set the
-/// scenario's threshold to twelve, so that every core crossed it and asked for takes
-/// the host dropped, and all three test targets stayed green. Here is that run, with
-/// the action traced.
+/// `Report::check` said this absence was asserted and it was not: on the unwired node
+/// of D-076's day the dropped action left no `RaftSnapshot` record, so the review set
+/// the scenario's threshold to twelve, every core asked for takes the host dropped,
+/// and all three test targets stayed green. The node serves the action since D-083,
+/// so at twelve every core takes a snapshot and the record is in the trace; the
+/// scenario's own check, which keys on that record, is what fails the run now.
 #[test]
 fn a_core_that_asks_for_a_snapshot_action_fails_the_run() {
     // The correct scenario keeps its cores below the threshold, and passes.
@@ -934,15 +933,15 @@ fn a_core_that_asks_for_a_snapshot_action_fails_the_run() {
     let report = ranges::asking_for_snapshots(1, 12);
     let violation = report
         .check()
-        .expect_err("a snapshot action this node drops is not caught");
-    println!("ranges: a core asking for a snapshot action gives: {violation}");
+        .expect_err("a run past this scenario's snapshot threshold is not caught");
+    println!("ranges: a core reaching the snapshot threshold gives: {violation}");
     assert!(
-        violation.contains("asked for the snapshot action"),
-        "the violation names the action dropped: {violation}"
+        violation.contains("took or restated a snapshot"),
+        "the violation names the snapshot the trace carries: {violation}"
     );
     assert!(
-        violation.contains("snapshot` task keyed by range and follower is its own slice's"),
-        "the violation names the slice that owes the path: {violation}"
+        violation.contains("asserts that path absent"),
+        "the violation names the absence this scenario asserts: {violation}"
     );
 }
 

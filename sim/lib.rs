@@ -21,12 +21,14 @@ use bytes::Bytes;
 
 pub mod echo;
 pub mod engine;
+pub mod install;
 pub mod lin;
 pub mod membership;
 pub mod parallel;
 pub mod quorum;
 pub mod raft;
 pub mod ranges;
+pub mod reseed;
 pub mod wal;
 
 pub use parallel::{sweep, verdict};

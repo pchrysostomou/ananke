@@ -747,6 +747,7 @@ fn a_higher_term_steps_a_leader_down_and_a_stale_response_is_ignored() {
                 echo: 0,
                 local: 0,
                 incarnation: 0,
+                refused: false,
             },
         },
     );
@@ -826,6 +827,7 @@ fn a_replayed_success_response_does_not_move_match_index_back() {
                 echo: 0,
                 local: 0,
                 incarnation: 0,
+                refused: false,
             },
         },
     );
@@ -882,6 +884,7 @@ fn a_follower_with_a_new_incarnation_is_probed_from_its_hint() {
                     echo: 0,
                     local: 0,
                     incarnation: 7,
+                    refused: false,
                 },
             },
         );
@@ -1205,14 +1208,22 @@ fn check_quorum_steps_a_leader_down_that_hears_from_no_majority() {
 }
 
 /// A leader of three whose server 3 is away and whose server 2 answers every
-/// heartbeat as a refused server does (RAFT.md §3) — a rejection with hint 1, echo
-/// 0 and store incarnation 0 — or, with `incarnation` above 0, as a quarantined
-/// server on its own store does; ticked for `ticks` ticks or until it stops
-/// leading, with the snapshot stream to server 2 acknowledged at the ticks
+/// heartbeat with a rejection carrying hint 1, echo 0, the store `incarnation` and
+/// the refused mark `refused` (RAFT.md §3); ticked for `ticks` ticks or until it
+/// stops leading, with the snapshot stream to server 2 acknowledged at the ticks
 /// `acked` says. The harness stands in for server 2, so nothing else answers.
+///
+/// The two are independent, which is the whole of PROPOSED D-087. The one-group
+/// server's store-less re-seed loop sends `(0, true)` and a quarantined follower on
+/// its own store sends `(n, false)`; **a node's re-seeded replica sends `(n, true)`**
+/// — a store of its own and nothing of the log in it — and under the key this test
+/// was written against, incarnation 0, that answer was indistinguishable from the
+/// quarantined one and D-049's rule never saw it.
+// PROPOSED(D-087): D-049's rule keyed on a refused mark the answer carries.
 fn leader_beside_a_follower_answering_as(
     variants: impl Into<Variants>,
     incarnation: u64,
+    refused: bool,
     answers: bool,
     acked: impl Fn(u64) -> bool,
     ticks: u64,
@@ -1244,6 +1255,7 @@ fn leader_beside_a_follower_answering_as(
                             echo: 0,
                             local: 0,
                             incarnation,
+                            refused,
                         },
                         now,
                     },
@@ -1280,7 +1292,9 @@ fn quorum_lost(cluster: &Cluster) -> Option<Vec<u64>> {
 /// makes none steps down within two windows, naming the follower it did not
 /// count; progress in one window does not carry into the next; and progress with
 /// no answer is no answer. A quarantined follower, echo 0 on its own store, is
-/// not a refused one and counts as any follower does. The leader as built
+/// not a refused one and counts as any follower does — **and a refused one on a
+/// store of its own, which is what a node's re-seed builds, is refused and does
+/// not** (PROPOSED D-087). The leader as built
 /// (`RefusedCountsForQuorum`) keeps its office on the rejections alone; the
 /// rejected alternative (`RefusedNeverCounts`) steps down though the stream
 /// progresses.
@@ -1291,7 +1305,7 @@ fn a_refused_followers_rejections_count_for_check_quorum_only_beside_reseed_prog
     let never = |_: u64| false;
 
     let progressing =
-        leader_beside_a_follower_answering_as(Variant::Correct, 0, true, every, 5 * windows);
+        leader_beside_a_follower_answering_as(Variant::Correct, 0, true, true, every, 5 * windows);
     assert_eq!(
         progressing.role(s(1)),
         Role::Leader,
@@ -1300,7 +1314,7 @@ fn a_refused_followers_rejections_count_for_check_quorum_only_beside_reseed_prog
     assert_eq!(quorum_lost(&progressing), None);
 
     let stalled =
-        leader_beside_a_follower_answering_as(Variant::Correct, 0, true, never, 5 * windows);
+        leader_beside_a_follower_answering_as(Variant::Correct, 0, true, true, never, 5 * windows);
     assert_eq!(stalled.role(s(1)), Role::Follower, "no progress, no count");
     assert_eq!(
         quorum_lost(&stalled),
@@ -1311,6 +1325,7 @@ fn a_refused_followers_rejections_count_for_check_quorum_only_beside_reseed_prog
     let first_window_only = leader_beside_a_follower_answering_as(
         Variant::Correct,
         0,
+        true,
         true,
         |tick| tick < windows / 2,
         5 * windows,
@@ -1323,7 +1338,7 @@ fn a_refused_followers_rejections_count_for_check_quorum_only_beside_reseed_prog
     assert_eq!(quorum_lost(&first_window_only), Some(vec![2]));
 
     let silent =
-        leader_beside_a_follower_answering_as(Variant::Correct, 0, false, every, 5 * windows);
+        leader_beside_a_follower_answering_as(Variant::Correct, 0, true, false, every, 5 * windows);
     assert_eq!(
         silent.role(s(1)),
         Role::Follower,
@@ -1336,16 +1351,44 @@ fn a_refused_followers_rejections_count_for_check_quorum_only_beside_reseed_prog
     );
 
     let quarantined =
-        leader_beside_a_follower_answering_as(Variant::Correct, 5, true, never, 5 * windows);
+        leader_beside_a_follower_answering_as(Variant::Correct, 5, false, true, never, 5 * windows);
     assert_eq!(
         quarantined.role(s(1)),
         Role::Leader,
         "a quarantined follower answers from its store"
     );
 
+    // The node's refused replica: a store of its own — so D-042's leader forgets
+    // what it knew of the lost log — and nothing of this log in it, so D-049's rule
+    // must see it. The two answers above differ from this one in exactly one field
+    // each, and under the key this rule was written with, incarnation 0, this one
+    // was the quarantined answer: counted, office kept, the hazard D-049 closed
+    // reopened wherever a re-seed rebuilds a store before the replica serves.
+    // PROPOSED(D-087): D-049's rule keyed on a refused mark the answer carries.
+    let refused_on_its_own_store =
+        leader_beside_a_follower_answering_as(Variant::Correct, 5, true, true, never, 5 * windows);
+    assert_eq!(
+        refused_on_its_own_store.role(s(1)),
+        Role::Follower,
+        "a refused follower is refused whatever store it answers from"
+    );
+    assert_eq!(
+        quorum_lost(&refused_on_its_own_store),
+        Some(vec![2]),
+        "the step-down names the follower whose rejection went uncounted"
+    );
+    let progressing_on_its_own_store =
+        leader_beside_a_follower_answering_as(Variant::Correct, 5, true, true, every, 5 * windows);
+    assert_eq!(
+        progressing_on_its_own_store.role(s(1)),
+        Role::Leader,
+        "and counts beside re-seed progress, exactly as a store-less one does"
+    );
+
     let as_built = leader_beside_a_follower_answering_as(
         Variant::RefusedCountsForQuorum,
         0,
+        true,
         true,
         never,
         5 * windows,
@@ -1359,6 +1402,7 @@ fn a_refused_followers_rejections_count_for_check_quorum_only_beside_reseed_prog
     let never_counts = leader_beside_a_follower_answering_as(
         Variant::RefusedNeverCounts,
         0,
+        true,
         true,
         every,
         5 * windows,
@@ -1376,11 +1420,138 @@ fn a_refused_followers_rejections_count_for_check_quorum_only_beside_reseed_prog
         &first_window_only,
         &silent,
         &quarantined,
+        &refused_on_its_own_store,
+        &progressing_on_its_own_store,
         &as_built,
         &never_counts,
     ] {
         invariants::all(&cluster.events).unwrap();
     }
+}
+
+/// What the mark on the answer **is** (PROPOSED D-087): a quarantined server with
+/// nothing of this log in it — and neither conjunct alone.
+///
+/// The test above steps the mark in by hand, as a parameter of the harness, so it
+/// asserts what a *leader* does with an answer that carries it and nothing about
+/// where such an answer comes from. [`Raft::refused`] is the other half, and it is
+/// the half the node's re-seeded replicas actually run. Its entry claims both
+/// conjuncts are necessary and neither sufficient; this is that claim, asserted.
+///
+/// - **The quarantine alone is not enough.** It is permanent (D-035, and durable),
+///   and D-049 says in as many words that a re-seeded follower that has since been
+///   caught up "counts as any follower does". So a quarantined server that has
+///   landed something is not refused, whether it landed by an append or by an
+///   install — the two ways the window closes, and the two last cases here.
+/// - **The empty log alone is not enough.** A server with an empty log that was
+///   never re-seeded is a fresh member, or one its leader has not yet reached: a
+///   re-seed *ask* (RAFT.md §3), not a refusal. Marking its rejections would tell
+///   every leader adding a member that the member holds nothing to commit with,
+///   which is true and is not what the mark means.
+/// - **And the mark is what the answer carries**, so the last part steps a
+///   quarantined core with an empty log and reads the bit off its rejections: set
+///   while it holds nothing, clear on the next rejection once one entry has landed.
+///   That is [`Raft::refused`] reaching the wire, which the harness above cannot
+///   see because it writes the bit itself.
+///
+/// Gate tier and no seeds: the predicate is a function of two fields, so a sweep
+/// would add nothing to reading them.
+// PROPOSED(D-087): D-049's rule keyed on a refused mark the answer carries.
+#[test]
+fn a_refused_server_is_a_quarantined_one_with_nothing_of_this_log_in_it() {
+    let members = Configuration::of(&[s(1), s(2), s(3)]);
+    let restored = |snap: (Index, Term), log: Vec<Entry>, quarantined: bool| {
+        Raft::restore_compacted(
+            s(2),
+            members.clone(),
+            config(Variant::Correct),
+            3,
+            7,
+            None,
+            snap.0,
+            snap.1,
+            None,
+            log,
+            quarantined,
+        )
+    };
+
+    let fresh = Raft::new(s(2), members.clone(), config(Variant::Correct), 3);
+    assert!(!fresh.quarantined());
+    assert!(
+        !fresh.refused(),
+        "an empty log alone is a fresh server, not a refused one"
+    );
+
+    let lost_it_all = restored((0, 0), Vec::new(), true);
+    assert!(
+        lost_it_all.refused(),
+        "a re-seeded store with nothing of this log in it is what the mark means"
+    );
+
+    let appended_to = restored((0, 0), log_of(&[7]), true);
+    assert!(appended_to.quarantined());
+    assert!(
+        !appended_to.refused(),
+        "one entry landed: the quarantine outlives the refusal, and D-049 counts \
+         this follower as any follower"
+    );
+
+    let installed_into = restored((5, 7), Vec::new(), true);
+    assert!(installed_into.quarantined());
+    assert!(
+        !installed_into.refused(),
+        "an install landed: the window closes the same way, with an empty log"
+    );
+
+    // The bit on the wire, off the same core: a rejection while it holds nothing
+    // carries the mark, and the next rejection after an entry lands does not.
+    let mut core = restored((0, 0), Vec::new(), true);
+    let answer = |core: &mut Raft, prev_index: Index, entries: Vec<Entry>| {
+        core.step(Input::Message {
+            now: 0,
+            from: s(1),
+            message: Message::AppendEntries {
+                term: 7,
+                prev_index,
+                // The consistency check reads the entry before `entries`, and an
+                // empty log's is (0, 0).
+                prev_term: if prev_index == 0 { 0 } else { 7 },
+                entries,
+                commit: 0,
+                sent: 0,
+            },
+        })
+        .iter()
+        .find_map(|o| match o {
+            Output::Send {
+                message:
+                    Message::AppendEntriesResponse {
+                        success, refused, ..
+                    },
+                ..
+            } => Some((*success, *refused)),
+            _ => None,
+        })
+        .expect("a follower answers every AppendEntries")
+    };
+    assert_eq!(
+        answer(&mut core, 3, Vec::new()),
+        (false, true),
+        "the rejection of a server holding nothing of the log carries the mark"
+    );
+    assert_eq!(
+        answer(&mut core, 0, log_of(&[7])),
+        (true, false),
+        "and the entry the leader reached back to fits"
+    );
+    assert!(!core.refused(), "which closes the window");
+    assert_eq!(
+        answer(&mut core, 3, Vec::new()),
+        (false, false),
+        "so the next rejection carries no mark, though the quarantine stands"
+    );
+    assert!(core.quarantined());
 }
 
 /// The vote rule behind the lease (RAFT.md §1, thesis §6.4.1): a follower that has

@@ -84,7 +84,7 @@ use std::sync::Arc;
 use ananke_env::{Environment, File, FileSystem, OpenOptions};
 use ananke_storage::manifest::{self, Manifest, SstMeta};
 use ananke_storage::sst::{SstReader, SstWriter};
-use ananke_storage::{Value, ikey};
+use ananke_storage::{Value, WriteBatch, ikey};
 use bytes::{Bytes, BytesMut};
 
 use crate::core::{Variant, Variants};
@@ -904,6 +904,188 @@ pub struct Repair {
     pub incarnation: u64,
 }
 
+/// The snapshot record a *checkpoint directory* carries for `prefix`, read out of
+/// the directory's own tables without opening it as a store.
+///
+/// The node's live install needs one thing from the bytes it was streamed that no
+/// message carries: the configuration in force at the snapshot's last index, which
+/// the repair writes into the receiver's snapshot record and which
+/// `Raft::restore_compacted` takes as the floor a revert cannot go below (D-029). The
+/// receiver cannot use the configuration *it* believes is in force, because a replica
+/// being fed a snapshot is behind by definition and a membership change inside the
+/// compacted prefix is exactly what it has not seen.
+///
+/// The one-group install reads it while it verifies the staged store
+/// ([`Assembler::on_chunk`]); a live install verifies nothing of its own — the engine
+/// does it, at `Engine::open_span_source` — so the read is here, on its own, and reads
+/// one key. It is the same walk [`Assembler::finish`] makes over the staged manifest's
+/// tables, and it lives in this crate for the reason the layout does: `ananke-raft`
+/// owns what a Raft key is, and `ananke-shard` must not learn it (Q40, D-060).
+///
+/// `Ok(None)` is a whole directory with no record for that prefix, which is a stream
+/// of a range whose store never took a snapshot.
+///
+/// # Errors
+///
+/// The filesystem's, or `InvalidData` when `CURRENT`, the manifest it names or a table
+/// cannot be read — the same damage `Engine::open_span_source` refuses the install for.
+// PROPOSED(D-083): the node's live install reads the streamed configuration out of the
+// staged directory, because no message carries it.
+pub async fn staged_record<E: Environment>(
+    env: &E,
+    dir: &Path,
+    prefix: &KeyPrefix,
+) -> io::Result<Option<SnapshotRecord>> {
+    let fs = env.fs();
+    let Some(current) = read_whole(env, &manifest::current_path(dir)).await? else {
+        return Err(bad("the staged directory has no CURRENT"));
+    };
+    let number = manifest::parse_current(&current).ok_or_else(|| bad("the staged CURRENT"))?;
+    let staged = match read_whole(env, &manifest::manifest_path(dir, number)).await? {
+        Some(bytes) => Manifest::decode(&bytes)?,
+        None => return Err(bad("the staged manifest")),
+    };
+    let key = prefix.snapshot_key();
+    // The newest write of the key wins, and a table's own `max_seq` orders the tables:
+    // the checkpoint's tables are written in key order at one version, so at most one
+    // of them holds it, but the walk does not rely on that.
+    let mut newest: Option<(u64, Bytes)> = None;
+    for meta in &staged.ssts {
+        let file = fs
+            .open(
+                &manifest::sst_path(dir, meta.number),
+                OpenOptions::new().read(true),
+            )
+            .await?;
+        let reader = Arc::new(SstReader::open(file).await?);
+        let mut entries = reader.iter();
+        entries.seek(&ikey::lower_bound(&key)).await?;
+        while let Some((raw, value)) = entries.next().await? {
+            let (user, seq) = ikey::decode(&raw)?;
+            if user[..] != key[..] {
+                break;
+            }
+            if newest.as_ref().is_none_or(|(at, _)| seq > *at)
+                && let Value::Live(bytes) = value
+            {
+                newest = Some((seq, bytes));
+            }
+        }
+    }
+    match newest {
+        Some((_, bytes)) => Ok(Some(store::decode_snapshot_record(bytes)?)),
+        None => Ok(None),
+    }
+}
+
+/// The writes an install's repair makes under the **receiver's** key prefix
+/// (RAFT.md:225-233), in key order: the receiver's own identity, which must survive
+/// the switch.
+///
+/// This is the one place the list is built. [`Assembler::finish`] writes them into
+/// the staged store's own table, before its `CURRENT`, and the node's live install
+/// carries the same batch through `Engine::install_spans` (D-066, D-068) — two
+/// switches of very different shapes, and one statement of what a repair *is*.
+/// Building it twice is how the two would come to disagree.
+///
+/// `replaced_log` is every log index the installed source holds, so a key the kept
+/// tail does not write is tombstoned rather than left as the *leader's* entry at
+/// that index. A caller whose source carries no log keys passes an empty set and
+/// gets no tombstones, which is not the same thing as forgetting them.
+// PROPOSED(D-083): one builder for the repair's writes, shared by the staged
+// install and the node's live install.
+#[must_use]
+pub fn repair_writes(
+    prefix: &KeyPrefix,
+    repair: &Repair,
+    last_index: Index,
+    last_term: Term,
+    config: &Configuration,
+    replaced_log: &BTreeSet<Index>,
+) -> WriteBatch {
+    let record = SnapshotRecord {
+        last_index,
+        last_term,
+        config: config.clone(),
+        dir: String::new(),
+        taken: false,
+        // The receiver's versions start over on the installed store. A later take
+        // may then share a name with a directory the receiver took before — a
+        // re-seeded server's lost store may have taken at the very index it takes
+        // at again — which is harmless because the next incarnation empties every
+        // directory its record does not name before any task of it runs (D-043).
+        take: 0,
+    };
+    let mut writes: BTreeMap<Bytes, Value> = BTreeMap::new();
+    writes.insert(
+        prefix.hard_key(),
+        Value::Live(store::encode_hard(repair.term, repair.vote)),
+    );
+    writes.insert(
+        prefix.applied_key(),
+        Value::Live(store::encode_applied(last_index)),
+    );
+    writes.insert(
+        prefix.snapshot_key(),
+        Value::Live(store::encode_snapshot_record(&record)),
+    );
+    // The receiver's `<prefix> / 2 / config` key (RAFT.md §3, D-029): the streamed
+    // checkpoint carries the leader's, which may name a configuration entry the kept
+    // tail does not hold, and the open refuses a key out of step with the log.
+    // Rewritten like the rest of tenant 0: the tail's latest configuration entry
+    // when it holds one, and otherwise the snapshot's own configuration at its last
+    // index, which the record carries.
+    let (config_index, in_force) = repair
+        .tail
+        .iter()
+        .fold(None, |kept, entry| match &entry.payload {
+            Payload::Config(config) => Some((entry.index, config.clone())),
+            _ => kept,
+        })
+        .unwrap_or_else(|| (last_index, config.clone()));
+    writes.insert(
+        prefix.config_key(),
+        Value::Live(store::encode_config(config_index, &in_force)),
+    );
+    // The quarantine key is always written explicitly: set when this store's history
+    // was ever re-seeded, and a tombstone otherwise — the streamed checkpoint carries
+    // the *leader's* tenant 0, and a flag of the leader's must not quarantine the
+    // receiver (D-035).
+    if repair.quarantined {
+        writes.insert(
+            prefix.quarantine_key(),
+            Value::Live(Bytes::from_static(&[1])),
+        );
+    } else {
+        writes.insert(prefix.quarantine_key(), Value::Tombstone);
+    }
+    // The incarnation key, for the same reason: the streamed checkpoint carries the
+    // leader's number, and the receiver's own must win (D-042).
+    writes.insert(
+        prefix.incarnation_key(),
+        Value::Live(store::encode_incarnation(repair.incarnation)),
+    );
+    for entry in &repair.tail {
+        writes.insert(
+            prefix.log_key(entry.index),
+            Value::Live(store::encode_entry(entry)),
+        );
+    }
+    for index in replaced_log {
+        writes
+            .entry(prefix.log_key(*index))
+            .or_insert(Value::Tombstone);
+    }
+    let mut batch = WriteBatch::new();
+    for (key, value) in writes {
+        match value {
+            Value::Live(bytes) => batch.put(key, bytes),
+            Value::Tombstone => batch.delete(key),
+        };
+    }
+    batch
+}
+
 /// A verified, fully-assembled stream, ready for [`Assembler::finish`].
 pub struct Staged {
     /// The sender.
@@ -1196,83 +1378,23 @@ impl<E: Environment> Assembler<E> {
                 }
             }
         }
-        let record = SnapshotRecord {
-            last_index: staged.last_index,
-            last_term: staged.last_term,
-            config: staged.config.clone(),
-            dir: String::new(),
-            taken: false,
-            // The receiver's versions start over on the installed store. A
-            // later take may then share a name with a directory the receiver
-            // took before — a re-seeded server's lost store may have taken at
-            // the very index it takes at again — which is harmless because the
-            // next incarnation empties every directory its record does not
-            // name before any task of it runs (D-043).
-            take: 0,
-        };
-        let mut writes: BTreeMap<Bytes, Value> = BTreeMap::new();
-        writes.insert(
-            self.prefix.hard_key(),
-            Value::Live(store::encode_hard(repair.term, repair.vote)),
+        // The repair's writes, from the one builder both installs use
+        // ([`repair_writes`]). The staged tables hold the *leader's* log keys, so
+        // `held` is what the kept tail must tombstone back out; the node's live
+        // install streams no log keys at all and passes an empty set there.
+        let writes = repair_writes(
+            &self.prefix,
+            repair,
+            staged.last_index,
+            staged.last_term,
+            &staged.config,
+            &held,
         );
-        writes.insert(
-            self.prefix.applied_key(),
-            Value::Live(store::encode_applied(staged.last_index)),
-        );
-        writes.insert(
-            self.prefix.snapshot_key(),
-            Value::Live(store::encode_snapshot_record(&record)),
-        );
-        // The receiver's `<prefix> / 2 / config` key (RAFT.md §3, D-029): the streamed
-        // checkpoint carries the leader's, which may name a configuration entry
-        // the kept tail does not hold, and the open refuses a key out of step
-        // with the log. Rewritten like the rest of tenant 0: the tail's latest
-        // configuration entry when it holds one, and otherwise the snapshot's
-        // own configuration at its last index, which the record carries.
-        let (config_index, config) = repair
-            .tail
-            .iter()
-            .fold(None, |kept, entry| match &entry.payload {
-                Payload::Config(config) => Some((entry.index, config.clone())),
-                _ => kept,
-            })
-            .unwrap_or_else(|| (staged.last_index, staged.config.clone()));
-        writes.insert(
-            self.prefix.config_key(),
-            Value::Live(store::encode_config(config_index, &config)),
-        );
-        // The quarantine key is always written explicitly: set when this store's
-        // history was ever re-seeded, and a tombstone otherwise — the streamed
-        // checkpoint carries the *leader's* tenant 0, and a flag of the leader's
-        // must not quarantine the receiver. (D-035).
-        if repair.quarantined {
-            writes.insert(
-                self.prefix.quarantine_key(),
-                Value::Live(Bytes::from_static(&[1])),
-            );
-        } else {
-            writes.insert(self.prefix.quarantine_key(), Value::Tombstone);
-        }
-        // The incarnation key, for the same reason: the streamed checkpoint
-        // carries the leader's number, and the receiver's own must win.
-        // D-042: store incarnations.
-        writes.insert(
-            self.prefix.incarnation_key(),
-            Value::Live(store::encode_incarnation(repair.incarnation)),
-        );
-        for entry in &repair.tail {
-            writes.insert(
-                self.prefix.log_key(entry.index),
-                Value::Live(store::encode_entry(entry)),
-            );
-        }
-        for index in &held {
-            writes
-                .entry(self.prefix.log_key(*index))
-                .or_insert(Value::Tombstone);
-        }
         let mut writer = SstWriter::new();
-        for (key, value) in &writes {
+        // `repair_writes` emits its ops in key order, which is the order
+        // `SstWriter::add` requires and the order this loop had when it walked a
+        // `BTreeMap`.
+        for (key, value) in writes.ops() {
             writer.add(key, seq, value);
         }
         let (first_key, last_key) = writer.key_range().expect("repair writes");
@@ -1392,6 +1514,27 @@ pub fn start_over(term: Term, staged: (Index, Term)) -> Message {
         file: Bytes::new(),
         offset: 0,
         status: SnapshotStatus::Restart,
+        incarnation: 0,
+    }
+}
+
+/// The receiver's answer that the stream must wait for a slot under its receive cap:
+/// nothing was staged, nothing was disturbed, and this stream has covered no ground it
+/// has to cover again (RAFT.md:214-218).
+///
+/// The one-group receiver has no cap and never sends this; a node does (D-075), and
+/// the answer is separate from [`start_over`] so that RAFT.md:210-212's restart bound
+/// counts a start-over and not a stream waiting its turn (D-090).
+// PROPOSED(D-090): a cap-wait is answered as a wait, not as a start-over.
+#[must_use]
+pub fn waiting(term: Term, staged: (Index, Term)) -> Message {
+    Message::InstallSnapshotResponse {
+        term,
+        last_index: staged.0,
+        last_term: staged.1,
+        file: Bytes::new(),
+        offset: 0,
+        status: SnapshotStatus::Waiting,
         incarnation: 0,
     }
 }

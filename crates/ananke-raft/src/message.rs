@@ -97,12 +97,26 @@ pub enum Message {
         local: u64,
         /// The responder's store incarnation (RAFT.md §3): 1 for a store started
         /// fresh, a fresh value for every store a re-seed rebuilt, 0 from a
-        /// refused server that has no store. A leader that sees it change
-        /// forgets what it knew of the follower's log, since a re-seeded store
-        /// may have lost entries the follower once acknowledged. The server
+        /// one-group refused server that has no store at all. A leader that sees
+        /// it change forgets what it knew of the follower's log, since a re-seeded
+        /// store may have lost entries the follower once acknowledged. The server
         /// stamps it on the way out, like `local`.
+        ///
+        /// It says *which* store answered, and nothing about whether there is one
+        /// to commit with: that is `refused`.
         // D-042: store incarnations.
         incarnation: u64,
+        /// Whether this is a **refused** server's rejection: the answerer lost its
+        /// state, holds nothing of this log, and can commit nothing for the leader
+        /// until its re-seed puts something in it (RAFT.md §3). Check quorum counts
+        /// such a rejection only beside re-seed progress in the same window
+        /// (D-049), so the mark has to reach the leader that counts the answer, and
+        /// it therefore rides on the wire rather than being inferred there.
+        ///
+        /// Never set on a success. It is carried in the same byte as `success`, so
+        /// a response frame is the length it always was.
+        // PROPOSED(D-087): D-049's rule keyed on a refused mark the answer carries.
+        refused: bool,
     },
     /// The leader asks the receiver to start an election at once, without a
     /// pre-vote (thesis §3.10, leadership transfer).
@@ -170,7 +184,26 @@ pub enum SnapshotStatus {
     /// The receiver cannot use the stream, because the identity changed under it
     /// or the assembled store failed its checks: start over from the first file,
     /// or take a fresh snapshot.
+    ///
+    /// This is the answer RAFT.md:210-212's bound counts: twice the stream is
+    /// restarted from its first byte, and at the third such ask the sender counts the
+    /// checkpoint unusable.
     Restart,
+    /// The receiver is assembling as many streams as its per-node cap allows and this
+    /// is not one of them (RAFT.md:214-218). Nothing was staged, nothing was disturbed
+    /// and no slot was taken; the stream takes one on the first chunk it sends while a
+    /// slot is free.
+    ///
+    /// It is a status of its own rather than a second use of
+    /// [`Restart`](SnapshotStatus::Restart) because the two say opposite things to a
+    /// sender: a restart says the ground this stream covered is gone, and a wait says
+    /// the receiver is busy and nothing has changed. No single bound is right for
+    /// both — a node whose receive cap is below its range count makes cap-waits
+    /// ordinary, and counting them against RAFT.md's restart bound declares a perfectly
+    /// usable checkpoint unusable after two asks and forces a pointless retake (D-090).
+    // PROPOSED(D-090): a cap-wait is its own status, so the restart bound counts a
+    // start-over and nothing else.
+    Waiting,
 }
 
 impl SnapshotStatus {
@@ -179,6 +212,7 @@ impl SnapshotStatus {
             SnapshotStatus::More => 0,
             SnapshotStatus::Installed => 1,
             SnapshotStatus::Restart => 2,
+            SnapshotStatus::Waiting => 3,
         }
     }
 
@@ -187,6 +221,7 @@ impl SnapshotStatus {
             0 => SnapshotStatus::More,
             1 => SnapshotStatus::Installed,
             2 => SnapshotStatus::Restart,
+            3 => SnapshotStatus::Waiting,
             _ => return Err(bad("snapshot status malformed")),
         })
     }
@@ -198,6 +233,7 @@ impl SnapshotStatus {
             SnapshotStatus::More => "more",
             SnapshotStatus::Installed => "installed",
             SnapshotStatus::Restart => "restart",
+            SnapshotStatus::Waiting => "waiting",
         }
     }
 }
@@ -429,9 +465,10 @@ impl Frame {
                 echo,
                 local,
                 incarnation,
+                refused,
                 ..
             } => {
-                out.put_u8(u8::from(*success));
+                out.put_u8(answer_byte(*success, *refused));
                 out.put_u64_le(*prev_index);
                 out.put_u64_le(*match_index);
                 out.put_u64_le(*hint);
@@ -570,11 +607,7 @@ impl Frame {
                 if bytes.is_empty() {
                     return Err(bad("frame torn"));
                 }
-                let success = match bytes.get_u8() {
-                    0 => false,
-                    1 => true,
-                    _ => return Err(bad("frame malformed")),
-                };
+                let (success, refused) = answer_of(bytes.get_u8())?;
                 let prev_index = u64_field(&mut bytes)?;
                 let match_index = u64_field(&mut bytes)?;
                 let hint = u64_field(&mut bytes)?;
@@ -590,6 +623,7 @@ impl Frame {
                     echo,
                     local,
                     incarnation,
+                    refused,
                 }
             }
             8 => {
@@ -649,6 +683,30 @@ impl Frame {
 
 fn int(v: u64) -> Json {
     i64::try_from(v).map_or_else(|_| Json::Str(v.to_string()), Json::Int)
+}
+
+/// The one byte an [`Message::AppendEntriesResponse`] spends on what kind of answer
+/// it is: bit 0 is `success`, bit 1 the refused mark (D-049). One byte and not two,
+/// so that adding the mark leaves every response frame exactly the length it was —
+/// the simulator drains a link at a modelled rate and bounds an outbox in bytes
+/// (D-056, D-072), so a frame that grew by one byte would move schedules on seeds
+/// that have nothing to do with this rule.
+// PROPOSED(D-087): D-049's rule keyed on a refused mark the answer carries.
+fn answer_byte(success: bool, refused: bool) -> u8 {
+    u8::from(success) | (u8::from(refused) << 1)
+}
+
+/// The inverse of [`answer_byte`]. A byte claiming both success and the refused mark
+/// is malformed: a refused server holds nothing of the log, so nothing ever fits in
+/// it, and a frame saying otherwise is not one this codec produced.
+// PROPOSED(D-087): D-049's rule keyed on a refused mark the answer carries.
+fn answer_of(byte: u8) -> io::Result<(bool, bool)> {
+    match byte {
+        0 => Ok((false, false)),
+        1 => Ok((true, false)),
+        2 => Ok((false, true)),
+        _ => Err(bad("frame malformed")),
+    }
 }
 
 /// The studio's view of a frame: an object whose `type` is `raft.<kind>`, with the
@@ -714,6 +772,7 @@ pub fn studio(payload: &[u8]) -> Json {
             match_index,
             hint,
             incarnation,
+            refused,
             ..
         } => {
             fields.push(("success", Json::Bool(*success)));
@@ -721,6 +780,12 @@ pub fn studio(payload: &[u8]) -> Json {
             fields.push(("matchIndex", int(*match_index)));
             fields.push(("hint", int(*hint)));
             fields.push(("incarnation", int(*incarnation)));
+            // Carried only when set, as `RaftQuorumLost`'s `uncounted` is (D-049):
+            // an ordinary answer's studio line is the line it always was.
+            // PROPOSED(D-087): D-049's rule keyed on a refused mark the answer carries.
+            if *refused {
+                fields.push(("refused", Json::Bool(true)));
+            }
         }
         Message::InstallSnapshot {
             last_index,
@@ -823,6 +888,22 @@ mod tests {
                 echo: 123_456_789,
                 local: 987_654_321,
                 incarnation: 4,
+                refused: false,
+            },
+            // The refused server's rejection, the answer D-049's rule is about: the
+            // same shape with the mark set, so the round trip covers both values of
+            // the byte they share.
+            // PROPOSED(D-087): D-049's rule keyed on a refused mark the answer carries.
+            Message::AppendEntriesResponse {
+                term: 3,
+                success: false,
+                prev_index: 9,
+                match_index: 0,
+                hint: 1,
+                echo: 0,
+                local: 987_654_321,
+                incarnation: 4,
+                refused: true,
             },
             Message::InstallSnapshot {
                 term: 3,
@@ -843,7 +924,53 @@ mod tests {
                 status: SnapshotStatus::More,
                 incarnation: 4,
             },
+            // The cap-wait's answer, which only a node ever sends: last in this list on
+            // purpose, so the `find`s below still take the `More` response above.
+            // PROPOSED(D-090): a cap-wait is its own status, so it is its own tag.
+            Message::InstallSnapshotResponse {
+                term: 3,
+                last_index: 40,
+                last_term: 2,
+                file: Bytes::new(),
+                offset: 0,
+                status: SnapshotStatus::Waiting,
+                incarnation: 4,
+            },
         ]
+    }
+
+    /// Every status survives the wire, and an unknown tag is refused.
+    ///
+    /// `Waiting` is tag 3 and was added by D-090; until this existed nothing in the
+    /// tree encoded or decoded it, because the one-group receiver never sends it and
+    /// the node's own scenario does not reach its cap. A status that does not round
+    /// trip is a sender told to start over when it was told to wait.
+    // PROPOSED(D-090): a cap-wait is its own status, so it is its own tag.
+    #[test]
+    fn every_snapshot_status_round_trips_through_its_tag() {
+        let every = [
+            SnapshotStatus::More,
+            SnapshotStatus::Installed,
+            SnapshotStatus::Restart,
+            SnapshotStatus::Waiting,
+        ];
+        for status in every {
+            assert_eq!(
+                SnapshotStatus::of(status.tag()).expect("a known tag"),
+                status,
+                "{} did not survive its own tag",
+                status.name()
+            );
+        }
+        // The tags are distinct, so no two statuses are the same byte on the wire.
+        let mut tags: Vec<u8> = every.iter().map(|status| status.tag()).collect();
+        tags.sort_unstable();
+        tags.dedup();
+        assert_eq!(tags.len(), every.len(), "two statuses share a tag");
+        assert!(
+            SnapshotStatus::of(every.len() as u8).is_err(),
+            "an unknown status tag is refused rather than guessed"
+        );
     }
 
     #[test]

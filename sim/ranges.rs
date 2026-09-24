@@ -74,6 +74,14 @@ pub const CLIENTS: u64 = 2;
 pub const DIR: &str = "/node";
 /// The node's inbox bound, in bytes (D-072).
 pub const INBOX_BYTES: usize = 64 * 1024;
+
+/// The node's cap on snapshot streams received and assembled at once (Q14, D-075).
+///
+/// D-075 fixes no default and recommends that a scenario which is not about the cap
+/// set it at or above the node's range count, so no stream waits by accident. These
+/// scenarios are not about the cap: they set it at [`RANGES`]. The re-seed shape, which
+/// *is* about the cap, sets it to two on purpose (SHARD.md §12).
+pub const SNAPSHOT_CAP: usize = RANGES as usize;
 /// How many trace records a run may hold before it is stopped as a runaway
 /// (`raft::TRACE_CAP`, and the figure Stage B measures per range).
 pub const TRACE_CAP: usize = raft::TRACE_CAP;
@@ -85,9 +93,11 @@ const OP_GAP: Duration = Duration::from_millis(5);
 /// The liveness window, in maximum election timeouts (`raft::LIVENESS_TIMEOUTS`).
 const LIVENESS_TIMEOUTS: u32 = 10;
 
-/// The cores' snapshot threshold: far above what this run's clients write, so that
-/// no core asks for a take the node has nowhere to send (SHARD.md §4; the `snapshot`
-/// task keyed by range and follower is its own slice's).
+/// The cores' snapshot threshold: this scenario's own, far above what this run's
+/// clients write, so that no core asks for a take, a record or an install. The node
+/// has had its `snapshot` task since D-083; this scenario asserts that path *absent*
+/// (SHARD.md §4), and the absence is honest only while this threshold keeps the path
+/// unreached (the owner's ruling, 2026-09-24: the threshold is each scenario's own).
 // PROPOSED(D-076): the snapshot threshold is the scenario's, and a run that reaches
 // it fails.
 pub const SNAPSHOT_THRESHOLD: u64 = 1 << 30;
@@ -598,11 +608,10 @@ impl Report {
             .map_err(|violation| format!("seed {seed}: {violation}"))?;
         self.frames_are_this_nodes()
             .map_err(|violation| format!("seed {seed}: {violation}"))?;
-        // The paths this slice's node does not have, asserted absent with the
-        // reason (CLAUDE.md:58-67): the `snapshot` task keyed by range and follower,
-        // Q15's refusal and re-seed, and follower compaction are the other Stage B
-        // slices'. The scenario keeps the cores below their snapshot threshold and
-        // rots no bit, so neither is reached; the day a schedule reaches one, this
+        // The paths this scenario asserts absent, with the reason (CLAUDE.md:58-67):
+        // the snapshot path and Q15's refusal and re-seed are other scenarios' subjects
+        // on the node. The scenario keeps the cores below its own snapshot threshold
+        // and rots no bit, so neither is reached; the day a schedule reaches one, this
         // says so instead of passing over it.
         if let Some(action) = self
             .records()
@@ -613,9 +622,8 @@ impl Report {
             })
         {
             return Err(format!(
-                "seed {seed}: server {} took or restated a snapshot of range {}, a path this \
-                 scenario's node does not have: the `snapshot` task keyed by range and follower \
-                 is another slice's",
+                "seed {seed}: server {} took or restated a snapshot of range {}: this scenario \
+                 asserts that path absent, and its own `snapshot_threshold` is what keeps it so",
                 action.0, action.1
             ));
         }
@@ -691,8 +699,7 @@ pub fn server_config_of(
             variants: variants.into(),
             tick_nanos: u64::try_from(TICK.as_nanos()).expect("small"),
             // [`SNAPSHOT_THRESHOLD`] is far above what this run's clients write: no
-            // core reaches it, so no take is asked for and the `snapshot` task this
-            // node has not got is never wanted. `Report::check` asserts that
+            // core reaches it, so no take is asked for. `Report::check` asserts that
             // absence, and `asking_for_snapshots` is the directed run that reaches
             // it and fails.
             snapshot_threshold,
@@ -700,6 +707,7 @@ pub fn server_config_of(
         },
         engine,
         inbox_bytes: INBOX_BYTES,
+        snapshot_cap: SNAPSHOT_CAP,
         node,
     }
 }
@@ -1054,14 +1062,13 @@ pub fn refusal(records: &[TraceRecord]) -> Refusal {
 /// directed case for the absence [`Report::check`] asserts on every seed of every
 /// tier.
 ///
-/// This node has no `snapshot` task — it is the snapshot slice's — so a core that
-/// asks for a take or a stream is asking for something that will never happen, and
-/// `ServerHost::snapshot` counted the request and dropped it. Counting was silent:
-/// nothing outside the node can read `Gaps`, and D-076's review set this threshold
-/// to twelve and found every check in the tree green over the dropped actions. The
-/// action is traced as a failure of the node now, and this is the run that says so
-/// (CLAUDE.md:58-67).
-// PROPOSED(D-076): the action this node drops is traced, not only counted.
+/// D-076's review set this threshold to twelve and found every check in the tree
+/// green over the actions the then-unwired node dropped; the node has served them
+/// since D-083. What this run proves is the *scenario's* assertion: at twelve every
+/// core takes a snapshot, the trace carries the `RaftSnapshot` records, and
+/// [`Report::check`] fails naming the absence it asserts (CLAUDE.md:58-67).
+// PROPOSED(D-076): the snapshot threshold is the scenario's, and a run that reaches
+// it fails.
 #[must_use]
 pub fn asking_for_snapshots(seed: u64, snapshot_threshold: u64) -> Report {
     run_with_of(

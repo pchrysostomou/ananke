@@ -322,13 +322,67 @@ pub struct RangeHold {
     /// that fitted: the replica its re-seed built being caught up.
     pub fitted: usize,
     /// Rejections of this range the victim delivered to this range's leader in the
-    /// hold stamped a store incarnation of its own: a re-seeded replica's, which
-    /// check quorum counts as any follower's (D-049).
+    /// hold **without** the refused mark: a re-seeded replica that has since been
+    /// caught up, which check quorum counts as any follower's (D-049).
     pub store_rejections: usize,
+    /// Answers of this range the victim delivered to this range's leader in the hold
+    /// stamped **incarnation 0**, from no store at all. D-077's node has no such
+    /// state — it rebuilds every range's store before any replica serves — and that
+    /// half of PROPOSED D-085's finding stands after D-087: what changed is that a
+    /// replica with a store of its own now *says* it holds nothing of the log, with
+    /// the mark, instead of the leader inferring it from a stamp the node never
+    /// sends. This must stay 0, or the re-seed's shape moved under both entries.
+    // PROPOSED(D-087): D-049's rule keyed on a refused mark the answer carries.
+    pub store_less_answers: usize,
+    /// Whether the victim has yet **sent** an answer of this range that fitted, since
+    /// this range's replica was re-seeded. Send order, not delivery order: see
+    /// `marked_after_fitted`. Reset at the re-seed — before it this replica was a
+    /// caught-up follower sending nothing but successes, and it is the re-seed that
+    /// empties its log — and counted whoever the answer went to, because the re-seed
+    /// is before the cut and leadership can move between the two.
+    // PROPOSED(D-087): D-049's rule keyed on a refused mark the answer carries.
+    pub sent_fitted: bool,
+    /// Marked rejections of this range the victim **sent** after it had already sent an
+    /// answer of this range that fitted. The mark says the replica holds nothing of
+    /// this log, and a replica that has accepted an entry holds something, so in send
+    /// order this is **0** unless the mark is computed from something other than this
+    /// range's own log — a mark read per *node*, say, from "this node was refused",
+    /// which is the shape a node of four ranges makes available and one group cannot:
+    /// at one instant the node's four replicas have caught up to four different places,
+    /// and a per-node mark is wrong for every one of them that is ahead.
+    // PROPOSED(D-087): D-049's rule keyed on a refused mark the answer carries.
+    pub marked_after_fitted: usize,
+    /// Its dual: rejections of this range the victim **sent** this range's leader after
+    /// the re-seed and before it had sent anything of this range that fitted, carrying
+    /// **no** mark. The re-seed leaves this replica quarantined with an empty log, which
+    /// is the whole of [`ananke_raft::Raft::refused`], and it stays that way until
+    /// something lands — and the first thing that lands is the first thing that fits.
+    /// So in send order every rejection in that window carries the mark, and this is
+    /// **0**.
+    ///
+    /// `marked_after_fitted` catches a mark that is set too widely; this catches one set
+    /// too narrowly, and only a node of several ranges can. The sweep-wide
+    /// `refused_rejections > 0` in `sim/tests/node.rs` sees only the mark's *total*
+    /// disappearance: a mark computed once per node from one replica and stamped on the
+    /// other three leaves three quarters of the node silently claiming to hold logs they
+    /// have nothing of, and every other figure in this struct unmoved. That is the same
+    /// "read per node where it is per (range, node)" defect the incarnation clause above
+    /// catches for stamps, and it is why the mark needs both directions asserted.
+    ///
+    /// The one other way the window closes is an **install**, which lands a snapshot
+    /// with no answer of its own that fitted: this would then read as a missing mark
+    /// on correct code. It cannot happen on this tree — no snapshot stream is opened
+    /// toward the victim — and `streams` is asserted 0 by a clause that runs *before*
+    /// this one, so the day PR #107's wiring lands the seed fails there, saying so,
+    /// and this clause is re-read with it.
+    // PROPOSED(D-087): D-049's rule keyed on a refused mark the answer carries.
+    pub unmarked_before_fitted: usize,
     /// Rejections of this range the victim delivered to this range's leader in the
-    /// hold stamped **incarnation 0**: a store-less refused server's, which is the
-    /// only answer D-049's rule is about. The node produces none, and
-    /// [`NodeReport::check`] says so per seed.
+    /// hold **carrying the refused mark**: the answer D-049's rule is the whole of.
+    /// Until PROPOSED D-087 this counted rejections stamped incarnation 0 instead,
+    /// of which the node sends none — the rule had no site here. Its replicas send
+    /// the mark on a store of their own, and this is now non-zero.
+    // PROPOSED(D-087): D-049's rule keyed on a refused mark the answer carries.
     pub refused_rejections: usize,
     /// The leader's first commit of its term past its commit index at the cut, in
     /// the hold.
@@ -701,6 +755,12 @@ impl NodeReport {
                 TraceEvent::RaftReseeded { server, range } if *server == victim => {
                     if let Some(hold) = holds.get_mut(range) {
                         hold.reseeded = true;
+                        // The window the mark describes opens here: the re-seed put an
+                        // empty store in place of the one this replica lost, so whatever
+                        // it had sent before is not evidence that it holds anything now.
+                        // PROPOSED(D-087): D-049's rule keyed on a refused mark the
+                        // answer carries.
+                        hold.sent_fitted = false;
                     }
                 }
                 // The re-seeded replica's own restatement of the store it built, which
@@ -761,8 +821,62 @@ impl NodeReport {
                         hold.commit_after_cut = Some(r.decided);
                     }
                 }
-                TraceEvent::MessageSent { id, payload, .. } => {
+                TraceEvent::MessageSent {
+                    id, to, payload, ..
+                } => {
                     payloads.insert(*id, payload.clone());
+                    // The mark, read in **send** order, in both directions. The counters
+                    // below are read at delivery, which is where check quorum sees them,
+                    // but different delays reorder messages (`SimConfig::max_delay`), so
+                    // a mark delivered after a success need not have been sent after
+                    // one. The mark is a claim about the answerer's own log at the
+                    // moment it answers, and in send order it is monotone per range:
+                    // once something lands in a replica the mark can never come back,
+                    // and until something lands every rejection carries it.
+                    //
+                    // Read from the refusal on, not from the cut: the re-seed is before
+                    // the cut, and a replica that caught up between the two would make
+                    // `sent_fitted` start false inside the hold and hide both counters.
+                    // PROPOSED(D-087): D-049's rule keyed on a refused mark the answer
+                    // carries.
+                    if i <= refusal {
+                        continue;
+                    }
+                    let Ok(decoded) = ananke_shard::frame::decode(payload) else {
+                        continue;
+                    };
+                    for tagged in decoded.messages {
+                        let Some(hold) = holds.get_mut(&tagged.range.get()) else {
+                            continue;
+                        };
+                        if tagged.frame.from.0 != victim {
+                            continue;
+                        }
+                        let to_leader = server_of(*to) == Some(hold.leader);
+                        match tagged.frame.message {
+                            // Whoever it went to: the question is what this replica
+                            // holds, and holding is not addressed to anyone.
+                            Message::AppendEntriesResponse { success: true, .. } => {
+                                hold.sent_fitted = true;
+                            }
+                            Message::AppendEntriesResponse {
+                                success: false,
+                                refused: true,
+                                ..
+                            } if to_leader => {
+                                hold.marked_after_fitted += usize::from(hold.sent_fitted);
+                            }
+                            Message::AppendEntriesResponse {
+                                success: false,
+                                refused: false,
+                                ..
+                            } if to_leader => {
+                                hold.unmarked_before_fitted +=
+                                    usize::from(hold.reseeded && !hold.sent_fitted);
+                            }
+                            _ => {}
+                        }
+                    }
                 }
                 TraceEvent::MessageDelivered { id, to, .. } if in_hold(r.at) => {
                     let Some(bytes) = payloads.get(id) else {
@@ -778,6 +892,26 @@ impl NodeReport {
                         if tagged.frame.from.0 != victim || server_of(*to) != Some(hold.leader) {
                             continue;
                         }
+                        // The mark and the incarnation are read separately, which
+                        // is the point of PROPOSED D-087: on the node a refused
+                        // replica's rejection carries **both** — the mark, because
+                        // it holds nothing of the log, and a store incarnation of
+                        // its own, because the re-seed built it a store. Under the
+                        // old key those were one field, and this reading could not
+                        // exist.
+                        //
+                        // So the stamp is counted *beside* the mark and not instead
+                        // of it. An arm matching `incarnation: 0` first would read
+                        // the two as one field again — the very thing D-087 undid —
+                        // and would swallow a store-less answer's mark the day the
+                        // node has one to send.
+                        // PROPOSED(D-087): D-049's rule keyed on a refused mark the
+                        // answer carries.
+                        if let Message::AppendEntriesResponse { incarnation: 0, .. } =
+                            tagged.frame.message
+                        {
+                            hold.store_less_answers += 1;
+                        }
                         match tagged.frame.message {
                             Message::AppendEntriesResponse {
                                 success: true,
@@ -789,12 +923,17 @@ impl NodeReport {
                             }
                             Message::AppendEntriesResponse {
                                 success: false,
-                                incarnation: 0,
+                                incarnation,
+                                refused: true,
                                 ..
-                            } => hold.refused_rejections += 1,
+                            } => {
+                                hold.refused_rejections += 1;
+                                hold.answered_incarnations.insert(incarnation);
+                            }
                             Message::AppendEntriesResponse {
                                 success: false,
                                 incarnation,
+                                refused: false,
                                 ..
                             } => {
                                 hold.store_rejections += 1;
@@ -830,12 +969,29 @@ impl NodeReport {
     ///    replica neither votes nor campaigns (D-035) and the keeper alone is no
     ///    majority. A range that reaches neither fails, naming the range: the scenario
     ///    must not pass by not asking.
-    /// 5. **The two absences D-049's halves need, per range, with the slice that owns
-    ///    each.** No answer of the victim's was a store-less refused server's — the
-    ///    rejection stamped incarnation 0 that is the only answer D-049's rule is
-    ///    about — so no step-down left anything `uncounted`; and no snapshot stream was
-    ///    opened toward the victim and no replica created by an install. The day
-    ///    either arrives this fails and says which half can then be built.
+    /// 5. **The mark tracks each range's own log, not the node's refusal** (PROPOSED
+    ///    D-087), in **both** directions, which is the pair of clauses a single-range
+    ///    world cannot state. No marked rejection of a range was *sent* after that
+    ///    range's replica had already answered it something that fitted — a mark set too
+    ///    widely; and no *unmarked* rejection of a range was sent after that range's
+    ///    replica was re-seeded and before it had sent anything of that range that
+    ///    fitted — a mark set too narrowly, which is what a mark read once per node from
+    ///    one replica and stamped on the other three looks like. Send order for both,
+    ///    not delivery: different delays reorder messages, and 32 of the node's 282
+    ///    marked rejections at a thousand seeds arrive after a success that was sent
+    ///    later. Both read from the refusal on rather than from the cut, because the
+    ///    re-seed is before the cut.
+    /// 6. **The one absence D-049's open half still needs, with the slice that owns
+    ///    it.** No snapshot stream was opened toward the victim and no replica was
+    ///    created by an install: the day PR #107's wiring arrives this fails and says
+    ///    so. The *other* absence this clause used to carry — that no answer of the
+    ///    victim's was a refused server's, so no step-down left anything `uncounted` —
+    ///    is gone: PROPOSED D-087 keyed D-049's rule on a refused mark the answer
+    ///    carries rather than on the store-less stamp the node never sends, and the
+    ///    victim's replicas now send the mark. The rule has a site here, so what was
+    ///    asserted absent is asserted **present**, over the sweep, in
+    ///    `sim/tests/node.rs`.
+    // PROPOSED(D-087): D-049's rule keyed on a refused mark the answer carries.
     ///
     /// # Errors
     ///
@@ -908,27 +1064,54 @@ impl NodeReport {
                     hold.streams
                 ));
             }
-            if hold.refused_rejections > 0 {
+            if hold.store_less_answers > 0 {
                 return fail(format!(
-                    "range {range}: node {victim} answered leader {} with {} rejections stamped \
-                     incarnation 0, the store-less refused server's answer D-049's rule is the \
-                     whole of. This tree's node re-seeds into a fresh engine before it serves, so \
-                     every answer carries a store incarnation of its own and `refused_answered` is \
-                     never set. Something now gives the node a store-less state: D-049's pair can \
-                     be re-asserted on it, and PROPOSED D-085's finding must be re-read",
-                    hold.leader, hold.refused_rejections
+                    "range {range}: node {victim} answered leader {} {} times from **no store**, \
+                     stamped incarnation 0, where D-077's node rebuilds every range's store \
+                     before any replica serves. The half of PROPOSED D-085's finding that \
+                     survives D-087 is that the node has no store-less state; if it has one now, \
+                     D-077's re-seed changed shape and both entries must be re-read",
+                    hold.leader, hold.store_less_answers
                 ));
             }
-            if let Some((_, uncounted)) = &hold.quorum_lost
-                && !uncounted.is_empty()
-            {
+            if hold.marked_after_fitted > 0 {
                 return fail(format!(
-                    "range {range}: leader {} stepped down leaving {uncounted:?} uncounted, where \
-                     no answer on the node is a refused server's. D-049's rule has a site on the \
-                     node now and its pair can be re-asserted there",
-                    hold.leader
+                    "range {range}: node {victim} sent leader {} {} rejections carrying the \
+                     refused mark **after** it had sent an answer of this range that fitted. \
+                     The mark says this replica holds nothing of this range's log, and a replica \
+                     that accepted an entry holds something, so the mark is being computed from \
+                     something other than this range's own log — from the node's refusal, most \
+                     likely, which is right for the replicas still behind and wrong for every \
+                     one that has caught up. One group cannot be wrong about this: it has one \
+                     replica, so per node and per replica are the same predicate",
+                    hold.leader, hold.marked_after_fitted
                 ));
             }
+            if hold.unmarked_before_fitted > 0 {
+                return fail(format!(
+                    "range {range}: node {victim} sent leader {} {} rejections of this range \
+                     carrying **no** refused mark, after its re-seed and before it had sent \
+                     anything of this range that fitted. In that window the replica is \
+                     quarantined on a store the re-seed built with nothing of this log in it, \
+                     which is exactly `Raft::refused`, so every rejection in it carries the \
+                     mark. One missing means the mark is being computed from something other \
+                     than this range's own state — read once per **node** and stamped on every \
+                     range, most likely, which is right for whichever replica it was read from \
+                     and wrong for the other three. The sweep-wide `refused_rejections > 0` \
+                     cannot see that: three quarters of the marks can go without it reaching \
+                     zero. One group cannot see it at all, having one replica",
+                    hold.leader, hold.unmarked_before_fitted
+                ));
+            }
+            // Until PROPOSED D-087 two clauses stood here asserting the *absence*
+            // of D-049's rule on the node: no rejection stamped incarnation 0, and
+            // no step-down naming anyone `uncounted`. Both were true, and both were
+            // true of a rule that had no site here rather than of a node that
+            // satisfied it. The mark gives it one, so the absence is gone and what
+            // replaces it is the per-range reading below: a keeper that kept its
+            // office must have been answered by something other than a refused
+            // rejection, and a cut-off leader must have been answered at all.
+            // PROPOSED(D-087): D-049's rule keyed on a refused mark the answer carries.
             let Some(incarnation) = hold.incarnation else {
                 return fail(format!(
                     "range {range}: node {victim}'s re-seeded replica of it restated no store \
@@ -965,8 +1148,11 @@ impl NodeReport {
                 if hold.fitted + hold.store_rejections == 0 {
                     return fail(format!(
                         "range {range}: keeper {keeper} kept its office through the hold with no \
-                         answer of this range from the node its refusal re-seeded, so the office \
-                         it kept was not kept on the answers this scenario is about"
+                         answer of this range from the node its refusal re-seeded other than {} \
+                         refused rejections, which D-049's rule does not count without re-seed \
+                         progress and of which this node has none. The office it kept was kept on \
+                         nothing this scenario is about",
+                        hold.refused_rejections
                     ));
                 }
                 let mine = hold.incarnation.expect("every range restated one");
@@ -1276,9 +1462,15 @@ impl Report {
                             status: SnapshotStatus::More | SnapshotStatus::Installed,
                             ..
                         } => hold.chunk_acks += 1,
+                        // The refused mark, not incarnation 0: on this server the
+                        // two coincide — its re-seed loop answers from no store at
+                        // all — and reading the mark is what makes this counter the
+                        // same counter on both clusters.
+                        // PROPOSED(D-087): D-049's rule keyed on a refused mark the
+                        // answer carries.
                         Message::AppendEntriesResponse {
                             success: false,
-                            incarnation: 0,
+                            refused: true,
                             ..
                         } => hold.refused_rejections += 1,
                         _ => {}
