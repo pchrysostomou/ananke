@@ -101,6 +101,30 @@ ananke/
 
 _Update this section at the end of every session._
 
+- Branch `phase-3-stream-restarts-cap-wait` (2026-09-23), PROPOSED D-090, stacked on
+  PR #107: the node gets RAFT.md:210-212's restart bound — `Outbound`'s `Counted`
+  carrying the two counters both bounds are made of, `STREAM_RESTARTS = 2`, the third ask
+  counting the checkpoint unusable — and the answer that keeps it from counting the wrong
+  thing, `SnapshotStatus::Waiting` for a cap-wait.
+  **Two bounds were measured and one of them is a finding, not a fix.** `CHUNK_RESENDS`
+  was going to be corrected 4 to 8, the number RAFT.md:210 states and the node's own
+  comment claimed — and the correct node trips it at *both* numbers, 3 781 give-ups at 4
+  and 2 112 at 8 over 32 seeds, because the receiver answers nothing while an install
+  decision is pending and the sender counts that silence as a lost chunk. Left at 4 and
+  filed as **issue #120** rather than widened (D-030, D-039). And on the cap-wait's own
+  bound: bounding a cap-wait by `CHUNK_RESENDS` ran to ten consecutive waits on one
+  stream with four ranges over a cap of two, so a cap-wait is now counted against no
+  give-up bound at all — a slot is granted to a stream *that is asking* (RAFT.md:218-220),
+  so a bound on the asking is a bound on the mechanism. Measured at 100 seeds in release
+  with the cap at two over four ranges: 800 cap-waits on the correct node against 2 151 as
+  it stood, and a worst single stream, receiver-side, of six asks in a row against
+  forty-four; 800 of 800 installs and 100 of 100 green in all three configurations. The
+  pair is deterministic in `ananke_shard::install` — `CapWaitIsAStartOver`, which a node of
+  one range cannot be wrong about, and `RestartsNotCounted` — and the review of this branch
+  added a third check beside them, for what the node *records* rather than what it decides:
+  the resend counter a cap-wait must clear and the restart counter a start-over must
+  increment were both deletable with the whole suite green, and are not now.
+
 - Branch `phase-3-lease-tier-nightly` (2026-09-23), PROPOSED D-088, off `origin/main` at
   `03e1829`: the owner's ruling on `LeaseTrustsTheClock`'s tier on the node. Its catch —
   a stale read found by linearizability — asserts from the **nightly's ten thousand**

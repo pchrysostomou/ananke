@@ -54,7 +54,8 @@ use std::time::Duration;
 
 use ananke_env::sim::{Sim, SimConfig, TraceRecord};
 use ananke_env::{
-    Clock, Either, Environment, Network, NodeId, RangeCause, Rng, Socket, TraceEvent, race,
+    Clock, Either, Environment, Network, NodeId, RangeCause, Rng, Socket, StartOver, TraceEvent,
+    race,
 };
 use ananke_raft::ServerId;
 use ananke_raft::apply::Command;
@@ -180,6 +181,29 @@ impl Report {
                 _ => None,
             })
             .collect()
+    }
+
+    /// Every chunk the node refused, counted by the reason it gave (D-083's
+    /// `RaftSnapshotStartOver`).
+    ///
+    /// The two that matter to RAFT.md:209-212's bounds are `Identity`, which the
+    /// restart bound counts, and `Cap`, which it must not: a node's receive cap sits
+    /// below its range count on purpose, so a bound that counted cap-waits would
+    /// declare a usable checkpoint unusable as a matter of routine (D-090). Reported
+    /// rather than asserted: this scenario's cap equals its range count, so what it
+    /// measures is the *restart* side, and the cap-wait side is measured where it is
+    /// built — the deterministic check in `ananke_shard::install`, and §12's re-seed
+    /// shape, which sets the cap below the count.
+    // PROPOSED(D-090): the restart and cap-wait counts are readable from a run.
+    #[must_use]
+    pub fn start_overs(&self) -> BTreeMap<StartOver, u64> {
+        let mut counts = BTreeMap::new();
+        for record in &self.records {
+            if let TraceEvent::RaftSnapshotStartOver { reason, .. } = &record.event {
+                *counts.entry(*reason).or_default() += 1;
+            }
+        }
+        counts
     }
 
     /// Takes made, as (server, range).
@@ -539,15 +563,18 @@ pub fn config(seed: u64) -> SimConfig {
 /// completed inside the run was a race, not a property. Four seeds in two hundred and
 /// fifty lost it, and tripling the window did not help.
 ///
-/// Stopping the writer removes the race from *this* scenario. It does not remove it
-/// from the node: a stream that keeps being told to start over never exhausts
-/// `CHUNK_RESENDS`, because the restart path resets that counter, and the node has no
-/// restart bound of its own — which RAFT.md:210-212 specifies and the one-group server
-/// honours. That is a finding about the product, recorded in D-083 and put to the
-/// owner, and it is deliberately **not** papered over here: this scenario is about
-/// whether an install lands and what it lands, and it should not also be the only
+/// Stopping the writer removes the race from *this* scenario. It did not remove it from
+/// the node, and that was D-083's finding: a stream that kept being told to start over
+/// never exhausted `CHUNK_RESENDS`, because the restart path reset that counter, and the
+/// node had no restart bound of its own — which RAFT.md:210-212 specifies and the
+/// one-group server honours. **The node has it now** (D-090), which is where that finding
+/// went: the restart is counted, the third ask counts the checkpoint unusable, and a
+/// cap-wait is a separate answer so the bound counts a start-over and not a stream
+/// waiting its turn. The determinism here is kept on its own merits — this scenario is
+/// about whether an install lands and what it lands, and it should not also be the only
 /// thing standing between a livelock and a green run.
 // PROPOSED(D-083): the scenario is deterministic about the situation it claims.
+// PROPOSED(D-090): the node's restart bound is where that finding went.
 async fn writer<E: Environment>(env: E, up_to: Arc<Mutex<u64>>, stop: Arc<AtomicBool>) {
     let Ok(sock) = env.net().bind(client_addr(1)).await else {
         return;

@@ -5634,6 +5634,12 @@ impl StreamProgress {
                 }
                 false
             }
+            // A cap-wait, which the one-group receiver never sends: it has no cap
+            // (RAFT.md:214-218). If one arrived it would be the opposite of progress —
+            // nothing was staged and the stream stands exactly where it stood — and it
+            // is not a restart either, so it is neither counted nor credited.
+            // PROPOSED(D-090): a cap-wait is not progress and is not a start-over.
+            message::SnapshotStatus::Waiting => false,
             message::SnapshotStatus::More => {
                 let done = self
                     .sizes

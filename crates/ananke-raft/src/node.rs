@@ -2141,6 +2141,18 @@ async fn snapshot_task<E: Environment>(
                             send_chunk(&env, &sock, &addrs, id, &config, out, chunk_timeout).await;
                         }
                     }
+                    SnapshotStatus::Waiting => {
+                        // A receiver with a cap on what it assembles at once, which
+                        // this server is not talking to today: the one-group receiver
+                        // holds one stream and has no cap (RAFT.md:214-218), so
+                        // nothing on this path answers a wait. The rule is the node's
+                        // (D-090) and is written here so that hearing one is a wait
+                        // rather than a mystery: nothing is restarted, nothing is
+                        // reset, and the chunk outstanding falls due on the ordinary
+                        // resend timer, which is what bounds it.
+                        // PROPOSED(D-090): a cap-wait is not a start-over.
+                        out.deadline = env.clock().now() + chunk_timeout;
+                    }
                     SnapshotStatus::More => {
                         if out.sender.on_more(&file, offset) {
                             env.trace(TraceEvent::RaftSnapshotResumed {

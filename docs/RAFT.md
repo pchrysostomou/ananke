@@ -830,7 +830,7 @@ waits in the inbox for the next:
   On the node (SHARD.md §4; Q14, Q41) it is one task keyed by (range, follower) on the
   way out and (range, sender) on the way in. Nothing caps the streams it sends, so a
   leader feeds every designated follower of a range at once (D-043); a per-node cap
-  bounds what it assembles, and a (range, sender) over the cap is told to restart and
+  bounds what it assembles, and a (range, sender) over the cap is told to wait and
   takes the first slot that frees. Its chunks go in frames of their own on a socket
   handle of its own, never through the per-peer outbox, so a 256 KiB chunk never spends
   the frame a round's heartbeats needed (Q41). Its install is not the adoption of §1:
