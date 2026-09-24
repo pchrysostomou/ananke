@@ -890,39 +890,92 @@ fn high_rate_share() -> u64 {
     (seeds() / 10).max(seeds().min(20))
 }
 
-/// The violations `variants` was caught by over the share, with the rate and the
+/// The violations a sweep found, split by the check that reported each: the ones
+/// the variant is **about**, and the ones some other check made.
+///
+/// **A catch is the variant's only when the check that reported it is a check the
+/// variant breaks** (RAFT.md §5's table, the `What catches it` column). Until
+/// PROPOSED D-091 every test here read `checked(...).err()` and counted whatever came
+/// back, so a violation by an unrelated check propped up a positive assertion —
+/// "caught" — and, in the absence tests, was reported as the variant being caught at
+/// all. One gap in the **correct** node's own run did exactly that: the timer bound
+/// PROPOSED D-089's per-range aim reached was reported on three different variants,
+/// on seeds where each of the three injects nothing, and the quoted violations were
+/// the timer strings word for word. Attribution is what tells those apart, and it is
+/// the shape `sim/tests/raft.rs` already uses for `NoPreVote`, whose catch is counted
+/// by the pre-vote check and not by whichever check a run failed first.
+// PROPOSED(D-082): a catch on the node is attributed, not counted.
+// PROPOSED(D-091): a catch is attributed to the variant's own violation, and a catch
+// by an unrelated violation fails rather than passes.
+#[derive(Debug, Default)]
+struct Caught {
+    /// Violations by one of the checks named for this variant: its catch.
+    own: Vec<String>,
+    /// Violations by any other check. These are real failures and they are reported
+    /// as themselves — never as this variant's catch.
+    other: Vec<String>,
+}
+
+impl Caught {
+    /// Splits `violations` by whether the check that made each is one of `checks`,
+    /// named as [`mechanism`] names them.
+    // PROPOSED(D-091): a catch is attributed to the variant's own violation.
+    fn split(violations: Vec<String>, checks: &[&str]) -> Self {
+        let mut caught = Self::default();
+        for violation in violations {
+            if checks.contains(&mechanism(&violation)) {
+                caught.own.push(violation);
+            } else {
+                caught.other.push(violation);
+            }
+        }
+        caught
+    }
+}
+
+/// The violations `variants` was caught by over the share, split by [`Caught`]
+/// against the `checks` this variant's catch is attributed to, with the rate and the
 /// mechanisms printed.
 ///
-/// It returns the violations and not a count, because a count cannot tell a catch by
-/// the check the variant is about from a catch by something else that happened to go
-/// wrong first. §12 asks each variant to be re-asserted "to the standard its Phase 2
-/// test asserts and no stronger", and two of Phase 2's tests assert the mechanism by
-/// name rather than a bare catch.
+/// §12 asks each variant to be re-asserted "to the standard its Phase 2 test asserts
+/// and no stronger", and `checks` is that standard: RAFT.md §5's `What catches it`
+/// for the variant, which is what its Phase 2 test asserts against.
 // PROPOSED(D-082): a catch on the node is attributed, not counted.
-fn caught_on(name: &str, variants: impl Into<Variants> + Copy + Send + Sync) -> Vec<String> {
+// PROPOSED(D-091): a catch is attributed to the variant's own violation.
+fn caught_on(
+    name: &str,
+    variants: impl Into<Variants> + Copy + Send + Sync,
+    checks: &[&str],
+) -> Caught {
     let seeds = high_rate_share();
-    let caught: Vec<String> = sweep(seeds, |seed| checked(&buggy(seed, variants)).err())
+    let violations: Vec<String> = sweep(seeds, |seed| checked(&buggy(seed, variants)).err())
         .into_iter()
         .flatten()
         .collect();
-    let rate = caught.len() as f64 * 100.0 / seeds as f64;
     let mut by_check: BTreeMap<&str, usize> = BTreeMap::new();
-    for violation in &caught {
+    for violation in &violations {
         *by_check.entry(mechanism(violation)).or_default() += 1;
     }
+    let caught = Caught::split(violations, checks);
+    let rate = caught.own.len() as f64 * 100.0 / seeds as f64;
     println!(
-        "node: {name} caught on {}/{seeds} seeds ({rate:.1}%), by {by_check:?}, first: {}",
-        caught.len(),
-        caught.first().map_or("", String::as_str)
+        "node: {name} caught on {}/{seeds} seeds ({rate:.1}%) by {checks:?}, its own checks; \
+         {} more violations came from other checks and are not its catch; every violation by \
+         {by_check:?}, first of its own: {}",
+        caught.own.len(),
+        caught.other.len(),
+        caught.own.first().map_or("", String::as_str)
     );
     caught
 }
 
-/// Which check a violation came from, for the attribution `caught_on` prints.
+/// Which check a violation came from, for the attribution [`Caught`] rests on.
 ///
-/// The names are the checks' own words. `server failed` is not a check at all: it is
-/// the node telling the scenario its own apply stream had a hole, which is a real
-/// catch of a real bug and a different statement from a safety fold's.
+/// The names are the checks' own words. `the node failed` is not a check at all: it
+/// is the node telling the scenario its own apply stream had a hole, which is a real
+/// catch of a real bug and a different statement from a safety fold's. The last two
+/// are `checked`'s own, not `Report::check`'s: what a run must reach for the stream
+/// variants to assert anything, and the one path this node has not got.
 // PROPOSED(D-082): a catch on the node is attributed, not counted.
 fn mechanism(violation: &str) -> &'static str {
     for (needle, name) in [
@@ -932,6 +985,7 @@ fn mechanism(violation: &str) -> &'static str {
         ("committed entries", "committed entries stay"),
         ("commit majority:", "commit by majority"),
         ("commit by current term", "commit by current term"),
+        ("match starts:", "match starts"),
         ("log matching", "log matching"),
         ("election safety", "election safety"),
         ("leader completeness", "leader completeness"),
@@ -939,6 +993,11 @@ fn mechanism(violation: &str) -> &'static str {
         ("liveness", "liveness"),
         ("follower log:", "the follower-log bound"),
         ("failed:", "the node failed"),
+        // PROPOSED(D-091): `checked`'s own two, which were "something else" before
+        // and are named now that a name decides where a violation is counted.
+        ("refused its store", "a store refused"),
+        ("this seed's evidence is vacuous", "no snapshot action"),
+        ("nothing was checkpointed for a stream", "no take completed"),
     ] {
         if violation.contains(needle) {
             return name;
@@ -959,10 +1018,18 @@ fn a_server_that_sends_before_it_persists_is_caught_on_the_node() {
     // persist leaves when that persist resolves, and the variant sends it first
     // (§10). On the node the round submits four ranges' persists together, so the
     // send the variant lets out early races a sync that carries other ranges' work.
-    let caught = caught_on("SendBeforePersist", Variant::SendBeforePersist);
+    // Attributed to the checks RAFT.md §5 names for it: commit by majority, and
+    // leader completeness where a crash falls between the send and the persist.
+    // PROPOSED(D-091): a catch is attributed to the variant's own violation.
+    let caught = caught_on(
+        "SendBeforePersist",
+        Variant::SendBeforePersist,
+        &["commit by majority", "leader completeness"],
+    );
     assert!(
-        !caught.is_empty(),
-        "SendBeforePersist was never caught on the node"
+        !caught.own.is_empty(),
+        "SendBeforePersist was never caught on the node by a check it breaks, which is what \
+         RAFT.md §5 names for it: {caught:?}"
     );
 }
 
@@ -976,10 +1043,17 @@ fn a_server_that_applies_before_commit_is_caught_on_the_node() {
     // bug by the node's own oracle, and it is a different statement from state
     // machine safety's, which is why the entry says so rather than leaving it in the
     // count.
-    let caught = caught_on("ApplyBeforeCommit", Variant::ApplyBeforeCommit);
+    // PROPOSED(D-091): a catch is attributed to the variant's own violation. The
+    // node's own oracle is named beside RAFT.md §5's two, for the reason above: a
+    // hole in the applied stream is this bug and nothing else's.
+    let caught = caught_on(
+        "ApplyBeforeCommit",
+        Variant::ApplyBeforeCommit,
+        &["state machine safety", "linearizability", "the node failed"],
+    );
     assert!(
-        !caught.is_empty(),
-        "ApplyBeforeCommit was never caught on the node"
+        !caught.own.is_empty(),
+        "ApplyBeforeCommit was never caught on the node by a check it breaks: {caught:?}"
     );
 }
 
@@ -990,13 +1064,9 @@ fn a_server_without_pre_vote_is_caught_on_the_node() {
     // catch here would be weaker than Phase 2's and this asserts the same thing — the
     // catch is pre-vote's own property, a server raising its term while cut off.
     // PROPOSED(D-082): a catch on the node is attributed, not counted.
-    let caught = caught_on("NoPreVote", Variant::NoPreVote);
-    let by_pre_vote = caught
-        .iter()
-        .filter(|violation| violation.contains("pre-vote:"))
-        .count();
+    let caught = caught_on("NoPreVote", Variant::NoPreVote, &["pre-vote"]);
     assert!(
-        by_pre_vote > 0,
+        !caught.own.is_empty(),
         "NoPreVote was never caught on the node by pre-vote's own property, which is what \
          its Phase 2 test asserts: {caught:?}"
     );
@@ -1007,28 +1077,50 @@ fn a_leader_that_commits_an_older_terms_entry_by_count_is_caught_on_the_node() {
     // The Figure 8 driver's window (D-031), on the node: the burst writes a key of
     // the range the arm drew, so the backlog the restarted leader re-sends is that
     // range's.
-    let caught = caught_on("CountOlderTermForCommit", Variant::CountOlderTermForCommit);
+    // PROPOSED(D-091): a catch is attributed to the variant's own violation.
+    let caught = caught_on(
+        "CountOlderTermForCommit",
+        Variant::CountOlderTermForCommit,
+        &["commit by current term", "leader completeness"],
+    );
     assert!(
-        !caught.is_empty(),
-        "CountOlderTermForCommit was never caught on the node"
+        !caught.own.is_empty(),
+        "CountOlderTermForCommit was never caught on the node by a check it breaks: {caught:?}"
     );
 }
 
 #[test]
 fn a_follower_that_truncates_on_every_append_is_caught_on_the_node() {
-    let caught = caught_on("TruncateOnEveryAppend", Variant::TruncateOnEveryAppend);
+    // PROPOSED(D-091): a catch is attributed to the variant's own violation.
+    let caught = caught_on(
+        "TruncateOnEveryAppend",
+        Variant::TruncateOnEveryAppend,
+        &["committed entries stay"],
+    );
     assert!(
-        !caught.is_empty(),
-        "TruncateOnEveryAppend was never caught on the node"
+        !caught.own.is_empty(),
+        "TruncateOnEveryAppend was never caught on the node by committed entries staying, \
+         which is what RAFT.md §5 names for it: {caught:?}"
     );
 }
 
 #[test]
 fn a_server_that_resets_its_timer_on_any_message_is_caught_on_the_node() {
-    let caught = caught_on("ResetTimerOnAnyRpc", Variant::ResetTimerOnAnyRpc);
+    // PROPOSED(D-091): a catch is attributed to the variant's own violation — the
+    // timer check, which is the one this variant is written for. That matters more
+    // here than anywhere else on this binary: PROPOSED D-091's fourth arm narrows
+    // the timer check, and a variant whose catch *is* the timer check is where a
+    // narrowing would show up as a loss. It does not: the rate is in the entry,
+    // measured before and after.
+    let caught = caught_on(
+        "ResetTimerOnAnyRpc",
+        Variant::ResetTimerOnAnyRpc,
+        &["timers"],
+    );
     assert!(
-        !caught.is_empty(),
-        "ResetTimerOnAnyRpc was never caught on the node"
+        !caught.own.is_empty(),
+        "ResetTimerOnAnyRpc was never caught on the node by the timer check, which is the \
+         check it is written for: {caught:?}"
     );
 }
 
@@ -1047,23 +1139,32 @@ fn a_leader_that_trusts_the_clock_is_caught_on_the_node() {
     // at 4 % the gate's twenty catch none with probability 0.44 and a hundred with
     // 0.017, so an assertion there would fail a tree with nothing wrong the day a
     // change redraws the schedules. The node's own rate is in the entry.
+    //
+    // The catch is counted by the check that makes it — the linearizability search,
+    // which is where a stale lease read is reported — and not by whichever check a
+    // run failed first (PROPOSED D-091).
     let seeds = seeds();
-    let caught: Vec<String> = sweep(seeds, |seed| {
+    let violations: Vec<String> = sweep(seeds, |seed| {
         checked(&buggy(seed, Variant::LeaseTrustsTheClock)).err()
     })
     .into_iter()
     .flatten()
     .collect();
-    let rate = caught.len() as f64 * 100.0 / seeds as f64;
+    let caught = Caught::split(violations, &["linearizability"]);
+    let rate = caught.own.len() as f64 * 100.0 / seeds as f64;
     println!(
-        "node: LeaseTrustsTheClock caught on {}/{seeds} seeds ({rate:.1}%), first: {}",
-        caught.len(),
-        caught.first().map_or("", String::as_str)
+        "node: LeaseTrustsTheClock caught on {}/{seeds} seeds ({rate:.1}%) by the \
+         linearizability search, its own check; {} more violations came from other checks \
+         and are not its catch, first of its own: {}",
+        caught.own.len(),
+        caught.other.len(),
+        caught.own.first().map_or("", String::as_str)
     );
     if seeds >= 1000 {
         assert!(
-            !caught.is_empty(),
-            "LeaseTrustsTheClock was never caught on the node"
+            !caught.own.is_empty(),
+            "LeaseTrustsTheClock's stale read was never caught on the node by the \
+             linearizability search, which is the check RAFT.md §5 names for it: {caught:?}"
         );
     }
 }
@@ -1597,35 +1698,78 @@ fn a_leader_that_ignores_incarnations_has_no_incarnation_to_ignore_on_the_node_y
 /// entry records, and this test pins what the node *does* do, so that the day the other
 /// half arrives the difference is visible.
 // PROPOSED(D-086): the pair on the node is the stream half alone until Q15's re-seed.
+// PROPOSED(D-091): a catch is attributed to the variant's own violation.
+#[derive(Debug)]
+struct Outcome {
+    /// The seed.
+    seed: u64,
+    /// The pair was caught by the liveness check on it.
+    pair: bool,
+    /// `SharedSnapshotDir` alone was.
+    stream: bool,
+    /// `IgnoreIncarnation` alone was.
+    incarnation: bool,
+    /// Violations by any other check, under any of the three: the node failing, not a
+    /// variant being caught.
+    otherwise: Vec<String>,
+}
+
 #[test]
 fn the_pair_on_the_node_is_the_stream_half_alone_until_the_reseed_lands() {
     // The share (D-055, D-061): this runs three variants on every seed it takes, and
     // what it asserts is the *equality* of two of them — a structural claim about one
     // half being a no-op, which a share settles as well as a tier and at a tenth of
     // the cost.
+    //
+    // **Caught, not failed** (PROPOSED D-091). Both halves are caught by the liveness
+    // check and by nothing else — `IgnoreIncarnation`'s wedge stalls a commit where
+    // the bound is asked, and `SharedSnapshotDir`'s stream never completes so neither
+    // designated follower counts (RAFT.md §5, which says of the second in so many
+    // words that "only the liveness check's catches count"). So a seed is counted for
+    // a variant only where the liveness check reported it. A violation by any other
+    // check is the node failing under a variant that injects nothing of that check's
+    // subject, and it is asserted separately, in its own words: the timer bound
+    // PROPOSED D-089's aim reached was reported here as `IgnoreIncarnation` being
+    // caught alone on seeds 272 and 516, which it cannot be while a store's
+    // incarnation never changes — the test said so and was read as a catch anyway.
     let seeds = high_rate_share();
     let both = Variants::of(&[Variant::IgnoreIncarnation, Variant::SharedSnapshotDir]);
-    let outcomes: Vec<(u64, bool, bool, bool)> = sweep(seeds, |seed| {
-        (
+    let by_liveness = |report: &raft::Report| -> (bool, Option<String>) {
+        match checked(report) {
+            Ok(()) => (false, None),
+            Err(violation) if mechanism(&violation) == "liveness" => (true, None),
+            Err(violation) => (false, Some(violation)),
+        }
+    };
+    let outcomes: Vec<Outcome> = sweep(seeds, |seed| {
+        let (pair, a) = by_liveness(&buggy(seed, both));
+        let (stream, b) = by_liveness(&buggy(seed, Variant::SharedSnapshotDir));
+        let (incarnation, c) = by_liveness(&buggy(seed, Variant::IgnoreIncarnation));
+        Outcome {
             seed,
-            checked(&buggy(seed, both)).is_err(),
-            checked(&buggy(seed, Variant::SharedSnapshotDir)).is_err(),
-            checked(&buggy(seed, Variant::IgnoreIncarnation)).is_err(),
-        )
+            pair,
+            stream,
+            incarnation,
+            otherwise: [a, b, c].into_iter().flatten().collect(),
+        }
     });
+    let otherwise: Vec<String> = outcomes
+        .iter()
+        .flat_map(|o| o.otherwise.iter().cloned())
+        .collect();
     // **Per seed, not per count.** Counts were what this compared until PROPOSED
     // D-086's review, and a count equality cannot see the pin disappear: a genuine
     // D-045 wedge on one seed and a stream-only catch on another leave `pair` and
     // `stream` equal, and the wedge — the whole reason the pair exists — goes
     // unreported. The sets are compared, and the seeds where the pair is caught and
     // neither half alone is are asserted empty, which is the wedge itself.
-    let seeds_where = |f: fn(&(u64, bool, bool, bool)) -> bool| -> BTreeSet<u64> {
-        outcomes.iter().filter(|o| f(o)).map(|o| o.0).collect()
+    let seeds_where = |f: fn(&Outcome) -> bool| -> BTreeSet<u64> {
+        outcomes.iter().filter(|o| f(o)).map(|o| o.seed).collect()
     };
-    let pair = seeds_where(|o| o.1);
-    let stream = seeds_where(|o| o.2);
-    let incarnation = seeds_where(|o| o.3);
-    let only_the_pair = seeds_where(|o| o.1 && !o.2 && !o.3);
+    let pair = seeds_where(|o| o.pair);
+    let stream = seeds_where(|o| o.stream);
+    let incarnation = seeds_where(|o| o.incarnation);
+    let only_the_pair = seeds_where(|o| o.pair && !o.stream && !o.incarnation);
     println!(
         "node: the pair caught on {}/{seeds} seeds {pair:?}, `SharedSnapshotDir` alone on {} \
          {stream:?}, `IgnoreIncarnation` alone on {} {incarnation:?}, and on {} seeds \
@@ -1660,8 +1804,18 @@ fn the_pair_on_the_node_is_the_stream_half_alone_until_the_reseed_lands() {
     // would mean something new either way.
     assert!(
         incarnation.is_empty(),
-        "`IgnoreIncarnation` alone is caught on the node on seeds {incarnation:?}, which it \
-         cannot be while a store's incarnation never changes: re-audit this test"
+        "`IgnoreIncarnation` alone is caught on the node by the liveness check on seeds \
+         {incarnation:?}, which it cannot be while a store's incarnation never changes: \
+         re-audit this test"
+    );
+    // And what none of the three is about: a run that failed some other check. That
+    // is the node failing, not a variant being caught, and it is reported as itself.
+    // PROPOSED(D-091): a catch is attributed to the variant's own violation.
+    assert!(
+        otherwise.is_empty(),
+        "a run under one of these variants failed a check none of them breaks, so the node \
+         itself failed and no variant was caught: read these as the correct node's and fix \
+         them there. {otherwise:?}"
     );
 }
 
@@ -1690,25 +1844,51 @@ fn the_pair_on_the_node_is_the_stream_half_alone_until_the_reseed_lands() {
 /// one it replaces, not a weaker one.
 // PROPOSED(D-082): each blocked variant is named by a test, not by prose.
 // PROPOSED(D-086): the four the stream path reaches are re-asserted above, not blocked.
+/// **The absence is of the variant's own catch, and of nothing else** (PROPOSED
+/// D-091). `checks` names the checks RAFT.md §5 says catch this variant; a violation
+/// by one of them is the path arriving and this test asking to be turned into §10's
+/// assertion. A violation by any *other* check is the correct node failing under a
+/// variant that injects nothing on it — a real failure, and this test's job is to say
+/// so in those words rather than to report it as the variant being caught.
+///
+/// That distinction is not hypothetical. The timer bound PROPOSED D-089's per-range
+/// aim reached made this function claim `AdoptionAsBuilt` was caught on seed 440 and
+/// `RefusalNotDurable` on seeds 272 and 516, quoting the timer strings as the
+/// variants' catches — three false catches of one gap in a run neither variant
+/// touched.
+// PROPOSED(D-091): a catch is attributed to the variant's own violation.
 fn blocked_on_the_node(
     name: &str,
     variants: impl Into<Variants> + Copy + Send + Sync,
+    checks: &[&str],
     waits_on: &str,
 ) {
     let seeds = high_rate_share();
-    let caught: Vec<String> = sweep(seeds, |seed| checked(&buggy(seed, variants)).err())
+    let violations: Vec<String> = sweep(seeds, |seed| checked(&buggy(seed, variants)).err())
         .into_iter()
         .flatten()
         .collect();
+    let caught = Caught::split(violations, checks);
     println!(
-        "node: {name} is not re-asserted here; over {seeds} seeds it was caught {} times, and \
-         it waits on {waits_on}",
-        caught.len()
+        "node: {name} is not re-asserted here; over {seeds} seeds it was caught {} times by \
+         {checks:?}, its own checks, and {} runs failed some other check; it waits on \
+         {waits_on}",
+        caught.own.len(),
+        caught.other.len()
     );
     assert!(
-        caught.is_empty(),
-        "{name} is caught on the node, so the path it breaks is reachable after all: turn this \
-         absence into the assertion §10 asks for. {caught:?}"
+        caught.own.is_empty(),
+        "{name} is caught on the node by {checks:?}, the checks RAFT.md §5 names for it, so \
+         the path it breaks is reachable after all: turn this absence into the assertion §10 \
+         asks for. {:?}",
+        caught.own
+    );
+    assert!(
+        caught.other.is_empty(),
+        "the node failed under {name} by a check {name} does not break, and {name} injects \
+         nothing on this node — so this is the **correct node's** failure and not a catch of \
+         {name}. Read it as the correct node's and fix it there. {:?}",
+        caught.other
     );
 }
 
@@ -1718,9 +1898,13 @@ fn a_server_whose_adoption_is_as_built_is_not_re_asserted_on_the_node_yet() {
     // remain rather than §10 amended. The two are the live install's single switch and
     // Q15's refused directory; neither path is in this tree. The third rule, a damaged
     // staging `CURRENT` refused, has no subject on a node that adopts no staged store.
+    // Its catch is `committed entries stay`: a voter restarts on a fresh store and
+    // restates a truncation from index 1 below its commit index (RAFT.md §5).
+    // PROPOSED(D-091): a catch is attributed to the variant's own violation.
     blocked_on_the_node(
         "AdoptionAsBuilt",
         Variant::AdoptionAsBuilt,
+        &["committed entries stay"],
         "the node's snapshot wiring and PR #86's refused directory",
     );
 }
@@ -1730,101 +1914,130 @@ fn a_server_whose_refusal_is_not_durable_is_not_re_asserted_on_the_node_yet() {
     // The node *does* read this one (`quiesce_on_loss` in `server::run`), and it still
     // has nothing to do: the disk does not rot on this cluster, because a refusal
     // stops the node until Q15's whole-node re-seed lands.
+    // Its catch is the `match starts` oracle — a leader tracing a second first rise
+    // of a follower's match under one incarnation — with `state machine safety` the
+    // route D-078 measured out of reach and `a store refused` the path itself
+    // arriving (RAFT.md §5). All three are named, so any of them turns this absence
+    // into §10's assertion.
+    // PROPOSED(D-091): a catch is attributed to the variant's own violation.
     blocked_on_the_node(
         "RefusalNotDurable",
         Variant::RefusalNotDurable,
+        &["match starts", "state machine safety", "a store refused"],
         "PR #86's whole-node refusal and re-seed",
     );
 }
 
-/// Seeds 272 and 516, which PROPOSED D-089's aim reaches and nothing before it did: a
-/// replica being fed a snapshot of one range goes past the timer bound without
-/// campaigning, while the **live** install of that range completes on it.
+/// Seeds 272 and 516, which PROPOSED D-089's aim reaches and nothing before it did,
+/// and which PROPOSED D-091's fourth arm answers for: a replica being fed a snapshot
+/// of one range goes past the timer bound without campaigning, while the node holds
+/// its core for the **live** install of that range.
 ///
-/// **This is a bound the correct node trips, and it is pinned rather than widened**
-/// (D-030, D-039; CLAUDE.md). Neither seed fails any safety fold: the four log
-/// invariants, the commit majority, linearizability, the payload oracle, the match
-/// starts, the isolation's term and D-065's two all pass, and the run's liveness bound
-/// passes — `Report::check` reaches the timer replay, which is the last of them, and
-/// reports there.
+/// **The mechanism is asserted both ways, not a bare green** (CLAUDE.md), which is
+/// the shape D-063's own pin has for seed 2605.
+/// `Report::timer_gaps_held_by_a_live_install` is the replay with every arm but this
+/// one — `TimerResets::WITHOUT_LIVE_INSTALL`, the check exactly as it stood on
+/// 1d17dcc — and on each seed it is that check's one gap, its violation word for
+/// word, on the (server, range) recorded, with the live install's hold in it; while
+/// `check()` is green. It also asserts that that replay finds nothing else on the
+/// seed, so the arm is seen to be exempting the hold and not more.
 ///
-/// **The mechanism, identical on both seeds.** The flagged replica's clock is last reset
-/// by an `AppendEntries` of its term. Its leader then stops appending to it and starts
-/// streaming it a snapshot of that range, re-opening the stream at offset 0 five times
-/// across the window (`RaftSnapshotResumed`), and the replica completes an install of
-/// that range inside it (`RaftSnapshot { taken: false }`) — seed 272 at 21.647 s, 290 ms
-/// into a window that runs 21.357 s to 21.758 s, on server 2's replica of range 4 under
-/// leader 3; seed 516 at 17.188 s, 267 ms into 16.921 s to 17.322 s, on server 2's
-/// replica of range 5 under leader 1. **No `InstallSnapshot` chunk of that range is
-/// delivered to it inside the window**, so D-030's reset arm has nothing to fire on, and
-/// the replica neither hears a leader of its term nor campaigns.
+/// **The shape, identical on both seeds.** The flagged replica's clock is last reset
+/// by an `AppendEntries` of its term. Its leader then stops appending to it and
+/// starts streaming it a snapshot of that range, re-opening the stream at offset 0
+/// five times across the window (`RaftSnapshotResumed`), and **no `InstallSnapshot`
+/// chunk of that range is delivered to it inside the window**, so D-030's reset arm
+/// has nothing to fire on. The install of that range is then decided on it — the
+/// moment the `raft` task hands the repair over and holds the range (D-066; PROPOSED
+/// D-083's `CoreWork::Hold`) — and from there to the manifest switch the replica's
+/// core takes no input and no tick, so it has no election timer to fire. The switch
+/// restores the replica, which traces its restatement and starts counting again.
 ///
-/// **Why none of the timer check's three arms covers it, which is the open question.**
-/// `TimerResets` has an arm for an install chunk delivered (D-030, seed 164), one for an
-/// install's restatement (D-039, seed 385) and one for the adoption of a completed
-/// install (PROPOSED D-063, seed 2605). The third is the one this looks like, and it was
-/// written for a server whose **run-loop incarnation ends at the completion and starts
-/// again at its restatement**, so there is no election timer in between. A node does not
-/// do that: "an install into a live store keeps its incarnation" (D-042, D-066), the
-/// range's replica is replaced in place, and there is no restatement to put it back. So
-/// the arm never fires here and the replay measures a stretch that, on a one-group
-/// server, would not have been one.
+/// Seed 272: server 2's replica of range 4 under leader 3, the window running
+/// 21.356963658 s to 21.757937867 s; the install decided at 21.647374004 s and its
+/// switch durable, with the restatement on it, at 21.789195738 s — so the flag fell
+/// 110.6 ms into the hold and 31.3 ms before the restatement. Seed 516: server 2's
+/// replica of range 5 under leader 1, the window 16.920911437 s to 17.321568677 s,
+/// the install decided at 17.188140918 s and switched at 17.328088046 s — 133.4 ms
+/// into the hold, 6.5 ms before the restatement.
 ///
-/// **What this test does not do is decide that.** Whether the check gains a fourth arm
-/// for the node's live install, or the node should campaign here and does not, is the
-/// owner's ruling and a decision of its own; PROPOSED D-089 takes it to them with these
-/// two seeds. What the test asserts is the **situation and its shape**, so that the day
-/// either changes it says so: the gap is there, it is the only one, it is on the
-/// (server, range) recorded, the install completes inside its window, and no chunk of
-/// that range lands inside it. A fourth arm removes the gap and fails this test, which
-/// is how it should be found.
+/// **Why none of the check's other three arms covers it.** `TimerResets` has an arm
+/// for an install chunk delivered (D-030, seed 164), one for an install's
+/// restatement (D-039, seed 385) and one for the adoption of a completed install
+/// (PROPOSED D-063, seed 2605). The third is the one this looks like, and it was
+/// written for a server whose **run-loop incarnation ends at the completion and
+/// begins again at its restatement**. A node does not do that: "an install into a
+/// live store keeps its incarnation" (D-042, D-066), the range's replica is replaced
+/// in place, and the completion's own restatement lands at the same instant — which
+/// is what D-063's `restates` predicate reads as a start's re-trace, so that arm does
+/// not fire here and would be the wrong one if it did. PROPOSED D-091 is the fourth
+/// arm the owner ruled on, keyed to the hold rather than to an incarnation ending, as
+/// D-066 said it would have to be.
 ///
-/// The base branch reaches none of this: its install crash reached the final chunk of
-/// the range it drew on 0 of 100 seeds, so the aim is what makes the situation
-/// reachable at all, and 1 000 seeds of the correct node were green before it.
+/// **The day the first assertion fails, the seed's schedule has moved off the
+/// situation and this pin is re-audited, not deleted** — as D-063's pin says of 2605.
 // PROPOSED(D-089): the stream arms aim their victim at a range it lags.
+// PROPOSED(D-091): the node's live install holds one range, and the replay does not
+// measure a replica whose core is held.
 #[test]
-fn seeds_272_and_516_go_past_the_timer_bound_while_a_live_install_completes() {
-    for (seed, server, range) in [(272u64, 2u64, 4u64), (516, 2, 5)] {
+fn seeds_272_and_516_are_a_live_installs_hold_and_the_fourth_arm_answers_for_them() {
+    for (seed, server, range, decided, switched) in [
+        (272u64, 2u64, 4u64, 21_647_374_004u64, 21_789_195_738u64),
+        (516, 2, 5, 17_188_140_918, 17_328_088_046),
+    ] {
         let report = correct(seed);
+        // Green, and green because the replica was held: `check()` passes and the
+        // replay under every arm finds nothing.
+        report
+            .check()
+            .unwrap_or_else(|violation| panic!("seed {seed} no longer passes: {violation}"));
         let gaps = report.timer_gaps(raft::TimerResets::ALL);
+        assert!(
+            gaps.is_empty(),
+            "seed {seed}: the timer replay reports {gaps:?}, so this seed is no longer the \
+             hold this pins"
+        );
+        // The other way: the check as it stood on 1d17dcc flags exactly one stretch,
+        // on the replica recorded, and the hold is in it.
+        let rescued = report.timer_gaps_held_by_a_live_install();
         assert_eq!(
-            gaps.len(),
+            rescued.len(),
             1,
-            "seed {seed}: the timer replay reports {} gaps, not the one this pins: {gaps:?}",
-            gaps.len()
+            "seed {seed}: the check without the fourth arm finds {} stretches held by a live \
+             install, not the one this pins: {rescued:?}",
+            rescued.len()
         );
-        let gap = gaps[0];
+        let gap = rescued[0];
         assert_eq!(
-            (gap.server, gap.range),
-            (server, range),
-            "seed {seed}: the gap moved off server {server}'s replica of range {range}, so the \
-             schedule this pins is not the schedule it runs: re-audit it against the entry"
+            (gap.server, gap.range, gap.live_installs),
+            (server, range, 1),
+            "seed {seed}: the stretch moved off server {server}'s replica of range {range}, or \
+             holds more than the one live install: re-audit this pin against the entry"
         );
-        // The violation `Report::check` reports is this gap and nothing earlier: every
-        // safety fold and the liveness bound run before the timer replay, so a seed
-        // that fails here has passed all of them.
-        // `expect_err` takes a message and not a format string, so the seed has to be
-        // interpolated here: this message is read on exactly the day a pinned seed stops
-        // failing, which is the day it has to say which seed.
-        let Err(violation) = report.check() else {
-            panic!(
-                "seed {seed} no longer goes past the timer bound: either the check has gained \
-                 its fourth arm for the node's live install — in which case this pin has done \
-                 its job and goes — or the schedule moved off the situation and the pin has to \
-                 be re-audited against the entry"
-            );
-        };
+        // And it is the *only* thing that check finds on the seed, so the arm is seen
+        // to be exempting the hold and not more.
         assert_eq!(
-            violation,
-            format!("seed {seed}: {}", gap.violation()),
-            "seed {seed}: the run now fails something other than the timer gap this pins"
+            report.timer_gaps(raft::TimerResets::WITHOUT_LIVE_INSTALL),
+            rescued,
+            "seed {seed}: the check without the fourth arm finds a stretch this arm does not \
+             answer for, so the arm is exempting more than the live install's hold"
         );
-        // The mechanism: the live install of that range completes inside the window,
-        // and no chunk of that range is delivered inside it.
-        let completed = report.records.iter().any(|record| {
-            record.decided > gap.since
-                && record.decided <= gap.at
+        // The mechanism, off the trace: the install of that range was decided inside
+        // the window and its switch — where the replica is restored and restates —
+        // landed after the flag. That is the hold, and the flag fell inside it.
+        let decided = ananke_env::Instant::from_nanos(decided);
+        let switched = ananke_env::Instant::from_nanos(switched);
+        assert!(
+            gap.since < decided && decided < gap.at && gap.at < switched,
+            "seed {seed}: the install was decided at {decided:?} and switched at {switched:?}, \
+             which no longer brackets the flag at {:?} inside the window since {:?}: the \
+             schedule moved and this pin is re-audited",
+            gap.at,
+            gap.since
+        );
+        let held = report.records.iter().any(|record| {
+            record.decided == decided
+                && record.at == switched
                 && matches!(
                     &record.event,
                     ananke_env::TraceEvent::RaftSnapshot {
@@ -1836,10 +2049,31 @@ fn seeds_272_and_516_go_past_the_timer_bound_while_a_live_install_completes() {
                 )
         });
         assert!(
-            completed,
-            "seed {seed}: no install of range {range} completed on server {server} inside the \
-             window, so this is no longer the live install's shape that PROPOSED D-089 pins"
+            held,
+            "seed {seed}: no live install of range {range} on server {server} was decided at \
+             {decided:?} and switched at {switched:?}, so this is no longer the shape PROPOSED \
+             D-091's arm is written for"
         );
+        // The restatement the hold closes on, at the switch: without it the replica
+        // would be out of the running set for the rest of the run.
+        let restated = report.records.iter().any(|record| {
+            record.at == switched
+                && matches!(
+                    &record.event,
+                    ananke_env::TraceEvent::RaftRecovered {
+                        server: who,
+                        range: of,
+                        ..
+                    } if *who == server && *of == range
+                )
+        });
+        assert!(
+            restated,
+            "seed {seed}: the restored replica of range {range} traced no restatement at the \
+             switch, so the hold has no close fence on this seed"
+        );
+        // And the leader was streaming it, which is why it heard nothing: the shape
+        // PROPOSED D-089's aim reaches.
         let resumed = report.records.iter().any(|record| {
             record.decided > gap.since
                 && record.decided <= gap.at

@@ -12177,6 +12177,18 @@ found by planting the mutation and none by reading the code. That is the honest 
 of the table: a campaign whose every row is caught has usually been written after the
 checks rather than against them.
 
+### Nothing moved
+
+The change is to the check's replay and to what `sim/tests/node.rs` counts a catch as; it
+touches no scenario, no fault and nothing in `crates/`, so no trace and no schedule moves.
+That is measured rather than asserted: `every_seed_passes_on_the_correct_node_under_the_
+raft_sweeps_arms` at the thousand-seed tier is **green, 1 000 seeds, 123 400 888 records**,
+and every coverage figure PROPOSED D-089 recorded comes back to the digit — `installs_fired`
+**131**, the install arm's aims by range **{2: 123, 3: 128, 4: 137, 5: 129}**, the re-take
+arm's **{2: 64, 3: 57, 4: 69, 5: 56}**, **616 of 763** aims keeping the range the schedule
+drew, **58 869** snapshot actions, 2 816 of 2 816 leader-relative arms hitting their range's
+leader. The only figures that move anywhere on this branch are the two gaps the arm removes.
+
 ### The pinned seeds, re-audited
 
 SHARD.md's Stage B names the node as one of three commits of the stage that may move
@@ -13883,6 +13895,359 @@ injection is asserted from a hundred seeds instead of ten thousand. Its catch on
 asserted nowhere; the arm is no longer the reason, and that is the state this entry takes
 to the owner.
 
+## PROPOSED D-091 — The node's live install holds one range, and the timer check stops measuring a replica whose core is held
+
+**The number.** The footer read D-090 on this branch, which is where PROPOSED D-089 left
+it, but `phase-3-stream-restarts-cap-wait` is open against its own copy of this file with
+a **D-090** of its own, so a number taken from the footer here would collide with it at
+the merge. This entry takes **D-091**, past it, and the footer moves to D-092. Every code
+site carries `// PROPOSED(D-091)`. The integrator may renumber it at the merge; nothing in
+the tree depends on the number beyond those markers, this heading and the footer.
+
+**Context.** PROPOSED D-089 aimed the stream arms at a range their victim lags, reached a
+situation nothing before it did, and took the consequence to the owner rather than fixing
+it itself: **the correct node trips the timer bound on seeds 272 and 516 of the first
+thousand**, where the base branch is green on all thousand. The owner ruled, and this
+entry is that ruling:
+
+> the fourth arm for a live install that keeps its incarnation, fenced at both ends as
+> D-063's was, and a catch attributed to the variant's own violation rather than any
+> violation — then re-measure `IgnoreIncarnation`, `RefusalNotDurable` and
+> `AdoptionAsBuilt` on the node and correct their entries.
+
+**Nothing is widened.** `TIMER_TIMEOUTS` is unchanged, `timer_bound` is unchanged, no
+seed is excluded from a sweep, and no trace and no schedule moves. What changes is the
+check's model of the node, which is the only thing D-030, D-039 and PROPOSED D-063 ever
+allowed to change here.
+
+### What the node does
+
+**An install into a live store keeps its incarnation** (D-042, D-066). D-063's arm was
+written for the one-group server, where a completed install **ends** the incarnation:
+`install_decision` returns `Next::Reinstall`, the outer loop re-runs `start_store`, and
+the server has no core and no election timer from the completion to its restatement. On a
+node that would restart every range on it (SHARD.md:1799), so D-066 decided that "every
+install on the node is a live install": the range's replica is replaced in place, in one
+manifest switch, and the node's other three ranges go on running. There is no incarnation
+to end and no restart to put one back.
+
+What the node does instead is **hold the one range**. D-066's words: "the range's core
+must take no input and no tick from the capture to the switch", implemented by
+`CoreWork::Hold` (PROPOSED D-083, `crates/ananke-shard/src/server.rs`). The `raft` task
+takes the hold at `SnapAnswer::Ready` and builds the repair from that core while nothing
+can step it; the `snapshot` task then does the switch; `SnapAnswer::Switched` restores the
+replica and releases the hold. **A core that takes no tick has no election timer to fire.**
+
+D-066 said this arm would be owed, in so many words, when it re-keyed D-063's readers:
+D-063's exemption "does not apply to a live install, which ends no incarnation. It is
+re-keyed to the range's hold above, the one stretch in which a replica's core has no timer
+to fire." That re-keying was never written. This entry is it.
+
+### What the check did
+
+The replay's notion of "running" is `up`, which a replica enters at its `RaftTerm` and
+leaves at a `NodeCrashed`, a `RangeRemoved` or — under D-063 — a completed install that
+retires the incarnation. The node's live install matches none of them, and D-063's arm
+does not fire on it: that arm excludes a completion with a `RaftRecovered` for the same
+replica at the same instant, because on the one-group server that shape is a start's
+re-trace of the store's snapshot; on the node the live install's own restatement lands at
+the switch's instant and reads as exactly that. So the replay measured the whole stretch,
+hold and all, against a bound the held core could not have met.
+
+On seed 272: server 2's replica of range 4 last heard an `AppendEntries` of its term from
+leader 3 at 21.356963658 s. Leader 3 then stopped appending and streamed it a snapshot of
+range 4, re-opening the stream at offset 0 five times across the window, and **no
+`InstallSnapshot` chunk of range 4 was delivered to it inside the window**, so D-030's arm
+had nothing to fire on. The install of range 4 was decided on it at 21.647374004 s — the
+step that takes the hold — and its switch was durable, with the restored replica's
+restatement on it, at 21.789195738 s. The flag fell at 21.757937867 s against server 2's
+400.94 ms bound: **110.6 ms inside the hold and 31.3 ms before the restatement**. Seed 516
+is the same shape on server 2's replica of range 5 under leader 1: window 16.920911437 s
+to 17.321568677 s, decided 17.188140918 s, switched 17.328088046 s, the flag 133.4 ms into
+the hold and 6.5 ms before the restatement.
+
+Neither seed fails any safety fold. `Report::check` reaches the timer replay, which runs
+last, and reports there.
+
+### Decision
+
+**For the timer check, the node's live install takes the replica out of the replay's
+running set from the install's decision to its restatement** — the same treatment D-063
+gives a completed install, keyed to the hold rather than to an incarnation ending, because
+on the node it is the hold and not the incarnation that stops the core.
+
+**The two fences, both named events.**
+
+- **It opens on the install's decision**, carried by the completion record
+  `RaftSnapshot { taken: false }`, which the replay places at that record's decision time
+  (D-047). The node decides the install when the `raft` task hands the repair over, which
+  is the step that takes the hold (`crates/ananke-shard/src/install.rs`, `finish`), so the
+  exemption is **never wider than the hold**. Read by durability time the record sits at
+  the switch and the restatement follows it at the same instant, so the exemption is empty
+  there: the narrower reading, which can hide nothing.
+- **It closes on the replica's restatement**, `RaftRecovered` for that (range, server),
+  which the restored replica traces at the switch (`CoreWork::Restore`) and which is where
+  the new replica's election timer starts counting. The replay re-admits it there and
+  resets its clock, exactly as a start does. Two other named events close it as well, and
+  both are ones every stretch already has: the replica's node crashing, after which its
+  restart's `RaftTerm` re-admits it as every crash's does, and its `RangeRemoved`.
+
+**Which `RaftSnapshot { taken: false }` is a live install** is read off a named event and
+not off a timing coincidence: the node reads the range's replica back out of the engine at
+the switch and traces it, and the read-back and the completion are paired by
+`(range, last_index, last_term)` (PROPOSED D-083, `Report::reads_back`). The one-group
+server writes that record on no path at all, so a staged install's completion never matches
+it and keeps D-063's arm. That is structural and not a measurement:
+`TraceEvent::RaftSnapshotState` is written by `crates/ananke-shard` alone — by the
+`snapshot` task after an install and by the node's own take — and the one-group server
+does not run it, so no trace of `Cluster::OneGroup` holds the record at all and this arm
+cannot fire on one. Measured over 40 seeds of each cluster, the shapes of
+`RaftSnapshot { taken: false }` separate with nothing shared: on the node, live installs
+(read-back present, decided before traced) and start re-traces (no read-back, traced as
+they happen); on one group, staged completions (no read-back, decided before traced) and
+start re-traces. The counts over the node's first thousand seeds are below.
+
+**What the arm does not exempt**, which is the whole of it, since an exemption that hides a
+genuine gap is strictly worse than the false catches it replaces. Each is asserted in
+`the_live_installs_hold_exempts_the_hold_and_nothing_else` (`sim/raft.rs`, `mod tests`) on
+records written by hand, where a wrong rule is a different **answer** and not a different
+rate:
+
+1. **The stretch before the hold opens.** A replica whose core is live and counting is
+   measured, and an install decided after the flag fell excuses nothing before it.
+2. **The node's other ranges.** The hold is one range's (PROPOSED D-083,
+   `hold_for_install`), so the arm takes the **replica** out of the running set and never
+   the node: a second replica on the same server, silent through the same window, is still
+   flagged.
+3. **A take.** The node reads a take back with the same event, so the read-back alone is
+   not the rule: a snapshot the replica took of its own accord is the live core's own work
+   and excuses nothing, as D-063's first test says of the one-group server.
+4. **A completed install with no read-back.** That is D-063's staged whole-store install,
+   which ends the incarnation; it keeps D-063's arm and D-063's fences, and this arm
+   answers for none of it.
+5. **Anything after the restatement.** The exemption closes where it opens: 450 ms of
+   silence after the restatement is a gap again, since the restatement.
+
+**The one thing it does exempt that is not bounded by a fence** is a hold the run ends
+inside: a trace that stops between a switch and its restatement leaves the replica out of
+the running set to the end of it. That is D-063's arm's property too — a run that ends
+mid-adoption leaves the server out the same way — and it is a stretch that does not exist
+rather than one that goes unmeasured. It is also measured rather than argued: over the
+node's first thousand seeds **11 949** live installs opened a hold and **every one of them
+closed**: 11 946 on the restatement at their own switch, 3 on a later restatement or
+`RaftTerm`, none on a `RangeRemoved`, and **none was still open when the run ended**.
+Under `ResetTimerOnAnyRpc`'s share of a hundred, 769 opened and all 769 closed — 765 and
+4.
+
+### Alternatives
+
+- *Widening the bound, or `TIMER_TIMEOUTS` from two to three.* Forbidden by D-030, D-039,
+  PROPOSED D-063 and RAFT.md §5 — "what was wrong was the check's model of the protocol,
+  not the bound" — and it would dull the catch of `ResetTimerOnAnyRpc`, whose catch **is**
+  the timer check and is re-measured below.
+- *Widening D-063's arm to fire on the node's completion.* This is the tempting one and it
+  is wrong twice. D-063's arm closes on the `RaftTerm` of the next incarnation, which a
+  live install does not produce, so the replica would leave the running set and never come
+  back — an exemption with one fence, which is the failure mode the owner's ruling names.
+  And it would have to drop the `restates` predicate to fire at all, which is D-063's own
+  first mutation: it makes a start's re-trace of the store's snapshot excuse a gap too.
+- *Resetting the clock at the switch instead of removing the hold.* The alternative D-063
+  measured and rejected, and it is worse here for the same reason: the hold alone can
+  outlast the bound, and a reset at its end still measures a core that took no tick against
+  a timer that did not exist. The hand-built test
+  `a_coreless_window_longer_than_the_bound_is_removed_not_measured_from_the_completion`
+  states it for D-063's arm and this entry does not reopen it.
+- *Leaving it and excluding the two seeds.* Not a decision this project makes: a bound the
+  correct system trips is a model error to fix, and a seed excluded from a sweep is the
+  check pretending it passed.
+
+### The attribution, which is the second half of the ruling
+
+**A catch is the variant's only when the check that reported it is a check the variant
+breaks.** Until this entry every test in `sim/tests/node.rs` read `checked(...).err()` and
+counted whatever came back, so a violation by an unrelated check propped up a positive
+assertion — "caught" — and, in the absence tests, was reported as the variant being caught
+at all. The timer gap above did exactly that, three times over, on runs where the variant
+in question injects nothing:
+
+- `the_pair_on_the_node_is_the_stream_half_alone_until_the_reseed_lands` failed claiming
+  `IgnoreIncarnation` alone was caught on seeds 272 and 516 — which it cannot be while a
+  store's incarnation never changes, as the test's own message says;
+- `a_server_whose_refusal_is_not_durable_is_not_re_asserted_on_the_node_yet` failed
+  claiming `RefusalNotDurable` was caught on the same two, the quoted violations being the
+  two timer strings word for word;
+- `a_server_whose_adoption_is_as_built_is_not_re_asserted_on_the_node_yet` failed the same
+  way on seed 440.
+
+So a catch now names the check it expects, which is what RAFT.md §5's `What catches it`
+column says for the variant and what its Phase 2 test asserts against — the shape
+`sim/tests/raft.rs` already had for `NoPreVote`, whose catch is counted by the pre-vote
+check and not by whichever check a run failed first. `Caught::split` puts every violation
+on one side or the other, and both sides are asserted:
+
+- a positive assertion counts **only** its own checks, so **a catch by an unrelated
+  violation now fails the test rather than passing it**;
+- an absence assertion reports its own checks as the path arriving, and everything else in
+  its own words: *"the node failed under X by a check X does not break, and X injects
+  nothing on this node — so this is the correct node's failure and not a catch of X."*
+  That is what these three would have said on seeds 272, 516 and 440, and it points at the
+  bound instead of at a phantom.
+
+Every variant on the node is now attributed: `SendBeforePersist` to commit by majority and
+leader completeness, `ApplyBeforeCommit` to state machine safety, linearizability and the
+node's own apply oracle, `NoPreVote` to pre-vote, `CountOlderTermForCommit` to commit by
+current term and leader completeness, `TruncateOnEveryAppend` to committed entries staying,
+`ResetTimerOnAnyRpc` to the timer check, `LeaseTrustsTheClock` to the linearizability
+search, `AdoptionAsBuilt` to committed entries staying, `RefusalNotDurable` to the match
+starts oracle, and `SharedSnapshotDir` and `IgnoreIncarnation` to the liveness check — the
+last two already were, and the rest were not.
+
+### The three rates the ruling asks for, re-measured
+
+Each was measured on this tree before and after the arm, at the tier its assertion uses.
+All three run over `high_rate_share`, a tenth of the tier, so the figures below are over a
+share of **1 000 seeds at the nightly's ten thousand**, which is the tier at which the
+false catches appear at all — seeds 272, 516 and 440 are past the share of every tier below
+it.
+
+| Variant, at its own tier | Before | After | What moved |
+|---|---|---|---|
+| `IgnoreIncarnation` alone, share of 1 000 | **2 of 1 000**, **0 of them by the liveness check** — seeds 272 and 516, both the timer string | **0 of 1 000**, 0 by the liveness check | the two false catches go; its own rate was 0 and stays 0 |
+| `RefusalNotDurable`, share of 1 000 | **2 of 1 000**, **0 of them by the match starts oracle, state machine safety or a refusal** — seeds 272 and 516, both the timer string | **0 of 1 000**, 0 by its own checks | the same two go; its own rate was 0 and stays 0 |
+| `AdoptionAsBuilt`, share of 1 000 | **1 of 1 000**, **0 of it by committed entries staying** — seed 440, the timer string | **0 of 1 000**, 0 by its own check | the false catch goes; its own rate was 0 and stays 0 |
+
+**None of the three was ever caught by a check it breaks**, before or after: the before
+column is three false catches of one bound, and the after column is the absence those
+tests were written to assert. The entries in `sim/tests/node.rs` and the code comments
+beside them are corrected to say so.
+
+**The three absence tests pass at the nightly's tier now, where all three were red, and
+each passes because its path is genuinely absent rather than because a gap was exempted.**
+What each would fail on the day its path became reachable is not left to inference; it is
+the assertion's own words, and it is a *different* message from the one an unrelated
+failure gets:
+
+- `a_server_whose_adoption_is_as_built_is_not_re_asserted_on_the_node_yet` — **0 catches by
+  committed entries staying, and 0 runs failed any other check**. A catch by committed
+  entries staying fails it with *"AdoptionAsBuilt is caught on the node by [\"committed
+  entries stay\"], the checks RAFT.md §5 names for it, so the path it breaks is reachable
+  after all: turn this absence into the assertion §10 asks for"*, which is the live
+  install's switch or Q15's refused directory arriving.
+- `a_server_whose_refusal_is_not_durable_is_not_re_asserted_on_the_node_yet` — **0 by the
+  match starts oracle, state machine safety or a store refused, and 0 otherwise**. Any of
+  those three fails it the same way, and `a store refused` is the whole-node refusal
+  itself landing.
+- `the_pair_on_the_node_is_the_stream_half_alone_until_the_reseed_lands` — **0 seeds where
+  `IgnoreIncarnation` alone is caught by the liveness check**; the pair is still exactly
+  the seed set `SharedSnapshotDir` alone is caught on, and there is still **no seed the
+  pair is caught on where neither half alone is**. That last is D-045's wedge, and the day
+  one appears it fails with *"pin it here rather than this absence, and take it to the
+  owner"*; a liveness catch on the incarnation half alone fails with *"which it cannot be
+  while a store's incarnation never changes"*, which is Q15's re-seed landing.
+
+And in every one of the three, a violation by a check the variant does not break now fails
+**as itself** — *"so this is the correct node's failure and not a catch of X"* — which is
+what these three should have said on seeds 272, 516 and 440 and did not.
+
+**One figure of the pair's moved, and it is D-086's.** That entry records
+`SharedSnapshotDir` caught **266 of 1 000** at the nightly's tier and says in its own words
+that the number was "measured before the merge and not since". It is measured since now,
+on this tree at that tier: the pair and the stream half alone are each caught on **235 of
+1 000**, on the same seed set to the seed, `IgnoreIncarnation` alone on **0**, and the
+pair-only set — D-045's wedge — **empty**. D-086 is corrected here rather than rewritten,
+as PROPOSED D-089 corrected its other two. The move is the merges' and the aim's, not this
+arm's: the arm removes two gaps over a thousand seeds and adds none, and neither of those
+seeds is in either set.
+
+### What the arm costs the timer check, measured both ways
+
+The narrowing takes nothing from the check's power, and that is measured the way D-063
+measured its own arm: both replays run over every seed of a band and their gaps diffed,
+stretch for stretch, under `TimerResets::ALL` against `TimerResets::WITHOUT_LIVE_INSTALL`.
+
+| Band, on the committed tree | Caught | Gaps this arm adds | Gaps it removes |
+| --- | --- | --- | --- |
+| the correct node, seeds 0..1000 | **0 failures** — green on all thousand, and 0 by the timer check | **0** | **2** — seeds 272 and 516, and nothing else on any other seed |
+| `ResetTimerOnAnyRpc`, share of 100 at the thousand-seed tier | **50 of 100 (50 %)**, **all 50 by the timer check** | **0** | **0** |
+
+So over the eleven hundred seeds run here the arm's whole effect is the removal of the two
+gaps this entry is about. **`ResetTimerOnAnyRpc` is the real timer failure planted**: the
+variant the check is written for, caught on half the share by the timer check and by
+nothing else, with the arm adding and removing **not one gap** of its 769 live installs.
+At 50 % the pair's catch is ten times D-061's 5 % line, so nothing moves tier.
+
+### The pinned seeds
+
+`seeds_272_and_516_are_a_live_installs_hold_and_the_fourth_arm_answers_for_them`
+(`sim/tests/node.rs`) replaces PROPOSED D-089's pin, which asserted the gap and said in its
+own words that "a fourth arm removes the gap and fails this test, which is how it should be
+found". It asserts the mechanism both ways, not a bare green (CLAUDE.md), in the shape
+D-063's pin has for seed 2605: `Report::timer_gaps_held_by_a_live_install` is the replay
+with every arm but this one — `TimerResets::WITHOUT_LIVE_INSTALL`, the check exactly as it
+stood on 1d17dcc — and on each seed it is that check's **one** gap, on the (server, range)
+recorded, with the one live install's hold in it, while `check()` is green. It also asserts
+that that replay finds nothing else on the seed, so the arm is seen to be exempting the
+hold and not more; that the install's decision and switch bracket the flag; that the
+restatement the hold closes on is there; and that the leader was re-opening a stream of
+that range inside the window, which is why the replica heard nothing.
+
+### The mutation campaign
+
+Five mutations, **planted one at a time**, each reverted from a pristine copy taken before
+the campaign and each restore followed by a build asserted to have recompiled
+`ananke-sim` (issue #102: a file restored by copy carries an mtime older than the build
+that compiled the mutant, and cargo then calls the unit fresh) and checked byte-identical
+by `sha256` against that copy. The campaign ended with `sim/raft.rs` hashing to
+`0ebc6edb59fdde4c18e91169c7d441feae1d68f45ae3cf8be60f93581d5211bc`, the pristine hash it
+began with.
+
+| | Mutation | The test that fails, and its words |
+|---|---|---|
+| **M1** | the arm switched off in `TimerResets::ALL` — **the check as this branch stood on 1d17dcc**, which is less a plant than a measurement of what this entry fixes | `seeds_272_and_516_are_a_live_installs_hold_…`: *"seed 272 no longer passes: seed 272: timers: server 2's replica of range 4 heard from no leader of its term and granted no vote since Instant(21.356963658s) and had not campaigned by Instant(21.757937867s)"* — the nightly's words, back. Both hand-built tests fail with it too. **This is the arm's absence planted, and it is what says the arm is what makes the two seeds pass** |
+| **M2** | **the close fence removed**: the `RaftRecovered` arm that re-admits a held replica does nothing, so a hold never closes | `a_live_install_that_keeps_its_incarnation_is_held_between_its_decision_and_its_restatement`: *"a restated replica is running again and measured again, from its restatement"*, `left: []`, `right: [TimerGap { server: 1, range: 2, since: Instant(520ms), at: Instant(970ms), … }]` |
+| **M3** | the hold takes the **whole node** out of the running set rather than the one range | `the_live_installs_hold_exempts_the_hold_and_nothing_else`: *"the hold is the installed range's alone: the node's other replicas keep their timers and are measured"*, `left: []`, `right: [(3, Instant(0ns), Instant(450ms))]` |
+| **M4** | the **read-back fence dropped**: every completed install reads as the node's live install, D-063's staged one included | `the_live_installs_hold_exempts_the_hold_and_nothing_else`: *"a completed install with no read-back is D-063's staged install, not the node's live one"* — **and D-063's own two tests fail with it**, `a_snapshot_a_server_took_itself_…` and `a_coreless_window_…`, which is the fence doing exactly the job the entry claims for it |
+| **M5** | the arm fires on a **take** as well as an install (`taken: false` dropped from its pattern) | `the_live_installs_hold_exempts_the_hold_and_nothing_else`: *"a snapshot the replica took itself is not a live install and excuses nothing, read back or not"*, `left: []`, `right: [(Instant(0ns), Instant(450ms))]` |
+
+**Five planted, five caught, and each by the test written for it.** M1 is also caught by
+the node's pin and, at the thousand-seed tier, by the correct node's sweep on exactly
+seeds 272 and 516.
+
+**M2 is the load-bearing row.** An exemption that hides a genuine gap is strictly worse
+than the false catches it replaces, so the question a fourth arm has to answer is not
+"does it let seeds 272 and 516 through" but "**can it swallow a real one**". M2 is that
+question planted: with the close fence gone the replica leaves the running set at the
+first live install of its range and never comes back, so every later stretch on it — one
+with no install anywhere near it included — goes unmeasured for the rest of the run. The
+hand-built test separates it in one comparison, because it asserts the gap *after* the
+restatement by its own `since`, and the two other closes are asserted where they arise.
+The sweeps say the same thing from the other side: over the correct node's first thousand
+seeds, **every one of 11 949 holds closed**, 11 946 of them on the restatement at their
+own switch.
+
+**And the real timer failure the sweeps plant.** `ResetTimerOnAnyRpc` is the variant the
+timer check is written for — its catch **is** the timer check — so a narrowing that
+swallowed real gaps would show there first. It does not: **50 of 100 caught, all 50 by the
+timer check, with the arm adding and removing not one gap** over the 769 live installs in
+that band. The replay still catches a real gap with the arm in.
+
+
+### Consequences
+
+`TimerResets` has a fourth arm and `TimerResets::ALL` switches it on; `TimerGap` carries
+`live_installs` as it carries `adoptions`; `Report::timer_gaps_held_by_a_live_install` is
+the predicate the pins read, beside D-063's. The timer pin is renamed with what it now
+asserts and its `scripts/nightly-shards.txt` row is re-weighed alone, from the built
+binary as that table's rows are: **0.7 to 1.1 cpu s**, the extra being the second replay
+the pin runs, at a one-minute load of about 20. Shard 4's header is recomputed from its
+rows with it — 1373.0 to 1373.4 — and it stays the lightest of the six, so the next row
+added still goes there. The change is confined to `Report` — the
+replay, its arms, `TimerGap`, `TimerResets` and two predicates — and to `sim/tests/node.rs`:
+the sweep, the scenario, the faults, the protocol and everything in `crates/` are untouched,
+and **no trace and no schedule moves**. `sim/tests/node.rs` attributes every catch to the
+checks the variant breaks, and the three absence tests assert the absence of the variant's
+own catch and report anything else as the node's own failure.
+
 ---
 
-_Next entry: D-090. Add one before implementing anything not covered above._
+_Next entry: D-092. Add one before implementing anything not covered above._

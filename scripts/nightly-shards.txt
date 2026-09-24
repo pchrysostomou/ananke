@@ -175,6 +175,12 @@
 # rows, it does not re-measure the rows. Shard 6 carries both the largest D-086 row and
 # the largest known understatement of one, so it is the shard that re-weigh moves.
 #
+# PROPOSED D-091 renames the timer pin — it now asserts its mechanism both ways rather
+# than the gap — and re-weighs its row alone, from the built binary as the rows above
+# were: 0.7 to **1.1 cpu s**, the extra being the second replay the pin runs, measured at
+# a one-minute load of about 20. Shard 4's header is recomputed from its rows with it,
+# 1373.0 to 1373.4, and it stays the lightest, so the next row added still goes there.
+#
 # shard	binary	cpu_s	test
 # shard 1: 1428.0 cpu s
 1	engine	625.1	an_install_in_two_switches_is_caught
@@ -232,7 +238,7 @@
 3	node	4.03	a_server_that_applies_before_commit_is_caught_on_the_node
 3	install	2.4	every_wiring_variant_is_caught
 3	node	261.0	a_server_that_installs_without_current_last_is_injected_on_the_node
-# shard 4: 1373.0 cpu s
+# shard 4: 1373.4 cpu s
 4	echo	0.1	same_seed_gives_byte_identical_trace
 4	engine	210.8	the_correct_engine_passes_every_seed
 4	engine	38.6	an_install_that_switches_one_span_at_a_time_is_caught
@@ -253,7 +259,7 @@
 4	node	0.11	a_node_under_the_raft_sweeps_arms_runs_every_range
 4	node	0.1	the_nodes_arms_aim_at_every_range_and_not_at_one
 4	node	73.9	the_pair_on_the_node_is_the_stream_half_alone_until_the_reseed_lands
-4	node	0.7	seeds_272_and_516_go_past_the_timer_bound_while_a_live_install_completes
+4	node	1.1	seeds_272_and_516_are_a_live_installs_hold_and_the_fourth_arm_answers_for_them
 # shard 5: 1395.1 cpu s
 5	echo	6.0	every_seed_satisfies_the_invariants_and_the_sweep_exercises_the_disk_faults
 5	engine	19.5	a_seek_that_counts_tombstones_is_caught

@@ -3626,6 +3626,48 @@ impl Report {
             })
     }
 
+    /// Whether the `RaftSnapshot { taken: false }` at `index` is **the node's live
+    /// install switching** rather than a staged whole-store install completing
+    /// (D-063's) or a start's re-trace of the store's snapshot.
+    ///
+    /// The node reads the range's replica back out of the engine at the switch and
+    /// traces it, and the two records are paired by `(range, last_index, last_term)`
+    /// (PROPOSED D-083, `crates/ananke-shard/src/install.rs`): the read-back is
+    /// traced immediately before the completion, at the same instant, because
+    /// nothing else runs between them. A take's read-back carries the same event and
+    /// is told apart by the pairing — a take's completion is `taken: true` and
+    /// carries its own index and term. The one-group server writes this record on no
+    /// path at all, so a staged install's completion never matches and keeps D-063's
+    /// arm.
+    ///
+    /// This is the fence the arm **opens** on, and it is a named event and not a
+    /// timing coincidence: no read-back, no exemption.
+    // PROPOSED(D-091): the node's live install holds one range, and the replay does
+    // not measure a replica whose core is held.
+    fn reads_back(records: &[TraceRecord], index: usize, range: u64, server: u64) -> bool {
+        let record = &records[index];
+        let TraceEvent::RaftSnapshot {
+            last_index,
+            last_term,
+            ..
+        } = &record.event
+        else {
+            return false;
+        };
+        index > 0
+            && records[index - 1].at == record.at
+            && matches!(
+                &records[index - 1].event,
+                TraceEvent::RaftSnapshotState {
+                    server: s,
+                    range: g,
+                    last_index: i,
+                    last_term: t,
+                    ..
+                } if (*g, *s, *i, *t) == (range, server, *last_index, *last_term)
+            )
+    }
+
     /// The timer check's replay, with the reset arms `resets` names switched on,
     /// handing `gap` every stretch in which a running follower went past its bound:
     /// once per stretch, at the first record past the bound, in record order. The
@@ -3670,6 +3712,14 @@ impl Report {
         let mut up: BTreeSet<(u64, u64)> = BTreeSet::new();
         let mut leaders: BTreeSet<(u64, u64)> = BTreeSet::new();
         let mut reseeded: BTreeSet<(u64, u64)> = BTreeSet::new();
+        // The replicas this replay took out of `up` for a live install's hold, and
+        // nothing else. It is a subset of the replicas not in `up`, and it is what
+        // tells the arm's close from every other way a replica is down: a crashed
+        // replica is re-admitted by its restart's `RaftTerm` and by nothing earlier,
+        // which is unchanged here.
+        // PROPOSED(D-091): the node's live install holds one range, and the replay
+        // does not measure a replica whose core is held.
+        let mut held: BTreeSet<(u64, u64)> = BTreeSet::new();
         let mut terms: BTreeMap<(u64, u64), u64> = BTreeMap::new();
         let mut clocks = TimerClocks::default();
         let mut reported: BTreeMap<(u64, u64), Instant> = BTreeMap::new();
@@ -3756,6 +3806,9 @@ impl Report {
                     if let Some(server) = record.node.map(|node| u64::from(node.get())) {
                         up.remove(&(*range, server));
                         leaders.remove(&(*range, server));
+                        // PROPOSED(D-091): a replica whose state was deleted is not
+                        // held for an install any more either.
+                        held.remove(&(*range, server));
                     }
                 }
                 // D-039: a completed snapshot install re-states the replica
@@ -3785,6 +3838,23 @@ impl Report {
                         *clocks.restatements.entry((*range, *server)).or_default() += 1;
                     }
                 }
+                // PROPOSED(D-091): **the close fence of the live install's hold.**
+                // The node releases the range at the switch and the restored replica
+                // traces its restatement (`CoreWork::Restore`,
+                // `crates/ananke-shard/src/server.rs`), which is where the new
+                // replica's election timer starts counting — so the replica is back
+                // in the running set here and its clock starts here, exactly as a
+                // start's does. This arm answers **only** a replica this replay took
+                // out for a hold: a `RaftRecovered` on a replica that is down for any
+                // other reason still does nothing, and its restart's `RaftTerm` is
+                // still what re-admits it.
+                TraceEvent::RaftRecovered { server, range, .. }
+                    if held.contains(&(*range, *server)) =>
+                {
+                    held.remove(&(*range, *server));
+                    up.insert((*range, *server));
+                    clocks.reset((*range, *server), at);
+                }
                 // PROPOSED(D-063): a completed install ends the incarnation
                 // (`Next::Reinstall`, `crates/ananke-raft/src/node.rs`): the server
                 // adopts the staged store, opens the engine on it and restates,
@@ -3801,6 +3871,61 @@ impl Report {
                 // (`Report::timer_gaps_rescued_by_adoption`). The restatement's own
                 // re-trace of the snapshot is not a completion: a `RaftRecovered`
                 // for the replica follows it at the same instant.
+                // PROPOSED(D-091): **the open fence of the live install's hold.** An
+                // install into a live store keeps its incarnation (D-042, D-066): the
+                // node replaces the range's replica in place, the engine is never
+                // reopened and the node's other three ranges go on running, so
+                // D-063's arm — written for a run-loop incarnation that ends at the
+                // completion and begins again at its restatement — does not apply and
+                // does not fire (its `restates` predicate sees the restatement this
+                // switch traces at the same instant). What the node does instead is
+                // **hold the one range**, from the repair's capture to the switch:
+                // "the range's core must take no input and no tick from the capture
+                // to the switch" (D-066), which `CoreWork::Hold` implements
+                // (`crates/ananke-shard/src/server.rs`, PROPOSED D-083). A core that
+                // takes no tick has no election timer to fire, and D-066 re-keyed
+                // D-063's exemption here in so many words: it "does not apply to a
+                // live install, which ends no incarnation. It is re-keyed to the
+                // range's hold above, the one stretch in which a replica's core has
+                // no timer to fire."
+                //
+                // The arm opens at the **install's decision**, which is this record's
+                // decision time: the node decides the install when the `raft` task
+                // hands the repair over, which is the step that takes the hold
+                // (`crates/ananke-shard/src/install.rs`, `finish`). So the exemption
+                // is never wider than the hold — the decision is at or after the hold
+                // is taken — and it closes at the restatement below. Read by
+                // durability time (D-047) the record sits at the switch and the
+                // restatement follows it at the same instant, so the exemption is
+                // empty there: the narrower reading, which can hide nothing.
+                //
+                // Seeds 272 and 516, which PROPOSED D-089's per-range aim reached and
+                // nothing before it did: server 2's replica of range 4, fed a
+                // snapshot of that range, last heard an AppendEntries of its term at
+                // 21.356963658 s, was held from the install's decision at
+                // 21.647374004 s to its restatement at 21.789195738 s, and the replay
+                // flagged it at 21.757937867 s — inside the hold
+                // (`Report::timer_gaps_held_by_a_live_install`).
+                TraceEvent::RaftSnapshot {
+                    server,
+                    range,
+                    taken: false,
+                    ..
+                } if up.contains(&(*range, *server))
+                    && Self::reads_back(&self.records, index, *range, *server) =>
+                {
+                    if resets.live_install {
+                        // One range's hold, and one range's. The node holds the range
+                        // being installed and leaves its other three running
+                        // (PROPOSED D-083, `hold_for_install`), so this takes the
+                        // replica out of the running set and never the node.
+                        up.remove(&(*range, *server));
+                        leaders.remove(&(*range, *server));
+                        held.insert((*range, *server));
+                    } else {
+                        *clocks.live_installs.entry((*range, *server)).or_default() += 1;
+                    }
+                }
                 TraceEvent::RaftSnapshot {
                     server,
                     range,
@@ -3825,6 +3950,11 @@ impl Report {
                 } => {
                     terms.insert((*range, *server), *term);
                     if !up.contains(&(*range, *server)) {
+                        // PROPOSED(D-091): a replica whose node crashed mid-install
+                        // is re-admitted by its restart's `RaftTerm`, as every start
+                        // is, and the hold closes with it. It is the second of the
+                        // arm's two closes and it is the one every crash already had.
+                        held.remove(&(*range, *server));
                         up.insert((*range, *server));
                         clocks.reset((*range, *server), at);
                     }
@@ -3862,6 +3992,10 @@ impl Report {
                     let server = u64::from(node.get());
                     up.retain(|&(_, s)| s != server);
                     leaders.retain(|&(_, s)| s != server);
+                    // PROPOSED(D-091): the hold dies with the node that took it. The
+                    // replica is down for the ordinary reason now, and its restart's
+                    // `RaftTerm` is what re-admits it.
+                    held.retain(|&(_, s)| s != server);
                 }
                 _ => {}
             }
@@ -3893,6 +4027,11 @@ impl Report {
                             .copied()
                             .unwrap_or(0),
                         adoptions: clocks.adoptions.get(&(range, server)).copied().unwrap_or(0),
+                        live_installs: clocks
+                            .live_installs
+                            .get(&(range, server))
+                            .copied()
+                            .unwrap_or(0),
                     };
                     if gap(found).is_break() {
                         return probed;
@@ -3974,6 +4113,15 @@ pub struct TimerResets {
     /// between (PROPOSED D-063, for seed 2605).
     // PROPOSED(D-063): a server adopting a completed install has no election timer.
     pub adoption: bool,
+    /// The node's live install holds the one range it replaces, from the repair's
+    /// capture to the manifest switch, and a held core takes no tick: the replica
+    /// leaves the replay's running set at the install's decision and its
+    /// restatement puts it back (PROPOSED D-091, for seeds 272 and 516). The
+    /// incarnation is kept across it (D-042, D-066), which is what makes this a
+    /// different arm from `adoption` and not a widening of it.
+    // PROPOSED(D-091): the node's live install holds one range, and the replay does
+    // not measure a replica whose core is held.
+    pub live_install: bool,
 }
 
 impl TimerResets {
@@ -3982,6 +4130,7 @@ impl TimerResets {
         install_snapshot: true,
         restatement: true,
         adoption: true,
+        live_install: true,
     };
     /// Neither arm: the check as it stood on 1373601, which read only
     /// AppendEntries as a leader's contact.
@@ -3989,12 +4138,14 @@ impl TimerResets {
         install_snapshot: false,
         restatement: false,
         adoption: false,
+        live_install: false,
     };
     /// Every arm but D-039's: the check as it stood on f54b468.
     pub const WITHOUT_RESTATEMENT: Self = Self {
         install_snapshot: true,
         restatement: false,
         adoption: false,
+        live_install: false,
     };
     /// Every arm but D-063's: the check as it stood on 1a1cad2, which read the
     /// install's restatement as the leader's contact but measured the adoption
@@ -4004,6 +4155,18 @@ impl TimerResets {
         install_snapshot: true,
         restatement: true,
         adoption: false,
+        live_install: false,
+    };
+    /// Every arm but PROPOSED D-091's: the check exactly as it stood on 1d17dcc,
+    /// which measured a replica against its bound while the node held its core for
+    /// a live install of that range.
+    // PROPOSED(D-091): the node's live install holds one range, and the replay does
+    // not measure a replica whose core is held.
+    pub const WITHOUT_LIVE_INSTALL: Self = Self {
+        install_snapshot: true,
+        restatement: true,
+        adoption: true,
+        live_install: false,
     };
 }
 
@@ -4035,6 +4198,12 @@ pub struct TimerGap {
     /// it out of the replay's running set: zero when that arm is on.
     // PROPOSED(D-063): a server adopting a completed install has no election timer.
     pub adoptions: usize,
+    /// Live installs of this range that switched on it, while it was up, whose hold
+    /// is inside `(since, at]` and did not take it out of the replay's running set:
+    /// zero when that arm is on.
+    // PROPOSED(D-091): the node's live install holds one range, and the replay does
+    // not measure a replica whose core is held.
+    pub live_installs: usize,
 }
 
 impl TimerGap {
@@ -4061,6 +4230,9 @@ struct TimerClocks {
     restatements: BTreeMap<(u64, u64), usize>,
     // PROPOSED(D-063): a server adopting a completed install has no election timer.
     adoptions: BTreeMap<(u64, u64), usize>,
+    // PROPOSED(D-091): the node's live install holds one range, and the replay does
+    // not measure a replica whose core is held.
+    live_installs: BTreeMap<(u64, u64), usize>,
     /// The index of the record being replayed.
     replaying: usize,
 }
@@ -4072,6 +4244,7 @@ impl TimerClocks {
         self.installs.remove(&replica);
         self.restatements.remove(&replica);
         self.adoptions.remove(&replica);
+        self.live_installs.remove(&replica);
     }
 }
 
@@ -4393,6 +4566,35 @@ impl Report {
         self.timer_gaps(TimerResets::WITHOUT_ADOPTION)
             .into_iter()
             .filter(|gap| gap.adoptions > 0)
+            .collect()
+    }
+
+    /// Seeds 272's and 516's situation: a replica past its timer bound over a
+    /// stretch the node spent holding its core for a **live install** of that range
+    /// — the gaps of the replay with every arm but PROPOSED D-091's that hold at
+    /// least one such install's switch. When [`Report::check`] passes, every gap of
+    /// that replay is one of these, since a stretch with no live install's hold in
+    /// it is flagged by the check itself.
+    ///
+    /// On the trace seed 272 fails with on 1d17dcc this is one gap: server 2's
+    /// replica of range 4, its clock last reset by an `AppendEntries` of its term at
+    /// 21.356963658 s; leader 3 then stopped appending to it and streamed it a
+    /// snapshot of range 4, re-opening the stream at offset 0 five times across the
+    /// window; the install was decided at 21.647374004 s, when the `raft` task handed
+    /// the repair over and held the range, and its switch was durable at
+    /// 21.789195738 s, where the restored replica traced its restatement. The flag
+    /// fell at 21.757937867 s, 31.3 ms before that restatement and 110.6 ms inside
+    /// the hold, against server 2's 400.94 ms bound. **No `InstallSnapshot` chunk of
+    /// range 4 was delivered to it inside the window**, so D-030's arm had nothing to
+    /// fire on, and the replica kept its incarnation across the install (D-042,
+    /// D-066), so D-063's had nothing to fire on either.
+    // PROPOSED(D-091): the node's live install holds one range, and the replay does
+    // not measure a replica whose core is held.
+    #[must_use]
+    pub fn timer_gaps_held_by_a_live_install(&self) -> Vec<TimerGap> {
+        self.timer_gaps(TimerResets::WITHOUT_LIVE_INSTALL)
+            .into_iter()
+            .filter(|gap| gap.live_installs > 0)
             .collect()
     }
 
@@ -7958,6 +8160,7 @@ mod tests {
                 installs: 0,
                 restatements: 0,
                 adoptions: 0,
+                live_installs: 0,
             }],
             "a snapshot the server took is not a completed install and excuses nothing",
         );
@@ -7992,6 +8195,7 @@ mod tests {
                 installs: 0,
                 restatements: 0,
                 adoptions: 1,
+                live_installs: 0,
             }],
         );
 
@@ -8009,6 +8213,7 @@ mod tests {
                 installs: 0,
                 restatements: 0,
                 adoptions: 0,
+                live_installs: 0,
             }],
             "a restated server is running again and measured again",
         );
@@ -8055,8 +8260,255 @@ mod tests {
                 installs: 0,
                 restatements: 0,
                 adoptions: 1,
+                live_installs: 0,
             }],
             "the check as it stood on 1a1cad2 flags the window",
+        );
+    }
+
+    /// The records the node's **live install** traces at its switch, in
+    /// `install.rs`'s stable order: the read-back of what landed, paired with the
+    /// completion by `(range, last_index, last_term)` (PROPOSED D-083), the
+    /// completion itself — decided when the `raft` task handed the repair over and
+    /// took the hold, traced when the manifest switch is durable — and the restored
+    /// replica's restatement.
+    ///
+    /// There is **no `RaftTerm`**: an install into a live store keeps its
+    /// incarnation (D-042, D-066), which is exactly what tells this from D-063's
+    /// staged install and from a start's re-trace.
+    // PROPOSED(D-091): the node's live install holds one range, and the replay does
+    // not measure a replica whose core is held.
+    fn live_install(decided: Instant, at: Instant, server: u64, range: u64) -> Vec<TraceRecord> {
+        vec![
+            record(
+                at,
+                at,
+                Some(server),
+                TraceEvent::RaftSnapshotState {
+                    server,
+                    range,
+                    last_index: 377,
+                    last_term: 13,
+                    applied: 377,
+                    user_keys: 2,
+                    user_digest: 0,
+                    log_keys: 0,
+                },
+            ),
+            record(
+                at,
+                decided,
+                Some(server),
+                TraceEvent::RaftSnapshot {
+                    server,
+                    range,
+                    last_index: 377,
+                    last_term: 13,
+                    taken: false,
+                },
+            ),
+            record(
+                at,
+                at,
+                Some(server),
+                TraceEvent::RaftRecovered {
+                    server,
+                    range,
+                    term: 13,
+                    applied: 377,
+                    last_index: 377,
+                    incarnation: 1,
+                },
+            ),
+        ]
+    }
+
+    /// The fourth arm's extent, in both directions, and the two fences it is held
+    /// between — the shape D-063's own two tests have, on records written by hand so
+    /// that a wrong rule is a different **answer** and not a different rate.
+    ///
+    /// The node holds the one range it is installing from the repair's capture to
+    /// the manifest switch (D-066; `CoreWork::Hold`, PROPOSED D-083), and a core
+    /// that takes no tick has no election timer to fire. So the **open fence** is the
+    /// install's decision, which the completion record carries, and the **close
+    /// fence** is the replica's restatement, which the restored core traces at the
+    /// switch. Here the install is decided at 300 ms and its switch is durable at
+    /// 520 ms, against a 400 ms bound: the stretch from the replica's start to 450 ms
+    /// is past the bound and 150 ms of it is inside the hold.
+    // PROPOSED(D-091): the node's live install holds one range, and the replay does
+    // not measure a replica whose core is held.
+    #[test]
+    fn a_live_install_that_keeps_its_incarnation_is_held_between_its_decision_and_its_restatement()
+    {
+        let mut records = vec![
+            record(ms(0), ms(0), Some(1), term(1, 1, "follower", None)),
+            silence(ms(450)),
+        ];
+        records.extend(live_install(ms(300), ms(520), 1, SINGLE_GROUP));
+        let held = report(records.clone(), Vec::new());
+        let gaps = held.timer_gaps(TimerResets::ALL);
+        assert!(
+            gaps.is_empty(),
+            "a replica whose core the node is holding for a live install of its range is not \
+             measured against a timer that cannot fire: {gaps:?}",
+        );
+        assert_eq!(held.timers_fire(), Ok(()));
+        // The mechanism the other way: the check exactly as it stood on 1d17dcc —
+        // every arm but this one — flags the stretch, and the gap carries the hold
+        // that excuses it. This is the shape seeds 272 and 516 pin.
+        assert_eq!(
+            held.timer_gaps_held_by_a_live_install(),
+            vec![TimerGap {
+                range: SINGLE_GROUP,
+                server: 1,
+                since: ms(0),
+                at: ms(450),
+                record: 1,
+                installs: 0,
+                restatements: 0,
+                adoptions: 0,
+                live_installs: 1,
+            }],
+            "the check as it stood on 1d17dcc flags the stretch the hold runs through",
+        );
+        // And the exemption **closes** where it opens: the restatement puts the
+        // replica back in the running set with a fresh clock, as the new replica's
+        // first tick does, so 450 ms of silence after it is a gap again — since the
+        // restatement, not since the start.
+        records.push(silence(ms(970)));
+        assert_eq!(
+            report(records, Vec::new()).timer_gaps(TimerResets::ALL),
+            vec![TimerGap {
+                range: SINGLE_GROUP,
+                server: 1,
+                since: ms(520),
+                at: ms(970),
+                record: 5,
+                installs: 0,
+                restatements: 0,
+                adoptions: 0,
+                live_installs: 0,
+            }],
+            "a restated replica is running again and measured again, from its restatement",
+        );
+    }
+
+    /// **What the arm does not exempt**, which is the whole of it: an exemption that
+    /// hides a genuine gap is strictly worse than the false catches it replaces, so
+    /// each of the four things it must keep measuring is asserted here rather than
+    /// left to a sweep.
+    ///
+    /// 1. *The stretch before the hold opens.* A replica whose core is live and
+    ///    counting is measured, and an install decided after the flag excuses
+    ///    nothing before it.
+    /// 2. *The node's other ranges.* The hold is one range's (PROPOSED D-083,
+    ///    `hold_for_install`) — the node's other three go on running — so the arm
+    ///    takes the replica out of the running set and never the node.
+    /// 3. *A take.* The node reads a take back and traces it with the same event
+    ///    (`crates/ananke-shard/src/server.rs`), so the read-back alone is not the
+    ///    rule: a snapshot the replica took of its own accord is the live core's own
+    ///    work and excuses nothing, as D-063's first test says of the one-group
+    ///    server.
+    /// 4. *A completed install with no read-back.* That is D-063's staged
+    ///    whole-store install, which ends the incarnation, and it keeps D-063's arm
+    ///    and D-063's fences. This arm answers for none of it.
+    // PROPOSED(D-091): the node's live install holds one range, and the replay does
+    // not measure a replica whose core is held.
+    #[test]
+    fn the_live_installs_hold_exempts_the_hold_and_nothing_else() {
+        const OTHER_RANGE: u64 = SINGLE_GROUP + 1;
+
+        // 1. The flag falls at 450 ms and the install is decided at 460 ms: the
+        //    replica was running with a core of its own for every millisecond the
+        //    bound was measured over.
+        let mut records = vec![
+            record(ms(0), ms(0), Some(1), term(1, 1, "follower", None)),
+            silence(ms(450)),
+        ];
+        records.extend(live_install(ms(460), ms(600), 1, SINGLE_GROUP));
+        let after = report(records, Vec::new());
+        assert_eq!(
+            after
+                .timer_gaps(TimerResets::ALL)
+                .iter()
+                .map(|gap| (gap.since, gap.at))
+                .collect::<Vec<_>>(),
+            vec![(ms(0), ms(450))],
+            "an install decided after the flag fell excuses nothing before it: the replica's \
+             own core was counting the whole way",
+        );
+
+        // 2. Server 1 runs two ranges. It is holding `SINGLE_GROUP` for a live
+        //    install; its replica of `OTHER_RANGE` is silent throughout and is still
+        //    flagged, because that core takes ticks and that timer can fire.
+        let mut records = vec![
+            record(ms(0), ms(0), Some(1), term(1, 1, "follower", None)),
+            record(
+                ms(0),
+                ms(0),
+                Some(1),
+                term_of(1, OTHER_RANGE, 1, "follower"),
+            ),
+            silence(ms(450)),
+        ];
+        records.extend(live_install(ms(300), ms(520), 1, SINGLE_GROUP));
+        let one_range = report(records, Vec::new());
+        assert_eq!(
+            one_range
+                .timer_gaps(TimerResets::ALL)
+                .iter()
+                .map(|gap| (gap.range, gap.since, gap.at))
+                .collect::<Vec<_>>(),
+            vec![(OTHER_RANGE, ms(0), ms(450))],
+            "the hold is the installed range's alone: the node's other replicas keep their \
+             timers and are measured",
+        );
+
+        // 3. A take, read back the same way: the live core's own work, and a gap.
+        let mut records = vec![
+            record(ms(0), ms(0), Some(1), term(1, 1, "follower", None)),
+            silence(ms(450)),
+        ];
+        records.extend(live_install(ms(300), ms(520), 1, SINGLE_GROUP));
+        let taken = records.len() - 2;
+        if let TraceEvent::RaftSnapshot { taken, .. } = &mut records[taken].event {
+            *taken = true;
+        }
+        let took = report(records, Vec::new());
+        assert_eq!(
+            took.timer_gaps(TimerResets::ALL)
+                .iter()
+                .map(|gap| (gap.since, gap.at))
+                .collect::<Vec<_>>(),
+            vec![(ms(0), ms(450))],
+            "a snapshot the replica took itself is not a live install and excuses nothing, \
+             read back or not",
+        );
+
+        // 4. A completed install with no read-back before it: D-063's staged
+        //    whole-store install, on D-063's arm and D-063's fences. This arm's
+        //    predicate answers nothing for it.
+        let mut records = vec![
+            record(ms(0), ms(0), Some(1), term(1, 1, "follower", None)),
+            snapshot(ms(200), 1, false),
+            silence(ms(450)),
+        ];
+        records.extend(restatement(ms(500), 1));
+        let staged = report(records, Vec::new());
+        assert!(
+            staged.timer_gaps_held_by_a_live_install().is_empty(),
+            "a completed install with no read-back is D-063's staged install, not the node's \
+             live one: {:?}",
+            staged.timer_gaps_held_by_a_live_install(),
+        );
+        assert_eq!(
+            staged
+                .timer_gaps_rescued_by_adoption()
+                .iter()
+                .map(|gap| (gap.since, gap.at, gap.adoptions))
+                .collect::<Vec<_>>(),
+            vec![(ms(0), ms(450), 1)],
+            "D-063's arm still answers for the staged install, and says so in its own words",
         );
     }
 
