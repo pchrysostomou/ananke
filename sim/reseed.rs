@@ -280,6 +280,33 @@ impl Report {
     /// Naming the first criterion that fails, with the seed and what it saw.
     pub fn check(&self) -> Result<(), String> {
         let seed = self.seed;
+        let read = self.read();
+        let every = Self::every_range();
+
+        // (c), first half, and it is first because it is an *ordering*: a replica that
+        //     answered before its mark is one that answered whether or not anything
+        //     else about the run went right, and the clause must be what catches it.
+        //     `ServeBeforeRefusedMark` — a node that writes no mark at all — is this
+        //     clause's plant, and while (a) came first the variant was caught by (a)
+        //     instead, which tests the wrong sentence.
+        //
+        //     First before the runaway cap too, for the same reason (PROPOSED D-086, on
+        //     its merge with `main`): the answer before the mark is in the trace's
+        //     prefix, and a run that later runs past the cap did not un-answer it. On
+        //     that merge the variant's seed 7 grew from 350 130 records to 401 151 —
+        //     the re-seeded node's installs complete and it serves, so the run does
+        //     more: proposals +33 %, applies +27 %, takes and switches +28 % — and the
+        //     cap, asked first, reported a runaway where (c) had its evidence all along.
+        //     The correct shape stays under the cap on every seed, so the cap still
+        //     reports a runaway there; this only stops a runaway from hiding (c).
+        if !read.served_before_the_mark.is_empty() {
+            return Err(format!(
+                "seed {seed}: (c) {:?} answered before their refused mark was durable: \
+                 a replica in a fresh engine that answers before its mark is one that \
+                 may vote again on state its node lost (D-035, D-042)",
+                read.served_before_the_mark
+            ));
+        }
         if self.records.len() > crate::ranges::TRACE_CAP {
             return Err(format!(
                 "seed {seed}: runaway: {} trace records, over the cap of {}",
@@ -288,8 +315,6 @@ impl Report {
             ));
         }
         self.reached()?;
-        let read = self.read();
-        let every = Self::every_range();
 
         // Before any of (a) to (e): the re-seeded node is still running. A node that
         // stopped answers nothing further, and every criterion below would then be
@@ -298,21 +323,6 @@ impl Report {
             return Err(format!(
                 "seed {seed}: node {VICTIM} stopped after its re-seed: {reason}. The \
                  point of Q15's re-seed is that the node does *not* stop"
-            ));
-        }
-
-        // (c), first half, and it is first because it is an *ordering*: a replica that
-        //     answered before its mark is one that answered whether or not anything
-        //     else about the run went right, and the clause must be what catches it.
-        //     `ServeBeforeRefusedMark` — a node that writes no mark at all — is this
-        //     clause's plant, and while (a) came first the variant was caught by (a)
-        //     instead, which tests the wrong sentence.
-        if !read.served_before_the_mark.is_empty() {
-            return Err(format!(
-                "seed {seed}: (c) {:?} answered before their refused mark was durable: \
-                 a replica in a fresh engine that answers before its mark is one that \
-                 may vote again on state its node lost (D-035, D-042)",
-                read.served_before_the_mark
             ));
         }
 

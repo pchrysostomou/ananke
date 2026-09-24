@@ -67,6 +67,26 @@ if [ -s "$work/shadowed" ]; then
     fail=1
 fi
 
+# The six `# shard N: X cpu s` headers are the table's own summary and nothing recomputed
+# them: PROPOSED D-086 added four rows, moved four shards' totals and left all six headers
+# reading the figures from before, which the prose two lines above them then contradicted.
+# The gate could not see it, so it checks it now. A tenth of a CPU second of slack absorbs
+# the rounding of the rows themselves.
+# PROPOSED(D-086): the shard headers are checked against the rows they summarise.
+for shard in 1 2 3 4 5 6; do
+    declared=$(sed -n "s/^# shard $shard: \([0-9.]*\) cpu s\$/\1/p" "$table")
+    if [ -z "$declared" ]; then
+        echo "check-nightly-shards: no '# shard $shard: <cpu_s> cpu s' header in $table" >&2
+        fail=1
+        continue
+    fi
+    computed=$(grep -v '^#' "$table" | awk -F'\t' -v s="$shard" '$1 == s { t += $3 } END { printf "%.1f", t }')
+    if ! awk -v a="$declared" -v b="$computed" 'BEGIN { exit ((a - b) < 0.11 && (b - a) < 0.11) ? 0 : 1 }'; then
+        echo "check-nightly-shards: shard $shard's header says $declared cpu s, its rows total $computed" >&2
+        fail=1
+    fi
+done
+
 if [ "$fail" -ne 0 ]; then
     exit 1
 fi

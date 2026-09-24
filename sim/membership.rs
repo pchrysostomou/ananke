@@ -48,15 +48,20 @@
 //! the two ranges. On one group there is one range and no overlap to have, which is
 //! why this could not be asserted before.
 //!
-//! **What the node has not got is asserted absent, with its reason, on every seed**
-//! (CLAUDE.md): `ananke_shard::snapshot` is not wired to
-//! `ananke_shard::server::ServerHost`, so the node takes no snapshot, streams none and
-//! installs none. The half of issue #46 that is *met* — a joining server fed by a
-//! snapshot in its learner phase, and the configuration key an install's repair writes
-//! — therefore stays asserted on [`Cluster::OneGroup`], unmoved and unweakened, and on
-//! the node [`Report::check`] fails any seed whose replicas reach the threshold, whose
-//! trace holds a snapshot action, or whose joiners were fed one. The day the wiring
-//! lands the sweep says so instead of passing over it.
+//! **What this scenario keeps unreached is asserted absent, with its reason, on every
+//! seed** (CLAUDE.md): its node cluster runs at [`NODE_SNAPSHOT_THRESHOLD`], `1 << 30`,
+//! so no replica reaches the threshold, no core asks for a take, a record or a stream,
+//! and no joiner is fed one. The `snapshot` task *is* wired to
+//! `ananke_shard::server::ServerHost` (PROPOSED D-083), and the raft-arms sweep runs
+//! its node at 12 and measures the path on every seed (PROPOSED D-086); this scenario's
+//! rates and bounds were measured without it, and it keeps its own setting rather than
+//! become a different scenario unmeasured (see the constant). The half of issue #46
+//! that is *met* — a joining server fed by a snapshot in its learner phase, and the
+//! configuration key an install's repair writes — therefore stays asserted on
+//! [`Cluster::OneGroup`], unmoved and unweakened, and on the node [`Report::check`]
+//! fails any seed whose replicas reach the threshold, whose trace holds a snapshot
+//! action, or whose joiners were fed one: that is the scenario's own configuration
+//! being held to, and the day it is changed the sweep says so.
 //!
 //! The checks are the sweep's (RAFT.md §2): the log invariants and rule folds,
 //! commit majority against the configuration in force, linearizability, and, on
@@ -97,9 +102,8 @@ use ananke_shard::variant::NodeVariants;
 
 use crate::lin::{self, History};
 use crate::raft::{
-    self, CLIENTS, ClientStats, Cluster, DIR, DRIFT_BOUND_PPM, LIVENESS_TIMEOUTS,
-    NODE_SNAPSHOT_THRESHOLD, SLICE, TICK, admin_addr, client_on, election_max, leader_of_range,
-    server_addr,
+    self, CLIENTS, ClientStats, Cluster, DIR, DRIFT_BOUND_PPM, LIVENESS_TIMEOUTS, SLICE, TICK,
+    admin_addr, client_on, election_max, leader_of_range, server_addr,
 };
 
 /// The raft sweep's snapshot threshold, which the membership servers run too, so that
@@ -109,6 +113,21 @@ pub const SNAPSHOT_THRESHOLD: u64 = 12;
 /// The raft sweep's chunk size: an install takes several chunks.
 // PROPOSED(D-058): the membership scenario past the snapshot threshold.
 pub const SNAPSHOT_CHUNK: usize = 4096;
+/// The **node** cluster's `snapshot_threshold`, `1 << 30`: far above what a run writes,
+/// so no replica of the node cluster reaches it and no core asks for a take, a record
+/// or a stream.
+///
+/// Until PROPOSED D-086 this was `raft::NODE_SNAPSHOT_THRESHOLD`, shared with the
+/// raft-arms sweep, and the absence it produced had a different reason: the `snapshot`
+/// task was not wired to the host. It is wired now (PROPOSED D-083), and the raft-arms
+/// sweep runs its node at 12 and reaches the path on every seed. This scenario keeps
+/// `1 << 30` as **its own** setting, because PROPOSED D-084's overlap, its rates and
+/// tiers and its two per-range bounds were all measured with the path unreached, and a
+/// threshold that reached it would be a different scenario — joiners fed by streams on
+/// a node — with every figure re-measured. That is the owner's to take; D-086 records
+/// it as not taken. The absence is still asserted on every seed, with this reason.
+// PROPOSED(D-086): the threshold is this scenario's own, not the raft sweep's.
+pub const NODE_SNAPSHOT_THRESHOLD: u64 = 1 << 30;
 /// How long the operator waits, at most, for a leader that has compacted since it took
 /// office before it asks for the grow: a fresh leader's first take waits two minimum
 /// election timeouts (D-030), and the client writes fill a threshold of 12 in well under
@@ -542,20 +561,21 @@ pub fn node_config(id: u64, variants: impl Into<Variants>) -> NodeConfig {
 /// Two parameters are **not** the one-group server's, and each is an absence this
 /// scenario asserts rather than leaves to be found (CLAUDE.md):
 ///
-/// - `snapshot_threshold` is [`NODE_SNAPSHOT_THRESHOLD`], far above what a run
-///   writes, where the one-group server's is [`SNAPSHOT_THRESHOLD`], 12. The node's
-///   host counts a snapshot action a core asks for in `ananke_shard::server::Gaps`
-///   and does nothing with it, because the `snapshot` task is not wired to the host
-///   in this tree: a threshold of 12 here would produce a stream of takes nobody
-///   serves and joiners behind a prefix nobody streams, which is a scenario nobody
-///   wrote. [`Report::check`] asserts on every seed that no replica reached the
-///   threshold, so the day the wiring lands the sweep says so.
-/// - the disk does not rot ([`Cluster::bitrot`]), because a refusal stops the node.
+/// - `snapshot_threshold` is [`NODE_SNAPSHOT_THRESHOLD`], this scenario's own
+///   `1 << 30`, far above what a run writes, where the one-group server's is
+///   [`SNAPSHOT_THRESHOLD`], 12. The node's `snapshot` task is wired (PROPOSED D-083)
+///   and the raft-arms sweep runs its node at 12 (PROPOSED D-086); a threshold of 12
+///   here would be a scenario with joiners fed by streams, whose overlap, rates and
+///   per-range bounds nobody has measured. [`Report::check`] asserts on every seed
+///   that no replica reached the threshold, so the day the setting is changed the
+///   sweep says so.
+/// - the disk does not rot ([`Cluster::bitrot`]): a refusal here would be a crash's
+///   doing, and this scenario's bounds were measured with no node re-seeded.
 ///
-/// Both are the same fact in two places: the node's install and refusal paths are
-/// other slices'. The half of issue #46 they carry — a joining server fed by a
-/// snapshot in its learner phase, and the configuration key an install's repair
-/// writes — keeps its assertion on [`Cluster::OneGroup`], unmoved (PROPOSED D-084).
+/// The half of issue #46 the first carries — a joining server fed by a snapshot in
+/// its learner phase, and the configuration key an install's repair writes — keeps its
+/// assertion on [`Cluster::OneGroup`], unmoved (PROPOSED D-084); the path itself is
+/// measured on the node by the raft-arms sweep (PROPOSED D-086).
 // PROPOSED(D-084): the membership scenario on the node, four ranges on every node.
 #[must_use]
 pub fn node_server_config(id: u64, variants: impl Into<Variants>) -> ServerConfig {
@@ -617,17 +637,19 @@ fn spawn_server(cluster: Cluster, sim: &Sim, id: u64, variants: Variants) {
 /// [`SNAPSHOT_THRESHOLD`] and where the operator asks for the grow only of a leader
 /// that has compacted since it took office, so the empty joiners start behind its
 /// compacted prefix. **False on the node**, and not because the requirement was
-/// relaxed: `ananke_shard::snapshot` is not wired to
-/// `ananke_shard::server::ServerHost`, so no leader there takes a snapshot, streams
-/// one or installs one, and a driver that waited for a compacted leader would wait
-/// out its two-second budget on every attempt and then fall back — costing the tier
-/// its time and asserting nothing.
+/// relaxed: this scenario's node cluster runs at [`NODE_SNAPSHOT_THRESHOLD`],
+/// `1 << 30`, so no leader there compacts, and a driver that waited for a compacted
+/// leader would wait out its two-second budget on every attempt and then fall back —
+/// costing the tier its time and asserting nothing. The `snapshot` task itself is
+/// wired (PROPOSED D-083); what keeps the path unreached here is the threshold, and
+/// why it stays is with the constant.
 ///
 /// The requirement is not dropped for the node: [`Report::check`] fails any seed
 /// whose replicas reach [`NODE_SNAPSHOT_THRESHOLD`], whose trace holds a snapshot
-/// action, or whose joiners were fed one, naming the slice that owns the wiring. The
+/// action, or whose joiners were fed one, naming the setting that keeps them out. The
 /// assertion that a joiner *is* fed stands where the path is, on
-/// [`Cluster::OneGroup`] (PROPOSED D-084).
+/// [`Cluster::OneGroup`] (PROPOSED D-084); the path itself is measured on the node by
+/// the raft-arms sweep (PROPOSED D-086).
 // PROPOSED(D-084): what the node cluster does not reach yet, asserted absent.
 #[must_use]
 pub fn feeds_joiners_by_snapshot(cluster: Cluster) -> bool {
@@ -1202,31 +1224,38 @@ impl Report {
             _ => None,
         }) {
             // On the node a refusal of *any* kind fails the run, and the reason is
-            // the node's own: Q15's whole-node refusal and its re-seed are another
-            // slice's (PR #86), and `ananke_shard::server::run` stops a node whose
-            // store is refused — taking its four ranges with it for the rest of the
-            // run. The disk is set not to rot there for the same reason, so this is
-            // an absence asserted with its cause and not a clause that never fires.
+            // the node's own. Q15's whole-node refusal and re-seed are in the tree
+            // (D-077): a node whose store is refused re-seeds every replica it holds
+            // beside the refused directory and goes on. This scenario's disk does not
+            // rot, so a refusal here would be a crash's doing, and its per-range
+            // bounds were measured with no node re-seeded: the absence is asserted
+            // with that cause, and D-077's fan-out is asserted where refusals are
+            // reached, on the raft-arms sweep (`sim/tests/node.rs`).
             // PROPOSED(D-084): what the node cluster does not reach yet, asserted absent.
+            // PROPOSED(D-086): the re-seed is in the tree; this scenario's bounds are not
+            // measured over one.
             if !feeds_joiners_by_snapshot(self.cluster) {
                 return fail(format!(
-                    "server {server} refused its store ({reason}), a path this node does not \
-                     have: Q15's whole-node refusal and re-seed are PR #86's"
+                    "server {server} refused its store ({reason}) and re-seeded (D-077), which \
+                     this scenario's per-range bounds were measured without: re-measure them \
+                     with it, or say why this seed's refusal is not the node's"
                 ));
             }
             return fail(format!("server {server} refused its store: {reason}"));
         }
-        // PROPOSED(D-084): the node's snapshot path is another slice's, asserted
-        // absent on every seed with its reason rather than left to be found.
+        // PROPOSED(D-084): the node's snapshot path is asserted absent on every seed
+        // with its reason rather than left to be found. The reason since PROPOSED D-086:
+        // this scenario's own threshold keeps it unreached (`NODE_SNAPSHOT_THRESHOLD`),
+        // where the raft-arms sweep runs its node at 12 and measures the path.
         if !feeds_joiners_by_snapshot(self.cluster) {
             let actions = self.snapshot_actions();
             if actions > 0 {
                 return fail(format!(
-                    "{actions} snapshot actions were traced, a path this node does not have: \
-                     `ananke_shard::snapshot` is not wired to \
-                     `ananke_shard::server::ServerHost`. Issue #46's snapshot-fed joiner is \
-                     not asserted here, and a run that reaches this must say so rather than \
-                     pass"
+                    "{actions} snapshot actions were traced under a `snapshot_threshold` of \
+                     {NODE_SNAPSHOT_THRESHOLD}, which this scenario sets so that none is: the \
+                     setting has changed, and issue #46's snapshot-fed joiner is not asserted \
+                     here — a run that reaches this must say so rather than pass, and the \
+                     scenario's bounds are re-measured with the path reached"
                 ));
             }
             // The absence proper. A `RaftSnapshot` record is not evidence on its own:
@@ -1239,18 +1268,18 @@ impl Report {
             if highest >= NODE_SNAPSHOT_THRESHOLD {
                 return fail(format!(
                     "a replica reached index {highest}, at or past the \
-                     {NODE_SNAPSHOT_THRESHOLD} this cluster sets `snapshot_threshold` to, so \
+                     {NODE_SNAPSHOT_THRESHOLD} this scenario sets `snapshot_threshold` to, so \
                      a core could ask for a take, a record or an install and the node would \
-                     drop it in silence: the snapshot path is not wired here"
+                     serve it: this scenario's own setting no longer keeps the path unreached"
                 ));
             }
             let fed = self.snapshot_fed_joiners();
             if !fed.is_empty() {
                 return fail(format!(
-                    "{fed:?} were counted as snapshot-fed joiners on a node that has no \
-                     snapshot path at all: issue #46's extension is met on the one-group \
-                     server and is owed here by the slice that wires \
-                     `ananke_shard::snapshot`"
+                    "{fed:?} were counted as snapshot-fed joiners under a threshold that keeps \
+                     the snapshot path unreached: issue #46's extension is met on the \
+                     one-group server, measured on the node by the raft-arms sweep, and not \
+                     asserted here"
                 ));
             }
         }

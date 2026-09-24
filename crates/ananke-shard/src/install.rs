@@ -607,52 +607,80 @@ impl<E: Environment> Task<E> {
             last_index: index,
             last_term: term,
         };
-        if self.plan.is_streaming(range, to, at) {
-            return;
-        }
+        // A range this node does not host has no version to stream and no core to
+        // answer; the ask cannot have come from here.
         let Some(store) = self.stores.get(&range).cloned() else {
             return;
         };
-        // The version to stream is the one this range's own snapshot record names, and
-        // a stream pins it for its whole life (D-043). A record that names no complete
-        // take — the store compacted without checkpointing (D-065, D-078), or a crash
-        // landed between the record and the checkpoint — is not a stream to open but a
-        // take to ask for, which `retake` does.
-        let dir = match store.snapshot_record().await {
-            Ok(Some(record)) if record.taken && record.last_index == index => record.dir,
+        // What the record names, if it names a take of its own: the fast path through
+        // `find_version`, which falls back to scanning the engine directory.
+        let recorded = match store.snapshot_record().await {
+            Ok(Some(record)) if record.taken => Some((record.last_index, record.take)),
+            _ => None,
+        };
+        // The version to stream is a **complete version directory of the index the core
+        // asked for**, and a stream pins it for its whole life (D-043). This is the
+        // one-group server's own rule (`start_stream` and `snapshot::find_version`,
+        // crates/ananke-raft/src/node.rs:2182 and snapshot.rs:165-191), keyed by range:
+        // `snap-r<range>-<index>-<take>` names survive later takes, which is exactly
+        // what the take counter is for, so a version of the asked index is still there
+        // after the record has moved on. A range that has no complete version of it —
+        // the store compacted without checkpointing (D-065, D-078), or a crash landed
+        // between the record and the checkpoint — is not a stream to open but a take to
+        // ask for, which `retake` does.
+        //
+        // **Complete is D-083's requirement and `find_version` is where it is now
+        // enforced**, on every candidate it considers rather than on the record's
+        // directory alone. The record is written *before* the checkpoint under it
+        // (RAFT.md §1, D-036), so a record naming a version is not a promise the
+        // version is there yet, and opening a half-written one is not a slow start but
+        // a permanent one: `Sender::open` lists the directory once and keeps that list
+        // for the stream's life, so a stream opened on a directory holding one table
+        // streams that table, says `done`, and hands the receiver a staged directory
+        // with no `CURRENT` that `open_span_source` refuses — for ever, because the
+        // identity never changes and the sender is never re-opened. Eleven seeds in two
+        // hundred and fifty lost an install to exactly that (D-083). `find_version`
+        // calls `ananke_raft::snapshot::checkpoint_complete` on each candidate and
+        // returns only one that passes, so the incomplete directory is skipped for a
+        // complete take of the same index where there is one and answered with `retake`
+        // where there is not — which is D-083's answer, reached by a lookup that can
+        // also see past the record.
+        // PROPOSED(D-083): a stream opens only a complete version.
+        //
+        // **It is emphatically not the store's snapshot record**, and PROPOSED D-086
+        // tried both of the other readings first. Matching the record's index *exactly*
+        // made a take landing between the core's ask and this read answer `retake`, and
+        // the core then took, asked and lost the race again: `sim/install.rs`'s seed 7,
+        // an install that never completed at any run length. Taking the record's
+        // identity *instead* fixed that and broke something worse — the identity then
+        // moved with every take, so each re-open of one logical install carried a new
+        // one, `is_streaming` never suppressed the duplicate, and each fresh stream
+        // restarted the receiver's assembly under it (RAFT.md:203-207). Three leaders
+        // of one range were opening streams at three identities at once. The index the
+        // core asked for is the only one of the three that is **stable**, which is why
+        // it is the one the version is looked up by.
+        // PROPOSED(D-086): a stream opens on a complete version of the index asked for.
+        let dir = match crate::snapshot::find_version(
+            &self.env,
+            &self.engine_dir,
+            range,
+            index,
+            recorded,
+        )
+        .await
+        {
+            Ok(Some(dir)) => dir,
             _ => return self.retake(range, to),
         };
-        // The record is written **before** the checkpoint under it (RAFT.md §1, D-036),
-        // so a record that names a version is not a promise the version is there yet.
-        // A stream opens only a *complete* one — `CURRENT` present — which is what
-        // `find_version` means by complete and what D-043 requires of a pinned version.
-        //
-        // Opening a half-written checkpoint is not a slow start, it is a permanent one:
-        // `Sender::open` lists the directory once and keeps that list for the stream's
-        // life, so a stream opened on a directory holding one table streams that table,
-        // says `done`, and hands the receiver a staged directory with no `CURRENT` that
-        // `open_span_source` refuses — for ever, because the identity never changes and
-        // the sender is never re-opened. Eleven seeds in two hundred and fifty lost an
-        // install to exactly this, each looping several hundred times on one range
-        // (D-083).
-        // PROPOSED(D-083): a stream opens only a complete version.
-        match snapshot::checkpoint_complete(&self.env, Path::new(&dir)).await {
-            Ok(true) => {}
-            // Incomplete or unreadable: the take that would finish it is the `apply`
-            // task's, so the core is told the checkpoint is unusable and asks for a
-            // fresh one. A take already in flight reuses its own version when it
-            // completes, and a crash between the record and the checkpoint is
-            // recovered by the same answer — which is why this is `retake` and not a
-            // silent wait that would strand the follower.
-            _ => return self.retake(range, to),
+        if self.plan.is_streaming(range, to, at) {
+            return;
         }
         let started = self.plan.stream(range, to, at);
         if matches!(started, Started::Waiting) {
             // Only `CapStreamsSent` answers this: Q14 puts no cap on streams sent.
             return self.give_up(range, to);
         }
-        let sender = match Sender::open(&self.env, Path::new(&dir), to, index, term, at.term).await
-        {
+        let sender = match Sender::open(&self.env, &dir, to, index, term, at.term).await {
             Ok(sender) => sender,
             Err(_) => {
                 self.plan.sent(range, to);
@@ -1042,7 +1070,27 @@ impl<E: Environment> Task<E> {
             // the repair's tail is all that goes back (D-083).
             &BTreeSet::new(),
         );
-        let switched = if install.repair_in_switch {
+        // Phase 2's `SnapshotWithoutCurrentLast` on the node's install path, by its own
+        // bit (Q37). RAFT.md:694 has it break "the staged `CURRENT` written last, after
+        // the repair"; on the node the commit point of an install is this manifest
+        // switch, and the rule becomes that the switch is made only with the range's
+        // repair carried in it (SHARD.md §12, question 2; D-066). That is exactly what
+        // [`NodeVariant::InstallWithoutRepair`] does, and D-075 named it "the node's
+        // translation" of the Phase 2 variant — but nothing read the Phase 2 bit, so a
+        // node whose cores carried it installed correctly. This is the same shape D-082
+        // found `SendBeforePersist` in: a bit set, carried, and read by nothing.
+        //
+        // The two are kept apart rather than merged. `InstallWithoutRepair` is the
+        // node's own variant and is asserted deterministically by D-083's checks; this
+        // is Phase 2's, re-asserted under `Fault::CrashInstalling` at its Phase 2 tier,
+        // and either alone breaks the rule.
+        // PROPOSED(D-086): Phase 2's `SnapshotWithoutCurrentLast` on the node's switch.
+        let with_repair = install.repair_in_switch
+            && !self
+                .config
+                .variants
+                .contains(ananke_raft::core::Variant::SnapshotWithoutCurrentLast);
+        let switched = if with_repair {
             store
                 .engine()
                 .install_spans(install.spans.clone(), source, batch)

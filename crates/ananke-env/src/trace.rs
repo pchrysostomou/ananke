@@ -707,6 +707,22 @@ pub enum TraceEvent {
         /// Why.
         reason: String,
     },
+    /// The most reads a replica has held registered at once so far, traced each time
+    /// that high-water mark rises: at the registration, where the map is at its
+    /// largest, and at a refusal, where a registration left behind first shows. A
+    /// handful of records a run, and the number `READS_OUTSTANDING` is checked
+    /// against, so a tier reads its worst instead of learning it from the failure
+    /// string of the first seed over the bound (PROPOSED D-076; the node's bound was
+    /// sized at a thousand seeds and main's nightly found nine against eight).
+    // PROPOSED(D-086): a replica's registered reads' high-water mark is traced.
+    RaftReadsOutstanding {
+        /// The server.
+        server: u64,
+        /// The range the replica is of.
+        range: u64,
+        /// The reads it holds registered now, more than it ever held before.
+        outstanding: u64,
+    },
     /// One replica of a node whose shared engine was refused whole (Q15; SHARD.md
     /// §11, storage 8, §12's "A loss in the shared engine").
     ///

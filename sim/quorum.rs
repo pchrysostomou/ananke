@@ -63,7 +63,21 @@ use crate::raft::{
     self, CLIENTS, ClientStats, Cluster, DIR, ELECTION_MIN, SERVERS, TICK, node_config,
     node_server_config, server_of,
 };
-
+/// The **node** cluster's `snapshot_threshold` for this scenario, `1 << 30`: far above
+/// what a run writes, so no leader compacts past the victim's re-seeded replicas and
+/// no stream is opened toward them.
+///
+/// The `snapshot` task is wired (PROPOSED D-083) and `sim/tests/node.rs`'s raft-arms
+/// sweep runs its node at 12 and measures the path on every seed (PROPOSED D-086);
+/// this scenario keeps its own setting because PROPOSED D-085's four answers and
+/// PROPOSED D-087's figures — 282 marked rejections, 0 step-downs naming anyone
+/// `uncounted`, the pair caught 0 of 1 000 — were measured with no stream toward the
+/// victim, and a threshold that opened one is the scenario D-049's open half needs,
+/// with every figure re-measured: the owner's to take, and D-086 records it as not
+/// taken. [`NodeReport::check`] asserts the absence this setting produces, with this
+/// reason.
+// PROPOSED(D-086): the threshold is this scenario's own, not the raft sweep's.
+pub const NODE_SNAPSHOT_THRESHOLD: u64 = 1 << 30;
 /// The frames the blocked link direction still carries, in bytes: a heartbeat and a
 /// rejection are a few dozen, a chunk of the sweep's snapshot four kilobytes and
 /// more.
@@ -219,7 +233,7 @@ fn spawn(
             Cluster::Node => {
                 let _ = ananke_shard::server::run(
                     inner,
-                    node_server_config(id, variants, node_variants),
+                    node_server_config(id, variants, node_variants, NODE_SNAPSHOT_THRESHOLD),
                 )
                 .await;
             }
@@ -371,10 +385,11 @@ pub struct RangeHold {
     ///
     /// The one other way the window closes is an **install**, which lands a snapshot
     /// with no answer of its own that fitted: this would then read as a missing mark
-    /// on correct code. It cannot happen on this tree — no snapshot stream is opened
-    /// toward the victim — and `streams` is asserted 0 by a clause that runs *before*
-    /// this one, so the day PR #107's wiring lands the seed fails there, saying so,
-    /// and this clause is re-read with it.
+    /// on correct code. It cannot happen under this scenario's configuration — its
+    /// node runs at [`NODE_SNAPSHOT_THRESHOLD`], so no leader compacts and no stream
+    /// is opened toward the victim — and `streams` is asserted 0 by a clause that
+    /// runs *before* this one, so the day the threshold is lowered the seed fails
+    /// there, saying so, and this clause is re-read with it.
     // PROPOSED(D-087): D-049's rule keyed on a refused mark the answer carries.
     pub unmarked_before_fitted: usize,
     /// Rejections of this range the victim delivered to this range's leader in the
@@ -981,10 +996,12 @@ impl NodeReport {
     ///    marked rejections at a thousand seeds arrive after a success that was sent
     ///    later. Both read from the refusal on rather than from the cut, because the
     ///    re-seed is before the cut.
-    /// 6. **The one absence D-049's open half still needs, with the slice that owns
-    ///    it.** No snapshot stream was opened toward the victim and no replica was
-    ///    created by an install: the day PR #107's wiring arrives this fails and says
-    ///    so. The *other* absence this clause used to carry — that no answer of the
+    /// 6. **The one absence D-049's open half still needs, with what keeps it.** No
+    ///    snapshot stream was opened toward the victim and no replica was created by
+    ///    an install: the wiring is in the tree (PR #107, PROPOSED D-083), and what
+    ///    keeps the path unreached here is this scenario's own
+    ///    [`NODE_SNAPSHOT_THRESHOLD`] — the day it is lowered this fails and says so.
+    ///    The *other* absence this clause used to carry — that no answer of the
     ///    victim's was a refused server's, so no step-down left anything `uncounted` —
     ///    is gone: PROPOSED D-087 keyed D-049's rule on a refused mark the answer
     ///    carries rather than on the store-less stamp the node never sends, and the
@@ -1031,12 +1048,13 @@ impl NodeReport {
             matches!(&r.event, TraceEvent::RangeCreated { cause, .. } if *cause == RangeCause::Snapshot)
         }) {
             return fail(format!(
-                "a replica was created by a snapshot install ({:?}), where this tree's \
-                 `ananke_shard::server::ServerHost` counts a snapshot action and drops it. The \
-                 node's snapshot wiring (PR #107) has landed, and the open half of D-049 — the \
+                "a replica was created by a snapshot install ({:?}), where this scenario's \
+                 `snapshot_threshold` of {NODE_SNAPSHOT_THRESHOLD} keeps every leader from \
+                 compacting: the threshold has been lowered, so the open half of D-049 — the \
                  stream whose acknowledgements make a refused follower count — can be asked of \
                  the node; ask also whether a re-seeded replica the leader can no longer feed \
-                 from its log is still counted, which is the finding in PROPOSED D-085",
+                 from its log is still counted, which is the finding in PROPOSED D-085, and \
+                 re-measure D-085's and D-087's figures with it",
                 record.event
             ));
         }
@@ -1059,8 +1077,10 @@ impl NodeReport {
             if hold.streams > 0 {
                 return fail(format!(
                     "range {range}: {} snapshot streams were opened toward refused node {victim}, \
-                     where this tree's node counts a snapshot action and drops it. The node's \
-                     snapshot wiring (PR #107) has landed and D-049's open half can be built",
+                     where this scenario's `snapshot_threshold` of {NODE_SNAPSHOT_THRESHOLD} \
+                     keeps every leader from compacting: the threshold has been lowered, so \
+                     D-049's open half can be built here and D-085's and D-087's figures are \
+                     re-measured with it",
                     hold.streams
                 ));
             }

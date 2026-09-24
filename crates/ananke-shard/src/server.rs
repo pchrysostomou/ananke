@@ -118,15 +118,20 @@ pub struct ServerConfig {
     pub node: NodeVariants,
 }
 
-/// What this slice's node was asked for and does not do: each counted, none silent.
+/// What the node was asked for, counted so a scenario can say whether a path was
+/// reached: each counted, none silent.
 ///
-/// A scenario asserts each of these at zero and says why, so the day a schedule
-/// reaches one of these paths the scenario says so instead of passing.
+/// The first is served now and the second is not; a scenario asserts each at the
+/// figure its own configuration produces and says why, so the day a schedule reaches
+/// a path the scenario did not expect it says so instead of passing.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Gaps {
-    /// Snapshot actions a core asked for: a take, or a stream to a follower behind
-    /// the compacted prefix. The `snapshot` task keyed by range and follower is its
-    /// own slice's, and is not wired to this host.
+    /// Snapshot actions a core asked for: a take, a follower's compaction record, or
+    /// a stream to a follower behind the compacted prefix. Counted whether or not the
+    /// `snapshot` task served it — it does since PROPOSED D-083 (`install::job_of`) —
+    /// so a scenario reads one number either way: the sweep that reaches the path
+    /// asserts it above zero on every seed (PROPOSED D-086), and a scenario whose
+    /// threshold keeps the path unreached asserts it zero, with that reason.
     pub snapshot_actions: u64,
     /// Client requests for a range this node does not host.
     pub requests_for_ranges_not_held: u64,
@@ -178,6 +183,10 @@ struct Replica {
     /// Reads waiting on the core, by the id handed to it.
     reads: BTreeMap<u64, (SocketAddr, Request)>,
     next_read: u64,
+    /// The most reads this replica has held registered at once, so a rise is traced
+    /// (`RaftReadsOutstanding`) and a tier reads its worst rather than the bound's
+    /// failure string (PROPOSED D-086, on D-076's bound).
+    reads_high_water: usize,
     /// The client work whose step is being driven now.
     in_flight: Option<InFlight>,
 }
@@ -189,7 +198,22 @@ impl Replica {
             proposed: BTreeMap::new(),
             reads: BTreeMap::new(),
             next_read: 0,
+            reads_high_water: 0,
             in_flight: None,
+        }
+    }
+
+    /// The registered reads this replica holds now and, when that is more than it
+    /// has ever held, the new high-water mark to trace: read at both moments the
+    /// bound is checked, so the trace carries the number the bound is held to.
+    // PROPOSED(D-086): a replica's registered reads' high-water mark is traced.
+    fn reads_held(&mut self) -> (usize, Option<usize>) {
+        let held = self.reads.len();
+        if held > self.reads_high_water {
+            self.reads_high_water = held;
+            (held, Some(held))
+        } else {
+            (held, None)
         }
     }
 
@@ -237,16 +261,31 @@ const PROPOSED_REMEMBERED: usize = 4096;
 /// A registration lives from the step that hands the read to the core until that
 /// core answers it (`read_ready`, `read_dropped`) or refuses it at the step, so what
 /// stands here at any moment is the reads the clients of this range have in flight
-/// with this replica — a small number, and one that does not grow with the run's
-/// length. Measured before it was asserted (D-061): over the node scenario's 1000
-/// seeds and 180 222 registrations the most any replica held at once was **4**, and
-/// over 100 seeds 3. The bound is twice that worst, and what passing it means is not
-/// a slow node but a registration nobody will ever take back — which is exactly the
-/// standing failure D-076 fixed and D-076's review found nothing asserting
-/// (CLAUDE.md:58-67).
+/// with this replica — and, since a client's retry is registered again beside its
+/// first registration (issue #125), as many of them as its clients retried while the
+/// core held the read. It does not grow with the run's length. Measured before it was
+/// asserted, and the bound is twice the measured worst (D-061, D-076 point 12):
+///
+/// - as first written, over `sim/ranges.rs`'s 1000 seeds and 180 222 registrations
+///   the most any replica held at once was **4**, on a node that never ran
+///   `Fault::RetakeUnderStream`, so the bound was 8;
+/// - re-measured on PR #109's merge with `main` (2026-09-24), which brought that arm
+///   onto the node, over 1000 seeds of every sweep that runs the node, in release:
+///   `sim/ranges.rs` 4, `sim/membership.rs` 4, `sim/raft.rs`'s arms on the node
+///   **16** (seed 644), the sharded `sim/quorum.rs` **19** — so the bound is **38**.
+///
+/// The bound was never wrong for the tree it was measured on, at the tier it was
+/// measured at: `main`'s own nightly on c178682 (run 36008940158, seed 297) reached
+/// 9 against the 8 with no such arm on the node, so a thousand seeds do not size this
+/// bound's tail and the nightly is the measurement that holds it. What passing it
+/// means is not a slow node but a registration nobody will ever take back — which is
+/// exactly the standing failure D-076 fixed and D-076's review found nothing
+/// asserting (CLAUDE.md:58-67). The high-water mark is traced
+/// (`TraceEvent::RaftReadsOutstanding`) so a tier reads its worst.
 // PROPOSED(D-076): a replica's outstanding read registrations are bounded, and the
 // node fails when they are not.
-const READS_OUTSTANDING: usize = 8;
+// PROPOSED(D-086): re-measured with the stream arms on the node, by D-076's rule.
+const READS_OUTSTANDING: usize = 38;
 
 /// What the node's tasks hand the `raft` task besides its peers' messages.
 pub enum Local {
@@ -308,6 +347,22 @@ pub struct ServerHost<E: Environment> {
     /// The node's own variants, for the paths a core knows nothing about.
     node: NodeVariants,
     gaps: Mutex<Gaps>,
+    /// What the `apply` task has applied per range, shared with that task.
+    ///
+    /// It is the `apply` task's own state and is written there on every entry. The
+    /// host holds the same map because a **live install replaces a range's state
+    /// machine with no entry passing through that task**: the switch installs the
+    /// snapshot's spans and the repair's applied index, and the task, still holding
+    /// what it applied before the install, fails the range's next job on the gap
+    /// between them — "range 2: apply of 13 after 10".
+    ///
+    /// A server needs no such sharing and this is one more place a node cannot copy
+    /// it: a server ends its run-loop incarnation across an install and builds this
+    /// map again from the store it comes back on (RAFT.md §1), where a node keeps
+    /// running every other range (SHARD.md §11, storage 5).
+    // PROPOSED(D-086): a live install moves the `apply` task's applied state with the
+    // replica, as it moves the core's.
+    applied: Arc<Mutex<BTreeMap<RangeId, Applied>>>,
 }
 
 fn lock<T>(what: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -337,7 +392,15 @@ impl<E: Environment> ServerHost<E> {
     /// and counting it where nobody reads the counter is the same as not seeing it
     /// (D-076's review).
     // PROPOSED(D-076): a replica's outstanding read registrations are bounded.
-    fn reads_are_bounded(&self, range: RangeId, outstanding: usize) {
+    // PROPOSED(D-086): the high-water mark is traced, so a tier reads its worst.
+    fn reads_are_bounded(&self, range: RangeId, outstanding: usize, high_water: Option<usize>) {
+        if let Some(high_water) = high_water {
+            self.env.trace(TraceEvent::RaftReadsOutstanding {
+                server: self.id.0,
+                range: range.get(),
+                outstanding: high_water as u64,
+            });
+        }
         if outstanding > READS_OUTSTANDING {
             self.failed(format!(
                 "range {} holds {outstanding} registered reads, over the {READS_OUTSTANDING} \
@@ -462,6 +525,35 @@ impl<E: Environment> ServerHost<E> {
             tail,
             core.quarantined(),
         );
+        // The `apply` task's applied state moves with the replica, as the core's
+        // watermark does (`Cores::installed`). The switch replaced this range's state
+        // machine wholesale and no entry passed through that task, so a task still
+        // holding what it applied before the install fails the range's next job on the
+        // gap — "range 2: apply of 13 after 10". The term and the configuration move
+        // with the index because the take reads all three for its snapshot record, and
+        // a record whose term or configuration is off is one D-029's revert floor reads
+        // wrong.
+        // PROPOSED(D-086): a live install moves the `apply` task's applied state.
+        lock(&self.applied).insert(
+            range,
+            Applied {
+                index: at.last_index,
+                term: at.last_term,
+                config: config.clone(),
+            },
+        );
+        // And the store's own caches, for the same reason one layer down: the switch
+        // wrote this range's hard state, log bounds and applied index without passing
+        // through `persist` or `apply`, which are what keep them (PROPOSED D-086).
+        if let Some(store) = self.stores.get(&range) {
+            store.restate_after_install(
+                restored.term(),
+                restored.vote(),
+                at.last_index + 1,
+                restored.last_index(),
+                at.last_index,
+            );
+        }
         if created {
             self.env.trace(TraceEvent::RangeCreated {
                 range: range.get(),
@@ -609,7 +701,8 @@ impl<E: Environment> Host for ServerHost<E> {
                 let id = state.register_read(from, request);
                 // Where the map is at its largest, so where a registration left
                 // behind by an earlier refusal shows.
-                self.reads_are_bounded(range, state.reads.len());
+                let (outstanding, high_water) = state.reads_held();
+                self.reads_are_bounded(range, outstanding, high_water);
                 Some(Input::Read {
                     id,
                     now: now_nanos(&self.env),
@@ -845,12 +938,13 @@ impl<E: Environment> Host for ServerHost<E> {
         // schedule of the scenario this slice measured. That answer is the next
         // slice's first job (D-076); what is fixed here is the entry left behind,
         // which is a standing failure and not a latency wart.
-        let (taken, outstanding) = {
+        let (taken, outstanding, high_water) = {
             let mut state = lock(replica);
             let taken = state.refuse(self.node.contains(NodeVariant::RefusedReadLeft));
-            (taken, state.reads.len())
+            let (outstanding, high_water) = state.reads_held();
+            (taken, outstanding, high_water)
         };
-        self.reads_are_bounded(range, outstanding);
+        self.reads_are_bounded(range, outstanding, high_water);
         let Some((from, client, seq)) = taken else {
             return;
         };
@@ -912,6 +1006,9 @@ struct ServerApplier<E: Environment> {
     ranges: Vec<Range>,
     engine_dir: PathBuf,
     node_variants: NodeVariants,
+    /// The cores' variants: read here for Phase 2's `SharedSnapshotDir`, whose bit
+    /// names the version directory a take writes (Q37, PROPOSED D-086).
+    cores: ananke_raft::core::Variants,
     /// Shared with the `snapshot` task: a live install moves a range's applied index,
     /// term and configuration without an apply, and both tasks read this.
     // PROPOSED(D-083): a live install moves the apply task's state with it.
@@ -952,6 +1049,7 @@ impl<E: Environment> ServerApplier<E> {
             state.index,
             take,
             self.node_variants,
+            self.cores,
         );
         let record = SnapshotRecord {
             last_index: state.index,
@@ -972,6 +1070,24 @@ impl<E: Environment> ServerApplier<E> {
             let Some(spans) = self.checkpoint_spans(range) else {
                 return self.take_failed(range);
             };
+            // The version directory is emptied before the checkpoint is written into
+            // it, exactly as the one-group take does (`snapshot::take_numbered`,
+            // snapshot.rs:671-677). `Engine::checkpoint_spans` refuses a directory
+            // that is not empty (`AlreadyExists`), so without this a take into a
+            // directory that already holds files **fails** instead of rewriting it.
+            //
+            // For the correct node this is a no-op: every take goes to
+            // `snap-r<range>-<index>-<take + 1>`, a name no take has used. It is what
+            // Phase 2's `SharedSnapshotDir` needs, and until PROPOSED D-086's review
+            // it was missing: under that variant the name has no take counter, so the
+            // re-take found its own directory full, `take_failed` answered the core,
+            // and no `RaftSnapshot { taken: true }` was traced. The variant then could
+            // not express D-043's bug at all — a directory rewritten under the stream
+            // reading it — and every fold that reads the symptom was structurally
+            // zero. The rates this slice first measured for it were measurements of
+            // that defect and not of the node.
+            // PROPOSED(D-086): a take empties its version directory, as Phase 2's does.
+            self.clear_version(&dir).await;
             let borrowed: Vec<std::ops::Range<&[u8]>> = spans
                 .iter()
                 .map(|span| &span.start[..]..&span.end[..])
@@ -994,13 +1110,19 @@ impl<E: Environment> ServerApplier<E> {
             if taken.is_err() {
                 return self.take_failed(range);
             }
-            // The checkpoint's own format record, after the engine's checkpoint, which
-            // requires an empty directory. A checkpoint is complete only with both its
-            // `CURRENT` and this (D-060), and completeness is what a stream opens on:
-            // without it every version of this node's looked half-written and no
-            // stream would open at all.
+            // The checkpoint's own format record, after the engine's checkpoint, as
+            // `snapshot::take_numbered` writes it for the one-group server (D-060,
+            // snapshot.rs:693). A checkpoint is complete only with both its `CURRENT`
+            // and this, and completeness is what a stream opens on: without it
+            // `snapshot::checkpoint_complete` calls every checkpoint this node takes
+            // incomplete, and the stream that looks for a complete version of the index
+            // its core asked for finds none, ever.
+            // A crash between the engine's checkpoint and this record leaves a version
+            // that reads incomplete, which costs a retake and never streams a
+            // half-written checkpoint — which is the property the record is for.
             // PROPOSED(D-083): the node's take writes the checkpoint's format record,
             // as a server's does.
+            // PROPOSED(D-086): a node's checkpoint carries D-060's format record.
             if ananke_raft::format::write_checkpoint_record(&self.env, &dir)
                 .await
                 .is_err()
@@ -1037,6 +1159,23 @@ impl<E: Environment> ServerApplier<E> {
             index: state.index,
             term: state.term,
         }));
+    }
+
+    /// Empties a version directory before a take writes into it, as
+    /// `snapshot::take_numbered` does for the one-group server (snapshot.rs:671-677).
+    ///
+    /// A missing directory is nothing to empty and is not an error: the common case is
+    /// a fresh numbered name that has never existed.
+    // PROPOSED(D-086): a take empties its version directory, as Phase 2's does.
+    async fn clear_version(&self, dir: &std::path::Path) {
+        let fs = self.env.fs();
+        let Ok(names) = fs.read_dir(dir).await else {
+            return;
+        };
+        for name in names {
+            let _ = fs.remove_file(&dir.join(name)).await;
+        }
+        let _ = fs.sync_dir(dir).await;
     }
 
     /// Reads a range's replica back out of the engine and traces what it holds, as the
@@ -1267,8 +1406,9 @@ fn now_nanos<E: Environment>(env: &E) -> u64 {
 /// # Errors
 ///
 /// The bind, the start, or an I/O error while running; each is traced before it is
-/// returned. A store refused for lost state marks the loss (D-044) and stops this
-/// node: the whole-node refusal and its re-seed are their own slice's (Q15).
+/// returned. A store refused for lost state marks the loss (D-044), refuses every
+/// replica the node holds with it and re-seeds each in a fresh engine beside the
+/// refused directory before any of them serves (D-077, `reseed`).
 pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()> {
     let ServerConfig {
         id,
@@ -1449,7 +1589,10 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
     let mut stores: BTreeMap<RangeId, Arc<RaftStore<E>>> = BTreeMap::new();
     let mut cores = Cores::new(node_variants);
     let mut replicas: BTreeMap<RangeId, Arc<Mutex<Replica>>> = BTreeMap::new();
-    let mut applied_at: BTreeMap<RangeId, Applied> = BTreeMap::new();
+    // Shared by the `apply` task and the host: the task writes it on every entry,
+    // and the host moves a range's entry when a live install replaces that range's
+    // state machine with no entry passing through the task (PROPOSED D-086).
+    let applied_at: Arc<Mutex<BTreeMap<RangeId, Applied>>> = Arc::default();
     for (range, store, recovered) in opened {
         let id_of = range.id;
         stores.insert(id_of, store.clone());
@@ -1500,7 +1643,7 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
         );
         let applied = store.applied();
         core.step(Input::Applied(applied));
-        applied_at.insert(
+        lock(&applied_at).insert(
             id_of,
             Applied {
                 index: applied,
@@ -1537,7 +1680,6 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
         cores.insert(id_of, core);
     }
 
-    let applied_at = Arc::new(Mutex::new(applied_at));
     let host = ServerHost {
         env: env.clone(),
         id,
@@ -1554,6 +1696,7 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
         variants,
         node: node_variants,
         gaps: Mutex::new(Gaps::default()),
+        applied: applied_at.clone(),
     };
     let answers = host.answers.clone();
     env.spawn("answers", {
@@ -1578,6 +1721,7 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
             ranges: ranges.clone(),
             engine_dir: engine.dir.clone(),
             node_variants,
+            cores: variants,
             applied: applied_at.clone(),
         };
         let jobs = jobs.clone();
@@ -1590,7 +1734,13 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
     // would give it a different address and make it a different peer (D-082). It owns
     // the node's `Snapshots` as its planner and keeps the I/O the planner has none of.
     // PROPOSED(D-083): `ananke_shard::snapshot` is run inside the node's server.
-    let mut plan = Snapshots::new(engine.dir.clone(), id, snapshot_cap, node_variants);
+    let mut plan = Snapshots::with_cores(
+        engine.dir.clone(),
+        id,
+        snapshot_cap,
+        node_variants,
+        variants,
+    );
     for range in &ranges {
         plan.host(
             range.id,

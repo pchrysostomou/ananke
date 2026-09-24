@@ -35,6 +35,7 @@
 //! | `RaftTerm` / `RaftVote` / `RaftLeader` / `RaftAppend` / `RaftTruncate` / `RaftCommit` / `RaftApply` | `log` `ananke.raft.term` / `.vote` / `.leader` / `.append` / `.truncate` / `.commit` / `.apply` |
 //! | `RaftRecovered` / `RaftProposed` / `RaftRefused` / `RaftServerFailed` / `RaftInboxDropped` | `log` `ananke.raft.recovered` / `.proposed` / `.refused` / `.failed` / `.inbox-dropped` |
 //! | `RaftReplicaRefused`                     | `log` `ananke.raft.replica-refused`           |
+//! | `RaftReadsOutstanding`                     | `log` `ananke.raft.reads-outstanding`           |
 //! | `RaftRead` / `RaftLeaseRevoked` / `RaftQuorumLost` / `RaftTransfer` | `log` `ananke.raft.read` / `.lease-revoked` / `.quorum-lost` / `.transfer` |
 //! | `RaftConfig` / `RaftSnapshot`            | `log` `ananke.raft.config` / `.snapshot`      |
 //! | `RaftCompacted` / `RaftReseeded` / `RaftSnapshotResumed` / `RaftAdopted` | `log` `ananke.raft.compacted` / `.reseeded` / `.snapshot-resumed` / `.adopted` |
@@ -1027,6 +1028,18 @@ fn convert(
             Some(Json::obj(vec![
                 ("server", int(*server)),
                 ("range", int(*range)),
+            ])),
+        ),
+        TraceEvent::RaftReadsOutstanding {
+            server,
+            range,
+            outstanding,
+        } => log(
+            "ananke.raft.reads-outstanding",
+            Some(Json::obj(vec![
+                ("server", int(*server)),
+                ("range", int(*range)),
+                ("outstanding", int(*outstanding)),
             ])),
         ),
         TraceEvent::RaftServerFailed { server, reason } => log(

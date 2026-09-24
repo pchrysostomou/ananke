@@ -827,18 +827,28 @@ impl<E: Environment, H: Host> Node<E, H> {
             // and the configuration it carries are exactly the state a snapshot at
             // that index would capture (D-065, D-078; D-036).
             //
-            // The node dropped it. `Host::snapshot` counts the action and
-            // `install::job_of` answers `None` for a record, so the core that asked
-            // for one set `take_pending` and was never told it was done — and a core
-            // with `take_pending` stuck asks for nothing again for the rest of its
-            // life on that node. It never compacts, so its log grows without bound
+            // The node dropped it, and two slices found that independently. `Host::snapshot`
+            // counts the action and `install::job_of` answers `None` for a record, so the
+            // core that asked for one set `take_pending` and was never told it was done —
+            // and a core with `take_pending` stuck asks for nothing again for the rest of
+            // its life on that node. It never compacts, so its log grows without bound
             // (the whole of D-065), and when it later takes office it never takes a
             // snapshot either, so it cannot stream one: a re-seeded replica of a range
-            // whose new leader had been a follower waits forever. The directed
-            // re-seed shape found it that way, one or two of its four ranges never
-            // installed on every seed.
+            // whose new leader had been a follower waits forever. The directed re-seed
+            // shape found it that way, one or two of its four ranges never installed on
+            // every seed (PROPOSED D-081). Under `sim/raft.rs`'s arms it is the same
+            // core leading later with `taken` empty and `take_pending` set: `replicate`
+            // asks for nothing and sends an empty AppendEntries at its own last index
+            // forever while the follower rejects with a hint the leader is not in a
+            // branch to read, and the range commits nothing again — the liveness bound,
+            // on the correct node, on seeds 17, 20 and 64 of the first hundred
+            // (PROPOSED D-086). Nothing before those two slices could see it: every
+            // other node scenario holds `snapshot_threshold` above what its clients
+            // write, so `Record` was never asked for at all.
             // PROPOSED(D-081): a follower's compaction record reaches the `apply`
             // task.
+            // PROPOSED(D-086): the follower's compaction record reaches the `apply`
+            // task, and the core is answered.
             Output::Snapshot(SnapshotAction::Record)
                 if !self
                     .config

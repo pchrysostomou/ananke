@@ -530,7 +530,16 @@ holding a live incarnation: one ends at a shutdown, a crash, or a **completed in
 which retires the incarnation and leaves the server adopting the staged store with no
 core and no election timer until its restatement starts the next one, so the bound is
 not asked of it across that window any more than it is of a crashed server before its
-restart (PROPOSED D-063, which supersedes D-039's arm in the check). One check is
+restart (PROPOSED D-063, which supersedes D-039's arm in the check). On a node an install
+ends no incarnation — a live install replaces the range's replica in place and keeps it
+(D-042, D-066) — so what stops the core there is not an incarnation ending but the
+**hold**: the node holds the one range it is installing, from the repair's capture to the
+manifest switch, and that range's core takes no input and no tick across it (D-066;
+PROPOSED D-083). A held core has no election timer to fire, so the bound is not asked of
+that replica across the hold either, fenced at both ends by named events — it opens on the
+install's decision and closes on the restored replica's restatement — and of that replica
+alone, the node's other ranges keeping their timers and being measured (PROPOSED D-091,
+seeds 272 and 516). One check is
 pre-vote's own property (thesis §9.6), asked of each of the isolated node's replicas
 (PROPOSED D-071): a replica on a server the schedule isolated has, at the heal,
 the term it had when the isolation began — a term is a range's, and one range's
@@ -984,10 +993,11 @@ no known-buggy variant: its crash test,
 The checks about time in §2 are bounds, not properties: a client write within ten
 maximum election timeouts of the last heal, and an election within two of a server's
 last reset, chosen so that the correct variant never trips them over ten thousand
-seeds. Each of the three times ten thousand seeds tripped the timer bound on the correct
-server, what was wrong was the check's model of the protocol, not the bound, and widening
+seeds. Each of the four times a sweep tripped the timer bound on the correct system, what
+was wrong was the check's model of the protocol, not the bound, and widening
 the bound would have dulled its catch of `ResetTimerOnAnyRpc` (seeds 164 and 385, D-030
-and D-039; seed 2605 of nightly run 35111624618, the adoption window, PROPOSED D-063).
+and D-039; seed 2605 of nightly run 35111624618, the adoption window, PROPOSED D-063;
+seeds 272 and 516 of the node's first thousand, the live install's hold, PROPOSED D-091).
 At ten thousand seeds the correct server passes both (nightly runs 34731272921 and
 34749071877, D-047; and run 35111624618 tripped the timer bound alone, on the one seed
 D-063 closes).

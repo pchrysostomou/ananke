@@ -951,42 +951,74 @@ fn a_core_that_asks_for_a_snapshot_action_fails_the_run() {
 ///
 /// D-076 fixed that leak and pinned `Replica::refuse` in a unit case, which is not
 /// the node: D-076's review planted the leak back in `ServerHost::rejected`, left
-/// `refuse` untouched, and every test in the tree stayed green. What sees it now is
+/// `refuse` untouched, and every test in the tree stayed green. What sees it is
 /// `READS_OUTSTANDING` — a replica's registrations bounded on the node's own path —
-/// and this is the run that says so.
+/// and at a bound of 8 this run caught it on 535 of 1 000 seeds.
+///
+/// **The bound is 38 since PR #109's merge with `main`** (D-076 point 12, re-measured
+/// by D-076's own rule with the stream arms on the node), and this scenario's runs are
+/// too short for the leak to reach it: **0 of 1 000 seeds** in release. So the catch is
+/// asserted where the bound sees it — `sim/tests/node.rs`'s
+/// `a_node_that_leaves_a_refused_reads_registration_behind_is_caught_on_the_node`,
+/// under the raft arms — and what this run asserts, at every tier, is the **fault's
+/// firing** (D-061): the leaking node holds more reads registered at once than the
+/// correct node does on the same seeds, read from the high-water mark both trace
+/// (`RaftReadsOutstanding`), and strictly more on some seed. Measured before it was
+/// asserted (D-061), on the merged tree in release: the leaking node held at most 19
+/// reads at once against the correct node's 4, and more than it on **1 000 of 1 000**
+/// seeds, so the firing is asserted at every tier. The catch rate is still printed
+/// here, and a catch that does happen is still required to be the bound's.
+// PROPOSED(D-086): the read leak's catch moves to the arms; its firing stays here.
 #[test]
 fn a_node_that_leaves_a_refused_reads_registration_behind_is_caught() {
     let seeds = seeds();
-    let mut caught = 0usize;
-    let results = sweep(seeds, |seed| {
-        let report = ranges::run(
+    let results: Vec<(bool, bool, u64, u64)> = sweep(seeds, |seed| {
+        let leaking = ranges::run(
             seed,
             Variants::default(),
             NodeVariants::of(&[NodeVariant::RefusedReadLeft]),
         );
-        let verdict = report.check();
+        let correct = ranges::run(seed, Variants::default(), NodeVariants::correct());
+        let verdict = leaking.check();
         let named = verdict
             .as_ref()
             .err()
             .is_some_and(|violation| violation.contains("registered reads"));
-        (verdict.is_err(), named)
+        let worst = |report: &ranges::Report| {
+            report
+                .checked
+                .reads_outstanding_worst()
+                .map_or(0, |(_, _, outstanding)| outstanding)
+        };
+        (verdict.is_err(), named, worst(&leaking), worst(&correct))
     });
-    let mut named = 0usize;
-    for (failed, by_the_bound) in &results {
-        caught += usize::from(*failed);
-        named += usize::from(*by_the_bound);
-    }
+    let caught = results.iter().filter(|(failed, _, _, _)| *failed).count();
+    let named = results.iter().filter(|(_, named, _, _)| *named).count();
+    let leaking_worst = results.iter().map(|(_, _, l, _)| *l).max().unwrap_or(0);
+    let correct_worst = results.iter().map(|(_, _, _, c)| *c).max().unwrap_or(0);
+    let seeds_the_leak_shows_on = results.iter().filter(|(_, _, l, c)| l > c).count();
+    let seeds_the_leak_hides_on = results.iter().filter(|(_, _, l, c)| l < c).count();
     let rate = caught as f64 * 100.0 / seeds as f64;
     println!(
         "ranges: RefusedReadLeft caught on {caught}/{seeds} seeds ({rate:.1}%), {named} of them \
-         by the outstanding-reads bound"
+         by the outstanding-reads bound; the leaking node held at most {leaking_worst} reads \
+         at once against the correct node's {correct_worst}, and held more than it on \
+         {seeds_the_leak_shows_on} seeds"
     );
-    // D-061: the rate is measured before it is asserted, and the assertion is made
-    // at the tier the rate supports. The figures are in D-076's entry.
+    // The firing, at every tier: a leak that the bound of 38 does not reach here is
+    // still a map that grows where the correct node's does not.
     assert!(
-        caught > 0,
-        "the node that keeps every read it refuses passed every one of {seeds} seeds"
+        seeds_the_leak_shows_on > 0,
+        "the node that keeps every read it refuses never held more reads than the correct \
+         node over {seeds} seeds, so the leak was not injected"
     );
+    assert_eq!(
+        seeds_the_leak_hides_on, 0,
+        "on {seeds_the_leak_hides_on} seeds the leaking node held fewer reads at once than the \
+         correct node, which a map that only grows cannot do: the variant is not the leak"
+    );
+    // A catch here is the bound's or it is not this pair's; the catch itself is
+    // asserted under the raft arms, where the bound sees it (D-076 point 12).
     assert_eq!(
         named,
         caught,
