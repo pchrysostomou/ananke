@@ -101,6 +101,38 @@ ananke/
 
 _Update this section at the end of every session._
 
+- Branch `phase-3-stage-b-membership` (2026-09-22), stacked on
+  `phase-3-stage-b-sweeps` (PR #101, PROPOSED D-082): **`sim/membership.rs` on the
+  node** (PROPOSED D-084), the second of Stage B's first exit criterion's three
+  scenarios. The scenario is one body of code driven against either of D-082's two
+  clusters: five one-group servers as before, byte for byte — seed 7's JSONL hashes to
+  `24358ff2…` on this branch and on the base — or five nodes of **four ranges each**,
+  3 → 5 → 3 on **every** range. The half of issue #46's extension four ranges make
+  possible is built and asserted on every seed: **a change of a range while another
+  range on the same node is changing**. The half they cannot reach — a joining server
+  fed by a snapshot in its learner phase — stays asserted on the one-group server and
+  is asserted *absent with its reason* on the node, whose `snapshot` task is not wired
+  (that slice follows D-082's). `SingleMajorityInJointConsensus` is re-asserted on the
+  node at 14 of 100 seeds against the one-group server's 19, above D-061's five per
+  cent, so its tier does not move. Liveness and availability became **per range** on
+  measured bounds (a range's gap 1.33 s at 1 000 seeds against 5 s; its first write
+  after a heal 1.81 s against 6 s). Eleven mutations were planted one at a time and ten
+  caught, six of them only because a guard was added for them; the review's round found
+  three checks asserting less than their names claimed, and the fixes are a **witness**
+  on the overlap fold (the answer checked against the trace read backwards — 0 of 100
+  unwitnessed correct, 38 of 100 for a fold that never clears its state), the side the
+  partition actually cut, and the ranges the transfer was asked for. **Two findings**,
+  both from the nightly's shard 3, red on 33 of 10 000 seeds, each seed re-run and
+  classified: 30 are **issue #81** — a voter removed and re-added inside one leader's
+  term, whose fix is PR #89 — and **3, seeds 6097, 7759 and 7887, were this slice's own
+  per-seed overlap clause**, tripped by **the scenario's own parameter and not by the
+  node**. `RANGE_STAGGER_MAX_MS` was 25 ms, the top of the range its own doc comment
+  names as the one that serialises the four changes. **The parameter was fixed, not the
+  clause** (D-030, D-039), and the value chosen on a ten-candidate measurement at 1 000
+  seeds: 2 ms, one of only two caps leaving no seed one step from failure, against
+  16.6 % of seeds at 25 ms. At 2 ms the overlap is witnessed on 1 000 of 1 000 and the
+  gate and CI are green; the ten-thousand tier is re-run on the fixed tip.
+
 - Branch `phase-3-stage-b-quorum` (2026-09-23), PR #104, PROPOSED D-085: `origin/main`
   merged in (carrying PR #86's whole-node refusal and re-seed, D-077), and the sharded
   `sim/quorum.rs` built on the node — `quorum::node_run`: three nodes of four ranges, one
