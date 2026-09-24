@@ -5844,6 +5844,7 @@ pub fn node_server_config(
         },
         engine,
         inbox_bytes: crate::ranges::INBOX_BYTES,
+        snapshot_cap: crate::ranges::SNAPSHOT_CAP,
         node,
     }
 }

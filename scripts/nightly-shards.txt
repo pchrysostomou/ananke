@@ -79,7 +79,7 @@
 # recomputed from the rows beneath it rather than carried over from either side. That
 # recomputation also corrects three headers this branch carried that its own rows did not
 # support — shards 3, 4 and 6, each out by 0.1 from the two-decimal `node` figures. The
-# merged shards run 1328.1 to 1442.9 cpu s against a mean of 1368.6, so the night is
+# merged shards run 1328.1 to 1442.9 cpu s against a mean of 1370.1, so the night is
 # bounded by shard 2 at about 5 % over the ideal. The next row added goes into the
 # lightest, which is shard 4.
 #
@@ -96,6 +96,35 @@
 # D-084's rows join the shards their own branch placed them in; this merge took main's
 # table otherwise, including the rows and weights D-085 brought in through PR #104.
 # shard	binary	cpu_s	test
+# D-083's three rows are the node's snapshot wiring, weighed on its own tree in release,
+# run alone, as user+sys of the test binary. They are small and they stay small: that
+# binary does not read ANANKE_SEEDS, because its situation is reached by construction on
+# every seed rather than searched for, so it runs the same eight seeds at every tier.
+# Putting it under the tiers is owed and is recorded as owed in D-083; the machine these
+# three were measured on was not idle, which for figures of a few CPU seconds against
+# shards of thirteen hundred changes no assignment. They were re-weighed after the
+# review of #107, which raised the binary's seed count from eight to thirty-two and
+# added the state read-back.
+#
+# **This merge combined two independent placements**: D-083's three `install` rows,
+# placed on this branch against the table as it stood before the base moved, and the
+# base's table (`phase-3-stage-b-sweeps`), which by then carried D-077's two `ranges`
+# rows, D-080's one `raft` row and D-082's seventeen `node` rows re-weighed to two
+# decimals by its review. It takes the union of both sides' rows and keeps every row in
+# the shard its own side placed it in, re-placing none of them; the eleven older `node`
+# rows this branch carried are the base's re-weighed seventeen, not rows of its own, so
+# the base's figures and placements stand for them. Every total below is recomputed from
+# the rows beneath it rather than carried over from either side.
+#
+# **This merge combined two independent placements**: D-083's three `install` rows, placed
+# on this branch, and D-084's four `node` rows, placed on main by the membership slice
+# (PR #106). No (binary, test) appears on both sides, so no weight had to be chosen
+# between two measurements; each row keeps the shard its own side placed it in and none is
+# re-placed. Every total below is recomputed from the 118 rows beneath it rather than
+# carried over from either side; the two the conflict fell in, shards 3 and 6, come to
+# 1463.6 and 1441.9. The merged shards run 1351.7 to 1463.6 cpu s against a mean of
+# 1421.1, so the night is bounded by shard 3 at about 3 % over the ideal. The next row
+# added goes into the lightest, which is shard 5.
 # shard 1: 1428.0 cpu s
 1	engine	625.1	an_install_in_two_switches_is_caught
 1	engine	36.8	an_install_whose_repair_precedes_its_switch_is_caught
@@ -130,7 +159,7 @@
 2	ranges	0.1	every_frame_between_two_nodes_may_carry_several_ranges
 2	ranges	0.1	no_batch_frame_of_the_node_parses_as_a_frame_of_the_one_group_server
 2	ranges	0.1	the_ranges_of_one_node_draw_their_own_election_timeouts
-# shard 3: 1461.2 cpu s
+# shard 3: 1463.6 cpu s
 3	echo	0.2	trace_hash_matches_the_pinned_golden
 3	engine	417.5	the_range_delete_crash_test_passes_every_seed
 3	engine	235.9	the_seek_crash_test_passes_every_seed
@@ -189,7 +218,7 @@
 5	raft	139.6	the_correct_server_passes_the_membership_scenario_on_every_seed
 5	raft	50.7	a_server_that_applies_before_commit_compacts_past_its_commit_index
 5	ranges	59.0	every_seed_passes_on_the_correct_node
-# shard 6: 1435.5 cpu s
+# shard 6: 1441.9 cpu s
 6	echo	0.1	a_busy_looping_task_fails_the_scenario_instead_of_hanging
 6	engine	310.3	an_engine_that_acknowledges_before_the_log_is_caught
 6	engine	204.5	an_engine_that_releases_a_memtable_before_the_manifest_is_caught
@@ -217,3 +246,6 @@
 6	ranges	53.9	a_node_that_steps_a_core_while_its_persist_is_outstanding_is_caught
 6	wal	34.4	a_log_that_skips_sync_dir_on_rotation_is_caught
 6	wal	0.3	same_seed_gives_byte_identical_trace
+3	install	2.4	every_wiring_variant_is_caught
+6	install	6.3	the_correct_node_installs_on_every_seed
+6	install	0.1	a_stream_flows_and_an_install_completes_on_every_range_and_every_follower
