@@ -22,7 +22,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use ananke_env::sim::TraceRecord;
-use ananke_env::{ClientOp, DropReason, Instant, TraceEvent};
+use ananke_env::{ClientOp, DropReason, Instant, MismatchAt, TraceEvent};
 
 use crate::raft::{self, range_of};
 
@@ -313,6 +313,14 @@ pub struct NodeCoverage {
     pub deletes: u64,
     /// See `puts`.
     pub cas: u64,
+    /// `RangeMismatchSent`, by where the server saw it (SHARD.md §3).
+    // PROPOSED(D-097)
+    pub mismatches_at: BTreeMap<MismatchAt, usize>,
+    /// `ClientMismatch` received, and `ClientSend` made.
+    // PROPOSED(D-097)
+    pub client_mismatches: usize,
+    /// See `client_mismatches`.
+    pub client_sends: usize,
 }
 
 impl NodeCoverage {
@@ -375,6 +383,9 @@ impl NodeCoverage {
             gets: by_kind.1,
             deletes: by_kind.2,
             cas: by_kind.3,
+            mismatches_at: raft::mismatches_sent_of(records),
+            client_mismatches: count(&|e| matches!(e, TraceEvent::ClientMismatch { .. })),
+            client_sends: count(&|e| matches!(e, TraceEvent::ClientSend { .. })),
         }
     }
 
@@ -459,6 +470,11 @@ impl NodeCoverageFold {
                 ClientOp::Delete { .. } => c.deletes += 1,
                 ClientOp::Cas { .. } => c.cas += 1,
             },
+            TraceEvent::RangeMismatchSent { at, .. } => {
+                *c.mismatches_at.entry(*at).or_default() += 1;
+            }
+            TraceEvent::ClientMismatch { .. } => c.client_mismatches += 1,
+            TraceEvent::ClientSend { .. } => c.client_sends += 1,
             _ => {}
         }
     }

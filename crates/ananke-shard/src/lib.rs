@@ -67,6 +67,7 @@ pub mod descriptor;
 pub mod frame;
 pub mod inbox;
 pub mod install;
+pub mod invariants;
 pub mod node;
 pub mod outbox;
 pub mod range;

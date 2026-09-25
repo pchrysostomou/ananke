@@ -44,7 +44,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use ananke_env::{ApplyEffect, FileSystem, MetaDescriptor, RangeCause, RangeState, RecoveredAs};
+use ananke_env::{
+    ApplyEffect, FileSystem, MetaDescriptor, MismatchAt, RangeCause, RangeState, RecoveredAs,
+};
 use ananke_env::{Clock, Decision, Environment, Network, Rng, Socket, TraceEvent};
 use ananke_raft::apply::{Command, Outcome, apply_command, user_key};
 use ananke_raft::client::{Reply, Request, Response};
@@ -62,7 +64,7 @@ use ananke_storage::{EngineConfig, WriteBatch};
 use bytes::Bytes;
 
 use crate::client::{RangedRequest, RangedResponse, is_ranged};
-use crate::descriptor::RangeDescriptor;
+use crate::descriptor::{FIRST_GENERATION, RangeDescriptor};
 use crate::frame::decode;
 use crate::inbox::{Inbox, Received};
 use crate::install::{self, SnapAnswer, SnapJob};
@@ -210,7 +212,7 @@ pub fn initial_state(
             range: range.id,
             start: span.start.clone(),
             end: span.end.clone(),
-            generation: 1,
+            generation: FIRST_GENERATION,
             voters: bootstrap.to_vec(),
             state: RangeState::Live,
         };
@@ -223,7 +225,7 @@ pub fn initial_state(
             let record = MetaRecord {
                 start: span.start.clone(),
                 range: range.id,
-                generation: 1,
+                generation: FIRST_GENERATION,
                 voters: bootstrap.to_vec(),
             };
             batch.put(system::meta_record_key(&span.end), record.encode());
@@ -231,7 +233,7 @@ pub fn initial_state(
                 range: range.id.get(),
                 start: span.start.clone(),
                 end: span.end.clone(),
-                generation: 1,
+                generation: FIRST_GENERATION,
                 voters: bootstrap.iter().map(|voter| voter.0).collect(),
                 won: vec![(span.start, span.end)],
             });
@@ -260,6 +262,39 @@ pub fn initial_state(
     (batch, meta_descriptors)
 }
 
+/// The descriptors a node not named at bootstrap writes for the ranges it hosts at
+/// its first start: the same descriptor the bootstrap nodes write for each, computed
+/// from configuration alone (SHARD.md §2), and nothing else — no Raft configuration,
+/// since D-076's interim replica starts on an empty one, and no digest.
+///
+/// A replica without its descriptor is one that serves without §3's checks, and the
+/// thousand-seed membership sweep found exactly that: node 5's interim replica of
+/// range 2, caught up from index 1 by the log and never installed, led the range and
+/// served a stale client's read of a key it does not hold (check 9, seed 652). The
+/// initial state at index 0 is in no log, so a replica that is caught up by appends
+/// alone must compute it from configuration, as the bootstrap nodes did.
+// PROPOSED(D-097)
+#[must_use]
+pub fn interim_state(bootstrap: &[ServerId], hosted: &[Range]) -> WriteBatch {
+    let mut batch = WriteBatch::new();
+    for range in hosted {
+        let span = range.span();
+        let descriptor = RangeDescriptor {
+            range: range.id,
+            start: span.start,
+            end: span.end,
+            generation: FIRST_GENERATION,
+            voters: bootstrap.to_vec(),
+            state: RangeState::Live,
+        };
+        batch.put(
+            KeyPrefix::group(range.id.get()).descriptor_key(),
+            descriptor.encode(),
+        );
+    }
+    batch
+}
+
 /// What the node was asked for, counted so a scenario can say whether a path was
 /// reached: each counted, none silent.
 ///
@@ -275,7 +310,9 @@ pub struct Gaps {
     /// asserts it above zero on every seed (PROPOSED D-086), and a scenario whose
     /// threshold keeps the path unreached asserts it zero, with that reason.
     pub snapshot_actions: u64,
-    /// Client requests for a range this node does not host.
+    /// Client requests for a range this node does not host, each answered
+    /// `RangeMismatch` at receipt with every descriptor it holds for the key
+    /// (SHARD.md §3; PROPOSED D-097, where D-076 failed the run).
     pub requests_for_ranges_not_held: u64,
 }
 
@@ -491,6 +528,14 @@ pub struct ServerHost<E: Environment> {
     /// The node's own variants, for the paths a core knows nothing about.
     node: NodeVariants,
     gaps: Mutex<Gaps>,
+    /// Every hosted replica's descriptor as the store holds it (SHARD.md §1, §3):
+    /// what the receipt check reads and what a `RangeMismatch` carries. Loaded from
+    /// the store at the start, reloaded after an install's switch, and shared with the
+    /// `apply` task, which answers a write refused at apply with the same descriptors.
+    /// Every replica has one: a bootstrap node's from its initial state, a node not
+    /// named at bootstrap's from `interim_state`, a re-seeded one's from its stream.
+    // PROPOSED(D-097)
+    descriptors: Arc<Mutex<BTreeMap<RangeId, RangeDescriptor>>>,
     /// What the `apply` task has applied per range, shared with that task.
     ///
     /// It is the `apply` task's own state and is written there on every entry. The
@@ -526,6 +571,38 @@ impl<E: Environment> ServerHost<E> {
 
     fn replica(&self, range: RangeId) -> Option<&Arc<Mutex<Replica>>> {
         self.replicas.get(&range)
+    }
+
+    /// Answers a request `RangeMismatch` with `descriptors`, traced (SHARD.md §3, §8).
+    // PROPOSED(D-097)
+    fn mismatch(
+        &self,
+        range: RangeId,
+        to: SocketAddr,
+        client: u64,
+        seq: u64,
+        at: MismatchAt,
+        descriptors: &[RangeDescriptor],
+    ) {
+        self.env.trace(TraceEvent::RangeMismatchSent {
+            range: range.get(),
+            client,
+            seq,
+            at,
+            descriptors: descriptors
+                .iter()
+                .map(|descriptor| (descriptor.range.get(), descriptor.generation))
+                .collect(),
+        });
+        self.answer_later(
+            range,
+            to,
+            client,
+            seq,
+            Reply::RangeMismatch {
+                descriptors: descriptors.iter().map(RangeDescriptor::encode).collect(),
+            },
+        );
     }
 
     /// Fails the node when a replica holds more registered reads than its clients
@@ -705,7 +782,7 @@ impl<E: Environment> ServerHost<E> {
                 parent: None,
                 start: span.start.clone(),
                 end: span.end.clone(),
-                generation: 1,
+                generation: FIRST_GENERATION,
                 voters: config.voters.iter().map(|voter| voter.0).collect(),
                 floor_index: at.last_index,
                 floor_term: at.last_term,
@@ -795,20 +872,51 @@ impl<E: Environment> Host for ServerHost<E> {
                 request,
             } => (range, from, request),
         };
+        // §3, at receipt, against this node's own descriptors and never the
+        // client's: a node with no replica of the range answers `RangeMismatch` with
+        // every descriptor it holds whose span contains the key; a replica whose
+        // descriptor does not contain the key, or is subsumed, answers with its own
+        // and every other that does. Nothing is proposed. A command that names no key
+        // is never mismatched. `TrustStaleDescriptor` takes the range the request
+        // names as proof and checks nothing here (§10, Q38).
+        // PROPOSED(D-097): the receipt check, where D-076 failed the run.
+        let key = request.command.key().map(|key| user_key(key));
         let Some(replica) = self.replica(range) else {
-            // The same absence, traced for the same reason: this node hosts the
-            // ranges its configuration names and nothing routes, so a request for
-            // another range is a client the run has no answer for. Routing and the
-            // answer that redirects it are Stage C's.
-            // PROPOSED(D-076): the request this node drops is traced, not only counted.
             lock(&self.gaps).requests_for_ranges_not_held += 1;
-            self.failed(format!(
-                "a client asked this node for range {}, which it does not host: nothing \
-                 routes yet, and the redirect is Stage C's",
-                range.get()
-            ));
+            let descriptors = key.as_ref().map_or_else(Vec::new, |key| {
+                descriptors_for(&lock(&self.descriptors), None, key)
+            });
+            self.mismatch(
+                range,
+                from,
+                request.client,
+                request.seq,
+                MismatchAt::Receipt,
+                &descriptors,
+            );
             return None;
         };
+        if let Some(key) = &key
+            && !self.node.contains(NodeVariant::TrustStaleDescriptor)
+        {
+            let refused = {
+                let held = lock(&self.descriptors);
+                held.get(&range)
+                    .filter(|own| !(own.contains(key) && own.state != RangeState::Subsumed))
+                    .map(|own| descriptors_for(&held, Some(own), key))
+            };
+            if let Some(descriptors) = refused {
+                self.mismatch(
+                    range,
+                    from,
+                    request.client,
+                    request.seq,
+                    MismatchAt::Receipt,
+                    &descriptors,
+                );
+                return None;
+            }
+        }
         let mut state = lock(replica);
         match &request.command {
             // An operator's wish, acted on at once and answered at once.
@@ -894,7 +1002,18 @@ impl<E: Environment> Host for ServerHost<E> {
                 CoreWork::Hold
             }
             // The switch is durable: this is the replica it built.
-            SnapAnswer::Switched { range, at, config } => {
+            SnapAnswer::Switched {
+                range,
+                at,
+                config,
+                descriptor,
+            } => {
+                // The descriptor the switch put in place is what the receipt check
+                // reads from here on (SHARD.md §3).
+                // PROPOSED(D-097)
+                if let Some(descriptor) = descriptor {
+                    lock(&self.descriptors).insert(*range, (**descriptor).clone());
+                }
                 match self.installed(*range, core, at, config) {
                     Some(installed) => CoreWork::Restore(Box::new(installed)),
                     None => CoreWork::Release,
@@ -1045,7 +1164,54 @@ impl<E: Environment> Host for ServerHost<E> {
             let version = store.engine().snapshot();
             let value = store.engine().get_at(&user_key(&key), &version).await?;
             let served_at = store.applied_at(&version).await?;
+            // §3, at serving: the descriptor at the applied index the read is served
+            // at, read from the same engine version as the value, so a split or
+            // subsume applied between receipt and serving answers `RangeMismatch`.
+            // `TrustStaleDescriptor` checks nothing here (§10).
+            // PROPOSED(D-097): the read check.
+            let descriptor = if self.node.contains(NodeVariant::TrustStaleDescriptor) {
+                None
+            } else {
+                store
+                    .engine()
+                    .get_at(&KeyPrefix::group(range.get()).descriptor_key(), &version)
+                    .await?
+                    .map(RangeDescriptor::decode)
+                    .transpose()?
+            };
             drop(version);
+            let encoded = user_key(&key);
+            if let Some(own) = descriptor
+                && !(own.contains(&encoded) && own.state != RangeState::Subsumed)
+            {
+                let descriptors = descriptors_for(&lock(&self.descriptors), Some(&own), &encoded);
+                let waiting = self
+                    .replica(range)
+                    .and_then(|replica| lock(replica).reads.remove(&id));
+                if let Some((from, request)) = waiting {
+                    self.env.trace(TraceEvent::RangeMismatchSent {
+                        range: range.get(),
+                        client: request.client,
+                        seq: request.seq,
+                        at: MismatchAt::Read,
+                        descriptors: descriptors
+                            .iter()
+                            .map(|descriptor| (descriptor.range.get(), descriptor.generation))
+                            .collect(),
+                    });
+                    self.answer(
+                        range,
+                        from,
+                        request.client,
+                        request.seq,
+                        Reply::RangeMismatch {
+                            descriptors: descriptors.iter().map(RangeDescriptor::encode).collect(),
+                        },
+                    )
+                    .await;
+                }
+                return Ok(());
+            }
             self.env.trace(TraceEvent::RaftRead {
                 server: self.id.0,
                 range: range.get(),
@@ -1153,6 +1319,10 @@ struct ServerApplier<E: Environment> {
     /// The cores' variants: read here for Phase 2's `SharedSnapshotDir`, whose bit
     /// names the version directory a take writes (Q37, PROPOSED D-086).
     cores: ananke_raft::core::Variants,
+    /// The host's descriptors, for the answer a write refused at apply carries
+    /// (SHARD.md §3).
+    // PROPOSED(D-097)
+    descriptors: Arc<Mutex<BTreeMap<RangeId, RangeDescriptor>>>,
     /// Shared with the `snapshot` task: a live install moves a range's applied index,
     /// term and configuration without an apply, and both tasks read this.
     // PROPOSED(D-083): a live install moves the apply task's state with it.
@@ -1469,7 +1639,48 @@ impl<E: Environment> Applier for ServerApplier<E> {
                     Payload::Command(bytes) => Command::decode(bytes.clone()).ok(),
                     Payload::Noop | Payload::Config(_) => None,
                 };
-                let outcome = match apply_command(store, entry.index, command.as_ref()).await {
+                // §3, at apply: a keyed command outside the span of the descriptor in
+                // force before its index — the store's, which the last structural apply
+                // below it wrote — or on a subsumed range, applies as nothing: the
+                // batch advances the applied index and writes no user key, and every
+                // replica refuses it alike (check 4 compares the effect). This is what
+                // makes a split take effect for proposals in flight and a
+                // `RangeMismatch` at apply definite. `ApplyIgnoresSpan` applies it
+                // whatever its key (§10). Every replica holds its descriptor
+                // (`initial_state`, `interim_state`, an install); one without is
+                // checked against nothing, and check 9 then sees what it applied.
+                // PROPOSED(D-097): the apply check.
+                let refused: Option<RangeDescriptor> = match command.as_ref().and_then(Command::key)
+                {
+                    Some(key) if !self.node_variants.contains(NodeVariant::ApplyIgnoresSpan) => {
+                        let held = match store
+                            .engine()
+                            .get(&KeyPrefix::group(range.get()).descriptor_key())
+                            .await
+                        {
+                            Ok(held) => held,
+                            Err(error) => {
+                                self.env.trace(TraceEvent::RaftServerFailed {
+                                    server: self.id.0,
+                                    reason: error.to_string(),
+                                });
+                                return;
+                            }
+                        };
+                        let encoded = user_key(key);
+                        held.and_then(|bytes| RangeDescriptor::decode(bytes).ok())
+                            .filter(|own| {
+                                !(own.contains(&encoded) && own.state != RangeState::Subsumed)
+                            })
+                    }
+                    _ => None,
+                };
+                let applied_command = if refused.is_some() {
+                    None
+                } else {
+                    command.as_ref()
+                };
+                let outcome = match apply_command(store, entry.index, applied_command).await {
                     Ok(outcome) => outcome,
                     Err(error) => {
                         self.env.trace(TraceEvent::RaftServerFailed {
@@ -1493,7 +1704,10 @@ impl<E: Environment> Applier for ServerApplier<E> {
                     }
                 }
                 // PROPOSED(D-069): `key` and `effect` (SHARD.md §8).
+                // PROPOSED(D-097): `out_of_span` for a keyed command the apply check
+                // refused.
                 let (key, effect) = match command.as_ref().and_then(Command::key) {
+                    Some(key) if refused.is_some() => (Some(key.clone()), ApplyEffect::OutOfSpan),
                     Some(key) => (Some(key.clone()), ApplyEffect::Applied),
                     None => (None, ApplyEffect::None),
                 };
@@ -1505,7 +1719,7 @@ impl<E: Environment> Applier for ServerApplier<E> {
                         index: entry.index,
                         entry_term: entry.term,
                         hash: entry.payload.hash(),
-                        key,
+                        key: key.clone(),
                         effect,
                     },
                 );
@@ -1516,12 +1730,46 @@ impl<E: Environment> Applier for ServerApplier<E> {
                 if let Some(waiting) = waiting
                     && waiting.term == entry.term
                 {
+                    // A write refused at apply is answered `RangeMismatch`, with the
+                    // refusing replica's descriptor and every other this node holds
+                    // that serves the key; the leader keeps its record of the request
+                    // (`Replica::proposed`), so a late copy of it is still deduplicated
+                    // (SHARD.md §3, Q10; D-026).
+                    // PROPOSED(D-097)
+                    let reply = match (&refused, key.as_ref()) {
+                        (Some(own), Some(key)) => {
+                            let descriptors = descriptors_for(
+                                &lock(&self.descriptors),
+                                Some(own),
+                                &user_key(key),
+                            );
+                            self.env.trace(TraceEvent::RangeMismatchSent {
+                                range: range.get(),
+                                client: waiting.client,
+                                seq: waiting.seq,
+                                at: MismatchAt::Apply,
+                                descriptors: descriptors
+                                    .iter()
+                                    .map(|descriptor| {
+                                        (descriptor.range.get(), descriptor.generation)
+                                    })
+                                    .collect(),
+                            });
+                            Reply::RangeMismatch {
+                                descriptors: descriptors
+                                    .iter()
+                                    .map(RangeDescriptor::encode)
+                                    .collect(),
+                            }
+                        }
+                        _ => Reply::Outcome(outcome),
+                    };
                     let response = RangedResponse {
                         range,
                         response: Response {
                             client: waiting.client,
                             seq: waiting.seq,
-                            reply: Reply::Outcome(outcome),
+                            reply,
                         },
                     };
                     let _ = self.sock.send(waiting.from, response.encode()).await;
@@ -1533,6 +1781,27 @@ impl<E: Environment> Applier for ServerApplier<E> {
             }
         })
     }
+}
+
+/// What a `RangeMismatch` for the encoded `key` carries (SHARD.md §3): `own`, the
+/// descriptor of the replica that refused, first if there is one, and every other
+/// descriptor the node holds that serves the key, in range order.
+// PROPOSED(D-097)
+fn descriptors_for(
+    held: &BTreeMap<RangeId, RangeDescriptor>,
+    own: Option<&RangeDescriptor>,
+    key: &[u8],
+) -> Vec<RangeDescriptor> {
+    let mut out: Vec<RangeDescriptor> = own.cloned().into_iter().collect();
+    out.extend(
+        held.values()
+            .filter(|descriptor| Some(descriptor.range) != own.map(|own| own.range))
+            .filter(|descriptor| {
+                descriptor.contains(key) && descriptor.state != RangeState::Subsumed
+            })
+            .cloned(),
+    );
+    out
 }
 
 /// The node's clock in nanoseconds, where the cores' lease arithmetic reads it.
@@ -1788,6 +2057,20 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
         });
     }
     let bootstrapped_before = is_bootstrap && !bootstrapped_now;
+    // A node not named at bootstrap writes its interim replicas' descriptors at its
+    // first start, in the configured directory alone, so that every replica of the
+    // node checks a key against a descriptor (SHARD.md §2, §3; `interim_state`).
+    // PROPOSED(D-097)
+    let first_descriptor = KeyPrefix::group(first.id.get()).descriptor_key();
+    let interim_now = !is_bootstrap
+        && !reseeded_now
+        && engine.dir == base_dir
+        && engine_of_node.get(&first_descriptor).await?.is_none();
+    if interim_now {
+        engine_of_node
+            .write(interim_state(&bootstrap, &hosted), true)
+            .await?;
+    }
 
     let mut stores: BTreeMap<RangeId, Arc<RaftStore<E>>> = BTreeMap::new();
     let mut cores = Cores::new(node_variants);
@@ -1796,10 +2079,22 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
     // and the host moves a range's entry when a live install replaces that range's
     // state machine with no entry passing through the task (PROPOSED D-086).
     let applied_at: Arc<Mutex<BTreeMap<RangeId, Applied>>> = Arc::default();
+    // Every replica's descriptor as the store holds it, for the receipt check and
+    // the answers that carry it (SHARD.md §3). A replica without one — a node not
+    // named at bootstrap, before its install — has no entry.
+    // PROPOSED(D-097)
+    let descriptors: Arc<Mutex<BTreeMap<RangeId, RangeDescriptor>>> = Arc::default();
     for (range, store, recovered) in opened {
         let id_of = range.id;
         stores.insert(id_of, store.clone());
         replicas.insert(id_of, Arc::new(Mutex::new(Replica::new())));
+        if let Some(bytes) = store
+            .engine()
+            .get(&KeyPrefix::group(id_of.get()).descriptor_key())
+            .await?
+        {
+            lock(&descriptors).insert(id_of, RangeDescriptor::decode(bytes)?);
+        }
         // Q13, D-057: each core seeded from `n{id}/r{range}/protocol`, so two ranges
         // on one node draw different election timeouts — and so that range r's
         // stream is r's alone, which is what makes a range's schedule independent of
@@ -1858,7 +2153,13 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
         if fresh {
             // §2 generalised: the ranges configuration fixes, created at the node's
             // first start, each traced with the span, generation and voters
-            // configuration gave it (§8). Nothing routes by any of it.
+            // configuration gave it (§8). The voters are the range's, the bootstrap
+            // nodes, on every node: a node not named at bootstrap starts its interim
+            // replica on an empty Raft configuration (`initial`, D-076), but the
+            // descriptor it is created with is the range's one descriptor, which is
+            // what check 7 holds every creation to. D-096 traced `initial` here, so
+            // the correct membership scenario disagreed with itself on nodes 4 and 5.
+            // PROPOSED(D-097)
             let span = range.span();
             env.trace(TraceEvent::RangeCreated {
                 range: id_of.get(),
@@ -1866,8 +2167,8 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
                 parent: None,
                 start: span.start,
                 end: span.end,
-                generation: 1,
-                voters: initial.iter().map(|voter| voter.0).collect(),
+                generation: FIRST_GENERATION,
+                voters: bootstrap.iter().map(|voter| voter.0).collect(),
                 floor_index: 0,
                 floor_term: 0,
                 incarnation: store.incarnation(),
@@ -1901,6 +2202,7 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
         variants,
         node: node_variants,
         gaps: Mutex::new(Gaps::default()),
+        descriptors: descriptors.clone(),
         applied: applied_at.clone(),
     };
     let answers = host.answers.clone();
@@ -1927,6 +2229,7 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
             engine_dir: engine.dir.clone(),
             node_variants,
             cores: variants,
+            descriptors: descriptors.clone(),
             applied: applied_at.clone(),
         };
         let jobs = jobs.clone();
