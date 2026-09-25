@@ -16968,4 +16968,220 @@ own catch and report anything else as the node's own failure.
 
 ---
 
-_Next entry: D-092. Add one before implementing anything not covered above._
+## PROPOSED D-092 — A split on a node whose block of range ids has run out is refused at proposal, and a block at or below its threshold keeps a refill outstanding
+
+**The number.** The footer reads D-092 and no open branch takes a number: PR #127 edits
+D-069's text and not the footer, and PR #128 moves D-040 and adds nothing. D-092 and
+D-093 are taken from the footer, which moves to D-094. No code site carries either yet;
+the Stage C slice that builds the lease marks its site `// PROPOSED(D-092)`.
+
+**Context.** Stage C's first question before code (SHARD.md:2427-2429). Q17 leases range
+ids to nodes in blocks: range 0 holds the counter and a lease record per node, a split
+takes the next id from its node's block with no write to range 0, and range 0's
+availability gates refilling a block, not performing a split (SHARD.md:3062-3068). The
+three rules that keep an id from being taken twice were approved as written on 2026-09-15
+(SHARD.md:639-657, 3270-3277): blocks are disjoint, a node adopts only a block granted to
+its current run, and its position in a block is volatile. What the approval left open, in
+its own words, is "what a split does when its node's block is exhausted and range 0 cannot
+refill it" (SHARD.md:3276-3277); the stage that builds the lease states it, and Stage C's
+build list carries it as "the exhausted block's answer as question 1 settles it"
+(SHARD.md:2462-2464).
+
+The situation is reachable. A node asks for a refill when the ids left in its block fall
+to the refill threshold, and the refill is a command to range 0, answered by range 0's
+leader. Range 0 is fixed on the three bootstrap nodes (Q9, SHARD.md:209-213) and elects
+like any range, so a node partitioned from range 0's leader, or one whose refill's answer
+keeps being lost, spends its block down through the threshold to empty while splits keep
+being asked of it: by the operator, or by the sweep's driver, which draws splits on stream
+`shard` and lands them on whichever node leads the range it drew. The question is what
+the leader of P does with a split when its node's block is empty and no grant has landed.
+
+**Four answers, on the facts as they stand.**
+
+- *A. Refuse at proposal.* The leader takes no id and proposes nothing. It answers the
+  split's asker as it answers a split asked while a change is catching up (Q23,
+  SHARD.md:3104-3108): refused, with the reason, here `NoRangeId`. The node's refill is
+  already outstanding, since the block passed its threshold before it emptied. The asker
+  retries.
+- *B. Wait.* The leader parks the split until its node's block refills, then takes an id
+  and proposes; a parked split is answered when it lands, or refused when a bound runs
+  out.
+- *C. A reserve, or a borrowed id.* Each block keeps one id back for use only while range
+  0 is unreachable; or the node asks a peer for an id out of the peer's block.
+- *D. A provisional id.* The split proposes with an id the node chooses, which range 0
+  confirms later.
+
+**Proposed: A.**
+
+- It is the shape the split already has. §5's checks at proposal are "for liveness only"
+  and every one of them refuses at proposal (SHARD.md:619-627); Q23's catching-up refusal
+  is one such, and Stage D's exit already counts those refusals per run as coverage
+  (SHARD.md:2643-2648). An empty block is one more reason on the same answer, and the
+  driver counts it the same way.
+- It adds no state and no rule. §5's three rules say which ids a node may take; A takes
+  none. Check 18's range-id clause (SHARD.md:1316-1322) folds every id a split took
+  against the blocks `RangeIdsLeased` granted; a refused split traces no `RangeSplit`, so
+  the clause has nothing to look at, and `IdBlockResumed` is untouched.
+- B's wait buys nothing the retry does not. A parked split is leader-local and volatile,
+  lost at a leadership change as D-032 loses a change's catch-up, so the asker must be
+  ready to retry anyway; once it is, the park is a second timer with a second bound to
+  measure, and it holds P against every other split for as long as range 0 is down.
+  Refusing hands P back to the asker at once.
+- C's reserve is exhaustion one id later, bought with a path that runs only while range
+  0 is down, which is the path least exercised. C's borrow breaks "blocks are disjoint"
+  unless the lender's position becomes durable, which Q17 declined to pay for. D breaks
+  uniqueness, the one guarantee Q17 keeps and check 18 folds.
+- What A costs is splits on that node while range 0 is unreachable, which is already the
+  cluster's state and not a second outage: range 0 unreachable is meta's root unreachable
+  for every client's cache miss (§2), and the partition that hides range 0's leader from
+  the node hides it from the rest of the cluster too. A split refused for want of an id
+  is a symptom of that outage, reported to the one asker that can retry.
+
+**The refill, restated so that A is enough.** A node whose block holds ids at or below
+the refill threshold has a refill outstanding at all times: it sends one, and resends it
+after a minimum election timeout until a grant carrying its current run nonce arrives,
+whether as the refill's answer or read back from its lease record (§5's second rule). A
+refill is idempotent by construction, since a copy that applies again grants a second
+block, which is a gap (SHARD.md:639-646), so the resend is the exception to D-026's rule
+against resending a write (DECISIONS.md:852-854) that §5 already claims for it. An empty
+block is the threshold's case with nothing left, and asks for nothing new. The block size
+and the threshold stay tunable (Q17); the slice that builds the lease chooses the pair on
+a measurement in `sim/shard.rs`, how often a split finds an empty block under Phase 2's
+network faults, printed at every tier beside the choice.
+
+**What is measured before it is asserted (Q39, D-061).** A split refused for want of an
+id is a coverage count of `sim/shard.rs`, counted per run and printed at every tier
+beside Stage D's four (SHARD.md:2643-2648), under the rule Stage D states for those:
+asserted non-zero over CI's hundred seeds and above, and a count a hundred seeds leave at
+zero is a hole in the driver's draw, fixed there and never a tier raised. The hole's fix,
+if one is needed, is a partition that isolates a splitting node from range 0's majority
+for long enough to spend its block, on the driver's own stream. The per-seed assertion,
+wherever the situation is reached: the refusal is the driver's answer; no `RangeSplit`
+and no `RangeCreated { cause: split }` follows it on that node until a `RangeIdsLeased`
+carrying that node's run is traced; and the same asker's retry after the heal takes
+effect within the liveness bound. A refusal at proposal is not a state transition of any
+range and traces no event of its own, as Q23's refusals trace none; if the studio needs to
+see one, that is one addition for both reasons and is proposed when it is needed.
+
+**Consequences.**
+
+- Stage C's build list reads "the exhausted block's answer as question 1 settles it"
+  (SHARD.md:2462-2464). This entry is that answer, and the lease slice cites it.
+- No new trace event and no new answer type: the reason rides the refusal Q23 already
+  returns.
+- The alternatives stay open where the measurement says so. If `sim/shard.rs` shows a
+  node's splits refused for want of an id on seeds where the node still reaches range
+  0's leader, the refill's resend is what to look at first, not this answer; that figure
+  is the count above, split by whether a `RangeIdsLeased` for the node was traced within
+  a minimum election timeout of the refusal.
+- Nothing moves: no schedule, no pinned hash, no code. This entry lands before the code
+  that depends on it, as §12 asks (SHARD.md:2065-2068).
+
+---
+
+## PROPOSED D-093 — Check 19's tripping variant is a test instrument of the range layer's own, `SplitLeavesGap`, outside §10's count
+
+**Context.** Stage C's second question before code (SHARD.md:2430-2437). §11's raft item
+12 asks every new fold of §8 to run under the incremental checker's equivalence test with
+a variant that trips it (SHARD.md:1889-1893;
+`the_incremental_checker_agrees_with_the_fold_over_the_whole_trace`,
+sim/tests/raft.rs:4414-4424), and §12 restates it for every stage: "a fold that no
+variant trips is a question to the owner, not a test left without one"
+(SHARD.md:2051-2056). Check 19, the ranges tile the keyspace — after every event no two
+latest spans overlap, and after every `RaftApply` of a range command they cover the
+addressable keyspace with no gap (SHARD.md:1323-1328) — is built in Stage C
+(SHARD.md:2480-2482), and §10 names no variant that trips it. The one mention is
+`UnfreezeBeforeAbortCommitted`'s row, which check 19 sees in shape (e) "only if R traces a
+value after the merge" (SHARD.md:1742). The question lists three ways out, and both Stage
+C's exit and Stage E's build list wait on the choice (SHARD.md:2519-2521, 2740-2741).
+
+**Why no variant of §10 trips check 19.** Each of the twenty-four breaks one rule with a
+reference, and that rule's own check catches it first. A variant that shapes a descriptor
+differently on different replicas is check 7's (agreement, SHARD.md:1214-1224); one that
+leaves two initialised replicas of one node covering a key is check 8's
+(SHARD.md:1225-1235); one that serves a key outside its span is check 9's
+(SHARD.md:1236-1241). Check 19 is the cluster-wide property those leave implicit: that the
+descriptors every replica agrees on, and every node keeps disjoint, also add up to the
+keyspace. The only way to reach it with checks 7 and 8 silent is to write the same wrong
+span on every replica of a range, and nothing in §10 does, because §10's variants are
+protocol mistakes and that is a translation mistake. That is not a hole in §10; it is what
+a tiling check is for, and the fold needs an instrument that the protocol's variants do not
+happen to be.
+
+**Three options, and what each asserts.**
+
+- *A. A variant for the equivalence test alone, outside §10's count.* Built in Stage C
+  beside check 19; the fold trips on every seed on which a split takes effect; asserted
+  from the stage that builds the fold.
+- *B. `UnfreezeBeforeAbortCommitted`, in Stage E, on the seeds of shape (e) where R traces
+  a value after the merge.* Leaves check 19 with no tripping variant through Stages C and
+  D, and rests on a rate nobody has measured, which the row's own wording allows to be
+  zero. Where it is not zero, checks 12 and 10 trip on the same seeds before 19 does, so
+  the trace the equivalence test sees carries several violations, and the first one is
+  never this fold's.
+- *C. §11's raft item 12 amended for check 19.* Exempts one fold from the rule that exists
+  because an incremental fold's bugs hide on traces with no violation (D-046).
+
+**Proposed: A**, with B kept as a measurement in Stage E and not as the assertion, and C
+not taken.
+
+**The variant, `SplitLeavesGap`.** Every replica of P applies the split with the right
+half's descriptor starting one key past the split key: R is written `[succ(k), y)` where
+the correct apply writes `[k, y)`, and `succ(k)` is `k` followed by a zero byte, the least
+key above it. P shrinks to `[x, k)` as it should. The split key itself then lies in no
+range, on every replica, from the split's apply on.
+
+What it trips, and what it does not. Every replica writes the same wrong span, so check 7
+is silent; the two spans on any one node are disjoint, so check 8 is silent; and no
+`RaftApply` or `RaftRead` names a key outside its own descriptor, so check 9 is silent — a
+request for `k` is answered `RangeMismatch` at receipt by P and by R alike, each correctly
+by §3's rules against its own descriptor. Check 19 trips at the `RaftApply` of the split
+entry on the first replica to apply it: the latest spans cover the keyspace with a gap of
+one key. It trips on *every seed* on which a split takes effect, so the equivalence test
+has a violating trace on every seed the sharded sweep runs, and no rate is measured;
+Stage C's exit already asserts per seed that the driver's splits take effect. Beyond the
+fold, the only other reporter is the liveness bound on uniform seeds, and only when a
+client's key is `k` itself, which the sweep's draw reaches on a share of seeds that is
+printed and asserted nowhere.
+
+Where it lives. In `ananke-shard`'s range-layer variant set (Q37, SHARD.md:3208-3212),
+beside the eight of §10 that Stage C builds, marked as a test instrument outside §10's
+count exactly as the node's `NodeVariant`s are: "they do not appear in
+`ananke_raft::Variant::BUGS` or in §10's count" (crates/ananke-shard/src/variant.rs:1-9).
+D-045 holds: a variant is a set, and this member's fix is the one expression that writes
+R's start. It is also CLAUDE.md's known-buggy variant for the fold's own sweep test: the
+pair rule asks that the buggy variant be *seen to fail* the check the correct system
+passes, and the equivalence test of §11 is that pair with the fold's incremental form held
+to the same verdict.
+
+**Why not a variant that overlaps.** A parent that keeps its whole span, R written over
+`[k, y)` with P left at `[x, y)`, is the other one-line mistake, and check 8 catches it on
+the first node to apply, before check 19 sees it; its protocol cousin,
+`SplitNotAtomicWithDescriptor` (Stage D), is check 7's. The gap is the one shape of a
+wrong split that only the tiling sees, which is what makes it the right instrument for the
+tiling's fold and not for any other.
+
+**What B buys, kept as a measurement.** Stage E's build list reads "check 19's variant, if
+Stage C's question 2 chose `UnfreezeBeforeAbortCommitted`" (SHARD.md:2740-2741); with A
+chosen that line is discharged. In its place `sim/merge.rs`'s shape (e) prints the seeds on
+which R traces a value after the merge and check 19 trips, as a figure beside check 10's
+and check 12's catches, asserted nowhere. If that figure clears D-061's five per cent at
+the tier (e) runs at, check 19 gains a second tripping variant in Stage E, as a
+strengthening the measurement earns and not a condition this entry sets.
+
+**Consequences.**
+
+- Check 19 runs under the equivalence test from Stage C with `SplitLeavesGap`, and Stage
+  C's exit line, "check 19 runs under the test the same way, and is asserted against a
+  tripping variant as question 2 settles" (SHARD.md:2519-2521), is settled: asserted, in
+  Stage C, on every seed.
+- §10's count stays twenty-four; §11's raft item 12 is not amended; the range layer's
+  variant set carries one member beyond §10's, as it already carries the node's.
+- The instrument is a split's, so it exists from the slice that builds the split's apply,
+  which is also where check 19 is first fed; the two land in the same slice, whose fold
+  test asserts the variant caught on every seed and the correct system green.
+- No schedule, no pinned hash, no code in this entry.
+
+---
+
+_Next entry: D-094. Add one before implementing anything not covered above._
