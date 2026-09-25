@@ -28,7 +28,7 @@ use std::io;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use moirae_trace::Json;
 
-use crate::apply::{Command, Outcome};
+use crate::apply::{Command, Outcome, SplitRefusal};
 use crate::types::ServerId;
 
 /// The first byte of a request.
@@ -167,6 +167,10 @@ impl Response {
                     None => out.put_u8(0),
                 }
             }
+            Reply::Outcome(Outcome::Refused(reason)) => {
+                out.put_u8(5);
+                out.put_u8(reason.code());
+            }
             Reply::NotLeader { leader } => {
                 out.put_u8(3);
                 out.put_u64_le(leader.map_or(u64::MAX, |l| l.0));
@@ -210,6 +214,14 @@ impl Response {
                     _ => return Err(bad("client packet malformed")),
                 };
                 Reply::Outcome(Outcome::Value(value))
+            }
+            5 => {
+                if bytes.is_empty() {
+                    return Err(bad("client packet torn"));
+                }
+                let reason = SplitRefusal::from_code(bytes.get_u8())
+                    .ok_or_else(|| bad("client packet malformed"))?;
+                Reply::Outcome(Outcome::Refused(reason))
             }
             3 => {
                 if bytes.len() < 8 {
@@ -278,6 +290,7 @@ pub fn studio(payload: &[u8]) -> Option<Json> {
             Command::MetaUpdate { .. } => "meta-update",
             Command::Lookup { .. } => "lookup",
             Command::Refill { .. } => "refill",
+            Command::Split { .. } => "split",
         };
         let mut fields = vec![
             ("type", Json::str("client.request")),
@@ -313,6 +326,10 @@ pub fn studio(payload: &[u8]) -> Option<Json> {
         ];
         match &response.reply {
             Reply::Outcome(Outcome::Done) => fields.push(("reply", Json::str("done"))),
+            Reply::Outcome(Outcome::Refused(reason)) => {
+                fields.push(("reply", Json::str("refused")));
+                fields.push(("reason", Json::str(reason.name())));
+            }
             Reply::Outcome(Outcome::Swapped(swapped)) => {
                 fields.push(("reply", Json::str("swapped")));
                 fields.push(("swapped", Json::Bool(*swapped)));
@@ -359,6 +376,8 @@ mod tests {
             Reply::Outcome(Outcome::Done),
             Reply::Outcome(Outcome::Swapped(true)),
             Reply::Outcome(Outcome::Value(None)),
+            Reply::Outcome(Outcome::Refused(SplitRefusal::NoRangeId)),
+            Reply::Outcome(Outcome::Refused(SplitRefusal::KeyOutsideSpan)),
             Reply::Outcome(Outcome::Value(Some(Bytes::from_static(b"v")))),
             Reply::NotLeader { leader: None },
             Reply::NotLeader {

@@ -18289,4 +18289,354 @@ draws no nonce and sends no refill.
 
 ---
 
-_Next entry: D-100. Add one before implementing anything not covered above._
+## PROPOSED D-100 — The split: proposed by a range's leader with an id from its node's block, re-checked and applied by every replica in one batch that writes both halves' descriptors and the right half's Raft state, the right half's core started from its floor and hurried to its first election, and check 18's split clause
+
+**The number.** Stacked on PR #135 (D-099), whose footer reads D-100. This takes
+**D-100** and moves the footer to D-101. Every code site carries `// PROPOSED(D-100)`.
+The exhausted block's answer is Stage C's question 1, PROPOSED D-092 on PR #129 and
+unanswered: this slice builds D-092's proposed A — a split asked while the node's block
+holds no id is refused `NoRangeId` at proposal and the asker retries — marked as
+proposed, and the owner's ruling replaces it in place.
+
+**Context.** Stage C's split (SHARD.md:2465-2472): "by operator's `Command::Split` and by
+the driver (Q18); the left half keeps P's id (Q19); R at current term 1, no vote, floor
+`(s, 1)` (Q20); R's replica on the node whose P led at the apply pre-votes at once and
+every heartbeat interval (Q21); Q23's rules for a split, refused at proposal while a
+change is catching up and at apply while the configuration at or below `s` is joint,
+and, on a replica that is not a voter of P at `s`, no R and a range delete of the right
+span; P's quarantine not copied (Q26)." §5 says the whole of it; §8's check 18 folds the
+lineage; §11's raft item 3 names the command. The placeholders (Q22), the overlap rule
+(Q27) and §10's four split variants are the next slices', so on this tree a
+message for a right half a node has not yet created is counted and dropped, as every
+message for a range not held has been since D-076, and R elects among the replicas that
+have applied `s`.
+
+### What is built
+
+1. **`Command::Split { key, right }`** in `ananke-raft`'s `Command`, an entry carrying
+   the key the split cuts at and the right half's id, which that crate reads nothing of
+   (Q40); `Command::key` is `None`, so §3's checks leave it alone. The operator asks
+   with `right` 0 and the leader fills it in. **`Outcome::Refused(SplitRefusal)`**, an
+   outcome of its own on the wire (tag 5) with the reason named: `KeyOutsideSpan`,
+   `NotLive`, `ConfigurationChanging`, `NoRangeId`, `SystemRange`; the studio decoder
+   names all three.
+2. **The proposal**, at the leader's receipt of a `Split` for a range it leads
+   (SHARD.md §5, Q18, Q23): a copy of a request whose entry is in the log is answered
+   when that entry applies, once, as every proposal is; on a replica that does not lead
+   the range the request is handed to the core as any proposal is and answered with the
+   leader it knows, and no id is taken for a split that will not be appended. A system
+   range refuses `SystemRange`; a leader with a change under way — servers catching up
+   as learners, or the joint configuration in force (`Raft::changing`) — refuses
+   `ConfigurationChanging` (Q23); a descriptor not `Live` refuses `NotLive`, a key not
+   strictly inside the span `KeyOutsideSpan`; then the right half's id is taken from the
+   node's block (`IdBlocks::take`, D-099) and a block with none left refuses
+   `NoRangeId`, PROPOSED D-092's A, built as proposed and replaced in place by the
+   owner's ruling. A refusal is answered with no entry; otherwise the refill is asked
+   for where the block has reached its threshold, and `Split { key, right }` is
+   proposed under the asker's client id and sequence number.
+3. **The apply**, on every replica of P at the entry's index `s`
+   (`ServerApplier::split`): the re-check against state every replica shares — the
+   key strictly inside the span of P's descriptor in force before `s`, that descriptor
+   `Live`, the latest configuration entry at or below `s` plain — and a split that
+   fails one applies as nothing, refused, with its reason to the asker. Otherwise one
+   synced batch holds P's applied index `s`, P's descriptor `[start, key)` at g + 1,
+   R's descriptor `[key, end)` at g + 1 with the voters of P's plain configuration at
+   `s`, `Live`, and — on a node that is a voter of that configuration — R's Raft state
+   under R's own prefix (`split_state_into`: a hard state of term 1 and no vote, an
+   applied index of `s`, a snapshot record of `(s, 1)` with that configuration and no
+   checkpoint, the configuration key, an incarnation drawn fresh, no quarantine; Q20,
+   Q26); on a replica that is not — a learner replaying `s` — P's shrunk descriptor
+   and a range delete of the right span's keys in its place (§5). No user key moves
+   (Q2). The batch traces `RangeSplit`, `RangeDescriptor` for P and `RangeCreated {
+   cause: split }` for R, then the entry's `RaftApply` with effect `took` (§8). On a
+   voter the node then opens R's store beside P's, enters it in the node's tables —
+   stores, replicas, descriptors, the `apply` task's applied state — starts R's core
+   from its floor with `Raft::restore_compacted` and hands it to the `raft` task as
+   `Local::RangeAdded`, which puts the core in place among the node's cores.
+4. **R's first election** (Q21): the `raft` task gives R's core `Input::Campaign` on
+   the node whose P led at the apply — the pre-vote now, and again every heartbeat
+   interval while the core is a follower or pre-candidate with no leader heard, until
+   the election timer fires or a leader is heard; a candidacy the pre-vote won waits
+   for its votes under the election timeout. The replicas that have not applied `s`
+   yet grant nothing, since they hold no R (the placeholder is the next slice's, Q22),
+   so R elects among the replicas that have applied `s`.
+5. **The node's tables are dynamic**: the stores, replicas, descriptors and applied
+   state are shared behind a lock among the host, the `apply` task and the `snapshot`
+   task, and a split adds to them at its apply. The `snapshot` task's plan learns R
+   and its spans from the host (`SnapJob::Host`), and P's span follows P's descriptor
+   there on every replica that applies the split, voter or not, so a take of P after
+   the split covers `[start, key)` and no key of R's and an install of P replaces
+   `[start, key)` and no key of R's; the plan is hosted from the descriptors at the
+   start too. The host's `installed` and the task's state read-back look a switched
+   range's span up in the descriptors, and in the configured list only for a replica
+   without one, a re-seed's before its install.
+6. **A restart reopens both halves from their keys** (§5): after the engine opens,
+   the node seeks tenant 0 one bounded seek per group present (D-055) and, for every
+   group configuration did not name, reads its descriptor back and opens its store —
+   `discover_ranges`, with `user_key_of` the inverse of the user-key encoding — so a
+   right half a split created is hosted, restated and hosted in the plan at the next
+   start as the configured ranges are. A re-seed's fresh engine holds no keys to read;
+   its right halves come back through the placeholders of the next slice.
+7. **The meta update after a split** (§1, §5): where the node led P at the apply, the
+   host hands the `meta` task both halves' descriptors, which it sends to the meta
+   range's leader as D-098's task sends a new leader's, so P's record at g + 1 and R's
+   at g + 1 are the first updates the meta range takes (`took`) since the bootstrap.
+8. **Check 18's split clause** (`invariants::SplitLineage`, under the range layer's
+   checker with the range-id clause): at the first apply of each split (P, `s`), with
+   P's descriptor before `s` `[x, y)` at g, P's value at `s` is `[x, k)` at g + 1 with
+   P's voters; R's `RangeCreated { cause: split }` is `[k, y)` at g + 1 with the voters
+   of P's plain configuration in force at `s`, floor index `s` and floor term 1; R is
+   fresh — no creation or split named R before — and lies in a block a
+   `RangeIdsLeased` traced before it granted to the node that led P in the split
+   entry's term (Q17); and every replica's `RangeSplit` of (P, `s`) names the same
+   right half and key. Check 7's map takes P's new value at `RangeSplit` and R at its
+   creation, so checks 9, 10 and 16 read a split's descriptors as they read the
+   bootstrap's. Unit tests for the clause: a split in shape on every replica, and a
+   right half named before, a wrong generation, wrong voters and an id in no block or
+   another node's block, each caught.
+9. **The sweep's split** (`sim/raft.rs`): every node schedule draws one `Fault::Split`
+   at a position among its arms from a stream of its own, asked by an admin of the
+   aimed range's leader at the second of the two keys the range's clients draw from
+   (`split_key_of`), the admin following `NotLeader` for a round of the servers and
+   recording the answer — done, refused with its reason, or unanswered — and every
+   schedule draws, after it, `Fault::SplitFromRestarted`: the node that proposed the
+   last split done is crashed, restarted, handed the lead of a range that split did not
+   cut (`Command::Transfer`) and asked, alone, to split it — §10's shape for
+   `IdBlockResumed`. The trace's payload oracle holds a replica event's range to the
+   configured six and every right half a `RangeSplit` names from then on. What the
+   trace shows of a split is folded by `splits_of`: splits that took effect, right
+   halves created, terms a right half led in, writes through a right half, right
+   halves reopened by a restart, installs switched onto a half after its split, and
+   writes refused at apply on a parent after its split — a write proposed under the
+   old span and appended above `s`, which §3's apply check refuses and the client
+   resends by its lookup.
+
+### What the split found on its way in
+
+Five faults on the correct node, none of which a tree without a split could reach, each
+found by a check or a pin and fixed in this slice:
+
+1. **The hurried pre-vote burnt a term a heartbeat** (Q21). The core repeated the
+   pre-vote every heartbeat interval while no leader was heard, and did so while it was
+   already a candidate, so the votes on their way were discarded and the term rose with
+   every heartbeat: seed 368's right half took twelve terms in 240 ms before it had a
+   leader, and its leader's stream to a follower restarted at every term. The repeat is
+   the pre-vote's alone now, while the core is a follower or pre-candidate; a candidacy
+   waits for its votes under the election timeout.
+2. **A restart did not reopen a right half.** The node opened the ranges configuration
+   named and nothing else, so a right half a split had created on it was gone at the
+   next start: its leader streamed a snapshot to a range the node did not host, refused
+   at the plan and started over at its first byte until the leader changed. Seed 368's
+   guard, every live install traced at one instant, is what saw it — a switch of the
+   right half with no state read back and no restatement. §5 says a crash after the
+   batch restarts both replicas from their keys, and it does now (item 6).
+3. **The host's `installed` kept the old core on a right half's install**: it read the
+   switched range's span in the list fixed at the start, D-098's finding on the task
+   over again for a range configuration never names. It reads the descriptors.
+4. **An install of the parent wrote over the right half's keys.** The `snapshot` task's
+   plan kept P's span as configuration named it, `[k6, k8)`, after the split had cut it
+   to `[k6, k7)`; a take of P from another node read `[k6, k8)` — R's keys as that
+   node's R held them — and the install of it on a node that had applied the split
+   replaced `[k6, k8)`, R's keys included, with the take's older values. Seed 3 under
+   `MetaOverwritesByArrival` read `k7` through R's leader at its applied index and got
+   `None` where a write had been placed: linearizability, on the correct path, the
+   variant's only part the schedule. P's span follows its descriptor in the plan on
+   every replica that applies the split, and the plan is hosted from the descriptors
+   at the start.
+5. **A replica that did not lead took an id for a split it would not append.** The
+   receipt took the id before the core said whether it led the range, so an admin's
+   ask at a follower burnt one of the node's block. The leader check comes first, and
+   a follower hands the request to its core as any proposal, answering the leader it
+   knows.
+
+And one in the sweep: the pre-vote check read a right half created before an isolation
+as raising its term from 0 at its first pre-vote inside it, since a right half starts
+at its floor's term and traces no `RaftTerm` for it; the creation is the term's source
+until an election moves it.
+
+And a sixth, D-099's, which the second split found: **the `meta` task numbered its
+requests from 0 at every start**, so a restarted node's first refill carried the
+(client, seq) its last run's had, and range 0's leader — which answers a copy of a
+request whose entry is in its log when that entry applies, once — took it for that copy
+and answered nothing, until the leader changed or the count passed the old run's: seed 0
+of the node sweep had a restarted node without a block for 1.7 s, and the correct node
+answered the restarted proposer's second split `NoRangeId` 52 times over 20 seeds. The
+task numbers its requests from the run's nonce now, so no run's request repeats an
+earlier run's; the meta range's updates after a restart were dropped the same way, which
+check 16 cannot see and the meta convergence bound of the sharded sweep would have.
+
+### What the sweeps say
+
+Every rate below was measured before its assertion was written (Q39, D-061), at the
+gate's twenty in debug on this session's container (a four-core Xeon, D-070) from
+`cargo test -p ananke-sim` with the prints kept; the thousand are the premerge on the
+same tree, under **The premerge** below.
+
+- **The correct node**, every sweep green with check 18's both clauses under the
+  incremental checker and over the whole trace, and the split's coverage folded
+  (`splits_of`), printed at every tier: over 20 seeds the admins asked **38 splits, 28
+  done**, 1 refused `KeyOutsideSpan`, 1 refused `NoRangeId` and 9 unanswered within
+  the round; **31 splits took effect**, 93 right-half replicas created, 74 terms led
+  by a right half, **1 611 writes applied through a right half**, **62 right halves
+  reopened by a restart** from their keys, **129 live installs switched onto a half
+  after its split**, and no write reached apply on a parent above its split's index
+  (1 of 20 on the tree before the sixth finding, so its floor is the thousand's). The
+  restarted proposer's second split — §10's shape for `IdBlockResumed` — was asked on
+  18 seeds and done on 10. Range 0 granted 134 blocks, the fewest on a seed 3 (D-099:
+  107, over fewer crashes); the meta range took 186 updates, both halves' after every
+  split; 140 mismatches at receipt and 1 at a read, none at apply. Asserted at every
+  tier: a split took effect, its right half created, led and written through, a right
+  half reopened by a restart, a half installed after its split; from the thousand, a
+  write refused at apply on a parent after its split.
+- **`IdBlockResumed`**, §10's rate, caught on **14 of 20** — **12 by check 18's
+  range-id clause**, "range 2's split at index 70 names right half 14, which a creation
+  or a split had named before it", and two by what a second range under a taken id
+  does next (a commit by count on the wrong log, a read served in the wrong range) —
+  on the 11 seeds of 20 where the restarted proposer's second split was done. Asserted
+  at every tier: the shape reached, and a catch by check 18. Seen injected as before:
+  range 0 granted **60 blocks to the variant's nodes against 134 to the correct
+  node's** over the same seeds, since a restarted node that resumes a block asks for
+  no refill.
+- **`MetaOverwritesByArrival`**, a reach now where D-098 asserted an absence: caught on
+  **3 of 20**, each by check 16 — "meta never goes back: node 2's meta apply of 41
+  names `[k0, k2)` for range 2 at generation 1, where meta named" it at 2 — a resend of
+  the parent's old descriptor arriving after the split's update, which the correct
+  meta range leaves alone and the variant stores. Asserted from the thousand's share
+  of a hundred (D-061); every catch check 16's and on a seed with a split, and the
+  split landed on the share, at every tier. Seen injected on seed 1: the variant's 96
+  updates each won their whole span where the correct meta range's 113 won on 6, the
+  split's two on three replicas.
+- **`ApplyIgnoresSpan` alone**, a reach where D-097 asserted an absence: caught on
+  **1 of 20** by check 9, "server 3 applied index 153 of range 5 for key `k7`, which
+  its descriptor in force there `[k6, k7)` does not hold" — a write proposed under P's
+  span before the split and appended above `s`, which the correct apply check refuses
+  and the variant applies. **Asserted from the nightly's ten thousand**, whose share of
+  a thousand at the measured 5 % sees none about once in 10^22, where the thousand's
+  share of a hundred would miss about one premerge in 170 — D-061's rule applied to
+  the share the assertion sees, and D-086's aimed arm the precedent; the owner's to
+  confirm. Every catch check 9's, with the write read off the trace, and the split
+  landed on the share, at every tier.
+  The pair with `TrustStaleDescriptor` holds at 20 of 20.
+- **D-099's, D-098's and D-097's variants under the split**: `TrustStaleDescriptor`
+  20 of 20, the apply check refusing on 15; `ClientIgnoresMismatch` 20 of 20;
+  `RefuseOneRangeOnly` on the sharded quorum scenario 20 of 20; the equivalence of
+  the checker at prefixes with its folds holds over 20 seeds and three variants.
+- **Phase 2's variants on the node** hold Stage B's standard, tabled at the thousand
+  under **The premerge**.
+
+### The premerge
+
+`scripts/premerge.sh` on this tree is green at a thousand seeds in **2 447 s** on this
+session's container, against D-099's 2 332 s on the same machine; the node binary
+1 010 s where it took 878, the two arms every schedule carries now — the split and
+the restarted proposer's second split — settling for a second or two of simulated time
+each on every seed.
+
+**The split at a thousand, on the correct node**: the admins asked **1 941 splits and 1 540
+were done**, 25 refused `KeyOutsideSpan` (the second split aimed at a range already
+cut), 187 refused `NoRangeId` — the restarted proposer asked before its new run's
+block landed, PROPOSED D-092's shape, and the asker's retry after it is what the
+`no-range-id` count counts — and 361 unanswered within the round; **1 630 splits took
+effect**, 4 874 right-half replicas created, 4 262 terms led by a right half, **101 072
+writes applied through a right half**, **3 906 right halves reopened by a restart**
+from their keys, **7 989 live installs switched onto a half after its split**, and
+**101 writes refused at apply on a parent after its split** — 1 of 20 at the gate and
+about a tenth of the seeds at the thousand, so its floor is the thousand's. The
+restarted proposer's second split was asked on 941 seeds and done on 594.
+
+**The variants' rates at a thousand** (the share of a hundred for the routing variants,
+D-061): `IdBlockResumed` **71 of 100** — 58 by check 18's range-id clause, 8 by state machine
+safety, 3 by commit by current term, 1 by descriptor agreement and 1 by check 9, every
+one what a second range under a taken id does — on the 52 seeds of 100 where the
+restarted proposer's second split was done; `MetaOverwritesByArrival` **18 of 100**,
+every catch check 16's; `ApplyIgnoresSpan` alone **5 of 100**, every catch check 9's
+with the write read off the trace, which is D-061's 5 % on the nose and the reason its
+catch is asserted from the nightly's ten thousand, where the share is a thousand: a
+sample of a hundred at that rate sees none about once in 170 runs; the pair with
+`TrustStaleDescriptor` 100 of 100, the trusted writes applied in the wrong range on 72.
+
+**D-099's and D-098's coverage under the split**: range 0 granted **6 899 blocks** over
+the thousand, the fewest on a seed 3 (D-099: 5 408 over fewer crashes, the resumed
+proposer's restart among them now), every block disjoint under check 18's range-id
+clause; the meta range applied 123 479 updates after the bootstrap and **took 9 759**
+(D-098: 94 113, none took), both halves' after every split; 5 502 lookups served
+(D-098: 5 541); 7 072 mismatches at receipt, 66 at a read — a client whose route
+predates the split, read-checked and corrected — and **101 at apply** (D-098: 3 631,
+none at a read or apply); the apply lag's median at the thousand 4.47 ms (D-099: 4.59
+at twenty); `TrustStaleDescriptor` 100 of 100 with the apply check refusing on 72,
+`ClientIgnoresMismatch` 100 of 100, `RefuseOneRangeOnly` 1 000 of 1 000 (345 by the
+fan-out clause, 655 by state machine safety on the meta range); the range layer's
+checker at prefixes agreed with its folds at 480 prefixes over 20 seeds and three
+variants, 243 in violation.
+
+**Phase 2's variants on the node** hold Stage B's standard at the thousand: `CountOlderTermForCommit` 26 of 100,
+`RefusedReadLeft` 99 of 1 000, `LeaseTrustsTheClock` 6 of 1 000 (D-099 measured 6,
+D-098 12, D-097 3 — the split's schedules keep the low figure recorded for the owner),
+`ResetTimerOnAnyRpc` 50 of 100, `SharedSnapshotDir` 41 of 100 with the liveness catch
+on 32, asserted from ten thousand as Phase 2 asserts it.
+
+**The pins**: seeds 272, 516, 368 and 493 keep their absence through an arm that
+counts and the guard; **the thousand counted three holds the arm answers for and
+names seed 633**, the lowest, and it is pinned in D-091's shape: server 2's replica of
+range 0, the root, held from 12.508 s for a live install decided at 12.508 s and
+switched, with the restatement on it, at 13.018 s, the replay flagging it at 12.905 s,
+397 ms into the hold; the check with the arm passes and the check without it flags
+exactly that stretch, and a stream toward the replica was re-opened inside the window.
+The premerge's figures are of the tree before the pin moved from seed 979, the first
+its first premerge folded, to 633, and before the counter named the lowest: a pin and
+a fold in `sim/tests/node.rs`, the simulation untouched.
+
+**The rows**: the three renamed node rows and the correct node's sweep's row are
+re-weighed from the built release binary at a thousand seeds (45.0 → 50.8, 40.1 →
+49.1, 58.9 → 50.0 and 547.2 → 678.8 cpu s), and the pin's row, 0.9 cpu s, goes to
+shard 5, the lightest.
+
+### The pinned seeds, re-audited
+
+Every node schedule moved: the split and the restarted proposer's second split are
+drawn among every schedule's arms, and the other arms' draws stay where they were
+(their own streams), but the run they act on does not. Seeds 272, 516 and 368 keep
+their absence, the check without the fourth arm finding no stretch held by a live
+install, through an arm that counts and the guard that every live install is traced
+at one instant — which is the guard that found the second and third findings above, a
+right half's switch with no state read back. **Seed 493's schedule moved off the hold
+D-099 pinned it for**, and its pin is the absence with its reason now, in seed 368's
+shape, with the guard (`live_installs_at_one_instant`, shared by both). The correct
+node's sweep counts the holds the arm answers for on every seed and names the lowest;
+at the gate's twenty it names none, and **the thousand counted three and names seed
+633**, the lowest — its two premerges on this tree folded 979 and 633 first, since the
+sweep folds its seeds in the order they finish, so the counter names the lowest now
+and not the first folded — pinned in D-091's shape as seed 493 was
+(`seed_633_is_a_live_installs_hold_and_the_fourth_arm_answers_for_it`): server 2's
+replica of range 0, the root — the first hold pinned on a system range — held from
+12.508 s for a live install decided at 12.508 s and switched, with the restatement on
+it, at 13.018 s, the replay flagging it at 12.905 s, 397 ms into the hold and 113 ms
+before the restatement; the one stretch the arm answers for equals what the check
+without it flags, the decision and the switch bracket the flag, the switch's three
+records land at one instant, and a stream toward the replica was re-opened inside the
+window. Seed 42's one-group JSONL is #133's.
+
+### Consequences
+
+- A node's ranges are no longer fixed at its start: a split adds one at its apply, a
+  restart reopens every group the engine holds, and every table the host, the `apply`
+  task and the `snapshot` task share is behind a lock. The one-group server is
+  untouched.
+- `IdBlocks::take` is called for the first time, and a block that has run out refuses
+  the split `NoRangeId` at proposal with the asker retrying — PROPOSED D-092's A, built
+  as proposed; the owner's ruling on question 1 replaces it in place.
+- A right half elects among the replicas of P that have applied `s`; a replica that
+  has not yet grants nothing and is streamed to once it has. The placeholders (Q22) and
+  the overlap rule (Q27) are C5b's and C5c's, and until them a re-seeded node's right
+  halves come back only through them: a fresh engine holds no keys to read them from.
+- The `meta` task's requests are numbered from the run's nonce; a leader's copy
+  detection reads a restarted node's first request as new, as it should.
+- Every node schedule carries two more arms, the split and the restarted proposer's
+  second split, so every node seed's schedule moved and the node binary's premerge
+  time grows by the arms' settle (tabled under **The premerge**).
+- Check 18 has both its clauses; check 8's overlap clause and check 20 wait for the
+  slices that build what they check.
+
+---
+
+_Next entry: D-101. Add one before implementing anything not covered above._

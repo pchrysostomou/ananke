@@ -1369,6 +1369,38 @@ pub fn initial_state_into(prefix: &KeyPrefix, config: &Configuration, batch: &mu
     );
 }
 
+/// The Raft state a split writes for the right half, under `prefix` (SHARD.md §5,
+/// Q20, Q26): a hard state of current term 1 and no vote, an applied index of
+/// `index`, the split's, a snapshot record of last index `index`, last term 1 and
+/// `config`, the parent's plain configuration at the split, naming no checkpoint, the
+/// configuration key at `index`, and `incarnation`, drawn fresh for the replica, with
+/// no quarantine. Every replica of the parent writes the same state from the same
+/// entry, so the new group starts from one floor on each of them.
+// PROPOSED(D-100)
+pub fn split_state_into(
+    prefix: &KeyPrefix,
+    config: &Configuration,
+    index: Index,
+    incarnation: u64,
+    batch: &mut WriteBatch,
+) {
+    batch.put(prefix.hard_key(), encode_hard(1, None));
+    batch.put(prefix.applied_key(), encode_applied(index));
+    batch.put(
+        prefix.snapshot_key(),
+        encode_snapshot_record(&SnapshotRecord {
+            last_index: index,
+            last_term: 1,
+            config: config.clone(),
+            dir: String::new(),
+            taken: false,
+            take: 0,
+        }),
+    );
+    batch.put(prefix.config_key(), encode_config(index, config));
+    batch.put(prefix.incarnation_key(), encode_incarnation(incarnation));
+}
+
 pub(crate) fn encode_config(index: Index, config: &Configuration) -> Bytes {
     let mut out = BytesMut::with_capacity(32);
     out.put_u64_le(index);

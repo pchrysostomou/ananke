@@ -333,6 +333,9 @@ pub struct NodeCoverage {
     /// (SHARD.md §5, Q17).
     // PROPOSED(D-099)
     pub ids_leased: usize,
+    /// `RangeSplit` records: every replica's apply of a split that took effect
+    /// (SHARD.md §5; PROPOSED D-100).
+    pub splits: usize,
 }
 
 impl NodeCoverage {
@@ -402,6 +405,7 @@ impl NodeCoverage {
             meta_applies: raft::meta_applies_of(records).0,
             meta_took: raft::meta_applies_of(records).1,
             ids_leased: count(&|e| matches!(e, TraceEvent::RangeIdsLeased { .. })),
+            splits: count(&|e| matches!(e, TraceEvent::RangeSplit { .. })),
         }
     }
 
@@ -502,6 +506,7 @@ impl NodeCoverageFold {
                 c.meta_took += usize::from(descriptors.iter().any(|d| !d.won.is_empty()));
             }
             TraceEvent::RangeIdsLeased { .. } => c.ids_leased += 1,
+            TraceEvent::RangeSplit { .. } => c.splits += 1,
             _ => {}
         }
     }
