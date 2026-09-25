@@ -14,7 +14,7 @@ use std::task::{Context, Poll};
 use ananke_env::sim::Sim;
 use ananke_env::{Environment, TraceEvent};
 use ananke_sim::echo::{self, Variant};
-use ananke_sim::{seeds, sweep, verdict, write_trace};
+use ananke_sim::{released_seeds, sweep, verdict, write_trace};
 use moirae_trace::trace_hash;
 
 /// The pinned hash of the seed-42 trace (`out/echo-42.jsonl`) of the `NoSyncDir`
@@ -71,7 +71,7 @@ fn different_seeds_give_different_traces() {
 fn every_seed_satisfies_the_invariants_and_the_sweep_exercises_the_disk_faults() {
     let sloppy = Mutex::new(Coverage::default());
     let correct = Mutex::new(Coverage::default());
-    let per_seed = sweep(seeds(), |seed| {
+    let per_seed = sweep(released_seeds(), |seed| {
         let mut pongs = 0;
         for (variant, coverage) in [(Variant::NoSyncDir, &sloppy), (Variant::Correct, &correct)] {
             let report = echo::run(seed, variant);

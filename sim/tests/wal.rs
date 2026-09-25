@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use ananke_env::{TraceEvent, WalStopReason};
 use ananke_sim::wal::{self, Excuse};
-use ananke_sim::{seeds, sweep, verdict, write_trace};
+use ananke_sim::{released_seeds, sweep, verdict, write_trace};
 use ananke_storage::Variant;
 
 /// Two runs with the same seed produce byte-identical traces.
@@ -34,7 +34,7 @@ fn the_seed_42_trace_is_written_for_the_studio() {
 #[test]
 fn the_correct_log_passes_every_seed() {
     let coverage = Mutex::new(Coverage::default());
-    let verdicts = sweep(seeds(), |seed| {
+    let verdicts = sweep(released_seeds(), |seed| {
         let report = wal::run(seed, Variant::Correct);
         coverage.lock().unwrap().add(&report);
         report.check().map_err(|violation| {
@@ -52,7 +52,7 @@ fn the_correct_log_passes_every_seed() {
 
 /// The negative controls: each known bug is caught on some seed.
 fn is_caught(variant: Variant) {
-    let caught: Vec<String> = sweep(seeds(), |seed| {
+    let caught: Vec<String> = sweep(released_seeds(), |seed| {
         wal::run(seed, variant).check().err().map(|v| v.to_string())
     })
     .into_iter()
@@ -61,7 +61,7 @@ fn is_caught(variant: Variant) {
     eprintln!(
         "{variant:?}: caught on {} of {} seeds, first: {}",
         caught.len(),
-        seeds(),
+        released_seeds(),
         caught.first().map_or("", String::as_str)
     );
     assert!(!caught.is_empty(), "{variant:?} was never caught");
