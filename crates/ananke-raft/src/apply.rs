@@ -84,6 +84,25 @@ pub enum Command {
         /// The servers that are to be the voters.
         voters: Vec<u64>,
     },
+    /// The meta range's update (SHARD.md §1): descriptors, each encoded by the range
+    /// layer (`ananke_shard::descriptor::RangeDescriptor`), which the meta range's
+    /// state machine applies as a maximum by generation. An entry, applied by the
+    /// range layer before [`apply_command`] sees it; this crate reads nothing of it
+    /// (SHARD.md, Q40), and a one-group server never receives one.
+    // PROPOSED(D-098)
+    MetaUpdate {
+        /// The descriptors, encoded.
+        descriptors: Vec<Bytes>,
+    },
+    /// A lookup (SHARD.md §1, §3): asked of the root, the meta range's descriptor;
+    /// asked of the meta range, the descriptor of the range whose span holds `key`.
+    /// A read, served as a get is and never an entry, and not a command that touches
+    /// `key`: it asks *about* it (Q36), so [`Command::key`] is `None`.
+    // PROPOSED(D-098)
+    Lookup {
+        /// The key asked about.
+        key: Bytes,
+    },
 }
 
 impl Command {
@@ -95,8 +114,18 @@ impl Command {
             | Command::Delete { key }
             | Command::Cas { key, .. }
             | Command::Get { key } => Some(key),
-            Command::Transfer { .. } | Command::Change { .. } => None,
+            Command::Transfer { .. }
+            | Command::Change { .. }
+            | Command::MetaUpdate { .. }
+            | Command::Lookup { .. } => None,
         }
+    }
+
+    /// Whether the command is a read: served at an applied index, never an entry.
+    // PROPOSED(D-098)
+    #[must_use]
+    pub fn is_read(&self) -> bool {
+        matches!(self, Command::Get { .. } | Command::Lookup { .. })
     }
 }
 
@@ -173,6 +202,17 @@ impl Command {
                     out.put_u64_le(*voter);
                 }
             }
+            Command::MetaUpdate { descriptors } => {
+                out.put_u8(6);
+                out.put_u16_le(u16::try_from(descriptors.len()).expect("descriptors fit u16"));
+                for descriptor in descriptors {
+                    put_bytes(&mut out, descriptor);
+                }
+            }
+            Command::Lookup { key } => {
+                out.put_u8(7);
+                put_bytes(&mut out, key);
+            }
         }
         out.freeze()
     }
@@ -233,6 +273,20 @@ impl Command {
                     voters: (0..count).map(|_| bytes.get_u64_le()).collect(),
                 }
             }
+            6 => {
+                if bytes.len() < 2 {
+                    return Err(bad("command torn"));
+                }
+                let count = bytes.get_u16_le();
+                let mut descriptors = Vec::with_capacity(usize::from(count));
+                for _ in 0..count {
+                    descriptors.push(get_bytes(&mut bytes)?);
+                }
+                Command::MetaUpdate { descriptors }
+            }
+            7 => Command::Lookup {
+                key: get_bytes(&mut bytes)?,
+            },
             _ => return Err(bad("command malformed")),
         };
         if !bytes.is_empty() {
@@ -276,7 +330,12 @@ pub async fn apply_command<E: Environment>(
             }
         }
         Some(Command::Get { key }) => Outcome::Value(store.engine().get(&user_key(key)).await?),
-        Some(Command::Transfer { .. }) | Some(Command::Change { .. }) => Outcome::Done,
+        // A meta update is the range layer's, applied by the node's applier before
+        // this is called; a lookup is a read and never an entry (PROPOSED D-098).
+        Some(Command::Transfer { .. })
+        | Some(Command::Change { .. })
+        | Some(Command::MetaUpdate { .. })
+        | Some(Command::Lookup { .. }) => Outcome::Done,
     };
     store.apply(index, batch).await?;
     Ok(outcome)
@@ -312,6 +371,15 @@ mod tests {
             Command::Transfer { to: 3 },
             Command::Change {
                 voters: vec![1, 2, 3, 4, 5],
+            },
+            Command::MetaUpdate {
+                descriptors: vec![Bytes::from_static(b"d1"), Bytes::from_static(b"")],
+            },
+            Command::MetaUpdate {
+                descriptors: Vec::new(),
+            },
+            Command::Lookup {
+                key: Bytes::from_static(b"k"),
             },
         ];
         for command in commands {

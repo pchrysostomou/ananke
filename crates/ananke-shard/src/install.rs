@@ -61,8 +61,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ananke_env::{
-    Clock, Either, Environment, File, FileSystem, MAX_FRAME_LEN, Network, OpenOptions, Socket,
-    StartOver, TraceEvent, race,
+    Clock, Decision, Either, Environment, File, FileSystem, MAX_FRAME_LEN, Network, OpenOptions,
+    Socket, StartOver, TraceEvent, race,
 };
 use ananke_raft::core::{RaftConfig, SnapshotAction};
 use ananke_raft::message::{Frame, Message, SnapshotStatus};
@@ -119,6 +119,12 @@ pub enum SnapJob {
         from: ServerId,
         /// The receiver's own identity, which must survive the switch.
         repair: Box<Repair>,
+        /// The `raft` task's decision at the step that took the hold, which is when
+        /// the install is decided (D-047): the switch is traced as decided here and
+        /// not when this task gets to the repair, since a node behind on every range
+        /// queues an install per range and the last one's hold began a queue ago.
+        // PROPOSED(D-098)
+        held: Decision,
     },
     /// A take of `range` completed: its versions are swept, and only its own
     /// (D-075).
@@ -557,7 +563,8 @@ impl<E: Environment> Task<E> {
                 range,
                 from,
                 repair,
-            } => self.finish(range, from, *repair).await,
+                held,
+            } => self.finish(range, from, *repair, held).await,
             SnapJob::Taken { range } => self.sweep(range).await,
         }
     }
@@ -1013,7 +1020,7 @@ impl<E: Environment> Task<E> {
 
     /// The `raft` task's repair for a stream that completed: D-066's live install, in
     /// one manifest switch, with the node's other ranges left running.
-    async fn finish(&mut self, range: RangeId, from: ServerId, repair: Repair) {
+    async fn finish(&mut self, range: RangeId, from: ServerId, repair: Repair, held: Decision) {
         let Some(install) = self
             .receiving
             .get_mut(&(range, from))
@@ -1042,9 +1049,16 @@ impl<E: Environment> Task<E> {
             self.answer(range, from, answer, store.incarnation()).await;
             return self.release(range);
         }
-        // D-047: the install is decided when the task takes the repair; it is traced
-        // once the manifest switch that carries it is durable.
-        let installing = self.env.decision();
+        // D-047: the install is decided when the `raft` task hands the repair over
+        // and takes the range's hold, and it is traced once the manifest switch that
+        // carries it is durable. The decision was this task's own until PROPOSED
+        // D-098, taken when it got to the repair: on a node behind on every range —
+        // five streams landing at once, the meta range's among them for the first
+        // time — the fifth's hold began a queue of installs earlier, and the timer
+        // check's exemption (D-091), which opens at this decision, opened after the
+        // replica's bound had passed and flagged a core that had no timer to fire
+        // (seed 368 of the raft sweep's arms on the correct node).
+        let installing = held;
         // The configuration in force at the snapshot's last index, out of the streamed
         // bytes: no message carries it, and the receiver's own view of the membership
         // is a replica's that is behind by definition (D-029).
@@ -1142,11 +1156,18 @@ impl<E: Environment> Task<E> {
         // store, and a take that dropped the range's user keys produces exactly the
         // same events as a correct one (D-083).
         // PROPOSED(D-083): what an install installed is read back and traced.
-        self.state_of(range, install.at, &store).await;
+        //
         // The descriptor the switch put in place, for the host's receipt check
-        // (SHARD.md §3). Read back rather than carried in the stream's record: it is
-        // what the store holds now, whatever the take put in.
-        // PROPOSED(D-097)
+        // (SHARD.md §3), read back rather than carried in the stream's record: it is
+        // what the store holds now, whatever the take put in (PROPOSED D-097). It is
+        // read **before** the state, because the timer check's live-install arm reads
+        // `RaftSnapshotState` and `RaftSnapshot` as one switch only at one instant
+        // (`Report::reads_back`, D-091), and D-097 put this read between them: every
+        // node install since traced the two an engine read apart, the arm matched
+        // none of them, and the hold it exempts was measured against the bound again
+        // — which seed 368 of the raft sweep's arms found, a node streamed five
+        // snapshots at once holding one range through four other installs
+        // (PROPOSED D-098).
         let descriptor = store
             .engine()
             .get(&KeyPrefix::group(range.get()).descriptor_key())
@@ -1155,6 +1176,7 @@ impl<E: Environment> Task<E> {
             .flatten()
             .and_then(|bytes| RangeDescriptor::decode(bytes).ok())
             .map(Box::new);
+        self.state_of(range, install.at, &store).await;
         self.env.trace_decided(
             installing,
             TraceEvent::RaftSnapshot {

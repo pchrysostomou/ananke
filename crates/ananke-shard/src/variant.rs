@@ -418,6 +418,14 @@ pub enum NodeVariant {
     /// the first resend, and the liveness bound a client that never converges.
     // PROPOSED(D-097)
     ClientIgnoresMismatch,
+    /// The meta range stores each update as it arrives: every record an update
+    /// overlaps is cut and replaced whatever its generation, where §1 keeps, per key,
+    /// the descriptor of the highest generation. An older update that arrives after a
+    /// newer one takes the newer's place, which check 16 sees at the first key whose
+    /// named generation falls (SHARD.md §8, §10); `Fault::MetaReorder` on the sharded
+    /// sweep is what makes one arrive so.
+    // PROPOSED(D-098)
+    MetaOverwritesByArrival,
 }
 
 impl NodeVariant {
@@ -475,6 +483,7 @@ impl NodeVariant {
         NodeVariant::TrustStaleDescriptor,
         NodeVariant::ApplyIgnoresSpan,
         NodeVariant::ClientIgnoresMismatch,
+        NodeVariant::MetaOverwritesByArrival,
     ];
 
     /// Q15's whole-node refusal and re-seed, in order: the six ways to get a node's
@@ -657,6 +666,9 @@ impl NodeVariant {
             NodeVariant::TrustStaleDescriptor => 1 << 49,
             NodeVariant::ApplyIgnoresSpan => 1 << 50,
             NodeVariant::ClientIgnoresMismatch => 1 << 51,
+            // PROPOSED(D-098): the meta range storing updates as they arrive. Eleven
+            // bits are left.
+            NodeVariant::MetaOverwritesByArrival => 1 << 52,
         }
     }
 
@@ -716,6 +728,7 @@ impl NodeVariant {
             NodeVariant::TrustStaleDescriptor => "TrustStaleDescriptor",
             NodeVariant::ApplyIgnoresSpan => "ApplyIgnoresSpan",
             NodeVariant::ClientIgnoresMismatch => "ClientIgnoresMismatch",
+            NodeVariant::MetaOverwritesByArrival => "MetaOverwritesByArrival",
         }
     }
 }
@@ -807,7 +820,7 @@ mod tests {
         // snapshot wiring, D-081's three for the directed re-seed shape, D-090's two for a
         // stream's bounds, D-076's review's two, D-095's one for the `apply` task that
         // waits for every range, and D-096's one for a fresh store taken for a bootstrap.
-        assert_eq!(NodeVariant::BUGS.len(), 52);
+        assert_eq!(NodeVariant::BUGS.len(), 53);
         for variant in NodeVariant::SNAPSHOT
             .iter()
             .chain(NodeVariant::WIRING)

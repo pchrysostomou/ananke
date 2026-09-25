@@ -68,6 +68,7 @@ pub mod frame;
 pub mod inbox;
 pub mod install;
 pub mod invariants;
+pub mod meta;
 pub mod node;
 pub mod outbox;
 pub mod range;
