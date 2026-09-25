@@ -17447,7 +17447,15 @@ where a Phase 2 scenario's client emits them.
    subsumed range, applies as nothing: the batch advances the applied index and writes no
    user key, the effect is `out_of_span`, and the waiting client is answered
    `RangeMismatch`. A command that names no key is never checked. Every answer traces
-   `RangeMismatchSent { at }` with the descriptors as (range, generation).
+   `RangeMismatchSent { at }` with the descriptors as (range, generation), and D-069's
+   trace oracle accepts `out_of_span` with a key as this stage's effect. **Every
+   replica holds its descriptor**: a bootstrap node's from its initial state, a node
+   not named at bootstrap's from `server::interim_state` — the same descriptor for
+   each range it hosts, computed from configuration alone, written at its first start
+   with no Raft configuration and no digest, since the initial state at index 0 is in
+   no log and a replica caught up by appends alone must compute it as the bootstrap
+   nodes did (§2) — and a re-seeded one's from its stream. A replica without one would
+   serve unchecked, which the thousand found (below).
 6. **The events**: `ClientSend` on every send, with `invoked`; `ClientMismatch` on every
    `RangeMismatch` received; both from the sweep's client on both clusters, so seed 42's
    one-group JSONL moves and its record is updated below.
@@ -17485,14 +17493,143 @@ where a Phase 2 scenario's client emits them.
 
 ### What the sweeps say
 
-Measured on the first commit, the wire alone, at the gate's twenty in debug: every
-node-family binary green (`node` 29 tests, `ranges` 13, `reseed` 7, `install` 3), the
-correct node's coverage within a seed of the tree before it (partitions 106, crashes 58
-against 57, apply lag median 3.07 ms against 3.03), and the schedules moved as §12 said
-they would: the pair `{IgnoreIncarnation, SharedSnapshotDir}` is caught on 3 of 20 where
-it was 7 of 20, and the re-seed shape's seed 1 holds 6 chunks back where it held 4. The
-second commit's measurements — the variants' catches, the coverage of the three checks,
-the premerge — are added here by that commit.
+Every rate below was measured before its assertion was written (Q39, D-061), at the
+gate's twenty in debug on this session's container (a four-core Xeon, D-070) from
+`cargo test -p ananke-sim` with the prints kept; the thousand are the premerge on the
+same tree, under **The premerge** below.
+
+**After the first commit, the wire alone**: every node-family binary green, the correct
+node's coverage within a seed of the tree before it (partitions 106, crashes 58 against
+57, apply lag median 3.07 ms against 3.03), and the schedules moved as §12 said they
+would: the pair `{IgnoreIncarnation, SharedSnapshotDir}` is caught on 3 of 20 where it
+was 7 of 20, and the re-seed shape's seed 1 holds 6 chunks back where it held 4.
+
+**After the second commit**, the checks, the events, the stale clients and the folds:
+
+- **The correct node**, every sweep green with the four folds in the incremental
+  checker and over the whole trace: the raft sweep's arms, the membership scenario,
+  the sharded quorum scenario, `ranges`, `reseed`, `install`. The three checks'
+  coverage: **80 mismatches at receipt over 20 seeds** and 60 received by the clients
+  (the difference is the network's drops and duplicates), none at a read's serving and
+  none at apply, which the sweep asserts — at least one at receipt a seed, since every
+  other client starts stale, and the other two absent with their reason until the split.
+  The apply lag's median moved to 4.33 ms from 3.07: a stale client's first request to
+  each range is refused and resent, and every request is eight bytes longer, on a run
+  the checker now also folds — a figure for the owner beside D-082's 20 ms threshold,
+  not a bound this entry moves.
+- **`TrustStaleDescriptor`**: caught on **20 of 20** seeds by check 9, every one at a
+  read served from the wrong range (a key of range 3 read from range 2's state, which
+  never holds it); the apply check, which the variant keeps, refused a trusted write and
+  the client resent it under a fresh `seq` on **17 of 20** — the three seeds it did not
+  are runs the incremental checker stopped at the read's violation before any trusted
+  write reached apply — and no write was applied in the wrong range on any seed. That
+  is Q10's path, refused at apply, resent, paired by `invoked`, closed by the resend's
+  apply, run on the correct apply code on 17 seeds of 20, where the correct server never
+  reaches it before the split. At the premerge's share of a hundred it is caught on **99
+  of 100**, and seed 48, the one it is not, is legitimate: its stale clients' first
+  operations on their stale ranges are writes, which the apply check refuses and the
+  resend corrects the cache by, so no read is ever served through a stale route there —
+  the variant's harm needs a read before a write on the same stale route. Asserted: the
+  catch on some seed (99 %, so at every tier, D-061), by check 9 or the history; the
+  reach on some seed (85 %, 77 of 100); no misapplied write.
+- **The pair `{TrustStaleDescriptor, ApplyIgnoresSpan}`**: caught on **20 of 20** by
+  check 9, 18 at a read and 2 at a write applied outside its span, whichever the schedule
+  reached first; the apply check refused nothing on any seed, and a trusted write was
+  applied in the wrong range on **17 of 20**, read off the trace against the scenario's
+  fixed map. Asserted: the catch on every seed, the apply check silent on every seed, a
+  misapplied write on some seed.
+- **`ApplyIgnoresSpan` alone**: caught on **0 of 20**, the apply check refused nothing
+  and nothing was misapplied — no correct server proposes a key outside its span and no
+  split lands under a proposal in flight — asserted as the absence with that reason; the
+  sharded sweep's split under a pending right-half burst is where §10 catches it.
+- **`ClientIgnoresMismatch`**: caught on **20 of 20** by check 17 at the first resend,
+  at 500 ms of simulated time on seed 0: a client's operation 1 sent again as 2 to range 2
+  at generation 0 after a mismatch named the key's owner at generation 1.
+- **`AnyFreshNodeBootstraps`** (D-096): still caught by check 7 on 20 of 20 membership
+  seeds; the run's other checks now fail it on 20 too, since the membership scenario's
+  check folds check 7 in full; and **the correct membership node passes check 7's first
+  step**, asserted, which D-096 never asked (below).
+- **The equivalence**: the range layer's checker fed in eight prefixes agreed with the
+  four folds over the whole prefix at **480 prefixes** over 20 seeds and three variants
+  (the correct node, `TrustStaleDescriptor`, `ClientIgnoresMismatch`), 232 of them in
+  violation.
+- **Phase 2's variants on the node** hold Stage B's standard at the gate's twenty:
+  `CountOlderTermForCommit` 5, `RefusedReadLeft` 3, `LeaseTrustsTheClock` 1,
+  `ResetTimerOnAnyRpc` 10 of 20; `StepWhilePersisting` 11 of 20 on `ranges`; the re-seed
+  shape's cap held a stream back on 20 of 20, `ReseedMarkNotSynced` 10 and
+  `RecordNeverQueued` 18 of 20; the one-group raft sweep 47 tests green.
+
+### The premerge
+
+**What the thousand found before it passed.** The first premerge of the second commit
+failed two tests at a thousand seeds, both real. `TrustStaleDescriptor`'s seed 48 was
+caught by D-069's trace oracle, which held `out_of_span` to be an effect of a stage the
+node does not run; it is this stage's now, and the oracle asks that it name its key. And
+the correct membership node's seed 652 was caught by **check 9**: node 5's interim
+replica of range 2 — a node not named at bootstrap, caught up from index 1 by the log
+and never installed, since the membership scenario compacts nothing — led the range and
+served a stale client's read of a key of range 3 from it, because it held no descriptor
+to check against: D-076's interim replica had the range's Raft state but not its
+descriptor, which the bootstrap batch writes and no log entry carries. `interim_state`
+is the fix, and the checks are what found it, on the first thousand-seed run of the
+first scenario with a node not named at bootstrap.
+
+`scripts/premerge.sh` on this tree at `ANANKE_SEEDS=1000` in release, on this session's
+container (D-070), **green in 2 246 s** on its third run, load 2.07 before and 4.03 after; the first two
+runs failed at the node binary on the two findings above and the trust variant's rate,
+and ran nothing after it. Against D-096's 2 149 s on the same machine: the `node` binary took 782 s (753), the checks folding at every look of every node run and the stale clients resending; `raft` 846 s (792), where every client send is now a record; `ranges` 76 s (59); `reseed` 45 s (32); `engine` 415 s, `wal` 17 s and `install` 6 s as before.
+
+**The node's rates at a thousand, against D-096's premerge on the same machine**, so
+that what routing moved is on record (every rate the node's sweeps assert, at its tier):
+
+| Sweep, at its tier | D-096 | This tree |
+| --- | ---: | ---: |
+| `TrustStaleDescriptor`, of 100 | — | **99** (77 refused at apply) |
+| `{TrustStaleDescriptor, ApplyIgnoresSpan}`, of 100 | — | **100** (77 misapplied) |
+| `ApplyIgnoresSpan` alone, of 100 | — | 0, the absence |
+| `ClientIgnoresMismatch`, of 100 | — | **100** |
+| `AnyFreshNodeBootstraps`, membership, of 100 | 1 000 of 1 000 | 100 |
+| `CountOlderTermForCommit`, of 100 | 31 | 38 |
+| `RefusedReadLeft`, of 1 000 | 116 (11.6 %) | 118 (11.8 %) |
+| `LeaseTrustsTheClock`, of 1 000 | 7 (0.7 %) | **3 (0.3 %)** |
+| `TruncateOnEveryAppend`, of 100 | 99 | 99 |
+| `SharedSnapshotDir`'s liveness catch, of 100 | 17 | 24 |
+| `SnapshotWithoutCurrentLast`, of 1 000 | 0 | 0 |
+| `SingleMajorityInJointConsensus`, raft sweep on the node, of 1 000 | 226 | 206 |
+| `ResetTimerOnAnyRpc`, of 100 | 50 | 50 |
+| `ApplyBeforeCommit`, `SendBeforePersist`, `NoPreVote`, of 100 | 100 each | 100 each |
+| The pair (`SharedSnapshotDir` + `IgnoreIncarnation`), of 100 | 22 | 27 |
+| `ApplyWaitsForEveryRange`, compared, of 25 | 25 | 25 |
+| Elections while joint, membership on the node, of 1 000 | 145 | 150 |
+| Mismatches at receipt / at a read / at apply, correct node, of 1 000 | — | **3 613 / 0 / 0**, 3 000 received |
+
+The one rate to put to the owner is the lease variant's: **3 of 1 000** on this tree
+where D-096 measured 7 and `main` 6, three draws of a rate near half a percent, which
+the node's test asserts from the nightly's ten thousand (D-082's reasoning: at 0.3 % a
+thousand seeds catch none with probability e^-3, about one run in twenty, and ten
+thousand once in 10^13) — the assertion's tier already holds, and the figure is
+recorded so the next slice sees whether it keeps falling. The thousand's other rows
+moved by a seed or a few, in both directions, as a schedule move does.
+
+**The coverage at a thousand**, against D-096's: leaders by range 4 511 / 4 454 on the
+system ranges and about 7 800 on each user range; applies 13 530 / 13 356 against
+369 000 to 391 000; 138.8 million trace records (135.5) — the sends, the mismatches and
+the stale clients' resends; **the apply lag's pooled median 4.40 ms** (3.09), per range
+2.41 / 2.45 / 4.29 / 4.37 / 4.73 / 4.51 ms, the user ranges' up by about 1.3 ms each,
+which is the figure the consequences name for the owner; one range's applies held
+another's for a median of 2.98 ms and at most 608 ms over 80 958 waits, 70 dropped
+(2.35 ms, 447 ms, 74 784, 32); the user ranges' apply spread 0.94 (0.94); 57 637 snapshot
+actions, 57.6 a seed, fewest 20 (58 559, 58.6, 24); the correct node re-took a range at an
+index it had taken on 470 seeds (493), into the same directory on none; 0 store refusals;
+seeds 272 and 516 at 34 and 22 live installs, no stretch held by one; the folds'
+equivalence on 100 seeds at eight prefixes, the lag verdict for `ApplyWaitsForEveryRange`
+(25, 25, 25) as before; the range layer's checker in agreement with its folds at 480
+prefixes. `sim/tests/ranges.rs`: 18 000 bootstrap creations, `StepWhilePersisting` caught on
+602 of 1 000 (607), `RefusedReadLeft` on none; the re-seed shape's cap held a stream
+back on 200 of 200 (median 4 chunks, most 11), `ReseedMarkNotSynced` 10 and
+`RecordNeverQueued` 18 of 20, `ServeBeforeRefusedMark` 20 of 20 by (c); the membership
+scenario's `SingleMajorityInJointConsensus` 241 of 1 000 (241); the one-group raft sweep's
+47 tests green with the client events in every trace.
 
 ### The pinned seeds, re-audited
 
@@ -17500,19 +17637,55 @@ After the first commit: seeds 272 and 516 (`sim/tests/node.rs`) keep the absence
 pinned — no stretch held by a live install, at 35 and 29 live installs where D-096
 counted 35 and 21 — and the pin's comment says so; the re-seed shape's seed 1 still holds
 a stream back, at 6 chunks; the one-group cluster's draws are unchanged, since one group
-carries no envelope and the client's hint is the map it always was. The second commit's
-events move seed 42's one-group JSONL, and that commit records the new hash beside
-D-082's.
+carries no envelope and the client's hint is the map it always was.
+
+After the second commit: seeds 272 and 516 keep the absence, at 34 and 22 live installs;
+the re-seed shape's seed 1 holds 4 chunks back; and **seed 42's one-group JSONL moves**,
+as §12 said the events commit would — the client's `ClientSend` on every send and its
+`ClientMismatch` are traced on one group too, where nothing is ever mismatched and every
+send names the group at the first generation, so the history's closure reads one rule on
+both clusters. It is **13 241 905 bytes and hashes to
+`c5b8d814dc0956af28bef72f8f9e0bbc959053a2173d7d1d96e3423a6c6540e8`** on this branch,
+where D-082 and D-096 recorded 12 898 025 bytes and
+`445f970010f9d493d489d7627543b77cccba863cb5675af4602686f5de182217`; the records that
+were there are unchanged, since one group's draws do not move — the replay and
+determinism tests hold — and the difference is the sends and nothing else.
+
+**What this commit found in D-096.** Its variant test asserted that
+`AnyFreshNodeBootstraps` is caught by check 7's first step on every membership seed, and
+never asked whether the correct node passes that step on the same scenario. It did not: a
+node not named at bootstrap traced its interim replica's creation with its own empty Raft
+configuration as the voters — D-076's "replica of an empty configuration" — so nodes 4
+and 5 disagreed with the bootstrap nodes on every user range, and the catch told the two
+systems apart on nothing. The creation now names the range's voters, the bootstrap
+nodes, on every node, while the interim replica's Raft configuration stays empty: the
+descriptor is the range's one descriptor and the configuration is the replica's own
+(§1, §2). The membership scenario's check folds check 7 in full over the correct node on
+every seed, and the variant test asserts the correct node's pass beside the catch.
 
 ### Consequences
 
 - Stage C's routing build is built as far as this branch reaches; the meta lookups (§1,
   §3), the range-id blocks (§5) and the split are the next slices', and
-  `ReadCheckAtReceiptOnly` comes with the split.
+  `ReadCheckAtReceiptOnly` comes with the split. Checks 7, 9, 10 and 17 run under the
+  incremental checker on every node run, and the equivalence test holds each to its
+  whole-trace fold; check 9 is asserted against `TrustStaleDescriptor` and the pair, and
+  check 17 against `ClientIgnoresMismatch`, as Stage C's exit asks; check 10 runs under
+  the test over every run and is asserted against `ApplyIgnoresSpan` where the split
+  gives that variant its path.
 - `Reply` has a third answer, and every match on it in the tree names it: the one-group
-  server never sends it, and its tests say so.
-- Every client packet of the node cluster is eight bytes longer, and every node schedule
-  moved with it; every pin whose schedule moved is re-audited above.
+  server never sends it, and its tests say so. D-076's failure of the run on a request
+  for a range the node does not host is gone: the node answers `RangeMismatch`.
+- Every client packet of the node cluster is eight bytes longer, every send and every
+  mismatch is a trace record, and every node schedule moved with them; every pin whose
+  schedule moved is re-audited above, and seed 42's one-group hash is recorded anew.
+- The apply lag's pooled median on the node's sweep is 4.33 ms at the gate's twenty
+  where it was 3.07 (the thousand under **The premerge**): the stale clients' refused
+  first requests and the eight bytes on every packet, which the owner reads beside
+  D-082's threshold.
+- `nightly-shards.txt` gains four `node` rows, weighed on this tree from the built
+  release binary at a thousand seeds: the three routing variants' tests and the range
+  layer's equivalence test.
 
 ---
 

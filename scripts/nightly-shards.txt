@@ -341,6 +341,17 @@
 # which runs D-082's share (a tenth of the tier; it weighed 404.2 cpu s over the whole
 # thousand, two clusters' traffic on every seed) at 39.5 cpu s (10.653 s real), into the
 # lightest shard after the re-weighing, shard 5 at 1533.8.
+# PROPOSED D-097 (routing) added four `node` rows, weighed on its tree from the built release
+# binary (`node-<hash> <test> --exact`) at ANANKE_SEEDS=1000, alone on this session's four-core
+# Xeon container right after its premerge, as user + sys. Three are small because the runs
+# they sweep stop at the first violation, half a second of simulated time in: the trust
+# variant's test at 0.9 cpu s (0.442 s real), the client variant's at 0.5 (0.126 s), and the
+# range layer's equivalence test, twenty seeds of three variants at eight prefixes, at 7.9
+# (2.085 s). The pair's test carries `ApplyIgnoresSpan` alone, a hundred full runs the checks
+# do not stop, at 40.1 cpu s (10.462 s real). Longest-first into the lightest shard: the pair
+# into shard 5 at 1573.3, the equivalence into shard 6 at 1597.0, and the two small ones after
+# it into shard 6. The rows D-096 re-weighed are left as they were: the node binary's premerge
+# time moved from 753 s to 782 s with the routing, a few per cent.
 # shard	binary	cpu_s	test
 # shard 1: 1977.1 cpu s
 # D-095 added two rows, both `node`, weighed on its tree from the built release binary
@@ -438,7 +449,7 @@
 4	wal	36.9	the_correct_log_passes_every_seed
 4	wal	0.2	the_seed_42_trace_is_written_for_the_studio
 4	node	29.1	the_node_folds_agree_with_their_whole_trace_readings
-# shard 5: 1573.3 cpu s
+# shard 5: 1613.4 cpu s
 5	echo	6.0	every_seed_satisfies_the_invariants_and_the_sweep_exercises_the_disk_faults
 5	engine	19.5	a_seek_that_counts_tombstones_is_caught
 5	node	58.8	a_leader_that_ignores_incarnations_has_an_incarnation_to_ignore_only_where_a_store_is_refused
@@ -451,7 +462,8 @@
 5	ranges	115.5	a_node_that_leaves_a_refused_reads_registration_behind_is_caught
 5	ranges	66.8	every_seed_passes_on_the_correct_node
 5	node	39.5	a_fresh_node_that_bootstraps_itself_is_caught_by_check_7_where_it_is_not_a_bootstrap_node
-# shard 6: 1597.0 cpu s
+5	node	40.1	a_server_that_ignores_the_span_at_apply_is_caught_with_trust_and_has_no_path_alone
+# shard 6: 1606.3 cpu s
 6	echo	0.1	a_busy_looping_task_fails_the_scenario_instead_of_hanging
 6	engine	310.3	an_engine_that_acknowledges_before_the_log_is_caught
 6	engine	204.5	an_engine_that_releases_a_memtable_before_the_manifest_is_caught
@@ -488,3 +500,6 @@
 6	reseed	0.4	an_answer_that_is_evidence_of_the_install_is_not_the_same_as_any_answer
 6	wal	34.4	a_log_that_skips_sync_dir_on_rotation_is_caught
 6	wal	0.3	same_seed_gives_byte_identical_trace
+6	node	7.9	the_range_layers_checks_agree_with_their_whole_trace_folds
+6	node	0.9	a_server_that_trusts_a_stale_descriptor_is_caught_by_check_9_on_the_node
+6	node	0.5	a_client_that_ignores_a_mismatch_is_caught_by_check_17_on_the_node

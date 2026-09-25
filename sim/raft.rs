@@ -81,8 +81,8 @@ use std::time::Duration;
 use ananke_env::moirae::Export;
 use ananke_env::sim::{RunHeader, Sim, SimConfig, TraceRecord};
 use ananke_env::{
-    ApplyEffect, ClientOp, ClientResult, Clock, Either, Environment, Instant, Network, NodeId,
-    RangeState, Rng, Socket, TraceEvent, race,
+    ApplyEffect, ClientOp, ClientResult, Clock, Either, Environment, Instant, MismatchAt, Network,
+    NodeId, RangeState, Rng, Socket, TraceEvent, race,
 };
 use ananke_raft::apply::{Command, Outcome, user_key};
 use ananke_raft::client::{Reply, Request, Response};
@@ -95,7 +95,7 @@ use ananke_shard::client::{Cache, RangedRequest, RangedResponse};
 use ananke_shard::descriptor::{FIRST_GENERATION, RangeDescriptor};
 use ananke_shard::range::RangeId;
 use ananke_shard::server::ServerConfig;
-use ananke_shard::variant::NodeVariants;
+use ananke_shard::variant::{NodeVariant, NodeVariants};
 use ananke_storage::EngineConfig;
 use bytes::Bytes;
 use moirae_sched::Policy;
@@ -340,14 +340,20 @@ impl Cluster {
         }
     }
 
-    /// The cache a client of this cluster starts with: the node cluster's bootstrap
-    /// descriptors (SHARD.md §2), nothing on one group, which has no ranges to
-    /// route among. A leader hint per range lives in it on both (SHARD.md §3).
-    // PROPOSED(D-097): the node cluster's client routes by its cache.
+    /// The cache client `n` of this cluster starts with: on the node cluster, the
+    /// bootstrap descriptors of its configuration (SHARD.md §2) for an even client
+    /// and [`stale_descriptor`] for an odd one — a client that knew the cluster before
+    /// its ranges were fixed, so that every seed has requests refused at receipt and
+    /// clients that converge through `RangeMismatch` alone, on a tree with no split to
+    /// make it (§3); nothing on one group, which has no ranges to route among. A
+    /// leader hint per range lives in it on both.
+    // PROPOSED(D-097): the node cluster's client routes by its cache, and every
+    // other client starts stale.
     #[must_use]
-    pub fn initial_cache(self) -> Cache {
+    pub fn initial_cache(self, n: u64) -> Cache {
         match self {
             Self::OneGroup => Cache::new(),
+            Self::Node if n % 2 == 1 => Cache::seeded(&[stale_descriptor()]),
             Self::Node => Cache::seeded(&node_descriptors()),
         }
     }
@@ -480,6 +486,39 @@ pub fn node_range_of_key(key: &Bytes) -> u64 {
         .and_then(|digits| digits.parse::<u64>().ok())
         .unwrap_or(0);
     crate::ranges::FIRST_RANGE + (digits / 2).min(crate::ranges::RANGES - 1)
+}
+
+/// `RangeMismatchSent` over `records`, by where the server saw it (SHARD.md §3).
+// PROPOSED(D-097)
+#[must_use]
+pub fn mismatches_sent_of(records: &[TraceRecord]) -> BTreeMap<MismatchAt, usize> {
+    let mut out = BTreeMap::new();
+    for record in records {
+        if let TraceEvent::RangeMismatchSent { at, .. } = &record.event {
+            *out.entry(*at).or_default() += 1;
+        }
+    }
+    out
+}
+
+/// The one descriptor a client that knew the cluster before its ranges were fixed
+/// would hold: §2's "range 2, the rest of the keyspace" over the whole user keyspace
+/// at generation 0, below every bootstrap descriptor, so that every `RangeMismatch`
+/// it draws replaces it for the part the answer names (SHARD.md §3).
+// PROPOSED(D-097): a client that starts stale.
+#[must_use]
+pub fn stale_descriptor() -> RangeDescriptor {
+    let ranges = crate::ranges::ranges();
+    let first = ranges.first().expect("a range").span();
+    let last = ranges.last().expect("a range").span();
+    RangeDescriptor {
+        range: RangeId(crate::ranges::FIRST_RANGE),
+        start: first.start,
+        end: last.end,
+        generation: 0,
+        voters: (1..=SERVERS).map(ServerId).collect(),
+        state: RangeState::Live,
+    }
 }
 
 /// The descriptors the node cluster's bootstrap writes for its user ranges (SHARD.md
@@ -2395,7 +2434,14 @@ pub fn payload_is_well_formed(records: &[TraceRecord], hosted: &[u64]) -> Result
                          names the key {key:?}"
                     ));
                 }
-                ApplyEffect::Applied | ApplyEffect::None => {}
+                // PROPOSED(D-097): the apply check's refusal, which names its key.
+                ApplyEffect::OutOfSpan if key.is_none() => {
+                    return Err(format!(
+                        "the trace's payload: server {server}'s apply of {index} is \
+                         `out_of_span` and names no key"
+                    ));
+                }
+                ApplyEffect::Applied | ApplyEffect::None | ApplyEffect::OutOfSpan => {}
                 other => {
                     return Err(format!(
                         "the trace's payload: server {server}'s apply of {index} is `{}`, which \
@@ -3104,6 +3150,14 @@ impl Report {
         {
             return fail(violation);
         }
+        // SHARD.md §8's checks 7, 9, 10 and 17, folded over the whole trace of a run
+        // that traces descriptors: the node's. One group traces none (Q40).
+        // PROPOSED(D-097)
+        if self.traces_descriptors()
+            && let Err(violation) = ananke_shard::invariants::all(&self.records)
+        {
+            return fail(violation);
+        }
         if let Err(violation) = lin::check(&self.history) {
             return fail(violation.to_string());
         }
@@ -3160,6 +3214,23 @@ impl Report {
             }
         }
         Ok(())
+    }
+
+    /// Whether the run traced a descriptor at all: the node cluster's runs do, from
+    /// every replica's bootstrap creation, and one group's never do.
+    // PROPOSED(D-097)
+    #[must_use]
+    pub fn traces_descriptors(&self) -> bool {
+        self.records
+            .iter()
+            .any(|r| matches!(r.event, TraceEvent::RangeCreated { .. }))
+    }
+
+    /// `RangeMismatchSent`, by where the server saw it (SHARD.md §3).
+    // PROPOSED(D-097)
+    #[must_use]
+    pub fn mismatches_sent(&self) -> BTreeMap<MismatchAt, usize> {
+        mismatches_sent_of(&self.records)
     }
 
     /// The largest in-memory log of any follower replica, against the entry bound
@@ -6629,7 +6700,15 @@ fn to_result(outcome: Outcome) -> ClientResult {
 /// `servers` is how many server nodes it may try: the membership scenario runs
 /// five, this sweep three.
 pub(crate) async fn client<E: Environment>(env: E, n: u64, servers: u64, stats: SharedStats) {
-    client_on(Cluster::OneGroup, env, n, servers, stats).await;
+    client_on(
+        Cluster::OneGroup,
+        env,
+        n,
+        servers,
+        stats,
+        NodeVariants::correct(),
+    )
+    .await;
 }
 
 /// The same client against `cluster`: the same draws, the same deadlines and the
@@ -6647,6 +6726,7 @@ pub(crate) async fn client_on<E: Environment>(
     n: u64,
     servers: u64,
     stats: SharedStats,
+    node: NodeVariants,
 ) {
     let Ok(sock) = env.net().bind(client_addr(n)).await else {
         return;
@@ -6657,7 +6737,7 @@ pub(crate) async fn client_on<E: Environment>(
     // What it knows of the ranges, and the leader it last heard of per range
     // (SHARD.md §3). On one group the cache holds no span and only the hint.
     // PROPOSED(D-097): the node cluster's client routes by its cache.
-    let mut cache = cluster.initial_cache();
+    let mut cache = cluster.initial_cache(n);
     // The server the last abandoned operation went to: not the first to try next.
     let mut avoid: Option<u64> = None;
     let mut known: BTreeMap<Bytes, Option<Bytes>> = BTreeMap::new();
@@ -6713,6 +6793,16 @@ pub(crate) async fn client_on<E: Environment>(
                 seq,
                 command: command.clone(),
             };
+            // PROPOSED(D-097): every send is traced, with the operation it belongs
+            // to (SHARD.md §8, §9).
+            env.trace(TraceEvent::ClientSend {
+                client: process,
+                seq,
+                range,
+                generation,
+                to: target,
+                invoked,
+            });
             if sock
                 .send(
                     server_addr(target),
@@ -6774,20 +6864,34 @@ pub(crate) async fn client_on<E: Environment>(
                 // PROPOSED(D-097)
                 Some(Reply::RangeMismatch { descriptors }) => {
                     stats.lock().unwrap().mismatched += 1;
-                    let mut learned = false;
-                    for descriptor in &descriptors {
-                        if let Ok(descriptor) = RangeDescriptor::decode(descriptor.clone()) {
-                            cache.learn(&descriptor);
-                            learned = true;
-                        }
-                    }
-                    if !learned {
-                        cache.evict(&user_key(&key));
-                    }
+                    let decoded: Vec<RangeDescriptor> = descriptors
+                        .iter()
+                        .filter_map(|bytes| RangeDescriptor::decode(bytes.clone()).ok())
+                        .collect();
+                    env.trace(TraceEvent::ClientMismatch {
+                        client: process,
+                        seq,
+                        descriptors: decoded
+                            .iter()
+                            .map(|d| (d.range.get(), d.generation, d.start.clone(), d.end.clone()))
+                            .collect(),
+                    });
                     if now >= deadline {
                         break;
                     }
                     seq += 1;
+                    // `ClientIgnoresMismatch`: the resend goes to the range and
+                    // generation the client had, merging nothing (§10, Q38).
+                    if node.contains(NodeVariant::ClientIgnoresMismatch) {
+                        target = target % servers + 1;
+                        continue;
+                    }
+                    if decoded.is_empty() {
+                        cache.evict(&user_key(&key));
+                    }
+                    for descriptor in &decoded {
+                        cache.learn(descriptor);
+                    }
                     (range, generation) = cluster.route(&mut cache, &key);
                     target = cache
                         .hint(RangeId(range))
@@ -7031,7 +7135,7 @@ pub fn run_on(
         let stats = stats[i].clone();
         env.spawn(
             "client",
-            client_on(cluster, inner, i as u64 + 1, SERVERS, stats),
+            client_on(cluster, inner, i as u64 + 1, SERVERS, stats, node_variants),
         );
     }
     let all_but = |server: u64, client: u64| -> (Vec<NodeId>, Vec<NodeId>) {
@@ -7050,7 +7154,13 @@ pub fn run_on(
     // draw reached the arm and not just the schedule (§11, env 8).
     // PROPOSED(D-082): a leader-relative arm resolves its leader per range.
     let mut aimed: Vec<(u64, u64, Instant)> = Vec::new();
-    let mut watch = Watch::default();
+    // The range layer's checks fold on the node cluster, which traces descriptors;
+    // one group traces none and is checked with an inactive checker.
+    // PROPOSED(D-097)
+    let mut watch = Watch {
+        shard: ananke_shard::invariants::Checker::new(cluster == Cluster::Node),
+        ..Watch::default()
+    };
     advance(&mut sim, schedule.warmup, &mut watch);
     let restart = |sim: &mut Sim, server: u64| {
         sim.restart(node_of_server(server));
@@ -7537,6 +7647,7 @@ pub fn run_on(
         clients_total.completed += s.completed;
         clients_total.abandoned += s.abandoned;
         clients_total.redirected += s.redirected;
+        clients_total.mismatched += s.mismatched;
     }
     Report {
         seed,
@@ -7571,6 +7682,10 @@ struct Watch {
     /// check kept across looks, so a look costs only the records since the last
     /// one (D-046).
     checker: invariants::Checker,
+    /// The range layer's checks — SHARD.md §8's 7, 9, 10 and 17 — fed the same
+    /// records at the same looks (Q40). Inactive on one group.
+    // PROPOSED(D-097)
+    shard: ananke_shard::invariants::Checker,
     /// How many trace records the checker has been fed.
     checked: usize,
 }
@@ -7581,6 +7696,7 @@ impl Default for Watch {
             slices: 0,
             stopped: None,
             checker: invariants::Checker::new(SERVERS as usize),
+            shard: ananke_shard::invariants::Checker::new(false),
             checked: 0,
         }
     }
@@ -7987,6 +8103,11 @@ fn advance(sim: &mut Sim, duration: Duration, watch: &mut Watch) {
             watch.checked += records.len();
             watch.checker.extend(crate::traced(&records));
             if let Err(violation) = watch.checker.verdict() {
+                watch.stopped = Some(format!("{violation} (at {:?})", sim.now()));
+                return;
+            }
+            watch.shard.extend(&records);
+            if let Err(violation) = watch.shard.verdict() {
                 watch.stopped = Some(format!("{violation} (at {:?})", sim.now()));
                 return;
             }

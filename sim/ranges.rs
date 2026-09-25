@@ -1462,6 +1462,7 @@ pub fn run_with_of(
         clients_total.completed += one.completed;
         clients_total.abandoned += one.abandoned;
         clients_total.redirected += one.redirected;
+        clients_total.mismatched += one.mismatched;
     }
     let checked = raft::Report::over_a_run(raft::Run {
         seed,

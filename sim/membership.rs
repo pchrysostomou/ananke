@@ -1195,6 +1195,13 @@ impl Report {
         {
             return fail(violation);
         }
+        // SHARD.md §8's checks 7, 9, 10 and 17 on the node cluster (Q40).
+        // PROPOSED(D-097)
+        if self.cluster == Cluster::Node
+            && let Err(violation) = ananke_shard::invariants::all(&self.records)
+        {
+            return fail(violation);
+        }
         if let Err(violation) = lin::check(&self.history) {
             return fail(violation.to_string());
         }
@@ -1887,13 +1894,13 @@ pub fn run_on_with_node(
     for id in 1..=SERVERS {
         spawn_server(cluster, &sim, id, variants, node);
     }
-    for (i, &node) in clients.iter().enumerate() {
-        let env = sim.env(node);
+    for (i, &client) in clients.iter().enumerate() {
+        let env = sim.env(client);
         let inner = env.clone();
         let stats = stats[i].clone();
         env.spawn(
             "client",
-            client_on(cluster, inner, i as u64 + 1, SERVERS, stats),
+            client_on(cluster, inner, i as u64 + 1, SERVERS, stats, node),
         );
     }
     let last_heal = sim.now();

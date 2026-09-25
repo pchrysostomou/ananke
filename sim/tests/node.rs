@@ -59,6 +59,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
+use ananke_env::MismatchAt;
 use ananke_env::TraceEvent;
 use ananke_env::sim::TraceRecord;
 use ananke_raft::core::{Variant, Variants};
@@ -319,6 +320,13 @@ struct Coverage {
     completed: u64,
     abandoned: u64,
     redirected: u64,
+    /// Tries answered `RangeMismatch`, and where the servers saw them (SHARD.md §3):
+    /// at receipt on every seed, since every other client starts stale; at a read's
+    /// serving and at apply never on the correct node before the split, asserted
+    /// absent with that reason (PROPOSED D-097).
+    mismatched: u64,
+    mismatches_at: BTreeMap<MismatchAt, usize>,
+    client_mismatches: usize,
     leaders_by_range: BTreeMap<u64, usize>,
     applies_by_range: BTreeMap<u64, usize>,
     multi_range_frames: usize,
@@ -409,6 +417,9 @@ impl std::fmt::Debug for Coverage {
             .field("completed", &self.completed)
             .field("abandoned", &self.abandoned)
             .field("redirected", &self.redirected)
+            .field("mismatched", &self.mismatched)
+            .field("mismatches_at", &self.mismatches_at)
+            .field("client_mismatches", &self.client_mismatches)
             .field("leaders_by_range", &self.leaders_by_range)
             .field("applies_by_range", &self.applies_by_range)
             .field("multi_range_frames", &self.multi_range_frames)
@@ -523,6 +534,11 @@ impl Coverage {
         self.completed += report.clients.completed;
         self.abandoned += report.clients.abandoned;
         self.redirected += report.clients.redirected;
+        self.mismatched += report.clients.mismatched;
+        for (at, count) in report.mismatches_sent() {
+            *self.mismatches_at.entry(at).or_default() += count;
+        }
+        self.client_mismatches += report.count(|e| matches!(e, TraceEvent::ClientMismatch { .. }));
         self.multi_range_frames += report.frames_of_several_ranges();
         let (hit, fired) = report.arms_hit_their_ranges();
         self.arms_hit += hit;
@@ -610,6 +626,37 @@ impl Coverage {
                 self.seeds
             );
         }
+        // **Routing's three checks** (SHARD.md §3; PROPOSED D-097). Every other client
+        // starts stale, so every seed has requests refused at receipt and merged back
+        // into the right range: at least one a seed, and in practice one per stale
+        // client per range it first touches. At a read's serving and at apply the
+        // correct node refuses nothing on this tree: no split moves a descriptor
+        // between a read's receipt and its serving or under a proposal in flight,
+        // and no correct server proposes a key its own descriptor does not serve.
+        // Both are asserted absent with that reason, so the day the split lands and
+        // reaches them this says so and the absence becomes a reach.
+        let at = |where_: MismatchAt| self.mismatches_at.get(&where_).copied().unwrap_or(0);
+        assert!(
+            at(MismatchAt::Receipt) >= self.seeds as usize,
+            "the sweep saw {} mismatches at receipt over {} seeds, fewer than one a seed: \
+             the clients that start stale are not being refused, or not being traced",
+            at(MismatchAt::Receipt),
+            self.seeds
+        );
+        assert_eq!(
+            (at(MismatchAt::Read), at(MismatchAt::Apply)),
+            (0, 0),
+            "the correct node refused a key at a read's serving or at apply, which \
+             nothing on this tree reaches before the split: a descriptor moved under a \
+             read or a proposal, or a server proposed a key it does not serve"
+        );
+        assert!(
+            self.client_mismatches >= self.seeds as usize,
+            "the clients traced {} mismatches over {} seeds: a client that is refused \
+             traces what it was told",
+            self.client_mismatches,
+            self.seeds
+        );
         // **The install arm reaching the moment it aims at**, which was not a floor
         // before PROPOSED D-089 because it was not a number: the arm drew its victim and
         // its range apart and reached the final chunk of the range it drew on **0 of
@@ -1275,6 +1322,21 @@ fn a_fresh_node_that_bootstraps_itself_is_caught_by_check_7_where_it_is_not_a_bo
         by_check_7, seeds as usize,
         "AnyFreshNodeBootstraps was not caught by check 7 on every membership seed"
     );
+    // And the correct node passes the same step on the same scenario, which D-096's
+    // version of this test never asked, and which was false: a node not named at
+    // bootstrap traced its interim replica's creation with its own empty Raft
+    // configuration as the voters, so nodes 4 and 5 disagreed with the bootstrap
+    // nodes on every range and the "catch" told the two systems apart on nothing.
+    // The creation now names the range's voters on every node (PROPOSED D-097), and
+    // the membership sweep folds check 7 in full over the correct node on every seed.
+    let honest = membership::run_on_node(
+        Cluster::Node,
+        1,
+        Variants::default(),
+        NodeVariants::correct(),
+    );
+    ananke_sim::ranges::creations_agree_of(&honest.records)
+        .expect("the correct membership node's creations agree on every range");
 
     let correct = raft::run_on_the_node(1, Variants::default(), NodeVariants::correct());
     let pretending = raft::run_on_the_node(1, Variants::default(), taken);
@@ -1283,6 +1345,286 @@ fn a_fresh_node_that_bootstraps_itself_is_caught_by_check_7_where_it_is_not_a_bo
         pretending.jsonl(),
         "on three nodes every node is a bootstrap node, so the variant should have had \
          nothing to do and the trace should not have moved"
+    );
+}
+
+/// The routing variants of §10 on the node, with the clients that start stale
+/// (PROPOSED D-097): what each is caught by, over `high_rate_share` seeds, printed and
+/// asserted.
+///
+/// **`TrustStaleDescriptor`** takes a stale client's range as proof and checks neither
+/// at receipt nor at serving. Its reads are served from the wrong range — a key of
+/// range 3 read from range 2's state, which never holds it — and check 9 sees the
+/// `RaftRead` outside the serving descriptor; its writes are proposed in the wrong
+/// range and the apply check, which the variant keeps, refuses them: `RangeMismatch`
+/// at apply, the client's resend under a fresh `seq`, the history pairing the two.
+/// That is the whole of Q10's path, run on the correct apply code where the correct
+/// server never reaches it before the split, and the test asserts it reached.
+///
+/// **The pair `{TrustStaleDescriptor, ApplyIgnoresSpan}`** applies those writes in the
+/// wrong range: check 9 catches it on every seed, at the first read served wrongly or
+/// the first write applied outside its span, whichever the schedule reaches first; and
+/// what the second half turns off is read straight off the trace — the apply check
+/// refuses nothing, and the trusted writes land in the wrong range. `ApplyIgnoresSpan`
+/// alone has no path on this tree — no correct server proposes a key outside its span,
+/// and no split lands under a proposal in flight — so it is caught on no seed, asserted
+/// as that absence with its reason; the sharded sweep's split under a pending
+/// right-half burst is where §10 catches it.
+///
+/// **`ClientIgnoresMismatch`** resends to the range and generation it had: check 17 at
+/// the first resend, on every seed, since every other client starts stale.
+// PROPOSED(D-097)
+fn routing_variant(name: &str, variants: &[NodeVariant]) -> Vec<Routed> {
+    let seeds = high_rate_share();
+    let taken = NodeVariants::of(variants);
+    let outcomes: Vec<Routed> = sweep(seeds, |seed| {
+        let report = raft::run_on_the_node(seed, Variants::default(), taken);
+        let at_apply = report
+            .mismatches_sent()
+            .get(&MismatchAt::Apply)
+            .copied()
+            .unwrap_or(0);
+        // Writes applied in a range the scenario's fixed map does not give the key
+        // to: what `ApplyIgnoresSpan` lets through, read against the map that is
+        // the truth on a tree with no split.
+        let misapplied = report.count(|e| {
+            matches!(
+                e,
+                TraceEvent::RaftApply {
+                    range,
+                    key: Some(key),
+                    effect: ananke_env::ApplyEffect::Applied,
+                    ..
+                } if raft::node_range_of_key(key) != *range
+            )
+        });
+        Routed {
+            seed,
+            why: report.check().err(),
+            at_apply,
+            misapplied,
+        }
+    });
+    let caught = outcomes.iter().filter(|o| o.why.is_some()).count();
+    let mut by_check: BTreeMap<&str, usize> = BTreeMap::new();
+    for outcome in &outcomes {
+        if let Some(why) = &outcome.why {
+            *by_check.entry(mechanism(why)).or_default() += 1;
+        }
+    }
+    let reached_apply = outcomes.iter().filter(|o| o.at_apply > 0).count();
+    let misapplied = outcomes.iter().filter(|o| o.misapplied > 0).count();
+    let at_a_read = outcomes
+        .iter()
+        .filter(|o| {
+            o.why
+                .as_deref()
+                .is_some_and(|why| why.contains("served a read"))
+        })
+        .count();
+    println!(
+        "node: {name} caught on {caught}/{seeds} seeds by {by_check:?}, {at_a_read} of them at \
+         a read; the apply check refused a write on {reached_apply}/{seeds}; a write was \
+         applied in the wrong range on {misapplied}/{seeds}; first: {}",
+        outcomes
+            .iter()
+            .find_map(|o| o.why.as_deref())
+            .map_or("none", |why| &why[..why.len().min(200)])
+    );
+    outcomes
+}
+
+/// One seed of a routing variant's sweep.
+struct Routed {
+    seed: u64,
+    why: Option<String>,
+    /// `RangeMismatchSent { at: apply }` on the run.
+    at_apply: usize,
+    /// Applied writes in a range the fixed map does not give the key to.
+    misapplied: usize,
+}
+
+#[test]
+fn a_server_that_trusts_a_stale_descriptor_is_caught_by_check_9_on_the_node() {
+    let outcomes = routing_variant("TrustStaleDescriptor", &[NodeVariant::TrustStaleDescriptor]);
+    let caught = outcomes.iter().filter(|o| o.why.is_some()).count();
+    // A rate, not every seed: 20 of 20 at the gate and 99 of 100 at the premerge's
+    // share. Seed 48 is the one it is not caught on, and legitimately: its stale
+    // clients' first operations on their stale ranges are writes, which the apply
+    // check refuses and the resend corrects the cache by, so no read is ever served
+    // through a stale route there. The variant's harm needs a read before a write on
+    // the same stale route, which is the schedule's to give (D-061: far above 5 %).
+    assert!(
+        caught > 0,
+        "TrustStaleDescriptor was caught on no seed: a stale client's read served from \
+         the wrong range goes unseen"
+    );
+    for outcome in &outcomes {
+        let Some(why) = outcome.why.as_deref() else {
+            continue;
+        };
+        assert!(
+            why.contains("serving within span") || why.contains("linearizability"),
+            "seed {}: caught by something other than check 9 or the history: {why}",
+            outcome.seed
+        );
+    }
+    // The apply check refusing the trusted writes, and the resend that follows:
+    // Q10's path reached on the correct apply code. A rate and not every seed,
+    // because the incremental checker stops the run at check 9's first violation —
+    // a read served from the wrong range — and on some seeds that read comes before
+    // any trusted write reaches apply: measured at 17 of 20 at the gate, so it is
+    // asserted at every tier (D-061) and printed. No write was applied in the
+    // wrong range: the apply check, kept by this variant, refused every one.
+    let reached = outcomes.iter().filter(|o| o.at_apply > 0).count();
+    assert!(
+        reached > 0,
+        "the apply check refused no trusted write on any seed, so Q10's path was not \
+         reached: the resend under a fresh seq and its pairing were exercised on nothing"
+    );
+    assert!(
+        outcomes.iter().all(|o| o.misapplied == 0),
+        "a trusted write was applied in the wrong range, which the apply check this \
+         variant keeps must refuse"
+    );
+}
+
+#[test]
+fn a_server_that_ignores_the_span_at_apply_is_caught_with_trust_and_has_no_path_alone() {
+    let pair = routing_variant(
+        "{TrustStaleDescriptor, ApplyIgnoresSpan}",
+        &[
+            NodeVariant::TrustStaleDescriptor,
+            NodeVariant::ApplyIgnoresSpan,
+        ],
+    );
+    let caught = pair.iter().filter(|o| o.why.is_some()).count();
+    assert_eq!(
+        caught,
+        pair.len(),
+        "the pair was not caught on every seed: a stale client's read is served from the \
+         wrong range on every seed it starts on, and its writes land there"
+    );
+    let by_check_9 = pair
+        .iter()
+        .filter(|o| {
+            o.why
+                .as_deref()
+                .is_some_and(|why| why.contains("serving within span"))
+        })
+        .count();
+    assert!(
+        by_check_9 > 0,
+        "check 9 caught the pair on no seed, so the applied write outside the span went \
+         unseen by the fold written for it"
+    );
+    // What the second half of the pair turns off, seen directly: the apply check
+    // refuses nothing on any seed, and the trusted writes land in the wrong range —
+    // the writes `TrustStaleDescriptor` alone has refused at apply. The run stops at
+    // check 9's first violation, which on most seeds is a read served wrongly before
+    // any such write, so the misapplied writes are read off the trace against the
+    // scenario's fixed map rather than waited for as the first violation; measured
+    // before asserted, and printed.
+    assert!(
+        pair.iter().all(|o| o.at_apply == 0),
+        "the apply check refused a write under ApplyIgnoresSpan, which turns it off"
+    );
+    let misapplied = pair.iter().filter(|o| o.misapplied > 0).count();
+    assert!(
+        misapplied > 0,
+        "no trusted write was applied in the wrong range on any seed of the pair, so the \
+         apply check's absence changed nothing the trace can see"
+    );
+    // The absence, with its reason: alone, the variant is caught on no seed of the
+    // share, and the apply check refuses nothing, because nothing reaches apply
+    // outside its span without a server that trusts a stale claim or a split.
+    let alone = routing_variant("ApplyIgnoresSpan", &[NodeVariant::ApplyIgnoresSpan]);
+    let caught = alone.iter().filter(|o| o.why.is_some()).count();
+    assert_eq!(
+        caught, 0,
+        "ApplyIgnoresSpan alone was caught, so some write reached apply outside its span \
+         on the correct receipt path: the split has landed or a server proposed what it \
+         does not serve, and this absence becomes a reach"
+    );
+    assert!(
+        alone.iter().all(|o| o.misapplied == 0),
+        "a write was applied in the wrong range with the receipt check in place"
+    );
+}
+
+#[test]
+fn a_client_that_ignores_a_mismatch_is_caught_by_check_17_on_the_node() {
+    let outcomes = routing_variant(
+        "ClientIgnoresMismatch",
+        &[NodeVariant::ClientIgnoresMismatch],
+    );
+    let seeds = outcomes.len();
+    let by_check_17 = outcomes
+        .iter()
+        .filter(|o| {
+            o.why
+                .as_deref()
+                .is_some_and(|why| why.contains("client refreshes"))
+        })
+        .count();
+    assert_eq!(
+        by_check_17, seeds,
+        "ClientIgnoresMismatch was not caught by check 17 on every seed: every other \
+         client starts stale and resends without merging"
+    );
+}
+
+/// The range layer's checker at prefixes against its folds over the whole trace
+/// (D-046; SHARD.md §8, §11 raft 12): fed in eight prefixes, its verdict at each is
+/// what folding the four checks over that prefix from the first record reports, in the
+/// same words, on the correct node and on the two variants that trip checks 9 and 17.
+// PROPOSED(D-097)
+#[test]
+fn the_range_layers_checks_agree_with_their_whole_trace_folds() {
+    const PREFIXES: usize = 8;
+    let seeds = high_rate_share().min(20);
+    let variants: [&[NodeVariant]; 3] = [
+        &[],
+        &[NodeVariant::TrustStaleDescriptor],
+        &[NodeVariant::ClientIgnoresMismatch],
+    ];
+    let mut compared = 0usize;
+    let mut tripped = 0usize;
+    for taken in variants {
+        let results = sweep(seeds, |seed| {
+            let report = raft::run_on_the_node(seed, Variants::default(), NodeVariants::of(taken));
+            let records = &report.records;
+            let mut incremental = ananke_shard::invariants::Checker::new(true);
+            let mut fed = 0usize;
+            let mut compared = 0usize;
+            let mut tripped = 0usize;
+            for prefix in 1..=PREFIXES {
+                let upto = records.len() * prefix / PREFIXES;
+                incremental.extend(&records[fed..upto]);
+                fed = upto;
+                let whole = ananke_shard::invariants::all(&records[..upto]);
+                assert_eq!(
+                    incremental.verdict(),
+                    whole,
+                    "seed {seed}, prefix {prefix}/{PREFIXES} under {taken:?}: the checker \
+                     fed in prefixes disagrees with the folds over the whole prefix"
+                );
+                compared += 1;
+                tripped += usize::from(whole.is_err());
+            }
+            (compared, tripped)
+        });
+        compared += results.iter().map(|(c, _)| c).sum::<usize>();
+        tripped += results.iter().map(|(_, t)| t).sum::<usize>();
+    }
+    println!(
+        "node: the range layer's checker agreed with its whole-trace folds at {compared} \
+         prefixes over {seeds} seeds and {} variants, {tripped} of them in violation",
+        variants.len()
+    );
+    assert!(
+        tripped > 0,
+        "no prefix was in violation, so the agreement was asserted on green alone"
     );
 }
 
@@ -1418,6 +1760,10 @@ fn mechanism(violation: &str) -> &'static str {
         ("election safety", "election safety"),
         ("leader completeness", "leader completeness"),
         ("linearizability", "linearizability"),
+        ("descriptor agreement", "descriptor agreement"),
+        ("serving within span", "serving within span"),
+        ("owners' generations", "owners' generations"),
+        ("client refreshes", "client refreshes"),
         ("liveness", "liveness"),
         ("follower log:", "the follower-log bound"),
         ("failed:", "the node failed"),

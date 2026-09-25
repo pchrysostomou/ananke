@@ -68,10 +68,11 @@ use ananke_raft::core::{RaftConfig, SnapshotAction};
 use ananke_raft::message::{Frame, Message, SnapshotStatus};
 use ananke_raft::queue::Queue;
 use ananke_raft::snapshot::{self, Repair, Sender};
-use ananke_raft::store::{PURPOSE_LOG, RaftStore};
+use ananke_raft::store::{KeyPrefix, PURPOSE_LOG, RaftStore};
 use ananke_raft::types::{Configuration, Index, ServerId, Term};
 use bytes::Bytes;
 
+use crate::descriptor::RangeDescriptor;
 use crate::range::RangeId;
 use crate::server::Range;
 use crate::snapshot::{Identity, Install, Landing, Route, Snapshots, Started};
@@ -191,6 +192,10 @@ pub enum SnapAnswer {
         /// The configuration in force at the snapshot's last index, read out of the
         /// streamed bytes (`ananke_raft::snapshot::staged_record`).
         config: Box<Configuration>,
+        /// The descriptor the switch put in place, read back from the store: what
+        /// the host's receipt check reads for this range from here on (SHARD.md §3).
+        // PROPOSED(D-097)
+        descriptor: Option<Box<RangeDescriptor>>,
     },
     /// The install did not switch: the range goes on with the replica it has, and its
     /// hold is released.
@@ -1138,6 +1143,18 @@ impl<E: Environment> Task<E> {
         // same events as a correct one (D-083).
         // PROPOSED(D-083): what an install installed is read back and traced.
         self.state_of(range, install.at, &store).await;
+        // The descriptor the switch put in place, for the host's receipt check
+        // (SHARD.md §3). Read back rather than carried in the stream's record: it is
+        // what the store holds now, whatever the take put in.
+        // PROPOSED(D-097)
+        let descriptor = store
+            .engine()
+            .get(&KeyPrefix::group(range.get()).descriptor_key())
+            .await
+            .ok()
+            .flatten()
+            .and_then(|bytes| RangeDescriptor::decode(bytes).ok())
+            .map(Box::new);
         self.env.trace_decided(
             installing,
             TraceEvent::RaftSnapshot {
@@ -1163,6 +1180,7 @@ impl<E: Environment> Task<E> {
                 range,
                 at: install.at,
                 config: Box::new(config),
+                descriptor,
             }));
     }
 
