@@ -324,6 +324,13 @@
 # 1442.9 to 1777.4 cpu s; the next row added goes into the lightest, which is shard 2.
 # shard	binary	cpu_s	test
 # shard 1: 1711.5 cpu s
+# D-095 added two rows, both `node`, weighed on its tree from the built release binary
+# (`node-<hash> <test> --exact`) at ANANKE_SEEDS=1000 and ANANKE_DEEP_SEEDS=100, alone on
+# this session's four-core Xeon container (load average 1.35/1.10/1.81 at the start), as
+# user + sys: the variant's catch, which sweeps every seed, at 180.6 cpu s (47.068 s
+# real), and the folds' comparison, which compares min(seeds, 100) seeds, at 26.7 cpu s.
+# Longest-first into the lightest shard: shard 2 was the lightest at
+# 1442.9 and takes the first, and shard 4 at 1462.4 takes the second.
 1	engine	625.1	an_install_in_two_switches_is_caught
 1	engine	36.8	an_install_whose_repair_precedes_its_switch_is_caught
 1	engine	0.6	seed_44_never_opens_empty_in_either_mode
@@ -340,7 +347,7 @@
 1	raft	0.2	seed_164_which_a_local_ten_thousand_seed_run_found_stays_green
 1	raft	0.2	seed_5909_which_the_nightly_found_stays_green
 1	wal	29.3	a_log_that_skips_the_checksum_is_caught
-# shard 2: 1442.9 cpu s
+# shard 2: 1623.5 cpu s
 2	echo	0.2	different_seeds_give_different_traces
 2	engine	581.7	the_live_install_crash_test_passes_every_seed
 2	engine	211.2	a_compaction_that_deletes_its_inputs_before_the_manifest_is_caught
@@ -358,6 +365,7 @@
 2	ranges	0.1	every_frame_between_two_nodes_may_carry_several_ranges
 2	ranges	0.1	no_batch_frame_of_the_node_parses_as_a_frame_of_the_one_group_server
 2	ranges	0.1	the_ranges_of_one_node_draw_their_own_election_timeouts
+2	node	180.6	an_apply_task_that_waits_for_every_range_is_caught_by_the_lag_fold_on_the_node
 # shard 3: 1777.4 cpu s
 3	echo	0.2	trace_hash_matches_the_pinned_golden
 3	engine	417.5	the_range_delete_crash_test_passes_every_seed
@@ -383,7 +391,7 @@
 3	raft	0.2	the_membership_scenario_has_byte_identical_traces_for_one_seed
 3	reseed	82.5	the_reseed_shape_holds_on_every_seed
 3	wal	21.2	a_log_that_acknowledges_before_syncing_is_caught
-# shard 4: 1462.4 cpu s
+# shard 4: 1489.1 cpu s
 4	echo	0.1	same_seed_gives_byte_identical_trace
 4	engine	210.8	the_correct_engine_passes_every_seed
 4	engine	38.6	an_install_that_switches_one_span_at_a_time_is_caught
@@ -410,6 +418,7 @@
 4	reseed	7.8	a_node_that_queues_no_compaction_record_is_caught
 4	wal	36.9	the_correct_log_passes_every_seed
 4	wal	0.2	the_seed_42_trace_is_written_for_the_studio
+4	node	26.7	the_node_folds_agree_with_their_whole_trace_readings
 # shard 5: 1502.4 cpu s
 5	echo	6.0	every_seed_satisfies_the_invariants_and_the_sweep_exercises_the_disk_faults
 5	engine	19.5	a_seek_that_counts_tombstones_is_caught
