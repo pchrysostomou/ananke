@@ -391,6 +391,13 @@ pub enum NodeVariant {
     /// cross-range hold folds trip on.
     // PROPOSED(D-095): the variant the apply-lag and cross-range hold folds trip on.
     ApplyWaitsForEveryRange,
+    /// A node takes a fresh store for a bootstrap: whether or not configuration
+    /// names it among range 0's replicas, a node whose store holds no digest writes
+    /// the initial state, and, lacking the bootstrap list it was not given, takes the
+    /// address book for every range's voters. Two clusters then bootstrap where
+    /// configuration named one, and check 7 reads the disagreement off the replicas'
+    /// creations (SHARD.md §2, §8; PROPOSED D-096).
+    AnyFreshNodeBootstraps,
 }
 
 impl NodeVariant {
@@ -444,6 +451,7 @@ impl NodeVariant {
         NodeVariant::RefusedReadLeft,
         NodeVariant::OneSeedForEveryCore,
         NodeVariant::ApplyWaitsForEveryRange,
+        NodeVariant::AnyFreshNodeBootstraps,
     ];
 
     /// Q15's whole-node refusal and re-seed, in order: the six ways to get a node's
@@ -620,6 +628,8 @@ impl NodeVariant {
             // PROPOSED(D-095): the apply task that waits for every range. Sixteen bits are
             // left.
             NodeVariant::ApplyWaitsForEveryRange => 1 << 47,
+            // PROPOSED(D-096): a fresh store taken for a bootstrap. Fifteen bits are left.
+            NodeVariant::AnyFreshNodeBootstraps => 1 << 48,
         }
     }
 
@@ -675,6 +685,7 @@ impl NodeVariant {
             NodeVariant::RefusedReadLeft => "RefusedReadLeft",
             NodeVariant::OneSeedForEveryCore => "OneSeedForEveryCore",
             NodeVariant::ApplyWaitsForEveryRange => "ApplyWaitsForEveryRange",
+            NodeVariant::AnyFreshNodeBootstraps => "AnyFreshNodeBootstraps",
         }
     }
 }
@@ -764,9 +775,9 @@ mod tests {
         // Twenty of the round's and the snapshot task's, the snapshot review's four,
         // D-077's six for Q15's whole-node refusal and re-seed, D-083's ten for the
         // snapshot wiring, D-081's three for the directed re-seed shape, D-090's two for a
-        // stream's bounds, D-076's review's two, and D-095's one for the `apply` task
-        // that waits for every range.
-        assert_eq!(NodeVariant::BUGS.len(), 48);
+        // stream's bounds, D-076's review's two, D-095's one for the `apply` task that
+        // waits for every range, and D-096's one for a fresh store taken for a bootstrap.
+        assert_eq!(NodeVariant::BUGS.len(), 49);
         for variant in NodeVariant::SNAPSHOT
             .iter()
             .chain(NodeVariant::WIRING)

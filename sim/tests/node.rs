@@ -888,18 +888,18 @@ fn every_seed_passes_on_the_correct_node_under_the_raft_sweeps_arms() {
     // 5: 33 776} — least over busiest, **0.87** — and a key map that answers one range
     // gives {2: 95 986, 3: 16 459, 4: 12 886, 5: 14 353}, **0.13**. The floor is half,
     // between them and far from both.
-    let least = coverage
+    // The spread is the user ranges' (PROPOSED D-096): ranges 0 and 1 apply their
+    // terms' no-ops and nothing else, since no client writes a system range, and a
+    // floor that counted them would read the bootstrap as a key map answering one
+    // range. They are printed with the rest of `applies_by_range`.
+    let user_applies: Vec<usize> = coverage
         .applies_by_range
-        .values()
-        .copied()
-        .min()
-        .unwrap_or(0);
-    let busiest = coverage
-        .applies_by_range
-        .values()
-        .copied()
-        .max()
-        .unwrap_or(0);
+        .iter()
+        .filter(|(range, _)| ranges().contains(range))
+        .map(|(_, applies)| *applies)
+        .collect();
+    let least = user_applies.iter().copied().min().unwrap_or(0);
+    let busiest = user_applies.iter().copied().max().unwrap_or(0);
     let spread = least as f64 / busiest.max(1) as f64;
     println!(
         "node: the least-applied range took {least} entries against the busiest range's \
@@ -1227,6 +1227,62 @@ fn an_apply_task_that_waits_for_every_range_is_caught_by_the_lag_fold_on_the_nod
     assert!(
         by_lag > 0,
         "ApplyWaitsForEveryRange was never caught by the lag fold over {seeds} seeds"
+    );
+}
+
+// --- The bootstrap (SHARD.md §2; PROPOSED D-096) ---
+
+/// A node that takes a fresh store for a bootstrap (`AnyFreshNodeBootstraps`), caught
+/// by check 7 on the membership scenario's five nodes, whose nodes 4 and 5 are not
+/// bootstrap nodes: each writes the initial state with the address book as every
+/// range's voters, so its creations disagree with the three bootstrap nodes' on every
+/// range, and `creations_agree_of` — check 7's first step — says so. The run's own
+/// checks are counted beside it, since what they make of two clusters bootstrapping
+/// where configuration named one is not this test's claim. Measured before asserted
+/// (D-061): the variant writes at every start, so the catch is every seed — 1 000 of
+/// 1 000 over a whole thousand in release — and the test runs [`high_rate_share`], a
+/// tenth of the tier, as every variant caught at a high rate on the node does
+/// (D-082): over the whole tier it weighed 404 cpu s, two clusters' traffic on every
+/// seed, and a catch on every seed needs no more of a tier than the share.
+///
+/// On a cluster of three, every node is a bootstrap node and the variant has nothing
+/// to do: its run is byte-identical to the correct node's, which is the absence
+/// asserted with its reason (CLAUDE.md), rather than a sweep passed by injecting
+/// nothing.
+// PROPOSED(D-096): the bootstrap nodes named in configuration.
+#[test]
+fn a_fresh_node_that_bootstraps_itself_is_caught_by_check_7_where_it_is_not_a_bootstrap_node() {
+    let seeds = high_rate_share();
+    let taken = NodeVariants::of(&[NodeVariant::AnyFreshNodeBootstraps]);
+    let outcomes: Vec<(Option<String>, Option<String>)> = sweep(seeds, |seed| {
+        let report = membership::run_on_node(Cluster::Node, seed, Variants::default(), taken);
+        (
+            ananke_sim::ranges::creations_agree_of(&report.records).err(),
+            report.check().err(),
+        )
+    });
+    let by_check_7 = outcomes.iter().filter(|o| o.0.is_some()).count();
+    let by_others = outcomes.iter().filter(|o| o.1.is_some()).count();
+    println!(
+        "AnyFreshNodeBootstraps: check 7 caught it on {by_check_7} of {seeds} membership seeds, \
+         the run's other checks on {by_others}; first: {}",
+        outcomes
+            .iter()
+            .find_map(|o| o.0.as_deref())
+            .unwrap_or("none")
+    );
+    assert_eq!(
+        by_check_7, seeds as usize,
+        "AnyFreshNodeBootstraps was not caught by check 7 on every membership seed"
+    );
+
+    let correct = raft::run_on_the_node(1, Variants::default(), NodeVariants::correct());
+    let pretending = raft::run_on_the_node(1, Variants::default(), taken);
+    assert_eq!(
+        correct.jsonl(),
+        pretending.jsonl(),
+        "on three nodes every node is a bootstrap node, so the variant should have had \
+         nothing to do and the trace should not have moved"
     );
 }
 
@@ -2890,166 +2946,120 @@ fn a_server_whose_refusal_is_not_durable_is_not_re_asserted_on_the_node_yet() {
     );
 }
 
-/// Seeds 272 and 516, which PROPOSED D-089's aim reaches and nothing before it did,
-/// and which PROPOSED D-091's fourth arm answers for: a replica being fed a snapshot
-/// of one range goes past the timer bound without campaigning, while the node holds
+/// Seeds 272 and 516, which PROPOSED D-089's aim reached and nothing before it did,
+/// and which PROPOSED D-091's fourth arm answered for: a replica being fed a snapshot
+/// of one range went past the timer bound without campaigning, while the node held
 /// its core for the **live** install of that range.
 ///
-/// **The mechanism is asserted both ways, not a bare green** (CLAUDE.md), which is
-/// the shape D-063's own pin has for seed 2605.
-/// `Report::timer_gaps_held_by_a_live_install` is the replay with every arm but this
-/// one — `TimerResets::WITHOUT_LIVE_INSTALL`, the check exactly as it stood on
-/// 1d17dcc — and on each seed it is that check's one gap, its violation word for
-/// word, on the (server, range) recorded, with the live install's hold in it; while
-/// `check()` is green. It also asserts that that replay finds nothing else on the
-/// seed, so the arm is seen to be exempting the hold and not more.
+/// **Since PROPOSED D-096 the situation is absent on both seeds, and that is what
+/// this pins — asserted, with its reason, not a bare green** (CLAUDE.md). The
+/// bootstrap put two more replicas on every node — the root and the meta range, six
+/// Raft groups where there were four — and with them every node's schedule moved:
+/// every incarnation and timeout is a later draw of the node's generator, every
+/// frame carries two more ranges' traffic, every install competes with two more
+/// groups for the node's tasks. The hold this pinned was rare before the move, two
+/// seeds in a thousand, and the probe that re-read the tree after it — the check
+/// exactly as it stood on 1d17dcc, `TimerResets::WITHOUT_LIVE_INSTALL`, over a
+/// thousand seeds in release — found **no seed at all** on which that check flags a
+/// stretch held by a live install, so the fourth arm exempts nothing this tree
+/// reaches. The arm stays, keyed to the hold as D-066 said it would have to be, and
+/// its mechanism is unchanged: the `raft` task hands the repair over and holds the
+/// range (D-066; PROPOSED D-083's `CoreWork::Hold`), and from there to the manifest
+/// switch the replica's core takes no input and no tick, so it has no election timer
+/// to fire. What has moved is the schedule that reached a hold long enough to cross
+/// the bound.
 ///
-/// **The shape, identical on both seeds.** The flagged replica's clock is last reset
-/// by an `AppendEntries` of its term. Its leader then stops appending to it and
-/// starts streaming it a snapshot of that range, re-opening the stream at offset 0
-/// five times across the window (`RaftSnapshotResumed`), and **no `InstallSnapshot`
-/// chunk of that range is delivered to it inside the window**, so D-030's reset arm
-/// has nothing to fire on. The install of that range is then decided on it — the
-/// moment the `raft` task hands the repair over and holds the range (D-066; PROPOSED
-/// D-083's `CoreWork::Hold`) — and from there to the manifest switch the replica's
-/// core takes no input and no tick, so it has no election timer to fire. The switch
-/// restores the replica, which traces its restatement and starts counting again.
+/// So the assertion here is the absence, both ways: `check()` is green, the replay
+/// under every arm finds nothing, **and the replay without the fourth arm finds
+/// nothing either** — the arm is exempting nothing on these seeds. The day the last
+/// of those fails, the schedule has reached the hold again and this pin is upgraded
+/// back to the shape below, not deleted.
 ///
-/// Seed 272: server 2's replica of range 4 under leader 3, the window running
-/// 21.356963658 s to 21.757937867 s; the install decided at 21.647374004 s and its
-/// switch durable, with the restatement on it, at 21.789195738 s — so the flag fell
-/// 110.6 ms into the hold and 31.3 ms before the restatement. Seed 516: server 2's
-/// replica of range 5 under leader 1, the window 16.920911437 s to 17.321568677 s,
-/// the install decided at 17.188140918 s and switched at 17.328088046 s — 133.4 ms
-/// into the hold, 6.5 ms before the restatement.
+/// **The shape it pinned, for that day** (identical on both seeds on 1d17dcc's
+/// schedule). The flagged replica's clock was last reset by an `AppendEntries` of its
+/// term. Its leader then stopped appending to it and started streaming it a snapshot
+/// of that range, re-opening the stream at offset 0 five times across the window
+/// (`RaftSnapshotResumed`), and no `InstallSnapshot` chunk of that range was delivered
+/// to it inside the window, so D-030's reset arm had nothing to fire on. The install
+/// of that range was then decided on it and from there to the switch its core was
+/// held. Seed 272: server 2's replica of range 4 under leader 3, the window
+/// 21.356963658 s to 21.757937867 s, the install decided at 21.647374004 s and switched,
+/// with the restatement on it, at 21.789195738 s — the flag 110.6 ms into the hold and
+/// 31.3 ms before the restatement. Seed 516: server 2's replica of range 5 under leader
+/// 1, the window 16.920911437 s to 17.321568677 s, the install decided at
+/// 17.188140918 s and switched at 17.328088046 s — 133.4 ms into the hold, 6.5 ms
+/// before the restatement. The upgraded pin asserts, on the seed the probe finds:
+/// `timer_gaps_held_by_a_live_install()` is exactly one stretch, on the (server,
+/// range) recorded with `live_installs == 1`; it equals
+/// `timer_gaps(TimerResets::WITHOUT_LIVE_INSTALL)`, so the arm exempts the hold and
+/// not more; the install's decision and switch bracket the flag; the `RaftSnapshot {
+/// taken: false }` and the `RaftRecovered` of that replica land at the switch; and a
+/// `RaftSnapshotResumed` toward the replica was decided inside the window.
 ///
-/// **Why none of the check's other three arms covers it.** `TimerResets` has an arm
+/// **Why none of the check's other three arms covered it.** `TimerResets` has an arm
 /// for an install chunk delivered (D-030, seed 164), one for an install's
 /// restatement (D-039, seed 385) and one for the adoption of a completed install
-/// (PROPOSED D-063, seed 2605). The third is the one this looks like, and it was
-/// written for a server whose **run-loop incarnation ends at the completion and
-/// begins again at its restatement**. A node does not do that: "an install into a
-/// live store keeps its incarnation" (D-042, D-066), the range's replica is replaced
-/// in place, and the completion's own restatement lands at the same instant — which
-/// is what D-063's `restates` predicate reads as a start's re-trace, so that arm does
-/// not fire here and would be the wrong one if it did. PROPOSED D-091 is the fourth
-/// arm the owner ruled on, keyed to the hold rather than to an incarnation ending, as
-/// D-066 said it would have to be.
-///
-/// **The day the first assertion fails, the seed's schedule has moved off the
-/// situation and this pin is re-audited, not deleted** — as D-063's pin says of 2605.
+/// (PROPOSED D-063, seed 2605). The third was written for a server whose run-loop
+/// incarnation ends at the completion and begins again at its restatement. A node
+/// does not do that: "an install into a live store keeps its incarnation" (D-042,
+/// D-066), the range's replica is replaced in place, and the completion's own
+/// restatement lands at the same instant — which is what D-063's `restates` predicate
+/// reads as a start's re-trace, so that arm does not fire and would be the wrong one
+/// if it did. PROPOSED D-091 is the fourth arm the owner ruled on.
 // PROPOSED(D-089): the stream arms aim their victim at a range it lags.
 // PROPOSED(D-091): the node's live install holds one range, and the replay does not
 // measure a replica whose core is held.
+// PROPOSED(D-096): the bootstrap's two system ranges moved every node schedule; the
+// hold is absent on both seeds and on a thousand, and the pin asserts the absence.
 #[test]
 fn seeds_272_and_516_are_a_live_installs_hold_and_the_fourth_arm_answers_for_them() {
-    for (seed, server, range, decided, switched) in [
-        (272u64, 2u64, 4u64, 21_647_374_004u64, 21_789_195_738u64),
-        (516, 2, 5, 17_188_140_918, 17_328_088_046),
-    ] {
+    for seed in [272u64, 516] {
         let report = correct(seed);
-        // Green, and green because the replica was held: `check()` passes and the
-        // replay under every arm finds nothing.
         report
             .check()
             .unwrap_or_else(|violation| panic!("seed {seed} no longer passes: {violation}"));
         let gaps = report.timer_gaps(raft::TimerResets::ALL);
         assert!(
             gaps.is_empty(),
-            "seed {seed}: the timer replay reports {gaps:?}, so this seed is no longer the \
-             hold this pins"
+            "seed {seed}: the timer replay reports {gaps:?} under every arm"
         );
-        // The other way: the check as it stood on 1d17dcc flags exactly one stretch,
-        // on the replica recorded, and the hold is in it.
+        // The absence, asserted: the check without the fourth arm finds no stretch
+        // held by a live install, so the arm exempts nothing on this seed. The day
+        // this fails, the schedule has reached the hold again: upgrade the pin to the
+        // shape in the comment above, with that seed's figures.
         let rescued = report.timer_gaps_held_by_a_live_install();
-        assert_eq!(
-            rescued.len(),
-            1,
-            "seed {seed}: the check without the fourth arm finds {} stretches held by a live \
-             install, not the one this pins: {rescued:?}",
+        assert!(
+            rescued.is_empty(),
+            "seed {seed}: the check without the fourth arm finds {} stretches held by a \
+             live install: {rescued:?}. The schedule has reached PROPOSED D-091's hold \
+             again on this seed, and this pin is upgraded to assert it, not left as an \
+             absence",
             rescued.len()
         );
-        let gap = rescued[0];
-        assert_eq!(
-            (gap.server, gap.range, gap.live_installs),
-            (server, range, 1),
-            "seed {seed}: the stretch moved off server {server}'s replica of range {range}, or \
-             holds more than the one live install: re-audit this pin against the entry"
-        );
-        // And it is the *only* thing that check finds on the seed, so the arm is seen
-        // to be exempting the hold and not more.
-        assert_eq!(
-            report.timer_gaps(raft::TimerResets::WITHOUT_LIVE_INSTALL),
-            rescued,
-            "seed {seed}: the check without the fourth arm finds a stretch this arm does not \
-             answer for, so the arm is exempting more than the live install's hold"
-        );
-        // The mechanism, off the trace: the install of that range was decided inside
-        // the window and its switch — where the replica is restored and restates —
-        // landed after the flag. That is the hold, and the flag fell inside it.
-        let decided = ananke_env::Instant::from_nanos(decided);
-        let switched = ananke_env::Instant::from_nanos(switched);
         assert!(
-            gap.since < decided && decided < gap.at && gap.at < switched,
-            "seed {seed}: the install was decided at {decided:?} and switched at {switched:?}, \
-             which no longer brackets the flag at {:?} inside the window since {:?}: the \
-             schedule moved and this pin is re-audited",
-            gap.at,
-            gap.since
+            report
+                .timer_gaps(raft::TimerResets::WITHOUT_LIVE_INSTALL)
+                .is_empty(),
+            "seed {seed}: the check without the fourth arm flags a stretch the arm does \
+             not answer for, and the replay under every arm did not: the arm is \
+             exempting more than a live install's hold"
         );
-        let held = report.records.iter().any(|record| {
-            record.decided == decided
-                && record.at == switched
-                && matches!(
+        // What the seed still does have, printed: live installs on the node, so the
+        // hold this arm is written for is exercised even where no stretch crosses the
+        // bound inside one.
+        let live_installs = report
+            .records
+            .iter()
+            .filter(|record| {
+                matches!(
                     &record.event,
-                    ananke_env::TraceEvent::RaftSnapshot {
-                        server: who,
-                        range: of,
-                        taken: false,
-                        ..
-                    } if *who == server && *of == range
+                    ananke_env::TraceEvent::RaftSnapshot { taken: false, .. }
                 )
-        });
-        assert!(
-            held,
-            "seed {seed}: no live install of range {range} on server {server} was decided at \
-             {decided:?} and switched at {switched:?}, so this is no longer the shape PROPOSED \
-             D-091's arm is written for"
-        );
-        // The restatement the hold closes on, at the switch: without it the replica
-        // would be out of the running set for the rest of the run.
-        let restated = report.records.iter().any(|record| {
-            record.at == switched
-                && matches!(
-                    &record.event,
-                    ananke_env::TraceEvent::RaftRecovered {
-                        server: who,
-                        range: of,
-                        ..
-                    } if *who == server && *of == range
-                )
-        });
-        assert!(
-            restated,
-            "seed {seed}: the restored replica of range {range} traced no restatement at the \
-             switch, so the hold has no close fence on this seed"
-        );
-        // And the leader was streaming it, which is why it heard nothing: the shape
-        // PROPOSED D-089's aim reaches.
-        let resumed = report.records.iter().any(|record| {
-            record.decided > gap.since
-                && record.decided <= gap.at
-                && matches!(
-                    &record.event,
-                    ananke_env::TraceEvent::RaftSnapshotResumed { to, range: of, .. }
-                        if *to == server && *of == range
-                )
-        });
-        assert!(
-            resumed,
-            "seed {seed}: the leader re-opened no stream of range {range} to server {server} \
-             inside the window: the replica was not being fed a snapshot and the gap is \
-             another shape"
+            })
+            .count();
+        println!(
+            "seed {seed}: no stretch held by a live install (PROPOSED D-096 moved the \
+             schedule off D-091's hold); {live_installs} live installs on the run"
         );
     }
 }
@@ -3586,8 +3596,16 @@ impl NodeMembershipCoverage {
                 "the node's membership runs never saw elections while joint: {self:?}"
             );
         }
-        let least = self.applies.values().copied().min().unwrap_or(0) as f64;
-        let busiest = self.applies.values().copied().max().unwrap_or(1).max(1) as f64;
+        // The spread is the user ranges' (PROPOSED D-096): the two system ranges apply
+        // their terms' no-ops and nothing else, and are printed with the rest.
+        let user_applies: Vec<usize> = self
+            .applies
+            .iter()
+            .filter(|(range, _)| ranges().contains(range))
+            .map(|(_, applies)| *applies)
+            .collect();
+        let least = user_applies.iter().copied().min().unwrap_or(0) as f64;
+        let busiest = user_applies.iter().copied().max().unwrap_or(1).max(1) as f64;
         assert!(
             least / busiest >= 0.5,
             "the least busy range applied {:.2} of the busiest range's entries, under the floor \
