@@ -101,6 +101,54 @@ ananke/
 
 _Update this section at the end of every session._
 
+- Branch `phase-3-stage-c-split` (2026-09-25), stacked on `phase-3-stage-c-range-ids`
+  (PR #135), PROPOSED D-100, **Stage C's split, the first of its four sub-slices:
+  proposed by a range's leader with an id from its node's block, re-checked and applied
+  by every replica in one batch, the right half's core started from its floor and
+  hurried to its first election, and check 18's split clause** (SHARD.md §5, Q18–Q21,
+  Q23, Q26; §8's check 18; §10's `IdBlockResumed` caught, `MetaOverwritesByArrival`
+  and `ApplyIgnoresSpan` alone reached). `Command::Split { key, right }` and
+  `Outcome::Refused(SplitRefusal)` on the wire; the proposal at the leader's receipt —
+  system range, a change under way (`Raft::changing`, Q23), not `Live`, the key outside
+  the span, no id in the block (PROPOSED D-092's A, as proposed) each refused with its
+  reason and no entry, a follower handing the ask to its core with no id taken — and
+  the apply on every replica: the re-check against shared state, one synced batch with
+  P's applied index and both halves' descriptors at g + 1, R's Raft state at the floor
+  `(s, 1)` on a voter of P's configuration at `s` and a range delete of the right span
+  on a replica that is not, `RangeSplit`, `RangeDescriptor`, `RangeCreated { split }`
+  traced, R's store opened beside P's, its core from `restore_compacted` handed to the
+  `raft` task as `Local::RangeAdded` and given `Input::Campaign` where the node led P
+  (Q21: the pre-vote now and every heartbeat interval while no leader is heard, a
+  candidacy waiting its timeout); the node's tables dynamic behind a lock, the
+  `snapshot` task's plan following both halves' spans; a restart reopening every group
+  the engine holds from its descriptor (`discover_ranges`, §5); the meta update for
+  both halves from the node that led P; check 18's split clause (`SplitLineage`) under
+  the range layer's checker; the sweep's `Fault::Split` on every node schedule and
+  `Fault::SplitFromRestarted`, §10's shape for `IdBlockResumed`, with the split's
+  coverage folded (`splits_of`). Five faults on the correct path found and fixed on the
+  way in (the entry's findings): the hurried pre-vote burning a term a heartbeat, a
+  restart not reopening a right half, the host keeping the old core on a right half's
+  install, an install of the parent writing over the right half's keys (a stale read
+  through R), a follower taking an id for a split it would not append, and D-099's
+  `meta` task numbering its requests from 0 at every start so a restarted node's refill
+  was dropped as a copy. Measured before asserted, at the gate's twenty: 31 splits took
+  effect, 62 right halves reopened by a restart, 129 installs onto a half after its
+  split; `IdBlockResumed` caught on 14 of 20 (12 by check 18) on the restarted
+  proposer's second split, asserted at every tier; `MetaOverwritesByArrival` 3 of 20 by
+  check 16, asserted from the thousand's share; `ApplyIgnoresSpan` alone 1 of 20 by
+  check 9 — 5 of 100 at the thousand, D-061's 5 % on the nose — asserted from the
+  nightly's share of a thousand. **Every node schedule moved**: seed 493's schedule
+  moved off D-099's hold, re-pinned as the absence with its reason, and **the thousand
+  names seed 633** of the three holds it counted, pinned in D-091's shape (server 2's
+  replica of range 0, the root).
+  The premerge is green at a thousand seeds in 2 447 s on this session's container
+  against D-099's 2 332, the node binary 1 010 s where it took 878 (two more arms on
+  every schedule), every rate tabled in the entry against D-099's: 1 630 splits took
+  effect, 101 072 writes through a right half, 3 906 right halves reopened, 7 989 halves
+  installed after their split, 101 writes refused at apply after a split; the restarted
+  proposer's second split done on 594 seeds; `IdBlockResumed` 71 of 100. The
+  placeholders (Q22), the overlap rule (Q27) and the split's other variants are
+  C5b–C5d's.
 - Branch `phase-3-stage-c-range-ids` (2026-09-25), stacked on `phase-3-stage-c-meta`
   (PR #134), PROPOSED D-099, **Stage C's range ids leased in blocks** (SHARD.md §5, Q17;
   §8's check 18, its range-id clause; §10's `IdBlockResumed`). `Command::Refill { node,

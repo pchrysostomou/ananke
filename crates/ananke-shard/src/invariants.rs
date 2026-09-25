@@ -43,7 +43,7 @@
 // PROPOSED(D-097): checks 7, 9, 10 and 17.
 // PROPOSED(D-098): check 16, and check 9's lookups.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound::{Excluded, Unbounded};
 
 use ananke_env::sim::TraceRecord;
@@ -383,8 +383,8 @@ impl GenerationsRise {
 pub struct IdsUnique {
     /// The grant at each index of range 0 by its first apply: node, run, first, last.
     granted: BTreeMap<u64, (u64, u64, u64, u64)>,
-    /// Every block granted, its first id to its last.
-    blocks: BTreeMap<u64, u64>,
+    /// Every block granted, its first id to its last and the node it went to.
+    blocks: BTreeMap<u64, (u64, u64)>,
     violation: Option<String>,
 }
 
@@ -425,7 +425,7 @@ impl IdsUnique {
             ));
             return;
         }
-        if let Some((held_first, held_last)) = self.blocks.range(..=*last).next_back()
+        if let Some((held_first, (held_last, _))) = self.blocks.range(..=*last).next_back()
             && *held_last >= *first
         {
             self.violation = Some(format!(
@@ -435,13 +435,290 @@ impl IdsUnique {
             ));
             return;
         }
-        self.blocks.insert(*first, *last);
+        self.blocks.insert(*first, (*last, *node));
     }
 
-    /// The blocks granted so far, first id to last, by first apply.
+    /// The blocks granted so far, by first apply: first id to (last id, node).
     #[must_use]
-    pub fn blocks(&self) -> &BTreeMap<u64, u64> {
+    pub fn blocks(&self) -> &BTreeMap<u64, (u64, u64)> {
         &self.blocks
+    }
+
+    /// The node the block holding `id` was granted to, if a block holds it.
+    #[must_use]
+    pub fn holder_of(&self, id: u64) -> Option<u64> {
+        self.blocks
+            .range(..=id)
+            .next_back()
+            .filter(|(_, (last, _))| *last >= id)
+            .map(|(_, (_, node))| *node)
+    }
+
+    /// The first violation.
+    ///
+    /// # Errors
+    ///
+    /// The violation, in words naming it.
+    pub fn verdict(&self) -> Result<(), String> {
+        self.violation.clone().map_or(Ok(()), Err)
+    }
+}
+
+/// Check 18's split clause (SHARD.md §8; §5), at the first apply of each split: with
+/// P's descriptor before `s` `[x, y)` at g, P's value at `s` is `[x, k)` at g + 1 with
+/// P's voters; R's `RangeCreated { cause: split }` is `[k, y)` at g + 1 with the voters
+/// of P's plain configuration in force at `s`, floor index `s` and floor term 1 (Q20);
+/// R is fresh — no `RangeCreated` of R and no `RangeSplit` naming R before that split's
+/// first `RangeSplit` — and R lies in a block a `RangeIdsLeased` traced before it
+/// granted to the node that led P in the split entry's term (Q17). Every replica's
+/// `RangeSplit` of (P, `s`) names the same right half and key.
+// PROPOSED(D-100)
+#[derive(Clone, Debug, Default)]
+pub struct SplitLineage {
+    /// Each range's configuration entries by index: whether joint, and the voters.
+    configs: BTreeMap<u64, BTreeMap<u64, (bool, Vec<u64>)>>,
+    /// The leader of each (range, term).
+    leaders: BTreeMap<(u64, u64), u64>,
+    /// Ranges a `RangeCreated` or a `RangeSplit` has named.
+    named: BTreeSet<u64>,
+    /// The first `RangeSplit` of each (parent, index): the right half and the key.
+    splits: BTreeMap<(u64, u64), (u64, Bytes)>,
+    /// Splits whose values await the first `RaftApply` of (parent, index), which
+    /// carries the split entry's term: (parent, index) to the right half.
+    pending: BTreeMap<(u64, u64), u64>,
+    /// The right halves' creations seen: right to (parent, floor index, floor term).
+    creations: BTreeMap<u64, (Option<u64>, u64, u64)>,
+    violation: Option<String>,
+}
+
+impl SplitLineage {
+    fn fail(&mut self, what: String) {
+        if self.violation.is_none() {
+            self.violation = Some(format!("descriptor lineage: {what}"));
+        }
+    }
+
+    /// The voters of `range`'s latest configuration at or below `index`, and whether
+    /// it is joint.
+    fn config_at(&self, range: u64, index: u64) -> Option<(bool, Vec<u64>)> {
+        self.configs
+            .get(&range)?
+            .range(..=index)
+            .next_back()
+            .map(|(_, config)| config.clone())
+    }
+
+    /// Folds one record against check 7's map and check 18's range-id clause as they
+    /// stand.
+    pub fn push(&mut self, record: &TraceRecord, descriptors: &Descriptors, ids: &IdsUnique) {
+        if self.violation.is_some() {
+            return;
+        }
+        let node = record.node.map(|node| u64::from(node.get()));
+        match &record.event {
+            TraceEvent::RaftConfig {
+                range,
+                index,
+                old,
+                joint,
+                ..
+            } => {
+                self.configs
+                    .entry(*range)
+                    .or_default()
+                    .entry(*index)
+                    .or_insert_with(|| (*joint, old.clone()));
+            }
+            TraceEvent::RaftLeader {
+                server,
+                range,
+                term,
+                ..
+            } => {
+                self.leaders.entry((*range, *term)).or_insert(*server);
+            }
+            TraceEvent::RangeCreated {
+                range,
+                cause,
+                parent,
+                floor_index,
+                floor_term,
+                ..
+            } => {
+                if *cause == RangeCause::Split {
+                    self.creations
+                        .entry(*range)
+                        .or_insert((*parent, *floor_index, *floor_term));
+                } else {
+                    self.named.insert(*range);
+                }
+            }
+            TraceEvent::RangeSplit {
+                range,
+                right,
+                key,
+                index,
+            } => {
+                if let Some((agreed_right, agreed_key)) = self.splits.get(&(*range, *index)) {
+                    if (*agreed_right, agreed_key) != (*right, key) {
+                        self.fail(format!(
+                            "node {node:?}'s replica of range {range} split at index {index} \
+                             with right half {right} at {key:?}, where the first apply of that \
+                             split had right half {agreed_right} at {agreed_key:?}"
+                        ));
+                    }
+                    return;
+                }
+                if self.named.contains(right) {
+                    self.fail(format!(
+                        "range {range}'s split at index {index} names right half {right}, \
+                         which a creation or a split had named before it (SHARD.md §5, Q17: \
+                         the right half's id is fresh)"
+                    ));
+                    return;
+                }
+                self.named.insert(*range);
+                self.named.insert(*right);
+                self.splits.insert((*range, *index), (*right, key.clone()));
+                self.pending.insert((*range, *index), *right);
+            }
+            TraceEvent::RaftApply {
+                range,
+                index,
+                entry_term,
+                effect,
+                ..
+            } => {
+                let Some(right) = self.pending.remove(&(*range, *index)) else {
+                    return;
+                };
+                if *effect != ApplyEffect::Took {
+                    self.fail(format!(
+                        "range {range}'s split at index {index} was traced and its apply's \
+                         effect is {effect:?}, not `took`"
+                    ));
+                    return;
+                }
+                let Some((_, key)) = self.splits.get(&(*range, *index)) else {
+                    return;
+                };
+                let key = key.clone();
+                self.check_values(*range, *index, right, &key, *entry_term, descriptors, ids);
+            }
+            _ => {}
+        }
+    }
+
+    /// The values a split leaves, checked at its first apply (SHARD.md §8, check 18).
+    #[allow(clippy::too_many_arguments)]
+    fn check_values(
+        &mut self,
+        parent: u64,
+        index: u64,
+        right: u64,
+        key: &Bytes,
+        term: u64,
+        descriptors: &Descriptors,
+        ids: &IdsUnique,
+    ) {
+        let Some(before) = descriptors.before(parent, index).cloned() else {
+            self.fail(format!(
+                "range {parent} split at index {index} with no descriptor in force before it"
+            ));
+            return;
+        };
+        let Some(left) = descriptors.at(parent, index).cloned() else {
+            self.fail(format!(
+                "range {parent} split at index {index} and traced no descriptor of its own \
+                 at that index"
+            ));
+            return;
+        };
+        let expected_left = Held {
+            start: before.start.clone(),
+            end: key.clone(),
+            generation: before.generation + 1,
+            voters: before.voters.clone(),
+            state: before.state,
+        };
+        if left != expected_left {
+            self.fail(format!(
+                "range {parent}'s value at its split's index {index} is {left:?}, where \
+                 {expected_left:?} is what the split leaves (SHARD.md §5)"
+            ));
+            return;
+        }
+        let Some((plain, voters)) = self
+            .config_at(parent, index)
+            .filter(|(joint, _)| !joint)
+            .map(|(joint, voters)| (!joint, voters))
+        else {
+            self.fail(format!(
+                "range {parent}'s split at index {index} took effect with no plain \
+                 configuration in force at or below it (Q23)"
+            ));
+            return;
+        };
+        debug_assert!(plain);
+        let Some(created) = descriptors.at(right, index).cloned() else {
+            self.fail(format!(
+                "range {parent}'s split at index {index} traced no creation of its right \
+                 half {right} at that index"
+            ));
+            return;
+        };
+        let expected_right = Held {
+            start: key.clone(),
+            end: before.end.clone(),
+            generation: before.generation + 1,
+            voters,
+            state: RangeState::Live,
+        };
+        if created != expected_right {
+            self.fail(format!(
+                "right half {right}'s creation at index {index} is {created:?}, where \
+                 {expected_right:?} is what range {parent}'s split leaves (SHARD.md §5)"
+            ));
+            return;
+        }
+        match self.creations.get(&right) {
+            Some((parent_named, floor_index, floor_term))
+                if *parent_named == Some(parent) && *floor_index == index && *floor_term == 1 => {}
+            Some((parent_named, floor_index, floor_term)) => {
+                self.fail(format!(
+                    "right half {right}'s creation names parent {parent_named:?} and floor \
+                     ({floor_index}, {floor_term}), where the split of range {parent} at \
+                     index {index} leaves ({index}, 1) (Q20)"
+                ));
+                return;
+            }
+            None => {
+                self.fail(format!(
+                    "right half {right} of range {parent}'s split at index {index} traced no \
+                     `RangeCreated`"
+                ));
+                return;
+            }
+        }
+        let Some(leader) = self.leaders.get(&(parent, term)).copied() else {
+            self.fail(format!(
+                "range {parent}'s split at index {index} was proposed in term {term}, whose \
+                 leader traced no `RaftLeader`"
+            ));
+            return;
+        };
+        match ids.holder_of(right) {
+            Some(holder) if holder == leader => {}
+            Some(holder) => self.fail(format!(
+                "right half {right} of range {parent}'s split at index {index} lies in a \
+                 block granted to node {holder}, where node {leader} led range {parent} in \
+                 the split entry's term {term} (SHARD.md §5, Q17)"
+            )),
+            None => self.fail(format!(
+                "right half {right} of range {parent}'s split at index {index} lies in no \
+                 block a `RangeIdsLeased` granted before it (SHARD.md §5, Q17)"
+            )),
+        }
     }
 
     /// The first violation.
@@ -656,6 +933,7 @@ pub struct Checker {
     meta: MetaNeverGoesBack,
     refreshes: ClientRefreshes,
     ids: IdsUnique,
+    lineage: SplitLineage,
 }
 
 impl Checker {
@@ -679,6 +957,7 @@ impl Checker {
         self.meta.push(record, &self.descriptors);
         self.refreshes.push(record);
         self.ids.push(record);
+        self.lineage.push(record, &self.descriptors, &self.ids);
     }
 
     /// Folds records in order.
@@ -705,7 +984,8 @@ impl Checker {
         self.generations.verdict()?;
         self.meta.verdict()?;
         self.refreshes.verdict()?;
-        self.ids.verdict()
+        self.ids.verdict()?;
+        self.lineage.verdict()
     }
 }
 
@@ -987,6 +1267,8 @@ mod tests {
         checker.push(&leased(3, 1, 7, 3, 10, 1));
         assert!(checker.verdict().is_ok(), "{:?}", checker.verdict());
         assert_eq!(checker.ids.blocks().len(), 3);
+        assert_eq!(checker.ids.holder_of(12), Some(2));
+        assert_eq!(checker.ids.holder_of(27), None);
     }
 
     #[test]
@@ -1018,6 +1300,152 @@ mod tests {
         let mut empty = Checker::new(true);
         empty.push(&leased(1, 1, 7, 5, 4, 1));
         assert!(empty.verdict().is_err());
+    }
+
+    /// The records a split of range `parent` at `index` with key `key` and right half
+    /// `right` leaves on node `on`, in the order the apply traces them (SHARD.md §5):
+    /// `RangeSplit`, the parent's `RangeDescriptor`, the right half's `RangeCreated`
+    /// and the entry's `RaftApply` in `term`.
+    #[allow(clippy::too_many_arguments)]
+    fn split_records(
+        on: u64,
+        parent: u64,
+        index: u64,
+        term: u64,
+        key: &[u8],
+        start: &[u8],
+        end: &[u8],
+        generation: u64,
+        right: u64,
+    ) -> Vec<TraceRecord> {
+        vec![
+            record(
+                on,
+                TraceEvent::RangeSplit {
+                    range: parent,
+                    right,
+                    key: user_key(key),
+                    index,
+                },
+            ),
+            record(
+                on,
+                TraceEvent::RangeDescriptor {
+                    range: parent,
+                    index,
+                    applied: index,
+                    start: user_key(start),
+                    end: user_key(key),
+                    generation: generation + 1,
+                    voters: vec![1, 2, 3],
+                    state: RangeState::Live,
+                },
+            ),
+            record(
+                on,
+                TraceEvent::RangeCreated {
+                    range: right,
+                    cause: RangeCause::Split,
+                    parent: Some(parent),
+                    start: user_key(key),
+                    end: user_key(end),
+                    generation: generation + 1,
+                    voters: vec![1, 2, 3],
+                    floor_index: index,
+                    floor_term: 1,
+                    incarnation: 5,
+                },
+            ),
+            record(
+                on,
+                TraceEvent::RaftApply {
+                    server: on,
+                    range: parent,
+                    index,
+                    entry_term: term,
+                    hash: 0,
+                    key: None,
+                    effect: ApplyEffect::Took,
+                },
+            ),
+        ]
+    }
+
+    /// The records before a split: the parent's bootstrap creation, its plain
+    /// configuration at index 0, its leader in term 2 on node 1, and node 1's block
+    /// of ids 6 to 13.
+    fn before_a_split() -> Vec<TraceRecord> {
+        let mut records = vec![created(1, 2, b"a", b"z", 1, &[1, 2, 3])];
+        records.push(record(
+            1,
+            TraceEvent::RaftConfig {
+                server: 1,
+                range: 2,
+                index: 0,
+                old: vec![1, 2, 3],
+                new: vec![],
+                joint: false,
+                learners: vec![],
+            },
+        ));
+        records.push(record(
+            1,
+            TraceEvent::RaftLeader {
+                server: 1,
+                range: 2,
+                term: 2,
+                last_index: 8,
+            },
+        ));
+        records.push(leased(1, 1, 7, 6, 13, 1));
+        records
+    }
+
+    #[test]
+    fn a_split_in_shape_passes_check_18_on_every_replica() {
+        let mut checker = Checker::new(true);
+        checker.extend(&before_a_split());
+        checker.extend(&split_records(1, 2, 9, 2, b"m", b"a", b"z", 1, 6));
+        checker.extend(&split_records(2, 2, 9, 2, b"m", b"a", b"z", 1, 6));
+        assert!(checker.verdict().is_ok(), "{:?}", checker.verdict());
+        assert_eq!(
+            checker.descriptors().at(6, 9).map(|held| held.generation),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn a_right_half_outside_the_leaders_block_is_caught() {
+        let mut checker = Checker::new(true);
+        checker.extend(&before_a_split());
+        checker.extend(&split_records(1, 2, 9, 2, b"m", b"a", b"z", 1, 20));
+        let verdict = checker.verdict().unwrap_err();
+        assert!(verdict.contains("lies in no block"), "{verdict}");
+        let mut other = Checker::new(true);
+        other.extend(&before_a_split());
+        other.push(&leased(1, 2, 9, 14, 21, 2));
+        other.extend(&split_records(1, 2, 9, 2, b"m", b"a", b"z", 1, 14));
+        let verdict = other.verdict().unwrap_err();
+        assert!(verdict.contains("granted to node 2"), "{verdict}");
+    }
+
+    #[test]
+    fn a_right_half_named_before_and_a_wrong_generation_are_caught() {
+        let mut checker = Checker::new(true);
+        checker.extend(&before_a_split());
+        checker.push(&created(1, 6, b"x", b"y", 1, &[1, 2, 3]));
+        checker.extend(&split_records(1, 2, 9, 2, b"m", b"a", b"z", 1, 6));
+        let verdict = checker.verdict().unwrap_err();
+        assert!(verdict.contains("had named before it"), "{verdict}");
+        let mut wrong = Checker::new(true);
+        wrong.extend(&before_a_split());
+        let mut records = split_records(1, 2, 9, 2, b"m", b"a", b"z", 1, 6);
+        if let TraceEvent::RangeDescriptor { generation, .. } = &mut records[1].event {
+            *generation = 1;
+        }
+        wrong.extend(&records);
+        let verdict = wrong.verdict().unwrap_err();
+        assert!(verdict.contains("is what the split leaves"), "{verdict}");
     }
 
     fn meta_applied(node: u64, index: u64, named: Vec<Named<'_>>) -> TraceRecord {

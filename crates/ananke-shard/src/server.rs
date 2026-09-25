@@ -49,15 +49,16 @@ use ananke_env::{
     ApplyEffect, FileSystem, MetaDescriptor, MismatchAt, RangeCause, RangeState, RecoveredAs,
 };
 use ananke_env::{Clock, Decision, Either, Environment, Network, Rng, Socket, TraceEvent, race};
-use ananke_raft::apply::{Command, Outcome, apply_command, user_key};
+use ananke_raft::apply::{Command, Outcome, SplitRefusal, apply_command, user_key, user_key_of};
 use ananke_raft::client::{Reply, Request, Response};
-use ananke_raft::core::{RaftConfig, SnapshotAction, Variant, Variants};
+use ananke_raft::core::{RaftConfig, Role, SnapshotAction, Variant, Variants};
 use ananke_raft::node::{Start, StartOrder, start_store};
 use ananke_raft::queue::Queue;
 use ananke_raft::snapshot::Repair;
 use ananke_raft::store::{
-    FIRST_INCARNATION, KeyPrefix, PURPOSE_CONFIG, PURPOSE_LOG, PURPOSE_META, RaftStore, Recovered,
-    SnapshotRecord, initial_state_into, is_marked_lost, mark_store_lost,
+    FIRST_INCARNATION, KeyPrefix, PURPOSE_CONFIG, PURPOSE_LOG, PURPOSE_META, RAFT_TENANT,
+    RaftStore, Recovered, SnapshotRecord, initial_state_into, is_marked_lost, key, mark_store_lost,
+    split_state_into,
 };
 use ananke_raft::types::{Configuration, Entry, Index, Payload, ServerId, Term};
 use ananke_raft::{Input, Message, Persist, Raft};
@@ -545,6 +546,48 @@ pub enum MetaJob {
     },
 }
 
+/// The ranges the engine holds beyond the ones `named` — a split's right half, whose
+/// state and descriptor the split's apply wrote and no configuration names (SHARD.md
+/// §5): one bounded seek per group present in tenant 0 (D-055), each read back from
+/// its descriptor. A group without a descriptor is not a range and is not opened.
+// PROPOSED(D-100)
+async fn discover_ranges<E: Environment>(
+    engine: &ananke_storage::Engine<E>,
+    named: &[Range],
+) -> io::Result<Vec<Range>> {
+    let version = engine.snapshot();
+    let end = key(RAFT_TENANT + 1, 0, &[]);
+    let mut from = key(RAFT_TENANT, 0, &[]);
+    let mut found = Vec::new();
+    while from < end {
+        let hit = engine.seek(&from[..]..&end[..], 1, &version).await?;
+        let Some((first, _)) = hit.into_iter().next() else {
+            break;
+        };
+        let group = u64::from_be_bytes(first[8..16].try_into().expect("eight bytes"));
+        let prefix = KeyPrefix::group(group);
+        let id = RangeId(group);
+        from = prefix.span().end;
+        if !named.iter().any(|range| range.id == id)
+            && let Some(bytes) = engine.get_at(&prefix.descriptor_key(), &version).await?
+            && let Ok(descriptor) = RangeDescriptor::decode(bytes)
+        {
+            let (start, end) = if id.get() < FIRST_USER_RANGE {
+                (descriptor.start, descriptor.end)
+            } else {
+                match (user_key_of(&descriptor.start), user_key_of(&descriptor.end)) {
+                    (Some(start), Some(end)) => {
+                        (Bytes::copy_from_slice(start), Bytes::copy_from_slice(end))
+                    }
+                    _ => continue,
+                }
+            };
+            found.push(Range { id, start, end });
+        }
+    }
+    Ok(found)
+}
+
 /// The client id the node's `meta` task sends under: above every process id a
 /// scenario's clients draw, and the node's own.
 // PROPOSED(D-098)
@@ -576,6 +619,17 @@ pub enum Local {
     // PROPOSED(D-083): the `snapshot` task answers the cores the way the `apply` task
     // does, through the node's one queue of local inputs.
     Snapshot(SnapAnswer),
+    /// A split's apply created the right half here: its core, built by the `apply`
+    /// task from the state the apply wrote, takes its place on the node (SHARD.md
+    /// §5; PROPOSED D-100).
+    RangeAdded {
+        /// The right half.
+        range: RangeId,
+        /// The range it split from.
+        parent: RangeId,
+        /// Its core, restored from the split's floor.
+        core: Box<Raft>,
+    },
 }
 
 /// The node's host: its socket, its engine, and a store and a replica per range.
@@ -584,8 +638,8 @@ pub struct ServerHost<E: Environment> {
     id: ServerId,
     sock: Arc<<E::Net as Network>::Socket>,
     addrs: BTreeMap<ServerId, SocketAddr>,
-    stores: BTreeMap<RangeId, Arc<RaftStore<E>>>,
-    replicas: BTreeMap<RangeId, Arc<Mutex<Replica>>>,
+    stores: Arc<Mutex<BTreeMap<RangeId, Arc<RaftStore<E>>>>>,
+    replicas: Arc<Mutex<BTreeMap<RangeId, Arc<Mutex<Replica>>>>>,
     jobs: Queue<ApplyJob>,
     /// The answers the `raft` task owes clients, sent by the node's `answers` task.
     ///
@@ -655,7 +709,7 @@ pub struct ServerHost<E: Environment> {
     applied: Arc<Mutex<BTreeMap<RangeId, Applied>>>,
 }
 
-fn lock<T>(what: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+pub(crate) fn lock<T>(what: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     // A panic under a lock would poison it; nothing here panics under one, and a
     // poisoned lock is taken anyway rather than crashing the node, as the server's
     // own `lock_pending` does.
@@ -670,8 +724,8 @@ impl<E: Environment> ServerHost<E> {
         *lock(&self.gaps)
     }
 
-    fn replica(&self, range: RangeId) -> Option<&Arc<Mutex<Replica>>> {
-        self.replicas.get(&range)
+    fn replica(&self, range: RangeId) -> Option<Arc<Mutex<Replica>>> {
+        lock(&self.replicas).get(&range).cloned()
     }
 
     /// A core of `range` sends an `AppendEntries` of `term`: it leads, and if this
@@ -791,7 +845,7 @@ impl<E: Environment> ServerHost<E> {
     async fn answer_read(&self, range: RangeId, id: u64, reply: Reply) {
         let waiting = self
             .replica(range)
-            .and_then(|replica| lock(replica).reads.remove(&id));
+            .and_then(|replica| lock(&replica).reads.remove(&id));
         if let Some((from, request)) = waiting {
             self.answer(range, from, request.client, request.seq, reply)
                 .await;
@@ -826,9 +880,9 @@ impl<E: Environment> ServerHost<E> {
             // An install into a live store keeps its incarnation: the kept tail is
             // everything acknowledged past the snapshot, so nothing a leader matched
             // is lost (D-042).
-            incarnation: self
-                .stores
+            incarnation: lock(&self.stores)
                 .get(&range)
+                .cloned()
                 .map_or(FIRST_INCARNATION, |store| store.incarnation()),
         }
     }
@@ -850,7 +904,14 @@ impl<E: Environment> ServerHost<E> {
         at: &Identity,
         config: &Configuration,
     ) -> Option<Raft> {
-        let span = self.ranges.iter().find(|r| r.id == range)?;
+        // The switched range's span: its descriptor as the host holds it, which a
+        // split's right half has and configuration never names (PROPOSED D-100), and
+        // for a replica without one — a re-seed's, before its install — the hosted
+        // list's (PROPOSED D-098).
+        let span: KeyRange<Bytes> = lock(&self.descriptors)
+            .get(&range)
+            .map(|descriptor| descriptor.start.clone()..descriptor.end.clone())
+            .or_else(|| self.ranges.iter().find(|r| r.id == range).map(Range::span))?;
         let tail: Vec<Entry> = if core.term_at(at.last_index) == Some(at.last_term) {
             (at.last_index + 1..=core.last_index())
                 .filter_map(|index| core.entry(index).cloned())
@@ -902,7 +963,7 @@ impl<E: Environment> ServerHost<E> {
         // And the store's own caches, for the same reason one layer down: the switch
         // wrote this range's hard state, log bounds and applied index without passing
         // through `persist` or `apply`, which are what keep them (PROPOSED D-086).
-        if let Some(store) = self.stores.get(&range) {
+        if let Some(store) = lock(&self.stores).get(&range).cloned() {
             store.restate_after_install(
                 restored.term(),
                 restored.vote(),
@@ -915,20 +976,19 @@ impl<E: Environment> ServerHost<E> {
             // The span encoded, as every other creation traces it (D-096); D-096's
             // own install creation traced the configured keys raw, which check 7 saw
             // the first time it was folded over a re-seed (PROPOSED D-098).
-            let encoded = span.span();
             self.env.trace(TraceEvent::RangeCreated {
                 range: range.get(),
                 cause: RangeCause::Snapshot,
                 parent: None,
-                start: encoded.start,
-                end: encoded.end,
+                start: span.start.clone(),
+                end: span.end.clone(),
                 generation: FIRST_GENERATION,
                 voters: config.voters.iter().map(|voter| voter.0).collect(),
                 floor_index: at.last_index,
                 floor_term: at.last_term,
-                incarnation: self
-                    .stores
+                incarnation: lock(&self.stores)
                     .get(&range)
+                    .cloned()
                     .map_or(FIRST_INCARNATION, |store| store.incarnation()),
             });
         }
@@ -947,9 +1007,9 @@ impl<E: Environment> ServerHost<E> {
             term: restored.term(),
             applied: at.last_index,
             last_index: restored.last_index(),
-            incarnation: self
-                .stores
+            incarnation: lock(&self.stores)
                 .get(&range)
+                .cloned()
                 .map_or(FIRST_INCARNATION, |store| store.incarnation()),
             // The install has filled it: a quarantined replica here is one the
             // re-seed marked and the stream then gave state to, which is
@@ -970,14 +1030,52 @@ impl<E: Environment> Host for ServerHost<E> {
 
     fn local_range(&self, local: &Self::Local) -> RangeId {
         match local {
-            Local::Request { range, .. } | Local::Applied { range, .. } => *range,
+            Local::Request { range, .. }
+            | Local::Applied { range, .. }
+            | Local::RangeAdded { range, .. } => *range,
             Local::Snapshot(answer) => answer.range(),
+        }
+    }
+
+    fn local_insert(&self, local: &Self::Local) -> Option<(Box<Raft>, RangeId)> {
+        match local {
+            Local::RangeAdded { core, parent, .. } => Some((core.clone(), *parent)),
+            _ => None,
+        }
+    }
+
+    /// The right half is on the node: the `snapshot` task hosts its spans, and where
+    /// this node's parent leads, both halves' new descriptors go to the meta range
+    /// (SHARD.md §1, §5; PROPOSED D-100). A leader of the right half tells meta again
+    /// when it takes office, so a node that did not lead the parent sends nothing.
+    fn range_added(&self, range: RangeId, parent: RangeId, led: bool) {
+        let span = lock(&self.descriptors)
+            .get(&range)
+            .map(|descriptor| descriptor.start.clone()..descriptor.end.clone());
+        self.snaps.push(SnapJob::Host {
+            range,
+            spans: vec![
+                KeyPrefix::group(range.get()).span(),
+                span.unwrap_or_else(|| KeyPrefix::group(range.get()).span()),
+            ],
+        });
+        if led {
+            let held = lock(&self.descriptors);
+            for id in [parent, range] {
+                if let Some(descriptor) = held.get(&id).cloned() {
+                    self.meta.push(MetaJob::Send {
+                        range: id,
+                        descriptor,
+                    });
+                }
+            }
         }
     }
 
     fn local_input(&self, local: Self::Local, core: &Raft) -> Option<Input> {
         let (range, from, request) = match local {
             Local::Applied { index, .. } => return Some(Input::Applied(index)),
+            Local::RangeAdded { .. } => return None,
             // The four answers that are a step of the range's core, as the `apply`
             // task's `Applied` is. The other three are not inputs at all and were
             // taken by `local_core` before this was reached.
@@ -1057,7 +1155,7 @@ impl<E: Environment> Host for ServerHost<E> {
                 return None;
             }
         }
-        let mut state = lock(replica);
+        let mut state = lock(&replica);
         match &request.command {
             // An operator's wish, acted on at once and answered at once.
             Command::Transfer { to } => {
@@ -1141,6 +1239,85 @@ impl<E: Environment> Host for ServerHost<E> {
                     now: now_nanos(&self.env),
                 })
             }
+            // A split's proposal (SHARD.md §5; PROPOSED D-100): the leader's checks,
+            // for liveness only — a user range, the key strictly inside the span of
+            // the descriptor this node holds, that descriptor `Live` — and the right
+            // half's id taken from the node's block. With no id left the split is
+            // refused `NoRangeId`, as Stage C's question 1 proposes (PROPOSED D-092,
+            // A), and the asker retries; the block's refill is already outstanding.
+            // What the leader cannot see here — the configuration plain, no change in
+            // flight — every replica re-checks at the apply (Q23). A copy of a split
+            // whose entry is in the log is answered when that entry applies, once.
+            Command::Split { key, .. } => {
+                if let Some(&(index, term)) = state.proposed.get(&(request.client, request.seq))
+                    && core.term_at(index) == Some(term)
+                {
+                    return None;
+                }
+                if core.role() != Role::Leader {
+                    // Not this node's to propose: the core answers as it answers any
+                    // proposal a follower is handed, with the leader it knows, and no
+                    // id is taken for a split that will not be appended (SHARD.md §5;
+                    // PROPOSED D-100).
+                    state.in_flight = Some(InFlight::Propose {
+                        from,
+                        client: request.client,
+                        seq: request.seq,
+                    });
+                    return Some(Input::Propose(request.command.encode()));
+                }
+                let cut = user_key(key);
+                let held = lock(&self.descriptors).get(&range).cloned();
+                let refused = if range == ROOT_RANGE || range == META_RANGE {
+                    Some(SplitRefusal::SystemRange)
+                } else if core.changing() {
+                    // Q23: a split is refused at proposal while a change is under way
+                    // — servers catching up as learners, or the joint configuration in
+                    // force — so that a split's right half inherits a plain
+                    // configuration and a learner does not replay the split.
+                    Some(SplitRefusal::ConfigurationChanging)
+                } else {
+                    match &held {
+                        Some(own) if own.state != RangeState::Live => Some(SplitRefusal::NotLive),
+                        Some(own) if !(own.start < cut && cut < own.end) => {
+                            Some(SplitRefusal::KeyOutsideSpan)
+                        }
+                        Some(_) => None,
+                        None => Some(SplitRefusal::NotLive),
+                    }
+                };
+                let right = if refused.is_none() {
+                    lock(&self.ids).take()
+                } else {
+                    None
+                };
+                let refused = refused.or(right.is_none().then_some(SplitRefusal::NoRangeId));
+                if let Some(reason) = refused {
+                    drop(state);
+                    self.answer_later(
+                        range,
+                        from,
+                        request.client,
+                        request.seq,
+                        Reply::Outcome(Outcome::Refused(reason)),
+                    );
+                    return None;
+                }
+                self.refill_if_needed();
+                let right = right.expect("an id was taken");
+                state.in_flight = Some(InFlight::Propose {
+                    from,
+                    client: request.client,
+                    seq: request.seq,
+                });
+                Some(Input::Propose(
+                    Command::Split {
+                        key: key.clone(),
+                        right,
+                    }
+                    .encode(),
+                ))
+            }
             _ => {
                 if let Some(&(index, term)) = state.proposed.get(&(request.client, request.seq))
                     && core.term_at(index) == Some(term)
@@ -1215,7 +1392,7 @@ impl<E: Environment> Host for ServerHost<E> {
         let Some(replica) = self.replica(range) else {
             return;
         };
-        let mut state = lock(replica);
+        let mut state = lock(&replica);
         // A rejection took the in-flight work already (`rejected`), so what is left
         // here was accepted.
         let Some(in_flight) = state.in_flight.take() else {
@@ -1262,10 +1439,10 @@ impl<E: Environment> Host for ServerHost<E> {
     }
 
     fn persist(&self, range: RangeId, persist: Persist) -> BoxedPersist {
-        let Some(store) = self.stores.get(&range).cloned() else {
+        let Some(store) = lock(&self.stores).get(&range).cloned() else {
             return Box::pin(async { Ok(()) });
         };
-        let replica = self.replica(range).cloned();
+        let replica = self.replica(range);
         let jobs = self.jobs.clone();
         let apply_before_commit = self.variants.contains(Variant::ApplyBeforeCommit);
         Box::pin(async move {
@@ -1289,9 +1466,9 @@ impl<E: Environment> Host for ServerHost<E> {
     }
 
     fn stamp(&self, range: RangeId, message: &mut Message) {
-        let incarnation = self
-            .stores
+        let incarnation = lock(&self.stores)
             .get(&range)
+            .cloned()
             .map_or(0, |store| store.incarnation());
         match message {
             Message::AppendEntries { sent, term, .. } => {
@@ -1329,14 +1506,14 @@ impl<E: Environment> Host for ServerHost<E> {
         lease: bool,
     ) -> Boxed<'_, io::Result<()>> {
         Box::pin(async move {
-            let Some(store) = self.stores.get(&range) else {
+            let Some(store) = lock(&self.stores).get(&range).cloned() else {
                 return Ok(());
             };
             let command = {
                 let Some(replica) = self.replica(range) else {
                     return Ok(());
                 };
-                let state = lock(replica);
+                let state = lock(&replica);
                 match state.reads.get(&id) {
                     Some((_, request)) => request.command.clone(),
                     None => return Ok(()),
@@ -1406,7 +1583,7 @@ impl<E: Environment> Host for ServerHost<E> {
                 let descriptors = descriptors_for(&lock(&self.descriptors), Some(&own), &encoded);
                 let waiting = self
                     .replica(range)
-                    .and_then(|replica| lock(replica).reads.remove(&id));
+                    .and_then(|replica| lock(&replica).reads.remove(&id));
                 if let Some((from, request)) = waiting {
                     self.env.trace(TraceEvent::RangeMismatchSent {
                         range: range.get(),
@@ -1468,7 +1645,7 @@ impl<E: Environment> Host for ServerHost<E> {
         // slice's first job (D-076); what is fixed here is the entry left behind,
         // which is a standing failure and not a latency wart.
         let (taken, outstanding, high_water) = {
-            let mut state = lock(replica);
+            let mut state = lock(&replica);
             let taken = state.refuse(self.node.contains(NodeVariant::RefusedReadLeft));
             let (outstanding, high_water) = state.reads_held();
             (taken, outstanding, high_water)
@@ -1528,11 +1705,10 @@ struct ServerApplier<E: Environment> {
     env: E,
     id: ServerId,
     sock: Arc<<E::Net as Network>::Socket>,
-    stores: BTreeMap<RangeId, Arc<RaftStore<E>>>,
-    replicas: BTreeMap<RangeId, Arc<Mutex<Replica>>>,
+    stores: Arc<Mutex<BTreeMap<RangeId, Arc<RaftStore<E>>>>>,
+    replicas: Arc<Mutex<BTreeMap<RangeId, Arc<Mutex<Replica>>>>>,
     local: Queue<Local>,
     snaps: Queue<SnapJob>,
-    ranges: Vec<Range>,
     engine_dir: PathBuf,
     node_variants: NodeVariants,
     /// The cores' variants: read here for Phase 2's `SharedSnapshotDir`, whose bit
@@ -1549,9 +1725,212 @@ struct ServerApplier<E: Environment> {
     /// The block of range ids a refill grants (SHARD.md §5, Q17).
     // PROPOSED(D-099)
     id_block: u64,
+    /// The cores' parameters, for the right half's core at a split (PROPOSED D-100).
+    raft: RaftConfig,
 }
 
 impl<E: Environment> ServerApplier<E> {
+    /// The range's span, from its descriptor as the host holds it.
+    fn span_of(&self, range: RangeId) -> Option<std::ops::Range<Bytes>> {
+        lock(&self.descriptors)
+            .get(&range)
+            .map(|descriptor| descriptor.start.clone()..descriptor.end.clone())
+    }
+
+    /// The split's apply on this replica of `range`, at `index`, cutting at `key` with
+    /// `right` the right half's id (SHARD.md §5; PROPOSED D-100). Every replica
+    /// re-checks here what the leader checked, against state every replica shares:
+    /// the key strictly inside the span of the descriptor in force before `index`,
+    /// that descriptor `Live`, and the configuration in force at or below `index`
+    /// plain (Q23). A split that fails a check applies as nothing, refused, and the
+    /// asker is told why. Otherwise one synced batch holds the applied index, both
+    /// halves' descriptors at the next generation and, on a voter of that
+    /// configuration, the right half's Raft state at the floor `(index, 1)` with a
+    /// fresh incarnation and no quarantine (Q20, Q26); a replica that is not a voter
+    /// gets the shrunk descriptor and a range delete of the right span instead. Then
+    /// the right half's store is opened beside the parent's, its core restored from
+    /// the floor, and both handed to the `raft` task as a range added.
+    async fn split(
+        &self,
+        range: RangeId,
+        index: Index,
+        key: &Bytes,
+        right: u64,
+        store: &Arc<RaftStore<E>>,
+    ) -> io::Result<(ApplyEffect, Outcome)> {
+        let prefix = KeyPrefix::group(range.get());
+        let held = store
+            .engine()
+            .get(&prefix.descriptor_key())
+            .await?
+            .and_then(|bytes| RangeDescriptor::decode(bytes).ok());
+        let refuse = |reason: SplitRefusal| (ApplyEffect::Refused, Outcome::Refused(reason));
+        let Some(parent) = held else {
+            store.apply(index, WriteBatch::new()).await?;
+            return Ok(refuse(SplitRefusal::NotLive));
+        };
+        let cut = user_key(key);
+        let config = lock(&self.applied)
+            .get(&range)
+            .map(|applied| applied.config.clone())
+            .unwrap_or_default();
+        let refused = if range == ROOT_RANGE || range == META_RANGE {
+            Some(SplitRefusal::SystemRange)
+        } else if !(parent.start < cut && cut < parent.end) {
+            Some(SplitRefusal::KeyOutsideSpan)
+        } else if parent.state != RangeState::Live {
+            Some(SplitRefusal::NotLive)
+        } else if config.new_voters.is_some() {
+            Some(SplitRefusal::ConfigurationChanging)
+        } else if right == 0 {
+            Some(SplitRefusal::NoRangeId)
+        } else {
+            None
+        };
+        if let Some(reason) = refused {
+            store.apply(index, WriteBatch::new()).await?;
+            return Ok(refuse(reason));
+        }
+        let right_id = RangeId(right);
+        let right_prefix = KeyPrefix::group(right);
+        let generation = parent.generation + 1;
+        let left = RangeDescriptor {
+            range,
+            start: parent.start.clone(),
+            end: cut.clone(),
+            generation,
+            voters: parent.voters.clone(),
+            state: RangeState::Live,
+        };
+        let created = RangeDescriptor {
+            range: right_id,
+            start: cut.clone(),
+            end: parent.end.clone(),
+            generation,
+            voters: config.voters.clone(),
+            state: RangeState::Live,
+        };
+        let voter = config.voters.contains(&self.id);
+        let incarnation = if self
+            .node_variants
+            .contains(NodeVariant::IncarnationPerRangeStream)
+        {
+            self.env.range_rng(right).next_u64()
+        } else {
+            self.env.rng().next_u64()
+        }
+        .max(FIRST_INCARNATION + 1);
+        let mut batch = WriteBatch::new();
+        batch.put(prefix.descriptor_key(), left.encode());
+        if voter {
+            batch.put(right_prefix.descriptor_key(), created.encode());
+            split_state_into(&right_prefix, &config, index, incarnation, &mut batch);
+        }
+        store.apply(index, batch).await?;
+        if !voter {
+            // Not a voter of the parent's configuration at the split: no right half
+            // here, and the right span's keys go, so this node holds no R outside R's
+            // configuration (SHARD.md §5, Q23).
+            store
+                .engine()
+                .delete_range(cut.clone()..parent.end.clone())
+                .await?;
+        }
+        self.env.trace(TraceEvent::RangeSplit {
+            range: range.get(),
+            right,
+            key: cut.clone(),
+            index,
+        });
+        self.env.trace(TraceEvent::RangeDescriptor {
+            range: range.get(),
+            index,
+            applied: index,
+            start: left.start.clone(),
+            end: left.end.clone(),
+            generation: left.generation,
+            voters: left.voters.iter().map(|voter| voter.0).collect(),
+            state: left.state,
+        });
+        // The `snapshot` task's span of P follows P's descriptor, on every replica
+        // that applies the split, voter or not: a take of P from here covers
+        // `[start, key)` and no key of R's, and an install of P here replaces
+        // `[start, key)` and no key of R's. With the span configuration named, a take
+        // of P after the split carried R's keys as the taker's R held them and an
+        // install of it wrote them over the receiver's R (seed 3 of the node sweep
+        // under `MetaOverwritesByArrival`, a stale read of `k7` through R; SHARD.md
+        // §5, Q27; PROPOSED D-100).
+        self.snaps.push(SnapJob::Host {
+            range,
+            spans: vec![
+                KeyPrefix::group(range.get()).span(),
+                left.start.clone()..left.end.clone(),
+            ],
+        });
+        lock(&self.descriptors).insert(range, left);
+        if !voter {
+            return Ok((ApplyEffect::Took, Outcome::Done));
+        }
+        self.env.trace(TraceEvent::RangeCreated {
+            range: right,
+            cause: RangeCause::Split,
+            parent: Some(range.get()),
+            start: created.start.clone(),
+            end: created.end.clone(),
+            generation: created.generation,
+            voters: created.voters.iter().map(|voter| voter.0).collect(),
+            floor_index: index,
+            floor_term: 1,
+            incarnation,
+        });
+        lock(&self.descriptors).insert(right_id, created);
+        // The right half's store beside the parent's, its core from the floor, and
+        // the node's tables for it; the `raft` task puts the core in place.
+        let (right_store, recovered) = store.open_sibling(right_prefix).await?;
+        let right_store = Arc::new(right_store);
+        lock(&self.stores).insert(right_id, right_store.clone());
+        lock(&self.replicas).insert(right_id, Arc::new(Mutex::new(Replica::new())));
+        lock(&self.applied).insert(
+            right_id,
+            Applied {
+                index,
+                term: 1,
+                config: config.clone(),
+            },
+        );
+        let seed = if self
+            .node_variants
+            .contains(NodeVariant::OneSeedForEveryCore)
+        {
+            self.env.rng().next_u64()
+        } else {
+            self.env.range_rng(right).next_u64()
+        };
+        let mut core = Raft::restore_compacted(
+            self.id,
+            config.clone(),
+            RaftConfig {
+                range: right,
+                ..self.raft.clone()
+            },
+            seed,
+            right_store.term(),
+            right_store.vote(),
+            index,
+            1,
+            Some(config),
+            recovered.log,
+            recovered.quarantined,
+        );
+        core.step(Input::Applied(index));
+        self.local.push(Local::RangeAdded {
+            range: right_id,
+            parent: range,
+            core: Box::new(core),
+        });
+        Ok((ApplyEffect::Took, Outcome::Done))
+    }
+
     /// A take of `range` at its applied index, or — with `checkpoint` false — a
     /// follower's compaction record with no checkpoint under it (D-065, D-078).
     ///
@@ -1725,10 +2104,9 @@ impl<E: Environment> ServerApplier<E> {
         last_term: Term,
         store: &Arc<RaftStore<E>>,
     ) {
-        let Some(span) = self.ranges.iter().find(|one| one.id == range) else {
+        let Some(user_span) = self.span_of(range) else {
             return;
         };
-        let user_span = span.span();
         let version = store.engine().snapshot();
         let Ok(user) = store
             .engine()
@@ -1783,7 +2161,7 @@ impl<E: Environment> ServerApplier<E> {
     /// on the wire and one less thing for the two ends to disagree about (D-083).
     // PROPOSED(D-083): the stream carries no log key, so the repair tombstones none.
     fn checkpoint_spans(&self, range: RangeId) -> Option<Vec<std::ops::Range<Bytes>>> {
-        let span = self.ranges.iter().find(|r| r.id == range)?;
+        let span = self.span_of(range)?;
         let prefix = KeyPrefix::group(range.get());
         if self
             .node_variants
@@ -1793,7 +2171,7 @@ impl<E: Environment> ServerApplier<E> {
             // one-group take does. The install then puts the *leader's* log keys into
             // the receiver's store, and the node's repair tombstones none of them
             // because it is built on the promise that none were sent (D-083).
-            return Some(vec![prefix.span(), span.span()]);
+            return Some(vec![prefix.span(), span]);
         }
         if self
             .node_variants
@@ -1810,7 +2188,7 @@ impl<E: Environment> ServerApplier<E> {
         Some(vec![
             prefix.purpose_span(PURPOSE_META),
             prefix.key(PURPOSE_CONFIG, &[])..prefix.span().end,
-            span.span(),
+            span,
         ])
     }
 }
@@ -1819,7 +2197,7 @@ impl<E: Environment> Applier for ServerApplier<E> {
     fn run(&self, job: ApplyJob) -> Boxed<'_, ()> {
         Box::pin(async move {
             let ApplyJob { range, work } = job;
-            let Some(store) = self.stores.get(&range) else {
+            let Some(store) = lock(&self.stores).get(&range).cloned() else {
                 return;
             };
             let entries = match work {
@@ -1830,8 +2208,8 @@ impl<E: Environment> Applier for ServerApplier<E> {
                 // the node, because there is one `apply` task and it takes one job at
                 // a time (Q14).
                 // PROPOSED(D-083): the take and the record are the `apply` task's.
-                ApplyWork::Take => return self.take(range, store, true).await,
-                ApplyWork::Record => return self.take(range, store, false).await,
+                ApplyWork::Take => return self.take(range, &store, true).await,
+                ApplyWork::Record => return self.take(range, &store, false).await,
             };
             for entry in entries {
                 // The store's own applied index wins when it is ahead: a live install
@@ -1931,7 +2309,29 @@ impl<E: Environment> Applier for ServerApplier<E> {
                     Some(Command::Refill { node, run }) => Some((*node, *run)),
                     _ => None,
                 };
-                let outcome = if let Some((node, run)) = refill {
+                // A split (SHARD.md §5; PROPOSED D-100): re-checked and applied by
+                // `split`, which writes both halves and hands the right half's core to
+                // the `raft` task; refused, it applies as nothing and the asker is
+                // told why.
+                let split: Option<(Bytes, u64)> = match applied_command {
+                    Some(Command::Split { key, right }) => Some((key.clone(), *right)),
+                    _ => None,
+                };
+                let outcome = if let Some((key, right)) = split {
+                    match self.split(range, entry.index, &key, right, &store).await {
+                        Ok((effect, outcome)) => {
+                            meta_effect = Some(effect);
+                            outcome
+                        }
+                        Err(error) => {
+                            self.env.trace(TraceEvent::RaftServerFailed {
+                                server: self.id.0,
+                                reason: error.to_string(),
+                            });
+                            return;
+                        }
+                    }
+                } else if let Some((node, run)) = refill {
                     let result = if range == ROOT_RANGE {
                         match ids::grant(store.engine(), ServerId(node), run, self.id_block).await {
                             Ok((batch, record)) => {
@@ -1949,7 +2349,7 @@ impl<E: Environment> Applier for ServerApplier<E> {
                             Err(error) => Err(error),
                         }
                     } else {
-                        apply_command(store, entry.index, None)
+                        apply_command(&store, entry.index, None)
                             .await
                             .map(|_| (ApplyEffect::Refused, Outcome::Done))
                     };
@@ -1989,7 +2389,7 @@ impl<E: Environment> Applier for ServerApplier<E> {
                             Err(error) => Err(error),
                         }
                     } else {
-                        apply_command(store, entry.index, None)
+                        apply_command(&store, entry.index, None)
                             .await
                             .map(|_| ApplyEffect::Refused)
                     };
@@ -2007,7 +2407,7 @@ impl<E: Environment> Applier for ServerApplier<E> {
                         }
                     }
                 } else {
-                    match apply_command(store, entry.index, applied_command).await {
+                    match apply_command(&store, entry.index, applied_command).await {
                         Ok(outcome) => outcome,
                         Err(error) => {
                             self.env.trace(TraceEvent::RaftServerFailed {
@@ -2051,10 +2451,10 @@ impl<E: Environment> Applier for ServerApplier<E> {
                         effect,
                     },
                 );
-                let waiting = self
-                    .replicas
+                let waiting = lock(&self.replicas)
                     .get(&range)
-                    .and_then(|replica| lock(replica).pending.remove(&entry.index));
+                    .cloned()
+                    .and_then(|replica| lock(&replica).pending.remove(&entry.index));
                 if let Some(waiting) = waiting
                     && waiting.term == entry.term
                 {
@@ -2168,7 +2568,13 @@ async fn meta_sender<E: Environment>(
 ) {
     let client = meta_client(id);
     let mut pending: BTreeMap<RangeId, (RangeDescriptor, u64)> = BTreeMap::new();
-    let mut seq = 0u64;
+    // The task's sequence numbers start at the run's nonce, so that no run's request
+    // carries a (client, seq) an earlier run's did: a leader answers a copy of a
+    // request whose entry is in its log when that entry applies, once, and a refill
+    // or an update numbered from 0 at every start was that copy at every restart —
+    // dropped until the leader changed or the count passed the old run's (seed 0 of
+    // the node sweep, a restarted node without a block for 1.7 s; PROPOSED D-100).
+    let mut seq = lock(&ids).run();
     let mut hint: Option<ServerId> = None;
     let mut turn = 0usize;
     // The refill outstanding, if any: its sequence number and the run it carries,
@@ -2198,12 +2604,12 @@ async fn meta_sender<E: Environment>(
         match event {
             Either::Left(Either::Left(None) | Either::Right(None)) => return,
             Either::Left(Either::Left(Some(MetaJob::Send { range, descriptor }))) => {
-                seq += 1;
+                seq = seq.wrapping_add(1);
                 pending.insert(range, (descriptor, seq));
                 to_send.push(range);
             }
             Either::Left(Either::Left(Some(MetaJob::Refill { run }))) => {
-                seq += 1;
+                seq = seq.wrapping_add(1);
                 refill = Some((seq, run));
                 send_refill = true;
             }
@@ -2382,7 +2788,9 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
     } else {
         Vec::new()
     };
-    let hosted: Vec<Range> = if is_bootstrap {
+    // What configuration names; every range the engine holds beyond these — a
+    // split's right half — is added below once the engine is open (SHARD.md §5).
+    let mut hosted: Vec<Range> = if is_bootstrap {
         [Range::root(), Range::meta()]
             .into_iter()
             .chain(ranges.iter().cloned())
@@ -2517,6 +2925,7 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
     };
     let first = hosted
         .first()
+        .cloned()
         .ok_or_else(|| io::Error::other("a node hosts at least one range"))?;
     let started = start_store(
         &env,
@@ -2567,16 +2976,26 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
             store, recovered, ..
         } => {
             let mut opened = vec![(first.clone(), Arc::new(store), recovered)];
-            for range in hosted.iter().skip(1) {
+            // SHARD.md §5: a crash after a split's batch restarts both halves from
+            // their keys, so the ranges the node opens are every group the engine
+            // holds, configuration's and the right halves splits created since.
+            // PROPOSED(D-100)
+            let discovered = discover_ranges(opened[0].1.engine(), &hosted).await?;
+            for range in hosted.iter().skip(1).cloned().chain(discovered) {
                 let (store, recovered) = opened[0]
                     .1
                     .open_sibling(KeyPrefix::group(range.id.get()))
                     .await?;
-                opened.push((range.clone(), Arc::new(store), recovered));
+                opened.push((range, Arc::new(store), recovered));
             }
             opened
         }
     };
+    for (range, _, _) in &opened {
+        if !hosted.iter().any(|named| named.id == range.id) {
+            hosted.push(range.clone());
+        }
+    }
 
     // §2: a fresh bootstrap node writes the initial state, computed from configuration
     // alone, in one synced batch before its tasks run, and its meta replica traces
@@ -2622,9 +3041,12 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
             .await?;
     }
 
-    let mut stores: BTreeMap<RangeId, Arc<RaftStore<E>>> = BTreeMap::new();
+    // The node's stores and replicas, shared by the host, the `apply` task and the
+    // `snapshot` task and mutable behind a lock: a split adds a range at its apply
+    // (SHARD.md §5; PROPOSED D-100).
+    let stores: Arc<Mutex<BTreeMap<RangeId, Arc<RaftStore<E>>>>> = Arc::default();
     let mut cores = Cores::new(node_variants);
-    let mut replicas: BTreeMap<RangeId, Arc<Mutex<Replica>>> = BTreeMap::new();
+    let replicas: Arc<Mutex<BTreeMap<RangeId, Arc<Mutex<Replica>>>>> = Arc::default();
     // Shared by the `apply` task and the host: the task writes it on every entry,
     // and the host moves a range's entry when a live install replaces that range's
     // state machine with no entry passing through the task (PROPOSED D-086).
@@ -2636,8 +3058,8 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
     let descriptors: Arc<Mutex<BTreeMap<RangeId, RangeDescriptor>>> = Arc::default();
     for (range, store, recovered) in opened {
         let id_of = range.id;
-        stores.insert(id_of, store.clone());
-        replicas.insert(id_of, Arc::new(Mutex::new(Replica::new())));
+        lock(&stores).insert(id_of, store.clone());
+        lock(&replicas).insert(id_of, Arc::new(Mutex::new(Replica::new())));
         if let Some(bytes) = store
             .engine()
             .get(&KeyPrefix::group(id_of.get()).descriptor_key())
@@ -2775,7 +3197,8 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
     // granted to (§10). A node with no replica of range 0 holds no record to read.
     // Then the first refill: a node starts with no block, at the threshold.
     // PROPOSED(D-099)
-    if let Some(store) = stores.get(&ROOT_RANGE)
+    let root_store = lock(&stores).get(&ROOT_RANGE).cloned();
+    if let Some(store) = &root_store
         && let Some(bytes) = store.engine().get(&system::lease_key(id)).await?
         && let Ok(record) = LeaseRecord::decode(bytes)
     {
@@ -2811,7 +3234,7 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
             .get(&ROOT_RANGE)
             .map_or(FIRST_GENERATION, |descriptor| descriptor.generation);
         let ids = ids.clone();
-        let root = stores.get(&ROOT_RANGE).cloned();
+        let root = lock(&stores).get(&ROOT_RANGE).cloned();
         async move {
             meta_sender(
                 env,
@@ -2836,12 +3259,12 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
             env: env.clone(),
             id,
             id_block,
+            raft: raft.clone(),
             sock: sock.clone(),
             stores: stores.clone(),
             replicas,
             local: local.clone(),
             snaps: snaps.clone(),
-            ranges: hosted.clone(),
             engine_dir: engine.dir.clone(),
             node_variants,
             cores: variants,
@@ -2866,9 +3289,16 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
         variants,
     );
     for range in &hosted {
+        // The span the store's descriptor holds, where the store has one: a split
+        // moved it off configuration's (SHARD.md §5; PROPOSED D-100). A replica
+        // without a descriptor — a node not named at bootstrap, before its install —
+        // is hosted at configuration's span, as the install that gives it one is.
+        let span = lock(&descriptors)
+            .get(&range.id)
+            .map_or_else(|| range.span(), |d| d.start.clone()..d.end.clone());
         plan.host(
             range.id,
-            vec![KeyPrefix::group(range.id.get()).span(), range.span()],
+            vec![KeyPrefix::group(range.id.get()).span(), span],
         );
     }
     env.spawn("snapshot", {
@@ -2881,12 +3311,12 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
             raft.clone(),
             node_variants,
             engine.dir.clone(),
-            // The six the node hosts, as the host and the `apply` task read them:
-            // `state_of` reads a switched range's span here, and with the user ranges
-            // alone a system range's switch traced no state read back, which left
-            // D-091's fourth arm nothing to pair it with (seed 368's guard, PROPOSED
-            // D-099).
-            hosted.clone(),
+            // Every range the node holds, by its descriptor: `state_of` reads a
+            // switched range's span here. The four configuration names left a system
+            // range's switch with no state read back and D-091's fourth arm nothing
+            // to pair it with (seed 368's guard, PROPOSED D-099), and a split adds
+            // ranges configuration never named (PROPOSED D-100).
+            descriptors.clone(),
             applied_at.clone(),
             plan,
             local.clone(),

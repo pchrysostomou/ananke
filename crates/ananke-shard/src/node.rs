@@ -169,6 +169,18 @@ pub trait Host {
         let _ = local;
         false
     }
+    /// A local input that adds a range to the node: the right half a split's apply
+    /// created, with the core the `apply` task built for it and the parent it split
+    /// from (SHARD.md §5; PROPOSED D-100). Asked only for a range the node does not
+    /// hold; `None` for every other input.
+    fn local_insert(&self, local: &Self::Local) -> Option<(Box<Raft>, RangeId)> {
+        let _ = local;
+        None
+    }
+    /// `range` was added beside its parent, whose replica here leads if `led`.
+    fn range_added(&self, range: RangeId, parent: RangeId, led: bool) {
+        let _ = (range, parent, led);
+    }
 
     /// The node cannot go on: the disk failed under it. The host traces it; the task
     /// returns the error.
@@ -558,10 +570,30 @@ impl<E: Environment, H: Host> Node<E, H> {
             }
             CoreWork::Step => {}
         }
-        let Some(core) = self.cores.core(range) else {
-            // A local input for a range this node does not hold: counted, never
-            // silent, as a message for one is.
+        if self.cores.core(range).is_none() {
+            // A range added at a split's apply (SHARD.md §5; PROPOSED D-100): the
+            // right half's core takes its place on the node, and where this node's
+            // parent leads, the new replica pre-votes at once and every heartbeat
+            // interval until it hears from a leader (Q21).
+            if let Some((core, parent)) = self.host.local_insert(&mine) {
+                let led = self
+                    .cores
+                    .core(parent)
+                    .is_some_and(|core| core.role() == ananke_raft::core::Role::Leader);
+                self.cores.insert(range, *core);
+                self.host.range_added(range, parent, led);
+                if led {
+                    let round = self
+                        .cores
+                        .messages(&self.env, [(range, Input::Campaign, None, 0)]);
+                    self.drive(round, None, persists).await?;
+                }
+                return Ok(());
+            }
             self.cores.count_input_for_a_range_not_held();
+            return Ok(());
+        }
+        let Some(core) = self.cores.core(range) else {
             return Ok(());
         };
         let Some(input) = self.host.local_input(mine, core) else {
