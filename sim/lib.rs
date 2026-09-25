@@ -21,6 +21,7 @@ use bytes::Bytes;
 
 pub mod echo;
 pub mod engine;
+pub mod folds;
 pub mod install;
 pub mod lin;
 pub mod membership;

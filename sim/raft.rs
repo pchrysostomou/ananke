@@ -1814,13 +1814,11 @@ impl Report {
     #[must_use]
     pub fn busiest_range_records_per_second(&self) -> f64 {
         let seconds = self.observed().as_secs_f64().max(f64::EPSILON);
-        let mut by_range: BTreeMap<u64, usize> = BTreeMap::new();
-        for record in &self.records {
-            if let Some(range) = range_of(&record.event) {
-                *by_range.entry(range).or_default() += 1;
-            }
-        }
-        by_range.into_values().max().unwrap_or(0) as f64 / seconds
+        records_by_range_of(&self.records)
+            .into_values()
+            .max()
+            .unwrap_or(0) as f64
+            / seconds
     }
 
     /// The messages the node's inbox dropped under its byte bound, by the kind it
@@ -1836,13 +1834,7 @@ impl Report {
     // PROPOSED(D-082): the inbox's drops under its byte bound, printed.
     #[must_use]
     pub fn inbox_drops(&self) -> BTreeMap<(&'static str, u64), usize> {
-        let mut by: BTreeMap<(&'static str, u64), usize> = BTreeMap::new();
-        for record in &self.records {
-            if let TraceEvent::RaftInboxDropped { range, kind, .. } = &record.event {
-                *by.entry((kind, *range)).or_default() += 1;
-            }
-        }
-        by
+        inbox_drops_of(&self.records)
     }
 
     /// Every apply's lag, in virtual time: from the `RaftCommit` that made a range's
@@ -1864,41 +1856,7 @@ impl Report {
     // PROPOSED(D-082): the apply lag per range, under the sweep's client load.
     #[must_use]
     pub fn apply_lags(&self) -> BTreeMap<u64, Vec<Duration>> {
-        let mut committed: BTreeMap<(u64, u64), (u64, BTreeMap<u64, Instant>)> = BTreeMap::new();
-        let mut lags: BTreeMap<u64, Vec<Duration>> = BTreeMap::new();
-        for record in &self.records {
-            match &record.event {
-                TraceEvent::RaftCommit {
-                    server,
-                    range,
-                    index,
-                    ..
-                } => {
-                    let (highest, at) = committed.entry((*server, *range)).or_default();
-                    for i in (*highest + 1)..=*index {
-                        at.insert(i, record.at);
-                    }
-                    *highest = (*highest).max(*index);
-                }
-                TraceEvent::RaftApply {
-                    server,
-                    range,
-                    index,
-                    ..
-                } => {
-                    if let Some((_, at)) = committed.get(&(*server, *range))
-                        && let Some(committed_at) = at.get(index)
-                        && record.at >= *committed_at
-                    {
-                        lags.entry(*range)
-                            .or_default()
-                            .push(record.at.duration_since(*committed_at));
-                    }
-                }
-                _ => {}
-            }
-        }
-        lags
+        apply_lags_of(&self.records)
     }
 
     /// The median apply lag over every range of the run, and the median per range.
@@ -1967,70 +1925,7 @@ impl Report {
     // PROPOSED(D-082): a window in which the node crashed is not a hold.
     #[must_use]
     pub fn cross_range_apply_holds_counted(&self) -> (Vec<Duration>, usize) {
-        // Every crash and restart, by the node that suffered it, in time order.
-        let mut downs: BTreeMap<u64, Vec<Instant>> = BTreeMap::new();
-        for record in &self.records {
-            let node = match &record.event {
-                TraceEvent::NodeCrashed { node } | TraceEvent::NodeRestarted { node } => {
-                    u64::from(node.get())
-                }
-                _ => continue,
-            };
-            downs.entry(node).or_default().push(record.at);
-        }
-        let mut committed: BTreeMap<(u64, u64), (u64, BTreeMap<u64, Instant>)> = BTreeMap::new();
-        // The two most recent applies on each node: (t0, t1) with t1's range.
-        let mut last: BTreeMap<u64, (Option<Instant>, Instant, u64)> = BTreeMap::new();
-        let mut holds = Vec::new();
-        let mut dropped = 0usize;
-        for record in &self.records {
-            match &record.event {
-                TraceEvent::RaftCommit {
-                    server,
-                    range,
-                    index,
-                    ..
-                } => {
-                    let (highest, at) = committed.entry((*server, *range)).or_default();
-                    for i in (*highest + 1)..=*index {
-                        at.insert(i, record.at);
-                    }
-                    *highest = (*highest).max(*index);
-                }
-                TraceEvent::RaftApply {
-                    server,
-                    range,
-                    index,
-                    ..
-                } => {
-                    if let Some(&(t0, t1, of)) = last.get(server)
-                        && of != *range
-                        && let Some((_, at)) = committed.get(&(*server, *range))
-                        && let Some(&ready) = at.get(index)
-                        && ready <= t1
-                    {
-                        let from = match t0 {
-                            Some(t0) if t0 > ready => t0,
-                            _ => ready,
-                        };
-                        // A node's own server id is its node id in these scenarios
-                        // (`node_of_server`), so the crash records are looked up by it.
-                        let crashed = downs
-                            .get(server)
-                            .is_some_and(|at| at.iter().any(|&a| a >= from && a <= t1));
-                        if crashed {
-                            dropped += 1;
-                        } else {
-                            holds.push(t1.duration_since(from));
-                        }
-                    }
-                    let t0 = last.get(server).map(|&(_, t1, _)| t1);
-                    last.insert(*server, (t0, record.at, *range));
-                }
-                _ => {}
-            }
-        }
-        (holds, dropped)
+        cross_range_apply_holds_of(&self.records)
     }
 
     /// Every peer frame this run's nodes sent, decoded: how many messages it
@@ -2132,20 +2027,171 @@ impl Report {
     // PROPOSED(D-082): what the node cluster does not reach yet, asserted absent.
     #[must_use]
     pub fn highest_index(&self) -> u64 {
-        self.records
-            .iter()
-            .filter_map(|record| match &record.event {
-                TraceEvent::RaftAppend { index, .. }
-                | TraceEvent::RaftCommit { index, .. }
-                | TraceEvent::RaftApply { index, .. } => Some(*index),
-                _ => None,
-            })
-            .max()
-            .unwrap_or(0)
+        highest_index_of(&self.records)
     }
 }
 
 /// The middle value of a sorted slice, the lower of the two when it is even.
+// PROPOSED(D-095): the whole-trace readings as functions over a prefix, so the
+// equivalence test in `sim/tests/node.rs` can hold the incremental folds to them.
+/// The apply lag per range over `records` from the first: the whole-trace reading
+/// [`Report::apply_lags`] takes, kept as the reference the incremental
+/// [`crate::folds::ApplyLagFold`] is held to (PROPOSED D-095).
+#[must_use]
+pub fn apply_lags_of(records: &[TraceRecord]) -> BTreeMap<u64, Vec<Duration>> {
+    let mut committed: BTreeMap<(u64, u64), (u64, BTreeMap<u64, Instant>)> = BTreeMap::new();
+    let mut lags: BTreeMap<u64, Vec<Duration>> = BTreeMap::new();
+    for record in records {
+        match &record.event {
+            TraceEvent::RaftCommit {
+                server,
+                range,
+                index,
+                ..
+            } => {
+                let (highest, at) = committed.entry((*server, *range)).or_default();
+                for i in (*highest + 1)..=*index {
+                    at.insert(i, record.at);
+                }
+                *highest = (*highest).max(*index);
+            }
+            TraceEvent::RaftApply {
+                server,
+                range,
+                index,
+                ..
+            } => {
+                if let Some((_, at)) = committed.get(&(*server, *range))
+                    && let Some(committed_at) = at.get(index)
+                    && record.at >= *committed_at
+                {
+                    lags.entry(*range)
+                        .or_default()
+                        .push(record.at.duration_since(*committed_at));
+                }
+            }
+            _ => {}
+        }
+    }
+    lags
+}
+
+/// The cross-range holds over `records` from the first, in two passes: the
+/// whole-trace reading [`Report::cross_range_apply_holds_counted`] takes, kept as the
+/// reference the one-pass [`crate::folds::CrossRangeHoldFold`] is held to (PROPOSED
+/// D-095).
+#[must_use]
+pub fn cross_range_apply_holds_of(records: &[TraceRecord]) -> (Vec<Duration>, usize) {
+    // Every crash and restart, by the node that suffered it, in time order.
+    let mut downs: BTreeMap<u64, Vec<Instant>> = BTreeMap::new();
+    for record in records {
+        let node = match &record.event {
+            TraceEvent::NodeCrashed { node } | TraceEvent::NodeRestarted { node } => {
+                u64::from(node.get())
+            }
+            _ => continue,
+        };
+        downs.entry(node).or_default().push(record.at);
+    }
+    let mut committed: BTreeMap<(u64, u64), (u64, BTreeMap<u64, Instant>)> = BTreeMap::new();
+    // The two most recent applies on each node: (t0, t1) with t1's range.
+    let mut last: BTreeMap<u64, (Option<Instant>, Instant, u64)> = BTreeMap::new();
+    let mut holds = Vec::new();
+    let mut dropped = 0usize;
+    for record in records {
+        match &record.event {
+            TraceEvent::RaftCommit {
+                server,
+                range,
+                index,
+                ..
+            } => {
+                let (highest, at) = committed.entry((*server, *range)).or_default();
+                for i in (*highest + 1)..=*index {
+                    at.insert(i, record.at);
+                }
+                *highest = (*highest).max(*index);
+            }
+            TraceEvent::RaftApply {
+                server,
+                range,
+                index,
+                ..
+            } => {
+                if let Some(&(t0, t1, of)) = last.get(server)
+                    && of != *range
+                    && let Some((_, at)) = committed.get(&(*server, *range))
+                    && let Some(&ready) = at.get(index)
+                    && ready <= t1
+                {
+                    let from = match t0 {
+                        Some(t0) if t0 > ready => t0,
+                        _ => ready,
+                    };
+                    // A node's own server id is its node id in these scenarios
+                    // (`node_of_server`), so the crash records are looked up by it.
+                    let crashed = downs
+                        .get(server)
+                        .is_some_and(|at| at.iter().any(|&a| a >= from && a <= t1));
+                    if crashed {
+                        dropped += 1;
+                    } else {
+                        holds.push(t1.duration_since(from));
+                    }
+                }
+                let t0 = last.get(server).map(|&(_, t1, _)| t1);
+                last.insert(*server, (t0, record.at, *range));
+            }
+            _ => {}
+        }
+    }
+    (holds, dropped)
+}
+
+/// The inbox's drops over `records`, by kind and range: [`Report::inbox_drops`]'s
+/// reading, the reference for [`crate::folds::NodeCoverageFold`] (PROPOSED D-095).
+#[must_use]
+pub fn inbox_drops_of(records: &[TraceRecord]) -> BTreeMap<(&'static str, u64), usize> {
+    let mut by: BTreeMap<(&'static str, u64), usize> = BTreeMap::new();
+    for record in records {
+        if let TraceEvent::RaftInboxDropped { range, kind, .. } = &record.event {
+            *by.entry((kind, *range)).or_default() += 1;
+        }
+    }
+    by
+}
+
+/// The highest index any append, commit or apply in `records` names:
+/// [`Report::highest_index`]'s reading, the reference for
+/// [`crate::folds::NodeCoverageFold`] (PROPOSED D-095).
+#[must_use]
+pub fn highest_index_of(records: &[TraceRecord]) -> u64 {
+    records
+        .iter()
+        .filter_map(|record| match &record.event {
+            TraceEvent::RaftAppend { index, .. }
+            | TraceEvent::RaftCommit { index, .. }
+            | TraceEvent::RaftApply { index, .. } => Some(*index),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// Records per range over `records`, by [`range_of`]: what
+/// [`Report::busiest_range_records_per_second`] reads, the reference for
+/// [`crate::folds::NodeCoverageFold`] (PROPOSED D-095).
+#[must_use]
+pub fn records_by_range_of(records: &[TraceRecord]) -> BTreeMap<u64, usize> {
+    let mut by_range: BTreeMap<u64, usize> = BTreeMap::new();
+    for record in records {
+        if let Some(range) = range_of(&record.event) {
+            *by_range.entry(range).or_default() += 1;
+        }
+    }
+    by_range
+}
+
 fn median(sorted: &[Duration]) -> Option<Duration> {
     if sorted.is_empty() {
         return None;

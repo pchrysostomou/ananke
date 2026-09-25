@@ -101,6 +101,27 @@ ananke/
 
 _Update this section at the end of every session._
 
+- Branch `phase-3-node-folds-equivalence` (2026-09-25), off `main` at 527adcd, PROPOSED
+  D-095, the owner's ruling (b) at Stage B's close: **the node's apply-lag, cross-range
+  hold and coverage folds run under the incremental checker's equivalence test**, the
+  line of Stage B's exit the tag names as unmet. `sim/folds.rs` gives each an
+  incremental form beside D-082's whole-trace reading, kept as the reference — the
+  hold's in one pass, since a hold's window ends before the apply that reports it —
+  and `the_node_folds_agree_with_their_whole_trace_readings` holds fold to reading at
+  eight prefixes of `min(seeds, 100)` seeds over four node variants in turn. The lag
+  keeps the one verdict there is, §4's heartbeat on each range's median, asked per run;
+  the hold and the coverage have no rule to break, so they are compared value for
+  value on runs a variant has moved. The tripping variant is new:
+  **`ApplyWaitsForEveryRange`**, Q14's grouping built as a wait, caught by the lag
+  verdict on **100 of 100** seeds (worst range median 6.32 s against 20 ms) and by the
+  run's other checks on 44. **The equivalence held on every seed at every prefix.** Two
+  findings for the owner: the hold's median under that variant stays at 2.5 ms, since a
+  stalled apply's hold is still the one job before it, which is why a threshold on the
+  hold would be the wrong instrument (D-082 made it a figure, not a bound); and the
+  correct node trips the per-run 20 ms median on a range on 2 of 25 seeds at a hundred,
+  which the pooled per-range median the sweep asserts (3.0 to 3.2 ms at a thousand)
+  does not show. Two shard rows, weighed here.
+
 - Merge update (2026-09-24): PR #109 (`phase-3-stage-b-stream-variants`, PROPOSED
   D-086, carrying #123's D-089 and D-091) merged `origin/main` at c178682 under the
   owner's ruling, to be gated, nightly-run and merged by the same session. Six files

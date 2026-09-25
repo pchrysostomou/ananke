@@ -16968,4 +16968,140 @@ own catch and report anything else as the node's own failure.
 
 ---
 
-_Next entry: D-092. Add one before implementing anything not covered above._
+## PROPOSED D-095 — The node's apply-lag, cross-range hold and coverage folds run under the equivalence test, and the variant that trips the two with a verdict
+
+**The number.** Off `main` at 527adcd, whose footer reads D-092. PR #129 takes D-092 and
+D-093 and PR #130 takes D-094, each on its own branch; this one takes **D-095** past
+all three and moves the footer to D-096. Whichever merges later resolves the footer as
+the union, as D-088 did. Every code site carries `// PROPOSED(D-095)`.
+
+**Context.** §12 asks that every new fold run under the incremental checker's
+equivalence test with a variant that trips it (SHARD.md:2051-2056; §11, raft 12,
+SHARD.md:1889-1893), the test `sim/tests/raft.rs` runs for the checker's checks
+(`the_incremental_checker_agrees_with_the_fold_over_the_whole_trace`, D-046): fed a
+run's records in chunks, a fold says at every prefix exactly what the same fold over
+the whole prefix from the first record says, the same verdict and the same words, and a
+quarter of the compared seeds run a variant the fold catches, so the comparison sees
+`Err` and not only `Ok`. Stage B's tag names the line as not met: "D-071's four checks
+keyed by range run under it with a tripping variant; the node's apply-lag, cross-range
+hold and coverage folds are measurements, not folds under that test." The owner's
+ruling (b) at the stage's close, 2026-09-25, is that they go under it.
+
+What the three were. D-082 built them as readings over a finished run
+(`raft::Report::apply_lags`, `cross_range_apply_holds_counted`, and the counters
+`sim/tests/node.rs`'s `Coverage::add` reads off the trace), asserted or printed once
+per sweep: the apply lag's per-range median against §4's heartbeat, asserted since
+D-082; the hold's median and maximum printed, the maximum sent to the owner (D-036,
+D-086); the coverage's counters printed and floored per sweep. None had an incremental
+form, none had a per-run verdict, and the hold's reading was two passes over the trace,
+every crash and restart taken first, which no incremental fold can be.
+
+### What is built
+
+1. **`sim/folds.rs`**, three folds fed one record at a time and readable at any prefix,
+   each beside its whole-trace reading, which D-082's functions keep as the reference:
+   `ApplyLagFold` against `raft::apply_lags_of`, `CrossRangeHoldFold` against
+   `raft::cross_range_apply_holds_of`, and `NodeCoverageFold` against
+   `NodeCoverage::read`, which is `Coverage::add`'s scans over a slice. The hold fold
+   is **one pass**: a hold's window `[from, t1]` ends at or before the apply that
+   reports it, so every crash inside it has been traced by then, and the fold takes
+   crashes as they come. `raft::Report`'s methods delegate to the readings unchanged,
+   so nothing a sweep printed before moves.
+2. **A verdict for the one that has a rule.** The lag's is the one the sweep has
+   asserted since D-082, asked per run: no range's median apply lag over the run
+   exceeds one heartbeat interval, 20 ms. The hold has none: D-082 recorded it as a
+   figure to the owner and not a bound — an upper bound on one job's hold and a lower
+   bound on the wait's total — and the measurement below shows why a threshold on it
+   would be the wrong instrument: the variant that stalls every apply for seconds
+   leaves the hold's median at 2.5 ms, because a stalled apply's hold is still the
+   duration of the one job before it, a disk sync. The hold fold's median and longest
+   are printed where the sweep printed them. A coverage counter has no rule to break
+   either. So for those two what the test asks is that fold and reading agree value
+   for value at every prefix, on runs whose values a variant has moved, and the
+   variants that move them are what the comparison runs.
+3. **The variant, `NodeVariant::ApplyWaitsForEveryRange`.** Q14's grouped applies built
+   as a wait: the `apply` task keeps every range's jobs in order and runs a group, one
+   job of each range it has seen, only when every one of those ranges has a job
+   pending, so a range that goes quiet — no leader, no writes — stalls the node's other
+   ranges' applies behind it. §4 and §12 build grouping only if the measured lag asks
+   for it, and never by waiting (SHARD.md:2322-2325); this is the shape the measurement
+   exists to rule out. `node::apply` takes the node's variants to choose the loop;
+   nothing else on the node changes.
+4. **The test**, `the_node_folds_agree_with_their_whole_trace_readings` in
+   `sim/tests/node.rs`: `min(seeds, 100)` seeds as the raft test compares, eight
+   prefixes, records pushed thirty-seven at a time, four variants in turn — the correct
+   node, `ApplyWaitsForEveryRange` for the two verdicts, `ChunksToTheInbox`, which moves
+   the inbox's drops, and `PersistsOneAtATime`, which moves every timing — and at every
+   prefix the lag's samples, medians and verdict, the hold's holds and dropped count,
+   and the coverage's counters compared with their readings. The seeds on which the
+   lag's verdict was in violation are printed per variant, at some prefix and over the
+   whole run, and the variant's own are asserted above zero.
+5. **The variant's catch**,
+   `an_apply_task_that_waits_for_every_range_is_caught_by_the_lag_fold_on_the_node`: the
+   variant under the raft arms on the node over `seeds()`, caught by the lag verdict on
+   every seed, with the run's other checks' catches, the worst range median and the
+   hold fold's reading of the same runs counted and printed beside it.
+6. Three unit tests in `sim/folds.rs` on hand-built records — a lag, the hold's four
+   shapes from D-082's own test, and a coverage trace with one of each kind — each
+   fold beside its reading.
+
+### The rates, every one measured before its assertion was written (Q39, D-061)
+
+Both tests run from the built release binary of this tree at `ANANKE_SEEDS=100`, on
+this session's container (a four-core Xeon, D-070), the two together in 11.5 s.
+
+**The equivalence held on every seed at every prefix**: 100 seeds, eight prefixes each,
+no fold differed from its reading, for the lag's samples and medians, the hold's holds
+and dropped count, and every coverage counter. The lag's verdict, in violation per
+variant, as (seeds run, in violation at some prefix, in violation over the whole run):
+
+| Variant | Seeds | At some prefix | Over the whole run |
+| --- | ---: | ---: | ---: |
+| `ApplyWaitsForEveryRange` | 25 | **25** | **25** |
+| `ChunksToTheInbox` | 25 | 15 | 13 |
+| `PersistsOneAtATime` | 25 | 11 | 5 |
+| correct | 25 | 7 | **2** |
+
+The variant the verdict is written for trips it on **every seed, 100 %**, so the
+comparison's assertion — some seed under it in violation over the whole run — holds at
+the gate's twenty compared seeds, of which five run it, and at every tier above. The
+other three rows are the instrument's own reading of the correct node and of two
+variants that move timing: early prefixes are a handful of applies during the first
+elections, where a range's median is a few samples, and **the correct node trips the
+per-run verdict over a whole run on 2 of 25 seeds**. That is why the sweep's assertion
+stays the pooled per-range median over the tier (3.0 to 3.2 ms at a thousand seeds on
+`main`) and the per-run verdict stays the test's instrument: a per-run breach on
+about one seed in twelve is a figure for the owner beside D-082's threshold, not a
+bound this entry asserts, and the test prints it at every tier.
+
+**The catch**: `ApplyWaitsForEveryRange` is caught by the lag verdict on **100 of 100**
+seeds, so it is asserted at every tier; the run's other checks — liveness on uniform
+seeds, where a range with no leader holds every other — fail it on 44 of 100; the
+worst range median lag was **6.32 s** against 20 ms, the first seed's 993 ms. The hold
+fold under the same runs read a median hold of **2.55 ms** over the seeds' medians and a
+longest of 4.47 s: the stall is the lag's to see and not the hold's, which is the
+measurement item 2 rests on.
+
+### Consequences
+
+- Stage B's second unmet exit line is met for the three folds the tag names: each runs
+  under the equivalence test from this entry, the two with a verdict against a variant
+  that trips them and the third against variants that move it.
+- - The sweep's own assertions are unchanged: the per-range median over the pooled sweep is
+  still what `every_seed_passes_on_the_correct_node_under_the_raft_sweeps_arms` asserts, and
+  the hold's maximum is still printed and sent to the owner. The per-run verdicts are the
+  equivalence test's instrument, and what they say of the correct node — a per-run breach of
+  the 20 ms median on a range on 2 of 25 seeds at a hundred — goes to the owner beside
+  D-082's threshold, printed at every tier.
+- - `nightly-shards.txt` gains two rows, weighed on this tree on this machine from the built
+  release binary at `ANANKE_SEEDS=1000`: the variant's catch at 180.6 cpu s into shard 2,
+  the lightest at 1442.9, and the comparison at 26.7 cpu s into shard 4, the lightest then
+  at 1462.4.
+- The coverage fold's reading of the ruling — value for value, no verdict — goes to the
+  owner as the one interpretation this entry makes; if the owner meant the sweep's
+  floors, those are per sweep and have no prefix to compare at, which is why they are
+  not here.
+
+---
+
+_Next entry: D-096. Add one before implementing anything not covered above._
