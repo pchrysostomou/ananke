@@ -10,7 +10,11 @@
 //!
 //! **The shape** (SHARD.md §12, Stage B's builds):
 //!
-//! - three servers, each hosting all four ranges;
+//! - three servers, each hosting all four user ranges and, since PROPOSED D-096, the
+//!   root and the meta range every bootstrap node hosts: six replicas, refused and
+//!   marked together. The four user ranges are re-seeded by a stream each, as below;
+//!   the two system ranges, which nothing writes to here, are re-seeded by the log
+//!   from its first entry, and (a) asserts that of them ([`Report::log_ranges`]);
 //! - the node refused by its store's lost mark at a restart, as `sim/quorum.rs`
 //!   refuses a server (D-049): it is crashed, its directory's marker is written, and
 //!   it is started again, so the directory that is refused is one that really held a
@@ -30,17 +34,19 @@
 //! - **(c), first half**: no replica answered anything other than its own re-seed stream
 //!   before its refused mark was durable. First, because it is an ordering, and because
 //!   `ServeBeforeRefusedMark` is its plant and was caught by (a) while (a) came first;
-//! - **(a)** each of the four ranges traces its `RangeCreated { cause: snapshot }`, with
-//!   exactly one start of the node between the refusal and the last install — the arm's —
-//!   and no `RaftAdopted` at all: every range installed **live**, into the directory the
-//!   re-seed built;
+//! - **(a)** each of the four user ranges traces its `RangeCreated { cause: snapshot }`,
+//!   with exactly one start of the node between the refusal and the last install — the
+//!   arm's — and no `RaftAdopted` at all: every range installed **live**, into the
+//!   directory the re-seed built; and each of the two system ranges is appended to from
+//!   index 1 after its mark, with no stream opened toward it and no install;
 //! - **(b)** every re-seed stream completes into an install, and the four were owed at
 //!   once — every mark before the first install. The cap *holding a stream back* is a
 //!   **rate**, not an every-seed property: measured, it happens on 199 seeds of 200, and
 //!   the seed it does not is a legitimate interleaving where each slot frees before the
 //!   next chunk arrives. The test prints that rate at every tier, asserts it against a
 //!   measured floor, and pins the mechanism on a seed that has it;
-//! - **(c), second half**: every replica answered something after **its own install**.
+//! - **(c), second half**: every streamed replica answered something after **its own
+//!   install**, and every replica the log rebuilt answered after its mark.
 //!   This is the half PR #86 could assert only as an absence, and it is keyed on the
 //!   install rather than on the mark because a replica that was never re-seeded answers
 //!   too — with the rejections of an empty log — so the mark-keyed set is a constant;
@@ -220,10 +226,38 @@ impl Report {
         VICTIM
     }
 
-    /// Every range of the scenario.
+    /// Every replica the node holds: the four user ranges and, since PROPOSED D-096,
+    /// the two system ranges every bootstrap node hosts. A refusal takes all six
+    /// down, the re-seed marks all six, and every restatement is read for all six.
     #[must_use]
     pub fn every_range() -> BTreeSet<u64> {
+        Self::log_ranges()
+            .into_iter()
+            .chain(Self::streamed_ranges())
+            .collect()
+    }
+
+    /// The ranges the re-seed rebuilds by a **stream**: the four user ranges, whose
+    /// clients' writes had their leaders compact past index 1 before the refusal, so
+    /// a leader that forgot the replica's progress (D-042) has nothing to append from
+    /// and streams. (a), (b), (d)'s install and the cap are about these four.
+    #[must_use]
+    pub fn streamed_ranges() -> BTreeSet<u64> {
         (0..RANGES).map(|i| FIRST_RANGE + i).collect()
+    }
+
+    /// The ranges the re-seed rebuilds by the **log**: the root and the meta range,
+    /// which nothing writes to in this shape, so their leaders hold every entry from
+    /// index 1 and compact nothing. A leader that forgot such a replica's progress
+    /// appends from index 1 and the replica, empty and marked, takes the log from its
+    /// first entry; no stream is opened and no install lands. It is the same re-seed
+    /// — the mark, the incarnation, the leader's reset — completed by the other of
+    /// Raft's two ways to catch a follower up, and (a) asserts it as such
+    /// (PROPOSED D-096). The day a system range carries writes enough to compact,
+    /// (a) says so here and the range moves to [`Self::streamed_ranges`].
+    #[must_use]
+    pub fn log_ranges() -> BTreeSet<u64> {
+        BTreeSet::from([crate::ranges::ROOT_RANGE, crate::ranges::META_RANGE])
     }
 
     /// The trace read for the refusal, the marks, the installs and the answers.
@@ -282,6 +316,8 @@ impl Report {
         let seed = self.seed;
         let read = self.read();
         let every = Self::every_range();
+        let streamed = Self::streamed_ranges();
+        let by_log = Self::log_ranges();
 
         // (c), first half, and it is first because it is an *ordering*: a replica that
         //     answered before its mark is one that answered whether or not anything
@@ -326,8 +362,8 @@ impl Report {
             ));
         }
 
-        // (a) Every range installed live into the new directory.
-        let missing: Vec<u64> = every
+        // (a) Every user range installed live into the new directory.
+        let missing: Vec<u64> = streamed
             .difference(&read.created_by_install)
             .copied()
             .collect();
@@ -338,8 +374,28 @@ impl Report {
                  A replica the re-seed left empty and marked is a replica that waits \
                  for its stream, and these are still waiting",
                 missing.len(),
-                every.len()
+                streamed.len()
             ));
+        }
+        // And the two system ranges rebuilt by the log from its first entry, with
+        // nothing streamed and nothing installed: their leaders compacted nothing
+        // (PROPOSED D-096; [`Self::log_ranges`]).
+        for range in &by_log {
+            let first = read.first_appended_after_the_mark.get(range).copied();
+            let streams = read.streams_to_victim.get(range).copied().unwrap_or(0);
+            let installed = read.installs.contains(range);
+            if first != Some(1) || streams != 0 || installed {
+                return Err(format!(
+                    "seed {seed}: (a) range {range}, a system range nothing writes to, \
+                     was not rebuilt on node {VICTIM} by the log from index 1: its \
+                     first append after its refused mark is at {first:?}, {streams} \
+                     streams were opened toward it and its install is {installed}. \
+                     A leader that compacted nothing appends from the first entry to \
+                     a follower whose progress it forgot (D-042), and a replica the \
+                     re-seed left empty takes that log; a stream here means the \
+                     range compacted, and it belongs with the streamed four"
+                ));
+            }
         }
         // A restart of the node between the refusal and its installs would mean the
         // ranges came back at a start rather than being installed into a running
@@ -369,15 +425,15 @@ impl Report {
         }
 
         // (b) Every re-seed stream completed, none abandoned for another identity.
-        let streamed: BTreeSet<u64> = read.streams_to_victim.keys().copied().collect();
-        let missing: Vec<u64> = every.difference(&streamed).copied().collect();
+        let opened: BTreeSet<u64> = read.streams_to_victim.keys().copied().collect();
+        let missing: Vec<u64> = streamed.difference(&opened).copied().collect();
         if !missing.is_empty() {
             return Err(format!(
                 "seed {seed}: (b) no stream was ever opened toward node {VICTIM} for \
                  {missing:?}"
             ));
         }
-        let missing: Vec<u64> = every.difference(&read.installs).copied().collect();
+        let missing: Vec<u64> = streamed.difference(&read.installs).copied().collect();
         if !missing.is_empty() {
             return Err(format!(
                 "seed {seed}: (b) {} of {} re-seed streams never completed into an \
@@ -385,7 +441,7 @@ impl Report {
                  a node that abandoned an assembly for a chunk of another identity \
                  would leave exactly this (SHARD.md:573-576)",
                 missing.len(),
-                every.len()
+                streamed.len()
             ));
         }
         // And they shared the node's slots. Two things are asserted, because the first
@@ -405,7 +461,7 @@ impl Report {
                      refused mark is at {mark:?} and the first install at {install:?}, \
                      so the node's cap of {RECEIVE_CAP} was never asked to hold {} \
                      streams back",
-                    every.len()
+                    streamed.len()
                 ));
             }
         }
@@ -439,7 +495,7 @@ impl Report {
                 read.marked
             ));
         }
-        let silent: Vec<u64> = every
+        let silent: Vec<u64> = streamed
             .difference(&read.answered_after_the_install)
             .copied()
             .collect();
@@ -453,6 +509,20 @@ impl Report {
                  set keyed on the mark alone is full on exactly the runs this is meant \
                  to fail ({:?} answered after their mark)",
                 read.answered_after_the_mark
+            ));
+        }
+        // A replica the log rebuilt has no install to key on: its answers *are* the
+        // rebuild — the acknowledgements of the appends from index 1 — so for it the
+        // mark is the right key, and (a) has already asserted the appends.
+        let silent: Vec<u64> = by_log
+            .difference(&read.answered_after_the_mark)
+            .copied()
+            .collect();
+        if !silent.is_empty() {
+            return Err(format!(
+                "seed {seed}: (c) {silent:?}, rebuilt by the log, answered nothing \
+                 after their refused mark, so nothing acknowledged the log that \
+                 rebuilt them"
             ));
         }
 
@@ -577,6 +647,10 @@ pub struct Read {
     pub stream_answers: BTreeSet<u64>,
     /// The ranges an install created on the victim: `RangeCreated { cause: snapshot }`.
     pub created_by_install: BTreeSet<u64>,
+    /// The index of the victim's first `RaftAppend` per range after that range's
+    /// refused mark: `1` for a replica the log rebuilt from its first entry
+    /// (PROPOSED D-096; [`Report::log_ranges`]).
+    pub first_appended_after_the_mark: BTreeMap<u64, u64>,
     /// The ranges whose install completed on the victim after the refusal.
     pub installs: BTreeSet<u64>,
     /// Where each range's first install after the refusal stands in the trace.
@@ -676,6 +750,16 @@ pub fn read(records: &[TraceRecord], victim: u64, node_of: BTreeMap<NodeId, u64>
                 state,
                 ..
             } if *server == victim => out.restatements.push((at, *range, *state)),
+            TraceEvent::RaftAppend {
+                server,
+                range,
+                index,
+                ..
+            } if *server == victim && out.marked.contains(range) => {
+                out.first_appended_after_the_mark
+                    .entry(*range)
+                    .or_insert(*index);
+            }
             TraceEvent::RaftAdopted { server } if *server == victim => out.adoptions += 1,
             TraceEvent::RaftServerFailed { server, reason } if *server == victim => {
                 out.failures.push(reason.clone());
@@ -796,7 +880,7 @@ pub fn server_config(id: u64, variants: impl Into<Variants>, node: NodeVariants)
             .map(|s| (ServerId(s), server_addr(s)))
             .collect(),
         ranges: crate::ranges::ranges(),
-        initial_voters: (1..=SERVERS).map(ServerId).collect(),
+        bootstrap: (1..=SERVERS).map(ServerId).collect(),
         raft: RaftConfig {
             variants: variants.into(),
             tick_nanos: u64::try_from(TICK.as_nanos()).expect("small"),
@@ -938,7 +1022,16 @@ pub fn run(seed: u64, variants: impl Into<Variants>, node_variants: NodeVariants
                         refused = true;
                         refused_seen = true;
                     }
-                    TraceEvent::RaftReseeded { server, range } if *server == VICTIM && refused => {
+                    // The first mark of a range the re-seed streams to: (d) is
+                    // about the install that lands after the restart, and a system
+                    // range the log rebuilds has none (PROPOSED D-096). The six
+                    // marks are written inside one arm step, so the crash lands at
+                    // the same moment whichever of them it is aimed at.
+                    TraceEvent::RaftReseeded { server, range }
+                        if *server == VICTIM
+                            && refused
+                            && Report::streamed_ranges().contains(range) =>
+                    {
                         arm.marked = Some(*range);
                         arm.fired = true;
                         break;

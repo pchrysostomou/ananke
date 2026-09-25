@@ -293,7 +293,23 @@ pub const NODE_SNAPSHOT_THRESHOLD: u64 = 12;
 pub const NODE_KEYS: u64 = 2 * crate::ranges::RANGES;
 
 impl Cluster {
-    /// The ranges every server of this cluster holds, in id order.
+    /// Every range a node of this cluster hosts, the system ranges first: what the
+    /// trace's oracle holds a replica event's range to, and what a coverage divides
+    /// by. The arms and the keys draw from [`Cluster::ranges`], the user ranges,
+    /// since no client writes a system range and no arm aims at one yet.
+    // PROPOSED(D-096): the bootstrap nodes host ranges 0 and 1 beside the user ranges.
+    #[must_use]
+    pub fn hosted(self) -> Vec<u64> {
+        match self {
+            Self::OneGroup => vec![SINGLE_GROUP],
+            Self::Node => [crate::ranges::ROOT_RANGE, crate::ranges::META_RANGE]
+                .into_iter()
+                .chain(self.ranges())
+                .collect(),
+        }
+    }
+
+    /// The user ranges every server of this cluster holds, in id order.
     #[must_use]
     pub fn ranges(self) -> Vec<u64> {
         match self {
@@ -6317,7 +6333,7 @@ pub fn node_server_config(
             .map(|s| (ServerId(s), server_addr(s)))
             .collect(),
         ranges: crate::ranges::ranges(),
-        initial_voters: (1..=SERVERS).map(ServerId).collect(),
+        bootstrap: (1..=SERVERS).map(ServerId).collect(),
         raft: RaftConfig {
             variants: variants.into(),
             tick_nanos: u64::try_from(TICK.as_nanos()).expect("small"),
@@ -7423,7 +7439,7 @@ pub fn run_on(
         stopped: watch.stopped,
         history,
         clients: clients_total,
-        ranges: cluster.ranges(),
+        ranges: cluster.hosted(),
         key_range: cluster.key_range(),
         cluster,
         aimed,

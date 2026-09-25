@@ -63,6 +63,7 @@
 //! Descriptors, split, merge and the rebalancer are each a later slice's.
 
 pub mod client;
+pub mod descriptor;
 pub mod frame;
 pub mod inbox;
 pub mod install;
@@ -73,6 +74,7 @@ pub mod reseed;
 pub mod round;
 pub mod server;
 pub mod snapshot;
+pub mod system;
 pub mod variant;
 
 pub use client::{RangedRequest, RangedResponse, is_ranged};

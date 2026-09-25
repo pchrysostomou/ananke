@@ -101,6 +101,36 @@ ananke/
 
 _Update this section at the end of every session._
 
+- Branch `phase-3-stage-c-bootstrap` (2026-09-25), stacked on
+  `phase-3-node-folds-equivalence` (PR #131), PROPOSED D-096, **Stage C's first slice: the
+  bootstrap** (SHARD.md §2; Q7, Q9, Q32; §1's range-local descriptor). A node's
+  configuration names range 0's replicas, the bootstrap nodes; a bootstrap node whose
+  store holds no digest writes the initial state in one synced batch before its tasks run
+  — every hosted range's configuration at index 0, first incarnation and descriptor at
+  generation 1 under a new `PURPOSE_DESCRIPTOR`, range 0's meta descriptor, counter, node
+  records and digest, range 1's record per user range — and hosts **ranges 0 and 1** as
+  Raft groups beside the user ranges, tracing `RangeCreated` for six replicas and
+  `MetaApplied { index: 0 }`. Every span the node names is an interval of encoded keys
+  (`Range::span`), the system ranges' in tenant 1. A node not named keeps Stage B's start,
+  replicas of an empty configuration, until this stage's placeholders. The variant beside
+  it, `AnyFreshNodeBootstraps`, takes a fresh store for a bootstrap with the address book
+  as voters and is caught by check 7's agreement fold on the membership scenario's five
+  nodes (1 000 of 1 000 over a whole thousand, measured; the test runs a tenth of the
+  tier, D-082's share); on three nodes it has nothing to do and its trace is
+  byte-identical, asserted as the absence. **Every node schedule moved**, as §12 said the
+  bootstrap commit would: seeds 272 and 516 no longer reach D-091's live-install hold (a
+  probe over a thousand release seeds found none that does) and their pin asserts the
+  absence both ways with its reason; the re-seed shape reads six replicas, the four user
+  ranges by a stream each as D-081 asserts and the two system ranges by the log from index
+  1, since their leaders compacted nothing, with the arm aimed at a streamed range's mark;
+  `sim/tests/ranges.rs` counts six; the apply spreads read the user ranges alone. It also
+  caught a bootstrap bug on every seed: a re-seeded bootstrap node bootstrapped again over
+  the directory its re-seed built, so the bootstrap is confined to the configured
+  directory on a start that did not re-seed. Sweeps: the premerge green at a thousand
+  seeds in 2 149 s on this session's container against `main`'s 1 760 s, the node binary
+  753 s where `main`'s took 487, every rate the node's sweeps assert within a seed or two
+  of `main`'s at the same tier (tabled in the entry), the four node-family binaries' shard
+  rows re-weighed on this tree.
 - Branch `phase-3-node-folds-equivalence` (2026-09-25), off `main` at 527adcd, PROPOSED
   D-095, the owner's ruling (b) at Stage B's close: **the node's apply-lag, cross-range
   hold and coverage folds run under the incremental checker's equivalence test**, the
