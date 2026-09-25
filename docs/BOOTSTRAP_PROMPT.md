@@ -101,6 +101,21 @@ ananke/
 
 _Update this section at the end of every session._
 
+- Branch `phase-3-premerge-released-tiers` (2026-09-25), off `main` at 527adcd, PROPOSED
+  D-094, the owner's ruling (a) at Stage B's close, approved in advance: **the released
+  phases' sweeps run at CI's hundred under the premerge**, through
+  `ananke_sim::released_seeds()` and `ANANKE_RELEASED_SEEDS=100`, which only
+  `scripts/premerge.sh` sets, so the premerge's thousand is the current phase's. The
+  sweeps that move are named by what they test and not by their file: Phase 1's nine
+  (`echo`, `wal`'s four, the correct engine and its three variants) and Phase 2's 22
+  (every sweep of `sim/tests/raft.rs`), 5 421.7 of the shard table's 9 613.8 cpu s; Stage
+  A's engine tests and every Stage B binary stay at the thousand. Five thousand-seed
+  assertions now open in the nightly alone (the betrayed-cut excuse, `RefusalNotDurable`,
+  `LeaseTrustsTheClock`, the membership scenario's elections while joint and its reverts)
+  and every rate line still prints at the premerge. **Measured back to back on this
+  container** (4-core Xeon, D-070): **1 760 s before, 966 s after, 45 % saved**, the raft binary 764 s to 84 s and the node binary unchanged to the second; the moved sweeps print their count as 100 and every rate line still prints. The gate, CI and the nightly are
+  untouched; CLAUDE.md says where a released phase's thousand-seed assertions run.
+
 - Merge update (2026-09-24): PR #109 (`phase-3-stage-b-stream-variants`, PROPOSED
   D-086, carrying #123's D-089 and D-091) merged `origin/main` at c178682 under the
   owner's ruling, to be gated, nightly-run and merged by the same session. Six files

@@ -76,7 +76,8 @@ Deferred ideas are GitHub issues labelled by phase; [docs/BACKLOG.md](docs/BACKL
   changes, so a pin that asserts only green silently stops meaning anything.
 - **An assertion belongs where the statistics support it.** A variant caught on under
   5% of seeds asserts its catch at the premerge tier, `seeds() >= 1000` (the premerge
-  and the nightly), never at the gate's twenty or CI's hundred. At 3%, twenty seeds
+  and the nightly; for a released phase's sweep, which runs `released_seeds()`, the
+  nightly alone, D-094), never at the gate's twenty or CI's hundred. At 3%, twenty seeds
   catch nothing more than half the time and a hundred about one time in twenty, so an
   assertion there fails a tree with nothing wrong the day a change redraws the
   schedules; a thousand miss about once in 10^13. What every tier still asserts is the
@@ -116,7 +117,7 @@ clippy.toml            Banned I/O paths (disallowed-methods / disallowed-types)
 
 ```
 scripts/gate.sh          # the only command that precedes a commit: 20 seeds, debug
-scripts/premerge.sh      # before asking for a merge: 1000 seeds, release, ~15 min
+scripts/premerge.sh      # before asking for a merge: 1000 seeds of the current phase's sweeps, 100 of the released phases' (D-094), release, ~15 min
 git log --format='%an %cn' main..HEAD | sort -u   # before any push: one line, pchrysostomou pchrysostomou
 ```
 
@@ -126,7 +127,11 @@ The gate runs, in order: `cargo fmt --all -- --check`, `cargo clippy --workspace
 `scripts/check-nightly-shards.sh` and the doctests. A new sweep in `sim/tests` names its
 nightly shard in `scripts/nightly-shards.txt` in the commit that adds it (D-064). The sweeps' four tiers (D-040): 20 seeds at the gate, 100 in CI,
 1000 under `scripts/premerge.sh` on the machine in front of you, 10 000 in the
-nightly workflow on GitHub — the only place ten thousand run. Every sweep runs its
+nightly workflow on GitHub — the only place ten thousand run. A sweep of a released
+phase's system, Phase 1's storage sweeps and Phase 2's one-group Raft sweeps, runs
+`released_seeds()`, which only the premerge lowers, to CI's hundred, so the premerge's
+thousand is the current phase's and those sweeps' thousand-seed assertions run in the
+nightly alone (D-094). Every sweep runs its
 seeds in parallel through `ananke_sim::sweep` (`sim/parallel.rs`, the one file
 outside `ananke-env` allowed host threads); each seed's simulation is independent,
 so a trace and a failing seed mean the same whichever way the sweep ran.
