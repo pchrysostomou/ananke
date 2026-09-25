@@ -18041,6 +18041,252 @@ determinism tests hold.
   had parted them; seed 368's pin asserts the instant, so a read added to the switch
   again fails a pinned seed rather than silencing an exemption over a thousand.
 
+## PROPOSED D-099 — Range ids leased in blocks: a refill to range 0 carrying the run's nonce, granted at the counter in one batch and traced, adopted only by the run that asked, and kept outstanding at or below the threshold
+
+**The number.** Stacked on PR #134 (D-098), whose footer reads D-099. This takes
+**D-099** and moves the footer to D-100. Every code site carries `// PROPOSED(D-099)`.
+Stage C's first question, what a split does when its node's block has run out while
+range 0 cannot refill it, is PROPOSED D-092 on PR #129 and unanswered; this slice
+builds nothing that depends on it — nothing on this tree takes an id — and the split
+slice takes the answer as the owner rules.
+
+**Context.** Stage C's fifth build (SHARD.md:2462-2464): "Range ids leased in blocks
+(§5, Q17): a refill carrying the node's run nonce, traced `RangeIdsLeased`, the three
+rules of §5, and the exhausted block's answer as question 1 settles it." §5 leases range
+ids to nodes in blocks: range 0 holds a u64 counter and a lease record per node, a node
+asks for a refill when the ids left in its block fall to the refill threshold, and a
+split takes the next id from its node's block with no write to range 0. The three rules
+(SHARD.md:639-657, approved as written): blocks are disjoint; a node takes ids only from
+a block of its current run; a node's position in a block is volatile. Check 18's
+range-id clause folds the guarantee (§8) and `IdBlockResumed` breaks the second rule
+(§10). D-096 wrote range 0's counter at bootstrap, one past the highest hosted id, with
+no block leased, and D-069 defined `RangeIdsLeased`.
+
+### What is built
+
+1. **`Command::Refill { node, run }`** in `ananke-raft`'s `Command`, an entry carrying
+   the asking node and its run nonce, which that crate reads nothing of (Q40) and a
+   one-group server never receives; `Command::key` is `None`, so §3's checks leave it
+   alone. **Range 0's lease record** (`ananke_shard::system::LeaseRecord`, under
+   `lease_key(node)` in the root table beside the counter): the run nonce the refill
+   carried and the block's first and last id.
+2. **The grant** (`ananke_shard::ids::grant`), applied by the node's `apply` task for
+   an entry of range 0 and no other: the block of `id_block` ids starting at the
+   counter goes to the asking node's run, its lease record and the counter past the
+   block are written in one batch with the entry's index, `RangeIdsLeased { node, run,
+   first, last, index }` is traced, the effect is `took`, and the asker is answered the
+   record's bytes. Every replica of range 0 reads the counter as its state stands
+   before the entry and applies the same entries, so every replica grants the same
+   block at the same index, and a copy of a refill that applies again grants a second
+   block, a gap. A refill in any other range's log applies as nothing, refused; at
+   receipt any range but range 0 answers it `RangeMismatch` with range 0's descriptor.
+3. **The node's block** (`ananke_shard::ids::IdBlocks`), in memory: the run nonce drawn
+   from the node's generator at every start, as a re-seed draws a store incarnation;
+   the block it takes from and its position in it; the blocks it adopted this run, each
+   once. It adopts a grant only if the grant carries this run's nonce, whether the grant
+   is the refill's answer or read back from its lease record; a grant to another run,
+   delivered late or read from the record, is never adopted. `take` hands out the block's
+   ids in order, each once, and writes nothing: a restart abandons the rest.
+4. **The refill**, on the `meta` task beside the meta range's updates: the host asks for
+   one when the ids left are at or below `refill_at` and none is outstanding — at the
+   start, where a node holds no block, and after every id taken — and the task sends
+   `Refill` to range 0's leader, the last it heard of or a voter of range 0 in turn,
+   under the node's own client id and a sequence number of its own, resending every
+   minimum election timeout until a grant of this run lands. Before each resend, where
+   the node holds a replica of range 0, it reads its lease record back: a grant of this
+   run already applied there is adopted and the refill is done, which is §5's second
+   rule's other case and what keeps a lost answer from costing a block. A block at or
+   below its threshold thus keeps a refill outstanding at all times (PROPOSED D-092's
+   restatement of §5, which this slice builds whichever answer question 1 takes). The
+   block size and the threshold are `ServerConfig`'s, tunable (Q17): eight and two on
+   every node scenario, a first pair; the sharded sweep's measurement, how often a
+   split finds an empty block under Phase 2's network faults, is what sets them.
+5. **At the start**, before the first refill, a node that holds a replica of range 0
+   reads its lease record and adopts it under the same rule — at a fresh start the
+   nonce is fresh and no record matches, which is the rule doing its work. This is the
+   site of **`NodeVariant::IdBlockResumed`**, §10's: the variant adopts, at its start,
+   the block its lease record names whatever run it was granted to, and takes ids from
+   that block's first.
+6. **Check 18's range-id clause**, the part a tree without a split reaches
+   (`ananke_shard::invariants::IdsUnique`, under the `Checker` after check 17): folding
+   `RangeIdsLeased` by the first apply of each of range 0's indices, no two grants share
+   an id, no block is empty, and every replica's apply of an index grants what its
+   first apply did. The clause's other half — the right half of a split lies in a
+   block granted before it to the node that led the parent — comes with the split.
+
+### What the sweeps say
+
+Every rate below was measured before its assertion was written (Q39, D-061), at the
+gate's twenty in debug on this session's container (a four-core Xeon, D-070) from
+`cargo test -p ananke-sim` with the prints kept; the thousand are the premerge on the
+same tree, under **The premerge** below.
+
+- **The correct node**, every sweep green with check 18's range-id clause under the
+  incremental checker's `Checker` and over the whole trace: **range 0 granted 107
+  blocks over 20 seeds, the fewest on a seed 3** — one per node at its start and one
+  per restart of a node, since a new run's nonce matches no record — asserted at one a
+  seed and printed; every block disjoint from every other, which the clause folds; no
+  id taken. D-098's coverage under the refills: 120 lookups served, 2 028 meta applies
+  and none `took`, 73 mismatches at receipt and 60 received, none at a read or at
+  apply; the apply lag's median at twenty 4.59 ms (D-098: 4.58); 2 852 916 trace records
+  over the 20 seeds (2 818 379).
+- **`IdBlockResumed`**: caught on **0 of 20**, asserted as the absence with its reason —
+  nothing takes an id before the split, so a block resumed from another run is one
+  nothing draws from twice, and check 18's clause has no split to see — and seen
+  injected: over the same 20 seeds range 0 granted **60 blocks to the variant's nodes
+  against 107 to the correct node's, over 55 crashes**, since a restarted node that
+  resumes its record's block asks for no refill. The sharded sweep's crash and restart
+  of a node that took an id, followed by a split led from it, is where §10 catches it,
+  with its "wrong if" as a check (SHARD.md:3278-3283).
+- **D-098's and D-097's variants under the refills**: `MetaOverwritesByArrival` 0 of 20
+  with seed 1's 86 updates winning their span against none; `TrustStaleDescriptor` 20 of
+  20, the apply check refusing on 15; the pair 20 of 20; `ApplyIgnoresSpan` alone 0;
+  `ClientIgnoresMismatch` 20 of 20; `RefuseOneRangeOnly` on the sharded quorum scenario
+  20 of 20, 7 by the fan-out clause and 13 by state machine safety on the meta range.
+- **The equivalence**: the checker fed at eight prefixes agreed with its six folds over
+  the whole prefix at **480 prefixes** over 20 seeds and three variants, 243 in violation.
+- **Phase 2's variants on the node** hold Stage B's standard at the gate's twenty:
+  `CountOlderTermForCommit` 4, `RefusedReadLeft` 3, `LeaseTrustsTheClock` 0,
+  `ResetTimerOnAnyRpc` 10, `SharedSnapshotDir`'s liveness catch 4 and the pair 6 of 20;
+  `StepWhilePersisting` 10 of 20 on `ranges`; the re-seed shape's seed 1 holds 4 chunks
+  back.
+
+**What seed 368's guard found.** Re-pinned as an absence (below), seed 368 asserts on
+every schedule that every live install on its run traces its state read back, its
+snapshot and its restatement at one instant, which is what D-091's fourth arm reads a
+switch by. It failed on this tree at the first switch of **a system range**: the switch
+of range 1 on server 1 traced no `RaftSnapshotState` at all, because the `snapshot`
+task's `state_of` looks the range's span up in its own copy of the configured user
+ranges — the same four-name list D-098 found on the host, kept on the task since D-083
+— and returns before it traces where it finds none. So every system-range install since
+the meta range first compacted (D-098) switched with no state read back, and D-091's arm,
+which pairs the switch with that record, was silent for every one of them: a hold of a
+system range's replica past its bound would have been flagged on the correct node, as
+seed 368's user-range hold was under D-097's silence. The task reads the hosted six now,
+as the host and the `apply` task do, and the guard is what found it, on the first tree
+whose schedule reached a system range's switch on a pinned seed; seeds 368, 272, 516
+and 493 each assert it on every switch of their runs.
+
+### The premerge
+
+`scripts/premerge.sh` on this tree at `ANANKE_SEEDS=1000` in release, on this session's
+container (D-070), **green in 2 332 s** on its second run, load 1.14 before and 4.05
+after; the first run was stopped at the node binary when seed 368's guard found the
+`snapshot` task's list (above), and ran on a tree before that fix. Against D-098's
+2 308 s on the same machine: the `node` binary took 878 s (834), the correct node's
+sweep replaying the timer check a second time on every seed for the holds it counts
+(below, and the shard table); `raft` 807 s (822); `ranges` 81 s (79); `reseed` 45 s
+(46); `engine` 409 s, `wal` 16 s and `install` 7 s as before. The pin of seed 493
+(below) was added after this run, on the seed it named; the gate ran it on the
+committed tree.
+
+**The node's rates at a thousand, against D-098's premerge on the same machine**, so
+that what the refills moved is on record (every rate the node's sweeps assert, at its
+tier):
+
+| Sweep, at its tier | D-098 | This tree |
+| --- | ---: | ---: |
+| `IdBlockResumed`, of 100 | — | 0, the absence; 60 grants to its nodes against 107 to the correct node's over 20 seeds and 55 crashes |
+| Range 0's grants, correct node, of 1 000 | — | **5 408**, fewest on a seed 3 |
+| Holds D-091's arm answered for, correct node, of 1 000 | — | **1**, seed 493 |
+| `TrustStaleDescriptor`, of 100 | 100 (74 refused at apply) | 100 (72 refused at apply) |
+| `{TrustStaleDescriptor, ApplyIgnoresSpan}`, of 100 | 100 (74 misapplied) | 100 (72 misapplied) |
+| `ApplyIgnoresSpan` alone, of 100 | 0, the absence | 0, the absence |
+| `ClientIgnoresMismatch`, of 100 | 100 | 100 |
+| `MetaOverwritesByArrival`, of 100 | 0, the absence; seed 1's 89 updates won their span | 0, the absence; seed 1's 86 |
+| `AnyFreshNodeBootstraps`, membership, of 100 | 100 | 100 |
+| `RefuseOneRangeOnly`, sharded quorum, of 1 000 | 1 000 (336 fan-out, 664 state machine safety) | 1 000 (343, 657) |
+| `CountOlderTermForCommit`, of 100 | 36 | 34 |
+| `RefusedReadLeft`, of 1 000 | 107 (10.7 %) | 114 (11.4 %) |
+| `LeaseTrustsTheClock`, of 1 000 | 12 (1.2 %) | **6 (0.6 %)** |
+| `TruncateOnEveryAppend`, of 100 | 98 | 100 |
+| `SharedSnapshotDir`'s liveness catch, of 100 | 18 | 15 |
+| `SnapshotWithoutCurrentLast`, of 1 000 | 0 | 0 |
+| `SingleMajorityInJointConsensus`, raft sweep on the node, of 1 000 | 211 | 202 |
+| `ResetTimerOnAnyRpc`, of 100 | 50 | 50 |
+| `ApplyBeforeCommit`, `SendBeforePersist`, `NoPreVote`, of 100 | 100 each | 100 each |
+| The pair (`SharedSnapshotDir` + `IgnoreIncarnation`), of 100 | 25 | 19 |
+| `ApplyWaitsForEveryRange`, compared, of 25 | 25 | 25 |
+| Elections while joint, membership on the node, of 1 000 | 163 | 151 |
+| Mismatches at receipt / at a read / at apply, correct node, of 1 000 | 3 631 / 0 / 0, 3 000 received | 3 606 / 0 / 0, 3 000 received |
+| Lookups served / meta applies after the bootstrap / `took`, correct node, of 1 000 | 5 541 / 94 113 / 0 | 5 502 / 93 150 / 0 |
+
+**The coverage at a thousand**, against D-098's: **range 0 granted 5 408 blocks over the
+thousand seeds, the fewest on a seed 3** — one per node at its start and one per restart
+— and every block disjoint, which check 18's clause folded on every seed; range 0's
+applies 29 503 where D-098 counted 13 428, the refills' entries, range 1's 105 624
+(106 648) and the user ranges' 365 000 to 389 000; leaders by range 4 467 / 4 560 on the
+system ranges and 7 788 to 7 830 on the user ranges; 144.6 million trace records
+(143.9); 5 502 lookups served, 93 150 meta applies and none `took`; 3 606 mismatches at
+receipt and 3 000 received, none at a read or at apply; the apply lag's pooled median
+4.66 ms (4.68), per range 2.59 / 5.51 / 4.45 / 4.56 / 5.11 / 4.68 ms; one range's
+applies held another's for a median of 3.06 ms and at most 501 ms over 110 733 waits, 69
+dropped (3.07 ms, 486 ms, 106 246, 98); the user ranges' apply spread 0.94; 65 031
+snapshot actions, 65.0 a seed, fewest 25 (64 870, 64.9, 22); the correct node re-took a
+range at an index it had taken on 530 seeds (553), into the same directory on none; 0
+store refusals; **one seed, 493, on which a live install's hold outlasted a replica's
+bound and D-091's arm answered for it**, the pin's new seed; seeds 272, 516 and 368 at
+41, 27 and 18 live installs, no stretch held by one; the folds' equivalence on 100 seeds
+at eight prefixes, the lag verdict for `ApplyWaitsForEveryRange` (25, 25, 25) as before;
+the range layer's checker in agreement with its six folds at 480 prefixes, 243 in
+violation. `sim/tests/ranges.rs`: 18 000 bootstrap creations, `StepWhilePersisting`
+caught on 646 of 1 000 (671), `RefusedReadLeft` on none; the re-seed shape's cap held a
+stream back on 200 of 200 (median 4 chunks, most 11), `ReseedMarkNotSynced` 11 (7) and
+`RecordNeverQueued` 18 of 20, `ServeBeforeRefusedMark` 20 of 20 by (c), and its
+`log_ranges` holds on every one of the 200; the membership scenario's
+`SingleMajorityInJointConsensus` 241 of 1 000 (241) on one group and 202 (211) on the
+node; the one-group raft sweep's 47 tests green, seed 42's JSONL at D-097's bytes and
+hash.
+
+**One rate to put to the owner**, asserted from the nightly's ten thousand as before: the
+lease variant's catch on the node at **6 of 1 000** where D-098 measured 12, D-097 3,
+D-096 7 and `main` 6 — draws of a rate near a percent, recorded. The thousand's other
+rows moved by a seed or a few, in both directions, as a schedule move does.
+
+**What the second replay costs.** The correct node's sweep runs the timer check's replay
+a second time on every seed, without the fourth arm, to count the holds the arm answered
+for: its row in the shard table goes from 387.4 to 547.2 cpu s at a thousand seeds,
+re-weighed on this tree, and the node binary's premerge time from 834 s to 878 s. It
+named seed 493 on its first thousand, which is what it is for; folding the count into
+the check's own replay, one pass for both, is the saving if the nightly's shards want it.
+
+### The pinned seeds, re-audited
+
+Every node schedule moves: the run nonce is a draw from the node's generator at every
+start, and the refill and its grant run beside every start's traffic. Seeds 272 and 516
+keep the absence D-096 pinned, at 41 and 27 live installs (D-098: 41 and 23). **Seed
+368's schedule moved off the hold** D-098 pinned it for: no stretch on it is held past a
+bound any more, and the pin asserts the absence with that reason and keeps the shape,
+as CLAUDE.md asks; what it keeps asserting on every schedule is the guard on the
+mechanism D-097 had silenced — every live install on the run traces its state read
+back, its snapshot and its restatement at one instant, 18 installs on seed 368 —
+so a read added to the switch again fails a pinned seed rather than an exemption over a
+thousand. The correct node's sweep now counts, on every seed, the holds D-091's arm
+answers for (`live_install_holds`), and names the first seed — **and the thousand named
+seed 493**: server 2's replica of range 5, its clock last reset at 8.066 s, fed a
+snapshot of that range, the install decided at 8.110 s where the `raft` task took the
+hold and switched at 8.478 s, flagged at 8.466 s, 356 ms into the hold and 12 ms before
+the restatement. It is pinned in D-091's shape
+(`seed_493_is_a_live_installs_hold_and_the_fourth_arm_answers_for_it`): the one
+stretch the arm answers for equals what the check without the arm flags, the decision
+and the switch bracket the flag, the switch's records land at one instant, and a stream
+toward the replica was re-opened inside the window; the day a schedule move takes it
+off the hold, it becomes an absence and the counter names the next. The
+re-seed shape's seed 1 holds 4 chunks back where D-098's held 2, its cap pin still
+holding; seed 42's one-group JSONL is D-097's, since one group
+draws no nonce and sends no refill.
+
+### Consequences
+
+- Range ids are leased and never taken on this tree: every node holds a block of eight
+  from its start, and the split slice is the first to call `IdBlocks::take`. The
+  exhausted block's answer is the split slice's, as PROPOSED D-092 is ruled.
+- `Command` has one more variant the one-group server never receives; its studio view
+  names it.
+- The `meta` task runs two errands — the meta range's updates and range 0's refills —
+  each to its own leader hint; a third system-range errand would make it the node's
+  system task in name as well.
+
 ---
 
-_Next entry: D-099. Add one before implementing anything not covered above._
+_Next entry: D-100. Add one before implementing anything not covered above._

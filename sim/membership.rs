@@ -612,6 +612,8 @@ pub fn node_server_config(
         // This scenario is not about the receive cap, so it sets it at the node's range
         // count and no stream waits by accident (D-075, as D-083's other scenarios do).
         snapshot_cap: crate::ranges::SNAPSHOT_CAP,
+        id_block: crate::ranges::ID_BLOCK,
+        refill_at: crate::ranges::REFILL_AT,
         node,
     }
 }

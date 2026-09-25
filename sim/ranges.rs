@@ -95,6 +95,17 @@ pub const INBOX_BYTES: usize = 64 * 1024;
 /// scenarios are not about the cap: they set it at [`RANGES`]. The re-seed shape, which
 /// *is* about the cap, sets it to two on purpose (SHARD.md §12).
 pub const SNAPSHOT_CAP: usize = RANGES as usize;
+
+/// The block of range ids a refill grants a node, and the ids left in its block at
+/// or below which it asks for the next (SHARD.md §5, Q17): tunable, and the same on
+/// every node scenario. Eight and two are a first pair; the sharded sweep's
+/// measurement, how often a split finds an empty block under Phase 2's network
+/// faults, is what sets them (PROPOSED D-092, D-099). On a tree with no split a node
+/// takes no id, so every node asks once at its start and again at every restart.
+// PROPOSED(D-099)
+pub const ID_BLOCK: u64 = 8;
+/// See [`ID_BLOCK`].
+pub const REFILL_AT: u64 = 2;
 /// How many trace records a run may hold before it is stopped as a runaway
 /// (`raft::TRACE_CAP`, and the figure Stage B measures per range).
 pub const TRACE_CAP: usize = raft::TRACE_CAP;
@@ -736,6 +747,8 @@ pub fn server_config_of(
         engine,
         inbox_bytes: INBOX_BYTES,
         snapshot_cap: SNAPSHOT_CAP,
+        id_block: ID_BLOCK,
+        refill_at: REFILL_AT,
         node,
     }
 }

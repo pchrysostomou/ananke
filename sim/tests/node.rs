@@ -336,6 +336,18 @@ struct Coverage {
     client_lookups: u64,
     meta_applies: usize,
     meta_took: usize,
+    /// Range 0's grants of blocks of range ids (SHARD.md §5, Q17; PROPOSED D-099), by
+    /// the first apply of each index, and the fewest on any one seed: every node asks
+    /// once at its start and again at every restart, and nothing on this tree takes
+    /// an id.
+    ids_granted: usize,
+    ids_granted_fewest: Option<usize>,
+    /// Seeds on which a live install's hold outlasted a replica's timer bound and
+    /// D-091's fourth arm answered for it (`timer_gaps_held_by_a_live_install`), and
+    /// the first such seed: what the hold's pin is moved to when a schedule move
+    /// takes the pinned seed off the hold (PROPOSED D-099, after seed 368).
+    live_install_holds: usize,
+    live_install_holds_first: Option<u64>,
     leaders_by_range: BTreeMap<u64, usize>,
     applies_by_range: BTreeMap<u64, usize>,
     multi_range_frames: usize,
@@ -433,6 +445,10 @@ impl std::fmt::Debug for Coverage {
             .field("client_lookups", &self.client_lookups)
             .field("meta_applies", &self.meta_applies)
             .field("meta_took", &self.meta_took)
+            .field("ids_granted", &self.ids_granted)
+            .field("ids_granted_fewest", &self.ids_granted_fewest)
+            .field("live_install_holds", &self.live_install_holds)
+            .field("live_install_holds_first", &self.live_install_holds_first)
             .field("leaders_by_range", &self.leaders_by_range)
             .field("applies_by_range", &self.applies_by_range)
             .field("multi_range_frames", &self.multi_range_frames)
@@ -557,6 +573,15 @@ impl Coverage {
         let (applies, took) = raft::meta_applies_of(&report.records);
         self.meta_applies += applies;
         self.meta_took += took;
+        let (granted, _) = raft::ids_leased_of(&report.records);
+        self.ids_granted += granted;
+        self.ids_granted_fewest = Some(self.ids_granted_fewest.map_or(granted, |f| f.min(granted)));
+        if !report.timer_gaps_held_by_a_live_install().is_empty() {
+            self.live_install_holds += 1;
+            if self.live_install_holds_first.is_none() {
+                self.live_install_holds_first = Some(report.seed);
+            }
+        }
         self.multi_range_frames += report.frames_of_several_ranges();
         let (hit, fired) = report.arms_hit_their_ranges();
         self.arms_hit += hit;
@@ -699,6 +724,17 @@ impl Coverage {
             self.meta_took, 0,
             "a meta update won something on the correct node, where nothing raises a \
              generation before the split: the absence becomes a reach"
+        );
+        // Range 0 granting blocks of ids (SHARD.md §5, Q17; PROPOSED D-099): every
+        // node asks at its start, so every seed has grants; the floor is one a seed,
+        // and the fewest on a seed is printed beside it.
+        assert!(
+            self.ids_granted_fewest.is_some_and(|fewest| fewest >= 1),
+            "range 0 granted no block of ids on some seed (fewest {:?}, {} over {} seeds): \
+             the nodes are not asking for a refill at their start",
+            self.ids_granted_fewest,
+            self.ids_granted,
+            self.seeds
         );
         // **The install arm reaching the moment it aims at**, which was not a floor
         // before PROPOSED D-089 because it was not a number: the arm drew its victim and
@@ -1631,6 +1667,59 @@ fn a_meta_range_that_stores_updates_as_they_arrive_has_no_path_on_the_node_yet()
         applies > 0 && took > 0 && took_correct == 0,
         "the variant was not seen injected: its updates should win their whole span \
          where the correct meta range's win nothing"
+    );
+}
+
+/// §10's `IdBlockResumed` on the node, which has no path on this tree (PROPOSED
+/// D-099): nothing takes an id before the split, so a block resumed from another run
+/// is a block nothing draws from twice, and check 18's range-id clause — which sees
+/// the variant at the first apply of a split whose right half was named before — has
+/// no split to see. Caught on no seed, asserted as that absence with its reason; the
+/// variant is seen injected all the same: a restarted node that adopts the block its
+/// lease record names asks range 0 for no refill, where the correct node, whose new
+/// run's nonce matches no record, asks at every restart — so over seeds with restarts
+/// the variant is granted fewer blocks than the correct node. The sharded sweep's
+/// crash and restart of a node that took an id, followed by a split led from it, is
+/// where §10 catches it, with its "wrong if" as a check.
+#[test]
+fn a_node_that_resumes_another_runs_block_of_ids_has_no_path_on_the_node_yet() {
+    let outcomes = routing_variant("IdBlockResumed", &[NodeVariant::IdBlockResumed]);
+    let caught = outcomes.iter().filter(|o| o.why.is_some()).count();
+    assert_eq!(
+        caught, 0,
+        "IdBlockResumed was caught, so an id was taken twice or a check saw the block \
+         resumed: the split has landed and this absence becomes a reach"
+    );
+    // Seen injected: over the first seeds of the share, the variant's nodes are
+    // granted fewer blocks than the correct node's, and its restarted nodes with a
+    // record to resume ask for none.
+    let seeds = high_rate_share().min(20);
+    let (variant_grants, correct_grants, restarts): (usize, usize, usize) = sweep(seeds, |seed| {
+        let variant = raft::run_on_the_node(
+            seed,
+            Variants::default(),
+            NodeVariants::of(&[NodeVariant::IdBlockResumed]),
+        );
+        let correct = correct(seed);
+        let restarts = correct.count(|e| matches!(e, TraceEvent::NodeCrashed { .. }));
+        (
+            raft::ids_leased_of(&variant.records).0,
+            raft::ids_leased_of(&correct.records).0,
+            restarts,
+        )
+    })
+    .into_iter()
+    .fold((0, 0, 0), |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2));
+    println!(
+        "node: IdBlockResumed over {seeds} seeds: range 0 granted {variant_grants} blocks to \
+         the variant's nodes against {correct_grants} to the correct node's, over {restarts} \
+         crashes"
+    );
+    assert!(
+        variant_grants < correct_grants,
+        "the variant was not seen injected: its restarted nodes should resume their \
+         record's block and ask for no refill, so range 0 should grant them fewer blocks \
+         ({variant_grants}) than the correct node's ({correct_grants})"
     );
 }
 
@@ -3536,29 +3625,41 @@ fn seeds_272_and_516_are_a_live_installs_hold_and_the_fourth_arm_answers_for_the
     }
 }
 
-/// **Seed 368 is the hold D-091's pin waited for**, found by this tree's premerge on the
-/// correct node under the raft sweep's arms, and pinned in the shape the pin above
-/// keeps for it (PROPOSED D-098).
+/// **Seed 368 was the hold D-091's pin waited for**, found by PROPOSED D-098's premerge
+/// on the correct node under the raft sweep's arms and pinned in the shape the pin
+/// above keeps; **PROPOSED D-099 moved every node schedule** — the run nonce drawn at
+/// every start and the refill sent from it (SHARD.md §5, §12) — and the schedule moved
+/// off the hold: no stretch on seed 368 is held past a bound any more. The pin asserts
+/// the absence with that reason, as seeds 272 and 516 do, and keeps the shape for the
+/// day the schedule reaches a hold again, which the correct node's sweep now looks for
+/// on every seed (`live_install_holds` in its coverage): the pin moves to the first
+/// seed it names.
 ///
-/// Server 1 came back behind on every range and was streamed five snapshots at once,
-/// the meta range's among them for the first time. Its `snapshot` task installed them
-/// one after another, and range 2's core was held from its stream's completion — the
-/// `raft` task handing the repair over — through four other ranges' installs to its
-/// own switch: a core with no timer to fire, for longer than its bound. Its clock was
-/// last reset by an `AppendEntries` of its term at 7.684 s; leader 2 then streamed it,
-/// re-opening the stream at offset 0 six times, lost its quorum at 7.863 s and stepped
-/// down; the install was decided at 7.768 s and switched, with the restatement on it,
-/// at 8.168 s; the replay flagged it at 8.079 s, inside the hold. The check with the
-/// fourth arm passes; the check without it flags exactly this stretch, with the one
-/// live install the arm answers for.
+/// **The shape it pinned on D-098's schedule.** Server 1 came back behind on every
+/// range and was streamed five snapshots at once, the meta range's among them for the
+/// first time. Its `snapshot` task installed them one after another, and range 2's
+/// core was held from its stream's completion — the `raft` task handing the repair
+/// over — through four other ranges' installs to its own switch: a core with no timer
+/// to fire, for longer than its bound. Its clock was last reset by an `AppendEntries`
+/// of its term at 7.684 s; leader 2 then streamed it, re-opening the stream at offset 0
+/// six times, lost its quorum at 7.863 s and stepped down; the install was decided at
+/// 7.768 s and switched, with the restatement on it, at 8.168 s; the replay flagged it
+/// at 8.079 s, inside the hold. The upgraded pin asserts, on the seed the sweep names:
+/// `timer_gaps_held_by_a_live_install()` is exactly one stretch, equal to
+/// `timer_gaps(TimerResets::WITHOUT_LIVE_INSTALL)`; the install's decision and switch
+/// bracket the flag; and a `RaftSnapshotResumed` toward the replica was decided inside
+/// the window.
 ///
-/// What found it is what had hidden it: the arm reads `RaftSnapshotState` and
-/// `RaftSnapshot { taken: false }` as one switch only at one instant, and D-097's
-/// descriptor read-back sat between them, so the arm had matched no node install
-/// since and this seed failed the second premerge of this tree. The read-back precedes
-/// the state now, and this pin asserts the two records at one instant so the arm
-/// cannot go silent that way again.
+/// **What stays asserted on every schedule**, because it is what had hidden the hold:
+/// the arm reads `RaftSnapshotState` and `RaftSnapshot { taken: false }` as one switch
+/// only at one instant (`Report::reads_back`), and D-097's descriptor read-back sat
+/// between them, so the arm had matched no node install and this seed failed D-098's
+/// second premerge. The read-back precedes the state now, and every live install on
+/// this seed's run is asserted to trace the two at one instant, so a read added to the
+/// switch again fails this pin rather than silencing an exemption over a thousand.
 // PROPOSED(D-098): the hold reached; the fourth arm's records at one instant.
+// PROPOSED(D-099): the nonce and the refill moved the schedule off the hold; the
+// absence, with its reason, and the one-instant guard over every install.
 #[test]
 fn seed_368_is_a_live_installs_hold_and_the_fourth_arm_answers_for_it() {
     let seed = 368u64;
@@ -3571,42 +3672,145 @@ fn seed_368_is_a_live_installs_hold_and_the_fourth_arm_answers_for_it() {
         gaps.is_empty(),
         "seed {seed}: the timer replay reports {gaps:?} under every arm"
     );
-    // The hold, reached: exactly one stretch the arm answers for, and the check without
-    // the arm flags that stretch and nothing else.
+    // The absence, asserted: no stretch the arm answers for, and nothing flagged
+    // without the arm either. The day the first fails, the schedule has reached a
+    // hold again on this seed: upgrade the pin to the shape in the comment above.
+    let held = report.timer_gaps_held_by_a_live_install();
+    assert!(
+        held.is_empty(),
+        "seed {seed}: the check without the fourth arm finds {} stretches held by a \
+         live install: {held:?}. The schedule has reached the hold again on this seed, \
+         and this pin is upgraded to assert it, not left as an absence",
+        held.len()
+    );
+    assert!(
+        report
+            .timer_gaps(raft::TimerResets::WITHOUT_LIVE_INSTALL)
+            .is_empty(),
+        "seed {seed}: the check without the fourth arm flags a stretch the arm does \
+         not answer for, and the replay under every arm did not"
+    );
+    // The guard: every live install on the run traces the state read back, the
+    // snapshot and the restatement at one instant, which is what the arm reads a
+    // switch by.
+    let mut switches = 0usize;
+    for (index, record) in report.records.iter().enumerate() {
+        let TraceEvent::RaftSnapshot {
+            server,
+            range,
+            taken: false,
+            ..
+        } = &record.event
+        else {
+            continue;
+        };
+        // A restart's restatement re-traces the snapshot too, after a `RaftTruncate`
+        // at the same instant; a switch follows its `RaftSnapshotState`.
+        let before = &report.records[index - 1];
+        if before.at == record.at && matches!(&before.event, TraceEvent::RaftTruncate { .. }) {
+            continue;
+        }
+        switches += 1;
+        assert!(
+            before.at == record.at
+                && matches!(
+                    &before.event,
+                    TraceEvent::RaftSnapshotState { server: s, range: g, .. }
+                        if (s, g) == (server, range)
+                ),
+            "seed {seed}: the switch of range {range} on server {server} at {:?} does not \
+             follow its state read back at the same instant ({:?} at {:?}): the fourth \
+             arm reads no such switch (D-097's silence)",
+            record.at,
+            before.event,
+            before.at
+        );
+        assert!(
+            report.records[index + 1..]
+                .iter()
+                .take_while(|after| after.at == record.at)
+                .any(|after| matches!(
+                    &after.event,
+                    TraceEvent::RaftRecovered { server: s, range: g, .. }
+                        if (s, g) == (server, range)
+                )),
+            "seed {seed}: the switch of range {range} on server {server} at {:?} is not \
+             followed by its restatement at the same instant",
+            record.at
+        );
+    }
+    assert!(
+        switches > 0,
+        "seed {seed}: no live install switched on the run, so the guard asserts nothing"
+    );
+    println!(
+        "seed {seed}: no stretch held by a live install (PROPOSED D-099 moved the schedule \
+         off D-098's hold); {switches} live installs on the run, every one traced at one \
+         instant"
+    );
+}
+
+/// **Seed 493 is the hold D-091's pin waited for**, named by the correct node's sweep
+/// on this tree's premerge (`live_install_holds_first`) and pinned in the shape D-091's
+/// pin keeps (PROPOSED D-099): a replica held for a live install past its timer bound,
+/// which the check with the fourth arm passes and the check without it flags, exactly
+/// that stretch and nothing else. Server 2's replica of range 5, its clock last reset
+/// at 8.066 s, was fed a snapshot of that range: the install was decided at 8.110 s,
+/// where the `raft` task handed the repair over and took the hold, and switched, with
+/// the restatement on it, at 8.478 s; the replay flags it at 8.466 s, 356 ms into the
+/// hold and 12 ms before the restatement.
+///
+/// What is asserted is the mechanism, not the pass: the one stretch the arm answers
+/// for equals what the check without the arm flags; the install's decision and its
+/// switch bracket the flag; the switch's state read back, its snapshot and its
+/// restatement land at one instant, which is what the arm reads a switch by; and a
+/// stream toward the replica was re-opened inside the window, the shape's leader
+/// streaming a follower it stopped appending to. The day the schedule moves off the
+/// hold, this pin becomes the absence with its reason, as seeds 272, 516 and 368 are,
+/// and the sweep's counter names the next.
+// PROPOSED(D-099): the hold reached, on the seed the sweep's counter named.
+#[test]
+fn seed_493_is_a_live_installs_hold_and_the_fourth_arm_answers_for_it() {
+    let seed = 493u64;
+    let report = correct(seed);
+    report
+        .check()
+        .unwrap_or_else(|violation| panic!("seed {seed} no longer passes: {violation}"));
+    let gaps = report.timer_gaps(raft::TimerResets::ALL);
+    assert!(
+        gaps.is_empty(),
+        "seed {seed}: the timer replay reports {gaps:?} under every arm"
+    );
     let held = report.timer_gaps_held_by_a_live_install();
     let without = report.timer_gaps(raft::TimerResets::WITHOUT_LIVE_INSTALL);
     assert_eq!(
         held.len(),
         1,
         "seed {seed}: the schedule has moved off the hold this pin asserts ({held:?}); \
-         assert the absence with its reason, as seeds 272 and 516 do"
+         assert the absence with its reason, as seeds 272, 516 and 368 do, and move the \
+         pin to the seed the correct node's sweep names"
     );
     assert_eq!(
         held, without,
         "seed {seed}: the arm exempts more than the live install's hold"
     );
     let gap = held[0];
-    assert_eq!((gap.server, gap.range, gap.live_installs), (1, 2, 1));
+    assert_eq!(gap.live_installs, 1);
+    let (server, range) = (gap.server, gap.range);
     // The install's decision and its switch bracket the flag, and the switch's records
-    // — the state read back, the snapshot and the restatement — land at one instant,
-    // which is what the arm reads them by (`Report::reads_back`).
-    let switch = report
+    // land at one instant.
+    let (index, record) = report
         .records
         .iter()
         .enumerate()
         .find(|(_, record)| {
             matches!(
                 &record.event,
-                TraceEvent::RaftSnapshot {
-                    server: 1,
-                    range: 2,
-                    taken: false,
-                    ..
-                }
+                TraceEvent::RaftSnapshot { server: s, range: g, taken: false, .. }
+                    if (*s, *g) == (server, range)
             ) && record.at > gap.since
         })
-        .expect("the live install of range 2 on server 1 switches after the window opens");
-    let (index, record) = switch;
+        .expect("the live install switches after the window opens");
     assert!(
         record.decided > gap.since && record.decided < gap.at && record.at > gap.at,
         "seed {seed}: the install's decision ({:?}) and switch ({:?}) do not bracket the \
@@ -3621,11 +3825,8 @@ fn seed_368_is_a_live_installs_hold_and_the_fourth_arm_answers_for_it() {
         before.at == record.at
             && matches!(
                 &before.event,
-                TraceEvent::RaftSnapshotState {
-                    server: 1,
-                    range: 2,
-                    ..
-                }
+                TraceEvent::RaftSnapshotState { server: s, range: g, .. }
+                    if (*s, *g) == (server, range)
             ),
         "seed {seed}: the state read back is not traced at the switch's instant: {:?} at \
          {:?}, the switch at {:?}",
@@ -3637,39 +3838,29 @@ fn seed_368_is_a_live_installs_hold_and_the_fourth_arm_answers_for_it() {
         report.records[index + 1..]
             .iter()
             .take_while(|after| after.at == record.at)
-            .any(|after| {
-                matches!(
-                    &after.event,
-                    TraceEvent::RaftRecovered {
-                        server: 1,
-                        range: 2,
-                        ..
-                    }
-                )
-            }),
+            .any(|after| matches!(
+                &after.event,
+                TraceEvent::RaftRecovered { server: s, range: g, .. }
+                    if (*s, *g) == (server, range)
+            )),
         "seed {seed}: the restatement does not follow the switch at its instant"
     );
-    // A stream toward the replica was re-opened inside the window, which is the shape:
-    // the leader streaming a follower it stopped appending to.
     assert!(
         report.records.iter().any(|record| {
             matches!(
                 &record.event,
-                TraceEvent::RaftSnapshotResumed {
-                    range: 2,
-                    to: 1,
-                    ..
-                }
+                TraceEvent::RaftSnapshotResumed { range: g, to, .. }
+                    if (*g, *to) == (range, server)
             ) && record.decided > gap.since
                 && record.decided <= gap.at
         }),
-        "seed {seed}: no stream toward server 1's replica of range 2 was re-opened inside \
-         the window"
+        "seed {seed}: no stream toward server {server}'s replica of range {range} was \
+         re-opened inside the window"
     );
     println!(
-        "seed {seed}: server 1's replica of range 2 held by its live install, the window \
-         {:?} to {:?}, the install decided at {:?} and switched at {:?}; the fourth arm \
-         answers for it",
+        "seed {seed}: server {server}'s replica of range {range} held by its live install, \
+         the window {:?} to {:?}, the install decided at {:?} and switched at {:?}; the \
+         fourth arm answers for it",
         gap.since, gap.at, record.decided, record.at
     );
 }

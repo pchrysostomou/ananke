@@ -65,6 +65,7 @@
 pub mod client;
 pub mod descriptor;
 pub mod frame;
+pub mod ids;
 pub mod inbox;
 pub mod install;
 pub mod invariants;

@@ -101,6 +101,46 @@ ananke/
 
 _Update this section at the end of every session._
 
+- Branch `phase-3-stage-c-range-ids` (2026-09-25), stacked on `phase-3-stage-c-meta`
+  (PR #134), PROPOSED D-099, **Stage C's range ids leased in blocks** (SHARD.md §5, Q17;
+  §8's check 18, its range-id clause; §10's `IdBlockResumed`). `Command::Refill { node,
+  run }`, an entry `ananke-raft` reads nothing of; range 0's lease record per node
+  (`system::LeaseRecord`, the run nonce and the block's first and last id) beside the
+  counter; `ananke_shard::ids::grant`, range 0's apply of a refill — the block of
+  `id_block` ids at the counter to the asking run, the record and the counter past the
+  block in one batch with the entry's index, `RangeIdsLeased` traced, effect `took`,
+  the record answered back — refused as a mismatch off range 0; `ids::IdBlocks`, the
+  node's block in memory: the run nonce drawn at every start, a grant adopted only if
+  it carries this run's nonce and each block once, ids taken in order from memory so a
+  restart abandons the rest; the refill on the `meta` task, asked when the ids left are
+  at or below `refill_at` and none is outstanding, resent every minimum election
+  timeout until a grant of this run lands, the lease record read back before each
+  resend where the node holds range 0 (§5's second rule's other case, PROPOSED D-092's
+  restatement); the block size and threshold `ServerConfig`'s, eight and two until the
+  sharded sweep measures them; the lease record read at the start, where
+  `IdBlockResumed` adopts whatever run's block it names; check 18's range-id clause,
+  the part without a split — grants by first apply, blocks disjoint, every replica of an
+  index granting the same — under the range layer's checker. Nothing takes an id on
+  this tree; the exhausted block's answer is the split slice's, as D-092 is ruled.
+  Measured before asserted: range 0 granted 107 blocks over 20 seeds, the fewest on a
+  seed 3, one per node at its start and one per restart; `IdBlockResumed` caught on no
+  seed, the absence asserted with its reason, and seen injected at 60 grants to its
+  nodes against 107 to the correct node's over 55 crashes; the checker's agreement with
+  its six folds at 480 prefixes. **Every node schedule moved** (the nonce, the refill):
+  seed 368's schedule moved off the hold D-098 pinned, re-pinned as the absence with a
+  guard that every live install traces its state, its snapshot and its restatement at
+  one instant — **which found** the `snapshot` task reading a switched range's span
+  from the configured user ranges, D-098's host finding on the task: a system range's
+  switch traced no state read back and D-091's arm was silent for every one since the
+  meta range first compacted; the task reads the hosted six. The correct node's sweep
+  counts the holds the arm answers for on every seed and names the first, where the pin
+  moves. The premerge is green at a thousand seeds in 2 332 s on this
+  session's container against D-098's 2 308, the node binary 878 s where it took 834
+  (the correct node's sweep replaying the timer check a second time on every seed, its
+  row re-weighed 387.4 → 547.2 cpu s), every rate tabled in the entry against D-098's:
+  5 408 blocks granted, fewest 3 a seed; the lease variant's catch 6 of 1 000 where D-098
+  measured 12, recorded for the owner. **The thousand named seed 493** as the hold
+  D-091's pin waited for, and it is pinned in D-091's shape.
 - Branch `phase-3-stage-c-meta` (2026-09-25), stacked on `phase-3-stage-c-routing`
   (PR #133), PROPOSED D-098, **Stage C's meta build: the root and the meta range**
   (SHARD.md §1; Q3, Q4, Q36; §8's check 16; §11, raft 3). `Command::MetaUpdate
