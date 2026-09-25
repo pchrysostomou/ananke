@@ -3011,6 +3011,8 @@ fn a_server_whose_refusal_is_not_durable_is_not_re_asserted_on_the_node_yet() {
 // measure a replica whose core is held.
 // PROPOSED(D-096): the bootstrap's two system ranges moved every node schedule; the
 // hold is absent on both seeds and on a thousand, and the pin asserts the absence.
+// PROPOSED(D-097): the generation on every client request moved every node schedule
+// again (SHARD.md §12); the absence holds on both seeds, at 35 and 29 live installs.
 #[test]
 fn seeds_272_and_516_are_a_live_installs_hold_and_the_fourth_arm_answers_for_them() {
     for seed in [272u64, 516] {

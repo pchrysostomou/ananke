@@ -17366,6 +17366,154 @@ tests, which pin determinism and not a hash.
 - The `initial_voters` of the one-group server's `NodeConfig` are unchanged; only the
   node's configuration is bootstrap's.
 
+
+## PROPOSED D-097 — Routing: a request carries its range and generation, a server checks the key against its own descriptor at receipt, at a read's serving and at apply, and a client merges what `RangeMismatch` tells it
+
+**The number.** Off `main` at 527adcd, stacked on PR #132 (D-096), whose footer reads
+D-097. This takes **D-097** and moves the footer to D-098. Every code site carries
+`// PROPOSED(D-097)`.
+
+**Context.** Stage C's second build (SHARD.md:2447-2456): "Routing (§3; §11, raft 4, 5,
+16): a request carries (range, generation) (Q10); the checks at receipt, at a read's
+serving and at apply, with the apply's `effect` traced; `RangeMismatch` carrying the
+node's descriptors for the key; a write answered `RangeMismatch` resent under a fresh
+`seq` that `ClientSend`'s `invoked` pairs with the original, the leader keeping its record
+of the original (Q10); a write with no answer abandoned as pending (Q11); the client cache
+merged by generation, with lookups through ranges 0 and 1 kept out of the history (Q36);
+the history closed only by an apply whose effect is `applied`, with an operation's
+proposals gathered by `invoked` (§9)." §12 names two of this build's commits among the
+three that move pinned hashes or schedules: the one that adds the generation to every
+client request, and the one that emits `ClientSend`, `ClientMismatch` and
+`RangeMismatchSent` (SHARD.md:2524-2529).
+
+What the tree had. A client of the node put its key's range on every message from the
+scenario's fixed map (D-072), and a node with no replica of that range failed its run
+(D-076); a node with one proposed or served whatever key the request carried, and every
+client command applied (D-069 traced `effect: applied` for all of them). The client's
+`NotLeader` hint was one leader per range and nothing else; `Reply` had two answers.
+
+### What is built, in two commits
+
+**The first commit: the generation on every client request, and the client's cache.**
+§12 names it as one of the three commits that move pinned schedules, and it does: the
+sim's links drain by the byte, so eight more bytes on every client packet move every
+node schedule.
+
+1. **`RangedRequest` carries `generation`**: `tag | range | generation | the raft
+   packet` (§3, Q10). A response is unchanged.
+2. **`Reply::RangeMismatch { descriptors }` beside `NotLeader`** in `ananke-raft`'s
+   client protocol, where §11's raft item 5 puts it, carrying the descriptors as bytes
+   that crate does not read: a range is the range layer's to name (Q40), and a one-group
+   server never answers it. `ananke_shard::descriptor::RangeDescriptor` is what the
+   bytes encode.
+3. **`ananke_shard::client::Cache`**: an ordered map from end key to descriptor with a
+   leader hint per range, merged by §1's generation rule. A descriptor learned replaces
+   the cached entries it overlaps that carry a lower generation — for the part it
+   overlaps, keeping the rest, since what the client believed of the keys outside the
+   learned span is still its best knowledge of them — and is dropped for every part an
+   entry of its own generation or a higher one covers; so the entries never overlap and
+   a lookup finds at most one. A `RangeMismatch` that carries nothing evicts the entry.
+4. **The sweep's client routes by it** (`raft::client_on`, both clusters): the node
+   cluster's client starts from the bootstrap descriptors of its configuration
+   (`raft::node_descriptors`), sends every request with the range and generation its
+   cache names, keeps its leader hints in the cache, and on `RangeMismatch` merges what
+   the answer carries, evicts on an empty one, and goes again to the range the cache
+   now names **under a fresh sequence number**, the operation's own (`invoked`) kept for
+   its `ClientInvoke` and `ClientReturn` (§9, Q10). A client with no entry for a key
+   takes the bootstrap descriptors again until Stage C's meta lookups exist (§1, §3),
+   which is what a lookup returns on a tree with no split. On one group the cache holds
+   no span and only the hint, and every draw falls where it fell. The scenario writers of
+   `sim/ranges.rs`, `sim/reseed.rs` and `sim/install.rs`, which route by their fixed
+   maps that no split moves, send the first generation and treat a mismatch as a lost
+   leader. The operator sockets do the same: a command that names no key is never
+   mismatched.
+
+**The second commit: the checks, the events, the history and the folds.** It is the
+commit §12 names as emitting `ClientSend`, `ClientMismatch` and `RangeMismatchSent`
+where a Phase 2 scenario's client emits them.
+
+5. **The three checks on the server, each against its own descriptor** (§3). *At
+   receipt*, in the host's synchronous `request`: a node with no replica of the range
+   answers `RangeMismatch` with every descriptor it holds whose span contains the key,
+   where D-076 failed the run; a replica whose descriptor does not contain the key
+   answers with its own and every other it holds that contains the key; nothing is
+   proposed. The host keeps every hosted replica's descriptor in memory for this,
+   loaded from the store at the start and reloaded after an install's switch. *At a
+   read's serving*: the descriptor is read at the same engine version as the value and
+   the applied index (D-069; §11, raft 15), and a key outside it, or a subsumed
+   descriptor, answers `RangeMismatch` in place of the value. *At apply*, in the `apply`
+   task before the batch: the descriptor in force before the index is the store's — the
+   one the last structural apply below it wrote — and a keyed command outside it, or on a
+   subsumed range, applies as nothing: the batch advances the applied index and writes no
+   user key, the effect is `out_of_span`, and the waiting client is answered
+   `RangeMismatch`. A command that names no key is never checked. Every answer traces
+   `RangeMismatchSent { at }` with the descriptors as (range, generation).
+6. **The events**: `ClientSend` on every send, with `invoked`; `ClientMismatch` on every
+   `RangeMismatch` received; both from the sweep's client on both clusters, so seed 42's
+   one-group JSONL moves and its record is updated below.
+7. **The history** (`sim/lin.rs`, §9): a `RaftProposed` under a resend's `seq` joins the
+   proposals of the operation the `ClientSend` for that `seq` names as `invoked`; only an
+   apply whose effect is `applied` closes an operation; one whose every proposal applied
+   to another effect did not take effect and leaves the history; one with a proposal
+   never applied stays pending.
+8. **The folds, in `ananke_shard::invariants`** (Q40): check 7's map, `(range, index)` to
+   the descriptor, with a second value a violation and a lookup of the descriptor in
+   force before an index; check 9 over `RaftApply` and `RaftRead`; check 10 over the
+   first applied write of each `(range, index)`; check 17 over `ClientInvoke`,
+   `ClientMismatch` and `ClientSend`. One `Checker` folds all four record by record and
+   gives one verdict, and `sim/raft.rs` runs it over every run that traces a
+   `RangeCreated` — the node's — as it runs `ananke-raft`'s, at the end of the run and,
+   under the equivalence test, at prefixes. `ranges::creations_agree_of`, D-096's first
+   step of check 7, is the map's verdict.
+9. **The variants**, §10's, in `NodeVariants`: `TrustStaleDescriptor` (the server takes
+   the range a request names as proof the key is in it, checking neither at receipt nor
+   at serving and keeping the apply check), `ApplyIgnoresSpan` (the apply check skipped),
+   and `ClientIgnoresMismatch` (the sweep's client resends to the range and generation it
+   had). `ReadCheckAtReceiptOnly` waits for the split: without a descriptor that changes
+   between a read's receipt and its serving it is the correct node, and it is added with
+   the split that gives it a path (§12).
+10. **A client that starts stale.** Every odd client of the node cluster starts with §2's
+    one-range map — range 2 over the whole user keyspace at generation 0 — as a client
+    that knew the cluster before its ranges were fixed would; every even client starts
+    from the bootstrap descriptors. So on every seed some requests are refused at receipt
+    and the client converges through `RangeMismatch` alone, which is the path §3 is about,
+    on a tree with no split to make it; and a server that trusts the stale claim
+    (`TrustStaleDescriptor`) proposes those writes, which the apply check then refuses,
+    so the whole of Q10's path — refused at apply, resent under a fresh `seq`, paired by
+    `invoked`, closed by the resend's apply — runs on the correct apply code on every seed
+    of that variant, where the correct server never reaches it before the split.
+
+### What the sweeps say
+
+Measured on the first commit, the wire alone, at the gate's twenty in debug: every
+node-family binary green (`node` 29 tests, `ranges` 13, `reseed` 7, `install` 3), the
+correct node's coverage within a seed of the tree before it (partitions 106, crashes 58
+against 57, apply lag median 3.07 ms against 3.03), and the schedules moved as §12 said
+they would: the pair `{IgnoreIncarnation, SharedSnapshotDir}` is caught on 3 of 20 where
+it was 7 of 20, and the re-seed shape's seed 1 holds 6 chunks back where it held 4. The
+second commit's measurements — the variants' catches, the coverage of the three checks,
+the premerge — are added here by that commit.
+
+### The pinned seeds, re-audited
+
+After the first commit: seeds 272 and 516 (`sim/tests/node.rs`) keep the absence D-096
+pinned — no stretch held by a live install, at 35 and 29 live installs where D-096
+counted 35 and 21 — and the pin's comment says so; the re-seed shape's seed 1 still holds
+a stream back, at 6 chunks; the one-group cluster's draws are unchanged, since one group
+carries no envelope and the client's hint is the map it always was. The second commit's
+events move seed 42's one-group JSONL, and that commit records the new hash beside
+D-082's.
+
+### Consequences
+
+- Stage C's routing build is built as far as this branch reaches; the meta lookups (§1,
+  §3), the range-id blocks (§5) and the split are the next slices', and
+  `ReadCheckAtReceiptOnly` comes with the split.
+- `Reply` has a third answer, and every match on it in the tree names it: the one-group
+  server never sends it, and its tests say so.
+- Every client packet of the node cluster is eight bytes longer, and every node schedule
+  moved with it; every pin whose schedule moved is re-audited above.
+
 ---
 
-_Next entry: D-097. Add one before implementing anything not covered above._
+_Next entry: D-098. Add one before implementing anything not covered above._

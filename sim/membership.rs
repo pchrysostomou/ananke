@@ -97,6 +97,7 @@ use ananke_raft::{NodeConfig, ServerId, invariants, run as run_server};
 use ananke_storage::EngineConfig;
 use moirae_sched::Policy;
 
+use ananke_shard::descriptor::FIRST_GENERATION;
 use ananke_shard::server::ServerConfig;
 use ananke_shard::variant::NodeVariants;
 
@@ -1583,7 +1584,10 @@ impl Driver {
                     },
                 };
                 if sock
-                    .send(server_addr(target), cluster.encode(range, request))
+                    .send(
+                        server_addr(target),
+                        cluster.encode(range, FIRST_GENERATION, request),
+                    )
                     .await
                     .is_err()
                 {
@@ -1617,7 +1621,11 @@ impl Driver {
                     None if only.is_some() => {
                         inner.clock().sleep(Duration::from_millis(25)).await;
                     }
-                    Some(Reply::NotLeader { leader: None }) | None => {
+                    // An operator's command names no key, so no server answers it
+                    // with a mismatch; one that did is tried elsewhere all the same.
+                    // PROPOSED(D-097)
+                    Some(Reply::NotLeader { leader: None } | Reply::RangeMismatch { .. })
+                    | None => {
                         inner.clock().sleep(Duration::from_millis(25)).await;
                         target = target % SERVERS + 1;
                     }
@@ -1656,7 +1664,10 @@ impl Driver {
                     command: Command::Transfer { to },
                 };
                 let _ = sock
-                    .send(server_addr(leader), cluster.encode(range, request))
+                    .send(
+                        server_addr(leader),
+                        cluster.encode(range, FIRST_GENERATION, request),
+                    )
                     .await;
             });
         }

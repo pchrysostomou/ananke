@@ -62,7 +62,7 @@ use ananke_storage::{EngineConfig, WriteBatch};
 use bytes::Bytes;
 
 use crate::client::{RangedRequest, RangedResponse, is_ranged};
-use crate::descriptor::RangeDescriptor;
+use crate::descriptor::{FIRST_GENERATION, RangeDescriptor};
 use crate::frame::decode;
 use crate::inbox::{Inbox, Received};
 use crate::install::{self, SnapAnswer, SnapJob};
@@ -210,7 +210,7 @@ pub fn initial_state(
             range: range.id,
             start: span.start.clone(),
             end: span.end.clone(),
-            generation: 1,
+            generation: FIRST_GENERATION,
             voters: bootstrap.to_vec(),
             state: RangeState::Live,
         };
@@ -223,7 +223,7 @@ pub fn initial_state(
             let record = MetaRecord {
                 start: span.start.clone(),
                 range: range.id,
-                generation: 1,
+                generation: FIRST_GENERATION,
                 voters: bootstrap.to_vec(),
             };
             batch.put(system::meta_record_key(&span.end), record.encode());
@@ -231,7 +231,7 @@ pub fn initial_state(
                 range: range.id.get(),
                 start: span.start.clone(),
                 end: span.end.clone(),
-                generation: 1,
+                generation: FIRST_GENERATION,
                 voters: bootstrap.iter().map(|voter| voter.0).collect(),
                 won: vec![(span.start, span.end)],
             });
@@ -705,7 +705,7 @@ impl<E: Environment> ServerHost<E> {
                 parent: None,
                 start: span.start.clone(),
                 end: span.end.clone(),
-                generation: 1,
+                generation: FIRST_GENERATION,
                 voters: config.voters.iter().map(|voter| voter.0).collect(),
                 floor_index: at.last_index,
                 floor_term: at.last_term,
@@ -1866,7 +1866,7 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
                 parent: None,
                 start: span.start,
                 end: span.end,
-                generation: 1,
+                generation: FIRST_GENERATION,
                 voters: initial.iter().map(|voter| voter.0).collect(),
                 floor_index: 0,
                 floor_term: 0,
