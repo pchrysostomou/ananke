@@ -17687,6 +17687,360 @@ every seed, and the variant test asserts the correct node's pass beside the catc
   release binary at a thousand seeds: the three routing variants' tests and the range
   layer's equivalence test.
 
+## PROPOSED D-098 — The root and the meta range: `MetaUpdate` applied as a maximum by generation, sent by each leader on taking office and resent until acknowledged, and lookups through ranges 0 and 1 by the bounded seek
+
+**The number.** Stacked on PR #133 (D-097), whose footer reads D-098. This takes
+**D-098** and moves the footer to D-099. Every code site carries `// PROPOSED(D-098)`.
+
+**Context.** Stage C's fourth build (SHARD.md:2457-2461): "The root and the meta range
+(§1; Q3, Q4): `MetaUpdate` applied as a maximum by generation, records keyed by end key
+in the system tenant and cut in the same batch, resent until acknowledged, and sent by
+each leader on taking office; lookups by Stage A's bounded seek." §1 says what the meta
+range is: an index of the range-local authority that lags and self-corrects, whose state
+after any set of updates is a maximum by generation per key and does not depend on
+their order, so an update may be sent any number of times; §11's raft item 3 names the
+commands (`MetaUpdate`, and the lookups, which are reads); §8's check 16 folds it, and
+Q36 keeps lookups out of the history.
+
+What the tree had. D-096 wrote the meta range's initial records at bootstrap, one per
+user range keyed by its end, and range 0's copy of the meta descriptor, and traced
+`MetaApplied { index: 0 }`; nothing read them and nothing wrote them again. D-097's
+client, with no entry for a key, took the bootstrap descriptors again in place of the
+lookup §3 names, and said so as the interim.
+
+### What is built
+
+1. **Two commands** in `ananke-raft`'s `Command`, where §11's raft item 3 puts them,
+   carrying nothing that crate reads (Q40): `MetaUpdate { descriptors }`, an entry whose
+   descriptors are encoded `RangeDescriptor`s, and `Lookup { key }`, a read, never an
+   entry. Neither names a key the command touches: `Command::key` is `None` for both, so
+   §3's three checks and the apply check leave them alone — a lookup asks *about* a key
+   and touches none (Q36) — and `apply_command` applies a `MetaUpdate` as an empty batch,
+   since the range layer's applier has applied it before that call.
+2. **The meta range's state machine** (`ananke_shard::meta`), applied by the node's
+   `apply` task for an entry of range 1 and no other: the records under the meta span
+   are read at the apply's version, and for each descriptor `d` of the update every
+   maximal sub-interval of `d`'s span that a record of lower generation names, or that
+   nothing names, is from then on named by `d` restricted to it, written as a record
+   keyed by its end and carrying its start; a record partly overwritten is cut at `d`'s
+   boundaries in the same batch, and a sub-interval a record of `d`'s generation or a
+   higher one names is left alone (§1, Q4). The descriptors of one update compose in
+   order over the same map, and the batch is the difference between the records read
+   and the records that result, applied with the entry's index. `MetaApplied { index }`
+   is traced with every descriptor and the sub-intervals it won; the effect is `took`
+   when any was won and `none` when the update changed nothing, which is what a resend
+   of an update already applied does, and what every update on this tree does after the
+   bootstrap, since nothing raises a generation before the split. An update for any
+   range but the meta range is refused at receipt as a mismatch, since it is the meta
+   range's alone.
+3. **The sender.** Every node runs a `meta` task. When a core of a user range takes
+   office — seen by the host where it stamps the core's outgoing `AppendEntries`, the
+   leader's first message of a term the node had not led the range in, so no hook is
+   added to the round and a follower's core is never asked — the host hands the task
+   the range's descriptor as the store holds it, and the task
+   sends `MetaUpdate` for it to the meta range's leader, the last one it heard of or a
+   voter of range 1 in turn, under the node's own client id and a sequence number of its
+   own, and resends every minimum election timeout until the meta range's leader answers
+   `Done`, whether or not the node still leads the range (Q3). A `NotLeader` answer
+   moves the target for the next send and a mismatch moves it on, and **neither sends
+   at once**: the first build resent on the answer itself, and a range 1 between
+   leaders, which answers `NotLeader` at once, made a storm of it — seed 1 of the node
+   sweep traced 585 000 messages in eight simulated seconds where it traces 13 000,
+   and the run hit the trace cap — so every send but the first waits for the timer,
+   and an update is not latency-critical. A range whose leadership changes again
+   before the acknowledgement has its newer descriptor take the older's place. The node's own
+   answers come back on its one socket, where the `net` task tells them from clients'
+   requests by their tag and from other nodes' clients by the client id, and hands them
+   to the task. Nothing on this tree changes a descriptor after its first, so every
+   update a leader sends names the bootstrap's descriptor at the first generation and
+   wins nothing: the path runs on every seed — a leader elected, an update sent, applied
+   to no change, acknowledged — and the split is what makes it change something.
+4. **Lookups.** A `Lookup { key }` asked of range 0 answers the meta range's descriptor,
+   range 0's copy (§1); asked of range 1 it answers the first record whose end key is
+   above the encoded key, read by the engine's bounded seek (D-055) at the same version
+   as the applied index, as a descriptor with that record's end, or nothing when no
+   record covers the key; asked of any other range it answers nothing. It is served as a
+   read is — by the lease or a heartbeat round, at an applied index — and traced
+   `RaftRead` with the key asked about, on the system range that served it. Check 9
+   holds a read served by range 0 or range 1 to nothing: it is a lookup, which any key
+   may ask, and check 16 and the convergence bound are what hold meta to account (Q36).
+5. **The client's lookups** (`raft::client_on`). A client whose cache holds no entry for
+   a key asks range 0 for the meta range's descriptor, if its cache lacks that, and then
+   range 1 for the key's, each a `Lookup` sent to the range's leader hint or its voters
+   in turn under a sequence number of its own, and merges what it learns before it
+   routes; a lookup answered with nothing leaves the operation to route by the map, and
+   the sweep counts none. Lookups are not operations: no `ClientInvoke`, `ClientReturn`
+   or `ClientSend` is traced for them and the history never sees them (Q36). The node
+   cluster's clients now come in thirds — the first stale as D-097 made it, the second
+   **knowing range 0 alone**, as a client that found the cluster through configuration
+   would (§2), the third from the bootstrap descriptors — and the sweep's two clients
+   are one of each of the first two kinds, so every seed has lookups through both
+   system ranges before that client's first request to a user range. The interim of
+   D-097, the bootstrap descriptors taken again on a miss, is gone.
+6. **Check 16** (`ananke_shard::invariants::MetaNeverGoesBack`, under the `Checker` with
+   the others): folds `MetaApplied` with check 7's map. Every descriptor a meta apply
+   names — range, start, end, generation and voters — equals the value check 7 holds for
+   its range at its generation, traced before the meta apply; and per key, over the
+   sub-intervals each apply won, the generation meta names never falls from one meta
+   index to the next. The bootstrap's `MetaApplied { index: 0 }` is traced after the
+   node's replicas' creations now, where D-096 traced it before them, so the map holds
+   what it names when it is folded. Check 16 runs under the equivalence test over the
+   correct node and this stage's variants, and is asserted against
+   `MetaOverwritesByArrival` where that variant has its path (below).
+7. **`NodeVariant::MetaOverwritesByArrival`**, §10's: the meta range stores each update
+   as it arrives, every overlapping record cut and replaced whatever its generation. On
+   this tree it has nothing to reorder — every update names the first generation and
+   the maximum and the arrival agree — so it is caught on no seed, asserted as that
+   absence with its reason, and `Fault::MetaReorder` on the sharded sweep, which needs
+   the split, is where §10 catches it: check 16 at the first key whose named generation
+   falls.
+
+**What the folds found on their way in.** Folding check 7 over the install and the
+re-seed scenarios for the first time — every node scenario runs the range layer's
+checks now, where D-097 ran them on the runs `raft::Report` judges — found D-096's
+install creation tracing the configured keys raw: a replica an install created traced
+`RangeCreated { cause: snapshot }` with `k6` and `k8` where every other creation, and
+the descriptor the install put in the store, carry the encoded span. The creation
+encodes its span now, and the scenarios that make installs into fresh replicas fold
+the check that saw it.
+
+**What the twenty found before they passed.** The first run of the node's sweeps on this
+tree failed twelve tests two ways. The history saw a put returned with a value: the
+client's lookups went under the operation's own sequence numbers, and the history, which
+gathers an operation's proposals by `invoked` (D-097), paired a lookup's answer with the
+operation whose number it had taken. Lookups count from a base of their own now
+(`LOOKUP_SEQ_BASE`), where no operation's number reaches. And state machine safety saw
+index 2 of range 1 applied to `none` on the bootstrap nodes and `took` on a re-seeded
+one: a replica of a system range rebuilt in a fresh engine started its state machine
+empty, since the index-0 state is in no log and range 1's leader, which compacted
+nothing, appends from index 1, so the first update won every span on it. The re-seed
+writes a refused system range's index-0 state and descriptor from configuration alone,
+as the bootstrap did, before the mark, and traces its `MetaApplied { index: 0 }` after
+the creations as the bootstrap's is. Both are the checks' findings, and both are what
+the twenty seeds are for.
+
+### What the sweeps say
+
+Every rate below was measured before its assertion was written (Q39, D-061), at the
+gate's twenty in debug on this session's container (a four-core Xeon, D-070) from
+`cargo test -p ananke-sim` with the prints kept; the thousand are the premerge on the
+same tree, under **The premerge** below.
+
+- **The correct node**, every sweep green with check 16 under the incremental checker's
+  `Checker` and over the whole trace, and every node scenario folding the range layer's
+  checks: the raft sweep's arms, the membership scenario, the sharded quorum scenario,
+  `ranges`, `reseed`, `install`. The meta range's and the lookups' coverage: **113
+  lookups served over 20 seeds**, on 95 misses of the clients' caches (a miss asks range
+  0 first when the cache lacks range 1's descriptor, so a miss is one lookup or two);
+  **1 917 meta applies after the bootstrap and none of them `took`**, both asserted —
+  at least two lookups served and one update applied a seed, and no `took` until the
+  split gives an update something to win; **74 mismatches at receipt** and 60 received
+  by the clients, none at a read or at apply (D-097 counted 80 and 60: one client in two
+  now starts knowing range 0 alone, looks its keys up and is never refused). The apply
+  lag's median at twenty is 4.58 ms where D-097 measured 4.33, range 1's own 5.43 ms,
+  its entries applied in the same task as every other range's; 2 818 379 trace records
+  over the 20 seeds.
+- **`MetaOverwritesByArrival`**: caught on **0 of 20**, asserted as the absence with its
+  reason — every update on this tree names the first generation, so the maximum and the
+  arrival agree on every key — and seen injected: on seed 1 the variant's meta range
+  applied 89 updates after the bootstrap and every one won its whole span, where the
+  correct node's 89 won nothing. `Fault::MetaReorder` on the sharded sweep, under the
+  split, is where §10 gives it the path.
+- **D-097's variants under the lookups**: `TrustStaleDescriptor` caught on **20 of 20**
+  by check 9, every one at a read, the apply check refusing a trusted write on 14 of 20
+  (D-097: 17); the pair `{TrustStaleDescriptor, ApplyIgnoresSpan}` on **20 of 20**, 16 at
+  a read, a write misapplied on 14 of 20 (17); `ApplyIgnoresSpan` alone on 0 of 20, the
+  absence; `ClientIgnoresMismatch` on **20 of 20** by check 17, at 500 ms of seed 0 as
+  before. The schedules moved — a client's lookups precede its first request, and every
+  leader's `MetaUpdate` runs beside its appends — and the rates held.
+- **`AnyFreshNodeBootstraps`** (D-096): caught by check 7 on 20 of 20 membership seeds,
+  the correct membership node passing the checker's five folds.
+- **`RefuseOneRangeOnly`** on the sharded quorum scenario (D-085): caught on **20 of
+  20**, **8 by the fan-out clause and 12 by state machine safety on the meta range**,
+  which is new. The variant re-creates the three replicas it did not refuse empty in the
+  fresh engine, and the meta range's among them, never refused and so never given the
+  index-0 state the re-seed writes a refused system range, takes every span at the first
+  update, which the verdict's invariants see before its fan-out clause is asked. Both are
+  the one bug, the node's other replicas serving over an engine that lost state (D-077);
+  the test asserts the fan-out clause seen and every catch one of the two, and prints the
+  share of each.
+- **The equivalence**: the checker fed at eight prefixes agreed with the five folds over
+  the whole prefix at **480 prefixes** over 20 seeds and three variants, 243 of them in
+  violation (D-097: 232).
+- **Phase 2's variants on the node** at the gate's twenty: `CountOlderTermForCommit` 4,
+  `RefusedReadLeft` 0, `LeaseTrustsTheClock` 2, `ResetTimerOnAnyRpc` 10,
+  `SharedSnapshotDir`'s liveness catch 4 and the pair 8 of 20; `StepWhilePersisting` 11
+  of 20 on `ranges`; the re-seed shape's cap held a stream back on 20 of 20 (median 4
+  chunks, most 8), `ReseedMarkNotSynced` 7 and
+  `RecordNeverQueued` 18 of 20, `ServeBeforeRefusedMark` 20 of 20 by (c); the one-group raft sweep's 47 tests green.
+
+### The premerge
+
+**What the thousand found before it passed.** The first premerge of this tree failed
+four node tests at a thousand seeds, all one finding, on the **correct node**: "range 1:
+an apply through 25 names index 22, which the core does not hold", on 9 of the correct
+node's 1 000 seeds under the raft sweep's arms and on the same schedules under three
+variants that inject nothing there (`AdoptionAsBuilt` 2 of 100, `ApplyIgnoresSpan` alone
+2 of 100, `RefusedReadLeft` 9 of 1 000, each read as the correct node's failure, as
+their tests say to). Seed 251 says what it is. The meta range carries entries now — one
+`MetaUpdate` per office taken on a user range — so its leader compacts at the
+scenario's threshold of twelve, and a follower that fell behind is streamed a snapshot
+for the first time on a system range. The install landed in the store and answered the
+leader, and the host's `installed`, asked to build the replica the switch had made,
+looked the range's span up in **the configured user ranges**: D-096 hosted ranges 0 and
+1 but left `ServerHost::ranges` the four configuration names, and nothing streamed a
+system range until this build. Finding no span it answered `Release`, the very thing
+`InstallKeepsTheOldCore` does on purpose — the store held the snapshot at 22, the core
+went on from the log it had, compacted through 22 when it learnt of the record, and
+the next commit's apply named 22 from a watermark still at 21. The host reads the
+hosted six now, as the `apply` task's take already did. The re-seed shape's
+`log_ranges` — the two system ranges rebuilt by the log, since their leaders compact
+nothing — is asked the same question by the thousand below.
+
+The second premerge failed two node tests on one seed, again the correct node's: **seed
+368, the timer check** — "server 1's replica of range 2 heard from no leader of its term
+and granted no vote since 7.684 s and had not campaigned by 8.079 s" — under the arms
+and under `RefusedReadLeft`, which injects nothing there. Server 1 came back behind on
+every range and was streamed five snapshots at once, the meta range's among them for
+the first time, and its `snapshot` task installed them one after another: ranges 5, 3,
+1 and 4 landed between 7.46 s and 8.02 s and range 2's at 8.17 s. Range 2's core was
+held from the moment its stream completed and the `raft` task handed the repair over
+(`CoreWork::Hold`, D-083) — a core with no timer to fire, which is exactly the hold
+D-091's fourth arm exempts. The arm did not fire, and the reason is D-097's: the arm
+reads `RaftSnapshotState` and `RaftSnapshot { taken: false }` as one switch only when
+the two are traced at one instant (`Report::reads_back`), and D-097 put the descriptor's
+read-back — an engine read, which takes simulated time — between them. **Every node
+install since D-097's second commit traced the two an engine read apart, the arm
+matched none of them, and the hold it exempts was measured against the bound again.**
+D-097's premerge passed because no hold outlasted the bound on its thousand; and its
+re-audit of seeds 272 and 516, "no stretch held by a live install", was read through
+that arm — `timer_gaps_held_by_a_live_install` counts what the arm would exempt, and
+the arm counted nothing — so the absence it asserted was the arm's silence and not the
+schedule's, which this entry corrects (the pinned seeds below). The read-back comes
+before the state now, and the two records share their instant again; seed 368 passes
+on that change alone, the arm counting its one hold. Beside it, the install is decided
+where the hold is taken: D-091 says "the node decides the install when the `raft` task
+hands the repair over, which is the step that takes the hold", and the code took the
+decision when the `snapshot` task got to the repair, a queue of installs later on a
+node behind on every range; the `raft` task's decision rides the `Finish` job now
+(`SnapJob::Finish::held`) and the switch is traced as decided there, so the exemption
+is the hold and no narrower — measured on seed 368 as not what cleared it. The read-leak
+test names the catches its bound did not make now, which is how the second seed was
+read as the first.
+
+`scripts/premerge.sh` on this tree at `ANANKE_SEEDS=1000` in release, on this session's
+container (D-070), **green in 2 308 s** on its third run, load 0.73 before and 4.00 after;
+the first two runs failed at the node binary on the two findings above and ran nothing
+after it. Against D-097's 2 246 s on the same machine: the `node` binary took 834 s
+(782), the meta range's entries applied and streamed on every seed and the range layer's
+five folds at every look; `raft` 822 s (846); `ranges` 79 s (76); `reseed` 46 s (45);
+`engine` 412 s, `wal` 17 s and `install` 6 s as before.
+
+**The node's rates at a thousand, against D-097's premerge on the same machine**, so
+that what the meta range moved is on record (every rate the node's sweeps assert, at
+its tier):
+
+| Sweep, at its tier | D-097 | This tree |
+| --- | ---: | ---: |
+| `TrustStaleDescriptor`, of 100 | 99 (77 refused at apply) | **100** (74 refused at apply) |
+| `{TrustStaleDescriptor, ApplyIgnoresSpan}`, of 100 | 100 (77 misapplied) | **100** (74 misapplied) |
+| `ApplyIgnoresSpan` alone, of 100 | 0, the absence | 0, the absence |
+| `ClientIgnoresMismatch`, of 100 | 100 | **100** |
+| `MetaOverwritesByArrival`, of 100 | — | 0, the absence; seed 1's 89 updates won their span, the correct node's none |
+| `AnyFreshNodeBootstraps`, membership, of 100 | 100 | 100 |
+| `RefuseOneRangeOnly`, sharded quorum, of 1 000 | 1 000, every one by the fan-out clause | **1 000**, 336 by the fan-out clause and 664 by state machine safety on the meta range |
+| `CountOlderTermForCommit`, of 100 | 38 | 36 |
+| `RefusedReadLeft`, of 1 000 | 118 (11.8 %) | 107 (10.7 %) |
+| `LeaseTrustsTheClock`, of 1 000 | 3 (0.3 %) | **12 (1.2 %)** |
+| `TruncateOnEveryAppend`, of 100 | 99 | 98 |
+| `SharedSnapshotDir`'s liveness catch, of 100 | 24 | 18 |
+| `SnapshotWithoutCurrentLast`, of 1 000 | 0 | 0 |
+| `SingleMajorityInJointConsensus`, raft sweep on the node, of 1 000 | 206 | 211 |
+| `ResetTimerOnAnyRpc`, of 100 | 50 | 50 |
+| `ApplyBeforeCommit`, `SendBeforePersist`, `NoPreVote`, of 100 | 100 each | 100 each |
+| The pair (`SharedSnapshotDir` + `IgnoreIncarnation`), of 100 | 27 | 25 |
+| `ApplyWaitsForEveryRange`, compared, of 25 | 25 | 25 |
+| Elections while joint, membership on the node, of 1 000 | 150 | 163 |
+| Mismatches at receipt / at a read / at apply, correct node, of 1 000 | 3 613 / 0 / 0, 3 000 received | 3 631 / 0 / 0, 3 000 received |
+| Lookups served / meta applies after the bootstrap / `took`, correct node, of 1 000 | — | **5 541 / 94 113 / 0** |
+
+**The coverage at a thousand**, against D-097's: leaders by range 4 477 / 4 586 on the
+system ranges (4 511 / 4 454) and 7 841 to 7 914 on the user ranges; applies 13 428 on
+range 0 (13 530) and **106 648 on range 1 where D-097 counted 13 356** — the meta
+updates, one per office taken on a user range — against 364 000 to 389 000 on the user
+ranges; 143.9 million trace records (138.8); **5 541 lookups served** on 4 629 misses of
+the clients' caches, **94 113 meta applies after the bootstrap and none `took`**; 3 631
+mismatches at receipt and 3 000 received, none at a read or at apply (3 613 / 3 000);
+**the apply lag's pooled median 4.68 ms** (4.40), per range 2.47 / 5.45 / 4.45 / 4.53 /
+5.08 / 4.68 ms, range 1's the highest now that it carries entries, a figure for the owner
+beside D-082's 20 ms threshold; one range's applies held another's for a median of
+3.07 ms and at most 486 ms over 106 246 waits, 98 dropped (2.98 ms, 608 ms, 80 958, 70);
+the user ranges' apply spread 0.94 (0.94); **64 870 snapshot actions, 64.9 a seed,
+fewest 22** (57 637, 57.6, 20), the meta range's leaders compacting and streaming, which
+is what reached the host's `installed` and the timer check's arm; the correct node
+re-took a range at an index it had taken on 553 seeds (470), into the same directory on
+none; 0 store refusals; seeds 272 and 516 at 41 and 23 live installs, no stretch held by
+one; the folds' equivalence on 100 seeds at eight prefixes, the lag verdict for
+`ApplyWaitsForEveryRange` (25, 25, 25) as before; the range layer's checker in
+agreement with its five folds at 480 prefixes, 243 in violation. `sim/tests/ranges.rs`:
+18 000 bootstrap creations, `StepWhilePersisting` caught on 671 of 1 000 (602),
+`RefusedReadLeft` on none; the re-seed shape's cap held a stream back on 200 of 200
+(median 4 chunks, most 8), `ReseedMarkNotSynced` 7 (10) and `RecordNeverQueued` 18 of
+20, `ServeBeforeRefusedMark` 20 of 20 by (c), **and its `log_ranges` holds**: the two
+system ranges are rebuilt by the log on every one of the 200, no leader of range 1
+compacting inside the re-seed shape's run; the membership scenario's
+`SingleMajorityInJointConsensus` 241 of 1 000 (241) on one group and 211 (206) on the
+node; the one-group raft sweep's 47 tests green, seed 42's JSONL at D-097's bytes and
+hash.
+
+**Two rates to put to the owner**, both asserted from the nightly's ten thousand and
+neither moved by this entry: the lease variant's catch on the node at **12 of 1 000**
+where D-097 measured 3, D-096 7 and `main` 6 — draws of a rate near a percent, the
+figure recorded so the next slice sees where it settles; and `SharedSnapshotDir`'s
+liveness catch at 18 of 100 (24) with the pair at 25 (27). The thousand's other rows
+moved by a seed or a few, in both directions, as a schedule move does.
+
+### The pinned seeds, re-audited
+
+Every node schedule moves again: a client's lookups precede its first request, with a
+draw for the server to ask when it holds no hint, and every leader's `MetaUpdate` and
+its acknowledgement run beside the appends. Seeds 272 and 516 (`sim/tests/node.rs`)
+keep the absence D-096 pinned — no stretch held by a live install, at 41 and 23 live
+installs where D-097 counted 34 and 22 — and the pin's comment
+says so — read through a fourth arm that counts again, where D-097's reading of the same
+absence was the arm's silence (**What the thousand found** above); **and seed 368 is
+the hold the pin waited for**, pinned in the shape D-091's pin keeps for it
+(`seed_368_is_a_live_installs_hold_and_the_fourth_arm_answers_for_it`): the check with
+the arm passes, the check without it flags exactly that stretch with the one live
+install the arm answers for, the install's decision at 7.768 s and its switch at
+8.168 s bracket the flag at 8.079 s, the state read back, the snapshot and the
+restatement land at the switch's one instant — asserted, so the arm cannot go silent
+the way D-097 silenced it — and a stream toward the replica was re-opened inside the
+window. The re-seed shape's seed 1 holds 2 chunks back where D-097's held 4, and its
+cap pin still holds. The one-group cluster's draws are unchanged — no lookup is asked on
+one group and no `MetaUpdate` sent, and the commands that were there keep their tags —
+so **seed 42's one-group JSONL is D-097's**, 13 241 905 bytes hashing to
+`c5b8d814dc0956af28bef72f8f9e0bbc959053a2173d7d1d96e3423a6c6540e8`, and the replay and
+determinism tests hold.
+
+### Consequences
+
+- Stage C's meta build is built as far as a tree with no split reaches: the update, the
+  apply, the sender, the lookups and check 16 run on every seed; the first update that
+  changes anything, the convergence bound and `Fault::MetaReorder` come with the split
+  and the sharded sweep (§12).
+- `Command` has two more variants and the one-group server never receives either; its
+  studio view names both.
+- The host learns of an office taken from the message it stamps, not from a hook on the
+  round: a leader's first `AppendEntries` of a term is the office, and nothing else in
+  the node needs to know a core's role.
+- The system ranges are streamed now, so every path a user range's install takes is a
+  system range's too: the host's `installed` reads the hosted six, and the day a slice
+  hosts a range configuration does not name, it is this list that must carry it.
+- D-091's fourth arm reads a switch by two records at one instant, and D-097's read-back
+  had parted them; seed 368's pin asserts the instant, so a read added to the switch
+  again fails a pinned seed rather than silencing an exemption over a thousand.
+
 ---
 
-_Next entry: D-098. Add one before implementing anything not covered above._
+_Next entry: D-099. Add one before implementing anything not covered above._

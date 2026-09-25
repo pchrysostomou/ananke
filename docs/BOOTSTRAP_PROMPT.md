@@ -101,6 +101,58 @@ ananke/
 
 _Update this section at the end of every session._
 
+- Branch `phase-3-stage-c-meta` (2026-09-25), stacked on `phase-3-stage-c-routing`
+  (PR #133), PROPOSED D-098, **Stage C's meta build: the root and the meta range**
+  (SHARD.md §1; Q3, Q4, Q36; §8's check 16; §11, raft 3). `Command::MetaUpdate
+  { descriptors }`, an entry whose descriptors are bytes `ananke-raft` does not read
+  (Q40), and `Command::Lookup { key }`, a read that asks about a key and touches none, so
+  neither is checked against a span; `ananke_shard::meta`, the meta range's state
+  machine — for each descriptor of an update every maximal sub-interval of its span that
+  a record of lower generation names, or that nothing names, is from then on named by
+  it, a record partly overwritten cut in the same batch, the descriptors of one update
+  composed over one map and the batch the difference, `MetaApplied` traced with what
+  each won and the effect `took` or `none`; every node's `meta` task, handed a user
+  range's descriptor when a core sends the first `AppendEntries` of a term the node had
+  not led it in, sending `MetaUpdate` to the meta range's leader under the node's own
+  client id and resending every minimum election timeout until acknowledged, whether or
+  not the node still leads (Q3), and never on the answer itself (the first build's
+  storm: 585 000 messages in eight simulated seconds on seed 1); a `Lookup` asked of
+  range 0 answering the meta range's descriptor and of range 1 the first record whose
+  end key is above the key, by the bounded seek at the read's version, traced as a read
+  on the system range that served it, which check 9 holds to nothing (Q36); the sweep's
+  client looking a key up through ranges 0 and 1 on a miss and the node cluster's second
+  client starting knowing range 0 alone, D-097's interim gone; check 16
+  (`MetaNeverGoesBack`) under the range layer's checker, the bootstrap's `MetaApplied`
+  traced after the creations; every node scenario folding the range layer's checks, the
+  install and re-seed scenarios included, which found D-096's install creation tracing
+  the configured keys raw; `MetaOverwritesByArrival` with no path on this tree, caught on
+  no seed and seen injected by the spans its updates win. Measured before asserted: 113
+  lookups served and 1 917 meta applies with none `took` over 20 seeds, both floors
+  asserted; D-097's rates held under the lookups; `RefuseOneRangeOnly` caught 8 by the
+  fan-out clause and 12 by state machine safety on the meta range, the second new; the
+  checker's agreement with its five folds at 480 prefixes. **Found by the twenty**: the
+  client's lookups under an operation's `seq` were paired with it by the history's
+  closure (`LOOKUP_SEQ_BASE`), and a re-seeded replica of a system range started its
+  state machine empty, diverging at the first update (the re-seed writes its index-0
+  state from configuration). Every node schedule moved and the pins hold (272 and 516
+  absent at 40 and 23 live installs, the re-seed's seed 1 at 2 chunks); seed 42's
+  one-group JSONL is D-097's. **Found at a thousand seeds**, on the correct node: the
+  meta range's leader compacts now, so a system range was streamed a snapshot for the
+  first time, and the host's `installed` looked the range's span up in the configured
+  user ranges, not the hosted six — the switch landed in the store and the old core was
+  kept, `InstallKeepsTheOldCore`'s own behaviour, and the next apply named an index the
+  compaction had removed (9 of 1 000 seeds; the host reads the hosted six); and, on
+  seed 368, a node streamed five snapshots at once held range 2's core through four
+  other installs and the timer check flagged it — D-091's live-install arm reads the
+  switch's two records as one only at one instant, and D-097's descriptor read-back sat
+  between them, so the arm had matched no node install since and its exemption, and the
+  absence seeds 272 and 516 asserted through it, were silent; the read-back precedes the
+  state now, and the install is decided where the hold is taken. The premerge is green at a
+  thousand seeds in 2 308 s on this session's container against D-097's 2 246, the node
+  binary 834 s where it took 782, every rate the node's sweeps assert tabled in the entry
+  against D-097's: 5 541 lookups served and 94 113 meta applies over the thousand, none
+  `took`; the lease variant's catch 12 of 1 000 where D-097 measured 3, recorded for the
+  owner; seed 368 pinned as D-091's hold; two `node` rows weighed on this tree.
 - Branch `phase-3-stage-c-routing` (2026-09-25), stacked on `phase-3-stage-c-bootstrap`
   (PR #132), PROPOSED D-097, **Stage C's routing** (SHARD.md §3; §8's checks 7, 9, 10 and
   17; §9; §11, raft 4, 5, 16), in the two commits §12 names as moving pinned schedules and

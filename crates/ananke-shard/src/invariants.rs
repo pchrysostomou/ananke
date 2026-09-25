@@ -26,6 +26,13 @@
 //! recorded one — sibling halves share `g + 1`, so without the range a left half
 //! writing a key its right sibling had written would pass.
 //!
+//! **Check 16**: every descriptor a meta apply names — range, start, end, generation
+//! and voters — equals the value check 7 holds for its range at its generation, traced
+//! before the meta apply; and per key, over the sub-intervals each apply won, the
+//! generation meta names never falls from one meta index to the next. A read served by
+//! range 0 or range 1 is a lookup, which any key may ask (Q36), and check 9 holds it to
+//! nothing: check 16 and the convergence bound are what hold meta to account.
+//!
 //! **Check 17**: a `ClientSend` for an operation, after a `ClientMismatch` for it that
 //! named a descriptor of generation G whose span contains the operation's key, to a
 //! range at a generation below G, is a violation. The send that was refused is tied to
@@ -34,13 +41,17 @@
 //! The keys the trace carries are user keys; the spans are encoded (§1), so every
 //! comparison encodes the key as the store does (`ananke_raft::apply::user_key`).
 // PROPOSED(D-097): checks 7, 9, 10 and 17.
+// PROPOSED(D-098): check 16, and check 9's lookups.
 
 use std::collections::BTreeMap;
+use std::ops::Bound::{Excluded, Unbounded};
 
 use ananke_env::sim::TraceRecord;
 use ananke_env::{ApplyEffect, ClientOp, RangeCause, RangeState, TraceEvent};
 use ananke_raft::apply::user_key;
 use bytes::Bytes;
+
+use crate::system::{META_RANGE, ROOT_RANGE};
 
 /// A descriptor as check 7 holds it: what a creation or a `RangeDescriptor` carries.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -76,6 +87,10 @@ impl Held {
 #[derive(Clone, Debug, Default)]
 pub struct Descriptors {
     by_range: BTreeMap<u64, BTreeMap<u64, Held>>,
+    /// The first value traced for each (range, generation): what a lookup by
+    /// generation takes (SHARD.md §8, check 7).
+    // PROPOSED(D-098)
+    by_generation: BTreeMap<(u64, u64), Held>,
     violation: Option<String>,
 }
 
@@ -107,10 +122,20 @@ impl Descriptors {
         self.by_range.is_empty()
     }
 
+    /// The first value traced for `range` at `generation`.
+    // PROPOSED(D-098)
+    #[must_use]
+    pub fn first_at_generation(&self, range: u64, generation: u64) -> Option<&Held> {
+        self.by_generation.get(&(range, generation))
+    }
+
     fn put(&mut self, range: u64, index: u64, held: Held, node: Option<u64>, what: &str) {
         let at = self.by_range.entry(range).or_default();
         match at.get(&index) {
             None => {
+                self.by_generation
+                    .entry((range, held.generation))
+                    .or_insert_with(|| held.clone());
                 at.insert(index, held);
             }
             Some(agreed) if *agreed == held => {}
@@ -249,6 +274,11 @@ impl ServingWithinSpan {
                     _ => {}
                 }
             }
+            // A read served by the root or the meta range is a lookup, which any key
+            // may ask (SHARD.md §1, §3; Q36): check 16 holds meta to account.
+            // PROPOSED(D-098)
+            TraceEvent::RaftRead { range, .. }
+                if *range == ROOT_RANGE.get() || *range == META_RANGE.get() => {}
             TraceEvent::RaftRead {
                 server,
                 range,
@@ -329,6 +359,109 @@ impl GenerationsRise {
             }
             _ => {
                 self.last.insert(key.clone(), (generation, *range));
+            }
+        }
+    }
+
+    /// The first violation, if one was folded.
+    ///
+    /// # Errors
+    ///
+    /// The violation, in words naming it.
+    pub fn verdict(&self) -> Result<(), String> {
+        self.violation.clone().map_or(Ok(()), Err)
+    }
+}
+
+/// Check 16, the meta range never goes back and names only real descriptors, over
+/// check 7's map.
+// PROPOSED(D-098)
+#[derive(Clone, Debug, Default)]
+pub struct MetaNeverGoesBack {
+    /// What meta names, as the sub-intervals its applies won: keyed by end, with the
+    /// start and the generation.
+    named: BTreeMap<Bytes, (Bytes, u64)>,
+    violation: Option<String>,
+}
+
+impl MetaNeverGoesBack {
+    /// Folds one record against `descriptors` as they stand.
+    pub fn push(&mut self, record: &TraceRecord, descriptors: &Descriptors) {
+        if self.violation.is_some() {
+            return;
+        }
+        let TraceEvent::MetaApplied {
+            index,
+            descriptors: named,
+        } = &record.event
+        else {
+            return;
+        };
+        let node = record.node.map(|node| u64::from(node.get()));
+        for meta in named {
+            match descriptors.first_at_generation(meta.range, meta.generation) {
+                None => {
+                    self.violation = Some(format!(
+                        "meta never goes back: node {node:?}'s meta apply of {index} names \
+                         range {} at generation {}, which check 7 had not traced before it \
+                         (SHARD.md §8, check 16)",
+                        meta.range, meta.generation
+                    ));
+                    return;
+                }
+                Some(held)
+                    if held.start != meta.start
+                        || held.end != meta.end
+                        || held.voters != meta.voters =>
+                {
+                    self.violation = Some(format!(
+                        "meta never goes back: node {node:?}'s meta apply of {index} names \
+                         range {} at generation {} as [{:?}, {:?}) with voters {:?}, where \
+                         check 7 holds [{:?}, {:?}) with voters {:?}",
+                        meta.range,
+                        meta.generation,
+                        meta.start,
+                        meta.end,
+                        meta.voters,
+                        held.start,
+                        held.end,
+                        held.voters
+                    ));
+                    return;
+                }
+                Some(_) => {}
+            }
+            for (start, end) in &meta.won {
+                if start >= end {
+                    continue;
+                }
+                let overlapping: Vec<Bytes> = self
+                    .named
+                    .range::<[u8], _>((Excluded(&start[..]), Unbounded))
+                    .take_while(|(_, (from, _))| from < end)
+                    .map(|(key, _)| key.clone())
+                    .collect();
+                for key in overlapping {
+                    let (from, generation) = self.named.remove(&key).expect("listed");
+                    if generation > meta.generation {
+                        self.violation = Some(format!(
+                            "meta never goes back: node {node:?}'s meta apply of {index} names \
+                             [{start:?}, {end:?}) for range {} at generation {}, where meta \
+                             named [{from:?}, {key:?}) at generation {generation} before it: \
+                             the generation meta names never falls (SHARD.md §1, §8)",
+                            meta.range, meta.generation
+                        ));
+                        return;
+                    }
+                    if from < *start {
+                        self.named.insert(start.clone(), (from.clone(), generation));
+                    }
+                    if key > *end {
+                        self.named.insert(key, (end.clone(), generation));
+                    }
+                }
+                self.named
+                    .insert(end.clone(), (start.clone(), meta.generation));
             }
         }
     }
@@ -439,6 +572,7 @@ pub struct Checker {
     descriptors: Descriptors,
     serving: ServingWithinSpan,
     generations: GenerationsRise,
+    meta: MetaNeverGoesBack,
     refreshes: ClientRefreshes,
 }
 
@@ -460,6 +594,7 @@ impl Checker {
         self.descriptors.push(record);
         self.serving.push(record, &self.descriptors);
         self.generations.push(record, &self.descriptors);
+        self.meta.push(record, &self.descriptors);
         self.refreshes.push(record);
     }
 
@@ -476,7 +611,7 @@ impl Checker {
         &self.descriptors
     }
 
-    /// The first violation, in check order: 7, 9, 10, 17.
+    /// The first violation, in check order: 7, 9, 10, 16, 17.
     ///
     /// # Errors
     ///
@@ -485,6 +620,7 @@ impl Checker {
         self.descriptors.verdict()?;
         self.serving.verdict()?;
         self.generations.verdict()?;
+        self.meta.verdict()?;
         self.refreshes.verdict()
     }
 }
@@ -738,6 +874,119 @@ mod tests {
                 .unwrap_err()
                 .starts_with("client refreshes:")
         );
+    }
+
+    /// A descriptor as a test names it: range, start, end, generation and the
+    /// sub-intervals it won, all keys raw.
+    type Named<'a> = (u64, &'a [u8], &'a [u8], u64, Vec<(&'a [u8], &'a [u8])>);
+
+    fn meta_applied(node: u64, index: u64, named: Vec<Named<'_>>) -> TraceRecord {
+        record(
+            node,
+            TraceEvent::MetaApplied {
+                index,
+                descriptors: named
+                    .into_iter()
+                    .map(
+                        |(range, start, end, generation, won)| ananke_env::MetaDescriptor {
+                            range,
+                            start: user_key(start),
+                            end: user_key(end),
+                            generation,
+                            voters: vec![1, 2, 3],
+                            won: won
+                                .into_iter()
+                                .map(|(s, e)| (user_key(s), user_key(e)))
+                                .collect(),
+                        },
+                    )
+                    .collect(),
+            },
+        )
+    }
+
+    #[test]
+    fn a_meta_apply_names_only_descriptors_check_7_traced_before_it() {
+        let mut checker = Checker::new(true);
+        checker.push(&meta_applied(
+            1,
+            0,
+            vec![(2, b"a", b"k", 1, vec![(b"a", b"k")])],
+        ));
+        assert!(
+            checker
+                .verdict()
+                .unwrap_err()
+                .contains("had not traced before it")
+        );
+        let mut checker = Checker::new(true);
+        checker.push(&created(1, 2, b"a", b"k", 1, &[1, 2, 3]));
+        checker.push(&meta_applied(
+            1,
+            0,
+            vec![(2, b"a", b"k", 1, vec![(b"a", b"k")])],
+        ));
+        checker.push(&meta_applied(
+            2,
+            0,
+            vec![(2, b"a", b"k", 1, vec![(b"a", b"k")])],
+        ));
+        checker.verdict().unwrap();
+        checker.push(&meta_applied(
+            3,
+            0,
+            vec![(2, b"a", b"z", 1, vec![(b"a", b"z")])],
+        ));
+        assert!(
+            checker
+                .verdict()
+                .unwrap_err()
+                .contains("where check 7 holds")
+        );
+    }
+
+    #[test]
+    fn a_meta_apply_that_names_a_lower_generation_for_a_key_is_a_violation() {
+        let mut checker = Checker::new(true);
+        checker.push(&created(1, 2, b"a", b"z", 1, &[1, 2, 3]));
+        checker.push(&meta_applied(
+            1,
+            0,
+            vec![(2, b"a", b"z", 1, vec![(b"a", b"z")])],
+        ));
+        let mut higher = created(1, 3, b"k", b"z", 2, &[1, 2, 3]);
+        if let TraceEvent::RangeCreated {
+            cause, floor_index, ..
+        } = &mut higher.event
+        {
+            *cause = RangeCause::Split;
+            *floor_index = 7;
+        }
+        checker.push(&higher);
+        checker.push(&meta_applied(
+            1,
+            5,
+            vec![(3, b"k", b"z", 2, vec![(b"k", b"z")])],
+        ));
+        // A resend of the parent's record wins nothing, and names no regression.
+        checker.push(&meta_applied(1, 6, vec![(2, b"a", b"z", 1, vec![])]));
+        checker.verdict().unwrap();
+        // The variant: the stale parent takes the span back.
+        checker.push(&meta_applied(
+            1,
+            7,
+            vec![(2, b"a", b"z", 1, vec![(b"a", b"z")])],
+        ));
+        assert!(checker.verdict().unwrap_err().contains("never falls"));
+    }
+
+    #[test]
+    fn a_read_served_by_a_system_range_is_a_lookup_and_check_9_holds_it_to_nothing() {
+        let mut checker = Checker::new(true);
+        checker.push(&created(1, 2, b"a", b"k", 1, &[1, 2, 3]));
+        checker.push(&read(1, 1, b"q", 3));
+        checker.push(&read(1, 0, b"", 3));
+        checker.verdict().unwrap();
     }
 
     #[test]

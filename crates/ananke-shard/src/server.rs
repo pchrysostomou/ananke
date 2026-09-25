@@ -41,13 +41,14 @@ use std::io;
 use std::net::SocketAddr;
 use std::ops::Range as KeyRange;
 use std::path::{Path, PathBuf};
+use std::pin::pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ananke_env::{
     ApplyEffect, FileSystem, MetaDescriptor, MismatchAt, RangeCause, RangeState, RecoveredAs,
 };
-use ananke_env::{Clock, Decision, Environment, Network, Rng, Socket, TraceEvent};
+use ananke_env::{Clock, Decision, Either, Environment, Network, Rng, Socket, TraceEvent, race};
 use ananke_raft::apply::{Command, Outcome, apply_command, user_key};
 use ananke_raft::client::{Reply, Request, Response};
 use ananke_raft::core::{RaftConfig, SnapshotAction, Variant, Variants};
@@ -68,6 +69,7 @@ use crate::descriptor::{FIRST_GENERATION, RangeDescriptor};
 use crate::frame::decode;
 use crate::inbox::{Inbox, Received};
 use crate::install::{self, SnapAnswer, SnapJob};
+use crate::meta;
 use crate::node::{
     Applier, ApplyJob, ApplyWork, Boxed, BoxedPersist, CoreWork, Host, Node,
     NodeConfig as TaskConfig, apply,
@@ -202,41 +204,56 @@ pub fn initial_state(
 ) -> (WriteBatch, Vec<MetaDescriptor>) {
     let mut batch = WriteBatch::new();
     let config = Configuration::of(bootstrap);
-    let mut meta_descriptors = Vec::new();
-    let mut counter = FIRST_USER_RANGE;
     for range in hosted {
         let prefix = KeyPrefix::group(range.id.get());
-        let span = range.span();
         initial_state_into(&prefix, &config, &mut batch);
-        let descriptor = RangeDescriptor {
-            range: range.id,
-            start: span.start.clone(),
-            end: span.end.clone(),
-            generation: FIRST_GENERATION,
-            voters: bootstrap.to_vec(),
-            state: RangeState::Live,
-        };
-        batch.put(prefix.descriptor_key(), descriptor.encode());
+        batch.put(
+            prefix.descriptor_key(),
+            bootstrap_descriptor(range, bootstrap).encode(),
+        );
+    }
+    root_state_into(bootstrap, servers, hosted, &mut batch);
+    let meta_descriptors = meta_state_into(bootstrap, hosted, &mut batch);
+    (batch, meta_descriptors)
+}
+
+/// The descriptor every range fixed at bootstrap starts with: its span at the first
+/// generation, with the bootstrap nodes as voters (SHARD.md §2).
+// PROPOSED(D-098): `initial_state`'s pieces, so a replica of a system range opened on
+// an empty store can write its index-0 state from configuration alone.
+#[must_use]
+pub fn bootstrap_descriptor(range: &Range, bootstrap: &[ServerId]) -> RangeDescriptor {
+    let span = range.span();
+    RangeDescriptor {
+        range: range.id,
+        start: span.start,
+        end: span.end,
+        generation: FIRST_GENERATION,
+        voters: bootstrap.to_vec(),
+        state: RangeState::Live,
+    }
+}
+
+/// Range 0's state at index 0 (SHARD.md §2): the meta range's descriptor, the
+/// range-id counter one past the highest hosted id with no block leased, a node record
+/// per bootstrap node and the digest of the bootstrap configuration.
+// PROPOSED(D-098)
+pub fn root_state_into(
+    bootstrap: &[ServerId],
+    servers: &[(ServerId, SocketAddr)],
+    hosted: &[Range],
+    batch: &mut WriteBatch,
+) {
+    let mut counter = FIRST_USER_RANGE;
+    for range in hosted {
         if range.id == META_RANGE {
-            batch.put(system::meta_descriptor_key(), descriptor.encode());
+            batch.put(
+                system::meta_descriptor_key(),
+                bootstrap_descriptor(range, bootstrap).encode(),
+            );
         }
         if !range.is_system() {
             counter = counter.max(range.id.get() + 1);
-            let record = MetaRecord {
-                start: span.start.clone(),
-                range: range.id,
-                generation: FIRST_GENERATION,
-                voters: bootstrap.to_vec(),
-            };
-            batch.put(system::meta_record_key(&span.end), record.encode());
-            meta_descriptors.push(MetaDescriptor {
-                range: range.id.get(),
-                start: span.start.clone(),
-                end: span.end.clone(),
-                generation: FIRST_GENERATION,
-                voters: bootstrap.iter().map(|voter| voter.0).collect(),
-                won: vec![(span.start, span.end)],
-            });
         }
     }
     batch.put(system::counter_key(), system::encode_counter(counter));
@@ -259,7 +276,39 @@ pub fn initial_state(
         system::digest_key(),
         system::encode_digest(system::digest(bootstrap, servers, &spans)),
     );
-    (batch, meta_descriptors)
+}
+
+/// Range 1's state at index 0 (SHARD.md §1, §2): a record per user range keyed by its
+/// end key. Returns what `MetaApplied { index: 0 }` names.
+// PROPOSED(D-098)
+pub fn meta_state_into(
+    bootstrap: &[ServerId],
+    hosted: &[Range],
+    batch: &mut WriteBatch,
+) -> Vec<MetaDescriptor> {
+    let mut meta_descriptors = Vec::new();
+    for range in hosted {
+        if range.is_system() {
+            continue;
+        }
+        let span = range.span();
+        let record = MetaRecord {
+            start: span.start.clone(),
+            range: range.id,
+            generation: FIRST_GENERATION,
+            voters: bootstrap.to_vec(),
+        };
+        batch.put(system::meta_record_key(&span.end), record.encode());
+        meta_descriptors.push(MetaDescriptor {
+            range: range.id.get(),
+            start: span.start.clone(),
+            end: span.end.clone(),
+            generation: FIRST_GENERATION,
+            voters: bootstrap.iter().map(|voter| voter.0).collect(),
+            won: vec![(span.start, span.end)],
+        });
+    }
+    meta_descriptors
 }
 
 /// The descriptors a node not named at bootstrap writes for the ranges it hosts at
@@ -466,6 +515,27 @@ const PROPOSED_REMEMBERED: usize = 4096;
 // PROPOSED(D-086): re-measured with the stream arms on the node, by D-076's rule.
 const READS_OUTSTANDING: usize = 38;
 
+/// What the host hands the node's `meta` task: a descriptor to tell the meta range
+/// (SHARD.md §1, Q3).
+// PROPOSED(D-098)
+pub enum MetaJob {
+    /// A core of `range` took office: its descriptor goes to the meta range.
+    Send {
+        /// The range.
+        range: RangeId,
+        /// Its descriptor as the store holds it.
+        descriptor: RangeDescriptor,
+    },
+}
+
+/// The client id the node's `meta` task sends under: above every process id a
+/// scenario's clients draw, and the node's own.
+// PROPOSED(D-098)
+#[must_use]
+pub fn meta_client(id: ServerId) -> u64 {
+    (1 << 62) | id.0
+}
+
 /// What the node's tasks hand the `raft` task besides its peers' messages.
 pub enum Local {
     /// A client's request, with the range it named.
@@ -536,6 +606,14 @@ pub struct ServerHost<E: Environment> {
     /// named at bootstrap's from `interim_state`, a re-seeded one's from its stream.
     // PROPOSED(D-097)
     descriptors: Arc<Mutex<BTreeMap<RangeId, RangeDescriptor>>>,
+    /// The term this node last took office in, per range: a leader's first
+    /// `AppendEntries` of a term it had not led is the office taken, and the range's
+    /// descriptor goes to the meta range (SHARD.md §1, Q3).
+    // PROPOSED(D-098)
+    led: Mutex<BTreeMap<RangeId, Term>>,
+    /// The work the node's `meta` task owes: the descriptors to tell the meta range.
+    // PROPOSED(D-098)
+    meta: Queue<MetaJob>,
     /// What the `apply` task has applied per range, shared with that task.
     ///
     /// It is the `apply` task's own state and is written there on every entry. The
@@ -571,6 +649,28 @@ impl<E: Environment> ServerHost<E> {
 
     fn replica(&self, range: RangeId) -> Option<&Arc<Mutex<Replica>>> {
         self.replicas.get(&range)
+    }
+
+    /// A core of `range` sends an `AppendEntries` of `term`: it leads, and if this
+    /// node had not led the range in that term, it has just taken office and sends the
+    /// range's descriptor to the meta range (SHARD.md §1, Q3). The system ranges send
+    /// nothing: meta holds the user ranges' records and range 0 holds meta's, and
+    /// neither changes in Phase 3 (Q4).
+    // PROPOSED(D-098)
+    fn took_office(&self, range: RangeId, term: Term) {
+        if range == META_RANGE || range == ROOT_RANGE {
+            return;
+        }
+        {
+            let mut led = lock(&self.led);
+            if led.get(&range) == Some(&term) {
+                return;
+            }
+            led.insert(range, term);
+        }
+        if let Some(descriptor) = lock(&self.descriptors).get(&range).cloned() {
+            self.meta.push(MetaJob::Send { range, descriptor });
+        }
     }
 
     /// Answers a request `RangeMismatch` with `descriptors`, traced (SHARD.md §3, §8).
@@ -776,12 +876,16 @@ impl<E: Environment> ServerHost<E> {
             );
         }
         if created {
+            // The span encoded, as every other creation traces it (D-096); D-096's
+            // own install creation traced the configured keys raw, which check 7 saw
+            // the first time it was folded over a re-seed (PROPOSED D-098).
+            let encoded = span.span();
             self.env.trace(TraceEvent::RangeCreated {
                 range: range.get(),
                 cause: RangeCause::Snapshot,
                 parent: None,
-                start: span.start.clone(),
-                end: span.end.clone(),
+                start: encoded.start,
+                end: encoded.end,
                 generation: FIRST_GENERATION,
                 voters: config.voters.iter().map(|voter| voter.0).collect(),
                 floor_index: at.last_index,
@@ -943,9 +1047,30 @@ impl<E: Environment> Host for ServerHost<E> {
                 });
                 Some(Input::Change(voters))
             }
+            // A meta update is the meta range's alone (SHARD.md §1): asked of any
+            // other range it is a mismatch, carrying the meta range's descriptor where
+            // this node holds it.
+            // PROPOSED(D-098)
+            Command::MetaUpdate { .. } if range != META_RANGE => {
+                drop(state);
+                let descriptors: Vec<RangeDescriptor> = lock(&self.descriptors)
+                    .get(&META_RANGE)
+                    .cloned()
+                    .into_iter()
+                    .collect();
+                self.mismatch(
+                    range,
+                    from,
+                    request.client,
+                    request.seq,
+                    MismatchAt::Receipt,
+                    &descriptors,
+                );
+                None
+            }
             // A read: served by the lease or after a heartbeat round, never through
-            // the log.
-            Command::Get { .. } => {
+            // the log. A lookup is one (SHARD.md §1; PROPOSED D-098).
+            Command::Get { .. } | Command::Lookup { .. } => {
                 // A core that does not lead refuses the read with `Rejected` and
                 // never names the id again (`core::on_read`), so the id is carried
                 // to the step as the work in flight — where the registration is
@@ -998,6 +1123,9 @@ impl<E: Environment> Host for ServerHost<E> {
                     range: *range,
                     from: *from,
                     repair: Box::new(self.repair(*range, core, at.last_index, at.last_term)),
+                    // The install is decided here, where the hold is taken (D-047;
+                    // PROPOSED D-098).
+                    held: self.env.decision(),
                 });
                 CoreWork::Hold
             }
@@ -1110,7 +1238,10 @@ impl<E: Environment> Host for ServerHost<E> {
             .get(&range)
             .map_or(0, |store| store.incarnation());
         match message {
-            Message::AppendEntries { sent, .. } => *sent = now_nanos(&self.env),
+            Message::AppendEntries { sent, term, .. } => {
+                *sent = now_nanos(&self.env);
+                self.took_office(range, *term);
+            }
             Message::AppendEntriesResponse {
                 local,
                 incarnation: mine,
@@ -1145,18 +1276,50 @@ impl<E: Environment> Host for ServerHost<E> {
             let Some(store) = self.stores.get(&range) else {
                 return Ok(());
             };
-            let key = {
+            let command = {
                 let Some(replica) = self.replica(range) else {
                     return Ok(());
                 };
                 let state = lock(replica);
                 match state.reads.get(&id) {
-                    Some((_, request)) => match request.command.key() {
-                        Some(key) => key.clone(),
-                        None => return Ok(()),
-                    },
+                    Some((_, request)) => request.command.clone(),
                     None => return Ok(()),
                 }
+            };
+            // A lookup (SHARD.md §1, §3; PROPOSED D-098): asked of the root, the meta
+            // range's descriptor; asked of the meta range, the descriptor of the range
+            // whose span holds the key, by the bounded seek; asked of any other range,
+            // nothing. Served at one engine version as a read is, and traced as one on
+            // the system range that served it — a lookup any key may ask (Q36).
+            if let Command::Lookup { key } = &command {
+                let version = store.engine().snapshot();
+                let found = if range == META_RANGE {
+                    meta::lookup(store.engine(), &version, &user_key(key)).await?
+                } else if range == ROOT_RANGE {
+                    meta::meta_descriptor(store.engine(), &version).await?
+                } else {
+                    None
+                };
+                let served_at = store.applied_at(&version).await?;
+                drop(version);
+                self.env.trace(TraceEvent::RaftRead {
+                    server: self.id.0,
+                    range: range.get(),
+                    index,
+                    lease,
+                    key: key.clone(),
+                    applied: served_at,
+                });
+                self.answer_read(
+                    range,
+                    id,
+                    Reply::Outcome(Outcome::Value(found.map(|descriptor| descriptor.encode()))),
+                )
+                .await;
+                return Ok(());
+            }
+            let Some(key) = command.key().cloned() else {
+                return Ok(());
             };
             // PROPOSED(D-069): the value and the applied index come from one engine
             // version, so the record says which state the client was answered from
@@ -1680,14 +1843,74 @@ impl<E: Environment> Applier for ServerApplier<E> {
                 } else {
                     command.as_ref()
                 };
-                let outcome = match apply_command(store, entry.index, applied_command).await {
-                    Ok(outcome) => outcome,
-                    Err(error) => {
-                        self.env.trace(TraceEvent::RaftServerFailed {
-                            server: self.id.0,
-                            reason: error.to_string(),
-                        });
-                        return;
+                // The meta range's state machine (SHARD.md §1; PROPOSED D-098): a
+                // `MetaUpdate` applied by an entry of range 1 merges its descriptors
+                // into the records as a maximum by generation and writes the
+                // difference with the entry's index; `MetaApplied` is traced with what
+                // each descriptor won, and the effect is `took` when anything was and
+                // `none` when the update changed nothing, as a resend does. An update
+                // in any other range's log applies as nothing, refused: it is the meta
+                // range's alone, and receipt refuses it before it is proposed.
+                let mut meta_effect: Option<ApplyEffect> = None;
+                let meta_update: Option<Vec<RangeDescriptor>> = match applied_command {
+                    Some(Command::MetaUpdate { descriptors }) => Some(
+                        descriptors
+                            .iter()
+                            .filter_map(|bytes| RangeDescriptor::decode(bytes.clone()).ok())
+                            .collect(),
+                    ),
+                    _ => None,
+                };
+                let outcome = if let Some(descriptors) = &meta_update {
+                    let result = if range == META_RANGE {
+                        let as_arrived = self
+                            .node_variants
+                            .contains(NodeVariant::MetaOverwritesByArrival);
+                        match meta::apply_update(store.engine(), descriptors, as_arrived).await {
+                            Ok((batch, applied)) => {
+                                let took_effect = applied.iter().any(|d| !d.won.is_empty());
+                                store.apply(entry.index, batch).await.map(|()| {
+                                    self.env.trace(TraceEvent::MetaApplied {
+                                        index: entry.index,
+                                        descriptors: applied,
+                                    });
+                                    if took_effect {
+                                        ApplyEffect::Took
+                                    } else {
+                                        ApplyEffect::None
+                                    }
+                                })
+                            }
+                            Err(error) => Err(error),
+                        }
+                    } else {
+                        apply_command(store, entry.index, None)
+                            .await
+                            .map(|_| ApplyEffect::Refused)
+                    };
+                    match result {
+                        Ok(effect) => {
+                            meta_effect = Some(effect);
+                            Outcome::Done
+                        }
+                        Err(error) => {
+                            self.env.trace(TraceEvent::RaftServerFailed {
+                                server: self.id.0,
+                                reason: error.to_string(),
+                            });
+                            return;
+                        }
+                    }
+                } else {
+                    match apply_command(store, entry.index, applied_command).await {
+                        Ok(outcome) => outcome,
+                        Err(error) => {
+                            self.env.trace(TraceEvent::RaftServerFailed {
+                                server: self.id.0,
+                                reason: error.to_string(),
+                            });
+                            return;
+                        }
                     }
                 };
                 {
@@ -1709,7 +1932,7 @@ impl<E: Environment> Applier for ServerApplier<E> {
                 let (key, effect) = match command.as_ref().and_then(Command::key) {
                     Some(key) if refused.is_some() => (Some(key.clone()), ApplyEffect::OutOfSpan),
                     Some(key) => (Some(key.clone()), ApplyEffect::Applied),
-                    None => (None, ApplyEffect::None),
+                    None => (None, meta_effect.unwrap_or(ApplyEffect::None)),
                 };
                 self.env.trace_decided(
                     took,
@@ -1809,6 +2032,111 @@ fn now_nanos<E: Environment>(env: &E) -> u64 {
     env.clock().now().as_nanos()
 }
 
+/// The node's `meta` task (SHARD.md §1, Q3; PROPOSED D-098): every descriptor the
+/// host hands it goes to the meta range's leader as a `MetaUpdate` under the node's
+/// own client id — the last leader it heard of, or range 1's voters in turn — and is
+/// sent again every `resend`, the minimum election timeout, until that leader answers
+/// `Done`, whether or not the node still leads the range. A `NotLeader` answer moves
+/// the target for the next send and a mismatch moves it on; neither sends at once,
+/// since a range between leaders answers at once too and the two would storm. A
+/// range handed over again before its acknowledgement has the newer descriptor take
+/// the older's place.
+#[allow(clippy::too_many_arguments)]
+async fn meta_sender<E: Environment>(
+    env: E,
+    id: ServerId,
+    sock: Arc<<E::Net as Network>::Socket>,
+    addrs: BTreeMap<ServerId, SocketAddr>,
+    voters: Vec<ServerId>,
+    jobs: Queue<MetaJob>,
+    answers: Queue<Response>,
+    resend: Duration,
+    generation: u64,
+) {
+    let client = meta_client(id);
+    let mut pending: BTreeMap<RangeId, (RangeDescriptor, u64)> = BTreeMap::new();
+    let mut seq = 0u64;
+    let mut hint: Option<ServerId> = None;
+    let mut turn = 0usize;
+    loop {
+        let event = {
+            let job = pin!(jobs.pop());
+            let answer = pin!(answers.pop());
+            let inner = pin!(race(&env, job, answer));
+            let timer = pin!(async {
+                if pending.is_empty() {
+                    std::future::pending::<()>().await;
+                } else {
+                    env.clock().sleep(resend).await;
+                }
+            });
+            race(&env, inner, timer).await
+        };
+        let mut to_send: Vec<RangeId> = Vec::new();
+        match event {
+            Either::Left(Either::Left(None) | Either::Right(None)) => return,
+            Either::Left(Either::Left(Some(MetaJob::Send { range, descriptor }))) => {
+                seq += 1;
+                pending.insert(range, (descriptor, seq));
+                to_send.push(range);
+            }
+            // An answer that is not the acknowledgement moves the target and nothing
+            // else: the next send waits for the timer. A resend on the answer itself
+            // was a storm — a range 1 between leaders answers `NotLeader` at once,
+            // the task sent again at once to the next voter, which answered the same,
+            // and one seed traced 585 000 messages in eight simulated seconds where
+            // it traces 12 000.
+            Either::Left(Either::Right(Some(response))) => match response.reply {
+                Reply::Outcome(_) => {
+                    pending.retain(|_, (_, sent)| *sent != response.seq);
+                }
+                Reply::NotLeader { leader } => {
+                    hint = leader;
+                    if hint.is_none() {
+                        turn += 1;
+                    }
+                }
+                Reply::RangeMismatch { .. } => {
+                    hint = None;
+                    turn += 1;
+                }
+            },
+            Either::Right(()) => {
+                if hint.is_none() {
+                    turn += 1;
+                }
+                to_send.extend(pending.keys().copied());
+            }
+        }
+        if to_send.is_empty() || voters.is_empty() {
+            continue;
+        }
+        let target = hint.unwrap_or(voters[turn % voters.len()]);
+        let Some(addr) = addrs.get(&target).copied() else {
+            continue;
+        };
+        for range in to_send {
+            let Some((descriptor, sent)) = pending.get(&range) else {
+                continue;
+            };
+            let request = RangedRequest {
+                range: META_RANGE,
+                generation,
+                request: Request {
+                    client,
+                    seq: *sent,
+                    command: Command::MetaUpdate {
+                        descriptors: vec![descriptor.encode()],
+                    },
+                },
+            };
+            if sock.send(addr, request.encode()).await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
 /// Runs one node until its socket closes or its disk fails under it. Spawn it with
 /// `Environment::spawn`; spawn it again after a crash to restart the node on what its
 /// disk kept, as a server is restarted today.
@@ -1880,24 +2208,34 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
     // several ranges, each tagged with its own (Q10, D-072); a client's packet
     // carries the range its key belongs to.
     let snaps: Queue<SnapJob> = Queue::new();
+    // The answers to the node's own `MetaUpdate`s, for its `meta` task (PROPOSED
+    // D-098).
+    let meta_answers: Queue<Response> = Queue::new();
     env.spawn("net", {
         let env = env.clone();
         let sock = sock.clone();
         let inbox = inbox.clone();
         let local = local.clone();
         let snaps = snaps.clone();
+        let meta_answers = meta_answers.clone();
         async move {
             loop {
                 let Ok((from, bytes)) = sock.recv().await else {
                     break;
                 };
                 if is_ranged(&bytes) {
-                    if let Ok(ranged) = RangedRequest::decode(bytes) {
+                    if let Ok(ranged) = RangedRequest::decode(bytes.clone()) {
                         local.push(Local::Request {
                             range: ranged.range,
                             from,
                             request: ranged.request,
                         });
+                    } else if let Ok(answered) = RangedResponse::decode(bytes)
+                        && answered.response.client == meta_client(id)
+                    {
+                        // An answer to the node's own `MetaUpdate`, for the `meta`
+                        // task (PROPOSED D-098).
+                        meta_answers.push(answered.response);
                     }
                     continue;
                 }
@@ -1987,6 +2325,9 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
     .await;
     // Whether this start re-seeded (below), which a bootstrap must never follow: a
     // re-seed's directory holds no digest and is not a fresh store (PROPOSED D-096).
+    // The meta range's index-0 state a re-seed wrote, traced after the creations as
+    // the bootstrap's is (PROPOSED D-098).
+    let mut reseeded_meta: Option<Vec<MetaDescriptor>> = None;
     let mut reseeded_now = false;
     let opened: Vec<(Range, Arc<RaftStore<E>>, Recovered)> = match started {
         Start::Failed(error) => {
@@ -2001,18 +2342,22 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
             // Q15: a loss in the *shared* engine refuses the whole node. The node
             // re-seeds into a fresh engine in a new directory beside the refused one,
             // which stays marked lost and quiesced (§11, storage 8; D-041).
-            reseed(
+            let reseeded = reseed(
                 &env,
                 server,
                 &base_dir,
                 &engine,
                 &present,
                 &hosted,
+                &bootstrap,
+                &servers,
                 variants,
                 node_variants,
                 &error,
             )
-            .await?
+            .await?;
+            reseeded_meta = reseeded.meta;
+            reseeded.opened
         }
         Start::Opened {
             store, recovered, ..
@@ -2048,13 +2393,14 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
         && !reseeded_now
         && engine.dir == base_dir
         && engine_of_node.get(&system::digest_key()).await?.is_none();
+    // Its `MetaApplied { index: 0 }` is traced after the replicas' creations below,
+    // so that check 16 finds every descriptor it names already in check 7's map
+    // (SHARD.md §8; PROPOSED D-098).
+    let mut bootstrap_meta: Option<Vec<MetaDescriptor>> = None;
     if bootstrapped_now {
         let (batch, descriptors) = initial_state(&bootstrap, &servers, &hosted);
         engine_of_node.write(batch, true).await?;
-        env.trace(TraceEvent::MetaApplied {
-            index: 0,
-            descriptors,
-        });
+        bootstrap_meta = Some(descriptors);
     }
     let bootstrapped_before = is_bootstrap && !bootstrapped_now;
     // A node not named at bootstrap writes its interim replicas' descriptors at its
@@ -2185,6 +2531,12 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
         );
         cores.insert(id_of, core);
     }
+    if let Some(descriptors) = bootstrap_meta.or(reseeded_meta) {
+        env.trace(TraceEvent::MetaApplied {
+            index: 0,
+            descriptors,
+        });
+    }
 
     let host = ServerHost {
         env: env.clone(),
@@ -2196,13 +2548,19 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
         jobs: Queue::new(),
         answers: Queue::new(),
         snaps: snaps.clone(),
-        ranges: ranges.clone(),
+        // The six the node hosts, not the four configuration names: `installed` reads
+        // a switched range's span here, and with the user ranges alone a system
+        // range's live install switched the store and kept the old core — the day
+        // the meta range first compacted (PROPOSED D-098).
+        ranges: hosted.clone(),
         initial: initial.clone(),
         raft: raft.clone(),
         variants,
         node: node_variants,
         gaps: Mutex::new(Gaps::default()),
         descriptors: descriptors.clone(),
+        led: Mutex::new(BTreeMap::new()),
+        meta: Queue::new(),
         applied: applied_at.clone(),
     };
     let answers = host.answers.clone();
@@ -2213,6 +2571,27 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
             while let Some((to, bytes)) = answers.pop().await {
                 let _ = sock.send(to, bytes).await;
             }
+        }
+    });
+    // The `meta` task: tells the meta range every descriptor a core of this node
+    // takes office over, and resends until acknowledged (SHARD.md §1, Q3; PROPOSED
+    // D-098).
+    env.spawn("meta", {
+        let env = env.clone();
+        let sock = sock.clone();
+        let addrs = addrs.clone();
+        let jobs = host.meta.clone();
+        let answers = meta_answers.clone();
+        let voters: Vec<ServerId> = bootstrap.clone();
+        let resend = Duration::from_nanos(raft.tick_nanos.saturating_mul(raft.election_ticks.0));
+        let generation = lock(&descriptors)
+            .get(&META_RANGE)
+            .map_or(FIRST_GENERATION, |descriptor| descriptor.generation);
+        async move {
+            meta_sender(
+                env, id, sock, addrs, voters, jobs, answers, resend, generation,
+            )
+            .await;
         }
     });
     let jobs = host.jobs.clone();
@@ -2388,10 +2767,14 @@ async fn reseed<E: Environment>(
     refused: &EngineConfig,
     present: &[Candidate],
     ranges: &[Range],
+    bootstrap: &[ServerId],
+    servers: &[(ServerId, SocketAddr)],
     variants: Variants,
     node_variants: NodeVariants,
     error: &io::Error,
-) -> io::Result<Vec<(Range, Arc<RaftStore<E>>, Recovered)>> {
+) -> io::Result<Reseeded<E>> {
+    // What `MetaApplied { index: 0 }` names for a re-seeded replica of the meta range.
+    let mut reseeded_meta: Option<Vec<MetaDescriptor>> = None;
     // 1. D-044: the loss is marked in the store directory before anything else.
     let reason = error.to_string();
     mark_store_lost(env, &refused.dir, &reason).await?;
@@ -2462,6 +2845,33 @@ async fn reseed<E: Environment>(
             }
         };
         if refused_ranges.iter().any(|refused| refused.id == range.id) {
+            // A replica of a system range rebuilt in a fresh engine starts its state
+            // machine at index 0, the bootstrap's, which is in no log: a leader whose
+            // meta range compacted nothing appends from index 1, and a replica that
+            // applied those entries over an empty state would diverge from the others
+            // at the first update — state machine safety saw it, `none` on the
+            // bootstrap nodes' replicas and `took` on the re-seeded one. The index-0
+            // state is computed from configuration alone (SHARD.md §2), so the
+            // re-seed writes it here, with the range's descriptor, before the mark;
+            // the Raft state is not written, since a re-seeded replica takes its term,
+            // its vote and its incarnation from the re-seed and not from a bootstrap
+            // (D-096). Its `MetaApplied { index: 0 }` is traced after the creations, as the
+            // bootstrap's is.
+            // PROPOSED(D-098)
+            if range.is_system() {
+                let mut initial = WriteBatch::new();
+                initial.put(
+                    KeyPrefix::group(range.id.get()).descriptor_key(),
+                    bootstrap_descriptor(range, bootstrap).encode(),
+                );
+                if range.id == ROOT_RANGE {
+                    root_state_into(bootstrap, servers, ranges, &mut initial);
+                } else {
+                    let descriptors = meta_state_into(bootstrap, ranges, &mut initial);
+                    reseeded_meta = Some(descriptors);
+                }
+                store.engine().write(initial, true).await?;
+            }
             let incarnation = if node_variants.contains(NodeVariant::IncarnationPerRangeStream) {
                 env.range_rng(range.id.get()).next_u64()
             } else {
@@ -2481,7 +2891,17 @@ async fn reseed<E: Environment>(
         }
         opened.push((range.clone(), Arc::new(store), recovered));
     }
-    Ok(opened)
+    Ok(Reseeded {
+        opened,
+        meta: reseeded_meta,
+    })
+}
+
+/// What a re-seed hands back: each range's store, and the meta range's index-0 state
+/// when the re-seed rebuilt a replica of it (PROPOSED D-098).
+struct Reseeded<E: Environment> {
+    opened: Vec<(Range, Arc<RaftStore<E>>, Recovered)>,
+    meta: Option<Vec<MetaDescriptor>>,
 }
 
 /// The restatement of one replica at the node's start (RAFT.md §2): the log as the

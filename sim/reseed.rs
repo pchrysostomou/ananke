@@ -315,6 +315,11 @@ impl Report {
     /// Naming the first criterion that fails, with the seed and what it saw.
     pub fn check(&self) -> Result<(), String> {
         let seed = self.seed;
+        // SHARD.md §8's checks 7, 9, 10, 16 and 17 over this node scenario's trace,
+        // as every node scenario folds them (Q40; PROPOSED D-097, D-098).
+        if let Err(violation) = ananke_shard::invariants::all(&self.records) {
+            return Err(format!("seed {seed}: {violation}"));
+        }
         let read = self.read();
         let every = Self::every_range();
         let streamed = Self::streamed_ranges();
