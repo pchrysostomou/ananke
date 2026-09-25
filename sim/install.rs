@@ -534,6 +534,8 @@ pub fn server_config(id: u64, variants: impl Into<Variants>, node: NodeVariants)
         // Not a scenario about the cap: at the node's range count, so no stream waits
         // by accident (D-075).
         snapshot_cap: SNAPSHOT_CAP,
+        id_block: crate::ranges::ID_BLOCK,
+        refill_at: crate::ranges::REFILL_AT,
         node,
     }
 }

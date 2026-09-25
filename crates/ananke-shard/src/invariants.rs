@@ -373,6 +373,87 @@ impl GenerationsRise {
     }
 }
 
+/// Check 18's range-id clause, the part a tree without a split reaches (SHARD.md §8;
+/// §5, Q17): folding `RangeIdsLeased` by the first apply of each of range 0's
+/// indices, no two grants share an id, and every replica's apply of an index grants
+/// what its first apply did. The clause's other half — the right half of a split lies
+/// in a block granted before it to the node that led the parent — waits on the split.
+// PROPOSED(D-099)
+#[derive(Clone, Debug, Default)]
+pub struct IdsUnique {
+    /// The grant at each index of range 0 by its first apply: node, run, first, last.
+    granted: BTreeMap<u64, (u64, u64, u64, u64)>,
+    /// Every block granted, its first id to its last.
+    blocks: BTreeMap<u64, u64>,
+    violation: Option<String>,
+}
+
+impl IdsUnique {
+    /// Folds one record.
+    pub fn push(&mut self, record: &TraceRecord) {
+        if self.violation.is_some() {
+            return;
+        }
+        let TraceEvent::RangeIdsLeased {
+            node,
+            run,
+            first,
+            last,
+            index,
+        } = &record.event
+        else {
+            return;
+        };
+        let on = record.node.map(|node| u64::from(node.get()));
+        let grant = (*node, *run, *first, *last);
+        if let Some(seen) = self.granted.get(index) {
+            if *seen != grant {
+                self.violation = Some(format!(
+                    "range ids: index {index} of range 0 granted node {}'s run {} the block \
+                     {}..={} at its first apply and node {node}'s run {run} the block \
+                     {first}..={last} on {on:?}",
+                    seen.0, seen.1, seen.2, seen.3
+                ));
+            }
+            return;
+        }
+        self.granted.insert(*index, grant);
+        if first > last {
+            self.violation = Some(format!(
+                "range ids: index {index} of range 0 granted node {node} an empty block \
+                 {first}..={last}"
+            ));
+            return;
+        }
+        if let Some((held_first, held_last)) = self.blocks.range(..=*last).next_back()
+            && *held_last >= *first
+        {
+            self.violation = Some(format!(
+                "range ids: the block {first}..={last} granted to node {node} at index {index} \
+                 of range 0 shares ids with the block {held_first}..={held_last} granted before \
+                 it (SHARD.md §5: blocks are disjoint)"
+            ));
+            return;
+        }
+        self.blocks.insert(*first, *last);
+    }
+
+    /// The blocks granted so far, first id to last, by first apply.
+    #[must_use]
+    pub fn blocks(&self) -> &BTreeMap<u64, u64> {
+        &self.blocks
+    }
+
+    /// The first violation.
+    ///
+    /// # Errors
+    ///
+    /// The violation, in words naming it.
+    pub fn verdict(&self) -> Result<(), String> {
+        self.violation.clone().map_or(Ok(()), Err)
+    }
+}
+
 /// Check 16, the meta range never goes back and names only real descriptors, over
 /// check 7's map.
 // PROPOSED(D-098)
@@ -574,6 +655,7 @@ pub struct Checker {
     generations: GenerationsRise,
     meta: MetaNeverGoesBack,
     refreshes: ClientRefreshes,
+    ids: IdsUnique,
 }
 
 impl Checker {
@@ -596,6 +678,7 @@ impl Checker {
         self.generations.push(record, &self.descriptors);
         self.meta.push(record, &self.descriptors);
         self.refreshes.push(record);
+        self.ids.push(record);
     }
 
     /// Folds records in order.
@@ -611,7 +694,7 @@ impl Checker {
         &self.descriptors
     }
 
-    /// The first violation, in check order: 7, 9, 10, 16, 17.
+    /// The first violation, in check order: 7, 9, 10, 16, 17, 18.
     ///
     /// # Errors
     ///
@@ -621,11 +704,12 @@ impl Checker {
         self.serving.verdict()?;
         self.generations.verdict()?;
         self.meta.verdict()?;
-        self.refreshes.verdict()
+        self.refreshes.verdict()?;
+        self.ids.verdict()
     }
 }
 
-/// The four checks folded over `records` from the first: the whole-trace form of
+/// The checks folded over `records` from the first: the whole-trace form of
 /// [`Checker`].
 ///
 /// # Errors
@@ -879,6 +963,62 @@ mod tests {
     /// A descriptor as a test names it: range, start, end, generation and the
     /// sub-intervals it won, all keys raw.
     type Named<'a> = (u64, &'a [u8], &'a [u8], u64, Vec<(&'a [u8], &'a [u8])>);
+
+    fn leased(node_on: u64, node: u64, run: u64, first: u64, last: u64, index: u64) -> TraceRecord {
+        record(
+            node_on,
+            TraceEvent::RangeIdsLeased {
+                node,
+                run,
+                first,
+                last,
+                index,
+            },
+        )
+    }
+
+    #[test]
+    fn disjoint_blocks_pass_and_every_replica_of_an_index_may_grant_the_same() {
+        let mut checker = Checker::new(true);
+        checker.push(&leased(1, 1, 7, 3, 10, 1));
+        checker.push(&leased(2, 1, 7, 3, 10, 1));
+        checker.push(&leased(1, 2, 9, 11, 18, 2));
+        checker.push(&leased(3, 3, 5, 19, 26, 3));
+        checker.push(&leased(3, 1, 7, 3, 10, 1));
+        assert!(checker.verdict().is_ok(), "{:?}", checker.verdict());
+        assert_eq!(checker.ids.blocks().len(), 3);
+    }
+
+    #[test]
+    fn two_grants_that_share_an_id_are_caught() {
+        let mut checker = Checker::new(true);
+        checker.push(&leased(1, 1, 7, 3, 10, 1));
+        checker.push(&leased(1, 2, 9, 10, 17, 2));
+        let verdict = checker.verdict().unwrap_err();
+        assert!(
+            verdict.starts_with("range ids: the block 10..=17"),
+            "{verdict}"
+        );
+        let mut below = Checker::new(true);
+        below.push(&leased(1, 1, 7, 11, 18, 1));
+        below.push(&leased(1, 2, 9, 3, 11, 2));
+        assert!(below.verdict().is_err());
+    }
+
+    #[test]
+    fn a_replica_that_grants_something_else_at_the_same_index_is_caught() {
+        let mut checker = Checker::new(true);
+        checker.push(&leased(1, 1, 7, 3, 10, 1));
+        checker.push(&leased(2, 1, 7, 11, 18, 1));
+        let verdict = checker.verdict().unwrap_err();
+        assert!(
+            verdict.starts_with("range ids: index 1 of range 0 granted"),
+            "{verdict}"
+        );
+        let mut empty = Checker::new(true);
+        empty.push(&leased(1, 1, 7, 5, 4, 1));
+        assert!(empty.verdict().is_err());
+    }
 
     fn meta_applied(node: u64, index: u64, named: Vec<Named<'_>>) -> TraceRecord {
         record(

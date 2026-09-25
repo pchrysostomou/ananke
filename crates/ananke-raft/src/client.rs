@@ -277,6 +277,7 @@ pub fn studio(payload: &[u8]) -> Option<Json> {
             Command::Change { .. } => "change",
             Command::MetaUpdate { .. } => "meta-update",
             Command::Lookup { .. } => "lookup",
+            Command::Refill { .. } => "refill",
         };
         let mut fields = vec![
             ("type", Json::str("client.request")),

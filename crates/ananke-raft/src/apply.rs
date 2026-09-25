@@ -103,6 +103,19 @@ pub enum Command {
         /// The key asked about.
         key: Bytes,
     },
+    /// A node's refill of its block of range ids (SHARD.md §5, Q17): asked of range 0,
+    /// whose apply grants the block at the counter to `node`, records it with `run`,
+    /// the node's run nonce, and advances the counter past it. An entry, applied by
+    /// the range layer before [`apply_command`] sees it, as a `MetaUpdate` is; this
+    /// crate reads nothing of it, and a one-group server never receives one. It
+    /// touches no key of the command's own, so [`Command::key`] is `None`.
+    // PROPOSED(D-099)
+    Refill {
+        /// The asking node.
+        node: u64,
+        /// The nonce of the node's current run.
+        run: u64,
+    },
 }
 
 impl Command {
@@ -117,7 +130,8 @@ impl Command {
             Command::Transfer { .. }
             | Command::Change { .. }
             | Command::MetaUpdate { .. }
-            | Command::Lookup { .. } => None,
+            | Command::Lookup { .. }
+            | Command::Refill { .. } => None,
         }
     }
 
@@ -213,6 +227,11 @@ impl Command {
                 out.put_u8(7);
                 put_bytes(&mut out, key);
             }
+            Command::Refill { node, run } => {
+                out.put_u8(8);
+                out.put_u64_le(*node);
+                out.put_u64_le(*run);
+            }
         }
         out.freeze()
     }
@@ -287,6 +306,15 @@ impl Command {
             7 => Command::Lookup {
                 key: get_bytes(&mut bytes)?,
             },
+            8 => {
+                if bytes.len() < 16 {
+                    return Err(bad("command torn"));
+                }
+                Command::Refill {
+                    node: bytes.get_u64_le(),
+                    run: bytes.get_u64_le(),
+                }
+            }
             _ => return Err(bad("command malformed")),
         };
         if !bytes.is_empty() {
@@ -335,7 +363,8 @@ pub async fn apply_command<E: Environment>(
         Some(Command::Transfer { .. })
         | Some(Command::Change { .. })
         | Some(Command::MetaUpdate { .. })
-        | Some(Command::Lookup { .. }) => Outcome::Done,
+        | Some(Command::Lookup { .. })
+        | Some(Command::Refill { .. }) => Outcome::Done,
     };
     store.apply(index, batch).await?;
     Ok(outcome)
@@ -380,6 +409,10 @@ mod tests {
             },
             Command::Lookup {
                 key: Bytes::from_static(b"k"),
+            },
+            Command::Refill {
+                node: 3,
+                run: 0x1122_3344_5566_7788,
             },
         ];
         for command in commands {

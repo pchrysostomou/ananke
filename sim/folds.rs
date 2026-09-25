@@ -329,6 +329,10 @@ pub struct NodeCoverage {
     pub meta_applies: usize,
     /// See `meta_applies`.
     pub meta_took: usize,
+    /// `RangeIdsLeased` records: every replica of range 0's apply of a refill
+    /// (SHARD.md §5, Q17).
+    // PROPOSED(D-099)
+    pub ids_leased: usize,
 }
 
 impl NodeCoverage {
@@ -397,6 +401,7 @@ impl NodeCoverage {
             lookups_served: raft::lookups_served_of(records),
             meta_applies: raft::meta_applies_of(records).0,
             meta_took: raft::meta_applies_of(records).1,
+            ids_leased: count(&|e| matches!(e, TraceEvent::RangeIdsLeased { .. })),
         }
     }
 
@@ -496,6 +501,7 @@ impl NodeCoverageFold {
                 c.meta_applies += 1;
                 c.meta_took += usize::from(descriptors.iter().any(|d| !d.won.is_empty()));
             }
+            TraceEvent::RangeIdsLeased { .. } => c.ids_leased += 1,
             _ => {}
         }
     }
