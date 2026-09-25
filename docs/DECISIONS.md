@@ -8214,9 +8214,11 @@ Six supporting enums and one struct come with them: `ApplyEffect`, `RangeCause`,
   this stage; a read's `applied` is at or above its `index` — and each of the three
   mutations above now fails, naming the record, as does a fourth stamping a single-key
   apply `none`. They are the oracle the checks of §8 will replace. Both folds are green
-  on every seed at the gate's twenty and at CI's hundred; the thousand-seed premerge
-  below was run before them, so the next premerge is the first to run them at that
-  tier.
+  on every seed at the gate's twenty, at CI's hundred, and at the thousand-seed premerge
+  run on the tree that carries them, ec7c185: green in 1 566 s at a mean one-minute load
+  of 32.27 over 155 samples. The nightly's ten thousand on the same tree is green too
+  (run 35491453049, 328 tests, 43.6 minutes), so every seed of every sweep has been
+  through them at every tier.
 - *RAFT.md §2's event table is updated in the same commit* (D-053): the `range` rule and
   its three exceptions, `RaftApply`'s `key` and `effect`, `RaftRead`'s move and its two
   new fields, and the three new events.
