@@ -962,9 +962,33 @@ fn now_nanos<E: Environment>(env: &E) -> u64 {
 /// applies are grouped into one synced batch *inside* this task, never into more
 /// tasks. The grouping is built only if the measured apply lag asks for it
 /// (SHARD.md §12), so this is the ungrouped task.
-pub async fn apply<A: Applier>(jobs: &Queue<ApplyJob>, applier: &A) {
+pub async fn apply<A: Applier>(jobs: &Queue<ApplyJob>, applier: &A, variants: NodeVariants) {
+    if variants.contains(NodeVariant::ApplyWaitsForEveryRange) {
+        return apply_waiting_for_every_range(jobs, applier).await;
+    }
     while let Some(job) = jobs.pop().await {
         applier.run(job).await;
+    }
+}
+
+/// [`NodeVariant::ApplyWaitsForEveryRange`]: Q14's grouping built as a wait. Jobs are
+/// kept per range in the order they came, and a group — one job of every range the
+/// task has ever seen, run in range order — goes only when every one of those ranges
+/// has a job pending. A range that stops committing holds the rest for as long as it
+/// is quiet; a closed queue drops what is pending, as the correct task's close drops
+/// nothing.
+// PROPOSED(D-095): the variant the apply-lag and cross-range hold folds trip on.
+async fn apply_waiting_for_every_range<A: Applier>(jobs: &Queue<ApplyJob>, applier: &A) {
+    let mut pending: BTreeMap<RangeId, VecDeque<ApplyJob>> = BTreeMap::new();
+    while let Some(job) = jobs.pop().await {
+        pending.entry(job.range).or_default().push_back(job);
+        while pending.values().all(|queue| !queue.is_empty()) {
+            for queue in pending.values_mut() {
+                if let Some(job) = queue.pop_front() {
+                    applier.run(job).await;
+                }
+            }
+        }
     }
 }
 
@@ -2672,7 +2696,7 @@ mod tests {
                 env: env.clone(),
                 log: log.clone(),
             };
-            async move { apply(&jobs, &applier).await }
+            async move { apply(&jobs, &applier, NodeVariants::correct()).await }
         });
         sim.run_for(Duration::from_millis(40));
         jobs.close();

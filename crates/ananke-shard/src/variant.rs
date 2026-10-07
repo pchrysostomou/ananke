@@ -382,6 +382,15 @@ pub enum NodeVariant {
     /// a check could read.
     // PROPOSED(D-090): the node honours RAFT.md's restart bound.
     RestartsNotCounted,
+    /// Q14's grouped applies built wrong: the `apply` task holds every range's ready
+    /// job until it holds one of each range it has seen, and then runs the group, so
+    /// a range that goes quiet — no leader, no writes — stalls the node's other
+    /// ranges' applies behind it. SHARD.md §4 and §12 build grouping only if the
+    /// measured apply lag asks for it, and never by waiting: this is the shape that
+    /// measurement exists to rule out, and what `sim/folds.rs`'s apply-lag and
+    /// cross-range hold folds trip on.
+    // PROPOSED(D-095): the variant the apply-lag and cross-range hold folds trip on.
+    ApplyWaitsForEveryRange,
 }
 
 impl NodeVariant {
@@ -434,6 +443,7 @@ impl NodeVariant {
         NodeVariant::RestartsNotCounted,
         NodeVariant::RefusedReadLeft,
         NodeVariant::OneSeedForEveryCore,
+        NodeVariant::ApplyWaitsForEveryRange,
     ];
 
     /// Q15's whole-node refusal and re-seed, in order: the six ways to get a node's
@@ -607,6 +617,9 @@ impl NodeVariant {
             // seed for every core. Seventeen bits are left.
             NodeVariant::RefusedReadLeft => 1 << 45,
             NodeVariant::OneSeedForEveryCore => 1 << 46,
+            // PROPOSED(D-095): the apply task that waits for every range. Sixteen bits are
+            // left.
+            NodeVariant::ApplyWaitsForEveryRange => 1 << 47,
         }
     }
 
@@ -661,6 +674,7 @@ impl NodeVariant {
             NodeVariant::RestartsNotCounted => "RestartsNotCounted",
             NodeVariant::RefusedReadLeft => "RefusedReadLeft",
             NodeVariant::OneSeedForEveryCore => "OneSeedForEveryCore",
+            NodeVariant::ApplyWaitsForEveryRange => "ApplyWaitsForEveryRange",
         }
     }
 }
@@ -749,9 +763,10 @@ mod tests {
         }
         // Twenty of the round's and the snapshot task's, the snapshot review's four,
         // D-077's six for Q15's whole-node refusal and re-seed, D-083's ten for the
-        // snapshot wiring, D-081's three for the directed re-seed shape, and D-090's two for a
-        // stream's bounds, and D-076's review's two.
-        assert_eq!(NodeVariant::BUGS.len(), 47);
+        // snapshot wiring, D-081's three for the directed re-seed shape, D-090's two for a
+        // stream's bounds, D-076's review's two, and D-095's one for the `apply` task
+        // that waits for every range.
+        assert_eq!(NodeVariant::BUGS.len(), 48);
         for variant in NodeVariant::SNAPSHOT
             .iter()
             .chain(NodeVariant::WIRING)

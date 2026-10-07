@@ -1726,7 +1726,7 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
         };
         let jobs = jobs.clone();
         async move {
-            apply(&jobs, &applier).await;
+            apply(&jobs, &applier, node_variants).await;
         }
     });
 

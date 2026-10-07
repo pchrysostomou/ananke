@@ -16968,154 +16968,140 @@ own catch and report anything else as the node's own failure.
 
 ---
 
-## PROPOSED D-094 — The released phases' sweeps run at CI's hundred under the premerge: `released_seeds()`, and the premerge's thousand is the current phase's
+## PROPOSED D-095 — The node's apply-lag, cross-range hold and coverage folds run under the equivalence test, and the variant that trips the two with a verdict
 
-**The number.** The footer on `main` reads D-092, and PR #129 (`phase-3-stage-c-questions`)
-takes D-092 and D-093 for Stage C's two questions and moves it to D-094. This branch is
-off `main` and not stacked on #129, since the owner approved this change in advance and
-it may merge first; it takes **D-094**, past #129's two, and moves the footer to D-095.
-Whichever merges second resolves the footer as the union, as D-088 did. Every code site
-carries `// PROPOSED(D-094)`.
+**The number.** Off `main` at 527adcd, whose footer reads D-092. PR #129 takes D-092 and
+D-093 and PR #130 takes D-094, each on its own branch; this one takes **D-095** past
+all three and moves the footer to D-096. Whichever merges later resolves the footer as
+the union, as D-088 did. Every code site carries `// PROPOSED(D-095)`.
 
-**Context.** D-040 set the premerge at a thousand seeds of every sweep, in release, on the
-machine in front of you, in about a quarter of an hour (DECISIONS.md:1735-1739), and §12
-holds every stage to that budget (SHARD.md:2041-2045). Stage B's tag names the budget as
-one of the two lines of its exit that were not met: `scripts/premerge.sh` measured 1 013 s
-clean on #86's tip and 1 881 s on the shape tip, and Stage B's own rows were about 640
-cpu s of the table's 7 765. The remedy the owner chose at the stage's close, 2026-09-25,
-is to re-tier the Phase 1 and Phase 2 sweeps, which have ten-thousand-seed nightlies of
-their own, and to write the entry first; the owner approved it in advance so the work
-need not stop for it.
+**Context.** §12 asks that every new fold run under the incremental checker's
+equivalence test with a variant that trips it (SHARD.md:2051-2056; §11, raft 12,
+SHARD.md:1889-1893), the test `sim/tests/raft.rs` runs for the checker's checks
+(`the_incremental_checker_agrees_with_the_fold_over_the_whole_trace`, D-046): fed a
+run's records in chunks, a fold says at every prefix exactly what the same fold over
+the whole prefix from the first record says, the same verdict and the same words, and a
+quarter of the compared seeds run a variant the fold catches, so the comparison sees
+`Err` and not only `Ok`. Stage B's tag names the line as not met: "D-071's four checks
+keyed by range run under it with a tripping variant; the node's apply-lag, cross-range
+hold and coverage folds are measurements, not folds under that test." The owner's
+ruling (b) at the stage's close, 2026-09-25, is that they go under it.
 
-**What the premerge is made of.** `scripts/nightly-shards.txt` weighs every test of the
-sim binaries in cpu seconds at a thousand seeds (D-064; 8-core Apple M2). Summed by the
-system each test runs:
+What the three were. D-082 built them as readings over a finished run
+(`raft::Report::apply_lags`, `cross_range_apply_holds_counted`, and the counters
+`sim/tests/node.rs`'s `Coverage::add` reads off the trace), asserted or printed once
+per sweep: the apply lag's per-range median against §4's heartbeat, asserted since
+D-082; the hold's median and maximum printed, the maximum sent to the owner (D-036,
+D-086); the coverage's counters printed and floored per sweep. None had an incremental
+form, none had a per-run verdict, and the hold's reading was two passes over the trace,
+every crash and restart taken first, which no incremental fold can be.
 
-| Rows | cpu s at 1 000 | Share | System under test |
-| --- | ---: | ---: | --- |
-| Phase 1: `echo`, `wal`, and the engine sweep's four (the correct engine and its three variants) | 1 065.7 | 11.1 % | the storage engine as v0.2.0 released it, with Stage A's lanes S and N on the correct engine's sweep |
-| Phase 2: `sim/tests/raft.rs`, whose every sweep runs the one-group server | 4 356.0 | 45.3 % | the one-group server as v0.3.0 released it: the raft arms, the membership scenario, `sim/quorum.rs`, the term-raise schedule, the lease trial |
-| Stage A's engine tests: the three crash tests and D-068's share | 2 198.3 | 22.9 % | the span primitives Phase 3 built |
-| Phase 3, Stage B: `node`, `ranges`, `reseed`, `install`, `parallel` | 1 968.6 | 20.5 % | the node |
-| Kept as they are: the incremental checker's comparison at `min(seeds, 100)` and the two fixed-seed audits | 25.2 | 0.3 % | — |
-| | **9 613.8** | | |
+### What is built
 
-More than half the premerge's cpu is spent sweeping systems no Phase 3 slice changes on
-purpose, each of which the nightly sweeps at ten thousand every night on `main`.
+1. **`sim/folds.rs`**, three folds fed one record at a time and readable at any prefix,
+   each beside its whole-trace reading, which D-082's functions keep as the reference:
+   `ApplyLagFold` against `raft::apply_lags_of`, `CrossRangeHoldFold` against
+   `raft::cross_range_apply_holds_of`, and `NodeCoverageFold` against
+   `NodeCoverage::read`, which is `Coverage::add`'s scans over a slice. The hold fold
+   is **one pass**: a hold's window `[from, t1]` ends at or before the apply that
+   reports it, so every crash inside it has been traced by then, and the fold takes
+   crashes as they come. `raft::Report`'s methods delegate to the readings unchanged,
+   so nothing a sweep printed before moves.
+2. **A verdict for the one that has a rule.** The lag's is the one the sweep has
+   asserted since D-082, asked per run: no range's median apply lag over the run
+   exceeds one heartbeat interval, 20 ms. The hold has none: D-082 recorded it as a
+   figure to the owner and not a bound — an upper bound on one job's hold and a lower
+   bound on the wait's total — and the measurement below shows why a threshold on it
+   would be the wrong instrument: the variant that stalls every apply for seconds
+   leaves the hold's median at 2.5 ms, because a stalled apply's hold is still the
+   duration of the one job before it, a disk sync. The hold fold's median and longest
+   are printed where the sweep printed them. A coverage counter has no rule to break
+   either. So for those two what the test asks is that fold and reading agree value
+   for value at every prefix, on runs whose values a variant has moved, and the
+   variants that move them are what the comparison runs.
+3. **The variant, `NodeVariant::ApplyWaitsForEveryRange`.** Q14's grouped applies built
+   as a wait: the `apply` task keeps every range's jobs in order and runs a group, one
+   job of each range it has seen, only when every one of those ranges has a job
+   pending, so a range that goes quiet — no leader, no writes — stalls the node's other
+   ranges' applies behind it. §4 and §12 build grouping only if the measured lag asks
+   for it, and never by waiting (SHARD.md:2322-2325); this is the shape the measurement
+   exists to rule out. `node::apply` takes the node's variants to choose the loop;
+   nothing else on the node changes.
+4. **The test**, `the_node_folds_agree_with_their_whole_trace_readings` in
+   `sim/tests/node.rs`: `min(seeds, 100)` seeds as the raft test compares, eight
+   prefixes, records pushed thirty-seven at a time, four variants in turn — the correct
+   node, `ApplyWaitsForEveryRange` for the two verdicts, `ChunksToTheInbox`, which moves
+   the inbox's drops, and `PersistsOneAtATime`, which moves every timing — and at every
+   prefix the lag's samples, medians and verdict, the hold's holds and dropped count,
+   and the coverage's counters compared with their readings. The seeds on which the
+   lag's verdict was in violation are printed per variant, at some prefix and over the
+   whole run, and the variant's own are asserted above zero.
+5. **The variant's catch**,
+   `an_apply_task_that_waits_for_every_range_is_caught_by_the_lag_fold_on_the_node`: the
+   variant under the raft arms on the node over `seeds()`, caught by the lag verdict on
+   every seed, with the run's other checks' catches, the worst range median and the
+   hold fold's reading of the same runs counted and printed beside it.
+6. Three unit tests in `sim/folds.rs` on hand-built records — a lag, the hold's four
+   shapes from D-082's own test, and a coverage trace with one of each kind — each
+   fold beside its reading.
 
-**Decision — the owner's of 2026-09-25, given in advance of this entry.** A sweep of a
-released phase's system runs `ananke_sim::released_seeds()` instead of `seeds()`:
-`ANANKE_RELEASED_SEEDS` when set and a number, else `seeds()`. `scripts/premerge.sh`
-exports it at **100**, CI's tier, beside `ANANKE_SEEDS=1000`. The gate, CI and the nightly
-set nothing, so they run those sweeps at 20, 100 and 10 000 as before. Nothing else moves:
-the same tests, the same arms, the same assertions with the same tier gates, and every
-rate line prints the count the sweep actually ran.
+### The rates, every one measured before its assertion was written (Q39, D-061)
 
-The sweeps that move are exactly the first two rows of the table: 31 tests, and one
-comparison. Phase 1's: `echo`'s sweep, `wal`'s four, and in `engine` the correct engine's
-sweep and the three Phase 1 variants through `is_caught`. Phase 2's: every test of
-`sim/tests/raft.rs` that swept `seeds()`, 22 of them, the six through `is_caught` and the
-three through `quorum_sweep` included; and the incremental checker's comparison,
-`compared_seeds()`, reads `released_seeds().min(100)`, which is 100 at every tier from CI
-up, as it was. The binary's 22 pinned-seed rows, under a cpu second each, run one seed
-whatever the tier and are in the row's figure without moving. The ones that stay are named
-by what they test, not by their file: Stage A's engine tests, which sweep the primitives
-Phase 3 built — and `high_rate_share()`, D-068's share of `seeds()`, with them — and every
-binary of Stage B.
+Both tests run from the built release binary of this tree at `ANANKE_SEEDS=100`, on
+this session's container (a four-core Xeon, D-070), the two together in 11.5 s.
 
-**What the premerge stops asserting, and where it is asserted instead.** Under the rule of
-D-061 an assertion gated `seeds >= 1000` ran at the premerge and the nightly. For the moved
-sweeps the premerge now sees a hundred, so those gates open in the nightly alone, which is
-the tier the owner named. They are five, by file: `sim/tests/wal.rs:181`, the betrayed-cut
-excuse reached (3.4 %, D-061); `sim/tests/raft.rs:2685`, `RefusalNotDurable` caught (D-056,
-1.32 % at the nightlies; 58 of 1 000 on this tree's baseline below); `raft.rs:3322`,
-`LeaseTrustsTheClock`'s stale read caught (4.0 %; 41 of 503 drift-exceeded seeds below);
-`raft.rs:4326`, the membership runs' elections while joint; and `raft.rs:4343`, their
-reverts to a compacted or installed prefix (D-058, 2.8 %). `raft.rs:3163`,
-`SharedSnapshotDir`'s liveness catch, was the nightly's already and does not move. Each
-keeps printing its rate at the premerge, so a slice that took a catch to zero would still
-show in the line; what the premerge no longer does is fail on it. The gates at `>= 100` are
-unchanged in effect, since a hundred is what the premerge now runs. No assertion text
-changes.
+**The equivalence held on every seed at every prefix**: 100 seeds, eight prefixes each,
+no fold differed from its reading, for the lag's samples and medians, the hold's holds
+and dropped count, and every coverage counter. The lag's verdict, in violation per
+variant, as (seeds run, in violation at some prefix, in violation over the whole run):
 
-**What it costs the premerge as a net.** Phase 3 slices change `ananke-raft`'s core —
-D-079's `RaftMatchStarted`, D-087's refused bit, D-091's arm — and `sim/raft.rs`'s
-one-group sweep is the regression net for those changes. That net drops from a thousand
-seeds to a hundred at the premerge and keeps its ten thousand in the nightly; a core
-change that reddens one seed in three hundred is seen by the nightly on `main` the night
-after it merges rather than by the premerge the hour before. That is the trade the ruling
-makes, and the nightly on every stage's branch before its tag (SHARD.md:2029-2037) is what
-bounds it: no stage closes on a premerge.
+| Variant | Seeds | At some prefix | Over the whole run |
+| --- | ---: | ---: | ---: |
+| `ApplyWaitsForEveryRange` | 25 | **25** | **25** |
+| `ChunksToTheInbox` | 25 | 15 | 13 |
+| `PersistsOneAtATime` | 25 | 11 | 5 |
+| correct | 25 | 7 | **2** |
 
-### The measurement, both trees on one machine, back to back (D-052, D-069, D-070)
+The variant the verdict is written for trips it on **every seed, 100 %**, so the
+comparison's assertion — some seed under it in violation over the whole run — holds at
+the gate's twenty compared seeds, of which five run it, and at every tier above. The
+other three rows are the instrument's own reading of the correct node and of two
+variants that move timing: early prefixes are a handful of applies during the first
+elections, where a range's median is a few samples, and **the correct node trips the
+per-run verdict over a whole run on 2 of 25 seeds**. That is why the sweep's assertion
+stays the pooled per-range median over the tier (3.0 to 3.2 ms at a thousand seeds on
+`main`) and the per-run verdict stays the test's instrument: a per-run breach on
+about one seed in twelve is a figure for the owner beside D-082's threshold, not a
+bound this entry asserts, and the test prints it at every tier.
 
-**The machine, and what every figure is a figure of** (D-070). This session's container:
-Linux 6.18.44 x86_64, an Intel Xeon at 2.80 GHz, **four cores**, nothing else of this
-session running during either run. Both runs from a warm release build (`cargo test
---release --no-run` first, D-052: instant for the first, 42 s for the second), each
-`scripts/premerge.sh` as it stands on its tree, with the one-minute load sampled every
-15 s beside the script's own before-and-after lines. The script's state line read
-`Battery Power` on both runs and that reading is wrong: the container lists no supply
-under `/sys/class/power_supply` at all, and the Linux branch took the absence of an
-`online` flag for a battery. This branch corrects that line to read `unknown power source`
-where nothing is listed, which is what D-070 asks of a field a machine does not report;
-the figures below are unaffected, since neither run was throttled and the load held at
-the four cores throughout both.
-
-| Run | Wall | Mean 1-min load (samples) | Load before / after |
-| --- | ---: | ---: | --- |
-| `main` at 527adcd, before | **1760 s** | 3.88 (118) | 0.42 / 4.00 |
-| the same tree plus this change, after | **966 s** | 3.98 (65) | 2.89 / 4.04 |
-| saved | **794 s, 45.1 %** | | |
-
-Per binary, from each test binary's own `finished in`:
-
-| Binary | Before | After |
-| --- | ---: | ---: |
-| `tests/raft.rs` | 764.1 s | 84.2 s |
-| `tests/node.rs` | 487.3 s | 488.7 s |
-| `tests/engine.rs` | 401.8 s | 302.3 s |
-| `tests/ranges.rs` | 48.2 s | 48.2 s |
-| `tests/reseed.rs` | 30.2 s | 30.1 s |
-| `tests/wal.rs` | 16.0 s | 1.8 s |
-| `tests/install.rs` | 5.3 s | 4.7 s |
-| `tests/parallel.rs` | 2.6 s | 2.7 s |
-| `tests/echo_cluster.rs` | 2.0 s | 2.0 s |
-
-Read the `raft` row first: 764 s to 84 s is the whole of Phase 2's sweep at a tenth of its
-seeds, and the `node` row beside it is unchanged to the second, which is the change doing
-exactly what it says and nothing else. The `engine` binary's 100 s are Phase 1's four
-sweeps; its remaining 302 s are Stage A's crash tests at the thousand, the next 22.9 % of
-the table above, left where the ruling leaves them. The `wal` binary is the smallest win
-and shows the ratio plainest, 16.0 to 1.8. Every moved sweep's rate line prints its
-count as 100 on the second run — `RefusalNotDurable: caught on 6 of 100 seeds` against
-58 of 1 000 on the first, the lease trial's drift on 52 of 100 against 503 of 1 000 —
-and the incremental checker's comparison ran its 100 seeds on both, as `min(seeds, 100)`
-says it should.
-
-**What this is not comparable with.** Stage B's tag quotes 1 013 s and 1 881 s; those are
-the eight-core Mac's, on trees before this one, under loads the tag does not give, and
-D-070 says a figure from another machine is evidence only beside its state. What this
-entry claims is the pair: the same tree, the same machine, the same hour, 45 % off. The
-share is of cpu and not of this machine, so the Mac's premerge should fall by about the
-same share; the next premerge run there records its own figure beside these, and does
-not carry these over.
+**The catch**: `ApplyWaitsForEveryRange` is caught by the lag verdict on **100 of 100**
+seeds, so it is asserted at every tier; the run's other checks — liveness on uniform
+seeds, where a range with no leader holds every other — fail it on 44 of 100; the
+worst range median lag was **6.32 s** against 20 ms, the first seed's 993 ms. The hold
+fold under the same runs read a median hold of **2.55 ms** over the seeds' medians and a
+longest of 4.47 s: the stall is the lag's to see and not the hold's, which is the
+measurement item 2 rests on.
 
 ### Consequences
 
-- `scripts/premerge.sh` prints both counts in its verdict line.
-- CLAUDE.md's verification line and its D-061 bullet say where a released phase's
-  thousand-seed assertions now run; D-040's text is superseded for the premerge's count
-  and not edited.
-- The nightly shard table is untouched: its weights are at a thousand seeds and the
-  nightly runs every row at ten thousand as before.
-- Stage A's engine tests are the next 22.9 % and are not moved here: they sweep primitives
-  Phase 3 built, the owner weighed their tiers on PR #70 (D-068) with the budget in view,
-  and the ruling names Phase 1 and Phase 2. Whether Stage A's join them when Stage C's
-  scenarios land is the owner's, with the figure above beside the question.
-- A later phase re-tiers Phase 3's sweeps the same way: `released_seeds()` is the switch,
-  and a test moves by naming it.
+- Stage B's second unmet exit line is met for the three folds the tag names: each runs
+  under the equivalence test from this entry, the two with a verdict against a variant
+  that trips them and the third against variants that move it.
+- - The sweep's own assertions are unchanged: the per-range median over the pooled sweep is
+  still what `every_seed_passes_on_the_correct_node_under_the_raft_sweeps_arms` asserts, and
+  the hold's maximum is still printed and sent to the owner. The per-run verdicts are the
+  equivalence test's instrument, and what they say of the correct node — a per-run breach of
+  the 20 ms median on a range on 2 of 25 seeds at a hundred — goes to the owner beside
+  D-082's threshold, printed at every tier.
+- - `nightly-shards.txt` gains two rows, weighed on this tree on this machine from the built
+  release binary at `ANANKE_SEEDS=1000`: the variant's catch at 180.6 cpu s into shard 2,
+  the lightest at 1442.9, and the comparison at 26.7 cpu s into shard 4, the lightest then
+  at 1462.4.
+- The coverage fold's reading of the ruling — value for value, no verdict — goes to the
+  owner as the one interpretation this entry makes; if the owner meant the sweep's
+  floors, those are per sweep and have no prefix to compare at, which is why they are
+  not here.
 
 ---
 
-_Next entry: D-095. Add one before implementing anything not covered above._
+_Next entry: D-096. Add one before implementing anything not covered above._

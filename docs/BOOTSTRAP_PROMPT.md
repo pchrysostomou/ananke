@@ -101,21 +101,28 @@ ananke/
 
 _Update this section at the end of every session._
 
-- Branch `phase-3-premerge-released-tiers` (2026-09-25), off `main` at 527adcd, PROPOSED
-- Current main status (2026-09-25): PR #129 merged Stage C questions D-092 and D-093 into `main`; the Stage C branch remains the documented basis for the subsequent slices.
-  D-094, the owner's ruling (a) at Stage B's close, approved in advance: **the released
-  phases' sweeps run at CI's hundred under the premerge**, through
-  `ananke_sim::released_seeds()` and `ANANKE_RELEASED_SEEDS=100`, which only
-  `scripts/premerge.sh` sets, so the premerge's thousand is the current phase's. The
-  sweeps that move are named by what they test and not by their file: Phase 1's nine
-  (`echo`, `wal`'s four, the correct engine and its three variants) and Phase 2's 22
-  (every sweep of `sim/tests/raft.rs`), 5 421.7 of the shard table's 9 613.8 cpu s; Stage
-  A's engine tests and every Stage B binary stay at the thousand. Five thousand-seed
-  assertions now open in the nightly alone (the betrayed-cut excuse, `RefusalNotDurable`,
-  `LeaseTrustsTheClock`, the membership scenario's elections while joint and its reverts)
-  and every rate line still prints at the premerge. **Measured back to back on this
-  container** (4-core Xeon, D-070): **1 760 s before, 966 s after, 45 % saved**, the raft binary 764 s to 84 s and the node binary unchanged to the second; the moved sweeps print their count as 100 and every rate line still prints. The gate, CI and the nightly are
-  untouched; CLAUDE.md says where a released phase's thousand-seed assertions run.
+- Branch `phase-3-node-folds-equivalence` (2026-09-25), off `main` at 527adcd, PROPOSED
+- PR #130 (D-094) merged into main on 2026-10-07; this branch carries its documentation before D-095.
+- Current main status (2026-09-25): PR #129 merged Stage C questions D-092 and D-093 into `main`; this fold slice preserves those decisions before D-095.
+  D-095, the owner's ruling (b) at Stage B's close: **the node's apply-lag, cross-range
+  hold and coverage folds run under the incremental checker's equivalence test**, the
+  line of Stage B's exit the tag names as unmet. `sim/folds.rs` gives each an
+  incremental form beside D-082's whole-trace reading, kept as the reference — the
+  hold's in one pass, since a hold's window ends before the apply that reports it —
+  and `the_node_folds_agree_with_their_whole_trace_readings` holds fold to reading at
+  eight prefixes of `min(seeds, 100)` seeds over four node variants in turn. The lag
+  keeps the one verdict there is, §4's heartbeat on each range's median, asked per run;
+  the hold and the coverage have no rule to break, so they are compared value for
+  value on runs a variant has moved. The tripping variant is new:
+  **`ApplyWaitsForEveryRange`**, Q14's grouping built as a wait, caught by the lag
+  verdict on **100 of 100** seeds (worst range median 6.32 s against 20 ms) and by the
+  run's other checks on 44. **The equivalence held on every seed at every prefix.** Two
+  findings for the owner: the hold's median under that variant stays at 2.5 ms, since a
+  stalled apply's hold is still the one job before it, which is why a threshold on the
+  hold would be the wrong instrument (D-082 made it a figure, not a bound); and the
+  correct node trips the per-run 20 ms median on a range on 2 of 25 seeds at a hundred,
+  which the pooled per-range median the sweep asserts (3.0 to 3.2 ms at a thousand)
+  does not show. Two shard rows, weighed here.
 
 - Merge update (2026-09-24): PR #109 (`phase-3-stage-b-stream-variants`, PROPOSED
   D-086, carrying #123's D-089 and D-091) merged `origin/main` at c178682 under the

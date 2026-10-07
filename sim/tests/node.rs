@@ -60,8 +60,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use ananke_env::TraceEvent;
+use ananke_env::sim::TraceRecord;
 use ananke_raft::core::{Variant, Variants};
-use ananke_shard::variant::NodeVariants;
+use ananke_shard::variant::{NodeVariant, NodeVariants};
+use ananke_sim::folds::{self, ApplyLagFold, CrossRangeHoldFold, NodeCoverage, NodeCoverageFold};
 use ananke_sim::raft::{self, Cluster};
 use ananke_sim::{seeds, sweep, verdict, write_trace};
 
@@ -996,6 +998,238 @@ fn every_seed_passes_on_the_correct_node_under_the_raft_sweeps_arms() {
 /// the median apply lag.
 const HEARTBEAT: Duration = Duration::from_millis(20);
 
+// --- The node's folds under the equivalence test (SHARD.md §11, raft 12; §12) ---
+
+/// The node variants the folds' comparison runs, one per seed in turn: the correct
+/// node, the variant the lag's verdict is written for, and two that move
+/// the coverage's counters — chunks charged to the inbox, which moves its drops, and
+/// persists paid one at a time, which moves every timing — so the comparison sees
+/// verdicts of both kinds and counters that differ from the correct node's, and not
+/// only `Ok` and one shape of trace.
+// PROPOSED(D-095): the node's folds under the equivalence test.
+const FOLDS_COMPARED: [Option<NodeVariant>; 4] = [
+    None,
+    Some(NodeVariant::ApplyWaitsForEveryRange),
+    Some(NodeVariant::ChunksToTheInbox),
+    Some(NodeVariant::PersistsOneAtATime),
+];
+
+/// How many prefixes of a run's trace the folds are compared over, and how many
+/// records are pushed at a time: the raft test's eight and its prime, so no prefix
+/// is a chunk boundary (`sim/tests/raft.rs`).
+const FOLD_PREFIXES: usize = 8;
+const FOLD_CHUNK: usize = 37;
+
+/// The node variants `variant` names, over the correct node.
+fn node_with(variant: Option<NodeVariant>) -> NodeVariants {
+    variant.map_or_else(NodeVariants::correct, |v| NodeVariants::correct().with(v))
+}
+
+/// The reference verdict, from the whole-prefix reading and the same rule the fold
+/// states: each range's median lag at most the threshold.
+fn lag_verdict_of(lags: &BTreeMap<u64, Vec<Duration>>, threshold: Duration) -> Result<(), String> {
+    let (_, per_range) = folds::medians_of(lags);
+    match per_range.iter().find(|(_, median)| **median > threshold) {
+        Some((range, median)) => Err(format!(
+            "apply lag: range {range}'s median apply lag is {median:?}, past the threshold of \
+             {threshold:?}"
+        )),
+        None => Ok(()),
+    }
+}
+
+/// What one run's comparison found beside its verdict: whether the lag's verdict was
+/// in violation at some prefix, and whether it was over the whole trace.
+#[derive(Clone, Copy, Debug, Default)]
+struct Compared {
+    lag_at_some_prefix: bool,
+    lag_over_the_whole: bool,
+}
+
+/// One run's comparison: at every prefix, each fold fed the records in chunks
+/// against its whole-prefix reading from the first record — the lag's samples,
+/// medians and verdict, the hold's holds and dropped count, and the coverage's
+/// counters value for value.
+fn compare_folds(
+    seed: u64,
+    variant: Option<NodeVariant>,
+    records: &[TraceRecord],
+) -> Result<Compared, String> {
+    let mut lag = ApplyLagFold::default();
+    let mut hold = CrossRangeHoldFold::default();
+    let mut coverage = NodeCoverageFold::default();
+    let mut fed = 0;
+    let mut found = Compared::default();
+    let differ = |what: &str, stop: usize| {
+        format!(
+            "seed {seed}: under {variant:?}, over the first {stop} of {} records, the {what} fold \
+             fed in chunks differs from its reading over the whole prefix",
+            records.len()
+        )
+    };
+    for step in 1..=FOLD_PREFIXES {
+        let stop = records.len() * step / FOLD_PREFIXES;
+        while fed < stop {
+            let next = (fed + FOLD_CHUNK).min(stop);
+            lag.extend(&records[fed..next]);
+            hold.extend(&records[fed..next]);
+            coverage.extend(&records[fed..next]);
+            fed = next;
+        }
+        let prefix = &records[..stop];
+
+        let read = raft::apply_lags_of(prefix);
+        if lag.lags() != &read || lag.medians() != folds::medians_of(&read) {
+            return Err(differ("apply-lag", stop));
+        }
+        let whole = lag_verdict_of(&read, HEARTBEAT);
+        if lag.verdict(HEARTBEAT) != whole {
+            return Err(format!(
+                "{}: the fold said {:?} and the reading {whole:?}",
+                differ("apply-lag", stop),
+                lag.verdict(HEARTBEAT)
+            ));
+        }
+        found.lag_at_some_prefix |= whole.is_err();
+        found.lag_over_the_whole = whole.is_err();
+
+        let (holds, dropped) = raft::cross_range_apply_holds_of(prefix);
+        if hold.holds() != (holds.as_slice(), dropped) {
+            return Err(differ("cross-range hold", stop));
+        }
+
+        let read = NodeCoverage::read(prefix);
+        if coverage.coverage() != &read {
+            return Err(format!(
+                "{}: the fold read {:?} and the reading {read:?}",
+                differ("coverage", stop),
+                coverage.coverage()
+            ));
+        }
+    }
+    Ok(found)
+}
+
+/// The node's three measurement folds under the equivalence test the checker's
+/// checks run under (D-046; SHARD.md §11, raft 12): the apply lag per range, the
+/// cross-range hold and the coverage's counters, each fed a run's records in chunks
+/// and read at every prefix, say exactly what their whole-prefix readings say — the
+/// same samples, the same holds, the same counters, and for the lag, the one with a
+/// verdict, the same `Ok` or `Err` with the same words. Stage B's tag names these
+/// three as measurements that had never run under the test. A quarter of the compared
+/// seeds run the variant that trips the lag's verdict over the whole run, and the
+/// count of seeds found in violation is printed per variant, at some prefix and over
+/// the whole trace, so a comparison that saw only `Ok` is visible — and so is what
+/// the per-run verdict says of the correct node, which is why the sweep asserts the
+/// pooled median and not this one.
+// PROPOSED(D-095): the node's folds under the equivalence test.
+#[test]
+fn the_node_folds_agree_with_their_whole_trace_readings() {
+    let compared = seeds().min(100);
+    let outcomes: Vec<(Option<NodeVariant>, Result<Compared, String>)> = sweep(compared, |seed| {
+        let variant = FOLDS_COMPARED[seed as usize % FOLDS_COMPARED.len()];
+        let report = raft::run_on_the_node(seed, Variants::default(), node_with(variant));
+        (variant, compare_folds(seed, variant, &report.records))
+    });
+    let mut by_variant: BTreeMap<String, (usize, usize, usize)> = BTreeMap::new();
+    for (variant, outcome) in &outcomes {
+        let name = variant.map_or_else(|| "Correct".to_owned(), |v| v.to_string());
+        let entry = by_variant.entry(name).or_default();
+        entry.0 += 1;
+        if let Ok(found) = outcome {
+            entry.1 += usize::from(found.lag_at_some_prefix);
+            entry.2 += usize::from(found.lag_over_the_whole);
+        }
+    }
+    println!(
+        "node folds: {compared} seeds compared at {FOLD_PREFIXES} prefixes each; the apply-lag \
+         verdict in violation, per variant as (seeds, at some prefix, over the whole run): \
+         {by_variant:?}"
+    );
+    let tripped = outcomes
+        .iter()
+        .filter(|(variant, outcome)| {
+            *variant == Some(NodeVariant::ApplyWaitsForEveryRange)
+                && matches!(outcome, Ok(found) if found.lag_over_the_whole)
+        })
+        .count();
+    let verdicts: Vec<Result<(), String>> =
+        outcomes.into_iter().map(|(_, o)| o.map(|_| ())).collect();
+    if let Err(mismatch) = verdict(&verdicts) {
+        panic!("{mismatch}");
+    }
+    assert!(
+        tripped > 0,
+        "no compared seed under ApplyWaitsForEveryRange reached a violation of the lag verdict \
+         over the whole run: the comparison saw only Ok of the variant it runs for"
+    );
+}
+
+/// The variant the lag fold's verdict is written for, caught by it: an `apply` task
+/// that waits for a job of every range before it runs any stalls the node's applies
+/// behind its quietest range, and every range's median lag goes past SHARD.md §4's
+/// heartbeat. What else catches it — the liveness bound on uniform seeds, where a
+/// range with no leader holds every other — is counted and printed beside it, since a
+/// variant caught only by something it does not break would be no evidence for the
+/// fold (D-091's attribution). The hold fold's figures under it are printed too: the
+/// wait a stalled apply spends is the lag's to see, not the hold's, which measures
+/// one job's duration (D-082), and the figure says so.
+// PROPOSED(D-095): the variant the apply-lag fold trips on.
+#[test]
+fn an_apply_task_that_waits_for_every_range_is_caught_by_the_lag_fold_on_the_node() {
+    /// What one run under the variant showed: the lag verdict's violation, the run's
+    /// other checks' failure, the worst range median, and the hold fold's median and
+    /// longest.
+    struct Caught {
+        by_lag: Option<String>,
+        by_other: Option<String>,
+        worst: Option<Duration>,
+        hold_median: Option<Duration>,
+        hold_longest: Option<Duration>,
+    }
+    let seeds = seeds();
+    let outcomes: Vec<Caught> = sweep(seeds, |seed| {
+        let report = raft::run_on_the_node(
+            seed,
+            Variants::default(),
+            NodeVariants::correct().with(NodeVariant::ApplyWaitsForEveryRange),
+        );
+        let mut lag = ApplyLagFold::default();
+        lag.extend(&report.records);
+        let mut hold = CrossRangeHoldFold::default();
+        hold.extend(&report.records);
+        let (hold_median, hold_longest) = hold.median_and_longest();
+        Caught {
+            by_lag: lag.verdict(HEARTBEAT).err(),
+            by_other: checked(&report).err(),
+            worst: lag.medians().1.into_values().max(),
+            hold_median,
+            hold_longest,
+        }
+    });
+    let by_lag = outcomes.iter().filter(|o| o.by_lag.is_some()).count();
+    let by_other = outcomes.iter().filter(|o| o.by_other.is_some()).count();
+    let worst = outcomes.iter().filter_map(|o| o.worst).max();
+    let mut hold_medians: Vec<Duration> = outcomes.iter().filter_map(|o| o.hold_median).collect();
+    hold_medians.sort_unstable();
+    let longest_hold = outcomes.iter().filter_map(|o| o.hold_longest).max();
+    println!(
+        "ApplyWaitsForEveryRange: the apply-lag verdict caught it on {by_lag} of {seeds} seeds; \
+         the run's other checks failed it on {by_other}; the worst range median lag was \
+         {worst:?} against {HEARTBEAT:?}; the hold fold read a median hold of {:?} over the \
+         seeds' medians and a longest of {longest_hold:?}; first by lag: {}",
+        median_of(&hold_medians),
+        outcomes
+            .iter()
+            .find_map(|o| o.by_lag.as_deref())
+            .unwrap_or("none")
+    );
+    assert!(
+        by_lag > 0,
+        "ApplyWaitsForEveryRange was never caught by the lag fold over {seeds} seeds"
+    );
+}
+
 fn median_of(sorted: &[Duration]) -> Option<Duration> {
     (!sorted.is_empty()).then(|| sorted[(sorted.len() - 1) / 2])
 }
@@ -1508,7 +1742,6 @@ fn a_seed_replays_to_the_same_trace_on_the_node() {
 
 // --- The sharded check-quorum scenario (PROPOSED D-085, D-049, D-077) ---
 
-use ananke_shard::variant::NodeVariant;
 use ananke_sim::quorum::{self, NodeReport};
 
 /// What a sweep of the sharded scenario saw, printed at every tier.
