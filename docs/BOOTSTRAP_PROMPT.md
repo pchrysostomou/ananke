@@ -102,6 +102,7 @@ ananke/
 _Update this section at the end of every session._
 
 - Branch `phase-3-node-folds-equivalence` (2026-09-25), off `main` at 527adcd, PROPOSED
+- Current main status (2026-09-25): PR #129 merged Stage C questions D-092 and D-093 into `main`; this fold slice preserves those decisions before D-095.
   D-095, the owner's ruling (b) at Stage B's close: **the node's apply-lag, cross-range
   hold and coverage folds run under the incremental checker's equivalence test**, the
   line of Stage B's exit the tag names as unmet. `sim/folds.rs` gives each an
