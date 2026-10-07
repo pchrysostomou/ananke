@@ -8,9 +8,11 @@
 //! Every sweep runs [`seeds`] consecutive seeds, in parallel through [`sweep`]
 //! (D-040), in four tiers: 20 by default and under `scripts/gate.sh`, 100 in CI,
 //! 1000 under `scripts/premerge.sh` in release on the machine in front of you, and
-//! 10 000 in the nightly workflow on GitHub, the only place ten thousand run. A seed
-//! that fails a sweep has its trace written through [`write_trace`] so the nightly
-//! can upload it and the studio can open it.
+//! 10 000 in the nightly workflow on GitHub, the only place ten thousand run. A sweep
+//! of a released phase's system runs [`released_seeds`] instead, which the premerge
+//! alone lowers, to CI's hundred (PROPOSED D-094). A seed that fails a sweep has its
+//! trace written through [`write_trace`] so the nightly can upload it and the studio
+//! can open it.
 
 use std::path::Path;
 
@@ -57,6 +59,23 @@ pub fn seeds() -> u64 {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_SEEDS)
+}
+
+/// How many seeds a sweep of a *released* phase's system runs: `ANANKE_RELEASED_SEEDS`
+/// if set and a number, else [`seeds`]. Phase 1's storage sweeps (`echo`, `wal`, the
+/// engine sweep and its Phase 1 variants) and Phase 2's one-group Raft sweeps (every
+/// sweep of `sim/tests/raft.rs`) call this instead of [`seeds`]. `scripts/premerge.sh`
+/// sets it to CI's hundred beside `ANANKE_SEEDS=1000`, so the premerge's thousand is
+/// the current phase's, and a released phase's assertion gated `>= 1000` runs in the
+/// nightly alone, which sets nothing and sweeps every test at ten thousand. The gate
+/// and CI set nothing either, so their twenty and hundred are unchanged.
+// PROPOSED(D-094): the released phases' sweeps at CI's hundred under the premerge.
+#[must_use]
+pub fn released_seeds() -> u64 {
+    std::env::var("ANANKE_RELEASED_SEEDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(seeds)
 }
 
 /// How many seeds the nightly's deep-levels run sweeps: `ANANKE_DEEP_SEEDS`, 0 when
