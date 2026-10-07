@@ -2022,7 +2022,7 @@ the stage that first pins Phase 3 seeds (Q13).
 - `scripts/gate.sh` exits 0 on the tree of every commit (CLAUDE.md).
 - The correct system passes every seed of every sweep and directed scenario the stage
   runs, at the gate's 20, CI's 100 and the premerge's 1 000 before the stage's merge is
-  asked, and at the nightly's 10 000 (D-040, DECISIONS.md:1417-1421) before a later stage
+  asked, and at the nightly's 10 000 (D-040, DECISIONS.md:1735-1739) before a later stage
   relies on a bound the stage asserts, since a bound is chosen so that the correct system
   never trips it over ten thousand seeds (§10). One scenario is excepted by name:
   `sim/balance.rs`, whose tiers are set by its measured cost (Q30) and stated under
@@ -2039,7 +2039,7 @@ the stage that first pins Phase 3 seeds (Q13).
   bound the correct system trips is a model error to fix, not a bound to widen (D-030,
   D-039; §10).
 - `scripts/premerge.sh` stays near fifteen minutes (Q39), the quarter of an hour D-040 set
-  (DECISIONS.md:1417-1420). The stage records its measured premerge beside the last one
+  (DECISIONS.md:1735-1738). The stage records its measured premerge beside the last one
   measured, 374.64 s on 1ef6d7e (PROPOSED D-052, DECISIONS.md:4033-4035), and sizes its
   new scenarios' seed shares to stay there, as the adoption storm's share was cut when it
   took the premerge from about thirteen minutes to forty (DECISIONS.md:1896-1913).
@@ -3224,7 +3224,7 @@ polls, raises its record cap, runs the balance check, checks 7-22 and linearizab
 not the timer check; the `GcBeforeRemovalCommitted`-to-a-client shape filed as an issue
 rather than built — issue #47; seed shares sized so premerge stays near fifteen minutes.
 Reason: premerge is meant to take about a quarter of an hour (D-040,
-DECISIONS.md:1417-1420), and cost is a constraint the owner has enforced: the adoption
+DECISIONS.md:1735-1738), and cost is a constraint the owner has enforced: the adoption
 storm was cut to one seed in four when it took premerge from about thirteen minutes to
 forty (DECISIONS.md:1896-1913).
 

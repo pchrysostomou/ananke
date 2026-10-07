@@ -102,6 +102,7 @@ ananke/
 _Update this section at the end of every session._
 
 - Branch `phase-3-premerge-released-tiers` (2026-09-25), off `main` at 527adcd, PROPOSED
+- Current main status (2026-09-25): PR #129 merged Stage C questions D-092 and D-093 into `main`; the Stage C branch remains the documented basis for the subsequent slices.
   D-094, the owner's ruling (a) at Stage B's close, approved in advance: **the released
   phases' sweeps run at CI's hundred under the premerge**, through
   `ananke_sim::released_seeds()` and `ANANKE_RELEASED_SEEDS=100`, which only
