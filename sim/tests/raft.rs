@@ -15,7 +15,7 @@ use ananke_raft::invariants::{self, Checker};
 use ananke_raft::store::{LOST_STATE, STORE_MARKER};
 use ananke_sim::raft::DRIFT_BOUND_PPM;
 use ananke_sim::raft::{self, Fault, Moved, RecordTime, TimerResets};
-use ananke_sim::{seeds, sweep, traced, verdict, write_trace};
+use ananke_sim::{released_seeds, sweep, traced, verdict, write_trace};
 
 /// Two runs with the same seed produce byte-identical traces.
 #[test]
@@ -1855,7 +1855,7 @@ fn a_term_change_stepped_inside_an_isolation_from_a_message_received_before_it_i
     // time removes, so each run goes through the sweeps' `checked` and its
     // assertions meet hundreds of real removals at every tier.
     let moved = Mutex::new(MovedSeeds::default());
-    let per_seed = sweep(seeds(), |seed| {
+    let per_seed = sweep(released_seeds(), |seed| {
         let report = raft::run_with(
             seed,
             raft::Schedule::term_raise_behind_a_step(TERM_RAISE_TRIES),
@@ -1901,7 +1901,7 @@ fn a_term_change_stepped_inside_an_isolation_from_a_message_received_before_it_i
         "term raised behind a step (D-050): the shape on {reached} of {} seeds, {changes} \
          changes in {isolations} isolations; {decided} rises decided before an isolation and \
          traced inside it (D-047)",
-        seeds()
+        released_seeds()
     );
     for line in per_seed
         .iter()
@@ -2073,7 +2073,7 @@ fn seed_4_of_the_term_raise_schedule_steps_a_message_received_before_its_isolati
 #[test]
 fn a_server_without_pre_vote_is_caught_on_the_term_raise_schedule() {
     let moved = Mutex::new(MovedSeeds::default());
-    let per_seed = sweep(seeds(), |seed| {
+    let per_seed = sweep(released_seeds(), |seed| {
         let report = raft::run_with(
             seed,
             raft::Schedule::term_raise_behind_a_step(TERM_RAISE_TRIES),
@@ -2114,7 +2114,7 @@ fn a_server_without_pre_vote_is_caught_on_the_term_raise_schedule() {
         "NoPreVote on the term-raise schedule: caught by the pre-vote check on {caught} of {} \
          seeds; {mixed} windows mixed a change received before the isolation with one that was \
          not, each flagged",
-        seeds()
+        released_seeds()
     );
     print_moved("NoPreVote on the term-raise schedule", moved);
     assert!(
@@ -2174,7 +2174,7 @@ fn the_correct_server_passes_every_seed() {
     let coverage = Mutex::new(Coverage::default());
     let episodes = Mutex::new((ReseedEpisodes::default(), EpisodeLengths::default()));
     let moved = Mutex::new(MovedSeeds::default());
-    let verdicts = sweep(seeds(), |seed| {
+    let verdicts = sweep(released_seeds(), |seed| {
         let report = raft::run(seed, Variant::Correct);
         coverage.lock().unwrap().add(&report);
         {
@@ -2205,14 +2205,16 @@ fn the_correct_server_passes_every_seed() {
 fn is_caught(variants: impl Into<Variants>) {
     let variants = variants.into();
     let moved = Mutex::new(MovedSeeds::default());
-    let caught: Vec<String> = sweep(seeds(), |seed| checked(&raft::run(seed, variants), &moved))
-        .into_iter()
-        .flatten()
-        .collect();
+    let caught: Vec<String> = sweep(released_seeds(), |seed| {
+        checked(&raft::run(seed, variants), &moved)
+    })
+    .into_iter()
+    .flatten()
+    .collect();
     eprintln!(
         "{variants:?}: caught on {} of {} seeds, first: {}",
         caught.len(),
-        seeds(),
+        released_seeds(),
         caught.first().map_or("", String::as_str)
     );
     print_moved(&format!("{variants:?}"), moved);
@@ -2383,7 +2385,7 @@ fn print_moved(name: &str, moved: Mutex<MovedSeeds>) {
 #[test]
 fn a_server_without_pre_vote_is_caught() {
     let moved = Mutex::new(MovedSeeds::default());
-    let caught: Vec<String> = sweep(seeds(), |seed| {
+    let caught: Vec<String> = sweep(released_seeds(), |seed| {
         checked(&raft::run(seed, Variant::NoPreVote), &moved)
     })
     .into_iter()
@@ -2394,7 +2396,7 @@ fn a_server_without_pre_vote_is_caught() {
         "{:?}: caught on {} of {} seeds, {by_pre_vote} by the pre-vote check, first: {}",
         Variants::from(Variant::NoPreVote),
         caught.len(),
-        seeds(),
+        released_seeds(),
         caught.first().map_or("", String::as_str)
     );
     print_moved("NoPreVote", moved);
@@ -2433,7 +2435,7 @@ fn a_server_that_applies_before_commit_is_caught() {
 /// whether the new fold *by itself* distinguishes the bug from correct code.
 #[test]
 fn a_server_that_applies_before_commit_compacts_past_its_commit_index() {
-    let caught: Vec<String> = sweep(seeds(), |seed| {
+    let caught: Vec<String> = sweep(released_seeds(), |seed| {
         let report = raft::run(seed, Variant::ApplyBeforeCommit);
         raft::compaction_stays_committed(&report.records)
             .err()
@@ -2445,7 +2447,7 @@ fn a_server_that_applies_before_commit_compacts_past_its_commit_index() {
     eprintln!(
         "ApplyBeforeCommit: the compaction fold caught it on {} of {} seeds, first: {}",
         caught.len(),
-        seeds(),
+        released_seeds(),
         caught.first().map_or("", String::as_str)
     );
     assert!(
@@ -2581,7 +2583,7 @@ fn a_server_that_installs_without_current_last_is_caught() {
 #[test]
 fn a_server_whose_adoption_is_as_built_is_caught() {
     let moved = Mutex::new(MovedSeeds::default());
-    let outcomes: Vec<(Option<String>, bool, usize)> = sweep(seeds(), |seed| {
+    let outcomes: Vec<(Option<String>, bool, usize)> = sweep(released_seeds(), |seed| {
         let report = raft::run(seed, Variant::AdoptionAsBuilt);
         let stormed = report
             .schedule
@@ -2597,7 +2599,7 @@ fn a_server_whose_adoption_is_as_built_is_caught() {
     eprintln!(
         "AdoptionAsBuilt: caught on {} of {} seeds, the adoption storm drawn on {stormed} seeds with {adoptions} adoptions under it, first: {}",
         caught.len(),
-        seeds(),
+        released_seeds(),
         caught.first().map_or("", |v| v.as_str())
     );
     print_moved("AdoptionAsBuilt", moved);
@@ -2609,7 +2611,7 @@ fn a_server_whose_adoption_is_as_built_is_caught() {
         adoptions > 0,
         "no staged install was ever adopted: the storm had nothing to crash into"
     );
-    if seeds() >= 100 {
+    if released_seeds() >= 100 {
         assert!(!caught.is_empty(), "AdoptionAsBuilt was never caught");
     }
 }
@@ -2634,7 +2636,7 @@ fn a_server_whose_adoption_is_as_built_is_caught() {
 #[test]
 fn a_server_whose_refusal_is_not_durable_is_caught() {
     let moved = Mutex::new(MovedSeeds::default());
-    let outcomes: Vec<(Option<String>, usize)> = sweep(seeds(), |seed| {
+    let outcomes: Vec<(Option<String>, usize)> = sweep(released_seeds(), |seed| {
         let report = raft::run(seed, Variant::RefusalNotDurable);
         (checked(&report, &moved), crashes_while_refused(&report))
     });
@@ -2643,7 +2645,7 @@ fn a_server_whose_refusal_is_not_durable_is_caught() {
     eprintln!(
         "RefusalNotDurable: caught on {} of {} seeds, crashed a refused server on {fired} seeds, first: {}",
         caught.len(),
-        seeds(),
+        released_seeds(),
         caught.first().map_or("", |v| v.as_str())
     );
     print_moved("RefusalNotDurable", moved);
@@ -2682,7 +2684,7 @@ fn a_server_whose_refusal_is_not_durable_is_caught() {
     // `seed_102_pins_the_refusal_that_is_not_durable_which_a_hundred_seeds_can_miss`.
     // Seeds 119 and 158, which held that pin before and which the moved schedules took
     // the situation off, are kept beside it as asserted absences.
-    if seeds() >= 1000 {
+    if released_seeds() >= 1000 {
         assert!(!caught.is_empty(), "RefusalNotDurable was never caught");
     }
 }
@@ -2973,7 +2975,7 @@ fn seed_119_which_pinned_the_refusal_that_is_not_durable_before_the_layout_refus
 #[test]
 fn a_leader_that_ignores_incarnations_never_forgets() {
     let moved = Mutex::new(MovedSeeds::default());
-    let outcomes: Vec<(Option<String>, usize, bool)> = sweep(seeds(), |seed| {
+    let outcomes: Vec<(Option<String>, usize, bool)> = sweep(released_seeds(), |seed| {
         let report = raft::run(seed, Variant::IgnoreIncarnation);
         let resets = report.count(|e| matches!(e, TraceEvent::RaftProgressReset { .. }));
         let reseeded = reseed_completed(&report);
@@ -2985,7 +2987,7 @@ fn a_leader_that_ignores_incarnations_never_forgets() {
     eprintln!(
         "IgnoreIncarnation: caught on {} of {} seeds, {resets} progress resets, a refused follower re-seeded and applying again on {reseeds} seeds, first: {}",
         caught.len(),
-        seeds(),
+        released_seeds(),
         caught.first().map_or("", |v| v.as_str())
     );
     print_moved("IgnoreIncarnation", moved);
@@ -2995,7 +2997,7 @@ fn a_leader_that_ignores_incarnations_never_forgets() {
     );
     // A refusal needs the disk's rot to land in a table still in use, and the
     // re-seed follows the refusal: twenty seeds cannot promise one, a hundred can.
-    if seeds() >= 100 {
+    if released_seeds() >= 100 {
         assert!(
             reseeds > 0,
             "no refused follower was ever re-seeded and applying again: the sweep never reached the state the wedge is built on"
@@ -3082,34 +3084,35 @@ fn a_leader_that_ignores_incarnations_never_forgets() {
 #[test]
 fn a_leader_that_shares_one_snapshot_directory_and_streams_one_follower_at_a_time_is_caught() {
     let moved = Mutex::new(MovedSeeds::default());
-    let outcomes: Vec<(Option<String>, bool, usize, bool, usize)> = sweep(seeds(), |seed| {
-        let report = raft::run(seed, Variant::SharedSnapshotDir);
-        let scrambled: Vec<_> = report
-            .retakes_under_streams()
-            .into_iter()
-            .filter(|retake| !retake.installed_after)
-            .collect();
-        // D-043's own symptom under a scrambled stream: the follower answering
-        // `More` for a file it has already been sent, over and over.
-        let looped = scrambled
-            .iter()
-            .map(|retake| {
-                report.duplicate_chunk_loop(
-                    retake.leader,
-                    retake.range,
-                    retake.follower,
-                    retake.retook,
-                )
-            })
-            .sum();
-        (
-            checked(&report, &moved),
-            retook_at_one_index(&report),
-            report.aimed_streams,
-            !scrambled.is_empty(),
-            looped,
-        )
-    });
+    let outcomes: Vec<(Option<String>, bool, usize, bool, usize)> =
+        sweep(released_seeds(), |seed| {
+            let report = raft::run(seed, Variant::SharedSnapshotDir);
+            let scrambled: Vec<_> = report
+                .retakes_under_streams()
+                .into_iter()
+                .filter(|retake| !retake.installed_after)
+                .collect();
+            // D-043's own symptom under a scrambled stream: the follower answering
+            // `More` for a file it has already been sent, over and over.
+            let looped = scrambled
+                .iter()
+                .map(|retake| {
+                    report.duplicate_chunk_loop(
+                        retake.leader,
+                        retake.range,
+                        retake.follower,
+                        retake.retook,
+                    )
+                })
+                .sum();
+            (
+                checked(&report, &moved),
+                retook_at_one_index(&report),
+                report.aimed_streams,
+                !scrambled.is_empty(),
+                looped,
+            )
+        });
     let caught: Vec<&String> = outcomes
         .iter()
         .filter_map(|(v, _, _, _, _)| v.as_ref())
@@ -3134,7 +3137,7 @@ fn a_leader_that_shares_one_snapshot_directory_and_streams_one_follower_at_a_tim
     eprintln!(
         "SharedSnapshotDir: caught on {} of {} seeds, {liveness} by the liveness check, by check {by_check:?}, re-took at an index already taken on {fired} seeds, scrambled a live stream the follower never installed after on {scrambled} seeds ({looped} duplicate-chunk loops after those), the aimed re-take arm reached its stream on {aimed} seeds, first: {}",
         caught.len(),
-        seeds(),
+        released_seeds(),
         caught.first().map_or("", |v| v.as_str())
     );
     print_moved("SharedSnapshotDir", moved);
@@ -3152,15 +3155,15 @@ fn a_leader_that_shares_one_snapshot_directory_and_streams_one_follower_at_a_tim
     // carries it and the gate's twenty do not (the owner's rule of 2026-09-15,
     // D-061). Until D-060 this was asserted nowhere, and the fold that reads it
     // was answering empty on every seed.
-    if seeds() >= 100 {
+    if released_seeds() >= 100 {
         assert!(
             scrambled > 0,
             "SharedSnapshotDir never re-took into a directory a live stream had open and left \
              unfinished: the wedge's stream half was not built on any of the {} seeds",
-            seeds()
+            released_seeds()
         );
     }
-    if seeds() >= 10_000 {
+    if released_seeds() >= 10_000 {
         assert!(
             liveness > 0,
             "SharedSnapshotDir's wedge was never caught by the liveness check; by check: {by_check:?}"
@@ -3241,7 +3244,7 @@ fn a_leader_that_trusts_the_clock_is_caught_and_the_guard_revokes() {
         stale: Option<String>,
         lease_reads_within: usize,
     }
-    let per_seed = sweep(seeds(), |seed| {
+    let per_seed = sweep(released_seeds(), |seed| {
         let correct = raft::run(seed, Variant::Correct);
         let led = correct.trials_led_by_slowest;
         if !correct.drift_exceeded() {
@@ -3292,7 +3295,7 @@ fn a_leader_that_trusts_the_clock_is_caught_and_the_guard_revokes() {
     }
     eprintln!(
         "lease safety: drift beyond {DRIFT_BOUND_PPM} ppm on {exceeded} of {} seeds; of those, the guard revoked on {revoked}, a stale read was caught without the guard on {stale}, neither on {neither}; the slowest clock led {slowest_led} of the trials; {lease_reads_within} lease reads on the seeds within the bound; first stale: {first_stale}",
-        seeds()
+        released_seeds()
     );
     assert!(exceeded > 0, "no seed exceeded the drift bound");
     assert!(revoked > 0, "the guard never revoked");
@@ -3319,7 +3322,7 @@ fn a_leader_that_trusts_the_clock_is_caught_and_the_guard_revokes() {
     // 0.96^20 = 0.44 and a hundred with 0.96^100 = 0.017, so the assertion there would
     // fail a tree with nothing wrong the day a change redraws the schedules; a thousand
     // catch none with probability 0.96^1000 = 1.9e-18.
-    if seeds() >= 1000 {
+    if released_seeds() >= 1000 {
         assert!(stale > 0, "LeaseTrustsTheClock was never caught");
     }
 }
@@ -3906,7 +3909,7 @@ fn the_membership_scenario_has_byte_identical_traces_for_one_seed() {
 #[test]
 fn the_correct_server_passes_the_membership_scenario_on_every_seed() {
     let coverage = Mutex::new(MembershipCoverage::default());
-    let verdicts = sweep(seeds(), |seed| {
+    let verdicts = sweep(released_seeds(), |seed| {
         let report = membership::run(seed, Variant::Correct);
         coverage.lock().unwrap().add(&report);
         report
@@ -3948,7 +3951,7 @@ fn the_correct_server_passes_the_membership_scenario_on_every_seed() {
     if let Err(violation) = verdict(&verdicts) {
         panic!("{violation}");
     }
-    coverage.assert_complete(seeds());
+    coverage.assert_complete(released_seeds());
 }
 
 /// The negative control: a server that counts one merged majority while joint
@@ -3956,7 +3959,7 @@ fn the_correct_server_passes_the_membership_scenario_on_every_seed() {
 /// of its runs fed a joining server a snapshot is printed beside the rate.
 #[test]
 fn a_server_that_counts_one_majority_in_joint_consensus_is_caught() {
-    let outcomes: Vec<(Option<String>, bool)> = sweep(seeds(), |seed| {
+    let outcomes: Vec<(Option<String>, bool)> = sweep(released_seeds(), |seed| {
         let report = membership::run(seed, Variant::SingleMajorityInJointConsensus);
         (
             report.check().err(),
@@ -3969,7 +3972,7 @@ fn a_server_that_counts_one_majority_in_joint_consensus_is_caught() {
         "SingleMajorityInJointConsensus: caught on {} of {} seeds, a joining server fed a \
          snapshot on {fed}, first: {}",
         caught.len(),
-        seeds(),
+        released_seeds(),
         caught.first().map_or("", String::as_str)
     );
     assert!(
@@ -4354,7 +4357,7 @@ impl MembershipCoverage {
 /// asked for at CI's tier and above, and the gate's twenty at the gate, which is a
 /// twentieth more runs than the gate's raft sweeps already do (D-046).
 fn compared_seeds() -> u64 {
-    seeds().min(100)
+    released_seeds().min(100)
 }
 
 /// The servers the comparison runs, one per seed in turn: the correct one, and
@@ -4449,7 +4452,7 @@ use ananke_sim::quorum::{self, Disk, Half};
 /// seed's violation, if it has one, and the figures the tests print.
 fn quorum_sweep(variant: Variant, half: Half) -> (Vec<String>, QuorumFigures) {
     let figures = Mutex::new(QuorumFigures::default());
-    let violations: Vec<String> = sweep(seeds(), |seed| {
+    let violations: Vec<String> = sweep(released_seeds(), |seed| {
         let report = quorum::run(seed, variant, half);
         figures.lock().unwrap().add(&report);
         report.check().err().inspect(|_| {
@@ -4522,7 +4525,7 @@ fn the_correct_leader_steps_down_on_a_blocked_reseed_and_commits_through_an_open
         eprintln!(
             "Correct {half:?}: {} of {} seeds failed, {figures:?}, first: {}",
             violations.len(),
-            seeds(),
+            released_seeds(),
             violations.first().map_or("", String::as_str)
         );
         assert!(violations.is_empty(), "{}", violations[0]);
@@ -4546,7 +4549,7 @@ fn a_leader_that_counts_a_refused_followers_rejections_whatever_its_stream_does_
         "{:?} Blocked: caught on {} of {} seeds, {figures:?}, first: {}",
         Variants::from(Variant::RefusedCountsForQuorum),
         caught.len(),
-        seeds(),
+        released_seeds(),
         caught.first().map_or("", String::as_str)
     );
     assert!(
@@ -4555,7 +4558,7 @@ fn a_leader_that_counts_a_refused_followers_rejections_whatever_its_stream_does_
     );
     assert_eq!(
         caught.len() as u64,
-        seeds(),
+        released_seeds(),
         "RefusedCountsForQuorum was not caught on every seed: {caught:?}"
     );
     assert!(
@@ -4579,12 +4582,12 @@ fn a_leader_that_counts_nothing_from_a_refused_follower_is_caught() {
         "{:?} Open: caught on {} of {} seeds, {figures:?}, first: {}",
         Variants::from(Variant::RefusedNeverCounts),
         caught.len(),
-        seeds(),
+        released_seeds(),
         caught.first().map_or("", String::as_str)
     );
     assert_eq!(
         caught.len() as u64,
-        seeds(),
+        released_seeds(),
         "RefusedNeverCounts was not caught on every seed: {caught:?}"
     );
 }
@@ -4605,7 +4608,7 @@ fn a_leader_that_counts_nothing_from_a_refused_follower_is_caught() {
 #[test]
 fn on_the_sweeps_disk_the_install_silence_deposes_the_leader_under_either_count() {
     for variant in [Variant::RefusedCountsForQuorum, Variant::Correct] {
-        let outcomes: Vec<(u64, bool, Option<Vec<u64>>)> = sweep(seeds(), |seed| {
+        let outcomes: Vec<(u64, bool, Option<Vec<u64>>)> = sweep(released_seeds(), |seed| {
             let report = quorum::run_on(seed, variant, Half::Open, Disk::Sweep);
             let lost = report
                 .hold()
@@ -4634,7 +4637,7 @@ fn on_the_sweeps_disk_the_install_silence_deposes_the_leader_under_either_count(
             "{:?} Open on the sweep's disk: failed on {} of {} seeds, {silent} by a step-down with nothing uncounted, {named} by one naming the refused follower, {} with no step-down {unfinished:?}",
             Variants::from(variant),
             failed.len(),
-            seeds(),
+            released_seeds(),
             unfinished.len()
         );
         if variant == Variant::RefusedCountsForQuorum {
@@ -4642,7 +4645,7 @@ fn on_the_sweeps_disk_the_install_silence_deposes_the_leader_under_either_count(
                 named, 0,
                 "the leader as built named an uncounted follower: the variant was not injected"
             );
-            if seeds() >= 100 {
+            if released_seeds() >= 100 {
                 assert!(
                     silent > 0,
                     "the install silence deposed no leader: the instant disk may no longer be needed"
