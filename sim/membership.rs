@@ -578,7 +578,11 @@ pub fn node_config(id: u64, variants: impl Into<Variants>) -> NodeConfig {
 /// measured on the node by the raft-arms sweep (PROPOSED D-086).
 // PROPOSED(D-084): the membership scenario on the node, four ranges on every node.
 #[must_use]
-pub fn node_server_config(id: u64, variants: impl Into<Variants>) -> ServerConfig {
+pub fn node_server_config(
+    id: u64,
+    variants: impl Into<Variants>,
+    node: NodeVariants,
+) -> ServerConfig {
     let mut engine = EngineConfig::new(PathBuf::from(DIR));
     engine.memtable_bytes = 16 * 1024;
     engine.segment_bytes = 16 * 1024;
@@ -590,11 +594,9 @@ pub fn node_server_config(id: u64, variants: impl Into<Variants>) -> ServerConfi
             .map(|s| (ServerId(s), server_addr(s)))
             .collect(),
         ranges: crate::ranges::ranges(),
-        initial_voters: if id <= INITIAL_VOTERS {
-            (1..=INITIAL_VOTERS).map(ServerId).collect()
-        } else {
-            Vec::new()
-        },
+        // SHARD.md §2: the bootstrap nodes are the same list on every node; a node not
+        // among them starts its replicas with an empty configuration (PROPOSED D-096).
+        bootstrap: (1..=INITIAL_VOTERS).map(ServerId).collect(),
         raft: RaftConfig {
             variants: variants.into(),
             max_batch: 1,
@@ -609,11 +611,11 @@ pub fn node_server_config(id: u64, variants: impl Into<Variants>) -> ServerConfi
         // This scenario is not about the receive cap, so it sets it at the node's range
         // count and no stream waits by accident (D-075, as D-083's other scenarios do).
         snapshot_cap: crate::ranges::SNAPSHOT_CAP,
-        node: NodeVariants::correct(),
+        node,
     }
 }
 
-fn spawn_server(cluster: Cluster, sim: &Sim, id: u64, variants: Variants) {
+fn spawn_server(cluster: Cluster, sim: &Sim, id: u64, variants: Variants, node: NodeVariants) {
     let env = sim.env(NodeId::new(u32::try_from(id).expect("small")));
     let inner = env.clone();
     match cluster {
@@ -624,7 +626,8 @@ fn spawn_server(cluster: Cluster, sim: &Sim, id: u64, variants: Variants) {
         }
         Cluster::Node => {
             env.spawn("node", async move {
-                let _ = ananke_shard::server::run(inner, node_server_config(id, variants)).await;
+                let _ =
+                    ananke_shard::server::run(inner, node_server_config(id, variants, node)).await;
             });
         }
     }
@@ -1204,7 +1207,10 @@ impl Report {
         // `RaftMatchStarted` states, folded here as in the raft sweep — this is the
         // scenario that drives changes, so it is where learners and re-tracked
         // followers raise a match.
-        if let Err(violation) = raft::payload_is_well_formed(&self.records, &self.ranges()) {
+        // PROPOSED(D-096): the oracle holds a record's range to every range hosted, the
+        // two system ranges included; the membership changes stay the user ranges'.
+        if let Err(violation) = raft::payload_is_well_formed(&self.records, &self.cluster.hosted())
+        {
             return fail(violation);
         }
         if let Err(violation) = raft::match_starts_are_first_rises(&self.records) {
@@ -1811,11 +1817,23 @@ pub fn run(seed: u64, variants: impl Into<Variants>) -> Report {
 // PROPOSED(D-084): the membership scenario on the node, four ranges on every node.
 #[must_use]
 pub fn run_on(cluster: Cluster, seed: u64, variants: impl Into<Variants>) -> Report {
+    run_on_node(cluster, seed, variants, NodeVariants::correct())
+}
+
+/// The same, with the node's own variants (PROPOSED D-096): the one-group server
+/// ignores them.
+#[must_use]
+pub fn run_on_node(
+    cluster: Cluster,
+    seed: u64,
+    variants: impl Into<Variants>,
+    node: NodeVariants,
+) -> Report {
     let schedule = match cluster {
         Cluster::OneGroup => Schedule::draw(seed),
         Cluster::Node => Schedule::draw_on_the_node(seed),
     };
-    run_on_with(cluster, seed, schedule, variants)
+    run_on_with_node(cluster, seed, schedule, variants, node)
 }
 
 /// Runs the scenario for `seed` with an explicit schedule.
@@ -1834,6 +1852,19 @@ pub fn run_on_with(
     schedule: Schedule,
     variants: impl Into<Variants>,
 ) -> Report {
+    run_on_with_node(cluster, seed, schedule, variants, NodeVariants::correct())
+}
+
+/// Runs the scenario on `cluster` for `seed` with an explicit schedule and the
+/// node's own variants (PROPOSED D-096).
+#[must_use]
+pub fn run_on_with_node(
+    cluster: Cluster,
+    seed: u64,
+    schedule: Schedule,
+    variants: impl Into<Variants>,
+    node: NodeVariants,
+) -> Report {
     let variants = variants.into();
     let mut sim = Sim::new(config_on(cluster, seed, &schedule));
     let servers: Vec<NodeId> = (0..SERVERS as usize)
@@ -1843,7 +1874,7 @@ pub fn run_on_with(
     let admin = sim.add_node();
     let stats: Vec<SharedStats> = (0..CLIENTS).map(|_| SharedStats::default()).collect();
     for id in 1..=SERVERS {
-        spawn_server(cluster, &sim, id, variants);
+        spawn_server(cluster, &sim, id, variants, node);
     }
     for (i, &node) in clients.iter().enumerate() {
         let env = sim.env(node);

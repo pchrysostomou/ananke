@@ -17102,6 +17102,270 @@ measurement item 2 rests on.
   floors, those are per sweep and have no prefix to compare at, which is why they are
   not here.
 
+
+## PROPOSED D-096 — Bootstrap: the bootstrap nodes named in configuration write the initial state in one batch, host ranges 0 and 1, and every range starts with a descriptor of its own
+
+**The number.** Off `main` at 527adcd, whose footer reads D-092. Three branches take
+numbers ahead of this one: PR #129 D-092 and D-093, PR #130 D-094, PR #131 D-095. This
+takes **D-096** and moves the footer to D-097; whichever merges later resolves the
+footer as the union, as D-088 did. Every code site carries `// PROPOSED(D-096)`.
+
+**Context.** Stage C's first build (SHARD.md:2439-2470): "Bootstrap (§2; Q7, Q9, Q32):
+exactly three bootstrap nodes, each with a fresh store writing the same initial state
+from configuration in one synced batch before its tasks run — ranges 0, 1 and 2, range
+0's range-id counter at 3 with no block leased, a node record per bootstrap node, and a
+digest of the bootstrap configuration; ranges 0 and 1 fixed on the bootstrap nodes",
+and "Descriptors (§1): the range-local copy, the authority, in the range's table and
+written in the apply batch that changes it (Q3, Q5)". §12 names the bootstrap commit as
+one of the three that move pinned hashes or schedules, "where a Phase 2 scenario runs
+under ranges 0, 1 and 2 and their initial batch" (SHARD.md:2524-2529).
+
+What the tree had. D-076 fixed "the ranges configuration at bootstrap": a node's
+configuration named the ranges it hosts with a span each, `initial_voters` said which
+voters every fresh replica starts with, every node created every configured range at
+its first start, and the span was "not a descriptor: nothing on the node reads it".
+There was no range 0, no range 1, no descriptor anywhere, no initial batch — each
+replica's incarnation was the only thing a fresh store wrote — and a node that was
+not a voter created the same replicas over an empty configuration.
+
+### What is built
+
+1. **The bootstrap nodes, named.** `ServerConfig::bootstrap` replaces `initial_voters`:
+   range 0's replicas, the voters every range fixed at bootstrap starts with, and
+   where ranges 0 and 1 live for good (Q7, Q9). A node whose id is among them is a
+   bootstrap node. Any other node starts with no range of its own and, until this
+   stage's placeholders (§5, Q22), with the configured user ranges as replicas of an
+   empty configuration, which is exactly how D-076 started a joining server: the
+   membership scenario's nodes 4 and 5 run as they did, with the interim named.
+2. **The initial state, one batch** (`server::initial_state`), computed from
+   configuration alone and written synced before any task is spawned, by a bootstrap
+   node whose store holds no digest. For every range the node hosts: its configuration
+   at index 0 and its first incarnation (`RaftStore`'s `initial_state_into`) and its
+   descriptor at generation 1, `Live`, with the bootstrap nodes as voters, under the
+   replica's own prefix beside its Raft state (`PURPOSE_DESCRIPTOR`, D-060's layout
+   extended by one purpose). In range 0's state, the system tenant's root table: the
+   meta range's descriptor (§1, "found through range 0"), the range-id counter one
+   past the highest hosted id with no block leased (§5, Q17), one node record per
+   bootstrap node carrying its address (Q8), and the digest of the bootstrap
+   configuration (Q7). In range 1's state, the meta table: a record per user range
+   keyed by its end key, carrying start, range, generation and voters (§1, Q4). The
+   digest is also what says a store was bootstrapped: a restart writes nothing and
+   creates no replica anew; a bootstrap node whose disk was replaced looks fresh and
+   writes it again, which is issue #43 and is not told apart here, as Q7 records.
+3. **Ranges 0 and 1, hosted.** `Range::root()` and `Range::meta()`, over the system
+   tenant's tables 0 and 1 (`ananke_shard::system`), are the first two replicas a
+   bootstrap node opens, before the configured user ranges; each is a Raft group like
+   any other, elects, heartbeats and applies its term's no-ops, and holds no client
+   key. `RangeCreated { cause: bootstrap }` is traced for each of a bootstrap node's
+   six replicas in Stage B's scenarios, and `MetaApplied { index: 0 }` once per
+   bootstrap node with the user ranges' records (§8, check 16's first record).
+4. **Every span is an interval of encoded keys** (§1). `Range::span` gives a user
+   range's bounds under the user tenant and a system range's as they are, and every
+   place the host built a span — the take's, the install's, the state digest's, the
+   creation's — reads it, so no span is encoded twice and no system span is encoded as
+   a user key. The descriptor, the meta record and the trace all carry the encoded
+   span; SHARD.md §2's "range 2, the rest of the keyspace" is what a configuration
+   naming one user range over everything produces, and Stage B's four user ranges are
+   that configuration with four.
+5. **`Cluster::hosted`**: the ranges a node of the cluster hosts, the system ranges
+   first, which is what the trace's oracle (`payload_is_well_formed`) holds a replica
+   event's range to and what the coverage divides records by; the arms and the keys
+   keep drawing from the user ranges, since no client writes a system range and no arm
+   aims at one yet.
+6. **The variant, `NodeVariant::AnyFreshNodeBootstraps`**, CLAUDE.md's known-buggy
+   variant beside the bootstrap: a node takes a fresh store for a bootstrap whether or
+   not configuration names it among range 0's replicas, and, lacking the bootstrap
+   list it was not given, takes the address book for every range's voters. Two
+   clusters then bootstrap where configuration named one. Check 7's first step reads
+   the disagreement off the replicas' creations (`ranges::creations_agree_of`, now a
+   function over any run's records), and the membership scenario on the node is
+   where it can: its nodes 4 and 5 are not bootstrap nodes. On a cluster of three
+   every node is one, the variant has nothing to do, and its run is byte-identical to
+   the correct node's, which the test asserts as the absence with its reason rather
+   than pass a sweep that injected nothing.
+
+### What the sweeps say
+
+Every rate below was measured before its assertion was written (Q39, D-061). The
+gate's twenty run in debug on this session's container (a four-core Xeon, D-070) from
+`cargo test -p ananke-sim` with the prints kept; the thousand are the premerge on the
+same tree, in release, whose figure is under **The premerge** below.
+
+**The variant, at the gate's twenty.** `AnyFreshNodeBootstraps` is caught by check 7's
+agreement fold on **20 of 20** membership seeds — every seed, as the variant writes at
+every start of a node the configuration did not name — and the run's own checks fail
+it on 10 of the 20 beside that, which is what two clusters bootstrapping where
+configuration named one do to a membership change and is not the test's claim. The
+first catch names it: node 5's replica of range 0 created with a descriptor whose voters
+are the address book, against the three bootstrap nodes' `[1, 2, 3]`. On three nodes
+the variant's seed 1 is byte-identical to the correct node's, asserted.
+
+**The re-seed shape, at the gate's twenty**, on six replicas: the correct system meets
+(a) to (e) on 20 of 20 seeds; the cap of two held a stream back on 20 of 20 (median 5
+chunks held, most 8); `ReseedMarkNotSynced` is caught on 11 of 20 (55 %, by (d)'s
+restatement as `Neither`), `RecordNeverQueued` on 18 of 20 (90 %, by (a)),
+`ServeBeforeRefusedMark` on 20 of 20, by (c). Seed 1: six replicas refused and marked,
+eight streams opened toward the node for the four user ranges, four installs, four
+chunks held back, and the arm crashed the node on range 2's mark at 9.073 s and
+restarted it at 9.473 s.
+
+**The node's sweeps, at the gate's twenty**, every one green with six ranges: the
+correct node under the raft sweep's arms, the membership scenario on the node, the
+sharded quorum scenario, the folds' equivalence (twenty seeds at eight prefixes each,
+no fold differed from its reading), and every variant's catch as its test asserts it.
+The coverage now divides by six: apply lag median 3.03 ms over every range, per range
+2.39 / 2.41 / 3.43 / 2.79 / 2.71 / 3.45 ms for ranges 0 to 5, 28 999 applies measured;
+one range's applies held another's for a median of 2.23 ms and at most 195.8 ms over
+1 419 waits; the least-applied **user** range took 6 215 entries against the busiest's
+8 215, a spread of 0.76, read over the user ranges alone since the two system ranges
+apply their terms' no-ops and nothing else. `sim/tests/ranges.rs` reads 360 bootstrap
+creations over its twenty seeds (three nodes, six replicas), leaders on every range
+(46 / 49 / 50 / 58 / 49 / 52 by range) and applies by range 138 / 147 for the system
+ranges against 2 352 to 2 530 for the user ranges; `StepWhilePersisting` is caught on
+11 of 20 there as before.
+
+### The premerge
+
+`scripts/premerge.sh` on this tree at `ANANKE_SEEDS=1000` in release, on this session's
+container (Linux, a four-core Intel Xeon at 2.80 GHz, D-070), **green in 2 149 s**, load
+1.22 before and 3.88 after. Against `main` at 527adcd's 1 760 s on the same machine
+(D-094's baseline): the branch is stacked on PR #131 off `main`, so PR #130's re-tier is
+not on it and the released phases ran their thousand here too — engine 408 s, raft 792 s
+(764 on `main`), wal 16 s — and the growth is the node's: **the `node` binary took 753 s
+where `main`'s took 487**, six replicas on every node where there were four, `ranges`
+59 s, `reseed` 32 s at its cap of two hundred, `install` 6 s. The shard rows of the four
+binaries the six ranges move were re-weighed on this tree from the built release binary
+(`nightly-shards.txt`), since a table that still carried the four-range figures would
+balance the nightly on numbers a third too small.
+
+**The variant at a thousand.** `AnyFreshNodeBootstraps` is caught by check 7's agreement
+fold on **1 000 of 1 000** membership seeds, the whole tier run for this measurement; the
+run's own checks fail it on 484 beside that. Over the whole tier the test weighed
+404 cpu s from the built release binary — two clusters' traffic on every seed — so it
+runs D-082's share, a tenth of the tier and never fewer than twenty, as every variant
+caught at a high rate on the node does, and its shard row is weighed on that: a catch on
+every seed needs no more of a tier than the share (D-061).
+
+**Every rate the node's sweeps assert, at a thousand, against `main`'s premerge on the
+same machine** (D-094's baseline run, whose node tests are `main`'s), so that what the
+six ranges moved is on record:
+
+| Sweep, at its tier | `main` | This tree |
+| --- | ---: | ---: |
+| `CountOlderTermForCommit`, of 100 | 30 | 31 |
+| `RefusedReadLeft`, of 1 000 | 108 (10.8 %) | 116 (11.6 %) |
+| `LeaseTrustsTheClock`, of 1 000 | 6 (0.6 %) | 7 (0.7 %) |
+| `TruncateOnEveryAppend`, of 100 | 99 | 99 |
+| `SharedSnapshotDir` failed / wedged, of 100 | 28 / 17 | 24 / 17 |
+| `SnapshotWithoutCurrentLast`, of 1 000 | 0 | 0 |
+| `SingleMajorityInJointConsensus`, raft sweep on the node, of 1 000 | 213 | 226 |
+| `SingleMajorityInJointConsensus`, membership on the node, of 1 000 | 190 (19 of 100) | 241 |
+| `ResetTimerOnAnyRpc`, of 100 | 50 | 50 |
+| `ApplyBeforeCommit`, `SendBeforePersist`, `NoPreVote`, of 100 | 100 each | 100 each |
+| The pair (`SharedSnapshotDir` + `IgnoreIncarnation`), of 100 | 25 | 22 |
+| `ApplyWaitsForEveryRange`, of 1 000 | 100 of 100 | 999 |
+| Elections while joint, membership on the node, of 1 000 | 144 | 145 |
+| `StepWhilePersisting` (`ranges`), of 1 000 | 594 (59.4 %) | 607 (60.7 %) |
+| `RefusedReadLeft` (`ranges`), of 1 000 | 0 | 0 |
+| The re-seed cap held a stream back, of 200 | 200 (median 4, most 9) | 200 (median 4, most 19) |
+| `ReseedMarkNotSynced`, of 20 | 10 | 11 |
+| `RecordNeverQueued`, of 20 | 18 | 18 |
+| `ServeBeforeRefusedMark`, of 20 | 20 | 20 |
+
+No rate crossed a tier: the two under D-061's 5 % — `LeaseTrustsTheClock` and
+`SnapshotWithoutCurrentLast`'s aimed arm — are asserted from the thousand and the ten
+thousand as before, and `SharedSnapshotDir`'s scramble, asserted from the thousand,
+reached 40 seeds of its share. The correct node passed every seed of every sweep; the
+sharded quorum scenario's correct system 0 of 1 000 failed, and `RefuseOneRangeOnly`,
+which now refuses range 0's store first, is caught on 1 000 of 1 000.
+
+**The coverage at a thousand**, six ranges against `main`'s four: leaders by range
+4 495 / 4 487 on the system ranges against about 7 850 on each user range, applies
+13 482 / 13 458 against 374 000 to 396 000 — the system ranges elect and heartbeat and
+apply their terms' no-ops, and nothing else — and 135.5 million trace records against
+123.4; the apply lag's pooled median **3.09 ms** as on `main` (3.09), per range 2.38 /
+2.44 / 3.02 / 3.07 / 3.25 / 3.13 ms for ranges 0 to 5 against 3.00 / 3.04 / 3.22 / 3.10
+for 2 to 5, 1 548 325 applies measured; one range's applies held another's for a
+median of 2.35 ms and at most 447 ms over 74 784 waits, 32 windows dropped (2.40 ms,
+417 ms, 66 469, 75); the user ranges' apply spread 0.94 (0.95); 58 559 snapshot actions,
+58.6 a seed, fewest 24 (58 877, 58.9, 21); the correct node re-took a range at an index it
+had taken on 493 seeds (461), into the same directory on none; 0 store refusals; seeds
+272 and 516 carry 35 and 21 live installs and no stretch held by one. The folds'
+equivalence held on 100 seeds at eight prefixes, the lag verdict per variant (seeds,
+at some prefix, over the whole run) `ApplyWaitsForEveryRange` (25, 25, 25),
+`ChunksToTheInbox` (25, 14, 11), correct (25, 8, **0**) — the correct node's two per-run
+breaches D-095 reported at a hundred are gone on these schedules, which is the draw and
+not a fix. `sim/tests/ranges.rs`: 18 000 bootstrap creations, leaders on every range
+(2 573 / 2 576 on the system ranges, 2 660 to 2 720 on the user ranges), applies 7 716 /
+7 727 against about 125 600, 41.0 million records (37.6).
+
+### The pinned seeds, re-audited
+
+**Seeds 272 and 516** (`sim/tests/node.rs`, PROPOSED D-089 and D-091: a replica fed a
+snapshot of one range crossing the timer bound while the node held its core for that
+range's live install) **no longer reach the hold**, and the pin now asserts the absence
+with its reason rather than a bare green (CLAUDE.md). The probe that re-read the tree —
+the check exactly as it stood on 1d17dcc, `TimerResets::WITHOUT_LIVE_INSTALL`, over
+`ANANKE_SEEDS=1000` in release — found **no seed of a thousand** on which that check
+flags a stretch held by a live install, where the tree before this slice had two in a
+thousand. The pin asserts on both seeds that `check()` is green, that the replay under
+every arm finds nothing, **and that the replay without the fourth arm finds nothing
+either**: the arm is exempting nothing this tree reaches. Its mechanism is unchanged and
+the shape it pinned is kept in the comment with both seeds' figures, so the day the
+last assertion fails the pin is upgraded back to it with that seed's figures, not
+deleted. Each seed's live installs are printed beside the absence, so the hold the arm is
+written for is seen exercised even where no stretch crosses the bound inside one.
+
+**Seed 1 of the re-seed shape** (`seed_1_pins_the_cap_holding_a_re_seed_back`) still
+holds a stream back on the new schedule, and the shape itself was re-read for six
+replicas. The four user ranges are re-seeded as D-081 asserts, by a stream each against
+the cap of two. The root and the meta range, which nothing writes to in the shape, are
+re-seeded **by the log**: their leaders hold every entry from index 1 and compacted
+nothing, so a leader that forgot the replica's progress on its new incarnation (D-042)
+appends from the first entry and the replica, empty and marked, takes the log — Raft's
+other way to catch a follower up, and the same re-seed, completed without a stream.
+`Report::streamed_ranges` and `Report::log_ranges` name the two sets; (a) asserts of
+each system range that its first append after its refused mark is at index 1, that no
+stream was opened toward it and that nothing installed into it, so the day a system
+range carries writes enough to compact, (a) says so and the range moves to the streamed
+set; (b), (d)'s install and the cap read the streamed four; (c)'s second half reads the
+streamed four against their installs and the log-rebuilt two against their marks, since
+for those the acknowledgements of the appends are the rebuild. The `reseed-crash` arm
+aims at the first refused mark of a streamed range, so (d)'s install after the restart
+keeps its meaning; the six marks are written inside one arm step, so the crash lands at
+the same moment whichever mark it is aimed at.
+
+**What the shape caught while this was built.** With ranges 0 and 1 on every node the
+shape's (a) went red on every seed for exactly those two, and the diagnosis was a
+bootstrap bug and not a shape's: a re-seeded bootstrap node, restarted, opened the
+directory its re-seed built (D-066), found no digest there — a re-seed writes none —
+and **bootstrapped again over the re-seed**, giving each replica the first incarnation
+back, so the leader never forgot its progress (D-042) and a range with nothing compacted
+was never appended to from index 1 or streamed. The bootstrap is confined to the
+configured directory on a start that did not re-seed (`reseeded_now`, `engine.dir ==
+base_dir`): a directory a re-seed built is not a fresh store, whether this start built
+it or an earlier one did, and its replicas' streams carry range 0's digest back with the
+rest. It is the shape doing what D-081 built it for, on the first slice after it.
+
+**The pinned hashes.** The one-group server is untouched, and seed 42's JSONL hashes as
+before (`sim/tests/echo.rs`, `sim/tests/raft.rs`); the node's own pins are the replay
+tests, which pin determinism and not a hash.
+
+### Consequences
+
+- Stage C's build list's first two items are built as far as this slice reaches:
+  descriptors range-local at generation 1, the bootstrap, the system ranges. The meta
+  range's `MetaUpdate`, the lookups, the refill and routing by descriptor are the next
+  slices' (§12).
+- Every node schedule moved, as §12 said the bootstrap commit would: two more cores per
+  bootstrap node draw from their own streams, elect and heartbeat, and the inbox, the
+  ticker and the frames carry them. The one-group server is untouched: seed 42's JSONL
+  hashes as before.
+- `sim/tests/ranges.rs`'s counts read six ranges where they read four, and the store
+  that opens first is range 0's, which is the one `RefuseOneRangeOnly` refuses.
+- The `initial_voters` of the one-group server's `NodeConfig` are unchanged; only the
+  node's configuration is bootstrap's.
+
 ---
 
-_Next entry: D-096. Add one before implementing anything not covered above._
+_Next entry: D-097. Add one before implementing anything not covered above._

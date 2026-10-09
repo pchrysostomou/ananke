@@ -39,10 +39,11 @@ fn correct(seed: u64) -> ranges::Report {
 fn a_node_holds_four_ranges_from_its_configuration_and_every_one_of_them_runs() {
     let report = correct(1);
     report.check().expect("the correct node passes seed 1");
+    // PROPOSED(D-096): the two system ranges are created at bootstrap beside the four.
     assert_eq!(
         report.bootstrap_creations(),
-        (ranges::NODES * ranges::RANGES) as usize,
-        "three nodes times four ranges of `RangeCreated {{ cause: bootstrap }}`"
+        (ranges::NODES * ranges::HOSTED) as usize,
+        "three nodes times six ranges of `RangeCreated {{ cause: bootstrap }}`"
     );
     let leaders = report.leaders_by_range();
     let applies = report.applies_by_range();
@@ -138,12 +139,13 @@ fn every_seed_passes_on_the_correct_node() {
         bound.saturating_sub(worst),
         bound.saturating_sub(worst_recovery)
     );
-    // The shape the keyed checks need, on every seed: four ranges on every node,
-    // each electing and applying. Asserted at every tier, since it is what says the
-    // sweep can tell a keyed check from a wrongly keyed one at all.
+    // The shape the keyed checks need, on every seed: six ranges on every node, the
+    // two system ranges included (PROPOSED D-096), each electing and applying.
+    // Asserted at every tier, since it is what says the sweep can tell a keyed check
+    // from a wrongly keyed one at all.
     assert_eq!(
         creations,
-        seeds as usize * (ranges::NODES * ranges::RANGES) as usize
+        seeds as usize * (ranges::NODES * ranges::HOSTED) as usize
     );
     for range in ranges::FIRST_RANGE..ranges::FIRST_RANGE + ranges::RANGES {
         assert!(leaders.contains_key(&range), "range {range} never led");
@@ -537,10 +539,11 @@ fn the_ranges_of_one_node_draw_their_own_election_timeouts() {
     for seed in 1..=4 {
         let records = ranges::alone(seed, std::time::Duration::from_millis(600));
         let first = ranges::first_campaigns(&records);
+        // PROPOSED(D-096): a bootstrap node hosts ranges 0 and 1 beside its four.
         assert_eq!(
             first.len(),
-            ranges::RANGES as usize,
-            "seed {seed}: only {:?} of the node's four ranges campaigned",
+            ranges::HOSTED as usize,
+            "seed {seed}: only {:?} of the node's six ranges campaigned",
             first.keys().collect::<Vec<_>>()
         );
         let at: BTreeSet<_> = first.values().copied().collect();
@@ -550,10 +553,17 @@ fn the_ranges_of_one_node_draw_their_own_election_timeouts() {
         );
         assert!(
             at.len() > 1,
-            "seed {seed}: the node's four ranges all campaigned at {at:?}, which is what a node \
+            "seed {seed}: the node's six ranges all campaigned at {at:?}, which is what a node \
              whose cores share one seed looks like"
         );
-        all_four += usize::from(at.len() == ranges::RANGES as usize);
+        // The figure measured above is the four user ranges', and stays theirs: the
+        // system ranges' draws are two more, read beside them (PROPOSED D-096).
+        let user_at: BTreeSet<_> = first
+            .iter()
+            .filter(|(range, _)| **range >= ranges::FIRST_RANGE)
+            .map(|(_, at)| *at)
+            .collect();
+        all_four += usize::from(user_at.len() == ranges::RANGES as usize);
     }
     assert!(
         all_four > 0,
@@ -582,8 +592,10 @@ fn the_ranges_of_one_node_draw_their_own_election_timeouts() {
 #[test]
 fn a_loss_in_the_shared_engine_refuses_the_whole_node_and_reseeds_beside_it() {
     let for_ = std::time::Duration::from_millis(600);
-    let every_range: BTreeSet<u64> = (0..ranges::RANGES)
-        .map(|i| ranges::FIRST_RANGE + i)
+    // PROPOSED(D-096): the two system ranges go down with the node too.
+    let every_range: BTreeSet<u64> = [ranges::ROOT_RANGE, ranges::META_RANGE]
+        .into_iter()
+        .chain((0..ranges::RANGES).map(|i| ranges::FIRST_RANGE + i))
         .collect();
 
     let (records, dirs) = ranges::refused_whole_dirs(1, for_, NodeVariants::correct());
@@ -680,11 +692,13 @@ fn a_loss_in_the_shared_engine_refuses_the_whole_node_and_reseeds_beside_it() {
         for_,
         NodeVariants::of(&[NodeVariant::RefuseOneRangeOnly]),
     ));
+    // The store that opens first is range 0's since PROPOSED D-096, so that is the one
+    // range the variant refuses.
     assert_eq!(
         one_range.replicas_refused,
-        BTreeSet::from([ranges::FIRST_RANGE]),
+        BTreeSet::from([ranges::ROOT_RANGE]),
         "RefuseOneRangeOnly refuses the one range whose store open failed and no other, \
-         leaving the node's three other replicas unrefused over an engine that lost state"
+         leaving the node's five other replicas unrefused over an engine that lost state"
     );
 
     let (refused_in_place, in_place) = ranges::refused_whole_dirs(
@@ -829,10 +843,12 @@ fn each_range_draws_its_election_timer_from_its_own_stream() {
             "ranges: seed {seed} campaign ticks with four ranges {with_four:?}, with three \
              {with_three:?}"
         );
+        // PROPOSED(D-096): the two system ranges campaign beside the three.
         assert_eq!(
             with_three.len(),
-            three.len(),
-            "seed {seed}: the node of three ranges campaigned with {with_three:?}"
+            three.len() + 2,
+            "seed {seed}: the node of three user ranges and two system ranges campaigned with \
+             {with_three:?}"
         );
         assert_eq!(
             of(&with_three),
@@ -878,8 +894,10 @@ fn each_range_draws_its_election_timer_from_its_own_stream() {
 #[test]
 fn a_restarted_node_opens_the_directory_its_reseed_built_and_is_not_refused_again() {
     let for_ = std::time::Duration::from_millis(600);
-    let every_range: BTreeSet<u64> = (0..ranges::RANGES)
-        .map(|i| ranges::FIRST_RANGE + i)
+    // PROPOSED(D-096): the two system ranges go down with the node too.
+    let every_range: BTreeSet<u64> = [ranges::ROOT_RANGE, ranges::META_RANGE]
+        .into_iter()
+        .chain((0..ranges::RANGES).map(|i| ranges::FIRST_RANGE + i))
         .collect();
 
     let (records, dirs) = ranges::refused_whole_restarted(1, for_, NodeVariants::correct());

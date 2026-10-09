@@ -1,10 +1,12 @@
 //! The directed re-seed shape: Stage B's exit criterion for Q15's path, (a) to (e) on
 //! every seed (SHARD.md §12; §11, storage 8).
 //!
-//! The scenario is `ananke_sim::reseed`: three servers of four ranges each, one of them
-//! refused by its store's lost mark at a restart, its cap on streams received set to two
-//! so the four re-seeds share two slots, and a `reseed-crash` arm that crashes it on the
-//! trace event of one replica's refused mark and restarts it.
+//! The scenario is `ananke_sim::reseed`: three servers of six replicas each — four user
+//! ranges and, since PROPOSED D-096, the root and the meta range — one of them refused by
+//! its store's lost mark at a restart, its cap on streams received set to two so the four
+//! user ranges' re-seeds share two slots, and a `reseed-crash` arm that crashes it on the
+//! trace event of one of those replicas' refused mark and restarts it. The two system
+//! ranges are re-seeded by the log from its first entry, and (a) asserts that of them.
 //!
 //! What each test here is for:
 //!
@@ -247,8 +249,9 @@ fn an_answer_that_is_evidence_of_the_install_is_not_the_same_as_any_answer() {
     let report = with(0, NodeVariant::RecordNeverQueued);
     let read = report.read();
     let every = Report::every_range();
+    let streamed = Report::streamed_ranges();
     assert!(
-        read.installs.len() < every.len(),
+        read.installs.len() < streamed.len(),
         "the plant leaves at least one range un-installed: {:?}",
         read.installs
     );
@@ -258,16 +261,16 @@ fn an_answer_that_is_evidence_of_the_install_is_not_the_same_as_any_answer() {
          why the mark is the wrong key: {read:?}"
     );
     assert!(
-        read.answered_after_the_install.len() < every.len(),
+        read.answered_after_the_install.len() < streamed.len(),
         "and keyed on its own install the set follows the installs: {:?} against {:?}",
         read.answered_after_the_install,
         read.installs
     );
     println!(
-        "reseed shape: on a run with {} of {} ranges installed, answers after the mark \
-         {:?}, answers after the install {:?}",
+        "reseed shape: on a run with {} of {} streamed ranges installed, answers after \
+         the mark {:?}, answers after the install {:?}",
         read.installs.len(),
-        every.len(),
+        streamed.len(),
         read.answered_after_the_mark,
         read.answered_after_the_install
     );

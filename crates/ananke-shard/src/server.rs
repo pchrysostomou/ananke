@@ -1,5 +1,5 @@
-//! The node as a running server: four ranges on one node, fixed at bootstrap from
-//! configuration (SHARD.md §2, §4; §12's Stage B).
+//! The node as a running server: the ranges of one node, fixed at bootstrap from
+//! configuration (SHARD.md §2, §4; §12's Stage B and Stage C's bootstrap).
 //!
 //! [`mod@node`](crate::node) is the node's *schedule* — one ticker, every core, Q41's
 //! round — over a [`Host`] it drives. This module is that host: one engine, one
@@ -8,12 +8,20 @@
 //!
 //! What configuration names is §2 generalised. A server's configuration today names
 //! "the voters a fresh store starts with" (`initial_voters`); a node's names *the
-//! ranges it hosts* and the voters each starts with, and a fresh replica of each is
-//! created at the node's first start and traced `RangeCreated { cause: bootstrap }`
-//! (§8). Nothing here changes a descriptor and nothing routes: the span a range holds
-//! is configuration's, carried so the creation can be traced with it, and no code
-//! reads it to decide anything. A client takes its key's range from the scenario's
-//! fixed map and puts it on every message ([`mod@client`](crate::client)).
+//! ranges it hosts* and **the bootstrap nodes** ([`ServerConfig::bootstrap`]): range
+//! 0's replicas, the voters every range fixed at bootstrap starts with, and where the
+//! root and the meta range live for good (§2; Q7, Q9). A bootstrap node whose store
+//! holds no digest writes the initial state — every hosted range's Raft state and
+//! descriptor, range 0's meta descriptor, counter, node records and digest, range 1's
+//! record per user range — in one synced batch before its tasks run
+//! ([`initial_state`]), hosts ranges 0 and 1 beside the configured user ranges, and
+//! traces `RangeCreated { cause: bootstrap }` for each replica and `MetaApplied {
+//! index: 0 }` once (§8). A node not named starts, until this stage's placeholders
+//! (§5, Q22), with the configured user ranges as replicas of an empty configuration,
+//! which is how D-076 started a joining server. Nothing here yet changes a descriptor
+//! after its first and nothing routes: a client takes its key's range from the
+//! scenario's fixed map and puts it on every message ([`mod@client`](crate::client)).
+//! PROPOSED(D-096).
 //!
 //! Each core is seeded from `n{id}/r{range}/protocol` (Q13, D-057): two ranges on one
 //! node draw different election timeouts, which is what keeps four ranges from
@@ -31,11 +39,12 @@
 use std::collections::BTreeMap;
 use std::io;
 use std::net::SocketAddr;
+use std::ops::Range as KeyRange;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use ananke_env::{ApplyEffect, FileSystem, RangeCause, RecoveredAs};
+use ananke_env::{ApplyEffect, FileSystem, MetaDescriptor, RangeCause, RangeState, RecoveredAs};
 use ananke_env::{Clock, Decision, Environment, Network, Rng, Socket, TraceEvent};
 use ananke_raft::apply::{Command, Outcome, apply_command, user_key};
 use ananke_raft::client::{Reply, Request, Response};
@@ -45,14 +54,15 @@ use ananke_raft::queue::Queue;
 use ananke_raft::snapshot::Repair;
 use ananke_raft::store::{
     FIRST_INCARNATION, KeyPrefix, PURPOSE_CONFIG, PURPOSE_LOG, PURPOSE_META, RaftStore, Recovered,
-    SnapshotRecord, is_marked_lost, mark_store_lost,
+    SnapshotRecord, initial_state_into, is_marked_lost, mark_store_lost,
 };
 use ananke_raft::types::{Configuration, Entry, Index, Payload, ServerId, Term};
 use ananke_raft::{Input, Message, Persist, Raft};
-use ananke_storage::EngineConfig;
+use ananke_storage::{EngineConfig, WriteBatch};
 use bytes::Bytes;
 
 use crate::client::{RangedRequest, RangedResponse, is_ranged};
+use crate::descriptor::RangeDescriptor;
 use crate::frame::decode;
 use crate::inbox::{Inbox, Received};
 use crate::install::{self, SnapAnswer, SnapJob};
@@ -65,21 +75,69 @@ use crate::range::RangeId;
 use crate::reseed::{Candidate, generation_of, newest_not_lost, reseed_dir};
 use crate::round::Cores;
 use crate::snapshot::{self, Identity, Snapshots};
+use crate::system::{self, FIRST_USER_RANGE, META_RANGE, MetaRecord, ROOT_RANGE};
 use crate::variant::{NodeVariant, NodeVariants};
 
-/// One range as configuration fixes it at bootstrap (SHARD.md §2).
+/// One range as configuration fixes it at bootstrap (SHARD.md §2): a user range,
+/// whose bounds are user keys, or one of the two system ranges, whose bounds are
+/// their own ([`Range::root`], [`Range::meta`]).
 ///
-/// The span is carried so the replica's `RangeCreated` can name it (§8's table). It
-/// is not a descriptor: nothing on the node reads it, no apply changes it, and no
-/// message is routed by it. Stage C gives ranges real descriptors in range 1.
+/// The span is what the replica's descriptor and its `RangeCreated` carry (§1, §8),
+/// encoded by [`Range::span`]. Until Stage C's routing slice nothing on the node
+/// reads a descriptor to decide anything: a client takes its key's range from the
+/// scenario's fixed map and puts it on every message.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Range {
     /// The range's id.
     pub id: RangeId,
-    /// The span's first key.
+    /// The span's first key: a user key for a user range.
     pub start: Bytes,
-    /// The key past the span's last.
+    /// The key past the span's last: a user key for a user range.
     pub end: Bytes,
+}
+
+impl Range {
+    /// Range 0, the root, over the system tenant's root table (SHARD.md §1, §2).
+    // PROPOSED(D-096)
+    #[must_use]
+    pub fn root() -> Self {
+        let span = system::root_span();
+        Self {
+            id: ROOT_RANGE,
+            start: span.start,
+            end: span.end,
+        }
+    }
+
+    /// Range 1, the meta range, over the system tenant's meta table.
+    // PROPOSED(D-096)
+    #[must_use]
+    pub fn meta() -> Self {
+        let span = system::meta_span();
+        Self {
+            id: META_RANGE,
+            start: span.start,
+            end: span.end,
+        }
+    }
+
+    /// Whether this is one of the two system ranges, whose bounds are encoded already.
+    #[must_use]
+    pub fn is_system(&self) -> bool {
+        self.id.get() < FIRST_USER_RANGE
+    }
+
+    /// The span over the engine's key order (SHARD.md §1): the system ranges' bounds
+    /// as they are, a user range's under the user tenant.
+    // PROPOSED(D-096): every span the node names is an interval of encoded keys.
+    #[must_use]
+    pub fn span(&self) -> KeyRange<Bytes> {
+        if self.is_system() {
+            self.start.clone()..self.end.clone()
+        } else {
+            user_key(&self.start)..user_key(&self.end)
+        }
+    }
 }
 
 /// How a node is configured (SHARD.md §2): its id, its address, the address book,
@@ -95,10 +153,15 @@ pub struct ServerConfig {
     /// The ranges this node hosts, fixed at bootstrap. Four per node in Stage B's
     /// scenarios, which is the plan's parameter and not a measurement.
     pub ranges: Vec<Range>,
-    /// The voters a fresh replica of each range starts with (§2: `initial_voters`
-    /// generalised). A replica whose store already holds a configuration uses that
-    /// one instead, as a server does today (D-029).
-    pub initial_voters: Vec<ServerId>,
+    /// Range 0's replicas, the bootstrap nodes (SHARD.md §2; Q7, Q9): the voters every
+    /// range fixed at bootstrap starts with, and where ranges 0 and 1 live for good. A
+    /// node whose id is among them is a bootstrap node: fresh, it writes the initial
+    /// state. Any other node starts with no range of its own and, until Stage C's
+    /// placeholders (§5, Q22), with the configured user ranges as replicas of an empty
+    /// configuration, as Stage B started a joining server. A replica whose store
+    /// already holds a configuration uses that one instead (D-029).
+    // PROPOSED(D-096): the bootstrap nodes named in configuration.
+    pub bootstrap: Vec<ServerId>,
     /// The cores' parameters.
     pub raft: RaftConfig,
     /// The engine's; one engine for the whole node (Q2).
@@ -116,6 +179,85 @@ pub struct ServerConfig {
     pub snapshot_cap: usize,
     /// The node's known-buggy variants (the round's and the wire's).
     pub node: NodeVariants,
+}
+
+/// The initial state a fresh bootstrap node writes (SHARD.md §2), computed from
+/// configuration alone, as one batch, and the descriptors range 1's first record
+/// names for the trace: for every hosted range its configuration at index 0 and its
+/// first incarnation ([`initial_state_into`]) and its descriptor at generation 1
+/// with the bootstrap nodes as voters (§1); in range 0's state the meta range's
+/// descriptor, the range-id counter one past the highest hosted id with no block
+/// leased (§5, Q17), one node record per bootstrap node (Q8) and the digest of the
+/// bootstrap configuration (Q7); in range 1's state a record per user range, keyed by
+/// end key (§1, Q4). Every bootstrap node computes the same bytes from the same
+/// configuration, which is what check 7 reads off their creations.
+// PROPOSED(D-096)
+#[must_use]
+pub fn initial_state(
+    bootstrap: &[ServerId],
+    servers: &[(ServerId, SocketAddr)],
+    hosted: &[Range],
+) -> (WriteBatch, Vec<MetaDescriptor>) {
+    let mut batch = WriteBatch::new();
+    let config = Configuration::of(bootstrap);
+    let mut meta_descriptors = Vec::new();
+    let mut counter = FIRST_USER_RANGE;
+    for range in hosted {
+        let prefix = KeyPrefix::group(range.id.get());
+        let span = range.span();
+        initial_state_into(&prefix, &config, &mut batch);
+        let descriptor = RangeDescriptor {
+            range: range.id,
+            start: span.start.clone(),
+            end: span.end.clone(),
+            generation: 1,
+            voters: bootstrap.to_vec(),
+            state: RangeState::Live,
+        };
+        batch.put(prefix.descriptor_key(), descriptor.encode());
+        if range.id == META_RANGE {
+            batch.put(system::meta_descriptor_key(), descriptor.encode());
+        }
+        if !range.is_system() {
+            counter = counter.max(range.id.get() + 1);
+            let record = MetaRecord {
+                start: span.start.clone(),
+                range: range.id,
+                generation: 1,
+                voters: bootstrap.to_vec(),
+            };
+            batch.put(system::meta_record_key(&span.end), record.encode());
+            meta_descriptors.push(MetaDescriptor {
+                range: range.id.get(),
+                start: span.start.clone(),
+                end: span.end.clone(),
+                generation: 1,
+                voters: bootstrap.iter().map(|voter| voter.0).collect(),
+                won: vec![(span.start, span.end)],
+            });
+        }
+    }
+    batch.put(system::counter_key(), system::encode_counter(counter));
+    for node in bootstrap {
+        if let Some((_, addr)) = servers.iter().find(|(id, _)| id == node) {
+            batch.put(
+                system::node_key(*node),
+                Bytes::from(addr.to_string().into_bytes()),
+            );
+        }
+    }
+    let spans: Vec<(RangeId, Bytes, Bytes)> = hosted
+        .iter()
+        .map(|range| {
+            let span = range.span();
+            (range.id, span.start, span.end)
+        })
+        .collect();
+    batch.put(
+        system::digest_key(),
+        system::encode_digest(system::digest(bootstrap, servers, &spans)),
+    );
+    (batch, meta_descriptors)
 }
 
 /// What the node was asked for, counted so a scenario can say whether a path was
@@ -341,7 +483,9 @@ pub struct ServerHost<E: Environment> {
     /// Every range this node hosts, with the ranges configuration fixed at bootstrap:
     /// what a replaced replica is rebuilt against, and what the initial voters are.
     ranges: Vec<Range>,
-    initial_voters: Vec<ServerId>,
+    /// The voters this node's fresh replicas start with: the bootstrap nodes on a
+    /// bootstrap node, nobody elsewhere (SHARD.md §2).
+    initial: Vec<ServerId>,
     raft: RaftConfig,
     variants: ananke_raft::core::Variants,
     /// The node's own variants, for the paths a core knows nothing about.
@@ -511,7 +655,7 @@ impl<E: Environment> ServerHost<E> {
         let seed = self.env.range_rng(range.get()).next_u64();
         let restored = Raft::restore_compacted(
             self.id,
-            Configuration::of(&self.initial_voters),
+            Configuration::of(&self.initial),
             RaftConfig {
                 range: range.get(),
                 ..self.raft.clone()
@@ -1192,7 +1336,7 @@ impl<E: Environment> ServerApplier<E> {
         let Some(span) = self.ranges.iter().find(|one| one.id == range) else {
             return;
         };
-        let user_span = user_key(&span.start)..user_key(&span.end);
+        let user_span = span.span();
         let version = store.engine().snapshot();
         let Ok(user) = store
             .engine()
@@ -1257,10 +1401,7 @@ impl<E: Environment> ServerApplier<E> {
             // one-group take does. The install then puts the *leader's* log keys into
             // the receiver's store, and the node's repair tombstones none of them
             // because it is built on the promise that none were sent (D-083).
-            return Some(vec![
-                prefix.span(),
-                user_key(&span.start)..user_key(&span.end),
-            ]);
+            return Some(vec![prefix.span(), span.span()]);
         }
         if self
             .node_variants
@@ -1277,7 +1418,7 @@ impl<E: Environment> ServerApplier<E> {
         Some(vec![
             prefix.purpose_span(PURPOSE_META),
             prefix.key(PURPOSE_CONFIG, &[])..prefix.span().end,
-            user_key(&span.start)..user_key(&span.end),
+            span.span(),
         ])
     }
 }
@@ -1415,7 +1556,7 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
         listen,
         servers,
         ranges,
-        initial_voters,
+        bootstrap,
         raft,
         engine,
         inbox_bytes,
@@ -1424,6 +1565,35 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
     } = config;
     let server = id.0;
     let variants = raft.variants;
+    // SHARD.md §2: a node whose id is among range 0's replicas is a bootstrap node. It
+    // hosts ranges 0 and 1 beside the user ranges configuration fixes, and every one
+    // of its fresh replicas starts with the bootstrap nodes as voters. Any other node
+    // hosts the configured user ranges as replicas of an empty configuration, as
+    // Stage B started a joining server, until Stage C's placeholders (§5, Q22).
+    // PROPOSED(D-096): the bootstrap nodes host the system ranges.
+    let named = bootstrap.contains(&id);
+    // `AnyFreshNodeBootstraps`: a node not named takes a fresh store for a bootstrap
+    // anyway, with the address book for the voters it was not given (PROPOSED D-096).
+    let pretends = !named && node_variants.contains(NodeVariant::AnyFreshNodeBootstraps);
+    let is_bootstrap = named || pretends;
+    let bootstrap: Vec<ServerId> = if pretends {
+        servers.iter().map(|(server, _)| *server).collect()
+    } else {
+        bootstrap
+    };
+    let initial: Vec<ServerId> = if is_bootstrap {
+        bootstrap.clone()
+    } else {
+        Vec::new()
+    };
+    let hosted: Vec<Range> = if is_bootstrap {
+        [Range::root(), Range::meta()]
+            .into_iter()
+            .chain(ranges.iter().cloned())
+            .collect()
+    } else {
+        ranges.clone()
+    };
     // The store's recovery must never hand back a state with a hole (RAFT.md §3).
     let engine = EngineConfig {
         allow_manifest_fallback: false,
@@ -1534,7 +1704,7 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
             .map_or_else(|| base_dir.clone(), |candidate| candidate.path.clone()),
         ..engine
     };
-    let first = ranges
+    let first = hosted
         .first()
         .ok_or_else(|| io::Error::other("a node hosts at least one range"))?;
     let started = start_store(
@@ -1546,6 +1716,9 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
         StartOrder::Correct,
     )
     .await;
+    // Whether this start re-seeded (below), which a bootstrap must never follow: a
+    // re-seed's directory holds no digest and is not a fresh store (PROPOSED D-096).
+    let mut reseeded_now = false;
     let opened: Vec<(Range, Arc<RaftStore<E>>, Recovered)> = match started {
         Start::Failed(error) => {
             env.trace(TraceEvent::RaftServerFailed {
@@ -1555,6 +1728,7 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
             return Err(error);
         }
         Start::Refused(error) => {
+            reseeded_now = true;
             // Q15: a loss in the *shared* engine refuses the whole node. The node
             // re-seeds into a fresh engine in a new directory beside the refused one,
             // which stays marked lost and quiesced (§11, storage 8; D-041).
@@ -1564,7 +1738,7 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
                 &base_dir,
                 &engine,
                 &present,
-                &ranges,
+                &hosted,
                 variants,
                 node_variants,
                 &error,
@@ -1575,7 +1749,7 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
             store, recovered, ..
         } => {
             let mut opened = vec![(first.clone(), Arc::new(store), recovered)];
-            for range in ranges.iter().skip(1) {
+            for range in hosted.iter().skip(1) {
                 let (store, recovered) = opened[0]
                     .1
                     .open_sibling(KeyPrefix::group(range.id.get()))
@@ -1585,6 +1759,35 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
             opened
         }
     };
+
+    // §2: a fresh bootstrap node writes the initial state, computed from configuration
+    // alone, in one synced batch before its tasks run, and its meta replica traces
+    // range 1's first record at index 0 (§8). The digest of the bootstrap
+    // configuration is what says it was written: a store that holds it was
+    // bootstrapped, so a restart writes nothing and creates no replica anew. A
+    // bootstrap node whose disk was replaced looks fresh and writes it again, which is
+    // issue #43 (Q7) and is not told apart here. A directory a re-seed built is not a
+    // fresh store, whether this start built it or an earlier one did (D-066 opens the
+    // newest not marked lost): its replicas are refused and marked, waiting for their
+    // streams, which carry every range's state back, range 0's digest included, and a
+    // bootstrap written over them would give each replica the first incarnation
+    // again and a leader nothing to forget by (D-042).
+    // PROPOSED(D-096): the initial state, one batch, before the tasks, in the
+    // configured directory alone.
+    let engine_of_node = opened[0].1.engine().clone();
+    let bootstrapped_now = is_bootstrap
+        && !reseeded_now
+        && engine.dir == base_dir
+        && engine_of_node.get(&system::digest_key()).await?.is_none();
+    if bootstrapped_now {
+        let (batch, descriptors) = initial_state(&bootstrap, &servers, &hosted);
+        engine_of_node.write(batch, true).await?;
+        env.trace(TraceEvent::MetaApplied {
+            index: 0,
+            descriptors,
+        });
+    }
+    let bootstrapped_before = is_bootstrap && !bootstrapped_now;
 
     let mut stores: BTreeMap<RangeId, Arc<RaftStore<E>>> = BTreeMap::new();
     let mut cores = Cores::new(node_variants);
@@ -1616,7 +1819,8 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
         let recovered_quarantined = recovered.quarantined;
         // A re-seeded replica is not fresh: its `RangeCreated` is the install's, with
         // `cause: snapshot`, and not a bootstrap's (§8; Q15).
-        let fresh = recovered.log.is_empty()
+        let fresh = !bootstrapped_before
+            && recovered.log.is_empty()
             && snapshot_record.is_none()
             && store.applied() == 0
             && store.term() == 0
@@ -1630,7 +1834,7 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
         };
         let mut core = Raft::restore_compacted(
             id,
-            Configuration::of(&initial_voters),
+            Configuration::of(&initial),
             core_config,
             seed,
             store.term(),
@@ -1655,14 +1859,15 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
             // §2 generalised: the ranges configuration fixes, created at the node's
             // first start, each traced with the span, generation and voters
             // configuration gave it (§8). Nothing routes by any of it.
+            let span = range.span();
             env.trace(TraceEvent::RangeCreated {
                 range: id_of.get(),
                 cause: RangeCause::Bootstrap,
                 parent: None,
-                start: range.start.clone(),
-                end: range.end.clone(),
+                start: span.start,
+                end: span.end,
                 generation: 1,
-                voters: initial_voters.iter().map(|voter| voter.0).collect(),
+                voters: initial.iter().map(|voter| voter.0).collect(),
                 floor_index: 0,
                 floor_term: 0,
                 incarnation: store.incarnation(),
@@ -1691,7 +1896,7 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
         answers: Queue::new(),
         snaps: snaps.clone(),
         ranges: ranges.clone(),
-        initial_voters: initial_voters.clone(),
+        initial: initial.clone(),
         raft: raft.clone(),
         variants,
         node: node_variants,
@@ -1718,7 +1923,7 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
             replicas,
             local: local.clone(),
             snaps: snaps.clone(),
-            ranges: ranges.clone(),
+            ranges: hosted.clone(),
             engine_dir: engine.dir.clone(),
             node_variants,
             cores: variants,
@@ -1741,13 +1946,10 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
         node_variants,
         variants,
     );
-    for range in &ranges {
+    for range in &hosted {
         plan.host(
             range.id,
-            vec![
-                KeyPrefix::group(range.id.get()).span(),
-                user_key(&range.start)..user_key(&range.end),
-            ],
+            vec![KeyPrefix::group(range.id.get()).span(), range.span()],
         );
     }
     env.spawn("snapshot", {

@@ -100,6 +100,13 @@ pub const PURPOSE_CONFIG: u64 = 2;
 /// snapshot's own identity, before the checkpoint's `CURRENT` (D-024).
 // PROPOSED(D-060)
 pub const PURPOSE_SNAPSHOT: u64 = 3;
+/// The purpose the range's descriptor lives under (SHARD.md §1, Q3, Q5): the
+/// range-local copy, the authority, written in the same batch as the apply that
+/// changes it. Its content is the range layer's (`ananke_shard::descriptor`); this
+/// crate names a group, never a range, and only keeps the key beside the group's
+/// other state so the whole of a replica is one key interval.
+// PROPOSED(D-096): the descriptor beside the replica's Raft state.
+pub const PURPOSE_DESCRIPTOR: u64 = 4;
 const NO_VOTE: u64 = u64::MAX;
 
 /// A key under `tenant` and `table`, SPEC §2.6's encoding.
@@ -206,6 +213,12 @@ impl KeyPrefix {
     /// The `prefix / 3 / snapshot` key (RAFT.md §3).
     pub(crate) fn snapshot_key(&self) -> Bytes {
         self.key(PURPOSE_SNAPSHOT, b"snapshot")
+    }
+
+    /// The key the range's descriptor lives under (SHARD.md §1; PROPOSED D-096).
+    #[must_use]
+    pub fn descriptor_key(&self) -> Bytes {
+        self.key(PURPOSE_DESCRIPTOR, b"descriptor")
     }
 
     /// The re-seed quarantine flag: present on a store rebuilt from a snapshot
@@ -1339,6 +1352,21 @@ pub(crate) fn encode_entry(entry: &Entry) -> Bytes {
     out.put_u64_le(entry.term);
     put_payload(&mut out, &entry.payload);
     out.freeze()
+}
+
+/// The Raft state a fresh replica is bootstrapped with, put into `batch` (SHARD.md §2):
+/// its configuration at index 0 and its first incarnation. A hard state of term 0
+/// and no vote and an applied index of 0 are what an absent key reads as, so nothing
+/// is written for them. What the batch is synced with, and what else it carries, is
+/// the caller's; `open` reads a configuration at index 0 as the store's own with
+/// nothing in the log (D-029).
+// PROPOSED(D-096): a bootstrap node writes every range's initial state in one batch.
+pub fn initial_state_into(prefix: &KeyPrefix, config: &Configuration, batch: &mut WriteBatch) {
+    batch.put(prefix.config_key(), encode_config(0, config));
+    batch.put(
+        prefix.incarnation_key(),
+        encode_incarnation(FIRST_INCARNATION),
+    );
 }
 
 pub(crate) fn encode_config(index: Index, config: &Configuration) -> Bytes {

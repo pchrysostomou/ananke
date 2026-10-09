@@ -64,7 +64,6 @@ use ananke_env::{
     Clock, Either, Environment, File, FileSystem, MAX_FRAME_LEN, Network, OpenOptions, Socket,
     StartOver, TraceEvent, race,
 };
-use ananke_raft::apply::user_key;
 use ananke_raft::core::{RaftConfig, SnapshotAction};
 use ananke_raft::message::{Frame, Message, SnapshotStatus};
 use ananke_raft::queue::Queue;
@@ -1329,7 +1328,7 @@ impl<E: Environment> Task<E> {
         self.ranges
             .iter()
             .find(|one| one.id == range)
-            .map(|one| user_key(&one.start)..user_key(&one.end))
+            .map(Range::span)
     }
 
     /// Tells a sender to start its stream over, and traces **why** (RAFT.md:203-212).

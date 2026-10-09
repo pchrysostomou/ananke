@@ -516,7 +516,7 @@ pub fn server_config(id: u64, variants: impl Into<Variants>, node: NodeVariants)
         listen: server_addr(id),
         servers: (1..=NODES).map(|s| (ServerId(s), server_addr(s))).collect(),
         ranges: crate::ranges::ranges(),
-        initial_voters: (1..=NODES).map(ServerId).collect(),
+        bootstrap: (1..=NODES).map(ServerId).collect(),
         raft: RaftConfig {
             variants: variants.into(),
             tick_nanos: u64::try_from(TICK.as_nanos()).expect("small"),

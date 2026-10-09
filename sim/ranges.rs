@@ -1,14 +1,17 @@
-//! The node scenario (SHARD.md §2, §4 and §12's Stage B): three nodes, **four
-//! ranges on every node**, each range placed as today's one group is.
+//! The node scenario (SHARD.md §2, §4 and §12's Stage B): three nodes, **four user
+//! ranges on every node**, each range placed as today's one group is, and — since
+//! PROPOSED D-096 — the root and the meta range every bootstrap node hosts, so each
+//! node runs six replicas and the three are the bootstrap nodes.
 //!
 //! Every other scenario in this directory runs `ananke_raft::run`, one server that is
 //! one Raft group. This one runs [`ananke_shard::server::run`]: one socket, one
 //! engine, one inbox, one `raft` task on one ticker and one `apply` task, with a
 //! store and a core per range. The ranges are fixed at bootstrap from configuration,
-//! as §2 generalises `initial_voters`, and each replica is traced
-//! `RangeCreated { cause: bootstrap }`. Nothing changes a descriptor and nothing
-//! routes: a client takes its key's range from [`range_of_key`], the fixed map below,
-//! and puts it on every message.
+//! as §2 generalises `initial_voters`: the three nodes are named as the bootstrap
+//! nodes, each writes the initial state in one batch at its first start, and each
+//! replica is traced `RangeCreated { cause: bootstrap }`. Nothing changes a
+//! descriptor after its first and nothing routes: a client takes its key's range from
+//! [`range_of_key`], the fixed map below, and puts it on every message.
 //!
 //! **Why four.** Four is the plan's parameter and not a measurement (SHARD.md §12):
 //! enough that a frame between two nodes carries messages of several ranges each way,
@@ -61,10 +64,19 @@ use bytes::Bytes;
 pub const NODES: u64 = 3;
 /// The ranges on every node: the plan's parameter (SHARD.md §12).
 pub const RANGES: u64 = 4;
-/// The first range's id. SHARD.md §2 keeps range 0 for the root span and range 1 for
-/// the meta span, so the keyspace starts at 2 — which is the one group a server runs
-/// today (`SINGLE_GROUP`).
+/// The first user range's id. SHARD.md §2 keeps range 0 for the root span and range 1
+/// for the meta span, so the keyspace starts at 2 — which is the one group a server
+/// runs today (`SINGLE_GROUP`).
 pub const FIRST_RANGE: u64 = 2;
+/// Range 0, the root, which every bootstrap node hosts (SHARD.md §1, §2).
+// PROPOSED(D-096)
+pub const ROOT_RANGE: u64 = 0;
+/// Range 1, the meta range, which every bootstrap node hosts (SHARD.md §1, §2).
+// PROPOSED(D-096)
+pub const META_RANGE: u64 = 1;
+/// The ranges a bootstrap node hosts: the two system ranges and [`RANGES`] user ranges.
+// PROPOSED(D-096)
+pub const HOSTED: u64 = RANGES + 2;
 /// The keys the clients draw from: two per range, so a range's liveness is about a
 /// key some client wrote to and not about the one key the cluster has.
 pub const KEYS: u64 = 8;
@@ -279,8 +291,9 @@ impl Report {
         self.checked.ranges()
     }
 
-    /// How many replicas were created at bootstrap: three nodes times four ranges on
-    /// a run where no node's store was replaced.
+    /// How many replicas were created at bootstrap: three nodes times six ranges — the
+    /// two system ranges and the four user ranges — on a run where no node's store
+    /// was replaced (PROPOSED D-096).
     #[must_use]
     pub fn bootstrap_creations(&self) -> usize {
         self.records()
@@ -558,9 +571,21 @@ impl Report {
     /// The first replica whose creation disagrees with another's, or is a second one.
     // PROPOSED(D-076): check 7's first step, for the creations this slice emits.
     pub fn creations_agree(&self) -> Result<(), String> {
+        creations_agree_of(self.records())
+    }
+}
+
+/// Check 7's first step over any run's records (PROPOSED D-076, D-096): every replica
+/// of a range was created once, at bootstrap, and with one descriptor.
+///
+/// # Errors
+///
+/// The first creation that was a second one, was not a bootstrap's, or disagreed.
+pub fn creations_agree_of(records: &[TraceRecord]) -> Result<(), String> {
+    {
         let mut first: BTreeMap<u64, Descriptor> = BTreeMap::new();
         let mut seen: BTreeSet<(u64, u64)> = BTreeSet::new();
-        for record in self.records() {
+        for record in records {
             let TraceEvent::RangeCreated { range, cause, .. } = &record.event else {
                 continue;
             };
@@ -576,7 +601,7 @@ impl Report {
                      {cause:?}, and this scenario bootstraps every replica"
                 ));
             }
-            let Some(descriptor) = Self::descriptor_of(&record.event) else {
+            let Some(descriptor) = Report::descriptor_of(&record.event) else {
                 continue;
             };
             match first.get(range) {
@@ -594,7 +619,9 @@ impl Report {
         }
         Ok(())
     }
+}
 
+impl Report {
     /// The run's verdict: every check of §8 that D-071 keyed by range, and this
     /// scenario's own two absences.
     ///
@@ -637,11 +664,11 @@ impl Report {
         // Every node hosts every range from its first start: four creations a node,
         // and every range led at some point, or the run put no work through it.
         let created = self.bootstrap_creations();
-        let wanted = usize::try_from(NODES * RANGES).expect("small");
+        let wanted = usize::try_from(NODES * HOSTED).expect("small");
         if created != wanted {
             return Err(format!(
                 "seed {seed}: {created} bootstrap creations, not the {wanted} of \
-                 {NODES} nodes times {RANGES} ranges"
+                 {NODES} nodes times {HOSTED} ranges, the two system ranges included"
             ));
         }
         Ok(())
@@ -694,7 +721,7 @@ pub fn server_config_of(
         listen: server_addr(id),
         servers: (1..=NODES).map(|s| (ServerId(s), server_addr(s))).collect(),
         ranges,
-        initial_voters: (1..=NODES).map(ServerId).collect(),
+        bootstrap: (1..=NODES).map(ServerId).collect(),
         raft: RaftConfig {
             variants: variants.into(),
             tick_nanos: u64::try_from(TICK.as_nanos()).expect("small"),
@@ -1431,7 +1458,10 @@ pub fn run_with_of(
         isolations,
         history,
         clients: clients_total,
-        ranges: (FIRST_RANGE..FIRST_RANGE + RANGES).collect(),
+        ranges: [ROOT_RANGE, META_RANGE]
+            .into_iter()
+            .chain(FIRST_RANGE..FIRST_RANGE + RANGES)
+            .collect(),
         key_range: range_of_key,
         stopped,
     });
