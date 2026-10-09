@@ -398,6 +398,26 @@ pub enum NodeVariant {
     /// configuration named one, and check 7 reads the disagreement off the replicas'
     /// creations (SHARD.md §2, §8; PROPOSED D-096).
     AnyFreshNodeBootstraps,
+    /// A server takes the range a request names as proof that the key is in it: it
+    /// checks the key against its own descriptor neither at receipt nor at a read's
+    /// serving, and keeps the apply check (SHARD.md §3, §10; Q38). This is the owner's
+    /// "client that trusts a stale descriptor", placed where trust can do harm: a
+    /// client's cache is advisory by design and a stale one costs a round trip unless
+    /// a server honours it. Check 9 catches the first read served for a key outside
+    /// the serving range's span; the writes it proposes the apply check refuses.
+    // PROPOSED(D-097)
+    TrustStaleDescriptor,
+    /// The apply check skipped: a command applies whatever its key, where §3's check
+    /// is what makes a split take effect for proposals in flight and a
+    /// `RangeMismatch` at apply definite. Check 9 catches the first applied write
+    /// outside the span, check 10 a write by the wrong owner (SHARD.md §10).
+    // PROPOSED(D-097)
+    ApplyIgnoresSpan,
+    /// The sweep's client resends to the range and generation it had, merging nothing
+    /// of what a `RangeMismatch` carried (SHARD.md §3, §10; Q38). Check 17 catches
+    /// the first resend, and the liveness bound a client that never converges.
+    // PROPOSED(D-097)
+    ClientIgnoresMismatch,
 }
 
 impl NodeVariant {
@@ -452,6 +472,9 @@ impl NodeVariant {
         NodeVariant::OneSeedForEveryCore,
         NodeVariant::ApplyWaitsForEveryRange,
         NodeVariant::AnyFreshNodeBootstraps,
+        NodeVariant::TrustStaleDescriptor,
+        NodeVariant::ApplyIgnoresSpan,
+        NodeVariant::ClientIgnoresMismatch,
     ];
 
     /// Q15's whole-node refusal and re-seed, in order: the six ways to get a node's
@@ -630,6 +653,10 @@ impl NodeVariant {
             NodeVariant::ApplyWaitsForEveryRange => 1 << 47,
             // PROPOSED(D-096): a fresh store taken for a bootstrap. Fifteen bits are left.
             NodeVariant::AnyFreshNodeBootstraps => 1 << 48,
+            // PROPOSED(D-097): §10's three routing variants. Twelve bits are left.
+            NodeVariant::TrustStaleDescriptor => 1 << 49,
+            NodeVariant::ApplyIgnoresSpan => 1 << 50,
+            NodeVariant::ClientIgnoresMismatch => 1 << 51,
         }
     }
 
@@ -686,6 +713,9 @@ impl NodeVariant {
             NodeVariant::OneSeedForEveryCore => "OneSeedForEveryCore",
             NodeVariant::ApplyWaitsForEveryRange => "ApplyWaitsForEveryRange",
             NodeVariant::AnyFreshNodeBootstraps => "AnyFreshNodeBootstraps",
+            NodeVariant::TrustStaleDescriptor => "TrustStaleDescriptor",
+            NodeVariant::ApplyIgnoresSpan => "ApplyIgnoresSpan",
+            NodeVariant::ClientIgnoresMismatch => "ClientIgnoresMismatch",
         }
     }
 }
@@ -777,7 +807,7 @@ mod tests {
         // snapshot wiring, D-081's three for the directed re-seed shape, D-090's two for a
         // stream's bounds, D-076's review's two, D-095's one for the `apply` task that
         // waits for every range, and D-096's one for a fresh store taken for a bootstrap.
-        assert_eq!(NodeVariant::BUGS.len(), 49);
+        assert_eq!(NodeVariant::BUGS.len(), 52);
         for variant in NodeVariant::SNAPSHOT
             .iter()
             .chain(NodeVariant::WIRING)

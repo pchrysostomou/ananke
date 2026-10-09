@@ -187,6 +187,7 @@ pub fn encode_counter(next: u64) -> Bytes {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::descriptor::FIRST_GENERATION;
 
     #[test]
     fn the_system_spans_are_the_two_tables_of_tenant_one_in_order() {
@@ -211,7 +212,7 @@ mod tests {
         let record = MetaRecord {
             start: Bytes::from_static(b"\x00\x00\x00\x00\x00\x00\x00\x02k0"),
             range: RangeId(2),
-            generation: 1,
+            generation: FIRST_GENERATION,
             voters: vec![ServerId(1), ServerId(2), ServerId(3)],
         };
         assert_eq!(MetaRecord::decode(record.encode()).unwrap(), record);

@@ -137,6 +137,10 @@ fn three_servers_elect_a_leader_and_a_clients_write_is_applied_on_every_server()
                             replies.push(outcome);
                             break;
                         }
+                        // A one-group server never answers this (SHARD.md §3).
+                        Reply::RangeMismatch { .. } => {
+                            panic!("a one-group server answered RangeMismatch")
+                        }
                     }
                 }
             }

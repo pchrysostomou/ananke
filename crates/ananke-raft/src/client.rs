@@ -9,14 +9,19 @@
 //! number identify the operation, so a late or duplicated response for an earlier
 //! operation is recognised and ignored.
 //!
-//! A server answers a request in one of three ways: with the command's outcome once
+//! A server answers a request in one of four ways: with the command's outcome once
 //! the entry it became is applied; with [`Reply::NotLeader`] at once when it is not
-//! the leader; or never, when the entry it proposed did not commit under its
-//! leadership and no leader after it carried the entry to commit. The client that
-//! hears nothing does not resend a write: the entry may yet commit, and a second copy
-//! would be a second write. It abandons the operation as pending (RAFT.md §4) and
-//! continues as a new process. Exactly-once retries need client sessions (thesis
-//! §6.3), which are deferred (issue #21).
+//! the leader; with [`Reply::RangeMismatch`] when the key is not the named range's to
+//! serve, at receipt, at a read's serving or at apply (SHARD.md §3), carrying the
+//! descriptors the node holds for the key as bytes this crate does not read — a range
+//! is the range layer's to name (SHARD.md, Q40), and a one-group server never answers
+//! this; or never, when the entry it proposed did not commit under its leadership and
+//! no leader after it carried the entry to commit. The client that hears nothing does
+//! not resend a write: the entry may yet commit, and a second copy would be a second
+//! write. It abandons the operation as pending (RAFT.md §4) and continues as a new
+//! process. Exactly-once retries need client sessions (thesis §6.3), which are
+//! deferred (issue #21). A write answered `RangeMismatch` did not take effect, and is
+//! sent again under a fresh sequence number (SHARD.md §3, Q10).
 
 use std::io;
 
@@ -55,6 +60,15 @@ pub enum Reply {
     NotLeader {
         /// The leader, if known.
         leader: Option<ServerId>,
+    },
+    /// The key is not the named range's to serve here (SHARD.md §3): refused at
+    /// receipt, at a read's serving or at apply, and never taken effect.
+    // PROPOSED(D-097): `RangeMismatch` beside `NotLeader` (SHARD.md §11, raft 5).
+    RangeMismatch {
+        /// The descriptors the node holds whose span contains the key, each encoded
+        /// by the range layer (`ananke_shard::descriptor::RangeDescriptor`); empty
+        /// when it holds none, which tells the client to look the key up again.
+        descriptors: Vec<Bytes>,
     },
 }
 
@@ -157,6 +171,13 @@ impl Response {
                 out.put_u8(3);
                 out.put_u64_le(leader.map_or(u64::MAX, |l| l.0));
             }
+            Reply::RangeMismatch { descriptors } => {
+                out.put_u8(4);
+                out.put_u16_le(u16::try_from(descriptors.len()).expect("descriptors fit u16"));
+                for descriptor in descriptors {
+                    put_bytes(&mut out, descriptor);
+                }
+            }
         }
         out.freeze()
     }
@@ -199,6 +220,17 @@ impl Response {
                     id => Some(ServerId(id)),
                 };
                 Reply::NotLeader { leader }
+            }
+            4 => {
+                if bytes.len() < 2 {
+                    return Err(bad("client packet torn"));
+                }
+                let count = bytes.get_u16_le();
+                let mut descriptors = Vec::with_capacity(usize::from(count));
+                for _ in 0..count {
+                    descriptors.push(get_bytes(&mut bytes)?);
+                }
+                Reply::RangeMismatch { descriptors }
             }
             _ => return Err(bad("client packet malformed")),
         };
@@ -286,6 +318,10 @@ pub fn studio(payload: &[u8]) -> Option<Json> {
                 fields.push(("reply", Json::str("not-leader")));
                 fields.push(("leader", leader.map_or(Json::Null, |l| int(l.0))));
             }
+            Reply::RangeMismatch { descriptors } => {
+                fields.push(("reply", Json::str("range-mismatch")));
+                fields.push(("descriptors", int(descriptors.len() as u64)));
+            }
         }
         Json::obj(fields)
     })
@@ -320,6 +356,12 @@ mod tests {
             Reply::NotLeader { leader: None },
             Reply::NotLeader {
                 leader: Some(ServerId(3)),
+            },
+            Reply::RangeMismatch {
+                descriptors: Vec::new(),
+            },
+            Reply::RangeMismatch {
+                descriptors: vec![Bytes::from_static(b"d1"), Bytes::from_static(b"")],
             },
         ];
         for reply in replies {

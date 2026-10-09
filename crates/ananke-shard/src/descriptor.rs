@@ -18,6 +18,11 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 use crate::range::RangeId;
 
+/// The generation a bootstrap writes every range at (SHARD.md §2): the first, which
+/// every split, merge and configuration change of the range then raises (§1, Q6).
+// PROPOSED(D-097)
+pub const FIRST_GENERATION: u64 = 1;
+
 /// The key past every key: one tenant past the last, which no encoded key reaches.
 /// The last range's end (SHARD.md §1).
 #[must_use]

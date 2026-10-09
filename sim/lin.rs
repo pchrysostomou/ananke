@@ -20,6 +20,30 @@
 //! independent registers and a key's register is one register whichever range
 //! served it, so a split, a merge or a move changes no partition (SHARD.md §9).
 //!
+//! Two more things the closure reads, since routing (SHARD.md §3, §9; PROPOSED
+//! D-097). An operation's proposals are gathered by `invoked`: a write refused with
+//! `RangeMismatch` is sent again under a fresh sequence number, each `ClientSend`
+//! names the `seq` of its operation's `ClientInvoke`, and a `RaftProposed` under a
+//! resend's `seq` joins the proposals of the operation that `seq`'s `ClientSend`
+//! names — a send with no `ClientSend` is its own operation's, as every send was
+//! before. And only an apply whose effect is `applied` closes an operation: `applied`
+//! is any client command executed within its span, whatever it wrote, so a `Cas`
+//! whose compare failed still closes its operation; an operation whose every
+//! proposal applied to another effect did not take effect and leaves the history, as
+//! one never proposed does; one with a proposal never applied stays pending.
+//!
+//! Two more things the closure reads, since routing (SHARD.md §3, §9; PROPOSED
+//! D-097). An operation's proposals are gathered by `invoked`: a write refused with
+//! `RangeMismatch` is sent again under a fresh sequence number, each `ClientSend`
+//! names the `seq` of its operation's `ClientInvoke`, and a `RaftProposed` under a
+//! resend's `seq` joins the proposals of the operation that `seq`'s `ClientSend`
+//! names — a send with no `ClientSend` is its own operation's, as every send was
+//! before. And only an apply whose effect is `applied` closes an operation: `applied`
+//! is any client command executed within its span, whatever it wrote, so a `Cas`
+//! whose compare failed still closes its operation; an operation whose every
+//! proposal applied to another effect did not take effect and leaves the history, as
+//! one never proposed does; one with a proposal never applied stays pending.
+//!
 //! Single-key operations partition by key, since the store is a product of
 //! independent registers, so each key is searched on its own: a state is the set of
 //! operations linearized so far and the register's value, and a state seen once is
@@ -48,7 +72,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use ananke_env::sim::TraceRecord;
-use ananke_env::{ClientOp, ClientResult, Instant, TraceEvent};
+use ananke_env::{ApplyEffect, ClientOp, ClientResult, Instant, TraceEvent};
 use bytes::Bytes;
 
 /// One entry of one Raft group, as `(range, index, term)`: what a proposal names
@@ -100,8 +124,24 @@ impl History {
         // PROPOSED(D-071): the history's closure keyed by (range, index, term).
         let mut proposed: BTreeMap<(u64, u64), Vec<EntryId>> = BTreeMap::new();
         let mut applied_at: BTreeMap<EntryId, Instant> = BTreeMap::new();
+        // Each send's operation, by (client, seq): what a resend's proposals are
+        // gathered under (SHARD.md §9).
+        // PROPOSED(D-097)
+        let mut invoked_by: BTreeMap<(u64, u64), u64> = BTreeMap::new();
+        // Entries that applied to an effect other than `applied`: a proposal that did
+        // not take effect (SHARD.md §9).
+        // PROPOSED(D-097)
+        let mut applied_as_nothing: BTreeSet<EntryId> = BTreeSet::new();
         for record in records {
             match &record.event {
+                TraceEvent::ClientSend {
+                    client,
+                    seq,
+                    invoked,
+                    ..
+                } => {
+                    invoked_by.insert((*client, *seq), *invoked);
+                }
                 TraceEvent::ClientInvoke { client, seq, op } => {
                     open.insert((*client, *seq), ops.len());
                     ops.push(Op {
@@ -131,8 +171,9 @@ impl History {
                     term,
                     ..
                 } => {
+                    let invoked = invoked_by.get(&(*client, *seq)).copied().unwrap_or(*seq);
                     proposed
-                        .entry((*client, *seq))
+                        .entry((*client, invoked))
                         .or_default()
                         .push((*range, *index, *term));
                 }
@@ -140,11 +181,15 @@ impl History {
                     range,
                     index,
                     entry_term,
+                    effect,
                     ..
                 } => {
-                    applied_at
-                        .entry((*range, *index, *entry_term))
-                        .or_insert(record.at);
+                    let entry = (*range, *index, *entry_term);
+                    if *effect == ApplyEffect::Applied {
+                        applied_at.entry(entry).or_insert(record.at);
+                    } else {
+                        applied_as_nothing.insert(entry);
+                    }
                 }
                 _ => {}
             }
@@ -163,6 +208,12 @@ impl History {
                         if let Some(at) = entries.iter().filter_map(|e| applied_at.get(e)).min() {
                             op.ret = Some(*at);
                             closed_by_apply += 1;
+                        } else if entries.iter().all(|e| applied_as_nothing.contains(e)) {
+                            // Every proposal applied to an effect other than
+                            // `applied`: the operation did not take effect and leaves
+                            // the history (SHARD.md §9).
+                            never_proposed += 1;
+                            continue;
                         }
                     }
                 }

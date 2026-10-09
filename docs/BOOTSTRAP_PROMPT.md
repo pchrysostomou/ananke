@@ -101,6 +101,48 @@ ananke/
 
 _Update this section at the end of every session._
 
+- Branch `phase-3-stage-c-routing` (2026-09-25), stacked on `phase-3-stage-c-bootstrap`
+  (PR #132), PROPOSED D-097, **Stage C's routing** (SHARD.md §3; §8's checks 7, 9, 10 and
+  17; §9; §11, raft 4, 5, 16), in the two commits §12 names as moving pinned schedules and
+  hashes. The first: a client request carries the generation of the descriptor it routed
+  by beside the range (Q10), `Reply::RangeMismatch { descriptors }` beside `NotLeader`
+  carrying descriptors as bytes `ananke-raft` does not read (Q40), and
+  `ananke_shard::client::Cache`, the client's descriptor cache merged by §1's generation
+  rule, which the sweep's client routes by on the node cluster and resends under a fresh
+  `seq` after a mismatch, the operation's own kept for its invoke and return (§9). The
+  second: the three checks on the server against its own descriptors — at receipt (a node
+  with no replica or a replica whose span lacks the key answers `RangeMismatch` with every
+  descriptor it holds for the key, where D-076 failed the run), at a read's serving (the
+  descriptor read at the value's engine version), at apply (a keyed command outside the
+  descriptor in force before its index applies as nothing with effect `out_of_span` and
+  the client is answered `RangeMismatch`, the leader keeping its record) — every one
+  traced `RangeMismatchSent`; `ClientSend` and `ClientMismatch` from the sweep's client on
+  both clusters; the history closed by `invoked` and by effect `applied`;
+  `ananke_shard::invariants` with checks 7, 9, 10 and 17 as folds, one `Checker` fed at
+  every look of the incremental checker on the node cluster and folded over the whole
+  trace by every node run; §10's `TrustStaleDescriptor`, `ApplyIgnoresSpan` and
+  `ClientIgnoresMismatch` (`ReadCheckAtReceiptOnly` comes with the split); and every other
+  client of the node cluster starting stale, with §2's one-range map at generation 0, so
+  every seed refuses requests at receipt and converges through `RangeMismatch` alone.
+  Measured before asserted: `TrustStaleDescriptor` caught on 20 of 20 by check 9 and the
+  apply check refusing its trusted writes on 17 of 20 (Q10's path, resent under a fresh
+  `seq`, on the correct apply code); the pair with `ApplyIgnoresSpan` caught on 20 of 20
+  with a write applied in the wrong range on 17; `ApplyIgnoresSpan` alone on no seed, the
+  absence asserted with its reason; `ClientIgnoresMismatch` on 20 of 20 by check 17; the
+  checker's agreement with its folds at 480 prefixes. **Every node schedule moved** with
+  both commits and the pins hold (272 and 516 absent, the re-seed's seed 1 held back);
+  seed 42's one-group JSONL moves with the client events to 13 241 905 bytes and
+  `c5b8d814…`, recorded in the entry. **Found in D-096**: its variant test never asked
+  that the correct membership node passes check 7's first step, and it did not — a node
+  not named at bootstrap traced its interim replica's creation with empty voters; fixed
+  here, the creation naming the range's voters on every node, and asserted. **Found at a
+  thousand seeds**: the same interim replica held no descriptor and, leading a range it
+  had been caught up to by the log alone, served a stale client's read unchecked (check 9,
+  seed 652); every node not named at bootstrap now writes its interim replicas'
+  descriptors from configuration at its first start (`interim_state`). The premerge is
+  green at a thousand seeds in 2 246 s on this session's container against D-096's 2 149,
+  the node binary 782 s where it took 753, every rate the node's sweeps assert tabled in
+  the entry against D-096's; four `node` rows weighed on this tree.
 - Branch `phase-3-stage-c-bootstrap` (2026-09-25), stacked on
   `phase-3-node-folds-equivalence` (PR #131), PROPOSED D-096, **Stage C's first slice: the
   bootstrap** (SHARD.md §2; Q7, Q9, Q32; §1's range-local descriptor). A node's

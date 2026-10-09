@@ -54,6 +54,7 @@ use ananke_raft::node::{Start, StartOrder, start_store};
 use ananke_raft::store::{KeyPrefix, is_marked_lost, mark_store_lost};
 use ananke_raft::{ServerId, invariants};
 use ananke_shard::client::{RangedRequest, RangedResponse};
+use ananke_shard::descriptor::FIRST_GENERATION;
 use ananke_shard::range::RangeId;
 use ananke_shard::server::{Range, ServerConfig};
 use ananke_shard::variant::NodeVariants;
@@ -1215,6 +1216,7 @@ async fn client<E: Environment>(env: E, n: u64, stats: Arc<Mutex<ClientStats>>) 
         let mut outcome = None;
         loop {
             let request = RangedRequest {
+                generation: FIRST_GENERATION,
                 range: RangeId(range),
                 request: Request {
                     client: process,
@@ -1271,6 +1273,19 @@ async fn client<E: Environment>(env: E, n: u64, stats: Arc<Mutex<ClientStats>>) 
                             target = target % NODES + 1;
                         }
                     }
+                }
+                // This scenario's clients route by its fixed map, which no split
+                // moves, so a mismatch is counted and the client tries elsewhere;
+                // the sweep's client (`raft::client_on`) is the one with a cache to
+                // merge it into (SHARD.md §3).
+                // PROPOSED(D-097)
+                Some(Reply::RangeMismatch { .. }) => {
+                    stats.lock().expect("the stats").mismatched += 1;
+                    if now >= deadline {
+                        break;
+                    }
+                    env.clock().sleep(Duration::from_millis(20)).await;
+                    target = target % NODES + 1;
                 }
                 None => {
                     if !write && now < deadline {
@@ -1447,6 +1462,7 @@ pub fn run_with_of(
         clients_total.completed += one.completed;
         clients_total.abandoned += one.abandoned;
         clients_total.redirected += one.redirected;
+        clients_total.mismatched += one.mismatched;
     }
     let checked = raft::Report::over_a_run(raft::Run {
         seed,

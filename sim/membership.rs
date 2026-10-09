@@ -97,6 +97,7 @@ use ananke_raft::{NodeConfig, ServerId, invariants, run as run_server};
 use ananke_storage::EngineConfig;
 use moirae_sched::Policy;
 
+use ananke_shard::descriptor::FIRST_GENERATION;
 use ananke_shard::server::ServerConfig;
 use ananke_shard::variant::NodeVariants;
 
@@ -1194,6 +1195,13 @@ impl Report {
         {
             return fail(violation);
         }
+        // SHARD.md §8's checks 7, 9, 10 and 17 on the node cluster (Q40).
+        // PROPOSED(D-097)
+        if self.cluster == Cluster::Node
+            && let Err(violation) = ananke_shard::invariants::all(&self.records)
+        {
+            return fail(violation);
+        }
         if let Err(violation) = lin::check(&self.history) {
             return fail(violation.to_string());
         }
@@ -1583,7 +1591,10 @@ impl Driver {
                     },
                 };
                 if sock
-                    .send(server_addr(target), cluster.encode(range, request))
+                    .send(
+                        server_addr(target),
+                        cluster.encode(range, FIRST_GENERATION, request),
+                    )
                     .await
                     .is_err()
                 {
@@ -1617,7 +1628,11 @@ impl Driver {
                     None if only.is_some() => {
                         inner.clock().sleep(Duration::from_millis(25)).await;
                     }
-                    Some(Reply::NotLeader { leader: None }) | None => {
+                    // An operator's command names no key, so no server answers it
+                    // with a mismatch; one that did is tried elsewhere all the same.
+                    // PROPOSED(D-097)
+                    Some(Reply::NotLeader { leader: None } | Reply::RangeMismatch { .. })
+                    | None => {
                         inner.clock().sleep(Duration::from_millis(25)).await;
                         target = target % SERVERS + 1;
                     }
@@ -1656,7 +1671,10 @@ impl Driver {
                     command: Command::Transfer { to },
                 };
                 let _ = sock
-                    .send(server_addr(leader), cluster.encode(range, request))
+                    .send(
+                        server_addr(leader),
+                        cluster.encode(range, FIRST_GENERATION, request),
+                    )
                     .await;
             });
         }
@@ -1876,13 +1894,13 @@ pub fn run_on_with_node(
     for id in 1..=SERVERS {
         spawn_server(cluster, &sim, id, variants, node);
     }
-    for (i, &node) in clients.iter().enumerate() {
-        let env = sim.env(node);
+    for (i, &client) in clients.iter().enumerate() {
+        let env = sim.env(client);
         let inner = env.clone();
         let stats = stats[i].clone();
         env.spawn(
             "client",
-            client_on(cluster, inner, i as u64 + 1, SERVERS, stats),
+            client_on(cluster, inner, i as u64 + 1, SERVERS, stats, node),
         );
     }
     let last_heal = sim.now();

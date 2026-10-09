@@ -62,6 +62,7 @@ use ananke_raft::apply::Command;
 use ananke_raft::client::{Reply, Request};
 use ananke_raft::core::{RaftConfig, Variants};
 use ananke_shard::client::{RangedRequest, RangedResponse};
+use ananke_shard::descriptor::FIRST_GENERATION;
 use ananke_shard::range::RangeId;
 use ananke_shard::server::ServerConfig;
 use ananke_shard::variant::NodeVariants;
@@ -601,6 +602,7 @@ async fn writer<E: Environment>(env: E, up_to: Arc<Mutex<u64>>, stop: Arc<Atomic
             .copied()
             .unwrap_or_else(|| 1 + env.rng().below(NODES_AT_ONCE));
         let request = RangedRequest {
+            generation: FIRST_GENERATION,
             range: RangeId(range),
             request: Request {
                 client: 1,
@@ -625,7 +627,11 @@ async fn writer<E: Environment>(env: E, up_to: Arc<Mutex<u64>>, stop: Arc<Atomic
                     leaders.insert(range, who.0);
                     break;
                 }
-                Reply::NotLeader { leader: None } => {
+                // This writer routes by the scenario's fixed map, which no split
+                // moves here, so a mismatch is not a route it can follow: it drops
+                // the hint and tries elsewhere, as it does for a leader it lost.
+                // PROPOSED(D-097)
+                Reply::NotLeader { leader: None } | Reply::RangeMismatch { .. } => {
                     leaders.remove(&range);
                     break;
                 }

@@ -530,7 +530,7 @@ pub fn node_run(
         let stats = Arc::new(Mutex::new(ClientStats::default()));
         env.spawn(
             "client",
-            raft::client_on(cluster, inner, i as u64 + 1, SERVERS, stats),
+            raft::client_on(cluster, inner, i as u64 + 1, SERVERS, stats, node_variants),
         );
     }
     let mut report = NodeReport {
