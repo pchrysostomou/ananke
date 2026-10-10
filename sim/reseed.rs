@@ -898,6 +898,8 @@ pub fn server_config(id: u64, variants: impl Into<Variants>, node: NodeVariants)
         inbox_bytes: INBOX_BYTES,
         // The whole point: two slots for four ranges (Q14, D-075).
         snapshot_cap: RECEIVE_CAP,
+        id_block: crate::ranges::ID_BLOCK,
+        refill_at: crate::ranges::REFILL_AT,
         node,
     }
 }

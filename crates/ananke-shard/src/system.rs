@@ -9,8 +9,9 @@
 //! been told, keyed by end key, each carrying its start, range, generation and voters
 //! (§1, Q4). Neither splits nor merges in Phase 3.
 //!
-//! This slice writes both at bootstrap and reads neither: the lookups, the refill
-//! and `MetaUpdate` are later slices' (§12, Stage C).
+//! D-096 wrote both at bootstrap; D-098 reads them by the lookups and writes range
+//! 1 by `MetaUpdate`; the refill of a node's block of ids (§5, Q17) is PROPOSED
+//! D-099's, and its lease record is here.
 
 use std::io;
 use std::net::SocketAddr;
@@ -56,6 +57,74 @@ pub fn meta_descriptor_key() -> Bytes {
 #[must_use]
 pub fn counter_key() -> Bytes {
     key(SYSTEM_TENANT, ROOT_TABLE, b"counter")
+}
+
+/// Where range 0 keeps node `id`'s lease record (§5, Q17): the block of ids last
+/// granted to it and the run nonce the refill carried.
+// PROPOSED(D-099)
+#[must_use]
+pub fn lease_key(id: ServerId) -> Bytes {
+    let mut name = BytesMut::with_capacity(14);
+    name.put_slice(b"lease/");
+    name.put_u64(id.0);
+    key(SYSTEM_TENANT, ROOT_TABLE, &name)
+}
+
+/// A node's lease record (§5, Q17): the block of range ids range 0 last granted it,
+/// `first..=last`, and the run nonce its refill carried, by which the node tells a
+/// grant of its current run from an earlier run's.
+// PROPOSED(D-099)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LeaseRecord {
+    /// The nonce of the run that asked.
+    pub run: u64,
+    /// The block's first id.
+    pub first: u64,
+    /// The block's last id.
+    pub last: u64,
+}
+
+impl LeaseRecord {
+    /// The record's bytes.
+    #[must_use]
+    pub fn encode(&self) -> Bytes {
+        let mut out = BytesMut::with_capacity(24);
+        out.put_u64_le(self.run);
+        out.put_u64_le(self.first);
+        out.put_u64_le(self.last);
+        out.freeze()
+    }
+
+    /// The record `encode` wrote.
+    ///
+    /// # Errors
+    ///
+    /// Bytes that are not one.
+    pub fn decode(mut bytes: Bytes) -> io::Result<Self> {
+        if bytes.len() != 24 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "a lease record"));
+        }
+        let run = bytes.get_u64_le();
+        let first = bytes.get_u64_le();
+        let last = bytes.get_u64_le();
+        if first > last {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "a lease record"));
+        }
+        Ok(Self { run, first, last })
+    }
+}
+
+/// The counter's value as range 0 keeps it: the next id never granted.
+///
+/// # Errors
+///
+/// Bytes that are not one.
+// PROPOSED(D-099)
+pub fn decode_counter(mut bytes: Bytes) -> io::Result<u64> {
+    if bytes.len() != 8 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "the counter"));
+    }
+    Ok(bytes.get_u64_le())
 }
 
 /// Where range 0 keeps node `id`'s record (§2, Q8): its address.
@@ -201,6 +270,8 @@ mod tests {
         assert!(root.start <= meta_descriptor_key() && meta_descriptor_key() < root.end);
         assert!(root.start <= counter_key() && counter_key() < root.end);
         assert!(root.start <= node_key(ServerId(3)) && node_key(ServerId(3)) < root.end);
+        assert!(root.start <= lease_key(ServerId(3)) && lease_key(ServerId(3)) < root.end);
+        assert_ne!(lease_key(ServerId(3)), node_key(ServerId(3)));
         assert!(root.start <= digest_key() && digest_key() < root.end);
         let record = meta_record_key(b"\x00\x00\x00\x00\x00\x00\x00\x02k2");
         assert!(meta.start <= record && record < meta.end);
@@ -217,6 +288,25 @@ mod tests {
         };
         assert_eq!(MetaRecord::decode(record.encode()).unwrap(), record);
         assert!(MetaRecord::decode(Bytes::from_static(b"\x09")).is_err());
+    }
+
+    #[test]
+    fn a_lease_record_and_the_counter_survive_their_encoding() {
+        let record = LeaseRecord {
+            run: 0xdead_beef,
+            first: 9,
+            last: 16,
+        };
+        assert_eq!(LeaseRecord::decode(record.encode()).unwrap(), record);
+        assert!(LeaseRecord::decode(Bytes::from_static(b"\x09")).is_err());
+        let backwards = LeaseRecord {
+            run: 1,
+            first: 5,
+            last: 4,
+        };
+        assert!(LeaseRecord::decode(backwards.encode()).is_err());
+        assert_eq!(decode_counter(encode_counter(17)).unwrap(), 17);
+        assert!(decode_counter(Bytes::from_static(b"\x01")).is_err());
     }
 
     #[test]

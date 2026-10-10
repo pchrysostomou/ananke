@@ -426,6 +426,16 @@ pub enum NodeVariant {
     /// sweep is what makes one arrive so.
     // PROPOSED(D-098)
     MetaOverwritesByArrival,
+    /// The node adopts, at its start, the block of range ids its lease record names,
+    /// whatever run it was granted to, and takes ids from that block's first, where
+    /// §5's second rule has a node adopt only a block granted to its current run:
+    /// a restart abandons the rest of every block it held, and the ids the earlier
+    /// run took from that block are taken twice. Check 18's range-id clause sees it
+    /// at the first apply of a split whose right half a `RangeCreated` or `RangeSplit`
+    /// named before (SHARD.md §8, §10); the sharded sweep's crash and restart of a
+    /// node that took an id, followed by a split led from it, is what reaches it.
+    // PROPOSED(D-099)
+    IdBlockResumed,
 }
 
 impl NodeVariant {
@@ -484,6 +494,7 @@ impl NodeVariant {
         NodeVariant::ApplyIgnoresSpan,
         NodeVariant::ClientIgnoresMismatch,
         NodeVariant::MetaOverwritesByArrival,
+        NodeVariant::IdBlockResumed,
     ];
 
     /// Q15's whole-node refusal and re-seed, in order: the six ways to get a node's
@@ -669,6 +680,9 @@ impl NodeVariant {
             // PROPOSED(D-098): the meta range storing updates as they arrive. Eleven
             // bits are left.
             NodeVariant::MetaOverwritesByArrival => 1 << 52,
+            // PROPOSED(D-099): a node resuming another run's block of ids. Ten bits
+            // are left.
+            NodeVariant::IdBlockResumed => 1 << 53,
         }
     }
 
@@ -729,6 +743,7 @@ impl NodeVariant {
             NodeVariant::ApplyIgnoresSpan => "ApplyIgnoresSpan",
             NodeVariant::ClientIgnoresMismatch => "ClientIgnoresMismatch",
             NodeVariant::MetaOverwritesByArrival => "MetaOverwritesByArrival",
+            NodeVariant::IdBlockResumed => "IdBlockResumed",
         }
     }
 }
@@ -819,8 +834,10 @@ mod tests {
         // D-077's six for Q15's whole-node refusal and re-seed, D-083's ten for the
         // snapshot wiring, D-081's three for the directed re-seed shape, D-090's two for a
         // stream's bounds, D-076's review's two, D-095's one for the `apply` task that
-        // waits for every range, and D-096's one for a fresh store taken for a bootstrap.
-        assert_eq!(NodeVariant::BUGS.len(), 53);
+        // waits for every range, D-096's one for a fresh store taken for a bootstrap,
+        // D-097's three for routing, D-098's one for the meta range and D-099's one for
+        // the range-id blocks.
+        assert_eq!(NodeVariant::BUGS.len(), 54);
         for variant in NodeVariant::SNAPSHOT
             .iter()
             .chain(NodeVariant::WIRING)

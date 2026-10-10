@@ -67,6 +67,7 @@ use bytes::Bytes;
 use crate::client::{RangedRequest, RangedResponse, is_ranged};
 use crate::descriptor::{FIRST_GENERATION, RangeDescriptor};
 use crate::frame::decode;
+use crate::ids::{self, IdBlocks};
 use crate::inbox::{Inbox, Received};
 use crate::install::{self, SnapAnswer, SnapJob};
 use crate::meta;
@@ -79,7 +80,7 @@ use crate::range::RangeId;
 use crate::reseed::{Candidate, generation_of, newest_not_lost, reseed_dir};
 use crate::round::Cores;
 use crate::snapshot::{self, Identity, Snapshots};
-use crate::system::{self, FIRST_USER_RANGE, META_RANGE, MetaRecord, ROOT_RANGE};
+use crate::system::{self, FIRST_USER_RANGE, LeaseRecord, META_RANGE, MetaRecord, ROOT_RANGE};
 use crate::variant::{NodeVariant, NodeVariants};
 
 /// One range as configuration fixes it at bootstrap (SHARD.md §2): a user range,
@@ -181,6 +182,14 @@ pub struct ServerConfig {
     /// above the node's range count, so no stream waits by accident.
     // PROPOSED(D-075): the receive cap is a node setting with no default.
     pub snapshot_cap: usize,
+    /// The block of range ids a refill grants, and the ids left in a node's block at
+    /// or below which it asks for the next (SHARD.md §5, Q17): tunable, and a first
+    /// pair until the sharded sweep measures how often a split finds an empty block
+    /// under Phase 2's network faults (PROPOSED D-092, D-099).
+    // PROPOSED(D-099)
+    pub id_block: u64,
+    /// See `id_block`.
+    pub refill_at: u64,
     /// The node's known-buggy variants (the round's and the wire's).
     pub node: NodeVariants,
 }
@@ -526,6 +535,14 @@ pub enum MetaJob {
         /// Its descriptor as the store holds it.
         descriptor: RangeDescriptor,
     },
+    /// The node's block of range ids is at or below its threshold: a refill goes to
+    /// range 0, carrying the run's nonce, until a grant of this run lands (SHARD.md
+    /// §5, Q17).
+    // PROPOSED(D-099)
+    Refill {
+        /// The run's nonce.
+        run: u64,
+    },
 }
 
 /// The client id the node's `meta` task sends under: above every process id a
@@ -614,6 +631,12 @@ pub struct ServerHost<E: Environment> {
     /// The work the node's `meta` task owes: the descriptors to tell the meta range.
     // PROPOSED(D-098)
     meta: Queue<MetaJob>,
+    /// The node's block of range ids for this run, shared with the `meta` task, which
+    /// adopts the grants (SHARD.md §5, Q17).
+    // PROPOSED(D-099)
+    ids: Arc<Mutex<IdBlocks>>,
+    /// The ids left at or below which a refill is asked for.
+    refill_at: u64,
     /// What the `apply` task has applied per range, shared with that task.
     ///
     /// It is the `apply` task's own state and is written there on every entry. The
@@ -670,6 +693,19 @@ impl<E: Environment> ServerHost<E> {
         }
         if let Some(descriptor) = lock(&self.descriptors).get(&range).cloned() {
             self.meta.push(MetaJob::Send { range, descriptor });
+        }
+    }
+
+    /// Asks the `meta` task for a refill of the node's block of range ids when the
+    /// ids left are at or below the threshold and no refill is outstanding (SHARD.md
+    /// §5, Q17): at the start, where the node holds no block, and after every id
+    /// taken. A block at or below its threshold keeps a refill outstanding at all
+    /// times (PROPOSED D-092).
+    // PROPOSED(D-099)
+    pub fn refill_if_needed(&self) {
+        let mut ids = lock(&self.ids);
+        if ids.needs_refill(self.refill_at) && ids.ask() {
+            self.meta.push(MetaJob::Refill { run: ids.run() });
         }
     }
 
@@ -1055,6 +1091,26 @@ impl<E: Environment> Host for ServerHost<E> {
                 drop(state);
                 let descriptors: Vec<RangeDescriptor> = lock(&self.descriptors)
                     .get(&META_RANGE)
+                    .cloned()
+                    .into_iter()
+                    .collect();
+                self.mismatch(
+                    range,
+                    from,
+                    request.client,
+                    request.seq,
+                    MismatchAt::Receipt,
+                    &descriptors,
+                );
+                None
+            }
+            // A refill is range 0's alone (SHARD.md §5): asked of any other range it is
+            // a mismatch, carrying range 0's descriptor where this node holds it.
+            // PROPOSED(D-099)
+            Command::Refill { .. } if range != ROOT_RANGE => {
+                drop(state);
+                let descriptors: Vec<RangeDescriptor> = lock(&self.descriptors)
+                    .get(&ROOT_RANGE)
                     .cloned()
                     .into_iter()
                     .collect();
@@ -1490,6 +1546,9 @@ struct ServerApplier<E: Environment> {
     /// term and configuration without an apply, and both tasks read this.
     // PROPOSED(D-083): a live install moves the apply task's state with it.
     applied: Arc<Mutex<BTreeMap<RangeId, Applied>>>,
+    /// The block of range ids a refill grants (SHARD.md §5, Q17).
+    // PROPOSED(D-099)
+    id_block: u64,
 }
 
 impl<E: Environment> ServerApplier<E> {
@@ -1861,7 +1920,53 @@ impl<E: Environment> Applier for ServerApplier<E> {
                     ),
                     _ => None,
                 };
-                let outcome = if let Some(descriptors) = &meta_update {
+                // A refill of a node's block of range ids (SHARD.md §5, Q17; PROPOSED
+                // D-099): applied by an entry of range 0, it grants the block at the
+                // counter to the asking node's run, writes its lease record and the
+                // counter with the entry's index, traces `RangeIdsLeased`, and answers
+                // the asker the record. In any other range's log a refill applies as
+                // nothing, refused: range 0 alone grants ids, and receipt refuses it
+                // before it is proposed.
+                let refill: Option<(u64, u64)> = match applied_command {
+                    Some(Command::Refill { node, run }) => Some((*node, *run)),
+                    _ => None,
+                };
+                let outcome = if let Some((node, run)) = refill {
+                    let result = if range == ROOT_RANGE {
+                        match ids::grant(store.engine(), ServerId(node), run, self.id_block).await {
+                            Ok((batch, record)) => {
+                                store.apply(entry.index, batch).await.map(|()| {
+                                    self.env.trace(TraceEvent::RangeIdsLeased {
+                                        node,
+                                        run,
+                                        first: record.first,
+                                        last: record.last,
+                                        index: entry.index,
+                                    });
+                                    (ApplyEffect::Took, Outcome::Value(Some(record.encode())))
+                                })
+                            }
+                            Err(error) => Err(error),
+                        }
+                    } else {
+                        apply_command(store, entry.index, None)
+                            .await
+                            .map(|_| (ApplyEffect::Refused, Outcome::Done))
+                    };
+                    match result {
+                        Ok((effect, outcome)) => {
+                            meta_effect = Some(effect);
+                            outcome
+                        }
+                        Err(error) => {
+                            self.env.trace(TraceEvent::RaftServerFailed {
+                                server: self.id.0,
+                                reason: error.to_string(),
+                            });
+                            return;
+                        }
+                    }
+                } else if let Some(descriptors) = &meta_update {
                     let result = if range == META_RANGE {
                         let as_arrived = self
                             .node_variants
@@ -2041,6 +2146,11 @@ fn now_nanos<E: Environment>(env: &E) -> u64 {
 /// since a range between leaders answers at once too and the two would storm. A
 /// range handed over again before its acknowledgement has the newer descriptor take
 /// the older's place.
+///
+/// Its second errand is range 0's (SHARD.md §5, Q17; PROPOSED D-099): a refill of
+/// the node's block of range ids, sent to range 0's leader — hinted apart from the
+/// meta range's — and resent on the same timer until a grant of this run lands, as an
+/// answer or read back from the node's lease record before each resend.
 #[allow(clippy::too_many_arguments)]
 async fn meta_sender<E: Environment>(
     env: E,
@@ -2052,19 +2162,30 @@ async fn meta_sender<E: Environment>(
     answers: Queue<Response>,
     resend: Duration,
     generation: u64,
+    ids: Arc<Mutex<IdBlocks>>,
+    root: Option<Arc<RaftStore<E>>>,
+    root_generation: u64,
 ) {
     let client = meta_client(id);
     let mut pending: BTreeMap<RangeId, (RangeDescriptor, u64)> = BTreeMap::new();
     let mut seq = 0u64;
     let mut hint: Option<ServerId> = None;
     let mut turn = 0usize;
+    // The refill outstanding, if any: its sequence number and the run it carries,
+    // resent on the timer until a grant of this run lands, as an answer or read back
+    // from the node's lease record where the node holds a replica of range 0
+    // (SHARD.md §5, Q17; PROPOSED D-099). Range 0's leader is hinted apart from the
+    // meta range's.
+    let mut refill: Option<(u64, u64)> = None;
+    let mut root_hint: Option<ServerId> = None;
+    let mut root_turn = 0usize;
     loop {
         let event = {
             let job = pin!(jobs.pop());
             let answer = pin!(answers.pop());
             let inner = pin!(race(&env, job, answer));
             let timer = pin!(async {
-                if pending.is_empty() {
+                if pending.is_empty() && refill.is_none() {
                     std::future::pending::<()>().await;
                 } else {
                     env.clock().sleep(resend).await;
@@ -2073,12 +2194,43 @@ async fn meta_sender<E: Environment>(
             race(&env, inner, timer).await
         };
         let mut to_send: Vec<RangeId> = Vec::new();
+        let mut send_refill = false;
         match event {
             Either::Left(Either::Left(None) | Either::Right(None)) => return,
             Either::Left(Either::Left(Some(MetaJob::Send { range, descriptor }))) => {
                 seq += 1;
                 pending.insert(range, (descriptor, seq));
                 to_send.push(range);
+            }
+            Either::Left(Either::Left(Some(MetaJob::Refill { run }))) => {
+                seq += 1;
+                refill = Some((seq, run));
+                send_refill = true;
+            }
+            // The refill's answers: a grant adopted if it is this run's, and range
+            // 0's leader hinted apart from the meta range's.
+            Either::Left(Either::Right(Some(response)))
+                if refill.is_some_and(|(sent, _)| sent == response.seq) =>
+            {
+                match response.reply {
+                    Reply::Outcome(Outcome::Value(Some(bytes))) => {
+                        if let Ok(record) = LeaseRecord::decode(bytes) {
+                            lock(&ids).adopt(&record, false);
+                        }
+                        refill = None;
+                    }
+                    Reply::Outcome(_) => refill = None,
+                    Reply::NotLeader { leader } => {
+                        root_hint = leader;
+                        if root_hint.is_none() {
+                            root_turn += 1;
+                        }
+                    }
+                    Reply::RangeMismatch { .. } => {
+                        root_hint = None;
+                        root_turn += 1;
+                    }
+                }
             }
             // An answer that is not the acknowledgement moves the target and nothing
             // else: the next send waits for the timer. A resend on the answer itself
@@ -2106,9 +2258,54 @@ async fn meta_sender<E: Environment>(
                     turn += 1;
                 }
                 to_send.extend(pending.keys().copied());
+                if let Some((_, run)) = refill {
+                    // §5's read-back: a grant whose answer was lost is in the node's
+                    // lease record, where this node is a replica of range 0 and has
+                    // applied it; one of this run is adopted and the refill is done.
+                    let read_back = match &root {
+                        Some(store) => store
+                            .engine()
+                            .get(&system::lease_key(id))
+                            .await
+                            .ok()
+                            .flatten()
+                            .and_then(|bytes| LeaseRecord::decode(bytes).ok())
+                            .filter(|record| record.run == run),
+                        None => None,
+                    };
+                    if let Some(record) = read_back {
+                        lock(&ids).adopt(&record, false);
+                        refill = None;
+                    } else {
+                        if root_hint.is_none() {
+                            root_turn += 1;
+                        }
+                        send_refill = true;
+                    }
+                }
             }
         }
-        if to_send.is_empty() || voters.is_empty() {
+        if voters.is_empty() {
+            continue;
+        }
+        if send_refill && let Some((sent, run)) = refill {
+            let target = root_hint.unwrap_or(voters[root_turn % voters.len()]);
+            if let Some(addr) = addrs.get(&target).copied() {
+                let request = RangedRequest {
+                    range: ROOT_RANGE,
+                    generation: root_generation,
+                    request: Request {
+                        client,
+                        seq: sent,
+                        command: Command::Refill { node: id.0, run },
+                    },
+                };
+                if sock.send(addr, request.encode()).await.is_err() {
+                    return;
+                }
+            }
+        }
+        if to_send.is_empty() {
             continue;
         }
         let target = hint.unwrap_or(voters[turn % voters.len()]);
@@ -2158,6 +2355,8 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
         engine,
         inbox_bytes,
         snapshot_cap,
+        id_block,
+        refill_at,
         node: node_variants,
     } = config;
     let server = id.0;
@@ -2200,6 +2399,11 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
         ..engine
     };
     let sock = Arc::new(env.net().bind(listen).await?);
+    // The run's nonce (SHARD.md §5, Q17): drawn at every start from the node's own
+    // generator, as a re-seed draws a store incarnation, and carried by every refill
+    // this run sends, so that a grant to an earlier run is never adopted.
+    // PROPOSED(D-099)
+    let ids: Arc<Mutex<IdBlocks>> = Arc::new(Mutex::new(IdBlocks::new(env.rng().next_u64())));
     let addrs: BTreeMap<ServerId, SocketAddr> = servers.iter().copied().collect();
     let inbox = Arc::new(Inbox::new(inbox_bytes));
     let local: Queue<Local> = Queue::new();
@@ -2561,8 +2765,24 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
         descriptors: descriptors.clone(),
         led: Mutex::new(BTreeMap::new()),
         meta: Queue::new(),
+        ids: ids.clone(),
+        refill_at,
         applied: applied_at.clone(),
     };
+    // The node's lease record, read back at the start (SHARD.md §5's second rule): a
+    // grant of this run is adopted — none can be at a fresh start, whose nonce is
+    // fresh — and any other run's is not; `IdBlockResumed` adopts whatever run it was
+    // granted to (§10). A node with no replica of range 0 holds no record to read.
+    // Then the first refill: a node starts with no block, at the threshold.
+    // PROPOSED(D-099)
+    if let Some(store) = stores.get(&ROOT_RANGE)
+        && let Some(bytes) = store.engine().get(&system::lease_key(id)).await?
+        && let Ok(record) = LeaseRecord::decode(bytes)
+    {
+        let any_run = node_variants.contains(NodeVariant::IdBlockResumed);
+        lock(&ids).adopt(&record, any_run);
+    }
+    host.refill_if_needed();
     let answers = host.answers.clone();
     env.spawn("answers", {
         let sock = sock.clone();
@@ -2587,9 +2807,25 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
         let generation = lock(&descriptors)
             .get(&META_RANGE)
             .map_or(FIRST_GENERATION, |descriptor| descriptor.generation);
+        let root_generation = lock(&descriptors)
+            .get(&ROOT_RANGE)
+            .map_or(FIRST_GENERATION, |descriptor| descriptor.generation);
+        let ids = ids.clone();
+        let root = stores.get(&ROOT_RANGE).cloned();
         async move {
             meta_sender(
-                env, id, sock, addrs, voters, jobs, answers, resend, generation,
+                env,
+                id,
+                sock,
+                addrs,
+                voters,
+                jobs,
+                answers,
+                resend,
+                generation,
+                ids,
+                root,
+                root_generation,
             )
             .await;
         }
@@ -2599,6 +2835,7 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
         let applier = ServerApplier {
             env: env.clone(),
             id,
+            id_block,
             sock: sock.clone(),
             stores: stores.clone(),
             replicas,
@@ -2644,7 +2881,12 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
             raft.clone(),
             node_variants,
             engine.dir.clone(),
-            ranges.clone(),
+            // The six the node hosts, as the host and the `apply` task read them:
+            // `state_of` reads a switched range's span here, and with the user ranges
+            // alone a system range's switch traced no state read back, which left
+            // D-091's fourth arm nothing to pair it with (seed 368's guard, PROPOSED
+            // D-099).
+            hosted.clone(),
             applied_at.clone(),
             plan,
             local.clone(),

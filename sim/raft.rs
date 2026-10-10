@@ -535,6 +535,23 @@ pub fn meta_applies_of(records: &[TraceRecord]) -> (usize, usize) {
     (applies, took)
 }
 
+/// `RangeIdsLeased` over `records` by the first apply of each of range 0's indices:
+/// the blocks granted (SHARD.md §5, Q17), and the nodes granted one.
+// PROPOSED(D-099)
+#[must_use]
+pub fn ids_leased_of(records: &[TraceRecord]) -> (usize, BTreeSet<u64>) {
+    let mut indices = BTreeSet::new();
+    let mut nodes = BTreeSet::new();
+    for record in records {
+        if let TraceEvent::RangeIdsLeased { node, index, .. } = &record.event
+            && indices.insert(*index)
+        {
+            nodes.insert(*node);
+        }
+    }
+    (indices.len(), nodes)
+}
+
 /// Range 0's descriptor as configuration fixes it (SHARD.md §2): what a client that
 /// found the cluster through configuration alone starts with.
 // PROPOSED(D-098)
@@ -6529,6 +6546,8 @@ pub fn node_server_config(
         engine,
         inbox_bytes: crate::ranges::INBOX_BYTES,
         snapshot_cap: crate::ranges::SNAPSHOT_CAP,
+        id_block: crate::ranges::ID_BLOCK,
+        refill_at: crate::ranges::REFILL_AT,
         node,
     }
 }
