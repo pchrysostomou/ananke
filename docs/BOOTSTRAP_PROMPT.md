@@ -101,6 +101,21 @@ ananke/
 
 _Update this section at the end of every session._
 
+- Branch `docs-restore-d092-d094` (2026-10-10), off `main` at fdc5fc0: **D-092, D-093 and
+  D-094 restored to DECISIONS.md verbatim**, in their numerical place before D-095. PR #129
+  merged D-092 and D-093 (Stage C's two questions, both PROPOSED and still unruled) and
+  PR #130 merged D-094 (the released phases' sweeps at CI's hundred under the premerge,
+  approved in advance by the owner's ruling of 2026-09-25); the branch-side merges of
+  `main` into #130's and #131's branches (2c9b667, f5a13d8, 894765c) resolved
+  DECISIONS.md's conflict by dropping them, and `main` carried the loss from 03be2da and
+  3a6d06b on, while the code, `CLAUDE.md` and `scripts/premerge.sh` went on citing D-092
+  and D-094 (D-093 is cited only by D-095's and D-096's numbering paragraphs). D-092 and
+  D-093 are taken from 0477456 (#129's merge; f9fdb0f's text is byte-identical), D-094
+  from 2c9b667 (#130's merged tip; 03be2da's text is byte-identical). The same merges
+  dropped this section's bullets for #129 and #130, which are restored below the fold
+  slice's, verbatim from 0477456 and from #130's branch (0411326); the two lines of merge
+  debris they left, which broke the fold slice's bullet and said that slice preserved
+  D-092 and D-093, are removed. Nothing else moves: no code, no schedule, no pinned hash.
 - Branch `phase-3-stage-c-split` (2026-09-25), stacked on `phase-3-stage-c-range-ids`
   (PR #135), PROPOSED D-100, **Stage C's split, the first of its four sub-slices:
   proposed by a range's leader with an id from its node's block, re-checked and applied
@@ -314,8 +329,6 @@ _Update this section at the end of every session._
   of `main`'s at the same tier (tabled in the entry), the four node-family binaries' shard
   rows re-weighed on this tree.
 - Branch `phase-3-node-folds-equivalence` (2026-09-25), off `main` at 527adcd, PROPOSED
-- PR #130 (D-094) merged into main on 2026-10-07; this branch carries its documentation before D-095.
-- Current main status (2026-09-25): PR #129 merged Stage C questions D-092 and D-093 into `main`; this fold slice preserves those decisions before D-095.
   D-095, the owner's ruling (b) at Stage B's close: **the node's apply-lag, cross-range
   hold and coverage folds run under the incremental checker's equivalence test**, the
   line of Stage B's exit the tag names as unmet. `sim/folds.rs` gives each an
@@ -335,6 +348,41 @@ _Update this section at the end of every session._
   correct node trips the per-run 20 ms median on a range on 2 of 25 seeds at a hundred,
   which the pooled per-range median the sweep asserts (3.0 to 3.2 ms at a thousand)
   does not show. Two shard rows, weighed here.
+- Branch `phase-3-stage-c-questions` (2026-09-25), off `main` at 527adcd, the tree the
+  tag `phase-3-stage-b` names: **Stage C's two questions before code, as PROPOSED D-092
+  and D-093 with a recommendation each** (SHARD.md §12, Stage C), written so the stage
+  can proceed on everything they do not block while the owner answers. D-092, question
+  1: a split on a node whose block of range ids has run out is **refused at proposal**,
+  the reason riding the refusal Q23 already returns, and a block at or below its
+  threshold keeps a refill outstanding, resent every minimum election timeout until a
+  grant of the node's run lands; no new state, no new event, and the count of such
+  refusals joins Stage D's coverage rule (non-zero from CI's hundred, a zero fixed in
+  the driver's draw). The wait, the reserve, the borrowed id and the provisional id are
+  each rejected with the reason. D-093, question 2: check 19 gets a tripping variant of
+  its own, **`SplitLeavesGap`**, every replica writing the right half from one key past
+  the split key, a test instrument outside §10's count exactly as the node's
+  `NodeVariant`s are; it trips the tiling fold on every seed with a split while checks
+  7, 8 and 9 stay silent, so the equivalence test is asserted from Stage C on every
+  seed, and `UnfreezeBeforeAbortCommitted`'s shape (e) is measured in Stage E and not
+  asserted. Docs only, the footer at D-094. The same day: the tag `phase-3-stage-b` on
+  527adcd, #124's D-040 move as PR #128, and the owner's three rulings at the stage's
+  close taken in order after this PR — the Phase 1 and Phase 2 sweeps re-tiered for the
+  premerge budget (entry first, pre-approved), the node's apply-lag, cross-range hold
+  and coverage folds under the equivalence test, and #126 as Stage C's.
+- Branch `phase-3-premerge-released-tiers` (2026-09-25), off `main` at 527adcd, PROPOSED
+  D-094, the owner's ruling (a) at Stage B's close, approved in advance: **the released
+  phases' sweeps run at CI's hundred under the premerge**, through
+  `ananke_sim::released_seeds()` and `ANANKE_RELEASED_SEEDS=100`, which only
+  `scripts/premerge.sh` sets, so the premerge's thousand is the current phase's. The
+  sweeps that move are named by what they test and not by their file: Phase 1's nine
+  (`echo`, `wal`'s four, the correct engine and its three variants) and Phase 2's 22
+  (every sweep of `sim/tests/raft.rs`), 5 421.7 of the shard table's 9 613.8 cpu s; Stage
+  A's engine tests and every Stage B binary stay at the thousand. Five thousand-seed
+  assertions now open in the nightly alone (the betrayed-cut excuse, `RefusalNotDurable`,
+  `LeaseTrustsTheClock`, the membership scenario's elections while joint and its reverts)
+  and every rate line still prints at the premerge. **Measured back to back on this
+  container** (4-core Xeon, D-070): **1 760 s before, 966 s after, 45 % saved**, the raft binary 764 s to 84 s and the node binary unchanged to the second; the moved sweeps print their count as 100 and every rate line still prints. The gate, CI and the nightly are
+  untouched; CLAUDE.md says where a released phase's thousand-seed assertions run.
 
 - Merge update (2026-09-24): PR #109 (`phase-3-stage-b-stream-variants`, PROPOSED
   D-086, carrying #123's D-089 and D-091) merged `origin/main` at c178682 under the
