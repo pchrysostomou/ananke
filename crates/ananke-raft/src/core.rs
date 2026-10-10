@@ -477,6 +477,14 @@ pub enum Input {
     Change(Vec<ServerId>),
     /// The server applied every entry through `index`.
     Applied(Index),
+    /// The range layer asks a follower with no leader to start its pre-vote now
+    /// rather than at its timer, and to repeat it every heartbeat interval until it
+    /// hears from a leader or its own timer fires (SHARD.md §5, Q21): the right
+    /// half's replica on the node whose parent led at the split's apply. A pre-vote
+    /// changes no term, so a repeat disturbs nothing; a quarantined server, a
+    /// non-voter and a server that knows a leader do nothing with it.
+    // PROPOSED(D-100)
+    Campaign,
     /// The snapshot task completed a [`SnapshotAction::Take`]: a checkpoint at
     /// `index`, whose entry has `term`, is on disk and recorded (RAFT.md §1).
     SnapshotTaken {
@@ -868,6 +876,9 @@ pub struct Raft {
     election_elapsed: u64,
     election_timeout: u64,
     heartbeat_elapsed: u64,
+    /// Q21's hurry: repeat the pre-vote every heartbeat interval until a leader is
+    /// heard or the election timer fires (PROPOSED D-100).
+    hurry: bool,
     /// Ticks led since the last election won: a fresh leader defers threshold
     /// snapshots until it has led a while (D-030).
     leader_ticks: u64,
@@ -988,6 +999,7 @@ impl Raft {
             granted: Vec::new(),
             progress: BTreeMap::new(),
             election_elapsed: 0,
+            hurry: false,
             election_timeout: 0,
             heartbeat_elapsed: 0,
             leader_ticks: 0,
@@ -1144,6 +1156,15 @@ impl Raft {
         self.log.get((index - self.snap_index) as usize - 1)
     }
 
+    /// Whether a membership change is under way on this server: the configuration in
+    /// force is joint, or this leader is catching servers up as learners before its
+    /// joint entry (D-032). What a leader refuses a split under (SHARD.md §5, Q23).
+    // PROPOSED(D-100)
+    #[must_use]
+    pub fn changing(&self) -> bool {
+        self.change.is_some() || self.membership.new_voters.is_some()
+    }
+
     /// The configuration in force: the latest configuration entry in the log,
     /// committed or not, or the initial configuration.
     #[must_use]
@@ -1192,6 +1213,7 @@ impl Raft {
                 self.applied = self.applied.max(index);
                 self.serve_reads();
             }
+            Input::Campaign => self.on_campaign(),
             Input::SnapshotTaken { index, term } => self.on_snapshot_taken(index, term),
             Input::SnapshotInstalled {
                 to,
@@ -1502,6 +1524,26 @@ impl Raft {
         self.membership.has_majority(granted)
     }
 
+    /// Whether this server may start an election: a voter, not quarantined.
+    fn may_campaign(&self) -> bool {
+        !self.quarantined && self.membership.is_voter(self.id)
+    }
+
+    /// [`Input::Campaign`]: the pre-vote now, and the hurry set until a leader is
+    /// heard or the timer fires (SHARD.md §5, Q21; PROPOSED D-100).
+    fn on_campaign(&mut self) {
+        if self.role != Role::Follower || self.leader.is_some() || !self.may_campaign() {
+            return;
+        }
+        self.hurry = true;
+        self.heartbeat_elapsed = 0;
+        if self.config.variants.contains(Variant::NoPreVote) {
+            self.become_candidate();
+        } else {
+            self.become_pre_candidate();
+        }
+    }
+
     fn on_tick(&mut self) {
         self.ticks += 1;
         self.election_elapsed += 1;
@@ -1603,7 +1645,26 @@ impl Raft {
                     self.take_pending = true;
                     self.outputs.push(Output::Snapshot(SnapshotAction::Record));
                 }
+                // Q21's hurry: the pre-vote again every heartbeat interval while no
+                // leader is heard, until the timer fires (PROPOSED D-100). Only while
+                // the pre-vote is what is in flight: a candidacy the pre-vote won waits
+                // for its votes under the election timeout, since a pre-vote started
+                // over it a heartbeat later would discard votes on their way and burn a
+                // term per heartbeat (seed 368 of the node sweep took twelve terms in
+                // 240 ms before its right half had a leader).
+                if self.hurry
+                    && self.leader.is_none()
+                    && matches!(self.role, Role::Follower | Role::PreCandidate)
+                    && self.election_elapsed < self.election_timeout
+                    && self.heartbeat_elapsed >= self.config.heartbeat_ticks
+                {
+                    self.heartbeat_elapsed = 0;
+                    if self.may_campaign() && !self.config.variants.contains(Variant::NoPreVote) {
+                        self.become_pre_candidate();
+                    }
+                }
                 if self.election_elapsed >= self.election_timeout {
+                    self.hurry = false;
                     // A quarantined server never campaigns: leading takes a vote
                     // for itself, and it grants none (RAFT.md §3).
                     if self.quarantined || !self.membership.is_voter(self.id) {
@@ -1707,6 +1768,7 @@ impl Raft {
     /// and the first round of AppendEntries.
     fn become_leader(&mut self) {
         self.leader = Some(self.id);
+        self.hurry = false;
         self.heartbeat_elapsed = 0;
         self.leader_ticks = 0;
         self.quorum_elapsed = 0;
@@ -2633,6 +2695,7 @@ impl Raft {
             self.become_follower(self.term, Some(from));
         }
         self.leader = Some(from);
+        self.hurry = false;
         self.election_elapsed = 0;
         // The promise a response makes runs from `sent`; a quarantined server makes
         // none, so it echoes 0 and no lease is ever measured from it (RAFT.md §3).

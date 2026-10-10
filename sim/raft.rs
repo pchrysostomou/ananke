@@ -84,7 +84,7 @@ use ananke_env::{
     ApplyEffect, ClientOp, ClientResult, Clock, Either, Environment, Instant, MismatchAt, Network,
     NodeId, RangeState, Rng, Socket, TraceEvent, race,
 };
-use ananke_raft::apply::{Command, Outcome, user_key};
+use ananke_raft::apply::{Command, Outcome, SplitRefusal, user_key};
 use ananke_raft::client::{Reply, Request, Response};
 use ananke_raft::core::{RaftConfig, Variants};
 use ananke_raft::message::{self, Frame, Message};
@@ -552,6 +552,97 @@ pub fn ids_leased_of(records: &[TraceRecord]) -> (usize, BTreeSet<u64>) {
     (indices.len(), nodes)
 }
 
+/// The splits over `records` (SHARD.md §5; PROPOSED D-100), by the first `RangeSplit`
+/// of each (parent, index): how many took effect, how many right halves were created
+/// on some replica, how many right halves elected a leader, and how many writes were
+/// applied through a right half.
+// PROPOSED(D-100)
+#[must_use]
+pub fn splits_of(records: &[TraceRecord]) -> SplitCoverage {
+    let mut seen: BTreeSet<(u64, u64)> = BTreeSet::new();
+    let mut rights: BTreeSet<u64> = BTreeSet::new();
+    let mut parents: BTreeSet<u64> = BTreeSet::new();
+    let mut coverage = SplitCoverage::default();
+    for record in records {
+        match &record.event {
+            TraceEvent::RangeSplit {
+                range,
+                right,
+                index,
+                ..
+            } => {
+                if seen.insert((*range, *index)) {
+                    coverage.applied += 1;
+                    rights.insert(*right);
+                    parents.insert(*range);
+                }
+            }
+            TraceEvent::RaftRecovered { range, .. } if rights.contains(range) => {
+                coverage.right_reopened += 1;
+            }
+            TraceEvent::RaftSnapshot {
+                range,
+                taken: false,
+                ..
+            } if rights.contains(range) || parents.contains(range) => {
+                coverage.halves_installed += 1;
+            }
+            TraceEvent::RangeMismatchSent {
+                range,
+                at: MismatchAt::Apply,
+                ..
+            } if parents.contains(range) => {
+                coverage.refused_at_apply += 1;
+            }
+            TraceEvent::RangeCreated {
+                range,
+                cause: ananke_env::RangeCause::Split,
+                ..
+            } => {
+                if rights.contains(range) {
+                    coverage.right_replicas += 1;
+                }
+            }
+            TraceEvent::RaftLeader { range, .. } if rights.contains(range) => {
+                coverage.right_leaders += 1;
+            }
+            TraceEvent::RaftApply {
+                range,
+                effect: ananke_env::ApplyEffect::Applied,
+                key: Some(_),
+                ..
+            } if rights.contains(range) => {
+                coverage.right_writes += 1;
+            }
+            _ => {}
+        }
+    }
+    coverage
+}
+
+/// What [`splits_of`] counts.
+// PROPOSED(D-100)
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SplitCoverage {
+    /// Splits that took effect, by first apply.
+    pub applied: usize,
+    /// Replicas of right halves created by a split's apply.
+    pub right_replicas: usize,
+    /// Terms a right half elected a leader in.
+    pub right_leaders: usize,
+    /// Keyed writes applied through a right half.
+    pub right_writes: usize,
+    /// Restatements of a right half: a restart that reopened it from its keys
+    /// (SHARD.md §5).
+    pub right_reopened: usize,
+    /// Live installs switched onto a half after its split — a parent after it split,
+    /// or a right half — each replacing the half's span and no key of the other's.
+    pub halves_installed: usize,
+    /// Writes refused at apply on a parent after its split: proposed under the
+    /// parent's old span and appended above the split's index (SHARD.md §3, §5).
+    pub refused_at_apply: usize,
+}
+
 /// Range 0's descriptor as configuration fixes it (SHARD.md §2): what a client that
 /// found the cluster through configuration alone starts with.
 // PROPOSED(D-098)
@@ -688,6 +779,29 @@ pub enum Fault {
         /// How long the third server's sends stay blocked past the restart: time
         /// for the old leader to campaign and re-send its backlog.
         steer: Duration,
+    },
+    /// A split of the range the arm aims at, asked by an admin of its leader at its
+    /// middle key (SHARD.md §5, Q18; PROPOSED D-100): drawn on the node cluster only,
+    /// where a range can split, and followed by `settle` for the right half to elect
+    /// and the clients to find it. The admin follows `NotLeader` for a round of the
+    /// servers and records the answer — done, or refused with its reason — for the
+    /// report; a split that lands is what the checks fold, and one refused is coverage.
+    Split {
+        /// How long the run waits after the ask.
+        settle: Duration,
+    },
+    /// §10's shape for `IdBlockResumed` (SHARD.md §5, Q17; PROPOSED D-100): the node
+    /// that proposed the last split done is crashed, restarted after `down`, handed
+    /// the lead of a range the split did not cut (`Command::Transfer`, thesis §3.10)
+    /// and asked, alone, to split it, then `settle` follows. A correct node's new run
+    /// draws a fresh block for the second split; the variant resumes its record's
+    /// block from the first id, the one the first split took, and check 18 sees the
+    /// right half named before. Drawn after the split; nothing if no split is done.
+    SplitFromRestarted {
+        /// How long the proposer stays down.
+        down: Duration,
+        /// How long the run waits after the ask.
+        settle: Duration,
     },
     /// A crash aimed at the middle of a snapshot install (RAFT.md §5, stage E).
     /// First `server` is isolated for `isolate`, long enough to fall behind the
@@ -1003,6 +1117,153 @@ const TRANSFER_WAIT: Duration = Duration::from_millis(300);
 const TRIAL_GAP: Duration = Duration::from_millis(500);
 /// The operator's client process in the trace.
 const ADMIN: u64 = 99 << 32;
+
+/// The split admin's first sequence number and address slot: above the term-raise
+/// admin's, whose slots are `TERM_RAISE_ADMIN` and after (PROPOSED D-100).
+const SPLIT_ADMIN: u64 = 100;
+/// How long a split's admin waits for each answer before it tries the next server.
+const SPLIT_WAIT_BUDGET: Duration = Duration::from_millis(600);
+/// How long the split admin waits before asking again after `NoRangeId` (PROPOSED
+/// D-092's A): a minimum election timeout, the refill's resend interval.
+const SPLIT_RETRY: Duration = Duration::from_millis(150);
+
+/// What the split arms' admins recorded on a run (SHARD.md §5; PROPOSED D-100).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SplitStats {
+    /// Splits asked.
+    pub asked: u64,
+    /// Answered done: proposed, and applied on the leader.
+    pub done: u64,
+    /// Refused, by the reason's name.
+    pub refused: BTreeMap<&'static str, u64>,
+    /// Asked of every server in turn and answered by none in time.
+    pub unanswered: u64,
+    /// The server that answered the last split done, and the range it split: what
+    /// [`Fault::SplitFromRestarted`] crashes and asks again.
+    pub proposer: Option<u64>,
+    /// The range the last split done cut.
+    pub range: Option<u64>,
+    /// Splits asked of a restarted proposer alone, and how many of those were done.
+    pub from_restarted: u64,
+    /// Of the splits asked of a restarted proposer, the ones answered done.
+    pub from_restarted_done: u64,
+}
+
+/// The key a split of `range` cuts at on the node cluster: the second of the two the
+/// range's clients draw from, so both halves keep one (PROPOSED D-100).
+#[must_use]
+pub fn split_key_of(range: u64) -> Bytes {
+    Bytes::from(format!("k{}", 2 * (range - crate::ranges::FIRST_RANGE) + 1))
+}
+
+/// The split admin: asks `range`'s leader, `target` first, to split at `key`, follows
+/// `NotLeader` around the servers once, and records the answer (PROPOSED D-100).
+// The ask's seven parts and its stickiness, spelt out rather than bundled.
+#[allow(clippy::too_many_arguments)]
+async fn split_admin<E: Environment>(
+    cluster: Cluster,
+    env: E,
+    seq: u64,
+    mut target: u64,
+    range: u64,
+    key: Bytes,
+    stats: Arc<Mutex<SplitStats>>,
+    sticky: bool,
+) {
+    let Ok(sock) = env.net().bind(admin_addr(seq)).await else {
+        return;
+    };
+    {
+        let mut stats = stats.lock().unwrap();
+        stats.asked += 1;
+        stats.from_restarted += u64::from(sticky);
+    }
+    // An admin that follows `NotLeader` round the servers asks each twice; one that
+    // sticks to a restarted node waits out its catch-up and the lead's transfer
+    // between asks, a minimum election timeout each, for four times as many.
+    let tries = if sticky { SERVERS * 4 } else { SERVERS * 2 };
+    for _ in 0..tries {
+        let request = Request {
+            client: ADMIN,
+            seq,
+            command: Command::Split {
+                key: key.clone(),
+                right: 0,
+            },
+        };
+        if sock
+            .send(
+                server_addr(target),
+                cluster.encode(range, FIRST_GENERATION, request),
+            )
+            .await
+            .is_err()
+        {
+            return;
+        }
+        let answer = {
+            let recv = pin!(sock.recv());
+            let timer = pin!(env.clock().sleep(SPLIT_WAIT_BUDGET));
+            race(&env, recv, timer).await
+        };
+        let Either::Left(Ok((_, bytes))) = answer else {
+            if sticky {
+                env.clock().sleep(SPLIT_RETRY).await;
+            } else {
+                target = target % SERVERS + 1;
+            }
+            continue;
+        };
+        let Ok(response) = RangedResponse::decode(bytes) else {
+            continue;
+        };
+        if response.response.seq != seq {
+            continue;
+        }
+        match response.response.reply {
+            Reply::Outcome(Outcome::Refused(reason)) => {
+                *stats
+                    .lock()
+                    .unwrap()
+                    .refused
+                    .entry(reason.name())
+                    .or_default() += 1;
+                if reason == SplitRefusal::NoRangeId {
+                    // PROPOSED D-092's A, as proposed: a split asked while the node's
+                    // block holds no id is refused and the asker retries — here after
+                    // a minimum election timeout, the refill's resend interval, for the
+                    // rest of the round.
+                    env.clock().sleep(SPLIT_RETRY).await;
+                    continue;
+                }
+                return;
+            }
+            Reply::Outcome(_) => {
+                let mut stats = stats.lock().unwrap();
+                stats.done += 1;
+                stats.from_restarted_done += u64::from(sticky);
+                stats.proposer = Some(target);
+                stats.range = Some(range);
+                return;
+            }
+            Reply::NotLeader { leader } => {
+                if sticky {
+                    env.clock().sleep(SPLIT_RETRY).await;
+                } else {
+                    target = leader.map_or(target % SERVERS + 1, |leader| leader.0);
+                }
+            }
+            Reply::RangeMismatch { .. } => {
+                if sticky {
+                    env.clock().sleep(SPLIT_RETRY).await;
+                } else {
+                    target = target % SERVERS + 1;
+                }
+            }
+        }
+    }
+    stats.lock().unwrap().unanswered += 1;
+}
 /// The base of the burst clients' process ids in the trace: the schedule's `n`th
 /// Figure 8 driver writes as process `BURST | n`, distinct per driver so two
 /// bursts' sequence numbers never collide in the history.
@@ -1308,6 +1569,21 @@ impl Schedule {
             faults.push(fault.clone());
             gaps.push(*gap);
         }
+        // One split per schedule, at a drawn position among the arms, from a stream
+        // of its own so the other arms' draws stay where they were (PROPOSED D-100).
+        let mut split = moirae_sched::stream(seed, "split");
+        let at = usize::try_from(split.below(faults.len() as u64 + 1)).expect("small");
+        let settle = Duration::from_millis(400 + split.below(401));
+        faults.insert(at, Fault::Split { settle });
+        gaps.insert(at, Duration::from_millis(100 + split.below(201)));
+        // And after it, the second split asked of its proposer restarted (§10's
+        // `IdBlockResumed` shape), at a drawn position among the arms that follow.
+        let after =
+            at + 1 + usize::try_from(split.below((faults.len() - at) as u64)).expect("small");
+        let down = Duration::from_millis(200 + split.below(201));
+        let settle = Duration::from_millis(800 + split.below(401));
+        faults.insert(after, Fault::SplitFromRestarted { down, settle });
+        gaps.insert(after, Duration::from_millis(100 + split.below(201)));
         let mut rng = moirae_sched::stream(seed, "arm-range");
         let range_picks = faults
             .iter()
@@ -1473,6 +1749,11 @@ impl Schedule {
                     (TERM_RAISE_WAIT_BUDGET + *isolate + *quiet)
                         * u32::try_from(*tries).expect("small")
                 }
+                // PROPOSED(D-100): the admin's ask and the settle after it.
+                Fault::Split { settle } => SPLIT_WAIT_BUDGET + *settle,
+                Fault::SplitFromRestarted { down, settle } => {
+                    *down + TRANSFER_WAIT + SPLIT_WAIT_BUDGET + *settle
+                }
             })
             .sum();
         let trials: Duration = self
@@ -1593,6 +1874,8 @@ pub struct Report {
     /// a run another scenario drove.
     // PROPOSED(D-082): a leader-relative arm resolves its leader per range.
     pub aimed: Vec<(u64, u64, Instant)>,
+    /// What the split arms' admins recorded (PROPOSED D-100).
+    pub splits: SplitStats,
 }
 
 /// What another scenario's run hands [`Report::over_a_run`].
@@ -1893,6 +2176,7 @@ impl Report {
             // the node scenario's run is named `OneGroup` here so it keeps it.
             cluster: Cluster::OneGroup,
             aimed: Vec::new(),
+            splits: SplitStats::default(),
         }
     }
 
@@ -2455,7 +2739,13 @@ pub fn range_of_key(_key: &Bytes) -> u64 {
 /// The first record that breaks one of the three, in words naming it.
 // PROPOSED(D-069): the payload of SHARD.md §8's trace has an oracle here.
 pub fn payload_is_well_formed(records: &[TraceRecord], hosted: &[u64]) -> Result<(), String> {
+    // The ranges the run hosts: configuration's, and every right half a split's apply
+    // creates from then on (SHARD.md §5; PROPOSED D-100).
+    let mut hosted: BTreeSet<u64> = hosted.iter().copied().collect();
     for record in records {
+        if let TraceEvent::RangeSplit { right, .. } = &record.event {
+            hosted.insert(*right);
+        }
         let range = range_of(&record.event);
         if let Some(range) = range
             && !hosted.contains(&range)
@@ -3891,6 +4181,19 @@ impl Report {
                     term,
                     ..
                 } if (*g, *s) == (range, server) => Some(*term),
+                // A right half starts at its floor's term (SHARD.md §5, Q20) and
+                // traces no `RaftTerm` for it: the creation is the term's source
+                // until an election moves it, else a replica created before an
+                // isolation reads as raising its term from 0 at its first pre-vote
+                // inside it (PROPOSED D-100).
+                TraceEvent::RangeCreated {
+                    range: g,
+                    cause: ananke_env::RangeCause::Split,
+                    floor_term,
+                    ..
+                } if *g == range && r.node.map(|node| u64::from(node.get())) == Some(server) => {
+                    Some(*floor_term)
+                }
                 _ => None,
             })
             .next_back()
@@ -6757,6 +7060,9 @@ fn to_result(outcome: Outcome) -> ClientResult {
         Outcome::Done => ClientResult::Done,
         Outcome::Swapped(swapped) => ClientResult::Swapped(swapped),
         Outcome::Value(value) => ClientResult::Value(value),
+        // A refusal answers a split, which no client sends as an operation of the
+        // history (SHARD.md §5, §9; PROPOSED D-100).
+        Outcome::Refused(reason) => unreachable!("a split's refusal, {reason:?}, as an operation"),
     }
 }
 
@@ -7465,6 +7771,9 @@ pub fn run_on(
         advance(&mut sim, TRIAL_GAP, &mut watch);
     }
     let mut bursts = 0u64;
+    // The split arms' admins and what they record (PROPOSED D-100).
+    let split_stats: Arc<Mutex<SplitStats>> = Arc::default();
+    let mut splits_asked = 0u64;
     let mut fills = 0u64;
     let mut aimed_streams = 0usize;
     // How many `Fault::CrashInstalling` arms got as far as the final chunk of the
@@ -7803,6 +8112,81 @@ pub fn run_on(
                 advance(&mut sim, *steer, &mut watch);
                 sim.heal();
             }
+            // PROPOSED(D-100): a split of the aimed range, asked of its leader.
+            Fault::Split { settle } => {
+                let leader = leader_of_range(&sim, aimed_range);
+                let key = split_key_of(aimed_range);
+                let seq = SPLIT_ADMIN + splits_asked;
+                splits_asked += 1;
+                let stats = split_stats.clone();
+                let env = sim.env(admin);
+                let inner = env.clone();
+                env.spawn("split", async move {
+                    split_admin(cluster, inner, seq, leader, aimed_range, key, stats, false).await;
+                });
+                advance(&mut sim, *settle, &mut watch);
+            }
+            // PROPOSED(D-100): §10's shape for `IdBlockResumed`. The node that proposed
+            // the last split done, crashed and restarted, is handed the lead of a range
+            // that split did not cut and asked, alone, to split it.
+            Fault::SplitFromRestarted { down, settle } => {
+                let (proposer, cut) = {
+                    let stats = split_stats.lock().unwrap();
+                    (stats.proposer, stats.range)
+                };
+                let (Some(proposer), Some(cut)) = (proposer, cut) else {
+                    // No split is done yet, so there is no block a restart could
+                    // resume from: the arm is a wait, counted as not reached.
+                    advance(&mut sim, *settle, &mut watch);
+                    continue;
+                };
+                sim.crash(node_of_server(proposer));
+                advance(&mut sim, *down, &mut watch);
+                restart(&mut sim, proposer);
+                let range = if aimed_range == cut {
+                    cluster
+                        .ranges()
+                        .into_iter()
+                        .find(|r| *r != cut)
+                        .expect("a second user range")
+                } else {
+                    aimed_range
+                };
+                let leader = leader_of_range(&sim, range);
+                if leader != proposer {
+                    let seq = SPLIT_ADMIN + splits_asked;
+                    splits_asked += 1;
+                    let env = sim.env(admin);
+                    let inner = env.clone();
+                    env.spawn("transfer", async move {
+                        let Ok(sock) = inner.net().bind(admin_addr(seq)).await else {
+                            return;
+                        };
+                        let request = Request {
+                            client: ADMIN,
+                            seq,
+                            command: Command::Transfer { to: proposer },
+                        };
+                        let _ = sock
+                            .send(
+                                server_addr(leader),
+                                cluster.encode(range, FIRST_GENERATION, request),
+                            )
+                            .await;
+                    });
+                    advance(&mut sim, TRANSFER_WAIT, &mut watch);
+                }
+                let key = split_key_of(range);
+                let seq = SPLIT_ADMIN + splits_asked;
+                splits_asked += 1;
+                let stats = split_stats.clone();
+                let env = sim.env(admin);
+                let inner = env.clone();
+                env.spawn("split", async move {
+                    split_admin(cluster, inner, seq, proposer, range, key, stats, true).await;
+                });
+                advance(&mut sim, *settle, &mut watch);
+            }
             Fault::IsolateOnTermRaise {
                 tries,
                 isolate,
@@ -7905,6 +8289,7 @@ pub fn run_on(
         key_range: cluster.key_range(),
         cluster,
         aimed,
+        splits: split_stats.lock().unwrap().clone(),
     }
 }
 
@@ -8519,6 +8904,7 @@ mod tests {
             key_range: range_of_key,
             cluster: Cluster::OneGroup,
             aimed: Vec::new(),
+            splits: SplitStats::default(),
         }
     }
 

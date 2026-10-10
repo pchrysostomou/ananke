@@ -395,13 +395,13 @@
 1	raft	0.2	seed_164_which_a_local_ten_thousand_seed_run_found_stays_green
 1	raft	0.2	seed_5909_which_the_nightly_found_stays_green
 1	wal	29.3	a_log_that_skips_the_checksum_is_caught
-# shard 2: 2003.2 cpu s
+# shard 2: 2134.8 cpu s
 2	echo	0.2	different_seeds_give_different_traces
 2	engine	581.7	the_live_install_crash_test_passes_every_seed
 2	engine	211.2	a_compaction_that_deletes_its_inputs_before_the_manifest_is_caught
 2	engine	34.6	a_checkpoint_that_copies_each_span_at_its_own_version_is_caught
 2	engine	16.6	the_correct_engine_passes_every_seed_with_deep_levels
-2	node	547.2	every_seed_passes_on_the_correct_node_under_the_raft_sweeps_arms
+2	node	678.8	every_seed_passes_on_the_correct_node_under_the_raft_sweeps_arms
 2	raft	276.0	a_leader_that_shares_one_snapshot_directory_and_streams_one_follower_at_a_time_is_caught
 2	raft	151.5	a_leader_that_counts_nothing_from_a_refused_follower_is_caught
 2	raft	4.4	a_server_that_sends_before_it_persists_is_caught
@@ -439,7 +439,7 @@
 3	raft	0.2	the_membership_scenario_has_byte_identical_traces_for_one_seed
 3	reseed	95.8	the_reseed_shape_holds_on_every_seed
 3	wal	21.2	a_log_that_acknowledges_before_syncing_is_caught
-# shard 4: 1668.6 cpu s
+# shard 4: 1659.7 cpu s
 4	echo	0.1	same_seed_gives_byte_identical_trace
 4	engine	210.8	the_correct_engine_passes_every_seed
 4	engine	38.6	an_install_that_switches_one_span_at_a_time_is_caught
@@ -468,8 +468,8 @@
 4	wal	0.2	the_seed_42_trace_is_written_for_the_studio
 4	node	29.1	the_node_folds_agree_with_their_whole_trace_readings
 4	node	0.5	seed_368_is_a_live_installs_hold_and_the_fourth_arm_answers_for_it
-4	node	58.9	a_node_that_resumes_another_runs_block_of_ids_has_no_path_on_the_node_yet
-# shard 5: 1613.9 cpu s
+4	node	50.0	a_node_that_resumes_another_runs_block_of_ids_is_caught_after_a_split
+# shard 5: 1623.8 cpu s
 5	echo	6.0	every_seed_satisfies_the_invariants_and_the_sweep_exercises_the_disk_faults
 5	engine	19.5	a_seek_that_counts_tombstones_is_caught
 5	node	58.8	a_leader_that_ignores_incarnations_has_an_incarnation_to_ignore_only_where_a_store_is_refused
@@ -482,9 +482,10 @@
 5	ranges	115.5	a_node_that_leaves_a_refused_reads_registration_behind_is_caught
 5	ranges	66.8	every_seed_passes_on_the_correct_node
 5	node	39.5	a_fresh_node_that_bootstraps_itself_is_caught_by_check_7_where_it_is_not_a_bootstrap_node
-5	node	40.1	a_server_that_ignores_the_span_at_apply_is_caught_with_trust_and_has_no_path_alone
+5	node	49.1	a_server_that_ignores_the_span_at_apply_is_caught_with_trust_and_after_a_split_alone
 5	node	0.5	seed_493_is_a_live_installs_hold_and_the_fourth_arm_answers_for_it
-# shard 6: 1651.3 cpu s
+5	node	0.9	seed_633_is_a_live_installs_hold_and_the_fourth_arm_answers_for_it
+# shard 6: 1657.1 cpu s
 6	echo	0.1	a_busy_looping_task_fails_the_scenario_instead_of_hanging
 6	engine	310.3	an_engine_that_acknowledges_before_the_log_is_caught
 6	engine	204.5	an_engine_that_releases_a_memtable_before_the_manifest_is_caught
@@ -524,4 +525,4 @@
 6	node	7.9	the_range_layers_checks_agree_with_their_whole_trace_folds
 6	node	0.9	a_server_that_trusts_a_stale_descriptor_is_caught_by_check_9_on_the_node
 6	node	0.5	a_client_that_ignores_a_mismatch_is_caught_by_check_17_on_the_node
-6	node	45.0	a_meta_range_that_stores_updates_as_they_arrive_has_no_path_on_the_node_yet
+6	node	50.8	a_meta_range_that_stores_updates_as_they_arrive_is_caught_by_check_16_after_a_split

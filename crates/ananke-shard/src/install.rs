@@ -74,7 +74,7 @@ use bytes::Bytes;
 
 use crate::descriptor::RangeDescriptor;
 use crate::range::RangeId;
-use crate::server::Range;
+use crate::server::lock;
 use crate::snapshot::{Identity, Install, Landing, Route, Snapshots, Started};
 use crate::variant::{NodeVariant, NodeVariants};
 
@@ -131,6 +131,14 @@ pub enum SnapJob {
     Taken {
         /// The range.
         range: RangeId,
+    },
+    /// The node holds `range` from now: a split's right half, with the spans an
+    /// install of it switches (SHARD.md §5; PROPOSED D-100).
+    Host {
+        /// The range.
+        range: RangeId,
+        /// Its Raft interval and its span.
+        spans: Vec<KeyRange<Bytes>>,
     },
 }
 
@@ -448,11 +456,13 @@ pub struct Task<E: Environment> {
     id: ServerId,
     sock: Arc<<E::Net as Network>::Socket>,
     addrs: BTreeMap<ServerId, SocketAddr>,
-    stores: BTreeMap<RangeId, Arc<RaftStore<E>>>,
+    stores: Arc<std::sync::Mutex<BTreeMap<RangeId, Arc<RaftStore<E>>>>>,
     config: RaftConfig,
     variants: NodeVariants,
     engine_dir: PathBuf,
-    ranges: Vec<Range>,
+    /// The host's descriptors: a switched range's span is read here (SHARD.md §3;
+    /// PROPOSED D-100, where the node's ranges stopped being configuration's).
+    descriptors: Arc<std::sync::Mutex<BTreeMap<RangeId, RangeDescriptor>>>,
     /// Shared with the `apply` task: a live install moves a range's applied index,
     /// term and configuration without an apply, and both tasks read this.
     // PROPOSED(D-083): a live install moves the apply task's state with it.
@@ -477,11 +487,11 @@ impl<E: Environment> Task<E> {
         id: ServerId,
         sock: Arc<<E::Net as Network>::Socket>,
         addrs: BTreeMap<ServerId, SocketAddr>,
-        stores: BTreeMap<RangeId, Arc<RaftStore<E>>>,
+        stores: Arc<std::sync::Mutex<BTreeMap<RangeId, Arc<RaftStore<E>>>>>,
         config: RaftConfig,
         variants: NodeVariants,
         engine_dir: PathBuf,
-        ranges: Vec<Range>,
+        descriptors: Arc<std::sync::Mutex<BTreeMap<RangeId, RangeDescriptor>>>,
         applied: Arc<std::sync::Mutex<BTreeMap<RangeId, crate::server::Applied>>>,
         plan: Snapshots,
         local: Queue<crate::server::Local>,
@@ -496,7 +506,7 @@ impl<E: Environment> Task<E> {
             config,
             variants,
             engine_dir,
-            ranges,
+            descriptors,
             applied,
             plan,
             local,
@@ -566,6 +576,7 @@ impl<E: Environment> Task<E> {
                 held,
             } => self.finish(range, from, *repair, held).await,
             SnapJob::Taken { range } => self.sweep(range).await,
+            SnapJob::Host { range, spans } => self.plan.host(range, spans),
         }
     }
 
@@ -614,13 +625,15 @@ impl<E: Environment> Task<E> {
     /// Opens a stream of `range`'s snapshot at `index` to `to`.
     async fn open(&mut self, range: RangeId, to: ServerId, index: Index, term: Term) {
         let at = Identity {
-            term: self.stores.get(&range).map_or(0, |store| store.term()),
+            term: lock(&self.stores)
+                .get(&range)
+                .map_or(0, |store| store.term()),
             last_index: index,
             last_term: term,
         };
         // A range this node does not host has no version to stream and no core to
         // answer; the ask cannot have come from here.
-        let Some(store) = self.stores.get(&range).cloned() else {
+        let Some(store) = lock(&self.stores).get(&range).cloned() else {
             return;
         };
         // What the record names, if it names a take of its own: the fast path through
@@ -783,7 +796,7 @@ impl<E: Environment> Task<E> {
         else {
             return;
         };
-        let Some(store) = self.stores.get(&range).cloned() else {
+        let Some(store) = lock(&self.stores).get(&range).cloned() else {
             return;
         };
         if term < store.term() {
@@ -958,7 +971,7 @@ impl<E: Environment> Task<E> {
                     // re-seed stream progresses, and this is what progress means. It
                     // is progress of *this range's* stream, and it answers this range's
                     // core alone (issue #103, `acked_for`).
-                    let hosted: Vec<RangeId> = self.stores.keys().copied().collect();
+                    let hosted: Vec<RangeId> = lock(&self.stores).keys().copied().collect();
                     for one in acked_for(range, &hosted, self.variants) {
                         self.local
                             .push(crate::server::Local::Snapshot(SnapAnswer::Acked {
@@ -1028,7 +1041,7 @@ impl<E: Environment> Task<E> {
         else {
             return self.abandon(range, from).await;
         };
-        let Some(store) = self.stores.get(&range).cloned() else {
+        let Some(store) = lock(&self.stores).get(&range).cloned() else {
             return self.abandon(range, from).await;
         };
         // The store may have caught up while the repair was being built: the one-group
@@ -1253,7 +1266,7 @@ impl<E: Environment> Task<E> {
     /// that took every unpinned version, as the one-group's does against a single
     /// snapshot record, would delete every *other* range's checkpoints (D-075).
     async fn sweep(&mut self, range: RangeId) {
-        let Some(store) = self.stores.get(&range).cloned() else {
+        let Some(store) = lock(&self.stores).get(&range).cloned() else {
             return;
         };
         let mut keep: BTreeSet<(Index, u64)> = BTreeSet::new();
@@ -1363,12 +1376,11 @@ impl<E: Environment> Task<E> {
         });
     }
 
-    /// The range's user-key interval, from the ranges configuration.
+    /// The range's span, from its descriptor as the host holds it.
     fn user_span(&self, range: RangeId) -> Option<KeyRange<Bytes>> {
-        self.ranges
-            .iter()
-            .find(|one| one.id == range)
-            .map(Range::span)
+        lock(&self.descriptors)
+            .get(&range)
+            .map(|descriptor| descriptor.start.clone()..descriptor.end.clone())
     }
 
     /// Tells a sender to start its stream over, and traces **why** (RAFT.md:203-212).
@@ -1418,9 +1430,9 @@ impl<E: Environment> Task<E> {
             from: from.0,
             reason,
         });
-        let incarnation = self
-            .stores
+        let incarnation = lock(&self.stores)
             .get(&range)
+            .cloned()
             .map_or(0, |store| store.incarnation());
         self.answer(range, from, refusal(status, term, at), incarnation)
             .await;

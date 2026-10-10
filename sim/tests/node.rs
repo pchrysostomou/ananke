@@ -348,6 +348,12 @@ struct Coverage {
     /// takes the pinned seed off the hold (PROPOSED D-099, after seed 368).
     live_install_holds: usize,
     live_install_holds_first: Option<u64>,
+    /// The split arm (SHARD.md §5; PROPOSED D-100): splits the admins asked, answered
+    /// done, refused by reason and unanswered; and, read off the trace, splits that
+    /// took effect, right halves' replicas created, terms a right half led in and
+    /// writes applied through a right half.
+    splits: raft::SplitStats,
+    split_coverage: raft::SplitCoverage,
     leaders_by_range: BTreeMap<u64, usize>,
     applies_by_range: BTreeMap<u64, usize>,
     multi_range_frames: usize,
@@ -449,6 +455,8 @@ impl std::fmt::Debug for Coverage {
             .field("ids_granted_fewest", &self.ids_granted_fewest)
             .field("live_install_holds", &self.live_install_holds)
             .field("live_install_holds_first", &self.live_install_holds_first)
+            .field("splits", &self.splits)
+            .field("split_coverage", &self.split_coverage)
             .field("leaders_by_range", &self.leaders_by_range)
             .field("applies_by_range", &self.applies_by_range)
             .field("multi_range_frames", &self.multi_range_frames)
@@ -576,11 +584,32 @@ impl Coverage {
         let (granted, _) = raft::ids_leased_of(&report.records);
         self.ids_granted += granted;
         self.ids_granted_fewest = Some(self.ids_granted_fewest.map_or(granted, |f| f.min(granted)));
+        self.splits.asked += report.splits.asked;
+        self.splits.done += report.splits.done;
+        self.splits.unanswered += report.splits.unanswered;
+        self.splits.from_restarted += report.splits.from_restarted;
+        self.splits.from_restarted_done += report.splits.from_restarted_done;
+        for (reason, count) in &report.splits.refused {
+            *self.splits.refused.entry(reason).or_default() += count;
+        }
+        let split = raft::splits_of(&report.records);
+        self.split_coverage.applied += split.applied;
+        self.split_coverage.right_replicas += split.right_replicas;
+        self.split_coverage.right_leaders += split.right_leaders;
+        self.split_coverage.right_writes += split.right_writes;
+        self.split_coverage.right_reopened += split.right_reopened;
+        self.split_coverage.halves_installed += split.halves_installed;
+        self.split_coverage.refused_at_apply += split.refused_at_apply;
         if !report.timer_gaps_held_by_a_live_install().is_empty() {
             self.live_install_holds += 1;
-            if self.live_install_holds_first.is_none() {
-                self.live_install_holds_first = Some(report.seed);
-            }
+            // The lowest seed, not the first folded: the sweep folds its seeds in
+            // the order they finish, which two premerges of one tree need not share
+            // (D-099's premerge named seed 979 and this tree's two named 979 and 633
+            // of the same three; PROPOSED D-100).
+            self.live_install_holds_first = Some(
+                self.live_install_holds_first
+                    .map_or(report.seed, |first| first.min(report.seed)),
+            );
         }
         self.multi_range_frames += report.frames_of_several_ranges();
         let (hit, fired) = report.arms_hit_their_ranges();
@@ -686,12 +715,17 @@ impl Coverage {
             at(MismatchAt::Receipt),
             self.seeds
         );
-        assert_eq!(
-            (at(MismatchAt::Read), at(MismatchAt::Apply)),
-            (0, 0),
-            "the correct node refused a key at a read's serving or at apply, which \
-             nothing on this tree reaches before the split: a descriptor moved under a \
-             read or a proposal, or a server proposed a key it does not serve"
+        // A split under a read in flight or a proposal in flight is what refuses at
+        // serving and at apply (SHARD.md §3, §5; PROPOSED D-100): reached now that the
+        // split arm lands one on most seeds, printed at every tier and asserted at
+        // the tier its rate supports by the sharded sweep's directed shapes, which
+        // aim a burst of right-half writes and gets at a split (D-061).
+        println!(
+            "node: the correct node refused {} keys at a read's serving and {} at apply \
+             over {} seeds, under the split arm",
+            at(MismatchAt::Read),
+            at(MismatchAt::Apply),
+            self.seeds
         );
         assert!(
             self.client_mismatches >= self.seeds as usize,
@@ -720,11 +754,71 @@ impl Coverage {
             self.meta_applies,
             self.seeds
         );
-        assert_eq!(
-            self.meta_took, 0,
-            "a meta update won something on the correct node, where nothing raises a \
-             generation before the split: the absence becomes a reach"
+        // A split raises both halves' generations, and the leader's update after it
+        // is the first the meta range takes (SHARD.md §1, §5; PROPOSED D-100): every
+        // split that took effect is a `took` on meta, and a run with no split has none.
+        if self.split_coverage.applied > 0 {
+            assert!(
+                self.meta_took > 0,
+                "{} splits took effect over {} seeds and the meta range took no update: \
+                 the leader that split is not telling meta, or meta is not raising",
+                self.split_coverage.applied,
+                self.seeds
+            );
+        } else {
+            assert_eq!(
+                self.meta_took, 0,
+                "a meta update won something on the correct node with no split applied, \
+                 where nothing else raises a generation"
+            );
+        }
+        // The split's coverage (SHARD.md §5; PROPOSED D-100), printed at every tier and
+        // asserted where the sample supports it (D-061). Well above 5 % of seeds at the
+        // gate's twenty, so asserted at every tier: a split took effect, its right half
+        // was created and led and took writes, a restart reopened a right half from
+        // its keys, and a live install switched onto a half after its split. A write
+        // refused at apply on a parent after its split — proposed under the old span
+        // and appended above the split's index — is the schedule's to give and was
+        // 1 of 20 at the gate, so it is asserted from the thousand, where the sample
+        // sees none about once in 10^22 at that rate; a shape the correct node must
+        // reach follows the same rule as a variant's catch (D-061).
+        println!(
+            "node: splits over {} seeds: {:?}; {:?}",
+            self.seeds, self.splits, self.split_coverage
         );
+        let split = &self.split_coverage;
+        assert!(
+            split.applied > 0 && split.right_replicas > 0 && split.right_leaders > 0,
+            "no split took effect, or no right half was created and led, over {} seeds: \
+             {split:?}",
+            self.seeds
+        );
+        assert!(
+            split.right_writes > 0,
+            "no write was applied through a right half over {} seeds: the clients never \
+             found one",
+            self.seeds
+        );
+        assert!(
+            split.right_reopened > 0,
+            "no restart reopened a right half from its keys over {} seeds (SHARD.md §5: a \
+             crash after the batch restarts both replicas)",
+            self.seeds
+        );
+        assert!(
+            split.halves_installed > 0,
+            "no live install switched onto a half after its split over {} seeds",
+            self.seeds
+        );
+        if self.seeds >= 1000 {
+            assert!(
+                split.refused_at_apply > 0,
+                "no write proposed under a parent's old span reached apply above the \
+                 split's index over {} seeds, so §3's apply check refused nothing after a \
+                 split",
+                self.seeds
+            );
+        }
         // Range 0 granting blocks of ids (SHARD.md §5, Q17; PROPOSED D-099): every
         // node asks at its start, so every seed has grants; the floor is one a seed,
         // and the fewest on a seed is printed beside it.
@@ -1463,25 +1557,39 @@ fn routing_variant(name: &str, variants: &[NodeVariant]) -> Vec<Routed> {
             .get(&MismatchAt::Apply)
             .copied()
             .unwrap_or(0);
-        // Writes applied in a range the scenario's fixed map does not give the key
-        // to: what `ApplyIgnoresSpan` lets through, read against the map that is
-        // the truth on a tree with no split.
-        let misapplied = report.count(|e| {
-            matches!(
-                e,
-                TraceEvent::RaftApply {
+        // Writes applied outside the span of the descriptor in force before their
+        // index: what `ApplyIgnoresSpan` lets through, read against check 7's map
+        // rather than the scenario's fixed map, which a split moves off (PROPOSED
+        // D-100).
+        let misapplied = {
+            let mut descriptors = ananke_shard::invariants::Descriptors::default();
+            let mut count = 0usize;
+            for record in &report.records {
+                descriptors.push(record);
+                if let TraceEvent::RaftApply {
                     range,
+                    index,
                     key: Some(key),
                     effect: ananke_env::ApplyEffect::Applied,
                     ..
-                } if raft::node_range_of_key(key) != *range
-            )
-        });
+                } = &record.event
+                    && let Some(held) = descriptors.before(*range, *index)
+                {
+                    let encoded = ananke_raft::apply::user_key(key);
+                    if !(held.start <= encoded && encoded < held.end) {
+                        count += 1;
+                    }
+                }
+            }
+            count
+        };
         Routed {
             seed,
             why: report.check().err(),
             at_apply,
             misapplied,
+            splits: raft::splits_of(&report.records).applied,
+            resumed: report.splits.from_restarted_done,
         }
     });
     let caught = outcomes.iter().filter(|o| o.why.is_some()).count();
@@ -1501,10 +1609,12 @@ fn routing_variant(name: &str, variants: &[NodeVariant]) -> Vec<Routed> {
                 .is_some_and(|why| why.contains("served a read"))
         })
         .count();
+    let split = outcomes.iter().filter(|o| o.splits > 0).count();
     println!(
         "node: {name} caught on {caught}/{seeds} seeds by {by_check:?}, {at_a_read} of them at \
          a read; the apply check refused a write on {reached_apply}/{seeds}; a write was \
-         applied in the wrong range on {misapplied}/{seeds}; first: {}",
+         applied in the wrong range on {misapplied}/{seeds}; the split landed on \
+         {split}/{seeds}; first: {}",
         outcomes
             .iter()
             .find_map(|o| o.why.as_deref())
@@ -1521,6 +1631,10 @@ struct Routed {
     at_apply: usize,
     /// Applied writes in a range the fixed map does not give the key to.
     misapplied: usize,
+    /// Splits that took effect on the run (PROPOSED D-100).
+    splits: usize,
+    /// Splits done by a proposer restarted after its last (`Fault::SplitFromRestarted`).
+    resumed: u64,
 }
 
 #[test]
@@ -1568,8 +1682,18 @@ fn a_server_that_trusts_a_stale_descriptor_is_caught_by_check_9_on_the_node() {
     );
 }
 
+/// `ApplyIgnoresSpan` with `TrustStaleDescriptor`, where the trusted writes land in
+/// the wrong range, and alone, where its path is the split's (SHARD.md §5; PROPOSED
+/// D-100): a write proposed under P's span before the split and appended above the
+/// split's index applies as nothing on the correct node, since the apply check reads
+/// the descriptor in force before its index, and applies in P under the variant —
+/// check 9's "serving within span". A rate, since the schedule has to put the split's
+/// index under a proposal already checked: 1 of 20 at the gate and 5 of 100 at the
+/// thousand's share, D-061's 5 % on the nose, so the catch is asserted from the
+/// nightly's ten thousand, whose share of a thousand sees none about once in 10^22,
+/// where the thousand's share of a hundred would miss about one premerge in 170.
 #[test]
-fn a_server_that_ignores_the_span_at_apply_is_caught_with_trust_and_has_no_path_alone() {
+fn a_server_that_ignores_the_span_at_apply_is_caught_with_trust_and_after_a_split_alone() {
     let pair = routing_variant(
         "{TrustStaleDescriptor, ApplyIgnoresSpan}",
         &[
@@ -1601,9 +1725,9 @@ fn a_server_that_ignores_the_span_at_apply_is_caught_with_trust_and_has_no_path_
     // refuses nothing on any seed, and the trusted writes land in the wrong range —
     // the writes `TrustStaleDescriptor` alone has refused at apply. The run stops at
     // check 9's first violation, which on most seeds is a read served wrongly before
-    // any such write, so the misapplied writes are read off the trace against the
-    // scenario's fixed map rather than waited for as the first violation; measured
-    // before asserted, and printed.
+    // any such write, so the misapplied writes are read off the trace against check
+    // 7's map rather than waited for as the first violation; measured before
+    // asserted, and printed.
     assert!(
         pair.iter().all(|o| o.at_apply == 0),
         "the apply check refused a write under ApplyIgnoresSpan, which turns it off"
@@ -1614,42 +1738,97 @@ fn a_server_that_ignores_the_span_at_apply_is_caught_with_trust_and_has_no_path_
         "no trusted write was applied in the wrong range on any seed of the pair, so the \
          apply check's absence changed nothing the trace can see"
     );
-    // The absence, with its reason: alone, the variant is caught on no seed of the
-    // share, and the apply check refuses nothing, because nothing reaches apply
-    // outside its span without a server that trusts a stale claim or a split.
+    // Alone: the split's path. Every catch is check 9's, at a write applied in P for
+    // a key the split moved to R, and the trace shows the write applied outside the
+    // span on that seed; the apply check refuses nothing, since the variant turns it
+    // off. The shape the variant needs, a split landed on the share, is well above
+    // D-061's 5 % and asserted at every tier; the catch itself is the schedule's —
+    // 1 of 20 at the gate, 5 of 100 at the thousand's share — and asserted where the
+    // sample supports it, the nightly's share of a thousand (D-061; D-086's aimed arm
+    // is the precedent for a 5 % catch's tier).
     let alone = routing_variant("ApplyIgnoresSpan", &[NodeVariant::ApplyIgnoresSpan]);
-    let caught = alone.iter().filter(|o| o.why.is_some()).count();
-    assert_eq!(
-        caught, 0,
-        "ApplyIgnoresSpan alone was caught, so some write reached apply outside its span \
-         on the correct receipt path: the split has landed or a server proposed what it \
-         does not serve, and this absence becomes a reach"
+    assert!(
+        alone.iter().all(|o| o.at_apply == 0),
+        "the apply check refused a write under ApplyIgnoresSpan alone, which turns it off"
     );
     assert!(
-        alone.iter().all(|o| o.misapplied == 0),
-        "a write was applied in the wrong range with the receipt check in place"
+        alone.iter().any(|o| o.splits > 0),
+        "no split landed on the share, so ApplyIgnoresSpan alone had no path to be caught on"
     );
+    for outcome in &alone {
+        let Some(why) = outcome.why.as_deref() else {
+            continue;
+        };
+        assert!(
+            why.contains("serving within span"),
+            "seed {}: ApplyIgnoresSpan alone was caught by something other than check 9: {why}",
+            outcome.seed
+        );
+        assert!(
+            outcome.misapplied > 0,
+            "seed {}: check 9 caught a write applied outside its span that the trace read \
+             against check 7's map does not show",
+            outcome.seed
+        );
+    }
+    let caught = alone.iter().filter(|o| o.why.is_some()).count();
+    if seeds() >= 10_000 {
+        assert!(
+            caught > 0,
+            "ApplyIgnoresSpan alone was caught on no seed of the share: no write proposed \
+             before a split reached apply above the split's index, or the fold for it is \
+             silent"
+        );
+    }
 }
 
-/// §10's `MetaOverwritesByArrival` on the node, which has no path on this tree
-/// (PROPOSED D-098): every update names the first generation, so the maximum and the
-/// arrival agree and check 16 sees no generation fall. Caught on no seed, asserted as
-/// that absence with its reason; the variant is seen injected all the same, since its
-/// updates win their whole span where the correct meta range's win nothing.
-/// `Fault::MetaReorder` on the sharded sweep, which needs the split, is where §10
-/// catches it.
+/// §10's `MetaOverwritesByArrival` on the node, whose path is the split's (PROPOSED
+/// D-100): the split's update names P and R at generation g + 1, and an update of P's
+/// old descriptor that arrives after it — a resend of a `MetaUpdate` the meta task
+/// was still carrying — is left alone by the correct meta range (§1's maximum by
+/// generation) and stored by the variant, where check 16 sees the generation fall.
+/// Before the split every update named the first generation and the variant had no
+/// path (PROPOSED D-098). A rate, the schedule's to give — 3 of 20 at the gate, 18 of
+/// 100 at the thousand's share, asserted from the thousand's share, where a sample of
+/// a hundred at that rate sees none about once in 10^8 (D-061); the split landing on
+/// the share is asserted at every tier, and the variant is seen injected
+/// by its updates each winning their whole span where the correct meta range's win
+/// nothing but the split's.
 #[test]
-fn a_meta_range_that_stores_updates_as_they_arrive_has_no_path_on_the_node_yet() {
+fn a_meta_range_that_stores_updates_as_they_arrive_is_caught_by_check_16_after_a_split() {
     let outcomes = routing_variant(
         "MetaOverwritesByArrival",
         &[NodeVariant::MetaOverwritesByArrival],
     );
-    let caught = outcomes.iter().filter(|o| o.why.is_some()).count();
-    assert_eq!(
-        caught, 0,
-        "MetaOverwritesByArrival was caught, so some update named a generation above \
-         the first: the split has landed and this absence becomes a reach"
+    assert!(
+        outcomes.iter().any(|o| o.splits > 0),
+        "no split landed on the share, so MetaOverwritesByArrival had no path to be caught on"
     );
+    for outcome in &outcomes {
+        let Some(why) = outcome.why.as_deref() else {
+            continue;
+        };
+        assert!(
+            why.contains("meta never goes back"),
+            "seed {}: MetaOverwritesByArrival was caught by something other than check 16: {why}",
+            outcome.seed
+        );
+        assert!(
+            outcome.splits > 0,
+            "seed {}: check 16 saw meta's generation fall on a seed with no split, where \
+             every update names the first generation",
+            outcome.seed
+        );
+    }
+    let caught = outcomes.iter().filter(|o| o.why.is_some()).count();
+    if seeds() >= 1000 {
+        assert!(
+            caught > 0,
+            "MetaOverwritesByArrival was caught on no seed of the share: no update of a \
+             split's parent at its old generation arrived after the split's, or check 16 \
+             is silent"
+        );
+    }
     let variant = raft::run_on_the_node(
         1,
         Variants::default(),
@@ -1657,38 +1836,60 @@ fn a_meta_range_that_stores_updates_as_they_arrive_has_no_path_on_the_node_yet()
     );
     let correct = correct(1);
     let (applies, took) = raft::meta_applies_of(&variant.records);
-    let (_, took_correct) = raft::meta_applies_of(&correct.records);
+    let (applies_correct, took_correct) = raft::meta_applies_of(&correct.records);
+    let splits_correct = raft::splits_of(&correct.records).applied;
     println!(
         "node: MetaOverwritesByArrival on seed 1: {applies} meta applies after the \
-         bootstrap, {took} of them winning their span, against {took_correct} on the \
-         correct node"
+         bootstrap, {took} of them winning their span, against {took_correct} of \
+         {applies_correct} on the correct node, whose {splits_correct} split is what they \
+         are"
     );
     assert!(
-        applies > 0 && took > 0 && took_correct == 0,
-        "the variant was not seen injected: its updates should win their whole span \
-         where the correct meta range's win nothing"
+        applies > 0 && took == applies && took_correct < applies_correct,
+        "the variant was not seen injected: its updates should each win their whole span \
+         where the correct meta range's resends win nothing"
     );
 }
 
-/// §10's `IdBlockResumed` on the node, which has no path on this tree (PROPOSED
-/// D-099): nothing takes an id before the split, so a block resumed from another run
-/// is a block nothing draws from twice, and check 18's range-id clause — which sees
-/// the variant at the first apply of a split whose right half was named before — has
-/// no split to see. Caught on no seed, asserted as that absence with its reason; the
-/// variant is seen injected all the same: a restarted node that adopts the block its
-/// lease record names asks range 0 for no refill, where the correct node, whose new
-/// run's nonce matches no record, asks at every restart — so over seeds with restarts
-/// the variant is granted fewer blocks than the correct node. The sharded sweep's
-/// crash and restart of a node that took an id, followed by a split led from it, is
-/// where §10 catches it, with its "wrong if" as a check.
+/// §10's `IdBlockResumed` on the node, caught by check 18's range-id clause at the
+/// first apply of a split whose right half was named before (SHARD.md §5, Q17; §10;
+/// PROPOSED D-100), on the schedule's shape for it: the node that proposed the last
+/// split done, crashed and restarted, handed the lead of a range that split did not
+/// cut and asked to split it (`Fault::SplitFromRestarted`). The correct node's new run
+/// draws a fresh block for the second split; the variant resumes its record's block
+/// from the first id, the one the first split took. Caught at every tier — 14 of 20 at
+/// the gate, 71 of 100 at the thousand's share, a sample of twenty at that rate
+/// seeing none about once in 10^10; the shape reached — a second split done by the restarted
+/// proposer — is asserted at every tier too; and the variant is seen injected by
+/// range 0 granting its nodes fewer blocks than the correct node's over the same
+/// crashes, since a restarted node that resumes a block asks for no refill.
 #[test]
-fn a_node_that_resumes_another_runs_block_of_ids_has_no_path_on_the_node_yet() {
+fn a_node_that_resumes_another_runs_block_of_ids_is_caught_after_a_split() {
     let outcomes = routing_variant("IdBlockResumed", &[NodeVariant::IdBlockResumed]);
-    let caught = outcomes.iter().filter(|o| o.why.is_some()).count();
-    assert_eq!(
-        caught, 0,
-        "IdBlockResumed was caught, so an id was taken twice or a check saw the block \
-         resumed: the split has landed and this absence becomes a reach"
+    let resumed = outcomes.iter().filter(|o| o.resumed > 0).count();
+    println!(
+        "node: IdBlockResumed: a restarted proposer's second split was done on {resumed}/{} \
+         seeds",
+        outcomes.len()
+    );
+    assert!(
+        resumed > 0,
+        "no restarted proposer's second split was done on the share, so IdBlockResumed had \
+         no id to take twice: the schedule's shape for it (SHARD.md §10) was not reached"
+    );
+    let by_check_18 = outcomes
+        .iter()
+        .filter(|o| {
+            o.why
+                .as_deref()
+                .is_some_and(|why| why.contains("descriptor lineage"))
+        })
+        .count();
+    assert!(
+        by_check_18 > 0,
+        "IdBlockResumed was caught by check 18's range-id clause on no seed of the share: \
+         the second split's right half is not the id the first took, or the clause is silent \
+         (SHARD.md §12's wrong-if: no variant ships uncaught)"
     );
     // Seen injected: over the first seeds of the share, the variant's nodes are
     // granted fewer blocks than the correct node's, and its restarted nodes with a
@@ -3690,9 +3891,18 @@ fn seed_368_is_a_live_installs_hold_and_the_fourth_arm_answers_for_it() {
         "seed {seed}: the check without the fourth arm flags a stretch the arm does \
          not answer for, and the replay under every arm did not"
     );
-    // The guard: every live install on the run traces the state read back, the
-    // snapshot and the restatement at one instant, which is what the arm reads a
-    // switch by.
+    let switches = live_installs_at_one_instant(seed, &report);
+    println!(
+        "seed {seed}: no stretch held by a live install (PROPOSED D-099 moved the schedule \
+         off D-098's hold); {switches} live installs on the run, every one traced at one \
+         instant"
+    );
+}
+
+/// The guard both absence pins keep (PROPOSED D-099, D-100): every live install on
+/// the run traces the state read back, the snapshot and the restatement at one
+/// instant, which is what D-091's fourth arm reads a switch by; how many there were.
+fn live_installs_at_one_instant(seed: u64, report: &raft::Report) -> usize {
     let mut switches = 0usize;
     for (index, record) in report.records.iter().enumerate() {
         let TraceEvent::RaftSnapshot {
@@ -3743,22 +3953,68 @@ fn seed_368_is_a_live_installs_hold_and_the_fourth_arm_answers_for_it() {
         switches > 0,
         "seed {seed}: no live install switched on the run, so the guard asserts nothing"
     );
+    switches
+}
+
+/// **Seed 493 was the hold D-091's pin waited for**, named by the correct node's sweep
+/// on D-099's premerge and pinned in the shape D-091's pin keeps: server 2's replica of
+/// range 5 held for a live install past its timer bound, the check with the fourth arm
+/// passing and the check without it flagging exactly that stretch. **PROPOSED D-100
+/// moved the schedule off it**: the split arm and the restarted proposer's second
+/// split are drawn among every node schedule's arms, so the seed's installs fall
+/// elsewhere. The pin is the absence with its reason now, as seeds 272, 516 and 368
+/// are: no stretch the arm answers for, nothing flagged without the arm either, and
+/// the guard, every live install on the run traced at one instant. The correct node's
+/// sweep counts the holds the arm answers for on every seed and names the first
+/// (`live_install_holds_first`), where the pin moves.
+// PROPOSED(D-100): the schedule moved off D-099's hold; the absence, with its reason.
+#[test]
+fn seed_493_is_a_live_installs_hold_and_the_fourth_arm_answers_for_it() {
+    let seed = 493u64;
+    let report = correct(seed);
+    report
+        .check()
+        .unwrap_or_else(|violation| panic!("seed {seed} no longer passes: {violation}"));
+    let gaps = report.timer_gaps(raft::TimerResets::ALL);
+    assert!(
+        gaps.is_empty(),
+        "seed {seed}: the timer replay reports {gaps:?} under every arm"
+    );
+    let held = report.timer_gaps_held_by_a_live_install();
+    assert!(
+        held.is_empty(),
+        "seed {seed}: the check without the fourth arm finds {} stretches held by a \
+         live install: {held:?}. The schedule has reached the hold again on this seed, \
+         and this pin is upgraded to assert it in D-099's shape, not left as an absence",
+        held.len()
+    );
+    assert!(
+        report
+            .timer_gaps(raft::TimerResets::WITHOUT_LIVE_INSTALL)
+            .is_empty(),
+        "seed {seed}: the check without the fourth arm flags a stretch the arm does \
+         not answer for, and the replay under every arm did not"
+    );
+    let switches = live_installs_at_one_instant(seed, &report);
     println!(
-        "seed {seed}: no stretch held by a live install (PROPOSED D-099 moved the schedule \
-         off D-098's hold); {switches} live installs on the run, every one traced at one \
+        "seed {seed}: no stretch held by a live install (PROPOSED D-100 moved the schedule \
+         off D-099's hold); {switches} live installs on the run, every one traced at one \
          instant"
     );
 }
 
-/// **Seed 493 is the hold D-091's pin waited for**, named by the correct node's sweep
-/// on this tree's premerge (`live_install_holds_first`) and pinned in the shape D-091's
-/// pin keeps (PROPOSED D-099): a replica held for a live install past its timer bound,
-/// which the check with the fourth arm passes and the check without it flags, exactly
-/// that stretch and nothing else. Server 2's replica of range 5, its clock last reset
-/// at 8.066 s, was fed a snapshot of that range: the install was decided at 8.110 s,
-/// where the `raft` task handed the repair over and took the hold, and switched, with
-/// the restatement on it, at 8.478 s; the replay flags it at 8.466 s, 356 ms into the
-/// hold and 12 ms before the restatement.
+/// **Seed 633 is the hold D-091's pin waits on, on this tree**: the split moved every
+/// node schedule (PROPOSED D-100) and off seed 493's hold, and the correct node's sweep
+/// at the thousand counted three holds the arm answers for and names the lowest
+/// (`live_install_holds_first`), 633 — its two premerges folded 979 and 633 first,
+/// which is why the counter names the lowest now and not the first folded. Pinned in the shape D-091's pin keeps: a replica held
+/// for a live install past its timer bound, which the check with the fourth arm passes
+/// and the check without it flags, exactly that stretch and nothing else. Server 2's
+/// replica of range 0, the root, its clock last reset at 12.508 s, was fed a snapshot of
+/// that range: the install was decided at 12.508 s, where the `raft` task handed the
+/// repair over and took the hold, and switched, with the restatement on it, at
+/// 13.018 s; the replay flags it at 12.905 s, 397 ms into the hold and 113 ms before
+/// the restatement.
 ///
 /// What is asserted is the mechanism, not the pass: the one stretch the arm answers
 /// for equals what the check without the arm flags; the install's decision and its
@@ -3766,12 +4022,12 @@ fn seed_368_is_a_live_installs_hold_and_the_fourth_arm_answers_for_it() {
 /// restatement land at one instant, which is what the arm reads a switch by; and a
 /// stream toward the replica was re-opened inside the window, the shape's leader
 /// streaming a follower it stopped appending to. The day the schedule moves off the
-/// hold, this pin becomes the absence with its reason, as seeds 272, 516 and 368 are,
+/// hold, this pin becomes the absence with its reason, as seeds 272, 516, 368 and 493 are,
 /// and the sweep's counter names the next.
-// PROPOSED(D-099): the hold reached, on the seed the sweep's counter named.
+// PROPOSED(D-100): the hold reached, on the seed the sweep's counter named.
 #[test]
-fn seed_493_is_a_live_installs_hold_and_the_fourth_arm_answers_for_it() {
-    let seed = 493u64;
+fn seed_633_is_a_live_installs_hold_and_the_fourth_arm_answers_for_it() {
+    let seed = 633u64;
     let report = correct(seed);
     report
         .check()
@@ -3787,7 +4043,7 @@ fn seed_493_is_a_live_installs_hold_and_the_fourth_arm_answers_for_it() {
         held.len(),
         1,
         "seed {seed}: the schedule has moved off the hold this pin asserts ({held:?}); \
-         assert the absence with its reason, as seeds 272, 516 and 368 do, and move the \
+         assert the absence with its reason, as seeds 272, 516, 368 and 493 do, and move the \
          pin to the seed the correct node's sweep names"
     );
     assert_eq!(

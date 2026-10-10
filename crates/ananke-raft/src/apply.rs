@@ -39,6 +39,15 @@ pub fn user_key(user: &[u8]) -> Bytes {
     key(USER_TENANT, USER_TABLE, user)
 }
 
+/// The user key an encoded key of the user's store carries: the inverse of
+/// [`user_key`], `None` for a key of another tenant or table.
+// PROPOSED(D-100): a restart reads a split's right half back from its descriptor.
+#[must_use]
+pub fn user_key_of(encoded: &[u8]) -> Option<&[u8]> {
+    let prefix = user_key(&[]);
+    encoded.strip_prefix(&prefix[..])
+}
+
 /// A command the state machine applies.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Command {
@@ -116,6 +125,21 @@ pub enum Command {
         /// The nonce of the node's current run.
         run: u64,
     },
+    /// A split of the range at `key` (SHARD.md §5, Q18, Q19): asked by an operator
+    /// with `right` zero, and proposed by the leader with `right` the id it took from
+    /// its node's block for the right half. An entry the range layer applies —
+    /// every replica at the same index re-checks it and writes both halves'
+    /// descriptors and the right half's Raft state in one batch — which this crate
+    /// reads nothing of, and a one-group server never receives. It touches no key of
+    /// its own: `key` is where the span is cut, so [`Command::key`] is `None` and
+    /// the range layer checks it against the span itself.
+    // PROPOSED(D-100)
+    Split {
+        /// The right half's first key.
+        key: Bytes,
+        /// The right half's range id; zero until the leader takes one.
+        right: u64,
+    },
 }
 
 impl Command {
@@ -131,7 +155,8 @@ impl Command {
             | Command::Change { .. }
             | Command::MetaUpdate { .. }
             | Command::Lookup { .. }
-            | Command::Refill { .. } => None,
+            | Command::Refill { .. }
+            | Command::Split { .. } => None,
         }
     }
 
@@ -152,6 +177,67 @@ pub enum Outcome {
     Swapped(bool),
     /// What a get found.
     Value(Option<Bytes>),
+    /// A split was refused, at its proposal or at its apply (SHARD.md §5, Q23;
+    /// PROPOSED D-100), with the reason.
+    Refused(SplitRefusal),
+}
+
+/// Why a split was refused (SHARD.md §5): the leader's checks at proposal, for
+/// liveness, and every replica's re-check at apply, against shared state.
+// PROPOSED(D-100)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SplitRefusal {
+    /// The key is not strictly inside the range's span.
+    KeyOutsideSpan,
+    /// The range's descriptor is not `Live`.
+    NotLive,
+    /// The configuration in force at the split is joint, or a change is in flight.
+    ConfigurationChanging,
+    /// The node's block of range ids holds none and range 0 has not refilled it
+    /// (Stage C's question 1, PROPOSED D-092).
+    NoRangeId,
+    /// The range is a system range, which neither splits nor merges in Phase 3
+    /// (SHARD.md §1).
+    SystemRange,
+}
+
+impl SplitRefusal {
+    /// The reason's wire byte.
+    #[must_use]
+    pub fn code(self) -> u8 {
+        match self {
+            SplitRefusal::KeyOutsideSpan => 1,
+            SplitRefusal::NotLive => 2,
+            SplitRefusal::ConfigurationChanging => 3,
+            SplitRefusal::NoRangeId => 4,
+            SplitRefusal::SystemRange => 5,
+        }
+    }
+
+    /// The reason a wire byte names.
+    #[must_use]
+    pub fn from_code(code: u8) -> Option<Self> {
+        match code {
+            1 => Some(SplitRefusal::KeyOutsideSpan),
+            2 => Some(SplitRefusal::NotLive),
+            3 => Some(SplitRefusal::ConfigurationChanging),
+            4 => Some(SplitRefusal::NoRangeId),
+            5 => Some(SplitRefusal::SystemRange),
+            _ => None,
+        }
+    }
+
+    /// The reason's name, for the studio.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            SplitRefusal::KeyOutsideSpan => "key-outside-span",
+            SplitRefusal::NotLive => "not-live",
+            SplitRefusal::ConfigurationChanging => "configuration-changing",
+            SplitRefusal::NoRangeId => "no-range-id",
+            SplitRefusal::SystemRange => "system-range",
+        }
+    }
 }
 
 fn bad(what: &str) -> io::Error {
@@ -231,6 +317,11 @@ impl Command {
                 out.put_u8(8);
                 out.put_u64_le(*node);
                 out.put_u64_le(*run);
+            }
+            Command::Split { key, right } => {
+                out.put_u8(9);
+                put_bytes(&mut out, key);
+                out.put_u64_le(*right);
             }
         }
         out.freeze()
@@ -315,6 +406,16 @@ impl Command {
                     run: bytes.get_u64_le(),
                 }
             }
+            9 => {
+                let key = get_bytes(&mut bytes)?;
+                if bytes.len() < 8 {
+                    return Err(bad("command torn"));
+                }
+                Command::Split {
+                    key,
+                    right: bytes.get_u64_le(),
+                }
+            }
             _ => return Err(bad("command malformed")),
         };
         if !bytes.is_empty() {
@@ -364,7 +465,8 @@ pub async fn apply_command<E: Environment>(
         | Some(Command::Change { .. })
         | Some(Command::MetaUpdate { .. })
         | Some(Command::Lookup { .. })
-        | Some(Command::Refill { .. }) => Outcome::Done,
+        | Some(Command::Refill { .. })
+        | Some(Command::Split { .. }) => Outcome::Done,
     };
     store.apply(index, batch).await?;
     Ok(outcome)
@@ -413,6 +515,14 @@ mod tests {
             Command::Refill {
                 node: 3,
                 run: 0x1122_3344_5566_7788,
+            },
+            Command::Split {
+                key: Bytes::from_static(b"m"),
+                right: 7,
+            },
+            Command::Split {
+                key: Bytes::new(),
+                right: 0,
             },
         ];
         for command in commands {

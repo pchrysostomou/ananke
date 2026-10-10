@@ -1328,6 +1328,11 @@ async fn client<E: Environment>(env: E, n: u64, stats: Arc<Mutex<ClientStats>>) 
                         Outcome::Done => ClientResult::Done,
                         Outcome::Swapped(swapped) => ClientResult::Swapped(swapped),
                         Outcome::Value(value) => ClientResult::Value(value),
+                        // A refusal answers a split, which no client sends as an
+                        // operation (SHARD.md §5, §9; PROPOSED D-100).
+                        Outcome::Refused(reason) => {
+                            unreachable!("a split's refusal, {reason:?}, as an operation")
+                        }
                     },
                 });
                 stats.lock().expect("the stats").completed += 1;
