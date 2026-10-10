@@ -340,48 +340,27 @@ impl Cluster {
         }
     }
 
-    /// The cache client `n` of this cluster starts with: on the node cluster, the
-    /// bootstrap descriptors of its configuration (SHARD.md §2) for an even client
-    /// and [`stale_descriptor`] for an odd one — a client that knew the cluster before
-    /// its ranges were fixed, so that every seed has requests refused at receipt and
-    /// clients that converge through `RangeMismatch` alone, on a tree with no split to
-    /// make it (§3); nothing on one group, which has no ranges to route among. A
-    /// leader hint per range lives in it on both.
+    /// The cache client `n` of this cluster starts with, on the node cluster, by
+    /// thirds: [`stale_descriptor`] for the first client and every third after it —
+    /// a client that knew the cluster before its ranges were fixed, so that every seed
+    /// has requests refused at receipt and clients that converge through
+    /// `RangeMismatch` alone (§3; PROPOSED D-097) — [`root_descriptor`] alone for the
+    /// second and every third after it, a client that found the cluster through
+    /// configuration and looks everything else up through ranges 0 and 1 (SHARD.md §2,
+    /// §3; PROPOSED D-098), and the bootstrap descriptors of the configuration for the
+    /// third (§2). The sweep's two clients are one of each of the first two kinds.
+    /// Nothing on one group, which has no ranges to route among. A leader hint per
+    /// range lives in it on both.
     // PROPOSED(D-097): the node cluster's client routes by its cache, and every
     // other client starts stale.
+    // PROPOSED(D-098): every third client starts knowing range 0 alone.
     #[must_use]
     pub fn initial_cache(self, n: u64) -> Cache {
         match self {
             Self::OneGroup => Cache::new(),
-            Self::Node if n % 2 == 1 => Cache::seeded(&[stale_descriptor()]),
+            Self::Node if n % 3 == 1 => Cache::seeded(&[stale_descriptor()]),
+            Self::Node if n % 3 == 2 => Cache::seeded(&[root_descriptor()]),
             Self::Node => Cache::seeded(&node_descriptors()),
-        }
-    }
-
-    /// Where a client of this cluster sends `key`: the range and the generation its
-    /// cache names (SHARD.md §3), or the group on one group.
-    ///
-    /// A client whose cache holds no entry for the key looks it up through the meta
-    /// range once Stage C's lookups exist (§1, §3); until then it takes the
-    /// bootstrap descriptors again, which is what a lookup would return on a tree
-    /// with no split, and what a `RangeMismatch` that carried nothing evicted.
-    // PROPOSED(D-097)
-    fn route(self, cache: &mut Cache, key: &Bytes) -> (u64, u64) {
-        match self {
-            Self::OneGroup => (range_of_key(key), FIRST_GENERATION),
-            Self::Node => {
-                let encoded = user_key(key);
-                if cache.lookup(&encoded).is_none() {
-                    for descriptor in node_descriptors() {
-                        cache.learn(&descriptor);
-                    }
-                }
-                cache
-                    .lookup(&encoded)
-                    .map_or((node_range_of_key(key), FIRST_GENERATION), |entry| {
-                        (entry.range.get(), entry.generation)
-                    })
-            }
         }
     }
 
@@ -506,6 +485,59 @@ pub fn mismatches_sent_of(records: &[TraceRecord]) -> BTreeMap<MismatchAt, usize
 /// at generation 0, below every bootstrap descriptor, so that every `RangeMismatch`
 /// it draws replaces it for the part the answer names (SHARD.md §3).
 // PROPOSED(D-097): a client that starts stale.
+#[must_use]
+pub fn root_descriptor() -> RangeDescriptor {
+    let span = ananke_shard::system::root_span();
+    RangeDescriptor {
+        range: ananke_shard::system::ROOT_RANGE,
+        start: span.start,
+        end: span.end,
+        generation: FIRST_GENERATION,
+        voters: (1..=SERVERS).map(ServerId).collect(),
+        state: RangeState::Live,
+    }
+}
+
+/// `RaftRead` served by the root or the meta range over `records`: the lookups
+/// (SHARD.md §1, §3; Q36).
+// PROPOSED(D-098)
+#[must_use]
+pub fn lookups_served_of(records: &[TraceRecord]) -> usize {
+    records
+        .iter()
+        .filter(|record| {
+            matches!(
+                &record.event,
+                TraceEvent::RaftRead { range, .. }
+                    if *range == ananke_shard::system::ROOT_RANGE.get()
+                        || *range == ananke_shard::system::META_RANGE.get()
+            )
+        })
+        .count()
+}
+
+/// `MetaApplied` after the bootstrap over `records`: how many, and how many of them
+/// won some sub-interval, which is what an update that changes something does
+/// (SHARD.md §1).
+// PROPOSED(D-098)
+#[must_use]
+pub fn meta_applies_of(records: &[TraceRecord]) -> (usize, usize) {
+    let mut applies = 0;
+    let mut took = 0;
+    for record in records {
+        if let TraceEvent::MetaApplied { index, descriptors } = &record.event
+            && *index > 0
+        {
+            applies += 1;
+            took += usize::from(descriptors.iter().any(|d| !d.won.is_empty()));
+        }
+    }
+    (applies, took)
+}
+
+/// Range 0's descriptor as configuration fixes it (SHARD.md §2): what a client that
+/// found the cluster through configuration alone starts with.
+// PROPOSED(D-098)
 #[must_use]
 pub fn stale_descriptor() -> RangeDescriptor {
     let ranges = crate::ranges::ranges();
@@ -1447,6 +1479,9 @@ pub struct ClientStats {
     /// Tries answered with RangeMismatch (SHARD.md §3).
     // PROPOSED(D-097)
     pub mismatched: u64,
+    /// Lookups the client made through range 0 or range 1 (SHARD.md §1, §3).
+    // PROPOSED(D-098)
+    pub lookups: u64,
 }
 
 type SharedStats = Arc<Mutex<ClientStats>>;
@@ -2441,7 +2476,20 @@ pub fn payload_is_well_formed(records: &[TraceRecord], hosted: &[u64]) -> Result
                          `out_of_span` and names no key"
                     ));
                 }
-                ApplyEffect::Applied | ApplyEffect::None | ApplyEffect::OutOfSpan => {}
+                // PROPOSED(D-098): a range command's effects, which name no key — a
+                // `MetaUpdate` took effect, or applied as nothing.
+                ApplyEffect::Took | ApplyEffect::Refused if key.is_some() => {
+                    return Err(format!(
+                        "the trace's payload: server {server}'s apply of {index} is `{}` \
+                         and names the key {key:?}, where a range command names none",
+                        effect.as_str()
+                    ));
+                }
+                ApplyEffect::Applied
+                | ApplyEffect::None
+                | ApplyEffect::OutOfSpan
+                | ApplyEffect::Took
+                | ApplyEffect::Refused => {}
                 other => {
                     return Err(format!(
                         "the trace's payload: server {server}'s apply of {index} is `{}`, which \
@@ -6693,6 +6741,146 @@ fn to_result(outcome: Outcome) -> ClientResult {
     }
 }
 
+/// Where a client of `cluster` sends `key`: the range and the generation its cache
+/// names (SHARD.md §3), looked up through ranges 0 and 1 when the cache holds no entry
+/// for the key (§1; PROPOSED D-098), or the group on one group. A lookup that finds
+/// nothing leaves the operation to the scenario's map at the first generation, which
+/// the sweep counts.
+/// Where a client's lookup sequence numbers start (SHARD.md §3, §9): an operation's
+/// number is what its `ClientSend`s and its proposals share, so a lookup, which is no
+/// operation, counts from a base no operation reaches in a run.
+const LOOKUP_SEQ_BASE: u64 = 1 << 40;
+
+#[allow(clippy::too_many_arguments)]
+async fn route_on<E: Environment>(
+    cluster: Cluster,
+    env: &E,
+    sock: &<E::Net as Network>::Socket,
+    cache: &mut Cache,
+    seq: &mut u64,
+    process: u64,
+    servers: u64,
+    key: &Bytes,
+    stats: &SharedStats,
+) -> (u64, u64) {
+    match cluster {
+        Cluster::OneGroup => (range_of_key(key), FIRST_GENERATION),
+        Cluster::Node => {
+            let encoded = user_key(key);
+            if cache.lookup(&encoded).is_none() {
+                stats.lock().unwrap().lookups += 1;
+                lookup_through(env, sock, cache, seq, process, servers, key).await;
+            }
+            cache
+                .lookup(&encoded)
+                .map_or((node_range_of_key(key), FIRST_GENERATION), |entry| {
+                    (entry.range.get(), entry.generation)
+                })
+        }
+    }
+}
+
+/// The client's lookup (SHARD.md §1, §3; Q36): range 1's descriptor through range 0
+/// when the cache lacks it, then the key's through range 1, each a `Lookup` sent to
+/// the range's leader hint or its voters in turn under a sequence number of its own,
+/// and what comes back merged into the cache. Not an operation: nothing of it is
+/// traced by the client or enters the history.
+async fn lookup_through<E: Environment>(
+    env: &E,
+    sock: &<E::Net as Network>::Socket,
+    cache: &mut Cache,
+    seq: &mut u64,
+    process: u64,
+    servers: u64,
+    key: &Bytes,
+) {
+    let meta = ananke_shard::system::META_RANGE;
+    let root = ananke_shard::system::ROOT_RANGE;
+    if !cache.entries().any(|entry| entry.range == meta) {
+        ask(env, sock, cache, seq, process, servers, root, Bytes::new()).await;
+    }
+    if cache.entries().any(|entry| entry.range == meta) {
+        ask(env, sock, cache, seq, process, servers, meta, key.clone()).await;
+    }
+}
+
+/// One lookup of `about` through `range`: sent to the range's hint or its voters in
+/// turn, followed on `NotLeader`, learned on an answer, given up after a round of
+/// tries or an answer that carries nothing.
+#[allow(clippy::too_many_arguments)]
+async fn ask<E: Environment>(
+    env: &E,
+    sock: &<E::Net as Network>::Socket,
+    cache: &mut Cache,
+    seq: &mut u64,
+    process: u64,
+    servers: u64,
+    range: RangeId,
+    about: Bytes,
+) {
+    let generation = cache
+        .entries()
+        .find(|entry| entry.range == range)
+        .map_or(FIRST_GENERATION, |entry| entry.generation);
+    let mut target = cache
+        .hint(range)
+        .map_or(1 + env.rng().below(servers), |leader| leader.0);
+    for _ in 0..servers * 2 {
+        *seq += 1;
+        let sent = *seq;
+        let request = RangedRequest {
+            range,
+            generation,
+            request: Request {
+                client: process,
+                seq: sent,
+                command: Command::Lookup { key: about.clone() },
+            },
+        };
+        if sock
+            .send(server_addr(target), request.encode())
+            .await
+            .is_err()
+        {
+            return;
+        }
+        let deadline = env.clock().now() + TRY_TIMEOUT;
+        let mut got = None;
+        loop {
+            let recv = pin!(sock.recv());
+            let timer = pin!(env.clock().sleep_until(deadline));
+            match race(env, recv, timer).await {
+                Either::Left(Ok((_, bytes))) => {
+                    if let Some(response) = Cluster::Node.decode(bytes)
+                        && response.client == process
+                        && response.seq == sent
+                    {
+                        got = Some(response.reply);
+                        break;
+                    }
+                }
+                Either::Left(Err(_)) => return,
+                Either::Right(()) => break,
+            }
+        }
+        match got {
+            Some(Reply::Outcome(Outcome::Value(Some(bytes)))) => {
+                if let Ok(descriptor) = RangeDescriptor::decode(bytes) {
+                    cache.learn(&descriptor);
+                }
+                cache.set_hint(range, ServerId(target));
+                return;
+            }
+            Some(Reply::Outcome(_) | Reply::RangeMismatch { .. }) => return,
+            Some(Reply::NotLeader { leader: Some(l) }) => target = l.0,
+            Some(Reply::NotLeader { leader: None }) | None => {
+                cache.clear_hint(range);
+                target = target % servers + 1;
+            }
+        }
+    }
+}
+
 /// One client: operations on random keys against the leader it last heard of,
 /// following NotLeader hints, abandoning a write it hears nothing about. Client 1
 /// reads more than it writes: it is the client the trial and the leader isolation
@@ -6738,12 +6926,27 @@ pub(crate) async fn client_on<E: Environment>(
     // (SHARD.md §3). On one group the cache holds no span and only the hint.
     // PROPOSED(D-097): the node cluster's client routes by its cache.
     let mut cache = cluster.initial_cache(n);
+    // The lookups' sequence numbers, from a base no operation reaches: a lookup
+    // under an operation's number would be paired with it by the history's closure
+    // (`invoked`), and the twenty-seed run saw a put answered with a lookup's value.
+    let mut lookup_seq: u64 = LOOKUP_SEQ_BASE;
     // The server the last abandoned operation went to: not the first to try next.
     let mut avoid: Option<u64> = None;
     let mut known: BTreeMap<Bytes, Option<Bytes>> = BTreeMap::new();
     loop {
         let key = Bytes::from(format!("k{}", env.rng().below(cluster.keys())));
-        let (mut range, mut generation) = cluster.route(&mut cache, &key);
+        let (mut range, mut generation) = route_on(
+            cluster,
+            &env,
+            &sock,
+            &mut cache,
+            &mut lookup_seq,
+            process,
+            servers,
+            &key,
+            &stats,
+        )
+        .await;
         // The operation's own number, which its `ClientInvoke` and `ClientReturn`
         // carry; a resend after a definite `RangeMismatch` goes under a fresh one
         // (SHARD.md §3, §9; Q10).
@@ -6892,7 +7095,18 @@ pub(crate) async fn client_on<E: Environment>(
                     for descriptor in &decoded {
                         cache.learn(descriptor);
                     }
-                    (range, generation) = cluster.route(&mut cache, &key);
+                    (range, generation) = route_on(
+                        cluster,
+                        &env,
+                        &sock,
+                        &mut cache,
+                        &mut lookup_seq,
+                        process,
+                        servers,
+                        &key,
+                        &stats,
+                    )
+                    .await;
                     target = cache
                         .hint(RangeId(range))
                         .map_or(target % servers + 1, |leader| leader.0);
@@ -7648,6 +7862,7 @@ pub fn run_on(
         clients_total.abandoned += s.abandoned;
         clients_total.redirected += s.redirected;
         clients_total.mismatched += s.mismatched;
+        clients_total.lookups += s.lookups;
     }
     Report {
         seed,

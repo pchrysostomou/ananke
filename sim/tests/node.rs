@@ -327,6 +327,15 @@ struct Coverage {
     mismatched: u64,
     mismatches_at: BTreeMap<MismatchAt, usize>,
     client_mismatches: usize,
+    /// The meta range in use (SHARD.md §1; PROPOSED D-098): lookups served by the
+    /// root and the meta range, the clients' lookup rounds, and the meta applies after
+    /// the bootstrap — every leader elected sends its descriptor — of which none wins
+    /// anything on this tree, since nothing raises a generation before the split,
+    /// asserted absent with that reason.
+    lookups_served: usize,
+    client_lookups: u64,
+    meta_applies: usize,
+    meta_took: usize,
     leaders_by_range: BTreeMap<u64, usize>,
     applies_by_range: BTreeMap<u64, usize>,
     multi_range_frames: usize,
@@ -420,6 +429,10 @@ impl std::fmt::Debug for Coverage {
             .field("mismatched", &self.mismatched)
             .field("mismatches_at", &self.mismatches_at)
             .field("client_mismatches", &self.client_mismatches)
+            .field("lookups_served", &self.lookups_served)
+            .field("client_lookups", &self.client_lookups)
+            .field("meta_applies", &self.meta_applies)
+            .field("meta_took", &self.meta_took)
             .field("leaders_by_range", &self.leaders_by_range)
             .field("applies_by_range", &self.applies_by_range)
             .field("multi_range_frames", &self.multi_range_frames)
@@ -539,6 +552,11 @@ impl Coverage {
             *self.mismatches_at.entry(at).or_default() += count;
         }
         self.client_mismatches += report.count(|e| matches!(e, TraceEvent::ClientMismatch { .. }));
+        self.lookups_served += raft::lookups_served_of(&report.records);
+        self.client_lookups += report.clients.lookups;
+        let (applies, took) = raft::meta_applies_of(&report.records);
+        self.meta_applies += applies;
+        self.meta_took += took;
         self.multi_range_frames += report.frames_of_several_ranges();
         let (hit, fired) = report.arms_hit_their_ranges();
         self.arms_hit += hit;
@@ -656,6 +674,31 @@ impl Coverage {
              traces what it was told",
             self.client_mismatches,
             self.seeds
+        );
+        // **The meta range in use** (SHARD.md §1; PROPOSED D-098). Every third client
+        // starts knowing range 0 alone, so every seed has lookups through both system
+        // ranges; every leader elected sends its descriptor to the meta range, so
+        // every seed has meta applies after the bootstrap; and none of them wins
+        // anything, since nothing raises a generation before the split — asserted
+        // absent with that reason, so the day the split lands this says so.
+        assert!(
+            self.lookups_served >= 2 * self.seeds as usize,
+            "the root and the meta range served {} lookups over {} seeds, fewer than two \
+             a seed: the clients that start knowing range 0 alone are not looking up",
+            self.lookups_served,
+            self.seeds
+        );
+        assert!(
+            self.meta_applies >= self.seeds as usize,
+            "the meta range applied {} updates after the bootstrap over {} seeds, fewer \
+             than one a seed: leaders taking office are not telling it",
+            self.meta_applies,
+            self.seeds
+        );
+        assert_eq!(
+            self.meta_took, 0,
+            "a meta update won something on the correct node, where nothing raises a \
+             generation before the split: the absence becomes a reach"
         );
         // **The install arm reaching the moment it aims at**, which was not a floor
         // before PROPOSED D-089 because it was not a number: the arm drew its victim and
@@ -1552,6 +1595,45 @@ fn a_server_that_ignores_the_span_at_apply_is_caught_with_trust_and_has_no_path_
     );
 }
 
+/// §10's `MetaOverwritesByArrival` on the node, which has no path on this tree
+/// (PROPOSED D-098): every update names the first generation, so the maximum and the
+/// arrival agree and check 16 sees no generation fall. Caught on no seed, asserted as
+/// that absence with its reason; the variant is seen injected all the same, since its
+/// updates win their whole span where the correct meta range's win nothing.
+/// `Fault::MetaReorder` on the sharded sweep, which needs the split, is where §10
+/// catches it.
+#[test]
+fn a_meta_range_that_stores_updates_as_they_arrive_has_no_path_on_the_node_yet() {
+    let outcomes = routing_variant(
+        "MetaOverwritesByArrival",
+        &[NodeVariant::MetaOverwritesByArrival],
+    );
+    let caught = outcomes.iter().filter(|o| o.why.is_some()).count();
+    assert_eq!(
+        caught, 0,
+        "MetaOverwritesByArrival was caught, so some update named a generation above \
+         the first: the split has landed and this absence becomes a reach"
+    );
+    let variant = raft::run_on_the_node(
+        1,
+        Variants::default(),
+        NodeVariants::of(&[NodeVariant::MetaOverwritesByArrival]),
+    );
+    let correct = correct(1);
+    let (applies, took) = raft::meta_applies_of(&variant.records);
+    let (_, took_correct) = raft::meta_applies_of(&correct.records);
+    println!(
+        "node: MetaOverwritesByArrival on seed 1: {applies} meta applies after the \
+         bootstrap, {took} of them winning their span, against {took_correct} on the \
+         correct node"
+    );
+    assert!(
+        applies > 0 && took > 0 && took_correct == 0,
+        "the variant was not seen injected: its updates should win their whole span \
+         where the correct meta range's win nothing"
+    );
+}
+
 #[test]
 fn a_client_that_ignores_a_mismatch_is_caught_by_check_17_on_the_node() {
     let outcomes = routing_variant(
@@ -2043,9 +2125,12 @@ fn a_node_that_leaves_a_refused_reads_registration_behind_is_caught_on_the_node(
     /// One seed under the leaking node: whether it failed, whether the bound named
     /// it, and the most reads one replica held at once.
     struct Leak {
+        seed: u64,
         failed: bool,
         named: bool,
         worst: Option<u64>,
+        /// The violation, for the catch the bound did not make.
+        why: Option<String>,
     }
     let seeds = seeds();
     let outcomes: Vec<Leak> = sweep(seeds, |seed| {
@@ -2060,11 +2145,13 @@ fn a_node_that_leaves_a_refused_reads_registration_behind_is_caught_on_the_node(
             .err()
             .is_some_and(|violation| violation.contains("registered reads"));
         Leak {
+            seed,
             failed: verdict.is_err(),
             named,
             worst: report
                 .reads_outstanding_worst()
                 .map(|(_, _, outstanding)| outstanding),
+            why: verdict.err(),
         }
     });
     let caught = outcomes.iter().filter(|leak| leak.failed).count();
@@ -2086,11 +2173,20 @@ fn a_node_that_leaves_a_refused_reads_registration_behind_is_caught_on_the_node(
              a draw"
         );
     }
+    let others: Vec<String> = outcomes
+        .iter()
+        .filter(|leak| leak.failed && !leak.named)
+        .map(|leak| {
+            leak.why
+                .clone()
+                .unwrap_or_else(|| format!("seed {}", leak.seed))
+        })
+        .collect();
     assert_eq!(
         named,
         caught,
         "{} of the {caught} seeds caught were caught by something other than the \
-         outstanding-reads bound, which is not what this pair is for",
+         outstanding-reads bound, which is not what this pair is for: {others:?}",
         caught - named
     );
 }
@@ -2303,6 +2399,15 @@ fn the_sharded_quorum_scenario_asks_four_leaders_about_one_refused_node() {
 ///
 /// Measured before it was asserted (Q39, D-061): caught on every seed of the gate's
 /// twenty, and the rate is printed at every tier.
+///
+/// Since the meta range carries entries (PROPOSED D-098), the lost state has a second
+/// witness: the replica of range 1 the variant re-creates empty in the fresh engine,
+/// never refused and so never given the index-0 state the re-seed writes a refused
+/// system range, applies the first `MetaUpdate` over nothing and takes every span,
+/// which state machine safety sees — and the verdict asks the ranges' invariants
+/// before the fan-out clause, so on those seeds it is what the catch names. Both are
+/// the one bug, the node's other replicas serving over an engine that lost state
+/// (D-077); the fan-out clause is asserted seen and each catch's share is printed.
 // PROPOSED(D-085): sharded is one fault and four answers, not the scenario four times.
 #[test]
 fn a_node_that_refuses_only_one_range_is_caught_on_the_sharded_quorum_scenario() {
@@ -2310,8 +2415,18 @@ fn a_node_that_refuses_only_one_range_is_caught_on_the_sharded_quorum_scenario()
         Variants::default(),
         NodeVariants::of(&[NodeVariant::RefuseOneRangeOnly]),
     );
+    let by_fan_out = caught
+        .iter()
+        .filter(|v| v.contains("but not this range's replica"))
+        .count();
+    let by_meta = caught
+        .iter()
+        .filter(|v| v.contains("state machine safety") && v.contains("of group 1 "))
+        .count();
     eprintln!(
-        "sharded quorum, RefuseOneRangeOnly: caught on {} of {} seeds, {figures:?}, first: {}",
+        "sharded quorum, RefuseOneRangeOnly: caught on {} of {} seeds ({by_fan_out} by the \
+         fan-out clause, {by_meta} by state machine safety on the meta range), {figures:?}, \
+         first: {}",
         caught.len(),
         seeds(),
         caught.first().map_or("", String::as_str)
@@ -2322,10 +2437,14 @@ fn a_node_that_refuses_only_one_range_is_caught_on_the_sharded_quorum_scenario()
         "RefuseOneRangeOnly was not caught on every seed: {caught:?}"
     );
     assert!(
-        caught
-            .iter()
-            .all(|v| v.contains("but not this range's replica")),
-        "caught by something other than the fan-out: {caught:?}"
+        by_fan_out > 0,
+        "the fan-out clause caught it on no seed: {caught:?}"
+    );
+    assert_eq!(
+        by_fan_out + by_meta,
+        caught.len(),
+        "caught by something other than the fan-out or the meta range's state machine: \
+         {caught:?}"
     );
 }
 
@@ -3359,6 +3478,11 @@ fn a_server_whose_refusal_is_not_durable_is_not_re_asserted_on_the_node_yet() {
 // hold is absent on both seeds and on a thousand, and the pin asserts the absence.
 // PROPOSED(D-097): the generation on every client request moved every node schedule
 // again (SHARD.md §12); the absence holds on both seeds, at 35 and 29 live installs.
+// PROPOSED(D-098): D-097's descriptor read-back had put an engine read between the
+// switch's two records, so `reads_back` matched no node install and the fourth arm
+// counted nothing — the absence D-097 read here was the arm's silence. With the arm
+// reading again the absence holds on both seeds, at 41 and 23 live installs, and the
+// hold the pin waited for was reached on seed 368, pinned below.
 #[test]
 fn seeds_272_and_516_are_a_live_installs_hold_and_the_fourth_arm_answers_for_them() {
     for seed in [272u64, 516] {
@@ -3410,6 +3534,144 @@ fn seeds_272_and_516_are_a_live_installs_hold_and_the_fourth_arm_answers_for_the
              schedule off D-091's hold); {live_installs} live installs on the run"
         );
     }
+}
+
+/// **Seed 368 is the hold D-091's pin waited for**, found by this tree's premerge on the
+/// correct node under the raft sweep's arms, and pinned in the shape the pin above
+/// keeps for it (PROPOSED D-098).
+///
+/// Server 1 came back behind on every range and was streamed five snapshots at once,
+/// the meta range's among them for the first time. Its `snapshot` task installed them
+/// one after another, and range 2's core was held from its stream's completion — the
+/// `raft` task handing the repair over — through four other ranges' installs to its
+/// own switch: a core with no timer to fire, for longer than its bound. Its clock was
+/// last reset by an `AppendEntries` of its term at 7.684 s; leader 2 then streamed it,
+/// re-opening the stream at offset 0 six times, lost its quorum at 7.863 s and stepped
+/// down; the install was decided at 7.768 s and switched, with the restatement on it,
+/// at 8.168 s; the replay flagged it at 8.079 s, inside the hold. The check with the
+/// fourth arm passes; the check without it flags exactly this stretch, with the one
+/// live install the arm answers for.
+///
+/// What found it is what had hidden it: the arm reads `RaftSnapshotState` and
+/// `RaftSnapshot { taken: false }` as one switch only at one instant, and D-097's
+/// descriptor read-back sat between them, so the arm had matched no node install
+/// since and this seed failed the second premerge of this tree. The read-back precedes
+/// the state now, and this pin asserts the two records at one instant so the arm
+/// cannot go silent that way again.
+// PROPOSED(D-098): the hold reached; the fourth arm's records at one instant.
+#[test]
+fn seed_368_is_a_live_installs_hold_and_the_fourth_arm_answers_for_it() {
+    let seed = 368u64;
+    let report = correct(seed);
+    report
+        .check()
+        .unwrap_or_else(|violation| panic!("seed {seed} no longer passes: {violation}"));
+    let gaps = report.timer_gaps(raft::TimerResets::ALL);
+    assert!(
+        gaps.is_empty(),
+        "seed {seed}: the timer replay reports {gaps:?} under every arm"
+    );
+    // The hold, reached: exactly one stretch the arm answers for, and the check without
+    // the arm flags that stretch and nothing else.
+    let held = report.timer_gaps_held_by_a_live_install();
+    let without = report.timer_gaps(raft::TimerResets::WITHOUT_LIVE_INSTALL);
+    assert_eq!(
+        held.len(),
+        1,
+        "seed {seed}: the schedule has moved off the hold this pin asserts ({held:?}); \
+         assert the absence with its reason, as seeds 272 and 516 do"
+    );
+    assert_eq!(
+        held, without,
+        "seed {seed}: the arm exempts more than the live install's hold"
+    );
+    let gap = held[0];
+    assert_eq!((gap.server, gap.range, gap.live_installs), (1, 2, 1));
+    // The install's decision and its switch bracket the flag, and the switch's records
+    // — the state read back, the snapshot and the restatement — land at one instant,
+    // which is what the arm reads them by (`Report::reads_back`).
+    let switch = report
+        .records
+        .iter()
+        .enumerate()
+        .find(|(_, record)| {
+            matches!(
+                &record.event,
+                TraceEvent::RaftSnapshot {
+                    server: 1,
+                    range: 2,
+                    taken: false,
+                    ..
+                }
+            ) && record.at > gap.since
+        })
+        .expect("the live install of range 2 on server 1 switches after the window opens");
+    let (index, record) = switch;
+    assert!(
+        record.decided > gap.since && record.decided < gap.at && record.at > gap.at,
+        "seed {seed}: the install's decision ({:?}) and switch ({:?}) do not bracket the \
+         flag ({:?}, since {:?})",
+        record.decided,
+        record.at,
+        gap.at,
+        gap.since
+    );
+    let before = &report.records[index - 1];
+    assert!(
+        before.at == record.at
+            && matches!(
+                &before.event,
+                TraceEvent::RaftSnapshotState {
+                    server: 1,
+                    range: 2,
+                    ..
+                }
+            ),
+        "seed {seed}: the state read back is not traced at the switch's instant: {:?} at \
+         {:?}, the switch at {:?}",
+        before.event,
+        before.at,
+        record.at
+    );
+    assert!(
+        report.records[index + 1..]
+            .iter()
+            .take_while(|after| after.at == record.at)
+            .any(|after| {
+                matches!(
+                    &after.event,
+                    TraceEvent::RaftRecovered {
+                        server: 1,
+                        range: 2,
+                        ..
+                    }
+                )
+            }),
+        "seed {seed}: the restatement does not follow the switch at its instant"
+    );
+    // A stream toward the replica was re-opened inside the window, which is the shape:
+    // the leader streaming a follower it stopped appending to.
+    assert!(
+        report.records.iter().any(|record| {
+            matches!(
+                &record.event,
+                TraceEvent::RaftSnapshotResumed {
+                    range: 2,
+                    to: 1,
+                    ..
+                }
+            ) && record.decided > gap.since
+                && record.decided <= gap.at
+        }),
+        "seed {seed}: no stream toward server 1's replica of range 2 was re-opened inside \
+         the window"
+    );
+    println!(
+        "seed {seed}: server 1's replica of range 2 held by its live install, the window \
+         {:?} to {:?}, the install decided at {:?} and switched at {:?}; the fourth arm \
+         answers for it",
+        gap.since, gap.at, record.decided, record.at
+    );
 }
 
 // --- The membership scenario on the node (SHARD.md §12's Stage B, issue #46) ---

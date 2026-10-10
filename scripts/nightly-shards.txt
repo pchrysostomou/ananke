@@ -352,6 +352,13 @@
 # into shard 5 at 1573.3, the equivalence into shard 6 at 1597.0, and the two small ones after
 # it into shard 6. The rows D-096 re-weighed are left as they were: the node binary's premerge
 # time moved from 753 s to 782 s with the routing, a few per cent.
+# PROPOSED D-098 (the meta range) added two `node` rows, weighed on its tree from the built release
+# binary (`node-<hash> <test> --exact`) at ANANKE_SEEDS=1000, alone on this session's four-core Xeon
+# container right after its premerge, as user + sys. The meta variant's no-path test, a hundred full
+# runs on the share beside one seed each of the variant and the correct node, at 45.0 cpu s
+# (42.816 user + 2.192 sys, 12.215 s real); seed 368's pin, one seed, at 0.5 (0.416 + 0.036,
+# 0.452 s real). Longest-first into the lightest shard: 45.0 into shard 6 at 1606.3 -> 1651.3, then
+# 0.5 into shard 4, the lightest after it, at 1609.2 -> 1609.7.
 # shard	binary	cpu_s	test
 # shard 1: 1977.1 cpu s
 # D-095 added two rows, both `node`, weighed on its tree from the built release binary
@@ -421,7 +428,7 @@
 3	raft	0.2	the_membership_scenario_has_byte_identical_traces_for_one_seed
 3	reseed	95.8	the_reseed_shape_holds_on_every_seed
 3	wal	21.2	a_log_that_acknowledges_before_syncing_is_caught
-# shard 4: 1609.2 cpu s
+# shard 4: 1609.7 cpu s
 4	echo	0.1	same_seed_gives_byte_identical_trace
 4	engine	210.8	the_correct_engine_passes_every_seed
 4	engine	38.6	an_install_that_switches_one_span_at_a_time_is_caught
@@ -449,6 +456,7 @@
 4	wal	36.9	the_correct_log_passes_every_seed
 4	wal	0.2	the_seed_42_trace_is_written_for_the_studio
 4	node	29.1	the_node_folds_agree_with_their_whole_trace_readings
+4	node	0.5	seed_368_is_a_live_installs_hold_and_the_fourth_arm_answers_for_it
 # shard 5: 1613.4 cpu s
 5	echo	6.0	every_seed_satisfies_the_invariants_and_the_sweep_exercises_the_disk_faults
 5	engine	19.5	a_seek_that_counts_tombstones_is_caught
@@ -463,7 +471,7 @@
 5	ranges	66.8	every_seed_passes_on_the_correct_node
 5	node	39.5	a_fresh_node_that_bootstraps_itself_is_caught_by_check_7_where_it_is_not_a_bootstrap_node
 5	node	40.1	a_server_that_ignores_the_span_at_apply_is_caught_with_trust_and_has_no_path_alone
-# shard 6: 1606.3 cpu s
+# shard 6: 1651.3 cpu s
 6	echo	0.1	a_busy_looping_task_fails_the_scenario_instead_of_hanging
 6	engine	310.3	an_engine_that_acknowledges_before_the_log_is_caught
 6	engine	204.5	an_engine_that_releases_a_memtable_before_the_manifest_is_caught
@@ -503,3 +511,4 @@
 6	node	7.9	the_range_layers_checks_agree_with_their_whole_trace_folds
 6	node	0.9	a_server_that_trusts_a_stale_descriptor_is_caught_by_check_9_on_the_node
 6	node	0.5	a_client_that_ignores_a_mismatch_is_caught_by_check_17_on_the_node
+6	node	45.0	a_meta_range_that_stores_updates_as_they_arrive_has_no_path_on_the_node_yet

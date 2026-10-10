@@ -321,6 +321,14 @@ pub struct NodeCoverage {
     pub client_mismatches: usize,
     /// See `client_mismatches`.
     pub client_sends: usize,
+    /// `RaftRead` served by range 0 or range 1: the lookups (SHARD.md §1, §3).
+    // PROPOSED(D-098)
+    pub lookups_served: usize,
+    /// `MetaApplied` after the bootstrap, and how many of them won something.
+    // PROPOSED(D-098)
+    pub meta_applies: usize,
+    /// See `meta_applies`.
+    pub meta_took: usize,
 }
 
 impl NodeCoverage {
@@ -386,6 +394,9 @@ impl NodeCoverage {
             mismatches_at: raft::mismatches_sent_of(records),
             client_mismatches: count(&|e| matches!(e, TraceEvent::ClientMismatch { .. })),
             client_sends: count(&|e| matches!(e, TraceEvent::ClientSend { .. })),
+            lookups_served: raft::lookups_served_of(records),
+            meta_applies: raft::meta_applies_of(records).0,
+            meta_took: raft::meta_applies_of(records).1,
         }
     }
 
@@ -475,6 +486,16 @@ impl NodeCoverageFold {
             }
             TraceEvent::ClientMismatch { .. } => c.client_mismatches += 1,
             TraceEvent::ClientSend { .. } => c.client_sends += 1,
+            TraceEvent::RaftRead { range, .. }
+                if *range == ananke_shard::system::ROOT_RANGE.get()
+                    || *range == ananke_shard::system::META_RANGE.get() =>
+            {
+                c.lookups_served += 1;
+            }
+            TraceEvent::MetaApplied { index, descriptors } if *index > 0 => {
+                c.meta_applies += 1;
+                c.meta_took += usize::from(descriptors.iter().any(|d| !d.won.is_empty()));
+            }
             _ => {}
         }
     }

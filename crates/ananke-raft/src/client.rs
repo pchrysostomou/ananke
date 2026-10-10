@@ -275,6 +275,8 @@ pub fn studio(payload: &[u8]) -> Option<Json> {
             Command::Get { .. } => "get",
             Command::Transfer { .. } => "transfer",
             Command::Change { .. } => "change",
+            Command::MetaUpdate { .. } => "meta-update",
+            Command::Lookup { .. } => "lookup",
         };
         let mut fields = vec![
             ("type", Json::str("client.request")),
@@ -284,6 +286,10 @@ pub fn studio(payload: &[u8]) -> Option<Json> {
         ];
         match &request.command {
             Command::Transfer { to } => fields.push(("to", int(*to))),
+            Command::MetaUpdate { descriptors } => {
+                fields.push(("descriptors", int(descriptors.len() as u64)));
+            }
+            Command::Lookup { key } => fields.push(("about", text(key))),
             Command::Change { voters } => fields.push((
                 "voters",
                 Json::Array(voters.iter().map(|&v| int(v)).collect()),
