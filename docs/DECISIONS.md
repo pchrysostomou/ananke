@@ -14572,6 +14572,14 @@ test it named.
    nothing — so nothing is red; only the reasons are stale. Left for the owner to place
    rather than widened into this slice.
 
+**Superseded in part by D-101.** The pair's attribution above — "every catch is that
+clause's own words" — was too strict from the start: the replicas the variant leaves
+unrefused come back empty and vote, and `NodeReport::check` asks the ranges' invariants
+before the fan-out clause, so a seed whose amnesiac vote elects a leader missing a
+committed entry is named by leader completeness (seed 3352 on 6c54705, seed 2994 on
+fdc5fc0). D-101 admits leader completeness off group 0 as a witness of the one bug and
+pins seed 2994's mechanism; the pair and its standard stand.
+
 ---
 
 ## PROPOSED D-086 — The node reaches the stream path: four bugs the reach found, and what each of Phase 2's four stream variants measures there
@@ -18041,6 +18049,12 @@ determinism tests hold.
   had parted them; seed 368's pin asserts the instant, so a read added to the switch
   again fails a pinned seed rather than silencing an exemption over a thousand.
 
+**Superseded in part by D-101.** The widening of `RefuseOneRangeOnly`'s attribution to
+state machine safety on group 1 was partial: on fdc5fc0 seed 2994 is caught by leader
+completeness on group 4, the variant's empty replica voting on state its node lost, and
+the nightly went red on it. D-101 admits that witness off group 0, with the split at ten
+thousand (3 338 / 6 661 / 1).
+
 ## PROPOSED D-099 — Range ids leased in blocks: a refill to range 0 carrying the run's nonce, granted at the counter in one batch and traced, adopted only by the run that asked, and kept outstanding at or below the threshold
 
 **The number.** Stacked on PR #134 (D-098), whose footer reads D-099. This takes
@@ -18637,6 +18651,169 @@ window. Seed 42's one-group JSONL is #133's.
 - Check 18 has both its clauses; check 8's overlap clause and check 20 wait for the
   slices that build what they check.
 
+## PROPOSED D-101 — `RefuseOneRangeOnly`'s third witness: leader completeness on any range but the root, because the verdict asks the invariants before the fan-out clause
+
+**The number.** Assigned with the fix PRs opened against `main` at fdc5fc0: this takes
+**D-101**, the two beside it take D-102 and D-103, and the footer here moves to D-102. At the
+merge the entries are a union in numerical order with one footer, highest + 1. Every code
+site carries `// PROPOSED(D-101)`.
+
+**Context.** The nightly on `main` at fdc5fc0 (run 38082122222) is red on one test alone:
+shard 3's `a_node_that_refuses_only_one_range_is_caught_on_the_sharded_quorum_scenario`,
+the pair D-085 shipped beside the sharded quorum scenario's correct node. Every one of the
+10 000 seeds was caught, as the test asks; what failed is its attribution, the assertion
+that every catch is the variant's own bug in a form the test names. CI's log cuts the
+panic's payload off; a local run of the same binary gives the same 3 338 / 6 661 split and
+names the remaining seed, **2994**, caught by **leader completeness**: "index 14 of group 4
+(term 1) was committed in term 1 but server 2, leader of term 3, does not hold it".
+
+The attribution was too strict from the start. D-085 (17f042f, PR #104) asserted that
+every catch was the fan-out clause's own words, measured at 1 000 of 1 000. Under
+`RefuseOneRangeOnly` the replicas the variant leaves unrefused have always come back empty
+and able to vote; what kept the assertion green was that no measured seed had reached a
+violation the verdict names first. PROPOSED D-096 (PR #132) made the store that opens
+first range 0's, so the variant refuses the root alone and leaves every user range
+unrefused, and moved every schedule: the nightly on 6c54705 (run 37918619653) went red on
+seed 3352, leader completeness on group 3. PR #133 moved the schedules off it. PROPOSED
+D-098 (PR #134, e4a8063) then met the meta range's own witness — state machine safety on
+group 1, 664 of 1 000 — and widened the assertion to admit it, **and to admit that
+alone**. On fdc5fc0 seed 2994 reaches leader completeness again, on group 4. **D-098's
+widening was partial**: it admitted the witness its thousand showed and not the one the
+variant's own documentation names, "three replicas voting again on state their node lost
+(D-035)".
+
+### The mechanism, seed 2994
+
+Read off the trace of `quorum::node_run(2994, …, RefuseOneRangeOnly)` and asserted by the
+pin below. Before the victim's crash, range 4's term 1 committed index 14 on a majority of
+the victim (server 1) and server 3; server 2 held up to index 13. The victim crashes at
+1.2 s and restarts at 1.22 s on a store marked lost. The variant refuses range 0 alone
+(`RaftReplicaRefused` names range 0 and nothing else), so the victim's replica of range 4 is
+re-created in the fresh engine as a first start would create it: `RaftRecovered` with term
+0, last index 0, incarnation 1, state `Neither` — empty and unmarked. Server 3 leads term
+2 briefly and is cut off at 1.32 s. Server 2 asks for votes in term 3, and the victim's
+empty replica grants both the pre-vote and the vote: its log is shorter than server 2's,
+so the up-to-date rule passes, and it is the only vote server 2 is given. With its own, it
+is the majority of three that elects server 2 at 1.498 s with index 13 as its last, and
+server 2 then writes a term-3 entry over index 14. Leader completeness sees the election.
+
+`NodeReport::check` asks `ranges::invariants_of` before the fan-out clause, and leader
+completeness is ahead of state machine safety in `Checker::verdict`'s order, so the catch is
+named leader completeness — the same bug, the node's other replicas serving over an engine
+that lost state (D-077), seen by a third check. On the correct node the same seed draws
+the same victim, its replica of range 4 is refused with its node and restated `Refused`
+on an incarnation of its own, it is asked for a vote 14 times after the refusal and grants
+none (D-035), and the seed passes. Seed 3352 on 6c54705 is the same mechanism on group 3,
+index 11, per the diagnosis of the red nightlies.
+
+### Decision
+
+1. **The pair's attribution admits leader completeness as the variant's third witness,
+   on any group but 0.** The group is read off the verdict's exact words — `ananke_raft::
+   invariants` writes "leader completeness: index {index} of group {group} (term
+   {entry_term}) was committed in term {in_term} but server {server}, leader of term
+   {term}, does not hold it" — by `leader_completeness_group` in `sim/tests/node.rs`,
+   which returns the group or `None`: the group is parsed from that clause's own words,
+   so no other text of a verdict can stand in for it. The test asserts every catch is the fan-out clause, state
+   machine safety on group 1, or leader completeness off group 0, and prints each share
+   at every tier.
+2. **Group 0 is excluded, and fails the test with a message of its own.** The variant
+   refuses `ranges.first()`, which is range 0, exactly as the correct node refuses it:
+   refused, re-seeded with the refused mark, quarantined from voting (D-035). The
+   variant's amnesia cannot reach the root, so a leader-completeness violation there is
+   something else, and the test says so rather than counting it.
+3. **Leader completeness alone, not every invariant.** Committed entries stay, commit by
+   majority and commit by current term are plausible witnesses of the same amnesia, and
+   none has been seen at ten thousand seeds on any tree. One that appears fails the test
+   and is read before it is admitted, as this one was.
+4. **Its firing is asserted at no tier.** It is one seed of ten thousand, far under
+   D-061's 5 %; the fan-out clause stays the witness asserted seen at every tier, and
+   **seed 2994's pin asserts the mechanism** — the variant's verdict word for word, the
+   commit and the victim holding index 14 before the refusal, the refusal of range 0
+   alone, the victim's replica of group 4 restated `(term 0, last index 0, incarnation
+   1, Neither)`, its granted vote the only one server 2 was given before its election,
+   the leader's last index 13 — and, on the correct node, the same victim, its replica
+   refused and restated `Refused` on an incarnation other than 1, asked and granting
+   nothing, the seed green. The day the schedule moves off, the pin fails and is
+   re-audited to the absence with its reason.
+5. **The test's documentation says the verdict asks the invariants before the fan-out
+   clause**, names the three witnesses, and corrects "three of the four replicas were
+   never refused" to what the bootstrap made true: the variant refuses the root alone,
+   and none of the four user ranges the clause asks about.
+
+This **supersedes D-085's attribution** — "every catch is that clause's own words" — and
+D-098's widening, which this completes. D-085's pair, its standard (caught on every seed
+at every tier) and its scenario are unchanged.
+
+### Measured before asserted (Q39), on this tree
+
+From the built release binary (`node-<hash> <test> --exact`), Apple M2, 8 cores, on AC
+Power; the ten thousand at load averages 3.18/4.44/18.91 before and 18.13/9.36/18.58
+after (D-070):
+
+| | 20 | 100 | 1 000 | 10 000 |
+|---|---:|---:|---:|---:|
+| `RefuseOneRangeOnly` caught | 20 | 100 | 1 000 | **10 000** |
+| … by the fan-out clause | 7 | 28 | 345 | **3 338** |
+| … by state machine safety on group 1 | 13 | 72 | 655 | **6 661** |
+| … by leader completeness off group 0 | 0 | 0 | 0 | **1** (seed 2994, group 4) |
+| … by leader completeness of group 0 | 0 | 0 | 0 | **0** |
+| correct node, failed | 0 | 0 | 0 | **0** |
+
+The ten thousand of the variant took 69.2 s (515.6 user + 15.4 sys), the correct node's
+74.1 s (448.4 + 14.4); the correct node's figures at ten thousand: 40 000 replicas refused
+and re-seeded, 25 871 ranges on the keeper's majority and every one committed through a
+re-seeded replica, 14 129 step-downs of a cut-off leader, 9 607 seeds carrying both
+outcomes, 0 streams. The split at the thousand is D-100's (345 / 655): nothing here moves
+a schedule. The diagnosis measured the same test patched on 6c54705 at 9 999 by the
+fan-out clause and seed 3352 by leader completeness.
+
+### What the widening could hide, shown with planted failures
+
+Admitting a witness loosens an assertion, so what it could hide was planted and run
+(each applied to this tree, swept at ten thousand from the release binary, and reverted;
+none is in the commit):
+
+- **D-035 broken in the core, on every range** — `on_pre_vote` and `on_request_vote`
+  grant past `self.quarantined`, so a refused or re-seeded replica votes: the correct
+  node's sweep fails **9 129 of 10 000**, 9 128 by its clause that a range whose leader
+  was cut off elects no other in the hold, and **seed 2994 by the identical leader-completeness verdict** the
+  variant gives; seed 2994's pin fails at its control half. The variant's test passes
+  under the plant (3 331 / 6 668 / 1): its own catches name every seed first, as they
+  would name any core bug first. **That is why the attribution may be widened: the pair's
+  correct half runs the same scenario on the same seeds at every tier, and it is what
+  catches a server that votes on lost state.**
+- **D-035 broken on range 0 alone**: 0 of 10 000 on the correct node, and the variant's
+  split unchanged. The scenario's hold clauses ask the four user ranges only, so a root
+  replica that votes after its refusal is seen by nothing here — filed as **issue #143**,
+  not widened into this slice.
+- **The group-0 exclusion.** No run on this tree produces leader completeness on group
+  0, the root plant included, so the exclusion is shown on a planted trace: seed 2994's
+  variant run with ranges 0 and 4 swapped in every record that names a range gives, from
+  the real `NodeReport::check`, "index 14 of group 0 (term 1) was committed in term 1 but
+  server 2, leader of term 3, does not hold it"; `leader_completeness_group` reads group
+  0, and the test fails on it. With the exclusion mutated away (`is_some()`), the same
+  verdict is counted as the variant's and the test passes.
+
+**The mutation a single-range world could not catch** is that last one. On one group,
+"which group the violation is on" cannot be wrong; here the variant refuses one range
+exactly as the correct node does and leaves the others amnesiac, and the attribution must
+tell the two apart by the group the verdict names.
+
+### Pinned hashes and seeds
+
+No production code changes, no draw and no trace event: no schedule moves, no pinned
+trace hash moves, and no pinned seed needs re-auditing. One pin is added,
+`seed_2994_is_an_unrefused_empty_replica_electing_a_leader_without_a_committed_entry`,
+two runs of one seed, weighed at 0.05 cpu s and rounded to 0.1 into the lightest nightly
+shard, shard 5 (1 623.8 → 1 623.9).
+
+### Asks
+
+- **PROPOSED**: admit leader completeness alone, as measured, and fail on any other
+  invariant until it is read — recommended. The alternative, every safety invariant from
+  `invariants_of` off group 0, would admit witnesses no tree has shown.
+
 ---
 
-_Next entry: D-101. Add one before implementing anything not covered above._
+_Next entry: D-102. Add one before implementing anything not covered above._

@@ -101,6 +101,18 @@ ananke/
 
 _Update this section at the end of every session._
 
+- Branch `phase-3-fix-refuse-one-range-witness` (2026-10-10), on `main` at fdc5fc0,
+  PROPOSED D-101, **the tip's only red nightly: `RefuseOneRangeOnly`'s attribution on the
+  sharded quorum scenario**. The variant's unrefused replicas come back empty and vote, and
+  `NodeReport::check` asks the invariants before the fan-out clause, so seed 2994's amnesiac
+  vote (server 1's empty replica of range 4 electing server 2 without the committed index
+  14) is named leader completeness. The pair's attribution admits leader completeness on any
+  group but 0 as the third witness (D-098's widening was partial), seed 2994's mechanism is
+  pinned beside the correct node's refusal of the same vote, and the test's documentation
+  says the invariants are asked first. At ten thousand: 10 000 caught, 3 338 by the fan-out
+  clause, 6 661 by state machine safety on the meta range, 1 by leader completeness, 0 on
+  group 0; the correct node 0 of 10 000 failed. No schedule, hash or production line moves.
+  Issue #143: the scenario's hold clauses never ask the system ranges.
 - Branch `phase-3-stage-c-split` (2026-09-25), stacked on `phase-3-stage-c-range-ids`
   (PR #135), PROPOSED D-100, **Stage C's split, the first of its four sub-slices:
   proposed by a range's leader with an id from its node's block, re-checked and applied
