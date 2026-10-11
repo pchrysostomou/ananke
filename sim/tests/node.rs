@@ -3685,7 +3685,8 @@ fn a_leader_that_ignores_incarnations_has_an_incarnation_to_ignore_only_where_a_
 /// events commit (cd3de12) it is 13 241 905 bytes hashing to
 /// `c5b8d814dc0956af28bef72f8f9e0bbc959053a2173d7d1d96e3423a6c6540e8`: the client's
 /// `ClientSend` and `ClientMismatch` records added, the one group's draws unchanged
-/// (D-097, D-104), and no test asserts either hash (#97). So
+/// (D-097, D-104). No test asserted either until D-105, which pins that trace by its
+/// body's FNV-1a hash, `SEED_42_BODY_HASH` in `sim/tests/raft.rs` (#97). So
 /// `seed_680_which_pinned_the_combined_variant_before_d056_no_longer_wedges` runs the
 /// run it was pinned on and keeps saying exactly what it says, and D-086's slice did
 /// not touch it.

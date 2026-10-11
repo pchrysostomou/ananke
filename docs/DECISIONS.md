@@ -17088,7 +17088,8 @@ see one, that is one addition for both reasons and is proposed when it is needed
 **Where this stands, recorded by D-104.** No ruling on this question is recorded, in this
 file or on PR #129. PR #136 (PROPOSED D-100) built answer A as proposed before one: a
 split asked of a leader whose block holds no id is refused `NoRangeId` at proposal
-(crates/ananke-shard/src/server.rs:1244-1250), the reason is on the wire as
+(crates/ananke-shard/src/server.rs:1255-1260,
+1302-1307), the reason is on the wire as
 `SplitRefusal::NoRangeId` (crates/ananke-raft/src/apply.rs:196-198), and the node sweep's
 split admin retries after an interval of the sweep's own (`SPLIT_RETRY`, sim/raft.rs). So
 "this entry lands before the code that depends on it" held of the entry and not of the
@@ -17096,6 +17097,7 @@ ruling it asks for: a ruling for A confirms those sites, and any other answer re
 them in place. The question remains the owner's. The block size and the threshold are
 still eight and two, unmeasured: the measurement this entry places in `sim/shard.rs`
 waits for that scenario (D-099).
+Code line numbers in this note are those of commit 0284c13 (D-104).
 
 ---
 
@@ -17206,7 +17208,9 @@ strengthening the measurement earns and not a condition this entry sets.
 is recorded. The split's apply landed in PR #136 (PROPOSED D-100) without check 19 and
 without `SplitLeavesGap`, where this entry's consequences have the two land in that
 slice: the range layer's `Checker` folds checks 7, 9, 10, 16, 17 and 18 and nothing of
-check 19 (crates/ananke-shard/src/invariants.rs), and no code names `SplitLeavesGap`.
+check 19 (crates/ananke-shard/src/invariants.rs), and no variant `SplitLeavesGap`
+exists (since D-105 one doc names it, `range_variant.rs`'s module doc, as an
+instrument not built).
 Check 19 runs nowhere on `main`, and Stage C's equivalence line for it waits on the
 ruling; the question remains the owner's.
 
@@ -17214,10 +17218,11 @@ ruling; the question remains the owner's.
 effect" is false. Stage C's exit criteria (SHARD.md:2502-2523) have no such line — their
 per-seed lines are `sim/split.rs` (i)'s and (ii)'s — and where splits run on this tree,
 the node sweep's split arms (D-104), they are asserted in aggregate: some split took
-effect over the tier (`split.applied > 0`, sim/tests/node.rs:791-796). The "every seed"
+effect over the tier (`split.applied > 0`, sim/tests/node.rs:802-807). The "every seed"
 this entry's assertion counts on is the set of seeds on which a split took effect, which
 nothing asserts per seed; under A, the fold's own test would have to read that set and
 assert it non-empty.
+Code line numbers in this note are those of commit 0284c13 (D-104).
 
 ---
 
@@ -18092,8 +18097,10 @@ every seed, and the variant test asserts the correct node's pass beside the catc
   release binary at a thousand seeds: the three routing variants' tests and the range
   layer's equivalence test.
 
-**Corrected by D-104: what Q10's entry owes.** §12 asks Q10's entry to say two things this
-one does not (SHARD.md:2561-2571). *Q10's hole is the class of seed 42's duplicate
+**Corrected by D-104: what Q10's entry owes.** Two things this entry does not say, and one
+sentence that says too much. §12's entries line asks Q10's entry for the first
+(SHARD.md:2568-2571), and Stage C's Issues line carries the second
+(SHARD.md:2563-2565). *Q10's hole is the class of seed 42's duplicate
 proposal.* The hole review found — a write refused at apply and forgotten by the leader,
 resent and applied in R, R merged back into P, and a delayed network copy of the original
 proposed by a leader of P that no longer remembers it, so that one operation takes effect
@@ -18103,12 +18110,22 @@ twice and a compare-and-set applied twice (D-026, DECISIONS.md:893-897). This en
 answer is D-026's with a fresh `seq` beside it: the leader keeps its record of the
 original by `(client, seq)`, and the resend goes under a fresh `seq` that `invoked`
 pairs. The record deduplicates a copy only while the original's entry is still in the
-leader's log (crates/ananke-shard/src/server.rs:1324-1330, the record checked against
+leader's log (crates/ananke-shard/src/server.rs:1335-1341, the record checked against
 `core.term_at`), the window D-026's had ("while the entry is in its log",
 DECISIONS.md:877-878); no directed test reaches Q10's late copy yet. *#21 is carried*
 (Q11): no client sessions in Phase 3, a write with no answer abandoned as pending, as
 this entry's client abandons it, and the per-range layout leaving room for the session
 table, which split batches, and merge batches, will need to carry when #21 lands.
+
+*Where the folds ran.* **After the second commit** has the correct node green "with the
+four folds in the incremental checker and over the whole trace" on the raft sweep's
+arms, the membership scenario, the sharded quorum scenario, `ranges`, `reseed` and
+`install`. The incremental checker ran only in the raft sweep's runner, as it still
+does (`Watch::shard`, sim/raft.rs:7735). Over the whole trace, the membership scenario
+folded the checks from cd3de12, and `ranges` through `raft::Report::check`. `install`
+and `reseed` first folded them in D-098 (e4a8063), and the sharded quorum scenario has
+never folded them (D-098's note; #140).
+Code line numbers in this note are those of commit 0284c13 (D-104).
 
 ---
 
@@ -18476,19 +18493,20 @@ thousand (3 338 / 6 661 / 1).
 folds found on their way in**, and **What the sweeps say**, whose first item names the
 sharded quorum scenario among them) is false for the sharded quorum scenario.
 `quorum::NodeReport::check` asks `ranges::invariants_of` — `ananke-raft`'s checks 1 to 4
-and `commit_majority` (sim/ranges.rs:1519-1522) — and the history (sim/quorum.rs:1037-1038),
+and `commit_majority` (sim/ranges.rs:1522-1525) — and the history (sim/quorum.rs:1051-1052),
 and sim/quorum.rs names `ananke_shard::invariants` at no commit from cd3de12, whose
 message says the same of "the membership and quorum scenarios", to b01db39. It holds for
 the rest: the raft sweep on the node, and `sim/ranges.rs` through it — that scenario's
-`Report::check` is `raft::Report::check` (sim/ranges.rs:647), which folds the range
-layer's checks over every run that traces a `RangeCreated` (sim/raft.rs:3511-3518) — and
-the membership, install and re-seed scenarios in their own checks (sim/membership.rs:1303-1309,
-sim/install.rs:350, sim/reseed.rs:320). Shown, not only read: with the whole-trace fold
+`Report::check` is `raft::Report::check` (sim/ranges.rs:648), which folds the range
+layer's checks over every run that traces a `RangeCreated` (sim/raft.rs:3521-3527) — and
+the membership, install and re-seed scenarios in their own checks (sim/membership.rs:1306-1312,
+sim/install.rs:353, sim/reseed.rs:323). Shown, not only read: with the whole-trace fold
 planted to fail on any run that traces a `RangeCreated`, `sim/tests/ranges.rs`'s seed-1
 test failed in the plant's words and the sharded quorum scenario's correct test passed
 (debug, two seeds; the plant reverted). Issue #140, which names sim/ranges.rs beside
 sim/quorum.rs, is right about the quorum scenario alone; folding the checks there, with
 the correct node measured green first, is its work.
+Code line numbers in this note are those of commit 0284c13 (D-104).
 
 ---
 
@@ -19104,6 +19122,7 @@ and an id in no block or another node's block", and crates/ananke-shard/src/inva
 has the split in shape, the right half outside the leader's block and in another node's,
 the right half named before and the wrong generation; none plants wrong voters, though
 `SplitLineage` compares them. Issue #150.
+Code line numbers in this note are those of commit 0284c13 (D-104).
 
 ---
 
@@ -19505,10 +19524,12 @@ owner's ruling. Issue #145.
 
 **The number.** Off `main` at b01db39, whose footer reads D-104. Three slices run beside
 each other off that tip: fix A takes D-102, this takes **D-104**, and the range layer's
-variant set takes D-105; the footer here moves to D-105. At the merge the entries are a
-union in numerical order with one footer, highest + 1. This entry changes documents and
-comments only — no code line, draw, trace event, bound, assertion or pinned hash — so no
-code site carries a marker of it; the comments it corrects cite it as `D-104`.
+variant set takes D-105. D-105 merged first (#152, 8496ca3); this branch merged that tip
+in with the entries as a union in numerical order, so the footer reads D-106. This entry
+changes documents and comments only — no code line, draw, trace event, bound, assertion
+or pinned hash. Its one PROPOSED point is marked `// PROPOSED(D-104)` at the split arms'
+draw (`Schedule::draw_on_the_node`, sim/raft.rs:1583-1584), a comment like the rest; the
+comments it corrects cite it as `D-104`.
 
 **Context.** The first five slices of Stage C (PRs #132 to #136, D-096 to D-100) did
 some things no entry states, and claimed some things the tree does not bear out. The
@@ -19516,9 +19537,13 @@ Stage C gap audit of `main` at fdc5fc0 (2026-10-10) and issue #142 found them. �
 that a stage record what it does in DECISIONS.md as it lands, and that no question be
 "settled inside the stage's code and recorded after it" (SHARD.md:2065-2068); what is
 already past can only be recorded. Every claim below was checked against `main` at
-b01db39 before it was written, with the evidence named beside it. Another entry's body is
-never rewritten here: each correction is a note appended at the end of the entry it
-corrects, and this entry says what each note says and why.
+b01db39 before it was written, and again on this branch after its merge of 8496ca3, with
+the evidence named beside it. **Line numbers** into code, here and in the notes this
+entry appends, are those of commit 0284c13, this branch's code after that merge and #153's
+review; the commit that adds them changes no line they cite. Into SHARD.md, SPEC.md and
+DECISIONS.md they are the same tree's. Another entry's body is never rewritten here: each
+correction is a note appended at the end of the entry it corrects, and this entry says
+what each note says and why.
 
 ### 1. PROPOSED: the node sweep's split arms stand in for `sim/shard.rs`'s driver, and stay when it lands
 
@@ -19526,32 +19551,44 @@ corrects, and this entry says what each note says and why.
 (Q18)" (SHARD.md:2465). The driver is `sim/shard.rs`'s: five nodes, three of them
 bootstrap nodes, "its driver, on stream `shard`, draws splits and leadership transfers",
 with the workload's split shapes and "a crash and restart of a node that has taken an id
-from its block, followed by a split led from that node" (SHARD.md:2488-2495). §10's rows
-for the stage's variants name "the sharded sweep" as where each is reached
-(SHARD.md:2532-2559).
+from its block, followed by a split led from that node" (SHARD.md:2488-2495). Five of
+§10's eight rows for the stage's variants name "the sharded sweep" as where each is
+reached; `SnapshotOverlapsReplica` and `UninitialisedReplicaVotes` name `sim/split.rs`,
+and `MetaOverwritesByArrival` names `Fault::MetaReorder`, an arm of `sim/shard.rs`
+(SHARD.md:2532-2559, 1595).
 
 **What the tree does.** There is no `sim/shard.rs`. D-100's item 9 put two arms on every
 schedule of the node sweep in `sim/raft.rs`, drawn by `Schedule::draw_on_the_node` from a
-stream of their own, `split` (sim/raft.rs:1577-1588):
+stream of their own, `split` (sim/raft.rs:1583-1599):
 
 - `Fault::Split`: an admin asks the aimed range's leader to split at `split_key_of(range)`,
-  the second of the range's two client keys (sim/raft.rs:1158).
+  the second of the range's two client keys (sim/raft.rs:1163-1168).
 - `Fault::SplitFromRestarted`: the node that proposed the last split done is crashed,
   restarted, handed the lead of a range that split did not cut (`Command::Transfer`), and
   asked alone to split it. This is §10's shape for `IdBlockResumed`.
 
-Every Stage C variant and every split coverage figure asserted on this tree is asserted
-on those arms:
+Every Stage C variant that needs a split, and every split coverage figure, is asserted on
+those arms:
 
-- `ApplyIgnoresSpan` alone: sim/tests/node.rs:1697.
-- `MetaOverwritesByArrival`: sim/tests/node.rs:1799.
-- `IdBlockResumed`: sim/tests/node.rs:1868.
-- The split's coverage (`splits_of`): sim/tests/node.rs:776-822.
+- `ApplyIgnoresSpan` alone:
+  `a_server_that_ignores_the_span_at_apply_is_caught_with_trust_and_after_a_split_alone`
+  (sim/tests/node.rs:1723).
+- `MetaOverwritesByArrival`:
+  `a_meta_range_that_stores_updates_as_they_arrive_is_caught_by_check_16_after_a_split`
+  (sim/tests/node.rs:1825).
+- `IdBlockResumed`: `a_node_that_resumes_another_runs_block_of_ids_is_caught_after_a_split`
+  (sim/tests/node.rs:1895).
+- The split's coverage (`splits_of`): sim/tests/node.rs:787-833.
 
-The variants' own docs still name the sharded sweep as the place
-(crates/ananke-shard/src/variant.rs, `MetaOverwritesByArrival` and `IdBlockResumed`).
-This entry leaves those two docs alone: D-105 moves both variants into the range layer's
-set, and two branches editing the same lines would conflict for nothing.
+`TrustStaleDescriptor`, `ClientIgnoresMismatch` and the pair `{TrustStaleDescriptor,
+ApplyIgnoresSpan}` need no split: the clients that start stale reach them
+(`routing_variant`, sim/tests/node.rs:1547-1573; the tests at 1665, 1723 and 1957).
+
+The two variants' docs named the sharded sweep as what reaches them. D-105 moved both into
+`crates/ananke-shard/src/range_variant.rs` with that wording, and this entry corrects it
+there: §10's `Fault::MetaReorder` and its crash-and-restart shape for `IdBlockResumed`
+are `sim/shard.rs`'s, which is not built, and on this tree the node sweep's split arms
+reach both variants.
 
 **What the arms are not.** They are not a driver:
 
@@ -19564,7 +19601,8 @@ So `sim/shard.rs` is owed in full: Stage C's first exit line (SHARD.md:2504-2507
 stream, and `Fault::MetaReorder`, whose second split of a left half the arms never draw.
 
 **Proposed: keep the arms after `sim/shard.rs` lands, as interim coverage that departs
-from §12's text and then stays as the node sweep's own.**
+from §12's text and then stays as the node sweep's own.** The point is marked
+`// PROPOSED(D-104)` above the draw (sim/raft.rs:1583-1584).
 
 - Removing them moves every node-sweep schedule, and with them every pin re-audited on
   those schedules: seeds 272, 516, 368, 493 and 633.
@@ -19584,17 +19622,19 @@ either is recorded, in DECISIONS.md or on #129. Stage C's entry criteria include
 answer A "as proposed, … the owner's ruling replaces it in place" (D-100's number
 paragraph):
 
-- `NoRangeId` at proposal (crates/ananke-shard/src/server.rs:1244-1250).
+- `NoRangeId` at proposal (crates/ananke-shard/src/server.rs:1255-1260, 1302-1307).
 - `SplitRefusal::NoRangeId` on the wire (crates/ananke-raft/src/apply.rs:196-198).
 - The sweep's admin retrying (sim/raft.rs).
 
 It built the split's apply without check 19 and without `SplitLeavesGap`. D-093's
 consequences say the instrument "exists from the slice that builds the split's apply,
-which is also where check 19 is first fed; the two land in the same slice". On b01db39:
+which is also where check 19 is first fed; the two land in the same slice". On b01db39,
+and on this branch after D-105's merge:
 
 - The range layer's `Checker` folds checks 7, 9, 10, 16 and 17 and check 18's two clauses,
   and nothing of check 19 (crates/ananke-shard/src/invariants.rs).
-- No code names `SplitLeavesGap`.
+- No variant `SplitLeavesGap` exists. Since D-105 one doc names it,
+  `range_variant.rs`'s module doc, among the instruments of which "None is built yet".
 
 **Both questions remain the owner's, and this entry decides neither.** What each ruling
 does now:
@@ -19647,13 +19687,18 @@ change every later commit of `main`. Later slices keep the rule.
 - **D-093.** It says "Stage C's exit already asserts per seed that the driver's splits
   take effect". That is false:
   - Stage C's exit has no such line (SHARD.md:2502-2523).
-  - The node sweep asserts splits in aggregate (sim/tests/node.rs:791-796).
-- **D-097.** It never says two things §12's entries line asks of Q10's entry
-  (SHARD.md:2561-2571):
-  - Q10's hole is the class of seed 42's duplicate proposal (D-026). Its record
-    deduplicates only within D-026's window, while the original's entry is in the
-    leader's log.
-  - #21 is carried: split batches and merge batches will need to carry the session table.
+  - The node sweep asserts splits in aggregate (sim/tests/node.rs:802-807).
+- **D-097.** Two things it does not say, and one sentence that says too much:
+  - Q10's hole is the class of seed 42's duplicate proposal (D-026), which §12's entries
+    line asks Q10's entry to say (SHARD.md:2568-2571). Its record deduplicates only
+    within D-026's window, while the original's entry is in the leader's log.
+  - #21 is carried, as Stage C's Issues line has it (SHARD.md:2563-2565): split batches
+    and merge batches will need to carry the session table.
+  - Its **After the second commit** has every node sweep green "with the four folds in
+    the incremental checker and over the whole trace", the sharded quorum scenario,
+    `reseed` and `install` among them. The incremental checker runs in the raft sweep's
+    runner alone. The sharded quorum scenario has never folded the checks, and `install`
+    and `reseed` first folded them in D-098 (e4a8063).
 - **D-098.** Its claim that every node scenario folds the range layer's checks is false
   for the sharded quorum scenario. It holds for `sim/ranges.rs`, which folds them through
   `raft::Report::check`; a planted fold showed both. So issue #140, which names both
@@ -19667,7 +19712,7 @@ change every later commit of `main`. Later slices keep the rule.
   that breaks D-035 on every range, and every seed is still caught. D-101 says the split
   is unchanged.
 
-### 5. Issue #142's comment and docs fixes
+### 5. Issue #142's comment and docs fixes, and the ones #153's review found
 
 Each is a comment or a document. None is a code line.
 
@@ -19690,8 +19735,9 @@ Each is a comment or a document. None is a code line.
   - The attribution. D-092 says only that the asker retries.
 
   The retry is the sweep's own choice, and the comments now say so.
-- **Fold counts.** These said "the four checks" or "checks 7, 9, 10 and 17", where the
-  checker folds seven: checks 7, 9, 10, 16 and 17 and check 18's two clauses.
+- **Fold counts.** These said "the four checks", "checks 7, 9, 10 and 17" or "checks 7,
+  9, 10, 16 and 17", where the checker folds seven: checks 7, 9, 10, 16 and 17 and check
+  18's two clauses.
   - `ananke_shard::invariants`: the module doc, which now has a check 18 paragraph, and
     the `Checker` doc.
   - `IdsUnique`'s doc. It said the clause's other half "waits on the split", and that
@@ -19699,12 +19745,21 @@ Each is a comment or a document. None is a code line.
   - `sim/raft.rs`: two comments.
   - `sim/membership.rs`: one comment.
   - The equivalence test's doc in `sim/tests/node.rs`.
+  - `sim/install.rs` and `sim/reseed.rs`: the comment over each scenario's fold
+    (sim/install.rs:349-352, sim/reseed.rs:319-322), found by #153's review. Each also
+    said "as every node scenario folds them", which item 4's D-098 correction makes
+    false; each now names the sharded quorum scenario as the one that does not (#140).
+- **`MetaOverwritesByArrival`'s and `IdBlockResumed`'s docs**
+  (crates/ananke-shard/src/range_variant.rs), found by #153's review once D-105 had
+  moved them: they said the sharded sweep reaches each, and now say what item 1 says.
 - **`sim/lin.rs`.** A paragraph of the module doc appeared twice, word for word. The copy
   is removed.
 - **`sim/tests/node.rs`'s seed 680 doc.** It cited seed 42's one-group hash `445f…` as
   current. It now gives `445f…` as D-086's and `c5b8d814…` as the hash since cd3de12
-  (D-097), and says no test asserts either (#97). On this tree the gate's run writes seed
-  42's trace at 13 241 905 bytes hashing to `c5b8d814…`.
+  (D-097). It said no test asserts either (#97); since D-105's merge one does, by the
+  body's FNV-1a hash (`SEED_42_BODY_HASH`, sim/tests/raft.rs), and the doc now says so.
+  On this tree the gate's run writes seed 42's trace at 13 241 905 bytes hashing to
+  `c5b8d814…`, and the pinned body hash passes.
 - **`NodeVariant::RefuseOneRangeOnly`'s doc.** It said "three unrefused replicas". Since
   D-096 the variant refuses the root alone. On a bootstrap node of the sharded quorum
   scenario it leaves five replicas unrefused: the meta range's and the four user ranges'.
@@ -19715,9 +19770,10 @@ Each is a comment or a document. None is a code line.
 
 ### Verification
 
-- **The gate.** `scripts/gate.sh` exits 0 on the committed tree.
-- **Comments only.** A filter over `git diff -U0 -- '*.rs'` finds no added or removed
-  line that is not a comment.
+- **The gate.** `scripts/gate.sh` exits 0 on each commit's tree, the merge of 8496ca3
+  included.
+- **Comments only.** A filter over `git diff -U0 8496ca3 -- '*.rs'` finds no added or
+  removed line that is not a comment.
 - **The premerge is not run.** No code line changes, so nothing it measures can move. The
   nightly at ten thousand runs on the tip.
 
