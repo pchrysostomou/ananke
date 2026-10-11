@@ -19,7 +19,7 @@
 //! the apply's version, merges every descriptor of the update in order over one map,
 //! and writes the difference.
 //!
-//! **The variant.** `NodeVariant::MetaOverwritesByArrival` stores each update as it
+//! **The variant.** `RangeVariant::MetaOverwritesByArrival` stores each update as it
 //! arrives: every overlapping record is cut and replaced whatever its generation, so
 //! an older update that arrives after a newer one takes the newer's place — the
 //! regression check 16 sees at the first key whose named generation falls (§8, §10).

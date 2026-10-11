@@ -64,6 +64,7 @@ use ananke_env::RecoveredAs;
 use ananke_env::TraceEvent;
 use ananke_env::sim::TraceRecord;
 use ananke_raft::core::{Variant, Variants};
+use ananke_shard::range_variant::{RangeVariant, RangeVariants};
 use ananke_shard::variant::{NodeVariant, NodeVariants};
 use ananke_sim::folds::{self, ApplyLagFold, CrossRangeHoldFold, NodeCoverage, NodeCoverageFold};
 use ananke_sim::raft::{self, Cluster};
@@ -71,12 +72,22 @@ use ananke_sim::{seeds, sweep, verdict, write_trace};
 
 /// The correct node, on the seeds this tier runs.
 fn correct(seed: u64) -> raft::Report {
-    raft::run_on_the_node(seed, Variants::default(), NodeVariants::correct())
+    raft::run_on_the_node(
+        seed,
+        Variants::default(),
+        NodeVariants::correct(),
+        RangeVariants::correct(),
+    )
 }
 
 /// A node whose cores carry `variants`, with the node itself correct.
 fn buggy(seed: u64, variants: impl Into<Variants>) -> raft::Report {
-    raft::run_on_the_node(seed, variants, NodeVariants::correct())
+    raft::run_on_the_node(
+        seed,
+        variants,
+        NodeVariants::correct(),
+        RangeVariants::correct(),
+    )
 }
 
 /// The ranges the node hosts.
@@ -1349,7 +1360,12 @@ fn the_node_folds_agree_with_their_whole_trace_readings() {
     let compared = seeds().min(100);
     let outcomes: Vec<(Option<NodeVariant>, Result<Compared, String>)> = sweep(compared, |seed| {
         let variant = FOLDS_COMPARED[seed as usize % FOLDS_COMPARED.len()];
-        let report = raft::run_on_the_node(seed, Variants::default(), node_with(variant));
+        let report = raft::run_on_the_node(
+            seed,
+            Variants::default(),
+            node_with(variant),
+            RangeVariants::correct(),
+        );
         (variant, compare_folds(seed, variant, &report.records))
     });
     let mut by_variant: BTreeMap<String, (usize, usize, usize)> = BTreeMap::new();
@@ -1414,6 +1430,7 @@ fn an_apply_task_that_waits_for_every_range_is_caught_by_the_lag_fold_on_the_nod
             seed,
             Variants::default(),
             NodeVariants::correct().with(NodeVariant::ApplyWaitsForEveryRange),
+            RangeVariants::correct(),
         );
         let mut lag = ApplyLagFold::default();
         lag.extend(&report.records);
@@ -1512,8 +1529,13 @@ fn a_fresh_node_that_bootstraps_itself_is_caught_by_check_7_where_it_is_not_a_bo
     ananke_sim::ranges::creations_agree_of(&honest.records)
         .expect("the correct membership node's creations agree on every range");
 
-    let correct = raft::run_on_the_node(1, Variants::default(), NodeVariants::correct());
-    let pretending = raft::run_on_the_node(1, Variants::default(), taken);
+    let correct = raft::run_on_the_node(
+        1,
+        Variants::default(),
+        NodeVariants::correct(),
+        RangeVariants::correct(),
+    );
+    let pretending = raft::run_on_the_node(1, Variants::default(), taken, RangeVariants::correct());
     assert_eq!(
         correct.jsonl(),
         pretending.jsonl(),
@@ -1548,11 +1570,12 @@ fn a_fresh_node_that_bootstraps_itself_is_caught_by_check_7_where_it_is_not_a_bo
 /// **`ClientIgnoresMismatch`** resends to the range and generation it had: check 17 at
 /// the first resend, on every seed, since every other client starts stale.
 // PROPOSED(D-097)
-fn routing_variant(name: &str, variants: &[NodeVariant]) -> Vec<Routed> {
+fn routing_variant(name: &str, variants: &[RangeVariant]) -> Vec<Routed> {
     let seeds = high_rate_share();
-    let taken = NodeVariants::of(variants);
+    let taken = RangeVariants::of(variants);
     let outcomes: Vec<Routed> = sweep(seeds, |seed| {
-        let report = raft::run_on_the_node(seed, Variants::default(), taken);
+        let report =
+            raft::run_on_the_node(seed, Variants::default(), NodeVariants::correct(), taken);
         let at_apply = report
             .mismatches_sent()
             .get(&MismatchAt::Apply)
@@ -1640,7 +1663,10 @@ struct Routed {
 
 #[test]
 fn a_server_that_trusts_a_stale_descriptor_is_caught_by_check_9_on_the_node() {
-    let outcomes = routing_variant("TrustStaleDescriptor", &[NodeVariant::TrustStaleDescriptor]);
+    let outcomes = routing_variant(
+        "TrustStaleDescriptor",
+        &[RangeVariant::TrustStaleDescriptor],
+    );
     let caught = outcomes.iter().filter(|o| o.why.is_some()).count();
     // A rate, not every seed: 20 of 20 at the gate and 99 of 100 at the premerge's
     // share. Seed 48 is the one it is not caught on, and legitimately: its stale
@@ -1698,8 +1724,8 @@ fn a_server_that_ignores_the_span_at_apply_is_caught_with_trust_and_after_a_spli
     let pair = routing_variant(
         "{TrustStaleDescriptor, ApplyIgnoresSpan}",
         &[
-            NodeVariant::TrustStaleDescriptor,
-            NodeVariant::ApplyIgnoresSpan,
+            RangeVariant::TrustStaleDescriptor,
+            RangeVariant::ApplyIgnoresSpan,
         ],
     );
     let caught = pair.iter().filter(|o| o.why.is_some()).count();
@@ -1747,7 +1773,7 @@ fn a_server_that_ignores_the_span_at_apply_is_caught_with_trust_and_after_a_spli
     // 1 of 20 at the gate, 5 of 100 at the thousand's share — and asserted where the
     // sample supports it, the nightly's share of a thousand (D-061; D-086's aimed arm
     // is the precedent for a 5 % catch's tier).
-    let alone = routing_variant("ApplyIgnoresSpan", &[NodeVariant::ApplyIgnoresSpan]);
+    let alone = routing_variant("ApplyIgnoresSpan", &[RangeVariant::ApplyIgnoresSpan]);
     assert!(
         alone.iter().all(|o| o.at_apply == 0),
         "the apply check refused a write under ApplyIgnoresSpan alone, which turns it off"
@@ -1799,7 +1825,7 @@ fn a_server_that_ignores_the_span_at_apply_is_caught_with_trust_and_after_a_spli
 fn a_meta_range_that_stores_updates_as_they_arrive_is_caught_by_check_16_after_a_split() {
     let outcomes = routing_variant(
         "MetaOverwritesByArrival",
-        &[NodeVariant::MetaOverwritesByArrival],
+        &[RangeVariant::MetaOverwritesByArrival],
     );
     assert!(
         outcomes.iter().any(|o| o.splits > 0),
@@ -1833,7 +1859,8 @@ fn a_meta_range_that_stores_updates_as_they_arrive_is_caught_by_check_16_after_a
     let variant = raft::run_on_the_node(
         1,
         Variants::default(),
-        NodeVariants::of(&[NodeVariant::MetaOverwritesByArrival]),
+        NodeVariants::correct(),
+        RangeVariants::of(&[RangeVariant::MetaOverwritesByArrival]),
     );
     let correct = correct(1);
     let (applies, took) = raft::meta_applies_of(&variant.records);
@@ -1866,7 +1893,7 @@ fn a_meta_range_that_stores_updates_as_they_arrive_is_caught_by_check_16_after_a
 /// crashes, since a restarted node that resumes a block asks for no refill.
 #[test]
 fn a_node_that_resumes_another_runs_block_of_ids_is_caught_after_a_split() {
-    let outcomes = routing_variant("IdBlockResumed", &[NodeVariant::IdBlockResumed]);
+    let outcomes = routing_variant("IdBlockResumed", &[RangeVariant::IdBlockResumed]);
     let resumed = outcomes.iter().filter(|o| o.resumed > 0).count();
     println!(
         "node: IdBlockResumed: a restarted proposer's second split was done on {resumed}/{} \
@@ -1900,7 +1927,8 @@ fn a_node_that_resumes_another_runs_block_of_ids_is_caught_after_a_split() {
         let variant = raft::run_on_the_node(
             seed,
             Variants::default(),
-            NodeVariants::of(&[NodeVariant::IdBlockResumed]),
+            NodeVariants::correct(),
+            RangeVariants::of(&[RangeVariant::IdBlockResumed]),
         );
         let correct = correct(seed);
         let restarts = correct.count(|e| matches!(e, TraceEvent::NodeCrashed { .. }));
@@ -1929,7 +1957,7 @@ fn a_node_that_resumes_another_runs_block_of_ids_is_caught_after_a_split() {
 fn a_client_that_ignores_a_mismatch_is_caught_by_check_17_on_the_node() {
     let outcomes = routing_variant(
         "ClientIgnoresMismatch",
-        &[NodeVariant::ClientIgnoresMismatch],
+        &[RangeVariant::ClientIgnoresMismatch],
     );
     let seeds = outcomes.len();
     let by_check_17 = outcomes
@@ -1957,16 +1985,21 @@ fn a_client_that_ignores_a_mismatch_is_caught_by_check_17_on_the_node() {
 fn the_range_layers_checks_agree_with_their_whole_trace_folds() {
     const PREFIXES: usize = 8;
     let seeds = high_rate_share().min(20);
-    let variants: [&[NodeVariant]; 3] = [
+    let variants: [&[RangeVariant]; 3] = [
         &[],
-        &[NodeVariant::TrustStaleDescriptor],
-        &[NodeVariant::ClientIgnoresMismatch],
+        &[RangeVariant::TrustStaleDescriptor],
+        &[RangeVariant::ClientIgnoresMismatch],
     ];
     let mut compared = 0usize;
     let mut tripped = 0usize;
     for taken in variants {
         let results = sweep(seeds, |seed| {
-            let report = raft::run_on_the_node(seed, Variants::default(), NodeVariants::of(taken));
+            let report = raft::run_on_the_node(
+                seed,
+                Variants::default(),
+                NodeVariants::correct(),
+                RangeVariants::of(taken),
+            );
             let records = &report.records;
             let mut incremental = ananke_shard::invariants::Checker::new(true);
             let mut fed = 0usize;
@@ -2430,6 +2463,7 @@ fn a_node_that_leaves_a_refused_reads_registration_behind_is_caught_on_the_node(
             seed,
             Variants::default(),
             NodeVariants::of(&[NodeVariant::RefusedReadLeft]),
+            RangeVariants::correct(),
         );
         let verdict = report.check();
         let named = verdict

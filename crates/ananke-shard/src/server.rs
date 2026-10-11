@@ -78,6 +78,7 @@ use crate::node::{
 };
 use crate::outbox::Outbox;
 use crate::range::RangeId;
+use crate::range_variant::{RangeVariant, RangeVariants};
 use crate::reseed::{Candidate, generation_of, newest_not_lost, reseed_dir};
 use crate::round::Cores;
 use crate::snapshot::{self, Identity, Snapshots};
@@ -195,6 +196,12 @@ pub struct ServerConfig {
     pub refill_at: u64,
     /// The node's known-buggy variants (the round's and the wire's).
     pub node: NodeVariants,
+    /// The range layer's known-buggy variants (SHARD.md §10, Q37), carried beside
+    /// `node`'s and the cores' `raft.variants` and read only where the range layer's
+    /// rules are kept: the receipt and serving checks, the apply check, the meta
+    /// range's apply and the lease record read at the start.
+    // PROPOSED(D-105): the range layer's own variant set.
+    pub range_variants: RangeVariants,
 }
 
 /// The initial state a fresh bootstrap node writes (SHARD.md §2), computed from
@@ -670,6 +677,8 @@ pub struct ServerHost<E: Environment> {
     variants: ananke_raft::core::Variants,
     /// The node's own variants, for the paths a core knows nothing about.
     node: NodeVariants,
+    /// The range layer's, for the receipt and serving checks (PROPOSED D-105).
+    range_variants: RangeVariants,
     gaps: Mutex<Gaps>,
     /// Every hosted replica's descriptor as the store holds it (SHARD.md §1, §3):
     /// what the receipt check reads and what a `RangeMismatch` carries. Loaded from
@@ -1137,7 +1146,9 @@ impl<E: Environment> Host for ServerHost<E> {
             return None;
         };
         if let Some(key) = &key
-            && !self.node.contains(NodeVariant::TrustStaleDescriptor)
+            && !self
+                .range_variants
+                .contains(RangeVariant::TrustStaleDescriptor)
         {
             let refused = {
                 let held = lock(&self.descriptors);
@@ -1567,7 +1578,10 @@ impl<E: Environment> Host for ServerHost<E> {
             // subsume applied between receipt and serving answers `RangeMismatch`.
             // `TrustStaleDescriptor` checks nothing here (§10).
             // PROPOSED(D-097): the read check.
-            let descriptor = if self.node.contains(NodeVariant::TrustStaleDescriptor) {
+            let descriptor = if self
+                .range_variants
+                .contains(RangeVariant::TrustStaleDescriptor)
+            {
                 None
             } else {
                 store
@@ -1713,6 +1727,9 @@ struct ServerApplier<E: Environment> {
     snaps: Queue<SnapJob>,
     engine_dir: PathBuf,
     node_variants: NodeVariants,
+    /// The range layer's, for the apply check and the meta range's apply (PROPOSED
+    /// D-105).
+    range_variants: RangeVariants,
     /// The cores' variants: read here for Phase 2's `SharedSnapshotDir`, whose bit
     /// names the version directory a take writes (Q37, PROPOSED D-086).
     cores: ananke_raft::core::Variants,
@@ -2254,7 +2271,7 @@ impl<E: Environment> Applier for ServerApplier<E> {
                 // PROPOSED(D-097): the apply check.
                 let refused: Option<RangeDescriptor> = match command.as_ref().and_then(Command::key)
                 {
-                    Some(key) if !self.node_variants.contains(NodeVariant::ApplyIgnoresSpan) => {
+                    Some(key) if !self.range_variants.contains(RangeVariant::ApplyIgnoresSpan) => {
                         let held = match store
                             .engine()
                             .get(&KeyPrefix::group(range.get()).descriptor_key())
@@ -2371,8 +2388,8 @@ impl<E: Environment> Applier for ServerApplier<E> {
                 } else if let Some(descriptors) = &meta_update {
                     let result = if range == META_RANGE {
                         let as_arrived = self
-                            .node_variants
-                            .contains(NodeVariant::MetaOverwritesByArrival);
+                            .range_variants
+                            .contains(RangeVariant::MetaOverwritesByArrival);
                         match meta::apply_update(store.engine(), descriptors, as_arrived).await {
                             Ok((batch, applied)) => {
                                 let took_effect = applied.iter().any(|d| !d.won.is_empty());
@@ -2766,6 +2783,7 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
         id_block,
         refill_at,
         node: node_variants,
+        range_variants,
     } = config;
     let server = id.0;
     let variants = raft.variants;
@@ -3185,6 +3203,7 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
         raft: raft.clone(),
         variants,
         node: node_variants,
+        range_variants,
         gaps: Mutex::new(Gaps::default()),
         descriptors: descriptors.clone(),
         led: Mutex::new(BTreeMap::new()),
@@ -3204,7 +3223,7 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
         && let Some(bytes) = store.engine().get(&system::lease_key(id)).await?
         && let Ok(record) = LeaseRecord::decode(bytes)
     {
-        let any_run = node_variants.contains(NodeVariant::IdBlockResumed);
+        let any_run = range_variants.contains(RangeVariant::IdBlockResumed);
         lock(&ids).adopt(&record, any_run);
     }
     host.refill_if_needed();
@@ -3269,6 +3288,7 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
             snaps: snaps.clone(),
             engine_dir: engine.dir.clone(),
             node_variants,
+            range_variants,
             cores: variants,
             descriptors: descriptors.clone(),
             applied: applied_at.clone(),

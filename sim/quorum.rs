@@ -55,6 +55,7 @@ use ananke_raft::core::Variants;
 use ananke_raft::message::{self, Frame, Message, SnapshotStatus};
 use ananke_raft::store::mark_store_lost;
 use ananke_raft::{invariants, run as run_server};
+use ananke_shard::range_variant::RangeVariants;
 use ananke_shard::variant::NodeVariants;
 use moirae_sched::Policy;
 
@@ -233,7 +234,13 @@ fn spawn(
             Cluster::Node => {
                 let _ = ananke_shard::server::run(
                     inner,
-                    node_server_config(id, variants, node_variants, NODE_SNAPSHOT_THRESHOLD),
+                    node_server_config(
+                        id,
+                        variants,
+                        node_variants,
+                        RangeVariants::correct(),
+                        NODE_SNAPSHOT_THRESHOLD,
+                    ),
                 )
                 .await;
             }
@@ -530,7 +537,14 @@ pub fn node_run(
         let stats = Arc::new(Mutex::new(ClientStats::default()));
         env.spawn(
             "client",
-            raft::client_on(cluster, inner, i as u64 + 1, SERVERS, stats, node_variants),
+            raft::client_on(
+                cluster,
+                inner,
+                i as u64 + 1,
+                SERVERS,
+                stats,
+                RangeVariants::correct(),
+            ),
         );
     }
     let mut report = NodeReport {
