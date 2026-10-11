@@ -19537,9 +19537,15 @@ write and 124 answer it past the bound of its call; 33 answer within it, most on
 that committed nothing from before the heal until after the end. The starting map passes
 131 of them: 82 never answer and 34 answer past the bound.
 
-**`sim/tests/node.rs`'s other pair tests** read the liveness fold only as a violation by
-another check than their variant's own, which none of them asserts; their figures before
-and after at ten thousand are the nightlies' (the PR has both).
+**`sim/tests/node.rs`'s other pair tests** read the liveness fold only through `check()`,
+and none of them asserts a catch by it. Between `main`'s nightly on 195f965 (38130516040)
+and this branch's on its merge with 8496ca3 (38153884049), every catch and coverage line
+every sweep prints is unchanged but three: `SharedSnapshotDir`'s and the pair's, as above,
+and `SnapshotWithoutCurrentLast`'s catch "by a check", 2 → 1 of ten thousand. Its liveness
+violation, on seed 7992, was 8885's artefact: k4's one post-heal write called 6 ms before
+the end, on a range that had completed ten post-heal writes, read against a total 3.970 s
+past the end; extended, it was answered 35 ms after its call. That test asserts the arm's
+firing alone.
 
 ### The pins
 
