@@ -101,6 +101,30 @@ ananke/
 
 _Update this section at the end of every session._
 
+- Branch `docs-stage-c-record` (2026-10-11), off `main` at b01db39, PROPOSED D-104, **Stage
+  C's record**, docs and comments only (no code line, schedule or pinned hash moves). It
+  records three things no entry stated. First, the node sweep's split arms
+  (`Fault::Split`, `Fault::SplitFromRestarted`, stream `split`) stand in for
+  `sim/shard.rs`'s driver: a departure from §12's text, proposed to be kept after that
+  scenario lands so node schedules do not move. Second, D-092's answer A shipped in #136
+  before any ruling, and #136 built the split's apply without D-093's check 19 or
+  `SplitLeavesGap`; both questions stay the owner's, and each entry gains a note saying
+  where it stands. Third, 2e8f969 and cd3de12 bundled other changes with the
+  schedule-moving changes §12 asks to be separate commits; recorded, not rewritten. It
+  appends "corrected by D-104" notes:
+  - D-093: Stage C's exit has no per-seed line saying splits take effect.
+  - D-097: Q10's hole is D-026's class, and #21 is carried.
+  - D-098: the sharded quorum scenario never folded the range layer's checks.
+    `sim/ranges.rs` does, shown with a planted fold, so #140 is half right.
+  - D-100: SPEC's "term 1" stands (Q20), Q26 differs from the draft, and no
+    wrong-voters unit test exists (#150).
+  - D-101: under the root-only plant the variant's split is 3 331 / 6 668 / 1, not
+    unchanged.
+
+  It also fixes every item of #142: ids.rs, the `id_block` and `ID_BLOCK` attributions,
+  `SPLIT_RETRY` (150 ms, not a minimum election timeout), the fold counts, the duplicate
+  paragraph in lin.rs, seed 42's hash citation, `RefuseOneRangeOnly`'s doc, and the
+  `---` separators before D-096 to D-099 and D-101.
 - Branch `phase-3-fix-membership-range-asked` (2026-10-11), off `main` at fdc5fc0 and
   merged with it at 195f965 (#137, #144),
   PROPOSED D-103 (amends D-084): **the node membership scenario's per-range liveness

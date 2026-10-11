@@ -32,18 +32,6 @@
 //! proposal applied to another effect did not take effect and leaves the history, as
 //! one never proposed does; one with a proposal never applied stays pending.
 //!
-//! Two more things the closure reads, since routing (SHARD.md §3, §9; PROPOSED
-//! D-097). An operation's proposals are gathered by `invoked`: a write refused with
-//! `RangeMismatch` is sent again under a fresh sequence number, each `ClientSend`
-//! names the `seq` of its operation's `ClientInvoke`, and a `RaftProposed` under a
-//! resend's `seq` joins the proposals of the operation that `seq`'s `ClientSend`
-//! names — a send with no `ClientSend` is its own operation's, as every send was
-//! before. And only an apply whose effect is `applied` closes an operation: `applied`
-//! is any client command executed within its span, whatever it wrote, so a `Cas`
-//! whose compare failed still closes its operation; an operation whose every
-//! proposal applied to another effect did not take effect and leaves the history, as
-//! one never proposed does; one with a proposal never applied stays pending.
-//!
 //! Single-key operations partition by key, since the store is a product of
 //! independent registers, so each key is searched on its own: a state is the set of
 //! operations linearized so far and the register's value, and a state seen once is

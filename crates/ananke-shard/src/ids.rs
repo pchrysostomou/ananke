@@ -14,8 +14,10 @@
 //! and harmless; so is a block abandoned at a restart, or one a node stopped using.
 //!
 //! What a split does on a node whose block has run out while range 0 is unreachable
-//! is Stage C's first question (PROPOSED D-092), answered by the slice that builds
-//! the split; nothing on this tree takes an id.
+//! is Stage C's first question (PROPOSED D-092), which the owner has not ruled on. A
+//! split's leader takes its right half's id here ([`IdBlocks::take`], PROPOSED D-100),
+//! and a block with none left refuses the split `NoRangeId` at proposal: D-092's
+//! answer A, built as proposed before a ruling, which replaces it in place (D-104).
 
 use std::collections::BTreeSet;
 use std::io;

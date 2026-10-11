@@ -1300,7 +1300,7 @@ impl Report {
         {
             return fail(violation);
         }
-        // SHARD.md §8's checks 7, 9, 10 and 17 on the node cluster (Q40).
+        // SHARD.md §8's checks 7, 9, 10, 16, 17 and 18 on the node cluster (Q40).
         // PROPOSED(D-097)
         if self.cluster == Cluster::Node
             && let Err(violation) = ananke_shard::invariants::all(&self.records)
