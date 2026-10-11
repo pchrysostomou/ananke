@@ -57,6 +57,22 @@ fn a_node_holds_four_ranges_from_its_configuration_and_every_one_of_them_runs() 
             "range {range} applied nothing: {applies:?}"
         );
     }
+    // The run's end is the run's (PROPOSED D-102). The report this scenario is checked
+    // as carries `Schedule::none()`, whose total is zero, and until D-102 the liveness
+    // readings took the end from it: every run of this scenario ended at the origin by
+    // that reading and a write pending at the end was never excused here. This
+    // scenario waits on nothing, so where it stopped is its own schedule's total.
+    assert_eq!(
+        report.checked.ended,
+        ananke_env::Instant::default() + report.schedule.total(),
+        "the node scenario's run carries where it stopped"
+    );
+    assert!(
+        report
+            .records()
+            .last()
+            .is_some_and(|r| r.at <= report.checked.ended)
+    );
 }
 
 #[test]
@@ -307,6 +323,7 @@ fn no_batch_frame_of_the_node_parses_as_a_frame_of_the_one_group_server() {
     let policy = report.checked.policy;
     let header = report.checked.run.clone();
     let last_heal = report.checked.last_heal;
+    let ended = report.checked.ended;
     let isolations = report.checked.isolations.clone();
     let of_run = report.checked.ranges.clone();
     let with_payload = |payload: bytes::Bytes| {
@@ -333,6 +350,7 @@ fn no_batch_frame_of_the_node_parses_as_a_frame_of_the_one_group_server() {
                 header: header.clone(),
                 records,
                 last_heal,
+                ended,
                 isolations: isolations.clone(),
                 history: Default::default(),
                 clients: Default::default(),
@@ -406,6 +424,7 @@ fn a_ranges_replicas_are_created_with_one_descriptor_and_created_once() {
     let policy = report.checked.policy;
     let header = report.checked.run.clone();
     let last_heal = report.checked.last_heal;
+    let ended = report.checked.ended;
     let isolations = report.checked.isolations.clone();
     let of_run = report.checked.ranges.clone();
     let over = |records: Vec<ananke_env::sim::TraceRecord>| ranges::Report {
@@ -420,6 +439,7 @@ fn a_ranges_replicas_are_created_with_one_descriptor_and_created_once() {
             header: header.clone(),
             records,
             last_heal,
+            ended,
             isolations: isolations.clone(),
             history: Default::default(),
             clients: Default::default(),
