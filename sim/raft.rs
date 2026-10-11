@@ -1580,6 +1580,8 @@ impl Schedule {
             faults.push(fault.clone());
             gaps.push(*gap);
         }
+        // PROPOSED(D-104): these two split arms stand in for `sim/shard.rs`'s driver, a
+        // departure from §12's text, and stay when it lands so no node schedule moves.
         // One split per schedule, at a drawn position among the arms, from a stream
         // of its own so the other arms' draws stay where they were (PROPOSED D-100).
         let mut split = moirae_sched::stream(seed, "split");
