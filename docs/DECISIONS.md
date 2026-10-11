@@ -18639,4 +18639,203 @@ window. Seed 42's one-group JSONL is #133's.
 
 ---
 
-_Next entry: D-101. Add one before implementing anything not covered above._
+## PROPOSED D-103 — The membership scenario's per-range liveness reads what the clients asked: a range asked for no write after the heal is no evidence, a range asked for anything and answering nothing still fails, and the range bound that cannot trip goes to the owner (amends D-084)
+
+**The number.** This branch is off `main` at fdc5fc0, whose footer reads D-101. Two fix
+branches open beside it take D-101 and D-102, and PR #137 restores D-092 to D-094; the
+brief that assigned this one gives it **D-103**, and the footer moves to D-104. Every code
+site carries `// PROPOSED(D-103)`. At the merge the entries are a union in numerical
+order with one footer.
+
+**Context.** Nightly 38042926336 on 314ac8f was red on shard 3 with one seed of ten
+thousand in `every_seed_passes_the_membership_scenario_on_the_correct_node`: *seed 1969:
+liveness: no client write of range 5 completed after the last heal at Instant(2.95s)*.
+Its diagnosis and the adversarial verification of that diagnosis agree it is a **check
+defect**, not the node's. Range 5 (k6, k7) was led by server 1 in term 3 from 2.1229 s
+to the end of the run, its voters {1, 2, 3} non-joint from index 13; after the heal the
+two clients asked it for **eleven reads and no write**, and it answered all eleven from
+its lease. The clause D-084 wrote (commit 1a1920a, merged by #106 at 85f868f) reads
+`time_to_write_after_heal_of(range)` and fails on `None`, and `None` is both "every write
+asked of the range stayed pending" and "no write of the range was asked". The raft sweep
+has read the second as no evidence since D-071's item 7 and D-076 ("a key no client
+wrote to in the window is no evidence either way"); `sim/membership.rs` never got the
+rule. #133 moved the seed's draws onto the old defect and introduced nothing of its own.
+The verifier showed the range live directly: turning any one of eight of those reads
+into a put of the same key, every other draw unchanged, completed the put in 19 to 46 ms
+(the one slot that did not was the one whose packet the network dropped). The draw's
+chance is about 9.4·10⁻⁶ at that seed's operation counts.
+
+On fdc5fc0 the seed passes — the meta range, the range ids and the split's arms
+(D-098 to D-100) moved every node schedule, and its range 5 is asked for eight writes
+after the heal — but the clause is unchanged, so the defect waits for the next schedule
+that draws it.
+
+### What changes
+
+1. **`Report::write_asked_after_heal_of(range)`**: whether any client's `ClientInvoke`
+   of a write (put, delete, cas) of a key of `range` is recorded at or after the last
+   heal. **Read from the invocations and not from the history**, because
+   `lin::History::from_trace` drops an operation that returned nothing and was never
+   proposed — and a write asked of a range with no leader, or of a leader that drops
+   its writes, is exactly that. A history-based "asked" hides the wedge the clause
+   exists to see; the planted wedge below shows it on every run it wedged.
+2. **The clause's new arm**, before the failing one: `None if
+   !write_asked_after_heal_of(range)`. No write was asked, so none completing is no
+   evidence: D-071's and D-076's rule, given to the per-range reading.
+3. **The verifier's strengthening**, inside that arm:
+   `Report::operations_after_heal_of(range)` counts the operations of the range asked
+   after the heal (reads and writes, from `ClientInvoke`) and how many returned
+   (`ClientReturn`, paired by client and the operation's own number). A range asked for
+   operations after the heal that answered none of them served nothing and **fails**,
+   with a message of its own: *range R completed no operation after the last heal at T,
+   of N asked, none of them a write*. A client retries a read until its deadline, so a
+   live range answers one; a range asked nothing at all after the heal passes.
+4. **`NodeMembershipCoverage::ranges_not_asked_after_heal`**: the (seed, range) pairs of
+   uniform runs on which no write of the range was asked after the heal, printed at
+   every tier with the rest of the coverage, so the case the arm excuses is counted
+   rather than passed over.
+5. **The two doc comments that said the opposite.** `RANGE_LIVENESS_TIMEOUTS` said the
+   clause that catches a wedged range is "that *no* write of that range completed after
+   the heal at all, which has nothing to tune and no margin to get wrong";
+   `longest_completion_gap_of` said a range wedged to nothing is "not a hole —
+   `time_to_write_after_heal_of` fails such a range outright". Both now say what the
+   clause does: it fails a range where it has evidence, a write asked and none
+   completed or operations asked and none answered; a range asked nothing after the
+   heal is seen by neither clause, which is a hole, and the scenario change below is
+   what would close it. `RANGE_LIVENESS_TIMEOUTS` also says that its bound cannot trip,
+   and why (the PROPOSED point below). This amends D-084's paragraph beginning "Six
+   seconds is most of an eight-second run", whose "the clause with teeth … has nothing
+   to tune and no margin to get wrong" seed 1969 refuted.
+6. **Two unit tests in `sim/membership.rs`**, run by the nightly's `rest` job like the
+   module's other two, so no shard row:
+   - `seed_1969_no_longer_leaves_a_range_unasked_for_a_write_after_the_heal` — **the
+     pin, in CLAUDE.md's absence form**: on this tree the seed is uniform and passes,
+     and **every** range of it was asked for a write after the heal, range 5's first
+     returning 376 ms after it. The reason is the schedule move named above. The day a
+     schedule brings a range of this seed back to no write asked, it fails and says to
+     upgrade the pin to its mechanism.
+   - `a_range_not_asked_for_a_write_after_the_heal_is_no_evidence_and_one_asked_still_is`
+     — **seed 1969's shape, built from seed 1969's own run on this tree**, no record
+     invented. Range 4's first operation after the heal is a read of k5 (asked at
+     3.076 s, answered at 3.217 s), its second a put of k4 (asked at 3.093 s); the run is
+     cut just before the put and range 4's answer to the read kept, as if the run had
+     ended once it gave it. Each case asserts its exact verdict:
+
+     | The records | Verdict |
+     |---|---|
+     | the shape: one read asked after the heal and answered, no write asked | **passes** |
+     | the same, the answer left out | **fails**: *range 4 completed no operation after the last heal at Instant(2.95s), of 1 asked, none of them a write* |
+     | the same, the read left out too | passes: nothing asked |
+     | cut just after the put was asked: asked, never proposed, and **the history holds no write of range 4 after the heal** | **fails with the original message**: *no client write of range 4 completed after the last heal at Instant(2.95s)* |
+     | cut just after range 4's leader proposed one of its writes: proposed, never applied, pending in the history | fails with the same message |
+
+     The test picks the range, not its text: the range whose first write after the heal
+     was asked latest among those asked only reads before it, each answered. If a
+     schedule move leaves no such range on the seed, it says so.
+
+Nothing else moves: no bound, no draw, no schedule, no trace, no pinned hash. **On one
+group the new arm is unreachable**: the cluster has one range, the cluster-wide clause
+above the per-range one fails first on `None`, and its 2 s bound is under the range's
+6 s, so the one-group scenario asks exactly what it asked.
+
+### Measured, at ten thousand seeds in release on this tree
+
+The machine (D-070): Darwin 25.6.0 arm64, Apple M2, 8 cores, **on AC Power**, with the
+two other fix branches' sweeps and builds beside it, load averages 191.49/147.51/85.82
+when the first run started and 170.82/182.94/173.48 when the last ended. The figures are
+virtual time and counts, which the host's load does not touch; only the wall times are
+host time. The binaries were built from this tree before the strengthening's message
+was reworded (no reading changed); the nightly on the tip runs the committed tree.
+
+- **The correct node's membership sweep: green, 10 000 of 10 000, in 488 s.** **Every
+  coverage figure is identical**, byte for byte once the new field is taken out, to
+  nightly 38082122222's on fdc5fc0 (shard 3, the same test at the same ten thousand):
+  516 967 060 records, 1 645 729 completed operations, the worst range gap 1.715638064 s,
+  the worst first write of a range after the heal 2.139833526 s against the cluster's
+  758.177932 ms, 403 952 joint configurations, 1 593 elections while joint — which is
+  what says no schedule moved. **`ranges_not_asked_after_heal: []`**: no uniform run of
+  the ten thousand reaches the case the arm excuses.
+- **`SingleMajorityInJointConsensus` on the node: caught on 1 974 of 10 000**, the
+  verdict line identical to nightly 38082122222's on fdc5fc0 (shard 6), first seed 4 by
+  commit majority, overlap on 9 732. The verdicts are the same seed for seed: a verdict
+  can change only on a run that reaches the per-range clause with a range not asked for
+  a write, and a probe over the variant's ten thousand found 3 501 such (seed, range)
+  pairs on 915 seeds, **every one on a seed the variant fails before the clause** (a run
+  its violation stopped), none on a seed it passes.
+- **The planted write wedge.** A scratch knob in the node's request path, built in a
+  target of its own and never committed: every client write range 5 receives from 3.0 s
+  of the node's own clock is dropped, unanswered and unproposed. Over the 5 000 uniform
+  runs of the ten thousand:
+  - **3 626 asked range 5 for a write after the heal and completed none, and all 3 626
+    fail.** 3 625 fail with the original message, *no client write of range 5 completed
+    after the last heal*. Seed 4321 fails one range earlier in the clause's order, on
+    range 4, by the second false-positive class below (its range 5 was asked for writes
+    and completed none too). **The history held no write of range 5 after the heal on
+    any of the 3 626, while 3 to 24 were asked**: a history-based "asked" would have
+    passed every one.
+  - 1 374 completed a write of range 5 after the heal, asked before the wedge began
+    (their heal fell before 3.0 s), and pass: the range was live after the heal.
+  - None was asked no write of range 5.
+- **The window the per-range bound is asked over**, from the last heal to the run's last
+  record, over the correct node's 5 000 uniform runs: **2.4 s on 4 945 of them** (one
+  completion poll of the shrink, then the settle), between 2.5 and 3.0 s on 46, between
+  4.0 and 4.406 s on 9, never over 6 s.
+
+### The mutation table: what a single-range world could not catch
+
+Five mutations, each planted alone against the unit tests (debug, this tree) and reverted
+before the next. M1 and M3 are no-ops on one group: one range, and every key its.
+
+| | Mutation | Caught by |
+|---|---|---|
+| **M1** | `write_asked_after_heal_of` ignores its range | the splice test's shape: *range 4's shape passes* fails with *no client write of range 4 completed…* — another range's write reads as range 4's, and seed 1969's false positive is back |
+| **M2** | `write_asked_after_heal_of` reads the history, not the invocations | the splice test's *asked, never proposed*: the write no leader proposed is not in the history, the range reads as asked nothing, and it fails only because the strengthening catches it with the other message. The planted wedge is the field case: its histories hold no write of range 5 while 3 to 24 were asked |
+| **M3** | `operations_after_heal_of` ignores its range | the splice test: range 4's operations read (5, 5) against its own (1, 1), and the unanswered case would pass |
+| **M4** | the new arm removed (D-084's clause as it was) | the splice test's shape fails with the original message: seed 1969's false positive |
+| **M5** | the strengthening removed | the splice test's unanswered case passes |
+
+### PROPOSED: the per-range liveness bound cannot trip, and the scenario change that would let it
+
+**A model error, recorded for the owner and not fixed here** (D-030, D-039: a reading of
+the correct system that cannot fail measures no more than one the correct system trips,
+and the fix moves every node membership schedule). `RANGE_LIVENESS_TIMEOUTS` is 30
+maximum election timeouts, **6 s**. The window it is asked over runs from the last heal
+to the end of the run: the shrink's completion polls, 200 ms each, then the settle,
+`election_max() * LIVENESS_TIMEOUTS + 200 ms` = 2.2 s, which was sized for one group.
+Measured above: 2.4 s on 4 945 of 5 000 uniform runs and at most 4.406 s; it could pass
+6 s only on a run whose shrink took about twenty completion polls after the heal, and
+none of the ten thousand did. The worst first write of a range after the heal is
+2.139833526 s on this tree (2.25 s on 314ac8f). A range's first write lands inside a
+window shorter than the bound or not at all, so the bound is never exceeded, and the
+per-range clause measures whether the clients drew a write of the range in time — client
+draws — not how long the cluster took.
+
+The same window leaves a **second false-positive class** this entry does not close: a
+range whose only writes after the heal never reached a leader in time. Such a range was
+asked, so the new arm does not excuse it, and it fails the clause correct as it is. Two
+ways in are known. A write lost to the network's 5 % drop, which the client never
+retries: the verifier estimates 0.1 to 0.3 such failures per ten-thousand-seed nightly
+(about 12 % of the writes asked after the heal across seed 1969's three runs never
+reached the history), against about one for the class fixed here. And, found by the
+planted wedge's seed 4321, the client cycling between the two servers a shrink removed
+from a range — the stepped-down leader answering `NotLeader` with no hint, the other
+naming it — until each write's 60 ms deadline passes, while the range's leader of the
+next term serves (issue #146). None occurred in the correct node's ten thousand above.
+
+**Recommendation:** after the last heal, the driver writes once to each range, retrying
+until the write is answered, and the settle is lengthened so the window after the heal
+exceeds the range bound. That lets the bound trip (the driver's write is the range's
+first, and its time is the cluster's), and it closes the second class for the check,
+since every range is then asked a write that is retried until it is answered; #146's
+routing is still worth fixing on its own. It moves every node membership schedule, so
+every figure D-084 and this entry measured is re-measured with it, and it waits for the
+owner's ruling. Issue #145.
+
+### What the PR asks
+
+- **PROPOSED, this entry's:** the not-asked arm and the strengthening, as built.
+- **PROPOSED, for the owner:** the scenario change above (#145).
+
+---
+
+_Next entry: D-104. Add one before implementing anything not covered above._

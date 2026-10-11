@@ -4213,6 +4213,13 @@ struct NodeMembershipCoverage {
     /// `assert_complete`).
     worst_cluster_gap: Duration,
     worst_cluster_write_after_heal: Duration,
+    /// The (seed, range) pairs of uniformly scheduled runs on which no client asked the
+    /// range for a write after the last heal ([`membership::Report::write_asked_after_heal_of`]):
+    /// the per-range liveness clause has no write to read there and asks only that the
+    /// range answered something it was asked, so how often that is the case is printed
+    /// at every tier rather than passed over.
+    // PROPOSED(D-103): a range not asked for a write after the heal is no evidence.
+    ranges_not_asked_after_heal: Vec<(u64, u64)>,
     /// The ranges the run's partitions aimed at, over the tier.
     aimed_ranges: BTreeSet<u64>,
     /// The ranges a leadership transfer was asked for, over the tier, and how many of
@@ -4269,6 +4276,9 @@ impl NodeMembershipCoverage {
             if let Some(took) = report.time_to_write_after_heal_of(range) {
                 self.worst_write_after_heal = self.worst_write_after_heal.max(took);
             }
+            if report.uniform() && !report.write_asked_after_heal_of(range) {
+                self.ranges_not_asked_after_heal.push((report.seed, range));
+            }
         }
         if let Some(gap) = report.longest_completion_gap() {
             self.worst_cluster_gap = self.worst_cluster_gap.max(gap);
@@ -4320,6 +4330,9 @@ impl NodeMembershipCoverage {
         self.worst_cluster_write_after_heal = self
             .worst_cluster_write_after_heal
             .max(other.worst_cluster_write_after_heal);
+        self.ranges_not_asked_after_heal
+            .extend(other.ranges_not_asked_after_heal);
+        self.ranges_not_asked_after_heal.sort_unstable();
         for (range, count) in other.leaders {
             *self.leaders.entry(range).or_default() += count;
         }

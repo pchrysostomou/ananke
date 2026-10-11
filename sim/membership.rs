@@ -174,13 +174,32 @@ pub const RANGE_AVAILABILITY_TIMEOUTS: u32 = 25;
 /// this bound's 6 s, a margin of 3.3× over the wider measurement. Virtual time, as
 /// above.
 ///
-/// Six seconds is most of a run, and that is said rather than hidden: **the clause
-/// that catches a wedged range is not this bound but the one beside it** — that *no*
-/// write of that range completed after the heal at all, which has nothing to tune and
-/// no margin to get wrong. This bound is the backstop under it, and a backstop the
-/// correct system trips would be a model error and not a bound to widen (D-030,
-/// D-039), so it is set where a thousand seeds say it will not be tripped.
+/// **This bound cannot trip on this scenario as it stands**, and that is a model error
+/// recorded for the owner, not a bound to move here (PROPOSED D-103). It is asked over
+/// the window from the last heal to the end of the run — the shrink's completion polls
+/// and then the settle, `election_max() * LIVENESS_TIMEOUTS + 200 ms`, which was sized
+/// for one group — and that window is about 2.4 s, under the bound's 6 s on every seed
+/// measured (D-103 has the figures). A range's first write after the heal lands inside
+/// the window or not at all, so the per-range clause measures whether the clients drew
+/// a write of the range in time, not how long the cluster took to serve one. What D-103
+/// recommends, the owner's because it moves every node membership schedule: after the
+/// heal, a write to each range from the driver, retried until answered, and a settle
+/// long enough that the window exceeds this bound.
+///
+/// What catches a wedged range meanwhile is the clause beside the bound: that no write
+/// of the range completed after the heal **although one was asked** — read off the
+/// clients' invocations ([`Report::write_asked_after_heal_of`]), since the history
+/// drops a write no leader proposed — or, where none was asked, that the range was
+/// asked for operations after the heal and answered none of them. A range asked
+/// nothing after the heal is no evidence and passes. This is not D-084's "nothing to
+/// tune and no margin to get wrong": on 314ac8f seed 1969's range 5 was asked only
+/// reads after the heal, served every one, and the clause as D-084 wrote it called it
+/// wedged. And a range whose only writes after the heal never reached a leader in time
+/// — lost in the network, since a client does not retry a write, or abandoned between
+/// two servers a shrink removed (issue #146) — still fails it, correct as the range is;
+/// D-103 says how often, and the same scenario change closes it (issue #145).
 // PROPOSED(D-084): a liveness check of a node is a check of each of its ranges.
+// PROPOSED(D-103): the bound cannot trip in a window of about 2.4 s; the owner's.
 pub const RANGE_LIVENESS_TIMEOUTS: u32 = 30;
 /// The most trace records a membership run may produce before it is stopped as
 /// a runaway: five servers over about ten virtual seconds stay well under it.
@@ -810,6 +829,73 @@ impl Report {
             .min()
     }
 
+    /// Whether any client **asked** for a write of `range`'s keys at or after the last
+    /// heal, read off the clients' own `ClientInvoke` records.
+    ///
+    /// The per-range liveness clause reads "no write of the range completed after the
+    /// heal" as a wedge, and that is evidence only where a write was asked for. The
+    /// clients draw a key uniformly and a range of four sees about a quarter of the
+    /// operations, so in the couple of seconds after the heal a range can simply not be
+    /// asked for one: on 314ac8f, seed 1969's range 5 was asked for eleven reads and no
+    /// write after the heal at 2.95 s, its leader of term 3 served every read, and the
+    /// clause called it wedged (nightly 38042926336, the only failure of ten thousand).
+    ///
+    /// Read from the invocations and **not from the history**, because the history
+    /// leaves out a write no leader ever proposed ([`History::from_trace`]) — exactly
+    /// what a range with no leader, or a leader that drops its writes, leaves behind,
+    /// which is the wedge the clause is there to see. A planted wedge of range 5's
+    /// writes showed it over ten thousand seeds: on each of the 3 626 runs it wedged, the
+    /// history held no write of range 5 after the heal while the clients had asked for
+    /// three to twenty-four (PROPOSED D-103). A history-based "asked" would have passed
+    /// every one of them.
+    // PROPOSED(D-103): a range no client asked for a write after the heal is no evidence.
+    #[must_use]
+    pub fn write_asked_after_heal_of(&self, range: u64) -> bool {
+        let key_range = self.cluster.key_range();
+        self.records.iter().any(|record| {
+            record.at >= self.last_heal
+                && matches!(
+                    &record.event,
+                    TraceEvent::ClientInvoke { op, .. }
+                        if op.is_write() && key_range(op.key()) == range
+                )
+        })
+    }
+
+    /// How many client operations of `range`'s keys, reads and writes alike, were
+    /// asked for at or after the last heal, and how many of those returned: read off
+    /// the clients' `ClientInvoke` and `ClientReturn` records, paired by (client, the
+    /// operation's own `seq`), for the reason [`Report::write_asked_after_heal_of`]
+    /// gives — the history drops an operation that returned nothing and was never
+    /// proposed, and every unanswered read is one.
+    ///
+    /// What a range not asked for a write after the heal is still held to: asked for
+    /// operations and answering none of them, it served nothing after the heal, which
+    /// is a wedge whatever the operations were.
+    // PROPOSED(D-103): a range asked after the heal and answering nothing still fails.
+    #[must_use]
+    pub fn operations_after_heal_of(&self, range: u64) -> (usize, usize) {
+        let key_range = self.cluster.key_range();
+        let mut asked: BTreeSet<(u64, u64)> = BTreeSet::new();
+        let mut returned = 0;
+        for record in &self.records {
+            match &record.event {
+                TraceEvent::ClientInvoke { client, seq, op }
+                    if record.at >= self.last_heal && key_range(op.key()) == range =>
+                {
+                    asked.insert((*client, *seq));
+                }
+                TraceEvent::ClientReturn { client, seq, .. }
+                    if asked.contains(&(*client, *seq)) =>
+                {
+                    returned += 1;
+                }
+                _ => {}
+            }
+        }
+        (asked.len(), returned)
+    }
+
     /// How long after the last heal the first client write completed, if one did.
     #[must_use]
     pub fn time_to_write_after_heal(&self) -> Option<Duration> {
@@ -855,11 +941,19 @@ impl Report {
     /// **What this does not catch**, and the liveness clause beside it does: a range
     /// wedged to nothing. With fewer than two completions there is no gap to measure
     /// and this answers `None`, so the range that served *least* is the one this says
-    /// least about. That is not a hole — `time_to_write_after_heal_of` fails such a
-    /// range outright, with no bound to tune — but it is why this is the weaker of the
-    /// two and not, as an earlier draft of this comment had it, the one with the most
-    /// to be wrong about.
+    /// least about. The liveness clause fails such a range where it has evidence: a
+    /// write of it asked after the heal and none completed, read off the clients'
+    /// invocations ([`Report::write_asked_after_heal_of`]), or operations of it asked
+    /// after the heal and none answered. **A range no client asked anything after the
+    /// heal is seen by neither clause** — nothing was asked, so nothing unanswered is
+    /// evidence — and that is a hole, not the "fails such a range outright" an earlier
+    /// version of this comment said: on 314ac8f, seed 1969 showed the outright reading
+    /// failing a range that was asked only reads and served every one (PROPOSED D-103).
+    /// The driver write to each range after the heal that D-103 recommends to the owner
+    /// is what would close it. This is still the weaker of the two clauses, and not, as
+    /// an earlier draft of this comment had it, the one with the most to be wrong about.
     // PROPOSED(D-084): an availability check of a node is a check of each of its ranges.
+    // PROPOSED(D-103): a range not asked after the heal is seen by neither clause.
     #[must_use]
     pub fn longest_completion_gap_of(&self, range: u64) -> Option<Duration> {
         let key_range = self.cluster.key_range();
@@ -1338,6 +1432,23 @@ impl Report {
                             "liveness: range {range}'s first client write after the last heal \
                              took {took:?}, over {range_bound:?}"
                         ));
+                    }
+                    // No client asked this range for a write after the heal: no write of it
+                    // completed because none was asked, which is no evidence of a wedge
+                    // (seed 1969 on 314ac8f). What it *was* asked for still is: a range
+                    // asked for operations after the heal that answered none of them
+                    // served nothing, and fails here.
+                    // PROPOSED(D-103): a range not asked for a write after the heal is
+                    // no evidence; one asked for anything and answering nothing still is.
+                    None if !self.write_asked_after_heal_of(range) => {
+                        let (asked, returned) = self.operations_after_heal_of(range);
+                        if asked > 0 && returned == 0 {
+                            return fail(format!(
+                                "liveness: range {range} completed no operation after the last \
+                                 heal at {:?}, of {asked} asked, none of them a write",
+                                self.last_heal
+                            ));
+                        }
                     }
                     None => {
                         return fail(format!(
@@ -2122,5 +2233,248 @@ mod tests {
                     .to_owned()
             ),
         );
+    }
+
+    /// The seed the node membership sweep failed on 314ac8f (nightly 38042926336, the one
+    /// failure of its ten thousand): range 5 was asked for eleven reads and no write after
+    /// the heal at 2.95 s, its leader of term 3 answered every read, and the per-range
+    /// liveness clause called it wedged because no write of it completed.
+    const SEED_1969: u64 = 1969;
+
+    /// Seed 1969, pinned in CLAUDE.md's absence form: **on this tree no range of its run
+    /// is left unasked for a write after the heal**, so the situation it was pinned for is
+    /// absent, and this asserts the absence rather than a bare green.
+    ///
+    /// The reason is a moved schedule and not a changed reading. Its heal is still at
+    /// 2.95 s and its run still ends at 5.35 s, but PRs #134 to #136 (the meta range, the
+    /// range ids and the split's arms, D-098 to D-100) moved every node schedule, and the
+    /// clients' draws after the heal moved with them: range 5 is asked for eight writes
+    /// after the heal here and the first returns 376 ms after it. The day a schedule move
+    /// brings a range of this seed back to no write asked, this fails, and the pin is
+    /// upgraded to its mechanism — the run passes, and that range answered what it was
+    /// asked — which the test below builds from this run's own records meanwhile.
+    // PROPOSED(D-103): a range not asked for a write after the heal is no evidence.
+    #[test]
+    fn seed_1969_no_longer_leaves_a_range_unasked_for_a_write_after_the_heal() {
+        let report = run_on(Cluster::Node, SEED_1969, Variant::Correct);
+        assert!(report.uniform(), "seed 1969 is uniformly scheduled");
+        assert_eq!(report.check().err(), None, "seed 1969 passes as it runs");
+        for range in report.ranges() {
+            assert!(
+                report.write_asked_after_heal_of(range),
+                "seed 1969's range {range} was asked for no write after the heal at {:?}: the \
+                 situation this seed was pinned for is back on this tree, so upgrade the pin to \
+                 assert its mechanism (PROPOSED D-103)",
+                report.last_heal
+            );
+        }
+        assert!(
+            report.time_to_write_after_heal_of(5).is_some(),
+            "seed 1969's range 5 completed a write after the heal"
+        );
+    }
+
+    /// Seed 1969's shape, built from seed 1969's own run on this tree, and the clause's
+    /// answer to it and to the wedges beside it (PROPOSED D-103). No record is invented:
+    /// every case is the run's own records, cut short, with some left out or with one
+    /// range's answers kept.
+    ///
+    /// On 314ac8f the seed's range 5 was asked for reads and no write after the heal, and
+    /// answered every read. On this tree no range of the run is left so (the pin above),
+    /// but a range whose first operations after the heal were reads, before its first
+    /// write, is: the run is cut just before that write and the range's answers to those
+    /// reads are kept, as if the run had ended once it gave them. Then:
+    ///
+    /// - **the shape passes**: no write was asked, so none completing is no evidence;
+    /// - with those answers left out, it **fails**: a range asked for operations after the
+    ///   heal that answered none of them served nothing;
+    /// - with the reads left out too, it passes: a range asked nothing is no evidence;
+    /// - cut just *after* that write was asked, it **fails with the original message**: the
+    ///   write was asked and no leader proposed it, which is what a range with no leader
+    ///   leaves behind — and the history holds no such write, which is why the clause reads
+    ///   the invocations;
+    /// - cut just after the range's leader proposed one of its writes, it fails the same
+    ///   way: proposed, and never applied.
+    // PROPOSED(D-103): a range not asked for a write after the heal is no evidence; one
+    // asked for anything and answering nothing still is.
+    #[test]
+    fn a_range_not_asked_for_a_write_after_the_heal_is_no_evidence_and_one_asked_still_is() {
+        let mut report = run_on(Cluster::Node, SEED_1969, Variant::Correct);
+        assert!(report.uniform(), "seed 1969 is uniformly scheduled");
+        let ran = report.records.clone();
+        let heal = report.last_heal;
+        let key_range = Cluster::Node.key_range();
+        let answer = |client: u64, seq: u64| {
+            ran.iter().position(|record| {
+                matches!(
+                    record.event,
+                    TraceEvent::ClientReturn { client: c, seq: s, .. } if c == client && s == seq
+                )
+            })
+        };
+        // For each range, the index of its first write asked after the heal and the reads
+        // asked of it before that, as (client, seq): the shape is a range with at least one
+        // such read, each answered in the run. The latest such cut is taken.
+        let (range, cut, reads) = report
+            .ranges()
+            .into_iter()
+            .filter_map(|range| {
+                let mut reads = Vec::new();
+                for (i, record) in ran.iter().enumerate() {
+                    if let TraceEvent::ClientInvoke { client, seq, op } = &record.event
+                        && record.at >= heal
+                        && key_range(op.key()) == range
+                    {
+                        if op.is_write() {
+                            let answered = reads.iter().all(|&(c, s)| answer(c, s).is_some());
+                            return (!reads.is_empty() && answered).then_some((range, i, reads));
+                        }
+                        reads.push((*client, *seq));
+                    }
+                }
+                None
+            })
+            .max_by_key(|&(_, cut, _)| cut)
+            .expect(
+                "some range of seed 1969 was asked reads after the heal, each answered, before its \
+                 first write: if the schedule has moved off it, build the shape on another seed",
+            );
+        let wedged = Some(format!(
+            "seed {SEED_1969}: liveness: no client write of range {range} completed after the \
+             last heal at {heal:?}"
+        ));
+        let is_answer = |record: &TraceRecord| {
+            matches!(
+                record.event,
+                TraceEvent::ClientReturn { client, seq, .. } if reads.contains(&(client, seq))
+            )
+        };
+        let is_read = |record: &TraceRecord| {
+            matches!(
+                record.event,
+                TraceEvent::ClientInvoke { client, seq, .. } if reads.contains(&(client, seq))
+            )
+        };
+
+        // Seed 1969's shape: asked reads and no write after the heal, every read answered.
+        let mut shape = ran[..cut].to_vec();
+        shape.extend(
+            ran[cut..]
+                .iter()
+                .filter(|record| is_answer(record))
+                .cloned(),
+        );
+        assert_eq!(
+            verdict(&mut report, shape),
+            None,
+            "range {range}'s shape passes"
+        );
+        assert!(!report.write_asked_after_heal_of(range));
+        assert_eq!(report.time_to_write_after_heal_of(range), None);
+        assert_eq!(
+            report.operations_after_heal_of(range),
+            (reads.len(), reads.len()),
+            "range {range} answered every read it was asked after the heal"
+        );
+
+        // The same reads, unanswered.
+        let unanswered: Vec<TraceRecord> = ran[..cut]
+            .iter()
+            .filter(|record| !is_answer(record))
+            .cloned()
+            .collect();
+        assert_eq!(
+            verdict(&mut report, unanswered.clone()),
+            Some(format!(
+                "seed {SEED_1969}: liveness: range {range} completed no operation after the last \
+                 heal at {heal:?}, of {} asked, none of them a write",
+                reads.len()
+            )),
+            "a range asked after the heal and answering nothing"
+        );
+
+        // Nothing asked of the range at all.
+        let unasked: Vec<TraceRecord> = unanswered
+            .into_iter()
+            .filter(|record| !is_read(record))
+            .collect();
+        assert_eq!(verdict(&mut report, unasked), None, "a range asked nothing");
+        assert_eq!(report.operations_after_heal_of(range), (0, 0));
+
+        // The range's first write after the heal asked, and nothing proposed of it.
+        assert_eq!(
+            verdict(&mut report, ran[..=cut].to_vec()),
+            wedged,
+            "asked, never proposed"
+        );
+        assert!(report.write_asked_after_heal_of(range));
+        let writes_in_the_history = |report: &Report| {
+            report
+                .history
+                .ops
+                .iter()
+                .filter(|op| op.op.is_write() && op.call >= heal && key_range(op.op.key()) == range)
+                .count()
+        };
+        assert_eq!(
+            writes_in_the_history(&report),
+            0,
+            "the history leaves out the write no leader proposed, which is why the clause \
+             reads the invocations"
+        );
+
+        // A write of the range asked after the heal and proposed by its leader, cut before
+        // it applied: the range's first proposal of a client write after the heal. A
+        // proposal names the send's number, which the send maps to its operation's.
+        let mut writes: BTreeSet<(u64, u64)> = BTreeSet::new();
+        let mut sends: BTreeMap<(u64, u64), u64> = BTreeMap::new();
+        let proposed = ran
+            .iter()
+            .enumerate()
+            .find_map(|(i, record)| match &record.event {
+                TraceEvent::ClientInvoke { client, seq, op }
+                    if record.at >= heal && op.is_write() && key_range(op.key()) == range =>
+                {
+                    writes.insert((*client, *seq));
+                    None
+                }
+                TraceEvent::ClientSend {
+                    client,
+                    seq,
+                    invoked,
+                    ..
+                } => {
+                    sends.insert((*client, *seq), *invoked);
+                    None
+                }
+                TraceEvent::RaftProposed {
+                    range: of,
+                    client,
+                    seq,
+                    ..
+                } if *of == range => {
+                    let invoked = sends.get(&(*client, *seq)).copied().unwrap_or(*seq);
+                    writes.contains(&(*client, invoked)).then_some(i)
+                }
+                _ => None,
+            })
+            .expect("the range's leader proposed a write of it after the heal");
+        assert_eq!(
+            verdict(&mut report, ran[..=proposed].to_vec()),
+            wedged,
+            "asked, proposed, never applied"
+        );
+        assert!(
+            writes_in_the_history(&report) > 0,
+            "the proposed write is in the history, pending"
+        );
+    }
+
+    /// `report`'s verdict with its trace replaced by `records` and its history read from
+    /// them again.
+    fn verdict(report: &mut Report, records: Vec<TraceRecord>) -> Option<String> {
+        report.records = records;
+        report.history = History::from_trace(&report.records);
+        report.check().err()
     }
 }
