@@ -1,11 +1,19 @@
 //! The node's known-buggy variants (CLAUDE.md's pair rule).
 //!
-//! [`ananke_raft::Variant`] is the Raft core's set: a protocol bug beside the correct
-//! protocol, caught by the sweeps. These are the *node's*: each is a plausible way to
-//! get Q41's round wrong, built beside the correct round and caught by the same check
-//! that asserts the correct round's order (SHARD.md §4). They are not Raft bugs — the
-//! core is untouched — so they are a set of their own rather than more of the core's,
-//! and they do not appear in [`ananke_raft::Variant::BUGS`] or in §10's count.
+//! A node is configured with three sets of known bugs, one per layer.
+//! [`ananke_raft::Variant`] is the Raft core's: a protocol bug beside the correct
+//! protocol, caught by the sweeps. [`RangeVariant`](crate::range_variant::RangeVariant)
+//! is the range layer's: SHARD.md §10's twenty-four as the stages build them, and the
+//! test instruments its checks need beside them (Q37, PROPOSED D-105). These are the
+//! *node's* (SHARD.md §4): each is a plausible way to get Q41's round, the node's wire,
+//! its `snapshot` or `apply` task, Q15's whole-node refusal or the node's start wrong,
+//! built beside the correct node and caught by a check that asserts what the correct
+//! node does. They are not Raft bugs — the core is untouched — and none is one of
+//! §10's, so they are a set of their own, and none of them appears in
+//! [`ananke_raft::Variant::BUGS`] or in §10's count. One sits on the line between the
+//! node and the range layer: [`NodeVariant::AnyFreshNodeBootstraps`] breaks §2's rule
+//! for which node writes the initial state, at the node's start, and stays here until
+//! the owner places it (PROPOSED D-105).
 //!
 //! Most are caught by a deterministic check in this crate, which is the pair rule's
 //! requirement — the buggy variant is *seen to fail* the check the correct code passes
@@ -398,44 +406,6 @@ pub enum NodeVariant {
     /// configuration named one, and check 7 reads the disagreement off the replicas'
     /// creations (SHARD.md §2, §8; PROPOSED D-096).
     AnyFreshNodeBootstraps,
-    /// A server takes the range a request names as proof that the key is in it: it
-    /// checks the key against its own descriptor neither at receipt nor at a read's
-    /// serving, and keeps the apply check (SHARD.md §3, §10; Q38). This is the owner's
-    /// "client that trusts a stale descriptor", placed where trust can do harm: a
-    /// client's cache is advisory by design and a stale one costs a round trip unless
-    /// a server honours it. Check 9 catches the first read served for a key outside
-    /// the serving range's span; the writes it proposes the apply check refuses.
-    // PROPOSED(D-097)
-    TrustStaleDescriptor,
-    /// The apply check skipped: a command applies whatever its key, where §3's check
-    /// is what makes a split take effect for proposals in flight and a
-    /// `RangeMismatch` at apply definite. Check 9 catches the first applied write
-    /// outside the span, check 10 a write by the wrong owner (SHARD.md §10).
-    // PROPOSED(D-097)
-    ApplyIgnoresSpan,
-    /// The sweep's client resends to the range and generation it had, merging nothing
-    /// of what a `RangeMismatch` carried (SHARD.md §3, §10; Q38). Check 17 catches
-    /// the first resend, and the liveness bound a client that never converges.
-    // PROPOSED(D-097)
-    ClientIgnoresMismatch,
-    /// The meta range stores each update as it arrives: every record an update
-    /// overlaps is cut and replaced whatever its generation, where §1 keeps, per key,
-    /// the descriptor of the highest generation. An older update that arrives after a
-    /// newer one takes the newer's place, which check 16 sees at the first key whose
-    /// named generation falls (SHARD.md §8, §10); `Fault::MetaReorder` on the sharded
-    /// sweep is what makes one arrive so.
-    // PROPOSED(D-098)
-    MetaOverwritesByArrival,
-    /// The node adopts, at its start, the block of range ids its lease record names,
-    /// whatever run it was granted to, and takes ids from that block's first, where
-    /// §5's second rule has a node adopt only a block granted to its current run:
-    /// a restart abandons the rest of every block it held, and the ids the earlier
-    /// run took from that block are taken twice. Check 18's range-id clause sees it
-    /// at the first apply of a split whose right half a `RangeCreated` or `RangeSplit`
-    /// named before (SHARD.md §8, §10); the sharded sweep's crash and restart of a
-    /// node that took an id, followed by a split led from it, is what reaches it.
-    // PROPOSED(D-099)
-    IdBlockResumed,
 }
 
 impl NodeVariant {
@@ -490,11 +460,6 @@ impl NodeVariant {
         NodeVariant::OneSeedForEveryCore,
         NodeVariant::ApplyWaitsForEveryRange,
         NodeVariant::AnyFreshNodeBootstraps,
-        NodeVariant::TrustStaleDescriptor,
-        NodeVariant::ApplyIgnoresSpan,
-        NodeVariant::ClientIgnoresMismatch,
-        NodeVariant::MetaOverwritesByArrival,
-        NodeVariant::IdBlockResumed,
     ];
 
     /// Q15's whole-node refusal and re-seed, in order: the six ways to get a node's
@@ -673,16 +638,10 @@ impl NodeVariant {
             NodeVariant::ApplyWaitsForEveryRange => 1 << 47,
             // PROPOSED(D-096): a fresh store taken for a bootstrap. Fifteen bits are left.
             NodeVariant::AnyFreshNodeBootstraps => 1 << 48,
-            // PROPOSED(D-097): §10's three routing variants. Twelve bits are left.
-            NodeVariant::TrustStaleDescriptor => 1 << 49,
-            NodeVariant::ApplyIgnoresSpan => 1 << 50,
-            NodeVariant::ClientIgnoresMismatch => 1 << 51,
-            // PROPOSED(D-098): the meta range storing updates as they arrive. Eleven
-            // bits are left.
-            NodeVariant::MetaOverwritesByArrival => 1 << 52,
-            // PROPOSED(D-099): a node resuming another run's block of ids. Ten bits
-            // are left.
-            NodeVariant::IdBlockResumed => 1 << 53,
+            // Bits 49 to 53 held §10's five — D-097's three for routing, D-098's one for
+            // the meta range and D-099's one for the range-id blocks — until PROPOSED
+            // D-105 moved them to the range layer's own set (`crate::range_variant`).
+            // They are free, and fifteen bits are left.
         }
     }
 
@@ -739,11 +698,6 @@ impl NodeVariant {
             NodeVariant::OneSeedForEveryCore => "OneSeedForEveryCore",
             NodeVariant::ApplyWaitsForEveryRange => "ApplyWaitsForEveryRange",
             NodeVariant::AnyFreshNodeBootstraps => "AnyFreshNodeBootstraps",
-            NodeVariant::TrustStaleDescriptor => "TrustStaleDescriptor",
-            NodeVariant::ApplyIgnoresSpan => "ApplyIgnoresSpan",
-            NodeVariant::ClientIgnoresMismatch => "ClientIgnoresMismatch",
-            NodeVariant::MetaOverwritesByArrival => "MetaOverwritesByArrival",
-            NodeVariant::IdBlockResumed => "IdBlockResumed",
         }
     }
 }
@@ -834,10 +788,10 @@ mod tests {
         // D-077's six for Q15's whole-node refusal and re-seed, D-083's ten for the
         // snapshot wiring, D-081's three for the directed re-seed shape, D-090's two for a
         // stream's bounds, D-076's review's two, D-095's one for the `apply` task that
-        // waits for every range, D-096's one for a fresh store taken for a bootstrap,
-        // D-097's three for routing, D-098's one for the meta range and D-099's one for
-        // the range-id blocks.
-        assert_eq!(NodeVariant::BUGS.len(), 54);
+        // waits for every range and D-096's one for a fresh store taken for a bootstrap.
+        // §10's five that D-097 to D-099 built here are the range layer's since PROPOSED
+        // D-105 (`crate::range_variant`), and no variant of §10 is a node variant.
+        assert_eq!(NodeVariant::BUGS.len(), 49);
         for variant in NodeVariant::SNAPSHOT
             .iter()
             .chain(NodeVariant::WIRING)

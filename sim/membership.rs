@@ -98,6 +98,7 @@ use ananke_storage::EngineConfig;
 use moirae_sched::Policy;
 
 use ananke_shard::descriptor::FIRST_GENERATION;
+use ananke_shard::range_variant::RangeVariants;
 use ananke_shard::server::ServerConfig;
 use ananke_shard::variant::NodeVariants;
 
@@ -636,6 +637,8 @@ pub fn node_server_config(
         id_block: crate::ranges::ID_BLOCK,
         refill_at: crate::ranges::REFILL_AT,
         node,
+        // No range-layer variant runs on this scenario (PROPOSED D-105).
+        range_variants: RangeVariants::correct(),
     }
 }
 
@@ -2022,7 +2025,14 @@ pub fn run_on_with_node(
         let stats = stats[i].clone();
         env.spawn(
             "client",
-            client_on(cluster, inner, i as u64 + 1, SERVERS, stats, node),
+            client_on(
+                cluster,
+                inner,
+                i as u64 + 1,
+                SERVERS,
+                stats,
+                RangeVariants::correct(),
+            ),
         );
     }
     let last_heal = sim.now();

@@ -16,6 +16,7 @@ use ananke_raft::store::{LOST_STATE, STORE_MARKER};
 use ananke_sim::raft::DRIFT_BOUND_PPM;
 use ananke_sim::raft::{self, Fault, Moved, RecordTime, TimerResets};
 use ananke_sim::{released_seeds, sweep, traced, verdict, write_trace};
+use moirae_trace::trace_hash;
 
 /// Two runs with the same seed produce byte-identical traces.
 #[test]
@@ -25,12 +26,34 @@ fn same_seed_gives_byte_identical_trace() {
     assert_eq!(first.jsonl().as_bytes(), second.jsonl().as_bytes());
 }
 
-/// The seed-42 trace is written for the studio.
+/// The pinned hash of the seed-42 trace (`out/raft-42.jsonl`) of the correct server on
+/// one group, under the pin rule `sim/tests/echo.rs` states: FNV-1a 64
+/// (`moirae_trace::trace_hash`) over the **body**, every line after the header, whose
+/// crate version must not move the pin. The whole file is 13 241 905 bytes and hashes
+/// to SHA-256 `c5b8d814dc0956af28bef72f8f9e0bbc959053a2173d7d1d96e3423a6c6540e8`, the
+/// figure PROPOSED D-097 and D-098 recorded by hand while nothing asserted it (issue
+/// #97). The value moves only in a commit that moves the one-group schedule or its
+/// trace, which updates it and says why (CLAUDE.md).
+// PROPOSED(D-105): seed 42's one-group trace asserted, not only written (#97).
+const SEED_42_BODY_HASH: &str = "63099038ab531265";
+
+/// The seed-42 trace is written for the studio, and its body hashes to the pinned
+/// value. The run is the studio's example and not a seed a sweep found, so what is
+/// pinned is the trace itself rather than a mechanism. It is written first, so a
+/// mismatch leaves the new bytes on disk to diff.
+// PROPOSED(D-105): seed 42's one-group trace asserted, not only written (#97).
 #[test]
 fn the_seed_42_trace_is_written_for_the_studio() {
     let report = raft::run(42, Variant::Correct);
-    write_trace("raft-42", &report.jsonl());
+    let jsonl = report.jsonl();
+    write_trace("raft-42", &jsonl);
     report.check().unwrap();
+    let body = jsonl.split_once('\n').map_or("", |(_, rest)| rest);
+    assert_eq!(
+        trace_hash(body),
+        SEED_42_BODY_HASH,
+        "seed 42's one-group trace moved: the commit that moves it updates the pin and says why"
+    );
 }
 
 /// Seed 164, found by a local ten-thousand-seed run on 1373601: the first
