@@ -101,6 +101,32 @@ ananke/
 
 _Update this section at the end of every session._
 
+- Branch `phase-3-fix-membership-range-asked` (2026-10-11), off `main` at fdc5fc0 and
+  merged with it at 195f965 (#137, #144),
+  PROPOSED D-103 (amends D-084): **the node membership scenario's per-range liveness
+  clause reads what the clients asked**, the check defect behind nightly 38042926336's
+  one failure (seed 1969 on 314ac8f: range 5 asked eleven reads and no write after the
+  heal, every read answered, called wedged). `Report::write_asked_after_heal_of`, read
+  from the clients' `ClientInvoke` records and not the history (which drops a write no
+  leader proposed); a range asked no write after the heal is no evidence, and one asked
+  for operations that answered none still fails (`operations_after_heal_of`, the
+  verifier's strengthening); `ranges_not_asked_after_heal` printed in the coverage; the
+  `RANGE_LIVENESS_TIMEOUTS` and `longest_completion_gap_of` comments corrected; seed 1969
+  pinned in absence form and its shape built from its own run's records in a unit test.
+  Measured at ten thousand in release: the correct sweep green with every coverage
+  figure identical to fdc5fc0's nightly and no range unasked; the joint-consensus
+  variant caught on the same 1 974; a planted write wedge of range 5 failing all 3 626
+  runs that asked it a write and completed none, whose histories held none of the 3 to
+  24 asked. **For the owner** (PROPOSED in D-103, issue #145): the 6 s per-range bound
+  cannot trip, since the window after the heal is 2.4 s on 4 945 of 5 000 uniform runs
+  and never over 4.406 s; recommended, a driver write to each range after the heal
+  retried until answered and a settle longer than the bound, which moves every node
+  membership schedule. Issue #146: a client can cycle between a range's two removed
+  servers after a shrink and abandon every write it routes there. After review, D-103
+  and `longest_completion_gap_of` state the residual exactly: a range asked no write
+  after the heal that answered one operation passes even if it then served nothing,
+  which `ranges_not_asked_after_heal` bounds (empty on the correct node at ten
+  thousand); the five single-range mutations re-run on the committed code.
 - Branch `phase-3-fix-refuse-one-range-witness` (2026-10-10), on `main` at fdc5fc0,
   PROPOSED D-101, **the tip's only red nightly: `RefuseOneRangeOnly`'s attribution on the
   sharded quorum scenario**. The variant's unrefused replicas come back empty and vote, and
