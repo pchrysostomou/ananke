@@ -191,7 +191,9 @@ pub const RANGE_AVAILABILITY_TIMEOUTS: u32 = 25;
 /// clients' invocations ([`Report::write_asked_after_heal_of`]), since the history
 /// drops a write no leader proposed — or, where none was asked, that the range was
 /// asked for operations after the heal and answered none of them. A range asked
-/// nothing after the heal is no evidence and passes. This is not D-084's "nothing to
+/// nothing after the heal is no evidence and passes, and so does one asked no write
+/// that answered one operation and then served nothing — the residual
+/// [`Report::longest_completion_gap_of`] states. This is not D-084's "nothing to
 /// tune and no margin to get wrong": on 314ac8f seed 1969's range 5 was asked only
 /// reads after the heal, served every one, and the clause as D-084 wrote it called it
 /// wedged. And a range whose only writes after the heal never reached a leader in time
@@ -944,16 +946,23 @@ impl Report {
     /// least about. The liveness clause fails such a range where it has evidence: a
     /// write of it asked after the heal and none completed, read off the clients'
     /// invocations ([`Report::write_asked_after_heal_of`]), or operations of it asked
-    /// after the heal and none answered. **A range no client asked anything after the
-    /// heal is seen by neither clause** — nothing was asked, so nothing unanswered is
-    /// evidence — and that is a hole, not the "fails such a range outright" an earlier
-    /// version of this comment said: on 314ac8f, seed 1969 showed the outright reading
-    /// failing a range that was asked only reads and served every one (PROPOSED D-103).
-    /// The driver write to each range after the heal that D-103 recommends to the owner
-    /// is what would close it. This is still the weaker of the two clauses, and not, as
-    /// an earlier draft of this comment had it, the one with the most to be wrong about.
+    /// after the heal and none answered. **A range asked no write after the heal that
+    /// answered at least one operation after it passes both clauses, even if it served
+    /// nothing after that answer**: the liveness clause asks no more of it, and this one
+    /// measures gaps between completions, no later completion closes the one after the
+    /// last answer, and its bound (5 s) is over the window after the heal (about 2.4 s)
+    /// regardless. A range asked nothing at all after the heal passes too: nothing was
+    /// asked, so nothing unanswered is evidence. That is a hole, not the "fails such a
+    /// range outright" an earlier version of this comment said: on 314ac8f, seed 1969
+    /// showed the outright reading failing a range that was asked only reads and served
+    /// every one (PROPOSED D-103). The membership sweep's `ranges_not_asked_after_heal`
+    /// coverage counts the runs that reach it, at every tier (none on the correct node
+    /// at ten thousand seeds), and the driver write to each range after the heal that
+    /// D-103 recommends to the owner is what would close it. This is still the weaker of
+    /// the two clauses, and not, as an earlier draft of this comment had it, the one with
+    /// the most to be wrong about.
     // PROPOSED(D-084): an availability check of a node is a check of each of its ranges.
-    // PROPOSED(D-103): a range not asked after the heal is seen by neither clause.
+    // PROPOSED(D-103): a range asked no write that answered once passes both clauses.
     #[must_use]
     pub fn longest_completion_gap_of(&self, range: u64) -> Option<Duration> {
         let key_range = self.cluster.key_range();

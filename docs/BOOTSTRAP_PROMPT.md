@@ -122,7 +122,11 @@ _Update this section at the end of every session._
   and never over 4.406 s; recommended, a driver write to each range after the heal
   retried until answered and a settle longer than the bound, which moves every node
   membership schedule. Issue #146: a client can cycle between a range's two removed
-  servers after a shrink and abandon every write it routes there.
+  servers after a shrink and abandon every write it routes there. After review, D-103
+  and `longest_completion_gap_of` state the residual exactly: a range asked no write
+  after the heal that answered one operation passes even if it then served nothing,
+  which `ranges_not_asked_after_heal` bounds (empty on the correct node at ten
+  thousand); the five single-range mutations re-run on the committed code.
 - Branch `phase-3-fix-refuse-one-range-witness` (2026-10-10), on `main` at fdc5fc0,
   PROPOSED D-101, **the tip's only red nightly: `RefuseOneRangeOnly`'s attribution on the
   sharded quorum scenario**. The variant's unrefused replicas come back empty and vote, and

@@ -19201,13 +19201,14 @@ two clients asked it for **eleven reads and no write**, and it answered all elev
 its lease. The clause D-084 wrote (commit 1a1920a, merged by #106 at 85f868f) reads
 `time_to_write_after_heal_of(range)` and fails on `None`, and `None` is both "every write
 asked of the range stayed pending" and "no write of the range was asked". The raft sweep
-has read the second as no evidence since D-071's item 7 and D-076 ("a key no client
-wrote to in the window is no evidence either way"); `sim/membership.rs` never got the
-rule. #133 moved the seed's draws onto the old defect and introduced nothing of its own.
-The verifier showed the range live directly: turning any one of eight of those reads
-into a put of the same key, every other draw unchanged, completed the put in 19 to 46 ms
-(the one slot that did not was the one whose packet the network dropped). The draw's
-chance is about 9.4·10⁻⁶ at that seed's operation counts.
+has read the second as no evidence since D-071's item 7 ("a key no client wrote to in
+the window is no evidence either way"), which D-076 gave its bite when its item 7 made
+`key_range` the run's own map; `sim/membership.rs` never got the rule. #133 moved the
+seed's draws onto the old defect and introduced nothing of its own. The verifier showed
+the range live directly: turning any one of eight of those reads into a put of the same
+key, every other draw unchanged, completed the put in 19 to 46 ms (the one slot that did
+not was the one whose packet the network dropped). The draw's chance is about 9.4·10⁻⁶
+at that seed's operation counts.
 
 On fdc5fc0 the seed passes — the meta range, the range ids and the split's arms
 (D-098 to D-100) moved every node schedule, and its range 5 is asked for eight writes
@@ -19225,7 +19226,7 @@ that draws it.
    exists to see; the planted wedge below shows it on every run it wedged.
 2. **The clause's new arm**, before the failing one: `None if
    !write_asked_after_heal_of(range)`. No write was asked, so none completing is no
-   evidence: D-071's and D-076's rule, given to the per-range reading.
+   evidence: D-071 item 7's rule, given to the per-range reading.
 3. **The verifier's strengthening**, inside that arm:
    `Report::operations_after_heal_of(range)` counts the operations of the range asked
    after the heal (reads and writes, from `ClientInvoke`) and how many returned
@@ -19233,7 +19234,8 @@ that draws it.
    operations after the heal that answered none of them served nothing and **fails**,
    with a message of its own: *range R completed no operation after the last heal at T,
    of N asked, none of them a write*. A client retries a read until its deadline, so a
-   live range answers one; a range asked nothing at all after the heal passes.
+   live range answers one; a range asked nothing at all after the heal passes, and so
+   does one that answered one operation and then nothing (the residual, item 5).
 4. **`NodeMembershipCoverage::ranges_not_asked_after_heal`**: the (seed, range) pairs of
    uniform runs on which no write of the range was asked after the heal, printed at
    every tier with the rest of the coverage, so the case the arm excuses is counted
@@ -19244,12 +19246,20 @@ that draws it.
    `longest_completion_gap_of` said a range wedged to nothing is "not a hole —
    `time_to_write_after_heal_of` fails such a range outright". Both now say what the
    clause does: it fails a range where it has evidence, a write asked and none
-   completed or operations asked and none answered; a range asked nothing after the
-   heal is seen by neither clause, which is a hole, and the scenario change below is
-   what would close it. `RANGE_LIVENESS_TIMEOUTS` also says that its bound cannot trip,
-   and why (the PROPOSED point below). This amends D-084's paragraph beginning "Six
-   seconds is most of an eight-second run", whose "the clause with teeth … has nothing
-   to tune and no margin to get wrong" seed 1969 refuted.
+   completed or operations asked and none answered. **The residual, exactly:** against
+   D-084, a verdict moves from fail to pass for any range asked no write after the heal
+   that answered at least one operation after it, and that includes a range that
+   answered one read and then served nothing. The availability clause does not see that
+   range either: it measures gaps between completions, no later completion closes the
+   one after the last answer, and its 5 s bound is over the 2.4 s window regardless. A
+   range asked nothing at all after the heal passes too: nothing was asked, so nothing
+   unanswered is evidence. What bounds the residual is `ranges_not_asked_after_heal`
+   (item 4), printed at every tier: **empty on the correct node at ten thousand**, so no
+   run there reaches the arm. The scenario change below is what would close it.
+   `RANGE_LIVENESS_TIMEOUTS` also says that its bound cannot trip, and why (the PROPOSED
+   point below). This amends D-084's paragraph beginning "Six seconds is most of an
+   eight-second run", whose "the clause with teeth … has nothing to tune and no margin to
+   get wrong" seed 1969 refuted.
 6. **Two unit tests in `sim/membership.rs`**, run by the nightly's `rest` job like the
    module's other two, so no shard row:
    - `seed_1969_no_longer_leaves_a_range_unasked_for_a_write_after_the_heal` — **the
@@ -19289,7 +19299,9 @@ two other fix branches' sweeps and builds beside it, load averages 191.49/147.51
 when the first run started and 170.82/182.94/173.48 when the last ended. The figures are
 virtual time and counts, which the host's load does not touch; only the wall times are
 host time. The binaries were built from this tree before the strengthening's message
-was reworded (no reading changed); the nightly on the tip runs the committed tree.
+was reworded (no reading changed); the adversarial review rebuilt both sweeps from
+eac0048's committed tree in release and reproduced the first two figures below exactly,
+and the nightly on the tip runs the committed tree.
 
 - **The correct node's membership sweep: green, 10 000 of 10 000, in 488 s.** **Every
   coverage figure is identical**, byte for byte once the new field is taken out, to
@@ -19327,8 +19339,13 @@ was reworded (no reading changed); the nightly on the tip runs the committed tre
 
 ### The mutation table: what a single-range world could not catch
 
-Five mutations, each planted alone against the unit tests (debug, this tree) and reverted
-before the next. M1 and M3 are no-ops on one group: one range, and every key its.
+Five mutations, each planted alone against the unit tests (debug) and reverted before the
+next. They were first run on this branch's tree before the strengthening's message was
+reworded, and **re-run after review on the committed code** (363af37, whose `crates/`
+and `sim/` library are eac0048's byte for byte; only `sim/tests/node.rs` came in from
+`main`): the unmutated tests pass and each mutation fails the splice test as below, M2's
+and M5's assertions quoting the committed message. M1 and M3 are no-ops on one group:
+one range, and every key its.
 
 | | Mutation | Caught by |
 |---|---|---|
