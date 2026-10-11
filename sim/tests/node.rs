@@ -3819,6 +3819,133 @@ fn seeds_12_and_8_under_a_shared_snapshot_dir_stay_wedges_the_true_end_alone_wou
     );
 }
 
+/// Seed 613 under `ApplyWaitsForEveryRange`: **a stall the exemption's range evidence
+/// excused as it first merged**, because that evidence was older than the writes it
+/// excused (PROPOSED D-102, after #157's review).
+///
+/// The variant's apply task waits for a job of every range before it runs any, so a
+/// node's applies stall behind its quietest range while the logs go on committing. The
+/// last heal is at 13.816 s and the run stops at 16.546 s. Range 4 (`k4`, `k5`, never
+/// split on this run) last completed a client write, to `k5`, 2.432 s before the end;
+/// `k4`'s three post-heal writes were called after it, 0.785 to 1.359 s before the end,
+/// and all three are pending. The clause as first merged asked only that the range had
+/// completed some write after the heal, so it excused all three and passed the run.
+/// Run on for 4 s more, every draw unchanged and the trace the same up to the original
+/// end, none of them is answered: a stall, not the artefact. The clause now asks for a
+/// completion after the write's own call, and there is none, so the per-key reading
+/// reports `k4` and `check()` fails on it. The mechanism is built by hand too, in
+/// `sim/raft.rs` (`a_completion_before_a_pending_writes_call_shows_nothing_of_it`).
+// PROPOSED(D-102): the exemption asks for the range shown live after the call.
+#[test]
+fn seed_613_under_apply_waits_for_every_range_is_a_stall_older_evidence_would_excuse() {
+    let variant = NodeVariants::correct().with(NodeVariant::ApplyWaitsForEveryRange);
+    let run = |schedule: raft::Schedule| {
+        raft::run_on(
+            Cluster::Node,
+            613,
+            schedule,
+            Variants::default(),
+            variant,
+            RangeVariants::correct(),
+        )
+    };
+    let report = run(raft::Schedule::draw_on_the_node(613));
+    assert!(report.uniform(), "seed 613 is a uniform schedule");
+    let k4 = bytes::Bytes::from_static(b"k4");
+    assert_eq!((report.key_range)(&k4), 4, "k4 is range 4's");
+    assert!(
+        !report
+            .records
+            .iter()
+            .any(|r| matches!(&r.event, TraceEvent::RangeSplit { range: 4, .. })),
+        "seed 613 splits range 4 now, so the range serving k4 at the end is to be re-read"
+    );
+    // k4's post-heal writes: all pending, every one called inside the bound of the end
+    // and before its client's wait, so the range's evidence alone decides them.
+    assert!(
+        keys_with_only_a_tail(&report).contains(&"k4".to_owned()),
+        "seed 613's post-heal writes to k4 are not all pending inside the bound of the end"
+    );
+    let writes: Vec<&ananke_sim::lin::Op> = report
+        .history
+        .ops
+        .iter()
+        .filter(|op| op.op.is_write() && op.call >= report.last_heal && op.op.key() == &k4)
+        .collect();
+    assert!(
+        writes
+            .iter()
+            .all(|op| report.ended.duration_since(op.call) > raft::WRITE_TIMEOUT),
+        "a write to k4 was still inside its client's wait at the end"
+    );
+    let first_call = writes
+        .iter()
+        .map(|op| op.call)
+        .min()
+        .expect("k4 is written after the heal");
+    // The range's completed post-heal writes: some, and every one before that call.
+    let completed: Vec<ananke_env::Instant> = report
+        .history
+        .ops
+        .iter()
+        .filter(|op| op.op.is_write() && op.call >= report.last_heal)
+        .filter(|op| (report.key_range)(op.op.key()) == 4)
+        .filter_map(|op| op.ret)
+        .collect();
+    let last = completed.iter().max().copied();
+    println!(
+        "seed 613: last heal {:?}, stopped at {:?}; range 4's last completed post-heal write \
+         at {last:?}; k4's {} writes called from {first_call:?}",
+        report.last_heal,
+        report.ended,
+        writes.len()
+    );
+    assert!(
+        last.is_some_and(|last| last < first_call),
+        "range 4 completed no post-heal write, or one after k4's first pending write was \
+         called: not the shape this pin is for"
+    );
+    assert_eq!(
+        report.liveness(),
+        Err(format!(
+            "liveness: no client write to k4 completed after the last heal at {:?}",
+            report.last_heal
+        )),
+        "seed 613's stall is not reported"
+    );
+    let violation = report
+        .check()
+        .expect_err("seed 613 fails under the variant");
+    assert_eq!(
+        mechanism(&violation),
+        "liveness",
+        "seed 613 fails first on something else: {violation}"
+    );
+    // The counterfactual: 4 s more, every draw unchanged.
+    let mut longer = raft::Schedule::draw_on_the_node(613);
+    longer.settle += Duration::from_secs(4);
+    let extended = run(longer);
+    assert_eq!(
+        &extended.records[..report.records.len()],
+        &report.records[..],
+        "the extended run is not the same run up to the original end"
+    );
+    let answered = writes
+        .iter()
+        .filter(|op| {
+            extended
+                .history
+                .ops
+                .iter()
+                .any(|e| e.process == op.process && e.seq == op.seq && e.ret.is_some())
+        })
+        .count();
+    assert_eq!(
+        answered, 0,
+        "a pending write to k4 was answered in the 4 s more: seed 613 is no longer a stall"
+    );
+}
+
 /// `IgnoreIncarnation` on the node (D-042), and **why it is still not re-asserted**:
 /// not the snapshot wiring, which this slice puts under these arms, and no longer
 /// Q15's whole-node refusal and re-seed, which are in the tree (D-077) — but their
