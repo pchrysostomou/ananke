@@ -101,6 +101,28 @@ ananke/
 
 _Update this section at the end of every session._
 
+- Branch `phase-3-stage-c-variant-set` (2026-10-11), off `main` at b01db39, PROPOSED
+  D-105, **the range layer's own variant set (Q37, Q38)**: `ananke_shard::range_variant`,
+  `RangeVariant` and `RangeVariants(u64)` with `NodeVariant`'s conventions (`BUGS`,
+  `name`, `Display`, a `const` bitmask whose empty set is correct), carried through
+  `ServerConfig::range_variants` beside the node's set and `ananke-raft`'s untouched
+  `Variants(u32)`, and through `raft::run_on_the_node`, `run_on`, `Cluster::spawn`,
+  `node_server_config` and the sweep's client. §10's five built so far —
+  `TrustStaleDescriptor`, `ApplyIgnoresSpan`, `ClientIgnoresMismatch`,
+  `MetaOverwritesByArrival`, `IdBlockResumed` — moved there from `NodeVariants`' bits 49
+  to 53, their tests and every name in `sim/` with them; `variant.rs`'s module doc says
+  what the node's set is (§4's, none of §10's). `RangeVariant::in_section_10` classifies
+  every member by an exhaustive match, held to §10's table by name: §10's twenty-four or
+  an instrument outside the count (D-093's `SplitLeavesGap`, Stage D's re-add window
+  variant, none built). The width is a `u64` because twenty-six members are known before
+  any review adds one and the node's set outgrew its `u32` inside Stage B.
+  **Nothing moved, measured**: on b01db39 and this tree, from one harness in release, 7 000
+  node runs (seeds 0 to 999 under each of the five, the pair and the correct node), the
+  pinned node seeds and 100 runs of five other node scenarios — every verdict and every
+  trace hash identical; the catch counts at 20, 100 and 1 000 seeds identical (the table
+  in D-105). Seed 42's one-group trace is now asserted by its body hash, as `echo`'s is
+  (#97). **For the owner**: `AnyFreshNodeBootstraps` stays in the node's set though it is
+  a range-layer instrument by D-093's reasoning (issue #151).
 - Branch `phase-3-fix-membership-range-asked` (2026-10-11), off `main` at fdc5fc0 and
   merged with it at 195f965 (#137, #144),
   PROPOSED D-103 (amends D-084): **the node membership scenario's per-range liveness
