@@ -1,9 +1,10 @@
-//! SHARD.md §8's checks 7, 9, 10 and 17 as folds over the trace, in the range layer
-//! where Q40 puts checks 7 to 22: descriptor agreement, serving within span, owners'
-//! generations rising, and a client refreshing on a mismatch. Each is a fold fed one
-//! record at a time, with a verdict readable at any prefix, so one [`Checker`] runs
-//! them incrementally beside `ananke_raft::invariants`'s and again over the whole
-//! trace at the end (D-046; §8).
+//! SHARD.md §8's checks 7, 9, 10, 16, 17 and 18 as folds over the trace, in the range
+//! layer where Q40 puts checks 7 to 22: descriptor agreement, serving within span,
+//! owners' generations rising, meta never going back, a client refreshing on a
+//! mismatch, and the lineage of range ids and splits. Each is a fold fed one record at
+//! a time, with a verdict readable at any prefix, so one [`Checker`] runs the seven —
+//! check 18 is two, [`IdsUnique`] and [`SplitLineage`] — incrementally beside
+//! `ananke_raft::invariants`'s and again over the whole trace at the end (D-046; §8).
 //!
 //! **Check 7** holds a map from (range, index) to the descriptor in force from that
 //! index: a `RangeCreated` of a bootstrap or a split is the value at (range,
@@ -37,6 +38,11 @@
 //! named a descriptor of generation G whose span contains the operation's key, to a
 //! range at a generation below G, is a violation. The send that was refused is tied to
 //! its operation through the `invoked` its own `ClientSend` carried.
+//!
+//! **Check 18**, two folds: [`IdsUnique`], the range-id clause over `RangeIdsLeased`
+//! (PROPOSED D-099), and [`SplitLineage`], the split clause at each split's first
+//! apply, which also holds a right half to a block granted to the node that led its
+//! parent (PROPOSED D-100).
 //!
 //! The keys the trace carries are user keys; the spans are encoded (§1), so every
 //! comparison encodes the key as the store does (`ananke_raft::apply::user_key`).
@@ -373,11 +379,11 @@ impl GenerationsRise {
     }
 }
 
-/// Check 18's range-id clause, the part a tree without a split reaches (SHARD.md §8;
-/// §5, Q17): folding `RangeIdsLeased` by the first apply of each of range 0's
-/// indices, no two grants share an id, and every replica's apply of an index grants
-/// what its first apply did. The clause's other half — the right half of a split lies
-/// in a block granted before it to the node that led the parent — waits on the split.
+/// Check 18's range-id clause, the part that needs no split (SHARD.md §8; §5, Q17):
+/// folding `RangeIdsLeased` by the first apply of each of range 0's indices, no two
+/// grants share an id, and every replica's apply of an index grants what its first
+/// apply did. The clause's other half — the right half of a split lies in a block
+/// granted before it to the node that led the parent — is [`SplitLineage`]'s.
 // PROPOSED(D-099)
 #[derive(Clone, Debug, Default)]
 pub struct IdsUnique {
@@ -918,9 +924,10 @@ impl ClientRefreshes {
     }
 }
 
-/// The four checks as one incremental checker: fed the records since its last look,
-/// with a verdict at any prefix that is what the folds over the whole prefix report,
-/// in the same words (D-046).
+/// The seven folds — checks 7, 9, 10, 16 and 17, and check 18's two clauses — as one
+/// incremental checker: fed the records since its last look, with a verdict at any
+/// prefix that is what the folds over the whole prefix report, in the same words
+/// (D-046).
 ///
 /// A checker built `active: false` folds nothing and reports nothing: what a run of
 /// the one-group server, which traces no descriptor, is checked with.

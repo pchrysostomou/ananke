@@ -99,10 +99,12 @@ pub const SNAPSHOT_CAP: usize = RANGES as usize;
 
 /// The block of range ids a refill grants a node, and the ids left in its block at
 /// or below which it asks for the next (SHARD.md §5, Q17): tunable, and the same on
-/// every node scenario. Eight and two are a first pair; the sharded sweep's
-/// measurement, how often a split finds an empty block under Phase 2's network
-/// faults, is what sets them (PROPOSED D-092, D-099). On a tree with no split a node
-/// takes no id, so every node asks once at its start and again at every restart.
+/// every node scenario. Eight and two are a first pair, unmeasured: D-092 has the pair
+/// chosen on a measurement in `sim/shard.rs`, how often a split finds an empty block
+/// under Phase 2's network faults, printed at every tier; that scenario does not exist
+/// yet, and D-099 deferred the choice to it (D-104). A node takes an id only for a
+/// split, which only the node sweep's split arms ask (`sim/raft.rs`, PROPOSED D-100);
+/// in the other node scenarios every node asks once at its start and at every restart.
 // PROPOSED(D-099)
 pub const ID_BLOCK: u64 = 8;
 /// See [`ID_BLOCK`].

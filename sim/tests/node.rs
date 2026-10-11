@@ -1977,8 +1977,9 @@ fn a_client_that_ignores_a_mismatch_is_caught_by_check_17_on_the_node() {
 
 /// The range layer's checker at prefixes against its folds over the whole trace
 /// (D-046; SHARD.md §8, §11 raft 12): fed in eight prefixes, its verdict at each is
-/// what folding the four checks over that prefix from the first record reports, in the
-/// same words, on the correct node and on the two variants that trip checks 9 and 17.
+/// what folding its seven folds (checks 7, 9, 10, 16, 17 and 18's two clauses) over that
+/// prefix from the first record reports, in the same words, on the correct node and on
+/// the two variants that trip checks 9 and 17.
 // PROPOSED(D-097)
 #[test]
 fn the_range_layers_checks_agree_with_their_whole_trace_folds() {
@@ -3935,14 +3936,19 @@ fn a_leader_that_ignores_incarnations_has_an_incarnation_to_ignore_only_where_a_
 /// the situation's absence, and that the first thousand seeds are searched again for a
 /// seed the pair is caught on.
 ///
-/// **Seed 680's own pin did not move, and the evidence is not an argument.** This slice
-/// changes nothing about `Cluster::OneGroup`: seed 42's moirae JSONL is 12 898 025
-/// bytes and hashes to
-/// `445f970010f9d493d489d7627543b77cccba863cb5675af4602686f5de182217` on this branch,
-/// which is the hash D-082 recorded for `origin/main` and for its own branch. So
+/// **Seed 680's own pin did not move, and the evidence is not an argument.** D-086's
+/// slice changed nothing about `Cluster::OneGroup`: seed 42's moirae JSONL was
+/// 12 898 025 bytes hashing to
+/// `445f970010f9d493d489d7627543b77cccba863cb5675af4602686f5de182217` on its branch,
+/// the hash D-082 recorded for `origin/main` and for its own branch. Since D-097's
+/// events commit (cd3de12) it is 13 241 905 bytes hashing to
+/// `c5b8d814dc0956af28bef72f8f9e0bbc959053a2173d7d1d96e3423a6c6540e8`: the client's
+/// `ClientSend` and `ClientMismatch` records added, the one group's draws unchanged
+/// (D-097, D-104). No test asserted either until D-105, which pins that trace by its
+/// body's FNV-1a hash, `SEED_42_BODY_HASH` in `sim/tests/raft.rs` (#97). So
 /// `seed_680_which_pinned_the_combined_variant_before_d056_no_longer_wedges` runs the
-/// run it was pinned on and keeps saying exactly what it says, and this slice does not
-/// touch it.
+/// run it was pinned on and keeps saying exactly what it says, and D-086's slice did
+/// not touch it.
 ///
 /// **On the node the pair is the stream half alone wherever no store is refused**,
 /// because the incarnation half has nothing to ignore without a re-seed, and a re-seed
