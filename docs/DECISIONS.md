@@ -19319,8 +19319,9 @@ D-103 beside it have merged (#144, #149), and this takes **D-102**, between them
 numerical order. The branch is off `main` at b01db39, whose footer reads D-104, and the
 footer stayed D-104; merged with `main` at 8496ca3, which brought D-105 (#152), the entries
 are a union in numerical order and the footer is D-106. #154 merged at e782365; this entry
-is amended in place on #157, merged with `main` at 7564917 (#153, D-104), and the footer
-stays D-106. Every code site carries `// PROPOSED(D-102)`.
+was amended in place after #157's review. #157 itself merged at 681165a (bc102d6), so the
+amendment is #159, merged with `main` at 7564917 (#153, D-104), and the footer stays
+D-106. Every code site carries `// PROPOSED(D-102)`.
 
 **Context.** `main`'s nightly on 6c54705 (#132, run 37918619653) failed seed 8885 of the
 correct node's raft-arms sweep — *"liveness: no client write to k5 completed after the
@@ -19734,19 +19735,21 @@ b01db39 (38141605412), the base, the lines that move are **four**:
 - `sim/tests/ranges.rs`'s directed seed asserts its run carries where it stopped, and the
   two runs it forges carry the real run's.
 
-**Mutations, each caught** (applied one at a time to this tree, the tree restored after):
-the end read from the schedule's total in `post_heal_writes` (four hand-built cases and
-seed 2809's pin fail); the evidence asked of the cluster, "some post-heal write completed
-anywhere" — the mutation a single-range world cannot catch (three hand-built cases and the
-seed-12/8 pin); the evidence through the starting map (the split case and the seed-12/8
-pin); no evidence asked inside the bound, the true end alone (three hand-built cases and
-the seed-12/8 pin); the client's wait dropped (the in-flight case and seed 2809's pin);
-`run_on` carrying the schedule's total as its end (the pins of 8885, 2809 and 12/8); and
-`sim/ranges.rs` carrying the origin as its end (its directed seed). After #157's review,
-on the amended tree: the evidence older than the write, any completion after the heal as
-first merged (the after-the-call case and seed 613's pin fail); and a completion read
-through the range serving its key at the end rather than at its return (the
-when-it-completed case fails, and no sweep pin, as no sweep verdict moves).
+**Mutations, each caught** (applied one at a time to this tree, the tree restored after;
+first on #154's tree, and all nine again on the amended tree at 88c01ba, whose results
+these are): the end read from the schedule's total in `post_heal_writes` (all six
+hand-built cases and seed 2809's pin fail); the evidence asked of the cluster, "a
+completion anywhere after the call" — the mutation a single-range world cannot catch
+(three hand-built cases and the seed-12/8 pin); the evidence through the starting map
+(the split case, the when-it-completed case and the seed-12/8 pin); no evidence asked
+inside the bound, the true end alone (five hand-built cases and the pins of 12/8 and 613);
+the client's wait dropped (the in-flight case and seed 2809's pin); `run_on` carrying the
+schedule's total as its end (the pins of 8885, 2809, 12/8 and 613); `sim/ranges.rs`
+carrying the origin as its end (its directed seed); after #157's review, the evidence
+older than the write, any completion after the heal as #154 merged it (the
+after-the-call case and seed 613's pin); and a completion read through the range serving
+its key at the end rather than at its return (the when-it-completed case alone, as no
+sweep verdict moves; a single-range world has no split to read it by).
 
 ### `SplitFromRestarted`'s no-split branch
 

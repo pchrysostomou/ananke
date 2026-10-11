@@ -146,7 +146,7 @@ _Update this section at the end of every session._
   once that range completed a client write, called after the heal, after the pending
   write's call, each completion the range's that served its key when it completed. #154
   merged that clause without the call condition, and #157's review found it passing
-  eleven real `ApplyWaitsForEveryRange` stalls; the amendment on #157 restores them (the
+  eleven real `ApplyWaitsForEveryRange` stalls; the amendment, #159, restores them (the
   completion's range at its return moves no verdict and makes the reading exact). What excuses a pending write is the PROPOSED ask, measured at ten
   thousand as (correct node failures; stalls passed; `SharedSnapshotDir` artefacts
   reported beyond #154's): #154's form 0, 11, 0; the taken form 0, 0, 7; the client's wait
