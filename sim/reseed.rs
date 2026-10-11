@@ -316,8 +316,10 @@ impl Report {
     /// Naming the first criterion that fails, with the seed and what it saw.
     pub fn check(&self) -> Result<(), String> {
         let seed = self.seed;
-        // SHARD.md §8's checks 7, 9, 10, 16 and 17 over this node scenario's trace,
-        // as every node scenario folds them (Q40; PROPOSED D-097, D-098).
+        // SHARD.md §8's checks 7, 9, 10, 16, 17 and 18 — `ananke_shard::invariants`'
+        // seven folds — over this node scenario's trace (Q40; PROPOSED D-097, D-098).
+        // Every node scenario folds them but the sharded quorum scenario, which does
+        // not yet (#140; D-104).
         if let Err(violation) = ananke_shard::invariants::all(&self.records) {
             return Err(format!("seed {seed}: {violation}"));
         }

@@ -187,15 +187,19 @@ pub enum NodeVariant {
     /// node's other replicas are neither. A node owns one engine (Q2), so a loss in it
     /// is every replica's: this is the whole of Q15 got wrong (SHARD.md §11, storage 8).
     ///
-    /// What the three unrefused replicas then do is worth stating exactly, because the
+    /// What the unrefused replicas then do is worth stating exactly, because the
     /// obvious sentence — that they "carry on over the same engine" — is not available
     /// to any implementation: the refused directory's marker says lost, so nothing can
     /// open it at all. They are re-created in the *new* engine instead, and because
     /// nothing refused them they are created there as a first start would create them:
-    /// quarantine clear, incarnation 1, empty. That is the same harm one range along —
-    /// three replicas voting again on state their node lost (D-035) and three leaders
-    /// keeping a `matched` the rebuilt log cannot honour (D-042) — reached by the
-    /// mistake a reader of §11 would actually make.
+    /// quarantine clear, incarnation 1, empty. Since the bootstrap (PROPOSED D-096) the
+    /// store that opens first is range 0's, so the variant refuses the root alone and
+    /// leaves every other replica the node hosts unrefused: on a bootstrap node of the
+    /// sharded quorum scenario, five, the meta range's and the four user ranges'. That
+    /// is the same harm one range along — those replicas voting again on state their
+    /// node lost (D-035) and their ranges' leaders keeping a `matched` the rebuilt log
+    /// cannot honour (D-042) — reached by the mistake a reader of §11 would actually
+    /// make (PROPOSED D-101; D-104).
     RefuseOneRangeOnly,
     /// The re-seed built in the refused directory instead of a new one beside it,
     /// which opens fresh a directory that held a store (D-041).

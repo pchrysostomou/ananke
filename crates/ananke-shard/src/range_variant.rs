@@ -72,8 +72,10 @@ pub enum RangeVariant {
     /// overlaps is cut and replaced whatever its generation, where §1 keeps, per key,
     /// the descriptor of the highest generation. An older update that arrives after a
     /// newer one takes the newer's place, which check 16 sees at the first key whose
-    /// named generation falls (SHARD.md §8, §10); `Fault::MetaReorder` on the sharded
-    /// sweep is what makes one arrive so.
+    /// named generation falls (SHARD.md §8, §10). §10 has `Fault::MetaReorder`, an arm
+    /// of `sim/shard.rs`, make one arrive so; neither is built, and on this tree the
+    /// node sweep's split arms reach it: a resend of the parent's update at its old
+    /// generation that arrives after the split's (PROPOSED D-100; D-104).
     // PROPOSED(D-098)
     MetaOverwritesByArrival,
     /// The node adopts, at its start, the block of range ids its lease record names,
@@ -82,8 +84,10 @@ pub enum RangeVariant {
     /// a restart abandons the rest of every block it held, and the ids the earlier
     /// run took from that block are taken twice. Check 18's range-id clause sees it
     /// at the first apply of a split whose right half a `RangeCreated` or `RangeSplit`
-    /// named before (SHARD.md §8, §10); the sharded sweep's crash and restart of a
-    /// node that took an id, followed by a split led from it, is what reaches it.
+    /// named before (SHARD.md §8, §10). §10's shape for it, a crash and restart of a
+    /// node that took an id followed by a split led from that node, is `sim/shard.rs`'s,
+    /// which is not built; on this tree the node sweep's `Fault::SplitFromRestarted`
+    /// arm draws that shape (PROPOSED D-100; D-104).
     // PROPOSED(D-099)
     IdBlockResumed,
 }

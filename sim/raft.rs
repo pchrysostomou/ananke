@@ -1131,8 +1131,11 @@ const ADMIN: u64 = 99 << 32;
 const SPLIT_ADMIN: u64 = 100;
 /// How long a split's admin waits for each answer before it tries the next server.
 const SPLIT_WAIT_BUDGET: Duration = Duration::from_millis(600);
-/// How long the split admin waits before asking again after `NoRangeId` (PROPOSED
-/// D-092's A): a minimum election timeout, the refill's resend interval.
+/// How long the split admin waits before asking again: after `NoRangeId`, and, for a
+/// restarted proposer's admin, after no answer, `NotLeader` or a mismatch. 150 ms is
+/// one and a half minimum election timeouts (`ELECTION_MIN`), the sweep's own choice
+/// (PROPOSED D-100): PROPOSED D-092's A says only that the asker retries, and the
+/// minimum election timeout is D-092's interval for the refill's resend (D-104).
 const SPLIT_RETRY: Duration = Duration::from_millis(150);
 
 /// What the split arms' admins recorded on a run (SHARD.md §5; PROPOSED D-100).
@@ -1188,7 +1191,7 @@ async fn split_admin<E: Environment>(
     }
     // An admin that follows `NotLeader` round the servers asks each twice; one that
     // sticks to a restarted node waits out its catch-up and the lead's transfer
-    // between asks, a minimum election timeout each, for four times as many.
+    // between asks, `SPLIT_RETRY` each, for four times as many.
     let tries = if sticky { SERVERS * 4 } else { SERVERS * 2 };
     for _ in 0..tries {
         let request = Request {
@@ -1239,7 +1242,7 @@ async fn split_admin<E: Environment>(
                 if reason == SplitRefusal::NoRangeId {
                     // PROPOSED D-092's A, as proposed: a split asked while the node's
                     // block holds no id is refused and the asker retries — here after
-                    // a minimum election timeout, the refill's resend interval, for the
+                    // `SPLIT_RETRY`, the sweep's own interval and not D-092's, for the
                     // rest of the round.
                     env.clock().sleep(SPLIT_RETRY).await;
                     continue;
@@ -1577,6 +1580,8 @@ impl Schedule {
             faults.push(fault.clone());
             gaps.push(*gap);
         }
+        // PROPOSED(D-104): these two split arms stand in for `sim/shard.rs`'s driver, a
+        // departure from §12's text, and stay when it lands so no node schedule moves.
         // One split per schedule, at a drawn position among the arms, from a stream
         // of its own so the other arms' draws stay where they were (PROPOSED D-100).
         let mut split = moirae_sched::stream(seed, "split");
@@ -3645,8 +3650,8 @@ impl Report {
         {
             return fail(violation);
         }
-        // SHARD.md §8's checks 7, 9, 10 and 17, folded over the whole trace of a run
-        // that traces descriptors: the node's. One group traces none (Q40).
+        // SHARD.md §8's checks 7, 9, 10, 16, 17 and 18, folded over the whole trace
+        // of a run that traces descriptors: the node's. One group traces none (Q40).
         // PROPOSED(D-097)
         if self.traces_descriptors()
             && let Err(violation) = ananke_shard::invariants::all(&self.records)
@@ -8468,8 +8473,8 @@ struct Watch {
     /// check kept across looks, so a look costs only the records since the last
     /// one (D-046).
     checker: invariants::Checker,
-    /// The range layer's checks — SHARD.md §8's 7, 9, 10 and 17 — fed the same
-    /// records at the same looks (Q40). Inactive on one group.
+    /// The range layer's checks — SHARD.md §8's 7, 9, 10, 16, 17 and 18 — fed the
+    /// same records at the same looks (Q40). Inactive on one group.
     // PROPOSED(D-097)
     shard: ananke_shard::invariants::Checker,
     /// How many trace records the checker has been fed.
