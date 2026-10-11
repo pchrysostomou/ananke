@@ -60,6 +60,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use ananke_env::MismatchAt;
+use ananke_env::RecoveredAs;
 use ananke_env::TraceEvent;
 use ananke_env::sim::TraceRecord;
 use ananke_raft::core::{Variant, Variants};
@@ -2684,21 +2685,36 @@ fn the_sharded_quorum_scenario_asks_four_leaders_about_one_refused_node() {
 /// **This is the catch a single-range world cannot make.** On one group, refusing the
 /// one range *is* refusing the node, so the variant does nothing there and D-077
 /// catches it on its own scenario's shape. Here it is caught from this scenario's
-/// side, by the clause that asks the fan-out per range: three of the four replicas
-/// were never refused, so they were never re-seeded either.
+/// side, by the clause that asks the fan-out per range: the store that opens first is
+/// range 0's (PROPOSED D-096), so the variant refuses the root alone, and none of the
+/// four user ranges' replicas the clause asks about was refused, so none was re-seeded
+/// either.
 ///
 /// Measured before it was asserted (Q39, D-061): caught on every seed of the gate's
 /// twenty, and the rate is printed at every tier.
 ///
-/// Since the meta range carries entries (PROPOSED D-098), the lost state has a second
-/// witness: the replica of range 1 the variant re-creates empty in the fresh engine,
-/// never refused and so never given the index-0 state the re-seed writes a refused
-/// system range, applies the first `MetaUpdate` over nothing and takes every span,
-/// which state machine safety sees — and the verdict asks the ranges' invariants
-/// before the fan-out clause, so on those seeds it is what the catch names. Both are
-/// the one bug, the node's other replicas serving over an engine that lost state
-/// (D-077); the fan-out clause is asserted seen and each catch's share is printed.
+/// **`NodeReport::check` asks the ranges' invariants before the fan-out clause**, so
+/// on a seed where the lost state already broke one of them, the catch is named by
+/// the invariant and not by the clause. The variant's replicas left unrefused are
+/// re-created empty in the fresh engine, at incarnation 1 and quarantine clear, and
+/// that state has two witnesses beside the clause, both the one bug — the node's other
+/// replicas serving over an engine that lost state (D-077):
+///
+/// - **state machine safety on the meta range** (PROPOSED D-098): the replica of range 1,
+///   never refused and so never given the index-0 state the re-seed writes a refused
+///   system range, applies the first `MetaUpdate` over nothing and takes every span;
+/// - **leader completeness** on a range the variant left unrefused (PROPOSED D-101): the
+///   empty replica votes again on state its node lost (D-035), and its vote elects a
+///   candidate missing an entry the range committed before the victim's crash. It is
+///   one seed in ten thousand (seed 2994), so its firing is asserted at no tier: seed
+///   2994's pin below asserts the mechanism instead. Group 0 is excluded: the variant
+///   refuses range 0 exactly as the correct node does, so a violation there is not
+///   this bug and fails the test.
+///
+/// The fan-out clause is asserted seen, every catch is one of the three, and each
+/// one's share is printed at every tier.
 // PROPOSED(D-085): sharded is one fault and four answers, not the scenario four times.
+// PROPOSED(D-101): leader completeness off group 0 is the third witness of the one bug.
 #[test]
 fn a_node_that_refuses_only_one_range_is_caught_on_the_sharded_quorum_scenario() {
     let (caught, figures) = quorum_node_sweep(
@@ -2713,12 +2729,22 @@ fn a_node_that_refuses_only_one_range_is_caught_on_the_sharded_quorum_scenario()
         .iter()
         .filter(|v| v.contains("state machine safety") && v.contains("of group 1 "))
         .count();
+    let by_vote = caught
+        .iter()
+        .filter(|v| leader_completeness_group(v).is_some_and(|group| group != 0))
+        .count();
+    let on_the_root: Vec<&String> = caught
+        .iter()
+        .filter(|v| leader_completeness_group(v) == Some(0))
+        .collect();
     eprintln!(
         "sharded quorum, RefuseOneRangeOnly: caught on {} of {} seeds ({by_fan_out} by the \
-         fan-out clause, {by_meta} by state machine safety on the meta range), {figures:?}, \
-         first: {}",
+         fan-out clause, {by_meta} by state machine safety on the meta range, {by_vote} by \
+         leader completeness off group 0, {} by leader completeness of group 0), \
+         {figures:?}, first: {}",
         caught.len(),
         seeds(),
+        on_the_root.len(),
         caught.first().map_or("", String::as_str)
     );
     assert_eq!(
@@ -2730,11 +2756,249 @@ fn a_node_that_refuses_only_one_range_is_caught_on_the_sharded_quorum_scenario()
         by_fan_out > 0,
         "the fan-out clause caught it on no seed: {caught:?}"
     );
+    assert!(
+        on_the_root.is_empty(),
+        "leader completeness failed on group 0, the range the variant refuses exactly as \
+         the correct node does, so it is not the variant's amnesia: {on_the_root:?}"
+    );
     assert_eq!(
-        by_fan_out + by_meta,
+        by_fan_out + by_meta + by_vote,
         caught.len(),
-        "caught by something other than the fan-out or the meta range's state machine: \
-         {caught:?}"
+        "caught by something other than the fan-out, the meta range's state machine or \
+         leader completeness off group 0: {caught:?}"
+    );
+}
+
+/// The group a leader-completeness verdict names, read off the words
+/// `ananke_raft::invariants` writes — "leader completeness: index {index} of group
+/// {group} (term {entry_term}) was committed in term {in_term} but server {server},
+/// leader of term {term}, does not hold it" — or `None` for any other verdict.
+// PROPOSED(D-101): leader completeness off group 0 is the third witness of the one bug.
+fn leader_completeness_group(verdict: &str) -> Option<u64> {
+    let (_, after) = verdict.split_once(": leader completeness: index ")?;
+    let (_, after) = after.split_once(" of group ")?;
+    let (group, after) = after.split_once(" (term ")?;
+    if !after.contains(" but server ") {
+        return None;
+    }
+    group.parse().ok()
+}
+
+/// **Seed 2994 is the variant's amnesiac vote** (PROPOSED D-101): the one seed of the
+/// nightly's ten thousand on fdc5fc0 (run 38082122222) that `RefuseOneRangeOnly` was
+/// caught on by leader completeness, which the pair's attribution did not then admit.
+///
+/// The mechanism, asserted rather than the verdict alone. Before the victim's crash
+/// the leader of range 4's term 1 committed index 14 on a majority that held the
+/// victim and not server 2. The victim restarts on a store marked lost; the variant
+/// refuses range 0 alone, so the victim's replica of range 4 is re-created in the
+/// fresh engine as a first start creates it — term 0, nothing in its log, incarnation
+/// 1, neither refused nor quarantined. With server 3 cut off, server 2 asks for votes
+/// in term 3, and the victim's empty replica grants one: it is the only vote server 2
+/// is given, and with its own it is the majority of three that elects server 2 with
+/// index 13 as its last, without index 14. Leader completeness names it, ahead of the
+/// fan-out clause.
+///
+/// The correct node on the same seed is the other half: the same victim, its replica
+/// of range 4 refused with its node, restated refused, granting no vote after the
+/// refusal (D-035), and the seed green.
+// PROPOSED(D-101): the amnesiac vote, pinned where the nightly found it.
+#[test]
+fn seed_2994_is_an_unrefused_empty_replica_electing_a_leader_without_a_committed_entry() {
+    let seed = 2994u64;
+    let (group, index, candidate, term) = (4u64, 14u64, 2u64, 3u64);
+    let report = quorum::node_run(
+        seed,
+        Variants::default(),
+        NodeVariants::of(&[NodeVariant::RefuseOneRangeOnly]),
+    );
+    let violation = report
+        .check()
+        .expect_err("seed 2994 is no longer caught under RefuseOneRangeOnly");
+    assert_eq!(
+        violation,
+        format!(
+            "seed {seed}: leader completeness: index {index} of group {group} (term 1) was \
+             committed in term 1 but server {candidate}, leader of term {term}, does not \
+             hold it"
+        ),
+        "seed {seed}'s schedule has moved off the amnesiac vote this pin asserts; assert \
+         the absence with its reason, and name the seed the pair's sweep counts by \
+         leader completeness instead"
+    );
+    assert_eq!(leader_completeness_group(&violation), Some(group));
+    let victim = report.cast.as_ref().expect("the cast was taken").victim;
+    let records = &report.records;
+    let refusal = records
+        .iter()
+        .position(|r| matches!(r.event, TraceEvent::RaftRefused { server, .. } if server == victim))
+        .expect("the victim was refused");
+    // Before the crash: the entry was committed, and the victim held it.
+    let before = &records[..refusal];
+    assert!(
+        before.iter().any(|r| matches!(
+            r.event,
+            TraceEvent::RaftCommit { range, index: i, .. } if range == group && i >= index
+        )),
+        "seed {seed}: index {index} of group {group} was not committed before the refusal"
+    );
+    assert!(
+        before.iter().any(|r| matches!(
+            r.event,
+            TraceEvent::RaftAppend { server, range, index: i, entry_term: 1, .. }
+                if server == victim && range == group && i == index
+        )),
+        "seed {seed}: the victim did not hold index {index} of group {group} before its crash"
+    );
+    // The refusal: range 0 alone, and the victim's replica of the group re-created
+    // empty and unmarked.
+    let after = &records[refusal..];
+    let refused: BTreeSet<u64> = after
+        .iter()
+        .filter_map(|r| match r.event {
+            TraceEvent::RaftReplicaRefused { server, range } if server == victim => Some(range),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        refused,
+        BTreeSet::from([0]),
+        "seed {seed}: the variant refused {refused:?}, not the root alone"
+    );
+    let recovered = after
+        .iter()
+        .find_map(|r| match &r.event {
+            TraceEvent::RaftRecovered {
+                server,
+                range,
+                term,
+                last_index,
+                incarnation,
+                state,
+                ..
+            } if *server == victim && *range == group => {
+                Some((*term, *last_index, *incarnation, *state))
+            }
+            _ => None,
+        })
+        .expect("the victim's replica of the group restated after the refusal");
+    assert_eq!(
+        recovered,
+        (0, 0, 1, RecoveredAs::Neither),
+        "seed {seed}: the victim's replica of group {group} did not come back empty, at \
+         incarnation 1 and unmarked"
+    );
+    // The vote, and the leader it made.
+    let elected = after
+        .iter()
+        .position(|r| {
+            matches!(
+                r.event,
+                TraceEvent::RaftLeader { server, range, term: t, .. }
+                    if server == candidate && range == group && t == term
+            )
+        })
+        .expect("the candidate was elected");
+    let TraceEvent::RaftLeader { last_index, .. } = after[elected].event else {
+        unreachable!("found as a leader record")
+    };
+    assert!(
+        last_index < index,
+        "seed {seed}: server {candidate} was elected with index {last_index} as its last, \
+         which holds index {index}"
+    );
+    let granted: BTreeSet<u64> = after[..elected]
+        .iter()
+        .filter_map(|r| match r.event {
+            TraceEvent::RaftVote {
+                server,
+                range,
+                term: t,
+                candidate: c,
+                granted: true,
+                pre: false,
+            } if range == group && t == term && c == candidate && server != candidate => {
+                Some(server)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        granted,
+        BTreeSet::from([victim]),
+        "seed {seed}: server {candidate}'s term {term} of group {group} was granted by \
+         {granted:?}, where the pin asserts the victim's empty replica alone made its \
+         majority"
+    );
+    // The correct node on the same seed: the same victim, its replica refused, no vote
+    // granted after the refusal, and the seed green.
+    let control = quorum::node_run(seed, Variants::default(), NodeVariants::correct());
+    control
+        .check()
+        .unwrap_or_else(|violation| panic!("the correct node fails seed {seed}: {violation}"));
+    assert_eq!(
+        control.cast.as_ref().expect("the cast was taken").victim,
+        victim,
+        "seed {seed}: the correct node's run chose another victim"
+    );
+    let refusal = control
+        .records
+        .iter()
+        .position(|r| matches!(r.event, TraceEvent::RaftRefused { server, .. } if server == victim))
+        .expect("the victim was refused");
+    let after = &control.records[refusal..];
+    assert!(
+        after.iter().any(|r| matches!(
+            r.event,
+            TraceEvent::RaftReplicaRefused { server, range } if server == victim && range == group
+        )),
+        "seed {seed}: the correct node did not refuse the victim's replica of group {group}"
+    );
+    let restated = after
+        .iter()
+        .find_map(|r| match &r.event {
+            TraceEvent::RaftRecovered {
+                server,
+                range,
+                incarnation,
+                state,
+                ..
+            } if *server == victim && *range == group => Some((*incarnation, *state)),
+            _ => None,
+        })
+        .expect("the victim's replica of the group restated after the refusal");
+    assert!(
+        restated.0 != 1 && restated.1 == RecoveredAs::Refused,
+        "seed {seed}: the correct node's replica of group {group} restated as {restated:?}, \
+         not refused on an incarnation of its own"
+    );
+    let votes: Vec<bool> = after
+        .iter()
+        .filter_map(|r| match r.event {
+            TraceEvent::RaftVote {
+                server,
+                range,
+                granted,
+                ..
+            } if server == victim && range == group => Some(granted),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !votes.is_empty(),
+        "seed {seed}: the correct node's refused replica of group {group} was asked for no \
+         vote, so the control no longer reaches the situation the variant's vote decided"
+    );
+    assert!(
+        !votes.contains(&true),
+        "seed {seed}: the correct node's refused replica of group {group} granted a vote"
+    );
+    println!(
+        "seed {seed}: server {victim}'s empty, unmarked replica of group {group} granted the \
+         one vote that elected server {candidate} in term {term} with index {last_index} as \
+         its last, without index {index}; the correct node refused it and it voted {} times, \
+         granting none",
+        votes.len()
     );
 }
 

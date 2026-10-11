@@ -370,6 +370,13 @@
 # now; folding the count into the check's own replay is the saving if the night wants it. Seed
 # 493's pin, one seed, at 0.5 (0.495 + 0.044, 0.578 s real), into the lightest after those,
 # shard 5 at 1613.4 -> 1613.9.
+# PROPOSED D-101 (RefuseOneRangeOnly's third witness) added one `node` row, seed 2994's pin, two
+# runs of one seed each (the variant and the correct node), weighed on its tree from the built
+# release binary (`node-<hash> <test> --exact`) at ANANKE_SEEDS=1000 ANANKE_DEEP_SEEDS=100, as
+# user + sys, on an Apple M2 of 8 cores on AC Power, load averages 9.19/16.10/18.51: 0.05 cpu s
+# on three runs (0.05 + 0.00, 0.04 + 0.00, 0.04 + 0.00), rounded up to 0.1 like the cheap rows
+# beside it. Into the lightest shard, shard 5 at 1623.8 -> 1623.9. The variant's own row keeps its
+# figure: its sweep is unchanged and only reads its catches once more.
 # shard	binary	cpu_s	test
 # shard 1: 1977.1 cpu s
 # D-095 added two rows, both `node`, weighed on its tree from the built release binary
@@ -469,7 +476,7 @@
 4	node	29.1	the_node_folds_agree_with_their_whole_trace_readings
 4	node	0.5	seed_368_is_a_live_installs_hold_and_the_fourth_arm_answers_for_it
 4	node	50.0	a_node_that_resumes_another_runs_block_of_ids_is_caught_after_a_split
-# shard 5: 1623.8 cpu s
+# shard 5: 1623.9 cpu s
 5	echo	6.0	every_seed_satisfies_the_invariants_and_the_sweep_exercises_the_disk_faults
 5	engine	19.5	a_seek_that_counts_tombstones_is_caught
 5	node	58.8	a_leader_that_ignores_incarnations_has_an_incarnation_to_ignore_only_where_a_store_is_refused
@@ -485,6 +492,7 @@
 5	node	49.1	a_server_that_ignores_the_span_at_apply_is_caught_with_trust_and_after_a_split_alone
 5	node	0.5	seed_493_is_a_live_installs_hold_and_the_fourth_arm_answers_for_it
 5	node	0.9	seed_633_is_a_live_installs_hold_and_the_fourth_arm_answers_for_it
+5	node	0.1	seed_2994_is_an_unrefused_empty_replica_electing_a_leader_without_a_committed_entry
 # shard 6: 1657.1 cpu s
 6	echo	0.1	a_busy_looping_task_fails_the_scenario_instead_of_hanging
 6	engine	310.3	an_engine_that_acknowledges_before_the_log_is_caught

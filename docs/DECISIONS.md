@@ -14572,6 +14572,14 @@ test it named.
    nothing — so nothing is red; only the reasons are stale. Left for the owner to place
    rather than widened into this slice.
 
+**Superseded in part by D-101.** The pair's attribution above — "every catch is that
+clause's own words" — was too strict from the start: the replicas the variant leaves
+unrefused come back empty and vote, and `NodeReport::check` asks the ranges' invariants
+before the fan-out clause, so a seed whose amnesiac vote elects a leader missing a
+committed entry is named by leader completeness (seed 3352 on 6c54705, seed 2994 on
+fdc5fc0). D-101 admits leader completeness off group 0 as a witness of the one bug and
+pins seed 2994's mechanism; the pair and its standard stand.
+
 ---
 
 ## PROPOSED D-086 — The node reaches the stream path: four bugs the reach found, and what each of Phase 2's four stream variants measures there
@@ -16968,6 +16976,372 @@ own catch and report anything else as the node's own failure.
 
 ---
 
+## PROPOSED D-092 — A split on a node whose block of range ids has run out is refused at proposal, and a block at or below its threshold keeps a refill outstanding
+
+**The number.** The footer reads D-092 and no open branch takes a number: PR #127 edits
+D-069's text and not the footer, and PR #128 moves D-040 and adds nothing. D-092 and
+D-093 are taken from the footer, which moves to D-094. No code site carries either yet;
+the Stage C slice that builds the lease marks its site `// PROPOSED(D-092)`.
+
+**Context.** Stage C's first question before code (SHARD.md:2427-2429). Q17 leases range
+ids to nodes in blocks: range 0 holds the counter and a lease record per node, a split
+takes the next id from its node's block with no write to range 0, and range 0's
+availability gates refilling a block, not performing a split (SHARD.md:3062-3068). The
+three rules that keep an id from being taken twice were approved as written on 2026-09-15
+(SHARD.md:639-657, 3270-3277): blocks are disjoint, a node adopts only a block granted to
+its current run, and its position in a block is volatile. What the approval left open, in
+its own words, is "what a split does when its node's block is exhausted and range 0 cannot
+refill it" (SHARD.md:3276-3277); the stage that builds the lease states it, and Stage C's
+build list carries it as "the exhausted block's answer as question 1 settles it"
+(SHARD.md:2462-2464).
+
+The situation is reachable. A node asks for a refill when the ids left in its block fall
+to the refill threshold, and the refill is a command to range 0, answered by range 0's
+leader. Range 0 is fixed on the three bootstrap nodes (Q9, SHARD.md:209-213) and elects
+like any range, so a node partitioned from range 0's leader, or one whose refill's answer
+keeps being lost, spends its block down through the threshold to empty while splits keep
+being asked of it: by the operator, or by the sweep's driver, which draws splits on stream
+`shard` and lands them on whichever node leads the range it drew. The question is what
+the leader of P does with a split when its node's block is empty and no grant has landed.
+
+**Four answers, on the facts as they stand.**
+
+- *A. Refuse at proposal.* The leader takes no id and proposes nothing. It answers the
+  split's asker as it answers a split asked while a change is catching up (Q23,
+  SHARD.md:3104-3108): refused, with the reason, here `NoRangeId`. The node's refill is
+  already outstanding, since the block passed its threshold before it emptied. The asker
+  retries.
+- *B. Wait.* The leader parks the split until its node's block refills, then takes an id
+  and proposes; a parked split is answered when it lands, or refused when a bound runs
+  out.
+- *C. A reserve, or a borrowed id.* Each block keeps one id back for use only while range
+  0 is unreachable; or the node asks a peer for an id out of the peer's block.
+- *D. A provisional id.* The split proposes with an id the node chooses, which range 0
+  confirms later.
+
+**Proposed: A.**
+
+- It is the shape the split already has. §5's checks at proposal are "for liveness only"
+  and every one of them refuses at proposal (SHARD.md:619-627); Q23's catching-up refusal
+  is one such, and Stage D's exit already counts those refusals per run as coverage
+  (SHARD.md:2643-2648). An empty block is one more reason on the same answer, and the
+  driver counts it the same way.
+- It adds no state and no rule. §5's three rules say which ids a node may take; A takes
+  none. Check 18's range-id clause (SHARD.md:1316-1322) folds every id a split took
+  against the blocks `RangeIdsLeased` granted; a refused split traces no `RangeSplit`, so
+  the clause has nothing to look at, and `IdBlockResumed` is untouched.
+- B's wait buys nothing the retry does not. A parked split is leader-local and volatile,
+  lost at a leadership change as D-032 loses a change's catch-up, so the asker must be
+  ready to retry anyway; once it is, the park is a second timer with a second bound to
+  measure, and it holds P against every other split for as long as range 0 is down.
+  Refusing hands P back to the asker at once.
+- C's reserve is exhaustion one id later, bought with a path that runs only while range
+  0 is down, which is the path least exercised. C's borrow breaks "blocks are disjoint"
+  unless the lender's position becomes durable, which Q17 declined to pay for. D breaks
+  uniqueness, the one guarantee Q17 keeps and check 18 folds.
+- What A costs is splits on that node while range 0 is unreachable, which is already the
+  cluster's state and not a second outage: range 0 unreachable is meta's root unreachable
+  for every client's cache miss (§2), and the partition that hides range 0's leader from
+  the node hides it from the rest of the cluster too. A split refused for want of an id
+  is a symptom of that outage, reported to the one asker that can retry.
+
+**The refill, restated so that A is enough.** A node whose block holds ids at or below
+the refill threshold has a refill outstanding at all times: it sends one, and resends it
+after a minimum election timeout until a grant carrying its current run nonce arrives,
+whether as the refill's answer or read back from its lease record (§5's second rule). A
+refill is idempotent by construction, since a copy that applies again grants a second
+block, which is a gap (SHARD.md:639-646), so the resend is the exception to D-026's rule
+against resending a write (DECISIONS.md:852-854) that §5 already claims for it. An empty
+block is the threshold's case with nothing left, and asks for nothing new. The block size
+and the threshold stay tunable (Q17); the slice that builds the lease chooses the pair on
+a measurement in `sim/shard.rs`, how often a split finds an empty block under Phase 2's
+network faults, printed at every tier beside the choice.
+
+**What is measured before it is asserted (Q39, D-061).** A split refused for want of an
+id is a coverage count of `sim/shard.rs`, counted per run and printed at every tier
+beside Stage D's four (SHARD.md:2643-2648), under the rule Stage D states for those:
+asserted non-zero over CI's hundred seeds and above, and a count a hundred seeds leave at
+zero is a hole in the driver's draw, fixed there and never a tier raised. The hole's fix,
+if one is needed, is a partition that isolates a splitting node from range 0's majority
+for long enough to spend its block, on the driver's own stream. The per-seed assertion,
+wherever the situation is reached: the refusal is the driver's answer; no `RangeSplit`
+and no `RangeCreated { cause: split }` follows it on that node until a `RangeIdsLeased`
+carrying that node's run is traced; and the same asker's retry after the heal takes
+effect within the liveness bound. A refusal at proposal is not a state transition of any
+range and traces no event of its own, as Q23's refusals trace none; if the studio needs to
+see one, that is one addition for both reasons and is proposed when it is needed.
+
+**Consequences.**
+
+- Stage C's build list reads "the exhausted block's answer as question 1 settles it"
+  (SHARD.md:2462-2464). This entry is that answer, and the lease slice cites it.
+- No new trace event and no new answer type: the reason rides the refusal Q23 already
+  returns.
+- The alternatives stay open where the measurement says so. If `sim/shard.rs` shows a
+  node's splits refused for want of an id on seeds where the node still reaches range
+  0's leader, the refill's resend is what to look at first, not this answer; that figure
+  is the count above, split by whether a `RangeIdsLeased` for the node was traced within
+  a minimum election timeout of the refusal.
+- Nothing moves: no schedule, no pinned hash, no code. This entry lands before the code
+  that depends on it, as §12 asks (SHARD.md:2065-2068).
+
+---
+
+## PROPOSED D-093 — Check 19's tripping variant is a test instrument of the range layer's own, `SplitLeavesGap`, outside §10's count
+
+**Context.** Stage C's second question before code (SHARD.md:2430-2437). §11's raft item
+12 asks every new fold of §8 to run under the incremental checker's equivalence test with
+a variant that trips it (SHARD.md:1889-1893;
+`the_incremental_checker_agrees_with_the_fold_over_the_whole_trace`,
+sim/tests/raft.rs:4414-4424), and §12 restates it for every stage: "a fold that no
+variant trips is a question to the owner, not a test left without one"
+(SHARD.md:2051-2056). Check 19, the ranges tile the keyspace — after every event no two
+latest spans overlap, and after every `RaftApply` of a range command they cover the
+addressable keyspace with no gap (SHARD.md:1323-1328) — is built in Stage C
+(SHARD.md:2480-2482), and §10 names no variant that trips it. The one mention is
+`UnfreezeBeforeAbortCommitted`'s row, which check 19 sees in shape (e) "only if R traces a
+value after the merge" (SHARD.md:1742). The question lists three ways out, and both Stage
+C's exit and Stage E's build list wait on the choice (SHARD.md:2519-2521, 2740-2741).
+
+**Why no variant of §10 trips check 19.** Each of the twenty-four breaks one rule with a
+reference, and that rule's own check catches it first. A variant that shapes a descriptor
+differently on different replicas is check 7's (agreement, SHARD.md:1214-1224); one that
+leaves two initialised replicas of one node covering a key is check 8's
+(SHARD.md:1225-1235); one that serves a key outside its span is check 9's
+(SHARD.md:1236-1241). Check 19 is the cluster-wide property those leave implicit: that the
+descriptors every replica agrees on, and every node keeps disjoint, also add up to the
+keyspace. The only way to reach it with checks 7 and 8 silent is to write the same wrong
+span on every replica of a range, and nothing in §10 does, because §10's variants are
+protocol mistakes and that is a translation mistake. That is not a hole in §10; it is what
+a tiling check is for, and the fold needs an instrument that the protocol's variants do not
+happen to be.
+
+**Three options, and what each asserts.**
+
+- *A. A variant for the equivalence test alone, outside §10's count.* Built in Stage C
+  beside check 19; the fold trips on every seed on which a split takes effect; asserted
+  from the stage that builds the fold.
+- *B. `UnfreezeBeforeAbortCommitted`, in Stage E, on the seeds of shape (e) where R traces
+  a value after the merge.* Leaves check 19 with no tripping variant through Stages C and
+  D, and rests on a rate nobody has measured, which the row's own wording allows to be
+  zero. Where it is not zero, checks 12 and 10 trip on the same seeds before 19 does, so
+  the trace the equivalence test sees carries several violations, and the first one is
+  never this fold's.
+- *C. §11's raft item 12 amended for check 19.* Exempts one fold from the rule that exists
+  because an incremental fold's bugs hide on traces with no violation (D-046).
+
+**Proposed: A**, with B kept as a measurement in Stage E and not as the assertion, and C
+not taken.
+
+**The variant, `SplitLeavesGap`.** Every replica of P applies the split with the right
+half's descriptor starting one key past the split key: R is written `[succ(k), y)` where
+the correct apply writes `[k, y)`, and `succ(k)` is `k` followed by a zero byte, the least
+key above it. P shrinks to `[x, k)` as it should. The split key itself then lies in no
+range, on every replica, from the split's apply on.
+
+What it trips, and what it does not. Every replica writes the same wrong span, so check 7
+is silent; the two spans on any one node are disjoint, so check 8 is silent; and no
+`RaftApply` or `RaftRead` names a key outside its own descriptor, so check 9 is silent — a
+request for `k` is answered `RangeMismatch` at receipt by P and by R alike, each correctly
+by §3's rules against its own descriptor. Check 19 trips at the `RaftApply` of the split
+entry on the first replica to apply it: the latest spans cover the keyspace with a gap of
+one key. It trips on *every seed* on which a split takes effect, so the equivalence test
+has a violating trace on every seed the sharded sweep runs, and no rate is measured;
+Stage C's exit already asserts per seed that the driver's splits take effect. Beyond the
+fold, the only other reporter is the liveness bound on uniform seeds, and only when a
+client's key is `k` itself, which the sweep's draw reaches on a share of seeds that is
+printed and asserted nowhere.
+
+Where it lives. In `ananke-shard`'s range-layer variant set (Q37, SHARD.md:3208-3212),
+beside the eight of §10 that Stage C builds, marked as a test instrument outside §10's
+count exactly as the node's `NodeVariant`s are: "they do not appear in
+`ananke_raft::Variant::BUGS` or in §10's count" (crates/ananke-shard/src/variant.rs:1-9).
+D-045 holds: a variant is a set, and this member's fix is the one expression that writes
+R's start. It is also CLAUDE.md's known-buggy variant for the fold's own sweep test: the
+pair rule asks that the buggy variant be *seen to fail* the check the correct system
+passes, and the equivalence test of §11 is that pair with the fold's incremental form held
+to the same verdict.
+
+**Why not a variant that overlaps.** A parent that keeps its whole span, R written over
+`[k, y)` with P left at `[x, y)`, is the other one-line mistake, and check 8 catches it on
+the first node to apply, before check 19 sees it; its protocol cousin,
+`SplitNotAtomicWithDescriptor` (Stage D), is check 7's. The gap is the one shape of a
+wrong split that only the tiling sees, which is what makes it the right instrument for the
+tiling's fold and not for any other.
+
+**What B buys, kept as a measurement.** Stage E's build list reads "check 19's variant, if
+Stage C's question 2 chose `UnfreezeBeforeAbortCommitted`" (SHARD.md:2740-2741); with A
+chosen that line is discharged. In its place `sim/merge.rs`'s shape (e) prints the seeds on
+which R traces a value after the merge and check 19 trips, as a figure beside check 10's
+and check 12's catches, asserted nowhere. If that figure clears D-061's five per cent at
+the tier (e) runs at, check 19 gains a second tripping variant in Stage E, as a
+strengthening the measurement earns and not a condition this entry sets.
+
+**Consequences.**
+
+- Check 19 runs under the equivalence test from Stage C with `SplitLeavesGap`, and Stage
+  C's exit line, "check 19 runs under the test the same way, and is asserted against a
+  tripping variant as question 2 settles" (SHARD.md:2519-2521), is settled: asserted, in
+  Stage C, on every seed.
+- §10's count stays twenty-four; §11's raft item 12 is not amended; the range layer's
+  variant set carries one member beyond §10's, as it already carries the node's.
+- The instrument is a split's, so it exists from the slice that builds the split's apply,
+  which is also where check 19 is first fed; the two land in the same slice, whose fold
+  test asserts the variant caught on every seed and the correct system green.
+- No schedule, no pinned hash, no code in this entry.
+
+---
+
+## PROPOSED D-094 — The released phases' sweeps run at CI's hundred under the premerge: `released_seeds()`, and the premerge's thousand is the current phase's
+
+**The number.** The footer on `main` reads D-092, and PR #129 (`phase-3-stage-c-questions`)
+takes D-092 and D-093 for Stage C's two questions and moves it to D-094. This branch is
+off `main` and not stacked on #129, since the owner approved this change in advance and
+it may merge first; it takes **D-094**, past #129's two, and moves the footer to D-095.
+Whichever merges second resolves the footer as the union, as D-088 did. Every code site
+carries `// PROPOSED(D-094)`.
+
+**Context.** D-040 set the premerge at a thousand seeds of every sweep, in release, on the
+machine in front of you, in about a quarter of an hour (DECISIONS.md:1735-1739), and §12
+holds every stage to that budget (SHARD.md:2041-2045). Stage B's tag names the budget as
+one of the two lines of its exit that were not met: `scripts/premerge.sh` measured 1 013 s
+clean on #86's tip and 1 881 s on the shape tip, and Stage B's own rows were about 640
+cpu s of the table's 7 765. The remedy the owner chose at the stage's close, 2026-09-25,
+is to re-tier the Phase 1 and Phase 2 sweeps, which have ten-thousand-seed nightlies of
+their own, and to write the entry first; the owner approved it in advance so the work
+need not stop for it.
+
+**What the premerge is made of.** `scripts/nightly-shards.txt` weighs every test of the
+sim binaries in cpu seconds at a thousand seeds (D-064; 8-core Apple M2). Summed by the
+system each test runs:
+
+| Rows | cpu s at 1 000 | Share | System under test |
+| --- | ---: | ---: | --- |
+| Phase 1: `echo`, `wal`, and the engine sweep's four (the correct engine and its three variants) | 1 065.7 | 11.1 % | the storage engine as v0.2.0 released it, with Stage A's lanes S and N on the correct engine's sweep |
+| Phase 2: `sim/tests/raft.rs`, whose every sweep runs the one-group server | 4 356.0 | 45.3 % | the one-group server as v0.3.0 released it: the raft arms, the membership scenario, `sim/quorum.rs`, the term-raise schedule, the lease trial |
+| Stage A's engine tests: the three crash tests and D-068's share | 2 198.3 | 22.9 % | the span primitives Phase 3 built |
+| Phase 3, Stage B: `node`, `ranges`, `reseed`, `install`, `parallel` | 1 968.6 | 20.5 % | the node |
+| Kept as they are: the incremental checker's comparison at `min(seeds, 100)` and the two fixed-seed audits | 25.2 | 0.3 % | — |
+| | **9 613.8** | | |
+
+More than half the premerge's cpu is spent sweeping systems no Phase 3 slice changes on
+purpose, each of which the nightly sweeps at ten thousand every night on `main`.
+
+**Decision — the owner's of 2026-09-25, given in advance of this entry.** A sweep of a
+released phase's system runs `ananke_sim::released_seeds()` instead of `seeds()`:
+`ANANKE_RELEASED_SEEDS` when set and a number, else `seeds()`. `scripts/premerge.sh`
+exports it at **100**, CI's tier, beside `ANANKE_SEEDS=1000`. The gate, CI and the nightly
+set nothing, so they run those sweeps at 20, 100 and 10 000 as before. Nothing else moves:
+the same tests, the same arms, the same assertions with the same tier gates, and every
+rate line prints the count the sweep actually ran.
+
+The sweeps that move are exactly the first two rows of the table: 31 tests, and one
+comparison. Phase 1's: `echo`'s sweep, `wal`'s four, and in `engine` the correct engine's
+sweep and the three Phase 1 variants through `is_caught`. Phase 2's: every test of
+`sim/tests/raft.rs` that swept `seeds()`, 22 of them, the six through `is_caught` and the
+three through `quorum_sweep` included; and the incremental checker's comparison,
+`compared_seeds()`, reads `released_seeds().min(100)`, which is 100 at every tier from CI
+up, as it was. The binary's 22 pinned-seed rows, under a cpu second each, run one seed
+whatever the tier and are in the row's figure without moving. The ones that stay are named
+by what they test, not by their file: Stage A's engine tests, which sweep the primitives
+Phase 3 built — and `high_rate_share()`, D-068's share of `seeds()`, with them — and every
+binary of Stage B.
+
+**What the premerge stops asserting, and where it is asserted instead.** Under the rule of
+D-061 an assertion gated `seeds >= 1000` ran at the premerge and the nightly. For the moved
+sweeps the premerge now sees a hundred, so those gates open in the nightly alone, which is
+the tier the owner named. They are five, by file: `sim/tests/wal.rs:181`, the betrayed-cut
+excuse reached (3.4 %, D-061); `sim/tests/raft.rs:2685`, `RefusalNotDurable` caught (D-056,
+1.32 % at the nightlies; 58 of 1 000 on this tree's baseline below); `raft.rs:3322`,
+`LeaseTrustsTheClock`'s stale read caught (4.0 %; 41 of 503 drift-exceeded seeds below);
+`raft.rs:4326`, the membership runs' elections while joint; and `raft.rs:4343`, their
+reverts to a compacted or installed prefix (D-058, 2.8 %). `raft.rs:3163`,
+`SharedSnapshotDir`'s liveness catch, was the nightly's already and does not move. Each
+keeps printing its rate at the premerge, so a slice that took a catch to zero would still
+show in the line; what the premerge no longer does is fail on it. The gates at `>= 100` are
+unchanged in effect, since a hundred is what the premerge now runs. No assertion text
+changes.
+
+**What it costs the premerge as a net.** Phase 3 slices change `ananke-raft`'s core —
+D-079's `RaftMatchStarted`, D-087's refused bit, D-091's arm — and `sim/raft.rs`'s
+one-group sweep is the regression net for those changes. That net drops from a thousand
+seeds to a hundred at the premerge and keeps its ten thousand in the nightly; a core
+change that reddens one seed in three hundred is seen by the nightly on `main` the night
+after it merges rather than by the premerge the hour before. That is the trade the ruling
+makes, and the nightly on every stage's branch before its tag (SHARD.md:2029-2037) is what
+bounds it: no stage closes on a premerge.
+
+### The measurement, both trees on one machine, back to back (D-052, D-069, D-070)
+
+**The machine, and what every figure is a figure of** (D-070). This session's container:
+Linux 6.18.44 x86_64, an Intel Xeon at 2.80 GHz, **four cores**, nothing else of this
+session running during either run. Both runs from a warm release build (`cargo test
+--release --no-run` first, D-052: instant for the first, 42 s for the second), each
+`scripts/premerge.sh` as it stands on its tree, with the one-minute load sampled every
+15 s beside the script's own before-and-after lines. The script's state line read
+`Battery Power` on both runs and that reading is wrong: the container lists no supply
+under `/sys/class/power_supply` at all, and the Linux branch took the absence of an
+`online` flag for a battery. This branch corrects that line to read `unknown power source`
+where nothing is listed, which is what D-070 asks of a field a machine does not report;
+the figures below are unaffected, since neither run was throttled and the load held at
+the four cores throughout both.
+
+| Run | Wall | Mean 1-min load (samples) | Load before / after |
+| --- | ---: | ---: | --- |
+| `main` at 527adcd, before | **1760 s** | 3.88 (118) | 0.42 / 4.00 |
+| the same tree plus this change, after | **966 s** | 3.98 (65) | 2.89 / 4.04 |
+| saved | **794 s, 45.1 %** | | |
+
+Per binary, from each test binary's own `finished in`:
+
+| Binary | Before | After |
+| --- | ---: | ---: |
+| `tests/raft.rs` | 764.1 s | 84.2 s |
+| `tests/node.rs` | 487.3 s | 488.7 s |
+| `tests/engine.rs` | 401.8 s | 302.3 s |
+| `tests/ranges.rs` | 48.2 s | 48.2 s |
+| `tests/reseed.rs` | 30.2 s | 30.1 s |
+| `tests/wal.rs` | 16.0 s | 1.8 s |
+| `tests/install.rs` | 5.3 s | 4.7 s |
+| `tests/parallel.rs` | 2.6 s | 2.7 s |
+| `tests/echo_cluster.rs` | 2.0 s | 2.0 s |
+
+Read the `raft` row first: 764 s to 84 s is the whole of Phase 2's sweep at a tenth of its
+seeds, and the `node` row beside it is unchanged to the second, which is the change doing
+exactly what it says and nothing else. The `engine` binary's 100 s are Phase 1's four
+sweeps; its remaining 302 s are Stage A's crash tests at the thousand, the next 22.9 % of
+the table above, left where the ruling leaves them. The `wal` binary is the smallest win
+and shows the ratio plainest, 16.0 to 1.8. Every moved sweep's rate line prints its
+count as 100 on the second run — `RefusalNotDurable: caught on 6 of 100 seeds` against
+58 of 1 000 on the first, the lease trial's drift on 52 of 100 against 503 of 1 000 —
+and the incremental checker's comparison ran its 100 seeds on both, as `min(seeds, 100)`
+says it should.
+
+**What this is not comparable with.** Stage B's tag quotes 1 013 s and 1 881 s; those are
+the eight-core Mac's, on trees before this one, under loads the tag does not give, and
+D-070 says a figure from another machine is evidence only beside its state. What this
+entry claims is the pair: the same tree, the same machine, the same hour, 45 % off. The
+share is of cpu and not of this machine, so the Mac's premerge should fall by about the
+same share; the next premerge run there records its own figure beside these, and does
+not carry these over.
+
+### Consequences
+
+- `scripts/premerge.sh` prints both counts in its verdict line.
+- CLAUDE.md's verification line and its D-061 bullet say where a released phase's
+  thousand-seed assertions now run; D-040's text is superseded for the premerge's count
+  and not edited.
+- The nightly shard table is untouched: its weights are at a thousand seeds and the
+  nightly runs every row at ten thousand as before.
+- Stage A's engine tests are the next 22.9 % and are not moved here: they sweep primitives
+  Phase 3 built, the owner weighed their tiers on PR #70 (D-068) with the budget in view,
+  and the ruling names Phase 1 and Phase 2. Whether Stage A's join them when Stage C's
+  scenarios land is the owner's, with the figure above beside the question.
+- A later phase re-tiers Phase 3's sweeps the same way: `released_seeds()` is the switch,
+  and a test moves by naming it.
+
+---
+
 ## PROPOSED D-095 — The node's apply-lag, cross-range hold and coverage folds run under the equivalence test, and the variant that trips the two with a verdict
 
 **The number.** Off `main` at 527adcd, whose footer reads D-092. PR #129 takes D-092 and
@@ -18041,6 +18415,12 @@ determinism tests hold.
   had parted them; seed 368's pin asserts the instant, so a read added to the switch
   again fails a pinned seed rather than silencing an exemption over a thousand.
 
+**Superseded in part by D-101.** The widening of `RefuseOneRangeOnly`'s attribution to
+state machine safety on group 1 was partial: on fdc5fc0 seed 2994 is caught by leader
+completeness on group 4, the variant's empty replica voting on state its node lost, and
+the nightly went red on it. D-101 admits that witness off group 0, with the split at ten
+thousand (3 338 / 6 661 / 1).
+
 ## PROPOSED D-099 — Range ids leased in blocks: a refill to range 0 carrying the run's nonce, granted at the counter in one batch and traced, adopted only by the run that asked, and kept outstanding at or below the threshold
 
 **The number.** Stacked on PR #134 (D-098), whose footer reads D-099. This takes
@@ -18637,6 +19017,169 @@ window. Seed 42's one-group JSONL is #133's.
 - Check 18 has both its clauses; check 8's overlap clause and check 20 wait for the
   slices that build what they check.
 
+## PROPOSED D-101 — `RefuseOneRangeOnly`'s third witness: leader completeness on any range but the root, because the verdict asks the invariants before the fan-out clause
+
+**The number.** Assigned with the fix PRs opened against `main` at fdc5fc0: this takes
+**D-101**, the two beside it take D-102 and D-103, and the footer here moves to D-102. At the
+merge the entries are a union in numerical order with one footer, highest + 1. Every code
+site carries `// PROPOSED(D-101)`.
+
+**Context.** The nightly on `main` at fdc5fc0 (run 38082122222) is red on one test alone:
+shard 3's `a_node_that_refuses_only_one_range_is_caught_on_the_sharded_quorum_scenario`,
+the pair D-085 shipped beside the sharded quorum scenario's correct node. Every one of the
+10 000 seeds was caught, as the test asks; what failed is its attribution, the assertion
+that every catch is the variant's own bug in a form the test names. CI's log cuts the
+panic's payload off; a local run of the same binary gives the same 3 338 / 6 661 split and
+names the remaining seed, **2994**, caught by **leader completeness**: "index 14 of group 4
+(term 1) was committed in term 1 but server 2, leader of term 3, does not hold it".
+
+The attribution was too strict from the start. D-085 (17f042f, PR #104) asserted that
+every catch was the fan-out clause's own words, measured at 1 000 of 1 000. Under
+`RefuseOneRangeOnly` the replicas the variant leaves unrefused have always come back empty
+and able to vote; what kept the assertion green was that no measured seed had reached a
+violation the verdict names first. PROPOSED D-096 (PR #132) made the store that opens
+first range 0's, so the variant refuses the root alone and leaves every user range
+unrefused, and moved every schedule: the nightly on 6c54705 (run 37918619653) went red on
+seed 3352, leader completeness on group 3. PR #133 moved the schedules off it. PROPOSED
+D-098 (PR #134, e4a8063) then met the meta range's own witness — state machine safety on
+group 1, 664 of 1 000 — and widened the assertion to admit it, **and to admit that
+alone**. On fdc5fc0 seed 2994 reaches leader completeness again, on group 4. **D-098's
+widening was partial**: it admitted the witness its thousand showed and not the one the
+variant's own documentation names, "three replicas voting again on state their node lost
+(D-035)".
+
+### The mechanism, seed 2994
+
+Read off the trace of `quorum::node_run(2994, …, RefuseOneRangeOnly)` and asserted by the
+pin below. Before the victim's crash, range 4's term 1 committed index 14 on a majority of
+the victim (server 1) and server 3; server 2 held up to index 13. The victim crashes at
+1.2 s and restarts at 1.22 s on a store marked lost. The variant refuses range 0 alone
+(`RaftReplicaRefused` names range 0 and nothing else), so the victim's replica of range 4 is
+re-created in the fresh engine as a first start would create it: `RaftRecovered` with term
+0, last index 0, incarnation 1, state `Neither` — empty and unmarked. Server 3 leads term
+2 briefly and is cut off at 1.32 s. Server 2 asks for votes in term 3, and the victim's
+empty replica grants both the pre-vote and the vote: its log is shorter than server 2's,
+so the up-to-date rule passes, and it is the only vote server 2 is given. With its own, it
+is the majority of three that elects server 2 at 1.498 s with index 13 as its last, and
+server 2 then writes a term-3 entry over index 14. Leader completeness sees the election.
+
+`NodeReport::check` asks `ranges::invariants_of` before the fan-out clause, and leader
+completeness is ahead of state machine safety in `Checker::verdict`'s order, so the catch is
+named leader completeness — the same bug, the node's other replicas serving over an engine
+that lost state (D-077), seen by a third check. On the correct node the same seed draws
+the same victim, its replica of range 4 is refused with its node and restated `Refused`
+on an incarnation of its own, it is asked for a vote 14 times after the refusal and grants
+none (D-035), and the seed passes. Seed 3352 on 6c54705 is the same mechanism on group 3,
+index 11, per the diagnosis of the red nightlies.
+
+### Decision
+
+1. **The pair's attribution admits leader completeness as the variant's third witness,
+   on any group but 0.** The group is read off the verdict's exact words — `ananke_raft::
+   invariants` writes "leader completeness: index {index} of group {group} (term
+   {entry_term}) was committed in term {in_term} but server {server}, leader of term
+   {term}, does not hold it" — by `leader_completeness_group` in `sim/tests/node.rs`,
+   which returns the group or `None`: the group is parsed from that clause's own words,
+   so no other text of a verdict can stand in for it. The test asserts every catch is the fan-out clause, state
+   machine safety on group 1, or leader completeness off group 0, and prints each share
+   at every tier.
+2. **Group 0 is excluded, and fails the test with a message of its own.** The variant
+   refuses `ranges.first()`, which is range 0, exactly as the correct node refuses it:
+   refused, re-seeded with the refused mark, quarantined from voting (D-035). The
+   variant's amnesia cannot reach the root, so a leader-completeness violation there is
+   something else, and the test says so rather than counting it.
+3. **Leader completeness alone, not every invariant.** Committed entries stay, commit by
+   majority and commit by current term are plausible witnesses of the same amnesia, and
+   none has been seen at ten thousand seeds on any tree. One that appears fails the test
+   and is read before it is admitted, as this one was.
+4. **Its firing is asserted at no tier.** It is one seed of ten thousand, far under
+   D-061's 5 %; the fan-out clause stays the witness asserted seen at every tier, and
+   **seed 2994's pin asserts the mechanism** — the variant's verdict word for word, the
+   commit and the victim holding index 14 before the refusal, the refusal of range 0
+   alone, the victim's replica of group 4 restated `(term 0, last index 0, incarnation
+   1, Neither)`, its granted vote the only one server 2 was given before its election,
+   the leader's last index 13 — and, on the correct node, the same victim, its replica
+   refused and restated `Refused` on an incarnation other than 1, asked and granting
+   nothing, the seed green. The day the schedule moves off, the pin fails and is
+   re-audited to the absence with its reason.
+5. **The test's documentation says the verdict asks the invariants before the fan-out
+   clause**, names the three witnesses, and corrects "three of the four replicas were
+   never refused" to what the bootstrap made true: the variant refuses the root alone,
+   and none of the four user ranges the clause asks about.
+
+This **supersedes D-085's attribution** — "every catch is that clause's own words" — and
+D-098's widening, which this completes. D-085's pair, its standard (caught on every seed
+at every tier) and its scenario are unchanged.
+
+### Measured before asserted (Q39), on this tree
+
+From the built release binary (`node-<hash> <test> --exact`), Apple M2, 8 cores, on AC
+Power; the ten thousand at load averages 3.18/4.44/18.91 before and 18.13/9.36/18.58
+after (D-070):
+
+| | 20 | 100 | 1 000 | 10 000 |
+|---|---:|---:|---:|---:|
+| `RefuseOneRangeOnly` caught | 20 | 100 | 1 000 | **10 000** |
+| … by the fan-out clause | 7 | 28 | 345 | **3 338** |
+| … by state machine safety on group 1 | 13 | 72 | 655 | **6 661** |
+| … by leader completeness off group 0 | 0 | 0 | 0 | **1** (seed 2994, group 4) |
+| … by leader completeness of group 0 | 0 | 0 | 0 | **0** |
+| correct node, failed | 0 | 0 | 0 | **0** |
+
+The ten thousand of the variant took 69.2 s (515.6 user + 15.4 sys), the correct node's
+74.1 s (448.4 + 14.4); the correct node's figures at ten thousand: 40 000 replicas refused
+and re-seeded, 25 871 ranges on the keeper's majority and every one committed through a
+re-seeded replica, 14 129 step-downs of a cut-off leader, 9 607 seeds carrying both
+outcomes, 0 streams. The split at the thousand is D-100's (345 / 655): nothing here moves
+a schedule. The diagnosis measured the same test patched on 6c54705 at 9 999 by the
+fan-out clause and seed 3352 by leader completeness.
+
+### What the widening could hide, shown with planted failures
+
+Admitting a witness loosens an assertion, so what it could hide was planted and run
+(each applied to this tree, swept at ten thousand from the release binary, and reverted;
+none is in the commit):
+
+- **D-035 broken in the core, on every range** — `on_pre_vote` and `on_request_vote`
+  grant past `self.quarantined`, so a refused or re-seeded replica votes: the correct
+  node's sweep fails **9 129 of 10 000**, 9 128 by its clause that a range whose leader
+  was cut off elects no other in the hold, and **seed 2994 by the identical leader-completeness verdict** the
+  variant gives; seed 2994's pin fails at its control half. The variant's test passes
+  under the plant (3 331 / 6 668 / 1): its own catches name every seed first, as they
+  would name any core bug first. **That is why the attribution may be widened: the pair's
+  correct half runs the same scenario on the same seeds at every tier, and it is what
+  catches a server that votes on lost state.**
+- **D-035 broken on range 0 alone**: 0 of 10 000 on the correct node, and the variant's
+  split unchanged. The scenario's hold clauses ask the four user ranges only, so a root
+  replica that votes after its refusal is seen by nothing here — filed as **issue #143**,
+  not widened into this slice.
+- **The group-0 exclusion.** No run on this tree produces leader completeness on group
+  0, the root plant included, so the exclusion is shown on a planted trace: seed 2994's
+  variant run with ranges 0 and 4 swapped in every record that names a range gives, from
+  the real `NodeReport::check`, "index 14 of group 0 (term 1) was committed in term 1 but
+  server 2, leader of term 3, does not hold it"; `leader_completeness_group` reads group
+  0, and the test fails on it. With the exclusion mutated away (`is_some()`), the same
+  verdict is counted as the variant's and the test passes.
+
+**The mutation a single-range world could not catch** is that last one. On one group,
+"which group the violation is on" cannot be wrong; here the variant refuses one range
+exactly as the correct node does and leaves the others amnesiac, and the attribution must
+tell the two apart by the group the verdict names.
+
+### Pinned hashes and seeds
+
+No production code changes, no draw and no trace event: no schedule moves, no pinned
+trace hash moves, and no pinned seed needs re-auditing. One pin is added,
+`seed_2994_is_an_unrefused_empty_replica_electing_a_leader_without_a_committed_entry`,
+two runs of one seed, weighed at 0.05 cpu s and rounded to 0.1 into the lightest nightly
+shard, shard 5 (1 623.8 → 1 623.9).
+
+### Asks
+
+- **PROPOSED**: admit leader completeness alone, as measured, and fail on any other
+  invariant until it is read — recommended. The alternative, every safety invariant from
+  `invariants_of` off group 0, would admit witnesses no tree has shown.
+
 ---
 
 ## PROPOSED D-103 — The membership scenario's per-range liveness reads what the clients asked: a range asked for no write after the heal is no evidence, a range asked for anything and answering nothing still fails, and the range bound that cannot trip goes to the owner (amends D-084)
@@ -18645,7 +19188,8 @@ window. Seed 42's one-group JSONL is #133's.
 branches open beside it take D-101 and D-102, and PR #137 restores D-092 to D-094; the
 brief that assigned this one gives it **D-103**, and the footer moves to D-104. Every code
 site carries `// PROPOSED(D-103)`. At the merge the entries are a union in numerical
-order with one footer.
+order with one footer: merged with `main` at 195f965, which brought D-101 (#144) and
+#137's D-092 to D-094, the footer stays D-104.
 
 **Context.** Nightly 38042926336 on 314ac8f was red on shard 3 with one seed of ten
 thousand in `every_seed_passes_the_membership_scenario_on_the_correct_node`: *seed 1969:
