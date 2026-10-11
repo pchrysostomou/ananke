@@ -19491,9 +19491,18 @@ write to k5 is proposed into the same log as a write to k4.
 
 **The range is the one serving the key where the run stopped**, not `Report::key_range`'s,
 for the reason above: `Report::splits_taken` folds the first `RangeSplit` of each split in
-the trace's order, and `Report::serving_at_the_end` moves the keys at or above each
-split's key — the engine's encoding of the user key, which keeps its order — to the right
-half.
+the trace's order, with when it was traced, and `Report::serving_at` moves the keys at or
+above each split's key — the engine's encoding of the user key, which keeps its order — to
+the right half. **A completion is the evidence of the range that served its key when it
+completed** (amended after #157's review): `serving_at` at the completion's return applies
+only the splits traced by then. As first merged, every completion was read through the
+range serving its key at the end, so a write a parent committed before a split later
+than it counted as the right half's evidence, though the right half's log did not exist
+yet, and not the left half's, which keeps the parent's log. On the correct node 372 of ten
+thousand runs trace a split's first `RangeSplit` after the last heal (the review's count).
+Read both ways, over every run of every scenario measured below, the two assignments give
+the same liveness and `check()` verdict on every run: the change makes the reading exact
+and moves no figure.
 
 **PROPOSED: what excuses a write pending at the end.** Both conditions are this entry's
 own, and neither is settled by SHARD.md §8, which asks the bound of every post-heal write
@@ -19548,11 +19557,13 @@ merged tree prints the same line, verdict for verdict and figure for figure, on 
 measured the same way, by a second probe built on this branch's merge with `main` at
 7564917, which reads every run under D-086's reading, #154's form, the taken form and the
 client's wait alone. Its reading of #154's form agrees with that tree's own
-`Report::liveness` on every run of every scenario below. Rebuilt on the amended tree, its
-taken form agrees with that tree's `Report::liveness` on every run it read there:
-`ApplyWaitsForEveryRange`'s ten thousand, seeds 0 to 1 999 of `SharedSnapshotDir`, and 0
-to 999 of the correct node, of D-045's pair and of one group's `SharedSnapshotDir`. The
-third column is #154's, the fourth
+`Report::liveness` on every run of every scenario below. It reads the taken form twice,
+each completion by the range serving its key at the end and at its return, and the two
+agree on every verdict of every run. Rebuilt on the amended tree at each of its two
+commits, the matching form agrees with that tree's `Report::liveness` on every run it read
+there: `ApplyWaitsForEveryRange`'s ten thousand, seeds 0 to 1 999 of `SharedSnapshotDir`,
+and 0 to 999 of the correct node, of D-045's pair and of one group's `SharedSnapshotDir`.
+The third column is #154's, the fourth
 the amended entry's; every node sweep whose check reads liveness is in the table, each at
 the tier its nightly runs.
 
@@ -19705,9 +19716,13 @@ b01db39 (38141605412), the base, the lines that move are **four**:
   to 1.359 s before the end, are all pending. The liveness fold reports k4 and `check()`
   fails on it. The pin also runs the counterfactual itself: with the settle extended by
   4 s the trace is the same up to the original end, and none of the three is answered.
-- **Four more hand-built cases** in `sim/raft.rs`: the evidence after the write's call
+- **Five more hand-built cases** in `sim/raft.rs`: the evidence after the write's call
   (`a_completion_before_a_pending_writes_call_shows_nothing_of_it`, after #157's review:
   one range, a completion 1 ms before the call is no evidence and one 1 ms after it is);
+  a completion as the evidence of the range serving its key when it completed
+  (`a_completion_is_the_evidence_of_the_range_serving_its_key_when_it_completed`, after
+  #157's review: a three-key range split at k1, a completion before the split is the left
+  half's evidence and not the right half's, and after it the right half's);
   the evidence asked of the range and not of the cluster
   (`a_write_pending_at_the_end_is_excused_only_on_a_range_shown_live`: one history under
   two maps, excused with both keys in one range and the wedge with each key its own —
@@ -19729,7 +19744,9 @@ the seed-12/8 pin); the client's wait dropped (the in-flight case and seed 2809'
 `run_on` carrying the schedule's total as its end (the pins of 8885, 2809 and 12/8); and
 `sim/ranges.rs` carrying the origin as its end (its directed seed). After #157's review,
 on the amended tree: the evidence older than the write, any completion after the heal as
-first merged (the after-the-call case and seed 613's pin fail).
+first merged (the after-the-call case and seed 613's pin fail); and a completion read
+through the range serving its key at the end rather than at its return (the
+when-it-completed case fails, and no sweep pin, as no sweep verdict moves).
 
 ### `SplitFromRestarted`'s no-split branch
 
@@ -19766,8 +19783,10 @@ was meant.
 - The run's end in the liveness readings is where the run stopped, on both sites.
 - A write pending at that end is evidence unless its client was still waiting for it, or it
   is inside the bound on a range — the range serving its key, splits followed — that
-  completed a post-heal write after it was called (amended after #157's review; as first
-  merged, any post-heal completion, which passed eleven `ApplyWaitsForEveryRange` stalls).
+  completed a post-heal write after it was called, each completion the range's that served
+  its key when it completed (both amended after #157's review; as first merged, any
+  post-heal completion, read through the range serving its key at the end, which passed
+  eleven `ApplyWaitsForEveryRange` stalls).
 - No bound moved, no schedule moved and no trace moved: the change is in the reading alone,
   so no pinned hash moves and no pinned seed's schedule is re-audited.
 - D-086's end-of-run reading is superseded, and D-086 carries a forward pointer.

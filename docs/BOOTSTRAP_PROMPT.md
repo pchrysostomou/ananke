@@ -144,9 +144,10 @@ _Update this section at the end of every session._
   stopped, and a write pending there is excused only inside its client's own wait
   (`WRITE_TIMEOUT`), or inside the bound on the range serving its key, splits followed,
   once that range completed a client write, called after the heal, after the pending
-  write's call. #154 merged that clause without the last condition, and #157's review
-  found it passing eleven real `ApplyWaitsForEveryRange` stalls; the amendment on #157
-  restores them. What excuses a pending write is the PROPOSED ask, measured at ten
+  write's call, each completion the range's that served its key when it completed. #154
+  merged that clause without the call condition, and #157's review found it passing
+  eleven real `ApplyWaitsForEveryRange` stalls; the amendment on #157 restores them (the
+  completion's range at its return moves no verdict and makes the reading exact). What excuses a pending write is the PROPOSED ask, measured at ten
   thousand as (correct node failures; stalls passed; `SharedSnapshotDir` artefacts
   reported beyond #154's): #154's form 0, 11, 0; the taken form 0, 0, 7; the client's wait
   alone 0, 0, 9. Neither
@@ -177,7 +178,7 @@ _Update this section at the end of every session._
   group's `SharedSnapshotDir` unmoved to the seed. Pinned: seed 8885 (the run stops
   2.588 s before its total; the tail absent, asserted with the reason), seed 2809, seeds 12
   and 8 under `SharedSnapshotDir`, seed 613 under `ApplyWaitsForEveryRange` (a stall with
-  its 4 s counterfactual run in the pin), five hand-built cases; eight mutations each
+  its 4 s counterfactual run in the pin), six hand-built cases; nine mutations each
   caught.
   `SplitFromRestarted`'s no-split `continue` read: it keeps `last_heal` at the last real
   heal and moving it would lose 47 uniform catches, so it stays (#147); the per-range

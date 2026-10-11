@@ -3391,9 +3391,10 @@ impl Report {
     }
 
     /// The splits the run took, in the trace's order, by the first `RangeSplit` of
-    /// each: (the parent, the right half, the right half's first key).
+    /// each: (the parent, the right half, the right half's first key, when that first
+    /// `RangeSplit` was traced).
     // PROPOSED(D-102): the exemption's evidence is the serving range's.
-    fn splits_taken(&self) -> Vec<(u64, u64, Bytes)> {
+    fn splits_taken(&self) -> Vec<(u64, u64, Bytes, Instant)> {
         let mut seen: BTreeSet<(u64, u64)> = BTreeSet::new();
         let mut splits = Vec::new();
         for record in &self.records {
@@ -3402,42 +3403,53 @@ impl Report {
             } = &record.event
                 && seen.insert((*range, *right))
             {
-                splits.push((*range, *right, key.clone()));
+                splits.push((*range, *right, key.clone(), record.at));
             }
         }
         splits
     }
 
-    /// The range serving `key` where the run stopped: [`Report::key_range`]'s, then
-    /// each split of `splits` ([`Report::splits_taken`]) moving the keys at or above
-    /// its key to its right half. [`Report::key_range`] is the map the run started
-    /// with and a split does not change it; this follows the splits, so a right half
-    /// and its parent are two ranges here, as they are two logs. A split's key is the
-    /// engine's encoding of the user's key, which keeps the user's order, so the
-    /// client's key is compared encoded.
+    /// The range serving `key` at `at`: [`Report::key_range`]'s, then each split of
+    /// `splits` ([`Report::splits_taken`]) traced at or before `at` moving the keys at
+    /// or above its key to its right half. At [`Report::ended`] that is every split:
+    /// the range serving the key where the run stopped. [`Report::key_range`] is the
+    /// map the run started with and a split does not change it; this follows the
+    /// splits, so a right half and its parent are two ranges here, as they are two
+    /// logs. A split's key is the engine's encoding of the user's key, which keeps the
+    /// user's order, so the client's key is compared encoded.
     // PROPOSED(D-102): the exemption's evidence is the serving range's.
-    fn serving_at_the_end(&self, splits: &[(u64, u64, Bytes)], key: &Bytes) -> u64 {
+    fn serving_at(&self, splits: &[(u64, u64, Bytes, Instant)], key: &Bytes, at: Instant) -> u64 {
         let encoded = user_key(key);
         splits
             .iter()
-            .fold((self.key_range)(key), |serving, (parent, right, first)| {
-                if serving == *parent && encoded >= *first {
-                    *right
-                } else {
-                    serving
-                }
-            })
+            .filter(|(_, _, _, traced)| *traced <= at)
+            .fold(
+                (self.key_range)(key),
+                |serving, (parent, right, first, _)| {
+                    if serving == *parent && encoded >= *first {
+                        *right
+                    } else {
+                        serving
+                    }
+                },
+            )
     }
 
     /// When each range last **completed** a client write called at or after the last
-    /// heal, each write by the range serving its key where the run stopped
-    /// ([`Report::serving_at_the_end`]): what shows a range live while a write was
-    /// pending on it, for [`Report::post_heal_writes`]'s exemption, which asks for a
-    /// completion after that write's own call. An operation the trace closed by its
-    /// entry's apply counts as completed, as everywhere else the history is read
-    /// (`lin.rs`): the entry committed, which is the evidence asked for.
+    /// heal: what shows a range live while a write was pending on it, for
+    /// [`Report::post_heal_writes`]'s exemption, which asks for a completion after
+    /// that write's own call. Each write is the range's that served its key **when it
+    /// completed** ([`Report::serving_at`] at its return), the log that committed it:
+    /// a write a parent committed before its split is the parent's evidence, which
+    /// its left half keeps, and never its right half's, whose log did not yet exist.
+    /// An operation the trace closed by its entry's apply counts as completed, as
+    /// everywhere else the history is read (`lin.rs`): the entry committed, which is
+    /// the evidence asked for.
     // PROPOSED(D-102): the exemption asks for the range shown live after the call.
-    fn last_completion_after_heal(&self, splits: &[(u64, u64, Bytes)]) -> BTreeMap<u64, Instant> {
+    fn last_completion_after_heal(
+        &self,
+        splits: &[(u64, u64, Bytes, Instant)],
+    ) -> BTreeMap<u64, Instant> {
         let mut last: BTreeMap<u64, Instant> = BTreeMap::new();
         for op in &self.history.ops {
             if let Some(ret) = op.ret
@@ -3445,7 +3457,7 @@ impl Report {
                 && op.call >= self.last_heal
             {
                 let at = last
-                    .entry(self.serving_at_the_end(splits, op.op.key()))
+                    .entry(self.serving_at(splits, op.op.key(), ret))
                     .or_insert(ret);
                 *at = (*at).max(ret);
             }
@@ -3522,7 +3534,7 @@ impl Report {
     /// log committing after the heal is what says the cluster serves the key.
     ///
     /// And it is the range **serving** the key where the run stopped
-    /// ([`Report::serving_at_the_end`]), not [`Report::key_range`]'s, because a split
+    /// ([`Report::serving_at`]), not [`Report::key_range`]'s, because a split
     /// makes two logs of one span and the starting map still reads them as one: under
     /// `SharedSnapshotDir` on the node, seeds 8 and 54 of `main` at fdc5fc0 wedge a
     /// split's left half for 6.7 and 5.9 s while its right half completes every
@@ -3547,7 +3559,7 @@ impl Report {
                 pending <= WRITE_TIMEOUT
                     || (pending <= bound
                         && last_completion
-                            .get(&self.serving_at_the_end(&splits, op.op.key()))
+                            .get(&self.serving_at(&splits, op.op.key(), self.ended))
                             .is_some_and(|completed| *completed > op.call))
             });
             op.op.is_write() && op.call >= self.last_heal && !excused
@@ -11056,8 +11068,8 @@ mod tests {
         let splits = split.splits_taken();
         assert_eq!(
             (
-                split.serving_at_the_end(&splits, &Bytes::from_static(b"k0")),
-                split.serving_at_the_end(&splits, &Bytes::from_static(b"k1"))
+                split.serving_at(&splits, &Bytes::from_static(b"k0"), split.ended),
+                split.serving_at(&splits, &Bytes::from_static(b"k1"), split.ended)
             ),
             (SINGLE_GROUP, right),
             "the split moves the keys at or above its key, and only those"
@@ -11070,6 +11082,63 @@ mod tests {
                     .to_owned()
             )
         );
+    }
+
+    /// A completion is the evidence of the range that served its key **when it
+    /// completed**, not where the run stopped (PROPOSED D-102, after #157's review). A
+    /// split traced after a write completed moves the write's key to the right half by
+    /// the end, but the write was the parent's to commit: read at the end, a parent's
+    /// commit before the split vouches for a right half whose log did not exist yet,
+    /// and the left half, which keeps the parent's log, loses it.
+    ///
+    /// One range of three keys split at `k1` at 2.0 s; `k1`'s write completes at
+    /// 1.7 s, before the split, after the pending write's call at 1.5 s. Pending on
+    /// `k0`, the left half's, it is excused: the parent's log, which the left half
+    /// keeps, committed after its call. Pending on `k2`, the right half's, it is the
+    /// wedge: nothing the right half committed shows it live. Split at 0.5 s instead,
+    /// before the completion, the two swap.
+    // PROPOSED(D-102): the exemption's evidence is the serving range's.
+    #[test]
+    fn a_completion_is_the_evidence_of_the_range_serving_its_key_when_it_completed() {
+        let right = SINGLE_GROUP + 40;
+        let term = record(
+            ms(0),
+            ms(0),
+            Some(1),
+            term_of(1, SINGLE_GROUP, 1, "follower"),
+        );
+        let split_at = |at| {
+            record(
+                ms(at),
+                ms(at),
+                Some(1),
+                TraceEvent::RangeSplit {
+                    range: SINGLE_GROUP,
+                    right,
+                    key: user_key(b"k1"),
+                    index: 5,
+                },
+            )
+        };
+        let with = |split: u64, pending: &str| Report {
+            history: History {
+                ops: vec![put_at(pending, 1500, None), put_at("k1", 1600, Some(1700))],
+                ..History::default()
+            },
+            ended: ms(2500),
+            ..report(vec![term.clone(), split_at(split)], Vec::new())
+        };
+        let wedge = |key: &str| {
+            Err(format!(
+                "liveness: no client write to {key} completed after the last heal at Instant(0ns)"
+            ))
+        };
+        // Split after the completion: the completion is the parent's, the left half's.
+        with(2000, "k0").liveness().unwrap();
+        assert_eq!(with(2000, "k2").liveness(), wedge("k2"));
+        // Split before it: the completion is the right half's.
+        assert_eq!(with(500, "k0").liveness(), wedge("k0"));
+        with(500, "k2").liveness().unwrap();
     }
 
     /// A write its client is still waiting for when the run stops — called less than
