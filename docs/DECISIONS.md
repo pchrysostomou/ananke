@@ -19338,12 +19338,17 @@ simulation stops"* (`Report::end`, `Instant::default() + self.schedule.total()`)
 premise is false, and the error was made in a48c1b5**, the commit that wrote D-086's
 seed-3164 fix, merged with #109 (527adcd). `Schedule::total` counts every budgeted wait at
 its whole budget — `INSTALL_WAIT_BUDGET`'s 4 s, `STREAM_WAIT_BUDGET`'s 2.5 s, the transfer,
-term-raise, flush, adoption and split budgets — and every arm's tail whether or not the
-arm reached it: `CrashInstalling`'s grace and down when no install landed,
+term-raise, flush and adoption budgets — and every arm's tail whether or not the arm
+reached it: `CrashInstalling`'s grace and down when no install landed,
 `RetakeUnderStream`'s freeze and hold when no stream opened. Each of those waits returns
-when its event lands, so the run stops before the total. Measured on this tree in release
-over the correct node's ten thousand seeds of the raft arms: **the total lies past the end
-of every one of the 10 000 runs**, by 1.2 s at the least, 1.5 s at the median and 8.371 s
+when its event lands, so the run stops before the total. The split budget is not even
+waited: `Schedule::total` adds `SPLIT_WAIT_BUDGET`'s 600 ms for `Fault::Split` and again
+for `Fault::SplitFromRestarted`, and `run_on` spends neither — the first arm advances only
+its settle, the second its down, `TRANSFER_WAIT` when the lead must move and its settle
+(#157's review) — so every node schedule's total lies at least 1.2 s past its end. Measured
+on this tree in release over the correct node's ten thousand seeds of the raft arms: **the
+total lies past the end of every one of the 10 000 runs**, by 1.2 s at the least (that
+floor), 1.5 s at the median and 8.371 s
 at the most, and by more than the 2 s liveness bound on **4 008**. Wherever it does, the
 exemption is partly or wholly dead, and a write pending at the true end inside the bound
 is read as the wedge. It was an incomplete fix from the start — 677cad3 failed seed 3164
@@ -19538,14 +19543,35 @@ that committed nothing from before the heal until after the end. The starting ma
 131 of them: 82 never answer and 34 answer past the bound.
 
 **`sim/tests/node.rs`'s other pair tests** read the liveness fold only through `check()`,
-and none of them asserts a catch by it. Between `main`'s nightly on 195f965 (38130516040)
-and this branch's on its merge with 8496ca3 (38153884049), every catch and coverage line
-every sweep prints is unchanged but three: `SharedSnapshotDir`'s and the pair's, as above,
-and `SnapshotWithoutCurrentLast`'s catch "by a check", 2 → 1 of ten thousand. Its liveness
-violation, on seed 7992, was 8885's artefact: k4's one post-heal write called 6 ms before
-the end, on a range that had completed ten post-heal writes, read against a total 3.970 s
-past the end; extended, it was answered 35 ms after its call. That test asserts the arm's
-firing alone.
+and none of them asserts a catch by it. This paragraph first compared `main`'s nightly on
+195f965 (38130516040) with this branch's on its merge with 8496ca3 (38153884049, at
+e782365) and said every catch and coverage line was unchanged but three. **That was false
+twice** (#157's review): 195f965 is not this branch's base, and its nightly also differs by
+D-103's membership coverage field; and a fourth line moved. Against `main`'s nightly on
+b01db39 (38141605412), the base, the lines that move are **four**:
+
+- `SharedSnapshotDir`'s and the pair's, as above.
+- `SnapshotWithoutCurrentLast`'s catch "by a check", 2 → 1 of ten thousand. Its liveness
+  violation, on seed 7992, was 8885's artefact: k4's one post-heal write called 6 ms before
+  the end, on a range that had completed ten post-heal writes, read against a total 3.970 s
+  past the end; extended, it was answered 35 ms after its call. That test asserts the
+  arm's firing alone.
+- **`ApplyWaitsForEveryRange`'s "the run's other checks failed it on", 8 345 → 8 335**
+  (`an_apply_task_that_waits_for_every_range_is_caught_by_the_lag_fold_on_the_node`). Eleven
+  uniform runs move from a liveness violation to none, and `check()` passes all eleven:
+  seeds 613, 1184, 3392, 5104, 5520, 6169, 6261, 6920, 8269, 8417 and 9205. Seed 1184 asks
+  no snapshot action, so the test's `checked` still fails it, and the line moves by ten. No
+  run moves the other way. Read by the counterfactual (settle extended by 4 s, every draw
+  unchanged, the extended trace a byte-identical prefix on all eleven), **every one is a
+  real stall, not the artefact**. Not one write the exemption excused on them is answered
+  in the 4 s more, but seed 6261's k4, answered 4.629 s after its call, past the bound.
+  The ranges go on committing past the end, since the variant stalls the applies and not
+  the logs. Each write was excused only by a post-heal write its range completed **before
+  it was called**, 0.744 to 2.724 s before the end. Seed 613 is the shape: k4's three writes
+  were called 0.785 to 1.359 s before the run stopped at 16.546 s, and range 4's last
+  completed write was 2.432 s before it. The test asserts the lag fold's catch alone, which
+  did not move, so no assertion changed. But the reading as merged passes these eleven
+  stalls, and that is the loosening D-030 and D-039 forbid.
 
 ### The pins
 

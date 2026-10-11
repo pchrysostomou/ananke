@@ -156,11 +156,17 @@ _Update this section at the end of every session._
   or answered past the bound, 4 ranges silent until 3.4–4.7 s after the heal and 2 (488,
   960) a write answered just past its client's wait; its nightly share 314/225/122/34 →
   316/227/122/34; `RefusedReadLeft` 1 097 by the bound both ways;
-  `SnapshotWithoutCurrentLast`'s catch by any check 2 → 1, its seed 7992 the artefact; the
-  nightly otherwise unchanged line for line; `sim/ranges.rs` and one group's
-  `SharedSnapshotDir` unmoved to the seed. Pinned: seed 8885 (the run stops 2.588 s before
-  its total; the tail absent, asserted with the reason), seed 2809, seeds 12 and 8 under
-  `SharedSnapshotDir`, four hand-built cases; seven mutations each caught.
+  `SnapshotWithoutCurrentLast`'s catch by any check 2 → 1, its seed 7992 the artefact;
+  `ApplyWaitsForEveryRange`'s "other checks" 8 345 → 8 335 against b01db39's nightly
+  (38141605412), which the first record missed (#157's review): eleven uniform stalls
+  passed, each excused by a write its range completed before the stalled one was called,
+  and none answered within the bound in a 4 s extension (1184 still fails `checked` on its
+  reach), the lag fold's catch, all the test asserts, unchanged; the nightly otherwise
+  unchanged line for line against b01db39's, not 195f965's, which differs by D-103's field
+  too; `sim/ranges.rs` and one group's `SharedSnapshotDir` unmoved to the seed. Pinned:
+  seed 8885 (the run stops 2.588 s before its total; the tail absent, asserted with the
+  reason), seed 2809, seeds 12 and 8 under `SharedSnapshotDir`, four hand-built cases;
+  seven mutations each caught.
   `SplitFromRestarted`'s no-split `continue` read: it keeps `last_heal` at the last real
   heal and moving it would lose 47 uniform catches, so it stays (#147); the per-range
   reading still keyed by the starting map is #148.
