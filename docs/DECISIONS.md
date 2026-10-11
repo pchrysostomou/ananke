@@ -19196,7 +19196,9 @@ shard, shard 5 (1 623.8 → 1 623.9).
 **The number.** Assigned with the fix PRs opened against `main` at fdc5fc0: D-101 and
 D-103 beside it have merged (#144, #149), and this takes **D-102**, between them in
 numerical order. The branch is off `main` at b01db39, whose footer reads D-104, and the
-footer stays D-104. Every code site carries `// PROPOSED(D-102)`.
+footer stayed D-104; merged with `main` at 8496ca3, which brought D-105 (#152), the entries
+are a union in numerical order and the footer is D-106. Every code site carries
+`// PROPOSED(D-102)`.
 
 **Context.** `main`'s nightly on 6c54705 (#132, run 37918619653) failed seed 8885 of the
 correct node's raft-arms sweep — *"liveness: no client write to k5 completed after the
@@ -19345,7 +19347,11 @@ liveness, then the old reading, then the timer check — reproduces `main`'s nig
 195f965 (run 38130516040) wherever that nightly prints a figure: `SharedSnapshotDir`'s
 categories on its share to the seed count, `RefusedReadLeft`'s 1 097, one group's
 `SharedSnapshotDir` 10 and 9, `sim/ranges.rs`'s 6 746 and 0. Nothing but the reading
-changed, so the runs before and after are the same runs.
+changed, so the runs before and after are the same runs. The figures are b01db39's with
+this change; the merge with 8496ca3 (D-105) moves no run, and the probe rebuilt on the
+merged tree prints the same line, verdict for verdict and figure for figure, on seeds 0 to
+999 of `SharedSnapshotDir`, 0 to 599 of the correct node and of one group, 0 to 299 of
+`RefusedReadLeft` and of `sim/ranges.rs`'s three.
 
 | Scenario, seeds 0–9 999 | before | after |
 |---|---|---|
@@ -19724,4 +19730,233 @@ owner's ruling. Issue #145.
 
 ---
 
-_Next entry: D-104. Add one before implementing anything not covered above._
+## PROPOSED D-105 — The range layer's own variant set: `RangeVariants`, a `u64` in `ananke-shard` beside the node's set and `ananke-raft`'s unchanged `Variants(u32)`, holding §10's five built so far; Q37 and Q38 as built
+
+**The number.** This branch is off `main` at b01db39, whose footer reads D-104. Two
+branches open beside it take D-102 (a fix) and D-104 (Stage C's docs record); the brief
+that assigned this one gives it **D-105**, and the footer moves to D-106. Every code site
+carries `// PROPOSED(D-105)`. At the merge the entries are a union in numerical order with
+one footer, the highest plus one.
+
+**Context.** Q37 answers where Phase 3's variants live: "a variant set of the range
+layer's own, in `ananke-shard`, carried beside `ananke-raft`'s unchanged `Variants(u32)`;
+Phase 2 variants re-asserted on the new node keep their bits", because §10's twenty-four
+beside the bits Raft's set already used would pass the width D-045 fixed "before the width
+is a decision to revisit", and `ananke-raft` never names a range (Q40;
+SHARD.md:3208-3212). Q38 ships both `TrustStaleDescriptor` and `ClientIgnoresMismatch`
+(SHARD.md:3214-3217). Stage C's build list has the set as one line
+(SHARD.md:2478-2479) and its entries list asks for an entry recording Q37 and Q38
+(SHARD.md:2577-2580). No entry wrote it. D-097, D-098 and D-099 built §10's first five
+as members of the node's set instead — `NodeVariant::TrustStaleDescriptor`,
+`ApplyIgnoresSpan` and `ClientIgnoresMismatch` (D-097's item 9), `MetaOverwritesByArrival`
+(D-098's item 7) and `IdBlockResumed` (D-099) at bits 49 to 53 of `NodeVariants(u64)` —
+whose module doc said, and still says of the node's own variants, that they "do not
+appear … in §10's count" (crates/ananke-shard/src/variant.rs:1-8 at b01db39). With
+fifty-four members ten bits were left, against some twenty of §10's still to come and the
+instruments beside them; and §10's variants were in the one set that says it holds none
+of them. An audit of Stage C at fdc5fc0 recorded the build line as partial for both
+reasons.
+
+### Decided
+
+1. **`ananke_shard::range_variant`**: `RangeVariant`, one arm per rule of the range layer
+   broken, and `RangeVariants(u64)`, a `Copy` bitmask with `correct()`, `of(&[..])`,
+   `contains`, `is_correct` and `with`, all `const`; `RangeVariant::BUGS` in declaration
+   order, `name()` and `Display` on both, the set printing `correct` or
+   `TrustStaleDescriptor+ApplyIgnoresSpan` — `NodeVariant`'s conventions exactly, so the
+   three sets read alike where a scenario configures them. Neither the node's set nor this
+   one has a parser (no scenario reads a variant from text), so none is added. The empty
+   set is the correct range layer and a set turns off exactly its members' fixes (D-045):
+   every site reads one bit.
+2. **The five move there, unchanged in meaning, doc and marker.** Their arms leave
+   `NodeVariant` (whose `BUGS` is forty-nine now, its test says so, and bits 49 to 53 are
+   recorded as freed); `RangeVariant` gives them bits 0 to 4. Each `// PROPOSED(D-097)`,
+   `(D-098)` and `(D-099)` stays on its arm.
+3. **Carried through the node's configuration beside the other two.**
+   `ServerConfig::range_variants` beside `ServerConfig::node` and the cores'
+   `raft.variants`; `ServerHost` reads it at the receipt and serving checks
+   (`TrustStaleDescriptor`), the `apply` task at the apply check and the meta range's apply
+   (`ApplyIgnoresSpan`, `MetaOverwritesByArrival`), and the start where the lease record is
+   read back (`IdBlockResumed`). The sweep's client is the range layer's, so
+   `raft::client_on` takes the range layer's set where it took the node's, and reads
+   `ClientIgnoresMismatch` from it. `raft::run_on`, `raft::run_on_the_node`, `Cluster::spawn`
+   and `raft::node_server_config` carry it as a parameter of its own; every node call site
+   names all three sets. The membership, quorum, `ranges`, install and re-seed scenarios,
+   which run no range variant, configure `RangeVariants::correct()`; their clients took
+   the node's set before and read only `ClientIgnoresMismatch` from it, which none of
+   their tests sets, so nothing they run reads differently.
+4. **Every name in `sim/` and the crate follows**: `sim/tests/node.rs`'s five variant
+   tests and the range layer's equivalence test take `RangeVariant`s; `meta.rs`'s module
+   doc names `RangeVariant::MetaOverwritesByArrival`. The entries that built the five —
+   D-097's item 9, D-098's item 7, D-099 — keep their text, which says what was built
+   then; this entry supersedes where those items put them.
+5. **`variant.rs`'s module doc** now says what the set is: the node's (§4) — the round,
+   the wire, the `snapshot` and `apply` tasks, Q15's refusal and re-seed, the node's
+   start — none of them §10's, beside `ananke_raft::Variant` and `RangeVariant`.
+6. **Stage B's node variants stay where they are**, with their bits.
+
+**Q37, as built.** The set is the range layer's own, in `ananke-shard`; `ananke-raft`'s
+`Variants` is untouched — `core.rs` is not in this diff, so every Phase 2 variant keeps its
+bit on the node, as Q37 asks. Its width is still a `u32`, with seventeen of thirty-two
+bits used, bits 0 to 16: §10's "sixteen" (SHARD.md:1560) predates D-078's
+`FollowerNeverCompacts`.
+
+**Q38, as built.** Both ship. `TrustStaleDescriptor` is the server's: it checks the key
+against its own descriptor neither at receipt nor at a read's serving and keeps the apply
+check (server.rs's receipt and serving checks), caught by check 9 at the first read served
+outside the serving range's span. `ClientIgnoresMismatch` is the client's: the sweep's
+client resends to the range and generation it had and merges nothing a `RangeMismatch`
+carried, caught by check 17 at the first resend. Both are caught today through the node
+cluster's clients that start stale (D-097's item 10), not yet on §10's shapes — the split
+while one client's cache names the parent, and the liveness bound on uniform seeds — which
+are the sharded sweep's (`sim/shard.rs`, not built): what each is caught by and at which
+tier is D-097's and D-100's, unchanged here and measured below.
+
+**The width: a `u64`.** Twenty-four of §10's and at least two instruments already
+proposed — D-093's `SplitLeavesGap` for check 19 and Stage D's variant for the re-add
+window assertion (SHARD.md:2586-2591) — are twenty-six members known before any review
+adds one, which would leave a `u32` six bits. The node's own set is the measure of how
+that goes: it began as the round's and the snapshot task's twenty, and the reviews and
+slices after added the variants their findings needed — the snapshot review's four,
+D-077's six, D-083's ten, D-081's three, D-090's two, D-076's review's two, D-095's and
+D-096's one each — so it outgrew its `u32` inside Stage B, at the merge that put the
+wiring's ten and Q15's six on one tree (D-081, "The branch"), and held fifty-four on
+b01db39. A `u64` holds §10's twenty-four and forty more at no cost a reader can see: the
+set is `Copy`, its operations `const`, and its bits reach no wire frame and no trace event
+(D-045), so the numbering is an implementation detail and the word is the machine's own.
+Nothing past sixty-four is guessed at: a variant given a bit past the sixty-fourth is an
+arithmetic overflow in `RangeVariant::bit`'s match, which does not compile, so the width
+cannot be outgrown silently and the day it is outgrown is a decision then. A `u128` was
+not taken because no count supports it.
+
+**Which are §10's, and which are instruments.** A member is one of two kinds, and
+`RangeVariant::in_section_10` says which by an exhaustive match, so a variant added later
+does not compile until it is classified as well as given a bit; the module's test holds
+the classification to §10's table, row by row by name, and asserts that no range variant
+shares a name with a node variant.
+
+- **§10's twenty-four**, five built: `TrustStaleDescriptor`, `ApplyIgnoresSpan`,
+  `ClientIgnoresMismatch`, `MetaOverwritesByArrival`, `IdBlockResumed`. The other
+  nineteen come with the stages that build their paths, into this set.
+- **Instruments outside the count**, none built: PROPOSED D-093's `SplitLeavesGap`, which
+  D-093 already places "in `ananke-shard`'s range-layer variant set (Q37) … marked as a
+  test instrument outside §10's count", and Stage D's re-add window variant. Both are
+  range-layer instruments by what they break — a split's span, a replica's incarnation at
+  its creation — and go here when built.
+- **PROPOSED, for the owner: `NodeVariant::AnyFreshNodeBootstraps` (D-096) stays in the
+  node's set.** It is neither Stage B's nor §10's: it breaks §2's rule for which node writes
+  the initial state, at the node's start, and is check 7's instrument on the membership
+  scenario — by D-093's reasoning a range-layer instrument. Moving it is a move of the same
+  kind as this entry's, but it runs on `membership::run_on_node`, whose plumbing carries no
+  range set yet, and the brief that made this slice named the five. Recommended: move it
+  into this set, as an instrument outside the count, in the slice that next touches the
+  membership scenario's plumbing (the per-fold equivalence slice, which runs check 7 against
+  it there); until then the node set's module doc names it as the one variant on the line.
+  Issue #151.
+
+**Seed 42's one-group trace, asserted (issue #97).** D-097 and D-098 recorded seed 42's
+one-group JSONL by hand — 13 241 905 bytes, SHA-256 `c5b8d814…` — and no test asserted it:
+`the_seed_42_trace_is_written_for_the_studio` wrote it and checked it green. The test now
+pins the trace as `sim/tests/echo.rs` pins `echo`'s, by the FNV-1a 64 moirae pins
+(`moirae_trace::trace_hash`) over the body, every line after the header, whose crate
+version must not move the pin: `63099038ab531265`, measured on b01db39 before this change
+and on this tree after it. The whole file the test writes on this tree is 13 241 905
+bytes with SHA-256 `c5b8d814dc0956af28bef72f8f9e0bbc959053a2173d7d1d96e3423a6c6540e8`,
+D-097's. A commit that moves the one-group trace updates the constant and says why, which
+is what #97 asked; seed 42 is the studio's example, not a seed a sweep found, so what is
+pinned is the trace and not a mechanism, and the test's doc says so.
+
+### This moves no schedule and no trace: measured
+
+The variants' bits reach no frame and no trace event, and no site's reading changed, so
+nothing should move; the claim is measured rather than argued. Both trees were built in
+release from one harness, `sim/tests/s4_measure.rs`, untracked and never committed, whose
+two copies differ only in how a set is named (`NodeVariants::of(&[NodeVariant::X])` on
+b01db39, `RangeVariants::of(&[RangeVariant::X])` here), and run on one machine (D-070:
+Darwin 25.6.0 arm64, Apple M2, 8 cores, on AC power, other slices' builds and sweeps
+beside it; every figure is a count or a hash, which the host's load does not touch). For
+every run it printed the verdict and the FNV-1a 64 hash and length of the run's moirae
+JSONL (of `{:?}` of the records for the install and re-seed scenarios, which export
+none).
+
+- **Seeds 0 to 999 of the node cluster** under each of the five, the pair
+  `{TrustStaleDescriptor, ApplyIgnoresSpan}` and the correct node: 7 000 runs, **every
+  verdict and every trace hash identical**, line for line (`diff` of the two outputs
+  empty).
+- **The pinned node seeds**: 272, 516, 368, 493 and 633 on the node cluster, 2 994 on the
+  sharded quorum scenario under the correct node and `RefuseOneRangeOnly`, 1 and 1 969 on
+  the membership node under the correct node and `AnyFreshNodeBootstraps`, and the re-seed
+  shape's seed 1: **every hash identical**.
+- **Seeds 0 to 19** of the sharded quorum, membership-node, `ranges`, install and re-seed
+  scenarios, which configure the new field and run no range variant: **every hash
+  identical**.
+- **Seed 42 on one group**: 13 241 905 bytes, whole-file FNV `addd005343895417`, body
+  `63099038ab531265`, on both.
+
+The catch counts, read from the same runs, seeds `0..n` for each tier's `n` — identical
+on both trees:
+
+| Set | 20 | 100 | 1 000 | Caught by, at 1 000 |
+|---|---|---|---|---|
+| `TrustStaleDescriptor` | 20 | 100 | 998 | check 9 (serving within span), 998 |
+| `ApplyIgnoresSpan` | 1 | 5 | 82 | check 9, 82 |
+| `ClientIgnoresMismatch` | 20 | 100 | 1 000 | check 17 (client refreshes), 1 000 |
+| `MetaOverwritesByArrival` | 3 | 18 | 149 | check 16 (meta never goes back), 149 |
+| `IdBlockResumed` | 14 | 71 | 628 | check 18 (descriptor lineage) 499, state machine safety 90, check 9 16, log matching 11, commit by current term 8, check 7 3, check 16 1 |
+| `{TrustStaleDescriptor, ApplyIgnoresSpan}` | 20 | 100 | 1 000 | check 9, 1 000 |
+| correct | 0 | 0 | 0 | — |
+
+These are the first `n` seeds, not the tests' shares: the variant tests run
+`high_rate_share()`, a tenth of the tier and never fewer than twenty, so the gate's and
+CI's runs see seeds 0 to 19 and the premerge's 0 to 99 — the first two columns. No
+assertion and no tier moves: `TrustStaleDescriptor` asserted caught at every tier, the
+pair on every seed, `ApplyIgnoresSpan` alone from the nightly's share (D-100: 5 of 100 is
+D-061's 5 % on the nose), `MetaOverwritesByArrival` from the thousand's share,
+`IdBlockResumed` and its shape at every tier, `ClientIgnoresMismatch` on every seed.
+`IdBlockResumed`'s attribution is loose — 129 of its 628 catches are not check 18's —
+and is the per-fold equivalence slice's to tighten, unchanged here.
+
+### The plumbing is load-bearing: mutations
+
+No check is added or changed, so there is no check with more than one range to be wrong
+about and no single-range mutation to show for one. What this entry adds that a mistake
+could silently empty is the plumbing: a set that reaches the configuration and not the
+site would leave each test passing on the correct node, injecting nothing. Each mutation
+below was planted alone in a copy of this tree, the five variants' tests and the range
+layer's equivalence test run in release at the gate's twenty, and reverted:
+
+| | Mutation | What fails, at the gate's twenty |
+|---|---|---|
+| — | none (the change as built) | nothing: the six tests pass, every figure as tabled above |
+| **M1** | `ServerHost` given the correct set (the receipt and serving checks) | `TrustStaleDescriptor` caught on 0 of 20, *"caught on no seed"*; the pair caught on 1 of 20, *"not caught on every seed"* |
+| **M2** | the `apply` task given the correct set (the apply check, the meta range's apply) | the pair's apply check refuses writes on 15 of 20, *"the apply check refused a write under ApplyIgnoresSpan"*; `MetaOverwritesByArrival` caught on 0 of 20 and its updates winning 12 of 116 spans as the correct node's do, *"not seen injected"* |
+| **M3** | the start's lease read given the correct set | `IdBlockResumed` caught on 0 of 20, *"caught by check 18's range-id clause on no seed"* |
+| **M4** | the sweep's client given the correct set | `ClientIgnoresMismatch` caught on 0 of 20, *"not caught by check 17 on every seed"* |
+| **M5** | `node_server_config` dropping the set it is given (the sim to the node) | `TrustStaleDescriptor`, the pair, `MetaOverwritesByArrival` and `IdBlockResumed` each caught on 0 of 20, four tests failing as under M1 to M3 |
+
+The range layer's equivalence test passed under every mutation (it asserts only that some
+prefix of its three systems trips, and `ClientIgnoresMismatch` trips under M1,
+`TrustStaleDescriptor` under M4); that is its known weakness, which the per-fold
+equivalence slice replaces, and not this entry's. The mutations were planted in a copy of
+this branch's changes before `rustfmt`, which changed their layout and nothing else.
+
+### Consequences
+
+- §10's variants are built into `RangeVariants` from here on, and the range layer's
+  instruments beside them; Stage B's are in `NodeVariants`, and Phase 2's in
+  `ananke-raft`'s set, untouched.
+- `raft::run_on_the_node` takes a fourth argument, the range layer's set, at every call.
+- No schedule, no trace, no pinned hash, no assertion and no tier moves; seed 42's
+  one-group trace is now asserted where it was only written.
+
+### What the PR asks
+
+- **PROPOSED, this entry's:** Q37's set as built, a `u64`, with §10's five in it and
+  `in_section_10` classifying every member; Q38 recorded as built.
+- **PROPOSED, for the owner:** `AnyFreshNodeBootstraps`'s place (issue #151).
+- **For the owner, from #97:** seed 42's one-group trace pinned by its body hash, as
+  `echo`'s is.
+
+---
+
+_Next entry: D-106. Add one before implementing anything not covered above._

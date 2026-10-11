@@ -94,8 +94,9 @@ use ananke_raft::{NodeConfig, ServerId, invariants, run as run_server};
 use ananke_shard::client::{Cache, RangedRequest, RangedResponse};
 use ananke_shard::descriptor::{FIRST_GENERATION, RangeDescriptor};
 use ananke_shard::range::RangeId;
+use ananke_shard::range_variant::{RangeVariant, RangeVariants};
 use ananke_shard::server::ServerConfig;
-use ananke_shard::variant::{NodeVariant, NodeVariants};
+use ananke_shard::variant::NodeVariants;
 use ananke_storage::EngineConfig;
 use bytes::Bytes;
 use moirae_sched::Policy;
@@ -393,7 +394,14 @@ impl Cluster {
     }
 
     /// Spawns server `id` on its node, as a start or as a restart.
-    fn spawn(self, sim: &Sim, id: u64, variants: Variants, node: NodeVariants) {
+    fn spawn(
+        self,
+        sim: &Sim,
+        id: u64,
+        variants: Variants,
+        node: NodeVariants,
+        range: RangeVariants,
+    ) {
         let env = sim.env(node_of_server(id));
         let inner = env.clone();
         match self {
@@ -406,7 +414,7 @@ impl Cluster {
                 env.spawn("node", async move {
                     let _ = ananke_shard::server::run(
                         inner,
-                        node_server_config(id, variants, node, NODE_SNAPSHOT_THRESHOLD),
+                        node_server_config(id, variants, node, range, NODE_SNAPSHOT_THRESHOLD),
                     )
                     .await;
                 });
@@ -6949,14 +6957,19 @@ pub fn node_config(id: u64, variants: impl Into<Variants>) -> NodeConfig {
 ///
 /// The disk does not rot on this cluster ([`Cluster::bitrot`]), which is the other
 /// parameter that is not the raft sweep's; its reason is with the figure.
+///
+/// The node carries three sets of known bugs: `variants` for its cores, `node` for
+/// itself and `range_variants` for the range layer (Q37).
 // PROPOSED(D-082): the arms are shared and the node is a second cluster of them.
 // PROPOSED(D-086): the threshold is the scenario's own — the sweep that reaches the
 // path passes 12, and a scenario whose rates were measured without it keeps `1 << 30`.
+// PROPOSED(D-105): the range layer's variants carried beside the node's.
 #[must_use]
 pub fn node_server_config(
     id: u64,
     variants: impl Into<Variants>,
     node: NodeVariants,
+    range_variants: RangeVariants,
     snapshot_threshold: u64,
 ) -> ServerConfig {
     let mut engine = EngineConfig::new(PathBuf::from(DIR));
@@ -6984,6 +6997,7 @@ pub fn node_server_config(
         id_block: crate::ranges::ID_BLOCK,
         refill_at: crate::ranges::REFILL_AT,
         node,
+        range_variants,
     }
 }
 
@@ -7351,7 +7365,7 @@ pub(crate) async fn client<E: Environment>(env: E, n: u64, servers: u64, stats: 
         n,
         servers,
         stats,
-        NodeVariants::correct(),
+        RangeVariants::correct(),
     )
     .await;
 }
@@ -7364,14 +7378,18 @@ pub(crate) async fn client<E: Environment>(env: E, n: u64, servers: u64, stats: 
 /// while node `b` leads the one beside it, and a client that remembered one would
 /// take a `NotLeader` on three ranges in four. On one group the map holds one key
 /// and every draw falls exactly where it fell before (PROPOSED D-082).
+///
+/// The client is the range layer's, so the variants it reads are the range layer's:
+/// [`RangeVariant::ClientIgnoresMismatch`] is the only one (PROPOSED D-105).
 // PROPOSED(D-082): the arms are shared and the node is a second cluster of them.
+// PROPOSED(D-105): the range layer's variants carried beside the node's.
 pub(crate) async fn client_on<E: Environment>(
     cluster: Cluster,
     env: E,
     n: u64,
     servers: u64,
     stats: SharedStats,
-    node: NodeVariants,
+    range_variants: RangeVariants,
 ) {
     let Ok(sock) = env.net().bind(client_addr(n)).await else {
         return;
@@ -7542,7 +7560,7 @@ pub(crate) async fn client_on<E: Environment>(
                     seq += 1;
                     // `ClientIgnoresMismatch`: the resend goes to the range and
                     // generation the client had, merging nothing (§10, Q38).
-                    if node.contains(NodeVariant::ClientIgnoresMismatch) {
+                    if range_variants.contains(RangeVariant::ClientIgnoresMismatch) {
                         target = target % servers + 1;
                         continue;
                     }
@@ -7758,20 +7776,30 @@ pub fn run_with(seed: u64, schedule: Schedule, variants: impl Into<Variants>) ->
         schedule,
         variants,
         NodeVariants::correct(),
+        RangeVariants::correct(),
     )
 }
 
 /// Runs the scenario for `seed` on the node of SHARD.md §4, with four ranges on
-/// every node, under the arms [`Schedule::draw_on_the_node`] keeps.
+/// every node, under the arms [`Schedule::draw_on_the_node`] keeps: the cores carry
+/// `variants`, the node `node` and the range layer `range`, three sets read by three
+/// layers (Q37).
 // PROPOSED(D-082): the arms are shared and the node is a second cluster of them.
+// PROPOSED(D-105): the range layer's variants carried beside the node's.
 #[must_use]
-pub fn run_on_the_node(seed: u64, variants: impl Into<Variants>, node: NodeVariants) -> Report {
+pub fn run_on_the_node(
+    seed: u64,
+    variants: impl Into<Variants>,
+    node: NodeVariants,
+    range: RangeVariants,
+) -> Report {
     run_on(
         Cluster::Node,
         seed,
         Schedule::draw_on_the_node(seed),
         variants,
         node,
+        range,
     )
 }
 
@@ -7781,6 +7809,7 @@ pub fn run_on_the_node(seed: u64, variants: impl Into<Variants>, node: NodeVaria
 /// heals is the same code whichever system is underneath, so the node's sweep and
 /// the one-group sweep cannot drift apart (PROPOSED D-082).
 // PROPOSED(D-082): the arms are shared and the node is a second cluster of them.
+// PROPOSED(D-105): the range layer's variants carried beside the node's.
 #[must_use]
 pub fn run_on(
     cluster: Cluster,
@@ -7788,6 +7817,7 @@ pub fn run_on(
     schedule: Schedule,
     variants: impl Into<Variants>,
     node_variants: NodeVariants,
+    range_variants: RangeVariants,
 ) -> Report {
     let variants = variants.into();
     let mut sim = Sim::new(config_on(cluster, seed, &schedule));
@@ -7798,7 +7828,7 @@ pub fn run_on(
     let admin = sim.add_node();
     let stats: Vec<SharedStats> = (0..CLIENTS).map(|_| SharedStats::default()).collect();
     for id in 1..=SERVERS {
-        cluster.spawn(&sim, id, variants, node_variants);
+        cluster.spawn(&sim, id, variants, node_variants, range_variants);
     }
     for (i, &node) in clients.iter().enumerate() {
         let env = sim.env(node);
@@ -7806,7 +7836,7 @@ pub fn run_on(
         let stats = stats[i].clone();
         env.spawn(
             "client",
-            client_on(cluster, inner, i as u64 + 1, SERVERS, stats, node_variants),
+            client_on(cluster, inner, i as u64 + 1, SERVERS, stats, range_variants),
         );
     }
     let all_but = |server: u64, client: u64| -> (Vec<NodeId>, Vec<NodeId>) {
@@ -7835,7 +7865,7 @@ pub fn run_on(
     advance(&mut sim, schedule.warmup, &mut watch);
     let restart = |sim: &mut Sim, server: u64| {
         sim.restart(node_of_server(server));
-        cluster.spawn(sim, server, variants, node_variants);
+        cluster.spawn(sim, server, variants, node_variants, range_variants);
     };
     // The lease trials: the operator hands leadership to the slowest clock, which
     // leads for a while and is then cut off with client 1; twice, so the variant's

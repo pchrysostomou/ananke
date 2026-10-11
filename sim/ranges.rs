@@ -56,6 +56,7 @@ use ananke_raft::{ServerId, invariants};
 use ananke_shard::client::{RangedRequest, RangedResponse};
 use ananke_shard::descriptor::FIRST_GENERATION;
 use ananke_shard::range::RangeId;
+use ananke_shard::range_variant::RangeVariants;
 use ananke_shard::server::{Range, ServerConfig};
 use ananke_shard::variant::NodeVariants;
 use ananke_storage::EngineConfig;
@@ -750,6 +751,8 @@ pub fn server_config_of(
         id_block: ID_BLOCK,
         refill_at: REFILL_AT,
         node,
+        // No range-layer variant runs on this scenario (PROPOSED D-105).
+        range_variants: RangeVariants::correct(),
     }
 }
 

@@ -59,6 +59,9 @@
 //! - [`mod@variant`], the node's known-buggy variants, each a plausible way to get
 //!   the round or the snapshot task wrong, built beside the correct code (CLAUDE.md's
 //!   pair rule).
+//! - [`mod@range_variant`], the range layer's: SHARD.md §10's variants as the stages
+//!   build them, and the test instruments the range layer's checks need, carried
+//!   beside the node's and `ananke-raft`'s unchanged set (Q37).
 //!
 //! Descriptors, split, merge and the rebalancer are each a later slice's.
 
@@ -73,6 +76,7 @@ pub mod meta;
 pub mod node;
 pub mod outbox;
 pub mod range;
+pub mod range_variant;
 pub mod reseed;
 pub mod round;
 pub mod server;
@@ -89,6 +93,7 @@ pub use node::{
 };
 pub use outbox::{Dropped, Outbox, Oversized};
 pub use range::RangeId;
+pub use range_variant::{RangeVariant, RangeVariants};
 pub use reseed::{
     Candidate, generation_dir, generation_of, newest_not_lost, next_generation, reseed_dir,
 };
