@@ -1477,6 +1477,9 @@ pub fn run_with_of(
     if stopped.is_none() {
         advance(&mut sim, schedule.settle, &mut stopped);
     }
+    // Where the run stopped, for the liveness readings' end (PROPOSED D-102): the
+    // report this run is checked as carries no schedule of this scenario's.
+    let ended = sim.now();
     let records = sim.trace();
     let history = History::from_trace(&records);
     let mut clients_total = ClientStats::default();
@@ -1495,6 +1498,7 @@ pub fn run_with_of(
         header: sim.run_header(),
         records,
         last_heal,
+        ended,
         isolations,
         history,
         clients: clients_total,

@@ -3560,6 +3560,265 @@ fn retook_into_one_directory(report: &raft::Report) -> bool {
     })
 }
 
+/// The keys of a range the liveness reading asks of whose post-heal writes are **all
+/// still pending where the run stopped, every one called inside the bound of that
+/// instant**: the keys whose verdict a pending-at-the-end exemption decides, whatever
+/// else it asks for (PROPOSED D-086, D-102). Read off the report's public parts, so
+/// that a pin says what the trace holds and not what the reading concluded.
+fn keys_with_only_a_tail(report: &raft::Report) -> Vec<String> {
+    let bound = raft::election_max() * raft::LIVENESS_TIMEOUTS;
+    let live = report.ranges_with_a_majority_up();
+    let mut by_key: BTreeMap<String, bool> = BTreeMap::new();
+    for op in &report.history.ops {
+        if !op.op.is_write() || op.call < report.last_heal {
+            continue;
+        }
+        if !live.contains(&(report.key_range)(op.op.key())) {
+            continue;
+        }
+        let tail = op.ret.is_none()
+            && report
+                .ended
+                .checked_duration_since(op.call)
+                .is_some_and(|elapsed| elapsed <= bound);
+        let all = by_key
+            .entry(String::from_utf8_lossy(op.op.key()).into_owned())
+            .or_insert(true);
+        *all &= tail;
+    }
+    by_key
+        .into_iter()
+        .filter_map(|(key, all)| all.then_some(key))
+        .collect()
+}
+
+/// The last `RaftCommit` any replica of `range` traced, if any.
+fn last_commit_of(report: &raft::Report, range: u64) -> Option<ananke_env::Instant> {
+    report
+        .records
+        .iter()
+        .filter(|r| matches!(&r.event, TraceEvent::RaftCommit { range: g, .. } if *g == range))
+        .map(|r| r.at)
+        .last()
+}
+
+/// Seed 8885 of the correct node's sweep, which `main`'s nightly on 6c54705 failed
+/// (run 37918619653) with "no client write to k5 completed after the last heal", and
+/// **why the situation it was pinned for is absent on this tree** (PROPOSED D-102).
+///
+/// The mechanism was two things. **The run stopped well before its schedule's
+/// total**: `Schedule::total` counts every budgeted wait at its whole budget, and on
+/// 6c54705 the `CrashInstalling` arm's install never landed (its grace and down never
+/// spent) and the `RetakeUnderStream` arm's stream opened 75 ms into a 2.5 s budget,
+/// so the run stopped at 24.432 s against a total of 27.146 s, 2.714 s early. And
+/// **k5's only post-heal write was pending at the end**: client 2's put, called 11 ms
+/// before the run stopped and proposed by range 4's leader, which had committed
+/// indexes 111 to 121 since the heal. D-086's exemption measured the write against
+/// the total, 2.725 s, over the 2 s bound, and kept it as the wedge.
+///
+/// On this tree the first half is still reached and is asserted: the run stops
+/// 2.588 s before its total, more than the bound. The second is absent: PROPOSED
+/// D-100 put `Fault::Split` and `Fault::SplitFromRestarted` on every node schedule,
+/// which moved this seed's run (last heal 25.867 s, stopped at 28.569 s), and k5 is
+/// written eleven times after the heal with every write completed — no key's
+/// post-heal writes are all pending at the end, so no exemption decides anything
+/// here. That is asserted as the absence, so the day a schedule brings the tail back
+/// this pin says so and can assert the verdict again. The mechanism itself, the run
+/// stopping before its total with a key's only write pending on a range shown live,
+/// is built by hand in `sim/raft.rs`
+/// (`a_write_pending_where_the_run_stopped_is_judged_against_that_instant`), where it
+/// fails against the total and passes against the end.
+// PROPOSED(D-102): seed 8885's end-of-run artefact, its absence on this tree asserted.
+#[test]
+fn seed_8885_stops_before_its_schedules_total_and_no_key_is_left_with_only_a_tail() {
+    let report = correct(8885);
+    let total = ananke_env::Instant::default() + report.schedule.total();
+    let bound = raft::election_max() * raft::LIVENESS_TIMEOUTS;
+    let early = total.duration_since(report.ended);
+    println!(
+        "seed 8885: last heal {:?}, stopped at {:?}, the schedule's total {total:?}, \
+         {early:?} early",
+        report.last_heal, report.ended
+    );
+    assert!(
+        early > bound,
+        "seed 8885 stopped {early:?} before its schedule's total, not more than the bound of \
+         {bound:?}: the half of the mechanism this tree still reaches is gone"
+    );
+    let tails = keys_with_only_a_tail(&report);
+    assert!(
+        tails.is_empty(),
+        "seed 8885 has keys whose post-heal writes are all pending inside the bound of the \
+         end ({tails:?}): the situation PROPOSED D-102 handles is back, so assert its verdict \
+         here again"
+    );
+    report
+        .check()
+        .expect("the correct node passes seed 8885 on this tree");
+}
+
+/// Seed 2809 of the correct node's sweep on fdc5fc0, which the exemption's range
+/// evidence **alone** fails, and why a write its client is still waiting for is no
+/// evidence on any range (PROPOSED D-102).
+///
+/// Range 4 splits at `k5` at 12.608 s, so its left half serves `k4` alone. The last
+/// heal is at 20.448 s and the run stops at 23.238 s. `k4` is read eight times after
+/// the heal, each served in 14 to 56 ms, and written once, called at 23.217 s, 21 ms
+/// before the run stops and inside its client's 60 ms wait. Nothing
+/// else of the half was written after the heal, so no completed write can show it
+/// live — a split half's evidence is its one key's — and the second condition of the
+/// exemption kept the write as the wedge. The first condition excuses it: the run
+/// stopped inside its client's own wait.
+// PROPOSED(D-102): a split half's one write in flight at the end.
+#[test]
+fn seed_2809_ends_with_a_split_halfs_one_write_in_flight_and_passes() {
+    let report = correct(2809);
+    assert!(report.uniform(), "seed 2809 is a uniform schedule");
+    assert!(
+        report.records.iter().any(|r| matches!(
+            &r.event,
+            TraceEvent::RangeSplit { range: 4, key, .. }
+                if ananke_raft::apply::user_key_of(key) == Some(&b"k5"[..])
+        )),
+        "seed 2809's range 4 no longer splits at k5"
+    );
+    let k4 =
+        |op: &&ananke_sim::lin::Op| op.call >= report.last_heal && op.op.key().as_ref() == b"k4";
+    let writes: Vec<&ananke_sim::lin::Op> = report
+        .history
+        .ops
+        .iter()
+        .filter(|op| op.op.is_write())
+        .filter(k4)
+        .collect();
+    let reads_served = report
+        .history
+        .ops
+        .iter()
+        .filter(|op| !op.op.is_write() && op.ret.is_some())
+        .filter(k4)
+        .count();
+    println!(
+        "seed 2809: k4 written {} times after the heal, read {reads_served} times; the run \
+         stopped at {:?}",
+        writes.len(),
+        report.ended
+    );
+    let [write] = writes.as_slice() else {
+        panic!("seed 2809's k4 is not written exactly once after the heal: {writes:?}");
+    };
+    let waited = report.ended.duration_since(write.call);
+    assert!(
+        write.ret.is_none() && waited <= raft::WRITE_TIMEOUT,
+        "seed 2809's one post-heal write to k4 is not pending inside its client's wait at the \
+         end ({waited:?}, returned {:?})",
+        write.ret
+    );
+    assert_eq!(keys_with_only_a_tail(&report), vec!["k4".to_owned()]);
+    assert!(
+        reads_served > 0,
+        "seed 2809's left half served no read of k4 after the heal"
+    );
+    report
+        .check()
+        .expect("the correct node passes seed 2809: the write was in flight");
+}
+
+/// Seeds 12 and 8 under `SharedSnapshotDir`: wedges that the run's true end **alone**
+/// would excuse, and that the exemption's evidence keeps (PROPOSED D-102).
+///
+/// Read against where the run stopped, every post-heal write to the wedged key was
+/// called inside the bound of the end, so D-086's exemption at the true end, asking
+/// nothing more, excuses them all and reads the run live. It is not: the range serving
+/// the key committed nothing for longer than the bound before the end while its leader
+/// kept proposing. The verifier of PROPOSED D-102's diagnosis found 33 such seeds of
+/// 2 000 on 6c54705, seed 12 among them; this tree's are in the entry. The exemption
+/// excuses a pending write only on a range some post-heal write completed on, and the
+/// range serving these keys completed none.
+///
+/// - **Seed 12** is the shape the verifier named: range 2 (`k0`, `k1`) last commits at
+///   10.574 s, the heal is at 18.198 s, and the four post-heal writes to its keys are
+///   all pending, the earliest called 1.028 s before the run stopped at 20.584 s. The
+///   run is uniform and `check()` reports the read bound first (39 registered reads
+///   against 38), so this is the wedge `read_bound_reports_a_wedge` attributes.
+/// - **Seed 8** is the same wedge on a split range, and is why the evidence is the
+///   range **serving** the key and not `Report::key_range`'s. Range 3 split at `k3`
+///   at 7.254 s; its left half, serving `k2`, last commits at 17.273 s, and both
+///   post-heal writes to `k2` are pending at the end; the right half, serving `k3`,
+///   completes every post-heal write. The run's starting map puts `k3` in range 3, so
+///   evidence read through it shows the wedged half live by its sibling's writes and
+///   excuses the wedge — as it does seed 54's. Here the liveness clause is the first
+///   `check()` reports.
+// PROPOSED(D-102): the exemption keeps the wedges the true end alone would excuse.
+#[test]
+fn seeds_12_and_8_under_a_shared_snapshot_dir_stay_wedges_the_true_end_alone_would_excuse() {
+    let bound = raft::election_max() * raft::LIVENESS_TIMEOUTS;
+    let twelve = buggy(12, Variant::SharedSnapshotDir);
+    let eight = buggy(8, Variant::SharedSnapshotDir);
+    for (report, keys, range) in [(&twelve, &["k0", "k1"][..], 2u64), (&eight, &["k2"][..], 3)] {
+        let seed = report.seed;
+        assert!(report.uniform(), "seed {seed} is a uniform schedule");
+        // The masking shape: every post-heal write to the wedged keys is pending and
+        // was called inside the bound of the end.
+        let tails = keys_with_only_a_tail(report);
+        assert!(
+            keys.iter().all(|key| tails.contains(&(*key).to_owned())),
+            "seed {seed}: the post-heal writes to {keys:?} are not all pending inside the \
+             bound of the end, so the true end alone would not excuse them: {tails:?}"
+        );
+        // The range serving them committed nothing for longer than the bound.
+        let last = last_commit_of(report, range).expect("the range committed once");
+        let stalled = report.ended.duration_since(last);
+        println!(
+            "seed {seed}: range {range}, serving {keys:?}, last committed {stalled:?} before \
+             the end"
+        );
+        assert!(
+            stalled > bound,
+            "seed {seed}: range {range} last committed {stalled:?} before the end, inside the \
+             bound: not the wedge this pin is for"
+        );
+        assert_eq!(
+            report.liveness(),
+            Err(format!(
+                "liveness: no client write to {} completed after the last heal at {:?}",
+                keys[0], report.last_heal
+            )),
+            "seed {seed}: the wedge is not reported"
+        );
+        assert!(wedged(report), "seed {seed}: the wedge is not attributed");
+    }
+    // Seed 12: the read bound reports first, and the attribution reads the wedge.
+    let violation = twelve.check().expect_err("seed 12 fails under the variant");
+    assert!(
+        read_bound_reports_a_wedge(&twelve, &violation),
+        "seed 12's read-bound trip is not attributed to the wedge: {violation}"
+    );
+    // Seed 8: the split, and the sibling the starting map would have counted.
+    assert!(
+        eight.records.iter().any(|r| matches!(
+            &r.event,
+            TraceEvent::RangeSplit { range: 3, key, .. }
+                if ananke_raft::apply::user_key_of(key) == Some(&b"k3"[..])
+        )),
+        "seed 8's range 3 no longer splits at k3"
+    );
+    assert!(
+        eight.history.ops.iter().any(|op| op.op.is_write()
+            && op.call >= eight.last_heal
+            && op.ret.is_some()
+            && op.op.key().as_ref() == b"k3"),
+        "seed 8's right half completed no post-heal write to k3, so the starting map had \
+         nothing to excuse the wedge with"
+    );
+    let violation = eight.check().expect_err("seed 8 fails under the variant");
+    assert_eq!(
+        mechanism(&violation),
+        "liveness",
+        "seed 8 fails first on something else: {violation}"
+    );
+}
+
 /// `IgnoreIncarnation` on the node (D-042), and **why it is still not re-asserted**:
 /// not the snapshot wiring, which this slice puts under these arms, and no longer
 /// Q15's whole-node refusal and re-seed, which are in the tree (D-077) — but their
