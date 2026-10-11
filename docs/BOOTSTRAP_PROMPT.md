@@ -101,6 +101,36 @@ ananke/
 
 _Update this section at the end of every session._
 
+- Branch `phase-3-fix-run-end-reading-2` (2026-10-11), off `main` at b01db39, PROPOSED
+  D-102, **the run's end in the liveness readings**, superseding D-086's end-of-run
+  reading. `main`'s nightly on 6c54705 failed the correct node on seed 8885 with a write
+  called 11 ms before the run stopped read as a wedge: D-086 read the run's end as the
+  schedule's total, which counts every budgeted wait at its whole budget and lies past the
+  end of every run the sweeps measured (the correct node's ten thousand by more than the 2 s
+  bound on 4 008, one group's on 9 624) — the error made in a48c1b5 — and `over_a_run`
+  carried a total of zero, so the exemption never applied to `sim/ranges.rs`.
+  `Report::ended` and `Run::ended` carry where the simulation stopped, and a write pending
+  there is excused only inside its client's own wait (`WRITE_TIMEOUT`, PROPOSED), or inside
+  the bound on the range serving its key, splits followed, once that range completed a
+  client write called after the heal. Neither proposed fix shipped as written: the true end
+  alone passes 457 uniform `SharedSnapshotDir` runs this reading fails, 424 of them writes
+  that a 4 s counterfactual extension shows never answered or answered past the bound; the
+  verifier's range evidence through the starting map passes 131, split halves vouched for by
+  their live siblings; read through the serving range without the client's wait it fails the
+  correct node on seed 2809, a split half's one write in flight. Measured at ten thousand in
+  release, before and after: the correct node and one group 0 and 0; `SharedSnapshotDir` on
+  the node 2 155 → 2 160 uniform liveness catches, the 12 no longer reported each the
+  artefact by its counterfactual, of the 17 new 11 writes never answered or answered past
+  the bound, 4 ranges silent until 3.4–4.7 s after the heal and 2 (488, 960) a write
+  answered just past its client's wait; its nightly share 314/225/122/34 →
+  316/227/122/34;
+  `RefusedReadLeft` 1 097 by the bound both ways; `sim/ranges.rs` and one group's
+  `SharedSnapshotDir` unmoved to the seed. Pinned: seed 8885 (the run stops 2.588 s before
+  its total; the tail absent, asserted with the reason), seed 2809, seeds 12 and 8 under
+  `SharedSnapshotDir`, four hand-built cases; seven mutations each caught.
+  `SplitFromRestarted`'s no-split `continue` read: it keeps `last_heal` at the last real
+  heal and moving it would lose 47 uniform catches, so it stays (#147); the per-range
+  reading still keyed by the starting map is #148.
 - Branch `phase-3-fix-membership-range-asked` (2026-10-11), off `main` at fdc5fc0 and
   merged with it at 195f965 (#137, #144),
   PROPOSED D-103 (amends D-084): **the node membership scenario's per-range liveness

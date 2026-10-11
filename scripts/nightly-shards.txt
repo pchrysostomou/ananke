@@ -377,6 +377,15 @@
 # on three runs (0.05 + 0.00, 0.04 + 0.00, 0.04 + 0.00), rounded up to 0.1 like the cheap rows
 # beside it. Into the lightest shard, shard 5 at 1623.8 -> 1623.9. The variant's own row keeps its
 # figure: its sweep is unchanged and only reads its catches once more.
+# PROPOSED D-102 (the run's end in the liveness readings) added three `node` rows, all pins of
+# fixed seeds, so the tier does not move them: weighed on its tree from the built release binary
+# (`node-<hash> <test> --exact`) at ANANKE_SEEDS=1000 ANANKE_DEEP_SEEDS=100, as user + sys, three
+# runs each, on an Apple M2 of 8 cores on AC Power, load averages 4.98/8.15/11.26 with this slice's
+# own measurement running beside them. Seeds 12 and 8 under `SharedSnapshotDir`, two runs, at 1.0
+# cpu s (0.89 + 0.05, 0.91 + 0.06, 0.91 + 0.04); seed 8885's pin, one run, at 0.6 (0.56 + 0.04,
+# 0.53 + 0.03, 0.54 + 0.04); seed 2809's pin, one run, at 0.3 (0.32 + 0.01, 0.33 + 0.01,
+# 0.32 + 0.01). Longest-first into the lightest shard, which stays shard 5 for all three:
+# 1623.9 -> 1624.9 -> 1625.5 -> 1625.8.
 # shard	binary	cpu_s	test
 # shard 1: 1977.1 cpu s
 # D-095 added two rows, both `node`, weighed on its tree from the built release binary
@@ -476,7 +485,7 @@
 4	node	29.1	the_node_folds_agree_with_their_whole_trace_readings
 4	node	0.5	seed_368_is_a_live_installs_hold_and_the_fourth_arm_answers_for_it
 4	node	50.0	a_node_that_resumes_another_runs_block_of_ids_is_caught_after_a_split
-# shard 5: 1623.9 cpu s
+# shard 5: 1625.8 cpu s
 5	echo	6.0	every_seed_satisfies_the_invariants_and_the_sweep_exercises_the_disk_faults
 5	engine	19.5	a_seek_that_counts_tombstones_is_caught
 5	node	58.8	a_leader_that_ignores_incarnations_has_an_incarnation_to_ignore_only_where_a_store_is_refused
@@ -493,6 +502,9 @@
 5	node	0.5	seed_493_is_a_live_installs_hold_and_the_fourth_arm_answers_for_it
 5	node	0.9	seed_633_is_a_live_installs_hold_and_the_fourth_arm_answers_for_it
 5	node	0.1	seed_2994_is_an_unrefused_empty_replica_electing_a_leader_without_a_committed_entry
+5	node	1.0	seeds_12_and_8_under_a_shared_snapshot_dir_stay_wedges_the_true_end_alone_would_excuse
+5	node	0.6	seed_8885_stops_before_its_schedules_total_and_no_key_is_left_with_only_a_tail
+5	node	0.3	seed_2809_ends_with_a_split_halfs_one_write_in_flight_and_passes
 # shard 6: 1657.1 cpu s
 6	echo	0.1	a_busy_looping_task_fails_the_scenario_instead_of_hanging
 6	engine	310.3	an_engine_that_acknowledges_before_the_log_is_caught

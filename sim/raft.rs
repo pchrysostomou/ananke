@@ -1805,6 +1805,16 @@ pub struct Report {
     pub run: RunHeader,
     /// When the last fault healed or the last crashed server restarted.
     pub last_heal: Instant,
+    /// Where the simulation stopped: the virtual time once the run's last advance
+    /// returned, read off the simulator and not worked out from the schedule.
+    ///
+    /// [`Schedule::total`] is not this. It counts every budgeted wait at its whole
+    /// budget — an install that landed early, a stream that opened at once, a
+    /// term raise delivered on the first try — and an arm's tail whether or not the
+    /// arm reached it, so it lies past the end of every run the sweeps measured, by
+    /// more than the liveness bound on many (PROPOSED D-102).
+    // PROPOSED(D-102): the run's end is where the simulation stopped.
+    pub ended: Instant,
     /// Every isolation of one server: (server, from, until).
     pub isolations: Vec<(u64, Instant, Instant)>,
     /// In how many of the trials the slowest clock led when the trial cut the
@@ -1893,6 +1903,9 @@ pub struct Run {
     pub records: Vec<TraceRecord>,
     /// When the run's last fault healed.
     pub last_heal: Instant,
+    /// Where the run's simulation stopped ([`Report::ended`]).
+    // PROPOSED(D-102): the run's end is where the simulation stopped.
+    pub ended: Instant,
     /// Every isolation of one node: (node, from, until).
     pub isolations: Vec<(u64, Instant, Instant)>,
     /// The clients' history.
@@ -2104,14 +2117,21 @@ impl Report {
     /// checks are asked of.
     ///
     /// Everything the checks read is the run's: the records, the isolations it made,
-    /// when it last healed, its clients' history, the ranges its configuration fixed
-    /// and the map from a key to its range. What is *not* the run's is
-    /// [`Report::schedule`], which is [`Schedule::none`] — the faults were not drawn
-    /// by [`Schedule::draw`] — and the fields of this scenario's own arms
+    /// when it last healed, where it stopped, its clients' history, the ranges its
+    /// configuration fixed and the map from a key to its range. What is *not* the
+    /// run's is [`Report::schedule`], which is [`Schedule::none`] — the faults were
+    /// not drawn by [`Schedule::draw`] — and the fields of this scenario's own arms
     /// (`trials_led_by_slowest`, `aimed_streams`), which are zero. No check reads
     /// any of them: the schedule is read for the clock drift alone, which a run with
     /// no skew and no drift has none of.
+    ///
+    /// The run's end was the one exception until PROPOSED D-102: the liveness
+    /// readings took it from the schedule, and [`Schedule::none`]'s total is zero, so
+    /// every run handed here ended at the origin by that reading and D-086's
+    /// exemption for a write pending at the end never applied to it. The end is the
+    /// run's own now ([`Run::ended`]).
     // PROPOSED(D-076): the node scenario is checked by the checks D-071 keyed.
+    // PROPOSED(D-102): the run's end is the run's, not the schedule's.
     #[must_use]
     pub fn over_a_run(run: Run) -> Self {
         let Run {
@@ -2121,6 +2141,7 @@ impl Report {
             header,
             records,
             last_heal,
+            ended,
             isolations,
             history,
             clients,
@@ -2143,6 +2164,7 @@ impl Report {
             records,
             run: header,
             last_heal,
+            ended,
             isolations,
             trials_led_by_slowest: 0,
             aimed_streams: 0,
@@ -3355,20 +3377,78 @@ impl Report {
             .min()
     }
 
-    /// The run's end: the schedule's whole duration from the origin, which is where
-    /// the simulation stops — not the last record, which a run's quiet tail leaves
-    /// behind and which a hand-built trace has nowhere near the run's length.
-    fn end(&self) -> Instant {
-        Instant::default() + self.schedule.total()
+    /// The splits the run took, in the trace's order, by the first `RangeSplit` of
+    /// each: (the parent, the right half, the right half's first key).
+    // PROPOSED(D-102): the exemption's evidence is the serving range's.
+    fn splits_taken(&self) -> Vec<(u64, u64, Bytes)> {
+        let mut seen: BTreeSet<(u64, u64)> = BTreeSet::new();
+        let mut splits = Vec::new();
+        for record in &self.records {
+            if let TraceEvent::RangeSplit {
+                range, right, key, ..
+            } = &record.event
+                && seen.insert((*range, *right))
+            {
+                splits.push((*range, *right, key.clone()));
+            }
+        }
+        splits
+    }
+
+    /// The range serving `key` where the run stopped: [`Report::key_range`]'s, then
+    /// each split of `splits` ([`Report::splits_taken`]) moving the keys at or above
+    /// its key to its right half. [`Report::key_range`] is the map the run started
+    /// with and a split does not change it; this follows the splits, so a right half
+    /// and its parent are two ranges here, as they are two logs. A split's key is the
+    /// engine's encoding of the user's key, which keeps the user's order, so the
+    /// client's key is compared encoded.
+    // PROPOSED(D-102): the exemption's evidence is the serving range's.
+    fn serving_at_the_end(&self, splits: &[(u64, u64, Bytes)], key: &Bytes) -> u64 {
+        let encoded = user_key(key);
+        splits
+            .iter()
+            .fold((self.key_range)(key), |serving, (parent, right, first)| {
+                if serving == *parent && encoded >= *first {
+                    *right
+                } else {
+                    serving
+                }
+            })
+    }
+
+    /// The ranges a client write called at or after the last heal **completed** on,
+    /// each by the range serving its key where the run stopped
+    /// ([`Report::serving_at_the_end`]): what shows a range live after the heal, for
+    /// [`Report::post_heal_writes`]'s exemption. An operation the trace closed by its
+    /// entry's apply counts as completed, as everywhere else the history is read
+    /// (`lin.rs`): the entry committed, which is the evidence asked for.
+    // PROPOSED(D-102): the exemption asks for the range shown live.
+    fn ranges_shown_live_after_heal(&self, splits: &[(u64, u64, Bytes)]) -> BTreeSet<u64> {
+        self.history
+            .ops
+            .iter()
+            .filter(|op| op.op.is_write() && op.call >= self.last_heal && op.ret.is_some())
+            .map(|op| self.serving_at_the_end(splits, op.op.key()))
+            .collect()
     }
 
     /// The post-heal writes the two liveness readings are asked of: every client
-    /// write called at or after the last heal, **except one still pending at the
-    /// run's end with the bound not yet run out since its call**. That write is no
-    /// evidence either way — the run ended before the bound could say whether it
-    /// would complete — which is what D-076's review said of a write in flight at
-    /// the end and how a write no leader proposed is already treated (`lin.rs`). A
-    /// pending write the bound *has* run out on stays what it is: the wedge.
+    /// write called at or after the last heal, **except one still pending where the
+    /// run stopped ([`Report::ended`]) that is no evidence either way** — the run
+    /// ended before the bound could say whether it would complete — which is what
+    /// D-076's review said of a write in flight at the end and how a write no leader
+    /// proposed is already treated (`lin.rs`). A pending write is that when either:
+    ///
+    /// - it was called less than [`WRITE_TIMEOUT`] before the end: its client was
+    ///   still waiting for the answer, and a run that stops inside a client's own
+    ///   wait says nothing of the cluster; or
+    /// - it was called inside the bound of the end **and the range serving its key
+    ///   completed a client write called after the heal**, so the write is waiting
+    ///   on a log shown to be committing.
+    ///
+    /// Any other pending write is evidence: one the bound has run out on is the
+    /// wedge, and so is one on a range no post-heal write completed on, which its
+    /// client had already given up waiting for.
     ///
     /// Found by the merged tree's first nightly (PROPOSED D-086, run 36049438254):
     /// seed 3164's only post-heal write to `k6` was a CAS issued 47 ms before the
@@ -3377,18 +3457,70 @@ impl Report {
     /// heal" — on a range that had committed six other writes since the heal and
     /// served the key twelve times. It was the branch's before the merge too,
     /// masked on #123's nightly by a tier-level tripwire that panicked first.
+    ///
+    /// **The end and the two conditions are PROPOSED D-102's**, and each answers a
+    /// defect of D-086's first form or of the fix for it.
+    ///
+    /// - *The end is where the run stopped.* D-086 read the end as
+    ///   [`Schedule::total`], which counts every budgeted wait at its whole budget
+    ///   and lies past the true end of every run the sweeps measured, by more than
+    ///   the bound on 4 008 of the correct node's ten thousand — by 2.714 s on seed
+    ///   8885 of `main`'s nightly on 6c54705 (run 37918619653), where k5's only
+    ///   post-heal write was called 11 ms before the run stopped and read as a wedge. A run handed over by
+    ///   another scenario carried [`Schedule::none`], whose total is zero, so the
+    ///   exemption never applied there at all.
+    /// - *Inside the bound, the range is shown live.* The true end alone excuses more
+    ///   than the artefact: under `SharedSnapshotDir` on the node it excused the only
+    ///   post-heal writes of ranges that had committed nothing for 6.5 to 18.4 s, on
+    ///   33 of seeds 0 to 1 999 of 6c54705, because each was called inside the bound
+    ///   of the end. A range that completed a post-heal write is committing, and a
+    ///   write pending on it at the end ran out of run, not of cluster; a range that
+    ///   completed none has shown nothing.
+    /// - *A write its client still waits for is no evidence on any range.* A split
+    ///   leaves each half of a two-key range serving one key, and a half's evidence is
+    ///   then that key's own: seed 2809 of the correct node on fdc5fc0 splits range 4
+    ///   at `k5`, and the left half's one key, `k4`, is written once after the heal,
+    ///   21 ms before the run stops — read as the wedge by the second condition alone,
+    ///   though the half served `k4` eight times after the heal. The wedges the second
+    ///   condition keeps are not of that shape: every one has a write its client had
+    ///   already given up on.
+    ///
+    /// The evidence is the range's and not the key's. For the per-key reading the
+    /// key's own would be no exemption at all — a key with a completed post-heal write
+    /// reads that write whatever its pending ones, and a key without one is exactly
+    /// the case excused — and the per-range reading's minimum is decided by any
+    /// completed write before a pending one can matter. The range is the unit the log
+    /// is: a write to `k5` is proposed into the same log as a write to `k4`, and that
+    /// log committing after the heal is what says the cluster serves the key.
+    ///
+    /// And it is the range **serving** the key where the run stopped
+    /// ([`Report::serving_at_the_end`]), not [`Report::key_range`]'s, because a split
+    /// makes two logs of one span and the starting map still reads them as one: under
+    /// `SharedSnapshotDir` on the node, seeds 8 and 54 of `main` at fdc5fc0 wedge a
+    /// split's left half for 6.7 and 5.9 s while its right half completes every
+    /// write, and evidence read through the starting map would excuse the wedged
+    /// half's pending writes by its sibling's.
     // PROPOSED(D-086): a write pending at the run's end inside the bound is no
     // evidence, as the reading's own doc said.
+    // PROPOSED(D-102): at the true end; inside the bound only on a range shown live;
+    // inside the client's own wait on any range.
     fn post_heal_writes(&self) -> impl Iterator<Item = &crate::lin::Op> {
         let bound = election_max() * LIVENESS_TIMEOUTS;
-        let end = self.end();
+        let splits = self.splits_taken();
+        let shown_live = self.ranges_shown_live_after_heal(&splits);
         self.history.ops.iter().filter(move |op| {
             let since = op.call.max(self.last_heal);
-            let pending_inside_the_bound = op.ret.is_none()
-                && end
-                    .checked_duration_since(since)
-                    .is_some_and(|elapsed| elapsed <= bound);
-            op.op.is_write() && op.call >= self.last_heal && !pending_inside_the_bound
+            let pending_for = op
+                .ret
+                .is_none()
+                .then(|| self.ended.checked_duration_since(since))
+                .flatten();
+            let excused = pending_for.is_some_and(|pending| {
+                pending <= WRITE_TIMEOUT
+                    || (pending <= bound
+                        && shown_live.contains(&self.serving_at_the_end(&splits, op.op.key())))
+            });
+            op.op.is_write() && op.call >= self.last_heal && !excused
         })
     }
 
@@ -8249,6 +8381,10 @@ pub fn run_on(
     if watch.stopped.is_none() {
         advance(&mut sim, schedule.settle, &mut watch);
     }
+    // Where the run stopped, read off the simulator: each budgeted wait above returns
+    // when its event lands, and an arm skips its tail when its wait ran out, so the
+    // schedule's total is not this (PROPOSED D-102).
+    let ended = sim.now();
     let records = sim.trace();
     let refused: Vec<(u64, String)> = records
         .iter()
@@ -8275,6 +8411,7 @@ pub fn run_on(
         run: sim.run_header(),
         records,
         last_heal,
+        ended,
         isolations,
         trials_led_by_slowest,
         aimed_streams,
@@ -8882,14 +9019,20 @@ mod tests {
 
     fn report(records: Vec<TraceRecord>, isolations: Vec<(u64, Instant, Instant)>) -> Report {
         let sim = Sim::new(SimConfig::new(0));
+        let schedule = Schedule::term_raise_behind_a_step(0);
+        // A hand-built run stops where its schedule's total says, 3.9 s: what every
+        // case below was written against while the end was read off the schedule
+        // (PROPOSED D-102). A case about the two differing sets `ended` itself.
+        let ended = Instant::default() + schedule.total();
         Report {
             seed: 0,
             variants: Variants::from(Variant::Correct),
             policy: Policy::Uniform,
-            schedule: Schedule::term_raise_behind_a_step(0),
+            schedule,
             records,
             run: sim.run_header(),
             last_heal: Instant::from_nanos(0),
+            ended,
             isolations,
             trials_led_by_slowest: 0,
             aimed_streams: 0,
@@ -10614,6 +10757,257 @@ mod tests {
             live_wedged.liveness(),
             Err(
                 "liveness: no client write to k0 completed after the last heal at Instant(0ns)"
+                    .to_owned()
+            )
+        );
+    }
+
+    /// A post-heal write to `key` called at `call` ms, returned at `ret` ms or still
+    /// pending.
+    fn put_at(key: &str, call: u64, ret: Option<u64>) -> lin::Op {
+        lin::Op {
+            process: 1,
+            seq: call,
+            call: ms(call),
+            ret: ret.map(ms),
+            op: ClientOp::Put {
+                key: Bytes::from(key.to_owned()),
+                value: Bytes::from_static(b"v"),
+            },
+            result: ret.map(|_| ananke_env::ClientResult::Done),
+        }
+    }
+
+    /// A write still pending where the run **stopped** is judged against that
+    /// instant, not against the schedule's total (PROPOSED D-102). A run whose
+    /// budgeted waits ended early stops before its schedule's total: seed 8885 of
+    /// `main`'s nightly on 6c54705 stopped 2.714 s before it, and a put to `k5` called
+    /// 11 ms before the end — on a range whose other key wrote throughout — was read
+    /// as a wedge, because 2.725 s separated its call from the total.
+    ///
+    /// The shape here is that one, scaled to the hand-built schedule's 3.9 s: the run
+    /// stops at 2.5 s, `k0` of the same range completes a write after the heal, and
+    /// `k1`'s only write is pending. Called 1.0 s before the end it is no evidence
+    /// either way, though 2.4 s separate it from the total — and read against the
+    /// total, as D-086 read it, it is the wedge, which is the half that says the end
+    /// is what moved the verdict. Called 2.1 s before the end it stays the wedge.
+    // PROPOSED(D-102): the run's end is where the simulation stopped.
+    #[test]
+    fn a_write_pending_where_the_run_stopped_is_judged_against_that_instant() {
+        let live = vec![record(
+            ms(0),
+            ms(0),
+            Some(1),
+            term_of(1, SINGLE_GROUP, 1, "follower"),
+        )];
+        let with = |ops, ended| Report {
+            history: History {
+                ops,
+                ..History::default()
+            },
+            ended,
+            ..report(live.clone(), Vec::new())
+        };
+        let total = Instant::default() + Schedule::term_raise_behind_a_step(0).total();
+        assert_eq!(total, ms(3900), "the schedule this case is about");
+        let tail = vec![put_at("k0", 1, Some(100)), put_at("k1", 1500, None)];
+        // Where the run stopped: no evidence either way.
+        with(tail.clone(), ms(2500)).liveness().unwrap();
+        // Read against the schedule's total: the artefact.
+        assert_eq!(
+            with(tail, total).liveness(),
+            Err(
+                "liveness: no client write to k1 completed after the last heal at Instant(0ns)"
+                    .to_owned()
+            )
+        );
+        // Called 2.1 s before the run stopped and still pending: the wedge.
+        assert_eq!(
+            with(
+                vec![put_at("k0", 1, Some(100)), put_at("k1", 400, None)],
+                ms(2500)
+            )
+            .liveness(),
+            Err(
+                "liveness: no client write to k1 completed after the last heal at Instant(0ns)"
+                    .to_owned()
+            )
+        );
+    }
+
+    /// A write pending inside the bound of the end is excused only on a range some
+    /// post-heal write **completed** on (PROPOSED D-102). The true end alone excused
+    /// the only post-heal writes of ranges `SharedSnapshotDir` had wedged for 6.5 to
+    /// 18.4 s, on 33 of 2 000 node seeds, because each was called inside the bound
+    /// of the end; a range that completed none has shown nothing, and its pending
+    /// writes are all the evidence there is.
+    ///
+    /// The mutation a single-range world could not catch is the evidence asked of
+    /// the cluster instead of the range — "some post-heal write completed somewhere".
+    /// With one range the two are one, so the pair is two maps of the same history:
+    /// `k0` completes and `k1`'s only write is pending 1.0 s before the end. With both
+    /// keys in one range `k0` shows `k1`'s range live and the write is excused; with
+    /// each key its own range, nothing shows `k1`'s range live and it is the wedge.
+    // PROPOSED(D-102): the exemption asks for the range shown live.
+    #[test]
+    fn a_write_pending_at_the_end_is_excused_only_on_a_range_shown_live() {
+        fn two_ranges(key: &Bytes) -> u64 {
+            if key.as_ref() == b"k0" {
+                SINGLE_GROUP
+            } else {
+                OTHER
+            }
+        }
+        let records = vec![
+            record(
+                ms(0),
+                ms(0),
+                Some(1),
+                term_of(1, SINGLE_GROUP, 1, "follower"),
+            ),
+            record(ms(0), ms(0), Some(1), term_of(1, OTHER, 1, "follower")),
+        ];
+        let tail = || History {
+            ops: vec![put_at("k0", 1, Some(100)), put_at("k1", 1500, None)],
+            ..History::default()
+        };
+        let one_range = Report {
+            history: tail(),
+            ended: ms(2500),
+            ..report(records.clone(), Vec::new())
+        };
+        let two = Report {
+            history: tail(),
+            ended: ms(2500),
+            key_range: two_ranges,
+            ..report(records, Vec::new())
+        };
+        assert_eq!(
+            two.ranges_with_a_majority_up(),
+            BTreeSet::from([SINGLE_GROUP, OTHER]),
+            "both ranges are asked of"
+        );
+        one_range.liveness().unwrap();
+        assert_eq!(
+            two.liveness(),
+            Err(
+                "liveness: no client write to k1 completed after the last heal at Instant(0ns)"
+                    .to_owned()
+            )
+        );
+    }
+
+    /// The range that shows a pending write's range live is the range **serving** its
+    /// key where the run stopped, not [`Report::key_range`]'s, which is the map the
+    /// run started with and which no split changes (PROPOSED D-102). Seeds 8 and 54
+    /// of the node's sweep under `SharedSnapshotDir` are this shape on `main` at
+    /// fdc5fc0: a range split at its second key, the left half wedged for 6.7 and
+    /// 5.9 s by the run's end with its key's post-heal writes pending inside the
+    /// bound, and the right half live — its key's writes completing, which the
+    /// starting map counts as the left half's own.
+    ///
+    /// Built here as the trace says it: `k1`'s writes complete and `k0`'s only write
+    /// is pending 1.0 s before the end. With no split both keys are one range's and
+    /// the write is excused; with the range split at `k1` the right half serves `k1`,
+    /// the left half has shown nothing, and it is the wedge.
+    // PROPOSED(D-102): the exemption's evidence is the serving range's.
+    #[test]
+    fn the_range_shown_live_is_the_range_serving_the_key_after_a_split() {
+        let right = SINGLE_GROUP + 40;
+        let term = record(
+            ms(0),
+            ms(0),
+            Some(1),
+            term_of(1, SINGLE_GROUP, 1, "follower"),
+        );
+        let split = record(
+            ms(0),
+            ms(0),
+            Some(1),
+            TraceEvent::RangeSplit {
+                range: SINGLE_GROUP,
+                right,
+                key: user_key(b"k1"),
+                index: 5,
+            },
+        );
+        let with = |records| Report {
+            history: History {
+                ops: vec![put_at("k1", 1, Some(100)), put_at("k0", 1500, None)],
+                ..History::default()
+            },
+            ended: ms(2500),
+            ..report(records, Vec::new())
+        };
+        let unsplit = with(vec![term.clone()]);
+        let split = with(vec![term, split]);
+        let splits = split.splits_taken();
+        assert_eq!(
+            (
+                split.serving_at_the_end(&splits, &Bytes::from_static(b"k0")),
+                split.serving_at_the_end(&splits, &Bytes::from_static(b"k1"))
+            ),
+            (SINGLE_GROUP, right),
+            "the split moves the keys at or above its key, and only those"
+        );
+        unsplit.liveness().unwrap();
+        assert_eq!(
+            split.liveness(),
+            Err(
+                "liveness: no client write to k0 completed after the last heal at Instant(0ns)"
+                    .to_owned()
+            )
+        );
+    }
+
+    /// A write its client is still waiting for when the run stops — called less than
+    /// [`WRITE_TIMEOUT`] before the end — is no evidence on **any** range, shown live
+    /// or not (PROPOSED D-102). A split half serves one key in the node's sweep, so
+    /// its evidence is that key's own, and seed 2809 of the correct node on fdc5fc0 is
+    /// the left half of range 4 whose one key is written once after the heal, 21 ms
+    /// before the run stops: no other write of the half could show it live.
+    ///
+    /// Each key here is its own range, as each half is. `k1`'s only write, called
+    /// 20 ms before the end, is excused; called 100 ms before it — past its client's
+    /// wait, on a range that completed nothing — it is the wedge.
+    // PROPOSED(D-102): inside the client's own wait, on any range.
+    #[test]
+    fn a_write_its_client_still_waits_for_at_the_end_is_no_evidence_on_any_range() {
+        fn two_ranges(key: &Bytes) -> u64 {
+            if key.as_ref() == b"k0" {
+                SINGLE_GROUP
+            } else {
+                OTHER
+            }
+        }
+        let records = vec![
+            record(
+                ms(0),
+                ms(0),
+                Some(1),
+                term_of(1, SINGLE_GROUP, 1, "follower"),
+            ),
+            record(ms(0), ms(0), Some(1), term_of(1, OTHER, 1, "follower")),
+        ];
+        let with = |call| Report {
+            history: History {
+                ops: vec![put_at("k0", 1, Some(100)), put_at("k1", call, None)],
+                ..History::default()
+            },
+            ended: ms(2500),
+            key_range: two_ranges,
+            ..report(records.clone(), Vec::new())
+        };
+        assert_eq!(
+            WRITE_TIMEOUT,
+            Duration::from_millis(60),
+            "the wait this case is about"
+        );
+        with(2480).liveness().unwrap();
+        assert_eq!(
+            with(2400).liveness(),
+            Err(
+                "liveness: no client write to k1 completed after the last heal at Instant(0ns)"
                     .to_owned()
             )
         );
