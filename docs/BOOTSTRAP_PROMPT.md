@@ -133,7 +133,7 @@ _Update this section at the end of every session._
   `// PROPOSED(D-104)` at the split arms' draw, seed 680's doc naming D-105's pin of seed
   42's trace, and every code line D-104 and its notes cite pinned to commit 0284c13.
 - Branch `phase-3-fix-run-end-reading-2` (2026-10-11), off `main` at b01db39 and merged
-  with it at 8496ca3 (#152), PROPOSED D-102, **the run's end in the liveness readings**,
+  with it at 8496ca3 (#152) and 7564917 (#153), PROPOSED D-102, **the run's end in the liveness readings**,
   superseding D-086's end-of-run reading. `main`'s nightly on 6c54705 failed the correct
   node on seed 8885 with a write called 11 ms before the run stopped read as a wedge:
   D-086 read the run's end as the schedule's total, which counts every budgeted wait at
@@ -142,25 +142,44 @@ _Update this section at the end of every session._
   error made in a48c1b5 — and `over_a_run` carried a total of zero, so the exemption never
   applied to `sim/ranges.rs`. `Report::ended` and `Run::ended` carry where the simulation
   stopped, and a write pending there is excused only inside its client's own wait
-  (`WRITE_TIMEOUT`, PROPOSED), or inside the bound on the range serving its key, splits
-  followed, once that range completed a client write called after the heal. Neither
+  (`WRITE_TIMEOUT`), or inside the bound on the range serving its key, splits followed,
+  once that range completed a client write, called after the heal, after the pending
+  write's call, each completion the range's that served its key when it completed. #154
+  merged that clause without the call condition, and #157's review found it passing
+  eleven real `ApplyWaitsForEveryRange` stalls; the amendment, #159, restores them (the
+  completion's range at its return moves no verdict and makes the reading exact). What excuses a pending write is the PROPOSED ask, measured at ten
+  thousand as (correct node failures; stalls passed; `SharedSnapshotDir` artefacts
+  reported beyond #154's): #154's form 0, 11, 0; the taken form 0, 0, 7; the client's wait
+  alone 0, 0, 9. Neither
   proposed fix shipped as written: the true end alone passes 457 uniform
   `SharedSnapshotDir` runs this reading fails, 424 of them writes that a 4 s
   counterfactual extension shows never answered or answered past the bound; the verifier's
   range evidence through the starting map passes 131, split halves vouched for by their
   live siblings; read through the serving range without the client's wait it fails the
   correct node on seed 2809, a split half's one write in flight. Measured at ten thousand
-  in release, before and after: the correct node and one group 0 and 0;
-  `SharedSnapshotDir` on the node 2 155 → 2 160 uniform liveness catches, the 12 no longer
+  in release, before, after #154 and after the amendment: the correct node and one group
+  0 and 0 throughout; `SharedSnapshotDir` on the node 2 155 → 2 160 → 2 167 uniform
+  liveness catches (the amendment's seven each a write answered within the bound, 81 ms to
+  1.338 s after its call, on a range that completed nothing since the call), the 12 no longer
   reported each the artefact by its counterfactual, of the 17 new 11 writes never answered
   or answered past the bound, 4 ranges silent until 3.4–4.7 s after the heal and 2 (488,
   960) a write answered just past its client's wait; its nightly share 314/225/122/34 →
-  316/227/122/34; `RefusedReadLeft` 1 097 by the bound both ways;
-  `SnapshotWithoutCurrentLast`'s catch by any check 2 → 1, its seed 7992 the artefact; the
-  nightly otherwise unchanged line for line; `sim/ranges.rs` and one group's
-  `SharedSnapshotDir` unmoved to the seed. Pinned: seed 8885 (the run stops 2.588 s before
-  its total; the tail absent, asserted with the reason), seed 2809, seeds 12 and 8 under
-  `SharedSnapshotDir`, four hand-built cases; seven mutations each caught.
+  316/227/122/34 → 317/228/122/34 (seed 869; D-045's pair 280 → 282 → 283);
+  `RefusedReadLeft` 1 097 by the bound throughout;
+  `SnapshotWithoutCurrentLast`'s catch by any check 2 → 1, its seed 7992 the artefact;
+  `ApplyWaitsForEveryRange`'s "other checks" 8 345 → 8 335 against b01db39's nightly
+  (38141605412), which the first record missed (#157's review): eleven uniform stalls
+  passed, each excused by a write its range completed before the stalled one was called,
+  and none answered within the bound in a 4 s extension (1184 still fails `checked` on its
+  reach), the lag fold's catch, all the test asserts, unchanged, and back to 8 345 after
+  the amendment; the nightly otherwise unchanged line for line against b01db39's, not
+  195f965's, which differs by D-103's field too; every other node variant sweep whose check
+  reads liveness, at its nightly tier, unmoved by the amendment; `sim/ranges.rs` and one
+  group's `SharedSnapshotDir` unmoved to the seed. Pinned: seed 8885 (the run stops
+  2.588 s before its total; the tail absent, asserted with the reason), seed 2809, seeds 12
+  and 8 under `SharedSnapshotDir`, seed 613 under `ApplyWaitsForEveryRange` (a stall with
+  its 4 s counterfactual run in the pin), six hand-built cases; nine mutations each
+  caught.
   `SplitFromRestarted`'s no-split `continue` read: it keeps `last_heal` at the last real
   heal and moving it would lose 47 uniform catches, so it stays (#147); the per-range
   reading still keyed by the starting map is #148.

@@ -19312,14 +19312,16 @@ seed is still caught, and #143 stands as filed.
 
 ---
 
-## PROPOSED D-102 — The run's end is where the simulation stopped, and a write pending there is evidence unless its client was still waiting or the range serving its key showed itself live: D-086's end-of-run reading superseded
+## PROPOSED D-102 — The run's end is where the simulation stopped, and a write pending there is evidence unless its client was still waiting or the range serving its key showed itself live after the write was called: D-086's end-of-run reading superseded
 
 **The number.** Assigned with the fix PRs opened against `main` at fdc5fc0: D-101 and
 D-103 beside it have merged (#144, #149), and this takes **D-102**, between them in
 numerical order. The branch is off `main` at b01db39, whose footer reads D-104, and the
 footer stayed D-104; merged with `main` at 8496ca3, which brought D-105 (#152), the entries
-are a union in numerical order and the footer is D-106. Every code site carries
-`// PROPOSED(D-102)`.
+are a union in numerical order and the footer is D-106. #154 merged at e782365; this entry
+was amended in place after #157's review. #157 itself merged at 681165a (bc102d6), so the
+amendment is #159, merged with `main` at 7564917 (#153, D-104), and the footer stays
+D-106. Every code site carries `// PROPOSED(D-102)`.
 
 **Context.** `main`'s nightly on 6c54705 (#132, run 37918619653) failed seed 8885 of the
 correct node's raft-arms sweep — *"liveness: no client write to k5 completed after the
@@ -19338,12 +19340,17 @@ simulation stops"* (`Report::end`, `Instant::default() + self.schedule.total()`)
 premise is false, and the error was made in a48c1b5**, the commit that wrote D-086's
 seed-3164 fix, merged with #109 (527adcd). `Schedule::total` counts every budgeted wait at
 its whole budget — `INSTALL_WAIT_BUDGET`'s 4 s, `STREAM_WAIT_BUDGET`'s 2.5 s, the transfer,
-term-raise, flush, adoption and split budgets — and every arm's tail whether or not the
-arm reached it: `CrashInstalling`'s grace and down when no install landed,
+term-raise, flush and adoption budgets — and every arm's tail whether or not the arm
+reached it: `CrashInstalling`'s grace and down when no install landed,
 `RetakeUnderStream`'s freeze and hold when no stream opened. Each of those waits returns
-when its event lands, so the run stops before the total. Measured on this tree in release
-over the correct node's ten thousand seeds of the raft arms: **the total lies past the end
-of every one of the 10 000 runs**, by 1.2 s at the least, 1.5 s at the median and 8.371 s
+when its event lands, so the run stops before the total. The split budget is not even
+waited: `Schedule::total` adds `SPLIT_WAIT_BUDGET`'s 600 ms for `Fault::Split` and again
+for `Fault::SplitFromRestarted`, and `run_on` spends neither — the first arm advances only
+its settle, the second its down, `TRANSFER_WAIT` when the lead must move and its settle
+(#157's review) — so every node schedule's total lies at least 1.2 s past its end. Measured
+on this tree in release over the correct node's ten thousand seeds of the raft arms: **the
+total lies past the end of every one of the 10 000 runs**, by 1.2 s at the least (that
+floor), 1.5 s at the median and 8.371 s
 at the most, and by more than the 2 s liveness bound on **4 008**. Wherever it does, the
 exemption is partly or wholly dead, and a write pending at the true end inside the bound
 is read as the wedge. It was an incomplete fix from the start — 677cad3 failed seed 3164
@@ -19401,6 +19408,52 @@ one key, so a half's evidence is that key's own, and a key there whose only post
 write is in flight at the end is read as the wedge — the artefact of seed 8885, back on
 every split half.
 
+### The evidence postdates the write (amended after #157's review)
+
+The second condition as first merged (#154, at e782365) asked only that the range serving
+the key had completed **some** client write called after the heal. That is evidence that
+the log committed after the heal, not that it was committing while the pending write
+waited, and `ApplyWaitsForEveryRange` shows the difference. Its apply task waits for a job
+of every range before it runs any, so a node's applies stall while its logs go on
+committing. On eleven of its ten thousand uniform runs the clause as merged excused writes
+that a 4 s extension of the run never answers within the bound. Each was excused by a
+completion on its range 0.744 to 2.724 s before the end, and before the write's own call
+(read seed by seed under "other pair tests" below; seed 613 is pinned). This entry
+rejects the true end alone because it passes real wedges, and by that same test the
+clause as merged loosened the reading on this variant, which D-030 and D-039 forbid. The
+review found it, and the measurement this entry first made of `SharedSnapshotDir` alone
+could not have.
+
+So the clause asks for a completion **after the pending write was called**: a client
+write, called after the heal, on the range serving the pending write's key, that
+completed after that call. It says the log committed while the write waited, and since
+the call is inside the bound, that the range had been silent for less than the bound
+when the run stopped. Three forms of what excuses a write pending past its client's
+wait and inside the bound, measured on this tree at ten thousand seeds in release, each
+over the same runs:
+
+| Evidence asked | Correct node: `check()` failures | `ApplyWaitsForEveryRange`: uniform stalls passed | `SharedSnapshotDir`: uniform artefacts reported beyond #154's |
+|---|---|---|---|
+| A completion on the serving range after the heal (#154) | 0 | 11 | 0 |
+| **A completion on the serving range after the write's call (taken)** | **0** | **0** | **7** |
+| None: the client's wait alone excuses | 0 | 0 | 9 |
+
+The correct node fails nothing under any of them, so the clause decides no correct
+verdict on these ten thousand; it decides variant runs. The seven artefacts the taken form
+reports under `SharedSnapshotDir` are seeds 869, 1556, 5585, 6505, 6828, 9113 and 9788.
+By their counterfactual, every pending write the merged form excused on them is answered
+within the bound of its own call, 81 ms to 1.338 s after it. Each was on a range that
+completed nothing between that call and the end, and the merged form excused it by an
+older completion. They are slow ranges under a buggy variant, read as wedges; 5585 is one
+of the twelve artefacts the true end released below, caught again. The client's wait
+alone reports two more, 1981 and 2572, whose ranges did complete a write after the
+pending one's call. Every other node sweep whose check reads liveness, each at the tier
+its nightly runs, moves no `check()` verdict between the three forms. That is the
+correct node, `RefusedReadLeft`, `SnapshotWithoutCurrentLast` and `LeaseTrustsTheClock` at
+ten thousand, and the fifteen other variant sets at their 1 000-seed shares, listed with
+the table below. D-045's pair moves with `SharedSnapshotDir` on its share, by seed 869.
+One group, correct and under `SharedSnapshotDir`, moves nothing at ten thousand.
+
 ### Taken
 
 Both liveness readings, per key and per range, take the post-heal writes from
@@ -19417,12 +19470,15 @@ moved, no schedule moved and no trace moved.
      waiting for the answer, and a run that stops inside a client's own wait says nothing
      of the cluster, on any range; or
    - it was called inside the bound of the end **and the range serving its key completed a
-     client write called after the heal**: a completed write is an entry of that log
-     committed after the heal, and a write pending on it ran out of run, not of cluster.
+     client write, called after the heal, after this write was called**: a completed write
+     is an entry of that log committed, and one committed after the pending write's call
+     says the log was committing while it waited, so it ran out of run, not of cluster.
+     This is the clause as amended after #157's review; as first merged (#154) it asked
+     for any completion after the heal, which excused real stalls (below).
 
    Any other pending write is evidence: one the bound ran out on is the wedge, as D-086
-   kept it, and so is one on a range that completed nothing after the heal, which its
-   client had already given up on.
+   kept it, and so is one on a range that completed nothing after it was called, which
+   its client had already given up on.
 
 **The evidence is the range's and not the key's.** The per-key reading leaves the choice
 open, and the key's own evidence would be no exemption at all: the per-key fold reads a
@@ -19436,27 +19492,53 @@ write to k5 is proposed into the same log as a write to k4.
 
 **The range is the one serving the key where the run stopped**, not `Report::key_range`'s,
 for the reason above: `Report::splits_taken` folds the first `RangeSplit` of each split in
-the trace's order, and `Report::serving_at_the_end` moves the keys at or above each
-split's key — the engine's encoding of the user key, which keeps its order — to the right
-half.
+the trace's order, with when it was traced, and `Report::serving_at` moves the keys at or
+above each split's key — the engine's encoding of the user key, which keeps its order — to
+the right half. **A completion is the evidence of the range that served its key when it
+completed** (amended after #157's review): `serving_at` at the completion's return applies
+only the splits traced by then. As first merged, every completion was read through the
+range serving its key at the end, so a write a parent committed before a split later
+than it counted as the right half's evidence, though the right half's log did not exist
+yet, and not the left half's, which keeps the parent's log. On the correct node 372 of ten
+thousand runs trace a split's first `RangeSplit` after the last heal (the review's count).
+Read both ways, over every run of every scenario measured below, the two assignments give
+the same liveness and `check()` verdict on every run: the change makes the reading exact
+and moves no figure.
 
-**PROPOSED: the client's wait as the in-flight threshold.** The first condition is this
-entry's own; it is what the range evidence cannot be on a split half that serves one key.
-`WRITE_TIMEOUT` is no new constant: a client gives a write one try and abandons it at its
-deadline, `WRITE_TIMEOUT` after the call, so a write younger than that at the end is the
-client's current operation — at most one per client — and nothing older can be excused by
-it. Measured on the correct node's ten thousand: of the 4 387 post-heal writes pending at
-the end, 9 had waited longer than 60 ms, 4 of them longer than the bound, and none of the
-9 decided a verdict; the slowest post-heal write that completed took 214.8 ms. **The
-recommendation is to keep it.** What it cannot see is a wedge whose only post-heal witness
-is a client's current write, and what it reports falsely is a write answered just past its
-client's wait on a split half nothing else showed live: measured below, one seed of ten
-thousand under `SharedSnapshotDir` for the first, on a schedule the check does not ask
-liveness of, and two for the second. The class they belong to — a range whose only
-post-heal writes come in the run's last moments — is closed where it belongs, by a driver
-write to every range after the heal, retried until answered, which D-103 proposes for the
-membership scenario for the same reason (#145); that changes every schedule and is not
-taken here.
+**PROPOSED: what excuses a write pending at the end.** Both conditions are this entry's
+own, and neither is settled by SHARD.md §8, which asks the bound of every post-heal write
+and says nothing of a run that stops before the bound can answer. The three forms are
+the table above. **The recommendation is the taken form**: the client's wait, or a
+completion on the serving range after the write's call.
+
+- *Against the form first merged* (any completion after the heal): it passes eleven real
+  stalls of `ApplyWaitsForEveryRange` in ten thousand, which the taken form reports, and
+  it spares seven `SharedSnapshotDir` runs whose writes were in fact answered within the
+  bound. Passing a wedge is the loosening D-030 and D-039 forbid; reporting a slow range
+  under a buggy variant as a wedge fails no correct run.
+- *Against the client's wait alone*: it reports two artefacts more under
+  `SharedSnapshotDir`, and it keeps no margin on the correct node. A write older than its
+  client's 60 ms wait is one its client abandoned, and the correct node's slowest
+  completed post-heal write took 214.8 ms, so a correct run can stop with a key's only
+  post-heal write between 60 ms and that old. The wait alone reads it as the wedge; the
+  taken form excuses it wherever the range completed anything since the write's call.
+  None of the correct node's ten thousand runs has one, so the margin is unmeasured.
+
+The first condition, the client's wait, is what the range evidence cannot be on a split
+half that serves one key, and it is no new constant. A client gives a write one try and
+abandons it at its deadline, `WRITE_TIMEOUT` after the call, so a write younger than that
+at the end is the client's current operation, at most one per client, and nothing older
+can be excused by it. Measured on the correct node's ten thousand: of the 4 387 post-heal
+writes pending at the end, 9 had waited longer than 60 ms, 4 of them longer than the
+bound, and none of the 9 decided a verdict; the slowest post-heal write that completed
+took 214.8 ms. What the taken form cannot see is a wedge whose only post-heal witness is a
+client's current write. What it reports falsely is a write answered after its client's
+wait on a range nothing else showed live after its call: two such seeds under
+`SharedSnapshotDir` as first measured below (488 and 960), and the seven above. The class
+they belong to, a range whose only post-heal writes come in the run's last moments, is
+closed where it belongs. That is a driver write to every range after the heal, retried
+until answered, which D-103 proposes for the membership scenario for the same reason
+(#145); it changes every schedule and is not taken here.
 
 ### Measured, before and after, at ten thousand seeds in release
 
@@ -19472,19 +19554,46 @@ changed, so the runs before and after are the same runs. The figures are b01db39
 this change; the merge with 8496ca3 (D-105) moves no run, and the probe rebuilt on the
 merged tree prints the same line, verdict for verdict and figure for figure, on seeds 0 to
 999 of `SharedSnapshotDir`, 0 to 599 of the correct node and of one group, 0 to 299 of
-`RefusedReadLeft` and of `sim/ranges.rs`'s three.
+`RefusedReadLeft` and of `sim/ranges.rs`'s three. The amendment after #157's review is
+measured the same way, by a second probe built on this branch's merge with `main` at
+7564917, which reads every run under D-086's reading, #154's form, the taken form and the
+client's wait alone. Its reading of #154's form agrees with that tree's own
+`Report::liveness` on every run of every scenario below. It reads the taken form twice,
+each completion by the range serving its key at the end and at its return, and the two
+agree on every verdict of every run. Rebuilt on the amended tree at each of its two
+commits, the matching form agrees with that tree's `Report::liveness` on every run it read
+there: `ApplyWaitsForEveryRange`'s ten thousand, seeds 0 to 1 999 of `SharedSnapshotDir`,
+and 0 to 999 of the correct node, of D-045's pair and of one group's `SharedSnapshotDir`.
+The third column is #154's, the fourth
+the amended entry's; every node sweep whose check reads liveness is in the table, each at
+the tier its nightly runs.
 
-| Scenario, seeds 0–9 999 | before | after |
-|---|---|---|
-| Correct node, raft arms: `check()` failures | 0 | **0** (the serving range alone: 1, seed 2809) |
-| One group, correct: `check()` failures | 0 | **0** (every reading: 0) |
-| Node, `SharedSnapshotDir`: liveness violations, uniform / all schedules | 2 155 / 4 279 | **2 160 / 4 279** (−12 +17 / −31 +31) |
-| — its share, seeds 0–999 (the nightly's): failed, wedged, read bound on a wedge (non-uniform), load | 314, 225, 122 (55), 34 | **316, 227, 122 (55), 34** |
-| — read bound on a wedge, and load, over 0–9 999 | 975, 249 | **975, 249** (three trips each way) |
-| Node, D-045's pair, seeds 0–999 | 280, the stream half's seeds | **282**, the stream half's seeds |
-| Node, `RefusedReadLeft`: caught, all by the bound | 1 097 | **1 097** (no liveness violation under any reading but the serving range alone's 2809) |
-| One group, `SharedSnapshotDir`: caught, by liveness | 10, 9 | **10, 9** (no seed moved under any reading) |
-| `sim/ranges.rs`, correct / `StepWhilePersisting` / `RefusedReadLeft`: caught | 0 / 6 746 / 0 | **0 / 6 746 / 0** (no liveness violation under any reading) |
+| Scenario, seeds 0–9 999 | before (D-086) | #154 | after (amended) |
+|---|---|---|---|
+| Correct node, raft arms: `check()` failures | 0 | 0 | **0** (the serving range alone: 1, seed 2809) |
+| One group, correct: `check()` failures | 0 | 0 | **0** (every reading: 0) |
+| Node, `SharedSnapshotDir`: liveness violations, uniform / all schedules | 2 155 / 4 279 | 2 160 / 4 279 | **2 167 / 4 289** (−11 +23 / −27 +37) |
+| — its share, seeds 0–999 (the nightly's): failed, wedged, read bound on a wedge (non-uniform), load | 314, 225, 122 (55), 34 | 316, 227, 122 (55), 34 | **317, 228, 122 (55), 34** (seed 869) |
+| — read bound on a wedge, and load, over 0–9 999 | 975, 249 | 975, 249 | **976, 248** (seed 6828) |
+| Node, D-045's pair, seeds 0–999 | 280, the stream half's seeds | 282, the stream half's seeds | **283** (seed 869), the stream half's seeds |
+| Node, `ApplyWaitsForEveryRange`: "the run's other checks failed it on" (`checked`) / uniform liveness violations | 8 345 / 4 999 | 8 335 / 4 988 | **8 345 / 4 999** |
+| Node, `SnapshotWithoutCurrentLast`: caught by a check | 2 | 1 | **1** (seed 7992, inside its client's wait) |
+| Node, `LeaseTrustsTheClock`: `check()` failures | 68 | 68 | **68** |
+| Node, `RefusedReadLeft`: caught, all by the bound | 1 097 | 1 097 | **1 097** (no liveness violation under any reading but the serving range alone's 2809) |
+| One group, `SharedSnapshotDir`: caught, by liveness | 10, 9 | 10, 9 | **10, 9** (no seed moved under any reading) |
+| `sim/ranges.rs`, correct / `StepWhilePersisting` / `RefusedReadLeft`: caught | 0 / 6 746 / 0 | 0 / 6 746 / 0 | **0 / 6 746 / 0** (no liveness violation under any reading) |
+| Node, the other fifteen variant sets the nightly runs on a 1 000-seed share: `check()` verdicts moved | — | 0 | **0** |
+
+The fifteen are `SendBeforePersist`, `ApplyBeforeCommit`, `NoPreVote`,
+`CountOlderTermForCommit`, `TruncateOnEveryAppend`, `ResetTimerOnAnyRpc`,
+`IgnoreIncarnation`, `AdoptionAsBuilt` and `RefusalNotDurable` on the node's cores, and the
+range layer's `TrustStaleDescriptor`, `ApplyIgnoresSpan`, the two together,
+`ClientIgnoresMismatch`, `MetaOverwritesByArrival` and `IdBlockResumed`. From D-086's
+reading to #154's the liveness fold's own verdict moves on 1, 33, 47, 3, 3 and 12 runs of
+`ApplyBeforeCommit`, `CountOlderTermForCommit`, `TruncateOnEveryAppend`,
+`ApplyIgnoresSpan`, `MetaOverwritesByArrival` and `IdBlockResumed`. Every one of those runs
+fails an earlier check with the same words under every reading, so no line those sweeps
+print moves, and the amendment moves none of them.
 
 The schedule's total lies past the end of every run of every node and one-group sweep
 measured: on the correct node by more than the bound on 4 008 of ten thousand, on one group
@@ -19530,6 +19639,13 @@ end.
   1.35 s, within it. Two read-bound trips move each way (6994 and 8943 to the variant's
   load, both live; 1074 and 3522 to the wedge, both slow but answering within the bound),
   none of them in the nightly's share.
+- **The amendment after #157's review** moves seven more uniform runs, each to a catch and
+  each the artefact by the same counterfactual: 869, 1556, 5585, 6505, 6828, 9113 and 9788,
+  read above. One is in the nightly's share, seed 869: k4's three writes and k5's one,
+  called 124 to 478 ms before the end, are answered 435 to 502 ms after their calls, and
+  range 4 last completed a write 797 ms before the end. Seed 6828 trips the read bound, so
+  its trip moves from the variant's load to the wedge. Three non-uniform runs move the same
+  way (2963, 6187, 8259), none of them tripping the read bound, so nothing reads them.
 
 **What the two rejected readings lose, read the same way.** The true end alone passes 457
 uniform runs this entry's reading fails: extended, 300 of them never answer the pending
@@ -19538,14 +19654,37 @@ that committed nothing from before the heal until after the end. The starting ma
 131 of them: 82 never answer and 34 answer past the bound.
 
 **`sim/tests/node.rs`'s other pair tests** read the liveness fold only through `check()`,
-and none of them asserts a catch by it. Between `main`'s nightly on 195f965 (38130516040)
-and this branch's on its merge with 8496ca3 (38153884049), every catch and coverage line
-every sweep prints is unchanged but three: `SharedSnapshotDir`'s and the pair's, as above,
-and `SnapshotWithoutCurrentLast`'s catch "by a check", 2 → 1 of ten thousand. Its liveness
-violation, on seed 7992, was 8885's artefact: k4's one post-heal write called 6 ms before
-the end, on a range that had completed ten post-heal writes, read against a total 3.970 s
-past the end; extended, it was answered 35 ms after its call. That test asserts the arm's
-firing alone.
+and none of them asserts a catch by it. This paragraph first compared `main`'s nightly on
+195f965 (38130516040) with this branch's on its merge with 8496ca3 (38153884049, at
+e782365) and said every catch and coverage line was unchanged but three. **That was false
+twice** (#157's review): 195f965 is not this branch's base, and its nightly also differs by
+D-103's membership coverage field; and a fourth line moved. Against `main`'s nightly on
+b01db39 (38141605412), the base, the lines that move are **four**:
+
+- `SharedSnapshotDir`'s and the pair's, as above.
+- `SnapshotWithoutCurrentLast`'s catch "by a check", 2 → 1 of ten thousand. Its liveness
+  violation, on seed 7992, was 8885's artefact: k4's one post-heal write called 6 ms before
+  the end, on a range that had completed ten post-heal writes, read against a total 3.970 s
+  past the end; extended, it was answered 35 ms after its call. That test asserts the
+  arm's firing alone.
+- **`ApplyWaitsForEveryRange`'s "the run's other checks failed it on", 8 345 → 8 335**
+  (`an_apply_task_that_waits_for_every_range_is_caught_by_the_lag_fold_on_the_node`). Eleven
+  uniform runs move from a liveness violation to none, and `check()` passes all eleven:
+  seeds 613, 1184, 3392, 5104, 5520, 6169, 6261, 6920, 8269, 8417 and 9205. Seed 1184 asks
+  no snapshot action, so the test's `checked` still fails it, and the line moves by ten. No
+  run moves the other way. Read by the counterfactual (settle extended by 4 s, every draw
+  unchanged, the extended trace a byte-identical prefix on all eleven), **every one is a
+  real stall, not the artefact**. Not one write the exemption excused on them is answered
+  in the 4 s more, but seed 6261's k4, answered 4.629 s after its call, past the bound.
+  The ranges go on committing past the end, since the variant stalls the applies and not
+  the logs. Each write was excused only by a post-heal write its range completed **before
+  it was called**, 0.744 to 2.724 s before the end. Seed 613 is the shape: k4's three writes
+  were called 0.785 to 1.359 s before the run stopped at 16.546 s, and range 4's last
+  completed write was 2.432 s before it. The test asserts the lag fold's catch alone, which
+  did not move, so no assertion changed. But the reading as merged passes these eleven
+  stalls, and that is the loosening D-030 and D-039 forbid. The amended clause (above)
+  reports all eleven again and moves no other `checked` verdict of the sweep, so the line
+  returns to 8 345.
 
 ### The pins
 
@@ -19559,8 +19698,8 @@ firing alone.
   tail back the pin says so. The mechanism itself is built by hand
   (`a_write_pending_where_the_run_stopped_is_judged_against_that_instant`, `sim/raft.rs`):
   a run stopped at 2.5 s against a total of 3.9 s, and a key's only write called 1.0 s
-  before the end on a range shown live, no evidence against the end and the wedge against
-  the total; called 2.1 s before the end it is still the wedge.
+  before the end on a range shown live after its call, no evidence against the end and the
+  wedge against the total; called 2.1 s before the end it is still the wedge.
 - **Seed 2809** (`seed_2809_ends_with_a_split_halfs_one_write_in_flight_and_passes`): the
   split at k5, k4 written once after the heal and pending inside its client's wait at the
   end, read eight times, and `check()` green.
@@ -19571,26 +19710,46 @@ firing alone.
   silent for 6.7 s. Both uniform, both reported by the liveness fold and attributed by
   `wedged`; seed 12's read-bound trip is `read_bound_reports_a_wedge`'s; seed 8's split,
   and its right half's completed writes to k3, are asserted present.
-- **Three more hand-built cases** in `sim/raft.rs`: the evidence asked of the range and not
-  of the cluster (`a_write_pending_at_the_end_is_excused_only_on_a_range_shown_live`: one
-  history under two maps, excused with both keys in one range and the wedge with each key
-  its own — **the mutation a single-range world cannot catch**, where range and cluster are
-  one); the evidence following a split
-  (`the_range_shown_live_is_the_range_serving_the_key_after_a_split`); and the client's wait
-  (`a_write_its_client_still_waits_for_at_the_end_is_no_evidence_on_any_range`: each key
-  its own range, excused at 20 ms and the wedge at 100 ms).
+- **Seed 613 under `ApplyWaitsForEveryRange`**
+  (`seed_613_under_apply_waits_for_every_range_is_a_stall_older_evidence_would_excuse`,
+  after #157's review): range 4, never split on the run, last completes a client write
+  (to k5) 2.432 s before the end, and k4's three post-heal writes, called after it, 0.785
+  to 1.359 s before the end, are all pending. The liveness fold reports k4 and `check()`
+  fails on it. The pin also runs the counterfactual itself: with the settle extended by
+  4 s the trace is the same up to the original end, and none of the three is answered.
+- **Five more hand-built cases** in `sim/raft.rs`: the evidence after the write's call
+  (`a_completion_before_a_pending_writes_call_shows_nothing_of_it`, after #157's review:
+  one range, a completion 1 ms before the call is no evidence and one 1 ms after it is);
+  a completion as the evidence of the range serving its key when it completed
+  (`a_completion_is_the_evidence_of_the_range_serving_its_key_when_it_completed`, after
+  #157's review: a three-key range split at k1, a completion before the split is the left
+  half's evidence and not the right half's, and after it the right half's);
+  the evidence asked of the range and not of the cluster
+  (`a_write_pending_at_the_end_is_excused_only_on_a_range_shown_live`: one history under
+  two maps, excused with both keys in one range and the wedge with each key its own —
+  **the mutation a single-range world cannot catch**, where range and cluster are one);
+  the evidence following a split
+  (`the_range_shown_live_is_the_range_serving_the_key_after_a_split`); and the client's
+  wait (`a_write_its_client_still_waits_for_at_the_end_is_no_evidence_on_any_range`: each
+  key its own range, excused at 20 ms and the wedge at 100 ms).
 - `sim/tests/ranges.rs`'s directed seed asserts its run carries where it stopped, and the
   two runs it forges carry the real run's.
 
-**Mutations, each caught** (applied one at a time to this tree, the tree restored after):
-the end read from the schedule's total in `post_heal_writes` (four hand-built cases and
-seed 2809's pin fail); the evidence asked of the cluster, "some post-heal write completed
-anywhere" — the mutation a single-range world cannot catch (three hand-built cases and the
-seed-12/8 pin); the evidence through the starting map (the split case and the seed-12/8
-pin); no evidence asked inside the bound, the true end alone (three hand-built cases and
-the seed-12/8 pin); the client's wait dropped (the in-flight case and seed 2809's pin);
-`run_on` carrying the schedule's total as its end (the pins of 8885, 2809 and 12/8); and
-`sim/ranges.rs` carrying the origin as its end (its directed seed).
+**Mutations, each caught** (applied one at a time to this tree, the tree restored after;
+first on #154's tree, and all nine again on the amended tree at 88c01ba, whose results
+these are): the end read from the schedule's total in `post_heal_writes` (all six
+hand-built cases and seed 2809's pin fail); the evidence asked of the cluster, "a
+completion anywhere after the call" — the mutation a single-range world cannot catch
+(three hand-built cases and the seed-12/8 pin); the evidence through the starting map
+(the split case, the when-it-completed case and the seed-12/8 pin); no evidence asked
+inside the bound, the true end alone (five hand-built cases and the pins of 12/8 and 613);
+the client's wait dropped (the in-flight case and seed 2809's pin); `run_on` carrying the
+schedule's total as its end (the pins of 8885, 2809, 12/8 and 613); `sim/ranges.rs`
+carrying the origin as its end (its directed seed); after #157's review, the evidence
+older than the write, any completion after the heal as #154 merged it (the
+after-the-call case and seed 613's pin); and a completion read through the range serving
+its key at the end rather than at its return (the when-it-completed case alone, as no
+sweep verdict moves; a single-range world has no split to read it by).
 
 ### `SplitFromRestarted`'s no-split branch
 
@@ -19627,16 +19786,23 @@ was meant.
 - The run's end in the liveness readings is where the run stopped, on both sites.
 - A write pending at that end is evidence unless its client was still waiting for it, or it
   is inside the bound on a range — the range serving its key, splits followed — that
-  completed a post-heal write.
+  completed a post-heal write after it was called, each completion the range's that served
+  its key when it completed (both amended after #157's review; as first merged, any
+  post-heal completion, read through the range serving its key at the end, which passed
+  eleven `ApplyWaitsForEveryRange` stalls).
 - No bound moved, no schedule moved and no trace moved: the change is in the reading alone,
   so no pinned hash moves and no pinned seed's schedule is re-audited.
 - D-086's end-of-run reading is superseded, and D-086 carries a forward pointer.
 
 ### Asks
 
-- **PROPOSED**: the client's wait (`WRITE_TIMEOUT`) as the threshold under which a write
-  pending at the end is no evidence on any range — recommended, as measured above. The
-  alternative is the range evidence alone, which fails the correct node on seed 2809.
+- **PROPOSED**: what excuses a write pending at the end inside the bound. Recommended, and
+  taken: its client's wait (`WRITE_TIMEOUT`), or a completion on the range serving its key
+  after its call. Measured at ten thousand (correct node failures; `ApplyWaitsForEveryRange`
+  uniform stalls passed; `SharedSnapshotDir` uniform artefacts reported beyond #154's):
+  #154's any completion after the heal 0, 11, 0; the taken form 0, 0, 7; the client's wait
+  alone 0, 0, 9. The range evidence without the client's wait fails the correct node on
+  seed 2809.
 
 ---
 
