@@ -7667,8 +7667,8 @@ is twenty:
 Every rate is well above 5 %, so each catch, and each catch by the variant's own check, is
 asserted from the gate's twenty (D-061, and its rule for new variants). All four run on
 `high_rate_share()`: `InstallSwitchPerSpan`, caught on more than four seeds in five, by D-055's
-rule for its high-rate variants; the other three, below four in five, by a choice this entry
-puts to the owner (*For the owner*, below). Each test asserts that some catch is its variant's
+rule for its high-rate variants; the other three, below four in five, by the owner's decision of
+2026-09-20 (*Decided*, below). Each test asserts that some catch is its variant's
 own check, by its words, so the property is what catches it and not merely a key that reads
 wrong afterwards:
 - `InstallSwitchPerSpan`'s first catch, at seed 0: *the install at record 114 over k13..k20,
@@ -7791,18 +7791,23 @@ share.** 3e66e86 moved `RepairAfterSwitch` and `CheckpointVersionPerSpan` onto
 `high_rate_share()`, and the review built `RepairBeforeSwitch` there beside them. D-055 put on
 the share only the variants caught on four seeds in five or more, and none of the three reaches
 that: 616, 529 and 468 of 1 000; D-061 sets the tier an assertion is made at, not which variants
-run a share. 9478da3 left the step to the owner and 3e66e86 took it, which is recorded here as
-what happened. The owner's reason for keeping it: the premerge budget is load-bearing — the
-nightly went from 3 h 38 min to 39 minutes in the change before this one (D-064), and D-040's
-quarter of an hour is what keeps iteration cheap — and three variants measuring four catches at
-the gate instead of twenty-five is a weaker sample, not a missing assertion, since each catch is
-asserted at the tier its rate supports, which is what D-061 requires.
+run a share. That step was not this entry's to take: 9478da3 left it to the owner and 3e66e86
+took it, and reported it. The owner's ruling on that: it was the right thing to report, and
+the rule stands — a choice left to the owner stays left to the owner. The owner's words on the
+choice itself: "keep the share as built. The premerge budget is load-bearing — we just spent a
+PR getting the nightly from 3h38 to 39 minutes, and D-040's quarter hour is what keeps
+iteration cheap. Three variants measuring 4 catches at the gate instead of 25 is a weaker
+sample, not a missing assertion: their catches are asserted at the tier their rates support,
+which is what D-061 requires." (The PR is #67, D-064. The 4 and the 25 are CI's figures by this
+entry's own table — CI's hundred falls from 25 catches to 4; the gate's twenty sees about 4
+under either option.)
 
-**The condition, the owner's.** These three variants get no independent hundred-seed evidence:
-CI's hundred runs the same twenty seeds of them that the gate runs, so a green CI says of them
-exactly what the gate said, and nothing more. The premerge's hundred and the nightly's thousand
-are their only larger samples. If a later change makes the engine sweep cheaper, this is
-revisited and they go back to every seed.
+**The condition, the owner's words.** "Record in D-068 that these three variants get no
+independent hundred-seed evidence, so CI's green on them means the gate's twenty. If a future
+change makes the engine sweep cheaper, revisit." What revisiting decides is the owner's.
+This entry adds, as its own reading and not the owner's: on the share, the premerge's hundred
+and the nightly's thousand are these three variants' only samples larger than the gate's
+twenty.
 
 Either way each catch, and each catch by the variant's own check, is asserted from the gate's
 twenty, since every rate is far above D-061's 5 %, and the gate runs twenty seeds of each under
