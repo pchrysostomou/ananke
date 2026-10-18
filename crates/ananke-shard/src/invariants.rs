@@ -392,23 +392,39 @@ impl GenerationsRise {
 /// folding `RangeIdsLeased` by the first apply of each of range 0's indices, no two
 /// grants share an id, and every replica's apply of an index grants what its first
 /// apply did. The clause's other half — the right half of a split lies in a block
-/// granted before it to the node that led the parent — is [`SplitLineage`]'s.
+/// granted before it to the node that led the parent — is [`SplitLineage`]'s, which
+/// reads who holds an id off this fold's grants ([`IdsUnique::holders_of`]).
+///
+/// **The grants are folded after the clause's own violation too**, and only the
+/// violation's message is latched: the split clause reads them, and its verdict is its
+/// own whatever this clause found ([`Checker::verdict_of`]). A fold that stopped at its
+/// violation would freeze the grants the split clause reads, and every split whose right
+/// half lies in a block granted after it would read "lies in no block" (PROPOSED D-106,
+/// #163's review). The checker's one verdict is unchanged by it: this clause is asked
+/// before the split clause.
 // PROPOSED(D-099)
+// PROPOSED(D-106): the grants folded after the clause's violation.
 #[derive(Clone, Debug, Default)]
 pub struct IdsUnique {
     /// The grant at each index of range 0 by its first apply: node, run, first, last.
     granted: BTreeMap<u64, (u64, u64, u64, u64)>,
-    /// Every block granted, its first id to its last and the node it went to.
-    blocks: BTreeMap<u64, (u64, u64)>,
+    /// Every non-empty block granted by the first apply of its index: its first id to
+    /// its last and the node it went to, for each block that starts there. The blocks
+    /// are disjoint while the clause holds, one to a first id; a block granted over
+    /// another's ids is kept beside it, since it was granted all the same.
+    blocks: BTreeMap<u64, Vec<(u64, u64)>>,
     violation: Option<String>,
 }
 
 impl IdsUnique {
+    fn fail(&mut self, what: String) {
+        if self.violation.is_none() {
+            self.violation = Some(what);
+        }
+    }
+
     /// Folds one record.
     pub fn push(&mut self, record: &TraceRecord) {
-        if self.violation.is_some() {
-            return;
-        }
         let TraceEvent::RangeIdsLeased {
             node,
             run,
@@ -422,8 +438,10 @@ impl IdsUnique {
         let on = record.node.map(|node| u64::from(node.get()));
         let grant = (*node, *run, *first, *last);
         if let Some(seen) = self.granted.get(index) {
+            // The first apply's grant is the index's; another replica's is no grant.
             if *seen != grant {
-                self.violation = Some(format!(
+                let seen = *seen;
+                self.fail(format!(
                     "range ids: index {index} of range 0 granted node {}'s run {} the block \
                      {}..={} at its first apply and node {node}'s run {run} the block \
                      {first}..={last} on {on:?}",
@@ -434,39 +452,47 @@ impl IdsUnique {
         }
         self.granted.insert(*index, grant);
         if first > last {
-            self.violation = Some(format!(
+            self.fail(format!(
                 "range ids: index {index} of range 0 granted node {node} an empty block \
                  {first}..={last}"
             ));
             return;
         }
-        if let Some((held_first, (held_last, _))) = self.blocks.range(..=*last).next_back()
-            && *held_last >= *first
+        // While the blocks are disjoint, one per first id and in order, a block that
+        // shares an id with any of them shares one with the last that starts at or below
+        // its own last id.
+        if let Some((held_first, held)) = self.blocks.range(..=*last).next_back()
+            && let Some(&(held_last, _)) = held.iter().find(|(held_last, _)| *held_last >= *first)
         {
-            self.violation = Some(format!(
+            let held_first = *held_first;
+            self.fail(format!(
                 "range ids: the block {first}..={last} granted to node {node} at index {index} \
                  of range 0 shares ids with the block {held_first}..={held_last} granted before \
                  it (SHARD.md §5: blocks are disjoint)"
             ));
-            return;
         }
-        self.blocks.insert(*first, (*last, *node));
+        self.blocks.entry(*first).or_default().push((*last, *node));
     }
 
-    /// The blocks granted so far, by first apply: first id to (last id, node).
+    /// The blocks granted so far by the first apply of each index, as first id to the
+    /// last id and the node of each block that starts there.
+    // PROPOSED(D-106): the grants folded after the clause's violation.
     #[must_use]
-    pub fn blocks(&self) -> &BTreeMap<u64, (u64, u64)> {
+    pub fn blocks(&self) -> &BTreeMap<u64, Vec<(u64, u64)>> {
         &self.blocks
     }
 
-    /// The node the block holding `id` was granted to, if a block holds it.
+    /// The nodes a block holding `id` was granted to, in the order of the blocks' first
+    /// ids: one at most while the blocks are disjoint, none if no block holds it.
+    // PROPOSED(D-106): the grants folded after the clause's violation.
     #[must_use]
-    pub fn holder_of(&self, id: u64) -> Option<u64> {
+    pub fn holders_of(&self, id: u64) -> Vec<u64> {
         self.blocks
             .range(..=id)
-            .next_back()
-            .filter(|(_, (last, _))| *last >= id)
-            .map(|(_, (_, node))| *node)
+            .flat_map(|(_, held)| held.iter())
+            .filter(|(last, _)| *last >= id)
+            .map(|(_, node)| *node)
+            .collect()
     }
 
     /// The first violation.
@@ -836,8 +862,9 @@ impl SplitLineage {
             ));
             return;
         };
-        match ids.holder_of(right) {
-            Some(holder) if holder == leader => {}
+        let holders = ids.holders_of(right);
+        match holders.first() {
+            _ if holders.contains(&leader) => {}
             Some(holder) => self.fail(format!(
                 "right half {right} of range {parent}'s split at index {index} lies in a \
                  block granted to node {holder}, where node {leader} led range {parent} in \
@@ -1111,7 +1138,12 @@ impl Fold {
 impl std::fmt::Display for Fold {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let words = self.words();
-        write!(f, "check {} ({})", self.check(), &words[..words.len() - 1])
+        write!(
+            f,
+            "check {} ({})",
+            self.check(),
+            words.strip_suffix(':').unwrap_or(words)
+        )
     }
 }
 
@@ -1172,7 +1204,10 @@ impl Checker {
         &self.descriptors
     }
 
-    /// `fold`'s own verdict: its first violation, whatever the other folds found.
+    /// `fold`'s own verdict: its first violation, whatever the other folds found. A fold
+    /// latches its message and stops judging at its violation; one whose state another
+    /// fold reads goes on folding that state — check 7's map, which every fold here
+    /// reads, and check 18's grants, which the split clause reads ([`IdsUnique`]).
     ///
     /// # Errors
     ///
@@ -1497,8 +1532,8 @@ mod tests {
         checker.push(&leased(3, 1, 7, 3, 10, 1));
         assert!(checker.verdict().is_ok(), "{:?}", checker.verdict());
         assert_eq!(checker.ids.blocks().len(), 3);
-        assert_eq!(checker.ids.holder_of(12), Some(2));
-        assert_eq!(checker.ids.holder_of(27), None);
+        assert_eq!(checker.ids.holders_of(12), vec![2]);
+        assert_eq!(checker.ids.holders_of(27), Vec::<u64>::new());
     }
 
     #[test]
@@ -1933,6 +1968,55 @@ mod tests {
         ));
         checker.extend(&split_records(1, 2, 9, 2, b"m", b"a", b"z", 1, 6));
         assert!(checker.verdict().is_ok(), "{:?}", checker.verdict());
+    }
+
+    /// The grants clause's violation leaves the split clause's own verdict what it is: a
+    /// split whose right half lies in a block granted after the grants clause latched is
+    /// in shape (PROPOSED D-106, #163's review). Before the fix the grants fold stopped
+    /// at its violation, the blocks the split clause reads froze, and both splits below
+    /// read "lies in no block". Once for each way the grants clause can latch that still
+    /// leaves a grant of record behind it: another replica granting something else at an
+    /// index, then a clean grant; and a grant over an earlier block's ids, which is a
+    /// block granted all the same.
+    // PROPOSED(D-106)
+    #[test]
+    fn the_grants_clause_keeps_folding_after_its_violation_for_the_split_clause() {
+        let mut agreement = Checker::new(true);
+        agreement.extend(&before_a_split());
+        agreement.push(&leased(2, 2, 9, 30, 37, 1));
+        agreement.push(&leased(1, 1, 7, 14, 21, 2));
+        agreement.extend(&split_records(1, 2, 9, 2, b"m", b"a", b"z", 1, 15));
+        let grants = agreement.verdict_of(Fold::RangeIds).unwrap_err();
+        assert!(
+            grants.starts_with("range ids: index 1 of range 0 granted node 1's run 7"),
+            "{grants}"
+        );
+        assert_eq!(agreement.verdict_of(Fold::SplitLineage), Ok(()));
+        assert_eq!(agreement.verdict(), Err(grants));
+
+        let mut overlap = Checker::new(true);
+        overlap.extend(&before_a_split());
+        overlap.push(&leased(1, 1, 7, 10, 17, 2));
+        overlap.extend(&split_records(1, 2, 9, 2, b"m", b"a", b"z", 1, 16));
+        let grants = overlap.verdict_of(Fold::RangeIds).unwrap_err();
+        assert!(
+            grants.contains("shares ids with the block 6..=13"),
+            "{grants}"
+        );
+        assert_eq!(overlap.verdict_of(Fold::SplitLineage), Ok(()));
+        assert_eq!(overlap.ids.holders_of(12), vec![1, 1]);
+
+        // And the split clause still judges the grants it reads: a right half in the
+        // overlapping block granted to another node is the split clause's own violation.
+        let mut elsewhere = Checker::new(true);
+        elsewhere.extend(&before_a_split());
+        elsewhere.push(&leased(1, 2, 9, 10, 17, 2));
+        elsewhere.extend(&split_records(1, 2, 9, 2, b"m", b"a", b"z", 1, 16));
+        let split = elsewhere.verdict_of(Fold::SplitLineage).unwrap_err();
+        assert!(
+            split.contains("lies in a block granted to node 2"),
+            "{split}"
+        );
     }
 
     /// Two folds in violation on one record — a write applied in a range whose span no

@@ -20588,6 +20588,28 @@ violation in the order 7, 9, 10, 16, 17, 18, which is what stops a run of the no
 else and no schedule moves. A unit test plants one write that breaks checks 9 and 10 at
 once and asserts both folds report it in their own words while the checker names check 9.
 
+**A fold whose state another fold reads goes on folding it after its own violation**
+(found by #163's review). A fold latches its first violation's message and stops judging;
+check 7's map, which every fold reads, already went on folding after check 7 latched, but
+`IdsUnique` returned at its first violation, and the split clause reads who holds an id
+off its blocks. So once the grants clause had tripped — another replica of range 0
+granting something else at an index, or a block granted over another's ids — a later
+split whose right half lay in a block granted after it read "lies in no block a
+`RangeIdsLeased` granted before it" in the split clause's own verdict, one fold's latch
+handing another a violation of its own. `IdsUnique` now folds every grant of record
+whatever it found — the first apply's grant at each index, a block granted over another's
+ids kept beside it (`IdsUnique::holders_of` reads every block holding an id, one at most
+while the blocks are disjoint) — and latches only its message.
+`the_grants_clause_keeps_folding_after_its_violation_for_the_split_clause` builds both
+ways and a third, a right half in an overlapping block granted to another node, still the
+split clause's own violation; all three fail on the tree before the fix, the first in the
+review's words. **Nothing moves**: the grants clause's verdict is the same message on
+every trace, the split clause's differs only on a trace where the grants clause tripped
+before a split, the checker's one verdict names the grants clause first on every such
+trace, and no run this slice measured trips the grants clause and then splits
+(`AnyFreshNodeBootstraps` on membership splits on none, `IdBlockResumed` trips the grants
+clause on none).
+
 ### 2. The wrong-voters case of check 18's split clause (issue #150)
 
 D-100's item 8 listed unit tests of the split clause for "a right half named before, a
