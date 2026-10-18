@@ -391,13 +391,20 @@ impl Descriptors {
 /// restatement states them again; a `RaftRefused` forgets them for good.
 ///
 /// **The right half's clause**: a node that is a voter of P's configuration at `s`
-/// — R's `RangeCreated { cause: split }` carries those voters — whose replica of P has
-/// applied `s`, traced as `RangeSplit`, as a `RaftApply` of `s` with effect `took`, or
-/// restated at an applied index at or past `s`, holds R initialised from then until a
-/// `RangeRemoved` of R or a `RaftRefused` on that node: at the `RaftApply` of `s`
-/// (R's creation precedes it, §8's fixed order) and at every `RangesRestated` after
-/// it, R is among the node's spans. The clause for a node that is not a voter there,
-/// that it traces no creation of R, is Stage D's (SHARD.md §12).
+/// whose replica of P has applied `s`, traced as `RangeSplit`, as a `RaftApply` of `s`
+/// with effect `took`, or restated at an applied index at or past `s`, holds R
+/// initialised from then until a `RangeRemoved` of R or a `RaftRefused` on that node:
+/// at the `RaftApply` of `s` (R's creation precedes it, §8's fixed order) and at every
+/// `RangesRestated` after it, R is among the node's spans. A split is known from the
+/// first replica to trace it — its `RangeSplit` and, after it in the fixed order, its
+/// descriptor of P at `s`, which names P's voters, or R's first
+/// `RangeCreated { cause: split }`, which names the voters of P's plain configuration
+/// at `s`, whichever comes first (check 18 holds the two equal) — so the first voter to
+/// apply it is asked at its own apply, R created or not, and a node that restated P at
+/// or past `s` before any replica traced the split owes R from the moment one does:
+/// one whose restatement closed without R is a violation then. The clause for a node
+/// that is not a voter there, that it traces no creation of R, is Stage D's (SHARD.md
+/// §12).
 ///
 /// Each clause keeps its own verdict ([`OneOwnerPerKey::overlap_verdict`],
 /// [`OneOwnerPerKey::right_half_verdict`]), so a scenario can read them apart.
@@ -411,10 +418,21 @@ pub struct OneOwnerPerKey {
     /// The server each node is, from the `RaftRecovered` its restatement traces.
     servers: BTreeMap<u64, u64>,
     /// Every split that took effect, by (parent, index): the right half and the
-    /// voters of the parent's configuration there, off R's first creation.
+    /// voters of the parent's configuration there, from the first replica to trace
+    /// it — its descriptor of the parent at the split, or R's first creation.
     splits: BTreeMap<(u64, u64), (u64, Vec<u64>)>,
+    /// Per node, the split its last `RangeSplit` named — (parent, index, right) —
+    /// until the node's descriptor of the parent at that index, which follows it in
+    /// §8's fixed order, says who its voters were.
+    splitting: BTreeMap<u64, (u64, u64, u64)>,
     /// Per node, the splits its replica of the parent applied: (parent, index).
     applied_splits: BTreeMap<u64, BTreeSet<(u64, u64)>>,
+    /// Per (node, range), the applied index the node's last restatement stated the
+    /// range at, since its last refusal: the restated form, read again when a split
+    /// of the range becomes known after it.
+    restated_at: BTreeMap<(u64, u64), u64>,
+    /// Per node, the ranges it held at its last `RangesRestated`.
+    restated_with: BTreeMap<u64, BTreeSet<u64>>,
     /// Per node, the right halves it must hold: right to (parent, index).
     owed: BTreeMap<u64, BTreeMap<u64, (u64, u64)>>,
     overlap: Option<String>,
@@ -448,6 +466,63 @@ impl OneOwnerPerKey {
         }
     }
 
+    /// The split of `parent` at `index` into `right` is known from here, with the
+    /// voters of the parent's configuration at it: every node whose replica of the
+    /// parent applied it, or restated the parent at or past it since its last refusal,
+    /// owes the right half, and one whose restatement has already closed without it
+    /// is a violation now.
+    fn register(&mut self, parent: u64, index: u64, right: u64, voters: &[u64]) {
+        if self.splits.contains_key(&(parent, index)) {
+            return;
+        }
+        self.splits
+            .insert((parent, index), (right, voters.to_vec()));
+        let applied: Vec<u64> = self
+            .applied_splits
+            .iter()
+            .filter(|(_, splits)| splits.contains(&(parent, index)))
+            .map(|(node, _)| *node)
+            .collect();
+        for node in applied {
+            self.owe(node, parent, index);
+        }
+        let restated: Vec<u64> = self
+            .restated_at
+            .iter()
+            .filter(|((_, range), applied)| *range == parent && **applied >= index)
+            .map(|((node, _), _)| *node)
+            .collect();
+        for node in restated {
+            self.applied_split(node, parent, index);
+            let owed = self
+                .owed
+                .get(&node)
+                .is_some_and(|owed| owed.contains_key(&right));
+            let held = self
+                .restated_with
+                .get(&node)
+                .is_some_and(|held| held.contains(&right));
+            if self.right_half.is_none() && owed && self.restated.contains(&node) && !held {
+                self.right_half = Some(Self::missing(
+                    node,
+                    parent,
+                    index,
+                    right,
+                    "at its restatement",
+                ));
+            }
+        }
+    }
+
+    /// The right half's clause's words for `node` lacking `right`.
+    fn missing(node: u64, parent: u64, index: u64, right: u64, at: &str) -> String {
+        format!(
+            "one owner per key: node {node} is a voter of range {parent}'s configuration at \
+             its split at index {index}, its replica of range {parent} has applied it, and \
+             {at} it holds no replica of the right half {right} (SHARD.md §8, check 8)"
+        )
+    }
+
     /// `node` holds `range` over `[start, end)` from here: no other of its spans may
     /// overlap it.
     fn hold(&mut self, node: u64, range: u64, start: &Bytes, end: &Bytes) {
@@ -475,14 +550,8 @@ impl OneOwnerPerKey {
             .get(&node)?
             .iter()
             .find_map(|(right, (parent, index))| {
-                (!held.is_some_and(|held| held.contains_key(right))).then(|| {
-                    format!(
-                        "one owner per key: node {node} is a voter of range {parent}'s \
-                     configuration at its split at index {index}, its replica of range \
-                     {parent} has applied it, and {at} it holds no replica of the right \
-                     half {right} (SHARD.md §8, check 8)"
-                    )
-                })
+                (!held.is_some_and(|held| held.contains_key(right)))
+                    .then(|| Self::missing(node, *parent, *index, *right, at))
             })
     }
 
@@ -508,31 +577,33 @@ impl OneOwnerPerKey {
                 self.hold(node, *range, start, end);
                 if *cause == RangeCause::Split
                     && let Some(parent) = parent
-                    && !self.splits.contains_key(&(*parent, *floor_index))
                 {
-                    self.splits
-                        .insert((*parent, *floor_index), (*range, voters.clone()));
-                    let applied: Vec<u64> = self
-                        .applied_splits
-                        .iter()
-                        .filter(|(_, splits)| splits.contains(&(*parent, *floor_index)))
-                        .map(|(node, _)| *node)
-                        .collect();
-                    for node in applied {
-                        self.owe(node, *parent, *floor_index);
-                    }
+                    self.register(*parent, *floor_index, *range, voters);
                 }
             }
             TraceEvent::RangeDescriptor {
                 range,
+                index,
                 applied,
                 start,
                 end,
+                voters,
                 ..
             } => {
                 self.hold(node, *range, start, end);
-                // A restatement of P at an applied index at or past a split of P.
+                // A split's own change of P, after its `RangeSplit`: the split is
+                // known from here, with P's voters at it, whether or not R is
+                // created after (PROPOSED D-107, #166's review).
+                if let Some(&(parent, at, right)) = self.splitting.get(&node)
+                    && (parent, at) == (*range, *index)
+                {
+                    self.splitting.remove(&node);
+                    self.register(parent, at, right, voters);
+                }
+                // A restatement of P at an applied index at or past a split of P: the
+                // splits known now, and any that becomes known later (`register`).
                 if !self.restated.contains(&node) {
+                    self.restated_at.insert((node, *range), *applied);
                     let splits: Vec<u64> = self
                         .splits
                         .range((*range, 0)..=(*range, *applied))
@@ -543,8 +614,14 @@ impl OneOwnerPerKey {
                     }
                 }
             }
-            TraceEvent::RangeSplit { range, index, .. } => {
+            TraceEvent::RangeSplit {
+                range,
+                right,
+                index,
+                ..
+            } => {
                 self.applied_split(node, *range, *index);
+                self.splitting.insert(node, (*range, *index, *right));
             }
             TraceEvent::RaftApply {
                 range,
@@ -569,14 +646,24 @@ impl OneOwnerPerKey {
             TraceEvent::NodeCrashed { .. } => {
                 self.spans.remove(&node);
                 self.restated.remove(&node);
+                self.splitting.remove(&node);
             }
             TraceEvent::RaftRefused { .. } => {
                 self.spans.remove(&node);
                 self.owed.remove(&node);
                 self.applied_splits.remove(&node);
+                self.splitting.remove(&node);
+                self.restated_at.retain(|(of, _), _| *of != node);
+                self.restated_with.remove(&node);
             }
             TraceEvent::RangesRestated { .. } => {
                 self.restated.insert(node);
+                let held: BTreeSet<u64> = self
+                    .spans
+                    .get(&node)
+                    .map(|held| held.keys().copied().collect())
+                    .unwrap_or_default();
+                self.restated_with.insert(node, held);
                 if self.right_half.is_none() {
                     self.right_half = self.owed_and_missing(node, "at its restatement");
                 }
@@ -2233,6 +2320,109 @@ mod tests {
         }
         let why = owners.right_half_verdict().unwrap_err();
         assert!(why.contains("at its apply of 9"), "{why}");
+    }
+
+    /// The split of range 2 at 9 into 6 as one replica traces it, with or without its
+    /// creation of the right half (the third record of `split_records`).
+    fn a_split_on(node: u64, creates_the_right_half: bool) -> Vec<TraceRecord> {
+        let mut records = split_records(node, 2, 9, 2, b"m", b"a", b"z", 1, 6);
+        if !creates_the_right_half {
+            records.remove(2);
+        }
+        records
+    }
+
+    /// Range 2 `[a, z)` created on nodes 1 to 3, each of them its voter.
+    fn three_voters() -> Vec<TraceRecord> {
+        let mut records = Vec::new();
+        for node in [1, 2, 3] {
+            records.push(created(node, 2, b"a", b"z", 1, &[1, 2, 3]));
+            records.push(recovered(node, 2, 0));
+        }
+        records
+    }
+
+    fn right_half_verdict_of(records: &[TraceRecord]) -> Result<(), String> {
+        let mut owners = OneOwnerPerKey::default();
+        for record in records {
+            owners.push(record);
+        }
+        owners.right_half_verdict()
+    }
+
+    #[test]
+    fn the_first_voter_to_apply_a_split_without_creating_its_right_half_is_caught_at_its_apply() {
+        // #166's review, B2 (a): the first replica to apply the split traces it and
+        // creates no right half; nodes 2 and 3 create it after. The split was known only
+        // from R's first creation, so node 1's apply was asked nothing.
+        let mut records = three_voters();
+        records.extend(a_split_on(1, false));
+        records.extend(a_split_on(2, true));
+        records.extend(a_split_on(3, true));
+        let why = right_half_verdict_of(&records).unwrap_err();
+        assert!(
+            why.starts_with("one owner per key: node 1 is a voter of range 2's configuration")
+                && why.contains("at its apply of 9 it holds no replica of the right half 6"),
+            "{why}"
+        );
+    }
+
+    #[test]
+    fn a_restatement_past_a_split_traced_before_the_split_owes_the_right_half_when_it_is() {
+        // #166's review, B2 (b): node 1 crashes after a durable apply of the split and
+        // restates P past it without R, closing its restatement before any replica has
+        // traced the split; nodes 2 and 3 trace it after. Read when it was traced, the
+        // restatement owed nothing.
+        let mut records = three_voters();
+        records.extend([
+            crashed(1),
+            recovered(1, 2, 9),
+            stated(1, 2, 9, b"a", b"m", 2),
+            restated(1, &[2]),
+        ]);
+        records.extend(a_split_on(2, true));
+        records.extend(a_split_on(3, true));
+        let why = right_half_verdict_of(&records).unwrap_err();
+        assert!(
+            why.starts_with("one owner per key: node 1 is a voter of range 2's configuration")
+                && why.contains("at its restatement it holds no replica of the right half 6"),
+            "{why}"
+        );
+        // The same restatement with R restated beside it is what a correct node does.
+        let mut whole = three_voters();
+        whole.extend([
+            crashed(1),
+            recovered(1, 2, 9),
+            stated(1, 2, 9, b"a", b"m", 2),
+            recovered(1, 6, 9),
+            stated(1, 6, 9, b"m", b"z", 2),
+            restated(1, &[2, 6]),
+        ]);
+        whole.extend(a_split_on(2, true));
+        whole.extend(a_split_on(3, true));
+        assert_eq!(right_half_verdict_of(&whole), Ok(()));
+    }
+
+    #[test]
+    fn a_split_no_voter_creates_the_right_half_of_is_caught_at_the_first_apply() {
+        // #166's review, B2 (c): no replica creates R, so a split known only from R's
+        // creation was never known at all.
+        let mut records = three_voters();
+        for node in [1, 2, 3] {
+            records.extend(a_split_on(node, false));
+        }
+        let why = right_half_verdict_of(&records).unwrap_err();
+        assert!(
+            why.contains("node 1 is a voter")
+                && why.contains("at its apply of 9 it holds no replica of the right half 6"),
+            "{why}"
+        );
+        // And with every voter creating R the clause holds.
+        let mut records = three_voters();
+        for node in [1, 2, 3] {
+            records.extend(a_split_on(node, true));
+        }
+        assert_eq!(right_half_verdict_of(&records), Ok(()));
     }
 
     fn meta_applied(node: u64, index: u64, named: Vec<Named<'_>>) -> TraceRecord {

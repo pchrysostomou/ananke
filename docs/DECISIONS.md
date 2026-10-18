@@ -20777,8 +20777,9 @@ untouched.
 ### 5. Check 8, Stage C's two clauses
 
 **What is built** (`invariants::OneOwnerPerKey`, folded by the range layer's `Checker`):
-an interval map per node, from `RangeCreated`, `RangeDescriptor`, `RangeRemoved`,
-`RangesRestated`, `NodeCrashed` and the node's `RaftRefused` (SHARD.md §8).
+an interval map per node, from `RangeCreated`, `RangeDescriptor`, `RangeSplit`,
+`RaftApply`, `RangeRemoved`, `RangesRestated`, `NodeCrashed` and the node's `RaftRefused`
+(SHARD.md §8).
 
 - **The overlap clause.** Per node, the span of every initialised replica — each
   creation, each descriptor applied, installed or restated — until its `RangeRemoved`;
@@ -20786,13 +20787,29 @@ an interval map per node, from `RangeCreated`, `RangeDescriptor`, `RangeRemoved`
   before R is created), no two of a node's spans overlap. A crash forgets the node's
   spans and its restatement states them again; a `RaftRefused` forgets them with the
   store.
-- **The right half's clause.** A node that is a voter of P's configuration at `s` — R's
-  first `RangeCreated { cause: split }` carries those voters — whose replica of P applied
-  `s`, traced as `RangeSplit`, as a `RaftApply` of `s` with `took`, or restated at an
-  applied index at or past `s`, holds R from then until a `RangeRemoved` of R or a
-  `RaftRefused` on that node: asked at the `RaftApply` of `s` (R's creation precedes it in
-  the fixed order) and at every `RangesRestated` after it. The clause for a node that is
-  not a voter there is Stage D's (SHARD.md §12).
+- **The right half's clause.** A node that is a voter of P's configuration at `s`, whose
+  replica of P applied `s` — traced as `RangeSplit`, as a `RaftApply` of `s` with `took`,
+  or restated at an applied index at or past `s` — holds R from then until a
+  `RangeRemoved` of R or a `RaftRefused` on that node: asked at the `RaftApply` of `s`
+  (R's creation precedes it in the fixed order) and at every `RangesRestated` after it. A
+  split is known from the first replica to trace it: its `RangeSplit` and, after it in the
+  fixed order, its descriptor of P at `s`, which names P's voters, or R's first
+  `RangeCreated { cause: split }`, which names the voters of P's plain configuration at
+  `s`, whichever comes first (check 18 holds the two equal). So the first voter to apply
+  it is asked at its own apply, R created or not, and a node that restated P at or past
+  `s` before any replica had traced the split owes R as soon as one does: one whose
+  restatement closed without R is a violation then. The clause for a node that is not a
+  voter there is Stage D's (SHARD.md §12).
+- **Corrected after #166's review (B2).** As first built, the clause learnt of a split only
+  from R's first creation, so it saw less than the item above says: (a) the first voter to
+  apply `s` was asked nothing at its apply when it created no R, and was caught only at a
+  later restart; (b) a voter that crashed after a durable apply of `s` and restated P past
+  it without R, before any replica had traced the split, owed nothing when the split was
+  traced after, and was caught only at a second restart — the case the restated form is
+  there for; (c) a split no voter created R for was never known at all. The review showed
+  all three by hand, and in a run: a voter's split that writes no right half was caught by
+  the clause on **0 of 100** seeds (check 18's lineage caught all 100). Each of (a), (b) and
+  (c) is a unit test that fails on the clause as first built.
 - Each clause keeps its own verdict (`overlap_verdict`, `right_half_verdict`). **The
   overlap clause is in the `Checker`'s verdict**, after check 18, so that no violation
   a fold before it reports moves to it and no variant test's attribution moves; **the
@@ -20802,15 +20819,24 @@ an interval map per node, from `RangeCreated`, `RangeDescriptor`, `RangeRemoved`
   and two nodes' spans, not; a voter that restarts and restates both halves, passing; one
   that restates P past the split without R, caught at its `RangesRestated`; a refused node,
   which owes nothing; a node installed past the split and then restarted, caught (the shape
-  below); a node that is not a voter there, owing nothing; and a voter that applies the
-  split without creating R, caught at its apply. Two existing unit tests that built two
-  overlapping spans on one node to exercise checks 10 and 16 now build them on two nodes,
-  since one node holding both is check 8's.
+  below); a node that is not a voter there, owing nothing; a voter that applies the split
+  without creating R after another created it, caught at its apply; and the review's (a),
+  (b) and (c). Two existing unit tests that built two overlapping spans on one node to
+  exercise checks 10 and 16 now build them on two nodes, since one node holding both is
+  check 8's.
 
-**STOP: the right half's clause trips on the correct node, and is not asserted.**
-Measured on the correct node under the raft sweep's arms before anything was asserted
-(Q39): **2 of 1 000** seeds, 45 and 878 (the nightly's ten thousand is recorded in the PR),
-every one the same mechanism, read off the trace:
+**The right half's clause trips on the correct node: a defect of the check, not of the
+system, and it is not asserted.** Measured on the correct node under the raft sweep's arms
+before anything was asserted (Q39): **2 of 1 000** seeds, 45 and 878, the same 2 with the
+review's fix as before it; and **13 of 10 000** in the nightly before the fix (runs
+39094467127 and 39097058290: 45, 878, 1227, 2405, 2414, 2632, 2670, 2756, 4267, 4723,
+4909, 7403, 9628), which the fix could only add to where a split becomes known after a
+voter restated past it or a first applier creates no R, which the correct node does on
+none of the thousand.
+Every one is the same shape, re-read off its trace: a voter of P that was never refused,
+never traced a `RaftApply` of `s` or a `RangeSplit` of P and never created R, whose last
+apply of P was below `s`, was installed P's post-split snapshot (at `s` itself on twelve,
+at 186 for seed 2670's split at 68), and then crashed. None is a re-seeded node.
 
 - *Seed 45.* Node 2's replica of range 4 `[k4, k6)` lagged the split at index 165 (key
   `k5`, right half 14). At 13.891 s it was installed P's snapshot at index 165, carrying
@@ -20826,38 +20852,70 @@ every one the same mechanism, read off the trace:
 A voter of P that lagged the split is installed P's post-split snapshot and holds no R,
 and on this tree nothing gives it R: a message for a range the node does not host is
 counted and dropped (D-076) until the placeholders (Q22). §8's clause reads its next
-restatement of P at or past `s` as an apply of `s`, and so owes it R. The system is not
-wrong here and the check is not loosened to say so: the clause is folded on every run,
-printed over the correct node's sweep at every tier with every seed's violation, and run
-under the equivalence test, and nothing asserts it.
+restatement of P at or past `s` as an apply of `s`, and so owes it R.
 
-**For the owner (PROPOSED).** Read literally, the clause trips on the correct system
-whenever a voter installed past a split restarts before it holds R, which the
-placeholders shorten and do not remove: with them, a voter installed past `s` takes R by
-R's own snapshot, which the overlap rule lets in once P no longer covers R's span, and a
-restart between the two installs is the same violation. **Recommended**: the clause owes
-R from an apply of `s` — `RangeSplit`, or the `RaftApply` of `s` — kept across restarts
-until R's `RangeRemoved` or a refusal, and from a restatement past `s` only where the node's
-replica of P was not installed at or past `s` since its last refusal: the restart after a
-crash between the split's durable batch and its trace, which is the case the restated form
-is there for; asserted from the placeholders' slice. The alternatives: §8's text as
-written, asserted once placeholders and the overlap rule make an installed voter's R
-arrive, with the window between the two installs measured and the restart inside it
-excused by name; or an install past `s` owing R at once, which no tree can meet, R's state
-not being in P's snapshot.
+**The shape is commoner than the trip (#166's review, N6).** On 16 of the 1 000 seeds a
+voter of P is installed past `s` (45, 118, 221, 333, 375, 466, 522, 579, 595, 604, 728,
+749, 878, 908, 915 and 975, ten of them at `s` itself), and on every one that voter holds
+no R for the rest of the run: R runs on two of its three voters. Only the two that crash
+afterwards trip the clause. This contradicts SHARD.md §5, "P's leader keeps bringing P's
+replicas up to date, and each of them applies `s`" (SHARD.md:784-786): P's leader compacts
+past `s` and feeds a lagging voter P's snapshot (on seed 45 node 1 compacted P through 165
+at 12.892 s and node 2 was installed at 13.891 s). Issue #170 asks the placeholders' slice
+to show it resolved.
 
-**The overlap clause on the correct node**: 0 of 1 000, and 0 of 100 of every other node
-scenario the probe ran, so it is in the verdict, and the nightly's ten thousand asks it of
-every node sweep's every seed. **Its tripping variant**, `SnapshotOverlapsReplica`, comes
-with the overlap rule's slice (SHARD.md §12, Stage C's exit: check 8 against it, *every
-seed*, on `sim/split.rs` (i)), which asserts the fold against it; until then the fold runs
-under the equivalence test over the correct node and Stage C's five variants built so
-far, `check_8_agrees_with_its_whole_trace_fold_on_the_node`: the checker fed in eight
-prefixes holds, at each, both clauses' verdicts that the fold over that whole prefix
-holds. The correct node's seed 45 is compared beside the share, so the agreement is held
-in violation too and not on green prefixes alone: twenty seeds at every tier, 968
-prefixes over the six systems and seed 45, 2 of them in violation, both seed 45's, which
-the test asserts. **Seed 45 is pinned** in the shape above
+**What the clause sees, with the review's fix.** Measured with each planting applied alone
+to this tree, on the correct node's sweep, seeds 0 to 99 (the patches are in the PR): a
+voter's split that writes no right half, caught on **100 of 100** at the first voter's
+apply, where the clause as first built caught none (check 18's lineage catches all 100 in
+the verdict); a restart that reopens no right half (`discover_ranges` emptied), caught on
+**98 of 100** by the clause alone, every run's verdict green but seed 80's, which fails
+the liveness bound besides; and, by unit test, a voter that crashes between
+the split's durable batch and its trace and restates P past `s` without R — the shape
+§10's `SplitNotAtomicWithDescriptor` leaves, "caught by check 8 at the same restart: the
+node holds no R" (SHARD.md:1728). What it reads as a violation and is none: the voter
+installed past `s` that restarts, above. What it cannot see: the same voter while it never
+restarts, 14 of the 16 seeds.
+
+**Its tripping variant (#166's review, N5).** `SnapshotOverlapsReplica` trips the overlap
+clause and not this one. §10 names Stage D's `SplitNotAtomicWithDescriptor` for it
+(SHARD.md:1728), so the clause has no tripping variant in Stage C, and "a fold that no
+variant trips is a question to the owner" (SHARD.md:2051-2056): it is put here.
+
+**For the owner (PROPOSED), rewritten after the review.** The clause as §8 words it is
+right about every planted bug above and wrong about the voter installed past `s`, and it
+says nothing of that voter until it restarts. **Recommended**: owe R from an apply of `s` —
+`RangeSplit`, or the `RaftApply` of `s` — kept across restarts until R's `RangeRemoved` or
+a refusal, and from a restatement past `s` only where the node's replica of P was not
+installed at or past `s` since its last refusal (the crash between the split's durable
+batch and its trace, which the restated form is there for). That keeps every catch above
+and `SplitNotAtomicWithDescriptor`'s, and stops reading the installed voter as an apply.
+The installed voter then needs a check of its own, where the placeholders make R reachable
+for it: R installed on it within a bound measured on the correct system (#170), so that a
+voter left without R stays visible whether or not it restarts. Assert both from the
+placeholders' slice, and the clause against `SplitNotAtomicWithDescriptor` in Stage D. The
+alternatives: §8's text as written, asserted once the placeholders bring an installed voter
+its R, with the window between P's install and R's measured and a restart inside it excused
+by name; or an install past `s` owing R at once, which no tree can meet, R's state not
+being in P's snapshot.
+
+**The overlap clause on the correct node**: 0 of 1 000, 0 of 100 of every other node
+scenario the probe ran, and 0 of 10 000 in the nightly, which asks it of every node sweep's
+every seed; so it is in the verdict. **Its tripping variant**, `SnapshotOverlapsReplica`,
+comes with the overlap rule's slice (SHARD.md §12, Stage C's exit: check 8 against it,
+*every seed*, on `sim/split.rs` (i)), which asserts the fold against it; until then the
+fold runs under the equivalence test over the correct node and Stage C's five variants
+built so far, `check_8_agrees_with_its_whole_trace_fold_on_the_node`: the checker fed in
+eight prefixes holds, at each, both clauses' verdicts that the fold over that whole prefix
+holds, the correct node's seed 45 compared beside the share so that a prefix in violation
+is compared too — twenty seeds at every tier, 968 prefixes, 2 in violation, both seed 45's,
+which the test asserts. **That comparison cannot fail by construction (#166's review,
+N7)**: the checker hands each record to the same `OneOwnerPerKey::push` the whole-prefix
+fold runs, and the overlap clause is never compared in violation. #163 replaces the range
+layer's equivalence test with one per pair over a `Fold` per check; check 8's comparison is
+rebuilt in that framework at the merge with it, shown able to fail with a planted
+divergence, and its in-violation comparison of the overlap clause comes with S9's
+`SnapshotOverlapsReplica`. **Seed 45 is pinned** in the shape above
 (`seed_45_restates_a_voter_installed_past_a_split_without_its_right_half`): the run green,
 the overlap clause green, the right half's clause's violation word for word, the install at
 165 at generation 2 following its switch's restatement, no split applied and no right half
