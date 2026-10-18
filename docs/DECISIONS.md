@@ -20589,9 +20589,30 @@ split's apply on a replica that is not a voter of P's configuration at `s` calls
 P's shrunk descriptor and the right span; a voter's apply is unchanged. The engine runs
 one install at a time and refuses another with nothing written
 (`InstallRefused::InProgress`), so the apply asks again after a millisecond
-(`INSTALL_RETRY`) while a live install of another range holds the engine: every range's
-applies wait that long, which is a few disk operations, on a path that only a learner
-replaying `s` takes.
+(`INSTALL_RETRY`) while another install holds the engine, and every range's applies wait
+with it, on a path that only a learner replaying `s` takes.
+
+**Corrected after #166's review (N1).** The loop asked again whatever had happened in the
+meantime. P's own live install can hold the engine while the entry waits — the node's hold
+stops P's core and not the `apply` task — and switch P past `s`, and then the apply failed
+"applying `s` after" the install's index, a server failure on correct code. The entry is
+now left to the install, as the apply loop leaves an entry the store is past (D-083), with
+nothing written (`apply_removing_unless_installed`; `split` answers `None` and the loop
+skips the entry). A directed unit test reaches the path,
+`a_non_voters_split_that_waits_for_the_engine_leaves_an_entry_an_install_moved_past`: the
+split's apply is told to wait and the store moves past its entry meanwhile, and on the
+loop as first built the test fails with exactly that error, "applying 9 after 20".
+The reverse, another range's live install refused at its switch while this one holds the
+engine and its stream started over (`install.rs`'s restart), is issue #169's.
+
+**It is not a few disk operations (#166's review, N2).** An install replaces its spans'
+history, so every table that holds an older write of P's applied-index key or its
+descriptor key is read and written again without it — nearly every table holding one of
+P's applies, the applied-index key being in every apply batch — beside the right span's
+own. On the directed test's nine-entry store the step takes some 48 ms of the simulated
+disk, and the node's one `apply` task waits for it. What it costs where it runs is Stage
+D's to measure (issue #169), and `RaftStore::applied_at`'s caveat now names this caller:
+a read at a version below its switch finds P's applied index absent.
 
 **Why not a range delete in `WriteBatch`.** That is a range tombstone in the engine's
 log record, memtable and tables: a change to Phase 1's storage format, which is released
@@ -20600,23 +20621,31 @@ and frozen, for one caller that an install already serves. Nor is this a departu
 engine already makes all or nothing. **The crash argument**: a crash before the switch
 is durable leaves the applied index at `s − 1`, P's old descriptor and the right span's
 keys, and the restart re-applies `s` from the log exactly once (RAFT.md §3); a crash
-after it leaves all three changed. Nothing between is reachable, because nothing is
-written before the switch: the install's numbers are log records that hold no write, and
-the repair's writes go into a table the switch lists.
+after it leaves all three changed. Nothing between is reachable, because nothing written
+before the switch is in service until it: the install's numbers are log records that hold
+no write, and the flushes, the rewritten tables and the repair's table are written first
+and listed only by the switch's manifest (the review's instrumented run of the directed
+test's first version put 11 of its 60 crashes in that window, and every one recovered as
+none of the step).
 
 **What says so.** No sweep reaches the path: every replica of the node sweep votes every
 range, and the membership scenario, whose nodes 4 and 5 replicate ranges they are not
 voters of, draws no split. A directed test is its evidence until Stage D's move after a
 split reaches it, `a_non_voters_split_writes_its_batch_and_removes_the_right_span_in_one_step`
 (crates/ananke-raft/tests/store.rs), with the pair rule's two halves on the same seeds:
-eight puts applied and synced, then the split's step, crashed at an offset of 0 to 60 ms
-into it the seed draws, on an honest disk of 0.1 to 2 ms an operation, and the store
-reopened. Over 60 seeds the one step left the split whole on **12** and none of it on
-**48**, never a mix, and no store refused at its open; the node's old shape, the synced
-batch and then the range delete, left the split applied over the right span's keys on
-**40 of 60**. The test asserts both halves: every one-step outcome whole or none, both
-seen, and the two-step shape caught on some seed. It moves no schedule: the voter's path
-is the code it was, and the non-voter's is reached by no scenario.
+a hard state and nine log entries persisted, eight puts applied and synced, then the
+split's step, crashed at an offset of 0 to 60 ms into it the seed draws, on an honest disk
+of 0.1 to 2 ms an operation, and the store reopened. Over 60 seeds the one step left the
+split whole on **13** and none of it on **47**, never a mix, and no store refused at its
+open; the node's old shape, the synced batch and then the range delete, left the split
+applied over the right span's keys on **37 of 60**. The test asserts both halves: every
+one-step outcome whole or none, both seen, and the two-step shape caught on some seed.
+**Corrected after #166's review (N8)**: in every outcome it now also holds what the step
+must not touch — the left span's keys with their values, the hard state and the log — and
+the review's mutation, the step deleting the left span's keys as well, which the test as
+first written passed, fails it at seed 6. (The persist before the step moved the crashes'
+timings: the first version's figures were 12, 48 and 40.) It moves no schedule: the
+voter's path is the code it was, and the non-voter's is reached by no scenario.
 
 ### 2. The restatement at a node's start, and what an install traces
 
@@ -20636,6 +20665,11 @@ is the code it was, and the non-voter's is reached by no scenario.
    voters whatever the snapshot held. Its span was already the read-back descriptor's.
    On a tree with splits a replica created from a snapshot of a range that had split was
    traced at the split's span and generation 1, a value check 7's map never holds.
+   **No run exercises it (#166's review, N4)**: on the correct node's thousand no install
+   creation is past the first generation, since no seed re-seeds a node after a split. The
+   reading is held by a unit test of `created_from`, which a revert of the call site would
+   pass; the directed re-seed-after-split shape that would exercise it is issue #172, the
+   placeholders' slice's natural work.
 3. **An install that changes an initialised replica's descriptor** — P's post-split
    snapshot onto a replica of P that never applied the split — traces a `RangeDescriptor`
    at the snapshot's last index (SHARD.md §5, §8), after the replica's `RaftRecovered`,
@@ -20647,7 +20681,10 @@ is the code it was, and the non-voter's is reached by no scenario.
    descriptor and the applied index and nothing says which change wrote which, and a
    snapshot carries the descriptor alone. Check 7 tells a statement from an apply's change
    by the replica's applied index as its node last traced it (below), and reads a
-   statement at `applied`.
+   statement at `applied`. The studio cannot: an apply's change, a restatement and an
+   install's change export as the same `ananke.range.descriptor` record, told apart only
+   by the `RaftRecovered` before them (#166's review, N11; issue #171, a `cause` field,
+   the owner's call).
 5. **No read, no draw, no await.** The start has already read every descriptor into the
    host's map and the switch has already read its own back, so each statement is a trace
    record and nothing the schedule can see.
@@ -20727,6 +20764,15 @@ and every `TaskPolled` kept, so a schedule that moved shows, and it records the 
   sharded quorum scenario under both, 1969 on the membership node and the re-seed
   shape's seed 1 — the same schedule. The one-group server is untouched, and seed 42's
   pinned body hash holds at the gate.
+- **The variants' node sweeps** (#166's review, N10, which ran a sample; re-run here on
+  seeds 0 to 99 of each): `ApplyIgnoresSpan`, `IdBlockResumed`, `MetaOverwritesByArrival`,
+  `TrustStaleDescriptor` and `ClientIgnoresMismatch`, and the node's `TakeSkipsTheUserKeys`
+  and `InstallKeepsTheOldCore`: the same schedule on every seed and the same catch counts.
+  Three catches change their words: `IdBlockResumed`'s seeds 54 and 67, from check 18's
+  lineage to check 7's restatement clause, the restarted node restating a right half
+  under an id the block reused before any replica had traced its split; and
+  `TakeSkipsTheUserKeys`'s seed 14, from check 16 to check 7, a variant whose test runs on
+  `sim/install.rs` and not on this sweep.
 
 **What the thousand fed check 7**, on the correct node: 6 902 restatements, 6.9 a seed
 (every node's first start and every restart); 44 134 descriptors restated; **16
@@ -20768,8 +20814,13 @@ the read bound (`READS_OUTSTANDING`) with the correct node green on it, which
 `read_bound_is_the_variants_load` counts as the variant's load; `ApplyWaitsForEveryRange`
 on 4 of 100, seed 10 going to the read bound beside the lag fold's catch, which is all
 that test asserts; the membership scenario, `sim/ranges.rs`, the sharded quorum scenario
-under both, the re-seed shape and `sim/install.rs` on none of their 100 (32). **No pinned
-seed's schedule moved** — 272, 516, 368, 493, 633, 8885, 2809, 12, 8, 613, 2994, 1969
+under both, the re-seed shape and `sim/install.rs` on none of their 100 (32). **It moves
+the range variants' node sweeps too** (#166's review, N10; seeds 0 to 99): `ApplyIgnoresSpan`
+on 2 (21 and 80) and `IdBlockResumed` on 1 (22), both tests that run a share of the tier,
+with every verdict as it was, and among the node's own variants that the node sweep does
+not ship `InstallKeepsTheOldCore` on 38 and `TakeSkipsTheUserKeys` on 1; `TrustStaleDescriptor`,
+`ClientIgnoresMismatch` and `MetaOverwritesByArrival` on none. **No pinned seed's schedule
+moved** — 272, 516, 368, 493, 633, 8885, 2809, 12, 8, 613, 2994, 1969
 and the re-seed shape's seed 1, each the same trace as before, so each pin asserts on the
 schedule it was written for (the gate runs every one); seed 42's one-group trace is
 untouched.
@@ -20975,24 +21026,34 @@ tree: the node's restatement still traces `taken: false`.
 
 ### 7. The mutations a single-range world could not catch
 
-Each planted on a scratch copy of section 4's tree behind a switch, run in release on the
-correct node's sweep, seeds 0 to 99, and reverted; none is in a commit.
+Each planted alone on a scratch copy of this tree, built in release, run on the correct
+node's sweep, seeds 0 to 99, and reverted; none is in a commit, and each planting is a
+patch posted on #166 so it can be run again. **Re-measured after #166's review (N9)**: the
+first round planted the first two behind a switch on section 4's tree and recorded 88 and
+99 where the review, planting them its own way, found 90 and 98; the plantings as posted
+give the review's figures, which are the ones below, and the third is the review's own.
 
 - **The split's batch leaves P's shrunk descriptor out** (the host's map still takes it,
   so the node serves P's new span until it restarts): caught on **98 of 100**, 90 by check
   7's restatement clause at the first restart past the split — seed 1, "node 2's replica
   of range 4 was restated at index 57 with `[k4, k6)` at generation 1, where the range's
   descriptor there is" `[k4, k5)` at generation 2 — and 8 by check 9, a read served after
-  a restart from the old span; check 8's overlap clause, read apart, sees it on 88 of the
+  a restart from the old span; check 8's overlap clause, read apart, sees it on 90 of the
   100, the restatement putting P's old span back beside R's. With one range per node no
   generation ever changes and no node holds two spans, so neither clause has anything to
   see.
-- **A restart reopens no right half** (`discover_ranges` emptied: D-100's second finding
-  put back): check 8's right half's clause on **99 of 100**, and every run's verdict green,
-  since R elects among its other replicas and no other check sees the replica gone. One
-  range has no right half. Against the correct node's 2 of 1 000 the clause tells the
-  planted bug from the system on 99 of 100, which is why §5 asks for it to be made sound
-  and not dropped.
+- **A restart reopens no right half** (`discover_ranges` returns nothing: D-100's second
+  finding put back): check 8's right half's clause on **98 of 100**, and every run's
+  verdict green but seed 80's, which fails the liveness bound besides; R elects among its
+  other replicas and no other check sees the replica gone. One range has no right half.
+- **A voter's split writes no right half** (the voter's batch carries P's shrunk
+  descriptor alone and the apply returns before R's creation, as a non-voter's does): the
+  right half's clause on **100 of 100**, at the first voter's apply, where the clause as
+  first built caught none; check 18's lineage catches all 100 in the verdict. One range
+  has no right half.
+
+Against the correct node's 2 of 1 000 the clause tells the planted bugs from the system on
+98 and 100 of 100, which is why §5 asks for it to be made sound and not dropped.
 
 ### Consequences
 
@@ -21006,9 +21067,17 @@ correct node's sweep, seeds 0 to 99, and reverted; none is in a commit.
   its right half's clause is folded, printed over the correct node at every tier, run under
   the equivalence test and pinned on seed 45, and asserted nowhere until the owner rules
   (section 5).
-- A split's non-voter removes the right span in the split's one switch; no sweep reaches
-  it until Stage D (section 1).
+- Check 7 never takes a statement for a value, and check 8's right half's clause knows a
+  split from its first trace: the two folds #166's review found to see less than this
+  entry said, fixed and measured to move no verdict and no schedule (sections 3 and 5).
+- A split's non-voter removes the right span in the split's one switch, and leaves an
+  entry its own parent's install moved the store past; no sweep reaches it until Stage D,
+  whose cost is issue #169's (section 1).
 - #126 stays open; #167 says what closes it (section 6).
+- Filed from #166's review: #169 (the non-voter's step's cost and the live install it
+  restarts), #170 (a voter installed past its split never gets the right half), #171
+  (the studio cannot tell a statement from a change), #172 (no run re-seeds a node after
+  a split).
 - The nightly gains two `node` rows in shard 5. The correct node's sweep folds the range
   layer's checker once more per seed for its coverage, and its row is not re-weighed.
 
@@ -21018,10 +21087,15 @@ correct node's sweep, seeds 0 to 99, and reverted; none is in a commit.
   than a range delete in `WriteBatch` (section 1); a statement's `index` its applied index
   (section 2, item 4); the plan re-hosted at a switch that moves the span (section 4); the
   overlap clause last in the checker's order (section 5). Recommended as built.
-- **For the owner**: check 8's right half's clause (section 5). Recommended: R owed from an
-  apply of `s`, kept across restarts, and from a restatement past `s` only where the node's
-  replica of P was not installed at or past `s` since its last refusal; asserted from the
-  placeholders' slice.
+- **For the owner**: check 8's right half's clause (section 5): how it reads a voter
+  installed past `s`, which it reports when that voter restarts (2 of 1 000, 13 of 10 000)
+  and never sees otherwise (16 of 1 000 hold no R), and its tripping variant, which Stage
+  C has none of. Recommended: R owed from an apply of `s`, kept across restarts, and from a
+  restatement past `s` only where the node's replica of P was not installed at or past `s`
+  since its last refusal; the installed voter held to R by a check of its own once the
+  placeholders make R reachable for it (#170); both asserted from the placeholders' slice,
+  and the clause against `SplitNotAtomicWithDescriptor` in Stage D.
+- **For the owner, from #166's review**: a `cause` on `RangeDescriptor` (#171).
 - **For the owner, #126**: the order #167 gives, the inbox's receipt stamp before the
   restatement's `taken`.
 

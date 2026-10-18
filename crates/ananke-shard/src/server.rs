@@ -1002,20 +1002,7 @@ impl<E: Environment> ServerHost<E> {
             // had split was created at generation 1 with the split's span, a value
             // check 7 holds no range at; a snapshot with no descriptor, which no
             // take of this tree makes, keeps the old reading (PROPOSED D-107).
-            let (generation, voters) = descriptor.map_or_else(
-                || {
-                    (
-                        FIRST_GENERATION,
-                        config.voters.iter().map(|voter| voter.0).collect(),
-                    )
-                },
-                |descriptor| {
-                    (
-                        descriptor.generation,
-                        descriptor.voters.iter().map(|voter| voter.0).collect(),
-                    )
-                },
-            );
+            let (generation, voters) = created_from(descriptor, config);
             self.env.trace(TraceEvent::RangeCreated {
                 range: range.get(),
                 cause: RangeCause::Snapshot,
@@ -1842,6 +1829,10 @@ impl<E: Environment> ServerApplier<E> {
     /// same atomic step (`RaftStore::apply_removing`, PROPOSED D-107). Then
     /// the right half's store is opened beside the parent's, its core restored from
     /// the floor, and both handed to the `raft` task as a range added.
+    ///
+    /// `None` is the entry left to an install: a non-voter's removal waited for the
+    /// engine while P's own live install switched P past `index`, which then carries
+    /// the entry's effect, and nothing was written here (PROPOSED D-107).
     async fn split(
         &self,
         range: RangeId,
@@ -1849,7 +1840,7 @@ impl<E: Environment> ServerApplier<E> {
         key: &Bytes,
         right: u64,
         store: &Arc<RaftStore<E>>,
-    ) -> io::Result<(ApplyEffect, Outcome)> {
+    ) -> io::Result<Option<(ApplyEffect, Outcome)>> {
         let prefix = KeyPrefix::group(range.get());
         let held = store
             .engine()
@@ -1859,7 +1850,7 @@ impl<E: Environment> ServerApplier<E> {
         let refuse = |reason: SplitRefusal| (ApplyEffect::Refused, Outcome::Refused(reason));
         let Some(parent) = held else {
             store.apply(index, WriteBatch::new()).await?;
-            return Ok(refuse(SplitRefusal::NotLive));
+            return Ok(Some(refuse(SplitRefusal::NotLive)));
         };
         let cut = user_key(key);
         let config = lock(&self.applied)
@@ -1881,7 +1872,7 @@ impl<E: Environment> ServerApplier<E> {
         };
         if let Some(reason) = refused {
             store.apply(index, WriteBatch::new()).await?;
-            return Ok(refuse(reason));
+            return Ok(Some(refuse(reason)));
         }
         let right_id = RangeId(right);
         let right_prefix = KeyPrefix::group(right);
@@ -1926,19 +1917,20 @@ impl<E: Environment> ServerApplier<E> {
             // both, where it was a second engine call after the synced batch and a
             // crash between the two left R's keys on a node whose P no longer covers
             // them and which holds no R, which nothing collects (issue #139). The
-            // engine runs one install at a time and refuses another with nothing
-            // written, so a live install of another range on this node is waited out.
+            // engine runs one install at a time, so another install on this node is
+            // waited out, and an entry P's own install moves the store past is left
+            // to it (`apply_removing_unless_installed`).
             // PROPOSED(D-107)
-            loop {
-                match store
-                    .apply_removing(index, batch.clone(), cut.clone()..parent.end.clone())
-                    .await
-                {
-                    Err(error) if install_in_progress(&error) => {
-                        self.env.clock().sleep(INSTALL_RETRY).await;
-                    }
-                    done => break done?,
-                }
+            if !apply_removing_unless_installed(
+                &self.env,
+                store,
+                index,
+                &batch,
+                cut.clone()..parent.end.clone(),
+            )
+            .await?
+            {
+                return Ok(None);
             }
         }
         self.env.trace(TraceEvent::RangeSplit {
@@ -1974,7 +1966,7 @@ impl<E: Environment> ServerApplier<E> {
         });
         lock(&self.descriptors).insert(range, left);
         if !voter {
-            return Ok((ApplyEffect::Took, Outcome::Done));
+            return Ok(Some((ApplyEffect::Took, Outcome::Done)));
         }
         self.env.trace(TraceEvent::RangeCreated {
             range: right,
@@ -2033,7 +2025,7 @@ impl<E: Environment> ServerApplier<E> {
             parent: range,
             core: Box::new(core),
         });
-        Ok((ApplyEffect::Took, Outcome::Done))
+        Ok(Some((ApplyEffect::Took, Outcome::Done)))
     }
 
     /// A take of `range` at its applied index, or — with `checkpoint` false — a
@@ -2424,10 +2416,14 @@ impl<E: Environment> Applier for ServerApplier<E> {
                 };
                 let outcome = if let Some((key, right)) = split {
                     match self.split(range, entry.index, &key, right, &store).await {
-                        Ok((effect, outcome)) => {
+                        Ok(Some((effect, outcome))) => {
                             meta_effect = Some(effect);
                             outcome
                         }
+                        // The entry is P's own install's, which moved the store past it
+                        // while a non-voter's removal waited for the engine: skipped, as
+                        // one the store is past at the head of the loop (PROPOSED D-107).
+                        Ok(None) => continue,
                         Err(error) => {
                             self.env.trace(TraceEvent::RaftServerFailed {
                                 server: self.id.0,
@@ -2638,8 +2634,10 @@ fn descriptors_for(
 }
 
 /// How long a split's apply on a non-voter waits before asking the engine again when
-/// another install holds it (`RaftStore::apply_removing`): a live install of one
-/// range takes a few disk operations, and the apply task asks again after one.
+/// another install holds it (`RaftStore::apply_removing`). The engine numbers an install
+/// only when no other runs, so each ask is a look at one lock and the wait is the other
+/// install's, tens of milliseconds for a live install; every range's applies wait with
+/// it (issue #169, Stage D's to measure).
 // PROPOSED(D-107)
 const INSTALL_RETRY: Duration = Duration::from_millis(1);
 
@@ -2649,6 +2647,41 @@ const INSTALL_RETRY: Duration = Duration::from_millis(1);
 fn install_in_progress(error: &io::Error) -> bool {
     ananke_storage::InstallRefused::from_io(error)
         == Some(ananke_storage::InstallRefused::InProgress)
+}
+
+/// A split's apply on a replica that is not a voter of P at `index`: the batch and the
+/// removal of `removed` in one switch (`RaftStore::apply_removing`), asked again while
+/// another install holds the engine (SHARD.md §5; issue #139). Answers `false`, having
+/// written nothing, when the store is found at or past `index`: P's own live install
+/// can hold the engine while this entry waits — the node's hold stops P's core and not
+/// the `apply` task (`install.rs`, the switch's re-check) — and switch P past it, and
+/// the entry is then the install's, as the apply loop skips an entry the store is past
+/// (D-083). Asking the engine again there failed "applying `index` after" the install's
+/// index, a server failure on correct code (#166's review).
+// PROPOSED(D-107)
+async fn apply_removing_unless_installed<E: Environment>(
+    env: &E,
+    store: &RaftStore<E>,
+    index: Index,
+    batch: &WriteBatch,
+    removed: std::ops::Range<Bytes>,
+) -> io::Result<bool> {
+    loop {
+        if store.applied() >= index {
+            return Ok(false);
+        }
+        match store
+            .apply_removing(index, batch.clone(), removed.clone())
+            .await
+        {
+            Ok(()) => return Ok(true),
+            // The store moved between the look above and the engine's own (a runtime
+            // with threads): the same install's entry.
+            Err(_) if store.applied() >= index => return Ok(false),
+            Err(error) if install_in_progress(&error) => env.clock().sleep(INSTALL_RETRY).await,
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 /// The node's clock in nanoseconds, where the cores' lease arithmetic reads it.
@@ -3818,6 +3851,29 @@ fn restate<E: Environment>(
     });
 }
 
+/// The generation and the voters an install's creation names (`RangeCreated { cause:
+/// snapshot }`, SHARD.md §8): the descriptor the switch put in place, read back from the
+/// store, and for a snapshot that carries none, which no take of this tree makes, the
+/// first generation and the configuration's voters. Until PROPOSED D-107 the creation
+/// named the first generation whatever the snapshot held.
+// PROPOSED(D-107)
+fn created_from(descriptor: Option<&RangeDescriptor>, config: &Configuration) -> (u64, Vec<u64>) {
+    descriptor.map_or_else(
+        || {
+            (
+                FIRST_GENERATION,
+                config.voters.iter().map(|voter| voter.0).collect(),
+            )
+        },
+        |descriptor| {
+            (
+                descriptor.generation,
+                descriptor.voters.iter().map(|voter| voter.0).collect(),
+            )
+        },
+    )
+}
+
 /// A replica's descriptor stated at an applied index it did not reach by an apply
 /// (SHARD.md §8): the last of its restatement at its node's start, and an install
 /// that changed an initialised replica's descriptor, at the snapshot's last index.
@@ -3847,6 +3903,117 @@ fn state_descriptor<E: Environment>(env: &E, descriptor: &RangeDescriptor, appli
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #166's review (N1): a non-voter's split apply that waits out another install,
+    /// and meanwhile finds the store moved past its entry — P's own live install
+    /// switched — writes nothing and leaves the entry to the install. Asking the engine
+    /// again there failed "applying 9 after 20", a server failure on correct code.
+    // PROPOSED(D-107)
+    #[test]
+    fn a_non_voters_split_that_waits_for_the_engine_leaves_an_entry_an_install_moved_past() {
+        use ananke_env::sim::{Sim, SimConfig};
+
+        // A disk whose every operation takes a millisecond or two, so the other
+        // install holds the engine for several of them.
+        let mut sim = Sim::new({
+            let mut config = SimConfig::new(7);
+            config.fs.latency_min = Duration::from_millis(1);
+            config.fs.latency_max = Duration::from_millis(2);
+            config
+        });
+        let node = sim.add_node();
+        let env = sim.env(node);
+        /// What the store held after: its applied index and the parent's descriptor.
+        type Left = Option<(Index, Option<Bytes>)>;
+        let answered: Arc<Mutex<Option<io::Result<bool>>>> = Arc::default();
+        let left: Arc<Mutex<Left>> = Arc::default();
+        env.clone().spawn("test", {
+            let (env, answered, left) = (env.clone(), answered.clone(), left.clone());
+            async move {
+                let prefix = KeyPrefix::group(2);
+                let (store, _) = RaftStore::open_dir(
+                    env.clone(),
+                    EngineConfig::new(std::path::PathBuf::from("/n1")),
+                    prefix.clone(),
+                )
+                .await
+                .expect("the store opens");
+                let store = Arc::new(store);
+                for index in 1..=8 {
+                    store
+                        .apply(index, WriteBatch::new())
+                        .await
+                        .expect("an empty apply");
+                }
+                // Another install holds the engine from here until it switches.
+                let held = store.engine().delete_range(user_key(b"x")..user_key(b"y"));
+                let mut batch = WriteBatch::new();
+                batch.put(prefix.descriptor_key(), Bytes::from_static(b"shrunk"));
+                env.clone().spawn("split", {
+                    let (env, store, answered) = (env.clone(), store.clone(), answered.clone());
+                    async move {
+                        let outcome = apply_removing_unless_installed(
+                            &env,
+                            &store,
+                            9,
+                            &batch,
+                            user_key(b"k4")..user_key(b"k8"),
+                        )
+                        .await;
+                        *lock(&answered) = Some(outcome);
+                    }
+                });
+                // The split's apply has asked once and been told to wait; P's own
+                // install then moves the store past its entry.
+                env.clock().sleep(Duration::from_micros(500)).await;
+                store.installed_at(20);
+                held.await.expect("the other install switches");
+                while lock(&answered).is_none() {
+                    env.clock().sleep(Duration::from_millis(1)).await;
+                }
+                let descriptor = store
+                    .engine()
+                    .get(&prefix.descriptor_key())
+                    .await
+                    .expect("a read");
+                *lock(&left) = Some((store.applied(), descriptor));
+            }
+        });
+        sim.run_for(Duration::from_secs(1));
+        let answered = lock(&answered).take().expect("the split's apply answered");
+        assert_eq!(
+            answered.map_err(|error| error.to_string()),
+            Ok(false),
+            "the entry the install moved the store past is left to it"
+        );
+        assert_eq!(
+            lock(&left).take(),
+            Some((20, None)),
+            "nothing of the split's batch was written"
+        );
+    }
+
+    /// #166's review (N4): an install's creation names the generation and the voters of
+    /// the descriptor its snapshot put in place — a re-seeded replica installed from a
+    /// range that has split is created at the split's generation — and the first
+    /// generation only for a snapshot that carries no descriptor. What reaches it in a
+    /// run is a re-seed after a split, which no scenario of this tree makes (issue
+    /// #172); this holds the reading itself.
+    // PROPOSED(D-107)
+    #[test]
+    fn an_install_creation_names_the_snapshots_generation_and_voters() {
+        let split = RangeDescriptor {
+            range: RangeId(4),
+            start: user_key(b"k4"),
+            end: user_key(b"k5"),
+            generation: 2,
+            voters: vec![ServerId(1), ServerId(2), ServerId(3)],
+            state: RangeState::Live,
+        };
+        let config = Configuration::of(&[ServerId(4), ServerId(5)]);
+        assert_eq!(created_from(Some(&split), &config), (2, vec![1, 2, 3]));
+        assert_eq!(created_from(None, &config), (FIRST_GENERATION, vec![4, 5]));
+    }
 
     fn client_addr() -> SocketAddr {
         "10.0.0.9:7000".parse().expect("an address")

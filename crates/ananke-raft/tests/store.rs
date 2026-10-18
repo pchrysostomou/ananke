@@ -606,8 +606,10 @@ enum Removal {
 }
 
 /// What a crash left of the split's apply: the applied index, whether the parent's
-/// shrunk descriptor is there, and how many of the right span's keys are.
-type Left = (u64, bool, usize);
+/// shrunk descriptor is there, how many of the right span's keys are, and whether
+/// everything outside the step's reach — the left span's keys and their values, the
+/// hard state and the log — is as it was.
+type Left = (u64, bool, usize, bool);
 
 /// One seed of the non-voter's apply under the disk's faults, crashed at a point the
 /// seed draws inside the step: eight puts applied and synced, then the ninth entry, a
@@ -670,6 +672,18 @@ fn non_voter_split_crashed(seed: u64, removal: Removal) -> Result<Left, String> 
             let (store, _) = RaftStore::open_dir(env.clone(), config(), prefix())
                 .await
                 .unwrap();
+            // A hard state and a log for the step to leave alone (#166's review, N8).
+            store
+                .persist(&Persist {
+                    term: 3,
+                    vote: Some(ServerId(2)),
+                    truncate_from: None,
+                    append: (1..=9).map(|index| entry(3, index, "e")).collect(),
+                    config: None,
+                    compact_to: None,
+                })
+                .await
+                .unwrap();
             for index in 1..=8u64 {
                 let command = Command::Put {
                     key: Bytes::from(format!("k{}", index - 1)),
@@ -711,10 +725,19 @@ fn non_voter_split_crashed(seed: u64, removal: Removal) -> Result<Left, String> 
     sim.restart(node);
     on_node(&mut sim, node, |env| {
         Box::pin(async move {
-            let (store, _) = RaftStore::open_dir(env, config(), prefix())
+            let (store, recovered) = RaftStore::open_dir(env, config(), prefix())
                 .await
                 .map_err(|e| e.to_string())?;
             let engine = store.engine().clone();
+            let mut untouched = (store.term(), store.vote()) == (3, Some(ServerId(2)))
+                && recovered.log.iter().map(|e| e.index).eq(1..=9);
+            for k in 0..4u64 {
+                untouched &= engine
+                    .get(&user_key(format!("k{k}").as_bytes()))
+                    .await
+                    .unwrap()
+                    == Some(Bytes::from(format!("v{}", k + 1)));
+            }
             let shrunk = engine
                 .get(&prefix().descriptor_key())
                 .await
@@ -731,7 +754,7 @@ fn non_voter_split_crashed(seed: u64, removal: Removal) -> Result<Left, String> 
                     right += 1;
                 }
             }
-            Ok((store.applied(), shrunk, right))
+            Ok((store.applied(), shrunk, right, untouched))
         })
     })
 }
@@ -757,18 +780,20 @@ fn a_non_voters_split_writes_its_batch_and_removes_the_right_span_in_one_step() 
     let mut mixed_buggy = Vec::new();
     for seed in 0..seeds {
         match non_voter_split_crashed(seed, Removal::OneStep) {
-            Ok((9, true, 0)) => whole += 1,
-            Ok((8, false, 4)) => neither += 1,
+            Ok((9, true, 0, true)) => whole += 1,
+            Ok((8, false, 4, true)) => neither += 1,
             Ok(left) => panic!(
-                "seed {seed}: the one-step apply left (applied, shrunk, right keys) = \
-                 {left:?}, neither the split whole nor none of it"
+                "seed {seed}: the one-step apply left (applied, shrunk, right keys, the rest \
+                 untouched) = {left:?}, neither the split whole nor none of it with the left \
+                 span, the hard state and the log as they were"
             ),
             Err(why) => {
                 println!("seed {seed}: the store refused at its open: {why}");
                 refused += 1;
             }
         }
-        if let Ok(left @ (9, true, right)) = non_voter_split_crashed(seed, Removal::BatchThenDelete)
+        if let Ok(left @ (9, true, right, _)) =
+            non_voter_split_crashed(seed, Removal::BatchThenDelete)
             && right > 0
         {
             mixed_buggy.push((seed, left));
