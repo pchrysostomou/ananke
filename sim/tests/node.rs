@@ -2425,6 +2425,33 @@ fn the_range_layers_folds_agree_one_by_one_and_check_17_trips_under_client_ignor
     );
 }
 
+/// The membership seeds on which `AnyFreshNodeBootstraps` trips check 18's grants clause
+/// among the first hundred (PROPOSED D-106, #163's review): 41, 74, 81 and 82, measured
+/// over seeds 0 to 999 in release, where it trips on 34, every one the clause's agreement
+/// branch at index 2 of range 0. Two groups of range 0 run side by side — the bootstrap
+/// nodes' and the one the variant's fresh nodes bootstrap beside it, whose leaders of term
+/// 1 the run's own verdict names first (election safety) — each leases the first block of
+/// its own counter, 6..=13, to some node's refill at index 2, and a replica of the one
+/// applies at index 2 what a replica of the other applied first. The clause's other two
+/// branches, two blocks sharing an id and an empty block, are reached by no variant and no
+/// instrument.
+const GRANTS_PINNED: [u64; 4] = [41, 74, 81, 82];
+
+/// The two nodes a violation of the grants clause's agreement branch at index 2 of range 0
+/// names — the first apply's grantee and the other replica's — when both were granted the
+/// block 6..=13: "range ids: index 2 of range 0 granted node A's run … the block 6..=13
+/// at its first apply and node B's run … the block 6..=13 on …".
+fn grants_at_index_2_of(violation: &str) -> Option<(u64, u64)> {
+    let after = violation.strip_prefix("range ids: index 2 of range 0 granted node ")?;
+    let (first, after) = after.split_once("'s run ")?;
+    let (_, after) = after.split_once(" the block 6..=13 at its first apply and node ")?;
+    let (second, after) = after.split_once("'s run ")?;
+    if !after.contains(" the block 6..=13 on ") {
+        return None;
+    }
+    Some((first.parse().ok()?, second.parse().ok()?))
+}
+
 /// Whether `violation` is check 18's **range-id clause**: a right half whose id a
 /// creation or a split had named before (the freshness failure, in
 /// [`Fold::SplitLineage`]'s words), or two grants of one id ([`Fold::RangeIds`]) — and
@@ -2478,6 +2505,11 @@ fn the_range_layers_folds_agree_one_by_one_and_check_18_trips_under_id_block_res
 /// `SplitNotAtomicWithDescriptor`, Stage D's (above). The pair's correct half is the
 /// correct membership node on the same seeds, compared fold by fold too, on which no
 /// fold trips.
+///
+/// **Check 18's grants clause** (`IdsUnique`), which no variant of §10 trips, is compared
+/// here on a violation at every tier: the variant trips it on 4 of the first hundred
+/// seeds and none of the first twenty, so those four are pinned ([`GRANTS_PINNED`]) and
+/// compared fold by fold whatever the tier, each asserting its mechanism.
 // PROPOSED(D-106): the range layer's folds compared fold by fold, per pair.
 #[test]
 fn the_range_layers_folds_agree_one_by_one_and_check_7_trips_under_any_fresh_node_bootstraps() {
@@ -2492,6 +2524,47 @@ fn the_range_layers_folds_agree_one_by_one_and_check_7_trips_under_any_fresh_nod
         tripped_on(&found, Fold::DescriptorAgreement),
         found.len(),
         "check 7 did not trip on every compared membership seed of AnyFreshNodeBootstraps"
+    );
+    // The pins: each seed's comparison is the one above where the tier compared it, and
+    // is run here where it did not, so the grants clause is compared fold by fold on a
+    // violation at the gate's twenty too (#163's review).
+    let pinned: Vec<(u64, Option<String>)> = sweep(GRANTS_PINNED.len() as u64, |at| {
+        let seed = GRANTS_PINNED[usize::try_from(at).expect("four pins")];
+        let words = match found.get(usize::try_from(seed).expect("a small seed")) {
+            Some(compared) => compared.tripped.get(&Fold::RangeIds).cloned(),
+            None => compare_range_folds(
+                seed,
+                "AnyFreshNodeBootstraps on the membership scenario, pinned",
+                &membership::run_on_node(Cluster::Node, seed, Variants::default(), taken).records,
+            )
+            .unwrap_or_else(|mismatch| panic!("{mismatch}"))
+            .tripped
+            .get(&Fold::RangeIds)
+            .cloned(),
+        };
+        (seed, words)
+    });
+    for (seed, words) in &pinned {
+        let words = words.as_deref().unwrap_or_else(|| {
+            panic!(
+                "seed {seed}: check 18's grants clause did not trip under \
+                 AnyFreshNodeBootstraps on the membership scenario, where it was pinned for \
+                 two clusters' replicas of range 0 granting the block 6..=13 at index 2 to \
+                 two runs: a schedule move took it off that shape, so re-audit the pin to the \
+                 shape's absence with its reason (CLAUDE.md)"
+            )
+        });
+        let granted = grants_at_index_2_of(words);
+        assert!(
+            granted.is_some_and(|(first, second)| first != second),
+            "seed {seed}: check 18's grants clause tripped in a shape other than its pin's, \
+             two clusters' replicas of range 0 granting the block 6..=13 at index 2 to the \
+             runs of two nodes: {words}"
+        );
+    }
+    println!(
+        "range folds: AnyFreshNodeBootstraps: check 18's grants clause compared in violation \
+         on the pinned seeds {GRANTS_PINNED:?}, each the agreement branch at index 2 of range 0"
     );
     let correct = range_folds_under("the correct membership node", compared, |seed| {
         membership::run_on_node(

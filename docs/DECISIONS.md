@@ -20801,16 +20801,36 @@ not a test left without one").** `IdsUnique`, check 18's half that no two grants
 and that every replica of range 0 grants at an index what its first apply granted, is
 tripped by no §10 variant: `IdBlockResumed` resumes a block and never grants one twice, so
 check 18 trips under it in the split clause's freshness failure. D-096's instrument
-does trip it: under `AnyFreshNodeBootstraps` two clusters' replicas of range 0 grant
-different blocks at one index — "index 2 of range 0 granted node 3's run … the block 6..=13
-at its first apply and node 2's run … the block 6..=13" — on 34 of the thousand membership
-seeds, 4 of the first hundred, none of the first twenty. So the comparison runs `IdsUnique`
-in violation on 4 of CI's hundred, which it does not assert, and the variant's own test reads
-it fold by fold and asserts it from the nightly's share (34 of 1 000). PROPOSED,
-recommended: that instrument stands as `IdsUnique`'s tripping variant, asserted where the
-nightly's share supports it. The alternatives: a test instrument of the range layer that
-grants a block twice, outside §10's count as D-093 proposes for check 19; or §11's raft item
-12 read with check 18 as one check, which `IdBlockResumed` trips.
+does trip it: under `AnyFreshNodeBootstraps` two groups of range 0 grant different runs a
+block at one index — "index 2 of range 0 granted node 3's run … the block 6..=13 at its
+first apply and node 2's run … the block 6..=13" — on 34 of the thousand membership seeds, 4
+of the first hundred (41, 74, 81 and 82), none of the first twenty.
+
+**It reaches one of the clause's three branches.** All 34 are the agreement branch at index
+2 of range 0: the bootstrap nodes' group of range 0 and the one the variant's fresh nodes
+bootstrap beside it — whose two leaders of term 1 the run's own verdict names first,
+election safety — each lease the first block of their own counter, 6..=13, to some node's
+refill at index 2, and a replica of the one applies at index 2 what a replica of the other
+applied first. The disjointness branch (two blocks sharing an id) and the empty-block branch
+are tripped by no variant and no instrument; the first alternative below, an instrument that
+grants a block twice, is what would reach the disjointness branch, which the recommended
+instrument cannot.
+
+**The comparison sees it in violation at every tier** (#163's review): the four seeds are
+pinned in `the_range_layers_folds_agree_one_by_one_and_check_7_trips_under_any_fresh_node_bootstraps`
+(`GRANTS_PINNED`) and compared fold by fold whatever the tier — out of the tier's own
+comparison at the gate's twenty, inside it from CI's hundred — each asserting its mechanism,
+the agreement branch at index 2 of range 0 granting the block 6..=13 to two nodes' runs, and
+failing the day a schedule move takes it off that shape, so the pin is re-audited to the
+shape's absence with its reason. And the variant's own test reads the clause fold by fold
+and asserts it from the nightly's share (34 of 1 000).
+
+PROPOSED, recommended: that instrument stands as `IdsUnique`'s tripping variant, asserted
+where the nightly's share supports it and compared on its pins at every tier. Both are built
+ahead of the owner's ruling — additive, and marked PROPOSED — and go if the owner picks an
+alternative: a test instrument of the range layer that grants a block twice, outside §10's
+count as D-093 proposes for check 19, which would reach the disjointness branch; or §11's
+raft item 12 read with check 18 as one check, which `IdBlockResumed` trips.
 
 **What the comparison costs.** The seven run at 31.2, 29.3, 28.2, 27.8, 23.1, 0.6 and 0.5 cpu
 s at the premerge's tier, against the old test's 7.9; the nightly's rows are re-weighed in
@@ -20893,6 +20913,13 @@ The gate's pins say the same of every pinned seed: seeds 272, 516, 368, 493, 633
 2809, 12, 8 and 613 on the node and seed 42's one-group hash, each asserting its mechanism or
 its absence as before, green on every commit of this slice.
 
+**Re-measured after the grants fix of item 1** (#163's review), on the fixed checker, from
+the same probe: the same 12 400 runs identical in records, hash and verdict to `main`'s
+and to the tree before the fix, and every fold's own verdict — each fold's trip and first
+words, with the run's verdict — on the 11 000 runs the per-fold probe reads (the node
+sweep's seven systems and the membership and quorum pairs, seeds 0 to 999) identical to
+the first measurement's.
+
 ### Consequences
 
 - Every fold of the range layer has a verdict a test can read on its own; the checker's
@@ -20928,9 +20955,12 @@ its absence as before, green on every commit of this slice.
   range layer's checks after `ananke-raft`'s and before the history (item 6).
 - **For the owner** (item 4, §12's rule for a fold no variant trips): `IdsUnique`'s
   tripping variant. Recommended: D-096's instrument `AnyFreshNodeBootstraps`, which trips it
-  on 34 of the thousand membership seeds and is asserted from the nightly's share; the
-  alternatives are a test instrument that grants a block twice, outside §10's count, or
-  check 18 read as one check, which `IdBlockResumed` trips.
+  on 34 of the thousand membership seeds — every one the clause's agreement branch, never
+  its disjointness or empty-block branch — asserted from the nightly's share and compared
+  on its four pinned seeds at every tier, both built ahead of the ruling and gone if it
+  falls the other way. The alternatives: a test instrument that grants a block twice,
+  outside §10's count, which would reach the disjointness branch the recommended one
+  cannot; or check 18 read as one check, which `IdBlockResumed` trips.
 
 ---
 
