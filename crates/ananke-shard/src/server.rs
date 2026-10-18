@@ -3455,13 +3455,16 @@ async fn generations<E: Environment>(env: &E, base: &Path) -> io::Result<Vec<Can
 ///    the two keys in one synced batch (`RaftStore::mark_reseeded`), and `RaftReseeded`
 ///    is traced when it is durable, per replica and carrying its range (§8).
 ///
-/// The incarnation is drawn per replica from the **node's** generator and is never the
-/// first incarnation. It is not drawn from the range's protocol stream: `SimEnv` derives
-/// a named stream from the seed and the name alone, so a replica created again for the
-/// same (range, node) would draw its predecessor's number and a leader comparing
-/// incarnations for inequality only (D-042) would never reset (Q26,
-/// SHARD.md:1372-1379). [`RangeVariant::IncarnationPerRangeStream`] is that mistake,
-/// a range-layer instrument since PROPOSED D-108.
+/// The incarnation is drawn per replica from the **node's** generator, as SHARD.md §8
+/// draws a fresh incarnation (Q26), and is never the first incarnation. It is never
+/// drawn from a named stream derived anew at each creation of a replica of the same
+/// (range, node): such a stream would hand a replica created again its predecessor's
+/// number, and a leader comparing incarnations for inequality only (D-042) would never
+/// reset (SHARD.md:1376-1383). [`RangeVariant::IncarnationPerRangeStream`], a
+/// range-layer instrument since PROPOSED D-108, draws it from the range's protocol
+/// stream instead. That stream is not derived anew: `range_rng` is one stream per node
+/// and range, continuing across draws and restarts. So the variant changes the draw
+/// without reaching the repeat (PROPOSED D-108).
 ///
 /// What the replicas are when this returns is empty and quarantined: each waits for its
 /// leader's stream, and the install that fills it is the node's snapshot *wiring*, which

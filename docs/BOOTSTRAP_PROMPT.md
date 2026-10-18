@@ -111,7 +111,20 @@ _Update this section at the end of every session._
   refusal scenario beside the node's set; `NodeVariant::BUGS` forty-seven, `RESEED`
   five, bits 25 and 48 freed. `IncarnationPerRangeStream` is read at two sites, not the
   one #151 named: the split's (D-100) is reached on the node cluster and run by no test
-  (issue #160). #155: the six read sites of the range layer's set (five in `server.rs`,
+  (issue #160). **Nothing moved, measured** on f8a15a7 and 72e362a from one harness in
+  release: 7 121 runs identical (verdict, trace hash, length) — the membership node, the
+  directed refusal and the node cluster at seeds 0 to 999 under each instrument and the
+  correct node, every node pin, seed 42's one-group hash and the other node scenarios'
+  twenty; `AnyFreshNodeBootstraps` caught by check 7 on 20/20, 100/100 and 1 000/1 000
+  and `IncarnationPerRangeStream` by the directed reading on 20/20, 100/100 and
+  1 000/1 000 on both trees; six plumbing mutations, M6 (the split's draw) failing
+  nothing. **For the owner** (PROPOSED in D-108): Stage D builds
+  `IncarnationFromRangeStream` as SHARD.md's question 1 proposes, and #151's reuse of
+  `IncarnationPerRangeStream` is not taken. `range_rng` is one stream per node and range
+  that continues across draws and restarts, so that variant repeats no incarnation and
+  the re-add assertion could not catch it; its doc and `reseed`'s said otherwise and are
+  corrected, and SHARD.md:1379-1381's parenthetical is issue #165. #155: the six read
+  sites of the range layer's set (five in `server.rs`,
   the sweep's client's) and the six prose-form sites carry `// PROPOSED(D-105)`, and a
   note appended to D-105 says what is marked and that its split by check was the
   uncommitted harness's (the tests count checks 16 and 18 as "something else").

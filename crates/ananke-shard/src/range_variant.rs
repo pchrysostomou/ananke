@@ -36,7 +36,8 @@
 //!   of the node's generator, at Q15's re-seed and at a split's right half (D-077,
 //!   PROPOSED D-100). Two more are proposed and not built: D-093's `SplitLeavesGap`
 //!   for check 19's fold, and Stage D's variant for the re-add window assertion (§12,
-//!   Stage D's question 1).
+//!   Stage D's question 1), which needs a stream derived anew at each creation and so
+//!   is not `IncarnationPerRangeStream` read at one more site (PROPOSED D-108).
 //!
 //! The set is a `u64` where Raft's is a `u32` (PROPOSED D-105): twenty-four of §10's
 //! and two instruments already proposed would leave a `u32` six bits for every
@@ -111,16 +112,22 @@ pub enum RangeVariant {
     // PROPOSED(D-096)
     // PROPOSED(D-108): moved from the node's set, outside §10's count.
     AnyFreshNodeBootstraps,
-    /// The replica's incarnation drawn from the per-range protocol stream,
-    /// `n{id}/r{range}/protocol`, rather than from the node's own generator.
-    /// `SimEnv` derives a named stream from the seed and the name alone, so a
-    /// replica created again for the same (range, node) draws the number its
-    /// predecessor drew, and a leader that compares incarnations for inequality only
-    /// (D-042) never resets (Q26; SHARD.md:1372-1379). It is read wherever the node
-    /// draws a replica's incarnation at its creation: Q15's re-seed (D-077) and a
-    /// split's right half (PROPOSED D-100). A test instrument outside §10's count;
-    /// the directed refusal scenario catches it (`sim/tests/ranges.rs`), and no test
-    /// runs it through a split (issue #160).
+    /// A replica's incarnation drawn at its creation from the range's protocol
+    /// stream, `n{id}/r{range}/protocol` (`Environment::range_rng`), rather than from
+    /// the node's own generator, from which SHARD.md §8 draws a fresh incarnation
+    /// (Q26). It is read wherever the node draws one: Q15's re-seed (D-077) and a
+    /// split's right half (PROPOSED D-100). What catches it is the draw itself: the
+    /// directed refusal scenario finds every re-seeded replica's incarnation different
+    /// from the node generator's (`sim/tests/ranges.rs`), and no test runs it through
+    /// a split (issue #160).
+    ///
+    /// It does not reach the harm §8 names for a stream derived anew at each creation:
+    /// a replica created again drawing its predecessor's number, which a leader that
+    /// compares incarnations for inequality only (D-042) would never reset
+    /// (SHARD.md:1376-1383). `range_rng` hands back one stream per node and range,
+    /// continuing across draws, handles and restarts, so every creation under this
+    /// variant draws a number of its own (PROPOSED D-108). A test instrument outside
+    /// §10's count.
     // PROPOSED(D-108): moved from the node's set, outside §10's count.
     IncarnationPerRangeStream,
 }
