@@ -1296,6 +1296,61 @@ impl<E: Environment> RaftStore<E> {
         self.applied.store(index, Ordering::Release);
         Ok(())
     }
+
+    /// Applies entry `index` as [`apply`](Self::apply) does and removes every key of
+    /// `removed` with it, in one atomic step: the writes and the applied index ride as
+    /// the repair of an install of nothing over `removed` and over each written key's
+    /// own one-key span (`[key, key ++ 0)`, which holds that key alone), so a single
+    /// manifest switch makes the removal and the writes durable together, and a crash
+    /// at any point leaves all of them or none (D-066, D-068: the install's repair).
+    /// No new primitive: the engine's range delete is that install with an empty
+    /// repair, and a batch has no range delete of its own.
+    ///
+    /// `removed` must hold no key the writes write; in its one caller it is a split's
+    /// right span, in the user tenant, and the writes are under this store's prefix.
+    ///
+    /// # Errors
+    ///
+    /// As [`apply`](Self::apply)'s, and the install's: refused
+    /// ([`ananke_storage::InstallRefused::InProgress`]) while another install runs on
+    /// the engine, with nothing written, which the caller retries; refused for spans
+    /// that overlap when `removed` holds a written key.
+    // PROPOSED(D-107): a split's non-voter writes its batch and the right span's
+    // removal in one switch (SHARD.md §5; issue #139).
+    pub async fn apply_removing(
+        &self,
+        index: Index,
+        mut writes: WriteBatch,
+        removed: std::ops::Range<Bytes>,
+    ) -> io::Result<()> {
+        let applied = self.applied();
+        if index != applied + 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("applying {index} after {applied}"),
+            ));
+        }
+        let mut out = BytesMut::with_capacity(8);
+        out.put_u64_le(index);
+        writes.put(self.prefix.applied_key(), out.freeze());
+        let mut spans: Vec<std::ops::Range<Bytes>> = writes
+            .ops()
+            .iter()
+            .map(|(key, _)| {
+                let mut past = key.to_vec();
+                past.push(0);
+                key.clone()..Bytes::from(past)
+            })
+            .collect();
+        spans.push(removed);
+        spans.sort_by(|a, b| a.start.cmp(&b.start));
+        spans.dedup();
+        self.engine
+            .install_spans(spans, ananke_storage::SpanSource::empty(), writes)
+            .await?;
+        self.applied.store(index, Ordering::Release);
+        Ok(())
+    }
 }
 
 fn decode_hard(mut bytes: Bytes) -> io::Result<(Term, Option<ServerId>)> {

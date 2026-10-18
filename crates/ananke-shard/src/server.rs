@@ -1766,7 +1766,8 @@ impl<E: Environment> ServerApplier<E> {
     /// halves' descriptors at the next generation and, on a voter of that
     /// configuration, the right half's Raft state at the floor `(index, 1)` with a
     /// fresh incarnation and no quarantine (Q20, Q26); a replica that is not a voter
-    /// gets the shrunk descriptor and a range delete of the right span instead. Then
+    /// gets the shrunk descriptor and a range delete of the right span instead, in the
+    /// same atomic step (`RaftStore::apply_removing`, PROPOSED D-107). Then
     /// the right half's store is opened beside the parent's, its core restored from
     /// the floor, and both handed to the `raft` task as a range added.
     async fn split(
@@ -1844,16 +1845,29 @@ impl<E: Environment> ServerApplier<E> {
         if voter {
             batch.put(right_prefix.descriptor_key(), created.encode());
             split_state_into(&right_prefix, &config, index, incarnation, &mut batch);
-        }
-        store.apply(index, batch).await?;
-        if !voter {
+            store.apply(index, batch).await?;
+        } else {
             // Not a voter of the parent's configuration at the split: no right half
             // here, and the right span's keys go, so this node holds no R outside R's
-            // configuration (SHARD.md §5, Q23).
-            store
-                .engine()
-                .delete_range(cut.clone()..parent.end.clone())
-                .await?;
+            // configuration (SHARD.md §5, Q23) — **in the batch's own step**: the
+            // batch rides as the repair of the range delete, one manifest switch for
+            // both, where it was a second engine call after the synced batch and a
+            // crash between the two left R's keys on a node whose P no longer covers
+            // them and which holds no R, which nothing collects (issue #139). The
+            // engine runs one install at a time and refuses another with nothing
+            // written, so a live install of another range on this node is waited out.
+            // PROPOSED(D-107)
+            loop {
+                match store
+                    .apply_removing(index, batch.clone(), cut.clone()..parent.end.clone())
+                    .await
+                {
+                    Err(error) if install_in_progress(&error) => {
+                        self.env.clock().sleep(INSTALL_RETRY).await;
+                    }
+                    done => break done?,
+                }
+            }
         }
         self.env.trace(TraceEvent::RangeSplit {
             range: range.get(),
@@ -2549,6 +2563,20 @@ fn descriptors_for(
             .cloned(),
     );
     out
+}
+
+/// How long a split's apply on a non-voter waits before asking the engine again when
+/// another install holds it (`RaftStore::apply_removing`): a live install of one
+/// range takes a few disk operations, and the apply task asks again after one.
+// PROPOSED(D-107)
+const INSTALL_RETRY: Duration = Duration::from_millis(1);
+
+/// Whether `error` is the engine refusing an install because another runs, which
+/// leaves nothing written and is asked again (`ananke_storage::InstallRefused`).
+// PROPOSED(D-107)
+fn install_in_progress(error: &io::Error) -> bool {
+    ananke_storage::InstallRefused::from_io(error)
+        == Some(ananke_storage::InstallRefused::InProgress)
 }
 
 /// The node's clock in nanoseconds, where the cores' lease arithmetic reads it.

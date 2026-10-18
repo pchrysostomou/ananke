@@ -20530,4 +20530,86 @@ this branch's changes before `rustfmt`, which changed their layout and nothing e
 
 ---
 
-_Next entry: D-106. Add one before implementing anything not covered above._
+## PROPOSED D-107 — A node restates every replica's descriptor at its start, an install traces the descriptor it puts in place, check 7 holds each statement to the map at its applied index, check 8's two Stage C clauses, and a split's non-voter removes the right span in the split's one switch
+
+**The number.** Off `main` at 6633266, whose footer reads D-106. Three slices run beside
+each other off that tip, as tracking issue #162 assigns them: the per-fold equivalence
+takes D-106, this takes **D-107**, and the variant set's follow-ups take D-108 if they
+need one; the footer here moves to D-108. At the merge the entries are a union in
+numerical order with one footer, the highest plus one. Every code site carries
+`// PROPOSED(D-107)`. The entry is written step by step with the slice's commits, each
+section in the commit that builds what it describes (PR for #162's S6).
+
+**Context.** Stage C's folds (SHARD.md §12): "check 7; check 8's clause that no two of a
+node's spans overlap and its clause that a voter of P at `s` that applied `s` holds R".
+SHARD.md §8 defines both, and the two events they need at a node's start: "At a node's
+start every replica restates its log, as a server does today before `RaftRecovered`
+(RAFT.md §2, check 4), and then its descriptor as a `RangeDescriptor` carrying its
+applied index; `RangesRestated` closes the node's restatement", and an install that
+changes an initialised replica traces a `RangeDescriptor` at the snapshot's last index.
+SHARD.md §5 puts a split's non-voter's range delete of the right span in the split's
+one synced batch. What the tree had, on 6633266: a `RangeDescriptor` only at a split's
+apply; `RangesRestated` defined by D-069 and emitted by nothing; an install's creation
+traced at the first generation whatever the snapshot held; no trace of an install that
+changes an initialised replica's descriptor; check 7 holding an install's creation to
+its map and nothing else; no check 8; and the non-voter's range delete a second engine
+call after the synced batch (issue #139).
+
+### 1. A split's non-voter removes the right span in the split's one switch (issue #139)
+
+**What the tree did.** `ServerApplier::split` applied the batch with P's shrunk
+descriptor and the applied index (`store.apply(index, batch)`) and then called
+`engine().delete_range(cut..parent.end)`, a second engine operation: `WriteBatch` has no
+range delete, and the engine's range delete is an install of nothing over the span
+(D-055). A crash between the two left the right span's keys on a node whose P no longer
+covers them and which holds no R, and nothing in §7 ever collects them, since no
+descriptor of R ever named the node.
+
+**What is built: no new primitive.** `RaftStore::apply_removing(index, writes,
+removed)` applies entry `index` as `apply` does and removes every key of `removed` in
+the same atomic step: the batch's writes and the applied index ride as the **repair** of
+an install of nothing over `removed` and over each written key's one-key span
+(`[key, key ++ 0)`, which holds that key alone), so one manifest switch makes the
+removal and the writes durable together (D-054's install, D-068's spans and repair). The
+split's apply on a replica that is not a voter of P's configuration at `s` calls it with
+P's shrunk descriptor and the right span; a voter's apply is unchanged. The engine runs
+one install at a time and refuses another with nothing written
+(`InstallRefused::InProgress`), so the apply asks again after a millisecond
+(`INSTALL_RETRY`) while a live install of another range holds the engine: every range's
+applies wait that long, which is a few disk operations, on a path that only a learner
+replaying `s` takes.
+
+**Why not a range delete in `WriteBatch`.** That is a range tombstone in the engine's
+log record, memtable and tables: a change to Phase 1's storage format, which is released
+and frozen, for one caller that an install already serves. Nor is this a departure from
+§5: the atomic step §5 asks for is there, and it is the install's switch, which the
+engine already makes all or nothing. **The crash argument**: a crash before the switch
+is durable leaves the applied index at `s − 1`, P's old descriptor and the right span's
+keys, and the restart re-applies `s` from the log exactly once (RAFT.md §3); a crash
+after it leaves all three changed. Nothing between is reachable, because nothing is
+written before the switch: the install's numbers are log records that hold no write, and
+the repair's writes go into a table the switch lists.
+
+**What says so.** No sweep reaches the path: every replica of the node sweep votes every
+range, and the membership scenario, whose nodes 4 and 5 replicate ranges they are not
+voters of, draws no split. A directed test is its evidence until Stage D's move after a
+split reaches it, `a_non_voters_split_writes_its_batch_and_removes_the_right_span_in_one_step`
+(crates/ananke-raft/tests/store.rs), with the pair rule's two halves on the same seeds:
+eight puts applied and synced, then the split's step, crashed at an offset of 0 to 60 ms
+into it the seed draws, on an honest disk of 0.1 to 2 ms an operation, and the store
+reopened. Over 60 seeds the one step left the split whole on **12** and none of it on
+**48**, never a mix, and no store refused at its open; the node's old shape, the synced
+batch and then the range delete, left the split applied over the right span's keys on
+**40 of 60**. The test asserts both halves: every one-step outcome whole or none, both
+seen, and the two-step shape caught on some seed. It moves no schedule: the voter's path
+is the code it was, and the non-voter's is reached by no scenario.
+
+### What follows
+
+The restatement at a node's start and the install traces, check 7's restatement clause,
+the `snapshot` task's plan re-hosted at a switch, check 8 and the measurements each is
+asserted on are this entry's next sections, each written in the commit that builds it.
+
+---
+
+_Next entry: D-108. Add one before implementing anything not covered above._

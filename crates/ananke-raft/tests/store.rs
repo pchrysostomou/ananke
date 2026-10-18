@@ -592,3 +592,204 @@ fn user_keys_are_tenant_2_and_tenant_1_stays_empty() {
         })
     });
 }
+
+/// How a split's apply on a node that is not a voter of the parent at the split
+/// writes its batch and removes the right span (SHARD.md §5, issue #139).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Removal {
+    /// One step: the batch rides as the repair of the range delete
+    /// (`RaftStore::apply_removing`, PROPOSED D-107).
+    OneStep,
+    /// The known-buggy shape the node ran until PROPOSED D-107: the synced batch, then
+    /// the range delete as a second engine call.
+    BatchThenDelete,
+}
+
+/// What a crash left of the split's apply: the applied index, whether the parent's
+/// shrunk descriptor is there, and how many of the right span's keys are.
+type Left = (u64, bool, usize);
+
+/// One seed of the non-voter's apply under the disk's faults, crashed at a point the
+/// seed draws inside the step: eight puts applied and synced, then the ninth entry, a
+/// split whose batch writes the parent's descriptor and removes the right span
+/// `[k4, k8)`, with the crash `offset` after the step began.
+fn non_voter_split_crashed(seed: u64, removal: Removal) -> Result<Left, String> {
+    use ananke_raft::format::{STORE_FORMAT, encode_record, format_path};
+
+    // An honest disk whose every operation takes a tenth of a millisecond to two, as
+    // the node sweep's does: a crash then lands inside the step, between its writes
+    // and its syncs, and what it leaves is the step's answer and never a sync that
+    // lied, which the store would refuse whatever the step did.
+    let mut sim = Sim::new({
+        let mut c = SimConfig::new(seed);
+        c.fs.latency_min = Duration::from_micros(100);
+        c.fs.latency_max = Duration::from_millis(2);
+        c
+    });
+    let node = sim.add_node();
+    let descriptor = Bytes::from_static(b"the parent's shrunk descriptor");
+    let span = user_key(b"k4")..user_key(b"k8");
+    // The store exists before the crash phase and its format record is durable, as
+    // in the apply's own crash test above.
+    on_node(&mut sim, node, |env| {
+        Box::pin(async move {
+            RaftStore::open_dir(env, config(), prefix()).await.unwrap();
+        })
+    });
+    for _ in 0..50 {
+        if sim.durable_contents(node, &format_path(Path::new("/raft")))
+            == Some(encode_record(STORE_FORMAT).to_vec())
+        {
+            break;
+        }
+        on_node(&mut sim, node, |env| {
+            Box::pin(async move {
+                let file = env
+                    .fs()
+                    .open(
+                        &format_path(Path::new("/raft")),
+                        ananke_env::OpenOptions::new().write(true),
+                    )
+                    .await
+                    .unwrap();
+                ananke_env::File::write_at(&file, 0, encode_record(STORE_FORMAT))
+                    .await
+                    .unwrap();
+                ananke_env::File::sync(&file).await.unwrap();
+            })
+        });
+    }
+    // Eight puts, each synced with its applied index, and then the split's apply,
+    // crashed `offset` after it began.
+    let offset = Duration::from_micros((seed * 7919) % 60_000);
+    let began: Out<()> = Arc::default();
+    let env = sim.env(node);
+    {
+        let (descriptor, span, began) = (descriptor.clone(), span.clone(), began.clone());
+        env.clone().spawn("applier", async move {
+            let (store, _) = RaftStore::open_dir(env.clone(), config(), prefix())
+                .await
+                .unwrap();
+            for index in 1..=8u64 {
+                let command = Command::Put {
+                    key: Bytes::from(format!("k{}", index - 1)),
+                    value: Bytes::from(format!("v{index}")),
+                };
+                apply_command(&store, index, Some(&command)).await.unwrap();
+            }
+            *began.lock().unwrap() = Some(());
+            let mut batch = ananke_storage::WriteBatch::new();
+            batch.put(prefix().descriptor_key(), descriptor);
+            match removal {
+                Removal::OneStep => store
+                    .apply_removing(9, batch, span)
+                    .await
+                    .expect("the split's apply on an engine nothing else installs on"),
+                Removal::BatchThenDelete => {
+                    store.apply(9, batch).await.expect("the split's batch");
+                    store
+                        .engine()
+                        .delete_range(span)
+                        .await
+                        .expect("the right span's removal");
+                }
+            }
+        });
+    }
+    for _ in 0..100_000 {
+        if began.lock().unwrap().is_some() {
+            break;
+        }
+        sim.run_for(Duration::from_micros(10));
+    }
+    assert!(
+        began.lock().unwrap().is_some(),
+        "seed {seed}: the eight puts never applied"
+    );
+    sim.run_for(offset);
+    sim.crash(node);
+    sim.restart(node);
+    on_node(&mut sim, node, |env| {
+        Box::pin(async move {
+            let (store, _) = RaftStore::open_dir(env, config(), prefix())
+                .await
+                .map_err(|e| e.to_string())?;
+            let engine = store.engine().clone();
+            let shrunk = engine
+                .get(&prefix().descriptor_key())
+                .await
+                .unwrap()
+                .is_some();
+            let mut right = 0;
+            for k in 4..8 {
+                if engine
+                    .get(&user_key(format!("k{k}").as_bytes()))
+                    .await
+                    .unwrap()
+                    .is_some()
+                {
+                    right += 1;
+                }
+            }
+            Ok((store.applied(), shrunk, right))
+        })
+    })
+}
+
+/// **Issue #139**: a split's apply on a node that is not a voter of the parent at the
+/// split writes the parent's shrunk descriptor and removes the right span's keys in
+/// **one** atomic step (SHARD.md §5): after a crash at any point the store holds the
+/// split applied, the descriptor shrunk and the right span empty, or none of the
+/// three. The known-buggy half is the node as it was — the synced batch, then the
+/// range delete as a second engine call — which a crash between the two leaves with
+/// the split applied and the right span's keys still on a node whose parent no longer
+/// covers them and which holds no right half.
+///
+/// The node sweep never runs this path (every replica votes every range there), so
+/// this directed test is its evidence until Stage D's move after a split reaches it.
+// PROPOSED(D-107): issue #139.
+#[test]
+fn a_non_voters_split_writes_its_batch_and_removes_the_right_span_in_one_step() {
+    let seeds = 60u64;
+    let mut whole = 0;
+    let mut neither = 0;
+    let mut refused = 0;
+    let mut mixed_buggy = Vec::new();
+    for seed in 0..seeds {
+        match non_voter_split_crashed(seed, Removal::OneStep) {
+            Ok((9, true, 0)) => whole += 1,
+            Ok((8, false, 4)) => neither += 1,
+            Ok(left) => panic!(
+                "seed {seed}: the one-step apply left (applied, shrunk, right keys) = \
+                 {left:?}, neither the split whole nor none of it"
+            ),
+            Err(why) => {
+                println!("seed {seed}: the store refused at its open: {why}");
+                refused += 1;
+            }
+        }
+        if let Ok(left @ (9, true, right)) = non_voter_split_crashed(seed, Removal::BatchThenDelete)
+            && right > 0
+        {
+            mixed_buggy.push((seed, left));
+        }
+    }
+    println!(
+        "a non-voter's split: one step left the split whole on {whole} seeds and none of it \
+         on {neither}, {refused} refused at the open; the batch then the delete left the \
+         split applied over the right span's keys on {} of {seeds}, the first {:?}",
+        mixed_buggy.len(),
+        mixed_buggy.first()
+    );
+    assert_eq!(refused, 0, "an honest disk refused a store");
+    assert!(
+        whole > 0 && neither > 0,
+        "the crash landed on one side of the step on every seed ({whole} whole, {neither} \
+         none), so the step's atomicity was not exercised"
+    );
+    assert!(
+        !mixed_buggy.is_empty(),
+        "the two-step apply was never crashed between its batch and its delete, so this \
+         test cannot tell it from the one-step apply"
+    );
+}
