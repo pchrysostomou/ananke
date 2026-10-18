@@ -481,6 +481,10 @@ pub struct Task<E: Environment> {
     /// placeholder's span is the snapshot's, and unknown until its stream completes.
     // PROPOSED(D-109)
     as_placeholder: BTreeSet<RangeId>,
+    /// The store the node's engine was opened through — its first range's, or its
+    /// anchor on a node that hosts none — which a placeholder's install opens the new
+    /// replica's store beside (PROPOSED D-109).
+    anchor: Arc<RaftStore<E>>,
 }
 
 impl<E: Environment> Task<E> {
@@ -506,6 +510,7 @@ impl<E: Environment> Task<E> {
         local: Queue<crate::server::Local>,
         snaps: Queue<SnapJob>,
         placeholders: Arc<std::sync::Mutex<BTreeSet<RangeId>>>,
+        anchor: Arc<RaftStore<E>>,
     ) -> Self {
         Self {
             env,
@@ -525,6 +530,7 @@ impl<E: Environment> Task<E> {
             receiving: BTreeMap::new(),
             placeholders,
             as_placeholder: BTreeSet::new(),
+            anchor,
         }
     }
 
@@ -1345,12 +1351,9 @@ impl<E: Environment> Task<E> {
                 .placeholder_refused(range, from, &install, StartOver::Overlaps)
                 .await;
         }
-        // The engine, through any store on it: the node has one engine (Q2).
-        let Some(beside) = lock(&self.stores).values().next().cloned() else {
-            return self
-                .placeholder_refused(range, from, &install, StartOver::Unusable)
-                .await;
-        };
+        // The engine, through the store it was opened through: the node has one engine
+        // (Q2), and a node that joined holds no other store until this install.
+        let beside = self.anchor.clone();
         let Ok(source) = beside.engine().open_span_source(&install.source).await else {
             return self
                 .placeholder_refused(range, from, &install, StartOver::Unusable)
@@ -1408,9 +1411,27 @@ impl<E: Environment> Task<E> {
                 incarnation,
             },
         );
+        // The descriptor the switch put in place: what the read-back below takes the span
+        // from, and what the host's receipt check reads from here on.
+        lock(&self.descriptors).insert(range, descriptor.clone());
+        // What landed, read back out of the engine and traced with the install, before
+        // the store is opened on it (`state_at`): counting events says a stream flowed,
+        // and nothing about what is in the store (D-083).
+        self.state_at(range, at, beside.engine(), &prefix, at.last_index)
+            .await;
+        self.env.trace_decided(
+            installing,
+            TraceEvent::RaftSnapshot {
+                server: self.id.0,
+                range: range.get(),
+                last_index: at.last_index,
+                last_term: at.last_term,
+                taken: false,
+            },
+        );
         // The store the switch wrote, opened beside the node's others: everything it
-        // reads the repair wrote, so the open writes nothing.
-        let store = match beside.open_sibling(prefix).await {
+        // reads the repair wrote, so on the correct node the open writes nothing.
+        let store = match beside.open_sibling(prefix.clone()).await {
             Ok((store, _)) => Arc::new(store),
             Err(error) => {
                 self.env.trace(TraceEvent::RaftServerFailed {
@@ -1431,25 +1452,11 @@ impl<E: Environment> Task<E> {
                 },
             );
         }
-        // The descriptor the switch put in place: what the state read back below takes
-        // the span from, and what the host's receipt check reads from here on.
-        lock(&self.descriptors).insert(range, descriptor.clone());
         self.clear_staging(&install.source).await;
         self.plan.finish(range, from);
         self.receiving.remove(&(range, from));
         self.as_placeholder.remove(&range);
         self.plan.host(range, spans);
-        self.state_of(range, at, &store).await;
-        self.env.trace_decided(
-            installing,
-            TraceEvent::RaftSnapshot {
-                server: self.id.0,
-                range: range.get(),
-                last_index: at.last_index,
-                last_term: at.last_term,
-                taken: false,
-            },
-        );
         let answer = snapshot::installed(at.term, (at.last_index, at.last_term));
         self.answer(range, from, answer, store.incarnation()).await;
         self.local
@@ -1606,20 +1613,35 @@ impl<E: Environment> Task<E> {
     /// landed are the bytes that were taken — which no count of events can say.
     // PROPOSED(D-083): what an install installed is read back and traced.
     async fn state_of(&self, range: RangeId, at: Identity, store: &RaftStore<E>) {
+        self.state_at(range, at, store.engine(), store.prefix(), store.applied())
+            .await;
+    }
+
+    /// [`state_of`](Self::state_of) over an engine and a range's prefix rather than its
+    /// store: what a placeholder's install reads back before the store is opened on what
+    /// it wrote, since the open itself tidies the log keys it finds under the snapshot,
+    /// and a take that streamed the log would be read back already tidied
+    /// (`TakeStreamsTheLogToo`; PROPOSED D-109).
+    async fn state_at(
+        &self,
+        range: RangeId,
+        at: Identity,
+        engine: &ananke_storage::Engine<E>,
+        prefix: &KeyPrefix,
+        applied: Index,
+    ) {
         let Some(spans) = self.user_span(range) else {
             return;
         };
-        let version = store.engine().snapshot();
-        let Ok(user) = store
-            .engine()
+        let version = engine.snapshot();
+        let Ok(user) = engine
             .scan(&spans.start[..]..&spans.end[..], &version)
             .await
         else {
             return;
         };
-        let log_span = store.prefix().purpose_span(PURPOSE_LOG);
-        let log = store
-            .engine()
+        let log_span = prefix.purpose_span(PURPOSE_LOG);
+        let log = engine
             .scan(&log_span.start[..]..&log_span.end[..], &version)
             .await
             .unwrap_or_default();
@@ -1634,7 +1656,7 @@ impl<E: Environment> Task<E> {
             range: range.get(),
             last_index: at.last_index,
             last_term: at.last_term,
-            applied: store.applied(),
+            applied,
             user_keys: user.len() as u64,
             user_digest: digest,
             log_keys: log.len() as u64,

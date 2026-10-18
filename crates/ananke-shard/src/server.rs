@@ -157,17 +157,21 @@ pub struct ServerConfig {
     pub listen: SocketAddr,
     /// Every node that may exist, and its address.
     pub servers: Vec<(ServerId, SocketAddr)>,
-    /// The ranges this node hosts, fixed at bootstrap. Four per node in Stage B's
-    /// scenarios, which is the plan's parameter and not a measurement.
+    /// The user ranges fixed at bootstrap: the ranges a bootstrap node's initial state
+    /// writes. Four in Stage B's scenarios, which is the plan's parameter and not a
+    /// measurement. A node that is not a bootstrap node hosts none of them.
     pub ranges: Vec<Range>,
     /// Range 0's replicas, the bootstrap nodes (SHARD.md §2; Q7, Q9): the voters every
-    /// range fixed at bootstrap starts with, and where ranges 0 and 1 live for good. A
-    /// node whose id is among them is a bootstrap node: fresh, it writes the initial
-    /// state. Any other node starts with no range of its own and, until Stage C's
-    /// placeholders (§5, Q22), with the configured user ranges as replicas of an empty
-    /// configuration, as Stage B started a joining server. A replica whose store
+    /// range fixed at bootstrap starts with, and where ranges 0 and 1 live for good.
+    /// There are exactly [`BOOTSTRAP_NODES`] of them, the replication factor (Q7, Q32),
+    /// and a node configured with any other number does not start. A node whose id is
+    /// among them is a bootstrap node: fresh, it writes the initial state. Any other node
+    /// is a node that joins: it starts holding nothing, and a range's replica is made on
+    /// it when a leader's message makes it a placeholder of the range and the snapshot
+    /// that placeholder asks for is installed (§2, §5, Q22). A replica whose store
     /// already holds a configuration uses that one instead (D-029).
     // PROPOSED(D-096): the bootstrap nodes named in configuration.
+    // PROPOSED(D-109): exactly three, and a node that joins holds nothing.
     pub bootstrap: Vec<ServerId>,
     /// The cores' parameters.
     pub raft: RaftConfig,
@@ -202,6 +206,43 @@ pub struct ServerConfig {
     /// range's apply and the lease record read at the start.
     // PROPOSED(D-105): the range layer's own variant set.
     pub range_variants: RangeVariants,
+}
+
+/// How many bootstrap nodes a cluster has: exactly as many as the replication factor,
+/// three (SHARD.md §2; Q7, Q32). §7's moves are one-for-one and never change a range's
+/// voter count, so the bootstrap nodes fix every range's for good, and five would leave
+/// every range at five voters.
+// PROPOSED(D-109): exactly three bootstrap nodes, enforced.
+pub const BOOTSTRAP_NODES: usize = 3;
+
+/// The group a node that hosts no range opens its engine through (SHARD.md §2): the
+/// node's anchor, a store under a group no range takes — range ids count up from 3 in
+/// blocks range 0 grants (Q17) and never reach it — which holds nothing but its own
+/// incarnation key, is never a replica, and is what the node's later replicas are
+/// opened beside. A node that hosts a range opens its engine through that range's
+/// store instead, as it always has.
+// PROPOSED(D-109): a node that joins holds nothing, and opens its engine through this.
+pub const ANCHOR_GROUP: u64 = u64::MAX;
+
+/// Whether `bootstrap` names exactly [`BOOTSTRAP_NODES`] nodes, each once (SHARD.md §2;
+/// Q7, Q32).
+///
+/// # Errors
+///
+/// Why it does not, in words the node's failure carries.
+// PROPOSED(D-109): exactly three bootstrap nodes, enforced.
+pub fn bootstrap_is_three(bootstrap: &[ServerId]) -> Result<(), String> {
+    let mut distinct = bootstrap.to_vec();
+    distinct.sort_unstable();
+    distinct.dedup();
+    if bootstrap.len() != BOOTSTRAP_NODES || distinct.len() != BOOTSTRAP_NODES {
+        return Err(format!(
+            "configuration names the bootstrap nodes {bootstrap:?}, where there are exactly \
+             {BOOTSTRAP_NODES}, each once: as many as the replication factor (SHARD.md §2; \
+             Q7, Q32)"
+        ));
+    }
+    Ok(())
 }
 
 /// The initial state a fresh bootstrap node writes (SHARD.md §2), computed from
@@ -328,39 +369,6 @@ pub fn meta_state_into(
         });
     }
     meta_descriptors
-}
-
-/// The descriptors a node not named at bootstrap writes for the ranges it hosts at
-/// its first start: the same descriptor the bootstrap nodes write for each, computed
-/// from configuration alone (SHARD.md §2), and nothing else — no Raft configuration,
-/// since D-076's interim replica starts on an empty one, and no digest.
-///
-/// A replica without its descriptor is one that serves without §3's checks, and the
-/// thousand-seed membership sweep found exactly that: node 5's interim replica of
-/// range 2, caught up from index 1 by the log and never installed, led the range and
-/// served a stale client's read of a key it does not hold (check 9, seed 652). The
-/// initial state at index 0 is in no log, so a replica that is caught up by appends
-/// alone must compute it from configuration, as the bootstrap nodes did.
-// PROPOSED(D-097)
-#[must_use]
-pub fn interim_state(bootstrap: &[ServerId], hosted: &[Range]) -> WriteBatch {
-    let mut batch = WriteBatch::new();
-    for range in hosted {
-        let span = range.span();
-        let descriptor = RangeDescriptor {
-            range: range.id,
-            start: span.start,
-            end: span.end,
-            generation: FIRST_GENERATION,
-            voters: bootstrap.to_vec(),
-            state: RangeState::Live,
-        };
-        batch.put(
-            KeyPrefix::group(range.id.get()).descriptor_key(),
-            descriptor.encode(),
-        );
-    }
-    batch
 }
 
 /// What the node was asked for, counted so a scenario can say whether a path was
@@ -684,8 +692,9 @@ pub struct ServerHost<E: Environment> {
     /// what the receipt check reads and what a `RangeMismatch` carries. Loaded from
     /// the store at the start, reloaded after an install's switch, and shared with the
     /// `apply` task, which answers a write refused at apply with the same descriptors.
-    /// Every replica has one: a bootstrap node's from its initial state, a node not
-    /// named at bootstrap's from `interim_state`, a re-seeded one's from its stream.
+    /// Every replica has one: a bootstrap node's from its initial state, a split's right
+    /// half's from the split's batch, an installed one's — a re-seeded replica's, or one
+    /// a placeholder's install made — from its stream.
     // PROPOSED(D-097)
     descriptors: Arc<Mutex<BTreeMap<RangeId, RangeDescriptor>>>,
     /// The term this node last took office in, per range: a leader's first
@@ -2539,7 +2548,7 @@ impl<E: Environment> Applier for ServerApplier<E> {
                 // makes a split take effect for proposals in flight and a
                 // `RangeMismatch` at apply definite. `ApplyIgnoresSpan` applies it
                 // whatever its key (§10). Every replica holds its descriptor
-                // (`initial_state`, `interim_state`, an install); one without is
+                // (`initial_state`, a split's batch, an install); one without is
                 // checked against nothing, and check 9 then sees what it applied.
                 // PROPOSED(D-097): the apply check.
                 let refused: Option<RangeDescriptor> = match command.as_ref().and_then(Command::key)
@@ -3115,12 +3124,26 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
     } = config;
     let server = id.0;
     let variants = raft.variants;
+    // SHARD.md §2: exactly three bootstrap nodes, the replication factor (Q7, Q32). A
+    // node configured with any other number stops before it binds anything, and says
+    // why: the bootstrap nodes fix every range's voter count for good.
+    // PROPOSED(D-109): exactly three bootstrap nodes, enforced.
+    if let Err(reason) = bootstrap_is_three(&bootstrap) {
+        env.trace(TraceEvent::RaftServerFailed {
+            server,
+            reason: reason.clone(),
+        });
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, reason));
+    }
     // SHARD.md §2: a node whose id is among range 0's replicas is a bootstrap node. It
     // hosts ranges 0 and 1 beside the user ranges configuration fixes, and every one
     // of its fresh replicas starts with the bootstrap nodes as voters. Any other node
-    // hosts the configured user ranges as replicas of an empty configuration, as
-    // Stage B started a joining server, until Stage C's placeholders (§5, Q22).
+    // is a node that joins and holds nothing: a range's replica is made on it when a
+    // leader's message makes it a placeholder and the snapshot the placeholder asks
+    // for is installed (§2, §5, Q22). D-076's interim replicas, the configured ranges
+    // on an empty configuration, are retired with the placeholders.
     // PROPOSED(D-096): the bootstrap nodes host the system ranges.
+    // PROPOSED(D-109): a node that joins holds nothing.
     let named = bootstrap.contains(&id);
     // `AnyFreshNodeBootstraps`: a node not named takes a fresh store for a bootstrap
     // anyway, with the address book for the voters it was not given (PROPOSED D-096).
@@ -3144,7 +3167,7 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
             .chain(ranges.iter().cloned())
             .collect()
     } else {
-        ranges.clone()
+        Vec::new()
     };
     // The store's recovery must never hand back a state with a hole (RAFT.md §3).
     let engine = EngineConfig {
@@ -3271,16 +3294,19 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
             .map_or_else(|| base_dir.clone(), |candidate| candidate.path.clone()),
         ..engine
     };
-    let first = hosted
-        .first()
-        .cloned()
-        .ok_or_else(|| io::Error::other("a node hosts at least one range"))?;
+    // The store the engine is opened through: the first hosted range's, or the node's
+    // anchor on a node that hosts none (`ANCHOR_GROUP`).
+    // PROPOSED(D-109)
+    let first_prefix = hosted.first().map_or_else(
+        || KeyPrefix::group(ANCHOR_GROUP),
+        |range| KeyPrefix::group(range.id.get()),
+    );
     let started = start_store(
         &env,
         server,
         &engine,
         variants,
-        &KeyPrefix::group(first.id.get()),
+        &first_prefix,
         StartOrder::Correct,
     )
     .await;
@@ -3290,7 +3316,7 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
     // the bootstrap's is (PROPOSED D-098).
     let mut reseeded_meta: Option<Vec<MetaDescriptor>> = None;
     let mut reseeded_now = false;
-    let opened: Vec<(Range, Arc<RaftStore<E>>, Recovered)> = match started {
+    let (anchor, opened): (Arc<RaftStore<E>>, Opened<E>) = match started {
         Start::Failed(error) => {
             env.trace(TraceEvent::RaftServerFailed {
                 server,
@@ -3318,25 +3344,30 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
             )
             .await?;
             reseeded_meta = reseeded.meta;
-            reseeded.opened
+            (reseeded.anchor, reseeded.opened)
         }
         Start::Opened {
             store, recovered, ..
         } => {
-            let mut opened = vec![(first.clone(), Arc::new(store), recovered)];
+            let anchor = Arc::new(store);
+            let mut opened = Vec::new();
+            if let Some(first) = hosted.first() {
+                opened.push((first.clone(), anchor.clone(), recovered));
+            }
             // SHARD.md §5: a crash after a split's batch restarts both halves from
             // their keys, so the ranges the node opens are every group the engine
-            // holds, configuration's and the right halves splits created since.
+            // holds, configuration's and the right halves splits created since — and,
+            // on a node that joined, every replica an install made on it (PROPOSED
+            // D-109); the anchor holds no descriptor and is no range.
             // PROPOSED(D-100)
-            let discovered = discover_ranges(opened[0].1.engine(), &hosted).await?;
+            let discovered = discover_ranges(anchor.engine(), &hosted).await?;
             for range in hosted.iter().skip(1).cloned().chain(discovered) {
-                let (store, recovered) = opened[0]
-                    .1
+                let (store, recovered) = anchor
                     .open_sibling(KeyPrefix::group(range.id.get()))
                     .await?;
                 opened.push((range, Arc::new(store), recovered));
             }
-            opened
+            (anchor, opened)
         }
     };
     for (range, _, _) in &opened {
@@ -3359,7 +3390,7 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
     // again and a leader nothing to forget by (D-042).
     // PROPOSED(D-096): the initial state, one batch, before the tasks, in the
     // configured directory alone.
-    let engine_of_node = opened[0].1.engine().clone();
+    let engine_of_node = anchor.engine().clone();
     let bootstrapped_now = is_bootstrap
         && !reseeded_now
         && engine.dir == base_dir
@@ -3374,20 +3405,6 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
         bootstrap_meta = Some(descriptors);
     }
     let bootstrapped_before = is_bootstrap && !bootstrapped_now;
-    // A node not named at bootstrap writes its interim replicas' descriptors at its
-    // first start, in the configured directory alone, so that every replica of the
-    // node checks a key against a descriptor (SHARD.md §2, §3; `interim_state`).
-    // PROPOSED(D-097)
-    let first_descriptor = KeyPrefix::group(first.id.get()).descriptor_key();
-    let interim_now = !is_bootstrap
-        && !reseeded_now
-        && engine.dir == base_dir
-        && engine_of_node.get(&first_descriptor).await?.is_none();
-    if interim_now {
-        engine_of_node
-            .write(interim_state(&bootstrap, &hosted), true)
-            .await?;
-    }
 
     // The node's stores and replicas, shared by the host, the `apply` task and the
     // `snapshot` task and mutable behind a lock: a split adds a range at its apply
@@ -3476,10 +3493,10 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
             // §2 generalised: the ranges configuration fixes, created at the node's
             // first start, each traced with the span, generation and voters
             // configuration gave it (§8). The voters are the range's, the bootstrap
-            // nodes, on every node: a node not named at bootstrap starts its interim
-            // replica on an empty Raft configuration (`initial`, D-076), but the
-            // descriptor it is created with is the range's one descriptor, which is
-            // what check 7 holds every creation to. D-096 traced `initial` here, so
+            // nodes, on every node — which is every node that creates a replica here,
+            // since a node that joins hosts none at its start (PROPOSED D-109) — and
+            // the descriptor it is created with is the range's one descriptor, which
+            // is what check 7 holds every creation to. D-096 traced `initial` here, so
             // the correct membership scenario disagreed with itself on nodes 4 and 5.
             // PROPOSED(D-097)
             let span = range.span();
@@ -3692,6 +3709,7 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
             local.clone(),
             snaps.clone(),
             placeholders,
+            anchor,
         );
         async move {
             task.run().await;
@@ -3845,15 +3863,19 @@ async fn reseed<E: Environment>(
         dir: fresh_dir,
         ..refused.clone()
     };
-    let first = ranges
-        .first()
-        .ok_or_else(|| io::Error::other("a node hosts at least one range"))?;
+    // The fresh engine is opened through the first range's store, or, on a node that
+    // hosts none, through its anchor (`ANCHOR_GROUP`), as the start opens it.
+    // PROPOSED(D-109)
+    let first_prefix = ranges.first().map_or_else(
+        || KeyPrefix::group(ANCHOR_GROUP),
+        |range| KeyPrefix::group(range.id.get()),
+    );
     let started = start_store(
         env,
         server,
         &fresh,
         variants,
-        &KeyPrefix::group(first.id.get()),
+        &first_prefix,
         StartOrder::Correct,
     )
     .await;
@@ -3875,6 +3897,15 @@ async fn reseed<E: Environment>(
     // 4. Each range's store, its durable refused mark written before it serves.
     let mut opened: Vec<(Range, Arc<RaftStore<E>>, Recovered)> = Vec::with_capacity(ranges.len());
     let mut first_opened = Some((first_store, first_recovered));
+    // A node that hosts no range keeps the store its engine was opened through as its
+    // anchor, and no replica.
+    // PROPOSED(D-109)
+    let mut anchor = None;
+    if ranges.is_empty()
+        && let Some((store, _)) = first_opened.take()
+    {
+        anchor = Some(Arc::new(store));
+    }
     for range in ranges {
         // The first range's store is the one the fresh engine was opened with; every
         // other is a sibling prefix in that same engine (§2, §4).
@@ -3934,16 +3965,32 @@ async fn reseed<E: Environment>(
         }
         opened.push((range.clone(), Arc::new(store), recovered));
     }
+    let anchor = match anchor {
+        Some(anchor) => anchor,
+        None => opened
+            .first()
+            .map(|(_, store, _)| store.clone())
+            .ok_or_else(|| io::Error::other("a re-seed opened no store"))?,
+    };
     Ok(Reseeded {
+        anchor,
         opened,
         meta: reseeded_meta,
     })
 }
 
-/// What a re-seed hands back: each range's store, and the meta range's index-0 state
-/// when the re-seed rebuilt a replica of it (PROPOSED D-098).
+/// The replicas a start opens: each range with its store and what the store's open
+/// recovered.
+type Opened<E> = Vec<(Range, Arc<RaftStore<E>>, Recovered)>;
+
+/// What a re-seed hands back: the store the fresh engine was opened through, each
+/// range's store, and the meta range's index-0 state when the re-seed rebuilt a
+/// replica of it (PROPOSED D-098).
 struct Reseeded<E: Environment> {
-    opened: Vec<(Range, Arc<RaftStore<E>>, Recovered)>,
+    /// The first range's store, or the node's anchor where it hosts none (PROPOSED
+    /// D-109).
+    anchor: Arc<RaftStore<E>>,
+    opened: Opened<E>,
     meta: Option<Vec<MetaDescriptor>>,
 }
 

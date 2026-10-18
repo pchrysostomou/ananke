@@ -21359,6 +21359,115 @@ of 14 taken out — the voter that never gets its right half — and asserts the
 (`check_8_agrees_with_its_whole_trace_fold_on_the_node`, now with
 `UninitialisedReplicaVotes` among its systems).
 
+### 7. A node that joins holds nothing, and there are exactly three bootstrap nodes (PR (b))
+
+**What the tree had.** A node not named among the bootstrap nodes started with the
+configured user ranges as replicas of an empty configuration (D-076's interim, D-096's
+"with the interim named"), each given the bootstrap's descriptor so that it checked keys
+against one (`interim_state`, D-097), and caught up by the log from index 1 once a change
+added it. SHARD.md §2 has a node that joins start with no ranges and get each "when a
+leader's message first names a range it does not host, uninitialised until a split or a
+snapshot gives it state", and puts exactly as many bootstrap nodes as the replication
+factor, three (Q7, Q32); the tree checked neither, and `sim/install.rs` ran five.
+
+**What is built** (`server.rs`).
+
+1. **Exactly three bootstrap nodes, each once** (`BOOTSTRAP_NODES`, `bootstrap_is_three`):
+   a node configured with any other list stops at its start, before it binds anything,
+   tracing `RaftServerFailed` with the reason. A directed test runs five, two, and three
+   with one named twice (`a_node_configured_with_other_than_three_bootstrap_nodes_stops_and_says_why`).
+   `AnyFreshNodeBootstraps` is checked on the configured list, before it puts the address
+   book in its place, so the instrument still runs.
+2. **A node that joins hosts nothing at its start**, and the interim is retired with
+   `interim_state`. Its replicas are the ones its placeholders' installs make, which its
+   restart finds by their descriptors as it finds a split's right halves (`discover_ranges`).
+3. **The anchor.** A node that hosts no range opens its engine through a store of its own
+   under a group no range takes (`ANCHOR_GROUP`, `u64::MAX`; range ids count up from 3
+   in blocks range 0 grants and never reach it), which holds nothing but its incarnation
+   key, is never a replica and carries no descriptor, so no restart takes it for one; a
+   re-seed's fresh engine opens through it the same way. A node that hosts a range opens
+   through that range's store, as it always has. The `snapshot` task opens a placeholder's
+   new store beside whichever it is, where section 2 had it take any store on the node, of
+   which a node that joined has none.
+
+**`sim/install.rs`** ran five bootstrap nodes, the late two bootstrapping their own
+replicas at their start and installing over them. It runs three now, and the late two
+join: an operator asks every range, every 250 ms, for all five as voters (D-029: a request
+for the same voters is harmless), the leader adds them as learners, its first message makes
+each a placeholder, and the placeholder's answer has the leader stream it the range's
+snapshot. Every assertion stands as it was — eight streams, eight installs, eight
+creations by install, two streams at once on one leader, what landed is what was taken —
+and **one variant's catch had to be made again**: `TakeStreamsTheLogToo`, a take that
+carries the leader's log, was caught on none of its three seeds, because section 2's
+install opened the new store, whose open tidies the log keys it finds under the snapshot,
+and read the state back after. The install now reads the state back and traces the
+install before it opens the store (`state_at`), and the variant is caught on 3 of 3 again
+("server 4's range 3 holds 13 log keys after installing at 72"); every other variant of the
+test is caught as before. On the node sweep that moves the schedule of exactly the 15 of
+the first thousand seeds that install into a placeholder, the read-back's scans now coming
+before the open's, every one green.
+
+**The membership scenario on the node.** Nodes 4 and 5 hold nothing, so the grow feeds
+each of them every user range's snapshot through its placeholder, on every seed. The
+absence the scenario asserted — no snapshot action, no joiner fed one — is now false by
+design and is replaced by its opposite: wherever the grow completed, both joiners' replicas
+of every range were created by an install into their placeholder (`Report::check`,
+`Report::installed_into_a_placeholder`), and over the tier at least the eight installs a
+seed's joiners need. What the scenario's threshold still keeps out, the leaders'
+compaction, stays asserted absent. The operator still asks the leader in force: the
+one-group scenario's rule of asking a compacted leader is about joiners starting behind a
+compacted prefix, which a placeholder's answer puts them behind anyway.
+**Measured at 1 000 seeds** (release, the test's own coverage): green on **1 000 of
+1 000**; both joiners installed into on every range on 1 000; 12 541 snapshot actions
+(12.5 a seed); the worst gap of any range **1.458 s** against its 5 s bound (D-084
+measured 1.332 s at the same tier, with the interim), the worst first write of a range
+after a heal **1.732 s** against 6 s (1.810 s), the cluster's 522.5 ms against 2 s and its
+first write after the heal 695.3 ms; no replica past the threshold (highest index 62).
+Every membership schedule on the node moves, by construction, and its pin, seed 1969,
+moves with it and still passes. `AnyFreshNodeBootstraps`'s pair on this scenario was read
+on `ranges::creations_agree_of`, check 7's first step, which was written for a scenario
+that bootstraps every replica and takes a creation by an install for a mistake: the correct
+node's joiners failed it on sight. Both halves now read check 7 as the range layer folds it
+(`invariants::Descriptors`), which holds an install's creation to its map: the variant is
+caught on every seed of the share as before (20 of 20 at the gate), and the correct node
+passes. The other node scenarios — `sim/ranges.rs`, the sharded
+quorum scenario under both, the re-seed shape — run three bootstrap nodes and nothing else,
+and none of their first hundred moved.
+
+### 8. `sim/split.rs` (ii), *vote*
+
+**What is built** (`sim/split.rs`, `sim/tests/split.rs`): SHARD.md §10's shape on four
+nodes, nodes 1 to 3 the bootstrap nodes and node 4 a node that joins and holds nothing.
+P is range 2, `[k0, k2)`, split at `k1`; a writer puts to `k0` and `k1` in turn, routing by
+what a `RangeMismatch` tells it. After two seconds a follower `x` of P, drawn from the seed
+among the two that do not lead it, is cut off from every other node; P's leader is asked to
+split; the run goes on until both halves have compacted past the split's index; then R's
+leader is crashed, the cut healed but for `x`'s links to the crashed node, which stay cut,
+and the crashed node restarts after ten maximum election timeouts. The verdict is checks 1
+to 4, the range layer's folds and no node stopped; the shape, per seed, is that it was built
+and that a pre-vote or vote request of R reached `x` before `x`'s creation of R (§12,
+Stage C's exit).
+
+**Measured before anything was asserted** (release, seeds 0 to 19, 0 to 99, 0 to 999): the
+correct system green with its shape built on **every seed of every tier**; `x` granted R no
+vote and no pre-vote before creating it on any seed; `x` created R on 20, 99 and **975** of
+them, 2.16 to 2.53 s after the heal — once the crashed node was back and R elected without
+`x`, from its leader's stream to `x`'s placeholder — and on the other 25 of the thousand R's
+leader is the restarted node, whose links to `x` stay cut, so `x` is a placeholder to the
+end, which the shape allows. Under `UninitialisedReplicaVotes` the shape is built on every
+seed too and `x`'s placeholder grants R's remaining replica a pre-vote and a vote **on every
+seed** (66, 322 and 3 063 grants), with which R elects without the crashed node and `x` has
+R a few hundred milliseconds after the heal; the run's own checks pass under it, which is what check
+20 is for, and check 20's catch on every seed is asserted with the fold (section 3). Both
+sweeps are asserted at every tier. Their nightly rows are in shard 5 and 6, the directed
+bootstrap test's in shard 4.
+
+**PROPOSED, settled here**: the anchor store; the bootstrap count enforced as a node
+failure at the start; `sim/install.rs`'s late nodes added by an operator's change rather
+than bootstrapped; and `sim/split.rs` (ii) without linearizability, which needs a client
+history this shape's writer does not keep and which SPEC §4's exit asks of `sim/split.rs`
+in Stage E (SHARD.md §12).
+
 ---
 
 _Next entry: D-110. Add one before implementing anything not covered above._

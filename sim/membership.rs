@@ -660,27 +660,25 @@ fn spawn_server(cluster: Cluster, sim: &Sim, id: u64, variants: Variants, node: 
     }
 }
 
-/// Whether a server joining `cluster`'s configuration is fed by a snapshot in its
-/// learner phase, which is the half of issue #46's extension Stage A met (D-058).
+/// Whether the operator asks `cluster`'s grow of a leader that has compacted since it
+/// took office, so that the empty joiners start behind its compacted prefix and are
+/// fed by a snapshot in their learner phase, which is the half of issue #46's extension
+/// Stage A met (D-058).
 ///
 /// True on the one-group server, whose leaders compact routinely at
-/// [`SNAPSHOT_THRESHOLD`] and where the operator asks for the grow only of a leader
-/// that has compacted since it took office, so the empty joiners start behind its
-/// compacted prefix. **False on the node**, and not because the requirement was
-/// relaxed: this scenario's node cluster runs at [`NODE_SNAPSHOT_THRESHOLD`],
-/// `1 << 30`, so no leader there compacts, and a driver that waited for a compacted
-/// leader would wait out its two-second budget on every attempt and then fall back —
-/// costing the tier its time and asserting nothing. The `snapshot` task itself is
-/// wired (PROPOSED D-083); what keeps the path unreached here is the threshold, and
-/// why it stays is with the constant.
-///
-/// The requirement is not dropped for the node: [`Report::check`] fails any seed
-/// whose replicas reach [`NODE_SNAPSHOT_THRESHOLD`], whose trace holds a snapshot
-/// action, or whose joiners were fed one, naming the setting that keeps them out. The
-/// assertion that a joiner *is* fed stands where the path is, on
-/// [`Cluster::OneGroup`] (PROPOSED D-084); the path itself is measured on the node by
-/// the raft-arms sweep (PROPOSED D-086).
-// PROPOSED(D-084): what the node cluster does not reach yet, asserted absent.
+/// [`SNAPSHOT_THRESHOLD`]. **False on the node**, whose cluster runs at
+/// [`NODE_SNAPSHOT_THRESHOLD`], `1 << 30`, so no leader there compacts, and a driver
+/// that waited for a compacted leader would wait out its two-second budget on every
+/// attempt and then fall back. The node's joiners are fed by a snapshot all the same:
+/// a node that joins holds nothing (SHARD.md §2), the leader's first message to it
+/// makes it a placeholder of the range, and the placeholder's refused server's answer
+/// has whichever leader it is take a snapshot and stream it (§5, Q22; PROPOSED D-109),
+/// which [`Report::check`] asserts of every joiner and every range (until D-109 a
+/// joiner here started with the configured ranges as replicas of an empty
+/// configuration, D-076's interim, caught up by the log alone, and the snapshot path
+/// was asserted absent here).
+// PROPOSED(D-084): the one-group server's grow asks a compacted leader.
+// PROPOSED(D-109): the node's joiners are fed through their placeholders.
 #[must_use]
 pub fn feeds_joiners_by_snapshot(cluster: Cluster) -> bool {
     match cluster {
@@ -1266,6 +1264,33 @@ impl Report {
         self.count(|e| matches!(e, TraceEvent::RaftSnapshot { .. }))
     }
 
+    /// Whether server `joiner`'s replica of `range` was created by an install into the
+    /// placeholder it made of the range: a `RangeReplicaCreated` of the range on its
+    /// node, and after it a `RangeCreated { cause: snapshot }` there (SHARD.md §5, Q22).
+    // PROPOSED(D-109): a node that joins gets every range through its placeholder.
+    #[must_use]
+    pub fn installed_into_a_placeholder(&self, joiner: u64, range: u64) -> bool {
+        let on = |record: &TraceRecord| {
+            record
+                .node
+                .is_some_and(|node| u64::from(node.get()) == joiner)
+        };
+        let Some(made) = self.records.iter().position(|record| {
+            on(record)
+                && matches!(&record.event, TraceEvent::RangeReplicaCreated { range: r } if *r == range)
+        }) else {
+            return false;
+        };
+        self.records[made..].iter().any(|record| {
+            on(record)
+                && matches!(
+                    &record.event,
+                    TraceEvent::RangeCreated { range: r, cause: ananke_env::RangeCause::Snapshot, .. }
+                        if *r == range
+                )
+        })
+    }
+
     /// The highest index any replica of any range appended, committed or applied:
     /// the condition behind every snapshot action a core can ask for, which the node
     /// cluster asserts stayed below its threshold.
@@ -1365,44 +1390,38 @@ impl Report {
             }
             return fail(format!("server {server} refused its store: {reason}"));
         }
-        // PROPOSED(D-084): the node's snapshot path is asserted absent on every seed
-        // with its reason rather than left to be found. The reason since PROPOSED D-086:
-        // this scenario's own threshold keeps it unreached (`NODE_SNAPSHOT_THRESHOLD`),
-        // where the raft-arms sweep runs its node at 12 and measures the path.
-        if !feeds_joiners_by_snapshot(self.cluster) {
-            let actions = self.snapshot_actions();
-            if actions > 0 {
-                return fail(format!(
-                    "{actions} snapshot actions were traced under a `snapshot_threshold` of \
-                     {NODE_SNAPSHOT_THRESHOLD}, which this scenario sets so that none is: the \
-                     setting has changed, and issue #46's snapshot-fed joiner is not asserted \
-                     here — a run that reaches this must say so rather than pass, and the \
-                     scenario's bounds are re-measured with the path reached"
-                ));
-            }
-            // The absence proper. A `RaftSnapshot` record is not evidence on its own:
-            // the node's `Host::snapshot` bumps `Gaps::snapshot_actions` and traces
-            // nothing, so a take the node dropped on the floor would leave the clause
-            // above green against a silence. What is asserted here is the *condition*
-            // behind every action a core can ask for — a log longer than
-            // `snapshot_threshold` — which the trace does carry.
+        // On the node a joiner holds nothing at its start (SHARD.md §2), so the grow's
+        // leaders feed it each range's snapshot through its placeholder (§5, Q22): the
+        // snapshot path is reached on every seed, and asserted reached, joiner by
+        // joiner and range by range, wherever the grow completed — every one of them
+        // created by an install into the placeholder its range's leader made of it. What
+        // this scenario's threshold still keeps out is the leaders' compaction, and that
+        // half of the absence stays asserted with its reason (PROPOSED D-086).
+        // PROPOSED(D-084): the node's compaction asserted absent.
+        // PROPOSED(D-109): and its joiners fed through their placeholders, asserted.
+        if self.cluster == Cluster::Node {
             let highest = self.highest_index();
             if highest >= NODE_SNAPSHOT_THRESHOLD {
                 return fail(format!(
                     "a replica reached index {highest}, at or past the \
                      {NODE_SNAPSHOT_THRESHOLD} this scenario sets `snapshot_threshold` to, so \
-                     a core could ask for a take, a record or an install and the node would \
-                     serve it: this scenario's own setting no longer keeps the path unreached"
+                     a leader could compact and feed a joiner past its prefix: this \
+                     scenario's own setting no longer keeps compaction out"
                 ));
             }
-            let fed = self.snapshot_fed_joiners();
-            if !fed.is_empty() {
-                return fail(format!(
-                    "{fed:?} were counted as snapshot-fed joiners under a threshold that keeps \
-                     the snapshot path unreached: issue #46's extension is met on the \
-                     one-group server, measured on the node by the raft-arms sweep, and not \
-                     asserted here"
-                ));
+            if self.grow_completed {
+                for joiner in INITIAL_VOTERS + 1..=SERVERS {
+                    for range in self.ranges() {
+                        if !self.installed_into_a_placeholder(joiner, range) {
+                            return fail(format!(
+                                "the grow completed, and server {joiner}'s replica of range \
+                                 {range} was not created by an install into its placeholder \
+                                 of the range, where a node that joins holds nothing and gets \
+                                 every range it is added to that way (SHARD.md §2, §5)"
+                            ));
+                        }
+                    }
+                }
             }
         }
         // Completion and availability are liveness: asked only of seeds the

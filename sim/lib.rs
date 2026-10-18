@@ -32,6 +32,7 @@ pub mod quorum;
 pub mod raft;
 pub mod ranges;
 pub mod reseed;
+pub mod split;
 pub mod wal;
 
 pub use parallel::{sweep, verdict};

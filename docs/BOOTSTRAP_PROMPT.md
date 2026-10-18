@@ -101,6 +101,18 @@ ananke/
 
 _Update this section at the end of every session._
 
+- Branch `phase-3-stage-c-joiners-split-vote` (2026-10-18), stacked on
+  `phase-3-stage-c-placeholders` (PR #173), PROPOSED D-109 §7–§8, **#162's S8 (b)**: exactly
+  three bootstrap nodes, enforced as a node failure at the start; a node that joins holds
+  nothing (D-076's interim replicas and `interim_state` retired) and opens its engine
+  through an anchor store under `ANCHOR_GROUP`; `sim/install.rs` on three bootstrap nodes
+  with the late two joined by an operator's change; the membership scenario on the node
+  feeding both joiners every range through their placeholders (asserted on every seed,
+  1 000 of 1 000 green, worst range gap 1.458 s against 5 s); `sim/split.rs` (ii), the
+  vote shape on four nodes: the correct system green with its shape built on every seed of
+  1 000, `UninitialisedReplicaVotes` injected on every seed, its check 20 catch to come
+  with the fold. A placeholder's install now reads its state back before its store opens
+  (`TakeStreamsTheLogToo` had gone uncaught in `sim/install.rs`).
 - Branch `phase-3-stage-c-placeholders` (2026-10-18), off `phase-3-stage-c-restatement-check8`
   at b21d76e (PR #166), draft PR stacked on #166, PROPOSED D-109 (footer D-110), **Stage C's
   placeholders (Q22)**, #162's S8, the first of three stacked PRs: (a) the placeholder,
