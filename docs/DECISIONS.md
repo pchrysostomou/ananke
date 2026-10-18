@@ -21101,4 +21101,264 @@ Against the correct node's 2 of 1 000 the clause tells the planted bugs from the
 
 ---
 
-_Next entry: D-108. Add one before implementing anything not covered above._
+## PROPOSED D-109 — Placeholders: a node that holds no replica of a range keeps a placeholder for it, which grants nothing, answers as a refused server does and takes only a snapshot that overlaps no replica on the node; `UninitialisedReplicaVotes` and check 20
+
+**The number.** Off `phase-3-stage-c-restatement-check8` at b21d76e (PR #166, D-107), whose
+footer reads D-108. Tracking issue #162 gives the per-fold equivalence D-106 (#163), the
+restatement and check 8 D-107 (#166) and the variant set's follow-ups D-108 (#164, merged),
+and the placeholders' slice, S8, **D-109**; the footer here moves to D-110, and at the merge
+the entries are a union in numerical order with one footer, the highest plus one. Every
+code site carries `// PROPOSED(D-109)`. The slice is three changes, each its own PR stacked
+on the one before, each with its own gate, checklist and sections of this entry: (a) the
+placeholder, `UninitialisedReplicaVotes` and check 20 (this PR, sections 1 to 6); (b)
+`sim/split.rs` (ii), the joining nodes that hold nothing and exactly three bootstrap
+nodes; (c) a re-seeded node's right halves (#172).
+
+**Context.** SHARD.md §5 (SHARD.md:759-780), Q22: "A node can receive R's messages before
+it holds R: its replica of P lags behind `s`, or R is being moved to it (§7). The node
+creates a placeholder for R with no descriptor, no span and no Raft state, and traces
+`RangeReplicaCreated`. A placeholder grants no vote or pre-vote, acknowledges nothing, and
+takes only a snapshot the overlap rule below allows; it becomes a replica at its node's
+apply of `s` or at such an install." It answers every AppendEntries "as a refused server
+does (RAFT.md:507-511): a rejection with a hint of 1, an echo of zero and store
+incarnation 0", counted for nothing in a lease or read-index round and for check quorum
+only as D-049 counts a refused server's. §8's check 20 folds it, §10's
+`UninitialisedReplicaVotes` breaks it, `sim/split.rs` (ii) builds its shape on every seed,
+and §8 has the timer check skip a placeholder. What the tree had, on b21d76e: a message for
+a range the node does not hold counted and dropped (D-076), so a right half elected among
+the replicas that had applied its split (D-100), and a voter of P installed P's
+post-split snapshot held no R for the rest of the run — 16 of the correct node's 1 000
+seeds, two of them tripping check 8's right half's clause when that voter restarted
+(D-107, #170).
+
+**The departure from D-033 (Q22's own entry).** D-033 has a server that is not a voter of
+its configuration in force — "a server with no configuration yet" among them — grant votes
+and pre-votes "by the usual rules". A placeholder grants nothing, for placeholders only.
+The usual rules were written for a server with a store: Raft's `votedFor` is persistent
+state, "updated on stable storage before responding to RPCs" (Ongaro and Ousterhout,
+*In Search of an Understandable Consensus Algorithm*, Figure 2), and a placeholder has no
+stable storage to hold a vote in. It cannot vote twice, because it never votes. What a
+placeholder gives up is the vote of a replica of R that has not yet applied `s`, which is
+the vote §5's first pre-vote "usually" fails to get anyway (Q21), and which the shape of
+`sim/split.rs` (ii) is built to need: there R elects only with it, and the correct system
+waits for the crashed node instead.
+
+### 1. The placeholder
+
+**What is built** (crates/ananke-shard: `server.rs`, `node.rs`, `round.rs`).
+
+1. **A message for a range the node holds no core of** is handed on, not dropped: the
+   round records it whole (`Round::unheld`, with the stamps its step would have carried)
+   beside the count it always had (`Meters::messages_for_ranges_not_held`), and the node
+   asks the host what to do with it (`Host::unheld`) before the round's early outputs,
+   since a placeholder has nothing to persist. A host with no placeholders answers
+   nothing, which is every test host in the tree.
+2. **The placeholder is the host's**: a set of range ids in memory, shared with the
+   `snapshot` task (`ServerHost::placeholders`), and nothing else — no descriptor, no span,
+   no Raft state, no store, no core. The first message of a range that has no replica on
+   the node makes one and traces `RangeReplicaCreated { range }`; a restart forgets every
+   one, as it forgets everything in memory, and the next message makes it again.
+3. **It answers an `AppendEntries` as a refused server does**: a rejection carrying the
+   request's term and previous index, a hint of 1, an echo of zero, store incarnation 0
+   (the host's stamp finds no store) and the refused mark (D-087), so check quorum counts it
+   only in a window in which a stream to it progressed (D-049) and no lease promise or read
+   confirmation is measured from it. The hint is what asks for the snapshot: the leader's
+   next index for the node goes to 1, which feeds the snapshot once the log is compacted
+   past it — a split-born range's log is, from its floor at `s` — and otherwise draws the
+   rejection at previous index 0 that designates it snapshot-fed (D-037).
+4. **It grants nothing**: a vote or pre-vote request, a `TimeoutNow` and every response go
+   unanswered, as a refused server drops them (RAFT.md §3), and nothing is traced of them.
+5. **It ends where its range is created on the node**: at the node's apply of the split
+   that makes it (`Local::RangeAdded` takes it out of the set), or at the install a stream
+   to it completes into (section 2).
+6. **A range being created is no placeholder's.** A split's apply traces R's creation and
+   puts R's descriptor in place, then opens R's store — a disk read — and hands R's core to
+   the `raft` task; a placeholder's install does the same from the `snapshot` task. A
+   message for R in that window finds no core. The host takes a range with a descriptor or
+   a store as initialised and drops its messages, as a core's are dropped while it is down,
+   rather than answer for a replica that holds the range. **Found by the first
+   measurement**: as first built, seed 0 of the correct node made a placeholder of right
+   half 14 on node 3 1.2 ms after node 3 traced 14's creation, and the timer check, which
+   skips a placeholder until its range's creation, never measured node 3's replica of 14
+   again; over the thousand, 2 408 placeholders were made before the fix and 2 105 after,
+   and 227 of the first figure were still placeholders when their run ended, every one a
+   range its node held.
+
+**PROPOSED, settled here** (SHARD.md does not say): the placeholder lives in the host as a
+set, not as a core in a placeholder mode of `ananke-raft` (Q40: that crate names no range,
+and "no Raft state" is a core's whole content); it is made by any message of its range, not
+only a leader's, as §8's re-add window already reads it ("a placeholder of X is also made
+on n by any stale leader's message"); its vote requests are dropped, not answered refused,
+as a refused server's are; and its answer carries the refused mark, which is what D-049's
+count reads since D-087.
+
+### 2. The install into a placeholder, and the overlap rule's half that protects it
+
+**What is built** (`install.rs`, the `snapshot` task; `ananke_raft::snapshot::staged_value`).
+A chunk of a placeholder's range is assembled as any stream's is, the range hosted in the
+task's plan at its Raft interval alone, since its span is the snapshot's and unknown until
+the stream completes, and answered with the stream's own term and store incarnation 0. At
+the stream's last chunk there is no core to hold and no replica's state to repair, so the
+task makes the install itself:
+
+1. the staged snapshot record and **the staged descriptor** are read out of the staged
+   tables (`staged_value`, the walk `staged_record` already made, for any key);
+2. **the install is refused where the descriptor's span overlaps an initialised replica on
+   the node**, or the range was created here meanwhile: the staged bytes are cleared and
+   the sender is asked to start over, traced `RaftSnapshotStartOver { reason: overlaps }`;
+3. otherwise the repair is a placeholder's — the stream's term, no vote, no kept tail, no
+   quarantine, since R's votes are in no store a re-seed could have lost (Q26), and an
+   incarnation drawn fresh from the node's generator (Q26, D-042) — and the one manifest
+   switch writes the replica's state under its prefix and replaces its span's keys
+   (D-066), the spans being the Raft interval and the descriptor's span;
+4. **the creation is traced at the switch**, `RangeCreated { cause: snapshot }` with the
+   descriptor's span, generation and voters, the snapshot's last index and term as the
+   floor and the fresh incarnation, before anything else is awaited: traced later, with the
+   core, a crash between the two would leave the node restating a replica the trace never
+   saw made, which check 20 would read as a placeholder's the day it granted a vote;
+5. the store is opened on what the switch wrote and entered in the node's tables with its
+   applied state and its descriptor, the range is hosted at its whole span, the replica is
+   read back and the install traced (`RaftSnapshotState`, `RaftSnapshot`), the sender is
+   answered installed with the new incarnation, and the `raft` task gets `Switched`, which
+   the host turns into the replica's core (`created_by_install`) — restored from the floor,
+   seeded from its range's stream (Q13), its recovery and its term stated as a start states
+   them, so the timer check and pre-vote's property follow it from there — and the core
+   takes its place on the node with no parent and no hurried election.
+
+**Why the refusal is here and not only in the overlap rule's slice.** §5 has a placeholder
+take "only a snapshot the overlap rule below allows", and the placeholders make the
+overlap reachable on the correct node: a voter of P that has not yet applied `s` is fed
+R's snapshot whenever R's leader reaches its placeholder first, and installing it would
+put two owners on `[key, end)` until P moved on, which check 8's overlap clause, asserted
+since D-107, fails. So the receiver's half of Q27 is built here, for a placeholder's
+install, and answered as a start-over: the leader restarts the stream, and by then P on
+that node has applied `s`, which creates R and ends the placeholder, or been installed
+past it, which moves its span off R's. **Measured**: 15 refusals on 10 of the correct
+node's first thousand seeds, and on none of them a second owner. The rule's own answer,
+`Overlaps`, the leader's wait of a minimum election timeout before it streams again, the
+fresh take where its checkpoint predates the last split, the same rule for an install onto
+an initialised replica, and `SnapshotOverlapsReplica` are S9's (D-110), which replaces this
+start-over. **PROPOSED**: the receiver's half here, answered as a start-over.
+
+**The apply's "R already initialised here" is not asserted here**, though §5 says "The apply
+asserts it", and the gate is why. With the refusal above R can be installed on a node only
+where no replica of P covers its span, and then no replica of P is there to apply `s`; but
+the assertion as first built, a voter's split that finds R's store on the node failing the
+node, fired under `IdBlockResumed` first: the variant's second split takes an id its node's
+first split already took, every voter's apply found that right half here, and every node
+stopped before tracing the split, so check 18's range-id clause — the variant's catch, and
+its pair in Stage C's exit — saw nothing, and the node sweep's test of it reached no second
+split. The assertion goes with the overlap rule's slice (S9), which owns the rest of the
+rule and has to place it after the split is traced or key it on an install.
+
+### 3. `UninitialisedReplicaVotes`
+
+`RangeVariant::UninitialisedReplicaVotes` (bit 7; bits 5 and 6 are D-108's two
+instruments): the placeholder grants every vote and pre-vote request it receives, answered
+granted at the request's term with nothing durable, and traces each grant as a
+`RaftVote { granted: true }`. One of §10's twenty-four.
+
+**Check 20 follows in this PR**, written as a `Fold` with a verdict of its own in #163's
+framework once #166 carries it (#162's merge order: #163, then #166, which merges `main`),
+with its pair in the equivalence test. Until then the variant is built and asserted
+nowhere. Measured before anything is asserted, with a scratch fold of check 20 as §8 words
+it over the node sweep's first thousand seeds: the variant is caught on **896** (15 of the
+first 20, 89 of the first 100) — every seed on which a placeholder was made, each at a
+right half's first pre-vote reaching a node that had not yet applied its split — and the
+run's own checks catch it on none, which is what check 20 is for; the correct node trips it
+on **0 of 1 000**.
+
+### 4. The timer check skips a placeholder
+
+`sim/raft.rs`'s replay keeps the placeholders per (range, server), from each
+`RangeReplicaCreated` to the range's `RangeCreated` on that node, forgets a node's at its
+crash, and measures none of them (SHARD.md §8). A placeholder has no core and is never in
+the replay's running set, which its first `RaftTerm` would put it in, so on this tree the
+skip changes no verdict; it is asked of a placeholder directly by a unit test
+(`a_placeholder_is_not_measured_and_the_replica_its_install_creates_is`), and the replica
+an install creates is measured from its creation.
+
+### 5. What the placeholders moved, measured
+
+One probe, a scratch test file never committed, built in release on b21d76e and on this
+tree, run on one machine (an Apple M2 of 8 cores on AC power, under other slices' gates and
+probes, load averages up to 240; every figure is a hash or a count, which load does not
+touch, D-070). Per run it hashes, FNV-1a 64 over each record's `Debug` form, the trace
+with `RangeReplicaCreated` left out and every `TaskPolled` kept, so a schedule that moved
+shows, and records the verdict.
+
+- **The correct node under the raft sweep's arms, seeds 0 to 999**: every verdict green on
+  both trees, and the schedule moved on **92 of 1 000**, the seeds where a placeholder
+  answered an `AppendEntries` and so sent something. Placeholders were made on **896**
+  seeds (15 of the first 20, 89 of the first 100), 2 105 in all: 2 088 ended by their
+  node's apply of the split, **15** by an install into them, on 15 seeds (one of the first
+  hundred), 2 forgotten by a crash, none still a placeholder when its run ended; **15**
+  placeholders' installs were refused as overlapping their node's parent, on 10 seeds
+  (none of the first hundred).
+- **Every other node scenario**, seeds 0 to 99 — the membership scenario on the node,
+  `sim/ranges.rs`, the sharded quorum scenario under the correct node and under
+  `RefuseOneRangeOnly`, the re-seed shape — and `sim/install.rs`'s 0 to 31: **the same
+  schedule on every seed**, every verdict as it was. None of them splits a range, so no
+  message reaches a node for a range it holds no replica of, and where one did, a
+  placeholder that sends nothing leaves its round as empty as it was: such a round flushes
+  nothing, as it never did. (The first build flushed it, and moved 81 of the re-seed
+  shape's hundred and all 32 of `sim/install.rs`'s by shipping what an earlier frame had
+  left in the outbox; and it read a store's term once per chunk instead of at each answer,
+  as the task always had. Both were put back before anything was committed.)
+- **The range layer's variants and the node's on the node sweep**, seeds 0 to 99 each,
+  schedules moved and seeds failing before and after: `ApplyIgnoresSpan` 10, 5 and 5;
+  `IdBlockResumed` 7, 71 and 71; `MetaOverwritesByArrival` 8, 18 and 18;
+  `TrustStaleDescriptor` and `ClientIgnoresMismatch` none, 100 and 100 each, caught before
+  any split; `TakeSkipsTheUserKeys` 7, 86 and 86; `ApplyWaitsForEveryRange` 40, 87 and 86;
+  `InstallKeepsTheOldCore` 83, 3 and 4; `SharedSnapshotDir` 79, 41 and 34. The last three
+  move most because they leave replicas lagging or wedged, which is where a right half's
+  leader meets a placeholder; their tests assert the tiers they did, and pass at the gate.
+- **The pinned seeds.** The same schedule on 272, 516, 633, 8885 and 2809 of the correct
+  node, on 2994 of the sharded quorum scenario under both, on 1969 of the membership node
+  and on the re-seed shape's seed 1; seed 42's one-group trace is untouched. Moved: 368
+  and 493 of the correct node, whose pins still find the live install's hold they assert;
+  12 under `SharedSnapshotDir`, whose pin still finds its wedge; **45**, the right half's
+  clause's pin, upgraded to the mechanism that now closes it (section 6); **8** under
+  `SharedSnapshotDir`, whose split range's right half now completes no post-heal write, so
+  the starting map has nothing to excuse its wedge with — the pin asserts that absence and
+  moved the shape to **seed 76**, the lowest of the first thousand to carry it on this tree
+  (76, 80, 277, 320, …); and **613** under `ApplyWaitsForEveryRange`, whose stall moved from
+  range 4's `k4` to range 2's `k1` with the same shape — every completion of the range
+  before the pending writes' calls, none after them in 4 s more — which the pin now asserts
+  on `k1`.
+
+### 6. Check 8's right half's clause, and #170
+
+**#170 is resolved.** On the correct node's first thousand seeds **15** voters of a split's
+parent were installed the parent's snapshot at or past the split while they held no right
+half — every one the shape #170 names, on seeds 45, 221, 333, 375, 401, 466, 579, 595, 604,
+642, 728, 749, 878, 915 and 975 — and **every one** was created its right half by its
+placeholder's install, after 99 ms to **2 367 ms** (seed 595, behind four refusals for
+overlap; the median 319 ms). None was left without it at its run's end.
+
+**The right half's clause, under both readings, at 1 000.** Its reading as §8 words it —
+owed from a restatement of P at or past `s` whatever installed P there — holds on **1 000
+of 1 000** of the correct node's seeds, where on b21d76e it tripped on 2 (45 and 878): the
+installed voter now holds R by its next restart. D-107's recommended reading — owed from an
+apply of `s`, kept across restarts, and from a restatement past `s` only where the node's P
+was not installed at or past `s` since its last refusal — holds on **1 000 of 1 000** too;
+it is a scratch fold (the probe's copy of `OneOwnerPerKey` with that one change), not in
+this tree. The owner has not ruled on D-107, so the clause stays folded and printed at every
+tier and asserted nowhere. What the placeholders change in the question: the trip D-107
+found is gone under both readings, and the installed voter's own check D-107 recommends —
+its right half within a bound — would be asked of waits measured at 99 ms to 2.367 s over a
+thousand seeds, past ten maximum election timeouts (2 s) on one of them, so a bound for it is
+to be measured at ten thousand before it is chosen. **Seed 45 is re-pinned** on the
+mechanism that closes it
+(`seed_45_a_voter_installed_past_a_split_gets_its_right_half_through_its_placeholder`): the
+install past the split at 165, no split applied on node 2, a placeholder of 14 made, 14
+created on node 2 by its install and before node 2's crash, the restatement after it naming
+14, and both of check 8's clauses green. The equivalence test's comparison in violation,
+which ran on seed 45's trip, runs on seed 45's trace with node 2's creation and restatements
+of 14 taken out — the voter that never gets its right half — and asserts the agreement there
+(`check_8_agrees_with_its_whole_trace_fold_on_the_node`, now with
+`UninitialisedReplicaVotes` among its systems).
+
+---
+
+_Next entry: D-110. Add one before implementing anything not covered above._

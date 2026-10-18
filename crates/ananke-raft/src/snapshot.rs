@@ -936,6 +936,31 @@ pub async fn staged_record<E: Environment>(
     dir: &Path,
     prefix: &KeyPrefix,
 ) -> io::Result<Option<SnapshotRecord>> {
+    match staged_value(env, dir, &prefix.snapshot_key()).await? {
+        Some(bytes) => Ok(Some(store::decode_snapshot_record(bytes)?)),
+        None => Ok(None),
+    }
+}
+
+/// The newest live value a *checkpoint directory* holds for `key`, read out of the
+/// directory's own tables without opening it as a store: the walk
+/// [`staged_record`] makes, for any key.
+///
+/// The node's install into a placeholder needs one value besides the record: the
+/// range's descriptor, which says what span the snapshot is of before anything is
+/// installed (SHARD.md §5's overlap rule, Q27). The key is the caller's, built by
+/// [`KeyPrefix`]; nothing here reads what the value means (Q40).
+///
+/// # Errors
+///
+/// As [`staged_record`]'s.
+// PROPOSED(D-109): a placeholder's install reads the streamed descriptor before it
+// switches.
+pub async fn staged_value<E: Environment>(
+    env: &E,
+    dir: &Path,
+    key: &[u8],
+) -> io::Result<Option<Bytes>> {
     let fs = env.fs();
     let Some(current) = read_whole(env, &manifest::current_path(dir)).await? else {
         return Err(bad("the staged directory has no CURRENT"));
@@ -945,7 +970,6 @@ pub async fn staged_record<E: Environment>(
         Some(bytes) => Manifest::decode(&bytes)?,
         None => return Err(bad("the staged manifest")),
     };
-    let key = prefix.snapshot_key();
     // The newest write of the key wins, and a table's own `max_seq` orders the tables:
     // the checkpoint's tables are written in key order at one version, so at most one
     // of them holds it, but the walk does not rely on that.
@@ -959,7 +983,7 @@ pub async fn staged_record<E: Environment>(
             .await?;
         let reader = Arc::new(SstReader::open(file).await?);
         let mut entries = reader.iter();
-        entries.seek(&ikey::lower_bound(&key)).await?;
+        entries.seek(&ikey::lower_bound(key)).await?;
         while let Some((raw, value)) = entries.next().await? {
             let (user, seq) = ikey::decode(&raw)?;
             if user[..] != key[..] {
@@ -972,10 +996,7 @@ pub async fn staged_record<E: Environment>(
             }
         }
     }
-    match newest {
-        Some((_, bytes)) => Ok(Some(store::decode_snapshot_record(bytes)?)),
-        None => Ok(None),
-    }
+    Ok(newest.map(|(_, bytes)| bytes))
 }
 
 /// The writes an install's repair makes under the **receiver's** key prefix
