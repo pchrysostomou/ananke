@@ -638,7 +638,7 @@ pub fn node_server_config(
         id_block: crate::ranges::ID_BLOCK,
         refill_at: crate::ranges::REFILL_AT,
         node,
-        // The range layer's set beside the node's (PROPOSED D-105).
+        // PROPOSED(D-105): the range layer's set beside the node's.
         // PROPOSED(D-108): `AnyFreshNodeBootstraps` is the one range-layer variant this
         // scenario runs.
         range_variants: range,

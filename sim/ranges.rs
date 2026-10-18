@@ -759,7 +759,7 @@ pub fn server_config_of(
         id_block: ID_BLOCK,
         refill_at: REFILL_AT,
         node,
-        // The range layer's set beside the node's (PROPOSED D-105).
+        // PROPOSED(D-105): the range layer's set beside the node's.
         // PROPOSED(D-108): the sweep and the scenarios beside it run none; the
         // refusal scenario runs `IncarnationPerRangeStream` (`refused_whole`).
         range_variants: range,

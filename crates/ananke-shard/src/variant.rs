@@ -31,6 +31,7 @@
 //! [`NodeVariant::PersistsNotArmed`] is caught over a small fixed set of scheduling
 //! seeds rather than on one, because what it breaks depends on which side of the
 //! task's race is polled first: the directed scenario is the set, not a seed.
+// PROPOSED(D-105): the node's set is §4's, and §10's variants are the range layer's.
 // PROPOSED(D-108): the two range-layer instruments moved out of the node's set.
 
 use std::fmt;
@@ -632,9 +633,10 @@ impl NodeVariant {
             NodeVariant::ApplyWaitsForEveryRange => 1 << 47,
             // Bit 48 held PROPOSED D-096's `AnyFreshNodeBootstraps`, a fresh store taken
             // for a bootstrap, until PROPOSED D-108 moved it to the range layer's set.
-            // Bits 49 to 53 held §10's five — D-097's three for routing, D-098's one for
-            // the meta range and D-099's one for the range-id blocks — until PROPOSED
-            // D-105 moved them to the range layer's own set (`crate::range_variant`).
+            // PROPOSED(D-105): bits 49 to 53 held §10's five — D-097's three for
+            // routing, D-098's one for the meta range and D-099's one for the range-id
+            // blocks — until D-105 moved them to the range layer's own set
+            // (`crate::range_variant`).
             // PROPOSED(D-108): bits 25 and 48 to 53 are free, and seventeen bits are
             // left.
         }

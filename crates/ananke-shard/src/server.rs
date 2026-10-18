@@ -680,7 +680,8 @@ pub struct ServerHost<E: Environment> {
     variants: ananke_raft::core::Variants,
     /// The node's own variants, for the paths a core knows nothing about.
     node: NodeVariants,
-    /// The range layer's, for the receipt and serving checks (PROPOSED D-105).
+    /// The range layer's, for the receipt and serving checks.
+    // PROPOSED(D-105)
     range_variants: RangeVariants,
     gaps: Mutex<Gaps>,
     /// Every hosted replica's descriptor as the store holds it (SHARD.md §1, §3):
@@ -1132,6 +1133,7 @@ impl<E: Environment> Host for ServerHost<E> {
         // is never mismatched. `TrustStaleDescriptor` takes the range the request
         // names as proof and checks nothing here (§10, Q38).
         // PROPOSED(D-097): the receipt check, where D-076 failed the run.
+        // PROPOSED(D-105): `TrustStaleDescriptor` read from the range layer's set.
         let key = request.command.key().map(|key| user_key(key));
         let Some(replica) = self.replica(range) else {
             lock(&self.gaps).requests_for_ranges_not_held += 1;
@@ -1581,6 +1583,7 @@ impl<E: Environment> Host for ServerHost<E> {
             // subsume applied between receipt and serving answers `RangeMismatch`.
             // `TrustStaleDescriptor` checks nothing here (§10).
             // PROPOSED(D-097): the read check.
+            // PROPOSED(D-105): `TrustStaleDescriptor` read from the range layer's set.
             let descriptor = if self
                 .range_variants
                 .contains(RangeVariant::TrustStaleDescriptor)
@@ -1730,8 +1733,9 @@ struct ServerApplier<E: Environment> {
     snaps: Queue<SnapJob>,
     engine_dir: PathBuf,
     node_variants: NodeVariants,
-    /// The range layer's, for the apply check and the meta range's apply (PROPOSED
-    /// D-105), and for the incarnation a split's right half draws.
+    /// The range layer's, for the apply check and the meta range's apply, and for the
+    /// incarnation a split's right half draws.
+    // PROPOSED(D-105)
     // PROPOSED(D-108): `IncarnationPerRangeStream` at a split.
     range_variants: RangeVariants,
     /// The cores' variants: read here for Phase 2's `SharedSnapshotDir`, whose bit
@@ -2276,6 +2280,7 @@ impl<E: Environment> Applier for ServerApplier<E> {
                 // (`initial_state`, `interim_state`, an install); one without is
                 // checked against nothing, and check 9 then sees what it applied.
                 // PROPOSED(D-097): the apply check.
+                // PROPOSED(D-105): `ApplyIgnoresSpan` read from the range layer's set.
                 let refused: Option<RangeDescriptor> = match command.as_ref().and_then(Command::key)
                 {
                     Some(key) if !self.range_variants.contains(RangeVariant::ApplyIgnoresSpan) => {
@@ -2394,6 +2399,8 @@ impl<E: Environment> Applier for ServerApplier<E> {
                     }
                 } else if let Some(descriptors) = &meta_update {
                     let result = if range == META_RANGE {
+                        // PROPOSED(D-105): `MetaOverwritesByArrival` read from the
+                        // range layer's set.
                         let as_arrived = self
                             .range_variants
                             .contains(RangeVariant::MetaOverwritesByArrival);
@@ -3232,6 +3239,7 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
         && let Some(bytes) = store.engine().get(&system::lease_key(id)).await?
         && let Ok(record) = LeaseRecord::decode(bytes)
     {
+        // PROPOSED(D-105): `IdBlockResumed` read from the range layer's set.
         let any_run = range_variants.contains(RangeVariant::IdBlockResumed);
         lock(&ids).adopt(&record, any_run);
     }

@@ -111,7 +111,10 @@ _Update this section at the end of every session._
   refusal scenario beside the node's set; `NodeVariant::BUGS` forty-seven, `RESEED`
   five, bits 25 and 48 freed. `IncarnationPerRangeStream` is read at two sites, not the
   one #151 named: the split's (D-100) is reached on the node cluster and run by no test
-  (issue #160).
+  (issue #160). #155: the six read sites of the range layer's set (five in `server.rs`,
+  the sweep's client's) and the six prose-form sites carry `// PROPOSED(D-105)`, and a
+  note appended to D-105 says what is marked and that its split by check was the
+  uncommitted harness's (the tests count checks 16 and 18 as "something else").
 - Branch `docs-stage-c-record` (2026-10-11), off `main` at b01db39 and merged with it at
   8496ca3 (#152, D-105; footer D-106), PROPOSED D-104, **Stage C's record**, docs and
   comments only (no code line, schedule or pinned hash moves). It records three things no

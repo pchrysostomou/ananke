@@ -20551,9 +20551,33 @@ is the other range-layer rule this entry names for its instruments — "a replic
 incarnation at its creation" — and this entry's module doc and table missed it (issue
 #151).
 
+**Corrected by D-108: what carries the marker, and where the table's split by check came
+from** (issue #155). *The marker.* "Every code site carries `// PROPOSED(D-105)`" was not
+so at this entry's merge (8496ca3). Six sites that read a member of the set carried no
+D-105 marker. Five are in crates/ananke-shard/src/server.rs: the receipt and serving
+checks, the apply check, the meta range's apply and the start's read of the lease record.
+They kept their D-097, D-098 or D-099 marker or had none. The sixth is the sweep's
+client's read of `ClientIgnoresMismatch` in sim/raft.rs. Six more sites named the entry in
+prose, "(PROPOSED D-105)", which a grep for the marker misses: the host's and the `apply`
+task's fields, and the configuration of the set in sim/install.rs, sim/membership.rs,
+sim/ranges.rs and sim/reseed.rs. D-108 marks all twelve, and with them `variant.rs`'s
+module doc and its record of the freed bits. What the sentence holds of now: the marker
+is on the set and its module, every field that holds it, every site that reads a member,
+every scenario's configuration of it, `sim/raft.rs`'s run functions and the sweep's
+client, `variant.rs`'s module doc and freed bits, and seed 42's pin. The sites that only
+pass the set along carry none: `server::run`'s destructuring and its construction of the
+host and the applier, sim/quorum.rs's two calls, `lib.rs`'s re-export and `meta.rs`'s doc.
+The variant tests this entry renamed keep the markers of the entries that built them.
+*The split by check.* The column "Caught by, at 1 000" was read from the uncommitted
+harness's output, which named the check that wrote each violation. The committed tests
+classify a violation by `mechanism` (sim/tests/node.rs), which names neither check 16 nor
+check 18 and counts both as "something else". Nightly 38144944562 printed
+`MetaOverwritesByArrival` as `{"something else": 149}`, and `IdBlockResumed`'s 499 by
+check 18 and 1 by check 16 among its `"something else": 500`. The totals agree.
+
 ---
 
-## PROPOSED D-108 — `AnyFreshNodeBootstraps` and `IncarnationPerRangeStream` move from `NodeVariants` into `RangeVariants`, as the range layer's instruments outside §10's count
+## PROPOSED D-108 — `AnyFreshNodeBootstraps` and `IncarnationPerRangeStream` move from `NodeVariants` into `RangeVariants`, as the range layer's instruments outside §10's count; D-105's markers and its table's source corrected
 
 **The number.** This branch is off `main` at f8a15a7, whose footer reads D-106. Two
 slices open beside it take D-106 (the per-fold equivalence) and D-107 (restatement and
@@ -20633,6 +20657,48 @@ since D-100's split (5ddc2fc): a split's right half on a voter of P
 (`ServerApplier::split`), where the correct node draws R's incarnation from the node's
 generator. The node cluster's split arms reach the second site. No test runs the variant
 there, so nothing fails if that read is wrong (issue #160).
+
+### #155: what carries `// PROPOSED(D-105)`, and where D-105's split by check came from
+
+D-105 says "Every code site carries `// PROPOSED(D-105)`". At its merge (8496ca3) that was
+not so, as #152's adversarial review found. Six sites that read a member of the set
+carried no D-105 marker:
+
+- the five in crates/ananke-shard/src/server.rs, which kept their D-097, D-098 or D-099
+  marker or had none: the receipt check and the serving check (`TrustStaleDescriptor`),
+  the apply check (`ApplyIgnoresSpan`), the meta range's apply (`MetaOverwritesByArrival`)
+  and the start's read of the lease record (`IdBlockResumed`);
+- the sweep's client's read of `ClientIgnoresMismatch` in sim/raft.rs, under D-097's
+  marker and the function's D-105 one. #155 did not name it.
+
+Six sites named the entry in prose, "(PROPOSED D-105)", which a grep for the marker
+misses. They are `ServerHost`'s field and the `apply` task's field, and the configuration
+of the set in sim/install.rs, sim/membership.rs, sim/ranges.rs and sim/reseed.rs. The
+`apply` task's field ran across two lines, so a grep for the prose missed it too, and #155
+named five. Each now carries the marker, the read sites naming the variant read there.
+So do `variant.rs`'s module doc and its record of the freed bits, which named D-105 only
+in prose.
+
+What the marker is on, exactly: the set and its module, every field that holds it, every
+site that reads a member, every scenario's configuration of it, `sim/raft.rs`'s run
+functions and the sweep's client, `variant.rs`'s module doc and freed bits, and seed 42's
+pin. The sites that only pass the set along carry none. These are `server::run`'s
+destructuring of the configuration and its construction of the host and the applier,
+sim/quorum.rs's two calls, `lib.rs`'s re-export and `meta.rs`'s doc, which names a
+variant. The variant tests D-105 renamed keep the markers of the entries that built them.
+`git grep -n 'PROPOSED(D-105)'` lists twenty-two lines on this tree.
+
+D-105's table has a column "Caught by, at 1 000". Its split by check comes from the
+uncommitted harness (`sim/tests/s4_measure.rs`), whose output named the check that wrote
+each violation. The committed tests classify a violation by `mechanism`
+(sim/tests/node.rs), whose list names neither check 16 ("meta never goes back") nor check
+18 ("descriptor lineage"), so it counts both as "something else". Nightly 38144944562 (on
+ccdbf24) printed `MetaOverwritesByArrival` as `{"something else": 149}` and
+`IdBlockResumed` as `{"commit by current term": 8, "descriptor agreement": 3, "log
+matching": 11, "serving within span": 16, "something else": 500, "state machine safety":
+90}`, the 500 being D-105's 499 by check 18 and 1 by check 16. `main`'s nightly on
+f8a15a7 (39015093151) prints the same. The totals agree; only the split's source was
+unstated. A note appended to D-105 says both. No code line other than comments moves.
 
 ### Consequences
 
