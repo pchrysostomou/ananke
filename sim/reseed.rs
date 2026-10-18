@@ -904,7 +904,7 @@ pub fn server_config(id: u64, variants: impl Into<Variants>, node: NodeVariants)
         id_block: crate::ranges::ID_BLOCK,
         refill_at: crate::ranges::REFILL_AT,
         node,
-        // No range-layer variant runs on this scenario (PROPOSED D-105).
+        // PROPOSED(D-105): no range-layer variant runs on this scenario.
         range_variants: RangeVariants::correct(),
     }
 }

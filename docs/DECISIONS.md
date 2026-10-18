@@ -10971,6 +10971,23 @@ The run is owed on AC, on a quiet machine.
   and restarts nodes for `Fault::Crash`, and the same two calls give the directed
   scenario its restart.
 
+**Corrected by D-108: item 4's reason.** Item 4's rule stands: a replica's incarnation is
+drawn at each creation from the node's generator, never below `FIRST_INCARNATION + 1`.
+Its reason does not hold of the stream it names. Item 4 says `n{id}/r{range}/protocol` is
+avoided because "`SimEnv` derives a named stream from the seed and the name alone, so a
+replica created again for the same (range, node) would draw its predecessor's number".
+`Environment::range_rng`, which D-057 built and which hands back that stream, makes it
+from the seed and the name the first time it is asked for. It hands back the same shared
+stream every time after (crates/ananke-env/src/sim/state.rs:178-193). Every handle and
+call continue it (crates/ananke-env/src/env.rs:36-42), and a crash and restart leave it
+where it was. So a replica created again for the same (range, node) under it draws the
+stream's next number, not its predecessor's. The repeat the item names needs a stream
+derived anew at each creation, which is what `node_stream` makes inside the simulator
+(state.rs:171-176). This entry's variant for the rule, `IncarnationPerRangeStream` (a
+range-layer instrument since D-108), therefore changes the draw and repeats nothing, and
+the directed scenario catches it by the draw itself. SHARD.md's copy of the same reason
+is issue #165.
+
 ---
 
 ## PROPOSED D-078 — Follower compaction as D-065 decided it: a record at the applied index, no checkpoint under it, and the follower log bounded at 64 × `snapshot_threshold`
@@ -20542,15 +20559,52 @@ this branch's changes before `rustfmt`, which changed their layout and nothing e
 - **For the owner, from #97:** seed 42's one-group trace pinned by its body hash, as
   `echo`'s is.
 
+**Corrected by D-108: the instruments.** "Instruments outside the count, none built", and
+the PROPOSED point that `AnyFreshNodeBootstraps` stays in the node's set. D-108 moves it
+into this set as an instrument outside §10's count, as this entry recommended, and with
+it `NodeVariant::IncarnationPerRangeStream` (D-077), which draws a replica's incarnation
+at its creation from its range's protocol stream instead of the node's generator. That
+is the other range-layer rule this entry names for its instruments — "a replica's
+incarnation at its creation" — and this entry's module doc and table missed it (issue
+#151).
+
+**Corrected by D-108: what carries the marker, and where the table's split by check came
+from** (issue #155). *The marker.* "Every code site carries `// PROPOSED(D-105)`" was not
+so at this entry's merge (8496ca3). Six sites that read a member of the set carried no
+D-105 marker. Five are in crates/ananke-shard/src/server.rs: the receipt and serving
+checks, the apply check, the meta range's apply and the start's read of the lease record.
+They kept their D-097, D-098 or D-099 marker or had none. The sixth is the sweep's
+client's read of `ClientIgnoresMismatch` in sim/raft.rs. Six more sites named the entry in
+prose, "(PROPOSED D-105)", which a grep for the marker misses: the host's and the `apply`
+task's fields, and the configuration of the set in sim/install.rs, sim/membership.rs,
+sim/ranges.rs and sim/reseed.rs. D-108 marks all twelve, and with them `variant.rs`'s
+module doc and its record of the freed bits. What the sentence holds of now: the marker
+is on the set and its module, every field that holds it, every site that reads one of
+§10's five, every scenario's configuration of it, `sim/raft.rs`'s run functions and the
+sweep's client, `variant.rs`'s module doc and freed bits, and seed 42's pin. The three
+sites that read the two instruments D-108 moved into the set carry D-108's marker
+instead. The sites that only pass the set along carry none: `server::run`'s destructuring
+and its construction of the host and the applier; in sim/raft.rs, `Cluster::spawn`,
+`client` and `run_with`; sim/quorum.rs's two calls; `lib.rs`'s re-export and `meta.rs`'s
+doc; and the helpers D-108 lists as passing the set along. The variant tests this entry
+renamed keep the markers of the entries that built them. `git grep -n 'PROPOSED(D-105)'
+-- crates sim` lists twenty-two lines at D-108.
+*The split by check.* The column "Caught by, at 1 000" was read from the uncommitted
+harness's output, which named the check that wrote each violation. The committed tests
+classify a violation by `mechanism` (sim/tests/node.rs), which names neither check 16 nor
+check 18 and counts both as "something else". Nightly 38144944562 printed
+`MetaOverwritesByArrival` as `{"something else": 149}`, and `IdBlockResumed`'s 499 by
+check 18 and 1 by check 16 among its `"something else": 500`. The totals agree.
+
 ---
 
 ## PROPOSED D-106 — Each of the range layer's folds keeps a verdict of its own and runs under the equivalence test against the variant that trips it
 
 **The number.** Off `main` at 6633266, whose footer reads D-106, and merged with it at
-f627399 (#161). Two slices run beside this one, S6 (D-107) and H1 (D-108 if it needs one);
-this takes **D-106** and moves the footer to D-107. At the merge the entries are a union in
-numerical order with one footer, the highest plus one. Every code site carries
-`// PROPOSED(D-106)`.
+f627399 (#161) and again after #164 (6370823, D-108). Two slices ran beside this one, S6
+(D-107, #166, open) and H1 (D-108, #164, merged first); this takes **D-106**. The entries are
+a union in numerical order with one footer, the highest taken plus one, so the footer reads
+D-109 with D-107 reserved for #166. Every code site carries `// PROPOSED(D-106)`.
 
 **Context.** Stage C's exit asks for "the equivalence test, each fold against the variant
 of this stage that trips it": checks 9 and 10 against `ApplyIgnoresSpan`, check 9 also
@@ -20937,11 +20991,12 @@ the first measurement's.
   split a right half and run membership changes beside splits without the clause failing
   the correct system.
 - Every node scenario folds the range layer's checks, the sharded quorum scenario included.
-- Two slices open beside this one touch what it touches, and whichever merges second
-  carries the other's change across: S6 (#166, D-107) adds check 8 to the range layer's
-  checker, which then needs a `Fold` of its own and a place in the comparison; H1 (#164,
-  D-108) moves `AnyFreshNodeBootstraps` into `RangeVariants`, and the two tests here that
-  name it as `NodeVariant::AnyFreshNodeBootstraps` move with it.
+- Two slices beside this one touch what it touches. H1's #164 (D-108) merged first and
+  moved `AnyFreshNodeBootstraps` into `RangeVariants`; the two tests here that name it read
+  it from the range layer's set since this branch's merge of 6370823, and run it beside the
+  correct node's set as #164's membership scenario does. S6's #166 (D-107) adds check 8 to
+  the range layer's checker: whichever of the two merges second gives check 8 a `Fold` of
+  its own and a place in the comparison.
 
 ### What the PR asks
 
@@ -20964,4 +21019,420 @@ the first measurement's.
 
 ---
 
-_Next entry: D-107. Add one before implementing anything not covered above._
+## PROPOSED D-108 — `AnyFreshNodeBootstraps` and `IncarnationPerRangeStream` move from `NodeVariants` into `RangeVariants`, as the range layer's instruments outside §10's count, measured; Stage D's re-add variant is not `IncarnationPerRangeStream`; D-105's markers and its table's source corrected; `TrustStaleDescriptor`'s test comment re-derived
+
+**The number.** This branch is off `main` at f8a15a7, whose footer reads D-106. Two
+slices open beside it take D-106 (the per-fold equivalence) and D-107 (restatement and
+check 8); the brief that assigned this one gives it **D-108**, and the footer moves to
+D-109. At the merge the entries are a union in numerical order with one footer, the
+highest plus one.
+
+**What carries `// PROPOSED(D-108)`**, said exactly, since D-105's "every code site" was
+not so (issue #155). The marker is on every site that declares, holds or reads one of
+the two variants: their arms and bits and the module doc of `range_variant.rs`; in
+`variant.rs` the module doc, `RESEED`, the two freed bits and the count its test asserts;
+`ServerConfig::range_variants` and the `apply` task's field; the three reads, which are
+`server::run`'s choice of bootstrap, `reseed`'s draw and the split's draw; and
+`reseed`'s new parameter. It is also on the configuration of the set in the membership
+scenario and in `sim/ranges.rs`, on the run functions of those two scenarios that take
+the set, on the two tests that run the instruments, and on `TrustStaleDescriptor`'s test
+comment (#156). The helpers that only pass the set along carry none.
+These are `spawn_server`, `spawn_node`, `spawn_node_of`, `server_config`,
+`server_config_of`'s signature, `run_on`, `run_on_with`, `alone_of`, `run_with_of` and
+`server::run`'s call of `reseed`.
+
+**Context.** PROPOSED D-105 moved §10's five built variants into the range layer's own
+set and left `NodeVariant::AnyFreshNodeBootstraps` (PROPOSED D-096) in the node's,
+though it breaks §2's rule for which node writes the initial state and is check 7's
+instrument on the membership scenario. By D-093's reasoning (`SplitLeavesGap` is placed
+in the range layer's set as an instrument outside §10's count) that makes it a
+range-layer instrument. D-105 recorded its place as a PROPOSED point for the owner and
+recommended the move (issue #151). #152's adversarial review found a second variant on
+the same line, `NodeVariant::IncarnationPerRangeStream` (D-077, bit 25). At Q15's re-seed
+it draws each replica's incarnation from the range's protocol stream,
+`n{id}/r{range}/protocol`, instead of from the node's generator. That breaks the rule a
+replica's incarnation at its creation keeps (SHARD.md:1376-1383), the second of the two
+range-layer rules D-105 names for its instruments, and D-105's module doc and entry
+missed it. The issue's second comment recommends moving both.
+
+### Decided
+
+1. **Both move into `RangeVariants`, as instruments outside §10's count.**
+   `RangeVariant::AnyFreshNodeBootstraps` takes bit 5 and
+   `RangeVariant::IncarnationPerRangeStream` bit 6; `in_section_10` answers false for
+   both; `RangeVariant::BUGS` holds seven. D-105's own test,
+   `every_variant_takes_a_bit_of_its_own_and_says_whether_it_is_one_of_section_10s`,
+   now asserts the five of §10's built so far and names the instruments,
+   `["AnyFreshNodeBootstraps", "IncarnationPerRangeStream"]`. An instrument added
+   unclassified, or one of §10's classified as an instrument, fails it. It still holds
+   every name against §10's table and asserts that no range variant shares a name with a
+   node variant. `NodeVariant` loses both. Its `BUGS` is forty-seven. `RESEED` is five,
+   since D-077 built six and the sixth was `IncarnationPerRangeStream`. Bits 25 and 48
+   are recorded as freed, with seventeen bits left. Each variant's doc moves with it,
+   unchanged in substance, and says what it is in this set and where it is read.
+   `IncarnationPerRangeStream`'s also says what it does not reach, which its old doc
+   had wrong (the PROPOSED point below).
+2. **Read from the range layer's set where it was read from the node's.**
+   `AnyFreshNodeBootstraps` is read at `server::run`'s choice of whether a node not named
+   takes a fresh store for a bootstrap. `IncarnationPerRangeStream` is read at two
+   places. One is `reseed`, which takes the range layer's set as a parameter of its own
+   beside the node's. The other is a split's apply (`ServerApplier::split`), whose
+   applier has held the set since D-105.
+3. **Carried by the two scenarios that run them, as D-105 carried the set.** The
+   membership scenario's `run_on_node`, `run_on_with_node`, `spawn_server` and
+   `node_server_config` take the range layer's set beside the node's. Its client takes
+   it too, as `raft::run_on_the_node`'s does; the client reads only
+   `ClientIgnoresMismatch`, which no test of this scenario sets. `run_on` and
+   `run_on_with` name both sets correct. In `sim/ranges.rs` the directed refusal
+   scenario (`refused_whole`, `refused_whole_dirs`, `refused_whole_restarted`) takes the
+   set, and so do the configuration and spawn helpers under it (`server_config`,
+   `server_config_of`, `spawn_node`, `spawn_node_of`). The sweep and `alone` name it
+   correct. Every node call site names its sets.
+4. **The tests follow.** Two tests take `RangeVariant`s now:
+   `a_fresh_node_that_bootstraps_itself_is_caught_by_check_7_where_it_is_not_a_bootstrap_node`
+   (sim/tests/node.rs) and
+   `a_loss_in_the_shared_engine_refuses_the_whole_node_and_reseeds_beside_it`
+   (sim/tests/ranges.rs). Nothing either asserts moves. D-077's and D-096's entries keep
+   their text, which says what was built then; this entry supersedes where they put the
+   two.
+
+**The second site, which #151 did not name.** `IncarnationPerRangeStream` is read at two
+sites, not one. The first is Q15's re-seed (D-077, `reseed`). The second has existed
+since D-100's split (5ddc2fc): a split's right half on a voter of P
+(`ServerApplier::split`), where the correct node draws R's incarnation from the node's
+generator. The node cluster's split arms reach the second site. No test runs the variant
+there, so nothing fails if that read is wrong (issue #160).
+
+### #155: what carries `// PROPOSED(D-105)`, and where D-105's split by check came from
+
+D-105 says "Every code site carries `// PROPOSED(D-105)`". At its merge (8496ca3) that was
+not so, as #152's adversarial review found. Six sites that read a member of the set
+carried no D-105 marker:
+
+- the five in crates/ananke-shard/src/server.rs, which kept their D-097, D-098 or D-099
+  marker or had none: the receipt check and the serving check (`TrustStaleDescriptor`),
+  the apply check (`ApplyIgnoresSpan`), the meta range's apply (`MetaOverwritesByArrival`)
+  and the start's read of the lease record (`IdBlockResumed`);
+- the sweep's client's read of `ClientIgnoresMismatch` in sim/raft.rs, under D-097's
+  marker and the function's D-105 one. #155 did not name it.
+
+Six sites named the entry in prose, "(PROPOSED D-105)", which a grep for the marker
+misses. They are `ServerHost`'s field and the `apply` task's field, and the configuration
+of the set in sim/install.rs, sim/membership.rs, sim/ranges.rs and sim/reseed.rs. The
+`apply` task's field ran across two lines, so a grep for the prose missed it too, and #155
+named five. Each now carries the marker, the read sites naming the variant read there.
+So do `variant.rs`'s module doc and its record of the freed bits, which named D-105 only
+in prose.
+
+What the marker is on, exactly: the set and its module, every field that holds it, every
+site that reads one of §10's five, every scenario's configuration of it, `sim/raft.rs`'s
+run functions and the sweep's client, `variant.rs`'s module doc and freed bits, and seed
+42's pin. The three sites that read the two instruments carry this entry's marker
+instead. The set's readers are therefore nine: six of §10's five, three of the
+instruments. The sites that only pass the set along carry no D-105 marker. They are:
+
+- `server::run`'s destructuring of the configuration and its construction of the host
+  and the applier;
+- in sim/raft.rs, `Cluster::spawn`, `client` (which names the set correct) and
+  `run_with`;
+- sim/quorum.rs's two calls;
+- `lib.rs`'s re-export, and `meta.rs`'s doc, which names a variant;
+- the membership and `sim/ranges.rs` helpers this entry lists under what carries its own
+  marker.
+
+The variant tests D-105 renamed keep the markers of the entries that built them.
+`git grep -n 'PROPOSED(D-105)' -- crates sim` lists twenty-two lines on this tree.
+Without the pathspec the grep also finds the docs that quote the marker, this entry
+among them, so its count there says nothing about code sites.
+
+D-105's table has a column "Caught by, at 1 000". Its split by check comes from the
+uncommitted harness (`sim/tests/s4_measure.rs`), whose output named the check that wrote
+each violation. The committed tests classify a violation by `mechanism`
+(sim/tests/node.rs), whose list names neither check 16 ("meta never goes back") nor check
+18 ("descriptor lineage"), so it counts both as "something else". Nightly 38144944562 (on
+ccdbf24) printed `MetaOverwritesByArrival` as `{"something else": 149}` and
+`IdBlockResumed` as `{"commit by current term": 8, "descriptor agreement": 3, "log
+matching": 11, "serving within span": 16, "something else": 500, "state machine safety":
+90}`, the 500 being D-105's 499 by check 18 and 1 by check 16. `main`'s nightly on
+f8a15a7 (39015093151) prints the same. The totals agree; only the split's source was
+unstated. A note appended to D-105 says both. No code line other than comments moves.
+
+### The move measured: no schedule and no trace moves
+
+The bits reach no frame and no trace event (D-045), and every site reads the same bit of
+the other set, so nothing should move. As D-105 did, the claim is measured. Before is
+`main` at f8a15a7; after is this entry's first commit, 72e362a. Both were built in
+release from one harness, `sim/tests/h1_measure.rs`, untracked and never committed. Its
+two copies differ only in a shim that names the sets: the variants in `NodeVariants`
+before, in `RangeVariants` after. Both ran on one machine (D-070: Darwin 27.0.0 arm64,
+Apple M2, 8 cores, on AC power). Two other slices' gates and sweeps ran beside them, at
+load averages of 70 to 460, and the runs took 2 520 s before and 2 804 s after; every
+figure is a count or a hash, which the host's load does not touch. For every run the
+harness printed the verdict, and the FNV-1a 64 hash and length of the run's moirae JSONL.
+The directed refusal scenario, `alone`, install and the re-seed shape export no JSONL, so
+for them it hashed `{:?}` of the records. `diff` of the two outputs is empty: 7 121 rows,
+every verdict, hash and length identical. The runs were:
+
+- **the membership scenario on the node, seeds 0 to 999**, under `AnyFreshNodeBootstraps`
+  and under the correct node;
+- **the directed refusal scenario** (`refused_whole`, 600 ms), seeds 0 to 999, under
+  `IncarnationPerRangeStream` and under the correct node, with every re-seeded replica's
+  incarnation;
+- **the node cluster, seeds 0 to 999**, under the correct node, under
+  `IncarnationPerRangeStream` (whose split site this cluster reaches) and under
+  `AnyFreshNodeBootstraps` (which has nothing to do on three bootstrap nodes);
+- **the pinned seeds.** On the node cluster: 272, 516, 368, 493, 633, 8885 and 2809 under
+  the correct node, 12 and 8 under `SharedSnapshotDir`, and 613 under
+  `ApplyWaitsForEveryRange`. On the sharded quorum scenario: 2 994 under the correct node
+  and `RefuseOneRangeOnly`. On the membership node: 1 and 1 969 under the correct node and
+  `AnyFreshNodeBootstraps`. Also the re-seed shape's seed 1, the refusal scenario's seed 1
+  under the instrument and the correct node, and `alone`'s seed 1;
+- **seed 42 on one group**: 13 241 905 bytes, whole-file FNV `addd005343895417`, body
+  `63099038ab531265` (D-105's `SEED_42_BODY_HASH`), on both trees;
+- **seeds 0 to 19** of the sharded quorum, membership-node, `ranges`, install and re-seed
+  scenarios under the correct node, every run green.
+
+The catch counts, over seeds `0..n` for each tier's `n`, are the same on both trees:
+
+| Variant | Scenario | Caught by | 20 | 100 | 1 000 |
+|---|---|---|---|---|---|
+| `AnyFreshNodeBootstraps` | membership, node | check 7's agreement step | 20 | 100 | 1 000 |
+| `AnyFreshNodeBootstraps` | membership, node | the run's own checks | 20 | 100 | 1 000 |
+| correct | membership, node | either | 0 | 0 | 0 |
+| `IncarnationPerRangeStream` | refusal, directed | the test's reading: each of the six replicas restates an incarnation, different from the correct node's | 20 | 100 | 1 000 |
+| `IncarnationPerRangeStream` | node cluster | the run's checks | 0 | 0 | 0 |
+| correct | node cluster | the run's checks | 0 | 0 | 0 |
+
+On the node cluster `AnyFreshNodeBootstraps` traces exactly as the correct node does, on
+all 1 000 seeds. `IncarnationPerRangeStream` there moves off the correct node's trace on
+20 of 20, 100 of 100 and 999 of 1 000 seeds. Those are exactly the seeds on which a split
+applies, and it moves on none without one: the split's site is reached, and nothing
+catches what it draws (#160).
+
+The tests see these seeds. The bootstrap test runs `high_rate_share()`, which is twenty
+seeds at the gate and in CI, a hundred at the premerge and a thousand in the nightly. The
+refusal test runs seed 1. `main`'s nightly on f8a15a7 (39015093151) printed the bootstrap
+test's 1 000 of 1 000, by check 7 and by the run's other checks. No assertion and no tier
+moves. The rows are in PR #164.
+
+### The plumbing is load-bearing: mutations
+
+No check is added or changed, so there is no check with more than one range to be wrong
+about, and no single-range mutation to show for one. What this entry adds that a mistake
+could silently empty is the plumbing. A set that reaches a scenario's configuration and
+not the site would leave each test passing while injecting nothing. Each mutation below
+was planted alone in a scratch worktree at 72e362a. The two tests were built in release
+and run at the gate's twenty, and the mutation was reverted before the next:
+
+| | Mutation | What fails |
+|---|---|---|
+| M0 | none | nothing: both tests pass, `AnyFreshNodeBootstraps` caught by check 7 on 20 of 20 |
+| M1 | `server::run`'s choice of bootstrap reads the correct set | the bootstrap test: check 7 catches 0 of 20, *"AnyFreshNodeBootstraps was not caught by check 7 on every membership seed"* |
+| M2 | `reseed`'s draw reads the correct set | the refusal test: *"IncarnationPerRangeStream draws range 0's number from its range's stream and not from the node's"*, the six incarnations the correct node's |
+| M3 | the membership scenario's `node_server_config` drops the set it is given | the bootstrap test, as under M1 |
+| M4 | the refusal scenario (`refused_sim`) drops the set it is given | the refusal test, as under M2 |
+| M5 | `server::run` hands `reseed` the correct set | the refusal test, as under M2 |
+| M6 | the split's draw reads the correct set | **nothing**: no test runs `IncarnationPerRangeStream` on a scenario that splits (#160) |
+
+Each failing mutation fails its own test and leaves the other passing. The script and
+its logs are in PR #164's record.
+
+### PROPOSED, for the owner: Stage D builds `IncarnationFromRangeStream`, because `IncarnationPerRangeStream` cannot stand in for it
+
+Stage D's question 1 proposes `IncarnationFromRangeStream` for the re-add window
+assertion, a variant "which draws a replica's incarnation from a named stream derived
+anew at each creation of a replica of the same (range, node)" (SHARD.md:2586-2591).
+#151's second comment recommends extending `IncarnationPerRangeStream` to the re-add's
+draw instead, so that one variant breaks the rule wherever an incarnation is drawn. That
+would inject nothing the assertion can see, because of what `range_rng` is.
+
+`IncarnationPerRangeStream` draws from `Environment::range_rng(range)`. That call hands
+back the node's one stream for the range, "made from the seed and the name the first time
+it is asked for … and the same shared stream every time after"
+(crates/ananke-env/src/sim/state.rs:178-193). Every handle and every call continue where
+the last draw left it (crates/ananke-env/src/env.rs:36-42), which
+`every_env_handle_continues_a_nodes_range_stream` asserts
+(crates/ananke-env/src/sim/tests.rs:1535-1550). `SimRng` is a shared handle
+(`Arc<Mutex<Pcg32>>`), and a crash leaves the node's streams where they were. A scratch
+check on this branch drew range 2's stream on node 1 of seed 1, crashed and restarted the
+node, and drew again: it got the stream's first number, then its second.
+
+So under the variant, a replica created again for the same (range, node) draws the
+stream's next number, not its predecessor's. A re-add's `RangeCreated` under it would
+carry an incarnation no collected replica had. The assertion's second clause trips only
+on one of (X, n)'s collected incarnations (SHARD.md:1366-1371), so it would see nothing,
+and a variant the assertion cannot catch fails the pair rule. The same holds where the
+variant is read today. A re-seed draws the stream's next number, which no earlier
+incarnation of the replica had: the bootstrap's is 1, and an earlier re-seed's was an
+earlier draw of the same stream. A split's right half has an id new to every node
+(check 18's range-id clause). So the variant changes the draw at both sites, and repeats
+nothing: the node cluster's checks pass it on all 1 000 seeds above.
+
+The repeat SHARD.md:1379-1383 names needs a stream derived anew at each creation. That is
+what `node_stream` does inside the simulator (crates/ananke-env/src/sim/state.rs:171-176),
+and `Environment` does not hand such a stream out. SHARD.md's parenthetical at
+1379-1381, that §4's `n{id}/r{range}/protocol` "would be" such a stream, describes the
+design before D-057 built `range_rng` as a shared one. The rule stands as written (issue
+#165).
+
+**Recommended:** Stage D builds `IncarnationFromRangeStream` as question 1 proposes. Every
+draw of a replica's incarnation at its creation takes the first number of a stream
+derived anew for the (range, node) at that creation. `IncarnationPerRangeStream` stays what
+D-077 built: the re-seed's and the split's draw taken from the wrong generator, caught by
+the draw. The two break the same rule in two different ways, and each doc says which.
+
+Two caveats go with the recommendation, so that the owner sees what it costs and what it
+catches (#164's review):
+
+- **It repeats only a drawn incarnation.** A stream derived anew gives a replica created
+  again the number its predecessor drew from the same stream, and nothing else.
+  - A bootstrap replica's incarnation is `FIRST_INCARNATION`, which is 1 and never drawn
+    (crates/ananke-raft/src/store.rs:247), and its `RangeCreated` carries it
+    (crates/ananke-shard/src/server.rs:3182).
+  - So when a node is re-added to a range it held from the bootstrap, the first re-add
+    draws a number of its own even under the variant, and neither clause of the re-add
+    assertion trips.
+  - The variant trips only where the collected replica was itself created by a draw that
+    reads it: a move's placeholder, a split's right half, a re-seed.
+  - Its catch rate is therefore the schedule's: a non-bootstrap replica collected, then
+    its node re-added. It is to be measured before any tier asserts it (D-061).
+- **It needs a stream the node does not have.** Node code holds no seed, and `Environment`
+  hands out no stream derived anew, only `range_rng`'s shared one. Building the variant
+  needs one of two things:
+  - an addition to `Environment`: a stream derived from the seed and a name at each call,
+    which is the simulator's `node_stream`, exposed;
+  - or a stream derived from the (range, node) name alone. That repeats as the variant
+    needs, but draws the same numbers on every seed.
+
+Neither weakens the case against reusing `IncarnationPerRangeStream`: under it the re-add
+would repeat nothing at all.
+
+The alternative the issue recommends, one variant read at every creation site, would
+need `IncarnationPerRangeStream`'s stream changed to one derived anew. That changes the
+variant's runs: the re-seed would no longer advance the range's stream, so the cores'
+seeds at that start would move. It is not this slice's. SHARD.md's question 1 is the
+owner's to answer and is not edited.
+
+`IncarnationPerRangeStream`'s doc, moved from D-077's, said that "`SimEnv` derives a named
+stream from the seed and the name alone, so a replica created again for the same (range,
+node) draws the number its predecessor drew". That is true of `node_stream` and not of
+`range_rng`. `reseed`'s doc said the same of the range's protocol stream. Both now say
+what the variant draws, what catches it, and that it does not reach the repeat. The
+range layer's module doc says why Stage D's variant is not this one read at one more
+site. D-077's item 4 gave the same reason, and a note appended to D-077 says it does not
+hold of `range_rng`. No code line other than comments moves.
+
+### #156: the seeds `TrustStaleDescriptor` is not caught on, re-derived
+
+The test's comment said the variant is caught on 99 of 100 at the premerge's share, and
+named seed 48 as the one it is not caught on. Measured on 72e362a in release, over seeds
+0 to 999 of the node cluster under the variant, it is caught on **20 of 20**, **100 of
+100** and **998 of 1 000**. Seed 48 is among the caught: server 2 serves a read of `k2`
+from range 2 at 214.8 ms, and the incremental checker stops the run at 500 ms with check
+9's verdict. The two seeds it is not caught on are **184 and 819**. #152's harness found
+the same on b01db39 and ccdbf24, and `main`'s nightly on f8a15a7 (39015093151) prints the
+same 998 of 1 000 at its share. The schedule has moved since D-097 wrote the comment. The
+test now prints the seeds it is not caught on, so the nightly reports them itself.
+
+**How the variant is caught.** The variant skips the receipt and serving checks, so it is
+caught when any range serves a read of a key outside its span (check 9). A diagnostic
+over seeds 0 to 999 read both clients' records: their `ClientInvoke`, `ClientSend`,
+`ClientReturn` and `ClientMismatch`. Beside them it read `RangeMismatchSent` at apply,
+`RangeSplit`, and every user range's `RaftRead`, with check 7's map of descriptors to say
+which read is outside its range's span. The 998 catches come three ways:
+
+- **Through client 1's stale range-2 entry**, on 992 seeds. Range 2 serves a key of
+  range 3, 4 or 5 before a write to that range has corrected the entry. The cache merges
+  a learned descriptor only over the part of a lower-generation entry it overlaps
+  (crates/ananke-shard/src/client.rs:169-185). So each of the three is corrected
+  separately, by a write to it that is refused at apply and whose `RangeMismatch` the
+  client merges.
+- **Through a client's cached entry for a range that split**, on five. A read is routed
+  to the parent after the split and served from the parent's state: range 2's split on
+  seeds 503 (client 2), 579, 660 and 759 (client 1), and range 3's on 999 (client 2).
+  That is §10's own shape for this variant, a split while a client's cache names the
+  parent.
+- **A read in flight across a split**, on seed 282. Client 2 sends a read of `k3` to
+  range 3 at 6.909 s, 6 ms before range 3's split at `k3` first applies. Server 1 serves
+  it at applied index 36, after the split, at 6.923 s. The serving check exists for
+  this, and the variant skips it.
+
+A refusal corrects a cache only when the client is still waiting for it. On 999, client
+2's cas of `k3` through its stale range-3 entry is refused at apply at 14.066 s, after the
+client has abandoned it, so nothing is merged. Its read of `k3` through the same entry is
+then served at 15.107 s.
+
+**The misses.** On 184 and 819 no read is served through a stale entry at all. Every
+operation through one is a write refused at apply, with two exceptions, and neither is a
+served read:
+
+- **Seed 184.** Client 1's range-2 entry is first taken, for ranges 5, 4 and 3, by a put
+  of `k6`, a cas of `k4` and a put of `k3`. Each is refused at apply, at 243, 307 and
+  370 ms, and merged. Its one read through the entry, its first operation, is of range
+  2's own key `k1`, which server 3 serves within range 2's span at 214 ms. The run's two
+  splits leave both clients' entries for the parent stale for the right half, and every
+  operation through them is a write:
+  - after range 3's split at `k3` (12.03 s), client 2's cas of `k3` at 12.06 s is refused
+    and merged. Client 1's cas of `k3` at 12.54 s is abandoned unanswered, the first
+    exception; its next, at 14.18 s, is refused and merged;
+  - after range 5's split at `k7` (16.22 s), client 1's delete of `k7` at 16.24 s is
+    refused and merged. Client 2's delete of `k7` at 16.28 s is refused after client 2
+    has abandoned it, and its cas of `k7` at 16.56 s is refused and merged.
+- **Seed 819.** Client 1's first operation is a read of `k4` through the stale entry at
+  0 ms, the second exception. It is sent to servers 1, 2, 3, 1 and 2 before range 2 elects
+  its first leader (server 2, at 194 ms), then to servers 3 and 1, and is abandoned
+  unserved at 255 ms. After it the entry is taken for ranges 3, 5 and 4 by deletes of
+  `k3`, `k6` and `k5`, refused at apply at 279, 357 and 682 ms and each merged. After
+  range 4's split at `k5` (11.62 s), client 2's cas of `k5`, sent to range 4 just before
+  the split applies, is refused at apply and resent to range 46. Client 1's put of `k5`
+  at 11.79 s through its stale range-4 entry is refused at apply and merged.
+
+The first version of this section, at 49ef296, was wrong in three ways. It read only
+client 1's records and range 2's reads. It called every catch range 2's. It said 184's
+splits never cut range 2, and so did not matter. #164's adversarial review found the
+catches through range 3 (282, 999) and the splits' routes on 184 and 819. The
+re-derivation above is over both clients' records.
+
+The 21 seeds whose first operation through client 1's entry is a write on each of ranges
+3, 4 and 5 stand as measured, and 20 of them are caught. On 18, the catch comes through a
+range whose first write was abandoned unanswered. On 579 and 759 it comes through range
+2's split.
+
+The comment now says how the 998 are caught and what the misses do, and the test prints
+the misses. It moves no assertion and no tier: the test asserts `caught > 0` at every
+tier and prints the rate. The same test's second figure, the apply check refusing a
+trusted write, was "17 of 20 at the gate". It is 15 of 20 at the gate and in CI, 72 of
+100 at the premerge's share and 720 of 1 000 at the nightly's, and the comment says so.
+That is far above D-061's 5 %, so the assertion's tier stands. The diagnostics that read
+the records, `sim/tests/h1_stale.rs` and `sim/tests/h1_routes.rs`, are untracked and were
+never committed. Their rows are in PR #164.
+
+### Consequences
+
+- The range layer's set holds §10's five and two instruments. The node's holds Stage B's
+  forty-seven and none of §10's.
+- `membership::run_on_node` and `run_on_with_node`, and `ranges::refused_whole`,
+  `refused_whole_dirs` and `refused_whole_restarted`, take the range layer's set beside
+  the node's.
+- No schedule, no trace, no pinned hash, no assertion and no tier moves: measured above,
+  7 121 runs identical on both trees.
+- `IncarnationPerRangeStream`'s doc and `reseed`'s say that `range_rng` continues, so the
+  variant changes a draw and repeats no incarnation.
+
+### What the PR asks
+
+- **PROPOSED, this entry's:** the two instruments in the range layer's set, outside §10's
+  count. This answers issue #151 and D-105's PROPOSED point as D-105 recommended.
+- **PROPOSED, for the owner:** Stage D's question 1 answered as SHARD.md proposes it.
+  Stage D builds `IncarnationFromRangeStream`, a stream derived anew at each creation,
+  read at every draw of a replica's incarnation at its creation. It does not extend
+  `IncarnationPerRangeStream`, whose stream continues and which the assertion could not
+  catch, so #151's recommendation is not taken. Two caveats go with it:
+  - it trips only on a re-add whose collected predecessor drew its incarnation, never on
+    one whose predecessor was a bootstrap replica, so its rate is to be measured;
+  - it needs an `Environment` addition or a stream derived from the name alone.
+  SHARD.md's parenthetical at 1379-1381 is issue #165.
+
+---
+
+_Next entry: D-109. Add one before implementing anything not covered above._

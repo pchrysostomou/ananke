@@ -1488,13 +1488,24 @@ fn an_apply_task_that_waits_for_every_range_is_caught_by_the_lag_fold_on_the_nod
 /// to do: its run is byte-identical to the correct node's, which is the absence
 /// asserted with its reason (CLAUDE.md), rather than a sweep passed by injecting
 /// nothing.
+///
+/// The variant is a range-layer instrument outside §10's count since PROPOSED D-108,
+/// which moved it out of the node's set and measured the move: every verdict, catch
+/// and trace hash of this test's runs is the same on both sides of it.
 // PROPOSED(D-096): the bootstrap nodes named in configuration.
+// PROPOSED(D-108): the instrument in the range layer's set.
 #[test]
 fn a_fresh_node_that_bootstraps_itself_is_caught_by_check_7_where_it_is_not_a_bootstrap_node() {
     let seeds = high_rate_share();
-    let taken = NodeVariants::of(&[NodeVariant::AnyFreshNodeBootstraps]);
+    let taken = RangeVariants::of(&[RangeVariant::AnyFreshNodeBootstraps]);
     let outcomes: Vec<(Option<String>, Option<String>, Option<String>)> = sweep(seeds, |seed| {
-        let report = membership::run_on_node(Cluster::Node, seed, Variants::default(), taken);
+        let report = membership::run_on_node(
+            Cluster::Node,
+            seed,
+            Variants::default(),
+            NodeVariants::correct(),
+            taken,
+        );
         (
             ananke_sim::ranges::creations_agree_of(&report.records).err(),
             report.check().err(),
@@ -1549,6 +1560,7 @@ fn a_fresh_node_that_bootstraps_itself_is_caught_by_check_7_where_it_is_not_a_bo
         1,
         Variants::default(),
         NodeVariants::correct(),
+        RangeVariants::correct(),
     );
     ananke_sim::ranges::creations_agree_of(&honest.records)
         .expect("the correct membership node's creations agree on every range");
@@ -1559,7 +1571,7 @@ fn a_fresh_node_that_bootstraps_itself_is_caught_by_check_7_where_it_is_not_a_bo
         NodeVariants::correct(),
         RangeVariants::correct(),
     );
-    let pretending = raft::run_on_the_node(1, Variants::default(), taken, RangeVariants::correct());
+    let pretending = raft::run_on_the_node(1, Variants::default(), NodeVariants::correct(), taken);
     assert_eq!(
         correct.jsonl(),
         pretending.jsonl(),
@@ -1700,12 +1712,31 @@ fn a_server_that_trusts_a_stale_descriptor_is_caught_by_check_9_on_the_node() {
         &[RangeVariant::TrustStaleDescriptor],
     );
     let caught = outcomes.iter().filter(|o| o.why.is_some()).count();
-    // A rate, not every seed: 20 of 20 at the gate and 99 of 100 at the premerge's
-    // share. Seed 48 is the one it is not caught on, and legitimately: its stale
-    // clients' first operations on their stale ranges are writes, which the apply
-    // check refuses and the resend corrects the cache by, so no read is ever served
-    // through a stale route there. The variant's harm needs a read before a write on
-    // the same stale route, which is the schedule's to give (D-061: far above 5 %).
+    // A rate, not every seed: 20 of 20 at the gate and in CI, 100 of 100 at the
+    // premerge's share and 998 of 1 000 at the nightly's, and the test prints the seeds
+    // it misses. The variant is caught when a range serves a read of a key outside its
+    // span. At the nightly's share that happens three ways. On 992 seeds it is through
+    // client 1's stale range-2 entry, before a write to the key's range has corrected
+    // it: the apply check refuses the write, and the client merges the descriptors its
+    // `RangeMismatch` carries. On five it is through a client's cached entry for a
+    // range that split: range 2's on seeds 503, 579, 660 and 759, range 3's on 999. On
+    // 282 it is a read sent to range 3 just before its split applied and served just
+    // after. On the two misses, seeds 184 and 819, no read is served through a stale
+    // entry at all. Every operation through one, client 1's range-2 entry or a client's
+    // entry for a range that split (ranges 3 and 5 on 184, range 4 on 819), is a write
+    // refused at apply, with two exceptions: on 184 client 1's cas of `k3` after range
+    // 3's split, abandoned unanswered, and on 819 client 1's first operation, a read of
+    // `k4` sent before range 2 had a leader, then only to followers, and abandoned
+    // unserved. Seed 48, which an earlier comment named as the miss, is caught. The
+    // seeds were re-derived from both clients' records in release. The variant's harm
+    // is the schedule's to give (D-061: far above 5 %).
+    // PROPOSED(D-108): the misses re-derived (#156), and printed.
+    let missed: Vec<u64> = outcomes
+        .iter()
+        .filter(|o| o.why.is_none())
+        .map(|o| o.seed)
+        .collect();
+    println!("node: TrustStaleDescriptor not caught on seeds {missed:?}");
     assert!(
         caught > 0,
         "TrustStaleDescriptor was caught on no seed: a stale client's read served from \
@@ -1725,9 +1756,10 @@ fn a_server_that_trusts_a_stale_descriptor_is_caught_by_check_9_on_the_node() {
     // Q10's path reached on the correct apply code. A rate and not every seed,
     // because the incremental checker stops the run at check 9's first violation —
     // a read served from the wrong range — and on some seeds that read comes before
-    // any trusted write reaches apply: measured at 17 of 20 at the gate, so it is
-    // asserted at every tier (D-061) and printed. No write was applied in the
-    // wrong range: the apply check, kept by this variant, refused every one.
+    // any trusted write reaches apply: measured at 15 of 20 at the gate and in CI, 72
+    // of 100 at the premerge's share and 720 of 1 000 at the nightly's, far above
+    // D-061's 5 %, so it is asserted at every tier and printed. No write was applied in
+    // the wrong range: the apply check, kept by this variant, refused every one.
     let reached = outcomes.iter().filter(|o| o.at_apply > 0).count();
     assert!(
         reached > 0,
@@ -2514,11 +2546,22 @@ fn the_range_layers_folds_agree_one_by_one_and_check_18_trips_under_id_block_res
 #[test]
 fn the_range_layers_folds_agree_one_by_one_and_check_7_trips_under_any_fresh_node_bootstraps() {
     let compared = range_folds_compared();
-    let taken = NodeVariants::of(&[NodeVariant::AnyFreshNodeBootstraps]);
+    // An instrument of the range layer's own set since PROPOSED D-108 (#151).
+    let taken = RangeVariants::of(&[RangeVariant::AnyFreshNodeBootstraps]);
+    let membership_run = |seed: u64| {
+        membership::run_on_node(
+            Cluster::Node,
+            seed,
+            Variants::default(),
+            NodeVariants::correct(),
+            taken,
+        )
+        .records
+    };
     let found = range_folds_under(
         "AnyFreshNodeBootstraps on the membership scenario",
         compared,
-        |seed| membership::run_on_node(Cluster::Node, seed, Variants::default(), taken).records,
+        membership_run,
     );
     assert_eq!(
         tripped_on(&found, Fold::DescriptorAgreement),
@@ -2535,7 +2578,7 @@ fn the_range_layers_folds_agree_one_by_one_and_check_7_trips_under_any_fresh_nod
             None => compare_range_folds(
                 seed,
                 "AnyFreshNodeBootstraps on the membership scenario, pinned",
-                &membership::run_on_node(Cluster::Node, seed, Variants::default(), taken).records,
+                &membership_run(seed),
             )
             .unwrap_or_else(|mismatch| panic!("{mismatch}"))
             .tripped
@@ -2572,6 +2615,7 @@ fn the_range_layers_folds_agree_one_by_one_and_check_7_trips_under_any_fresh_nod
             seed,
             Variants::default(),
             NodeVariants::correct(),
+            RangeVariants::correct(),
         )
         .records
     });
