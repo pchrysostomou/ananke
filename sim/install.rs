@@ -9,12 +9,18 @@
 //! the floor in silence (D-082). This scenario is the opposite of those: it is built to
 //! reach the path on every seed, and it fails if it does not.
 //!
-//! **The shape.** Five voters and four ranges. Three nodes start; **two start late**,
-//! after the running three have written past `snapshot_threshold` and their leaders
-//! have compacted. The two late nodes are then behind every range's compacted prefix,
-//! so each range's leader must stream to *both at once* — four ranges times two
-//! followers, eight streams, which is what makes "per range and per follower" a claim
-//! this scenario can check rather than a phrase.
+//! **The shape.** Five nodes and four ranges. The three bootstrap nodes start; **two
+//! nodes that join start late**, after the running three have written past
+//! `snapshot_threshold` and their leaders have compacted, and an operator asks every
+//! range for the five as voters. A node that joins holds nothing (SHARD.md §2): the
+//! leader adding it as a learner makes it a placeholder of the range, and the
+//! placeholder's refused server's answer puts it behind the compacted prefix, so each
+//! range's leader must stream to *both at once* — four ranges times two followers,
+//! eight streams, which is what makes "per range and per follower" a claim this
+//! scenario can check rather than a phrase. Until PROPOSED D-109 the five were all
+//! bootstrap nodes and the late two bootstrapped their own replicas when they started;
+//! there are exactly three bootstrap nodes now (§2; Q7, Q32), and the late two get
+//! every replica through an install into a placeholder.
 //!
 //! Two nodes rather than one is deliberate: with a single follower behind the prefix,
 //! a leader that fed its followers one at a time would be indistinguishable from one
@@ -73,10 +79,10 @@ use bytes::Bytes;
 use crate::raft::{TICK, client_addr, server_addr};
 use crate::ranges::{DIR, FIRST_RANGE, RANGES, SNAPSHOT_CAP, range_of_key};
 
-/// Voters in the cluster.
+/// The nodes in the cluster, and every range's voters once the operator's change lands.
 pub const NODES: u64 = 5;
-/// The three that start at once: a majority of five, so the cluster makes progress
-/// while the other two are not there.
+/// The three that start at once, the bootstrap nodes (SHARD.md §2; PROPOSED D-109): the
+/// cluster's voters until the two that join are added.
 pub const NODES_AT_ONCE: u64 = 3;
 /// How many keys the writer cycles through.
 const KEYS: u64 = 8;
@@ -512,8 +518,8 @@ impl Report {
     }
 }
 
-/// One node's configuration for this scenario: five voters, four ranges, and a
-/// threshold low enough that the path is reached.
+/// One node's configuration for this scenario: three bootstrap nodes, four ranges, and
+/// a threshold low enough that the path is reached.
 #[must_use]
 pub fn server_config(id: u64, variants: impl Into<Variants>, node: NodeVariants) -> ServerConfig {
     let mut engine = EngineConfig::new(PathBuf::from(DIR));
@@ -525,7 +531,8 @@ pub fn server_config(id: u64, variants: impl Into<Variants>, node: NodeVariants)
         listen: server_addr(id),
         servers: (1..=NODES).map(|s| (ServerId(s), server_addr(s))).collect(),
         ranges: crate::ranges::ranges(),
-        bootstrap: (1..=NODES).map(ServerId).collect(),
+        // PROPOSED(D-109): exactly three bootstrap nodes; the late two join.
+        bootstrap: (1..=NODES_AT_ONCE).map(ServerId).collect(),
         raft: RaftConfig {
             variants: variants.into(),
             tick_nanos: u64::try_from(TICK.as_nanos()).expect("small"),
@@ -658,6 +665,73 @@ async fn writer<E: Environment>(env: E, up_to: Arc<Mutex<u64>>, stop: Arc<Atomic
     }
 }
 
+/// The operator: asks every range, again and again, for all five nodes as its voters,
+/// once the two that join have started (RAFT.md §1, D-029). A leader adds the two as
+/// learners, which reaches them as placeholders (SHARD.md §5); a leadership change
+/// before the joint entry abandons the change (D-032), and the operator's next ask
+/// starts it again, which a request for the same voters makes harmless.
+// PROPOSED(D-109): the late two are added by a change, as a node that joins is.
+async fn operator<E: Environment>(env: E) {
+    let Ok(sock) = env.net().bind(client_addr(2)).await else {
+        return;
+    };
+    let voters: Vec<u64> = (1..=NODES).collect();
+    let mut leaders: BTreeMap<u64, u64> = BTreeMap::new();
+    let mut seq = 0u64;
+    loop {
+        for range in FIRST_RANGE..FIRST_RANGE + RANGES {
+            seq += 1;
+            let target = leaders
+                .get(&range)
+                .copied()
+                .unwrap_or_else(|| 1 + env.rng().below(NODES_AT_ONCE));
+            let request = RangedRequest {
+                generation: FIRST_GENERATION,
+                range: RangeId(range),
+                request: Request {
+                    client: 2,
+                    seq,
+                    command: Command::Change {
+                        voters: voters.clone(),
+                    },
+                },
+            };
+            let _ = sock.send(server_addr(target), request.encode()).await;
+            let deadline = env.clock().now() + Duration::from_millis(80);
+            loop {
+                let recv = pin!(sock.recv());
+                let timer = pin!(env.clock().sleep_until(deadline));
+                let bytes = match race(&env, recv, timer).await {
+                    Either::Left(Ok((_, bytes))) => bytes,
+                    Either::Left(Err(_)) | Either::Right(()) => {
+                        leaders.remove(&range);
+                        break;
+                    }
+                };
+                let Ok(response) = RangedResponse::decode(bytes) else {
+                    continue;
+                };
+                if response.response.seq != seq {
+                    continue;
+                }
+                match response.response.reply {
+                    Reply::NotLeader { leader: Some(who) } => {
+                        leaders.insert(range, who.0);
+                    }
+                    Reply::Outcome(_) => {
+                        leaders.insert(range, target);
+                    }
+                    Reply::NotLeader { leader: None } | Reply::RangeMismatch { .. } => {
+                        leaders.remove(&range);
+                    }
+                }
+                break;
+            }
+        }
+        env.clock().sleep(Duration::from_millis(250)).await;
+    }
+}
+
 /// Runs the scenario for `seed`.
 #[must_use]
 pub fn run(seed: u64, variants: impl Into<Variants>, node_variants: NodeVariants) -> Report {
@@ -685,9 +759,16 @@ pub fn run(seed: u64, variants: impl Into<Variants>, node_variants: NodeVariants
     // that fed it.
     stop.store(true, Ordering::Relaxed);
     let wrote = *committed.lock().expect("the counter");
-    // And the other two arrive, behind every range's compacted prefix.
+    // And the other two arrive, holding nothing, and the operator asks every range
+    // for them: each range's leader adds them, and feeds each its range's snapshot
+    // through the placeholder its first message makes of it (PROPOSED D-109).
     for id in NODES_AT_ONCE + 1..=NODES {
         spawn(&sim, nodes[id as usize - 1], id, variants, node_variants);
+    }
+    {
+        let env = sim.env(client);
+        let inner = env.clone();
+        env.spawn("operator", operator(inner));
     }
     sim.run_for(AFTER);
     Report {
