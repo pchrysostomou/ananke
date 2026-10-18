@@ -1049,15 +1049,17 @@ impl<E: Environment> RaftStore<E> {
     /// install's number sees the span it replaced as empty rather than as it stood
     /// (D-054, and [`Snapshot`]'s own documentation). A value and an applied index
     /// taken at one version could then straddle a switch and be the state at no
-    /// index at all. Nothing can reach that today: `Engine::install_span`,
-    /// `install_spans`, `delete_range` and `delete_ranges` have no caller outside
-    /// ananke-storage's own tests and the engine sweep — none in this crate, in
-    /// `ananke-server` or in the raft scenarios — and a server's engine is fixed for
-    /// the life of its incarnation, a re-seed opening a fresh one in a new directory
-    /// behind a restart. Stage B's live per-range install (SHARD.md §11, storage 8)
-    /// is what makes the straddle possible, and that item carries this caveat, filed
-    /// as issue #72: it must say what a read served across an install of its own
-    /// range sees.
+    /// index at all. A server cannot reach that: its engine is fixed for the life of
+    /// its incarnation, a re-seed opening a fresh one in a new directory behind a
+    /// restart, and nothing it runs calls `Engine::install_span`, `install_spans`,
+    /// `delete_range` or `delete_ranges`. Two callers can: the node's live per-range
+    /// install (`ananke-shard`, SHARD.md §11, storage 8), which carries this caveat as
+    /// issue #72 — what a read served across an install of its own range sees — and
+    /// [`apply_removing`](Self::apply_removing) here, a split's apply on a replica that
+    /// is not a voter of the parent, whose switch replaces this key's one-key span, so
+    /// that a read at a version below it finds the applied index absent, which reads
+    /// as zero. Nothing reads a non-voter's applied index at such a version: the path
+    /// is reached by no scenario until Stage D's move after a split (PROPOSED D-107).
     ///
     /// Zero where the key is absent at that version, which is to say where nothing
     /// had applied when it was taken. A served read cannot see it: the core holds a
@@ -1293,6 +1295,70 @@ impl<E: Environment> RaftStore<E> {
         out.put_u64_le(index);
         writes.put(self.prefix.applied_key(), out.freeze());
         self.engine.write(writes, true).await?;
+        self.applied.store(index, Ordering::Release);
+        Ok(())
+    }
+
+    /// Applies entry `index` as [`apply`](Self::apply) does and removes every key of
+    /// `removed` with it, in one atomic step: the writes and the applied index ride as
+    /// the repair of an install of nothing over `removed` and over each written key's
+    /// own one-key span (`[key, key ++ 0)`, which holds that key alone), so a single
+    /// manifest switch makes the removal and the writes durable together, and a crash
+    /// at any point leaves all of them or none (D-066, D-068: the install's repair).
+    /// No new primitive: the engine's range delete is that install with an empty
+    /// repair, and a batch has no range delete of its own.
+    ///
+    /// **It is not a cheap write.** An install replaces its spans' history, so every
+    /// table that holds an older write of a written key is read and written again
+    /// without it; the applied-index key is in every apply batch, which makes that
+    /// nearly every table holding one of this store's applies, beside the removed
+    /// span's own. On a nine-entry store the step takes some 48 ms of the simulated
+    /// disk, and a read at a version below its switch finds the applied index absent
+    /// ([`applied_at`](Self::applied_at)). Its one caller is reached by no scenario
+    /// until Stage D (issue #169).
+    ///
+    /// `removed` must hold no key the writes write; in its one caller it is a split's
+    /// right span, in the user tenant, and the writes are under this store's prefix.
+    ///
+    /// # Errors
+    ///
+    /// As [`apply`](Self::apply)'s, and the install's: refused
+    /// ([`ananke_storage::InstallRefused::InProgress`]) while another install runs on
+    /// the engine, with nothing written, which the caller retries; refused for spans
+    /// that overlap when `removed` holds a written key.
+    // PROPOSED(D-107): a split's non-voter writes its batch and the right span's
+    // removal in one switch (SHARD.md §5; issue #139).
+    pub async fn apply_removing(
+        &self,
+        index: Index,
+        mut writes: WriteBatch,
+        removed: std::ops::Range<Bytes>,
+    ) -> io::Result<()> {
+        let applied = self.applied();
+        if index != applied + 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("applying {index} after {applied}"),
+            ));
+        }
+        let mut out = BytesMut::with_capacity(8);
+        out.put_u64_le(index);
+        writes.put(self.prefix.applied_key(), out.freeze());
+        let mut spans: Vec<std::ops::Range<Bytes>> = writes
+            .ops()
+            .iter()
+            .map(|(key, _)| {
+                let mut past = key.to_vec();
+                past.push(0);
+                key.clone()..Bytes::from(past)
+            })
+            .collect();
+        spans.push(removed);
+        spans.sort_by(|a, b| a.start.cmp(&b.start));
+        spans.dedup();
+        self.engine
+            .install_spans(spans, ananke_storage::SpanSource::empty(), writes)
+            .await?;
         self.applied.store(index, Ordering::Release);
         Ok(())
     }
