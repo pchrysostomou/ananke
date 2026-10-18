@@ -1024,7 +1024,9 @@ pub enum TraceEvent {
     RangeDescriptor {
         /// The range.
         range: u64,
-        /// The index the descriptor took this value at.
+        /// The index the descriptor took this value at: the apply's. A restatement
+        /// and an install do not keep it and carry the replica's applied index here
+        /// too, as `applied` (PROPOSED D-107).
         index: u64,
         /// The replica's applied index: the snapshot's last index for an install,
         /// the replica's own at a restatement.
@@ -1044,8 +1046,10 @@ pub enum TraceEvent {
     /// restatement at a start.
     // PROPOSED(D-069): defined and exported here; emitted by the stage that
     // builds what it reports.
+    // PROPOSED(D-107): emitted at every start of a node.
     RangesRestated {
-        /// The ranges restated, sorted.
+        /// The ranges restated, sorted: every initialised replica the node holds, one
+        /// with a descriptor (PROPOSED D-107).
         ranges: Vec<u64>,
     },
     /// A node made a placeholder for a range it does not hold (SHARD.md §5).

@@ -908,12 +908,19 @@ impl<E: Environment> ServerHost<E> {
     /// replica held, the snapshot's index and term, the configuration in force at it,
     /// the kept tail and the quarantine.
     // PROPOSED(D-083): the replica a switch builds replaces the one it replaced.
+    //
+    // `descriptor` is the one the switch put in place, read back from the store, and
+    // `changed` the same when it differs from the one the replica held before: an
+    // install creates a replica with the snapshot's descriptor and changes an
+    // initialised one's to it (SHARD.md §8; PROPOSED D-107).
     fn installed(
         &self,
         range: RangeId,
         core: &Raft,
         at: &Identity,
         config: &Configuration,
+        descriptor: Option<&RangeDescriptor>,
+        changed: Option<&RangeDescriptor>,
     ) -> Option<Raft> {
         // The switched range's span: its descriptor as the host holds it, which a
         // split's right half has and configuration never names (PROPOSED D-100), and
@@ -987,14 +994,36 @@ impl<E: Environment> ServerHost<E> {
             // The span encoded, as every other creation traces it (D-096); D-096's
             // own install creation traced the configured keys raw, which check 7 saw
             // the first time it was folded over a re-seed (PROPOSED D-098).
+            //
+            // The span, the generation and the voters are the snapshot's descriptor's
+            // (SHARD.md §8: the creation carries the replica's descriptor). This
+            // traced the first generation and the configuration's voters whatever
+            // the snapshot held, so a re-seeded replica installed from a range that
+            // had split was created at generation 1 with the split's span, a value
+            // check 7 holds no range at; a snapshot with no descriptor, which no
+            // take of this tree makes, keeps the old reading (PROPOSED D-107).
+            let (generation, voters) = descriptor.map_or_else(
+                || {
+                    (
+                        FIRST_GENERATION,
+                        config.voters.iter().map(|voter| voter.0).collect(),
+                    )
+                },
+                |descriptor| {
+                    (
+                        descriptor.generation,
+                        descriptor.voters.iter().map(|voter| voter.0).collect(),
+                    )
+                },
+            );
             self.env.trace(TraceEvent::RangeCreated {
                 range: range.get(),
                 cause: RangeCause::Snapshot,
                 parent: None,
                 start: span.start.clone(),
                 end: span.end.clone(),
-                generation: FIRST_GENERATION,
-                voters: config.voters.iter().map(|voter| voter.0).collect(),
+                generation,
+                voters,
                 floor_index: at.last_index,
                 floor_term: at.last_term,
                 incarnation: lock(&self.stores)
@@ -1032,6 +1061,17 @@ impl<E: Environment> ServerHost<E> {
                 RecoveredAs::Neither
             },
         });
+        // An install onto an initialised replica that changes its descriptor — P's
+        // post-split snapshot onto a P that never applied the split — is traced as a
+        // `RangeDescriptor` at the snapshot's last index (SHARD.md §5, §8). It follows
+        // the replica's `RaftRecovered`, which states the applied index it is read at,
+        // so check 7 reads it as a statement and not as a value an apply put; the
+        // switch's own records stay at one instant before it (D-091's fourth arm).
+        // A creation's descriptor is its `RangeCreated`, above.
+        // PROPOSED(D-107)
+        if !created && let Some(descriptor) = changed {
+            state_descriptor(&self.env, descriptor, at.last_index);
+        }
         Some(restored)
     }
 }
@@ -1385,10 +1425,13 @@ impl<E: Environment> Host for ServerHost<E> {
                 // The descriptor the switch put in place is what the receipt check
                 // reads from here on (SHARD.md §3).
                 // PROPOSED(D-097)
-                if let Some(descriptor) = descriptor {
-                    lock(&self.descriptors).insert(*range, (**descriptor).clone());
-                }
-                match self.installed(*range, core, at, config) {
+                let before = descriptor.as_ref().and_then(|descriptor| {
+                    lock(&self.descriptors).insert(*range, (**descriptor).clone())
+                });
+                let changed = descriptor
+                    .as_deref()
+                    .filter(|descriptor| before.as_ref() != Some(*descriptor));
+                match self.installed(*range, core, at, config, descriptor.as_deref(), changed) {
                     Some(installed) => CoreWork::Restore(Box::new(installed)),
                     None => CoreWork::Release,
                 }
@@ -3104,6 +3147,8 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
     // named at bootstrap, before its install — has no entry.
     // PROPOSED(D-097)
     let descriptors: Arc<Mutex<BTreeMap<RangeId, RangeDescriptor>>> = Arc::default();
+    // The initialised replicas this start restated, for `RangesRestated` (§8).
+    let mut restated: Vec<u64> = Vec::new();
     for (range, store, recovered) in opened {
         let id_of = range.id;
         lock(&stores).insert(id_of, store.clone());
@@ -3203,8 +3248,20 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
             (snap_index, snap_term),
             recovered_quarantined,
         );
+        // §8: the replica's log restated, then its descriptor at its applied index. A
+        // replica with no descriptor — a re-seeded user range before its install —
+        // is not initialised and has none to restate (PROPOSED D-107).
+        if let Some(descriptor) = lock(&descriptors).get(&id_of) {
+            state_descriptor(&env, descriptor, applied);
+            restated.push(id_of.get());
+        }
         cores.insert(id_of, core);
     }
+    // §8: `RangesRestated` closes the node's restatement, naming every initialised
+    // replica it restated; check 8 reads the node's spans as complete here.
+    // PROPOSED(D-107)
+    restated.sort_unstable();
+    env.trace(TraceEvent::RangesRestated { ranges: restated });
     if let Some(descriptors) = bootstrap_meta.or(reseeded_meta) {
         env.trace(TraceEvent::MetaApplied {
             index: 0,
@@ -3628,7 +3685,7 @@ struct Reseeded<E: Environment> {
 
 /// The restatement of one replica at the node's start (RAFT.md §2): the log as the
 /// disk holds it, the snapshot it records, the configuration in force and the term,
-/// each naming the range (§8).
+/// each naming the range (§8), and then its descriptor (`state_descriptor`).
 fn restate<E: Environment>(
     env: &E,
     server: u64,
@@ -3729,6 +3786,32 @@ fn restate<E: Environment>(
         term: core.term(),
         role: "follower",
         received: None,
+    });
+}
+
+/// A replica's descriptor stated at an applied index it did not reach by an apply
+/// (SHARD.md §8): the last of its restatement at its node's start, and an install
+/// that changed an initialised replica's descriptor, at the snapshot's last index.
+/// The index the descriptor took this value at is not kept anywhere — a split's
+/// batch writes the descriptor and the applied index and no record of which change
+/// wrote which, and a snapshot carries the descriptor alone — so a statement carries
+/// the applied index as both `index` and `applied`. Check 7 tells it from an apply's
+/// by the replica's applied index its node traced last (`RaftRecovered`, which
+/// precedes both forms), and reads it at `applied`, never as a value it puts.
+///
+/// No read happens here: the descriptor is one the node read back already, so a
+/// statement adds a record and no disk operation, and moves no schedule.
+// PROPOSED(D-107): the restatement of §8 at every start, and an install's change.
+fn state_descriptor<E: Environment>(env: &E, descriptor: &RangeDescriptor, applied: Index) {
+    env.trace(TraceEvent::RangeDescriptor {
+        range: descriptor.range.get(),
+        index: applied,
+        applied,
+        start: descriptor.start.clone(),
+        end: descriptor.end.clone(),
+        generation: descriptor.generation,
+        voters: descriptor.voters.iter().map(|voter| voter.0).collect(),
+        state: descriptor.state,
     });
 }
 

@@ -20604,11 +20604,115 @@ batch and then the range delete, left the split applied over the right span's ke
 seen, and the two-step shape caught on some seed. It moves no schedule: the voter's path
 is the code it was, and the non-voter's is reached by no scenario.
 
+### 2. The restatement at a node's start, and what an install traces
+
+**What is built** (crates/ananke-shard/src/server.rs).
+
+1. **The restatement.** At every start, after each replica's log is restated as RAFT.md
+   §2 has it (`restate`: `RaftTruncate`, `RaftSnapshot`, `RaftReseeded`, the appends,
+   `RaftConfig`, `RaftRecovered`, `RaftTerm`), a replica whose store holds a descriptor
+   traces it as a `RangeDescriptor` at the replica's applied index (`state_descriptor`);
+   after the last replica the node traces `RangesRestated`, naming every replica it
+   restated, sorted, and then the bootstrap's or the re-seed's `MetaApplied { index: 0 }`
+   as before. A replica without a descriptor — a re-seeded user range before its stream
+   installs it — is not initialised: it is neither restated nor named.
+2. **An install's creation** (`RangeCreated { cause: snapshot }`, the re-seed's case)
+   carries the generation and the voters of the descriptor the switch put in place, read
+   back from the store, where it carried the first generation and the configuration's
+   voters whatever the snapshot held. Its span was already the read-back descriptor's.
+   On a tree with splits a replica created from a snapshot of a range that had split was
+   traced at the split's span and generation 1, a value check 7's map never holds.
+3. **An install that changes an initialised replica's descriptor** — P's post-split
+   snapshot onto a replica of P that never applied the split — traces a `RangeDescriptor`
+   at the snapshot's last index (SHARD.md §5, §8), after the replica's `RaftRecovered`,
+   at the switch's instant: the switch's own records keep their one instant before it,
+   which D-091's fourth arm reads a switch by (D-098's finding; seed 368's guard).
+   An install that leaves the descriptor as it was traces none, as §8's table has it.
+4. **Both statements carry the applied index as `index` as well as `applied`.** No store
+   keeps the index a descriptor took its value at: the split's batch writes the
+   descriptor and the applied index and nothing says which change wrote which, and a
+   snapshot carries the descriptor alone. Check 7 tells a statement from an apply's change
+   by the replica's applied index as its node last traced it (below), and reads a
+   statement at `applied`.
+5. **No read, no draw, no await.** The start has already read every descriptor into the
+   host's map and the switch has already read its own back, so each statement is a trace
+   record and nothing the schedule can see.
+
+### 3. Check 7's restatement clause
+
+SHARD.md §8, check 7: "A restatement at a node's start, and an install — its
+`RangeCreated { cause: snapshot }` or its `RangeDescriptor` — carry an index and must
+equal the map's latest value at or below that index, whichever of the two is traced
+first." The tree held an install's creation to the map and nothing else.
+
+**What is built** (`invariants::Descriptors`). A `RangeDescriptor` whose `applied` is at
+or below the replica's applied index as its node last traced it — a `RaftApply`'s index,
+a `RaftRecovered`'s `applied`, a creation's floor — is a **statement**: a restatement
+while its node has not yet closed its restatement since its last crash, an install's
+change after. One above it is an apply's own change, traced before the apply's
+`RaftApply` (§8's fixed order), and is a value of the map as before. A statement, and an
+install's creation, must equal the map's latest value at or below its index; where the
+map holds nothing at or below it, it is the first value traced there, as an install's
+creation was. Every statement is judged when it is traced and again whenever a later
+value of its range lands at or below its index, so "whichever of the two is traced
+first" holds in both orders. A statement of a later generation than the map's latest at
+or below its index **waits**: a replica whose node crashed between a split's durable
+batch and its trace states P's new descriptor before any replica has traced the split.
+It is a violation as soon as the range takes that generation at an index past the
+statement's, and stays unjudged while the range never takes it. Any other difference is
+a violation where it is seen. This is where §5's single batch is proven at every start:
+"a node that restarts with a descriptor its applied index cannot hold is seen here".
+
+Three unit tests build the shapes by hand: a restatement past a split that agrees, one
+below it that states the old value and agrees, and one past it with the old value,
+caught, which the old fold would have taken as a value (`a_restatement_must_agree_…`); a
+restatement ahead of the map that waits for the split it holds, agrees when the split is
+traced at or below its index and is caught when the split lands past it, and one that
+agreed and is caught by a split traced later at or below its index
+(`a_restatement_ahead_of_the_map_…`); and an install's change held to the map at the
+snapshot's last index (`an_install_that_changes_…`).
+
+No variant of this stage trips check 7 (SHARD.md §12: it is asserted against
+`SplitNotAtomicWithDescriptor` in Stage D, which builds that variant); it runs under the
+equivalence test over the correct node and this stage's variants, as before. The
+mutation a single-range world could not catch is below (**The mutations**).
+
+**Measured: these two sections move no schedule.** One probe, a scratch test file
+never committed, was built in release on 6633266 and on a tree carrying sections 2 and
+3 with section 1 and check 8 beside them (so the comparison clears those too), and run
+on one machine: an Apple M2 of 8 cores on AC power, under two other slices' gates and
+probes (load averages near 450); every figure is a hash or a count, which load does not
+touch (D-070). Per run it hashes, FNV-1a 64, the trace with the three kinds these
+sections add or change left out (`RangeDescriptor`, `RangesRestated`, `RangeCreated`)
+and every `TaskPolled` kept, so a schedule that moved shows, and it records the verdict.
+
+- The correct node under the raft sweep's arms, seeds 0 to 999: the same schedule on
+  **1 000 of 1 000**, every verdict green on both; 51 052 records added.
+- Seeds 0 to 99 of the membership scenario on the node, `sim/ranges.rs`, the sharded
+  quorum scenario's correct node and `RefuseOneRangeOnly`, the re-seed shape,
+  `SharedSnapshotDir` and `ApplyWaitsForEveryRange` on the node, and seeds 0 to 31 of
+  `sim/install.rs`: the same schedule on every seed, every verdict as it was.
+- Every pinned node seed — 272, 516, 368, 493, 633, 8885 and 2809 on the correct node,
+  12 and 8 under `SharedSnapshotDir`, 613 under `ApplyWaitsForEveryRange`, 2994 on the
+  sharded quorum scenario under both, 1969 on the membership node and the re-seed
+  shape's seed 1 — the same schedule. The one-group server is untouched, and seed 42's
+  pinned body hash holds at the gate.
+
+**What the thousand fed check 7**, on the correct node: 6 902 restatements, 6.9 a seed
+(every node's first start and every restart); 44 134 descriptors restated; **16
+installs that changed an initialised replica's descriptor**, on 16 seeds, each P's
+post-split snapshot onto a replica of P that lagged the split; 44 150 statements judged
+and held, none in violation. **No install creation past the first generation**: no seed
+of the thousand re-seeds a node after its range split and installs the post-split
+snapshot into the fresh engine, and on 6633266 check 7 would have failed any seed that
+did, which the nightly's ten thousand on that tree did not see; the creation's fix is
+argued and not exercised, until a scenario re-seeds a node after a split.
+
 ### What follows
 
-The restatement at a node's start and the install traces, check 7's restatement clause,
-the `snapshot` task's plan re-hosted at a switch, check 8 and the measurements each is
-asserted on are this entry's next sections, each written in the commit that builds it.
+The `snapshot` task's plan re-hosted at a switch, check 8, #126 and the measurements each
+is asserted on are this entry's next sections, each written in the commit that builds
+it.
 
 ---
 

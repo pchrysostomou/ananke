@@ -9,10 +9,12 @@
 //! **Check 7** holds a map from (range, index) to the descriptor in force from that
 //! index: a `RangeCreated` of a bootstrap or a split is the value at (range,
 //! `floor_index`), a `RangeDescriptor` at an apply the value at (range, `index`), and
-//! a second value for one (range, index) is a violation. An install's `RangeCreated`
-//! carries an index and must equal the map's latest value at or below it, whichever of
-//! the two is traced first. Every other check reads "the descriptor in force before an
-//! index" off this map: the latest value strictly below it.
+//! a second value for one (range, index) is a violation. A restatement at a node's
+//! start and an install — its `RangeCreated` or its `RangeDescriptor` — are
+//! statements: each carries an index and must equal the map's latest value at or below
+//! it, judged when it is traced and again at every later value of its range at or
+//! below that index (PROPOSED D-107). Every other check reads "the descriptor in force
+//! before an index" off this map: the latest value strictly below it.
 //!
 //! **Check 9**: a `RaftApply` whose effect is `applied` and whose key lies outside the
 //! span of its range's descriptor in force before its index, or whose descriptor is
@@ -48,6 +50,7 @@
 //! comparison encodes the key as the store does (`ananke_raft::apply::user_key`).
 // PROPOSED(D-097): checks 7, 9, 10 and 17.
 // PROPOSED(D-098): check 16, and check 9's lookups.
+// PROPOSED(D-107): check 7's restatement clause.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound::{Excluded, Unbounded};
@@ -97,7 +100,37 @@ pub struct Descriptors {
     /// generation takes (SHARD.md §8, check 7).
     // PROPOSED(D-098)
     by_generation: BTreeMap<(u64, u64), Held>,
+    /// Each replica's applied index as its node last traced it, by (node, range):
+    /// a `RaftApply`'s index, a `RaftRecovered`'s `applied`, a creation's floor. A
+    /// `RangeDescriptor` at or below it states a value the replica holds at an index
+    /// it did not reach by that apply — a restatement or an install — and one above
+    /// it is the apply's own change, traced before the apply's `RaftApply` (§8's fixed
+    /// order).
+    // PROPOSED(D-107)
+    applied: BTreeMap<(u64, u64), u64>,
+    /// The nodes that closed their restatement (`RangesRestated`) since their last
+    /// crash: a statement on any other node is a restatement, which only names it.
+    // PROPOSED(D-107)
+    restated: BTreeSet<u64>,
+    /// Every statement a value is held to, per range: a restatement and an install,
+    /// each at its index. Judged when it is traced and again at every later value of
+    /// its range, so a value traced after it at or below its index is held to it too.
+    // PROPOSED(D-107)
+    statements: BTreeMap<u64, Vec<Statement>>,
+    /// How many statements were folded.
+    stated: usize,
     violation: Option<String>,
+}
+
+/// A descriptor a replica stated at an index without changing the range's: a
+/// restatement at its node's start, or an install (SHARD.md §8, check 7).
+// PROPOSED(D-107)
+#[derive(Clone, Debug)]
+struct Statement {
+    index: u64,
+    held: Held,
+    node: Option<u64>,
+    what: &'static str,
 }
 
 impl Descriptors {
@@ -128,6 +161,14 @@ impl Descriptors {
         self.by_range.is_empty()
     }
 
+    /// How many statements — restatements and installs — have been folded, the
+    /// first value traced at their index among them.
+    // PROPOSED(D-107)
+    #[must_use]
+    pub fn statements(&self) -> usize {
+        self.stated
+    }
+
     /// The first value traced for `range` at `generation`.
     // PROPOSED(D-098)
     #[must_use]
@@ -143,6 +184,7 @@ impl Descriptors {
                     .entry((range, held.generation))
                     .or_insert_with(|| held.clone());
                 at.insert(index, held);
+                self.judge(range);
             }
             Some(agreed) if *agreed == held => {}
             Some(agreed) => {
@@ -154,6 +196,83 @@ impl Descriptors {
                     ));
                 }
             }
+        }
+    }
+
+    /// A value a replica states at `index` without changing the range's: it must
+    /// equal the map's latest value at or below `index`, or be the first value traced
+    /// there, which it then is (SHARD.md §8, check 7).
+    ///
+    /// "Latest" is read at whatever point of the trace the two are both traced, in
+    /// either order. A statement ahead of every value at or below its index — of a
+    /// later generation than the latest — waits for the change it holds, which a
+    /// replica whose node crashed between that change's durable batch and its trace
+    /// may state before any replica traced it; it is a violation as soon as the
+    /// range takes its generation past its index, and stays unjudged while the range
+    /// never takes it at all. Any other difference is a violation where it is seen.
+    // PROPOSED(D-107): check 7's restatement clause.
+    fn state(&mut self, range: u64, index: u64, held: Held, node: Option<u64>, what: &'static str) {
+        self.stated += 1;
+        if self.at(range, index).is_none() {
+            self.put(range, index, held, node, what);
+            return;
+        }
+        self.statements.entry(range).or_default().push(Statement {
+            index,
+            held,
+            node,
+            what,
+        });
+        self.judge(range);
+    }
+
+    /// Judges every statement of `range` against the map as it stands.
+    // PROPOSED(D-107)
+    fn judge(&mut self, range: u64) {
+        if self.violation.is_some() {
+            return;
+        }
+        let (Some(statements), Some(values)) =
+            (self.statements.get(&range), self.by_range.get(&range))
+        else {
+            return;
+        };
+        let mut violation = None;
+        for statement in statements {
+            let Some((_, agreed)) = values.range(..=statement.index).next_back() else {
+                continue;
+            };
+            if *agreed == statement.held {
+                continue;
+            }
+            let (index, held, node, what) = (
+                statement.index,
+                &statement.held,
+                statement.node,
+                statement.what,
+            );
+            if held.generation > agreed.generation {
+                if let Some((taken, _)) = values
+                    .range((Excluded(index), Unbounded))
+                    .find(|(_, value)| value.generation == held.generation)
+                {
+                    violation = Some(format!(
+                        "descriptor agreement: node {node:?}'s replica of range {range} was \
+                         {what} at index {index} with {held:?}, a generation the range took \
+                         only at index {taken}: a descriptor its applied index cannot hold"
+                    ));
+                    break;
+                }
+                continue;
+            }
+            violation = Some(format!(
+                "descriptor agreement: node {node:?}'s replica of range {range} was {what} at \
+                 index {index} with {held:?}, where the range's descriptor there is {agreed:?}"
+            ));
+            break;
+        }
+        if violation.is_some() {
+            self.violation = violation;
         }
     }
 
@@ -171,6 +290,9 @@ impl Descriptors {
                 floor_index,
                 ..
             } => {
+                if let Some(node) = node {
+                    self.applied.insert((node, *range), *floor_index);
+                }
                 let held = Held {
                     start: start.clone(),
                     end: end.clone(),
@@ -182,33 +304,19 @@ impl Descriptors {
                     RangeCause::Bootstrap | RangeCause::Split => {
                         self.put(*range, *floor_index, held, node, "created");
                     }
-                    // An install: it must equal the latest value at or below its
-                    // index, or be the first value traced there.
-                    _ => match self.at(*range, *floor_index) {
-                        Some(agreed) if *agreed == held => {}
-                        Some(agreed) => {
-                            if self.violation.is_none() {
-                                self.violation = Some(format!(
-                                    "descriptor agreement: node {node:?}'s replica of range \
-                                     {range} was installed at index {floor_index} with \
-                                     {held:?}, where the range's descriptor there is \
-                                     {agreed:?}"
-                                ));
-                            }
-                        }
-                        None => self.put(*range, *floor_index, held, node, "installed"),
-                    },
+                    // An install: a statement at its floor.
+                    _ => self.state(*range, *floor_index, held, node, "installed"),
                 }
             }
             TraceEvent::RangeDescriptor {
                 range,
                 index,
+                applied,
                 start,
                 end,
                 generation,
                 voters,
                 state,
-                ..
             } => {
                 let held = Held {
                     start: start.clone(),
@@ -217,7 +325,40 @@ impl Descriptors {
                     voters: voters.clone(),
                     state: *state,
                 };
-                self.put(*range, *index, held, node, "changed");
+                // A statement — the restatement at a node's start, or an install onto
+                // an initialised replica — follows the `RaftRecovered` that states the
+                // applied index it is read at; an apply's change comes before the
+                // apply it belongs to (PROPOSED D-107).
+                let stated = node
+                    .and_then(|node| self.applied.get(&(node, *range)))
+                    .is_some_and(|known| *applied <= *known);
+                if stated {
+                    let restating = node.is_some_and(|node| !self.restated.contains(&node));
+                    let what = if restating { "restated" } else { "installed" };
+                    self.state(*range, *applied, held, node, what);
+                } else {
+                    self.put(*range, *index, held, node, "changed");
+                }
+            }
+            TraceEvent::RaftApply { range, index, .. } => {
+                if let Some(node) = node {
+                    self.applied.insert((node, *range), *index);
+                }
+            }
+            TraceEvent::RaftRecovered { range, applied, .. } => {
+                if let Some(node) = node {
+                    self.applied.insert((node, *range), *applied);
+                }
+            }
+            TraceEvent::RangesRestated { .. } => {
+                if let Some(node) = node {
+                    self.restated.insert(node);
+                }
+            }
+            TraceEvent::NodeCrashed { .. } => {
+                if let Some(node) = node {
+                    self.restated.remove(&node);
+                }
             }
             _ => {}
         }
@@ -1453,6 +1594,164 @@ mod tests {
         wrong.extend(&records);
         let verdict = wrong.verdict().unwrap_err();
         assert!(verdict.contains("is what the split leaves"), "{verdict}");
+    }
+
+    // --- Check 7's restatement clause (PROPOSED D-107) ---
+
+    /// A replica's restatement of its log: what precedes its descriptor's.
+    fn recovered(node: u64, range: u64, applied: u64) -> TraceRecord {
+        record(
+            node,
+            TraceEvent::RaftRecovered {
+                server: node,
+                range,
+                term: 2,
+                applied,
+                last_index: applied,
+                incarnation: 1,
+                state: ananke_env::RecoveredAs::Neither,
+            },
+        )
+    }
+
+    /// A descriptor stated at `applied`: a restatement, or an install's change.
+    fn stated(
+        node: u64,
+        range: u64,
+        applied: u64,
+        start: &[u8],
+        end: &[u8],
+        generation: u64,
+    ) -> TraceRecord {
+        record(
+            node,
+            TraceEvent::RangeDescriptor {
+                range,
+                index: applied,
+                applied,
+                start: user_key(start),
+                end: user_key(end),
+                generation,
+                voters: vec![1, 2, 3],
+                state: RangeState::Live,
+            },
+        )
+    }
+
+    fn restated(node: u64, ranges: &[u64]) -> TraceRecord {
+        record(
+            node,
+            TraceEvent::RangesRestated {
+                ranges: ranges.to_vec(),
+            },
+        )
+    }
+
+    fn crashed(node: u64) -> TraceRecord {
+        record(
+            node,
+            TraceEvent::NodeCrashed {
+                node: NodeId::new(u32::try_from(node).expect("small")),
+            },
+        )
+    }
+
+    /// The split of range 2 `[a, z)` at index 9 into `[a, m)` and right half 6 `[m,
+    /// z)`, on nodes 1 and 2, each having restated range 2 at its bootstrap first.
+    fn a_split_applied() -> Vec<TraceRecord> {
+        let mut records = before_a_split();
+        for node in [1, 2] {
+            records.push(recovered(node, 2, 0));
+            records.push(stated(node, 2, 0, b"a", b"z", 1));
+            records.push(restated(node, &[2]));
+        }
+        records.extend(split_records(1, 2, 9, 2, b"m", b"a", b"z", 1, 6));
+        records.extend(split_records(2, 2, 9, 2, b"m", b"a", b"z", 1, 6));
+        records
+    }
+
+    #[test]
+    fn a_restatement_must_agree_with_the_descriptor_in_force_at_its_applied_index() {
+        let mut checker = Checker::new(true);
+        checker.extend(&a_split_applied());
+        // Node 1 restarts at applied 12, past the split: P's shrunk descriptor, and R.
+        checker.push(&crashed(1));
+        checker.push(&recovered(1, 2, 12));
+        checker.push(&stated(1, 2, 12, b"a", b"m", 2));
+        checker.push(&recovered(1, 6, 12));
+        checker.push(&stated(1, 6, 12, b"m", b"z", 2));
+        checker.push(&restated(1, &[2, 6]));
+        assert!(checker.verdict().is_ok(), "{:?}", checker.verdict());
+        // A restatement below the split states P's first value, and agrees.
+        checker.push(&crashed(2));
+        checker.push(&recovered(2, 2, 5));
+        checker.push(&stated(2, 2, 5, b"a", b"z", 1));
+        assert!(checker.verdict().is_ok(), "{:?}", checker.verdict());
+        // A node that restarts past the split with P's old descriptor holds a
+        // descriptor its applied index cannot hold: check 7's restatement clause.
+        let mut stale = checker.clone();
+        stale.push(&crashed(2));
+        stale.push(&recovered(2, 2, 12));
+        stale.push(&stated(2, 2, 12, b"a", b"z", 1));
+        let why = stale.verdict().unwrap_err();
+        assert!(why.starts_with("descriptor agreement:"), "{why}");
+        assert!(why.contains("restated at index 12"), "{why}");
+        // Read as a value an apply put, the same record would have passed: it is the
+        // first value traced at index 12, which a restatement must never be.
+        assert_eq!(
+            stale.descriptors().at(2, 12).map(|held| held.generation),
+            Some(2),
+            "a restatement put no value of its own"
+        );
+    }
+
+    #[test]
+    fn a_restatement_ahead_of_the_map_waits_for_the_change_it_holds() {
+        // Node 2 states P's post-split descriptor at 12 before any replica traced the
+        // split (a crash between the split's batch and its trace): it waits.
+        let mut early = Checker::new(true);
+        early.extend(&before_a_split());
+        early.push(&recovered(2, 2, 12));
+        early.push(&stated(2, 2, 12, b"a", b"m", 2));
+        assert!(early.verdict().is_ok(), "{:?}", early.verdict());
+        // The split then traced at 9 is the change it held.
+        let mut agreed = early.clone();
+        agreed.extend(&split_records(1, 2, 9, 2, b"m", b"a", b"z", 1, 6));
+        assert!(agreed.verdict().is_ok(), "{:?}", agreed.verdict());
+        // Traced at 15, past the restatement's 12, it is a generation the replica
+        // could not hold at 12.
+        let mut late = early.clone();
+        late.extend(&split_records(1, 2, 15, 2, b"m", b"a", b"z", 1, 6));
+        let why = late.verdict().unwrap_err();
+        assert!(why.contains("took only at index 15"), "{why}");
+        // A restatement that agreed with the map is judged again by a change traced
+        // later at or below its index.
+        let mut later = Checker::new(true);
+        later.extend(&before_a_split());
+        later.push(&recovered(2, 2, 12));
+        later.push(&stated(2, 2, 12, b"a", b"z", 1));
+        assert!(later.verdict().is_ok(), "{:?}", later.verdict());
+        later.extend(&split_records(1, 2, 9, 2, b"m", b"a", b"z", 1, 6));
+        let why = later.verdict().unwrap_err();
+        assert!(why.contains("restated at index 12"), "{why}");
+    }
+
+    #[test]
+    fn an_install_that_changes_an_initialised_replica_is_a_statement_at_its_last_index() {
+        let mut checker = Checker::new(true);
+        checker.extend(&a_split_applied());
+        // Node 3 held P before the split and is installed P's snapshot at 20.
+        checker.push(&recovered(3, 2, 0));
+        checker.push(&stated(3, 2, 0, b"a", b"z", 1));
+        checker.push(&restated(3, &[2]));
+        checker.push(&recovered(3, 2, 20));
+        checker.push(&stated(3, 2, 20, b"a", b"m", 2));
+        assert!(checker.verdict().is_ok(), "{:?}", checker.verdict());
+        let mut wrong = checker.clone();
+        wrong.push(&recovered(3, 2, 21));
+        wrong.push(&stated(3, 2, 21, b"a", b"z", 1));
+        let why = wrong.verdict().unwrap_err();
+        assert!(why.contains("installed at index 21"), "{why}");
     }
 
     fn meta_applied(node: u64, index: u64, named: Vec<Named<'_>>) -> TraceRecord {

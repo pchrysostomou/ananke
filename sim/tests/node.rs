@@ -400,6 +400,12 @@ struct Coverage {
     /// asserted, because this node has no follower compaction to bound it.
     largest_follower_log: u64,
     follower_log_multiples: BTreeMap<u64, u64>,
+    /// The restatements check 7 reads (SHARD.md §8; PROPOSED D-107): the nodes'
+    /// `RangesRestated`, and the descriptors stated at an applied index an apply did
+    /// not reach — restated at a start, or changed by an install — which check 7
+    /// holds to its map.
+    restatements: usize,
+    descriptors_stated: usize,
 }
 
 /// Everything but the two sample vectors, which are summarised.
@@ -491,6 +497,8 @@ impl std::fmt::Debug for Coverage {
             .field("busiest_range_per_second", &self.busiest_range_per_second)
             .field("largest_follower_log", &self.largest_follower_log)
             .field("follower_log_multiples", &self.follower_log_multiples)
+            .field("restatements", &self.restatements)
+            .field("descriptors_stated", &self.descriptors_stated)
             .finish()
     }
 }
@@ -499,6 +507,12 @@ impl Coverage {
     fn add(&mut self, report: &raft::Report) {
         use ananke_env::{ClientOp, DropReason, TraceEvent};
         self.seeds += 1;
+        // PROPOSED(D-107): the restatements, and the descriptors check 7 holds to its
+        // map as statements.
+        let mut checker = ananke_shard::invariants::Checker::new(true);
+        checker.extend(&report.records);
+        self.restatements += report.count(|e| matches!(e, TraceEvent::RangesRestated { .. }));
+        self.descriptors_stated += checker.descriptors().statements();
         self.uniform_seeds += u64::from(report.uniform());
         self.partitions += report.count(|e| matches!(e, TraceEvent::PartitionStarted { .. }));
         self.crashes += report.count(|e| matches!(e, TraceEvent::NodeCrashed { .. }));
@@ -1057,6 +1071,29 @@ fn every_seed_passes_on_the_correct_node_under_the_raft_sweeps_arms() {
     );
 
     coverage.assert_complete();
+
+    // §8's restatement, which check 7's restatement clause reads: every node restates
+    // every replica it holds at every start, its first included, so three nodes give
+    // at least three a seed (PROPOSED D-107).
+    println!(
+        "node: {} restatements and {} descriptors stated at an applied index an apply did \
+         not reach, over {seeds} seeds",
+        coverage.restatements, coverage.descriptors_stated
+    );
+    assert!(
+        coverage.restatements >= 3 * seeds as usize,
+        "{} restatements over {seeds} seeds: a node that starts traces `RangesRestated` once \
+         it has restated its replicas (SHARD.md §8)",
+        coverage.restatements
+    );
+    assert!(
+        coverage.descriptors_stated >= coverage.restatements,
+        "{} descriptors stated against {} restatements: every node restates at least the \
+         replicas it hosts from its first start, so check 7's restatement clause was fed \
+         nothing to hold (SHARD.md §8)",
+        coverage.descriptors_stated,
+        coverage.restatements
+    );
 
     // §4's threshold is on the median apply lag, and it is asked **per range**. The
     // pooled median hides a breach: with the scenario's key map answering one range,
