@@ -20708,11 +20708,46 @@ snapshot into the fresh engine, and on 6633266 check 7 would have failed any see
 did, which the nightly's ten thousand on that tree did not see; the creation's fix is
 argued and not exercised, until a scenario re-seeds a node after a split.
 
+### 4. The `snapshot` task's plan re-hosted at a switch that moves the span
+
+**What the tree had.** The `snapshot` task's plan holds, per range, the spans an install
+of it replaces: hosted at the start from the descriptor the store holds, or at
+configuration's span for a replica without one, and moved by a split's apply on every
+replica that applies it (`SnapJob::Host`, PROPOSED D-100's fourth finding: with the span
+configuration named, an install of P wrote over R's keys). A live install that put a
+descriptor of another span in place left the plan where it was: P's post-split snapshot
+onto a replica of P that lagged the split, and a re-seeded replica, hosted at
+configuration's span, installed from a range that had split. That replica's next install
+replaces the old span. On this tree it holds nothing there, since it never created R;
+once the placeholders (Q22) give a lagging voter its R by R's own snapshot, that replace
+would take R's keys with it, D-100's fourth finding in the other order.
+
+**What is built.** The host, handling the switch's answer (`SnapAnswer::Switched`), puts
+the descriptor the switch read back in place and, where its span differs from the span
+the plan held — the replica's previous descriptor's, or configuration's for one without
+— re-hosts the range at it, as a split's apply does. A take already read the span from
+the descriptor. An install that leaves the span where it was pushes nothing.
+
+**It moves schedules, so it is its own commit.** The push wakes the `snapshot` task,
+whose poll is a draw of the simulator's scheduler (`TaskPolled`). From the same probe as
+sections 2 and 3, against the tree of those sections: the correct node's schedule moved
+on **7 of 1 000** seeds (333, 375, 579, 595, 604, 728 and 878), every one green on both
+trees, of the 16 on which an install moved a span; `SharedSnapshotDir` on 12 of 100,
+four verdicts differing — three name another wedged key and seed 35 goes from green to
+the read bound (`READS_OUTSTANDING`) with the correct node green on it, which
+`read_bound_is_the_variants_load` counts as the variant's load; `ApplyWaitsForEveryRange`
+on 4 of 100, seed 10 going to the read bound beside the lag fold's catch, which is all
+that test asserts; the membership scenario, `sim/ranges.rs`, the sharded quorum scenario
+under both, the re-seed shape and `sim/install.rs` on none of their 100 (32). **No pinned
+seed's schedule moved** — 272, 516, 368, 493, 633, 8885, 2809, 12, 8, 613, 2994, 1969
+and the re-seed shape's seed 1, each the same trace as before, so each pin asserts on the
+schedule it was written for (the gate runs every one); seed 42's one-group trace is
+untouched.
+
 ### What follows
 
-The `snapshot` task's plan re-hosted at a switch, check 8, #126 and the measurements each
-is asserted on are this entry's next sections, each written in the commit that builds
-it.
+Check 8, #126 and the measurements each is asserted on are this entry's next sections,
+each written in the commit that builds it.
 
 ---
 

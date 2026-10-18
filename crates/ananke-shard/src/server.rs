@@ -1428,6 +1428,35 @@ impl<E: Environment> Host for ServerHost<E> {
                 let before = descriptor.as_ref().and_then(|descriptor| {
                     lock(&self.descriptors).insert(*range, (**descriptor).clone())
                 });
+                // And the span the `snapshot` task's plan hosts the range at, which is
+                // what an install of it replaces: an install that moved the span — P's
+                // post-split snapshot onto a replica of P that never applied the
+                // split, or a re-seeded replica, hosted at configuration's span,
+                // installed from a range that had split — re-hosts it, as a split's
+                // apply does (PROPOSED D-100), so the range's next install replaces the
+                // span it holds now and no key of a right half beside it (SHARD.md §5,
+                // Q27). A take reads the span from the descriptor put in place above.
+                // The plan holds the span the replica's descriptor held, or
+                // configuration's for a replica without one (`run`), so an install
+                // that leaves the span where it was pushes nothing.
+                // PROPOSED(D-107)
+                let hosted_at = before
+                    .as_ref()
+                    .map(|before| before.start.clone()..before.end.clone())
+                    .or_else(|| self.ranges.iter().find(|r| r.id == *range).map(Range::span));
+                if let Some(descriptor) = descriptor
+                    && hosted_at.is_none_or(|span| {
+                        (&span.start, &span.end) != (&descriptor.start, &descriptor.end)
+                    })
+                {
+                    self.snaps.push(SnapJob::Host {
+                        range: *range,
+                        spans: vec![
+                            KeyPrefix::group(range.get()).span(),
+                            descriptor.start.clone()..descriptor.end.clone(),
+                        ],
+                    });
+                }
                 let changed = descriptor
                     .as_deref()
                     .filter(|descriptor| before.as_ref() != Some(*descriptor));
