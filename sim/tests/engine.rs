@@ -823,10 +823,11 @@ fn a_checkpoint_that_copies_each_span_at_its_own_version_is_caught() {
 /// `CheckpointVersionPerSpan`, whose catch by their own checks a share of twenty
 /// misses with probability about 4e-4 at most on their thousand-seed rates, so that
 /// the premerge stays near the quarter of an hour D-040 set. That goes past D-055's
-/// four in five, and is a choice D-068 puts to the owner, with running them on
-/// every seed beside it.
+/// four in five, and the owner decided it on 2026-09-20 (D-068, *Decided*): the
+/// three stay on the share, with no independent hundred-seed evidence, revisited
+/// if the engine sweep gets cheaper.
 // PROPOSED(D-055): the high-rate variants run a share of the seeds.
-// PROPOSED(D-068): and three of D-068's, for the premerge's time: the owner's choice.
+// D-068 (decided): and three of D-068's, for the premerge's time.
 fn high_rate_share() -> u64 {
     (seeds() / 10).max(seeds().min(20))
 }
