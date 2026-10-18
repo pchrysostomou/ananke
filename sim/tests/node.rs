@@ -1681,23 +1681,30 @@ fn a_server_that_trusts_a_stale_descriptor_is_caught_by_check_9_on_the_node() {
     );
     let caught = outcomes.iter().filter(|o| o.why.is_some()).count();
     // A rate, not every seed: 20 of 20 at the gate and in CI, 100 of 100 at the
-    // premerge's share and 998 of 1 000 at the nightly's. Seeds 184 and 819 are the two
-    // it is not caught on, and legitimately. The variant is caught when range 2 serves
-    // a read of a key outside its span. One way is through the stale client's stale
-    // entry, before a write to that key's range has corrected it: the apply check
-    // refuses the write, and the client merges the descriptors its `RangeMismatch`
-    // carries. The other is after a split of range 2, while a cache still names it. On
-    // seed 184 the first operation through the stale entry on each of ranges 3, 4 and 5
-    // is a write (a put of `k3`, a cas of `k4`, a put of `k6`), each refused at apply
-    // by 370 ms. Its one read through the entry is of range 2's own key `k1`, which
-    // range 2 serves rightly, and range 2 never splits. On seed 819 the first is a read
-    // of `k4`, sent at the run's start before range 2 had a leader, then only to
-    // followers, and abandoned unserved at 255 ms. The first operation on each range
-    // after it is a write (three deletes), each refused at apply by 682 ms. The
-    // variant's harm is the schedule's to give (D-061: far above 5 %). Seed 48, which
-    // an earlier comment named as the miss, is caught. The seeds were re-derived from
-    // the stale client's sends in release.
-    // PROPOSED(D-108): the misses re-derived (#156).
+    // premerge's share and 998 of 1 000 at the nightly's, and the test prints the seeds
+    // it misses. The variant is caught when a range serves a read of a key outside its
+    // span. At the nightly's share that happens three ways. On 992 seeds it is through
+    // client 1's stale range-2 entry, before a write to the key's range has corrected
+    // it: the apply check refuses the write, and the client merges the descriptors its
+    // `RangeMismatch` carries. On five it is through a client's cached entry for a
+    // range that split: range 2's on seeds 503, 579, 660 and 759, range 3's on 999. On
+    // 282 it is a read sent to range 3 just before its split applied and served just
+    // after. On the two misses, seeds 184 and 819, no read is served through a stale
+    // entry at all. Every operation through one, client 1's range-2 entry or a client's
+    // entry for a range that split (ranges 3 and 5 on 184, range 4 on 819), is a write
+    // refused at apply, with two exceptions: on 184 client 1's cas of `k3` after range
+    // 3's split, abandoned unanswered, and on 819 client 1's first operation, a read of
+    // `k4` sent before range 2 had a leader, then only to followers, and abandoned
+    // unserved. Seed 48, which an earlier comment named as the miss, is caught. The
+    // seeds were re-derived from both clients' records in release. The variant's harm
+    // is the schedule's to give (D-061: far above 5 %).
+    // PROPOSED(D-108): the misses re-derived (#156), and printed.
+    let missed: Vec<u64> = outcomes
+        .iter()
+        .filter(|o| o.why.is_none())
+        .map(|o| o.seed)
+        .collect();
+    println!("node: TrustStaleDescriptor not caught on seeds {missed:?}");
     assert!(
         caught > 0,
         "TrustStaleDescriptor was caught on no seed: a stale client's read served from \
@@ -1717,9 +1724,10 @@ fn a_server_that_trusts_a_stale_descriptor_is_caught_by_check_9_on_the_node() {
     // Q10's path reached on the correct apply code. A rate and not every seed,
     // because the incremental checker stops the run at check 9's first violation —
     // a read served from the wrong range — and on some seeds that read comes before
-    // any trusted write reaches apply: measured at 17 of 20 at the gate, so it is
-    // asserted at every tier (D-061) and printed. No write was applied in the
-    // wrong range: the apply check, kept by this variant, refused every one.
+    // any trusted write reaches apply: measured at 15 of 20 at the gate and in CI, 72
+    // of 100 at the premerge's share and 720 of 1 000 at the nightly's, far above
+    // D-061's 5 %, so it is asserted at every tier and printed. No write was applied in
+    // the wrong range: the apply check, kept by this variant, refused every one.
     let reached = outcomes.iter().filter(|o| o.at_apply > 0).count();
     assert!(
         reached > 0,

@@ -40,12 +40,12 @@
 //!   is not `IncarnationPerRangeStream` read at one more site (PROPOSED D-108).
 //!
 //! The set is a `u64` where Raft's is a `u32` (PROPOSED D-105): twenty-four of §10's
-//! and two instruments already proposed would leave a `u32` six bits for every
-//! variant the stages' reviews add, and the node's own set, planned at twenty, reached
-//! fifty-four and outgrew its `u32` inside Stage B. The bits reach no wire frame and
-//! no trace event (D-045), so the numbering is free to change; and a variant past the
-//! sixty-fourth bit is an overflow in `RangeVariant::bit`'s match, which does not
-//! compile, so the width cannot be outgrown silently.
+//! and the four instruments built or proposed beside them, two of each, would leave a
+//! `u32` four bits for every variant the stages' reviews add, and the node's own set,
+//! planned at twenty, reached fifty-four and outgrew its `u32` inside Stage B. The bits
+//! reach no wire frame and no trace event (D-045), so the numbering is free to change;
+//! and a variant past the sixty-fourth bit is an overflow in `RangeVariant::bit`'s
+//! match, which does not compile, so the width cannot be outgrown silently.
 //!
 //! Until D-105 the five sat in [`NodeVariants`](crate::variant::NodeVariants) at bits 49
 //! to 53, and until D-108 the two instruments at bits 48 and 25. Neither move moved a

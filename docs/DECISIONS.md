@@ -10971,6 +10971,23 @@ The run is owed on AC, on a quiet machine.
   and restarts nodes for `Fault::Crash`, and the same two calls give the directed
   scenario its restart.
 
+**Corrected by D-108: item 4's reason.** Item 4's rule stands: a replica's incarnation is
+drawn at each creation from the node's generator, never below `FIRST_INCARNATION + 1`.
+Its reason does not hold of the stream it names. Item 4 says `n{id}/r{range}/protocol` is
+avoided because "`SimEnv` derives a named stream from the seed and the name alone, so a
+replica created again for the same (range, node) would draw its predecessor's number".
+`Environment::range_rng`, which D-057 built and which hands back that stream, makes it
+from the seed and the name the first time it is asked for. It hands back the same shared
+stream every time after (crates/ananke-env/src/sim/state.rs:178-193). Every handle and
+call continue it (crates/ananke-env/src/env.rs:36-42), and a crash and restart leave it
+where it was. So a replica created again for the same (range, node) under it draws the
+stream's next number, not its predecessor's. The repeat the item names needs a stream
+derived anew at each creation, which is what `node_stream` makes inside the simulator
+(state.rs:171-176). This entry's variant for the rule, `IncarnationPerRangeStream` (a
+range-layer instrument since D-108), therefore changes the draw and repeats nothing, and
+the directed scenario catches it by the draw itself. SHARD.md's copy of the same reason
+is issue #165.
+
 ---
 
 ## PROPOSED D-078 — Follower compaction as D-065 decided it: a record at the applied index, no checkpoint under it, and the follower log bounded at 64 × `snapshot_threshold`
@@ -20562,12 +20579,16 @@ prose, "(PROPOSED D-105)", which a grep for the marker misses: the host's and th
 task's fields, and the configuration of the set in sim/install.rs, sim/membership.rs,
 sim/ranges.rs and sim/reseed.rs. D-108 marks all twelve, and with them `variant.rs`'s
 module doc and its record of the freed bits. What the sentence holds of now: the marker
-is on the set and its module, every field that holds it, every site that reads a member,
-every scenario's configuration of it, `sim/raft.rs`'s run functions and the sweep's
-client, `variant.rs`'s module doc and freed bits, and seed 42's pin. The sites that only
-pass the set along carry none: `server::run`'s destructuring and its construction of the
-host and the applier, sim/quorum.rs's two calls, `lib.rs`'s re-export and `meta.rs`'s doc.
-The variant tests this entry renamed keep the markers of the entries that built them.
+is on the set and its module, every field that holds it, every site that reads one of
+§10's five, every scenario's configuration of it, `sim/raft.rs`'s run functions and the
+sweep's client, `variant.rs`'s module doc and freed bits, and seed 42's pin. The three
+sites that read the two instruments D-108 moved into the set carry D-108's marker
+instead. The sites that only pass the set along carry none: `server::run`'s destructuring
+and its construction of the host and the applier; in sim/raft.rs, `Cluster::spawn`,
+`client` and `run_with`; sim/quorum.rs's two calls; `lib.rs`'s re-export and `meta.rs`'s
+doc; and the helpers D-108 lists as passing the set along. The variant tests this entry
+renamed keep the markers of the entries that built them. `git grep -n 'PROPOSED(D-105)'
+-- crates sim` lists twenty-two lines at D-108.
 *The split by check.* The column "Caught by, at 1 000" was read from the uncommitted
 harness's output, which named the check that wrote each violation. The committed tests
 classify a violation by `mechanism` (sim/tests/node.rs), which names neither check 16 nor
@@ -20683,13 +20704,25 @@ So do `variant.rs`'s module doc and its record of the freed bits, which named D-
 in prose.
 
 What the marker is on, exactly: the set and its module, every field that holds it, every
-site that reads a member, every scenario's configuration of it, `sim/raft.rs`'s run
-functions and the sweep's client, `variant.rs`'s module doc and freed bits, and seed 42's
-pin. The sites that only pass the set along carry none. These are `server::run`'s
-destructuring of the configuration and its construction of the host and the applier,
-sim/quorum.rs's two calls, `lib.rs`'s re-export and `meta.rs`'s doc, which names a
-variant. The variant tests D-105 renamed keep the markers of the entries that built them.
-`git grep -n 'PROPOSED(D-105)'` lists twenty-two lines on this tree.
+site that reads one of §10's five, every scenario's configuration of it, `sim/raft.rs`'s
+run functions and the sweep's client, `variant.rs`'s module doc and freed bits, and seed
+42's pin. The three sites that read the two instruments carry this entry's marker
+instead. The set's readers are therefore nine: six of §10's five, three of the
+instruments. The sites that only pass the set along carry no D-105 marker. They are:
+
+- `server::run`'s destructuring of the configuration and its construction of the host
+  and the applier;
+- in sim/raft.rs, `Cluster::spawn`, `client` (which names the set correct) and
+  `run_with`;
+- sim/quorum.rs's two calls;
+- `lib.rs`'s re-export, and `meta.rs`'s doc, which names a variant;
+- the membership and `sim/ranges.rs` helpers this entry lists under what carries its own
+  marker.
+
+The variant tests D-105 renamed keep the markers of the entries that built them.
+`git grep -n 'PROPOSED(D-105)' -- crates sim` lists twenty-two lines on this tree.
+Without the pathspec the grep also finds the docs that quote the marker, this entry
+among them, so its count there says nothing about code sites.
 
 D-105's table has a column "Caught by, at 1 000". Its split by check comes from the
 uncommitted harness (`sim/tests/s4_measure.rs`), whose output named the check that wrote
@@ -20821,12 +20854,37 @@ and `Environment` does not hand such a stream out. SHARD.md's parenthetical at
 design before D-057 built `range_rng` as a shared one. The rule stands as written (issue
 #165).
 
-**Recommended:** Stage D builds `IncarnationFromRangeStream` as question 1 proposes, read
-at the re-add's draw. Its stream is derived anew from the seed and a name of the (range,
-node)'s at each creation, and that is the repeat itself. `IncarnationPerRangeStream`
-stays what D-077 built: the re-seed's and the split's draw taken from the wrong
-generator, caught by the draw. The two break the same rule in two different ways, and
-each doc says which.
+**Recommended:** Stage D builds `IncarnationFromRangeStream` as question 1 proposes. Every
+draw of a replica's incarnation at its creation takes the first number of a stream
+derived anew for the (range, node) at that creation. `IncarnationPerRangeStream` stays what
+D-077 built: the re-seed's and the split's draw taken from the wrong generator, caught by
+the draw. The two break the same rule in two different ways, and each doc says which.
+
+Two caveats go with the recommendation, so that the owner sees what it costs and what it
+catches (#164's review):
+
+- **It repeats only a drawn incarnation.** A stream derived anew gives a replica created
+  again the number its predecessor drew from the same stream, and nothing else.
+  - A bootstrap replica's incarnation is `FIRST_INCARNATION`, which is 1 and never drawn
+    (crates/ananke-raft/src/store.rs:247), and its `RangeCreated` carries it
+    (crates/ananke-shard/src/server.rs:3182).
+  - So when a node is re-added to a range it held from the bootstrap, the first re-add
+    draws a number of its own even under the variant, and neither clause of the re-add
+    assertion trips.
+  - The variant trips only where the collected replica was itself created by a draw that
+    reads it: a move's placeholder, a split's right half, a re-seed.
+  - Its catch rate is therefore the schedule's: a non-bootstrap replica collected, then
+    its node re-added. It is to be measured before any tier asserts it (D-061).
+- **It needs a stream the node does not have.** Node code holds no seed, and `Environment`
+  hands out no stream derived anew, only `range_rng`'s shared one. Building the variant
+  needs one of two things:
+  - an addition to `Environment`: a stream derived from the seed and a name at each call,
+    which is the simulator's `node_stream`, exposed;
+  - or a stream derived from the (range, node) name alone. That repeats as the variant
+    needs, but draws the same numbers on every seed.
+
+Neither weakens the case against reusing `IncarnationPerRangeStream`: under it the re-add
+would repeat nothing at all.
 
 The alternative the issue recommends, one variant read at every creation site, would
 need `IncarnationPerRangeStream`'s stream changed to one derived anew. That changes the
@@ -20840,61 +20898,93 @@ node) draws the number its predecessor drew". That is true of `node_stream` and 
 `range_rng`. `reseed`'s doc said the same of the range's protocol stream. Both now say
 what the variant draws, what catches it, and that it does not reach the repeat. The
 range layer's module doc says why Stage D's variant is not this one read at one more
-site. No code line other than comments moves.
+site. D-077's item 4 gave the same reason, and a note appended to D-077 says it does not
+hold of `range_rng`. No code line other than comments moves.
 
 ### #156: the seeds `TrustStaleDescriptor` is not caught on, re-derived
 
 The test's comment said the variant is caught on 99 of 100 at the premerge's share, and
 named seed 48 as the one it is not caught on. Measured on 72e362a in release, over seeds
 0 to 999 of the node cluster under the variant, it is caught on **20 of 20**, **100 of
-100** and **998 of 1 000**. Seed 48 is among the caught: check 9 sees server 2 serve a
-read of `k2` from range 2 at 500 ms. The two seeds it is not caught on are **184 and
-819**. #152's harness found the same on b01db39 and ccdbf24, and `main`'s nightly on
-f8a15a7 (39015093151) prints the same 998 of 1 000 at its share. The schedule has moved
-since D-097 wrote the comment.
+100** and **998 of 1 000**. Seed 48 is among the caught: server 2 serves a read of `k2`
+from range 2 at 214.8 ms, and the incremental checker stops the run at 500 ms with check
+9's verdict. The two seeds it is not caught on are **184 and 819**. #152's harness found
+the same on b01db39 and ccdbf24, and `main`'s nightly on f8a15a7 (39015093151) prints the
+same 998 of 1 000 at its share. The schedule has moved since D-097 wrote the comment. The
+test now prints the seeds it is not caught on, so the nightly reports them itself.
 
-The comment's explanation was re-derived from each run's records:
+**How the variant is caught.** The variant skips the receipt and serving checks, so it is
+caught when any range serves a read of a key outside its span (check 9). A diagnostic
+over seeds 0 to 999 read both clients' records: their `ClientInvoke`, `ClientSend`,
+`ClientReturn` and `ClientMismatch`. Beside them it read `RangeMismatchSent` at apply,
+`RangeSplit`, and every user range's `RaftRead`, with check 7's map of descriptors to say
+which read is outside its range's span. The 998 catches come three ways:
 
-- the stale client's `ClientInvoke`, `ClientReturn` and `ClientMismatch`;
-- its `ClientSend`s through the stale entry, that is to range 2 at generation 0;
-- `RangeMismatchSent` at apply;
-- range 2's `RaftLeader` and `RaftRead`;
-- `RangeSplit`.
+- **Through client 1's stale range-2 entry**, on 992 seeds. Range 2 serves a key of
+  range 3, 4 or 5 before a write to that range has corrected the entry. The cache merges
+  a learned descriptor only over the part of a lower-generation entry it overlaps
+  (crates/ananke-shard/src/client.rs:169-185). So each of the three is corrected
+  separately, by a write to it that is refused at apply and whose `RangeMismatch` the
+  client merges.
+- **Through a client's cached entry for a range that split**, on five. A read is routed
+  to the parent after the split and served from the parent's state: range 2's split on
+  seeds 503 (client 2), 579, 660 and 759 (client 1), and range 3's on 999 (client 2).
+  That is §10's own shape for this variant, a split while a client's cache names the
+  parent.
+- **A read in flight across a split**, on seed 282. Client 2 sends a read of `k3` to
+  range 3 at 6.909 s, 6 ms before range 3's split at `k3` first applies. Server 1 serves
+  it at applied index 36, after the split, at 6.923 s. The serving check exists for
+  this, and the variant skips it.
 
-The explanation was that the stale client's first operations on its stale ranges are
-writes, refused at apply, whose `RangeMismatch` corrects its cache. That needs one
-qualification. The cache merges a learned descriptor only over the part of a
-lower-generation entry it overlaps (crates/ananke-shard/src/client.rs:169-185). So each
-range the stale entry misroutes (3, 4 and 5) is corrected separately, by a write to it
-refused at apply. The harm is a read **served** through the entry before that.
+A refusal corrects a cache only when the client is still waiting for it. On 999, client
+2's cas of `k3` through its stale range-3 entry is refused at apply at 14.066 s, after the
+client has abandoned it, so nothing is merged. Its read of `k3` through the same entry is
+then served at 15.107 s.
 
-- **Seed 184 fits as written.** The first operation through the stale entry on each of
-  ranges 5, 4 and 3 is a write: a put of `k6`, a cas of `k4` and a put of `k3`. They are
-  refused at apply at 243, 307 and 370 ms, and each answer's descriptors are merged. Its
-  one read through the entry is its first operation, a read of range 2's own key `k1`,
-  which server 3 serves within range 2's span at 214 ms. The run's two splits, of range 3
-  at `k3` (12.0 s) and of range 5 at `k7` (16.2 s), never cut range 2.
-- **Seed 819 needs the qualification.** Its first operation is a read of `k4` through the
-  stale entry at 0 ms. It is sent to servers 1, 2, 3, 1 and 2 before range 2 elects its
-  first leader (server 2, at 194 ms), then to servers 3 and 1, and is abandoned unserved
-  at 255 ms. After it, the first operation on each of ranges 3, 5 and 4 is a delete, of
-  `k3`, `k6` and `k5`, refused at apply at 279, 357 and 682 ms.
+**The misses.** On 184 and 819 no read is served through a stale entry at all. Every
+operation through one is a write refused at apply, with two exceptions, and neither is a
+served read:
 
-What decides a seed, then, is whether each misrouted range's part of the entry is
-corrected before a read through it is served. Over the thousand, 21 seeds' first
-operation through the stale entry is a write on each of the three ranges, and 20 of them
-are caught all the same:
+- **Seed 184.** Client 1's range-2 entry is first taken, for ranges 5, 4 and 3, by a put
+  of `k6`, a cas of `k4` and a put of `k3`. Each is refused at apply, at 243, 307 and
+  370 ms, and merged. Its one read through the entry, its first operation, is of range
+  2's own key `k1`, which server 3 serves within range 2's span at 214 ms. The run's two
+  splits leave both clients' entries for the parent stale for the right half, and every
+  operation through them is a write:
+  - after range 3's split at `k3` (12.03 s), client 2's cas of `k3` at 12.06 s is refused
+    and merged. Client 1's cas of `k3` at 12.54 s is abandoned unanswered, the first
+    exception; its next, at 14.18 s, is refused and merged;
+  - after range 5's split at `k7` (16.22 s), client 1's delete of `k7` at 16.24 s is
+    refused and merged. Client 2's delete of `k7` at 16.28 s is refused after client 2
+    has abandoned it, and its cas of `k7` at 16.56 s is refused and merged.
+- **Seed 819.** Client 1's first operation is a read of `k4` through the stale entry at
+  0 ms, the second exception. It is sent to servers 1, 2, 3, 1 and 2 before range 2 elects
+  its first leader (server 2, at 194 ms), then to servers 3 and 1, and is abandoned
+  unserved at 255 ms. After it the entry is taken for ranges 3, 5 and 4 by deletes of
+  `k3`, `k6` and `k5`, refused at apply at 279, 357 and 682 ms and each merged. After
+  range 4's split at `k5` (11.62 s), client 2's cas of `k5`, sent to range 4 just before
+  the split applies, is refused at apply and resent to range 46. Client 1's put of `k5`
+  at 11.79 s through its stale range-4 entry is refused at apply and merged.
 
-- on 18, one of those writes was abandoned unanswered and corrected nothing, and the
-  catch is a later read, through the entry, of a key of that very range;
-- on seeds 579 and 759 the catch is a read of `k1` that range 2 served after a split of
-  range 2 had put `k1` outside its span. That is §10's own shape for this variant, a
-  split while a client's cache names the parent.
+The first version of this section, at 49ef296, was wrong in three ways. It read only
+client 1's records and range 2's reads. It called every catch range 2's. It said 184's
+splits never cut range 2, and so did not matter. #164's adversarial review found the
+catches through range 3 (282, 999) and the splits' routes on 184 and 819. The
+re-derivation above is over both clients' records.
 
-Seed 184 is the twenty-first. The comment now says what seeds 184 and 819 do. It moves no
-assertion and no tier: the test asserts `caught > 0` at every tier and prints the rate.
-The diagnostic that read the records, `sim/tests/h1_stale.rs`, is untracked and was never
-committed. Its per-seed rows are in PR #164.
+The 21 seeds whose first operation through client 1's entry is a write on each of ranges
+3, 4 and 5 stand as measured, and 20 of them are caught. On 18, the catch comes through a
+range whose first write was abandoned unanswered. On 579 and 759 it comes through range
+2's split.
+
+The comment now says how the 998 are caught and what the misses do, and the test prints
+the misses. It moves no assertion and no tier: the test asserts `caught > 0` at every
+tier and prints the rate. The same test's second figure, the apply check refusing a
+trusted write, was "17 of 20 at the gate". It is 15 of 20 at the gate and in CI, 72 of
+100 at the premerge's share and 720 of 1 000 at the nightly's, and the comment says so.
+That is far above D-061's 5 %, so the assertion's tier stands. The diagnostics that read
+the records, `sim/tests/h1_stale.rs` and `sim/tests/h1_routes.rs`, are untracked and were
+never committed. Their rows are in PR #164.
 
 ### Consequences
 
@@ -20914,9 +21004,13 @@ committed. Its per-seed rows are in PR #164.
   count. This answers issue #151 and D-105's PROPOSED point as D-105 recommended.
 - **PROPOSED, for the owner:** Stage D's question 1 answered as SHARD.md proposes it.
   Stage D builds `IncarnationFromRangeStream`, a stream derived anew at each creation,
-  read at the re-add's draw. It does not extend `IncarnationPerRangeStream`, whose stream
-  continues and which the assertion could not catch. #151's recommendation is not taken,
-  for that reason. SHARD.md's parenthetical at 1379-1381 is issue #165.
+  read at every draw of a replica's incarnation at its creation. It does not extend
+  `IncarnationPerRangeStream`, whose stream continues and which the assertion could not
+  catch, so #151's recommendation is not taken. Two caveats go with it:
+  - it trips only on a re-add whose collected predecessor drew its incarnation, never on
+    one whose predecessor was a bootstrap replica, so its rate is to be measured;
+  - it needs an `Environment` addition or a stream derived from the name alone.
+  SHARD.md's parenthetical at 1379-1381 is issue #165.
 
 ---
 

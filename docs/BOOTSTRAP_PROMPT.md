@@ -122,17 +122,24 @@ _Update this section at the end of every session._
   `IncarnationFromRangeStream` as SHARD.md's question 1 proposes, and #151's reuse of
   `IncarnationPerRangeStream` is not taken. `range_rng` is one stream per node and range
   that continues across draws and restarts, so that variant repeats no incarnation and
-  the re-add assertion could not catch it; its doc and `reseed`'s said otherwise and are
-  corrected, and SHARD.md:1379-1381's parenthetical is issue #165. #155: the six read
-  sites of the range layer's set (five in `server.rs`,
-  the sweep's client's) and the six prose-form sites carry `// PROPOSED(D-105)`, and a
-  note appended to D-105 says what is marked and that its split by check was the
-  uncommitted harness's (the tests count checks 16 and 18 as "something else"). #156:
-  `TrustStaleDescriptor` is caught on 20/20, 100/100 and 998/1 000, missing seeds 184 and
-  819 (seed 48 is caught), re-derived from the stale client's records: on 184 the first
-  operation through the stale entry on each misrouted range is a write refused at apply,
-  and range 2 never splits; on 819 the first is a read of `k4` sent before range 2 had a
-  leader and abandoned unserved, then three deletes refused at apply.
+  the re-add assertion could not catch it. Its doc and `reseed`'s said otherwise and are
+  corrected, a note on D-077 corrects item 4's reason, and SHARD.md:1379-1381's
+  parenthetical is issue #165. The recommendation carries two caveats. The new variant
+  repeats only an incarnation that was itself drawn, never a bootstrap replica's 1, so
+  its catch rate is to be measured. It also needs an `Environment` addition or a stream
+  derived from the name alone. #155: the six sites that read one of §10's five from the
+  range layer's set (five in `server.rs`, the sweep's client's) and the six prose-form
+  sites carry `// PROPOSED(D-105)`; the three that read the two instruments carry
+  `// PROPOSED(D-108)`. A note appended to D-105 says what is marked and that its split
+  by check was the uncommitted harness's; the tests count checks 16 and 18 as "something
+  else". #156: `TrustStaleDescriptor` is caught on 20/20, 100/100 and 998/1 000, missing
+  seeds 184 and 819 (seed 48 is caught), and the test prints its misses. The mechanism
+  was re-derived from both clients' records after #164's review found the first version
+  wrong. 992 seeds are caught through client 1's stale range-2 entry, five through a
+  client's cached entry for a range that split (range 2 on 503, 579, 660 and 759, range 3
+  on 999), and 282 by a read in flight across range 3's split. On 184 and 819 no read is
+  served through a stale entry. Every operation through one is a write refused at apply,
+  but for one write abandoned on 184 and 819's first read, abandoned unserved.
 - Branch `docs-stage-c-record` (2026-10-11), off `main` at b01db39 and merged with it at
   8496ca3 (#152, D-105; footer D-106), PROPOSED D-104, **Stage C's record**, docs and
   comments only (no code line, schedule or pinned hash moves). It records three things no
