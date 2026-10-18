@@ -20665,11 +20665,12 @@ a `RaftRecovered`'s `applied`, a creation's floor — is a **statement**: a rest
 while its node has not yet closed its restatement since its last crash, an install's
 change after. One above it is an apply's own change, traced before the apply's
 `RaftApply` (§8's fixed order), and is a value of the map as before. A statement, and an
-install's creation, must equal the map's latest value at or below its index; where the
-map holds nothing at or below it, it is the first value traced there, as an install's
-creation was. Every statement is judged when it is traced and again whenever a later
-value of its range lands at or below its index, so "whichever of the two is traced
-first" holds in both orders. A statement of a later generation than the map's latest at
+install's creation, must equal the map's latest value at or below its index, and is
+never a value of the map itself. Every statement is judged when it is traced and again
+whenever a later value of its range lands at or below its index, so "whichever of the
+two is traced first" holds in both orders; one whose range holds no value at or below
+its index yet waits for one, and stays unjudged while none lands. A statement of a later
+generation than the map's latest at
 or below its index **waits**: a replica whose node crashed between a split's durable
 batch and its trace states P's new descriptor before any replica has traced the split.
 It is a violation as soon as the range takes that generation at an index past the
@@ -20677,14 +20678,29 @@ statement's, and stays unjudged while the range never takes it. Any other differ
 a violation where it is seen. This is where §5's single batch is proven at every start:
 "a node that restarts with a descriptor its applied index cannot hold is seen here".
 
-Three unit tests build the shapes by hand: a restatement past a split that agrees, one
+**Corrected after #166's review (B1).** As first built, a statement whose range held no
+value at or below its index was put as the map's value there: judged against nothing, it
+became the first value of its generation, which check 16 reads. The review built the case
+by hand — node 1 crashes after a durable split of range 2 at 9 and restates the right
+half 6 over a wrong span at 12, closing its restatement before any replica has traced the
+split, and node 2 applies the split after — and it passed, where the same records with
+node 2's creation first failed. So "holds in both orders" was not true of that fold. The
+statement is now held until a value lands under it and judged then.
+
+Five unit tests build the shapes by hand: a restatement past a split that agrees, one
 below it that states the old value and agrees, and one past it with the old value,
 caught, which the old fold would have taken as a value (`a_restatement_must_agree_…`); a
 restatement ahead of the map that waits for the split it holds, agrees when the split is
 traced at or below its index and is caught when the split lands past it, and one that
 agreed and is caught by a split traced later at or below its index
-(`a_restatement_ahead_of_the_map_…`); and an install's change held to the map at the
-snapshot's last index (`an_install_that_changes_…`).
+(`a_restatement_ahead_of_the_map_…`); an install's change held to the map at the
+snapshot's last index (`an_install_that_changes_…`); and the review's case in both orders,
+caught in each with the true span the first value of generation 2
+(`a_statement_traced_before_any_value_of_its_range_…`), beside the same crash with the
+true span, which waits and then agrees (`a_statement_with_no_value_under_it_waits_…`). The
+last two fail on the fold as first built. **Measured with the fix**, from the same probe as
+below: on the correct node's thousand no statement found its range with no value under it,
+and every verdict and every schedule hash is the tip's (15bc0c5), seed for seed.
 
 No variant of this stage trips check 7 (SHARD.md §12: it is asserted against
 `SplitNotAtomicWithDescriptor` in Stage D, which builds that variant); it runs under the

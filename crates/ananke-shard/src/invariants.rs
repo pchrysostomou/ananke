@@ -206,23 +206,23 @@ impl Descriptors {
     }
 
     /// A value a replica states at `index` without changing the range's: it must
-    /// equal the map's latest value at or below `index`, or be the first value traced
-    /// there, which it then is (SHARD.md §8, check 7).
+    /// equal the map's latest value at or below `index` (SHARD.md §8, check 7).
     ///
     /// "Latest" is read at whatever point of the trace the two are both traced, in
-    /// either order. A statement ahead of every value at or below its index — of a
-    /// later generation than the latest — waits for the change it holds, which a
-    /// replica whose node crashed between that change's durable batch and its trace
-    /// may state before any replica traced it; it is a violation as soon as the
-    /// range takes its generation past its index, and stays unjudged while the range
-    /// never takes it at all. Any other difference is a violation where it is seen.
+    /// either order, and a statement is never a value of the map itself. One whose
+    /// range holds no value at or below its index yet — a replica whose node crashed
+    /// between a split's durable batch and its trace restates the right half before
+    /// any replica has traced its creation — waits for one and is judged when it
+    /// lands; it stays unjudged while none does. A statement ahead of every value at
+    /// or below its index — of a later generation than the latest — waits the same way
+    /// for the change it holds, and is a violation as soon as the range takes its
+    /// generation past its index. Any other difference is a violation where it is
+    /// seen. Until #166's review a statement with no value under it was put as the
+    /// value there, judged against nothing, and made the first value of its
+    /// generation, which check 16 reads (PROPOSED D-107).
     // PROPOSED(D-107): check 7's restatement clause.
     fn state(&mut self, range: u64, index: u64, held: Held, node: Option<u64>, what: &'static str) {
         self.stated += 1;
-        if self.at(range, index).is_none() {
-            self.put(range, index, held, node, what);
-            return;
-        }
         self.statements.entry(range).or_default().push(Statement {
             index,
             held,
@@ -2008,6 +2008,109 @@ mod tests {
         wrong.push(&stated(3, 2, 21, b"a", b"z", 1));
         let why = wrong.verdict().unwrap_err();
         assert!(why.contains("installed at index 21"), "{why}");
+    }
+
+    /// #166's review (B1): node 1 crashes after a durable split of range 2 at 9 and
+    /// restates both halves at 12 — the right half 6 over a wrong span `[m, y)` —
+    /// before any replica has traced the split, and node 2 applies it after.
+    fn a_wrong_right_half_restated_before_its_split_is_traced()
+    -> (Vec<TraceRecord>, Vec<TraceRecord>) {
+        let mut before = Vec::new();
+        for node in [1, 2, 3] {
+            before.push(created(node, 2, b"a", b"z", 1, &[1, 2, 3]));
+        }
+        let restatement = vec![
+            crashed(1),
+            recovered(1, 2, 12),
+            stated(1, 2, 12, b"a", b"m", 2),
+            recovered(1, 6, 12),
+            stated(1, 6, 12, b"m", b"y", 2),
+            restated(1, &[2, 6]),
+        ];
+        let split = split_records(2, 2, 9, 2, b"m", b"a", b"z", 1, 6);
+        let statement_first = before
+            .iter()
+            .chain(&restatement)
+            .chain(&split)
+            .cloned()
+            .collect();
+        let split_first = before
+            .iter()
+            .chain(&split)
+            .chain(&restatement)
+            .cloned()
+            .collect();
+        (statement_first, split_first)
+    }
+
+    #[test]
+    fn a_statement_traced_before_any_value_of_its_range_is_judged_when_one_lands() {
+        let (statement_first, split_first) =
+            a_wrong_right_half_restated_before_its_split_is_traced();
+        for (order, records) in [
+            ("statement first", statement_first),
+            ("split first", split_first),
+        ] {
+            let mut descriptors = Descriptors::default();
+            for record in &records {
+                descriptors.push(record);
+            }
+            let why = descriptors
+                .verdict()
+                .expect_err("the wrong right half is caught in either order");
+            assert!(
+                why.starts_with(
+                    "descriptor agreement: node Some(1)'s replica of range 6 was \
+                     restated at index 12"
+                ),
+                "{order}: {why}"
+            );
+            // The map holds the creation's value and never the statement's, so check 16
+            // reads the right half's true span as the first at its generation.
+            assert_eq!(
+                descriptors
+                    .first_at_generation(6, 2)
+                    .map(|held| (held.start.clone(), held.end.clone())),
+                Some((user_key(b"m"), user_key(b"z"))),
+                "{order}"
+            );
+            assert_eq!(
+                descriptors.at(6, 12).map(|held| held.end.clone()),
+                Some(user_key(b"z")),
+                "{order}: a statement put no value of its own"
+            );
+        }
+    }
+
+    #[test]
+    fn a_statement_with_no_value_under_it_waits_and_agrees_when_the_right_one_lands() {
+        // The same crash, the right half restated with its true span: it waits, and the
+        // creation traced after it is the value it agrees with.
+        let mut records = Vec::new();
+        for node in [1, 2, 3] {
+            records.push(created(node, 2, b"a", b"z", 1, &[1, 2, 3]));
+        }
+        records.extend([
+            crashed(1),
+            recovered(1, 2, 12),
+            stated(1, 2, 12, b"a", b"m", 2),
+            recovered(1, 6, 12),
+            stated(1, 6, 12, b"m", b"z", 2),
+            restated(1, &[2, 6]),
+        ]);
+        let mut descriptors = Descriptors::default();
+        for record in &records {
+            descriptors.push(record);
+        }
+        assert!(descriptors.verdict().is_ok(), "{:?}", descriptors.verdict());
+        assert!(
+            descriptors.at(6, 12).is_none(),
+            "a statement with no value under it is no value of the map"
+        );
+        for record in &split_records(2, 2, 9, 2, b"m", b"a", b"z", 1, 6) {
+            descriptors.push(record);
+        }
+        assert!(descriptors.verdict().is_ok(), "{:?}", descriptors.verdict());
     }
 
     #[test]
