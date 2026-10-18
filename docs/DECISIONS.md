@@ -20645,7 +20645,117 @@ sits at the split's index now.
 **Nothing moves.** The node sweep traces no configuration change — its only configurations
 are the bootstrap's at index 0, which the old history read off the restatement's
 `RaftConfig` and the new one reads off the creation — and no range variant changes one, so
-the clause reads the same voters on every run it judged before; measured below (item 7).
+the clause reads the same voters on every run it judged before; measured under **Nothing
+moved** below.
+
+### 4. The equivalence test, fold by fold and one test per pair
+
+**Measured first.** Each fold's trips per system, over the node sweep's arms under each of
+§10's five and the pair, seeds 0 to 999 in release, every fold folded over each run's whole
+trace (`invariants::folded`), counted over the first 20, 100 and 1 000 seeds — what the
+gate's, CI's and the premerge's comparisons see, the nightly's being CI's hundred:
+
+| System | split took effect | 7 | 9 | 9 at an apply | 10 | 16 | 17 | 18, `IdsUnique` | 18, `SplitLineage` |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| correct | 20 / 100 / 999 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `ApplyIgnoresSpan` | 20 / 100 / 999 | 0 | 1 / 5 / 82 | 1 / 5 / 82 | **1 / 3 / 26** | 0 | 0 | 0 | 0 |
+| `TrustStaleDescriptor` | 0 / 0 / 8 | 0 | 20 / 100 / 998 | 0 | 0 | 0 | 0 | 0 | 0 |
+| the pair of the two | 0 / 0 / 0 | 0 | 20 / 100 / 1 000 | 2 / 9 / 112 | **4 / 25 / 210** | 0 | 0 | 0 | 0 |
+| `MetaOverwritesByArrival` | 20 / 100 / 999 | 0 | 0 | 0 | 0 | 3 / 18 / 149 | 0 | 0 | 0 |
+| `ClientIgnoresMismatch` | 0 / 0 / 0 | 0 | 0 | 0 | 0 | 0 | 20 / 100 / 1 000 | 0 | 0 |
+| `IdBlockResumed` | 20 / 100 / 997 | 0 / 1 / 3 | 1 / 5 / 72 | 1 / 4 / 37 | 0 | 0 / 0 / 1 | 0 | **0** | 14 / 71 / 628 |
+
+And on the membership scenario on the node: the correct node trips no fold on any of the
+thousand; `AnyFreshNodeBootstraps` trips check 7 on all 1 000 (two clusters' creations at
+index 0 of every range), check 16 on all 1 000 and `IdsUnique` on 0 / 4 / 34.
+
+**Check 10 is seen to trip for the first time.** Under `ApplyIgnoresSpan` alone on 26 of the
+thousand, every one on a seed check 9 tripped too: a write proposed under P's span before
+the split and applied in P above the split's index (check 9), and the right half's own
+write of the key at the same generation ("range 30 wrote `k7` at index 154 at generation 2,
+after range 5 wrote it at generation 2"). Under the pair on 210: a stale client's write
+applied in the range it named, and the key's owner's write at the first generation ("range
+4 wrote `k4` at index 2 at generation 1, after range 2 wrote it at generation 1"). Every one
+of these runs read as check 9's before item 1. Under `TrustStaleDescriptor` alone check 9 is
+at a read on every seed it trips and check 10 trips on none — the apply check the variant
+keeps refuses every trusted write — so every check-10 trip under the pair, and every check-9
+trip at an apply, is the apply check's absence.
+
+**The tests.** `the_range_layers_checks_agree_with_their_whole_trace_folds` is replaced by
+seven tests in `sim/tests/node.rs`, one per pair. Each runs its system over `min(seeds,
+100)` seeds — the hundred the one-group checker's equivalence test compares (D-046), the
+gate's twenty at the gate — and on every run, at eight prefixes of the trace with the
+records fed thirty-seven at a time, compares each fold's own verdict fed in chunks with the
+same fold folded over the whole prefix from the first record: the same `Ok` or `Err` in the
+same words, the violation in the fold's own words (`Fold::words`) and latched from the
+prefix that first shows it, and the checker's one verdict, which stops a run, the same too.
+Each prints at every tier every fold's trip count over the seeds compared, the split's reach
+and the first violation of each fold, and asserts its pair at the tier its measured rate
+supports (D-061):
+
+| Test, `the_range_layers_folds_agree_one_by_one_…` | Systems | Asserted |
+|---|---|---|
+| `…on_the_correct_node` | the correct node | no fold trips on any seed, and a split took effect on some seed: every tier |
+| `…and_checks_9_and_10_trip_under_apply_ignores_span` | the pair; `ApplyIgnoresSpan` alone | with trust, check 9 at an apply and check 10 each on some seed, from CI's hundred (at the gate's twenty, 2 and 4 of 20: the first would miss about one gate in ten); alone, a split on some seed and check 9 only ever at an apply, every tier, its trips printed |
+| `…and_check_9_trips_under_trust_stale_descriptor` | `TrustStaleDescriptor` | check 9 on some seed, and check 10 on none: every tier |
+| `…and_check_16_trips_under_meta_overwrites_by_arrival` | `MetaOverwritesByArrival` | a split on some seed, every tier; check 16 on some seed, from CI's hundred (3 of 20 would miss about one gate in twenty-five) |
+| `…and_check_17_trips_under_client_ignores_mismatch` | `ClientIgnoresMismatch` | check 17 on every seed: every tier |
+| `…and_check_18_trips_under_id_block_resumed` | `IdBlockResumed` | check 18's range-id clause — two grants of one id (`range ids:`), or a right half a creation or a split named before — on some seed: every tier |
+| `…and_check_7_trips_under_any_fresh_node_bootstraps` | `AnyFreshNodeBootstraps` and the correct node, membership | check 7 on every seed under the variant, and no fold on the correct node: every tier |
+
+**Check 7** runs under every one of them and trips under no variant of the node sweep but
+`IdBlockResumed`, on 3 of the thousand — a second range created under a taken id, which
+check 18 sees first. §12 asserts check 7 against Stage D's `SplitNotAtomicWithDescriptor`,
+which is not built; under the test it is seen to trip by D-096's instrument.
+
+**Where a fold's rate is under D-061's 5 % the comparison prints it and a variant test,
+which sweeps the nightly's share of a thousand, asserts it.** `ApplyIgnoresSpan` alone's
+check 10 (26 of 1 000) is read fold by fold in its variant test
+(`a_server_that_ignores_the_span_at_apply_is_caught_with_trust_and_after_a_split_alone`),
+printed at every tier, every trip asserted to sit beside a check-9 trip on the same run, and
+asserted from the nightly's share beside the variant's catch. Every routing variant's test
+now reads the folds a run tripped (`Routed::tripped`) for this.
+
+**A question for the owner (§12: "a fold that no variant trips is a question to the owner,
+not a test left without one").** `IdsUnique`, check 18's half that no two grants share an id
+and that every replica of range 0 grants at an index what its first apply granted, is
+tripped by no §10 variant: `IdBlockResumed` resumes a block and never grants one twice, so
+check 18 trips under it in the split clause's freshness failure. D-096's instrument
+does trip it: under `AnyFreshNodeBootstraps` two clusters' replicas of range 0 grant
+different blocks at one index — "index 2 of range 0 granted node 3's run … the block 6..=13
+at its first apply and node 2's run … the block 6..=13" — on 34 of the thousand membership
+seeds, 4 of the first hundred, none of the first twenty. So the comparison runs `IdsUnique`
+in violation on 4 of CI's hundred, which it does not assert, and the variant's own test reads
+it fold by fold and asserts it from the nightly's share (34 of 1 000). PROPOSED,
+recommended: that instrument stands as `IdsUnique`'s tripping variant, asserted where the
+nightly's share supports it. The alternatives: a test instrument of the range layer that
+grants a block twice, outside §10's count as D-093 proposes for check 19; or §11's raft item
+12 read with check 18 as one check, which `IdBlockResumed` trips.
+
+**What the comparison costs.** The seven run at 31.2, 29.3, 28.2, 27.8, 23.1, 0.6 and 0.5 cpu
+s at the premerge's tier, against the old test's 7.9; the nightly's rows are re-weighed in
+`scripts/nightly-shards.txt`, and the shards run 1 977.1 / 2 134.8 / 1 923.7 / 1 671.7 /
+1 677.9 / 1 661.6.
+
+### Nothing moved
+
+The folds run after the fact, item 1 leaves the checker's verdict as it was, and item 3's
+history reads the same configurations on every run the node sweep makes, so no schedule
+should move; it was measured rather than argued. Every run below, its record count and a
+hash of its records, on `main` at f8a15a7 and on this slice's code, from one probe built
+on each tree in release (untracked, not committed):
+
+- the node sweep's arms, seeds 0 to 999 under each of the correct node, `ApplyIgnoresSpan`,
+  `TrustStaleDescriptor`, the pair, `MetaOverwritesByArrival`, `ClientIgnoresMismatch` and
+  `IdBlockResumed`: **7 000 of 7 000 identical**, every verdict identical;
+- the membership scenario on the node, seeds 0 to 999 of the correct node and of
+  `AnyFreshNodeBootstraps`; the sharded quorum scenario, seeds 0 to 999 of the correct node
+  and of `RefuseOneRangeOnly`; `sim/ranges.rs`'s correct node, seeds 0 to 999; `install`
+  and `reseed`, seeds 0 to 199: **5 400 of 5 400 identical**, every verdict identical.
+
+The gate's pins say the same of every pinned seed: seeds 272, 516, 368, 493, 633, 2994, 8885,
+2809, 12, 8 and 613 on the node and seed 42's one-group hash, each asserting its mechanism or
+its absence as before, green on every commit of this slice.
 
 ---
 
