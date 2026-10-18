@@ -101,6 +101,43 @@ ananke/
 
 _Update this section at the end of every session._
 
+- Branch `phase-3-stage-c-restatement-check8` (2026-10-18), off `main` at 6633266, PR
+  #166, PROPOSED D-107 (footer D-108), **Stage C's restatement, check 7's restatement
+  clause, check 8, the install traces and the non-voter's delete** (#162's S6, continued
+  from an earlier agent's uncommitted tree, which this kept and split into commits). Four
+  steps, each its own commit on a green gate. (1) #139: a split's replica that is not a
+  voter of P at `s` writes its batch and removes the right span in **one manifest switch**,
+  `RaftStore::apply_removing`, the batch riding as the repair of an install of nothing
+  (D-054, D-068), no new engine primitive; unreached by any sweep, held by a directed crash
+  test of both shapes on 60 seeds (one step: whole 12, none 48, never a mix; the old two
+  steps: split applied over the right span's keys on 40). (2) Every start traces each
+  initialised replica's `RangeDescriptor` at its applied index and `RangesRestated`; an
+  install that changes an initialised replica traces its `RangeDescriptor` after the
+  switch's restatement; an install's creation names the snapshot's generation and voters;
+  check 7 holds every statement — a `RangeDescriptor` at or below the replica's last traced
+  applied index — to its map at that index, in either order, a later generation waiting for
+  the change it holds. **Measured to move no schedule**: 1 000 of 1 000 correct-node seeds
+  and every other node scenario's 100 and every pin hash the same trace with the three
+  kinds left out; 6 902 restatements, 44 134 descriptors restated and 16 installs that
+  changed a descriptor over the thousand, none in violation. (3) The `snapshot` task's plan
+  re-hosted at a switch that moves the span, as a split's apply does: **moves 7 of 1 000
+  correct-node schedules** (and 12 / 4 of 100 under `SharedSnapshotDir` /
+  `ApplyWaitsForEveryRange`), no pinned seed. (4) Check 8 (`OneOwnerPerKey`): the overlap
+  clause in the range layer's verdict, 0 of 1 000 on the correct node; **the right half's
+  clause trips on the correct node, 2 of 1 000 (seeds 45 and 878) — a STOP**: a voter of P
+  that lagged the split is installed P's post-split snapshot, holds no R (nothing creates it
+  before the placeholders), restarts and restates P past `s`, which §8's clause reads as an
+  apply of `s`. Folded, printed at every tier, under the equivalence test with seed 45
+  compared in violation, seed 45 pinned with its mechanism, **not asserted**; the owner's
+  question in D-107 with a recommendation. Mutations: the split's batch without P's
+  descriptor, 98 of 100 (check 7's restatement clause 90, check 8's overlap clause 88 read
+  apart); a restart reopening no right half, 99 of 100 by the right half's clause alone.
+  **#126 left open**: restating each snapshot record's `taken` as the one-group server
+  does catches `SnapshotWithoutCurrentLast` on 19 of 1 000 by state machine safety, but
+  fails the correct node's pre-vote check on seed 358 (the node stamps a message's receipt
+  at its round's drain, D-073, and the restatement's "installed" had hidden it); issue #167.
+  Measured on an Apple M2 under two other slices' load (~450); the premerge and the nightly
+  are in the PR.
 - Branch `docs-stage-c-record` (2026-10-11), off `main` at b01db39 and merged with it at
   8496ca3 (#152, D-105; footer D-106), PROPOSED D-104, **Stage C's record**, docs and
   comments only (no code line, schedule or pinned hash moves). It records three things no
