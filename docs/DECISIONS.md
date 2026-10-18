@@ -20577,7 +20577,7 @@ check 18 and 1 by check 16 among its `"something else": 500`. The totals agree.
 
 ---
 
-## PROPOSED D-108 — `AnyFreshNodeBootstraps` and `IncarnationPerRangeStream` move from `NodeVariants` into `RangeVariants`, as the range layer's instruments outside §10's count, measured; Stage D's re-add variant is not `IncarnationPerRangeStream`; D-105's markers and its table's source corrected
+## PROPOSED D-108 — `AnyFreshNodeBootstraps` and `IncarnationPerRangeStream` move from `NodeVariants` into `RangeVariants`, as the range layer's instruments outside §10's count, measured; Stage D's re-add variant is not `IncarnationPerRangeStream`; D-105's markers and its table's source corrected; `TrustStaleDescriptor`'s test comment re-derived
 
 **The number.** This branch is off `main` at f8a15a7, whose footer reads D-106. Two
 slices open beside it take D-106 (the per-fold equivalence) and D-107 (restatement and
@@ -20593,7 +20593,8 @@ the two variants: their arms and bits and the module doc of `range_variant.rs`; 
 `server::run`'s choice of bootstrap, `reseed`'s draw and the split's draw; and
 `reseed`'s new parameter. It is also on the configuration of the set in the membership
 scenario and in `sim/ranges.rs`, on the run functions of those two scenarios that take
-the set, and on the two tests. The helpers that only pass the set along carry none.
+the set, on the two tests that run the instruments, and on `TrustStaleDescriptor`'s test
+comment (#156). The helpers that only pass the set along carry none.
 These are `spawn_server`, `spawn_node`, `spawn_node_of`, `server_config`,
 `server_config_of`'s signature, `run_on`, `run_on_with`, `alone_of`, `run_with_of` and
 `server::run`'s call of `reseed`.
@@ -20840,6 +20841,60 @@ node) draws the number its predecessor drew". That is true of `node_stream` and 
 what the variant draws, what catches it, and that it does not reach the repeat. The
 range layer's module doc says why Stage D's variant is not this one read at one more
 site. No code line other than comments moves.
+
+### #156: the seeds `TrustStaleDescriptor` is not caught on, re-derived
+
+The test's comment said the variant is caught on 99 of 100 at the premerge's share, and
+named seed 48 as the one it is not caught on. Measured on 72e362a in release, over seeds
+0 to 999 of the node cluster under the variant, it is caught on **20 of 20**, **100 of
+100** and **998 of 1 000**. Seed 48 is among the caught: check 9 sees server 2 serve a
+read of `k2` from range 2 at 500 ms. The two seeds it is not caught on are **184 and
+819**. #152's harness found the same on b01db39 and ccdbf24, and `main`'s nightly on
+f8a15a7 (39015093151) prints the same 998 of 1 000 at its share. The schedule has moved
+since D-097 wrote the comment.
+
+The comment's explanation was re-derived from each run's records:
+
+- the stale client's `ClientInvoke`, `ClientReturn` and `ClientMismatch`;
+- its `ClientSend`s through the stale entry, that is to range 2 at generation 0;
+- `RangeMismatchSent` at apply;
+- range 2's `RaftLeader` and `RaftRead`;
+- `RangeSplit`.
+
+The explanation was that the stale client's first operations on its stale ranges are
+writes, refused at apply, whose `RangeMismatch` corrects its cache. That needs one
+qualification. The cache merges a learned descriptor only over the part of a
+lower-generation entry it overlaps (crates/ananke-shard/src/client.rs:169-185). So each
+range the stale entry misroutes (3, 4 and 5) is corrected separately, by a write to it
+refused at apply. The harm is a read **served** through the entry before that.
+
+- **Seed 184 fits as written.** The first operation through the stale entry on each of
+  ranges 5, 4 and 3 is a write: a put of `k6`, a cas of `k4` and a put of `k3`. They are
+  refused at apply at 243, 307 and 370 ms, and each answer's descriptors are merged. Its
+  one read through the entry is its first operation, a read of range 2's own key `k1`,
+  which server 3 serves within range 2's span at 214 ms. The run's two splits, of range 3
+  at `k3` (12.0 s) and of range 5 at `k7` (16.2 s), never cut range 2.
+- **Seed 819 needs the qualification.** Its first operation is a read of `k4` through the
+  stale entry at 0 ms. It is sent to servers 1, 2, 3, 1 and 2 before range 2 elects its
+  first leader (server 2, at 194 ms), then to servers 3 and 1, and is abandoned unserved
+  at 255 ms. After it, the first operation on each of ranges 3, 5 and 4 is a delete, of
+  `k3`, `k6` and `k5`, refused at apply at 279, 357 and 682 ms.
+
+What decides a seed, then, is whether each misrouted range's part of the entry is
+corrected before a read through it is served. Over the thousand, 21 seeds' first
+operation through the stale entry is a write on each of the three ranges, and 20 of them
+are caught all the same:
+
+- on 18, one of those writes was abandoned unanswered and corrected nothing, and the
+  catch is a later read, through the entry, of a key of that very range;
+- on seeds 579 and 759 the catch is a read of `k1` that range 2 served after a split of
+  range 2 had put `k1` outside its span. That is §10's own shape for this variant, a
+  split while a client's cache names the parent.
+
+Seed 184 is the twenty-first. The comment now says what seeds 184 and 819 do. It moves no
+assertion and no tier: the test asserts `caught > 0` at every tier and prints the rate.
+The diagnostic that read the records, `sim/tests/h1_stale.rs`, is untracked and was never
+committed. Its per-seed rows are in PR #164.
 
 ### Consequences
 

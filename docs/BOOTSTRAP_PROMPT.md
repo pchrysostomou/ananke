@@ -127,7 +127,12 @@ _Update this section at the end of every session._
   sites of the range layer's set (five in `server.rs`,
   the sweep's client's) and the six prose-form sites carry `// PROPOSED(D-105)`, and a
   note appended to D-105 says what is marked and that its split by check was the
-  uncommitted harness's (the tests count checks 16 and 18 as "something else").
+  uncommitted harness's (the tests count checks 16 and 18 as "something else"). #156:
+  `TrustStaleDescriptor` is caught on 20/20, 100/100 and 998/1 000, missing seeds 184 and
+  819 (seed 48 is caught), re-derived from the stale client's records: on 184 the first
+  operation through the stale entry on each misrouted range is a write refused at apply,
+  and range 2 never splits; on 819 the first is a read of `k4` sent before range 2 had a
+  leader and abandoned unserved, then three deletes refused at apply.
 - Branch `docs-stage-c-record` (2026-10-11), off `main` at b01db39 and merged with it at
   8496ca3 (#152, D-105; footer D-106), PROPOSED D-104, **Stage C's record**, docs and
   comments only (no code line, schedule or pinned hash moves). It records three things no

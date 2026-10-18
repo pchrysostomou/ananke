@@ -1680,12 +1680,24 @@ fn a_server_that_trusts_a_stale_descriptor_is_caught_by_check_9_on_the_node() {
         &[RangeVariant::TrustStaleDescriptor],
     );
     let caught = outcomes.iter().filter(|o| o.why.is_some()).count();
-    // A rate, not every seed: 20 of 20 at the gate and 99 of 100 at the premerge's
-    // share. Seed 48 is the one it is not caught on, and legitimately: its stale
-    // clients' first operations on their stale ranges are writes, which the apply
-    // check refuses and the resend corrects the cache by, so no read is ever served
-    // through a stale route there. The variant's harm needs a read before a write on
-    // the same stale route, which is the schedule's to give (D-061: far above 5 %).
+    // A rate, not every seed: 20 of 20 at the gate and in CI, 100 of 100 at the
+    // premerge's share and 998 of 1 000 at the nightly's. Seeds 184 and 819 are the two
+    // it is not caught on, and legitimately. The variant is caught when range 2 serves
+    // a read of a key outside its span. One way is through the stale client's stale
+    // entry, before a write to that key's range has corrected it: the apply check
+    // refuses the write, and the client merges the descriptors its `RangeMismatch`
+    // carries. The other is after a split of range 2, while a cache still names it. On
+    // seed 184 the first operation through the stale entry on each of ranges 3, 4 and 5
+    // is a write (a put of `k3`, a cas of `k4`, a put of `k6`), each refused at apply
+    // by 370 ms. Its one read through the entry is of range 2's own key `k1`, which
+    // range 2 serves rightly, and range 2 never splits. On seed 819 the first is a read
+    // of `k4`, sent at the run's start before range 2 had a leader, then only to
+    // followers, and abandoned unserved at 255 ms. The first operation on each range
+    // after it is a write (three deletes), each refused at apply by 682 ms. The
+    // variant's harm is the schedule's to give (D-061: far above 5 %). Seed 48, which
+    // an earlier comment named as the miss, is caught. The seeds were re-derived from
+    // the stale client's sends in release.
+    // PROPOSED(D-108): the misses re-derived (#156).
     assert!(
         caught > 0,
         "TrustStaleDescriptor was caught on no seed: a stale client's read served from \
