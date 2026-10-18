@@ -20737,6 +20737,24 @@ s at the premerge's tier, against the old test's 7.9; the nightly's rows are re-
 `scripts/nightly-shards.txt`, and the shards run 1 977.1 / 2 134.8 / 1 923.7 / 1 671.7 /
 1 677.9 / 1 661.6.
 
+### 5. `IdBlockResumed`'s catch is check 18's range-id clause (issue #141)
+
+`a_node_that_resumes_another_runs_block_of_ids_is_caught_after_a_split` counted a catch
+whenever the run's verdict contained `descriptor lineage`, which `SplitLineage` writes for
+every failure of the split clause — a wrong generation, wrong voters, no plain
+configuration in force — as well as for the right half's freshness, so D-100's "caught by
+check 18's range-id clause" was not what the test established. It counts now a verdict
+that is two grants of one id (`range ids:`) or the freshness failure ("which a creation or
+a split had named before it"): `by_the_range_id_clause`, which the pair's equivalence test
+reads the fold's own verdict with too. Re-measured over the variant test's shares at the
+gate, the premerge and the nightly (seeds 0–19, 0–99, 0–999): **12, 58 and 499**, the
+loose predicate's own figures — every `descriptor lineage:` verdict of the variant's runs
+is the freshness failure, so the narrowing moves no count and makes the attribution what
+it says. Read fold by fold, the clause trips on 628 of the thousand, exactly the seeds the
+variant is caught on: the run's verdict names another check first on 129 of them (state
+machine safety on 90, check 9 on 16, log matching on 11, commit by current term on 8,
+check 7 on 3, check 16 on 1), and check 18's clause trips beneath every one.
+
 ### Nothing moved
 
 The folds run after the fact, item 1 leaves the checker's verdict as it was, and item 3's

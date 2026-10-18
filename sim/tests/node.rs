@@ -1969,14 +1969,29 @@ fn a_node_that_resumes_another_runs_block_of_ids_is_caught_after_a_split() {
         "no restarted proposer's second split was done on the share, so IdBlockResumed had \
          no id to take twice: the schedule's shape for it (SHARD.md §10) was not reached"
     );
+    // The catch is check 18's range-id clause's — a right half a creation or a split
+    // named before, or two grants of one id — and not any `descriptor lineage:`
+    // violation, which a wrong generation or wrong voters also begin with (issue #141).
+    // Re-measured over seeds 0 to 999 in release, the shares of the gate, the premerge
+    // and the nightly: 12 of the first twenty, 58 of the first hundred and 499 of the
+    // thousand, the loose predicate's own figures, since every `descriptor lineage:`
+    // verdict of the variant's runs is the freshness failure; the narrowing moves no count
+    // and makes the attribution what it says. The run's verdict names another check
+    // first on 129 of the 628 seeds the variant is caught on — state machine safety on
+    // 90, check 9 on 16, log matching on 11, commit by current term on 8, check 7 on 3,
+    // check 16 on 1 — and check 18's clause trips beneath every one of them, read fold by
+    // fold (`the_range_layers_folds_agree_one_by_one_and_check_18_trips_under_id_block_resumed`).
+    // PROPOSED(D-106): IdBlockResumed's catch narrowed to check 18's range-id clause.
     let by_check_18 = outcomes
         .iter()
-        .filter(|o| {
-            o.why
-                .as_deref()
-                .is_some_and(|why| why.contains("descriptor lineage"))
-        })
+        .filter(|o| o.why.as_deref().is_some_and(by_the_range_id_clause))
         .count();
+    println!(
+        "node: IdBlockResumed: caught by check 18's range-id clause on {by_check_18}/{}, \
+         by any check on {}",
+        outcomes.len(),
+        outcomes.iter().filter(|o| o.why.is_some()).count()
+    );
     assert!(
         by_check_18 > 0,
         "IdBlockResumed was caught by check 18's range-id clause on no seed of the share: \
