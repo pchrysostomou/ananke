@@ -318,8 +318,8 @@ impl Report {
         let seed = self.seed;
         // SHARD.md §8's checks 7, 9, 10, 16, 17 and 18 — `ananke_shard::invariants`'
         // seven folds — over this node scenario's trace (Q40; PROPOSED D-097, D-098).
-        // Every node scenario folds them but the sharded quorum scenario, which does
-        // not yet (#140; D-104).
+        // Every node scenario folds them, the sharded quorum scenario since PROPOSED
+        // D-106 (#140).
         if let Err(violation) = ananke_shard::invariants::all(&self.records) {
             return Err(format!("seed {seed}: {violation}"));
         }

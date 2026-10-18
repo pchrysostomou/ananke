@@ -20546,10 +20546,11 @@ this branch's changes before `rustfmt`, which changed their layout and nothing e
 
 ## PROPOSED D-106 — Each of the range layer's folds keeps a verdict of its own and runs under the equivalence test against the variant that trips it
 
-**The number.** Off `main` at 6633266, whose footer reads D-106. Two slices run beside
-this one, S6 (D-107) and H1 (D-108 if it needs one); this takes **D-106** and moves the
-footer to D-107. At the merge the entries are a union in numerical order with one footer,
-the highest plus one. Every code site carries `// PROPOSED(D-106)`.
+**The number.** Off `main` at 6633266, whose footer reads D-106, and merged with it at
+f627399 (#161). Two slices run beside this one, S6 (D-107) and H1 (D-108 if it needs one);
+this takes **D-106** and moves the footer to D-107. At the merge the entries are a union in
+numerical order with one footer, the highest plus one. Every code site carries
+`// PROPOSED(D-106)`.
 
 **Context.** Stage C's exit asks for "the equivalence test, each fold against the variant
 of this stage that trips it": checks 9 and 10 against `ApplyIgnoresSpan`, check 9 also
@@ -20727,8 +20728,11 @@ which sweeps the nightly's share of a thousand, asserts it.** `ApplyIgnoresSpan`
 check 10 (26 of 1 000) is read fold by fold in its variant test
 (`a_server_that_ignores_the_span_at_apply_is_caught_with_trust_and_after_a_split_alone`),
 printed at every tier, every trip asserted to sit beside a check-9 trip on the same run, and
-asserted from the nightly's share beside the variant's catch. Every routing variant's test
-now reads the folds a run tripped (`Routed::tripped`) for this.
+asserted from the nightly's share beside the variant's catch; every routing variant's test
+now reads the folds a run tripped (`Routed::tripped`) for this. `IdsUnique` under
+`AnyFreshNodeBootstraps` (34 of 1 000, below) is read the same way in that variant's test
+(`a_fresh_node_that_bootstraps_itself_is_caught_by_check_7_where_it_is_not_a_bootstrap_node`)
+and asserted from its nightly share.
 
 **A question for the owner (§12: "a fold that no variant trips is a question to the owner,
 not a test left without one").** `IdsUnique`, check 18's half that no two grants share an id
@@ -20769,6 +20773,44 @@ variant is caught on: the run's verdict names another check first on 129 of them
 machine safety on 90, check 9 on 16, log matching on 11, commit by current term on 8,
 check 7 on 3, check 16 on 1), and check 18's clause trips beneath every one.
 
+### 6. The sharded quorum scenario folds the range layer's checks (issue #140)
+
+D-098 said every node scenario folds the range layer's checks, and D-104's note on it found
+that the sharded quorum scenario never did: `quorum::NodeReport::check` asked
+`ranges::invariants_of` — `ananke-raft`'s checks 1 to 4 and commit by majority — and the
+history, and nothing of `ananke_shard::invariants`. #140 named `sim/ranges.rs` beside it;
+that half does not hold (its `Report::check` is `raft::Report::check`, which folds the
+range layer's checks over every run that traces a `RangeCreated`, as D-104 showed with a
+plant), so the work is the quorum scenario's alone. `NodeReport::check` now asks
+`ananke_shard::invariants::all` after `ananke-raft`'s checks and before the history, where
+`raft::Report::check` asks them, so a run both fail reads the same on both scenarios; the
+comments in `sim/install.rs` and `sim/reseed.rs` that named it the exception say so, and
+`RefuseOneRangeOnly`'s test says where the checks are asked.
+
+**Measured before asserted**, from the built release binary at ten thousand seeds:
+
+- the correct node: **0 of 10 000 failed**, and on seeds 0 to 999 no fold of the seven in
+  violation on any seed;
+- `RefuseOneRangeOnly`: **10 000 of 10 000 caught, 3 338 by the fan-out clause, 6 661 by
+  state machine safety on the meta range, 1 by leader completeness off group 0** (seed
+  2994), none on group 0 — D-101's split to the seed — and no fold of the seven in violation
+  on any of seeds 0 to 999, so the fold names no catch the attribution does not admit;
+- every verdict and every run's records on seeds 0 to 999 of both systems identical to
+  `main`'s (**Nothing moved**, below).
+
+**The fold is reached, shown with a plant**: `ananke_shard::invariants::all` made to fail on
+any trace with a `RangeCreated` fails the scenario's correct test on this tree in the
+plant's words, "seed 0: PROBE: the range layer's whole-trace fold ran", on 2 of 2 seeds
+(release; reverted), where D-104 ran the same plant on `main` at b01db39 and the test
+passed.
+
+The four rows of `scripts/nightly-shards.txt` whose tests ask `NodeReport::check` are
+re-weighed in place on this tree at a thousand seeds: the variant's test 46.1 → 41.0, the
+correct node's 39.4 → 36.1, D-049's site 78.1 → 72.9 and seed 2994's pin 0.1 → 0.1 — lower
+for the machine despite the fold: D-096 re-weighed every node row on a four-core Xeon
+container, slower per core than this M2. Each keeps its shard, and the shards run 1 977.1 /
+2 134.8 / 1 918.6 / 1 666.5 / 1 677.9 / 1 658.3.
+
 ### Nothing moved
 
 The folds run after the fact, item 1 leaves the checker's verdict as it was, and item 3's
@@ -20788,6 +20830,45 @@ on each tree in release (untracked, not committed):
 The gate's pins say the same of every pinned seed: seeds 272, 516, 368, 493, 633, 2994, 8885,
 2809, 12, 8 and 613 on the node and seed 42's one-group hash, each asserting its mechanism or
 its absence as before, green on every commit of this slice.
+
+### Consequences
+
+- Every fold of the range layer has a verdict a test can read on its own; the checker's
+  one verdict, which stops a run, is what it was, so no run, schedule, trace or pinned hash
+  moves (**Nothing moved**).
+- Stage C's exit line "the equivalence test, each fold against the variant of this stage
+  that trips it" is met for checks 9, 10, 16, 17 and 18 against `ApplyIgnoresSpan`,
+  `TrustStaleDescriptor`, `MetaOverwritesByArrival`, `ClientIgnoresMismatch` and
+  `IdBlockResumed`; check 7 runs under the test over the correct node and every variant,
+  tripped by D-096's instrument, and waits for Stage D's `SplitNotAtomicWithDescriptor`;
+  check 9 against `ReadCheckAtReceiptOnly`, check 8 against `SnapshotOverlapsReplica` and
+  check 20 against `UninitialisedReplicaVotes` wait for those variants (S8, S9, S11 of #162),
+  and check 19 for D-093.
+- Check 18's split clause reads the configuration in force, so `sim/shard.rs`'s driver can
+  split a right half and run membership changes beside splits without the clause failing
+  the correct system.
+- Every node scenario folds the range layer's checks, the sharded quorum scenario included.
+- Two slices open beside this one touch what it touches, and whichever merges second
+  carries the other's change across: S6 (#166, D-107) adds check 8 to the range layer's
+  checker, which then needs a `Fold` of its own and a place in the comparison; H1 (#164,
+  D-108) moves `AnyFreshNodeBootstraps` into `RangeVariants`, and the two tests here that
+  name it as `NodeVariant::AnyFreshNodeBootstraps` move with it.
+
+### What the PR asks
+
+- **PROPOSED, this entry's**, each recommended as built: a verdict per fold with the
+  checker's one verdict unchanged (item 1); check 18's configuration history keyed on the
+  committed configuration, with a creation's at its floor (item 3); the equivalence test
+  as one test per pair over `min(seeds, 100)` seeds, each pair asserted at the tier its
+  measured rate supports, and a fold whose rate is under 5 % read fold by fold in its
+  variant's test and asserted from the nightly's share (item 4); `IdBlockResumed`'s catch
+  narrowed to check 18's range-id clause (item 5); the sharded quorum scenario folding the
+  range layer's checks after `ananke-raft`'s and before the history (item 6).
+- **For the owner** (item 4, §12's rule for a fold no variant trips): `IdsUnique`'s
+  tripping variant. Recommended: D-096's instrument `AnyFreshNodeBootstraps`, which trips it
+  on 34 of the thousand membership seeds and is asserted from the nightly's share; the
+  alternatives are a test instrument that grants a block twice, outside §10's count, or
+  check 18 read as one check, which `IdBlockResumed` trips.
 
 ---
 

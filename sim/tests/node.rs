@@ -1836,8 +1836,8 @@ fn a_server_that_ignores_the_span_at_apply_is_caught_with_trust_and_after_a_spli
     // had, check 10 on the same run, which the run's verdict never names. Measured over
     // seeds 0 to 999 in release: 1 of 20, 3 of 100 and 26 of 1 000, every one on a seed
     // check 9 tripped too — under D-061's 5 %, so asserted from the nightly's share of a
-    // thousand, which sees none about once in 10^11, beside the catch; printed at every
-    // tier.
+    // thousand, which sees none about once in 3 × 10^11, beside the catch; printed at
+    // every tier.
     let by_check_10 = alone
         .iter()
         .filter(|o| o.tripped.contains(&Fold::GenerationsRise))
@@ -3224,6 +3224,13 @@ fn the_sharded_quorum_scenario_asks_four_leaders_about_one_refused_node() {
 ///
 /// The fan-out clause is asserted seen, every catch is one of the three, and each
 /// one's share is printed at every tier.
+///
+/// `NodeReport::check` asks the range layer's checks too, after the ranges' invariants
+/// and before the history and the fan-out clause (PROPOSED D-106, issue #140). None of
+/// their seven folds is in violation under the variant on any of seeds 0 to 999, and at
+/// ten thousand the split is D-101's to the seed (3 338 / 6 661 / 1), so they name no
+/// catch the attribution does not admit; one that ever did would fail this test as
+/// "caught by something other than", and be read before it is admitted.
 // PROPOSED(D-085): sharded is one fault and four answers, not the scenario four times.
 // PROPOSED(D-101): leader completeness off group 0 is the third witness of the one bug.
 #[test]

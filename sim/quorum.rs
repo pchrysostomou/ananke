@@ -985,8 +985,10 @@ impl NodeReport {
     /// 1. **The setup.** The one `mark_store_lost` refused the node — an absence read
     ///    off a run that refused nothing is no evidence at all — and every range found
     ///    a leader that is not the victim before the cut.
-    /// 2. **The safety checks** of §8 keyed by range, commit by majority and
-    ///    linearizability over the trace.
+    /// 2. **The safety checks** of §8 keyed by range, commit by majority, the range
+    ///    layer's checks — 7, 9, 10, 16, 17 and 18, folded over the whole trace as every
+    ///    other node scenario folds them (issue #140) — and linearizability over the
+    ///    trace.
     /// 3. **The fan-out (D-077).** Every one of the node's four replicas was refused
     ///    with it and re-seeded, each stamping its answers with a store incarnation of
     ///    its own, the four of them four different numbers.
@@ -1049,6 +1051,16 @@ impl NodeReport {
             ));
         };
         crate::ranges::invariants_of(&self.records).map_err(|v| format!("seed {seed}: {v}"))?;
+        // SHARD.md §8's checks 7, 9, 10, 16, 17 and 18, which D-098 said every node
+        // scenario folds and this one never did (issue #140; D-104's note on D-098).
+        // After `ananke-raft`'s checks and before the history, where `raft::Report::check`
+        // asks them, so a run both fail reads the same on both scenarios. Measured before
+        // it was asserted: the correct node green on 10 000 of 10 000 seeds, no fold of the
+        // seven in violation on any of seeds 0 to 999 under the correct node or
+        // `RefuseOneRangeOnly`, and that variant's attribution D-101's 3 338 / 6 661 / 1 at
+        // ten thousand, to the seed (PROPOSED D-106).
+        // PROPOSED(D-106): the sharded quorum scenario folds the range layer's checks.
+        ananke_shard::invariants::all(&self.records).map_err(|v| format!("seed {seed}: {v}"))?;
         lin::check(&self.history).map_err(|v| format!("seed {seed}: {v}"))?;
         let holds = self.holds().expect("a cast has holds");
         let (cut, _) = self.cut.expect("a cast has a cut");

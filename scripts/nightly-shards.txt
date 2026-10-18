@@ -407,6 +407,13 @@
 # (1977.1 / 2134.8 / 1923.7 / 1643.9 / 1594.3 / 1632.3): the correct node's 31.2 into shard 5, the
 # meta pair's 29.3 into 5, the membership pair's 28.2 into 6, `ApplyIgnoresSpan`'s 27.8 into 4, the
 # id-block pair's 23.1 into 5, the trust pair's 0.6 and the client pair's 0.5 into 6.
+# D-106's step 6 (the sharded quorum scenario folds the range layer's checks, #140) re-weighed
+# in place the four `node` rows whose tests ask `NodeReport::check`, from the built release
+# binary (`node-<hash> <test> --exact`) at ANANKE_SEEDS=1000 ANANKE_DEEP_SEEDS=100, as user + sys,
+# on the Apple M2 of 8 cores on AC Power under load averages 262-298: `RefuseOneRangeOnly`'s
+# test 46.1 -> 41.0, the correct node's 39.4 -> 36.1, D-049's site 78.1 -> 72.9 and seed 2994's
+# pin 0.1 -> 0.1, lower for the machine despite the fold (D-096 re-weighed every node row on a
+# four-core Xeon container). Each keeps its shard.
 # shard	binary	cpu_s	test
 # shard 1: 1977.1 cpu s
 # D-095 added two rows, both `node`, weighed on its tree from the built release binary
@@ -451,7 +458,7 @@
 2	ranges	0.1	no_batch_frame_of_the_node_parses_as_a_frame_of_the_one_group_server
 2	ranges	0.1	the_ranges_of_one_node_draw_their_own_election_timeouts
 2	node	179.0	an_apply_task_that_waits_for_every_range_is_caught_by_the_lag_fold_on_the_node
-# shard 3: 1923.7 cpu s
+# shard 3: 1918.6 cpu s
 3	echo	0.2	trace_hash_matches_the_pinned_golden
 3	engine	417.5	the_range_delete_crash_test_passes_every_seed
 3	engine	235.9	the_seek_crash_test_passes_every_seed
@@ -462,7 +469,7 @@
 3	install	5.0	every_wiring_variant_is_caught
 3	node	353.7	a_server_that_installs_without_current_last_is_injected_on_the_node
 3	node	105.5	every_seed_passes_the_membership_scenario_on_the_correct_node
-3	node	46.1	a_node_that_refuses_only_one_range_is_caught_on_the_sharded_quorum_scenario
+3	node	41.0	a_node_that_refuses_only_one_range_is_caught_on_the_sharded_quorum_scenario
 3	node	30.4	a_server_without_pre_vote_is_caught_on_the_node
 3	node	5.9	a_server_that_applies_before_commit_is_caught_on_the_node
 3	raft	281.7	a_server_whose_refusal_is_not_durable_is_caught
@@ -476,12 +483,12 @@
 3	raft	0.2	the_membership_scenario_has_byte_identical_traces_for_one_seed
 3	reseed	95.8	the_reseed_shape_holds_on_every_seed
 3	wal	21.2	a_log_that_acknowledges_before_syncing_is_caught
-# shard 4: 1671.7 cpu s
+# shard 4: 1666.5 cpu s
 4	echo	0.1	same_seed_gives_byte_identical_trace
 4	engine	210.8	the_correct_engine_passes_every_seed
 4	engine	38.6	an_install_that_switches_one_span_at_a_time_is_caught
 4	node	159.6	the_pair_on_the_node_is_the_stream_half_alone_where_no_store_is_refused
-4	node	78.1	d_049s_rule_has_a_site_on_the_node_now_and_its_pair_waits_on_the_scenarios_own_threshold
+4	node	72.9	d_049s_rule_has_a_site_on_the_node_now_and_its_pair_waits_on_the_scenarios_own_threshold
 4	node	34.9	a_server_whose_refusal_is_not_durable_is_not_re_asserted_on_the_node_yet
 4	node	2.7	a_follower_that_truncates_on_every_append_is_caught_on_the_node
 4	node	2.3	seeds_272_and_516_are_a_live_installs_hold_and_the_fourth_arm_answers_for_them
@@ -531,7 +538,7 @@
 5	node	31.2	the_range_layers_folds_agree_one_by_one_on_the_correct_node
 5	node	29.3	the_range_layers_folds_agree_one_by_one_and_check_16_trips_under_meta_overwrites_by_arrival
 5	node	23.1	the_range_layers_folds_agree_one_by_one_and_check_18_trips_under_id_block_resumed
-# shard 6: 1661.6 cpu s
+# shard 6: 1658.3 cpu s
 6	echo	0.1	a_busy_looping_task_fails_the_scenario_instead_of_hanging
 6	engine	310.3	an_engine_that_acknowledges_before_the_log_is_caught
 6	engine	204.5	an_engine_that_releases_a_memtable_before_the_manifest_is_caught
@@ -541,7 +548,7 @@
 6	install	0.3	a_stream_flows_and_an_install_completes_on_every_range_and_every_follower
 6	node	67.4	a_leader_that_shares_one_snapshot_directory_is_caught_on_the_node
 6	node	76.2	a_server_that_counts_one_majority_in_joint_consensus_is_caught_on_the_node
-6	node	39.4	the_sharded_quorum_scenario_asks_four_leaders_about_one_refused_node
+6	node	36.1	the_sharded_quorum_scenario_asks_four_leaders_about_one_refused_node
 6	node	35.2	a_server_whose_adoption_is_as_built_is_not_re_asserted_on_the_node_yet
 6	node	31.7	a_server_that_resets_its_timer_on_any_message_is_caught_on_the_node
 6	node	28.1	a_leader_that_commits_an_older_terms_entry_by_count_is_caught_on_the_node
