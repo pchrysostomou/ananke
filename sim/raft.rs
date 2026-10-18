@@ -7594,6 +7594,7 @@ pub(crate) async fn client_on<E: Environment>(
                     seq += 1;
                     // `ClientIgnoresMismatch`: the resend goes to the range and
                     // generation the client had, merging nothing (§10, Q38).
+                    // PROPOSED(D-105): read from the range layer's set.
                     if range_variants.contains(RangeVariant::ClientIgnoresMismatch) {
                         target = target % servers + 1;
                         continue;
