@@ -1922,6 +1922,130 @@ mod tests {
         );
     }
 
+    /// The records of a configuration entry of range 2 that node 1 appends and applies at
+    /// `index` in term 2: its `RaftAppend`, the `RaftConfig` the append traces, and its
+    /// first `RaftApply`, which commits it.
+    fn a_committed_configuration(
+        index: u64,
+        hash: u64,
+        old: &[u64],
+        new: &[u64],
+        joint: bool,
+    ) -> Vec<TraceRecord> {
+        vec![
+            record(
+                1,
+                TraceEvent::RaftAppend {
+                    server: 1,
+                    range: 2,
+                    index,
+                    entry_term: 2,
+                    hash,
+                },
+            ),
+            record(
+                1,
+                TraceEvent::RaftConfig {
+                    server: 1,
+                    range: 2,
+                    index,
+                    old: old.to_vec(),
+                    new: new.to_vec(),
+                    joint,
+                    learners: vec![],
+                },
+            ),
+            record(
+                1,
+                TraceEvent::RaftApply {
+                    server: 1,
+                    range: 2,
+                    index,
+                    entry_term: 2,
+                    hash,
+                    key: None,
+                    effect: ApplyEffect::None,
+                },
+            ),
+        ]
+    }
+
+    /// A membership change the range committed — its joint entry at 5 and the plain
+    /// `C_new` at 7 that ends it, each appended and applied — is what a split at 9 reads:
+    /// R created with `C_new`'s voters is in shape, and R created with `C_old`'s is
+    /// caught, naming `C_new`'s as what the split leaves (#163's review: no case read the
+    /// voters of a plain configuration an append put in force, so emptying them passed
+    /// every case). The descriptor's own change at `C_new` is Stage D's clause and is not
+    /// traced here; P's value keeps its voters.
+    // PROPOSED(D-106)
+    #[test]
+    fn a_plain_configuration_committed_after_a_joint_one_is_the_one_a_later_split_reads() {
+        let change = [
+            a_committed_configuration(5, 77, &[1, 2, 3], &[1, 2, 4], true),
+            a_committed_configuration(7, 88, &[1, 2, 4], &[], false),
+        ]
+        .concat();
+        let mut in_force = Checker::new(true);
+        in_force.extend(&before_a_split());
+        in_force.extend(&change);
+        let mut records = split_records(1, 2, 9, 2, b"m", b"a", b"z", 1, 6);
+        if let TraceEvent::RangeCreated { voters, .. } = &mut records[2].event {
+            *voters = vec![1, 2, 4];
+        }
+        in_force.extend(&records);
+        assert_eq!(in_force.verdict(), Ok(()));
+
+        let mut old = Checker::new(true);
+        old.extend(&before_a_split());
+        old.extend(&change);
+        old.extend(&split_records(1, 2, 9, 2, b"m", b"a", b"z", 1, 6));
+        let verdict = old.verdict_of(Fold::SplitLineage).unwrap_err();
+        assert!(
+            verdict.starts_with("descriptor lineage: right half 6's creation at index 9"),
+            "{verdict}"
+        );
+        assert!(verdict.contains("voters: [1, 2, 4]"), "{verdict}");
+    }
+
+    /// An install's creation puts no configuration in force: it names the descriptor's
+    /// voters, which say nothing of whether the configuration at its floor is joint, and
+    /// the snapshot's configuration is in the entries their own appends traced. A joint
+    /// configuration the range committed at 5, an install of the range at 7 on node 3,
+    /// and a split at 9 that took effect while joint: still caught (Q23). Holding the
+    /// install's creation as a configuration in force would read it as plain and pass
+    /// the split (#163's review).
+    // PROPOSED(D-106)
+    #[test]
+    fn an_installs_creation_puts_no_configuration_in_force() {
+        let mut checker = Checker::new(true);
+        checker.extend(&before_a_split());
+        checker.extend(&a_committed_configuration(
+            5,
+            77,
+            &[1, 2, 3],
+            &[1, 2, 4],
+            true,
+        ));
+        let mut install = created(3, 2, b"a", b"z", 1, &[1, 2, 3]);
+        if let TraceEvent::RangeCreated {
+            cause,
+            floor_index,
+            floor_term,
+            ..
+        } = &mut install.event
+        {
+            (*cause, *floor_index, *floor_term) = (RangeCause::Snapshot, 7, 2);
+        }
+        checker.push(&install);
+        checker.verdict().unwrap();
+        checker.extend(&split_records(1, 2, 9, 2, b"m", b"a", b"z", 1, 6));
+        let verdict = checker.verdict_of(Fold::SplitLineage).unwrap_err();
+        assert!(
+            verdict.contains("with no plain configuration in force"),
+            "{verdict}"
+        );
+    }
+
     /// The history is a range's own: a joint configuration another range committed at the
     /// split's own index is not the splitting range's, and the split is in shape (Q23 asks
     /// it of P's configuration alone). With one range every configuration is P's and a

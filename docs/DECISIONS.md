@@ -20679,6 +20679,46 @@ The case's first draft put the other range's entry below the split's index, wher
 right half's creation shadowed it in a shared history and the first mutation passed; it
 sits at the split's index now.
 
+**Two more cases, after #163's review**, which found that no case read the voters of a
+plain configuration an append put in force — every appended configuration in the cases
+above is joint and refused, every plain one a creation's — so a history holding such a
+configuration with no voters passed all of them, and that no case held an install's
+creation out of the history. `a_plain_configuration_committed_after_a_joint_one_is_the_one_a_later_split_reads`
+commits a membership change, its joint entry at 5 and the plain `C_new` at 7 that ends it,
+and splits at 9: R created with `C_new`'s voters is in shape and R created with `C_old`'s is
+caught, naming `C_new`'s as what the split leaves. That is the path a membership change
+beside a split takes, which no sweep reaches yet (the node sweep changes no configuration
+and the membership scenario splits nothing). `an_installs_creation_puts_no_configuration_in_force`
+commits a joint configuration at 5, installs the range at 7 on another node, and splits at
+9 while joint: still refused, since an install's creation names the descriptor's voters,
+which say nothing of whether the configuration at its floor is joint — the snapshot's
+configuration is in the entries their own appends traced. The review's mutations, each
+planted alone in this item's file: the history keyed by the index alone fails five cases,
+or six with the committed entries keyed so too; the first configuration traced standing
+fails the truncation case; no history from a right half's creation fails the right half's;
+none from a bootstrap's fails eight; an appended configuration held with no voters fails
+the membership change's case; an install's creation seeding the history fails the
+install's case; an appended configuration never counting, and the earliest configuration
+at or below the index winning, fail four each. Four survive and are equivalent on every
+trace the core can produce: the `RaftTruncate` arm removed (a truncation's revert names an
+index below the one it truncated from, so the index match alone drops it); the
+append-index match dropped (a configuration held with another index's entry is not the
+entry the range committed at its own index, so it never counts, and would name the
+configuration in force there if it did); the last apply winning (check 4 holds every later
+apply of an index to the first); and the committed entry recorded at every apply (an index
+holding no configuration is never read).
+
+**This refines §8's wording.** SHARD.md defines the history under check 11 — "a history
+per (range, index) of the configuration in force, built from each `RaftConfig`'s `index`"
+— and Stage C's build list folds it for check 18 in the same words. Read as "the first
+`RaftConfig` traced at an index", that is #138's first half, and it holds nothing for a
+right half; this item builds it from the committed configuration entries and the
+creations' floors, and check 11, which Stage E builds over the same history, reads it the
+same way. SHARD.md's text is left as approved: its line numbers are cited throughout
+DECISIONS.md, SHARD.md itself and the code, and a pointer added at check 11 would shift
+every citation after it, so this entry is the refinement's record and the stage that builds
+check 11 cites it.
+
 **Nothing moves.** The node sweep traces no configuration change — its only configurations
 are the bootstrap's at index 0, which the old history read off the restatement's
 `RaftConfig` and the new one reads off the creation — and no range variant changes one, so
