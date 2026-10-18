@@ -1562,6 +1562,42 @@ mod tests {
         assert!(verdict.contains("is what the split leaves"), "{verdict}");
     }
 
+    /// A split whose right half's creation names voters other than P's plain
+    /// configuration at `s`, and one whose P value at `s` names voters other than P's,
+    /// are each caught, each in its own words (issue #150; D-100's item 8 listed the
+    /// case and the tree had none).
+    // PROPOSED(D-106)
+    #[test]
+    fn a_split_that_leaves_wrong_voters_on_either_half_is_caught() {
+        let mut right = Checker::new(true);
+        right.extend(&before_a_split());
+        let mut records = split_records(1, 2, 9, 2, b"m", b"a", b"z", 1, 6);
+        if let TraceEvent::RangeCreated { voters, .. } = &mut records[2].event {
+            *voters = vec![1, 2, 4];
+        }
+        right.extend(&records);
+        let verdict = right.verdict_of(Fold::SplitLineage).unwrap_err();
+        assert!(
+            verdict.starts_with("descriptor lineage: right half 6's creation at index 9"),
+            "{verdict}"
+        );
+        assert!(verdict.contains("voters: [1, 2, 4]"), "{verdict}");
+
+        let mut left = Checker::new(true);
+        left.extend(&before_a_split());
+        let mut records = split_records(1, 2, 9, 2, b"m", b"a", b"z", 1, 6);
+        if let TraceEvent::RangeDescriptor { voters, .. } = &mut records[1].event {
+            *voters = vec![1, 2, 5];
+        }
+        left.extend(&records);
+        let verdict = left.verdict_of(Fold::SplitLineage).unwrap_err();
+        assert!(
+            verdict.starts_with("descriptor lineage: range 2's value at its split's index 9"),
+            "{verdict}"
+        );
+        assert!(verdict.contains("voters: [1, 2, 5]"), "{verdict}");
+    }
+
     /// Two folds in violation on one record — a write applied in a range whose span no
     /// longer holds its key, to a key its sibling wrote at the same generation — are
     /// each reported by their own fold, and the checker's verdict names the first in

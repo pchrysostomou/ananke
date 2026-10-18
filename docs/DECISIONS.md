@@ -20573,6 +20573,18 @@ violation in the order 7, 9, 10, 16, 17, 18, which is what stops a run of the no
 else and no schedule moves. A unit test plants one write that breaks checks 9 and 10 at
 once and asserts both folds report it in their own words while the checker names check 9.
 
+### 2. The wrong-voters case of check 18's split clause (issue #150)
+
+D-100's item 8 listed unit tests of the split clause for "a right half named before, a
+wrong generation, wrong voters and an id in no block or another node's block", and the
+tree had every one but the wrong voters (D-104's note on D-100).
+`a_split_that_leaves_wrong_voters_on_either_half_is_caught` plants both halves of it: R's
+`RangeCreated { cause: split }` naming voters other than P's plain configuration at `s`,
+and P's `RangeDescriptor` at `s` naming voters other than P's, each caught by the split
+clause's own verdict in its own words ("right half 6's creation at index 9 is …" and
+"range 2's value at its split's index 9 is …", each naming the planted voters). It tests
+the clause as it stood; no line of the check changes.
+
 ---
 
 _Next entry: D-107. Add one before implementing anything not covered above._
