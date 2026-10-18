@@ -101,6 +101,42 @@ ananke/
 
 _Update this section at the end of every session._
 
+- Branch `phase-3-stage-c-fold-equivalence` (2026-10-18), off `main` at 6633266 and merged
+  with it at f8a15a7 (#161) and 6370823 (#164), PROPOSED D-106 (footer D-109, D-107 being
+  #166's), PR #163, **each of the range layer's folds keeps a verdict of its own and runs
+  under the equivalence test against the variant that trips it**; closes #138, #140, #141
+  and #150. Resumed from a session of
+  2026-10-12 that died with all of it uncommitted, committed in gated steps and every figure
+  re-measured. `invariants::Fold`, `Checker::verdict_of` and `verdicts`, and
+  `invariants::folded`; `Checker::verdict`, which stops a node run, unchanged. The old
+  equivalence test (one verdict, twenty seeds of three systems at every tier) is replaced by
+  seven, one per pair, over `min(seeds, 100)` seeds, fold by fold at eight prefixes: the
+  correct node; checks 9 and 10 against `ApplyIgnoresSpan` with and without
+  `TrustStaleDescriptor`; 9 against `TrustStaleDescriptor`; 16 against
+  `MetaOverwritesByArrival`; 17 against `ClientIgnoresMismatch`; 18 against `IdBlockResumed`;
+  7 against `AnyFreshNodeBootstraps` on membership beside the correct membership node (§12
+  asserts 7 against Stage D's `SplitNotAtomicWithDescriptor`). Measured first at seeds 0 to
+  999 (the table in D-106): **check 10 trips for the first time**, 26 of 1 000 under
+  `ApplyIgnoresSpan` alone, every one beside check 9, and 210 under the pair; `IdsUnique`
+  (check 18's grants) is tripped by no §10 variant and by `AnyFreshNodeBootstraps` on 34 of
+  1 000 membership seeds, the owner's question in D-106. #138: check 18's configuration
+  history keyed on the committed configuration, a right half's seeded from its creation —
+  a split of a right half and a truncated configuration entry, both failing on `main` in the
+  issue's words, and a two-range case, with five mutations each caught. #140: the sharded
+  quorum scenario folds the range layer's checks, measured at ten thousand before it was
+  asserted (correct node 0 failed, `RefuseOneRangeOnly` D-101's 3 338 / 6 661 / 1 to the
+  seed), and shown reached with a plant. #141: `IdBlockResumed`'s catch narrowed, 12 / 58 /
+  499 unchanged. #150: the wrong-voters case. **Nothing moved**: 12 400 runs hashed on
+  `main` and on the branch, identical, every verdict too. Nightly rows: seven added, the old
+  one removed, ten re-weighed on the M2. Issue #168: a test print that cuts a verdict by
+  bytes. After #163's review: the grants clause goes on folding its grants after its own
+  violation, which had given the split clause false "lies in no block" verdicts (no figure
+  moves, re-measured); two more cases of check 18's history (a committed membership change,
+  an install), killing the review's two surviving mutations; the grants clause compared on
+  a violation at every tier on four pinned membership seeds; D-106's owner question names
+  the one branch the instrument reaches. The two tests naming `AnyFreshNodeBootstraps`
+  read it from `RangeVariants` since the merge of #164. The premerge's D-070 lines and the
+  nightly's verdict on each tip are in #163.
 - Branch `phase-3-variant-set-followups` (2026-10-12, resumed 2026-10-18), off `main` at
   f8a15a7, PROPOSED D-108, **the variant set's follow-ups** (#151, #155, #156), one
   commit per step. #151: `AnyFreshNodeBootstraps` (D-096) and `IncarnationPerRangeStream`

@@ -20598,6 +20598,427 @@ check 18 and 1 by check 16 among its `"something else": 500`. The totals agree.
 
 ---
 
+## PROPOSED D-106 — Each of the range layer's folds keeps a verdict of its own and runs under the equivalence test against the variant that trips it
+
+**The number.** Off `main` at 6633266, whose footer reads D-106, and merged with it at
+f627399 (#161) and again after #164 (6370823, D-108). Two slices ran beside this one, S6
+(D-107, #166, open) and H1 (D-108, #164, merged first); this takes **D-106**. The entries are
+a union in numerical order with one footer, the highest taken plus one, so the footer reads
+D-109 with D-107 reserved for #166. Every code site carries `// PROPOSED(D-106)`.
+
+**Context.** Stage C's exit asks for "the equivalence test, each fold against the variant
+of this stage that trips it": checks 9 and 10 against `ApplyIgnoresSpan`, check 9 also
+against `TrustStaleDescriptor` (and `ReadCheckAtReceiptOnly`, not built), check 16 against
+`MetaOverwritesByArrival`, check 17 against `ClientIgnoresMismatch`, check 18 against
+`IdBlockResumed`, and check 7 over the correct system and this stage's variants, asserted
+against `SplitNotAtomicWithDescriptor` in Stage D, which builds it (SHARD.md §12; §11,
+raft 12). What the tree had is D-097's item 8: one `Checker` folding the seven folds and
+giving **one verdict**, the first violation in the order 7, 9, 10, 16, 17, 18
+(crates/ananke-shard/src/invariants.rs at 6633266). So a write applied outside its span,
+which breaks check 9 and, where its range's sibling wrote the key at the same generation,
+check 10 on the same record, was reported as check 9 alone: every `ApplyIgnoresSpan`
+catch read as check 9's, and check 10 had never been seen to trip on any run. The
+equivalence test (`the_range_layers_checks_agree_with_their_whole_trace_folds`,
+sim/tests/node.rs) compared that one verdict, on `high_rate_share().min(20)` seeds —
+twenty at every tier — of three systems (the correct node, `TrustStaleDescriptor`,
+`ClientIgnoresMismatch`), and asserted only that some prefix was in violation.
+
+**The work was resumed.** A session on 2026-10-12 did most of this and died with all of it
+uncommitted; none of its measurements survived. This branch commits it in steps, each
+gated, and re-measures every figure the uncommitted work quoted before any assertion it
+carried is kept.
+
+### 1. A verdict per fold
+
+`ananke_shard::invariants::Fold` names the seven folds — checks 7, 9, 10, 16 and 17, and
+check 18's range-id clause (`IdsUnique`) and split clause (`SplitLineage`) — with the check
+each is (`Fold::check`), the words every violation of it begins with (`Fold::words`) and
+`Fold::ALL` in the order the checker asks them. `Checker::verdict_of(fold)` is that fold's
+own latched verdict, `Checker::verdicts()` all seven, and `invariants::folded(records)` the
+checker folded over a trace from its first record, the whole-trace form a checker fed in
+pieces must equal fold by fold (D-046). **`Checker::verdict` is unchanged**: the first
+violation in the order 7, 9, 10, 16, 17, 18, which is what stops a run of the node sweep
+(`sim/raft.rs`'s `advance`) and what `invariants::all` returns, so no run stops anywhere
+else and no schedule moves. A unit test plants one write that breaks checks 9 and 10 at
+once and asserts both folds report it in their own words while the checker names check 9.
+
+**A fold whose state another fold reads goes on folding it after its own violation**
+(found by #163's review). A fold latches its first violation's message and stops judging;
+check 7's map, which every fold reads, already went on folding after check 7 latched, but
+`IdsUnique` returned at its first violation, and the split clause reads who holds an id
+off its blocks. So once the grants clause had tripped — another replica of range 0
+granting something else at an index, or a block granted over another's ids — a later
+split whose right half lay in a block granted after it read "lies in no block a
+`RangeIdsLeased` granted before it" in the split clause's own verdict, one fold's latch
+handing another a violation of its own. `IdsUnique` now folds every grant of record
+whatever it found — the first apply's grant at each index, a block granted over another's
+ids kept beside it (`IdsUnique::holders_of` reads every block holding an id, one at most
+while the blocks are disjoint) — and latches only its message.
+`the_grants_clause_keeps_folding_after_its_violation_for_the_split_clause` builds both
+ways and a third, a right half in an overlapping block granted to another node, still the
+split clause's own violation; all three fail on the tree before the fix, the first in the
+review's words. **Nothing moves**: the grants clause's verdict is the same message on
+every trace, the split clause's differs only on a trace where the grants clause tripped
+before a split, the checker's one verdict names the grants clause first on every such
+trace, and no run this slice measured trips the grants clause and then splits
+(`AnyFreshNodeBootstraps` on membership splits on none, `IdBlockResumed` trips the grants
+clause on none).
+
+### 2. The wrong-voters case of check 18's split clause (issue #150)
+
+D-100's item 8 listed unit tests of the split clause for "a right half named before, a
+wrong generation, wrong voters and an id in no block or another node's block", and the
+tree had every one but the wrong voters (D-104's note on D-100).
+`a_split_that_leaves_wrong_voters_on_either_half_is_caught` plants both halves of it: R's
+`RangeCreated { cause: split }` naming voters other than P's plain configuration at `s`,
+and P's `RangeDescriptor` at `s` naming voters other than P's, each caught by the split
+clause's own verdict in its own words ("right half 6's creation at index 9 is …" and
+"range 2's value at its split's index 9 is …", each naming the planted voters). It tests
+the clause as it stood; no line of the check changes.
+
+### 3. Check 18's configuration history is the configuration in force (issue #138)
+
+§8's check 18 reads "the voters of P's plain configuration in force at `s`" from the
+history per (range, index) that check 11 defines, "built from each `RaftConfig`'s
+`index`". `SplitLineage` built it with `entry(index).or_insert_with(..)`, so **the first
+`RaftConfig` traced at an index stood** — and the core traces `RaftConfig` when it
+*appends* a configuration entry, committed or not (`Raft::adopt` from `append_local`,
+crates/ananke-raft/src/core.rs), so an entry truncated and replaced at its index kept its
+place in the history, and a split above it was judged against a configuration that was
+never committed. And a right half's core starts at its floor from `restore_compacted` with
+P's configuration and traces no `RaftConfig` for it, so the history held nothing for a
+right half: **a split of a right half failed the correct trace** with "took effect with no
+plain configuration in force at or below it (Q23)". Neither was reached — the node sweep's
+arms split each configured range once at a fixed key (D-104) — and both are reached the
+day `sim/shard.rs`'s driver splits from the current spans.
+
+Decided, marked `// PROPOSED(D-106)`:
+
+- **A configuration counts at an index only when the range committed the entry that
+  carried it.** The fold holds each `RaftConfig` with the entry its own server's
+  `RaftAppend` traced just before it at the same index — the core traces the two in that
+  order for every entry it appends — as `(term, hash)`, and records the entry the range
+  first applied at each index holding one (check 4 holds every later apply there to it).
+  The configuration in force at `s` is the latest at or below `s` whose entry is the one
+  committed there. A `RaftConfig` traced with no append of its index before it — a
+  restatement at a node's start, or the revert a truncation makes to a configuration
+  already traced at its own append — adds nothing.
+- **The configurations no entry carries are a creation's**: a bootstrap's at index 0 and
+  a right half's at its floor `s`, held from the `RangeCreated` with its voters, plain. A
+  right half's is the voters its creation names, which the same clause holds to P's plain
+  configuration at `s` at the split that made it, so a split of a right half reads the
+  configuration its creation names.
+
+**Fails before, passes after.** Two hand-built cases: a split of a right half
+(`a_split_of_a_right_half_reads_the_configuration_its_creation_names`, which also plants a
+joint configuration the half commits below its own split, still refused there as on any
+range, Q23), and a joint entry appended at an index, truncated and replaced by another
+entry (`a_configuration_truncated_at_its_index_is_not_the_one_in_force_and_a_committed_one_is`,
+whose pair is the same joint entry committed, still refused). On `main` at f8a15a7, with
+only the API of item 1 swapped for `verdict()`, both fail in the issue's words: "range 6's
+split at index 15 took effect with no plain configuration in force at or below it (Q23)"
+and "range 2's split at index 9 took effect with no plain configuration in force at or
+below it (Q23)". On this tree both pass.
+
+**The mutation a single-range world cannot catch**: the history keyed by the index alone,
+as one range's would be. A third case puts another range's committed joint entry at the
+splitting range's own index (`a_configuration_another_range_committed_is_not_the_splitting_ranges`),
+and the split is in shape. Planted one at a time in this step's file, each mutation fails
+named cases: the history keyed by the index alone fails that case, the two above and the
+wrong-voters case of item 2 (with one history the right half's own creation at `s` is read
+as P's configuration there, so its voters are compared with themselves); the first
+configuration traced at an index standing fails the truncation case; no history from a
+right half's creation fails the right half's; no history from a bootstrap's fails seven.
+The case's first draft put the other range's entry below the split's index, where the
+right half's creation shadowed it in a shared history and the first mutation passed; it
+sits at the split's index now.
+
+**Two more cases, after #163's review**, which found that no case read the voters of a
+plain configuration an append put in force — every appended configuration in the cases
+above is joint and refused, every plain one a creation's — so a history holding such a
+configuration with no voters passed all of them, and that no case held an install's
+creation out of the history. `a_plain_configuration_committed_after_a_joint_one_is_the_one_a_later_split_reads`
+commits a membership change, its joint entry at 5 and the plain `C_new` at 7 that ends it,
+and splits at 9: R created with `C_new`'s voters is in shape and R created with `C_old`'s is
+caught, naming `C_new`'s as what the split leaves. That is the path a membership change
+beside a split takes, which no sweep reaches yet (the node sweep changes no configuration
+and the membership scenario splits nothing). `an_installs_creation_puts_no_configuration_in_force`
+commits a joint configuration at 5, installs the range at 7 on another node, and splits at
+9 while joint: still refused, since an install's creation names the descriptor's voters,
+which say nothing of whether the configuration at its floor is joint — the snapshot's
+configuration is in the entries their own appends traced. The review's mutations, each
+planted alone in this item's file: the history keyed by the index alone fails five cases,
+or six with the committed entries keyed so too; the first configuration traced standing
+fails the truncation case; no history from a right half's creation fails the right half's;
+none from a bootstrap's fails eight; an appended configuration held with no voters fails
+the membership change's case; an install's creation seeding the history fails the
+install's case; an appended configuration never counting, and the earliest configuration
+at or below the index winning, fail four each. Four survive and are equivalent on every
+trace the core can produce: the `RaftTruncate` arm removed (a truncation's revert names an
+index below the one it truncated from, so the index match alone drops it); the
+append-index match dropped (a configuration held with another index's entry is not the
+entry the range committed at its own index, so it never counts, and would name the
+configuration in force there if it did); the last apply winning (check 4 holds every later
+apply of an index to the first); and the committed entry recorded at every apply (an index
+holding no configuration is never read).
+
+**This refines §8's wording.** SHARD.md defines the history under check 11 — "a history
+per (range, index) of the configuration in force, built from each `RaftConfig`'s `index`"
+— and Stage C's build list folds it for check 18 in the same words. Read as "the first
+`RaftConfig` traced at an index", that is #138's first half, and it holds nothing for a
+right half; this item builds it from the committed configuration entries and the
+creations' floors, and check 11, which Stage E builds over the same history, reads it the
+same way. SHARD.md's text is left as approved: its line numbers are cited throughout
+DECISIONS.md, SHARD.md itself and the code, and a pointer added at check 11 would shift
+every citation after it, so this entry is the refinement's record and the stage that builds
+check 11 cites it.
+
+**Nothing moves.** The node sweep traces no configuration change — its only configurations
+are the bootstrap's at index 0, which the old history read off the restatement's
+`RaftConfig` and the new one reads off the creation — and no range variant changes one, so
+the clause reads the same voters on every run it judged before; measured under **Nothing
+moved** below.
+
+### 4. The equivalence test, fold by fold and one test per pair
+
+**Measured first.** Each fold's trips per system, over the node sweep's arms under each of
+§10's five and the pair, seeds 0 to 999 in release, every fold folded over each run's whole
+trace (`invariants::folded`), counted over the first 20, 100 and 1 000 seeds — what the
+gate's, CI's and the premerge's comparisons see, the nightly's being CI's hundred:
+
+| System | split took effect | 7 | 9 | 9 at an apply | 10 | 16 | 17 | 18, `IdsUnique` | 18, `SplitLineage` |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| correct | 20 / 100 / 999 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `ApplyIgnoresSpan` | 20 / 100 / 999 | 0 | 1 / 5 / 82 | 1 / 5 / 82 | **1 / 3 / 26** | 0 | 0 | 0 | 0 |
+| `TrustStaleDescriptor` | 0 / 0 / 8 | 0 | 20 / 100 / 998 | 0 | 0 | 0 | 0 | 0 | 0 |
+| the pair of the two | 0 / 0 / 0 | 0 | 20 / 100 / 1 000 | 2 / 9 / 112 | **4 / 25 / 210** | 0 | 0 | 0 | 0 |
+| `MetaOverwritesByArrival` | 20 / 100 / 999 | 0 | 0 | 0 | 0 | 3 / 18 / 149 | 0 | 0 | 0 |
+| `ClientIgnoresMismatch` | 0 / 0 / 0 | 0 | 0 | 0 | 0 | 0 | 20 / 100 / 1 000 | 0 | 0 |
+| `IdBlockResumed` | 20 / 100 / 997 | 0 / 1 / 3 | 1 / 5 / 72 | 1 / 4 / 37 | 0 | 0 / 0 / 1 | 0 | **0** | 14 / 71 / 628 |
+
+And on the membership scenario on the node: the correct node trips no fold on any of the
+thousand; `AnyFreshNodeBootstraps` trips check 7 on all 1 000 (two clusters' creations at
+index 0 of every range), check 16 on all 1 000 and `IdsUnique` on 0 / 4 / 34.
+
+**Check 10 is seen to trip for the first time.** Under `ApplyIgnoresSpan` alone on 26 of the
+thousand, every one on a seed check 9 tripped too: a write proposed under P's span before
+the split and applied in P above the split's index (check 9), and the right half's own
+write of the key at the same generation ("range 30 wrote `k7` at index 154 at generation 2,
+after range 5 wrote it at generation 2"). Under the pair on 210: a stale client's write
+applied in the range it named, and the key's owner's write at the first generation ("range
+4 wrote `k4` at index 2 at generation 1, after range 2 wrote it at generation 1"). Every one
+of these runs read as check 9's before item 1. Under `TrustStaleDescriptor` alone check 9 is
+at a read on every seed it trips and check 10 trips on none — the apply check the variant
+keeps refuses every trusted write — so every check-10 trip under the pair, and every check-9
+trip at an apply, is the apply check's absence.
+
+**The tests.** `the_range_layers_checks_agree_with_their_whole_trace_folds` is replaced by
+seven tests in `sim/tests/node.rs`, one per pair. Each runs its system over `min(seeds,
+100)` seeds — the hundred the one-group checker's equivalence test compares (D-046), the
+gate's twenty at the gate — and on every run, at eight prefixes of the trace with the
+records fed thirty-seven at a time, compares each fold's own verdict fed in chunks with the
+same fold folded over the whole prefix from the first record: the same `Ok` or `Err` in the
+same words, the violation in the fold's own words (`Fold::words`) and latched from the
+prefix that first shows it, and the checker's one verdict, which stops a run, the same too.
+Each prints at every tier every fold's trip count over the seeds compared, the split's reach
+and the first violation of each fold, and asserts its pair at the tier its measured rate
+supports (D-061):
+
+| Test, `the_range_layers_folds_agree_one_by_one_…` | Systems | Asserted |
+|---|---|---|
+| `…on_the_correct_node` | the correct node | no fold trips on any seed, and a split took effect on some seed: every tier |
+| `…and_checks_9_and_10_trip_under_apply_ignores_span` | the pair; `ApplyIgnoresSpan` alone | with trust, check 9 at an apply and check 10 each on some seed, from CI's hundred (at the gate's twenty, 2 and 4 of 20: the first would miss about one gate in ten); alone, a split on some seed and check 9 only ever at an apply, every tier, its trips printed |
+| `…and_check_9_trips_under_trust_stale_descriptor` | `TrustStaleDescriptor` | check 9 on some seed, and check 10 on none: every tier |
+| `…and_check_16_trips_under_meta_overwrites_by_arrival` | `MetaOverwritesByArrival` | a split on some seed, every tier; check 16 on some seed, from CI's hundred (3 of 20 would miss about one gate in twenty-five) |
+| `…and_check_17_trips_under_client_ignores_mismatch` | `ClientIgnoresMismatch` | check 17 on every seed: every tier |
+| `…and_check_18_trips_under_id_block_resumed` | `IdBlockResumed` | check 18's range-id clause — two grants of one id (`range ids:`), or a right half a creation or a split named before — on some seed: every tier |
+| `…and_check_7_trips_under_any_fresh_node_bootstraps` | `AnyFreshNodeBootstraps` and the correct node, membership | check 7 on every seed under the variant, and no fold on the correct node: every tier |
+
+**Check 7** runs under every one of them and trips under no variant of the node sweep but
+`IdBlockResumed`, on 3 of the thousand — a second range created under a taken id, which
+check 18 sees first. §12 asserts check 7 against Stage D's `SplitNotAtomicWithDescriptor`,
+which is not built; under the test it is seen to trip by D-096's instrument.
+
+**Where a fold's rate is under D-061's 5 % the comparison prints it and a variant test,
+which sweeps the nightly's share of a thousand, asserts it.** `ApplyIgnoresSpan` alone's
+check 10 (26 of 1 000) is read fold by fold in its variant test
+(`a_server_that_ignores_the_span_at_apply_is_caught_with_trust_and_after_a_split_alone`),
+printed at every tier, every trip asserted to sit beside a check-9 trip on the same run, and
+asserted from the nightly's share beside the variant's catch; every routing variant's test
+now reads the folds a run tripped (`Routed::tripped`) for this. `IdsUnique` under
+`AnyFreshNodeBootstraps` (34 of 1 000, below) is read the same way in that variant's test
+(`a_fresh_node_that_bootstraps_itself_is_caught_by_check_7_where_it_is_not_a_bootstrap_node`)
+and asserted from its nightly share.
+
+**A question for the owner (§12: "a fold that no variant trips is a question to the owner,
+not a test left without one").** `IdsUnique`, check 18's half that no two grants share an id
+and that every replica of range 0 grants at an index what its first apply granted, is
+tripped by no §10 variant: `IdBlockResumed` resumes a block and never grants one twice, so
+check 18 trips under it in the split clause's freshness failure. D-096's instrument
+does trip it: under `AnyFreshNodeBootstraps` two groups of range 0 grant different runs a
+block at one index — "index 2 of range 0 granted node 3's run … the block 6..=13 at its
+first apply and node 2's run … the block 6..=13" — on 34 of the thousand membership seeds, 4
+of the first hundred (41, 74, 81 and 82), none of the first twenty.
+
+**It reaches one of the clause's three branches.** All 34 are the agreement branch at index
+2 of range 0: the bootstrap nodes' group of range 0 and the one the variant's fresh nodes
+bootstrap beside it — whose two leaders of term 1 the run's own verdict names first,
+election safety — each lease the first block of their own counter, 6..=13, to some node's
+refill at index 2, and a replica of the one applies at index 2 what a replica of the other
+applied first. The disjointness branch (two blocks sharing an id) and the empty-block branch
+are tripped by no variant and no instrument; the first alternative below, an instrument that
+grants a block twice, is what would reach the disjointness branch, which the recommended
+instrument cannot.
+
+**The comparison sees it in violation at every tier** (#163's review): the four seeds are
+pinned in `the_range_layers_folds_agree_one_by_one_and_check_7_trips_under_any_fresh_node_bootstraps`
+(`GRANTS_PINNED`) and compared fold by fold whatever the tier — out of the tier's own
+comparison at the gate's twenty, inside it from CI's hundred — each asserting its mechanism,
+the agreement branch at index 2 of range 0 granting the block 6..=13 to two nodes' runs, and
+failing the day a schedule move takes it off that shape, so the pin is re-audited to the
+shape's absence with its reason. And the variant's own test reads the clause fold by fold
+and asserts it from the nightly's share (34 of 1 000).
+
+PROPOSED, recommended: that instrument stands as `IdsUnique`'s tripping variant, asserted
+where the nightly's share supports it and compared on its pins at every tier. Both are built
+ahead of the owner's ruling — additive, and marked PROPOSED — and go if the owner picks an
+alternative: a test instrument of the range layer that grants a block twice, outside §10's
+count as D-093 proposes for check 19, which would reach the disjointness branch; or §11's
+raft item 12 read with check 18 as one check, which `IdBlockResumed` trips.
+
+**What the comparison costs.** The seven run at 31.2, 29.3, 28.2, 27.8, 23.1, 0.6 and 0.5 cpu
+s at the premerge's tier, against the old test's 7.9; the nightly's rows are re-weighed in
+`scripts/nightly-shards.txt`, and the shards run 1 977.1 / 2 134.8 / 1 923.7 / 1 671.7 /
+1 677.9 / 1 661.6.
+
+### 5. `IdBlockResumed`'s catch is check 18's range-id clause (issue #141)
+
+`a_node_that_resumes_another_runs_block_of_ids_is_caught_after_a_split` counted a catch
+whenever the run's verdict contained `descriptor lineage`, which `SplitLineage` writes for
+every failure of the split clause — a wrong generation, wrong voters, no plain
+configuration in force — as well as for the right half's freshness, so D-100's "caught by
+check 18's range-id clause" was not what the test established. It counts now a verdict
+that is two grants of one id (`range ids:`) or the freshness failure ("which a creation or
+a split had named before it"): `by_the_range_id_clause`, which the pair's equivalence test
+reads the fold's own verdict with too. Re-measured over the variant test's shares at the
+gate, the premerge and the nightly (seeds 0–19, 0–99, 0–999): **12, 58 and 499**, the
+loose predicate's own figures — every `descriptor lineage:` verdict of the variant's runs
+is the freshness failure, so the narrowing moves no count and makes the attribution what
+it says. Read fold by fold, the clause trips on 628 of the thousand, exactly the seeds the
+variant is caught on: the run's verdict names another check first on 129 of them (state
+machine safety on 90, check 9 on 16, log matching on 11, commit by current term on 8,
+check 7 on 3, check 16 on 1), and check 18's clause trips beneath every one.
+
+### 6. The sharded quorum scenario folds the range layer's checks (issue #140)
+
+D-098 said every node scenario folds the range layer's checks, and D-104's note on it found
+that the sharded quorum scenario never did: `quorum::NodeReport::check` asked
+`ranges::invariants_of` — `ananke-raft`'s checks 1 to 4 and commit by majority — and the
+history, and nothing of `ananke_shard::invariants`. #140 named `sim/ranges.rs` beside it;
+that half does not hold (its `Report::check` is `raft::Report::check`, which folds the
+range layer's checks over every run that traces a `RangeCreated`, as D-104 showed with a
+plant), so the work is the quorum scenario's alone. `NodeReport::check` now asks
+`ananke_shard::invariants::all` after `ananke-raft`'s checks and before the history, where
+`raft::Report::check` asks them, so a run both fail reads the same on both scenarios; the
+comments in `sim/install.rs` and `sim/reseed.rs` that named it the exception say so, and
+`RefuseOneRangeOnly`'s test says where the checks are asked.
+
+**Measured before asserted**, from the built release binary at ten thousand seeds:
+
+- the correct node: **0 of 10 000 failed**, and on seeds 0 to 999 no fold of the seven in
+  violation on any seed;
+- `RefuseOneRangeOnly`: **10 000 of 10 000 caught, 3 338 by the fan-out clause, 6 661 by
+  state machine safety on the meta range, 1 by leader completeness off group 0** (seed
+  2994), none on group 0 — D-101's split to the seed — and no fold of the seven in violation
+  on any of seeds 0 to 999, so the fold names no catch the attribution does not admit;
+- every verdict and every run's records on seeds 0 to 999 of both systems identical to
+  `main`'s (**Nothing moved**, below).
+
+**The fold is reached, shown with a plant**: `ananke_shard::invariants::all` made to fail on
+any trace with a `RangeCreated` fails the scenario's correct test on this tree in the
+plant's words, "seed 0: PROBE: the range layer's whole-trace fold ran", on 2 of 2 seeds
+(release; reverted), where D-104 ran the same plant on `main` at b01db39 and the test
+passed.
+
+The four rows of `scripts/nightly-shards.txt` whose tests ask `NodeReport::check` are
+re-weighed in place on this tree at a thousand seeds: the variant's test 46.1 → 41.0, the
+correct node's 39.4 → 36.1, D-049's site 78.1 → 72.9 and seed 2994's pin 0.1 → 0.1 — lower
+for the machine despite the fold: D-096 re-weighed every node row on a four-core Xeon
+container, slower per core than this M2. Each keeps its shard, and the shards run 1 977.1 /
+2 134.8 / 1 918.6 / 1 666.5 / 1 677.9 / 1 658.3.
+
+### Nothing moved
+
+The folds run after the fact, item 1 leaves the checker's verdict as it was, and item 3's
+history reads the same configurations on every run the node sweep makes, so no schedule
+should move; it was measured rather than argued. Every run below, its record count and a
+hash of its records, on `main` at f8a15a7 and on this slice's code, from one probe built
+on each tree in release (untracked, not committed):
+
+- the node sweep's arms, seeds 0 to 999 under each of the correct node, `ApplyIgnoresSpan`,
+  `TrustStaleDescriptor`, the pair, `MetaOverwritesByArrival`, `ClientIgnoresMismatch` and
+  `IdBlockResumed`: **7 000 of 7 000 identical**, every verdict identical;
+- the membership scenario on the node, seeds 0 to 999 of the correct node and of
+  `AnyFreshNodeBootstraps`; the sharded quorum scenario, seeds 0 to 999 of the correct node
+  and of `RefuseOneRangeOnly`; `sim/ranges.rs`'s correct node, seeds 0 to 999; `install`
+  and `reseed`, seeds 0 to 199: **5 400 of 5 400 identical**, every verdict identical.
+
+The gate's pins say the same of every pinned seed: seeds 272, 516, 368, 493, 633, 2994, 8885,
+2809, 12, 8 and 613 on the node and seed 42's one-group hash, each asserting its mechanism or
+its absence as before, green on every commit of this slice.
+
+**Re-measured after the grants fix of item 1** (#163's review), on the fixed checker, from
+the same probe: the same 12 400 runs identical in records, hash and verdict to `main`'s
+and to the tree before the fix, and every fold's own verdict — each fold's trip and first
+words, with the run's verdict — on the 11 000 runs the per-fold probe reads (the node
+sweep's seven systems and the membership and quorum pairs, seeds 0 to 999) identical to
+the first measurement's.
+
+### Consequences
+
+- Every fold of the range layer has a verdict a test can read on its own; the checker's
+  one verdict, which stops a run, is what it was, so no run, schedule, trace or pinned hash
+  moves (**Nothing moved**).
+- Stage C's exit line "the equivalence test, each fold against the variant of this stage
+  that trips it" is met for checks 9, 10, 16, 17 and 18 against `ApplyIgnoresSpan`,
+  `TrustStaleDescriptor`, `MetaOverwritesByArrival`, `ClientIgnoresMismatch` and
+  `IdBlockResumed`; check 7 runs under the test over the correct node and every variant,
+  tripped by D-096's instrument, and waits for Stage D's `SplitNotAtomicWithDescriptor`;
+  check 9 against `ReadCheckAtReceiptOnly`, check 8 against `SnapshotOverlapsReplica` and
+  check 20 against `UninitialisedReplicaVotes` wait for those variants (S8, S9, S11 of #162),
+  and check 19 for D-093.
+- Check 18's split clause reads the configuration in force, so `sim/shard.rs`'s driver can
+  split a right half and run membership changes beside splits without the clause failing
+  the correct system.
+- Every node scenario folds the range layer's checks, the sharded quorum scenario included.
+- Two slices beside this one touch what it touches. H1's #164 (D-108) merged first and
+  moved `AnyFreshNodeBootstraps` into `RangeVariants`; the two tests here that name it read
+  it from the range layer's set since this branch's merge of 6370823, and run it beside the
+  correct node's set as #164's membership scenario does. S6's #166 (D-107) adds check 8 to
+  the range layer's checker: whichever of the two merges second gives check 8 a `Fold` of
+  its own and a place in the comparison.
+
+### What the PR asks
+
+- **PROPOSED, this entry's**, each recommended as built: a verdict per fold with the
+  checker's one verdict unchanged (item 1); check 18's configuration history keyed on the
+  committed configuration, with a creation's at its floor (item 3); the equivalence test
+  as one test per pair over `min(seeds, 100)` seeds, each pair asserted at the tier its
+  measured rate supports, and a fold whose rate is under 5 % read fold by fold in its
+  variant's test and asserted from the nightly's share (item 4); `IdBlockResumed`'s catch
+  narrowed to check 18's range-id clause (item 5); the sharded quorum scenario folding the
+  range layer's checks after `ananke-raft`'s and before the history (item 6).
+- **For the owner** (item 4, §12's rule for a fold no variant trips): `IdsUnique`'s
+  tripping variant. Recommended: D-096's instrument `AnyFreshNodeBootstraps`, which trips it
+  on 34 of the thousand membership seeds — every one the clause's agreement branch, never
+  its disjointness or empty-block branch — asserted from the nightly's share and compared
+  on its four pinned seeds at every tier, both built ahead of the ruling and gone if it
+  falls the other way. The alternatives: a test instrument that grants a block twice,
+  outside §10's count, which would reach the disjointness branch the recommended one
+  cannot; or check 18 read as one check, which `IdBlockResumed` trips.
+
+---
+
 ## PROPOSED D-108 — `AnyFreshNodeBootstraps` and `IncarnationPerRangeStream` move from `NodeVariants` into `RangeVariants`, as the range layer's instruments outside §10's count, measured; Stage D's re-add variant is not `IncarnationPerRangeStream`; D-105's markers and its table's source corrected; `TrustStaleDescriptor`'s test comment re-derived
 
 **The number.** This branch is off `main` at f8a15a7, whose footer reads D-106. Two
