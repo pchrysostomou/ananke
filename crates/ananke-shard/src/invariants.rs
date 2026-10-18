@@ -42,7 +42,9 @@
 //! **Check 18**, two folds: [`IdsUnique`], the range-id clause over `RangeIdsLeased`
 //! (PROPOSED D-099), and [`SplitLineage`], the split clause at each split's first
 //! apply, which also holds a right half to a block granted to the node that led its
-//! parent (PROPOSED D-100).
+//! parent (PROPOSED D-100). The split clause reads P's configuration in force at the
+//! split's index from a history of the configurations each range committed, which a
+//! right half's creation seeds at its floor (PROPOSED D-106).
 //!
 //! **Each fold has a verdict of its own** ([`Fold`], [`Checker::verdict_of`]), so that a
 //! run in which two folds are in violation shows both: [`Checker::verdict`], which
@@ -54,7 +56,7 @@
 //! comparison encodes the key as the store does (`ananke_raft::apply::user_key`).
 // PROPOSED(D-097): checks 7, 9, 10 and 17.
 // PROPOSED(D-098): check 16, and check 9's lookups.
-// PROPOSED(D-106): a verdict per fold.
+// PROPOSED(D-106): a verdict per fold, and check 18's configuration history.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound::{Excluded, Unbounded};
@@ -477,6 +479,21 @@ impl IdsUnique {
     }
 }
 
+/// One configuration a range may have had in force from an index, as check 18's
+/// history holds it (SHARD.md §8, check 11's history, which check 18 folds).
+// PROPOSED(D-106): check 18's configuration history keyed on the configuration in force.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Candidate {
+    /// The configuration entry's term and payload hash, as the `RaftAppend` that put it
+    /// in the log traced them; `None` for a configuration in force by construction, a
+    /// range's creation at its floor, which no entry carries.
+    entry: Option<(u64, u64)>,
+    /// Whether it is joint.
+    joint: bool,
+    /// The voters, or the old voters while joint.
+    voters: Vec<u64>,
+}
+
 /// Check 18's split clause (SHARD.md §8; §5), at the first apply of each split: with
 /// P's descriptor before `s` `[x, y)` at g, P's value at `s` is `[x, k)` at g + 1 with
 /// P's voters; R's `RangeCreated { cause: split }` is `[k, y)` at g + 1 with the voters
@@ -485,11 +502,33 @@ impl IdsUnique {
 /// first `RangeSplit` — and R lies in a block a `RangeIdsLeased` traced before it
 /// granted to the node that led P in the split entry's term (Q17). Every replica's
 /// `RangeSplit` of (P, `s`) names the same right half and key.
+///
+/// **The configuration in force at `s`** is the one the committed log puts there: the
+/// latest configuration at or below `s` that the range committed. The core traces a
+/// `RaftConfig` when it *appends* a configuration entry (`Raft::adopt`, RAFT.md §1), so
+/// an entry that is later truncated and replaced at the same index was traced too, and
+/// the first `RaftConfig` traced at an index is not the one in force (issue #138). So a
+/// configuration is held with the entry that carried it — the term and hash of the
+/// `RaftAppend` its own server traced just before it — and counts at an index only when
+/// the range's first `RaftApply` there applied that entry. A `RaftConfig` traced with no
+/// such append before it is a restatement or a revert to an entry already traced at its
+/// own append, and adds nothing. The configurations no entry carries are a creation's: a
+/// bootstrap's at index 0 and a right half's at its floor `s`, where its core starts from
+/// P's configuration and traces none (`restore_compacted`), so a split of a right half
+/// reads the configuration its creation names (issue #138).
 // PROPOSED(D-100)
+// PROPOSED(D-106): check 18's configuration history keyed on the configuration in force.
 #[derive(Clone, Debug, Default)]
 pub struct SplitLineage {
-    /// Each range's configuration entries by index: whether joint, and the voters.
-    configs: BTreeMap<u64, BTreeMap<u64, (bool, Vec<u64>)>>,
+    /// Each range's configurations by the index they are in force from, every one
+    /// traced there, with the entry that carried it.
+    configs: BTreeMap<u64, BTreeMap<u64, Vec<Candidate>>>,
+    /// The entry each (range, server)'s last `RaftAppend` traced, until its next
+    /// record of that replica's log or configuration: index, term and hash.
+    appended: BTreeMap<(u64, u64), (u64, u64, u64)>,
+    /// The entry each (range, index) holding a configuration was first applied as:
+    /// its term and hash, the committed entry there (check 4).
+    committed: BTreeMap<(u64, u64), (u64, u64)>,
     /// The leader of each (range, term).
     leaders: BTreeMap<(u64, u64), u64>,
     /// Ranges a `RangeCreated` or a `RangeSplit` has named.
@@ -511,14 +550,37 @@ impl SplitLineage {
         }
     }
 
-    /// The voters of `range`'s latest configuration at or below `index`, and whether
-    /// it is joint.
+    /// The voters of `range`'s configuration in force at `index`, and whether it is
+    /// joint: the latest at or below it that the range committed — carried by the entry
+    /// the range first applied at its index, or in force by a creation.
+    // PROPOSED(D-106): check 18's configuration history keyed on the configuration in force.
     fn config_at(&self, range: u64, index: u64) -> Option<(bool, Vec<u64>)> {
         self.configs
             .get(&range)?
             .range(..=index)
-            .next_back()
-            .map(|(_, config)| config.clone())
+            .rev()
+            .find_map(|(at, candidates)| {
+                let committed = self.committed.get(&(range, *at));
+                candidates
+                    .iter()
+                    .find(|candidate| {
+                        candidate.entry.is_none() || candidate.entry.as_ref() == committed
+                    })
+                    .map(|candidate| (candidate.joint, candidate.voters.clone()))
+            })
+    }
+
+    /// Holds `candidate` as one of `range`'s configurations from `index`.
+    fn hold(&mut self, range: u64, index: u64, candidate: Candidate) {
+        let held = self
+            .configs
+            .entry(range)
+            .or_default()
+            .entry(index)
+            .or_default();
+        if !held.contains(&candidate) {
+            held.push(candidate);
+        }
     }
 
     /// Folds one record against check 7's map and check 18's range-id clause as they
@@ -529,18 +591,42 @@ impl SplitLineage {
         }
         let node = record.node.map(|node| u64::from(node.get()));
         match &record.event {
+            // PROPOSED(D-106): the configuration history keyed on the configuration in
+            // force — each configuration held with the entry its own append traced.
+            TraceEvent::RaftAppend {
+                server,
+                range,
+                index,
+                entry_term,
+                hash,
+            } => {
+                self.appended
+                    .insert((*range, *server), (*index, *entry_term, *hash));
+            }
+            TraceEvent::RaftTruncate { server, range, .. } => {
+                self.appended.remove(&(*range, *server));
+            }
             TraceEvent::RaftConfig {
+                server,
                 range,
                 index,
                 old,
                 joint,
                 ..
             } => {
-                self.configs
-                    .entry(*range)
-                    .or_default()
-                    .entry(*index)
-                    .or_insert_with(|| (*joint, old.clone()));
+                if let Some((appended, term, hash)) = self.appended.remove(&(*range, *server))
+                    && appended == *index
+                {
+                    self.hold(
+                        *range,
+                        *index,
+                        Candidate {
+                            entry: Some((term, hash)),
+                            joint: *joint,
+                            voters: old.clone(),
+                        },
+                    );
+                }
             }
             TraceEvent::RaftLeader {
                 server,
@@ -554,6 +640,7 @@ impl SplitLineage {
                 range,
                 cause,
                 parent,
+                voters,
                 floor_index,
                 floor_term,
                 ..
@@ -564,6 +651,22 @@ impl SplitLineage {
                         .or_insert((*parent, *floor_index, *floor_term));
                 } else {
                     self.named.insert(*range);
+                }
+                // A bootstrap's configuration at index 0 and a right half's at its
+                // floor are in force by the creation, and no entry carries them; an
+                // install's is its snapshot's, whose entries their own appends traced,
+                // and a creation names no joint configuration's other half.
+                // PROPOSED(D-106): a right half's history seeded from its creation.
+                if matches!(cause, RangeCause::Bootstrap | RangeCause::Split) {
+                    self.hold(
+                        *range,
+                        *floor_index,
+                        Candidate {
+                            entry: None,
+                            joint: false,
+                            voters: voters.clone(),
+                        },
+                    );
                 }
             }
             TraceEvent::RangeSplit {
@@ -599,9 +702,22 @@ impl SplitLineage {
                 range,
                 index,
                 entry_term,
+                hash,
                 effect,
                 ..
             } => {
+                // The entry a range first applied at an index holding a configuration
+                // is the committed one there (check 4 holds every later apply to it).
+                // PROPOSED(D-106): the configuration history keyed on the one in force.
+                if self
+                    .configs
+                    .get(range)
+                    .is_some_and(|held| held.contains_key(index))
+                {
+                    self.committed
+                        .entry((*range, *index))
+                        .or_insert((*entry_term, *hash));
+                }
                 let Some(right) = self.pending.remove(&(*range, *index)) else {
                     return;
                 };
@@ -1596,6 +1712,227 @@ mod tests {
             "{verdict}"
         );
         assert!(verdict.contains("voters: [1, 2, 5]"), "{verdict}");
+    }
+
+    /// A split of a right half: the half's core starts from its floor with P's
+    /// configuration and traces no `RaftConfig` for it, so the configuration in force
+    /// at its own split is the one its creation names (issue #138). Before PROPOSED
+    /// D-106 the history held only traced configurations, and the second split failed
+    /// the correct trace with "no plain configuration in force".
+    // PROPOSED(D-106)
+    #[test]
+    fn a_split_of_a_right_half_reads_the_configuration_its_creation_names() {
+        let mut checker = Checker::new(true);
+        checker.extend(&before_a_split());
+        checker.extend(&split_records(1, 2, 9, 2, b"m", b"a", b"z", 1, 6));
+        checker.push(&record(
+            1,
+            TraceEvent::RaftLeader {
+                server: 1,
+                range: 6,
+                term: 2,
+                last_index: 14,
+            },
+        ));
+        checker.extend(&split_records(1, 6, 15, 2, b"t", b"m", b"z", 2, 7));
+        checker.extend(&split_records(2, 6, 15, 2, b"t", b"m", b"z", 2, 7));
+        assert!(checker.verdict().is_ok(), "{:?}", checker.verdict());
+        assert_eq!(
+            checker.descriptors().at(7, 15).map(|held| held.generation),
+            Some(3)
+        );
+        // And what is read is the configuration in force at the half's own split: a
+        // joint one the half committed below it refuses that split (Q23), as on any
+        // range.
+        let mut joint = Checker::new(true);
+        joint.extend(&before_a_split());
+        joint.extend(&split_records(1, 2, 9, 2, b"m", b"a", b"z", 1, 6));
+        joint.push(&record(
+            1,
+            TraceEvent::RaftLeader {
+                server: 1,
+                range: 6,
+                term: 2,
+                last_index: 14,
+            },
+        ));
+        joint.push(&record(
+            1,
+            TraceEvent::RaftAppend {
+                server: 1,
+                range: 6,
+                index: 12,
+                entry_term: 2,
+                hash: 31,
+            },
+        ));
+        joint.push(&record(
+            1,
+            TraceEvent::RaftConfig {
+                server: 1,
+                range: 6,
+                index: 12,
+                old: vec![1, 2, 3],
+                new: vec![1, 2, 4],
+                joint: true,
+                learners: vec![],
+            },
+        ));
+        let mut entry = applied(1, 6, 12, b"q", ApplyEffect::None);
+        if let TraceEvent::RaftApply {
+            entry_term,
+            hash,
+            key,
+            ..
+        } = &mut entry.event
+        {
+            (*entry_term, *hash, *key) = (2, 31, None);
+        }
+        joint.push(&entry);
+        joint.extend(&split_records(1, 6, 15, 2, b"t", b"m", b"z", 2, 7));
+        let verdict = joint.verdict_of(Fold::SplitLineage).unwrap_err();
+        assert!(
+            verdict.starts_with("descriptor lineage: range 6's split at index 15 took effect"),
+            "{verdict}"
+        );
+    }
+
+    /// The configuration entries a trace shows at one index of range 2: server 3
+    /// appends a joint configuration there in term 2, and `committed` is what the
+    /// range's first apply of that index applied — that entry, or a no-op of term 3
+    /// that replaced it after a truncation.
+    fn a_joint_entry_at_5(committed: (u64, u64)) -> Vec<TraceRecord> {
+        vec![
+            record(
+                3,
+                TraceEvent::RaftAppend {
+                    server: 3,
+                    range: 2,
+                    index: 5,
+                    entry_term: 2,
+                    hash: 77,
+                },
+            ),
+            record(
+                3,
+                TraceEvent::RaftConfig {
+                    server: 3,
+                    range: 2,
+                    index: 5,
+                    old: vec![1, 2, 3],
+                    new: vec![1, 2, 4],
+                    joint: true,
+                    learners: vec![],
+                },
+            ),
+            record(
+                3,
+                TraceEvent::RaftTruncate {
+                    server: 3,
+                    range: 2,
+                    from_index: 5,
+                },
+            ),
+            // The revert to the configuration in force below it, traced with no
+            // append before it: a restatement, which adds nothing.
+            record(
+                3,
+                TraceEvent::RaftConfig {
+                    server: 3,
+                    range: 2,
+                    index: 0,
+                    old: vec![9],
+                    new: vec![],
+                    joint: false,
+                    learners: vec![],
+                },
+            ),
+            record(
+                1,
+                TraceEvent::RaftApply {
+                    server: 1,
+                    range: 2,
+                    index: 5,
+                    entry_term: committed.0,
+                    hash: committed.1,
+                    key: None,
+                    effect: ApplyEffect::None,
+                },
+            ),
+        ]
+    }
+
+    /// A configuration entry the core traced at its append and then truncated is not
+    /// the configuration in force at its index: the core traces `RaftConfig` at
+    /// append, committed or not, and before PROPOSED D-106 the first one traced at an
+    /// index stood (issue #138). The pair: the same joint entry, committed, is in force
+    /// and still refuses the split (Q23).
+    // PROPOSED(D-106)
+    #[test]
+    fn a_configuration_truncated_at_its_index_is_not_the_one_in_force_and_a_committed_one_is() {
+        let mut truncated = Checker::new(true);
+        truncated.extend(&before_a_split());
+        truncated.extend(&a_joint_entry_at_5((3, 55)));
+        truncated.extend(&split_records(1, 2, 9, 2, b"m", b"a", b"z", 1, 6));
+        assert!(truncated.verdict().is_ok(), "{:?}", truncated.verdict());
+
+        let mut committed = Checker::new(true);
+        committed.extend(&before_a_split());
+        committed.extend(&a_joint_entry_at_5((2, 77)));
+        committed.extend(&split_records(1, 2, 9, 2, b"m", b"a", b"z", 1, 6));
+        let verdict = committed.verdict_of(Fold::SplitLineage).unwrap_err();
+        assert!(
+            verdict.contains("with no plain configuration in force"),
+            "{verdict}"
+        );
+    }
+
+    /// The history is a range's own: a joint configuration another range committed at the
+    /// split's own index is not the splitting range's, and the split is in shape (Q23 asks
+    /// it of P's configuration alone). With one range every configuration is P's and a
+    /// history keyed by the index alone says the same; with two it refuses this split.
+    // PROPOSED(D-106)
+    #[test]
+    fn a_configuration_another_range_committed_is_not_the_splitting_ranges() {
+        let mut checker = Checker::new(true);
+        checker.extend(&before_a_split());
+        checker.push(&created(1, 3, b"z", b"zz", 1, &[1, 2, 3]));
+        checker.push(&record(
+            1,
+            TraceEvent::RaftAppend {
+                server: 1,
+                range: 3,
+                index: 9,
+                entry_term: 2,
+                hash: 77,
+            },
+        ));
+        checker.push(&record(
+            1,
+            TraceEvent::RaftConfig {
+                server: 1,
+                range: 3,
+                index: 9,
+                old: vec![1, 2, 3],
+                new: vec![1, 2, 4],
+                joint: true,
+                learners: vec![],
+            },
+        ));
+        checker.push(&record(
+            1,
+            TraceEvent::RaftApply {
+                server: 1,
+                range: 3,
+                index: 9,
+                entry_term: 2,
+                hash: 77,
+                key: None,
+                effect: ApplyEffect::None,
+            },
+        ));
+        checker.extend(&split_records(1, 2, 9, 2, b"m", b"a", b"z", 1, 6));
+        assert!(checker.verdict().is_ok(), "{:?}", checker.verdict());
     }
 
     /// Two folds in violation on one record — a write applied in a range whose span no

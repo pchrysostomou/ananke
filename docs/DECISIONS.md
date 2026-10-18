@@ -20585,6 +20585,68 @@ clause's own verdict in its own words ("right half 6's creation at index 9 is �
 "range 2's value at its split's index 9 is …", each naming the planted voters). It tests
 the clause as it stood; no line of the check changes.
 
+### 3. Check 18's configuration history is the configuration in force (issue #138)
+
+§8's check 18 reads "the voters of P's plain configuration in force at `s`" from the
+history per (range, index) that check 11 defines, "built from each `RaftConfig`'s
+`index`". `SplitLineage` built it with `entry(index).or_insert_with(..)`, so **the first
+`RaftConfig` traced at an index stood** — and the core traces `RaftConfig` when it
+*appends* a configuration entry, committed or not (`Raft::adopt` from `append_local`,
+crates/ananke-raft/src/core.rs), so an entry truncated and replaced at its index kept its
+place in the history, and a split above it was judged against a configuration that was
+never committed. And a right half's core starts at its floor from `restore_compacted` with
+P's configuration and traces no `RaftConfig` for it, so the history held nothing for a
+right half: **a split of a right half failed the correct trace** with "took effect with no
+plain configuration in force at or below it (Q23)". Neither was reached — the node sweep's
+arms split each configured range once at a fixed key (D-104) — and both are reached the
+day `sim/shard.rs`'s driver splits from the current spans.
+
+Decided, marked `// PROPOSED(D-106)`:
+
+- **A configuration counts at an index only when the range committed the entry that
+  carried it.** The fold holds each `RaftConfig` with the entry its own server's
+  `RaftAppend` traced just before it at the same index — the core traces the two in that
+  order for every entry it appends — as `(term, hash)`, and records the entry the range
+  first applied at each index holding one (check 4 holds every later apply there to it).
+  The configuration in force at `s` is the latest at or below `s` whose entry is the one
+  committed there. A `RaftConfig` traced with no append of its index before it — a
+  restatement at a node's start, or the revert a truncation makes to a configuration
+  already traced at its own append — adds nothing.
+- **The configurations no entry carries are a creation's**: a bootstrap's at index 0 and
+  a right half's at its floor `s`, held from the `RangeCreated` with its voters, plain. A
+  right half's is the voters its creation names, which the same clause holds to P's plain
+  configuration at `s` at the split that made it, so a split of a right half reads the
+  configuration its creation names.
+
+**Fails before, passes after.** Two hand-built cases: a split of a right half
+(`a_split_of_a_right_half_reads_the_configuration_its_creation_names`, which also plants a
+joint configuration the half commits below its own split, still refused there as on any
+range, Q23), and a joint entry appended at an index, truncated and replaced by another
+entry (`a_configuration_truncated_at_its_index_is_not_the_one_in_force_and_a_committed_one_is`,
+whose pair is the same joint entry committed, still refused). On `main` at f8a15a7, with
+only the API of item 1 swapped for `verdict()`, both fail in the issue's words: "range 6's
+split at index 15 took effect with no plain configuration in force at or below it (Q23)"
+and "range 2's split at index 9 took effect with no plain configuration in force at or
+below it (Q23)". On this tree both pass.
+
+**The mutation a single-range world cannot catch**: the history keyed by the index alone,
+as one range's would be. A third case puts another range's committed joint entry at the
+splitting range's own index (`a_configuration_another_range_committed_is_not_the_splitting_ranges`),
+and the split is in shape. Planted one at a time in this step's file, each mutation fails
+named cases: the history keyed by the index alone fails that case, the two above and the
+wrong-voters case of item 2 (with one history the right half's own creation at `s` is read
+as P's configuration there, so its voters are compared with themselves); the first
+configuration traced at an index standing fails the truncation case; no history from a
+right half's creation fails the right half's; no history from a bootstrap's fails seven.
+The case's first draft put the other range's entry below the split's index, where the
+right half's creation shadowed it in a shared history and the first mutation passed; it
+sits at the split's index now.
+
+**Nothing moves.** The node sweep traces no configuration change — its only configurations
+are the bootstrap's at index 0, which the old history read off the restatement's
+`RaftConfig` and the new one reads off the creation — and no range variant changes one, so
+the clause reads the same voters on every run it judged before; measured below (item 7).
+
 ---
 
 _Next entry: D-107. Add one before implementing anything not covered above._
