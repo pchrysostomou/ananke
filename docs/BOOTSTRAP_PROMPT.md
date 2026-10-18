@@ -101,6 +101,17 @@ ananke/
 
 _Update this section at the end of every session._
 
+- Branch `phase-3-variant-set-followups` (2026-10-12, resumed 2026-10-18), off `main` at
+  f8a15a7, PROPOSED D-108, **the variant set's follow-ups** (#151, #155, #156), one
+  commit per step. #151: `AnyFreshNodeBootstraps` (D-096) and `IncarnationPerRangeStream`
+  (D-077) move from `NodeVariants` into `RangeVariants` as instruments outside §10's
+  count (bits 5 and 6, `in_section_10` false, D-105's test naming them), read from the
+  range layer's set at the start's choice of bootstrap, at the re-seed and at a split's
+  right half, and carried by the membership scenario and `sim/ranges.rs`'s directed
+  refusal scenario beside the node's set; `NodeVariant::BUGS` forty-seven, `RESEED`
+  five, bits 25 and 48 freed. `IncarnationPerRangeStream` is read at two sites, not the
+  one #151 named: the split's (D-100) is reached on the node cluster and run by no test
+  (issue #160).
 - Branch `docs-stage-c-record` (2026-10-11), off `main` at b01db39 and merged with it at
   8496ca3 (#152, D-105; footer D-106), PROPOSED D-104, **Stage C's record**, docs and
   comments only (no code line, schedule or pinned hash moves). It records three things no

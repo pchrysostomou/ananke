@@ -199,8 +199,11 @@ pub struct ServerConfig {
     /// The range layer's known-buggy variants (SHARD.md §10, Q37), carried beside
     /// `node`'s and the cores' `raft.variants` and read only where the range layer's
     /// rules are kept: the receipt and serving checks, the apply check, the meta
-    /// range's apply and the lease record read at the start.
+    /// range's apply and the lease record read at the start; and, for its two
+    /// instruments, the start's choice of bootstrap and the draw of a replica's
+    /// incarnation at a re-seed and at a split.
     // PROPOSED(D-105): the range layer's own variant set.
+    // PROPOSED(D-108): and its two instruments, read at the start and at a creation.
     pub range_variants: RangeVariants,
 }
 
@@ -1728,7 +1731,8 @@ struct ServerApplier<E: Environment> {
     engine_dir: PathBuf,
     node_variants: NodeVariants,
     /// The range layer's, for the apply check and the meta range's apply (PROPOSED
-    /// D-105).
+    /// D-105), and for the incarnation a split's right half draws.
+    // PROPOSED(D-108): `IncarnationPerRangeStream` at a split.
     range_variants: RangeVariants,
     /// The cores' variants: read here for Phase 2's `SharedSnapshotDir`, whose bit
     /// names the version directory a take writes (Q37, PROPOSED D-086).
@@ -1830,9 +1834,12 @@ impl<E: Environment> ServerApplier<E> {
             state: RangeState::Live,
         };
         let voter = config.voters.contains(&self.id);
+        // R's incarnation, from the node's generator and never from R's stream
+        // (Q26); `IncarnationPerRangeStream` draws it from the stream.
+        // PROPOSED(D-108): the instrument read from the range layer's set.
         let incarnation = if self
-            .node_variants
-            .contains(NodeVariant::IncarnationPerRangeStream)
+            .range_variants
+            .contains(RangeVariant::IncarnationPerRangeStream)
         {
             self.env.range_rng(right).next_u64()
         } else {
@@ -2796,7 +2803,8 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
     let named = bootstrap.contains(&id);
     // `AnyFreshNodeBootstraps`: a node not named takes a fresh store for a bootstrap
     // anyway, with the address book for the voters it was not given (PROPOSED D-096).
-    let pretends = !named && node_variants.contains(NodeVariant::AnyFreshNodeBootstraps);
+    // PROPOSED(D-108): the instrument read from the range layer's set.
+    let pretends = !named && range_variants.contains(RangeVariant::AnyFreshNodeBootstraps);
     let is_bootstrap = named || pretends;
     let bootstrap: Vec<ServerId> = if pretends {
         servers.iter().map(|(server, _)| *server).collect()
@@ -2986,6 +2994,7 @@ pub async fn run<E: Environment>(env: E, config: ServerConfig) -> io::Result<()>
                 &servers,
                 variants,
                 node_variants,
+                range_variants,
                 &error,
             )
             .await?;
@@ -3443,7 +3452,8 @@ async fn generations<E: Environment>(env: &E, base: &Path) -> io::Result<Vec<Can
 /// a named stream from the seed and the name alone, so a replica created again for the
 /// same (range, node) would draw its predecessor's number and a leader comparing
 /// incarnations for inequality only (D-042) would never reset (Q26,
-/// SHARD.md:1372-1379). [`NodeVariant::IncarnationPerRangeStream`] is that mistake.
+/// SHARD.md:1372-1379). [`RangeVariant::IncarnationPerRangeStream`] is that mistake,
+/// a range-layer instrument since PROPOSED D-108.
 ///
 /// What the replicas are when this returns is empty and quarantined: each waits for its
 /// leader's stream, and the install that fills it is the node's snapshot *wiring*, which
@@ -3465,6 +3475,8 @@ async fn reseed<E: Environment>(
     servers: &[(ServerId, SocketAddr)],
     variants: Variants,
     node_variants: NodeVariants,
+    // PROPOSED(D-108): the range layer's set, for `IncarnationPerRangeStream`.
+    range_variants: RangeVariants,
     error: &io::Error,
 ) -> io::Result<Reseeded<E>> {
     // What `MetaApplied { index: 0 }` names for a re-seeded replica of the meta range.
@@ -3566,7 +3578,8 @@ async fn reseed<E: Environment>(
                 }
                 store.engine().write(initial, true).await?;
             }
-            let incarnation = if node_variants.contains(NodeVariant::IncarnationPerRangeStream) {
+            // PROPOSED(D-108): the instrument read from the range layer's set.
+            let incarnation = if range_variants.contains(RangeVariant::IncarnationPerRangeStream) {
                 env.range_rng(range.id.get()).next_u64()
             } else {
                 env.rng().next_u64()

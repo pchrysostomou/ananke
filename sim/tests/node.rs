@@ -1487,13 +1487,24 @@ fn an_apply_task_that_waits_for_every_range_is_caught_by_the_lag_fold_on_the_nod
 /// to do: its run is byte-identical to the correct node's, which is the absence
 /// asserted with its reason (CLAUDE.md), rather than a sweep passed by injecting
 /// nothing.
+///
+/// The variant is a range-layer instrument outside §10's count since PROPOSED D-108,
+/// which moved it out of the node's set and measured the move: every verdict, catch
+/// and trace hash of this test's runs is the same on both sides of it.
 // PROPOSED(D-096): the bootstrap nodes named in configuration.
+// PROPOSED(D-108): the instrument in the range layer's set.
 #[test]
 fn a_fresh_node_that_bootstraps_itself_is_caught_by_check_7_where_it_is_not_a_bootstrap_node() {
     let seeds = high_rate_share();
-    let taken = NodeVariants::of(&[NodeVariant::AnyFreshNodeBootstraps]);
+    let taken = RangeVariants::of(&[RangeVariant::AnyFreshNodeBootstraps]);
     let outcomes: Vec<(Option<String>, Option<String>)> = sweep(seeds, |seed| {
-        let report = membership::run_on_node(Cluster::Node, seed, Variants::default(), taken);
+        let report = membership::run_on_node(
+            Cluster::Node,
+            seed,
+            Variants::default(),
+            NodeVariants::correct(),
+            taken,
+        );
         (
             ananke_sim::ranges::creations_agree_of(&report.records).err(),
             report.check().err(),
@@ -1525,6 +1536,7 @@ fn a_fresh_node_that_bootstraps_itself_is_caught_by_check_7_where_it_is_not_a_bo
         1,
         Variants::default(),
         NodeVariants::correct(),
+        RangeVariants::correct(),
     );
     ananke_sim::ranges::creations_agree_of(&honest.records)
         .expect("the correct membership node's creations agree on every range");
@@ -1535,7 +1547,7 @@ fn a_fresh_node_that_bootstraps_itself_is_caught_by_check_7_where_it_is_not_a_bo
         NodeVariants::correct(),
         RangeVariants::correct(),
     );
-    let pretending = raft::run_on_the_node(1, Variants::default(), taken, RangeVariants::correct());
+    let pretending = raft::run_on_the_node(1, Variants::default(), NodeVariants::correct(), taken);
     assert_eq!(
         correct.jsonl(),
         pretending.jsonl(),

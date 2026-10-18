@@ -27,6 +27,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use ananke_env::TraceEvent;
 use ananke_raft::core::Variants;
+use ananke_shard::range_variant::{RangeVariant, RangeVariants};
 use ananke_shard::variant::{NodeVariant, NodeVariants};
 use ananke_sim::{ranges, seeds, sweep, verdict, write_trace};
 
@@ -618,7 +619,8 @@ fn a_loss_in_the_shared_engine_refuses_the_whole_node_and_reseeds_beside_it() {
         .chain((0..ranges::RANGES).map(|i| ranges::FIRST_RANGE + i))
         .collect();
 
-    let (records, dirs) = ranges::refused_whole_dirs(1, for_, NodeVariants::correct());
+    let (records, dirs) =
+        ranges::refused_whole_dirs(1, for_, NodeVariants::correct(), RangeVariants::correct());
     let read = ranges::refusal(&records);
 
     // The node is refused once, as a node, and every replica it holds is refused with
@@ -711,6 +713,7 @@ fn a_loss_in_the_shared_engine_refuses_the_whole_node_and_reseeds_beside_it() {
         1,
         for_,
         NodeVariants::of(&[NodeVariant::RefuseOneRangeOnly]),
+        RangeVariants::correct(),
     ));
     // The store that opens first is range 0's since PROPOSED D-096, so that is the one
     // range the variant refuses.
@@ -725,6 +728,7 @@ fn a_loss_in_the_shared_engine_refuses_the_whole_node_and_reseeds_beside_it() {
         1,
         for_,
         NodeVariants::of(&[NodeVariant::ReseedIntoRefusedDir]),
+        RangeVariants::correct(),
     );
     let in_place_read = ranges::refusal(&refused_in_place);
     assert_eq!(
@@ -753,6 +757,7 @@ fn a_loss_in_the_shared_engine_refuses_the_whole_node_and_reseeds_beside_it() {
         1,
         for_,
         NodeVariants::of(&[NodeVariant::ServeBeforeRefusedMark]),
+        RangeVariants::correct(),
     ));
     assert_eq!(
         unmarked.marked,
@@ -770,10 +775,15 @@ fn a_loss_in_the_shared_engine_refuses_the_whole_node_and_reseeds_beside_it() {
         unmarked.incarnations
     );
 
+    // The range layer's instrument for a replica's incarnation at its creation, in the
+    // range layer's set since PROPOSED D-108, which moved it out of the node's set
+    // and measured the move: this run's incarnations and trace unchanged.
+    // PROPOSED(D-108)
     let per_range = ranges::refusal(&ranges::refused_whole(
         1,
         for_,
-        NodeVariants::of(&[NodeVariant::IncarnationPerRangeStream]),
+        NodeVariants::correct(),
+        RangeVariants::of(&[RangeVariant::IncarnationPerRangeStream]),
     ));
     // Every replica still restates an incarnation — the variant is a different draw,
     // not a missing one — and every one of them is a different number from the node
@@ -920,7 +930,8 @@ fn a_restarted_node_opens_the_directory_its_reseed_built_and_is_not_refused_agai
         .chain((0..ranges::RANGES).map(|i| ranges::FIRST_RANGE + i))
         .collect();
 
-    let (records, dirs) = ranges::refused_whole_restarted(1, for_, NodeVariants::correct());
+    let (records, dirs) =
+        ranges::refused_whole_restarted(1, for_, NodeVariants::correct(), RangeVariants::correct());
     let read = ranges::refusal(&records);
 
     assert_eq!(

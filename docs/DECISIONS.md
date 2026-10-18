@@ -20542,6 +20542,114 @@ this branch's changes before `rustfmt`, which changed their layout and nothing e
 - **For the owner, from #97:** seed 42's one-group trace pinned by its body hash, as
   `echo`'s is.
 
+**Corrected by D-108: the instruments.** "Instruments outside the count, none built", and
+the PROPOSED point that `AnyFreshNodeBootstraps` stays in the node's set. D-108 moves it
+into this set as an instrument outside §10's count, as this entry recommended, and with
+it `NodeVariant::IncarnationPerRangeStream` (D-077), which draws a replica's incarnation
+at its creation from its range's protocol stream instead of the node's generator. That
+is the other range-layer rule this entry names for its instruments — "a replica's
+incarnation at its creation" — and this entry's module doc and table missed it (issue
+#151).
+
 ---
 
-_Next entry: D-106. Add one before implementing anything not covered above._
+## PROPOSED D-108 — `AnyFreshNodeBootstraps` and `IncarnationPerRangeStream` move from `NodeVariants` into `RangeVariants`, as the range layer's instruments outside §10's count
+
+**The number.** This branch is off `main` at f8a15a7, whose footer reads D-106. Two
+slices open beside it take D-106 (the per-fold equivalence) and D-107 (restatement and
+check 8); the brief that assigned this one gives it **D-108**, and the footer moves to
+D-109. At the merge the entries are a union in numerical order with one footer, the
+highest plus one.
+
+**What carries `// PROPOSED(D-108)`**, said exactly, since D-105's "every code site" was
+not so (issue #155). The marker is on every site that declares, holds or reads one of
+the two variants: their arms and bits and the module doc of `range_variant.rs`; in
+`variant.rs` the module doc, `RESEED`, the two freed bits and the count its test asserts;
+`ServerConfig::range_variants` and the `apply` task's field; the three reads, which are
+`server::run`'s choice of bootstrap, `reseed`'s draw and the split's draw; and
+`reseed`'s new parameter. It is also on the configuration of the set in the membership
+scenario and in `sim/ranges.rs`, on the run functions of those two scenarios that take
+the set, and on the two tests. The helpers that only pass the set along carry none.
+These are `spawn_server`, `spawn_node`, `spawn_node_of`, `server_config`,
+`server_config_of`'s signature, `run_on`, `run_on_with`, `alone_of`, `run_with_of` and
+`server::run`'s call of `reseed`.
+
+**Context.** PROPOSED D-105 moved §10's five built variants into the range layer's own
+set and left `NodeVariant::AnyFreshNodeBootstraps` (PROPOSED D-096) in the node's,
+though it breaks §2's rule for which node writes the initial state and is check 7's
+instrument on the membership scenario. By D-093's reasoning (`SplitLeavesGap` is placed
+in the range layer's set as an instrument outside §10's count) that makes it a
+range-layer instrument. D-105 recorded its place as a PROPOSED point for the owner and
+recommended the move (issue #151). #152's adversarial review found a second variant on
+the same line, `NodeVariant::IncarnationPerRangeStream` (D-077, bit 25). At Q15's re-seed
+it draws each replica's incarnation from the range's protocol stream,
+`n{id}/r{range}/protocol`, instead of from the node's generator. That breaks the rule a
+replica's incarnation at its creation keeps (SHARD.md:1376-1383), the second of the two
+range-layer rules D-105 names for its instruments, and D-105's module doc and entry
+missed it. The issue's second comment recommends moving both.
+
+### Decided
+
+1. **Both move into `RangeVariants`, as instruments outside §10's count.**
+   `RangeVariant::AnyFreshNodeBootstraps` takes bit 5 and
+   `RangeVariant::IncarnationPerRangeStream` bit 6; `in_section_10` answers false for
+   both; `RangeVariant::BUGS` holds seven. D-105's own test,
+   `every_variant_takes_a_bit_of_its_own_and_says_whether_it_is_one_of_section_10s`,
+   now asserts the five of §10's built so far and names the instruments,
+   `["AnyFreshNodeBootstraps", "IncarnationPerRangeStream"]`. An instrument added
+   unclassified, or one of §10's classified as an instrument, fails it. It still holds
+   every name against §10's table and asserts that no range variant shares a name with a
+   node variant. `NodeVariant` loses both. Its `BUGS` is forty-seven. `RESEED` is five,
+   since D-077 built six and the sixth was `IncarnationPerRangeStream`. Bits 25 and 48
+   are recorded as freed, with seventeen bits left. Each variant's doc moves with it,
+   unchanged in substance, and says what it is in this set and where it is read.
+2. **Read from the range layer's set where it was read from the node's.**
+   `AnyFreshNodeBootstraps` is read at `server::run`'s choice of whether a node not named
+   takes a fresh store for a bootstrap. `IncarnationPerRangeStream` is read at two
+   places. One is `reseed`, which takes the range layer's set as a parameter of its own
+   beside the node's. The other is a split's apply (`ServerApplier::split`), whose
+   applier has held the set since D-105.
+3. **Carried by the two scenarios that run them, as D-105 carried the set.** The
+   membership scenario's `run_on_node`, `run_on_with_node`, `spawn_server` and
+   `node_server_config` take the range layer's set beside the node's. Its client takes
+   it too, as `raft::run_on_the_node`'s does; the client reads only
+   `ClientIgnoresMismatch`, which no test of this scenario sets. `run_on` and
+   `run_on_with` name both sets correct. In `sim/ranges.rs` the directed refusal
+   scenario (`refused_whole`, `refused_whole_dirs`, `refused_whole_restarted`) takes the
+   set, and so do the configuration and spawn helpers under it (`server_config`,
+   `server_config_of`, `spawn_node`, `spawn_node_of`). The sweep and `alone` name it
+   correct. Every node call site names its sets.
+4. **The tests follow.** Two tests take `RangeVariant`s now:
+   `a_fresh_node_that_bootstraps_itself_is_caught_by_check_7_where_it_is_not_a_bootstrap_node`
+   (sim/tests/node.rs) and
+   `a_loss_in_the_shared_engine_refuses_the_whole_node_and_reseeds_beside_it`
+   (sim/tests/ranges.rs). Nothing either asserts moves. D-077's and D-096's entries keep
+   their text, which says what was built then; this entry supersedes where they put the
+   two.
+
+**The second site, which #151 did not name.** `IncarnationPerRangeStream` is read at two
+sites, not one. The first is Q15's re-seed (D-077, `reseed`). The second has existed
+since D-100's split (5ddc2fc): a split's right half on a voter of P
+(`ServerApplier::split`), where the correct node draws R's incarnation from the node's
+generator. The node cluster's split arms reach the second site. No test runs the variant
+there, so nothing fails if that read is wrong (issue #160).
+
+### Consequences
+
+- The range layer's set holds §10's five and two instruments. The node's holds Stage B's
+  forty-seven and none of §10's.
+- `membership::run_on_node` and `run_on_with_node`, and `ranges::refused_whole`,
+  `refused_whole_dirs` and `refused_whole_restarted`, take the range layer's set beside
+  the node's.
+- No schedule, no trace, no pinned hash, no assertion and no tier is meant to move. The
+  bits reach no frame and no trace event (D-045), and every site reads the same bit of
+  the other set.
+
+### What the PR asks
+
+- **PROPOSED, this entry's:** the two instruments in the range layer's set, outside §10's
+  count. This answers issue #151 and D-105's PROPOSED point as D-105 recommended.
+
+---
+
+_Next entry: D-109. Add one before implementing anything not covered above._

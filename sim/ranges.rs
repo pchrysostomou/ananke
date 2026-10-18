@@ -713,8 +713,13 @@ pub fn config(seed: u64, schedule: &Schedule) -> SimConfig {
 
 /// One node's configuration: its ranges, and the voters each starts with.
 #[must_use]
-pub fn server_config(id: u64, variants: impl Into<Variants>, node: NodeVariants) -> ServerConfig {
-    server_config_of(id, variants, node, ranges(), SNAPSHOT_THRESHOLD)
+pub fn server_config(
+    id: u64,
+    variants: impl Into<Variants>,
+    node: NodeVariants,
+    range: RangeVariants,
+) -> ServerConfig {
+    server_config_of(id, variants, node, range, ranges(), SNAPSHOT_THRESHOLD)
 }
 
 /// The same, with the ranges named: what the directed scenario for D-057's keying
@@ -724,6 +729,7 @@ pub fn server_config_of(
     id: u64,
     variants: impl Into<Variants>,
     node: NodeVariants,
+    range: RangeVariants,
     ranges: Vec<Range>,
     snapshot_threshold: u64,
 ) -> ServerConfig {
@@ -753,28 +759,50 @@ pub fn server_config_of(
         id_block: ID_BLOCK,
         refill_at: REFILL_AT,
         node,
-        // No range-layer variant runs on this scenario (PROPOSED D-105).
-        range_variants: RangeVariants::correct(),
+        // The range layer's set beside the node's (PROPOSED D-105).
+        // PROPOSED(D-108): the sweep and the scenarios beside it run none; the
+        // refusal scenario runs `IncarnationPerRangeStream` (`refused_whole`).
+        range_variants: range,
     }
 }
 
-fn spawn_node(sim: &Sim, at: NodeId, id: u64, variants: Variants, node: NodeVariants) {
-    spawn_node_of(sim, at, id, variants, node, ranges(), SNAPSHOT_THRESHOLD);
+fn spawn_node(
+    sim: &Sim,
+    at: NodeId,
+    id: u64,
+    variants: Variants,
+    node: NodeVariants,
+    range: RangeVariants,
+) {
+    spawn_node_of(
+        sim,
+        at,
+        id,
+        variants,
+        node,
+        range,
+        ranges(),
+        SNAPSHOT_THRESHOLD,
+    );
 }
 
+// The node's start in full: its configuration's parts, each set of variants, and
+// the ranges and threshold the directed scenarios name.
+#[allow(clippy::too_many_arguments)]
 fn spawn_node_of(
     sim: &Sim,
     at: NodeId,
     id: u64,
     variants: Variants,
     node: NodeVariants,
+    range: RangeVariants,
     ranges: Vec<Range>,
     snapshot_threshold: u64,
 ) {
     let env = sim.env(at);
     let inner = env.clone();
     env.spawn("node", async move {
-        let config = server_config_of(id, variants, node, ranges, snapshot_threshold);
+        let config = server_config_of(id, variants, node, range, ranges, snapshot_threshold);
         let _ = ananke_shard::server::run(inner, config).await;
     });
 }
@@ -827,6 +855,7 @@ pub fn alone_of(
         1,
         Variants::default(),
         node,
+        RangeVariants::correct(),
         ranges,
         SNAPSHOT_THRESHOLD,
     );
@@ -875,7 +904,14 @@ async fn lose_the_store<E: ananke_env::Environment>(env: &E) -> std::io::Result<
 /// The other two voters are configured and never started, so nothing arrives to fill
 /// the re-seeded replicas and the state they wait in is the state the assertions read.
 // PROPOSED(D-077): Q15's whole-node refusal, and the re-seed per replica.
-fn refused_sim(seed: u64, for_: Duration, node_variants: NodeVariants) -> (Sim, NodeId) {
+// PROPOSED(D-108): the range layer's set beside the node's, for
+// `IncarnationPerRangeStream`.
+fn refused_sim(
+    seed: u64,
+    for_: Duration,
+    node_variants: NodeVariants,
+    range_variants: RangeVariants,
+) -> (Sim, NodeId) {
     let schedule = Schedule {
         warmup: for_,
         faults: Vec::new(),
@@ -890,9 +926,8 @@ fn refused_sim(seed: u64, for_: Duration, node_variants: NodeVariants) -> (Sim, 
         if lose_the_store(&inner).await.is_err() {
             return;
         }
-        let _ =
-            ananke_shard::server::run(inner, server_config(1, Variants::default(), node_variants))
-                .await;
+        let config = server_config(1, Variants::default(), node_variants, range_variants);
+        let _ = ananke_shard::server::run(inner, config).await;
     });
     sim.run_for(for_);
     (sim, at)
@@ -952,21 +987,31 @@ fn engine_dirs(sim: &mut Sim, at: NodeId) -> BTreeMap<String, bool> {
 /// *not* stop, which is what `run` did before this slice and what the trace shows by
 /// carrying records past the refusal.
 // PROPOSED(D-077): Q15's whole-node refusal, and the re-seed per replica.
+// PROPOSED(D-108): the range layer's set beside the node's.
 #[must_use]
-pub fn refused_whole(seed: u64, for_: Duration, node_variants: NodeVariants) -> Vec<TraceRecord> {
-    refused_sim(seed, for_, node_variants).0.trace()
+pub fn refused_whole(
+    seed: u64,
+    for_: Duration,
+    node_variants: NodeVariants,
+    range_variants: RangeVariants,
+) -> Vec<TraceRecord> {
+    refused_sim(seed, for_, node_variants, range_variants)
+        .0
+        .trace()
 }
 
 /// [`refused_whole`]'s trace together with the node's engine directories as the run
 /// left them.
 // PROPOSED(D-077): Q15's whole-node refusal, and the re-seed per replica.
+// PROPOSED(D-108): the range layer's set beside the node's.
 #[must_use]
 pub fn refused_whole_dirs(
     seed: u64,
     for_: Duration,
     node_variants: NodeVariants,
+    range_variants: RangeVariants,
 ) -> (Vec<TraceRecord>, BTreeMap<String, bool>) {
-    let (mut sim, at) = refused_sim(seed, for_, node_variants);
+    let (mut sim, at) = refused_sim(seed, for_, node_variants, range_variants);
     let dirs = engine_dirs(&mut sim, at);
     (sim.trace(), dirs)
 }
@@ -988,16 +1033,25 @@ pub fn refused_whole_dirs(
 /// The crash is the simulator's (§1.3): every task on the node dies and its disk keeps
 /// only what was synced, which is what the re-seed's marks were.
 // PROPOSED(D-077): Q15's whole-node refusal, and the re-seed per replica.
+// PROPOSED(D-108): the range layer's set beside the node's.
 #[must_use]
 pub fn refused_whole_restarted(
     seed: u64,
     for_: Duration,
     node_variants: NodeVariants,
+    range_variants: RangeVariants,
 ) -> (Vec<TraceRecord>, BTreeMap<String, bool>) {
-    let (mut sim, at) = refused_sim(seed, for_, node_variants);
+    let (mut sim, at) = refused_sim(seed, for_, node_variants, range_variants);
     sim.crash(at);
     sim.restart(at);
-    spawn_node(&sim, at, 1, Variants::default(), node_variants);
+    spawn_node(
+        &sim,
+        at,
+        1,
+        Variants::default(),
+        node_variants,
+        range_variants,
+    );
     sim.run_for(for_);
     let dirs = engine_dirs(&mut sim, at);
     (sim.trace(), dirs)
@@ -1396,6 +1450,7 @@ pub fn run_with_of(
             id,
             variants,
             node_variants,
+            RangeVariants::correct(),
             ranges(),
             snapshot_threshold,
         );
@@ -1465,6 +1520,7 @@ pub fn run_with_of(
                     *node,
                     variants,
                     node_variants,
+                    RangeVariants::correct(),
                 );
                 // A crashed node's replicas are all down, and all back: the window
                 // is one isolation of the node, as the timer check reads it.
