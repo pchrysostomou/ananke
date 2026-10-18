@@ -97,7 +97,7 @@ pub use range_variant::{RangeVariant, RangeVariants};
 pub use reseed::{
     Candidate, generation_dir, generation_of, newest_not_lost, next_generation, reseed_dir,
 };
-pub use round::{Act, Cores, Meters, Round, Stamps};
+pub use round::{Act, Cores, Meters, Round, Stamps, Unheld};
 pub use server::{Gaps, Local, Range, ServerConfig, ServerHost, run};
 pub use snapshot::{
     Adopted, Identity, Install, Landing, Route, Snapshots, Started, Streams, parse_version,

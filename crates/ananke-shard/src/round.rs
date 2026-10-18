@@ -37,7 +37,7 @@ use std::collections::{BTreeMap, VecDeque};
 
 use ananke_env::{Decision, Environment};
 use ananke_raft::core::SnapshotAction;
-use ananke_raft::{Index, Input, Output, Persist, Raft, ServerId};
+use ananke_raft::{Index, Input, Message, Output, Persist, Raft, ServerId};
 
 use crate::RangeId;
 use crate::variant::{NodeVariant, NodeVariants};
@@ -96,6 +96,26 @@ pub struct Submission {
     pub persist: Persist,
 }
 
+/// A message for a range this node holds no core of, with the stamps its step would
+/// have carried (SHARD.md §5, Q22).
+///
+/// The round has no core to step it into. It hands it to the node, whose host keeps a
+/// *placeholder* for the range — no descriptor, no span, no Raft state — and answers
+/// for it as a refused server answers, so the leader that sent it feeds the node the
+/// range's snapshot (`Host::unheld`).
+// PROPOSED(D-109): a message for a range not held is the placeholder's.
+#[derive(Clone, Debug)]
+pub struct Unheld {
+    /// The range the message names, which the node does not hold.
+    pub range: RangeId,
+    /// Who sent it.
+    pub from: ServerId,
+    /// The message.
+    pub message: Message,
+    /// The stamps its step would have carried: when it was decided and received.
+    pub stamps: Stamps,
+}
+
 /// What one round asks of the node.
 ///
 /// `early` is executed and flushed **before** the round's sync; `persists` is
@@ -112,13 +132,18 @@ pub struct Round {
     /// order, and arrival order for a round of messages. Submission order is the WAL
     /// group's write order, so it is not decorative.
     pub persists: Vec<Submission>,
+    /// The round's messages for ranges this node holds no core of, in the order they
+    /// arrived: each a placeholder's to answer before the round's sync, since a
+    /// placeholder has nothing to persist (SHARD.md §5, Q22).
+    // PROPOSED(D-109): a message for a range not held is the placeholder's.
+    pub unheld: Vec<Unheld>,
 }
 
 impl Round {
     /// Whether the round asks nothing at all.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.early.is_empty() && self.persists.is_empty()
+        self.early.is_empty() && self.persists.is_empty() && self.unheld.is_empty()
     }
 
     /// Whether any of the round's early outputs is a send, and so whether flushing
@@ -585,8 +610,19 @@ impl Cores {
         let early = variants.contains(NodeVariant::DeferredFlushedEarly);
         let mut applied = self.applied.get(&range).copied().unwrap_or(0);
         let Some(slot) = self.slots.get_mut(&range) else {
-            // A message for a range this node does not hold: counted, never silent.
+            // A message for a range this node does not hold: counted, never silent, and
+            // handed to the node, whose placeholder for the range answers it (SHARD.md
+            // §5, Q22).
+            // PROPOSED(D-109): a message for a range not held is the placeholder's.
             self.meters.messages_for_ranges_not_held += 1;
+            if let Input::Message { from, message, .. } = input {
+                round.unheld.push(Unheld {
+                    range,
+                    from,
+                    message,
+                    stamps,
+                });
+            }
             return;
         };
         // Phase 2's `SendBeforePersist` on the node (SHARD.md §10, §12). §10 calls it
@@ -1136,13 +1172,28 @@ mod tests {
 
     /// A message for a range this node does not hold is counted, not dropped in
     /// silence: with four ranges to a node and a rebalancer moving them, a frame
-    /// routed by a stale map must not look like no frame at all.
+    /// routed by a stale map must not look like no frame at all. And it is handed on,
+    /// whole, for the placeholder that answers it (SHARD.md §5, Q22).
+    // PROPOSED(D-109): a message for a range not held is the placeholder's.
     #[test]
     fn a_message_for_a_range_the_node_does_not_hold_is_counted() {
         let env = env();
         let mut cores = cores(NodeVariants::correct());
         let round = cores.messages(&env, [(RangeId(9), append(1, 1), None, 64)]);
-        assert!(round.is_empty(), "no core stepped: {round:?}");
+        assert!(
+            round.early.is_empty() && round.persists.is_empty(),
+            "no core stepped: {round:?}"
+        );
+        assert_eq!(round.unheld.len(), 1, "the message is handed on: {round:?}");
+        assert_eq!(round.unheld[0].range, RangeId(9));
+        assert!(matches!(
+            round.unheld[0].message,
+            Message::AppendEntries { prev_index: 0, .. }
+        ));
+        assert!(
+            !round.is_empty(),
+            "a round with a placeholder's work is not empty"
+        );
         assert_eq!(cores.meters().messages_for_ranges_not_held, 1);
         // And one that arrives for a range the node holds but cannot step yet is
         // held, not counted as unrouted.

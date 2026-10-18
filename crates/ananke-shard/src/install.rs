@@ -62,13 +62,13 @@ use std::time::Duration;
 
 use ananke_env::{
     Clock, Decision, Either, Environment, File, FileSystem, MAX_FRAME_LEN, Network, OpenOptions,
-    Socket, StartOver, TraceEvent, race,
+    Rng, Socket, StartOver, TraceEvent, race,
 };
 use ananke_raft::core::{RaftConfig, SnapshotAction};
 use ananke_raft::message::{Frame, Message, SnapshotStatus};
 use ananke_raft::queue::Queue;
 use ananke_raft::snapshot::{self, Repair, Sender};
-use ananke_raft::store::{KeyPrefix, PURPOSE_LOG, RaftStore};
+use ananke_raft::store::{FIRST_INCARNATION, KeyPrefix, PURPOSE_LOG, RaftStore};
 use ananke_raft::types::{Configuration, Index, ServerId, Term};
 use bytes::Bytes;
 
@@ -472,6 +472,15 @@ pub struct Task<E: Environment> {
     snaps: Queue<SnapJob>,
     sending: BTreeMap<(RangeId, ServerId), Outbound>,
     receiving: BTreeMap<(RangeId, ServerId), Inbound>,
+    /// The host's placeholders (SHARD.md §5, Q22): the ranges this node holds no
+    /// replica of and has had messages for, whose streams this task assembles and
+    /// installs into a replica of its own creating.
+    // PROPOSED(D-109)
+    placeholders: Arc<std::sync::Mutex<BTreeSet<RangeId>>>,
+    /// The ranges the plan hosts as placeholders, at their Raft interval alone: a
+    /// placeholder's span is the snapshot's, and unknown until its stream completes.
+    // PROPOSED(D-109)
+    as_placeholder: BTreeSet<RangeId>,
 }
 
 impl<E: Environment> Task<E> {
@@ -496,6 +505,7 @@ impl<E: Environment> Task<E> {
         plan: Snapshots,
         local: Queue<crate::server::Local>,
         snaps: Queue<SnapJob>,
+        placeholders: Arc<std::sync::Mutex<BTreeSet<RangeId>>>,
     ) -> Self {
         Self {
             env,
@@ -513,6 +523,8 @@ impl<E: Environment> Task<E> {
             snaps,
             sending: BTreeMap::new(),
             receiving: BTreeMap::new(),
+            placeholders,
+            as_placeholder: BTreeSet::new(),
         }
     }
 
@@ -796,17 +808,38 @@ impl<E: Environment> Task<E> {
         else {
             return;
         };
-        let Some(store) = lock(&self.stores).get(&range).cloned() else {
+        let store = lock(&self.stores).get(&range).cloned();
+        // A placeholder's stream (SHARD.md §5, Q22): the node holds no replica of the
+        // range, and its placeholder asked for the snapshot with a refused server's
+        // answer. It is assembled as any stream is, and answered with the stream's own
+        // term and store incarnation 0, since there is no store; a range that is
+        // neither is not this node's to answer for. A range whose descriptor is in place
+        // and whose store is not yet is being created here — a split's apply traced its
+        // creation and is opening its store — and is no placeholder's any more: the
+        // chunk goes unanswered, and the sender's resend lands on the replica.
+        // PROPOSED(D-109)
+        let creating = store.is_none() && lock(&self.descriptors).contains_key(&range);
+        let placeholder = store.is_none() && !creating && lock(&self.placeholders).contains(&range);
+        if store.is_none() && !placeholder {
             return;
-        };
-        if term < store.term() {
+        }
+        self.host_as(range, placeholder);
+        // The term and the store incarnation every answer carries: the store's, read
+        // where each answer is made, as they always were, and a placeholder's, which are
+        // the stream's own term and 0.
+        let held_term = || store.as_ref().map_or(term, |store| store.term());
+        let incarnation = || store.as_ref().map_or(0, |store| store.incarnation());
+        if term < held_term() {
             // A stale leader's stream: let it time out.
             return;
         }
-        if store.applied() >= last_index {
+        if store
+            .as_ref()
+            .is_some_and(|store| store.applied() >= last_index)
+        {
             // Everything the snapshot carries is already here: say so.
-            let answer = snapshot::installed(store.term(), (last_index, last_term));
-            return self.answer(range, from, answer, store.incarnation()).await;
+            let answer = snapshot::installed(held_term(), (last_index, last_term));
+            return self.answer(range, from, answer, incarnation()).await;
         }
         if self
             .receiving
@@ -842,7 +875,7 @@ impl<E: Environment> Task<E> {
                     from,
                     cap_status(self.variants),
                     StartOver::Cap,
-                    store.term(),
+                    held_term(),
                     (last_index, last_term),
                 )
                 .await;
@@ -860,7 +893,7 @@ impl<E: Environment> Task<E> {
                     range,
                     from,
                     StartOver::NotHosted,
-                    store.term(),
+                    held_term(),
                     (last_index, last_term),
                 )
                 .await;
@@ -870,8 +903,8 @@ impl<E: Environment> Task<E> {
                 // already completed: its answer was lost, so the node answers the
                 // resend what it answered the first — installed — and installs
                 // nothing a second time (D-075).
-                let answer = snapshot::installed(store.term(), (last_index, last_term));
-                self.answer(range, from, answer, store.incarnation()).await;
+                let answer = snapshot::installed(held_term(), (last_index, last_term));
+                self.answer(range, from, answer, incarnation()).await;
             }
             Landing::Restarted { dir, .. } => {
                 self.clear(&dir).await;
@@ -880,7 +913,7 @@ impl<E: Environment> Task<E> {
                     range,
                     from,
                     StartOver::Identity,
-                    store.term(),
+                    held_term(),
                     (last_index, last_term),
                 )
                 .await;
@@ -892,7 +925,7 @@ impl<E: Environment> Task<E> {
                             range,
                             from,
                             StartOver::Unusable,
-                            store.term(),
+                            held_term(),
                             (last_index, last_term),
                         )
                         .await;
@@ -900,8 +933,8 @@ impl<E: Environment> Task<E> {
                 let inbound = self.receiving.entry((range, from)).or_default();
                 advance(inbound, &file, offset, total, data.len());
                 let (want, at_offset) = wanted(inbound);
-                let answer = snapshot::ack(store.term(), (last_index, last_term), want, at_offset);
-                self.answer(range, from, answer, store.incarnation()).await;
+                let answer = snapshot::ack(held_term(), (last_index, last_term), want, at_offset);
+                self.answer(range, from, answer, incarnation()).await;
             }
             Landing::Complete(install) => {
                 if self
@@ -914,10 +947,16 @@ impl<E: Environment> Task<E> {
                             range,
                             from,
                             StartOver::Unusable,
-                            store.term(),
+                            held_term(),
                             (last_index, last_term),
                         )
                         .await;
+                }
+                if placeholder {
+                    // No core to hold and no replica's state to repair: the install is
+                    // made here (SHARD.md §5, Q22).
+                    // PROPOSED(D-109)
+                    return self.install_placeholder(range, from, *install).await;
                 }
                 self.receiving.entry((range, from)).or_default().pending = Some(install);
                 // The `raft` task holds the range and builds the repair from its core;
@@ -1217,6 +1256,232 @@ impl<E: Environment> Task<E> {
                 config: Box::new(config),
                 descriptor,
             }));
+    }
+
+    /// Keeps the plan's hosting of `range` in step with what the range is on this node
+    /// (SHARD.md §5, Q22): a placeholder is hosted at its Raft interval alone, since its
+    /// span is the snapshot's and unknown until a stream of it completes; a range hosted
+    /// as a placeholder that has a store now — its node applied the split that makes it
+    /// — is hosted at its descriptor's span, as the split's own `Host` job hosts it, so
+    /// a stream that completes into it replaces its whole span.
+    // PROPOSED(D-109)
+    fn host_as(&mut self, range: RangeId, placeholder: bool) {
+        if placeholder {
+            if self.as_placeholder.insert(range) {
+                self.plan
+                    .host(range, vec![KeyPrefix::group(range.get()).span()]);
+            }
+        } else if self.as_placeholder.contains(&range)
+            && let Some(span) = self.user_span(range)
+        {
+            self.as_placeholder.remove(&range);
+            self.plan
+                .host(range, vec![KeyPrefix::group(range.get()).span(), span]);
+        }
+    }
+
+    /// A placeholder's stream completed (SHARD.md §5, Q22): the install that creates
+    /// the replica. There is no core to hold and no replica's state to repair, so it is
+    /// made here, in this task, and the `raft` task is handed the replica it made.
+    ///
+    /// The snapshot's span is read out of the staged bytes first, and the install is
+    /// refused where that span overlaps an initialised replica on this node: §5's
+    /// overlap rule (Q27), which keeps one owner per key on a node (check 8). A node
+    /// whose replica of a parent has not applied the split is fed the right half's
+    /// snapshot whenever the right half's leader reaches its placeholder first, and
+    /// installing it would put two owners on the right half's keys until the parent
+    /// moved on. The refusal is a start-over (`StartOver::Overlaps`) and the leader
+    /// streams again: by then the parent here has applied the split, which creates the
+    /// right half and ends the placeholder, or installed a snapshot past it, which moves
+    /// its span off the right half's. The rule's own answer, `Overlaps`, and the
+    /// leader's wait before it streams again are the overlap rule's slice's.
+    ///
+    /// Otherwise the repair is a placeholder's: the stream's term, no vote, no kept
+    /// tail, no quarantine — R's votes are in no store a re-seed could have lost (Q26)
+    /// — and an incarnation drawn fresh from the node's generator (Q26, D-042). The
+    /// switch writes the replica's whole state under its prefix and replaces its span's
+    /// keys, in one manifest switch (D-066), and the store is opened on what it wrote.
+    // PROPOSED(D-109): a placeholder's install creates the replica, and is refused
+    // where it would overlap.
+    async fn install_placeholder(&mut self, range: RangeId, from: ServerId, install: Install) {
+        let installing = self.env.decision();
+        let prefix = KeyPrefix::group(range.get());
+        let at = install.at;
+        let config = match snapshot::staged_record(&self.env, &install.source, &prefix).await {
+            Ok(Some(record)) => record.config,
+            Ok(None) | Err(_) => {
+                return self
+                    .placeholder_refused(range, from, &install, StartOver::Unusable)
+                    .await;
+            }
+        };
+        let descriptor = match snapshot::staged_value(
+            &self.env,
+            &install.source,
+            &prefix.descriptor_key(),
+        )
+        .await
+        {
+            Ok(Some(bytes)) => RangeDescriptor::decode(bytes)
+                .ok()
+                .filter(|descriptor| descriptor.start < descriptor.end),
+            Ok(None) | Err(_) => None,
+        };
+        // A stream that carries no descriptor says nothing of the span it would install,
+        // and nothing can be checked against it: no take of this tree makes one.
+        let Some(descriptor) = descriptor else {
+            return self
+                .placeholder_refused(range, from, &install, StartOver::Unusable)
+                .await;
+        };
+        // The range itself initialised meanwhile — this node applied the split that
+        // makes it while the stream was read — is the same refusal: the replica is here
+        // now, and the sender's next stream lands on it.
+        let overlaps = lock(&self.descriptors).iter().any(|(other, held)| {
+            *other == range || (held.start < descriptor.end && descriptor.start < held.end)
+        });
+        if overlaps {
+            return self
+                .placeholder_refused(range, from, &install, StartOver::Overlaps)
+                .await;
+        }
+        // The engine, through any store on it: the node has one engine (Q2).
+        let Some(beside) = lock(&self.stores).values().next().cloned() else {
+            return self
+                .placeholder_refused(range, from, &install, StartOver::Unusable)
+                .await;
+        };
+        let Ok(source) = beside.engine().open_span_source(&install.source).await else {
+            return self
+                .placeholder_refused(range, from, &install, StartOver::Unusable)
+                .await;
+        };
+        let incarnation = self.env.rng().next_u64().max(FIRST_INCARNATION + 1);
+        let repair = Repair {
+            term: at.term,
+            vote: None,
+            tail: Vec::new(),
+            quarantined: false,
+            incarnation,
+        };
+        let batch = snapshot::repair_writes(
+            &prefix,
+            &repair,
+            at.last_index,
+            at.last_term,
+            &config,
+            &BTreeSet::new(),
+        );
+        let spans = vec![
+            prefix.span(),
+            descriptor.start.clone()..descriptor.end.clone(),
+        ];
+        if beside
+            .engine()
+            .install_spans(spans.clone(), source, batch)
+            .await
+            .is_err()
+        {
+            return self
+                .placeholder_refused(range, from, &install, StartOver::Unusable)
+                .await;
+        }
+        // The replica exists from the switch, durably, so its creation is traced here,
+        // before anything else is awaited (SHARD.md §8: an event is traced once the
+        // batch it reports is durable). Traced later, with the core, a crash between
+        // the two would leave the node restating a replica the trace never saw made,
+        // which check 20 reads as a placeholder's the day it grants a vote. It names
+        // the snapshot's descriptor, its last index and term as the floor, and the
+        // fresh incarnation (Q26).
+        self.env.trace_decided(
+            installing,
+            TraceEvent::RangeCreated {
+                range: range.get(),
+                cause: ananke_env::RangeCause::Snapshot,
+                parent: None,
+                start: descriptor.start.clone(),
+                end: descriptor.end.clone(),
+                generation: descriptor.generation,
+                voters: descriptor.voters.iter().map(|voter| voter.0).collect(),
+                floor_index: at.last_index,
+                floor_term: at.last_term,
+                incarnation,
+            },
+        );
+        // The store the switch wrote, opened beside the node's others: everything it
+        // reads the repair wrote, so the open writes nothing.
+        let store = match beside.open_sibling(prefix).await {
+            Ok((store, _)) => Arc::new(store),
+            Err(error) => {
+                self.env.trace(TraceEvent::RaftServerFailed {
+                    server: self.id.0,
+                    reason: format!("opening {range}'s store after its install: {error}"),
+                });
+                return;
+            }
+        };
+        lock(&self.stores).insert(range, store.clone());
+        if let Ok(mut applied) = self.applied.lock() {
+            applied.insert(
+                range,
+                crate::server::Applied {
+                    index: at.last_index,
+                    term: at.last_term,
+                    config: config.clone(),
+                },
+            );
+        }
+        // The descriptor the switch put in place: what the state read back below takes
+        // the span from, and what the host's receipt check reads from here on.
+        lock(&self.descriptors).insert(range, descriptor.clone());
+        self.clear_staging(&install.source).await;
+        self.plan.finish(range, from);
+        self.receiving.remove(&(range, from));
+        self.as_placeholder.remove(&range);
+        self.plan.host(range, spans);
+        self.state_of(range, at, &store).await;
+        self.env.trace_decided(
+            installing,
+            TraceEvent::RaftSnapshot {
+                server: self.id.0,
+                range: range.get(),
+                last_index: at.last_index,
+                last_term: at.last_term,
+                taken: false,
+            },
+        );
+        let answer = snapshot::installed(at.term, (at.last_index, at.last_term));
+        self.answer(range, from, answer, store.incarnation()).await;
+        self.local
+            .push(crate::server::Local::Snapshot(SnapAnswer::Switched {
+                range,
+                at,
+                config: Box::new(config),
+                descriptor: Some(Box::new(descriptor)),
+            }));
+    }
+
+    /// A placeholder's install refused: its staged bytes go, and the sender is asked
+    /// for the stream again, saying why.
+    // PROPOSED(D-109)
+    async fn placeholder_refused(
+        &mut self,
+        range: RangeId,
+        from: ServerId,
+        install: &Install,
+        reason: StartOver,
+    ) {
+        self.clear(&install.source).await;
+        self.plan.finish(range, from);
+        self.receiving.remove(&(range, from));
+        self.start_over(
+            range,
+            from,
+            reason,
+            install.at.term,
+            (install.at.last_index, install.at.last_term),
+        )
+        .await;
     }
 
     /// The install did not switch: the staging directory starts over, the sender is

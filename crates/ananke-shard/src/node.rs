@@ -48,7 +48,7 @@ use bytes::Bytes;
 use crate::inbox::{Inbox, Received};
 use crate::outbox::Outbox;
 use crate::range::RangeId;
-use crate::round::{Act, Cores, Meters, Round};
+use crate::round::{Act, Cores, Meters, Round, Unheld};
 use crate::variant::{NodeVariant, NodeVariants};
 
 /// A future a host hands back, borrowing the host and awaited before the task takes
@@ -171,11 +171,25 @@ pub trait Host {
     }
     /// A local input that adds a range to the node: the right half a split's apply
     /// created, with the core the `apply` task built for it and the parent it split
-    /// from (SHARD.md §5; PROPOSED D-100). Asked only for a range the node does not
-    /// hold; `None` for every other input.
-    fn local_insert(&self, local: &Self::Local) -> Option<(Box<Raft>, RangeId)> {
+    /// from (SHARD.md §5; PROPOSED D-100), or a replica a placeholder's install created,
+    /// which has no parent (§5, Q22; PROPOSED D-109). Asked only for a range the node
+    /// does not hold; `None` for every other input.
+    fn local_insert(&self, local: &Self::Local) -> Option<(Box<Raft>, Option<RangeId>)> {
         let _ = local;
         None
+    }
+
+    /// A message for a range this node holds no replica of (SHARD.md §5, Q22): the host
+    /// keeps a *placeholder* for the range — no descriptor, no span, no Raft state —
+    /// and hands back what the placeholder does with the message, which the node
+    /// executes as a core's early outputs, before the round's sync: a placeholder has
+    /// nothing to persist. The correct placeholder answers an `AppendEntries` as a
+    /// refused server does and grants nothing. The default, a host with no
+    /// placeholders, does nothing with it.
+    // PROPOSED(D-109): a message for a range not held is the placeholder's.
+    fn unheld(&self, range: RangeId, from: ServerId, message: Message) -> Vec<Output> {
+        let _ = (range, from, message);
+        Vec::new()
     }
     /// `range` was added beside its parent, whose replica here leads if `led`.
     fn range_added(&self, range: RangeId, parent: RangeId, led: bool) {
@@ -576,6 +590,15 @@ impl<E: Environment, H: Host> Node<E, H> {
             // parent leads, the new replica pre-votes at once and every heartbeat
             // interval until it hears from a leader (Q21).
             if let Some((core, parent)) = self.host.local_insert(&mine) {
+                // A replica a placeholder's install created takes its place on the
+                // node and nothing more: it was not born at a split, so no parent of
+                // it here led, and its first election is its own timer's (SHARD.md §5,
+                // Q22).
+                // PROPOSED(D-109)
+                let Some(parent) = parent else {
+                    self.cores.insert(range, *core);
+                    return Ok(());
+                };
                 let led = self
                     .cores
                     .core(parent)
@@ -693,8 +716,31 @@ impl<E: Environment, H: Host> Node<E, H> {
         persists: &mut Persists,
     ) -> io::Result<()> {
         let mut queue = VecDeque::from([(first, credit)]);
-        while let Some((round, credit)) = queue.pop_front() {
-            if round.is_empty() && credit.is_none() {
+        while let Some((mut round, credit)) = queue.pop_front() {
+            // The placeholders' answers first: they wait on nothing (SHARD.md §5, Q22). A
+            // message a placeholder sends nothing for leaves the round as empty as it was,
+            // so a round of those alone flushes nothing, as it never did.
+            // PROPOSED(D-109): a message for a range not held is the placeholder's.
+            let mut answered = false;
+            for Unheld {
+                range,
+                from,
+                message,
+                stamps,
+            } in std::mem::take(&mut round.unheld)
+            {
+                for output in self.host.unheld(range, from, message) {
+                    answered |= matches!(output, Output::Send { .. });
+                    self.act(Act {
+                        range,
+                        stamps,
+                        output,
+                        entries: None,
+                    })
+                    .await?;
+                }
+            }
+            if round.is_empty() && !answered && credit.is_none() {
                 continue;
             }
             let sends_early = round.sends_early();
