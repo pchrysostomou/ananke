@@ -44,10 +44,17 @@
 //! apply, which also holds a right half to a block granted to the node that led its
 //! parent (PROPOSED D-100).
 //!
+//! **Each fold has a verdict of its own** ([`Fold`], [`Checker::verdict_of`]), so that a
+//! run in which two folds are in violation shows both: [`Checker::verdict`], which
+//! stops a run, reports the first of them in the order 7, 9, 10, 16, 17, 18, and a
+//! catch read through it alone would credit every write applied outside its span to
+//! check 9 and never show check 10 trip on the same write (PROPOSED D-106).
+//!
 //! The keys the trace carries are user keys; the spans are encoded (§1), so every
 //! comparison encodes the key as the store does (`ananke_raft::apply::user_key`).
 // PROPOSED(D-097): checks 7, 9, 10 and 17.
 // PROPOSED(D-098): check 16, and check 9's lookups.
+// PROPOSED(D-106): a verdict per fold.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound::{Excluded, Unbounded};
@@ -924,10 +931,79 @@ impl ClientRefreshes {
     }
 }
 
+/// One of the range layer's seven folds: SHARD.md §8's checks 7, 9, 10, 16 and 17, and
+/// check 18's two clauses, each of which keeps a verdict of its own in [`Checker`].
+// PROPOSED(D-106): a verdict per fold.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Fold {
+    /// Check 7, descriptor agreement ([`Descriptors`]).
+    DescriptorAgreement,
+    /// Check 9, serving within span ([`ServingWithinSpan`]).
+    ServingWithinSpan,
+    /// Check 10, owners' generations rise ([`GenerationsRise`]).
+    GenerationsRise,
+    /// Check 16, the meta range never goes back ([`MetaNeverGoesBack`]).
+    MetaNeverGoesBack,
+    /// Check 17, a client refreshes on a mismatch ([`ClientRefreshes`]).
+    ClientRefreshes,
+    /// Check 18's range-id clause ([`IdsUnique`]).
+    RangeIds,
+    /// Check 18's split clause ([`SplitLineage`]).
+    SplitLineage,
+}
+
+impl Fold {
+    /// Every fold, in the order [`Checker::verdict`] asks them: 7, 9, 10, 16, 17, 18.
+    pub const ALL: [Self; 7] = [
+        Self::DescriptorAgreement,
+        Self::ServingWithinSpan,
+        Self::GenerationsRise,
+        Self::MetaNeverGoesBack,
+        Self::ClientRefreshes,
+        Self::RangeIds,
+        Self::SplitLineage,
+    ];
+
+    /// The check of SHARD.md §8 the fold is; check 18 is two folds.
+    #[must_use]
+    pub const fn check(self) -> u32 {
+        match self {
+            Self::DescriptorAgreement => 7,
+            Self::ServingWithinSpan => 9,
+            Self::GenerationsRise => 10,
+            Self::MetaNeverGoesBack => 16,
+            Self::ClientRefreshes => 17,
+            Self::RangeIds | Self::SplitLineage => 18,
+        }
+    }
+
+    /// The words every violation of the fold begins with.
+    #[must_use]
+    pub const fn words(self) -> &'static str {
+        match self {
+            Self::DescriptorAgreement => "descriptor agreement:",
+            Self::ServingWithinSpan => "serving within span:",
+            Self::GenerationsRise => "owners' generations:",
+            Self::MetaNeverGoesBack => "meta never goes back:",
+            Self::ClientRefreshes => "client refreshes:",
+            Self::RangeIds => "range ids:",
+            Self::SplitLineage => "descriptor lineage:",
+        }
+    }
+}
+
+impl std::fmt::Display for Fold {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let words = self.words();
+        write!(f, "check {} ({})", self.check(), &words[..words.len() - 1])
+    }
+}
+
 /// The seven folds — checks 7, 9, 10, 16 and 17, and check 18's two clauses — as one
 /// incremental checker: fed the records since its last look, with a verdict at any
 /// prefix that is what the folds over the whole prefix report, in the same words
-/// (D-046).
+/// (D-046), for each fold on its own ([`Checker::verdict_of`]) and for the seven
+/// together ([`Checker::verdict`]).
 ///
 /// A checker built `active: false` folds nothing and reports nothing: what a run of
 /// the one-group server, which traces no descriptor, is checked with.
@@ -980,32 +1056,63 @@ impl Checker {
         &self.descriptors
     }
 
-    /// The first violation, in check order: 7, 9, 10, 16, 17, 18.
+    /// `fold`'s own verdict: its first violation, whatever the other folds found.
+    ///
+    /// # Errors
+    ///
+    /// The fold's violation, in words naming it ([`Fold::words`]).
+    // PROPOSED(D-106): a verdict per fold.
+    pub fn verdict_of(&self, fold: Fold) -> Result<(), String> {
+        match fold {
+            Fold::DescriptorAgreement => self.descriptors.verdict(),
+            Fold::ServingWithinSpan => self.serving.verdict(),
+            Fold::GenerationsRise => self.generations.verdict(),
+            Fold::MetaNeverGoesBack => self.meta.verdict(),
+            Fold::ClientRefreshes => self.refreshes.verdict(),
+            Fold::RangeIds => self.ids.verdict(),
+            Fold::SplitLineage => self.lineage.verdict(),
+        }
+    }
+
+    /// Every fold's own verdict, in check order.
+    // PROPOSED(D-106): a verdict per fold.
+    pub fn verdicts(&self) -> [(Fold, Result<(), String>); 7] {
+        Fold::ALL.map(|fold| (fold, self.verdict_of(fold)))
+    }
+
+    /// The first violation, in check order: 7, 9, 10, 16, 17, 18. This is what stops a
+    /// run, and it names one fold where several may be in violation: read
+    /// [`Checker::verdict_of`] for what each fold found.
     ///
     /// # Errors
     ///
     /// The violation, in words naming it.
     pub fn verdict(&self) -> Result<(), String> {
-        self.descriptors.verdict()?;
-        self.serving.verdict()?;
-        self.generations.verdict()?;
-        self.meta.verdict()?;
-        self.refreshes.verdict()?;
-        self.ids.verdict()?;
-        self.lineage.verdict()
+        Fold::ALL
+            .into_iter()
+            .try_for_each(|fold| self.verdict_of(fold))
     }
 }
 
+/// The checker folded over `records` from the first: the whole-trace form of
+/// [`Checker`], whose verdicts, together and per fold, an incremental checker fed the
+/// same records in pieces must equal (D-046).
+// PROPOSED(D-106): a verdict per fold.
+#[must_use]
+pub fn folded(records: &[TraceRecord]) -> Checker {
+    let mut checker = Checker::new(true);
+    checker.extend(records);
+    checker
+}
+
 /// The checks folded over `records` from the first: the whole-trace form of
-/// [`Checker`].
+/// [`Checker::verdict`].
 ///
 /// # Errors
 ///
 /// The first violation, in check order.
 pub fn all(records: &[TraceRecord]) -> Result<(), String> {
-    let mut checker = Checker::new(true);
-    checker.extend(records);
-    checker.verdict()
+    folded(records).verdict()
 }
 
 #[cfg(test)]
@@ -1453,6 +1560,45 @@ mod tests {
         wrong.extend(&records);
         let verdict = wrong.verdict().unwrap_err();
         assert!(verdict.contains("is what the split leaves"), "{verdict}");
+    }
+
+    /// Two folds in violation on one record — a write applied in a range whose span no
+    /// longer holds its key, to a key its sibling wrote at the same generation — are
+    /// each reported by their own fold, and the checker's verdict names the first in
+    /// check order. Read through that verdict alone, check 10's violation is never seen,
+    /// which is how every catch of `ApplyIgnoresSpan` read as check 9's before PROPOSED
+    /// D-106.
+    // PROPOSED(D-106)
+    #[test]
+    fn each_fold_keeps_its_own_verdict_and_the_checker_names_the_first() {
+        let mut checker = Checker::new(true);
+        checker.extend(&before_a_split());
+        checker.extend(&split_records(1, 2, 9, 2, b"m", b"a", b"z", 1, 6));
+        checker.push(&applied(1, 6, 10, b"q", ApplyEffect::Applied));
+        checker.verdict().unwrap();
+        // Range 2, now `[a, m)` at generation 2, writes `q`, which its right half
+        // wrote at generation 2: outside its span (check 9) and a sibling's write at a
+        // generation not above it (check 10).
+        checker.push(&applied(1, 2, 11, b"q", ApplyEffect::Applied));
+        let nine = checker.verdict_of(Fold::ServingWithinSpan).unwrap_err();
+        let ten = checker.verdict_of(Fold::GenerationsRise).unwrap_err();
+        assert!(nine.starts_with(Fold::ServingWithinSpan.words()), "{nine}");
+        assert!(ten.starts_with(Fold::GenerationsRise.words()), "{ten}");
+        assert_eq!(checker.verdict(), Err(nine));
+        for (fold, verdict) in checker.verdicts() {
+            if !matches!(fold, Fold::ServingWithinSpan | Fold::GenerationsRise) {
+                assert_eq!(verdict, Ok(()), "{fold}");
+            }
+        }
+        assert_eq!(
+            Fold::ALL.map(Fold::check),
+            [7, 9, 10, 16, 17, 18, 18],
+            "the order the checker's verdict asks the folds in"
+        );
+        assert_eq!(
+            Fold::GenerationsRise.to_string(),
+            "check 10 (owners' generations)"
+        );
     }
 
     fn meta_applied(node: u64, index: u64, named: Vec<Named<'_>>) -> TraceRecord {

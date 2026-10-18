@@ -20530,4 +20530,49 @@ this branch's changes before `rustfmt`, which changed their layout and nothing e
 
 ---
 
-_Next entry: D-106. Add one before implementing anything not covered above._
+## PROPOSED D-106 — Each of the range layer's folds keeps a verdict of its own and runs under the equivalence test against the variant that trips it
+
+**The number.** Off `main` at 6633266, whose footer reads D-106. Two slices run beside
+this one, S6 (D-107) and H1 (D-108 if it needs one); this takes **D-106** and moves the
+footer to D-107. At the merge the entries are a union in numerical order with one footer,
+the highest plus one. Every code site carries `// PROPOSED(D-106)`.
+
+**Context.** Stage C's exit asks for "the equivalence test, each fold against the variant
+of this stage that trips it": checks 9 and 10 against `ApplyIgnoresSpan`, check 9 also
+against `TrustStaleDescriptor` (and `ReadCheckAtReceiptOnly`, not built), check 16 against
+`MetaOverwritesByArrival`, check 17 against `ClientIgnoresMismatch`, check 18 against
+`IdBlockResumed`, and check 7 over the correct system and this stage's variants, asserted
+against `SplitNotAtomicWithDescriptor` in Stage D, which builds it (SHARD.md §12; §11,
+raft 12). What the tree had is D-097's item 8: one `Checker` folding the seven folds and
+giving **one verdict**, the first violation in the order 7, 9, 10, 16, 17, 18
+(crates/ananke-shard/src/invariants.rs at 6633266). So a write applied outside its span,
+which breaks check 9 and, where its range's sibling wrote the key at the same generation,
+check 10 on the same record, was reported as check 9 alone: every `ApplyIgnoresSpan`
+catch read as check 9's, and check 10 had never been seen to trip on any run. The
+equivalence test (`the_range_layers_checks_agree_with_their_whole_trace_folds`,
+sim/tests/node.rs) compared that one verdict, on `high_rate_share().min(20)` seeds —
+twenty at every tier — of three systems (the correct node, `TrustStaleDescriptor`,
+`ClientIgnoresMismatch`), and asserted only that some prefix was in violation.
+
+**The work was resumed.** A session on 2026-10-12 did most of this and died with all of it
+uncommitted; none of its measurements survived. This branch commits it in steps, each
+gated, and re-measures every figure the uncommitted work quoted before any assertion it
+carried is kept.
+
+### 1. A verdict per fold
+
+`ananke_shard::invariants::Fold` names the seven folds — checks 7, 9, 10, 16 and 17, and
+check 18's range-id clause (`IdsUnique`) and split clause (`SplitLineage`) — with the check
+each is (`Fold::check`), the words every violation of it begins with (`Fold::words`) and
+`Fold::ALL` in the order the checker asks them. `Checker::verdict_of(fold)` is that fold's
+own latched verdict, `Checker::verdicts()` all seven, and `invariants::folded(records)` the
+checker folded over a trace from its first record, the whole-trace form a checker fed in
+pieces must equal fold by fold (D-046). **`Checker::verdict` is unchanged**: the first
+violation in the order 7, 9, 10, 16, 17, 18, which is what stops a run of the node sweep
+(`sim/raft.rs`'s `advance`) and what `invariants::all` returns, so no run stops anywhere
+else and no schedule moves. A unit test plants one write that breaks checks 9 and 10 at
+once and asserts both folds report it in their own words while the checker names check 9.
+
+---
+
+_Next entry: D-107. Add one before implementing anything not covered above._
