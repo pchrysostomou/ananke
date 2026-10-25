@@ -5312,7 +5312,16 @@ fn a_leader_that_ignores_incarnations_has_an_incarnation_to_ignore_only_where_a_
 /// bugs and so is not what D-045 pinned. That goes to the owner as the entry records,
 /// and this test pins what the node *does* do, so that a seed where the incarnation
 /// half does something is seen: the equality below fails on it and says to pin it.
+///
+/// **Since the placeholders the incarnation half has something else to ignore** (PROPOSED
+/// D-111, of D-109's placeholders): a placeholder answers with store incarnation 0, and the replica its node makes
+/// next answers with a fresh one, which the correct leader resets the follower's progress
+/// at and `IgnoreIncarnation` does not. The equality became the claim that the pair and
+/// the stream half differ only on a seed where a store was refused or such a reset
+/// happened. The first seed where the pair is caught and neither half alone is, 57 of the
+/// premerge's share, is pinned with its mechanism.
 // PROPOSED(D-086): the pair on the node is the stream half alone until Q15's re-seed.
+// PROPOSED(D-111): and wherever no placeholder's reset happens.
 // PROPOSED(D-086): on the merge with `main`, the re-seed is in the tree and rare here.
 // PROPOSED(D-091): a catch is attributed to the variant's own violation.
 #[derive(Debug)]
@@ -5337,10 +5346,50 @@ struct Outcome {
     /// Runs on which the read bound fired with no wedge and the correct node passes
     /// the seed: the variant's load on a bound that counts retries (issue #125).
     load: usize,
+    /// Resets under `SharedSnapshotDir` alone that a placeholder explains: a leader's
+    /// first `RaftProgressReset` of a follower after the follower made a placeholder of
+    /// the range, at the incarnation going from the placeholder's 0 to the fresh one
+    /// its replica drew (D-109; PROPOSED D-111). The incarnation half ignores exactly that.
+    placeholder_resets: usize,
+}
+
+/// The first reset per (leader, range, follower) after each placeholder the follower
+/// made of the range: the resets whose incarnation change a placeholder explains
+/// (PROPOSED D-111; the bound #173's review, N1, asked of the incarnation test).
+// PROPOSED(D-111)
+fn placeholder_resets(report: &raft::Report) -> usize {
+    let mut placeholders: BTreeMap<(u64, u64), usize> = BTreeMap::new();
+    let mut used: BTreeSet<(u64, u64, u64, usize)> = BTreeSet::new();
+    let mut explained = 0;
+    for record in &report.records {
+        match &record.event {
+            TraceEvent::RangeReplicaCreated { range } => {
+                if let Some(node) = record.node {
+                    *placeholders
+                        .entry((*range, u64::from(node.get())))
+                        .or_default() += 1;
+                }
+            }
+            TraceEvent::RaftProgressReset {
+                server,
+                range,
+                follower,
+                ..
+            } if placeholders
+                .get(&(*range, *follower))
+                .is_some_and(|made| used.insert((*server, *range, *follower, *made))) =>
+            {
+                explained += 1;
+            }
+            _ => {}
+        }
+    }
+    explained
 }
 
 #[test]
-fn the_pair_on_the_node_is_the_stream_half_alone_where_no_store_is_refused() {
+fn the_pair_on_the_node_is_the_stream_half_alone_where_no_store_is_refused_and_no_placeholder_reset()
+ {
     // The share (D-055, D-061): this runs three variants on every seed it takes, and
     // what it asserts is the *equality* of two of them — a structural claim about one
     // half being a no-op, which a share settles as well as a tier and at a tenth of
@@ -5416,6 +5465,7 @@ fn the_pair_on_the_node_is_the_stream_half_alone_where_no_store_is_refused() {
                 + under_incarnation.refused.len(),
             read_bound_on_wedge: usize::from(a_bound) + usize::from(b_bound) + usize::from(c_bound),
             load: usize::from(a_load) + usize::from(b_load) + usize::from(c_load),
+            placeholder_resets: placeholder_resets(&under_stream),
         }
     });
     let otherwise: Vec<String> = outcomes
@@ -5438,6 +5488,7 @@ fn the_pair_on_the_node_is_the_stream_half_alone_where_no_store_is_refused() {
     let refused = seeds_where(|o| o.refused > 0);
     let read_bound_on_wedge: usize = outcomes.iter().map(|o| o.read_bound_on_wedge).sum();
     let load = seeds_where(|o| o.load > 0);
+    let past_a_placeholder = seeds_where(|o| o.placeholder_resets > 0);
     println!(
         "node: the pair caught on {}/{seeds} seeds {pair:?}, `SharedSnapshotDir` alone on {} \
          {stream:?}, `IgnoreIncarnation` alone on {} {incarnation:?}, and on {} seeds \
@@ -5447,31 +5498,50 @@ fn the_pair_on_the_node_is_the_stream_half_alone_where_no_store_is_refused() {
          {load:?} the read bound fired under a variant with no wedge, where the correct node \
          passes — the variant's load on a bound that counts retries, not a catch and not \
          the node's failure; a store was refused on {} seeds {refused:?}, the only ones the \
-         incarnation half has anything to ignore on",
+         incarnation half had a re-seed to ignore on; and on {} seeds {past_a_placeholder:?} \
+         the stream half's leader reset a follower's progress past its placeholder, which the \
+         incarnation half ignores (PROPOSED D-111)",
         pair.len(),
         stream.len(),
         incarnation.len(),
         only_the_pair.len(),
         load.len(),
-        refused.len()
+        refused.len(),
+        past_a_placeholder.len()
     );
-    // The wedge itself, asserted rather than printed: a seed the pair is caught on and
-    // neither half alone is, is a wedge that needs both bugs, which is what D-045
-    // pinned seed 680 for and what this node cannot produce while `IgnoreIncarnation`
-    // is a no-op on it. The day one appears, pin it here as D-045 pinned 680.
+    // What the incarnation half has to ignore on this node (PROPOSED D-111). Before the
+    // placeholders a store's incarnation changed only at a re-seed, so the pair was the
+    // stream half seed for seed. A placeholder answers with store incarnation 0, and the
+    // replica its node then makes answers with the fresh one its creation drew (Q26): a
+    // change the correct leader forgets the follower's progress at (D-042), and
+    // `IgnoreIncarnation` does not. So the pair differs from the stream half only on a
+    // seed where a store was refused or a placeholder's reset happened, and that is what
+    // is asserted, seed for seed, in place of the equality, which held until the
+    // placeholders. A seed the pair is caught on and neither half alone is, is a wedge
+    // that needs both bugs, D-045's shape: it is printed, it must be one of those, and
+    // the first of them is pinned with its mechanism
+    // (`seed_57_the_pair_wedges_where_neither_half_does_past_a_placeholders_reset`).
+    // Measured on this tree, release, over the premerge's share of a hundred: the pair is
+    // caught on 32 seeds and the stream half on 33, and they differ on three, each past a
+    // placeholder's reset, with no store refused. On 57 the pair is caught and neither
+    // half alone is. On 40 and 76 the stream half alone is caught and the pair is not.
+    // Placeholders' resets happen on 17 of the hundred.
+    let unexplained: BTreeSet<u64> = pair
+        .symmetric_difference(&stream)
+        .copied()
+        .filter(|seed| {
+            outcomes
+                .iter()
+                .find(|o| o.seed == *seed)
+                .is_some_and(|o| o.refused == 0 && o.placeholder_resets == 0)
+        })
+        .collect();
     assert!(
-        only_the_pair.is_empty(),
-        "the pair is caught on seeds {only_the_pair:?} where neither half alone is: that is a \
-         wedge needing both bugs, which is what D-045 pinned seed 680 for — pin it here \
-         rather than this absence, and take it to the owner"
-    );
-    // And the equality that says why: `IgnoreIncarnation` is a no-op on this node, so
-    // the pair is exactly the stream half, seed for seed.
-    assert_eq!(
-        pair, stream,
-        "the pair no longer catches exactly the seeds `SharedSnapshotDir` alone catches on \
-         the node, so `IgnoreIncarnation` is doing something here now: search the first \
-         thousand seeds for a wedge that needs both bugs and pin it, as D-045 pinned 680"
+        unexplained.is_empty(),
+        "the pair and `SharedSnapshotDir` alone differ on seeds {unexplained:?}, where no store \
+         was refused and no leader reset a follower's progress past its placeholder: \
+         `IgnoreIncarnation` had nothing to ignore there, so something else is moving the \
+         pair. Search them for a wedge that needs both bugs and pin it, as D-045 pinned 680"
     );
     // `IgnoreIncarnation` alone is caught on 0 of 10 000 on one group too
     // (RAFT.md:697, SHARD.md:1579), so this is **not** the guard that sees Q15's
@@ -5491,6 +5561,112 @@ fn the_pair_on_the_node_is_the_stream_half_alone_where_no_store_is_refused() {
         "a run under one of these variants failed a check none of them breaks, so the node \
          itself failed and no variant was caught: read these as the correct node's and fix \
          them there. {otherwise:?}"
+    );
+}
+
+/// **Seed 57: the pair wedges where neither half does, past a placeholder's reset**
+/// (PROPOSED D-111; D-045's shape on the node). Range 5's split at index 37 makes right
+/// half 14 (`[k7, k8)`), led by node 3. Node 2 makes a placeholder of 14 before it applies
+/// the split (8.826 s), answers 14's leader with store incarnation 0, and then creates 14
+/// by its apply (8.932 s), whose replica answers with the fresh incarnation it drew.
+/// Under `SharedSnapshotDir` alone the leader resets node 2's progress of 14 at that change
+/// (8.952 s), as D-042 says it must, and the run passes. Under the pair `IgnoreIncarnation`
+/// skips the reset, no leader resets any follower's progress in the run, the schedules
+/// part there, and range 5, the split's left half (`[k6, k7)`), completes no write to `k6`
+/// after the last heal (13.453 s): its leader, node 2 in term 8, takes a checkpoint over
+/// and over (73 takes after 12 s) and commits nothing it proposes. How the skipped reset on
+/// 14 leads to 5's stall is not traced past the schedules' parting. `IgnoreIncarnation` alone passes, and so does the correct node; no store is
+/// refused on any of the four runs. What is asserted is that, step by step; the day a
+/// schedule moves the seed off it, this says so and the pin is re-audited.
+// PROPOSED(D-111): the pair's wedge on the node, past a placeholder.
+#[test]
+fn seed_57_the_pair_wedges_where_neither_half_does_past_a_placeholders_reset() {
+    let seed = 57u64;
+    let (left, right, cut, leader, follower) = (5u64, 14u64, 37u64, 3u64, 2u32);
+    let pair = buggy(
+        seed,
+        Variants::of(&[Variant::IgnoreIncarnation, Variant::SharedSnapshotDir]),
+    );
+    let stream = buggy(seed, Variant::SharedSnapshotDir);
+    let incarnation = buggy(seed, Variant::IgnoreIncarnation);
+    let honest = correct(seed);
+    for (name, report) in [
+        ("the correct node", &honest),
+        ("SharedSnapshotDir alone", &stream),
+        ("IgnoreIncarnation alone", &incarnation),
+    ] {
+        checked(report).unwrap_or_else(|violation| {
+            panic!(
+                "seed {seed}: {name} no longer passes, so the pin's shape has moved: {violation}"
+            )
+        });
+    }
+    for report in [&honest, &pair, &stream, &incarnation] {
+        assert!(
+            report.refused.is_empty(),
+            "seed {seed}: a store was refused, which is the incarnation half's other path"
+        );
+    }
+    let violation = checked(&pair).expect_err("the pair passes seed 57: re-audit the pin");
+    assert!(
+        mechanism(&violation) == "liveness"
+            && violation.contains("no client write to k6 completed after the last heal"),
+        "seed {seed}: the pair is caught other than by range {left}'s liveness on `k6`: \
+         {violation}"
+    );
+    // The split and node 2's placeholder of the right half before its own apply of it,
+    // the same on both runs up to the reset.
+    for (name, report) in [("the pair", &pair), ("SharedSnapshotDir alone", &stream)] {
+        let on = |record: &TraceRecord| record.node.is_some_and(|n| n.get() == follower);
+        let made = report.records.iter().position(|record| {
+            on(record)
+                && matches!(record.event, TraceEvent::RangeReplicaCreated { range } if range == right)
+        });
+        let created = report.records.iter().position(|record| {
+            on(record)
+                && matches!(
+                    &record.event,
+                    TraceEvent::RangeCreated { range, cause: ananke_env::RangeCause::Split, parent: Some(p), floor_index, .. }
+                        if *range == right && *p == left && *floor_index == cut
+                )
+        });
+        assert!(
+            matches!((made, created), (Some(made), Some(created)) if made < created),
+            "seed {seed} under {name}: node {follower} did not make a placeholder of {right} \
+             before its apply of range {left}'s split at {cut} created it ({made:?}, {created:?})"
+        );
+    }
+    // The one reset the correct leader makes and the incarnation half skips.
+    let resets = |report: &raft::Report| -> Vec<(u64, u64, u64)> {
+        report
+            .records
+            .iter()
+            .filter_map(|record| match record.event {
+                TraceEvent::RaftProgressReset {
+                    server,
+                    range,
+                    follower,
+                    ..
+                } => Some((server, range, follower)),
+                _ => None,
+            })
+            .collect()
+    };
+    assert_eq!(
+        resets(&stream),
+        vec![(leader, right, u64::from(follower))],
+        "seed {seed}: under SharedSnapshotDir alone the leader's resets are not the one past \
+         node {follower}'s placeholder of {right}"
+    );
+    assert_eq!(
+        placeholder_resets(&stream),
+        1,
+        "seed {seed}: the reset is not a placeholder's"
+    );
+    assert!(
+        resets(&pair).is_empty(),
+        "seed {seed}: under the pair a leader reset a follower's progress, which \
+         IgnoreIncarnation never does"
     );
 }
 
