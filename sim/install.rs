@@ -9,12 +9,18 @@
 //! the floor in silence (D-082). This scenario is the opposite of those: it is built to
 //! reach the path on every seed, and it fails if it does not.
 //!
-//! **The shape.** Five voters and four ranges. Three nodes start; **two start late**,
-//! after the running three have written past `snapshot_threshold` and their leaders
-//! have compacted. The two late nodes are then behind every range's compacted prefix,
-//! so each range's leader must stream to *both at once* — four ranges times two
-//! followers, eight streams, which is what makes "per range and per follower" a claim
-//! this scenario can check rather than a phrase.
+//! **The shape.** Five nodes and four ranges. The three bootstrap nodes start; **two
+//! nodes that join start late**, after the running three have written past
+//! `snapshot_threshold` and their leaders have compacted, and an operator asks every
+//! range for the five as voters. A node that joins holds nothing (SHARD.md §2): the
+//! leader adding it as a learner makes it a placeholder of the range, and the
+//! placeholder's refused server's answer puts it behind the compacted prefix, so each
+//! range's leader must stream to *both at once* — four ranges times two followers,
+//! eight streams, which is what makes "per range and per follower" a claim this
+//! scenario can check rather than a phrase. Until PROPOSED D-109 the five were all
+//! bootstrap nodes and the late two bootstrapped their own replicas when they started;
+//! there are exactly three bootstrap nodes now (§2; Q7, Q32), and the late two get
+//! every replica through an install into a placeholder.
 //!
 //! Two nodes rather than one is deliberate: with a single follower behind the prefix,
 //! a leader that fed its followers one at a time would be indistinguishable from one
@@ -54,8 +60,8 @@ use std::time::Duration;
 
 use ananke_env::sim::{Sim, SimConfig, TraceRecord};
 use ananke_env::{
-    Clock, Either, Environment, Network, NodeId, RangeCause, Rng, Socket, StartOver, TraceEvent,
-    race,
+    Clock, Either, Environment, Network, NodeId, RangeCause, RecoveredAs, Rng, Socket, StartOver,
+    TraceEvent, race,
 };
 use ananke_raft::ServerId;
 use ananke_raft::apply::Command;
@@ -73,10 +79,10 @@ use bytes::Bytes;
 use crate::raft::{TICK, client_addr, server_addr};
 use crate::ranges::{DIR, FIRST_RANGE, RANGES, SNAPSHOT_CAP, range_of_key};
 
-/// Voters in the cluster.
+/// The nodes in the cluster, and every range's voters once the operator's change lands.
 pub const NODES: u64 = 5;
-/// The three that start at once: a majority of five, so the cluster makes progress
-/// while the other two are not there.
+/// The three that start at once, the bootstrap nodes (SHARD.md §2; PROPOSED D-109): the
+/// cluster's voters until the two that join are added.
 pub const NODES_AT_ONCE: u64 = 3;
 /// How many keys the writer cycles through.
 const KEYS: u64 = 8;
@@ -440,7 +446,13 @@ impl Report {
             };
             // The replica's applied index is the snapshot's last index: an install
             // that left it anywhere else has a state machine out of step with the
-            // metadata describing it.
+            // metadata describing it. An install into a placeholder, which every one
+            // owed here is since PROPOSED D-109, reads its state back before its store
+            // is opened and traces it after, with the applied index the opened store
+            // reports. Until #174's review (N1) it traced the snapshot's own index, and
+            // this clause could not fail. A repair planted one index short is now
+            // traced one short on all 64 owed installs of seeds 0 to 7; it also stops
+            // the node at its next apply, which the check above reports first.
             let (last_index, last_term) = (key.last_index, key.last_term);
             if held.applied != last_index {
                 return Err(format!(
@@ -478,7 +490,11 @@ impl Report {
             }
             // A live install streams no log key, so what the receiver holds is its
             // kept tail and nothing else. A take that carried the leader's log would
-            // leave those keys here, untombstoned (D-083's first departure).
+            // leave those keys here, untombstoned (D-083's first departure). An
+            // install into a placeholder is read back before its store is opened, and
+            // the open deletes every log key at or below the snapshot's index: what is
+            // counted here is what the switch left, which no opened store serves, and
+            // the one point at which a carried log can still be seen.
             if held.log_keys > 0 {
                 let tail_bound = self.highest_index(*range).saturating_sub(last_index);
                 if held.log_keys > tail_bound {
@@ -512,8 +528,8 @@ impl Report {
     }
 }
 
-/// One node's configuration for this scenario: five voters, four ranges, and a
-/// threshold low enough that the path is reached.
+/// One node's configuration for this scenario: three bootstrap nodes, four ranges, and
+/// a threshold low enough that the path is reached.
 #[must_use]
 pub fn server_config(id: u64, variants: impl Into<Variants>, node: NodeVariants) -> ServerConfig {
     let mut engine = EngineConfig::new(PathBuf::from(DIR));
@@ -525,7 +541,8 @@ pub fn server_config(id: u64, variants: impl Into<Variants>, node: NodeVariants)
         listen: server_addr(id),
         servers: (1..=NODES).map(|s| (ServerId(s), server_addr(s))).collect(),
         ranges: crate::ranges::ranges(),
-        bootstrap: (1..=NODES).map(ServerId).collect(),
+        // PROPOSED(D-109): exactly three bootstrap nodes; the late two join.
+        bootstrap: (1..=NODES_AT_ONCE).map(ServerId).collect(),
         raft: RaftConfig {
             variants: variants.into(),
             tick_nanos: u64::try_from(TICK.as_nanos()).expect("small"),
@@ -658,6 +675,73 @@ async fn writer<E: Environment>(env: E, up_to: Arc<Mutex<u64>>, stop: Arc<Atomic
     }
 }
 
+/// The operator: asks every range, again and again, for all five nodes as its voters,
+/// once the two that join have started (RAFT.md §1, D-029). A leader adds the two as
+/// learners, which reaches them as placeholders (SHARD.md §5); a leadership change
+/// before the joint entry abandons the change (D-032), and the operator's next ask
+/// starts it again, which a request for the same voters makes harmless.
+// PROPOSED(D-109): the late two are added by a change, as a node that joins is.
+async fn operator<E: Environment>(env: E) {
+    let Ok(sock) = env.net().bind(client_addr(2)).await else {
+        return;
+    };
+    let voters: Vec<u64> = (1..=NODES).collect();
+    let mut leaders: BTreeMap<u64, u64> = BTreeMap::new();
+    let mut seq = 0u64;
+    loop {
+        for range in FIRST_RANGE..FIRST_RANGE + RANGES {
+            seq += 1;
+            let target = leaders
+                .get(&range)
+                .copied()
+                .unwrap_or_else(|| 1 + env.rng().below(NODES_AT_ONCE));
+            let request = RangedRequest {
+                generation: FIRST_GENERATION,
+                range: RangeId(range),
+                request: Request {
+                    client: 2,
+                    seq,
+                    command: Command::Change {
+                        voters: voters.clone(),
+                    },
+                },
+            };
+            let _ = sock.send(server_addr(target), request.encode()).await;
+            let deadline = env.clock().now() + Duration::from_millis(80);
+            loop {
+                let recv = pin!(sock.recv());
+                let timer = pin!(env.clock().sleep_until(deadline));
+                let bytes = match race(&env, recv, timer).await {
+                    Either::Left(Ok((_, bytes))) => bytes,
+                    Either::Left(Err(_)) | Either::Right(()) => {
+                        leaders.remove(&range);
+                        break;
+                    }
+                };
+                let Ok(response) = RangedResponse::decode(bytes) else {
+                    continue;
+                };
+                if response.response.seq != seq {
+                    continue;
+                }
+                match response.response.reply {
+                    Reply::NotLeader { leader: Some(who) } => {
+                        leaders.insert(range, who.0);
+                    }
+                    Reply::Outcome(_) => {
+                        leaders.insert(range, target);
+                    }
+                    Reply::NotLeader { leader: None } | Reply::RangeMismatch { .. } => {
+                        leaders.remove(&range);
+                    }
+                }
+                break;
+            }
+        }
+        env.clock().sleep(Duration::from_millis(250)).await;
+    }
+}
+
 /// Runs the scenario for `seed`.
 #[must_use]
 pub fn run(seed: u64, variants: impl Into<Variants>, node_variants: NodeVariants) -> Report {
@@ -685,9 +769,16 @@ pub fn run(seed: u64, variants: impl Into<Variants>, node_variants: NodeVariants
     // that fed it.
     stop.store(true, Ordering::Relaxed);
     let wrote = *committed.lock().expect("the counter");
-    // And the other two arrive, behind every range's compacted prefix.
+    // And the other two arrive, holding nothing, and the operator asks every range
+    // for them: each range's leader adds them, and feeds each its range's snapshot
+    // through the placeholder its first message makes of it (PROPOSED D-109).
     for id in NODES_AT_ONCE + 1..=NODES {
         spawn(&sim, nodes[id as usize - 1], id, variants, node_variants);
+    }
+    {
+        let env = sim.env(client);
+        let inner = env.clone();
+        env.spawn("operator", operator(inner));
     }
     sim.run_for(AFTER);
     Report {
@@ -709,4 +800,288 @@ fn spawn(sim: &Sim, at: NodeId, id: u64, variants: Variants, node: NodeVariants)
     env.spawn("node", async move {
         let _ = ananke_shard::server::run(inner, server_config(id, variants, node)).await;
     });
+}
+
+// A node that joined, re-seeded: its replicas come back quarantined (#174's review, B1).
+
+/// The node that joins and then loses its store.
+pub const JOINER: u64 = 4;
+/// How long the joiner runs on its store before the loss, from its start: its ranges add
+/// it as a voter and stream it their snapshots through its placeholders.
+const JOINED_FOR: Duration = Duration::from_secs(8);
+/// How long the run goes on after the joiner starts again on its lost store, before the
+/// bootstrap node leading the most user ranges is crashed.
+const REJOINED_FOR: Duration = Duration::from_secs(8);
+/// How long the run goes on after that crash: the ranges it led elect among the rest,
+/// the re-seeded joiner among the voters asked.
+const AFTER_THE_CRASH: Duration = Duration::from_secs(4);
+
+/// What one run of the joiner's re-seed traced ([`run_joiner_reseed`]).
+#[derive(Clone, Debug)]
+pub struct JoinerReseed {
+    /// The seed.
+    pub seed: u64,
+    /// The run's trace.
+    pub records: Vec<TraceRecord>,
+    /// The user ranges the joiner was a voter of, in its leaders' last configuration,
+    /// when its store was lost.
+    pub voter_of: BTreeSet<u64>,
+    /// The bootstrap node crashed after the re-seed: the one leading the most user ranges.
+    pub crashed: Option<u64>,
+    /// Which server each simulated node is.
+    node_of: BTreeMap<NodeId, u64>,
+}
+
+impl JoinerReseed {
+    fn server_of(&self, record: &TraceRecord) -> Option<u64> {
+        record
+            .node
+            .and_then(|node| self.node_of.get(&node).copied())
+    }
+
+    /// Where the joiner's refusal stands in the trace.
+    #[must_use]
+    pub fn refused_at(&self) -> Option<usize> {
+        self.records.iter().position(|record| {
+            matches!(record.event, TraceEvent::RaftRefused { server, .. } if server == JOINER)
+        })
+    }
+
+    /// The ranges the joiner was created again by an install after its refusal.
+    #[must_use]
+    pub fn created_after_refusal(&self) -> BTreeSet<u64> {
+        let Some(refused) = self.refused_at() else {
+            return BTreeSet::new();
+        };
+        self.records[refused..]
+            .iter()
+            .filter(|record| self.server_of(record) == Some(JOINER))
+            .filter_map(|record| match &record.event {
+                TraceEvent::RangeCreated {
+                    range,
+                    cause: RangeCause::Snapshot,
+                    ..
+                } => Some(*range),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The ranges the joiner stated quarantined after its refusal: a `RaftReseeded` of the
+    /// range and a `RaftRecovered` of it saying `Quarantined` (D-035, D-081).
+    #[must_use]
+    pub fn quarantined_after_refusal(&self) -> BTreeSet<u64> {
+        let Some(refused) = self.refused_at() else {
+            return BTreeSet::new();
+        };
+        let after = &self.records[refused..];
+        let marked: BTreeSet<u64> = after
+            .iter()
+            .filter_map(|record| match record.event {
+                TraceEvent::RaftReseeded { server, range } if server == JOINER => Some(range),
+                _ => None,
+            })
+            .collect();
+        after
+            .iter()
+            .filter_map(|record| match record.event {
+                TraceEvent::RaftRecovered {
+                    server,
+                    range,
+                    state: RecoveredAs::Quarantined,
+                    ..
+                } if server == JOINER && marked.contains(&range) => Some(range),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The votes and pre-votes the joiner granted after its refusal, as (range, term, pre).
+    #[must_use]
+    pub fn granted_after_refusal(&self) -> Vec<(u64, u64, bool)> {
+        let Some(refused) = self.refused_at() else {
+            return Vec::new();
+        };
+        self.records[refused..]
+            .iter()
+            .filter_map(|record| match record.event {
+                TraceEvent::RaftVote {
+                    server,
+                    range,
+                    term,
+                    granted: true,
+                    pre,
+                    ..
+                } if server == JOINER => Some((range, term, pre)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The vote and pre-vote requests the joiner answered after its refusal, granted or
+    /// not: what says the ranges asked it.
+    #[must_use]
+    pub fn answered_after_refusal(&self) -> usize {
+        let Some(refused) = self.refused_at() else {
+            return 0;
+        };
+        self.records[refused..]
+            .iter()
+            .filter(|record| {
+                matches!(record.event, TraceEvent::RaftVote { server, .. } if server == JOINER)
+            })
+            .count()
+    }
+
+    /// The run's checks: no node stopped, checks 1 to 4 and the range layer's folds.
+    ///
+    /// # Errors
+    ///
+    /// The first violation, with the seed.
+    pub fn check(&self) -> Result<(), String> {
+        let seed = self.seed;
+        if let Some((server, reason)) = self.records.iter().find_map(|record| match &record.event {
+            TraceEvent::RaftServerFailed { server, reason } => Some((*server, reason.clone())),
+            _ => None,
+        }) {
+            return Err(format!("seed {seed}: server {server} stopped: {reason}"));
+        }
+        ananke_raft::invariants::all(crate::traced(&self.records))
+            .map_err(|violation| format!("seed {seed}: {violation}"))?;
+        ananke_shard::invariants::all(&self.records)
+            .map_err(|violation| format!("seed {seed}: {violation}"))
+    }
+}
+
+/// The user ranges `JOINER` is a voter of in the last `RaftConfig` each range's leaders
+/// traced.
+fn joiner_voter_of(records: &[TraceRecord]) -> BTreeSet<u64> {
+    let mut last: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
+    for record in records {
+        // The voters in force: the new set while joint, the only one otherwise.
+        if let TraceEvent::RaftConfig {
+            range,
+            old,
+            new,
+            joint,
+            ..
+        } = &record.event
+        {
+            last.insert(*range, if *joint { new.clone() } else { old.clone() });
+        }
+    }
+    last.into_iter()
+        .filter(|(range, voters)| {
+            (FIRST_RANGE..FIRST_RANGE + RANGES).contains(range) && voters.contains(&JOINER)
+        })
+        .map(|(range, _)| range)
+        .collect()
+}
+
+/// The bootstrap node whose latest leadership covers the most user ranges.
+fn busiest_leader(records: &[TraceRecord]) -> Option<u64> {
+    let mut leader: BTreeMap<u64, (u64, u64)> = BTreeMap::new();
+    for record in records {
+        if let TraceEvent::RaftLeader {
+            server,
+            range,
+            term,
+            ..
+        } = &record.event
+            && (FIRST_RANGE..FIRST_RANGE + RANGES).contains(range)
+            && leader.get(range).is_none_or(|(at, _)| *term >= *at)
+        {
+            leader.insert(*range, (*term, *server));
+        }
+    }
+    let mut led: BTreeMap<u64, usize> = BTreeMap::new();
+    for (_, server) in leader.values() {
+        if *server <= NODES_AT_ONCE {
+            *led.entry(*server).or_default() += 1;
+        }
+    }
+    led.into_iter()
+        .max_by_key(|(server, count)| (*count, std::cmp::Reverse(*server)))
+        .map(|(server, _)| server)
+}
+
+/// Runs the joiner's re-seed for `seed` on the correct system (#174's review, B1).
+///
+/// The three bootstrap nodes run as [`run`]'s do. Nodes 4 and 5 join and the operator
+/// asks every user range for all five as voters, so each range streams the joiners its
+/// snapshot through their placeholders. Once the joiner has run `JOINED_FOR`, it is
+/// crashed and starts again on a store marked lost, so it is refused and re-seeded
+/// (Q15). It hosts nothing, so the re-seed rebuilds no replica: every replica it held
+/// comes back through its placeholder's install, and on a node that runs on an engine a
+/// re-seed built that install is quarantined (PROPOSED D-109 §2). Then the bootstrap node
+/// leading the most user ranges is crashed, so those ranges elect among the rest and ask
+/// the joiner's replicas for votes.
+#[must_use]
+pub fn run_joiner_reseed(seed: u64) -> JoinerReseed {
+    let variants = Variants::default();
+    let node_variants = NodeVariants::correct();
+    let mut sim = Sim::new(config(seed));
+    let nodes: Vec<_> = (0..NODES as usize).map(|_| sim.add_node()).collect();
+    let client = sim.add_node();
+    let committed: Arc<Mutex<u64>> = Arc::default();
+    let stop: Arc<AtomicBool> = Arc::default();
+    for id in 1..=NODES_AT_ONCE {
+        spawn(&sim, nodes[id as usize - 1], id, variants, node_variants);
+    }
+    {
+        let env = sim.env(client);
+        let inner = env.clone();
+        env.spawn("client", writer(inner, committed, stop.clone()));
+    }
+    sim.run_for(BEFORE);
+    stop.store(true, Ordering::Relaxed);
+    for id in NODES_AT_ONCE + 1..=NODES {
+        spawn(&sim, nodes[id as usize - 1], id, variants, node_variants);
+    }
+    {
+        let env = sim.env(client);
+        let inner = env.clone();
+        env.spawn("operator", operator(inner));
+    }
+    sim.run_for(JOINED_FOR);
+    let voter_of = joiner_voter_of(&sim.trace());
+    let at = nodes[JOINER as usize - 1];
+    sim.crash(at);
+    sim.restart(at);
+    {
+        let env = sim.env(at);
+        let inner = env.clone();
+        env.spawn("node", async move {
+            if ananke_raft::store::mark_store_lost(
+                &inner,
+                std::path::Path::new(DIR),
+                "the scenario lost the joiner's store",
+            )
+            .await
+            .is_err()
+            {
+                return;
+            }
+            let _ =
+                ananke_shard::server::run(inner, server_config(JOINER, variants, node_variants))
+                    .await;
+        });
+    }
+    sim.run_for(REJOINED_FOR);
+    let crashed = busiest_leader(&sim.trace());
+    if let Some(victim) = crashed {
+        sim.crash(nodes[victim as usize - 1]);
+    }
+    sim.run_for(AFTER_THE_CRASH);
+    JoinerReseed {
+        seed,
+        records: sim.trace(),
+        voter_of,
+        crashed,
+        node_of: nodes
+            .iter()
+            .enumerate()
+            .map(|(at, node)| (*node, at as u64 + 1))
+            .collect(),
+    }
 }

@@ -482,6 +482,10 @@ pub struct Task<E: Environment> {
     /// placeholder's span is the snapshot's, and unknown until its stream completes.
     // PROPOSED(D-109)
     as_placeholder: BTreeSet<RangeId>,
+    /// The store the node's engine was opened through — its first range's, or its
+    /// anchor on a node that hosts none — which a placeholder's install opens the new
+    /// replica's store beside (PROPOSED D-109).
+    anchor: Arc<RaftStore<E>>,
     /// Whether the node runs on an engine a re-seed built: a placeholder's install then
     /// writes the quarantine (the host's `on_a_reseed`; D-035).
     // PROPOSED(D-109)
@@ -514,6 +518,7 @@ impl<E: Environment> Task<E> {
         local: Queue<crate::server::Local>,
         snaps: Queue<SnapJob>,
         placeholders: Arc<std::sync::Mutex<BTreeSet<RangeId>>>,
+        anchor: Arc<RaftStore<E>>,
         on_a_reseed: bool,
         range_variants: RangeVariants,
     ) -> Self {
@@ -535,6 +540,7 @@ impl<E: Environment> Task<E> {
             receiving: BTreeMap::new(),
             placeholders,
             as_placeholder: BTreeSet::new(),
+            anchor,
             on_a_reseed,
             range_variants,
         }
@@ -1364,12 +1370,9 @@ impl<E: Environment> Task<E> {
                 .placeholder_refused(range, from, &install, StartOver::Overlaps)
                 .await;
         }
-        // The engine, through any store on it: the node has one engine (Q2).
-        let Some(beside) = lock(&self.stores).values().next().cloned() else {
-            return self
-                .placeholder_refused(range, from, &install, StartOver::Unusable)
-                .await;
-        };
+        // The engine, through the store it was opened through: the node has one engine
+        // (Q2), and a node that joined holds no other store until this install.
+        let beside = self.anchor.clone();
         let Ok(source) = beside.engine().open_span_source(&install.source).await else {
             return self
                 .placeholder_refused(range, from, &install, StartOver::Unusable)
@@ -1449,9 +1452,24 @@ impl<E: Environment> Task<E> {
         // reads from here on.
         // PROPOSED(D-109)
         lock(&self.descriptors).insert(range, descriptor.clone());
+        // What landed, read back out of the engine before the store is opened on it
+        // (`read_back`): counting events says a stream flowed, and nothing about what is
+        // in the store (D-083). It is traced once the store is open, with the applied
+        // index the store reports (`trace_state`).
+        let read = self.read_back(range, beside.engine(), &prefix).await;
+        self.env.trace_decided(
+            installing,
+            TraceEvent::RaftSnapshot {
+                server: self.id.0,
+                range: range.get(),
+                last_index: at.last_index,
+                last_term: at.last_term,
+                taken: false,
+            },
+        );
         // The store the switch wrote, opened beside the node's others: everything it
-        // reads the repair wrote, so the open writes nothing.
-        let store = match beside.open_sibling(prefix).await {
+        // reads the repair wrote, so on the correct node the open writes nothing.
+        let store = match beside.open_sibling(prefix.clone()).await {
             Ok((store, _)) => Arc::new(store),
             Err(error) => {
                 // The replica is on disk and its descriptor in place, so the node
@@ -1468,6 +1486,9 @@ impl<E: Environment> Task<E> {
                 return;
             }
         };
+        if let Some(read) = read {
+            self.trace_state(range, at, store.applied(), read);
+        }
         lock(&self.stores).insert(range, store.clone());
         if let Ok(mut applied) = self.applied.lock() {
             applied.insert(
@@ -1484,17 +1505,6 @@ impl<E: Environment> Task<E> {
         self.receiving.remove(&(range, from));
         self.as_placeholder.remove(&range);
         self.plan.host(range, spans);
-        self.state_of(range, at, &store).await;
-        self.env.trace_decided(
-            installing,
-            TraceEvent::RaftSnapshot {
-                server: self.id.0,
-                range: range.get(),
-                last_index: at.last_index,
-                last_term: at.last_term,
-                taken: false,
-            },
-        );
         let answer = snapshot::installed(at.term, (at.last_index, at.last_term));
         self.answer(range, from, answer, store.incarnation()).await;
         self.local
@@ -1651,38 +1661,65 @@ impl<E: Environment> Task<E> {
     /// landed are the bytes that were taken — which no count of events can say.
     // PROPOSED(D-083): what an install installed is read back and traced.
     async fn state_of(&self, range: RangeId, at: Identity, store: &RaftStore<E>) {
-        let Some(spans) = self.user_span(range) else {
-            return;
-        };
-        let version = store.engine().snapshot();
-        let Ok(user) = store
-            .engine()
+        let applied = store.applied();
+        if let Some(read) = self.read_back(range, store.engine(), store.prefix()).await {
+            self.trace_state(range, at, applied, read);
+        }
+    }
+
+    /// What [`state_of`](Self::state_of) reads, over an engine and a range's prefix
+    /// rather than its store: what a placeholder's install reads back before the store
+    /// is opened on what it wrote, since the open itself deletes the log keys it finds
+    /// at or below the snapshot's index, and a take that streamed the log would be read
+    /// back already tidied (`TakeStreamsTheLogToo`; PROPOSED D-109). What it reads there
+    /// is therefore the state the switch left, which no opened store serves: the log
+    /// keys at or below the snapshot's index it counts are gone once the open runs, and
+    /// everything else it reads the open leaves as it is. `None` where the range has no
+    /// descriptor or the scan of its user keys fails, and nothing is traced.
+    async fn read_back(
+        &self,
+        range: RangeId,
+        engine: &ananke_storage::Engine<E>,
+        prefix: &KeyPrefix,
+    ) -> Option<ReadBack> {
+        let spans = self.user_span(range)?;
+        let version = engine.snapshot();
+        let user = engine
             .scan(&spans.start[..]..&spans.end[..], &version)
             .await
-        else {
-            return;
-        };
-        let log_span = store.prefix().purpose_span(PURPOSE_LOG);
-        let log = store
-            .engine()
+            .ok()?;
+        let log_span = prefix.purpose_span(PURPOSE_LOG);
+        let log = engine
             .scan(&log_span.start[..]..&log_span.end[..], &version)
             .await
             .unwrap_or_default();
         drop(version);
         // Order-independent so the digest does not depend on how the scan happened to
         // walk, and so two replicas of one range agree when they hold the same keys.
-        let digest = user.iter().fold(0u64, |acc, (key, value)| {
+        let user_digest = user.iter().fold(0u64, |acc, (key, value)| {
             acc.wrapping_add(fnv(key).rotate_left(1) ^ fnv(value))
         });
+        Some(ReadBack {
+            user_keys: user.len() as u64,
+            user_digest,
+            log_keys: log.len() as u64,
+        })
+    }
+
+    /// Traces what was read back, with the applied index the replica's store reports:
+    /// on a placeholder's install, the store opened after the read-back, so the traced
+    /// index is the one the replica serves from and not the snapshot's own, which would
+    /// make the check that compares the two unable to fail (#174's review, N1).
+    fn trace_state(&self, range: RangeId, at: Identity, applied: Index, read: ReadBack) {
         self.env.trace(TraceEvent::RaftSnapshotState {
             server: self.id.0,
             range: range.get(),
             last_index: at.last_index,
             last_term: at.last_term,
-            applied: store.applied(),
-            user_keys: user.len() as u64,
-            user_digest: digest,
-            log_keys: log.len() as u64,
+            applied,
+            user_keys: read.user_keys,
+            user_digest: read.user_digest,
+            log_keys: read.log_keys,
         });
     }
 
@@ -1929,6 +1966,17 @@ pub fn job_of(range: RangeId, action: SnapshotAction) -> Option<SnapJob> {
         }),
         SnapshotAction::Take | SnapshotAction::Record => None,
     }
+}
+
+/// What a replica's read-back found (`read_back`): what `RaftSnapshotState` carries
+/// beside the snapshot's identity and the applied index.
+struct ReadBack {
+    /// The range's user keys.
+    user_keys: u64,
+    /// An order-free digest of those keys and their values.
+    user_digest: u64,
+    /// The range's Raft log keys.
+    log_keys: u64,
 }
 
 /// A small order-free hash for the state digest: FNV-1a over the bytes.

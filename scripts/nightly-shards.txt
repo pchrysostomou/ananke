@@ -443,6 +443,24 @@
 # shard 4 at 1666.5 -> 1684.9, then shard 5 at 1678.3 -> 1696.3. Check 16's comparison, which
 # now also compares its two pinned seeds where the tier does not, keeps its row: at the
 # thousand it compares a hundred seeds that include both (32.4 + 1.1 measured beside them).
+# PROPOSED D-109 (placeholders) added three `split` rows, `sim/split.rs` (ii), weighed on its tree
+# from the built release binary (`split-<hash> <test> --exact`) at ANANKE_SEEDS=1000
+# ANANKE_DEEP_SEEDS=100, as user + sys, on an Apple M2 of 8 cores on AC Power with other slices'
+# runs beside it (load averages 28/16/31): the shape under `UninitialisedReplicaVotes` at 125.1 cpu
+# s (121.46 + 3.59, 16.66 s real), the correct system at 124.0 (120.44 + 3.55, 16.64 s real), the
+# bootstrap count's directed test at 0.0, written 0.1 like the cheap rows beside it. Longest-first
+# into the lightest shard: shard 5 at 1648.5 -> 1773.6, shard 6 at 1657.1 -> 1781.1, shard 4 at
+# 1659.7 -> 1659.8. It renamed no row. The two `node` rows renamed in place in shard 5 (seed
+# 45's pin, the split wedge's pin moved from seed 8 to 76), keeping their shards and weights,
+# were renamed by the placeholders' PR before it, #173 (0064770), which wrote no header line.
+# At #173's merge into #174 (#173 at 0059470, with #166's c0d9b07), the three `split` rows are
+# placed again, longest-first into the merged tree's lightest shard, their weights kept: shard 4
+# at 1684.9 -> 1810.0, shard 6 at 1686.1 -> 1810.1, shard 5 at 1696.3 -> 1696.4.
+# PROPOSED D-109 §7 (a joiner re-seeded) added one `install` row, the joiner's re-seed, capped at
+# 200 seeds at the premerge and the nightly: weighed on its tree from the built release binary
+# (`install-<hash> <test> --exact`) at ANANKE_SEEDS=1000 ANANKE_DEEP_SEEDS=100, as user + sys,
+# two runs, on an Apple M2 of 8 cores (load averages up to 77): 56.9 cpu s, the mean of 52.2
+# (49.32 + 2.87) and 61.7 (58.49 + 3.17). Into the lightest shard, shard 5 at 1696.4 -> 1753.3.
 # shard	binary	cpu_s	test
 # shard 1: 1977.1 cpu s
 # D-095 added two rows, both `node`, weighed on its tree from the built release binary
@@ -512,7 +530,7 @@
 3	raft	0.2	the_membership_scenario_has_byte_identical_traces_for_one_seed
 3	reseed	95.8	the_reseed_shape_holds_on_every_seed
 3	wal	21.2	a_log_that_acknowledges_before_syncing_is_caught
-# shard 4: 1684.9 cpu s
+# shard 4: 1810.0 cpu s
 4	echo	0.1	same_seed_gives_byte_identical_trace
 4	engine	210.8	the_correct_engine_passes_every_seed
 4	engine	38.6	an_install_that_switches_one_span_at_a_time_is_caught
@@ -544,7 +562,8 @@
 4	node	34.2	a_node_that_resumes_another_runs_block_of_ids_is_caught_after_a_split
 4	node	27.8	the_range_layers_folds_agree_one_by_one_and_checks_9_and_10_trip_under_apply_ignores_span
 4	node	18.4	the_range_layers_folds_agree_one_by_one_and_check_20_trips_under_uninitialised_replica_votes
-# shard 5: 1696.3 cpu s
+4	split	125.1	a_placeholder_that_grants_votes_grants_one_on_every_seed_of_the_vote_shape
+# shard 5: 1753.3 cpu s
 5	echo	6.0	every_seed_satisfies_the_invariants_and_the_sweep_exercises_the_disk_faults
 5	engine	19.5	a_seek_that_counts_tombstones_is_caught
 5	node	58.8	a_leader_that_ignores_incarnations_has_an_incarnation_to_ignore_only_where_a_store_is_refused
@@ -570,7 +589,9 @@
 5	node	23.1	the_range_layers_folds_agree_one_by_one_and_check_18_trips_under_id_block_resumed
 5	node	0.4	seed_45_a_voter_installed_past_a_split_gets_its_right_half_through_its_placeholder
 5	node	18.0	a_placeholder_that_grants_votes_is_caught_by_check_20
-# shard 6: 1686.1 cpu s
+5	split	0.1	a_node_configured_with_other_than_three_bootstrap_nodes_stops_and_says_why
+5	install	56.9	a_joiner_reseeded_gets_its_replicas_back_quarantined_and_grants_nothing
+# shard 6: 1810.1 cpu s
 6	echo	0.1	a_busy_looping_task_fails_the_scenario_instead_of_hanging
 6	engine	310.3	an_engine_that_acknowledges_before_the_log_is_caught
 6	engine	204.5	an_engine_that_releases_a_memtable_before_the_manifest_is_caught
@@ -614,3 +635,4 @@
 6	node	0.6	the_range_layers_folds_agree_one_by_one_and_check_9_trips_under_trust_stale_descriptor
 6	node	0.5	the_range_layers_folds_agree_one_by_one_and_check_17_trips_under_client_ignores_mismatch
 6	reseed	27.8	a_reseeded_nodes_right_half_comes_back_through_its_placeholder_quarantined
+6	split	124.0	every_seed_of_the_vote_shape_passes_on_the_correct_node

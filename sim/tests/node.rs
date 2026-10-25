@@ -51,10 +51,11 @@
 //!   bounds measured on the correct node before they were written;
 //! - `SingleMajorityInJointConsensus` re-asserted on the node to the standard its
 //!   Phase 2 test asserts and no stronger, at the tier it uses today;
-//! - the half of issue #46 the node **cannot** reach — a joining server fed by a
-//!   snapshot in its learner phase — asserted absent on every seed with its reason and
-//!   the slice that owns the wiring, and left asserted where the path is, on
-//!   `Cluster::OneGroup`.
+//! - the other half of issue #46, a joining server fed by a snapshot in its learner
+//!   phase: since the placeholders (PROPOSED D-109) a node that joins holds nothing and
+//!   gets every range it is added to through its placeholder's install, asserted on
+//!   every seed, joiner by joiner and range by range. Until then a joiner here started
+//!   with D-076's interim replicas and the path was asserted absent.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
@@ -1642,7 +1643,10 @@ fn an_apply_task_that_waits_for_every_range_is_caught_by_the_lag_fold_on_the_nod
 /// by check 7 on the membership scenario's five nodes, whose nodes 4 and 5 are not
 /// bootstrap nodes: each writes the initial state with the address book as every
 /// range's voters, so its creations disagree with the three bootstrap nodes' on every
-/// range, and `creations_agree_of` — check 7's first step — says so. The run's own
+/// range, and check 7 says so — read since PROPOSED D-109 as the range layer folds it,
+/// and not as `creations_agree_of`, its first step, which takes a replica created by an
+/// install for a mistake and so fails the correct node's joiners now that they hold
+/// nothing until their placeholders' installs. The run's own
 /// checks are counted beside it, since what they make of two clusters bootstrapping
 /// where configuration named one is not this test's claim. Measured before asserted
 /// (D-061): the variant writes at every start, so the catch is every seed — 1 000 of
@@ -1665,6 +1669,19 @@ fn an_apply_task_that_waits_for_every_range_is_caught_by_the_lag_fold_on_the_nod
 fn a_fresh_node_that_bootstraps_itself_is_caught_by_check_7_where_it_is_not_a_bootstrap_node() {
     let seeds = high_rate_share();
     let taken = RangeVariants::of(&[RangeVariant::AnyFreshNodeBootstraps]);
+    // Check 7 as the range layer folds it, which holds an install's creation to its
+    // map as well as a bootstrap's: since the placeholders the correct membership
+    // node's joiners are created by installs into their placeholders (PROPOSED D-109),
+    // which `ranges::creations_agree_of` — check 7's first step, written for a
+    // scenario that bootstraps every replica — rejects on sight, so the pair is read
+    // on the fold that both systems are judged by.
+    let check_7 = |records: &[TraceRecord]| {
+        let mut descriptors = ananke_shard::invariants::Descriptors::default();
+        for record in records {
+            descriptors.push(record);
+        }
+        descriptors.verdict()
+    };
     let outcomes: Vec<(Option<String>, Option<String>, Option<String>)> = sweep(seeds, |seed| {
         let report = membership::run_on_node(
             Cluster::Node,
@@ -1674,7 +1691,7 @@ fn a_fresh_node_that_bootstraps_itself_is_caught_by_check_7_where_it_is_not_a_bo
             taken,
         );
         (
-            ananke_sim::ranges::creations_agree_of(&report.records).err(),
+            check_7(&report.records).err(),
             report.check().err(),
             invariants::folded(&report.records)
                 .verdict_of(Fold::RangeIds)
@@ -1715,13 +1732,14 @@ fn a_fresh_node_that_bootstraps_itself_is_caught_by_check_7_where_it_is_not_a_bo
              share: no two clusters' replicas of range 0 granted different blocks at one index"
         );
     }
-    // And the correct node passes the same step on the same scenario, which D-096's
+    // And the correct node passes the same check on the same scenario, which D-096's
     // version of this test never asked, and which was false: a node not named at
     // bootstrap traced its interim replica's creation with its own empty Raft
     // configuration as the voters, so nodes 4 and 5 disagreed with the bootstrap
     // nodes on every range and the "catch" told the two systems apart on nothing.
-    // The creation now names the range's voters on every node (PROPOSED D-097), and
-    // the membership sweep folds check 7 in full over the correct node on every seed.
+    // The creation named the range's voters on every node from PROPOSED D-097; since
+    // PROPOSED D-109 a node that joins holds nothing and its replicas are its
+    // placeholders' installs, which check 7 holds to its map.
     let honest = membership::run_on_node(
         Cluster::Node,
         1,
@@ -1729,8 +1747,7 @@ fn a_fresh_node_that_bootstraps_itself_is_caught_by_check_7_where_it_is_not_a_bo
         NodeVariants::correct(),
         RangeVariants::correct(),
     );
-    ananke_sim::ranges::creations_agree_of(&honest.records)
-        .expect("the correct membership node's creations agree on every range");
+    check_7(&honest.records).expect("the correct membership node passes check 7");
 
     let correct = raft::run_on_the_node(
         1,
@@ -6094,10 +6111,14 @@ struct NodeMembershipCoverage {
     /// Partitions that cut off the leader of the range they drew, and partitions made.
     partitions_hit: usize,
     partitions_made: usize,
-    /// Snapshot actions traced, and the highest index any replica reached: the two
-    /// halves of the absence this cluster asserts (`Report::check`).
+    /// Snapshot actions traced, and the highest index any replica reached: the takes
+    /// and installs that feed the joiners through their placeholders, and the
+    /// compaction this scenario's threshold keeps out (`Report::check`; PROPOSED D-109).
     snapshot_actions: usize,
     highest_index: u64,
+    /// Seeds on which both joiners' replicas of every range were created by an install
+    /// into their placeholders (PROPOSED D-109).
+    joiners_installed_on_every_range: u64,
     /// Ranges that elected a leader and ranges that applied something, over the tier.
     leaders: BTreeMap<u64, usize>,
     applies: BTreeMap<u64, usize>,
@@ -6168,6 +6189,15 @@ impl NodeMembershipCoverage {
         self.partitions_made += made;
         self.snapshot_actions += report.snapshot_actions();
         self.highest_index = self.highest_index.max(report.highest_index());
+        // PROPOSED(D-109): the joiners fed through their placeholders.
+        self.joiners_installed_on_every_range += u64::from(
+            (membership::INITIAL_VOTERS + 1..=membership::SERVERS).all(|joiner| {
+                report
+                    .ranges()
+                    .into_iter()
+                    .all(|range| report.installed_into_a_placeholder(joiner, range))
+            }),
+        );
         for range in report.ranges() {
             if let Some(gap) = report.longest_completion_gap_of(range) {
                 self.worst_range_gap = self.worst_range_gap.max(gap);
@@ -6221,6 +6251,7 @@ impl NodeMembershipCoverage {
         self.partitions_made += other.partitions_made;
         self.snapshot_actions += other.snapshot_actions;
         self.highest_index = self.highest_index.max(other.highest_index);
+        self.joiners_installed_on_every_range += other.joiners_installed_on_every_range;
         self.worst_range_gap = self.worst_range_gap.max(other.worst_range_gap);
         self.worst_write_after_heal = self
             .worst_write_after_heal
@@ -6378,13 +6409,28 @@ impl NodeMembershipCoverage {
             self.shrinks_completed, self.seeds,
             "some seed's shrink did not complete on every range: {self:?}"
         );
-        // The absence this scenario's own threshold produces, over the tier as well as
-        // per seed (`membership::NODE_SNAPSHOT_THRESHOLD`; PROPOSED D-086 says why it
-        // stays at `1 << 30` where the raft-arms sweep runs its node at 12).
+        // A node that joins holds nothing (SHARD.md §2), so every seed's grow feeds both
+        // joiners every range's snapshot through their placeholders (§5, Q22): at least
+        // the eight installs that makes, beside the takes that feed them, on every seed,
+        // and on every seed both joiners' replicas of every range created that way. The
+        // absence this scenario's own threshold produces is the leaders' compaction, over
+        // the tier as well as per seed (`membership::NODE_SNAPSHOT_THRESHOLD`; PROPOSED
+        // D-086 says why it stays at `1 << 30` where the raft-arms sweep runs its node at
+        // 12).
+        // PROPOSED(D-109)
+        let joiners = (membership::SERVERS - membership::INITIAL_VOTERS) as usize;
+        let installs_a_seed = joiners * Cluster::Node.ranges().len();
+        assert!(
+            self.snapshot_actions >= installs_a_seed * self.seeds as usize,
+            "the node traced {} snapshot actions over {} seeds, fewer than the {installs_a_seed} \
+             installs a seed's joiners need: {self:?}",
+            self.snapshot_actions,
+            self.seeds
+        );
         assert_eq!(
-            self.snapshot_actions, 0,
-            "the node traced a snapshot action, which this scenario's threshold keeps \
-             unreached: {self:?}"
+            self.joiners_installed_on_every_range, self.seeds,
+            "some seed's joiners got a range other than through an install into their \
+             placeholder: {self:?}"
         );
         assert!(
             self.highest_index < ananke_sim::membership::NODE_SNAPSHOT_THRESHOLD,
@@ -6591,7 +6637,8 @@ impl NodeMembershipCoverage {
 /// Every figure SHARD.md §12 asks of a sweep on the node is printed beside the
 /// verdict: the trace records a run holds per range per virtual second against
 /// `TRACE_CAP`, the worst gap and first write after a heal any range showed against
-/// their bounds, and the two halves of the snapshot path's absence.
+/// their bounds, the snapshot actions that feed the joiners through their placeholders,
+/// and the compaction this scenario's threshold keeps out (PROPOSED D-109).
 // PROPOSED(D-084): the membership scenario on the node, four ranges on every node.
 #[test]
 fn every_seed_passes_the_membership_scenario_on_the_correct_node() {
