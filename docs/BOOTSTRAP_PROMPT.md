@@ -129,8 +129,9 @@ _Update this section at the end of every session._
   upgraded to the placeholder that closes it, 8's split wedge moved to seed 76, 613's stall
   moved from `k4` to `k1`.
 - Branch `phase-3-stage-c-restatement-check8` (2026-10-18), off `main` at 6633266, PR
-  #166, PROPOSED D-107 (footer D-108), **Stage C's restatement, check 7's restatement
-  clause, check 8, the install traces and the non-voter's delete** (#162's S6, continued
+  #166, PROPOSED D-107 (footer D-109 since the merge of `main` at 5e3d575), **Stage C's
+  restatement, check 7's restatement clause, check 8, the install traces and the
+  non-voter's delete** (#162's S6, continued
   from an earlier agent's uncommitted tree, which this kept and split into commits). Four
   steps, each its own commit on a green gate. (1) #139: a split's replica that is not a
   voter of P at `s` writes its batch and removes the right span in **one manifest switch**,
@@ -175,7 +176,87 @@ _Update this section at the end of every session._
   to move no verdict and no schedule, and the clause still 2 of 1 000 on the correct node.
   The non-voter's step leaves an entry its parent's own install moved past (N1, a directed
   unit test); its directed crash test holds the keys outside the removed span (N8); the
-  install creation's reading is a tested function (N4). Issues #169 to #172.
+  install creation's reading is a tested function (N4). Issues #169 to #172. Merged with
+  `main` at 5e3d575 (#163, D-106): check 8's two clauses are `Fold::Overlap` and
+  `Fold::RightHalf`, compared fold by fold under every pair, the overlap clause last in
+  `Checker::verdict` and the right half's not in it; the old check 8 test and its nightly
+  row removed, seed 45 compared in violation at every tier; a planted fold that loses its
+  state between chunks fails the correct node's test on seed 45 (N7, D-107 section 8).
+- Branch `phase-3-stage-c-fold-equivalence` (2026-10-18), off `main` at 6633266 and merged
+  with it at f8a15a7 (#161) and 6370823 (#164), PROPOSED D-106 (footer D-109, D-107 being
+  #166's), PR #163, **each of the range layer's folds keeps a verdict of its own and runs
+  under the equivalence test against the variant that trips it**; closes #138, #140, #141
+  and #150. Resumed from a session of
+  2026-10-12 that died with all of it uncommitted, committed in gated steps and every figure
+  re-measured. `invariants::Fold`, `Checker::verdict_of` and `verdicts`, and
+  `invariants::folded`; `Checker::verdict`, which stops a node run, unchanged. The old
+  equivalence test (one verdict, twenty seeds of three systems at every tier) is replaced by
+  seven, one per pair, over `min(seeds, 100)` seeds, fold by fold at eight prefixes: the
+  correct node; checks 9 and 10 against `ApplyIgnoresSpan` with and without
+  `TrustStaleDescriptor`; 9 against `TrustStaleDescriptor`; 16 against
+  `MetaOverwritesByArrival`; 17 against `ClientIgnoresMismatch`; 18 against `IdBlockResumed`;
+  7 against `AnyFreshNodeBootstraps` on membership beside the correct membership node (§12
+  asserts 7 against Stage D's `SplitNotAtomicWithDescriptor`). Measured first at seeds 0 to
+  999 (the table in D-106): **check 10 trips for the first time**, 26 of 1 000 under
+  `ApplyIgnoresSpan` alone, every one beside check 9, and 210 under the pair; `IdsUnique`
+  (check 18's grants) is tripped by no §10 variant and by `AnyFreshNodeBootstraps` on 34 of
+  1 000 membership seeds, the owner's question in D-106. #138: check 18's configuration
+  history keyed on the committed configuration, a right half's seeded from its creation —
+  a split of a right half and a truncated configuration entry, both failing on `main` in the
+  issue's words, and a two-range case, with five mutations each caught. #140: the sharded
+  quorum scenario folds the range layer's checks, measured at ten thousand before it was
+  asserted (correct node 0 failed, `RefuseOneRangeOnly` D-101's 3 338 / 6 661 / 1 to the
+  seed), and shown reached with a plant. #141: `IdBlockResumed`'s catch narrowed, 12 / 58 /
+  499 unchanged. #150: the wrong-voters case. **Nothing moved**: 12 400 runs hashed on
+  `main` and on the branch, identical, every verdict too. Nightly rows: seven added, the old
+  one removed, ten re-weighed on the M2. Issue #168: a test print that cuts a verdict by
+  bytes. After #163's review: the grants clause goes on folding its grants after its own
+  violation, which had given the split clause false "lies in no block" verdicts (no figure
+  moves, re-measured); two more cases of check 18's history (a committed membership change,
+  an install), killing the review's two surviving mutations; the grants clause compared on
+  a violation at every tier on four pinned membership seeds; D-106's owner question names
+  the one branch the instrument reaches. The two tests naming `AnyFreshNodeBootstraps`
+  read it from `RangeVariants` since the merge of #164. The premerge's D-070 lines and the
+  nightly's verdict on each tip are in #163.
+- Branch `phase-3-variant-set-followups` (2026-10-12, resumed 2026-10-18), off `main` at
+  f8a15a7, PROPOSED D-108, **the variant set's follow-ups** (#151, #155, #156), one
+  commit per step. #151: `AnyFreshNodeBootstraps` (D-096) and `IncarnationPerRangeStream`
+  (D-077) move from `NodeVariants` into `RangeVariants` as instruments outside §10's
+  count (bits 5 and 6, `in_section_10` false, D-105's test naming them), read from the
+  range layer's set at the start's choice of bootstrap, at the re-seed and at a split's
+  right half, and carried by the membership scenario and `sim/ranges.rs`'s directed
+  refusal scenario beside the node's set; `NodeVariant::BUGS` forty-seven, `RESEED`
+  five, bits 25 and 48 freed. `IncarnationPerRangeStream` is read at two sites, not the
+  one #151 named: the split's (D-100) is reached on the node cluster and run by no test
+  (issue #160). **Nothing moved, measured** on f8a15a7 and 72e362a from one harness in
+  release: 7 121 runs identical (verdict, trace hash, length) — the membership node, the
+  directed refusal and the node cluster at seeds 0 to 999 under each instrument and the
+  correct node, every node pin, seed 42's one-group hash and the other node scenarios'
+  twenty; `AnyFreshNodeBootstraps` caught by check 7 on 20/20, 100/100 and 1 000/1 000
+  and `IncarnationPerRangeStream` by the directed reading on 20/20, 100/100 and
+  1 000/1 000 on both trees; six plumbing mutations, M6 (the split's draw) failing
+  nothing. **For the owner** (PROPOSED in D-108): Stage D builds
+  `IncarnationFromRangeStream` as SHARD.md's question 1 proposes, and #151's reuse of
+  `IncarnationPerRangeStream` is not taken. `range_rng` is one stream per node and range
+  that continues across draws and restarts, so that variant repeats no incarnation and
+  the re-add assertion could not catch it. Its doc and `reseed`'s said otherwise and are
+  corrected, a note on D-077 corrects item 4's reason, and SHARD.md:1379-1381's
+  parenthetical is issue #165. The recommendation carries two caveats. The new variant
+  repeats only an incarnation that was itself drawn, never a bootstrap replica's 1, so
+  its catch rate is to be measured. It also needs an `Environment` addition or a stream
+  derived from the name alone. #155: the six sites that read one of §10's five from the
+  range layer's set (five in `server.rs`, the sweep's client's) and the six prose-form
+  sites carry `// PROPOSED(D-105)`; the three that read the two instruments carry
+  `// PROPOSED(D-108)`. A note appended to D-105 says what is marked and that its split
+  by check was the uncommitted harness's; the tests count checks 16 and 18 as "something
+  else". #156: `TrustStaleDescriptor` is caught on 20/20, 100/100 and 998/1 000, missing
+  seeds 184 and 819 (seed 48 is caught), and the test prints its misses. The mechanism
+  was re-derived from both clients' records after #164's review found the first version
+  wrong. 992 seeds are caught through client 1's stale range-2 entry, five through a
+  client's cached entry for a range that split (range 2 on 503, 579, 660 and 759, range 3
+  on 999), and 282 by a read in flight across range 3's split. On 184 and 819 no read is
+  served through a stale entry. Every operation through one is a write refused at apply,
+  but for one write abandoned on 184 and 819's first read, abandoned unserved.
 - Branch `docs-stage-c-record` (2026-10-11), off `main` at b01db39 and merged with it at
   8496ca3 (#152, D-105; footer D-106), PROPOSED D-104, **Stage C's record**, docs and
   comments only (no code line, schedule or pinned hash moves). It records three things no

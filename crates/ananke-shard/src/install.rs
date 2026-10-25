@@ -74,6 +74,7 @@ use bytes::Bytes;
 
 use crate::descriptor::RangeDescriptor;
 use crate::range::RangeId;
+use crate::range_variant::{RangeVariant, RangeVariants};
 use crate::server::lock;
 use crate::snapshot::{Identity, Install, Landing, Route, Snapshots, Started};
 use crate::variant::{NodeVariant, NodeVariants};
@@ -485,6 +486,9 @@ pub struct Task<E: Environment> {
     /// writes the quarantine (the host's `on_a_reseed`; D-035).
     // PROPOSED(D-109)
     on_a_reseed: bool,
+    /// The range layer's variants: a placeholder's install is a creation, and draws its
+    /// incarnation as `IncarnationPerRangeStream` says (PROPOSED D-108, D-109).
+    range_variants: RangeVariants,
 }
 
 impl<E: Environment> Task<E> {
@@ -511,6 +515,7 @@ impl<E: Environment> Task<E> {
         snaps: Queue<SnapJob>,
         placeholders: Arc<std::sync::Mutex<BTreeSet<RangeId>>>,
         on_a_reseed: bool,
+        range_variants: RangeVariants,
     ) -> Self {
         Self {
             env,
@@ -531,6 +536,7 @@ impl<E: Environment> Task<E> {
             placeholders,
             as_placeholder: BTreeSet::new(),
             on_a_reseed,
+            range_variants,
         }
     }
 
@@ -1370,13 +1376,13 @@ impl<E: Environment> Task<E> {
                 .await;
         };
         // A creation draws its incarnation as every creation does (Q26): from the node's
-        // generator, or, under `IncarnationPerRangeStream`, from the range's own stream,
+        // generator, or, under `RangeVariant::IncarnationPerRangeStream`, from the range's own stream,
         // which gives a replica created again for the same (range, node) the number its
         // predecessor drew, as the split's creation and the re-seed's do.
         // PROPOSED(D-109)
         let incarnation = if self
-            .variants
-            .contains(NodeVariant::IncarnationPerRangeStream)
+            .range_variants
+            .contains(RangeVariant::IncarnationPerRangeStream)
         {
             self.env.range_rng(range.get()).next_u64()
         } else {

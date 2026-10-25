@@ -10,10 +10,11 @@
 //! built beside the correct node and caught by a check that asserts what the correct
 //! node does. They are not Raft bugs — the core is untouched — and none is one of
 //! §10's, so they are a set of their own, and none of them appears in
-//! [`ananke_raft::Variant::BUGS`] or in §10's count. One sits on the line between the
-//! node and the range layer: [`NodeVariant::AnyFreshNodeBootstraps`] breaks §2's rule
-//! for which node writes the initial state, at the node's start, and stays here until
-//! the owner places it (PROPOSED D-105).
+//! [`ananke_raft::Variant::BUGS`] or in §10's count. Two that sat here broke rules of
+//! the range layer's rather than the node's — `AnyFreshNodeBootstraps`, §2's rule for
+//! which node writes the initial state, and `IncarnationPerRangeStream`, a replica's
+//! incarnation at its creation — and are the range layer's instruments since
+//! PROPOSED D-108 ([`RangeVariant`](crate::range_variant::RangeVariant)).
 //!
 //! Most are caught by a deterministic check in this crate, which is the pair rule's
 //! requirement — the buggy variant is *seen to fail* the check the correct code passes
@@ -30,6 +31,8 @@
 //! [`NodeVariant::PersistsNotArmed`] is caught over a small fixed set of scheduling
 //! seeds rather than on one, because what it breaks depends on which side of the
 //! task's race is polled first: the directed scenario is the set, not a seed.
+// PROPOSED(D-105): the node's set is §4's, and §10's variants are the range layer's.
+// PROPOSED(D-108): the two range-layer instruments moved out of the node's set.
 
 use std::fmt;
 
@@ -218,12 +221,6 @@ pub enum NodeVariant {
     /// answers first is a replica that may vote again on state its node lost (D-035)
     /// and whose leader keeps a `matched` the rebuilt log cannot honour (D-042).
     ServeBeforeRefusedMark,
-    /// The replica's incarnation drawn from the per-range protocol stream rather than
-    /// from the node's own generator. `SimEnv` derives a named stream from the seed and
-    /// the name alone, so a replica created again for the same (range, node) draws the
-    /// number its predecessor drew, and a leader that compares incarnations for
-    /// inequality only (D-042) never resets (Q26; SHARD.md:1372-1379).
-    IncarnationPerRangeStream,
     /// A range whose live install is between its decision and its manifest switch is
     /// stepped anyway, rather than held. The replica being replaced is behind its
     /// leader by definition, so a step of it in that window appends entries at indices
@@ -403,13 +400,6 @@ pub enum NodeVariant {
     /// cross-range hold folds trip on.
     // PROPOSED(D-095): the variant the apply-lag and cross-range hold folds trip on.
     ApplyWaitsForEveryRange,
-    /// A node takes a fresh store for a bootstrap: whether or not configuration
-    /// names it among range 0's replicas, a node whose store holds no digest writes
-    /// the initial state, and, lacking the bootstrap list it was not given, takes the
-    /// address book for every range's voters. Two clusters then bootstrap where
-    /// configuration named one, and check 7 reads the disagreement off the replicas'
-    /// creations (SHARD.md §2, §8; PROPOSED D-096).
-    AnyFreshNodeBootstraps,
 }
 
 impl NodeVariant {
@@ -444,7 +434,6 @@ impl NodeVariant {
         NodeVariant::ReuseLostGeneration,
         NodeVariant::OpenNewestEvenIfLost,
         NodeVariant::ServeBeforeRefusedMark,
-        NodeVariant::IncarnationPerRangeStream,
         NodeVariant::StepWhileInstalling,
         NodeVariant::InstallKeepsTheOldCore,
         NodeVariant::ChunksToTheInbox,
@@ -463,23 +452,24 @@ impl NodeVariant {
         NodeVariant::RefusedReadLeft,
         NodeVariant::OneSeedForEveryCore,
         NodeVariant::ApplyWaitsForEveryRange,
-        NodeVariant::AnyFreshNodeBootstraps,
     ];
 
-    /// Q15's whole-node refusal and re-seed, in order: the six ways to get a node's
-    /// refusal wrong (SHARD.md §11, storage 8; D-077). Four of the six are mutations a
-    /// single-range world could not catch at all — with one range on a node, refusing
-    /// only that range *is* refusing the node, and a per-range incarnation stream is
-    /// the node's own generator drawn once — and the two about directories need a node
-    /// refused twice in a run, which one range reaches no sooner but which no check
-    /// before this slice asked of any node.
+    /// Q15's whole-node refusal and re-seed, in order: the five ways to get a node's
+    /// refusal wrong (SHARD.md §11, storage 8; D-077). Three of the five are mutations
+    /// a single-range world could not catch at all — with one range on a node, refusing
+    /// only that range *is* refusing the node — and the two about directories need a
+    /// node refused twice in a run, which one range reaches no sooner but which no
+    /// check before D-077 asked of any node. D-077 built six: the sixth, a re-seeded
+    /// replica's incarnation drawn from its range's stream, is a rule of the range
+    /// layer's, a replica's incarnation at its creation, and is
+    /// `RangeVariant::IncarnationPerRangeStream` since PROPOSED D-108.
+    // PROPOSED(D-108): D-077's sixth moved to the range layer's set.
     pub const RESEED: &'static [NodeVariant] = &[
         NodeVariant::RefuseOneRangeOnly,
         NodeVariant::ReseedIntoRefusedDir,
         NodeVariant::ReuseLostGeneration,
         NodeVariant::OpenNewestEvenIfLost,
         NodeVariant::ServeBeforeRefusedMark,
-        NodeVariant::IncarnationPerRangeStream,
     ];
 
     /// The `snapshot` task's own, in order: the fifteen ways to get a snapshot keyed by
@@ -541,7 +531,7 @@ impl NodeVariant {
 
     /// The directed re-seed shape's own, outside §10's count of range-layer variants:
     /// D-067's [`ReseedMarkNotSynced`](Self::ReseedMarkNotSynced), the one way to get
-    /// Q15's *durability* wrong as against the six ways to get the refusal itself wrong
+    /// Q15's *durability* wrong as against the five ways to get the refusal itself wrong
     /// ([`RESEED`](Self::RESEED)), and the four holes the shape found in the node when
     /// a refusal and the wiring first met on one tree — the applied index an install
     /// makes durable — no, that one is D-083's — the watermark a start begins at, a
@@ -603,8 +593,9 @@ impl NodeVariant {
             NodeVariant::ReuseLostGeneration => 1 << 22,
             NodeVariant::OpenNewestEvenIfLost => 1 << 23,
             NodeVariant::ServeBeforeRefusedMark => 1 << 24,
-            NodeVariant::IncarnationPerRangeStream => 1 << 25,
-            // Bits 20 to 25 are D-077's six, which `main` took while the snapshot
+            // PROPOSED(D-108): bit 25 held D-077's sixth, `IncarnationPerRangeStream`,
+            // until it moved to the range layer's set; it is free.
+            // Bits 20 to 25 were D-077's six, which `main` took while the snapshot
             // review's slice was open; before that merge the review's four held 20 to
             // 23. They take 26 to 29 instead, and D-083's ten follow at 30 to 39, so no
             // two variants share a bit. D-081's three for the directed re-seed shape
@@ -640,12 +631,14 @@ impl NodeVariant {
             // PROPOSED(D-095): the apply task that waits for every range. Sixteen bits are
             // left.
             NodeVariant::ApplyWaitsForEveryRange => 1 << 47,
-            // PROPOSED(D-096): a fresh store taken for a bootstrap. Fifteen bits are left.
-            NodeVariant::AnyFreshNodeBootstraps => 1 << 48,
-            // Bits 49 to 53 held §10's five — D-097's three for routing, D-098's one for
-            // the meta range and D-099's one for the range-id blocks — until PROPOSED
-            // D-105 moved them to the range layer's own set (`crate::range_variant`).
-            // They are free, and fifteen bits are left.
+            // Bit 48 held PROPOSED D-096's `AnyFreshNodeBootstraps`, a fresh store taken
+            // for a bootstrap, until PROPOSED D-108 moved it to the range layer's set.
+            // PROPOSED(D-105): bits 49 to 53 held §10's five — D-097's three for
+            // routing, D-098's one for the meta range and D-099's one for the range-id
+            // blocks — until D-105 moved them to the range layer's own set
+            // (`crate::range_variant`).
+            // PROPOSED(D-108): bits 25 and 48 to 53 are free, and seventeen bits are
+            // left.
         }
     }
 
@@ -678,7 +671,6 @@ impl NodeVariant {
             NodeVariant::ReuseLostGeneration => "ReuseLostGeneration",
             NodeVariant::OpenNewestEvenIfLost => "OpenNewestEvenIfLost",
             NodeVariant::ServeBeforeRefusedMark => "ServeBeforeRefusedMark",
-            NodeVariant::IncarnationPerRangeStream => "IncarnationPerRangeStream",
             NodeVariant::InstallWrongRangesSpans => "InstallWrongRangesSpans",
             NodeVariant::AdmitsAnUnhostedRange => "AdmitsAnUnhostedRange",
             NodeVariant::AssemblyHeldForDepartedSender => "AssemblyHeldForDepartedSender",
@@ -701,7 +693,6 @@ impl NodeVariant {
             NodeVariant::RefusedReadLeft => "RefusedReadLeft",
             NodeVariant::OneSeedForEveryCore => "OneSeedForEveryCore",
             NodeVariant::ApplyWaitsForEveryRange => "ApplyWaitsForEveryRange",
-            NodeVariant::AnyFreshNodeBootstraps => "AnyFreshNodeBootstraps",
         }
     }
 }
@@ -789,13 +780,15 @@ mod tests {
             seen |= variant.bit();
         }
         // Twenty of the round's and the snapshot task's, the snapshot review's four,
-        // D-077's six for Q15's whole-node refusal and re-seed, D-083's ten for the
-        // snapshot wiring, D-081's three for the directed re-seed shape, D-090's two for a
-        // stream's bounds, D-076's review's two, D-095's one for the `apply` task that
-        // waits for every range and D-096's one for a fresh store taken for a bootstrap.
-        // §10's five that D-097 to D-099 built here are the range layer's since PROPOSED
-        // D-105 (`crate::range_variant`), and no variant of §10 is a node variant.
-        assert_eq!(NodeVariant::BUGS.len(), 49);
+        // five of D-077's six for Q15's whole-node refusal and re-seed, D-083's ten for
+        // the snapshot wiring, D-081's three for the directed re-seed shape, D-090's two
+        // for a stream's bounds, D-076's review's two and D-095's one for the `apply`
+        // task that waits for every range. §10's five that D-097 to D-099 built here are
+        // the range layer's since PROPOSED D-105 (`crate::range_variant`), and no
+        // variant of §10 is a node variant; D-077's sixth and D-096's one, range-layer
+        // instruments outside §10's count, are the range layer's since PROPOSED D-108.
+        // PROPOSED(D-108)
+        assert_eq!(NodeVariant::BUGS.len(), 47);
         for variant in NodeVariant::SNAPSHOT
             .iter()
             .chain(NodeVariant::WIRING)
@@ -810,7 +803,7 @@ mod tests {
         }
         assert_eq!(NodeVariant::SNAPSHOT.len(), 15);
         assert_eq!(NodeVariant::WIRING.len(), 10);
-        assert_eq!(NodeVariant::RESEED.len(), 6);
+        assert_eq!(NodeVariant::RESEED.len(), 5);
         assert_eq!(NodeVariant::SHAPE.len(), 3);
         assert_eq!(NodeVariant::BOUNDS.len(), 2);
         // The discipline, the wiring, the re-seed, the shape and the bounds are pairwise

@@ -27,21 +27,32 @@
 //!   stale descriptor is both a server's trust and a client's: Q38 ships
 //!   `TrustStaleDescriptor` and `ClientIgnoresMismatch` side by side.
 //! - **A test instrument outside that count**: a variant built so that a check of
-//!   §8 has something that trips it where no protocol mistake of §10 does — PROPOSED
-//!   D-093's `SplitLeavesGap` for check 19's fold, and Stage D's variant for the
-//!   re-add window assertion (§12, Stage D's question 1). None is built yet.
+//!   §8 has something that trips it where no protocol mistake of §10 does. Two are
+//!   built, both moved here from the node's set by PROPOSED D-108 because each
+//!   breaks a rule of the range layer's and not of the node's:
+//!   [`RangeVariant::AnyFreshNodeBootstraps`] breaks §2's rule for which node writes
+//!   the initial state and is check 7's instrument on the membership scenario
+//!   (PROPOSED D-096), and [`RangeVariant::IncarnationPerRangeStream`] draws a
+//!   replica's incarnation at its creation from the range's protocol stream instead
+//!   of the node's generator, at Q15's re-seed and at a split's right half (D-077,
+//!   PROPOSED D-100). Two more are proposed and not built: D-093's `SplitLeavesGap`
+//!   for check 19's fold, and Stage D's variant for the re-add window assertion (§12,
+//!   Stage D's question 1), which needs a stream derived anew at each creation and so
+//!   is not `IncarnationPerRangeStream` read at one more site (PROPOSED D-108).
 //!
 //! The set is a `u64` where Raft's is a `u32` (PROPOSED D-105): twenty-four of §10's
-//! and two instruments already proposed would leave a `u32` six bits for every
-//! variant the stages' reviews add, and the node's own set, planned at twenty, reached
-//! fifty-four and outgrew its `u32` inside Stage B. The bits reach no wire frame and
-//! no trace event (D-045), so the numbering is free to change; and a variant past the
-//! sixty-fourth bit is an overflow in `RangeVariant::bit`'s match, which does not
-//! compile, so the width cannot be outgrown silently.
+//! and the four instruments built or proposed beside them, two of each, would leave a
+//! `u32` four bits for every variant the stages' reviews add, and the node's own set,
+//! planned at twenty, reached fifty-four and outgrew its `u32` inside Stage B. The bits
+//! reach no wire frame and no trace event (D-045), so the numbering is free to change;
+//! and a variant past the sixty-fourth bit is an overflow in `RangeVariant::bit`'s
+//! match, which does not compile, so the width cannot be outgrown silently.
 //!
 //! Until D-105 the five sat in [`NodeVariants`](crate::variant::NodeVariants) at bits 49
-//! to 53. Moving them moved no schedule and no trace: D-105 measures it.
+//! to 53, and until D-108 the two instruments at bits 48 and 25. Neither move moved a
+//! schedule or a trace: D-105 and D-108 measure it.
 // PROPOSED(D-105): the range layer's own variant set (Q37).
+// PROPOSED(D-108): the two range-layer instruments the node's set held.
 
 use std::fmt;
 
@@ -91,6 +102,35 @@ pub enum RangeVariant {
     /// arm draws that shape (PROPOSED D-100; D-104).
     // PROPOSED(D-099)
     IdBlockResumed,
+    /// A node takes a fresh store for a bootstrap: whether or not configuration
+    /// names it among range 0's replicas, a node whose store holds no digest writes
+    /// the initial state, and, lacking the bootstrap list it was not given, takes the
+    /// address book for every range's voters. Two clusters then bootstrap where
+    /// configuration named one, and check 7 reads the disagreement off the replicas'
+    /// creations (SHARD.md §2, §8; PROPOSED D-096). A test instrument outside §10's
+    /// count: §10 has no variant for §2's rule, and check 7 needs one on the
+    /// membership scenario, whose nodes 4 and 5 are not bootstrap nodes.
+    // PROPOSED(D-096)
+    // PROPOSED(D-108): moved from the node's set, outside §10's count.
+    AnyFreshNodeBootstraps,
+    /// A replica's incarnation drawn at its creation from the range's protocol
+    /// stream, `n{id}/r{range}/protocol` (`Environment::range_rng`), rather than from
+    /// the node's own generator, from which SHARD.md §8 draws a fresh incarnation
+    /// (Q26). It is read wherever the node draws one: Q15's re-seed (D-077) and a
+    /// split's right half (PROPOSED D-100). What catches it is the draw itself: the
+    /// directed refusal scenario finds every re-seeded replica's incarnation different
+    /// from the node generator's (`sim/tests/ranges.rs`), and no test runs it through
+    /// a split (issue #160).
+    ///
+    /// It does not reach the harm §8 names for a stream derived anew at each creation:
+    /// a replica created again drawing its predecessor's number, which a leader that
+    /// compares incarnations for inequality only (D-042) would never reset
+    /// (SHARD.md:1376-1383). `range_rng` hands back one stream per node and range,
+    /// continuing across draws, handles and restarts, so every creation under this
+    /// variant draws a number of its own (PROPOSED D-108). A test instrument outside
+    /// §10's count.
+    // PROPOSED(D-108): moved from the node's set, outside §10's count.
+    IncarnationPerRangeStream,
     /// A placeholder grants votes: a node that holds no replica of a range answers
     /// that range's `PreVote` and `RequestVote` granted, every one it receives, with
     /// nothing durable, where SHARD.md §5 has a placeholder grant nothing (Q22) and
@@ -111,6 +151,8 @@ impl RangeVariant {
         RangeVariant::ClientIgnoresMismatch,
         RangeVariant::MetaOverwritesByArrival,
         RangeVariant::IdBlockResumed,
+        RangeVariant::AnyFreshNodeBootstraps,
+        RangeVariant::IncarnationPerRangeStream,
         RangeVariant::UninitialisedReplicaVotes,
     ];
 
@@ -127,8 +169,11 @@ impl RangeVariant {
             RangeVariant::MetaOverwritesByArrival => 1 << 3,
             // PROPOSED(D-099): a node resuming another run's block of ids.
             RangeVariant::IdBlockResumed => 1 << 4,
-            // PROPOSED(D-109): a placeholder that grants votes. Bits 5 and 6 are left
-            // to the two instruments PROPOSED D-108 moves here from the node's set.
+            // PROPOSED(D-108): the two instruments the node's set held at bits 48
+            // (D-096) and 25 (D-077).
+            RangeVariant::AnyFreshNodeBootstraps => 1 << 5,
+            RangeVariant::IncarnationPerRangeStream => 1 << 6,
+            // PROPOSED(D-109): a placeholder that grants votes.
             RangeVariant::UninitialisedReplicaVotes => 1 << 7,
         }
     }
@@ -145,6 +190,7 @@ impl RangeVariant {
             | RangeVariant::MetaOverwritesByArrival
             | RangeVariant::IdBlockResumed
             | RangeVariant::UninitialisedReplicaVotes => true,
+            RangeVariant::AnyFreshNodeBootstraps | RangeVariant::IncarnationPerRangeStream => false,
         }
     }
 
@@ -157,6 +203,8 @@ impl RangeVariant {
             RangeVariant::ClientIgnoresMismatch => "ClientIgnoresMismatch",
             RangeVariant::MetaOverwritesByArrival => "MetaOverwritesByArrival",
             RangeVariant::IdBlockResumed => "IdBlockResumed",
+            RangeVariant::AnyFreshNodeBootstraps => "AnyFreshNodeBootstraps",
+            RangeVariant::IncarnationPerRangeStream => "IncarnationPerRangeStream",
             RangeVariant::UninitialisedReplicaVotes => "UninitialisedReplicaVotes",
         }
     }
@@ -273,8 +321,10 @@ mod tests {
             seen |= variant.bit();
         }
         // D-097's three for routing, D-098's one for the meta range, D-099's one for
-        // the range-id blocks and D-109's one for placeholders, all of them §10's.
-        assert_eq!(RangeVariant::BUGS.len(), 6);
+        // the range-id blocks and D-109's one for placeholders, all of them §10's; and
+        // the two instruments PROPOSED D-108 moved here from the node's set, neither of
+        // them §10's.
+        assert_eq!(RangeVariant::BUGS.len(), 8);
         for variant in RangeVariant::BUGS {
             assert_eq!(
                 variant.in_section_10(),
@@ -287,6 +337,20 @@ mod tests {
             .filter(|variant| variant.in_section_10())
             .count();
         assert!(counted <= SECTION_10.len());
+        assert_eq!(counted, 6, "§10's six built so far");
+        // The instruments outside the count, by name: the two the node's set held
+        // until D-108, each a rule of the range layer's broken (§2's bootstrap writer,
+        // a replica's incarnation at its creation).
+        let instruments: Vec<&str> = RangeVariant::BUGS
+            .iter()
+            .filter(|variant| !variant.in_section_10())
+            .map(|variant| variant.name())
+            .collect();
+        assert_eq!(
+            instruments,
+            ["AnyFreshNodeBootstraps", "IncarnationPerRangeStream"],
+            "the range layer's instruments outside §10's count"
+        );
         // No range variant is also a node variant: the two sets share no name.
         for variant in RangeVariant::BUGS {
             assert!(
