@@ -7012,6 +7012,12 @@ impl StreamProgress {
             // is not a restart either, so it is neither counted nor credited.
             // PROPOSED(D-090): a cap-wait is not progress and is not a start-over.
             message::SnapshotStatus::Waiting => false,
+            // The overlap rule's refusal (PROPOSED D-110): the stream ends there, and
+            // nothing it covered is progress.
+            message::SnapshotStatus::Overlaps => {
+                self.streams.remove(&(to, from));
+                false
+            }
             message::SnapshotStatus::More => {
                 let done = self
                     .sizes

@@ -2479,7 +2479,9 @@ fn node_records(seed: u64, taken: &[RangeVariant]) -> Vec<TraceRecord> {
 /// clause's words there: the comparison is held in violation, where a fold fed in
 /// chunks that lost its state between them reads `Ok` (#166's review, N7). Its overlap
 /// clause trips on no run of this tree, so its comparison in violation comes with its
-/// tripping variant, S9's `SnapshotOverlapsReplica` (SHARD.md §12).
+/// tripping variant, S9's `SnapshotOverlapsReplica` (SHARD.md §12), on `sim/split.rs` (i)
+/// (`the_range_layers_folds_agree_one_by_one_and_check_8_trips_under_snapshot_overlaps_replica`,
+/// PROPOSED D-110).
 // PROPOSED(D-106): the range layer's folds compared fold by fold, per pair.
 // PROPOSED(D-107): check 8's two clauses among them.
 #[test]
@@ -2810,6 +2812,42 @@ fn a_placeholder_that_grants_votes_is_caught_by_check_20() {
         "UninitialisedReplicaVotes was caught on no seed of the share: no placeholder \
          received a vote request, or check 20 is silent"
     );
+}
+
+/// Check 8 against `SnapshotOverlapsReplica` (SHARD.md §12, Stage C's exit: "check 8
+/// against `SnapshotOverlapsReplica`"), the overlap clause's tripping variant, deferred
+/// here from S6 (PROPOSED D-107, D-110). Compared on `sim/split.rs` (i), where the
+/// variant's install of R over `x`'s lagging P lands on every seed (1 000 of 1 000
+/// measured), rather than on the node sweep, whose correct node refuses an install for
+/// overlap on about one seed in a hundred (PROPOSED D-109) and whose variant runs reach
+/// the shape about as rarely. Every compared seed's folds agree fold by fold, and check
+/// 8's overlap clause is in violation on every one, in its own words, at every tier
+/// (D-061: every seed). The correct system's shape (i) holds check 8 green on every seed
+/// through the run's verdict (`sim/tests/split.rs`).
+// PROPOSED(D-110)
+#[test]
+fn the_range_layers_folds_agree_one_by_one_and_check_8_trips_under_snapshot_overlaps_replica() {
+    let compared = range_folds_compared();
+    let found = range_folds_under("SnapshotOverlapsReplica on split (i)", compared, |seed| {
+        ananke_sim::split::run_overlap(
+            seed,
+            RangeVariants::of(&[RangeVariant::SnapshotOverlapsReplica]),
+        )
+        .records
+    });
+    assert_eq!(
+        tripped_on(&found, Fold::Overlap),
+        found.len(),
+        "check 8's overlap clause did not trip on every compared seed of \
+         SnapshotOverlapsReplica on split (i)"
+    );
+    for (seed, outcome) in found.iter().enumerate() {
+        let words = &outcome.tripped[&Fold::Overlap];
+        assert!(
+            words.contains("overlaps its replica of range"),
+            "seed {seed}: check 8's overlap clause tripped in other words: {words}"
+        );
+    }
 }
 
 /// Check 17 against `ClientIgnoresMismatch` (SHARD.md §12, Stage C's exit): a resend to
