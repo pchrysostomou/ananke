@@ -466,6 +466,12 @@
 # and added seed 57's pin, four runs of one seed, weighed from the built release binary at
 # ANANKE_SEEDS=1000 ANANKE_DEEP_SEEDS=100, as user + sys, two runs: 0.9 cpu s (0.91 + 0.02 both
 # times). Into the lightest shard, shard 5 at 1753.3 -> 1754.2.
+# PROPOSED D-112 (the pre-vote fold reads an install's creation as a term source) added two
+# `node` rows, pins of fixed seeds, weighed on its tree from the built release binary
+# (`node-<hash> <test> --exact`) at ANANKE_SEEDS=1000 ANANKE_DEEP_SEEDS=100, as user + sys, two
+# runs each, on an Apple M2 of 8 cores beside a 10 000-seed run (load averages 15 to 28): seed
+# 1817's at 0.4 cpu s (0.38 + 0.03, 0.40 + 0.02) and seed 248's at 0.3 (0.32 + 0.02, 0.30 +
+# 0.02). Longest-first into the lightest shard, shard 5 for both: 1754.2 -> 1754.6 -> 1754.9.
 # shard	binary	cpu_s	test
 # shard 1: 1977.1 cpu s
 # D-095 added two rows, both `node`, weighed on its tree from the built release binary
@@ -568,7 +574,7 @@
 4	node	27.8	the_range_layers_folds_agree_one_by_one_and_checks_9_and_10_trip_under_apply_ignores_span
 4	node	18.4	the_range_layers_folds_agree_one_by_one_and_check_20_trips_under_uninitialised_replica_votes
 4	split	125.1	a_placeholder_that_grants_votes_grants_one_on_every_seed_of_the_vote_shape
-# shard 5: 1754.2 cpu s
+# shard 5: 1754.9 cpu s
 5	echo	6.0	every_seed_satisfies_the_invariants_and_the_sweep_exercises_the_disk_faults
 5	engine	19.5	a_seek_that_counts_tombstones_is_caught
 5	node	58.8	a_leader_that_ignores_incarnations_has_an_incarnation_to_ignore_only_where_a_store_is_refused
@@ -597,6 +603,8 @@
 5	split	0.1	a_node_configured_with_other_than_three_bootstrap_nodes_stops_and_says_why
 5	install	56.9	a_joiner_reseeded_gets_its_replicas_back_quarantined_and_grants_nothing
 5	node	0.9	seed_57_the_pair_is_the_stream_halfs_wedge_on_a_schedule_its_skipped_reset_moved
+5	node	0.4	seed_1817_a_placeholders_install_straddles_an_isolation_and_keeps_its_term
+5	node	0.3	seed_248_an_installs_stream_term_above_its_floor_straddles_an_isolation
 # shard 6: 1810.1 cpu s
 6	echo	0.1	a_busy_looping_task_fails_the_scenario_instead_of_hanging
 6	engine	310.3	an_engine_that_acknowledges_before_the_log_is_caught

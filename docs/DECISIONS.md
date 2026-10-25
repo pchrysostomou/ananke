@@ -22768,6 +22768,122 @@ caught on no seed (0 of 1 000).
 which D-109's placeholders made false. SHARD.md's Stage B search for a seed where the pair
 wedges and neither half does still has no answer on the node: seed 57 is not one. D-109 is
 unchanged; this entry records its placeholders' effect on the pair. **PROPOSED.**
+## PROPOSED D-112 — The pre-vote fold reads an install's creation as a term source: a replica an install created before an isolation, whose core first states its term inside it, takes that restatement's term, where it equals the term of the stream the install completed
+
+**The number.** Off `main` at 2aab845, whose footer reads D-112. D-110 is S9's, in #180, not
+yet merged; D-111 is on `main`. This entry takes D-112 and the footer moves to D-113; at
+S9's merge the entries are a union in numerical order with one footer, the highest plus
+one. Every code site carries `// PROPOSED(D-112)`.
+
+**Context: a correct-server failure, and a check defect.** The 10 000-seed nightly on
+0e07274 (run 40220930109, on what is now `main`) failed three tests on one mechanism:
+- the correct node's sweep, seed 1817: "pre-vote: server 3 raised its term from 0 to 2
+  while isolated from Instant(15.76s) to Instant(16.628s)";
+- `RefusedReadLeft`'s test, the same seed and words, counted as a catch by something other
+  than the outstanding-reads bound;
+- `ApplyIgnoresSpan`'s test, seed 248: "pre-vote: server 3 raised its term from 0 to 5
+  while isolated from Instant(15.674s) to Instant(16.602s)".
+
+Both reproduce on `main` at 2aab845. In both, a placeholder's install creates the
+replica just before the isolation begins, and the replica's term never moves in the window.
+
+**The trace, seed 1817, range 70 on node 3.**
+1. Range 2 splits into 70 at 15.024 s while node 3 is down, and node 1 leads 70 at term 2.
+2. Node 3 restarts at 15.187 s and makes a placeholder of 70 at 15.277 s, and node 1
+   streams it 70's snapshot.
+3. The install's switch traces `RangeCreated { cause: snapshot, floor_index: 72,
+   floor_term: 2 }` at 15.730 s (decided 15.641 s) and `RaftSnapshot { taken: false }` at
+   15.745 s. The switch has written the replica's term durably: the stream's term, 2.
+4. Node 3 is cut off at **15.760 s**.
+5. The replica's core starts with `created_by_install`'s restatement: `RaftRecovered
+   { term: 2 }` and `RaftTerm { term: 2, role: follower, received: None }` at 15.768 s.
+6. It pre-votes five times at term 2, and after the heal at 16.628 s it is a follower at
+   term 2.
+
+On seed 248 the shape is the same on range 38:
+- creation at 15.608 s, `RaftSnapshot` at 15.652 s, cut off at 15.674 s;
+- restatement at term 5 at 15.687 s, where the snapshot's last term, the creation's
+  `floor_term`, is 2.
+
+**Why it is not a server bug.** The replica's term is the stream's from the switch, which
+is durable before the window. No core of the replica exists between the switch and the
+restatement: the host drops the range's messages from the creation's trace on (D-109
+§1.6). The replica pre-votes and never raises its term. Pre-vote's property holds.
+
+**Why the fold flagged it.** `term_by` counted `RaftTerm` and a split's `RangeCreated` as a
+replica's term sources, and nothing else.
+- At the window's start it found none for this replica and read 0.
+- `created_term_in` reads only a creation traced inside the window.
+- The install skip reads `RaftSnapshot { taken: false }` inside the window. A placeholder's
+  install traces it from the `snapshot` task at the switch, and the restatement comes from
+  the `raft` task at `Switched`, tens of milliseconds later, so an isolation can begin
+  between the two.
+
+The check's own doc meant this to be excused ("an install's restatement re-states the term
+the stream carried, which is no election of the isolated server's"). It looked for the
+wrong record.
+
+**Introduced by #173, widened by #174.**
+- Both seeds pass at b21d76e, c0d9b07 (#166), 0064770 and 0059470 (#173).
+- They fail from 6cc89db, #174's first commit, through 75d6bb8, 9f6f12a, 0e07274 and
+  `main`.
+- The defect is #173's (D-109, 0064770): replicas created by an install, and so this
+  straddle, first exist there.
+- 6cc89db moved `RaftSnapshot { taken: false }`, the skip's event, ahead of the store's
+  open and the read-back. That widened the gap before the restatement, and both seeds
+  land in it.
+- Schedules differ across those commits, so whether another seed reaches the narrower gap
+  at 0059470 is not measured.
+
+**What is built** (`sim/raft.rs`, the pre-vote fold).
+- **A new term source.** An install's creation, `RangeCreated { cause: snapshot }`, is now
+  a term source. Its term is the term of the replica's restatement after it: `RaftRecovered
+  { term }` and then `RaftTerm` of that term, role `follower`, no receipt
+  (`Report::installed_term`).
+- **Tied to the stream.** That term is taken only where it equals the term of the stream
+  the install completed (`Report::install_stream_terms`). The stream is the last
+  `InstallSnapshot` chunk marked done for the creation's snapshot, the same floor index and
+  term, delivered to the node before the creation. Its term is the stream's identity's,
+  which the switch writes as the replica's term.
+- **Otherwise unchanged.** A creation the trace cannot tie reads as it did before this
+  entry: the source before it, else 0.
+- **What it can still catch.** A restatement of a term above the stream's is not taken. A
+  first term record that is no restatement is not taken. A raise after the restatement is
+  still a raise.
+- **Cost.** `RaftRecovered` joins the fold's records. The stream's term is read by
+  decoding only the payloads delivered to the node, backwards from each install's creation,
+  which is rare.
+
+**What the check still trusts**, written down rather than built around. It pairs the
+creation with a stream by the snapshot's floor index and term, taking the last such done
+chunk delivered before the creation. If two streams of one snapshot at different terms
+both reach the node before its switch, the later one is read. That is the stream a switch
+on the latest chunk installs, and a mismatch reads as a violation, not as an excuse. It
+also trusts that a restatement of exactly that term, after a `RaftRecovered` of it, is the
+creation's own. The trace format is not changed for this.
+
+**Tested.**
+- **The unit test**
+  `an_installs_creation_before_an_isolation_is_read_at_the_term_its_stream_carried` covers
+  four cases on hand-written records:
+  - restated at the stream's term and kept: no violation, where the fold before this entry
+    read "from 0 to 5";
+  - then a candidacy at 6 inside the window: "from 5 to 6";
+  - a first term record that is no restatement: "from 0 to 5";
+  - a restatement above the stream's term: "from 0 to 6".
+- **The pins.** `seed_1817_a_placeholders_install_straddles_an_isolation_and_keeps_its_term`
+  (correct node) and `seed_248_an_installs_stream_term_above_its_floor_straddles_an_isolation`
+  (`ApplyIgnoresSpan`) assert on the trace that:
+  - the creation and the install's `RaftSnapshot` come before the window;
+  - the restatement comes inside it;
+  - the stream's term equals the restatement's (2, and 5 against a floor of 2);
+  - no term moves inside the window;
+  - the check holds the isolation green.
+- **Before the fix**, with the new source switched off, both pins fail in the nightly's
+  exact words, and so does the unit test's first case.
+- **The tiers.** The correct node's sweep passes at a thousand in release, and the three
+  tests the nightly failed pass at ANANKE_SEEDS=10000 in release on this tree. **PROPOSED.**
+
 ---
 
-_Next entry: D-112 (D-110 is reserved for S9). Add one before implementing anything not covered above._
+_Next entry: D-113 (D-110 is S9's, in #180). Add one before implementing anything not covered above._
