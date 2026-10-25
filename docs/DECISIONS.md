@@ -22872,74 +22872,107 @@ ANANKE_DEEP_SEEDS=100 with other slices' runs beside them (load 282 to 294): (i)
 
 ---
 
-## PROPOSED D-111 — D-045's pair on the node differs from the stream half only where a store is refused or a placeholder's reset happens; seed 57, where the pair wedges and neither half does, pinned
+## PROPOSED D-111 — D-045's pair on the node is the stream half's record for record up to the stream half's first progress reset, and is caught differently only past a refused store or a placeholder's reset; seed 57 pinned as the stream half's wedge on a schedule the skipped reset moved
 
 **The number.** Off `main` at 2d59c96 (#173 and #174 merged, D-109), whose footer reads
 D-110. D-110 is reserved for S9, the overlap rule, which D-109 §2 names and another slice is
-building. This entry takes D-111, and the footer moves to D-112; at S9's merge the entries
+building. This entry takes D-111, and the footer moves to D-112. At S9's merge the entries
 are a union in numerical order with one footer, the highest plus one. Every code site
 carries `// PROPOSED(D-111)`.
 
-**Context.** Found by #174's premerge at 0e07274, on the pair test's seed 57; a correction to
-what D-086 says of the pair on the node, made true by D-109's placeholders. `the_pair_on_the_node_is_the_stream_half_alone_where_no_store_is_refused` asserted
-two things:
-- that `{IgnoreIncarnation, SharedSnapshotDir}` is caught on exactly the seeds
-  `SharedSnapshotDir` alone is;
-- that no seed catches the pair and neither half.
+**Context.** #174's premerge at 0e07274 failed
+`the_pair_on_the_node_is_the_stream_half_alone_where_no_store_is_refused` on seed 57 of its
+share of a hundred. That test asserted two things of `{IgnoreIncarnation, SharedSnapshotDir}`
+on the node:
+- it is caught on exactly the seeds `SharedSnapshotDir` alone is caught on;
+- no seed catches the pair and neither half.
 
-Both rested on D-086's reading: a store's incarnation changes only at a re-seed, so on the
-node the incarnation half has nothing to ignore. The placeholders end that. A placeholder
-answers with store incarnation 0. The replica its node creates next, by its apply of the
-split or by the install, answers with the fresh incarnation it drew (Q26). The correct
-leader resets the follower's progress at that change (D-042), and `IgnoreIncarnation`
-does not. This is the reset the incarnation test excuses once per leader and placeholder
-(#173's review, N1).
+Both rested on D-086's reading that a store's incarnation changes only at a re-seed, so on
+the node the incarnation half has nothing to ignore.
+
+D-109's placeholders end that. A placeholder answers with store incarnation 0. The replica
+its node creates next, by its apply of the split or by the install, answers with the fresh
+incarnation it drew (Q26). The correct leader resets the follower's progress at that change
+(D-042). `IgnoreIncarnation` does not: it returns before the reset and before its trace
+(`ananke-raft`'s `core.rs`, `note_incarnation`). This is the reset the incarnation test
+excuses once per leader and placeholder (#173's review, N1).
 
 Introduced at 0064770, the placeholders' first commit. Seed 57 runs green under all four
-systems on b21d76e, which has no placeholder.
+systems on b21d76e, which has no placeholder. The correct node passes seed 57 on every tree.
 
-**Measured** in release, seeds `0..n` of the test's share:
+**Measured** in release over the test's share, seeds `0..n`. The figures reproduced in
+#179's review.
 
 | Share | Pair caught | Stream half caught | Pair only | Stream half only | Seeds with a placeholder's reset |
 |---|---|---|---|---|---|
 | 100 (premerge) | 32 | 33 | 1 (57) | 2 (40, 76) | 17 |
 | 1 000 (nightly) | 284 | 284 | 19 | 19 | 202 |
 
-On every seed of both shares where the two differ, the stream half's leader reset a
-follower's progress past its placeholder, and no store was refused. The correct node passes
-seed 57, and so does each half alone.
+- On every seed of both shares where the two are caught differently, the stream half's
+  leader reset a follower's progress past its placeholder, and no store was refused on
+  either run.
+- The split is even, 19 and 19. An interaction where the pair's stale progress were itself
+  the wedge would make the pair's catches a superset of the stream half's. An even split is
+  what a schedule moved one way or the other looks like.
 
-**What changed in the tests.**
-- The equality is replaced by what is now exactly true, seed for seed: the pair and the
-  stream half differ only on a seed where a store was refused or a placeholder's reset
-  happened.
-- The test is renamed
+**Seed 57 is not D-045's wedge** (corrected before this entry merged; #179's review, B1). As
+first written, this entry called seed 57 "a wedge needing both bugs" and asked the owner to
+adopt it as the pair's pin. The review traced the chain past the point where the schedules
+part, and the pin now asserts each step:
+1. **The placeholder.** Range 5's split at 37 makes right half 14, led by node 3. Node 2
+   makes a placeholder of 14, which answers 14's leader with store incarnation 0, before
+   its own apply of the split creates 14.
+2. **The reset.** Under the stream half alone, the run's one `RaftProgressReset` is node 3's
+   of node 2 in 14, at the change to the fresh incarnation. The pair's run is the stream
+   half's record for record up to that reset. `IgnoreIncarnation` acts on no other range.
+3. **The extra takes.** Without the reset node 3 keeps node 2's next index at 1, below 14's
+   floor at 37, and designates node 2 for a snapshot it does not need. Under
+   `SharedSnapshotDir` it takes 14 again and again: eleven times to 9.585 s, until, by the
+   review's instrumentation, it loses 14's quorum. The stream half takes 14 no more after the reset. The schedule moves
+   from there.
+4. **The stall.** On the moved schedule range 5's leader, node 2, asks streams that wait
+   behind range 4's stream and are given up. It then fails its lookups for a complete
+   version and retakes. That much is the review's instrumentation (209 failed lookups); the
+   pin asserts what the trace shows: 48 takes after the last heal (13.453 s), no stream opened, no write
+   applied to `k6`. This is `SharedSnapshotDir`'s own retake loop. The stream half runs it on
+   this seed too (12 takes after the heal) and gets out of it.
+
+So the incarnation half's part is a short-lived, unneeded snapshot designation on range 14,
+which moves the schedule. The wedge on the moved schedule is the stream half's.
+
+**The correct node makes no `RaftProgressReset` on seed 57.** Its schedule is not the
+variants'. On it, node 2's placeholder of 14 is sent no `AppendEntries` before the split's
+apply creates 14, so it answers none with store incarnation 0, and the leader sees no change
+to reset at. D-042's situation is reached on this seed only on `SharedSnapshotDir`'s
+schedule. The pin asserts that, with this reason.
+
+**What changes in the tests.**
+- **The records claim.** The equality of catches is replaced, seed for seed, by what
+  determinism makes exactly true. `IgnoreIncarnation` acts only at an incarnation change,
+  which is where the stream half's leader traces its reset. So the pair's run is the stream
+  half's record for record up to the stream half's first reset, and the whole of it where
+  there is none. This is asserted on every seed of the share. Nothing is claimed past that
+  record, where the schedules part (#179's review, N1).
+- **The catches claim.** The two runs are caught differently only where the stream half's
+  leader reset a follower's progress past its placeholder, or a store was refused on one of
+  the two compared runs (#179's review, N2). The third run, `IgnoreIncarnation` alone, no
+  longer counts toward that excuse.
+- **The rename.** The test is renamed
   `the_pair_on_the_node_is_the_stream_half_alone_where_no_store_is_refused_and_no_placeholder_reset`.
-- The pair-only seeds are printed. The first of them is pinned:
-  `seed_57_the_pair_wedges_where_neither_half_does_past_a_placeholders_reset`.
+- **The shared helper.** The placeholder-reset bound is one function,
+  `resets_past_placeholders`, read by this test and by the incarnation test (#179's review,
+  N3).
+- **The pin.** `seed_57_the_pair_is_the_stream_halfs_wedge_on_a_schedule_its_skipped_reset_moved`
+  asserts steps 1 to 4 and the correct node's absent reset, with its reason. It drops the
+  assertion that the pair traces no reset, which could not fail.
 
-**Seed 57's mechanism, as the pin asserts it.**
-1. Range 5's split at 37 makes right half 14, led by node 3.
-2. Node 2 makes a placeholder of 14 before its own apply of the split creates 14.
-3. Under the stream half alone the run's one `RaftProgressReset` is node 3's of node 2 in
-   14, and the run passes.
-4. Under the pair no leader resets any follower, and range 5 completes no write to `k6`
-   after the last heal.
+The pair's catch is still not asserted at any tier, and the incarnation half alone is still
+caught on no seed (0 of 1 000).
 
-How the skipped reset on 14 leads to range 5's stall is not traced past the point where the
-schedules part. Range 5's leader, node 2, takes a checkpoint over and over and commits
-nothing it proposes. No other bound moves. The pair's catch is still not asserted at any
-tier, and the incarnation half alone is still caught on no seed (0 of 1 000).
-
-**For the owner.** D-045's wedge needing both bugs is now reachable on the node through a
-placeholder rather than a re-seed: 19 seeds in 1 000 catch the pair and neither half alone.
-SHARD.md's Stage B search for such a seed now has an answer on the node. Whether seed 57
-should become the pair's pin in place of D-086's absence is the owner's to rule.
-
-**Corrects** D-086's "the pair on the node is the stream half alone until Q15's re-seed", as
-D-109's placeholders make it false. D-109 itself is unchanged; this is the entry its
-placeholders' effect on the pair is recorded in. **PROPOSED.**
-
+**Corrects** D-086's "the pair on the node is the stream half alone until Q15's re-seed",
+which D-109's placeholders made false. SHARD.md's Stage B search for a seed where the pair
+wedges and neither half does still has no answer on the node: seed 57 is not one. D-109 is
+unchanged; this entry records its placeholders' effect on the pair. **PROPOSED.**
 ---
 
 _Next entry: D-112. Add one before implementing anything not covered above._

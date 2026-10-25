@@ -606,7 +606,7 @@
 5	node	18.0	a_placeholder_that_grants_votes_is_caught_by_check_20
 5	split	0.1	a_node_configured_with_other_than_three_bootstrap_nodes_stops_and_says_why
 5	install	56.9	a_joiner_reseeded_gets_its_replicas_back_quarantined_and_grants_nothing
-5	node	0.9	seed_57_the_pair_wedges_where_neither_half_does_past_a_placeholders_reset
+5	node	0.9	seed_57_the_pair_is_the_stream_halfs_wedge_on_a_schedule_its_skipped_reset_moved
 5	split	226.1	every_seed_of_the_overlap_shape_passes_on_the_correct_node
 # shard 6: 1832.3 cpu s
 6	echo	0.1	a_busy_looping_task_fails_the_scenario_instead_of_hanging
