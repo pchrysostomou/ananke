@@ -414,6 +414,19 @@
 # test 46.1 -> 41.0, the correct node's 39.4 -> 36.1, D-049's site 78.1 -> 72.9 and seed 2994's
 # pin 0.1 -> 0.1, lower for the machine despite the fold (D-096 re-weighed every node row on a
 # four-core Xeon container). Each keeps its shard.
+# PROPOSED D-107 (restatement, check 8) added two `node` rows, weighed on its tree from the built
+# release binary (`node-<hash> <test> --exact`) at ANANKE_SEEDS=1000 ANANKE_DEEP_SEEDS=100, as
+# user + sys, on an Apple M2 of 8 cores on AC Power with two other slices' gates and probes beside
+# it (load averages about 350): check 8 under the equivalence test, twenty seeds of six systems at
+# eight prefixes and the correct node's seed 45, at 22.1 cpu s (21.33 + 0.74, 13.43 s real); seed
+# 45's pin, one run, at 0.4 (0.35 + 0.02, 0.95 s real). Longest-first into the lightest shard,
+# shard 5 for both: 1626.0 -> 1648.1 -> 1648.5. The correct node's sweep folds the range layer's
+# checker once more per seed for its coverage (restatements, statements, check 8's right half);
+# its row is not re-weighed here, which the premerge's node time shows.
+# At D-107's merge with `main` at 5e3d575 (D-106), D-107's check 8 test
+# (`check_8_agrees_with_its_whole_trace_fold_on_the_node`, shard 5, 22.1) is removed: D-106's
+# per-pair tests compare check 8's two clauses as folds. Shard 5 is main's 1677.9 plus seed 45's
+# pin, 1678.3; no row is re-weighed or re-placed.
 # shard	binary	cpu_s	test
 # shard 1: 1977.1 cpu s
 # D-095 added two rows, both `node`, weighed on its tree from the built release binary
@@ -514,7 +527,7 @@
 4	node	0.5	seed_368_is_a_live_installs_hold_and_the_fourth_arm_answers_for_it
 4	node	34.2	a_node_that_resumes_another_runs_block_of_ids_is_caught_after_a_split
 4	node	27.8	the_range_layers_folds_agree_one_by_one_and_checks_9_and_10_trip_under_apply_ignores_span
-# shard 5: 1677.9 cpu s
+# shard 5: 1678.3 cpu s
 5	echo	6.0	every_seed_satisfies_the_invariants_and_the_sweep_exercises_the_disk_faults
 5	engine	19.5	a_seek_that_counts_tombstones_is_caught
 5	node	58.8	a_leader_that_ignores_incarnations_has_an_incarnation_to_ignore_only_where_a_store_is_refused
@@ -538,6 +551,7 @@
 5	node	31.2	the_range_layers_folds_agree_one_by_one_on_the_correct_node
 5	node	29.3	the_range_layers_folds_agree_one_by_one_and_check_16_trips_under_meta_overwrites_by_arrival
 5	node	23.1	the_range_layers_folds_agree_one_by_one_and_check_18_trips_under_id_block_resumed
+5	node	0.4	seed_45_restates_a_voter_installed_past_a_split_without_its_right_half
 # shard 6: 1658.3 cpu s
 6	echo	0.1	a_busy_looping_task_fails_the_scenario_instead_of_hanging
 6	engine	310.3	an_engine_that_acknowledges_before_the_log_is_caught

@@ -409,6 +409,16 @@ nodes in the scenario that drives it, and a core's events carry the range its
 | `ClientInvoke` | a client operation starts | `client`, `seq`, `op` |
 | `ClientReturn` | it returns | `client`, `seq`, `result` |
 
+The range layer's events — a replica's creation, its descriptor, a split — are SHARD.md
+§8's table, not this one. Where they meet this table's: a node's start restates every
+replica as above, `RaftRecovered` then `RaftTerm`, and then, for an initialised replica,
+its descriptor as a `RangeDescriptor` at the replica's applied index; `RangesRestated`
+closes the node's restatement. A live install that changes an initialised replica's
+descriptor traces a `RangeDescriptor` at the snapshot's last index after the switch's
+`RaftRecovered`. Both carry the applied index as `index` too, and follow the
+`RaftRecovered` that states it, which is how check 7 tells them from an apply's change
+(PROPOSED D-107).
+
 Each event carries the node's persistent term, so the studio's per-term filter (issue
 #3) needs nothing more. Every check reads the trace of a run. Checks 1 to 4 and the
 three rule folds below are folds in `ananke_raft::invariants`, run as one incremental

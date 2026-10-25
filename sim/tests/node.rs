@@ -401,6 +401,16 @@ struct Coverage {
     /// asserted, because this node has no follower compaction to bound it.
     largest_follower_log: u64,
     follower_log_multiples: BTreeMap<u64, u64>,
+    /// The restatements check 7 reads (SHARD.md §8; PROPOSED D-107): the nodes'
+    /// `RangesRestated`, and the descriptors stated at an applied index an apply did
+    /// not reach — restated at a start, or changed by an install — which check 7
+    /// holds to its map.
+    restatements: usize,
+    descriptors_stated: usize,
+    /// Check 8's right-half clause over the correct node, **folded and not asserted**
+    /// (PROPOSED D-107): the seeds on which a voter of a parent at its split restated
+    /// the parent at or past the split without the right half, with the violation.
+    right_half_not_restated: Vec<(u64, String)>,
 }
 
 /// Everything but the two sample vectors, which are summarised.
@@ -492,6 +502,9 @@ impl std::fmt::Debug for Coverage {
             .field("busiest_range_per_second", &self.busiest_range_per_second)
             .field("largest_follower_log", &self.largest_follower_log)
             .field("follower_log_multiples", &self.follower_log_multiples)
+            .field("restatements", &self.restatements)
+            .field("descriptors_stated", &self.descriptors_stated)
+            .field("right_half_not_restated", &self.right_half_not_restated)
             .finish()
     }
 }
@@ -500,6 +513,17 @@ impl Coverage {
     fn add(&mut self, report: &raft::Report) {
         use ananke_env::{ClientOp, DropReason, TraceEvent};
         self.seeds += 1;
+        // PROPOSED(D-107): the restatements, and the descriptors check 7 holds to its
+        // map as statements.
+        let checker = invariants::folded(&report.records);
+        self.restatements += report.count(|e| matches!(e, TraceEvent::RangesRestated { .. }));
+        self.descriptors_stated += checker.descriptors().statements();
+        // PROPOSED(D-107): check 8's right-half clause, folded over the correct node
+        // and printed, not asserted.
+        if let Err(violation) = checker.verdict_of(Fold::RightHalf) {
+            self.right_half_not_restated.push((report.seed, violation));
+            self.right_half_not_restated.sort();
+        }
         self.uniform_seeds += u64::from(report.uniform());
         self.partitions += report.count(|e| matches!(e, TraceEvent::PartitionStarted { .. }));
         self.crashes += report.count(|e| matches!(e, TraceEvent::NodeCrashed { .. }));
@@ -1058,6 +1082,41 @@ fn every_seed_passes_on_the_correct_node_under_the_raft_sweeps_arms() {
     );
 
     coverage.assert_complete();
+
+    // §8's restatement, which check 7's restatement clause reads: every node restates
+    // every replica it holds at every start, its first included, so three nodes give
+    // at least three a seed (PROPOSED D-107).
+    println!(
+        "node: {} restatements and {} descriptors stated at an applied index an apply did \
+         not reach, over {seeds} seeds",
+        coverage.restatements, coverage.descriptors_stated
+    );
+    assert!(
+        coverage.restatements >= 3 * seeds as usize,
+        "{} restatements over {seeds} seeds: a node that starts traces `RangesRestated` once \
+         it has restated its replicas (SHARD.md §8)",
+        coverage.restatements
+    );
+    assert!(
+        coverage.descriptors_stated >= coverage.restatements,
+        "{} descriptors stated against {} restatements: every node restates at least the \
+         replicas it hosts from its first start, so check 7's restatement clause was fed \
+         nothing to hold (SHARD.md §8)",
+        coverage.descriptors_stated,
+        coverage.restatements
+    );
+    // Check 8's right-half clause, folded over every seed and **not asserted**: on this
+    // tree a voter of P installed past P's split holds no R and gets none back, since a
+    // placeholder (Q22) is what would take R's snapshot, and the restatement after its
+    // next restart reads as an apply of the split without R (PROPOSED D-107, for the
+    // owner). Printed at every tier, with every seed's violation.
+    println!(
+        "node: check 8's right-half clause, folded and not asserted (PROPOSED D-107), finds \
+         a voter of a parent at its split restating the parent at or past it without the \
+         right half on {}/{seeds} seeds: {:?}",
+        coverage.right_half_not_restated.len(),
+        coverage.right_half_not_restated
+    );
 
     // §4's threshold is on the median apply lag, and it is asked **per range**. The
     // pooled median hides a breach: with the scenario's key map answering one range,
@@ -2263,25 +2322,37 @@ fn node_records(seed: u64, taken: &[RangeVariant]) -> Vec<TraceRecord> {
     .records
 }
 
-/// The range layer's seven folds fold by fold on the correct node (SHARD.md §12, Stage
-/// C's exit: "check 7 runs under the test over the correct system and this stage's
+/// The range layer's folds fold by fold on the correct node (SHARD.md §12, Stage C's
+/// exit: "check 7 runs under the test over the correct system and this stage's
 /// variants"), each fed in chunks against its fold over the whole prefix; and no fold
-/// trips, which the correct node's sweep asserts of the checker's one verdict on every
-/// seed. Check 7 runs here and under every pair below; no variant of Stage C's §10 set
-/// trips it, and it is asserted against `SplitNotAtomicWithDescriptor` in Stage D, which
-/// builds that variant (SHARD.md §12) — `AnyFreshNodeBootstraps`, D-096's instrument,
-/// trips it on the membership scenario below.
+/// that stops a run trips ([`Fold::VERDICT`]), which the correct node's sweep asserts
+/// of the checker's one verdict on every seed. Check 7 runs here and under every pair
+/// below; no variant of Stage C's §10 set trips it, and it is asserted against
+/// `SplitNotAtomicWithDescriptor` in Stage D, which builds that variant (SHARD.md §12)
+/// — `AnyFreshNodeBootstraps`, D-096's instrument, trips it on the membership scenario
+/// below.
+///
+/// **Check 8** runs here and under every pair below too, its two clauses a fold each
+/// (PROPOSED D-107). Its right half's clause trips on the correct node itself — a voter
+/// installed past a split holds no right half until placeholders exist — so it is
+/// compared and printed and not asserted absent, and its seed 45
+/// ([`RIGHT_HALF_PINNED`]) is compared fold by fold whatever the tier, out of the tier's
+/// own comparison at the gate's twenty and inside it from CI's hundred, asserting the
+/// clause's words there: the comparison is held in violation, where a fold fed in
+/// chunks that lost its state between them reads `Ok` (#166's review, N7). Its overlap
+/// clause trips on no run of this tree, so its comparison in violation comes with its
+/// tripping variant, S9's `SnapshotOverlapsReplica` (SHARD.md §12).
 // PROPOSED(D-106): the range layer's folds compared fold by fold, per pair.
+// PROPOSED(D-107): check 8's two clauses among them.
 #[test]
 fn the_range_layers_folds_agree_one_by_one_on_the_correct_node() {
-    let found = range_folds_under("the correct node", range_folds_compared(), |seed| {
-        node_records(seed, &[])
-    });
+    let compared = range_folds_compared();
+    let found = range_folds_under("the correct node", compared, |seed| node_records(seed, &[]));
     for (seed, outcome) in found.iter().enumerate() {
+        let stopping = stopping_folds(outcome);
         assert!(
-            outcome.tripped.is_empty(),
-            "seed {seed}: the correct node tripped {:?}",
-            outcome.tripped
+            stopping.is_empty(),
+            "seed {seed}: the correct node tripped {stopping:?}"
         );
     }
     assert!(
@@ -2289,6 +2360,49 @@ fn the_range_layers_folds_agree_one_by_one_on_the_correct_node() {
         "no split took effect on the correct node's compared seeds, so check 18's split \
          clause and every fold reading a split's descriptors compared nothing of one"
     );
+    // PROPOSED(D-107): check 8's right half's clause, compared in violation at every
+    // tier.
+    let (seed, ..) = RIGHT_HALF_PINNED;
+    let words = match found.get(usize::try_from(seed).expect("a small seed")) {
+        Some(compared) => compared.tripped.get(&Fold::RightHalf).cloned(),
+        None => compare_range_folds(seed, "the correct node, pinned", &node_records(seed, &[]))
+            .unwrap_or_else(|mismatch| panic!("{mismatch}"))
+            .tripped
+            .get(&Fold::RightHalf)
+            .cloned(),
+    };
+    assert_eq!(
+        words.as_deref(),
+        Some(right_half_pinned_words().as_str()),
+        "seed {seed}: check 8's right half's clause was not compared in violation in its \
+         pin's shape: a schedule move took the seed off it, so re-pin it to the seed the \
+         correct node's sweep names next, or assert the shape's absence with its reason \
+         (CLAUDE.md)"
+    );
+    let on: Vec<usize> = found
+        .iter()
+        .enumerate()
+        .filter(|(_, outcome)| outcome.tripped.contains_key(&Fold::RightHalf))
+        .map(|(seed, _)| seed)
+        .collect();
+    println!(
+        "range folds: the correct node: check 8's right half's clause, compared and not \
+         asserted absent (PROPOSED D-107), in violation on seeds {on:?} of the {compared} \
+         compared, and compared in violation on the pinned seed {seed} at every tier"
+    );
+}
+
+/// The folds of `outcome` in violation that stop a run ([`Fold::VERDICT`]): every one
+/// but check 8's right half's clause, which a correct system trips until placeholders
+/// exist (PROPOSED D-107).
+// PROPOSED(D-107)
+fn stopping_folds(outcome: &FoldsFound) -> BTreeMap<Fold, &str> {
+    outcome
+        .tripped
+        .iter()
+        .filter(|(fold, _)| Fold::VERDICT.contains(fold))
+        .map(|(fold, words)| (*fold, words.as_str()))
+        .collect()
 }
 
 /// Whether check 9's violation is at an apply — a write applied outside the span of
@@ -2620,12 +2734,127 @@ fn the_range_layers_folds_agree_one_by_one_and_check_7_trips_under_any_fresh_nod
         .records
     });
     for (seed, outcome) in correct.iter().enumerate() {
+        // PROPOSED(D-107): check 8's right half's clause is compared and printed above,
+        // and not asserted absent on a correct system.
+        let stopping = stopping_folds(outcome);
         assert!(
-            outcome.tripped.is_empty(),
-            "seed {seed}: the correct membership node tripped {:?}",
-            outcome.tripped
+            stopping.is_empty(),
+            "seed {seed}: the correct membership node tripped {stopping:?}"
         );
     }
+}
+
+/// The correct node's seed on which check 8's right half's clause trips, in the shape
+/// `seed_45_restates_a_voter_installed_past_a_split_without_its_right_half` asserts:
+/// (seed, node, parent, the split's index, the right half).
+// PROPOSED(D-107)
+const RIGHT_HALF_PINNED: (u64, u32, u64, u64, u64) = (45, 2, 4, 165, 14);
+
+/// Check 8's right half's clause's violation on [`RIGHT_HALF_PINNED`], word for word.
+// PROPOSED(D-107)
+fn right_half_pinned_words() -> String {
+    let (_, node, parent, index, right) = RIGHT_HALF_PINNED;
+    format!(
+        "one owner per key: node {node} is a voter of range {parent}'s configuration at its \
+         split at index {index}, its replica of range {parent} has applied it, and at its \
+         restatement it holds no replica of the right half {right} (SHARD.md §8, check 8)"
+    )
+}
+
+/// **Seed 45 is the shape check 8's right-half clause trips on the correct node**
+/// (PROPOSED D-107): node 2's replica of range 4 lagged the split at index 165 (key
+/// `k5`, right half 14) and was installed P's post-split snapshot at 165 — the install's
+/// `RangeDescriptor`, at generation 2 — without applying the split or creating 14; after
+/// its next restart it restated range 4 past 165 and its `RangesRestated` named no 14,
+/// which the clause reads as an apply of the split without its right half. On this tree
+/// nothing gives that voter its right half (a message for a range a node does not host
+/// is counted and dropped until the placeholders, Q22), so the clause is folded and not
+/// asserted: the correct node's thousand found it on seeds 45 and 878, both this shape.
+/// What is asserted is the mechanism: the run green under every check that is asserted,
+/// check 8's overlap clause green, the right half's clause's violation in its words, the
+/// install past the split, no split applied and no right half created on the node, a
+/// crash after the install, and the restatement after it without the right half. The
+/// day a schedule moves the seed off the shape this pin says so, and moves to the next
+/// seed the correct node's sweep names (`right_half_not_restated`).
+// PROPOSED(D-107): the right half's clause's STOP, pinned where the thousand found it.
+#[test]
+fn seed_45_restates_a_voter_installed_past_a_split_without_its_right_half() {
+    let (seed, node, parent, index, right) = RIGHT_HALF_PINNED;
+    let report = correct(seed);
+    report
+        .check()
+        .unwrap_or_else(|violation| panic!("seed {seed} no longer passes: {violation}"));
+    let checker = invariants::folded(&report.records);
+    assert_eq!(
+        checker.verdict_of(Fold::Overlap),
+        Ok(()),
+        "seed {seed}: check 8's overlap clause"
+    );
+    assert_eq!(
+        checker.verdict_of(Fold::RightHalf),
+        Err(right_half_pinned_words()),
+        "seed {seed}'s schedule has moved off the shape this pin asserts: pin the seed the \
+         correct node's sweep names next, or assert the absence with its reason"
+    );
+    let on = |record: &TraceRecord| record.node.is_some_and(|n| n.get() == node);
+    let installed = report
+        .records
+        .iter()
+        .position(|record| {
+            on(record)
+                && matches!(
+                    &record.event,
+                    TraceEvent::RangeDescriptor { range, applied, generation: 2, .. }
+                        if (*range, *applied) == (parent, index)
+                )
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "seed {seed}: node {node}'s replica of range {parent} was installed no snapshot \
+                 at {index} carrying the split's generation"
+            )
+        });
+    assert!(
+        matches!(
+            &report.records[installed - 1].event,
+            TraceEvent::RaftRecovered { range, applied, .. } if (*range, *applied) == (parent, index)
+        ),
+        "seed {seed}: the install's descriptor does not follow its switch's restatement"
+    );
+    assert!(
+        !report.records.iter().any(|record| on(record)
+            && matches!(&record.event, TraceEvent::RangeSplit { range, .. } if *range == parent)),
+        "seed {seed}: node {node} applied range {parent}'s split itself"
+    );
+    assert!(
+        !report.records.iter().any(|record| on(record)
+            && matches!(&record.event, TraceEvent::RangeCreated { range, .. } if *range == right)),
+        "seed {seed}: node {node} created the right half {right}"
+    );
+    let crashed = installed
+        + report.records[installed..]
+            .iter()
+            .position(|record| {
+                matches!(&record.event, TraceEvent::NodeCrashed { node: n } if n.get() == node)
+            })
+            .unwrap_or_else(|| panic!("seed {seed}: node {node} never crashed after the install"));
+    let restated = report.records[crashed..]
+        .iter()
+        .find_map(|record| match &record.event {
+            TraceEvent::RangesRestated { ranges } if on(record) => Some(ranges.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("seed {seed}: node {node} never restated after its crash"));
+    assert!(
+        restated.contains(&parent) && !restated.contains(&right),
+        "seed {seed}: node {node}'s restatement after its crash named {restated:?}"
+    );
+    println!(
+        "seed {seed}: node {node}'s replica of range {parent} installed past the split at \
+         {index} at {:?}, crashed at {:?}, and restated {restated:?} without the right half \
+         {right}",
+        report.records[installed].at, report.records[crashed].at
+    );
 }
 
 fn median_of(sorted: &[Duration]) -> Option<Duration> {

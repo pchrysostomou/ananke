@@ -101,6 +101,60 @@ ananke/
 
 _Update this section at the end of every session._
 
+- Branch `phase-3-stage-c-restatement-check8` (2026-10-18), off `main` at 6633266, PR
+  #166, PROPOSED D-107 (footer D-109 since the merge of `main` at 5e3d575), **Stage C's
+  restatement, check 7's restatement clause, check 8, the install traces and the
+  non-voter's delete** (#162's S6, continued
+  from an earlier agent's uncommitted tree, which this kept and split into commits). Four
+  steps, each its own commit on a green gate. (1) #139: a split's replica that is not a
+  voter of P at `s` writes its batch and removes the right span in **one manifest switch**,
+  `RaftStore::apply_removing`, the batch riding as the repair of an install of nothing
+  (D-054, D-068), no new engine primitive; unreached by any sweep, held by a directed crash
+  test of both shapes on 60 seeds (one step: whole 12, none 48, never a mix; the old two
+  steps: split applied over the right span's keys on 40). (2) Every start traces each
+  initialised replica's `RangeDescriptor` at its applied index and `RangesRestated`; an
+  install that changes an initialised replica traces its `RangeDescriptor` after the
+  switch's restatement; an install's creation names the snapshot's generation and voters;
+  check 7 holds every statement — a `RangeDescriptor` at or below the replica's last traced
+  applied index — to its map at that index, in either order, a later generation waiting for
+  the change it holds. **Measured to move no schedule**: 1 000 of 1 000 correct-node seeds,
+  100 seeds each of the membership, ranges, sharded quorum, re-seed and install
+  scenarios, of `SharedSnapshotDir` and `ApplyWaitsForEveryRange` and of seven variants'
+  node sweeps, and every pin, hash the same trace with the three kinds left out; 6 902 restatements, 44 134 descriptors restated and 16 installs that
+  changed a descriptor over the thousand, none in violation. (3) The `snapshot` task's plan
+  re-hosted at a switch that moves the span, as a split's apply does: **moves 7 of 1 000
+  correct-node schedules** (and 12 / 4 of 100 under `SharedSnapshotDir` /
+  `ApplyWaitsForEveryRange`), no pinned seed. (4) Check 8 (`OneOwnerPerKey`): the overlap
+  clause in the range layer's verdict, 0 of 1 000 on the correct node; **the right half's
+  clause trips on the correct node, 2 of 1 000 (seeds 45 and 878) and 13 of 10 000 — a
+  defect of the check, not of the system**: a voter of P
+  that lagged the split is installed P's post-split snapshot, holds no R (nothing creates it
+  before the placeholders), restarts and restates P past `s`, which §8's clause reads as an
+  apply of `s`. Folded, printed at every tier, under the equivalence test with seed 45
+  compared in violation, seed 45 pinned with its mechanism, **not asserted**; the owner's
+  question in D-107 with a recommendation. Mutations, each planting a patch on the PR: the
+  split's batch without P's descriptor, 98 of 100 (check 7's restatement clause 90, check
+  8's overlap clause 90 read apart); a restart reopening no right half, 98 of 100 by the
+  right half's clause alone; a voter's split writing no right half, 100 of 100.
+  **#126 left open**: restating each snapshot record's `taken` as the one-group server
+  does catches `SnapshotWithoutCurrentLast` on 19 of 1 000 by state machine safety, but
+  fails the correct node's pre-vote check on seed 358 (the node stamps a message's receipt
+  at its round's drain, D-073, and the restatement's "installed" had hidden it); issue #167.
+  Measured on an Apple M2 under two other slices' load (~450); the premerge and the nightly
+  are in the PR. **After #166's review** (one adversarial reviewer): check 7 holds a
+  statement with no value under it until one lands, never as a value (B1, the review's
+  trace a unit test in both orders); check 8's right half's clause knows a split from its
+  first `RangeSplit` and reads a restatement again when a split becomes known after it
+  (B2: a voter's split writing no right half now 100 of 100, where it was 0); both measured
+  to move no verdict and no schedule, and the clause still 2 of 1 000 on the correct node.
+  The non-voter's step leaves an entry its parent's own install moved past (N1, a directed
+  unit test); its directed crash test holds the keys outside the removed span (N8); the
+  install creation's reading is a tested function (N4). Issues #169 to #172. Merged with
+  `main` at 5e3d575 (#163, D-106): check 8's two clauses are `Fold::Overlap` and
+  `Fold::RightHalf`, compared fold by fold under every pair, the overlap clause last in
+  `Checker::verdict` and the right half's not in it; the old check 8 test and its nightly
+  row removed, seed 45 compared in violation at every tier; a planted fold that loses its
+  state between chunks fails the correct node's test on seed 45 (N7, D-107 section 8).
 - Branch `phase-3-stage-c-fold-equivalence` (2026-10-18), off `main` at 6633266 and merged
   with it at f8a15a7 (#161) and 6370823 (#164), PROPOSED D-106 (footer D-109, D-107 being
   #166's), PR #163, **each of the range layer's folds keeps a verdict of its own and runs
