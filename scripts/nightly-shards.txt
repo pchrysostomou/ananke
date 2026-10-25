@@ -443,6 +443,11 @@
 # shard 4 at 1666.5 -> 1684.9, then shard 5 at 1678.3 -> 1696.3. Check 16's comparison, which
 # now also compares its two pinned seeds where the tier does not, keeps its row: at the
 # thousand it compares a hundred seeds that include both (32.4 + 1.1 measured beside them).
+# PROPOSED D-109 §6 (D-045's pair on the node, seed 57) renamed one `node` row in place, the pair
+# test, now `..._where_no_store_is_refused_and_no_placeholder_reset`, keeping its shard and weight,
+# and added seed 57's pin, four runs of one seed, weighed on its tree from the built release
+# binary at ANANKE_SEEDS=1000 ANANKE_DEEP_SEEDS=100, as user + sys, two runs: 0.9 cpu s (0.91 +
+# 0.02 both times). Into the lightest shard, shard 4 at 1684.9 -> 1685.8.
 # shard	binary	cpu_s	test
 # shard 1: 1977.1 cpu s
 # D-095 added two rows, both `node`, weighed on its tree from the built release binary
@@ -512,11 +517,11 @@
 3	raft	0.2	the_membership_scenario_has_byte_identical_traces_for_one_seed
 3	reseed	95.8	the_reseed_shape_holds_on_every_seed
 3	wal	21.2	a_log_that_acknowledges_before_syncing_is_caught
-# shard 4: 1684.9 cpu s
+# shard 4: 1685.8 cpu s
 4	echo	0.1	same_seed_gives_byte_identical_trace
 4	engine	210.8	the_correct_engine_passes_every_seed
 4	engine	38.6	an_install_that_switches_one_span_at_a_time_is_caught
-4	node	159.6	the_pair_on_the_node_is_the_stream_half_alone_where_no_store_is_refused
+4	node	159.6	the_pair_on_the_node_is_the_stream_half_alone_where_no_store_is_refused_and_no_placeholder_reset
 4	node	72.9	d_049s_rule_has_a_site_on_the_node_now_and_its_pair_waits_on_the_scenarios_own_threshold
 4	node	34.9	a_server_whose_refusal_is_not_durable_is_not_re_asserted_on_the_node_yet
 4	node	2.7	a_follower_that_truncates_on_every_append_is_caught_on_the_node
@@ -544,6 +549,7 @@
 4	node	34.2	a_node_that_resumes_another_runs_block_of_ids_is_caught_after_a_split
 4	node	27.8	the_range_layers_folds_agree_one_by_one_and_checks_9_and_10_trip_under_apply_ignores_span
 4	node	18.4	the_range_layers_folds_agree_one_by_one_and_check_20_trips_under_uninitialised_replica_votes
+4	node	0.9	seed_57_the_pair_wedges_where_neither_half_does_past_a_placeholders_reset
 # shard 5: 1696.3 cpu s
 5	echo	6.0	every_seed_satisfies_the_invariants_and_the_sweep_exercises_the_disk_faults
 5	engine	19.5	a_seek_that_counts_tombstones_is_caught
